@@ -12,6 +12,7 @@
 //! | Test | Criterion |
 //! |---|---|
 //! | `fail_db_checkout_fires_on_exactly_the_third_checkout` | AC2 — the DB-checkout effect class fails deterministically, targetable by ordinal |
+//! | `fail_db_checkout_on_targets_a_named_pool` | AC2 — the ordinal is counted on the *named pool's* own counter, and a plan naming a pool the app does not have fires nothing |
 //! | `db_checkout_fault_is_captured_as_a_server_error_via_reporting` | AC4 — the 5xx the fault produced is captured through `reporting.rs` into the structured outcome |
 //! | `fault_plan_composes_with_a_user_db_interceptor` | AC1 — the plan drives the fault through the existing `DbConnectionInterceptor` seam and composes with (never replaces) a user-installed one |
 //! | `same_seed_replays_a_byte_identical_db_outcome_100_times` | the issue's success metric, on the DB lane |
@@ -44,6 +45,10 @@ const SEED: u64 = 0x5EED;
 
 /// Requests driven by the explicit-ordinal scenarios.
 const REQUESTS: usize = 5;
+
+/// Requests driven by the named-pool scenario: enough to show the fault firing
+/// once and the checkouts either side of it succeeding.
+const NAMED_POOL_REQUESTS: usize = 4;
 
 /// Requests driven by the seed-derived replay scenario, matching the
 /// `random_db_checkout_faults` range below so every drawn ordinal is reachable.
@@ -165,6 +170,108 @@ async fn fail_db_checkout_fires_on_exactly_the_third_checkout() {
         outcome.final_state.db_checkouts,
         u64::try_from(REQUESTS).expect("request count fits in u64"),
         "every checkout is counted, fired or not"
+    );
+}
+
+/// AC2 (per-target ordinals on the database lane): `fail_db_checkout_on` counts
+/// its ordinal on the **named pool's own** counter, and a plan naming a pool
+/// this app does not have quietly fires nothing rather than falling back to
+/// "any pool".
+///
+/// Both halves matter. The first pins the targeting: naming `primary` and
+/// ordinal 2 must fail the 2nd checkout on that pool, with `target` and
+/// `target_ordinal` on the record saying so — an implementation that ignored
+/// the pool name and used the global counter would pass a single-pool test by
+/// accident, which is why the record is asserted field by field.
+///
+/// The second is the negative control, and it is the one an
+/// "unrecognised name falls through to the global counter" bug fails: a plan
+/// aimed at `replica` on a `primary`-only app must leave every request at 200
+/// and land the entry in [`FaultOutcome::unfired`] — planned, never reached —
+/// rather than silently faulting `primary` instead. `unfired` also carries the
+/// pool name, so a mistyped target is visible in the outcome record instead of
+/// looking like a scenario that simply did not trigger.
+#[tokio::test(start_paused = true)]
+async fn fail_db_checkout_on_targets_a_named_pool() {
+    // ── The pool the app actually has ───────────────────────────────────
+    let sim = mount(
+        SEED,
+        FaultPlan::from_seed(SEED).fail_db_checkout_on("primary", 2),
+    );
+
+    let mut statuses = Vec::with_capacity(NAMED_POOL_REQUESTS);
+    for _ in 0..NAMED_POOL_REQUESTS {
+        statuses.push(sim.client().get("/touch").send().await.status.as_u16());
+    }
+    assert_eq!(
+        statuses,
+        vec![200, 503, 200, 200],
+        "only the 2nd checkout on the named pool fails"
+    );
+
+    let outcome = sim.client().fault_outcome().await;
+    assert_eq!(
+        outcome.fired.len(),
+        1,
+        "exactly one planned fault fired; got {:?}",
+        outcome.fired
+    );
+    let fired = &outcome.fired[0];
+    assert_eq!(fired.effect, FaultEffect::DbCheckout);
+    assert_eq!(
+        fired.target, "primary",
+        "the named pool is the one that failed"
+    );
+    assert_eq!(
+        fired.target_ordinal, 2,
+        "the 2nd checkout on `primary` specifically"
+    );
+    assert!(outcome.suppressed.is_empty());
+    assert!(
+        outcome.unfired.is_empty(),
+        "the named ordinal was reached; got {:?}",
+        outcome.unfired
+    );
+
+    // ── A pool this app does not have ───────────────────────────────────
+    let absent = mount(
+        SEED,
+        FaultPlan::from_seed(SEED).fail_db_checkout_on("replica", 1),
+    );
+
+    let mut absent_statuses = Vec::with_capacity(NAMED_POOL_REQUESTS);
+    for _ in 0..NAMED_POOL_REQUESTS {
+        absent_statuses.push(absent.client().get("/touch").send().await.status.as_u16());
+    }
+    assert_eq!(
+        absent_statuses,
+        vec![200; NAMED_POOL_REQUESTS],
+        "a plan aimed at a pool the app does not have must not fault the pool it does"
+    );
+
+    let absent_outcome = absent.client().fault_outcome().await;
+    assert!(
+        absent_outcome.fired.is_empty(),
+        "nothing may fire against an absent pool; got {:?}",
+        absent_outcome.fired
+    );
+    assert_eq!(
+        absent_outcome.unfired.len(),
+        1,
+        "the planned-but-never-reached entry is reported; got {:?}",
+        absent_outcome.unfired
+    );
+    assert_eq!(absent_outcome.unfired[0].effect, FaultEffect::DbCheckout);
+    assert_eq!(
+        absent_outcome.unfired[0].target.as_deref(),
+        Some("replica"),
+        "the outcome names the pool the plan was aiming at"
+    );
+    assert_eq!(absent_outcome.unfired[0].ordinal, 1);
+    assert_eq!(
+        absent_outcome.final_state.db_checkouts,
+        u64::try_from(NAMED_POOL_REQUESTS).expect("request count fits in u64"),
+        "the checkouts still happened; they just were not the plan's target"
     );
 }
 

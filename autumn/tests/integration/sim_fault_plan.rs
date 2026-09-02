@@ -18,13 +18,17 @@
 //!
 //! | Test | Criterion |
 //! |---|---|
+//! | `a_test_app_without_a_plan_is_unchanged` | AC1/AC5 control — an app with no plan attached behaves exactly as before, and the worked example's charge is only lost *because* of the plan |
 //! | `fail_job_execution_fires_on_exactly_the_target_ordinal` | AC2 — the job-execution effect class fails deterministically, targetable by ordinal |
 //! | `fail_job_targets_a_named_job_by_its_own_ordinal` | AC2 — per-target ordinals are counted per job name, not globally |
 //! | `fault_plan_composes_with_a_user_job_interceptor` | AC1 — the plan drives faults through the existing `interceptor.rs` traits, composing with (never clobbering) a user interceptor and the always-on job recorder |
+//! | `fault_plan_composes_with_an_active_chaos_lane` | AC1 — an authored plan and a probabilistic `Chaos` lane coexist; neither clobbers the other's interceptor or clock |
 //! | `fault_timing_is_gated_by_the_injected_clock` | AC3 — the fault window is read from the app's injected `ClockSource`, so no wall-clock read leaks in |
 //! | `outcome_is_serializable_and_round_trips` | AC4 — the run produces a structured, serializable outcome record |
 //! | `same_seed_replays_a_byte_identical_outcome_100_times` | the issue's success metric — 100 consecutive replays of one seed, byte-identical |
 //! | `worked_example_charge_card_fails_before_the_fix_and_passes_after` | AC5 — one scenario failing before a fix and passing after |
+//! | `a_multi_worker_config_is_rejected_at_build_time` | the determinism guards in `TestApp::build` refuse a config that would make ordinals unreplayable |
+//! | `a_sampled_reporting_config_is_rejected_at_build_time` | ditto, for the sampler that would randomly drop 5xx out of the outcome |
 //!
 //! Every test that drives jobs runs under the process-global job runtime lock
 //! (`job::global_job_runtime_test_lock`) and starts from a cleared global job
@@ -41,10 +45,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use autumn_web::app::AppBuilder;
+use autumn_web::config::AutumnConfig;
 use autumn_web::job;
 use autumn_web::plugin::Plugin;
 use autumn_web::prelude::*;
-use autumn_web::sim::{FaultEffect, FaultOutcome, FaultPlan, Sim};
+use autumn_web::sim::{Chaos, FaultEffect, FaultOutcome, FaultPlan, Sim};
 use autumn_web::sim_test;
 use autumn_web::test::TestApp;
 use chrono::{DateTime, TimeZone, Utc};
@@ -170,6 +175,15 @@ impl Plugin for ChargeCardJobPlugin {
     }
 }
 
+/// A do-nothing route, so the build-time guard tests at the bottom of this
+/// module can mount an app that registers **no jobs** — the guards run before
+/// any job runtime starts, so those tests need neither the process-global job
+/// runtime lock nor a drain.
+#[get("/ping")]
+async fn ping() -> &'static str {
+    "pong"
+}
+
 /// Counts execute-seam passes and how many of them came back `Err`.
 ///
 /// Installed via [`TestApp::with_job_interceptor`] alongside a plan, so the
@@ -217,6 +231,73 @@ async fn settle(sim: &Sim) {
         sim.advance(RETRY_WINDOW).await;
         sim.run_to_idle().await;
     }
+}
+
+/// The control for everything below: an app built **without** a plan is
+/// unchanged by this feature.
+///
+/// Two claims, both of which a regression in `TestApp::build`'s wiring would
+/// break silently. First, the no-plan path stays inert: no ledger is created
+/// ([`TestClient::fault_ledger`](autumn_web::test::TestClient::fault_ledger)
+/// returns `None`), the job runs exactly once with no injected failure, and the
+/// always-on job recorder still records the enqueue — i.e. attaching the fault
+/// machinery to `build` did not perturb apps that never opt in.
+///
+/// Second, it is the control for the AC5 worked example
+/// (`worked_example_charge_card_fails_before_the_fix_and_passes_after`): the
+/// *same* `charge_card_v1` job, `max_attempts = 1` and all, records its charge
+/// when no plan is attached. Without this, "the charge is lost" down there
+/// would be equally consistent with a broken job as with a working fault
+/// injector; here it pins the loss on the plan.
+#[sim_test]
+async fn a_test_app_without_a_plan_is_unchanged(mut sim: Sim) {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+    reset_probe_state();
+
+    // ── No plan, the probe job ──────────────────────────────────────────
+    sim.build(TestApp::new().plugin(FaultProbeJobPlugin));
+
+    FaultPlanProbeJob::enqueue(ProbeArgs { id: 7 })
+        .await
+        .expect("enqueue via the in-process job runtime");
+    settle(&sim).await;
+
+    assert!(
+        sim.client().fault_ledger().is_none(),
+        "no plan was attached, so no ledger exists to snapshot"
+    );
+    assert_eq!(
+        *PROBE_RUNS.lock().expect("probe ledger is not poisoned"),
+        vec![7],
+        "the job ran exactly once, unfaulted: no plan means no injected failure and no retry"
+    );
+    assert_eq!(
+        sim.client().enqueued_jobs().len(),
+        1,
+        "the always-on job recorder is untouched by the no-plan path"
+    );
+
+    // ── No plan, the worked example's pre-fix charge job ────────────────
+    let mut control_sim = Sim::from_seed(sim.seed);
+    job::clear_global_job_client();
+    reset_probe_state();
+    control_sim.build(TestApp::new().plugin(ChargeCardJobPlugin));
+
+    ChargeCardV1Job::enqueue(ProbeArgs { id: 0 })
+        .await
+        .expect("enqueue the pre-fix charge job");
+    settle(&control_sim).await;
+
+    assert!(control_sim.client().fault_ledger().is_none());
+    assert_eq!(
+        *CHARGED.lock().expect("charge ledger is not poisoned"),
+        vec![0],
+        "AC5 control: with no plan attached, `charge_card_v1` charges normally — so the \
+         lost charge in the worked example is caused by the plan, not by the job"
+    );
+
+    job::clear_global_job_client();
 }
 
 /// AC2 (job effect class): a plan naming the 2nd job execution fails **exactly**
@@ -442,6 +523,71 @@ async fn fault_plan_composes_with_a_user_job_interceptor(mut sim: Sim) {
     job::clear_global_job_client();
 }
 
+/// AC1 (composition, the other direction): an authored plan and an **active
+/// `Chaos` lane** coexist on the same app.
+///
+/// This is the composition case a user interceptor cannot cover, because
+/// `Sim::build` installs chaos itself: when [`Chaos`] is active it calls
+/// `with_clock` **and** `with_job_interceptor` on the `TestApp` on its way to
+/// `build()`, both of which are last-one-wins slots. So the two lanes are
+/// racing for the same two seams, and a wiring bug in either direction is
+/// plausible: the plan's interceptor could be dropped in favour of the chaos
+/// one, or the plan could take over the clock the skew wrapper installed.
+///
+/// `clock_skew` is chosen because it activates chaos without needing a
+/// database, and because it is the fault class that owns the clock — the seam
+/// the plan reads its window and its `FiredFault` stamps from. All three
+/// claims are asserted at once: the plan's fault fires, the retry it triggers
+/// still carries the job to success, and the chaos lane still recorded its own
+/// (non-firing) enqueue decision.
+#[sim_test]
+async fn fault_plan_composes_with_an_active_chaos_lane(mut sim: Sim) {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+    reset_probe_state();
+
+    sim.chaos(Chaos::default().clock_skew(Duration::from_secs(1)));
+    sim.build(
+        TestApp::new()
+            .plugin(FaultProbeJobPlugin)
+            .with_fault_plan(FaultPlan::from_seed(SEED).fail_job_execution(1)),
+    );
+
+    FaultPlanProbeJob::enqueue(ProbeArgs { id: 0 })
+        .await
+        .expect("enqueue the probe job");
+    settle(&sim).await;
+
+    let outcome = sim.client().fault_outcome().await;
+
+    assert_eq!(
+        outcome.fired.len(),
+        1,
+        "the plan's interceptor survived chaos installing its own; got {:?}",
+        outcome.fired
+    );
+    assert_eq!(outcome.fired[0].ordinal, 1);
+    assert_eq!(outcome.fired[0].target, "fault_plan_probe");
+    assert_eq!(outcome.final_state.job_executions_failed, 1);
+    assert_eq!(
+        outcome.final_state.job_executions_succeeded, 1,
+        "the retry the injected failure caused still ran to success under the skewed clock"
+    );
+    assert_eq!(
+        *PROBE_RUNS.lock().expect("probe ledger is not poisoned"),
+        vec![0],
+        "the handler ran exactly once — on the retry, not on the faulted attempt"
+    );
+
+    assert!(
+        !sim.__chaos_events().is_empty(),
+        "the chaos lane still recorded its enqueue decision: attaching a plan did not \
+         clobber the chaos job interceptor"
+    );
+
+    job::clear_global_job_client();
+}
+
 /// Enqueue one probe, drain it, advance virtual time by `advance_by`, then
 /// enqueue and drain a second — so the plan's 2nd job execution happens at a
 /// known point on the **injected** clock. Returns that run's outcome.
@@ -533,6 +679,13 @@ async fn fault_timing_is_gated_by_the_injected_clock(mut sim: Sim) {
     );
     assert_eq!(outside.suppressed[0].ordinal, 2);
     assert_eq!(outside.suppressed[0].elapsed_ms, 11_000);
+    assert!(
+        outside.unfired.is_empty(),
+        "suppression *consumes* the ordinal: the planned fault was reached and then held \
+         back by the window, which is a different outcome from never being reached at all; \
+         got {:?}",
+        outside.unfired
+    );
     assert_eq!(
         outside.final_state.job_executions_failed, 0,
         "a suppressed fault never fails an attempt"
@@ -708,8 +861,18 @@ fn same_seed_replays_a_byte_identical_outcome_100_times() {
 ///
 /// To reproduce the pre-fix failure against the *fixed* code, revert
 /// `charge_card_v2`'s attribute to `max_attempts = 1` and rerun: the "after"
-/// half below then fails on `charged.contains(&1)`, printing the deterministic
-/// `AUTUMN_SIM_SEED=…` replay line that reruns the identical schedule.
+/// half below then fails on
+/// `assert_eq!(after.final_state.job_executions_succeeded, 1)` — the first
+/// assertion that can tell the two versions apart, since with a single attempt
+/// there is no retry to succeed — and, were that one removed, on
+/// `assert_eq!(charged_after, vec![1])` immediately after it. Either way the
+/// panic prints the deterministic `AUTUMN_SIM_SEED=…` replay line that reruns
+/// the identical schedule.
+///
+/// The control that the *plan* (and not some defect in the job) is what loses
+/// the charge is `a_test_app_without_a_plan_is_unchanged` at the top of this
+/// module: it runs this same `charge_card_v1` with no plan attached and the
+/// charge is recorded normally.
 ///
 /// This is the shape a real regression test takes, and it is only expressible
 /// because the plan names an *ordinal* rather than a probability: "the first
@@ -793,4 +956,49 @@ async fn worked_example_charge_card_fails_before_the_fix_and_passes_after(mut si
     );
 
     job::clear_global_job_client();
+}
+
+/// A plan is only replayable if the surrounding config cannot reorder what it
+/// records, so `TestApp::build` refuses `jobs.workers > 1` up front rather than
+/// producing a scenario that passes locally and flakes in CI.
+///
+/// Two concurrent workers can swap which execution is the Nth, so
+/// `fail_job_execution(2)` would name a different attempt from run to run — the
+/// exact failure the ordinal API exists to rule out. The guard runs before any
+/// job runtime starts, which is why this app registers routes only and needs
+/// neither the process-global job lock nor `#[sim_test]` (a plain paused
+/// current-thread runtime composes with `#[should_panic]`, which the sim macro
+/// does not).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[should_panic(expected = "jobs.workers = 1")]
+async fn a_multi_worker_config_is_rejected_at_build_time() {
+    let mut config = AutumnConfig::default();
+    config.jobs.workers = 2;
+
+    let _client = TestApp::new()
+        .config(config)
+        .routes(routes![ping])
+        .with_fault_plan(FaultPlan::from_seed(SEED).fail_job_execution(1))
+        .build();
+}
+
+/// The companion guard: error-report sampling below `1.0` draws OS randomness,
+/// so a sampled-out 5xx would drop out of `FaultOutcome::server_errors` at
+/// random and the "byte-identical across 100 replays" claim would be false a
+/// fraction of the time. `TestApp::build` refuses that config outright.
+///
+/// Gated on `reporting` because the guard — and the `reporting` config section
+/// it reads — only exist under that feature.
+#[cfg(feature = "reporting")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[should_panic(expected = "reporting.sample_rate = 1.0")]
+async fn a_sampled_reporting_config_is_rejected_at_build_time() {
+    let mut config = AutumnConfig::default();
+    config.reporting.sample_rate = 0.5;
+
+    let _client = TestApp::new()
+        .config(config)
+        .routes(routes![ping])
+        .with_fault_plan(FaultPlan::from_seed(SEED).fail_job_execution(1))
+        .build();
 }
