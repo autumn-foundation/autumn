@@ -34,6 +34,32 @@
 //! `format!`-built URL — is a `syn::Error` naming the annotation that
 //! discharges it, never a silent zero.
 //!
+//! The sweep's counterpart at the other end is the **awaited-call rule**. A
+//! synchronous call handed no tracked handle cannot enqueue, write or call out
+//! (and `spawn` is refused outright), but an awaited one needs no handle at
+//! all: `start_finance_job().await` reaches the global job client and
+//! `svc.notify().await` can build its own `Client`. So an awaited call the
+//! analysis cannot read is refused. Readable means: rooted at a tracked
+//! handle, carrying one as an argument, an already-swept verb (`enqueue*`,
+//! `spawn*`), a constructor, or on the **inert-async allowlist** — which is
+//! exactly:
+//!
+//! * `sleep`, `sleep_until`, `yield_now`, `timeout` (`tokio::time` /
+//!   `tokio::task`); `timeout` awaits the future it is handed, so that future
+//!   is judged at the `await` instead;
+//! * chains whose root binding is named `session`, `flash`, `cache`,
+//!   `cookies`, `cookie_jar` or `csrf`, or whose root parameter is typed
+//!   `Session`, `Flash`, `CookieJar`, `PrivateCookieJar`, `SignedCookieJar`,
+//!   `Csrf`, `CsrfToken` or `Cache…` (through any extractor wrapping it) —
+//!   request-local plumbing that stores no rows a grant governs;
+//! * `.commit()` / `.rollback()`, which end a transaction rather than acting
+//!   through it;
+//! * the guard prologue an attribute macro prepends — a call rooted at
+//!   `autumn_web` whose function is `__`-prefixed, which is what `#[secured]`,
+//!   `#[authorize]`, `#[step_up]` and `#[throttle]` emit ahead of the body.
+//!
+//! Everything else is discharged with `#[agent_effect(none, reason = "…")]`.
+//!
 //! Statement-level escape hatches: `#[agent_effect(writes(Model), ...,
 //! reason = "…")]` declares a site's effects (they are still checked against
 //! the grant — the hatch declares, it never grants), and
@@ -132,6 +158,11 @@ const WRITE_METHODS: &[&str] = &[
     "upsert_many",
     "restore",
     "soft_delete",
+    // `#[repository]` generates `purge(id)` for a soft-delete model: the hard
+    // delete behind the tombstone, bounded to one row by its `find(id)`.
+    "purge",
+    // The counter-cache repair sweep, bounded to one parent row.
+    "recompute_counter_caches_for",
 ];
 
 /// Repository methods whose row count is not bounded at compile time.
@@ -143,6 +174,9 @@ const UNBOUNDED_WRITE_METHODS: &[&str] = &[
     "purge_all",
     "delete_where",
     "update_where",
+    // The counter-cache repair sweep with no parent id rewrites the cached
+    // column on every parent row.
+    "recompute_counter_caches",
 ];
 
 /// Chain methods that leave the invoking tenant or shard. `for_tenant(arg)` is
@@ -815,13 +849,21 @@ struct Analyzer {
     /// Names bound to some other effect verb as a function item, and the path
     /// they were bound to (`let schedule = NotifyFinanceJob::enqueue;`).
     fn_aliases: HashMap<String, syn::Path>,
+    /// Parameter names whose async surface is request-local plumbing
+    /// (`session`, a `CookieJar`, …), read off the signature.
+    inert_roots: HashSet<String>,
+    /// Names bound to a call the analysis could not read. Binding a future and
+    /// awaiting the *name* is the same effect as awaiting the call.
+    unread_futures: HashSet<String>,
 }
 
 impl Analyzer {
-    fn new(handles: HashMap<String, Handle>, action: String) -> Self {
+    fn new(handles: HashMap<String, Handle>, action: String, inert_roots: HashSet<String>) -> Self {
         Self {
             handles,
             action,
+            inert_roots,
+            unread_futures: HashSet::new(),
             effects: Vec::new(),
             seen: HashSet::new(),
             effect_free_sites: Vec::new(),
@@ -1098,7 +1140,7 @@ impl Analyzer {
                 // Remembered so a transaction handed this closure by name is
                 // still walked under the rollback rule (P2-1).
                 Expr::Closure(closure) => {
-                    self.closures.insert(name, closure.clone());
+                    self.closures.insert(name.clone(), closure.clone());
                 }
                 // `let s = tokio::spawn;` — an alias is still a detachment.
                 Expr::Path(path)
@@ -1108,19 +1150,30 @@ impl Analyzer {
                         .last()
                         .is_some_and(|s| SPAWN_FNS.contains(&s.ident.to_string().as_str())) =>
                 {
-                    self.spawn_aliases.insert(name);
+                    self.spawn_aliases.insert(name.clone());
                 }
                 // `let schedule = NotifyFinanceJob::enqueue;` — a function
                 // item bound to a local name. The call site then mentions no
                 // verb the sweep can see, so the aliased *path* is remembered
                 // and the call is classified against it.
                 Expr::Path(path) if is_effect_verb_path(&path.path) => {
-                    self.fn_aliases.insert(name, path.path.clone());
+                    self.fn_aliases.insert(name.clone(), path.path.clone());
                 }
                 _ => {
                     self.closures.remove(&name);
                     self.spawn_aliases.remove(&name);
                     self.fn_aliases.remove(&name);
+                }
+            }
+            // `let fut = start_finance_job(); fut.await;` — binding the future
+            // and awaiting the name is the same effect as awaiting the call,
+            // spelled so the call site carries no `.await` to read.
+            match &*init.expr {
+                head @ (Expr::Call(_) | Expr::MethodCall(_)) if !self.awaited_is_readable(head) => {
+                    self.unread_futures.insert(name.clone());
+                }
+                _ => {
+                    self.unread_futures.remove(&name);
                 }
             }
         }
@@ -1299,7 +1352,7 @@ impl Analyzer {
     #[allow(clippy::too_many_lines)]
     fn expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Await(e) => self.expr(&e.base),
+            Expr::Await(e) => self.awaited(&e.base),
             Expr::Try(e) => self.expr(&e.expr),
             Expr::Paren(e) => self.expr(&e.expr),
             Expr::Group(e) => self.expr(&e.expr),
@@ -1746,7 +1799,12 @@ impl Analyzer {
             if method.method != "dispatch" {
                 continue;
             }
-            let Some(topic) = method.args.iter().find_map(literal_of) else {
+            // `dispatch(&state, "<topic>", &payload)` — the topic is the
+            // second argument, and only the second. Reading "the first
+            // literal anywhere" let a payload literal stand in for a topic
+            // the analysis could not read: `dispatch(&state, &chosen_topic,
+            // "allowed")` recorded the *payload* as the granted topic.
+            let Some(topic) = method.args.get(WEBHOOK_TOPIC_ARG).and_then(literal_of) else {
                 let action = self.action.clone();
                 self.error(
                     method.method.span(),
@@ -1870,7 +1928,7 @@ impl Analyzer {
             "erases a row set nobody bounded"
         } else if CROSS_TENANT_METHODS.contains(&name) {
             "leaves the invoking tenant"
-        } else if name == "dispatch" && literal_arg().is_some() {
+        } else if name == "dispatch" && method.args.len() > WEBHOOK_TOPIC_ARG {
             "fans out to subscriber-supplied URLs"
         } else if OUTBOUND_VERBS.contains(&name)
             && literal_arg().is_some_and(|url| is_absolute_url(&url))
@@ -1970,6 +2028,135 @@ impl Analyzer {
     }
 
     // ── Calls ────────────────────────────────────────────────────────
+
+    /// Walk an awaited expression, and refuse the call at its head when the
+    /// analysis cannot read what awaiting it does.
+    ///
+    /// An `await` is the only place a handler can start work: a synchronous
+    /// call that takes no tracked handle cannot enqueue a job, open a socket
+    /// or write a row without one (and `spawn` is refused outright). An
+    /// awaited one can — `start_finance_job().await` reaches the global job
+    /// client, and `svc.notify().await` can build its own `Client` — and
+    /// neither mentions a handle for the handle-rooted rules to key on.
+    fn awaited(&mut self, base: &Expr) {
+        self.expr(base);
+        let head = strip_transparent(base);
+        if self.awaited_is_readable(head) {
+            // A combinator awaits the future it is handed, so that future is
+            // judged here, where the `await` actually is.
+            if let Expr::Call(call) = head
+                && call_path_name(call)
+                    .is_some_and(|name| ASYNC_COMBINATORS.contains(&name.as_str()))
+            {
+                for arg in &call.args {
+                    let inner = strip_transparent(arg);
+                    if matches!(inner, Expr::Call(_) | Expr::MethodCall(_))
+                        && !self.awaited_is_readable(inner)
+                    {
+                        self.refuse_awaited(inner.span());
+                    }
+                }
+            }
+            return;
+        }
+        self.refuse_awaited(head.span());
+    }
+
+    /// Has the analysis already read what this awaited head does?
+    fn awaited_is_readable(&self, head: &Expr) -> bool {
+        match head {
+            Expr::Call(call) => self.awaited_call_is_readable(call),
+            Expr::MethodCall(mc) => self.awaited_chain_is_readable(mc),
+            // A bound future is the call that produced it, deferred.
+            Expr::Path(path) => path
+                .path
+                .get_ident()
+                .is_none_or(|ident| !self.unread_futures.contains(&ident.to_string())),
+            // `(async move { … }).await`, `if …{…}.await` — the block's own
+            // statements are walked, so there is nothing unread here.
+            _ => true,
+        }
+    }
+
+    /// An awaited path call: `job::enqueue(..)`, `helper(&repo)`, `sleep(d)`.
+    fn awaited_call_is_readable(&self, call: &ExprCall) -> bool {
+        // An unnamed callee, a handle-carrying argument, a closure invoked in
+        // place: every one of these already has its own reading, and its own
+        // refusal when there is none.
+        if immediately_invoked_closure(&call.func).is_some()
+            || call.args.iter().any(|arg| self.carries_handle(arg))
+        {
+            return true;
+        }
+        let Some(name) = call_path_name(call) else {
+            return true;
+        };
+        is_enqueue(&name)
+            || SPAWN_FNS.contains(&name.as_str())
+            || is_constructor_call(call)
+            || INERT_ASYNC_PATHS.contains(&name.as_str())
+            || is_framework_prologue_call(call)
+    }
+
+    /// An awaited method chain: readable when it is rooted at a tracked
+    /// handle, when a swept verb already speaks for it, or when its root is
+    /// request-local plumbing.
+    fn awaited_chain_is_readable(&self, outermost: &ExprMethodCall) -> bool {
+        let mut methods: Vec<&ExprMethodCall> = Vec::new();
+        let mut current = outermost;
+        let root = loop {
+            methods.push(current);
+            match strip_transparent(&current.receiver) {
+                Expr::MethodCall(inner) => current = inner,
+                other => break other,
+            }
+        };
+        if self.expr_handle(root).is_some() || self.container_handle(root).is_some() {
+            return true;
+        }
+        if methods.iter().any(|m| {
+            let name = m.method.to_string();
+            is_enqueue(&name)
+                || SPAWN_FNS.contains(&name.as_str())
+                || INERT_ASYNC_VERBS.contains(&name.as_str())
+                || Self::method_handle(m).is_some()
+                || m.args.iter().any(|arg| self.carries_handle(arg))
+        }) {
+            return true;
+        }
+        self.root_is_inert(root)
+    }
+
+    /// Is this chain root the request-local plumbing the allowlist names?
+    fn root_is_inert(&self, root: &Expr) -> bool {
+        match strip_transparent(root) {
+            Expr::Path(path) => path.path.get_ident().is_some_and(|ident| {
+                let name = ident.to_string();
+                INERT_ASYNC_ROOT_NAMES.contains(&name.as_str()) || self.inert_roots.contains(&name)
+            }),
+            // `state.session`, `self.cache` — the field names the same thing.
+            Expr::Field(field) => {
+                let name = member_name(&field.member);
+                INERT_ASYNC_ROOT_NAMES.contains(&name.as_str())
+            }
+            _ => false,
+        }
+    }
+
+    fn refuse_awaited(&mut self, span: Span) {
+        let action = self.action.clone();
+        self.error(
+            span,
+            format!(
+                "agent authority: this is an awaited call the analysis cannot read, and an \
+                 awaited call needs no handle to act — it can enqueue a job through the global \
+                 client or build an HTTP client of its own — so `{action}`'s effects cannot be \
+                 proven.\n\nMove the effect into this handler, declare what the call does with \
+                 `#[agent_effect(..., reason = \"...\")]`, or — if it is verified to perform \
+                 none — discharge it with `#[agent_effect(none, reason = \"...\")]`. {GUIDE}"
+            ),
+        );
+    }
 
     fn call(&mut self, call: &ExprCall) {
         let name = call_path_name(call);
@@ -2228,7 +2415,12 @@ impl Analyzer {
             self.record(Kind::Job, subject, provenance, span);
             return;
         }
-        let Some(job) = args.iter().find_map(literal_of) else {
+        // Every enqueue API in `autumn_web::job` — free function and
+        // `JobClient` method alike — takes the job name first. Reading "the
+        // first literal anywhere" meant `enqueue_after_commit(&chosen, "ok")`
+        // recorded the *payload* as the job, and the grant checked a name the
+        // call never used.
+        let Some(job) = args.get(JOB_NAME_ARG).and_then(literal_of) else {
             let action = self.action.clone();
             self.error(
                 span,
@@ -2676,6 +2868,48 @@ fn url_defect(url: &str) -> Option<&'static str> {
 const RAW_SQL_FNS: &[&str] = &["sql_query", "sql", "execute_raw"];
 
 /// Leading keywords that only read.
+/// Awaited calls that cannot start an effect, matched on the call's last path
+/// segment. `timeout`/`select`-style combinators await the future they are
+/// handed, so that future is judged as if it were awaited at this site.
+const INERT_ASYNC_PATHS: &[&str] = &["sleep", "sleep_until", "yield_now", "timeout"];
+
+/// Combinators among the above that await a future given as an argument.
+const ASYNC_COMBINATORS: &[&str] = &["timeout"];
+
+/// Root *bindings* whose async surface is request-local plumbing: it stores no
+/// rows an agent's grant governs, calls nothing out, and enqueues nothing.
+const INERT_ASYNC_ROOT_NAMES: &[&str] =
+    &["session", "flash", "cache", "cookies", "cookie_jar", "csrf"];
+
+/// The types behind those names, so a differently-named parameter is covered
+/// too. Matched on the last path segment; `Cache` matches by prefix.
+const INERT_ASYNC_ROOT_TYPES: &[&str] = &[
+    "Session",
+    "Flash",
+    "CookieJar",
+    "PrivateCookieJar",
+    "SignedCookieJar",
+    "Csrf",
+    "CsrfToken",
+];
+
+/// Chain-terminal methods that end a transaction rather than acting through
+/// it. `db.tx(..)` is the shape this codebase uses, but a hand-rolled
+/// `tx.commit().await` is not an unread effect.
+const INERT_ASYNC_VERBS: &[&str] = &["commit", "rollback"];
+
+/// `dispatch(&state, topic, payload)` — the topic's argument index
+/// (`autumn/src/webhook_outbound.rs`, the one arity there is).
+const WEBHOOK_TOPIC_ARG: usize = 1;
+
+/// The job name's argument index. Every `autumn_web::job` enqueue API takes it
+/// first: the free functions (`enqueue`, `enqueue_in`, `enqueue_at`,
+/// `enqueue_on_conn`, `enqueue_in_on_conn`, `enqueue_at_on_conn`,
+/// `enqueue_in_tx`, `enqueue_after_commit`, `enqueue_in_after_commit`,
+/// `enqueue_at_after_commit`, `enqueue_tracked*`) and the `JobClient` methods,
+/// whose receiver syn keeps out of the argument list.
+const JOB_NAME_ARG: usize = 0;
+
 const SQL_READ_STATEMENTS: &[&str] = &["SELECT", "WITH"];
 
 /// Leading keywords that change rows or schema. Schema statements are folded
@@ -3049,6 +3283,37 @@ fn is_safe_free_call(call: &ExprCall) -> bool {
         .any(|safe| safe.len() == segments.len() && safe.iter().zip(&segments).all(|(a, b)| a == b))
 }
 
+/// Is this the guard prologue an attribute macro emitted ahead of the body?
+///
+/// `#[secured]`, `#[authorize]`, `#[step_up]` and `#[throttle]` stack with
+/// `#[agent_operable]` and each prepend an awaited check —
+/// `autumn_web::auth::__check_secured_with_key`,
+/// `autumn_web::authorization::__check_policy_scoped`,
+/// `autumn_web::step_up::__check_step_up_with_config`,
+/// `autumn_web::security::__check_throttle`, and the idempotency replay beside
+/// them. They are the framework refusing the request, never the handler acting,
+/// and no handler author writes this shape: the path is rooted at `autumn_web`
+/// and its function is `__`-prefixed, which is reserved. A `Self::__autumn_…`
+/// call is *not* covered — that is a generated repository method, and one of
+/// them really does sweep rows.
+fn is_framework_prologue_call(call: &ExprCall) -> bool {
+    let Expr::Path(path) = &*call.func else {
+        return false;
+    };
+    let rooted = path
+        .path
+        .segments
+        .first()
+        .is_some_and(|first| first.ident == "autumn_web");
+    rooted
+        && path.path.segments.len() > 1
+        && path
+            .path
+            .segments
+            .last()
+            .is_some_and(|last| last.ident.to_string().starts_with("__"))
+}
+
 /// The container key a field access names: `.0` / `.1` positionally, `.field`
 /// by name.
 fn part_of_member(member: &syn::Member) -> Part {
@@ -3307,6 +3572,46 @@ fn repository_subject(path: &syn::Path) -> Subject {
     }
 }
 
+/// Parameter names whose async surface is request-local plumbing.
+///
+/// The allowlist is by *type* here and by name at the call site, so a
+/// `Session` parameter called something else is still recognised.
+fn signature_inert_roots(input_fn: &ItemFn) -> HashSet<String> {
+    let mut roots = HashSet::new();
+    for arg in &input_fn.sig.inputs {
+        let syn::FnArg::Typed(typed) = arg else {
+            continue;
+        };
+        if type_is_inert_root(&typed.ty) {
+            collect_pat_idents(&typed.pat, &mut roots);
+        }
+    }
+    roots
+}
+
+/// Is this type one of the request-local plumbing types, at any depth inside
+/// the extractors that carry it (`Extension<Session>`, `State<AppCache>`)?
+fn type_is_inert_root(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(r) => type_is_inert_root(&r.elem),
+        Type::Paren(p) => type_is_inert_root(&p.elem),
+        Type::Group(g) => type_is_inert_root(&g.elem),
+        Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+            let name = segment.ident.to_string();
+            if INERT_ASYNC_ROOT_TYPES.contains(&name.as_str()) || name.starts_with("Cache") {
+                return true;
+            }
+            match &segment.arguments {
+                syn::PathArguments::AngleBracketed(args) => args.args.iter().any(|arg| {
+                    matches!(arg, syn::GenericArgument::Type(inner) if type_is_inert_root(inner))
+                }),
+                _ => false,
+            }
+        }),
+        _ => false,
+    }
+}
+
 /// The effect handles a handler's signature introduces.
 fn signature_handles(input_fn: &ItemFn) -> HashMap<String, Handle> {
     let generics: HashSet<String> = input_fn
@@ -3555,7 +3860,11 @@ pub fn agent_operable_macro(attr: TokenStream, item: TokenStream) -> TokenStream
     let action = raw_name.strip_prefix("r#").unwrap_or(&raw_name).to_string();
     let grant_name = path_string(&grant);
 
-    let mut analyzer = Analyzer::new(signature_handles(&input_fn), action.clone());
+    let mut analyzer = Analyzer::new(
+        signature_handles(&input_fn),
+        action.clone(),
+        signature_inert_roots(&input_fn),
+    );
     analyzer.block(&input_fn.block);
 
     let Analyzer {
@@ -4957,6 +5266,101 @@ mod tests {
             }"#,
         ),
         (
+            // `dispatch(&state, topic, payload)` — reading "the first literal
+            // anywhere" let the *payload* stand in for a topic nobody could
+            // read, and the grant checked a topic the call never fired.
+            "webhook topic read out of the payload position",
+            ExpectedKind::Rejected,
+            "dispatch",
+            r#"async fn h(manager: WebhookOutboundManager, state: AppState, chosen: String) -> R {
+                manager.dispatch(&state, &chosen, "refund.created").await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            // Every `autumn_web::job` enqueue API takes the name first.
+            "job name read out of the payload position",
+            ExpectedKind::Rejected,
+            "enqueue_after_commit",
+            r#"async fn h(chosen: String) -> R {
+                autumn_web::job::enqueue_after_commit(&chosen, "notify_finance").await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            // `purge` is the hard delete `#[repository]` generates behind a
+            // soft-delete tombstone. It was in no verb list, so it erased a
+            // row under a grant that allows no write at all.
+            "generated purge is a bounded write",
+            ExpectedKind::Write,
+            "Payout",
+            r"async fn h(payouts: PgPayoutRepository, id: i64) -> R {
+                payouts.purge(id).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "counter-cache repair sweep is an unbounded write",
+            ExpectedKind::UnboundedWrite,
+            "Payout",
+            r"async fn h(payouts: PgPayoutRepository) -> R {
+                payouts.recompute_counter_caches().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "counter-cache repair for one parent is a bounded write",
+            ExpectedKind::Write,
+            "Payout",
+            r"async fn h(payouts: PgPayoutRepository, parent: i64) -> R {
+                payouts.recompute_counter_caches_for(parent).await?;
+                Ok(())
+            }",
+        ),
+        (
+            // An awaited call needs no handle to act: it can reach the global
+            // job client, or build an HTTP client of its own. The handler
+            // named nothing the handle-rooted rules could key on, and expanded
+            // clean.
+            "awaited helper with no handle argument",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                start_finance_job().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "awaited method on an untracked receiver",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(svc: FinanceService) -> R {
+                svc.kick_off().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "future bound to a name and awaited later",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let job = start_finance_job();
+                job.await?;
+                Ok(())
+            }",
+        ),
+        (
+            // A combinator awaits the future it is handed, so the future is
+            // judged at the `await` rather than at its own call site.
+            "effect hidden inside an awaited combinator",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                tokio::time::timeout(d, start_finance_job()).await??;
+                Ok(())
+            }",
+        ),
+        (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
             "reason",
@@ -4994,7 +5398,7 @@ mod tests {
             r#"async fn h(mut db: Db) -> R {
                 db.tx(|conn| async move {
                     diesel::insert_into(refunds::table).values(&b).execute(conn).await?;
-                    autumn_web::job::enqueue_on_conn(conn, "notify_finance", payload).await?;
+                    autumn_web::job::enqueue_on_conn("notify_finance", payload, conn).await?;
                     Ok(())
                 }.scope_boxed()).await?;
                 Ok(())
@@ -5158,6 +5562,56 @@ mod tests {
                 let r = repo.create(&b).await?;
                 let seen = payouts.find_all().await?;
                 Ok((r, seen))
+            }",
+        ),
+        (
+            // The inert-async allowlist, by name and by type: request-local
+            // plumbing stores no rows a grant governs.
+            "session write is request-local plumbing",
+            r#"async fn h(session: Session) -> R {
+                session.insert("seen", true).await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "plumbing recognised by its type rather than its name",
+            r"async fn h(jar: PrivateCookieJar) -> R {
+                let seen = jar.load().await?;
+                Ok(seen)
+            }",
+        ),
+        (
+            "awaited sleep is not an effect",
+            r"async fn h(repo: PgRefundRepository, delay: Duration) -> R {
+                tokio::time::sleep(delay).await;
+                Ok(repo.find_all().await?)
+            }",
+        ),
+        (
+            "commit ends a transaction rather than acting through it",
+            r"async fn h(mut db: Db) -> R {
+                let tx = db.begin().await?;
+                tx.commit().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "awaited call discharged with #[agent_effect(none)]",
+            r#"async fn h() -> R {
+                #[agent_effect(none, reason = "renders a template; verified effect-free")]
+                let page = render_page().await?;
+                Ok(page)
+            }"#,
+        ),
+        (
+            // What `#[secured]` prepends when it stacks with this macro. The
+            // guard refusing the request is not the handler acting.
+            "guard prologue emitted by a stacked attribute macro",
+            r"async fn h(repo: PgRefundRepository) -> R {
+                if let Err(e) = autumn_web::auth::__check_secured_with_key(&s, k, R).await {
+                    return Err(e);
+                }
+                Ok(repo.find_all().await?)
             }",
         ),
         (

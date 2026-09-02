@@ -399,11 +399,42 @@ authority under a manifest that says otherwise.
   `with_base_url(x)` proves nothing about the host that will be reached; nor
   does a relative literal with no alias, or a `named(..)` alias chosen at
   runtime.
-- **A non-literal job name or webhook topic** — the subject is the whole claim.
+- **A non-literal job name or webhook topic** — the subject is the whole claim,
+  and it is read from the argument that *holds* it: the job name is the first
+  argument of every `autumn_web::job` enqueue API, and the topic is the second
+  argument of `dispatch(&state, topic, payload)`. A literal somewhere else in
+  the call is not the subject. `enqueue_after_commit(&chosen, "notify_finance")`
+  is refused, not recorded as the job `notify_finance`.
 - **A `dyn Trait`, `impl Trait` or fn-generic parameter** — any method call on
   one is opaque. (`Json<T>`, `Path<T>`, `Query<T>`, `Form<T>` and friends are
   never handles, so they never trigger this.)
 - **A detached task** — `tokio::spawn` and its relatives, as above.
+- **An awaited call the analysis cannot read** — `start_finance_job().await`,
+  `svc.kick_off().await`, or a future bound to a name and awaited later. This
+  is the one refusal that does not need a handle to be in sight, and it is the
+  counterpart of the [effect verb sweep](#what-counts-as-an-effect): a
+  *synchronous* call handed no tracked handle cannot enqueue, write or call out
+  (and `spawn` is refused outright), but an awaited one can reach the global job
+  client or construct its own `Client`. So the rule is inverted for `.await`:
+  readable, or refused.
+
+  An awaited call is **readable** when it is rooted at a tracked handle
+  (`repo.find_all().await`), carries one as an argument
+  (`refunds::table.load(&mut *db).await`), is a verb the sweep already speaks
+  for (`enqueue*`, `spawn*`), is a constructor, or is on the **inert-async
+  allowlist**, which is exactly:
+
+  | Allowed | Why |
+  |---|---|
+  | `sleep`, `sleep_until`, `yield_now`, `timeout` | scheduling, not work. `timeout` *awaits the future it is handed*, so that future is judged at the `await` instead — `timeout(d, start_finance_job()).await` is still refused |
+  | a chain whose root binding is named `session`, `flash`, `cache`, `cookies`, `cookie_jar` or `csrf` | request-local plumbing; it stores no rows a grant governs |
+  | a chain whose root parameter is typed `Session`, `Flash`, `CookieJar`, `PrivateCookieJar`, `SignedCookieJar`, `Csrf`, `CsrfToken` or `Cache…` — through any extractor wrapping it | the same allowance, for a parameter that is named something else |
+  | `.commit()` / `.rollback()` | these end a transaction rather than acting through it |
+  | a call rooted at `autumn_web` whose function is `__`-prefixed | the guard prologue `#[secured]`, `#[authorize]`, `#[step_up]` and `#[throttle]` prepend when they stack with this macro — the framework refusing the request, not the handler acting. A `Self::__autumn_…` call is *not* covered: that is a generated repository method |
+
+  Everything else is discharged the usual way: declare what the call does with
+  `#[agent_effect(...)]`, or — when it is verified to do nothing an agent's
+  grant governs — with `#[agent_effect(none, reason = "...")]`.
 
 Each fails with a diagnostic naming the call site, both sides of the
 disagreement, and the annotation that resolves it.
