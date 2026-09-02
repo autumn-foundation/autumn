@@ -83,7 +83,7 @@ BARE = r'(?:[^()\s]|\([^()\s]*\))+'
 # A link title may be delimited by ", ' or (). Accepting only double quotes
 # meant a link like `[x](missing.md 'why')` failed to match at all, so it was
 # skipped rather than checked — the gate reporting success on a broken link.
-TITLE = r'''(?:\s+(?:"[^"]*"|'[^']*'|\([^()]*\)))?'''
+TITLE = r'''(?:\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\((?:[^()\\]|\\.)*\)))?'''
 DEST = r'\(\s*(?:<([^<>]*)>|(' + BARE + r'))' + TITLE + r'\s*\)'
 # Two label shapes, because a linked image nests one link inside another:
 # `[![alt](img.png)](page.md)`. The flat label finds the inner image target,
@@ -92,8 +92,10 @@ DEST = r'\(\s*(?:<([^<>]*)>|(' + BARE + r'))' + TITLE + r'\s*\)'
 # `\.` keeps an escaped bracket inside the label instead of ending it, so
 # `[closing \]](page.md)` still yields its destination.
 FLAT = r'(?:[^\[\]\\]|\\.)'
-INLINE = re.compile(r'\[' + FLAT + r'*\]' + DEST)
-NESTED = re.compile(r'\[(?:' + FLAT + r'|\[' + FLAT + r'*\])*\]' + DEST)
+# `\[sample](x.md)` renders literal text, so the opening bracket must be
+# unescaped for this to be a link at all.
+INLINE = re.compile(r'(?<!\\)\[' + FLAT + r'*\]' + DEST)
+NESTED = re.compile(r'(?<!\\)\[(?:' + FLAT + r'|\[' + FLAT + r'*\])*\]' + DEST)
 REFDEF = re.compile(r'^ {0,3}\[' + FLAT + r'+\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
 
 
@@ -347,7 +349,11 @@ for f in files:
         found.add(f"{s}-{n}")
 
     for i in range(start, len(lines)):
-        line = lines[i]
+        # A heading nested in a block quote still renders a heading and still
+        # carries an anchor, so the quote prefix is stripped here just as the
+        # fence scanner strips it. Indexing only unquoted headings would
+        # reject a valid link to `> ## Quoted Heading`.
+        line = BLOCKQUOTE.sub("", lines[i])
         atx = re.match(r'^ {0,3}(#{1,6})\s+(.*)$', line)
         if atx:
             add(atx.group(2))
@@ -792,6 +798,27 @@ self_test() {
   printf 'See [ok](jobs.md#MixedId).\n' >> "$c44/docs/guide/mail.md"
   git -C "$c44" commit -qam html-anchor-case
   check "explicit HTML id matches its own case" pass "$c44"
+
+  # A title may contain its own delimiter, escaped. Stopping at the escaped
+  # quote made the whole link fail to match, so it was skipped, not checked.
+  local c45="$tmp/c45"; make_corpus "$c45"
+  printf '\nSee [broken](missing.md "title with \\" quote").\n' >> "$c45/docs/guide/mail.md"
+  git -C "$c45" commit -qam escaped-title-delimiter
+  check "broken link with an escaped title delimiter is caught" fail "$c45"
+
+  # A heading nested in a block quote still carries an anchor.
+  local c46="$tmp/c46"; make_corpus "$c46"
+  printf '\n> ## Quoted Heading\n' >> "$c46/docs/guide/jobs.md"
+  printf 'See [ok](jobs.md#quoted-heading).\n' >> "$c46/docs/guide/mail.md"
+  git -C "$c46" commit -qam quoted-heading
+  check "heading inside a block quote is indexed" pass "$c46"
+
+  # An escaped opening bracket renders literal text, not a link.
+  local c47="$tmp/c47"; make_corpus "$c47"
+  printf '\nLiteral: \\[sample](totally-made-up.md) renders as text.\n' \
+    >> "$c47/docs/guide/mail.md"
+  git -C "$c47" commit -qam escaped-open-bracket
+  check "escaped opening bracket is not a link" pass "$c47"
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]]
