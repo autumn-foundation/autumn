@@ -283,19 +283,27 @@ async fn slow_refund_feed() -> Sse<impl Stream<Item = Result<Event, std::convert
     Sse::new(stream)
 }
 
+#[derive(Serialize, Deserialize)]
+struct BulkReport {
+    rows: String,
+}
+
 /// A governed tool whose body blows past the MCP tool-result cap.
 ///
-/// The handler itself succeeds — it answers `200` and starts writing — so the
-/// only place the failure becomes visible is when the buffered path tries to
-/// read the body back (issue #1691 review round 2).
+/// The handler itself succeeds — it answers `200` with a well-formed JSON body
+/// — so the only place the failure becomes visible is when the buffered path
+/// tries to read that body back (issue #1691 review round 2). It returns
+/// `Json<T>` rather than a bare `String` because MCP only derives a tool for a
+/// route with a response schema.
 #[get("/api/oversized")]
 #[api_doc(mcp, summary = "Return more than the tool-result cap")]
-async fn oversized_report() -> String {
-    // One byte over the 10 MiB `MAX_TOOL_RESPONSE_BYTES`: the smallest body
-    // that makes the tool-result buffer refuse. `Accept-Encoding` is not among
-    // the headers the MCP replay forwards, so nothing compresses this back
-    // under the cap before it is measured.
-    "r".repeat(10 * 1024 * 1024 + 1)
+async fn oversized_report() -> AutumnResult<Json<BulkReport>> {
+    // Over the 10 MiB `MAX_TOOL_RESPONSE_BYTES` once serialized. `Accept-
+    // Encoding` is not among the headers the MCP replay forwards, so nothing
+    // compresses this back under the cap before it is measured.
+    Ok(Json(BulkReport {
+        rows: "r".repeat(10 * 1024 * 1024 + 1),
+    }))
 }
 
 /// Reversible twin of [`send_payout`]: a broken sink must NOT stop it.
