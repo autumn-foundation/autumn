@@ -521,13 +521,24 @@ cascade returns a typed conflict instead of removing the row.
   `restrict` 409, rolls the entire thing back. The generated delete acquires its
   own connection and opens that transaction itself; it is not `Db::tx` and does
   not nest inside one.
-- **`restrict` probes first.** Every `restrict` dependent is probed *before* any
-  mutating action runs and before the parent's own `before_delete` hook fires.
-  Mutating actions fire child hooks that a later rollback cannot retract, so a
-  blocked delete never touches one. The probe follows the parent's delete kind:
-  a soft-deleting parent only counts *live* children, so an already-soft-deleted
-  child does not block it, while a hard-deleting parent counts soft-deleted
-  children too — they would still dangle.
+- **`restrict` probes first, within a tier.** Every `restrict` dependent is
+  probed *before* any mutating action at the same level and before the parent's
+  own `before_delete` hook fires; a `destroy`d child likewise pre-scans all of
+  its siblings' `restrict` grandchildren before any of their hooks run. Mutating
+  actions fire child hooks that a rollback cannot retract, so within one parent's
+  cascade a blocked delete never touches one. The probe follows the parent's
+  delete kind: a soft-deleting parent only counts *live* children, so an
+  already-soft-deleted child does not block it, while a hard-deleting parent
+  counts soft-deleted children too — they would still dangle.
+
+  The guarantee is scoped to a tier, and `delete_many` is where that shows.
+  Its Phase 1 probes the batch's **direct** `restrict` dependents across every
+  parent, but deeper `restrict` dependents are probed inside each parent's own
+  cascade in Phase 2 — so an earlier parent's child hook can fire before a later
+  parent's *grandchild* `restrict` answers 409. The transaction still rolls back
+  in full; a hook side effect that is not a commit hook does not. If a hook has
+  effects outside the database, keep the `restrict` on the leg you are deleting
+  rather than a level down, or delete those parents one at a time.
 - **Both delete paths.** `delete_by_id` / `destroy` and the bulk `delete_many`
   both run the cascade. On `delete_many` the ordering is the same — restrict
   probes for the whole batch first (a 409 rolls the entire batch back), then the

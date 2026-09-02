@@ -271,6 +271,76 @@ pub struct ModelDepHoPost {
 #[autumn_web::repository(ModelDepHoPost, table = "dep_ho_posts")]
 pub trait ModelDepHoPostRepository {}
 
+// Codex round 2: the BULK has_one test gets its own graph and its own counter.
+// Sharing `DESTROYED_HO_PROFILES` with the single-record test above would make
+// the pair order-dependent — each resets the counter and then asserts a
+// different total, so under libtest's default parallel mode (which a direct
+// local `cargo test -- --ignored` run uses; only CI's sweep passes
+// `--test-threads=1`) one test's reset could land between the other's reset and
+// its assertion. A dedicated graph is how every other scenario in this file
+// stays independent, so the bulk case gets one too.
+
+diesel::table! {
+    dep_ho2_posts (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+diesel::table! {
+    dep_ho2_profiles (id) {
+        id -> Int8,
+        post_id -> Int8,
+        bio -> Text,
+    }
+}
+
+pub static DESTROYED_HO2_PROFILES: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Default)]
+pub struct DepHo2ProfileHooks;
+
+impl MutationHooks for DepHo2ProfileHooks {
+    type Model = DepHo2Profile;
+    type NewModel = NewDepHo2Profile;
+    type UpdateModel = UpdateDepHo2Profile;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &DepHo2Profile,
+    ) -> AutumnResult<()> {
+        DESTROYED_HO2_PROFILES.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[autumn_web::model(table = "dep_ho2_profiles")]
+pub struct DepHo2Profile {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub bio: String,
+}
+
+#[autumn_web::repository(
+    DepHo2Profile,
+    table = "dep_ho2_profiles",
+    hooks = DepHo2ProfileHooks
+)]
+pub trait DepHo2ProfileRepository {}
+
+#[autumn_web::model(table = "dep_ho2_posts")]
+#[has_one(DepHo2Profile, fk = "post_id", name = md_profile, dependent = destroy)]
+pub struct ModelDepHo2Post {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(ModelDepHo2Post, table = "dep_ho2_posts")]
+pub trait ModelDepHo2PostRepository {}
+
 // ── #1702 scope item 3: the both-sites precedence rule, behaviourally ────────
 //
 // The reconciliation this issue asked for is "repository attribute wins; the
@@ -1424,6 +1494,10 @@ async fn setup_pool() -> (
         "CREATE TABLE bs_parents (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
         "CREATE TABLE bs_children (id BIGSERIAL PRIMARY KEY, parent_id BIGINT NOT NULL REFERENCES bs_parents(id), body TEXT NOT NULL)",
         "CREATE TABLE bs_ghosts (id BIGSERIAL PRIMARY KEY, parent_id BIGINT NOT NULL, body TEXT NOT NULL)",
+        // Codex round 2: dedicated graph for the BULK has_one test, so its hook
+        // counter is not shared with the single-record has_one test.
+        "CREATE TABLE dep_ho2_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE dep_ho2_profiles (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep_ho2_posts(id), bio TEXT NOT NULL)",
     ] {
         diesel::sql_query(stmt)
             .execute(&mut conn)
@@ -1523,6 +1597,8 @@ fn dependent_repository_surface_is_generated() {
     // paths. Its `config.dependents` is non-empty (repository attribute present),
     // so the compile-time cascade is what gets emitted and the model's own
     // `dependents()` — which still reports its one inert spec — is not consulted.
+    assert_is_fn(<PgModelDepHo2PostRepository as ModelDepHo2PostRepository>::delete_many);
+    assert_is_fn(PgDepHo2ProfileRepository::__autumn_apply_dependent_on_conn);
     assert_is_fn(<PgBsParentRepository as BsParentRepository>::delete_by_id);
     assert_is_fn(<PgBsParentRepository as BsParentRepository>::delete_many);
     assert_is_fn(PgBsChildRepository::__autumn_apply_dependent_on_conn);
@@ -2871,13 +2947,13 @@ async fn delete_many_model_declared_has_one_dependent_destroys_children() {
 
     for p in 1..=2 {
         diesel::sql_query(format!(
-            "INSERT INTO dep_ho_posts (id, title) VALUES ({p}, 'bulk has-one {p}')"
+            "INSERT INTO dep_ho2_posts (id, title) VALUES ({p}, 'bulk has-one {p}')"
         ))
         .execute(&mut conn)
         .await
         .unwrap();
         diesel::sql_query(format!(
-            "INSERT INTO dep_ho_profiles (id, post_id, bio) VALUES ({p}, {p}, 'bio {p}')"
+            "INSERT INTO dep_ho2_profiles (id, post_id, bio) VALUES ({p}, {p}, 'bio {p}')"
         ))
         .execute(&mut conn)
         .await
@@ -2885,18 +2961,18 @@ async fn delete_many_model_declared_has_one_dependent_destroys_children() {
     }
     // A third parent left out of the batch, to prove the bulk cascade is keyed on
     // the batched ids rather than sweeping the child table.
-    diesel::sql_query("INSERT INTO dep_ho_posts (id, title) VALUES (3, 'not batched')")
+    diesel::sql_query("INSERT INTO dep_ho2_posts (id, title) VALUES (3, 'not batched')")
         .execute(&mut conn)
         .await
         .unwrap();
-    diesel::sql_query("INSERT INTO dep_ho_profiles (id, post_id, bio) VALUES (3, 3, 'keep me')")
+    diesel::sql_query("INSERT INTO dep_ho2_profiles (id, post_id, bio) VALUES (3, 3, 'keep me')")
         .execute(&mut conn)
         .await
         .unwrap();
 
-    DESTROYED_HO_PROFILES.store(0, Ordering::SeqCst);
+    DESTROYED_HO2_PROFILES.store(0, Ordering::SeqCst);
 
-    let repo = PgModelDepHoPostRepository::with_pool_untracked(pool.clone());
+    let repo = PgModelDepHo2PostRepository::with_pool_untracked(pool.clone());
     repo.delete_many(&[1, 2])
         .await
         .expect("bulk model-declared has_one cascade must not FK-error");
@@ -2904,21 +2980,21 @@ async fn delete_many_model_declared_has_one_dependent_destroys_children() {
     assert_eq!(
         count(
             &mut conn,
-            "SELECT COUNT(*) AS n FROM dep_ho_profiles WHERE post_id IN (1, 2)"
+            "SELECT COUNT(*) AS n FROM dep_ho2_profiles WHERE post_id IN (1, 2)"
         )
         .await,
         0,
         "each batched parent's has_one child was destroyed"
     );
     assert_eq!(
-        AtomicUsize::load(&DESTROYED_HO_PROFILES, Ordering::SeqCst),
+        AtomicUsize::load(&DESTROYED_HO2_PROFILES, Ordering::SeqCst),
         2,
         "each destroyed has_one child fired its before_delete hook exactly once"
     );
     assert_eq!(
         count(
             &mut conn,
-            "SELECT COUNT(*) AS n FROM dep_ho_profiles WHERE post_id = 3"
+            "SELECT COUNT(*) AS n FROM dep_ho2_profiles WHERE post_id = 3"
         )
         .await,
         1,
@@ -2956,8 +3032,6 @@ async fn delete_many_model_declared_restrict_blocks_and_rolls_back() {
         .execute(&mut conn)
         .await
         .unwrap();
-
-    DESTROYED_COMMENTS.store(0, Ordering::SeqCst);
 
     let repo = PgModelDepPostRepository::with_pool_untracked(pool.clone());
     let err = repo
