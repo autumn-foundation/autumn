@@ -549,6 +549,15 @@ path = "tests/sandbox_header_alloc_gate.rs"
 name = "sandbox_stderr_alloc_gate"
 path = "tests/sandbox_stderr_alloc_gate.rs"
 
+# Allocation gate for the response-side wire checks: a `Location` segment and a
+# declared content type are both guest-chosen strings the wire asks a yes/no
+# question about, and both were lower-cased whole to answer it. Its own binary
+# for the same reason as the gates above — `allocation-counter` installs a
+# process-wide global allocator.
+[[test]]
+name = "sandbox_response_alloc_gate"
+path = "tests/sandbox_response_alloc_gate.rs"
+
 # Allocation gate for the scaffolded form-render helpers on the same 12-field
 # workload as `benches/form_render.rs` (Bolt follow-up to #2295/#2298, looking
 # at the per-field `error_id` allocation). Own binary for the same

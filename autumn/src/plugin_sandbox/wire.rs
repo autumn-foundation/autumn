@@ -216,10 +216,14 @@ fn redirect_target_allowed(target: &str, prefix: &str) -> bool {
 /// once during normalisation, so `%252e%252e` becomes the literal text
 /// `%2e%2e` and stays a segment name rather than climbing.
 fn is_double_dot_segment(segment: &str) -> bool {
-    matches!(
-        segment.to_ascii_lowercase().as_str(),
-        ".." | ".%2e" | "%2e." | "%2e%2e"
-    )
+    // Compared against the borrowed segment. Lower-casing it first copied a
+    // string the guest chose the length of — a `Location` with no `/` after the
+    // prefix is one segment holding the whole value — to answer a question four
+    // fixed spellings can answer in place, while `run` still holds the parsed
+    // response and its clone.
+    ["..", ".%2e", "%2e.", "%2e%2e"]
+        .iter()
+        .any(|spelling| spelling.eq_ignore_ascii_case(segment))
 }
 
 /// Content types a sandboxed plugin's response may declare.
@@ -260,7 +264,19 @@ pub fn response_header_allowed(name: &str) -> bool {
         .any(|allowed| allowed.eq_ignore_ascii_case(name))
 }
 
-/// What a denial records of a name the allowlist refused.
+/// Is this content type's essence one the slice serves?
+///
+/// Answered against the borrowed essence, for the same reason
+/// [`response_header_allowed`] is: the caller must not have to copy a
+/// guest-sized string to ask.
+#[must_use]
+fn content_type_allowed(essence: &str) -> bool {
+    ALLOWED_RESPONSE_CONTENT_TYPES
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(essence))
+}
+
+/// What a denial records of a guest-chosen value the allowlist refused.
 ///
 /// A response header name is the guest's, and bounded only by the stdout line
 /// ceiling — roughly twice the response ceiling. Lower-casing it to decide
@@ -275,7 +291,7 @@ pub fn response_header_allowed(name: &str) -> bool {
 /// it and says when it kept less.
 const DENIED_NAME_EXCERPT: usize = 128;
 
-fn denied_name_excerpt(name: &str) -> String {
+fn denied_excerpt(name: &str) -> String {
     let mut out = String::with_capacity(name.len().min(DENIED_NAME_EXCERPT));
     for (kept, ch) in name.chars().enumerate() {
         if kept == DENIED_NAME_EXCERPT {
@@ -517,7 +533,7 @@ impl SandboxResponse {
             // logged — so the longer the name a guest chose, the more the host
             // held to throw it away.
             if !response_header_allowed(name) {
-                denied.push(denied_name_excerpt(name));
+                denied.push(denied_excerpt(name));
                 return false;
             }
             // `Location` is the one allowed header that makes the *client* act,
@@ -531,7 +547,7 @@ impl SandboxResponse {
             // the one it must not have. An absolute URL is refused by the same
             // rule, which closes the open-redirect half as well.
             if name.eq_ignore_ascii_case("location") && !redirect_target_allowed(value, prefix) {
-                denied.push(denied_name_excerpt(name));
+                denied.push(denied_excerpt(name));
                 return false;
             }
             true
@@ -579,18 +595,16 @@ impl SandboxResponse {
         // a proxy or client that takes the last one sees whatever it says. A
         // check that read only the first would enforce the allowlist against
         // the value a guest least wanted to smuggle anything through.
+        // The essence is borrowed, not lower-cased. With no `;` it is the whole
+        // header value, which the guest sizes, and copying it was how the
+        // allowlist was consulted — a third live copy beside the parsed
+        // response and the clone `run` holds, to decide the type is not one
+        // this slice serves.
         let mut declared = self
             .headers
             .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-            .map(|(_, value)| {
-                value
-                    .split(';')
-                    .next()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_ascii_lowercase()
-            });
+            .map(|(_, value)| value.split(';').next().unwrap_or_default().trim());
 
         let first = declared.next()?;
 
@@ -600,19 +614,17 @@ impl SandboxResponse {
         // reported is whichever one is actually off the list, so the denial
         // names the interesting header rather than the first one.
         if let Some(extra) = declared.next() {
-            return Some(
-                if ALLOWED_RESPONSE_CONTENT_TYPES.contains(&extra.as_str()) {
-                    first
-                } else {
-                    extra
-                },
-            );
+            return Some(if content_type_allowed(extra) {
+                denied_excerpt(first)
+            } else {
+                denied_excerpt(extra)
+            });
         }
 
-        if ALLOWED_RESPONSE_CONTENT_TYPES.contains(&first.as_str()) {
+        if content_type_allowed(first) {
             None
         } else {
-            Some(first)
+            Some(denied_excerpt(first))
         }
     }
 
