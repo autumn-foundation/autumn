@@ -1589,19 +1589,34 @@ struct ModuleShape {
     table_elements: u64,
 }
 
-/// Whether any *active* element segment writes past the table it targets.
+/// What an element section declares, and whether it writes past a table.
+struct ElementSectionShape {
+    /// The first active segment that writes past its table, as (one past its
+    /// furthest write, what the table starts with).
+    overflow: Option<(u64, u64)>,
+    /// Items the section's segments declare between them.
+    ///
+    /// Read from each segment's leading count rather than by counting the
+    /// items walked, which is what lets the walk stop at the ceiling instead
+    /// of reaching it one entry at a time.
+    items: usize,
+}
+
+/// What the element section declares, and whether any *active* segment writes
+/// past the table it targets.
 ///
 /// `None` when the section cannot be read — the same restraint the data walk
 /// uses: an offset this cannot evaluate is left to the engine rather than
 /// guessed at.
-fn element_section_overflows(
+fn element_section_shape(
     wasm: &[u8],
     start: usize,
     section_end: usize,
     table_minimums: &[u64],
-) -> Option<(u64, u64)> {
+) -> Option<ElementSectionShape> {
     let (count, mut at) = leb128(wasm, start)?;
     let mut overflow = None;
+    let mut declared = 0usize;
     for _ in 0..count {
         let (flags, next) = leb128(wasm, at)?;
         at = next;
@@ -1626,6 +1641,25 @@ fn element_section_overflows(
         }
         let (items, next) = leb128(wasm, at)?;
         at = next;
+        // The segment's own count, before a single item is read. Nothing else
+        // sees it: `declared_entries` sums each *section's* leading count, so
+        // one segment holding millions of indices adds one, and
+        // `MAX_TABLE_ELEMENTS` bounds only what a table starts with, which a
+        // passive segment never touches. So the ceiling that exists to bound
+        // declarations before anything allocates per declaration was blind to
+        // the one place a declaration is nested.
+        //
+        // Returning here rather than walking on is the point. Past the ceiling
+        // the module is refused whatever the remaining segments hold, so
+        // reading them is work an artifact chose for this process — the same
+        // rule the section-count walk follows, one level down.
+        declared = declared.saturating_add(items);
+        if declared > MAX_DECLARED_ENTRIES {
+            return Some(ElementSectionShape {
+                overflow,
+                items: declared,
+            });
+        }
         if flags >= 4 {
             // `vec(expr)`: each element is a constant expression.
             for _ in 0..items {
@@ -1658,7 +1692,10 @@ fn element_section_overflows(
             }
         }
     }
-    overflow
+    Some(ElementSectionShape {
+        overflow,
+        items: declared,
+    })
 }
 
 /// Skip one constant expression, returning the offset just past its `end`.
@@ -2136,12 +2173,15 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
         if id == ELEMENT_SECTION && within_segment_ceiling {
             // The table section precedes this one in a well-formed module, so
             // the minimums are known by the time the segments are read.
-            element_overflow = element_section_overflows(
+            if let Some(element) = element_section_shape(
                 wasm,
                 after_size,
                 end,
                 table_minimums.get(..table_count_seen).unwrap_or_default(),
-            );
+            ) {
+                element_overflow = element.overflow;
+                declared_entries = declared_entries.saturating_add(element.items);
+            }
         }
         if id == DATA_SECTION && within_segment_ceiling {
             // Active segments carry a constant offset and a length, and both
@@ -4872,6 +4912,110 @@ path = "/hello/greet"
                 }
             ),
             "{err:?}",
+        );
+    }
+
+    #[test]
+    fn one_segment_cannot_declare_more_entries_than_the_ceiling_allows() {
+        // `declared_entries` sums each *section's* leading count, which is one
+        // LEB128 per section and is what makes reading the shape cheap. The
+        // element section is the one place that undercounts: its leading count
+        // is the number of *segments*, and a segment carries its own count of
+        // items. So one passive segment holding millions of function indices
+        // added exactly one to the ceiling that exists to bound declarations
+        // before anything allocates per declaration.
+        //
+        // Nothing else caught it. `MAX_TABLE_ELEMENTS` bounds what a table
+        // starts with, and a passive segment is never written to a table;
+        // `MAX_INIT_SEGMENTS` counts segments, and there is one; and the byte
+        // ceiling admits a 16 MiB section, which is millions of one-byte
+        // indices. The walk then read every one of them, and `Module::new`
+        // expanded the whole initializer list after it.
+        fn uleb(mut value: usize, out: &mut Vec<u8>) {
+            while value >= 0x80 {
+                let low = u8::try_from(value & 0x7f).expect("masked to seven bits");
+                out.push(low | 0x80);
+                value >>= 7;
+            }
+            out.push(u8::try_from(value).expect("the loop leaves under 0x80"));
+        }
+
+        // One passive segment (flags 1, elemkind 0x00) declaring one item more
+        // than the ceiling admits, each a one-byte `funcidx 0`.
+        let items = MAX_DECLARED_ENTRIES + 1;
+        let mut body = vec![0x01, 0x01, 0x00];
+        uleb(items, &mut body);
+        body.resize(body.len() + items, 0x00);
+
+        let mut wasm = Vec::from(b"\0asm\x01\0\0\0".as_slice());
+        wasm.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]); // type () -> ()
+        wasm.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]); // one function
+        wasm.extend_from_slice(&[TABLE_SECTION, 0x04, 0x01, 0x70, 0x00, 0x01]);
+        wasm.push(ELEMENT_SECTION);
+        uleb(body.len(), &mut wasm);
+        wasm.extend_from_slice(&body);
+
+        // The fixture has to clear every *other* ceiling, or it would be
+        // refused for a reason that has nothing to do with the nested count.
+        let shape = module_shape(&wasm).expect("the header walk must not fail");
+        assert!(
+            shape.segments <= MAX_INIT_SEGMENTS,
+            "the segment count is not what refuses this fixture",
+        );
+        assert!(
+            shape.init_bytes <= MAX_INIT_SECTION_BYTES,
+            "the byte ceiling is not what refuses this fixture: {}",
+            shape.init_bytes,
+        );
+        assert!(
+            shape.table_elements <= u64::from(MAX_TABLE_ELEMENTS),
+            "the table ceiling is not what refuses this fixture",
+        );
+        assert!(
+            shape.declared_entries > MAX_DECLARED_ENTRIES,
+            "the segment's own items never reached the ceiling: {}",
+            shape.declared_entries,
+        );
+
+        let err = refuse_unbounded_shape(&wasm)
+            .expect_err("a segment over the entry ceiling must be refused");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "declared section entries",
+                    ..
+                }
+            ),
+            "{err:?}",
+        );
+
+        // And the count is read *before* the items are, which is what keeps the
+        // refusal from costing what it refuses. Here the section claims far
+        // more items than it carries: a walk that reads them runs off the end
+        // of the section and reports nothing, leaving the module to be refused
+        // for some later reason — or not at all. One that stops at the ceiling
+        // still refuses it, from the count alone.
+        let mut truncated = Vec::from(b"\0asm\x01\0\0\0".as_slice());
+        truncated.extend_from_slice(&[TABLE_SECTION, 0x04, 0x01, 0x70, 0x00, 0x01]);
+        let mut claim = vec![0x01, 0x01, 0x00];
+        uleb(MAX_DECLARED_ENTRIES * 16, &mut claim);
+        claim.extend_from_slice(&[0x00, 0x00, 0x00]);
+        truncated.push(ELEMENT_SECTION);
+        uleb(claim.len(), &mut truncated);
+        truncated.extend_from_slice(&claim);
+
+        let err = refuse_unbounded_shape(&truncated)
+            .expect_err("a section claiming more entries than it carries must be refused");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "declared section entries",
+                    ..
+                }
+            ),
+            "the count was not consulted before the items were walked: {err:?}",
         );
     }
 
