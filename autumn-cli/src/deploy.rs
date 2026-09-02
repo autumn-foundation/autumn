@@ -1493,17 +1493,11 @@ pub fn build_rollback_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
 
 // ── Command entrypoint ───────────────────────────────────────────────────────
 
-/// Run the requested `autumn deploy` subcommand.
-///
-/// # Errors
-///
-/// Returns [`DeployError::Config`] when the project config cannot be loaded and
-/// [`DeployError::PreflightFailed`] when `check` finds a failing grader.
 /// The refusal for a native-Windows `autumn deploy`, or `None` on a supported
 /// host.
 ///
 /// `deploy` shells out to `ssh`/`sh` and stages secrets through
-/// [`exec::stage_temp_file`], whose `chmod 0600` is `#[cfg(unix)]` — so a native
+/// `exec::stage_temp_file`, whose `chmod 0600` is `#[cfg(unix)]` — so a native
 /// Windows deploy would stage the environment file carrying the app's signing
 /// secret and database password without the owner-only mode the Unix path
 /// applies, relying on whatever the containing directory's ACLs happen to be.
@@ -1516,6 +1510,14 @@ fn windows_deploy_refusal(os: &str) -> Option<String> {
     (os == "windows").then(|| crate::platform::tier_two_windows_error("autumn deploy"))
 }
 
+/// Run the requested `autumn deploy` subcommand.
+///
+/// # Errors
+///
+/// Returns [`DeployError::UnsupportedPlatform`] on native Windows (the daemon
+/// and deploy paths are Tier 2 / WSL2, see #1616),
+/// [`DeployError::Config`] when the project config cannot be loaded, and
+/// [`DeployError::PreflightFailed`] when `check` finds a failing grader.
 pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployError> {
     // Refuse before anything else: no config load, no SSH probe, no temp file.
     if let Some(refusal) = windows_deploy_refusal(std::env::consts::OS) {
