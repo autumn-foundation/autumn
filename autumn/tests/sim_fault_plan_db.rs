@@ -280,6 +280,9 @@ async fn fail_db_checkout_on_targets_a_named_pool() {
 /// `FaultOutcome::server_errors` with its status, method, matched route and
 /// message — and the whole record round-trips through canonical JSON, which is
 /// what makes it byte-comparable across replays.
+// `FaultOutcome::server_errors` is populated only when the `reporting` feature
+// (a default) is compiled in; without it the field is empty by contract.
+#[cfg(feature = "reporting")]
 #[tokio::test(start_paused = true)]
 async fn db_checkout_fault_is_captured_as_a_server_error_via_reporting() {
     let sim = mount(SEED, FaultPlan::from_seed(SEED).fail_db_checkout(1));
