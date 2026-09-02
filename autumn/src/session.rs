@@ -798,12 +798,11 @@ impl<S: SessionStore> SessionLayer<S> {
     /// ran.
     ///
     /// When set, a request that mutates this key — an org switch, a
-    /// tenant-scoped login — has its deferred idempotency alias (see
-    /// [`crate::idempotency::add_deferred_session_replay_key`]) keyed by the
-    /// *finalized* value rather than the tenant resolved before the handler
-    /// ran. Without this, a retry presenting the rotated session lands in the
-    /// pre-mutation tenant's storage slot, misses the cached response, and
-    /// re-executes the mutation.
+    /// tenant-scoped login — has its deferred idempotency replay alias keyed
+    /// by the *finalized* value rather than the tenant resolved before the
+    /// handler ran. Without this, a retry presenting the rotated session
+    /// lands in the pre-mutation tenant's storage slot, misses the cached
+    /// response, and re-executes the mutation.
     #[must_use]
     pub fn with_tenancy_session_key(mut self, key: Option<Arc<str>>) -> Self {
         self.tenancy_session_key = key;
