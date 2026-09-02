@@ -63,7 +63,7 @@ pub trait BookmarkRepository {
 
 Each declared method becomes an **inherent method** on the generated
 `PgBookmarkRepository` struct that returns a lazy
-[`GroupedAggregate`](autumn_web::aggregate::GroupedAggregate) builder (mirroring
+[`GroupedAggregate`](https://docs.rs/autumn-web/latest/autumn_web/aggregate/struct.GroupedAggregate.html) builder (mirroring
 `find_in_batches`). Nothing touches the database until you call the terminal
 `.load()`.
 
@@ -101,14 +101,14 @@ let top_tags: Vec<(String, i64)> = repo
     .await?;
 ```
 
-Use [`order_by_aggregate_asc`](autumn_web::aggregate::GroupedAggregate::order_by_aggregate_asc)
+Use [`order_by_aggregate_asc`](https://docs.rs/autumn-web/latest/autumn_web/aggregate/struct.GroupedAggregate.html#method.order_by_aggregate_asc)
 for smallest-first. The ordering is on the *aggregate value*, not the group key —
 that is what makes it a leaderboard rather than an alphabetical list.
 
 ## Filtering before the group
 
-[`filter_eq`](autumn_web::aggregate::GroupedAggregate::filter_eq) and
-[`filter_range`](autumn_web::aggregate::GroupedAggregate::filter_range) scope
+[`filter_eq`](https://docs.rs/autumn-web/latest/autumn_web/aggregate/struct.GroupedAggregate.html#method.filter_eq) and
+[`filter_range`](https://docs.rs/autumn-web/latest/autumn_web/aggregate/struct.GroupedAggregate.html#method.filter_range) scope
 which rows feed the aggregate — they apply **before** grouping, and both bounds
 are bound as query parameters (never string-interpolated):
 
@@ -127,7 +127,7 @@ windows the input to a time-series roll-up.
 ## Time series with `DateBucket`
 
 Grouping on a raw `created_at` timestamp gives one bucket per distinct instant —
-almost never what you want. [`bucket`](autumn_web::aggregate::GroupedAggregate::bucket)
+almost never what you want. [`bucket`](https://docs.rs/autumn-web/latest/autumn_web/aggregate/struct.GroupedAggregate.html#method.bucket)
 groups by `date_trunc('<unit>', <col>)` instead, collapsing the timestamps into
 `Day`, `Week`, or `Month` buckets keyed by each bucket's start:
 

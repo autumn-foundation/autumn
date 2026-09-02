@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A markdown link gate for the docs corpus [no-plugin]:** `check-docs.sh`
+  gated rustdoc intra-doc links and `check-plugin-freshness.sh` gated the
+  `docs/guide/*.md` paths named from `skills/` and `agents/`, but nothing
+  checked the 383-file markdown corpus itself — so a guide could link to a
+  page that was renamed, never written, or lives one directory up, and
+  nothing noticed. `scripts/check-docs-links.sh` resolves every relative
+  link and heading anchor in tracked markdown and now runs in CI's docs-only
+  job. Its baseline found **19 broken links across 11 pages**, all fixed
+  here: five rustdoc paths pasted into `aggregates.md` as markdown targets
+  (they render as links to a directory that does not exist), three
+  `docs/design/` links off by one directory level, `authorization.md` and
+  `generators.md` pointing into `docs/api/` and `docs/reference/` trees that
+  have never existed, `tauri.md` pointing at a `managed-pg.md` that is
+  really `daemon.md`, two guides promising a `custom_config_loader` example
+  that is not in the workspace, and four heading anchors that no longer
+  match their headings. External links are deliberately out of scope
+  (network-flaky, and not fixable in this repo).
+
 - **One retention policy for every table Autumn creates (#1605):** every
   deployed Autumn app accumulated framework-owned data forever by default —
   job history, tracking records, idempotency responses, experiment
