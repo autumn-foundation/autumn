@@ -176,3 +176,34 @@ performed the switch is untouched (it correctly reflects the tenant the
 corrected. No public API changed — `SessionLayer::new`'s signature is
 unchanged, and the new field defaults to `None` (today's behavior) for every
 other tenancy source and for apps not using session tenancy.
+
+## Follow-up 2: forcing a tenant onto an always-exempt path's alias (same day, pre-merge)
+
+A second Codex pass on the follow-up above caught the mirror-image bug: the
+override I'd just added didn't check whether the *original* request had
+resolved a tenant at all. `[tenancy] public_paths` routes (an idempotent login
+that also writes the tenancy session key, `examples/teams`'s
+`establish_session` shape: `session.rotate_id()` then `session.insert(tenant
+key, ...)`) are exempt from tenancy resolution unconditionally — that is a
+property of the *path*, not of session content. The primary key such a request
+commits under is tenantless, and it stays tenantless on every retry to that
+same path, however the handler mutates the session. My first follow-up read
+the just-written tenant from session data and forced it into the alias anyway,
+producing an alias keyed by a tenant no future request to that path can ever
+present — the retry misses both the (tenantless) primary and the
+(tenant-shaped) alias, and re-executes the login mutation.
+
+**Reproduction:** `session_tenancy_public_path_alias_stays_tenantless` in
+`autumn/tests/integration/idempotency_tenant_scope.rs`. Red run:
+`session-alias-public-path-red.txt` (`left: "logged-in-2"`, `right:
+"logged-in-1"`). Green run: `session-alias-public-path-green.txt`.
+
+**Fix:** `DeferredIdempotencyCommit::add_session_alias`
+(`autumn/src/idempotency.rs`) now only honors a `tenant_override` when
+`state.key_context.tenant` — the tenant captured for the *primary* key of the
+request that produced this commit — is `Some`. A tenantless primary (exempt
+path, tenancy disabled, or a non-session source) forces the override back to
+`None`, so the alias stays in the same tenantless namespace every future
+request to that path will compute. The org-switch case from the first
+follow-up is untouched: `/switch-org` is not a `public_paths` route, so its
+primary key already carries a tenant, and the override still applies.

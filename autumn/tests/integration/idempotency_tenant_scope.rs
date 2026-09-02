@@ -236,3 +236,63 @@ async fn session_tenancy_alias_uses_finalized_tenant_after_switch() {
         "the retry must be served from the idempotency cache"
     );
 }
+
+static LOGIN_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// An idempotent login on a `public_paths` route: rotates the session id
+/// *and* writes the tenancy session key, mirroring `examples/teams`'s
+/// `establish_session` (`session.rotate_id()` then `session.insert(tenant
+/// key, ...)`).
+#[post("/idempotent-login")]
+#[public]
+async fn idempotent_login(session: Session) -> String {
+    let calls = LOGIN_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    session.rotate_id().await;
+    session.insert("tenant_id", "org-a").await;
+    format!("logged-in-{calls}")
+}
+
+/// A `public_paths` route is exempt from tenancy resolution unconditionally —
+/// that is a property of the *path*, not of session content, so a retry to it
+/// resolves no tenant however the handler mutates the session. The primary
+/// key this request commits under is therefore tenantless; the finalized
+/// tenant the handler just wrote to the (rotated) session must NOT be forced
+/// into the alias, or the alias becomes unreachable by any retry to this
+/// always-exempt path — the exact "reserve a tenant-shaped alias nothing can
+/// ever match" version of the underlying bug.
+#[tokio::test]
+async fn session_tenancy_public_path_alias_stays_tenantless() {
+    let mut config = tenancy_config("session");
+    config.tenancy.public_paths = vec!["/idempotent-login".to_owned()];
+    let app = TestApp::new()
+        .config(config)
+        .idempotent()
+        .routes(routes![idempotent_login])
+        .build();
+
+    let first = app
+        .post("/idempotent-login")
+        .header("idempotency-key", "login-key")
+        .body("{}")
+        .send()
+        .await;
+    first.assert_ok();
+    assert_eq!(first.text(), "logged-in-1");
+    assert!(
+        first.header("set-cookie").is_some(),
+        "the rotated session id must reach the client via Set-Cookie"
+    );
+
+    let retry = app
+        .post("/idempotent-login")
+        .header("idempotency-key", "login-key")
+        .body("{}")
+        .send()
+        .await;
+    retry.assert_ok();
+    assert_eq!(
+        retry.text(),
+        "logged-in-1",
+        "a retry to an always-exempt public path must replay the cached login, not re-run it"
+    );
+}

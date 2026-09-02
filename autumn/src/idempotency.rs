@@ -1371,6 +1371,14 @@ impl DeferredIdempotencyCommit {
             return;
         };
 
+        // Only honor the override when the request that produced this commit
+        // itself resolved a tenant. Tenancy resolution is a property of the
+        // *path*, not of session content — a `[tenancy] public_paths` route
+        // (or a request under a non-session tenancy source) computes no
+        // tenant now and never will on retry, however a handler mutates the
+        // session. Forcing a tenant into that alias would make it un-matchable
+        // by any future request to the same always-exempt path.
+        let tenant_override = tenant_override.filter(|_| state.key_context.tenant.is_some());
         let storage_key = state.key_context.storage_key(session_id, tenant_override);
         if primary_replay_after_guard_denial && storage_key != state.storage_key {
             state.primary_replay_after_guard_denial = true;
