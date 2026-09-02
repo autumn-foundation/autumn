@@ -873,6 +873,12 @@ jobs:
       # managed cluster, reloads, and shuts down. It only means a crash here
       # yields a backtrace without line numbers.
       CARGO_PROFILE_DEV_DEBUG: "0"
+      # Second, independent mitigation for the same limit. `/DEBUG:LongSymbolTruncate`
+      # is what the linker itself recommends in the LNK4318 warning that precedes
+      # the fatal LNK4319, so this exact toolchain supports it. Belt and braces
+      # deliberately: a Windows CI cycle costs ~35 minutes, and the previous
+      # single-remedy attempt did not hold.
+      RUSTFLAGS: "-Clink-arg=/DEBUG:LongSymbolTruncate"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -921,6 +927,22 @@ jobs:
           # the last release instead of the pull request.
           $webPath = ("$env:GITHUB_WORKSPACE\autumn" -replace '\\', '/')
           Add-Content -Path "tier1_app\Cargo.toml" -Value "`n[patch.crates-io]`nautumn-web = { path = `"$webPath`" }`n"
+
+          # Drop debug info for this build. autumn-web's graph plus
+          # `managed-pg-bundled` overflows the MSVC PDB public-symbol limit
+          # (LNK4319) — see docs/guide/platform-support.md and issue #2448,
+          # which tracks scaffolding this so users never meet it.
+          #
+          # Written into the MANIFEST, not left to `CARGO_PROFILE_DEV_DEBUG`
+          # alone: that variable is set job-wide and verifiably works locally
+          # (it drops `-Cdebuginfo` for the package and its dependencies), yet
+          # the failing Windows link still carried `/DEBUG` and debug-bearing
+          # autumn_web objects. A manifest profile cannot be missed, and
+          # `package."*"` covers every dependency explicitly rather than by
+          # inheritance.
+          Add-Content -Path "tier1_app\Cargo.toml" -Value "`n[profile.dev]`ndebug = 0`n`n[profile.dev.package.`"*`"]`ndebug = 0`n"
+          Write-Host "--- generated Cargo.toml tail ---"
+          Get-Content "tier1_app\Cargo.toml" -Tail 12 | Write-Host
 
       - name: "Journey: autumn doctor reports the platform tier"
         run: |

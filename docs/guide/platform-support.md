@@ -53,6 +53,18 @@ debug = "line-tables-only"   # or `0` if that is still too much
 inspection) at a fraction of the symbol count. Autumn's own `windows-tier1` CI
 job builds with `debug = 0` for this reason.
 
+Set it in the **manifest**, not via `CARGO_PROFILE_DEV_DEBUG`. That environment
+variable does drop debug info, but autumn's CI hit the limit again with it set,
+so the manifest profile — plus `[profile.dev.package."*"]` to cover
+dependencies explicitly — is the reliable spelling. If you still hit LNK4319,
+add the linker's own remedy:
+
+```toml
+# .cargo/config.toml
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Clink-arg=/DEBUG:LongSymbolTruncate"]
+```
+
 ### Three other Windows details worth knowing
 
 **Managed Postgres has two native entry points, and one that is not.**
