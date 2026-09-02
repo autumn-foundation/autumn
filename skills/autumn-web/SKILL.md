@@ -2354,6 +2354,8 @@ autumn test                      # provision/target an isolated *_test DB, migra
 autumn test --reset -- --nocapture   # drop+recreate the test DB; forward args to the harness
 autumn db backup --keep 7        # dump control DB + shards to ./backups/<profile>/<ts>/; db restore <artifact> reverses it
 autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/MinIO/R2); db offsite list; db restore offsite:<profile>/latest  # (0.6.0)
+autumn db replica restore --force        # SQLite tier: rebuild from the continuous replica; --timestamp <RFC3339> for PITR, --overwrite to replace an existing file  # (0.7.0)
+autumn db replica status --json          # replica generation, segments, and current replication lag; db replica verify proves it restorable  # (0.7.0)
 autumn db scrub --artifact backups/prod/<run> --force   # restore a prod backup into staging, then anonymize every PII column; --check for CI
 autumn db retention --dry-run    # per-dataset retention window, its source, and rows eligible for purge; --purge to enforce now (needs --force outside dev/test), --dataset X, --json  # (0.7.0)
 autumn seed --count 50 --model Post  # generate+insert 50 faked rows via the model's factory (both flags together)
@@ -2751,6 +2753,69 @@ is configured — an email-only `[alerts]` config is not notified (issue #1743).
 Pointing the offsite bucket at the app's
 own `[storage.s3]` bucket at the same endpoint needs `allow_shared_bucket = true`. See
 `docs/guide/daemon.md`.
+
+### Continuous SQLite replication + point-in-time restore (0.7.0, issue #1628)
+
+On the zero-ops **SQLite** tier (#1614), `[replication]` ships the write-ahead
+log to an offsite destination continuously **from inside the running process** —
+no sidecar, no external tools. The contract is *at most `rpo_secs` (default 10)
+of committed writes lost* when the machine dies, versus one whole backup interval
+with snapshots alone. It composes with `autumn db backup`; it does not replace it.
+Postgres targets are refused at boot (use WAL-G / pgBackRest there).
+
+```toml
+[replication]
+enabled = true
+rpo_secs = 10               # the contract; the loop ships every rpo_secs / 2
+snapshot_interval_secs = 3600   # how often a fresh base snapshot is taken
+max_wal_bytes = 16777216    # WAL size that forces a checkpoint (next WAL index)
+retention_hours = 168       # how far back a point-in-time restore can reach
+verify_interval_secs = 21600    # 0 disables the periodic restore verification
+# path = "/mnt/backup-disk/replica"   # a directory destination instead of S3
+
+[replication.s3]
+bucket   = "myapp-replicas"
+region   = "auto"
+endpoint = "https://<accountid>.r2.cloudflarestorage.com"
+force_path_style = true
+access_key_id_env     = "AUTUMN_REPLICA_ACCESS_KEY_ID"    # names, not values
+secret_access_key_env = "AUTUMN_REPLICA_SECRET_ACCESS_KEY"
+```
+
+Same destination conventions as `[backup.offsite]` (#1619): own section, profile
+overlays, an `AUTUMN_REPLICATION__*` override for every key, env-var-indirected
+credentials, and a refusal to share the app's `[storage.s3]` bucket **and**
+endpoint without `allow_shared_bucket = true`.
+
+Recovery on a fresh box that has only the binary, `autumn.toml` and the
+credentials:
+
+```bash
+autumn db replica status --json   # generation, segments, current-as-of, lag
+autumn db replica restore --force # latest state (--force clears the prod guard)
+autumn db replica restore --timestamp 2026-09-02T14:29:00Z --force --overwrite
+autumn db replica verify          # prove the replica restorable, touching nothing
+```
+
+`--force` gates the **profile**; `--overwrite` gates **replacing an existing
+database file** — deliberately separate, so a drill that always passes `--force`
+cannot destroy a live database. Restore refuses rather than best-efforts: a hole
+in the segment sequence, a digest mismatch, a discontinuous segment, a generation
+without its commit marker, or a rebuilt database that fails `PRAGMA
+integrity_check` is an error, and nothing is published until every check passes.
+A `--timestamp` outside the retention window is refused with the oldest reachable
+instant named, never silently rounded.
+
+Operationally: enabling replication makes the replicator the **only** component
+that checkpoints (pooled connections get `PRAGMA wal_autocheckpoint = 0`), so an
+unreachable destination stalls checkpointing and grows the `-wal` — it costs disk,
+never data — and the tier's single-host/single-writer contract stops being
+advisory. Lag, the current generation and the last successful verification appear
+on `/actuator/health` under the `sqlite-replication` indicator; the indicator goes
+`DOWN` past three RPOs of lag or on a failed verification, which the existing
+`[alerts]` pipeline escalates (see `AlertCondition::HealthIndicatorDown`).
+Verification is a **real restore** on an interval, not a checksum. See
+`docs/guide/sqlite-in-production.md`.
 
 ### VPS deploys and fleets — `autumn deploy` (0.6.0; fleets 0.7.0, issues #1607/#1621)
 
