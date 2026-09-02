@@ -166,6 +166,7 @@ pub fn route_macro(
     let (native_cfg, edge_companion) = emit_edge_items(edge, fn_name, &handler_name, vis, &path);
 
     // ── OpenAPI metadata ────────────────────────────────────────
+    let pools_tokens = emit_pool_slice(&derive_pools(&input_fn));
     let path_params = api_doc::extract_path_params(&path.value());
     let path_params_tokens = api_doc::emit_path_param_slice(&path_params);
     let request_body = api_doc::schema_option(api_doc::infer_request_body(&input_fn));
@@ -277,6 +278,7 @@ pub fn route_macro(
                     sunset_opt_out: #sunset_opt_out_val,
                     has_policy: #has_policy_val,
                     authorize_bindings: #authorize_bindings,
+                    pools: #pools_tokens,
                     public: #is_public,
                     module_path: ::core::module_path!(),
                     source_file: ::core::file!(),
@@ -374,6 +376,96 @@ fn has_extension_param(input_fn: &syn::ItemFn) -> bool {
         };
         tokens_contain_ident(&quote! { #pat_type }, "Extension")
     })
+}
+
+/// Extractor identifiers that prove a route holds a pooled or external
+/// resource for the length of the request, paired with the pool tag recorded
+/// in the capacity contract (issue #1733).
+///
+/// Deliberately narrow: only extractors that *are* a handle on the resource,
+/// for the length of the request, are listed. `DeferredDb` is excluded on both
+/// counts — it is `pub(crate)`, so no app author can write it, and its whole
+/// point is *not* holding a connection across the body read. An extractor that merely happens to consult the database on
+/// some paths (`Session`, `Tenant`, `Flags`) is not, because a contract that
+/// over-claims is worse than one that under-claims — see the "provable
+/// subset" caveat on `RouteInfo::pools`.
+const POOL_EXTRACTORS: &[(&str, &str)] = &[
+    ("CrossShard", "db"),
+    ("Db", "db"),
+    ("Events", "events"),
+    ("Mailer", "mail"),
+    ("Notifications", "notifications"),
+    ("Presence", "presence"),
+    ("ShardedDb", "db"),
+    ("ShardedReadDb", "db"),
+    ("Shards", "db"),
+];
+
+/// The pool tags a handler's declared extractors prove it touches, sorted and
+/// deduplicated so the emitted contract diff is stable.
+///
+/// Only the parameter *types* are scanned, never the binding names, so a
+/// parameter called `events` cannot be mistaken for the `Events` extractor.
+/// Like every source-level check in this crate, a type alias that hides the
+/// extractor's name is not resolved.
+fn derive_pools(input_fn: &syn::ItemFn) -> Vec<&'static str> {
+    let mut pools: Vec<&'static str> = Vec::new();
+    for arg in &input_fn.sig.inputs {
+        let syn::FnArg::Typed(pat_type) = arg else {
+            continue;
+        };
+        let Some(extractor) = declared_extractor(&pat_type.ty) else {
+            continue;
+        };
+        for (name, pool) in POOL_EXTRACTORS {
+            if extractor == *name && !pools.contains(pool) {
+                pools.push(pool);
+            }
+        }
+    }
+    pools.sort_unstable();
+    pools
+}
+
+/// The name of the extractor a parameter *declares*, or `None` when the type
+/// is not a plain path.
+///
+/// Deliberately NOT a recursive search for a resource name anywhere in the
+/// type: `State<AppState<Db>>` declares `State`, not `Db`. Matching nested
+/// generic arguments would contradict the documented rule that a pool held
+/// through an application `State` value is invisible to this derivation, and
+/// would write false `db-bound` shapes — and digest drift — into the contract.
+/// Under-claiming is the safe direction here; over-claiming is a lie.
+///
+/// Transparent wrappers axum itself sees through are peeled, so `Option<Db>`
+/// and `&Db` still declare `Db`. Like every source-level check in this crate,
+/// a type alias that hides the name is not resolved.
+fn declared_extractor(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Reference(inner) => declared_extractor(&inner.elem),
+        syn::Type::Paren(inner) => declared_extractor(&inner.elem),
+        syn::Type::Group(inner) => declared_extractor(&inner.elem),
+        syn::Type::Path(path) => {
+            let segment = path.path.segments.last()?;
+            if segment.ident == "Option"
+                && let syn::PathArguments::AngleBracketed(args) = &segment.arguments
+                && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+            {
+                return declared_extractor(inner);
+            }
+            Some(segment.ident.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Emit the derived pool set as a `&'static [&'static str]` literal.
+fn emit_pool_slice(pools: &[&'static str]) -> TokenStream {
+    if pools.is_empty() {
+        quote! { &[] }
+    } else {
+        quote! { &[#(#pools),*] }
+    }
 }
 
 /// Whether `stream` contains `needle` as an exact identifier, at any nesting.
@@ -2089,5 +2181,165 @@ mod tests {
             generated.contains("authorize_bindings : & []"),
             "a string literal must not be mistaken for a generated binding marker: {generated}"
         );
+    }
+
+    // ── capacity contract: statically derived pool set (#1733) ───────────
+
+    #[test]
+    fn route_macro_records_the_database_pool_from_a_db_extractor() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/posts" },
+            quote! {
+                async fn index(db: Db) -> String {
+                    let _ = db;
+                    String::new()
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains(r#"pools : & ["db"]"#),
+            "a `Db` extractor must prove the database pool: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_records_no_pools_for_a_compute_only_handler() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/about" },
+            quote! {
+                async fn about() -> &'static str {
+                    "about"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pools : & []"),
+            "a handler declaring no resource extractor proves no pool: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_records_each_distinct_pool_once_and_in_order() {
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/posts" },
+            quote! {
+                async fn create(db: Db, mailer: Mailer, events: Events) -> String {
+                    let _ = (db, mailer, events);
+                    String::new()
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains(r#"pools : & ["db" , "events" , "mail"]"#),
+            "pools must be sorted and deduplicated for a stable contract diff: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_recognizes_sharded_database_extractors() {
+        for extractor in ["ShardedDb", "ShardedReadDb", "Shards", "CrossShard"] {
+            let ty = syn::Ident::new(extractor, proc_macro2::Span::call_site());
+            let generated = route_macro(
+                "GET",
+                "get",
+                quote! { "/posts" },
+                quote! {
+                    async fn index(db: #ty) -> String {
+                        let _ = db;
+                        String::new()
+                    }
+                },
+            )
+            .to_string();
+
+            assert!(
+                generated.contains(r#"pools : & ["db"]"#),
+                "`{extractor}` is a database handle: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_macro_sees_a_pool_extractor_through_a_qualified_path() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/posts" },
+            quote! {
+                async fn index(db: autumn_web::db::Db) -> String {
+                    let _ = db;
+                    String::new()
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains(r#"pools : & ["db"]"#),
+            "a fully qualified extractor path still proves the pool: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_does_not_read_a_pool_out_of_a_nested_generic() {
+        // `State<AppState<Db>>` is an application-held state value, not a `Db`
+        // extractor. Recording the database pool here would contradict the
+        // documented rule that `State`-held resources are invisible, and would
+        // put false `db-bound` shapes (and digest drift) into the contract.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/posts" },
+            quote! {
+                async fn index(state: State<AppState<Db>>) -> String {
+                    let _ = state;
+                    String::new()
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pools : & []"),
+            "a pool name nested inside another type is not a declared extractor: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_still_sees_a_pool_through_option_and_reference_wrappers() {
+        // The recognizer looks at the declared extractor, so the transparent
+        // wrappers axum itself understands must not hide it.
+        for spelling in ["Option < Db >", "& Db"] {
+            let ty: syn::Type = syn::parse_str(spelling).expect("type parses");
+            let generated = route_macro(
+                "GET",
+                "get",
+                quote! { "/posts" },
+                quote! {
+                    async fn index(db: #ty) -> String {
+                        let _ = db;
+                        String::new()
+                    }
+                },
+            )
+            .to_string();
+
+            assert!(
+                generated.contains(r#"pools : & ["db"]"#),
+                "`{spelling}` still declares the database extractor: {generated}"
+            );
+        }
     }
 }

@@ -8,6 +8,8 @@ mod assets;
 mod build;
 mod cache_audit;
 mod canary;
+mod capacity;
+mod capacity_driver;
 mod capsule;
 mod check;
 mod cold_start_driver;
@@ -1523,6 +1525,77 @@ enum Commands {
     #[command(name = "data-flow")]
     DataFlow(DataFlowArgs),
 
+    /// Derive and enforce this build's capacity contract (issue #1733).
+    ///
+    /// Builds the app in release mode, reads its route graph, walks a seeded
+    /// concurrency ladder against it, and records the saturation envelope in
+    /// `capacity.lock`. With `--check`, compares a rebuild against the
+    /// committed contract instead of writing one — the CI gate.
+    Calibrate {
+        /// Package to calibrate (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to calibrate (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Path of the capacity contract to write, or to check against.
+        #[arg(long, default_value = autumn_web::capacity::CONTRACT_FILE_NAME, value_name = "PATH")]
+        contract: String,
+        /// Gate mode: fail with a diff when this build regresses beyond
+        /// tolerance versus the committed contract. Writes nothing.
+        #[arg(long)]
+        check: bool,
+        /// Autumn profile to calibrate under — the configuration the contract
+        /// will govern.
+        /// [default: prod; with --check, the committed contract's own profile]
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Cargo features for the calibrated build (repeatable; comma- or
+        /// space-separated inside one). Measure the binary you deploy.
+        #[arg(long, value_name = "FEATURES")]
+        features: Vec<String>,
+        /// Build the calibrated binary with `--all-features`.
+        #[arg(long)]
+        all_features: bool,
+        /// Build the calibrated binary with `--no-default-features`.
+        #[arg(long)]
+        no_default_features: bool,
+        /// Drive load against these paths instead of the discovered ones
+        /// (repeatable). Use when a route needs query parameters or headers
+        /// the driver cannot invent.
+        #[arg(long = "target", value_name = "PATH")]
+        targets: Vec<String>,
+        /// Seed for the request profile, so a calibration is replayable.
+        /// [default: 1733; with --check, the committed contract's own seed]
+        #[arg(long, value_name = "SEED")]
+        seed: Option<u64>,
+        /// Concurrency ladder to walk (comma-separated).
+        /// [default: 1,2,4,8,16,32,64; with --check, the committed ladder]
+        #[arg(long, value_delimiter = ',', value_name = "N")]
+        concurrency: Vec<usize>,
+        /// Milliseconds to hold each rung of the ladder.
+        /// [default: 2000; with --check, the committed value]
+        #[arg(long, value_name = "MS")]
+        rung_ms: Option<u64>,
+        /// Milliseconds of discarded warmup before the ladder.
+        /// [default: 1000; with --check, the committed value]
+        #[arg(long, value_name = "MS")]
+        warmup_ms: Option<u64>,
+        /// Measurements per rung; the median is recorded. Raise it on a noisy
+        /// machine.
+        /// [default: 3; with --check, the committed value]
+        #[arg(long, value_name = "N")]
+        runs: Option<u32>,
+        /// Fractional sustained-throughput drop `--check` tolerates.
+        #[arg(long, default_value_t = crate::capacity::DEFAULT_RPS_TOLERANCE, value_name = "FRACTION")]
+        tolerance_rps: f64,
+        /// Fractional P99-latency rise `--check` tolerates.
+        #[arg(long, default_value_t = crate::capacity::DEFAULT_P99_TOLERANCE, value_name = "FRACTION")]
+        tolerance_p99: f64,
+        /// Also emit the measured contract as JSON on stdout.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print every mounted route — method, path, handler, source, middleware.
     ///
     /// Compiles the application (debug profile) and introspects its route
@@ -4208,6 +4281,53 @@ fn run_command(command: Commands) {
                 features,
                 release: args.release,
             });
+        }
+        Commands::Calibrate {
+            package,
+            bin,
+            contract,
+            check,
+            profile,
+            features,
+            all_features,
+            no_default_features,
+            targets,
+            seed,
+            concurrency,
+            rung_ms,
+            warmup_ms,
+            runs,
+            tolerance_rps,
+            tolerance_p99,
+            json,
+        } => {
+            let exit_code = capacity_driver::run(&capacity_driver::CalibrateOptions {
+                package: package.as_deref(),
+                bin: bin.as_deref(),
+                contract_path: &contract,
+                check,
+                profile,
+                named_features: !features.is_empty() || all_features || no_default_features,
+                features: routes::CargoFeatures {
+                    features,
+                    all: all_features,
+                    no_default: no_default_features,
+                },
+                targets,
+                seed,
+                concurrency,
+                rung_ms,
+                warmup_ms,
+                runs,
+                tolerances: capacity::Tolerances {
+                    rps: tolerance_rps,
+                    p99: tolerance_p99,
+                },
+                json,
+            });
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
         }
         Commands::Routes {
             package,
@@ -9454,6 +9574,78 @@ mod tests {
         };
         assert_eq!(example, "examples/todo-app");
         assert_eq!(runs, 10);
+    }
+
+    // ── autumn calibrate (#1733) ────────────────────────────────────
+
+    #[test]
+    fn parse_calibrate_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "calibrate"]).unwrap();
+        let Commands::Calibrate {
+            contract,
+            check,
+            seed,
+            concurrency,
+            rung_ms,
+            warmup_ms,
+            tolerance_rps,
+            tolerance_p99,
+            ..
+        } = cli.command
+        else {
+            panic!("expected calibrate");
+        };
+        assert_eq!(contract, "capacity.lock");
+        assert!(
+            !check,
+            "calibrate writes a contract unless --check is passed"
+        );
+        // Unspecified, so `--check` can replay whatever the committed
+        // contract recorded rather than this invocation's defaults.
+        assert_eq!(seed, None);
+        assert!(concurrency.is_empty());
+        assert_eq!(rung_ms, None);
+        assert_eq!(warmup_ms, None);
+        assert!((tolerance_rps - capacity::DEFAULT_RPS_TOLERANCE).abs() < f64::EPSILON);
+        assert!((tolerance_p99 - capacity::DEFAULT_P99_TOLERANCE).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_calibrate_check_mode_with_custom_ladder_and_tolerances() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "calibrate",
+            "--check",
+            "-p",
+            "blog",
+            "--contract",
+            "deploy/capacity.lock",
+            "--concurrency",
+            "1,8,64,256",
+            "--tolerance-rps",
+            "0.1",
+            "--tolerance-p99",
+            "0.3",
+        ])
+        .unwrap();
+        let Commands::Calibrate {
+            package,
+            contract,
+            check,
+            concurrency,
+            tolerance_rps,
+            tolerance_p99,
+            ..
+        } = cli.command
+        else {
+            panic!("expected calibrate");
+        };
+        assert!(check);
+        assert_eq!(package.as_deref(), Some("blog"));
+        assert_eq!(contract, "deploy/capacity.lock");
+        assert_eq!(concurrency, vec![1, 8, 64, 256]);
+        assert!((tolerance_rps - 0.1).abs() < f64::EPSILON);
+        assert!((tolerance_p99 - 0.3).abs() < f64::EPSILON);
     }
 
     #[test]

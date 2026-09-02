@@ -229,12 +229,3 @@ autumn config history max_upload_mb
   in `autumn.toml` and require a restart.
 - **Feature flags** (boolean on/off): see the feature-flags guide.
 - **Per-tenant overrides**: blocked on the multi-tenancy milestone; revisit later.
-
----
-
-## Example: tunable rate limit
-
-See [`examples/runtime-config/`](../../examples/runtime-config/) for a
-runnable demonstration.  The example declares a `rate_limit_rps` key and shows
-how a handler reads the live value so that `autumn config set rate_limit_rps 50`
-takes effect immediately without restarting the server.

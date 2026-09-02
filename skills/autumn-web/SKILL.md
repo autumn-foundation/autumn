@@ -87,6 +87,7 @@ the framework almost certainly already generates or ships it:
 | A hand-rolled `AtomicU64` + a `MetricsSource` impl (or a whole second `prometheus`/`metrics` crate exporter) just to count something in a handler | `autumn_web::metrics` — `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`, plus `gauge`, `histogram` and `timer(..).start()` (a guard that records on drop, so early `?` returns and panics are covered) / `time` / `time_async`. Registers itself on first use and lands on the stock `/actuator/prometheus` and `/actuator/metrics` (`app` key) with zero `AppBuilder` wiring; caps cardinality (100 *labeled* series/instrument) instead of leaking series (0.7.0, issue #1378). `describe_*` and `set_histogram_buckets` do not register anything, so startup calls work in either order; gauges and histograms take `usize`/`u64`/`i64` directly (`set(queue.len())`). `MetricsSource` is still the answer when a subsystem already owns the numbers. See `docs/guide/metrics.md` |
 | Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + `PostgreSQL` wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. A capsule also carries every framework effect the run produced — outbound HTTP (webhooks included), job enqueues, cache reads/writes, mail, the resolved tenant and every random draw — and replay serves each from the capsule: no socket is opened, no job is queued, no mail is delivered, and a minted UUID/session id/CSRF token reappears byte-for-byte. A failure *inside a job* records a job-scoped capsule that `autumn replay` dispatches. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598/#1634) |
 | Triaging the same production bug twice because the first fix had no test pinning it | `autumn capsule test <capsule>` converts a capsule into a committed regression test: it copies the capsule's bytes **verbatim** into `tests/capsules/` (so whatever redaction removed stays removed), generates a `#[tokio::test]` beside it, registers both in `tests/integration/mod.rs`, and scaffolds a `capsule_support::router` hook once. The test drives the same replay engine `autumn replay` does and runs under plain `cargo test` with **zero live dependencies** — no network, DB, queue or Docker. `autumn capsule verify` replays the whole committed corpus, which doubles as an upgrade gate: run it against a new Autumn before deploying that version. Job capsules are refused here (no request to drive) — replay those with `autumn replay`. See `docs/guide/failure-capsules.md` (0.7.0, #1634) |
+| Proving a retry path survives "the 3rd DB checkout fails" or "the 2nd `send_invoice` execution fails" with a real-clock test that can only hope for the timing, or with `Chaos` rates that never reproduce the exact failure | `autumn_web::sim::FaultPlan` — an **authored**, seed-deterministic fault scenario attached with `TestApp::with_fault_plan(plan)`: `FaultPlan::from_seed(seed).fail_db_checkout(3).fail_job("send_invoice", 2)` fails exactly those effects through the existing interceptor seams (no app code changes), `only_between(from, to)` gates faults on the injected clock, `random_*_faults(n, 1..=k)` picks ordinals from the seed. `client.fault_outcome().await` returns a serializable `FaultOutcome` (`fired` / `suppressed` / `unfired` / `server_errors` via reporting / `final_state`); `to_json_string()` is byte-identical on every replay of a seed under `#[sim_test]`. Drain jobs with `Sim::run_to_idle` (not `perform_enqueued_jobs`, which bypasses `intercept_execute`). See `docs/guide/simulation-testing.md` → "Authored fault scenarios" (#1680) |
 | Hand-assembled `Cache-Control` header strings on a handler | `etag::cache_for(Duration)` → `CacheControl`; attach as a tuple `(cache_for(dur).public(), html!{…})` or `.wrap(resp)`. Chain `public`/`private`, `max_age`, `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`, `must_revalidate`, `immutable`; `header_value()` renders a deterministic value. Defaults to `private` (a secured page can't be silently made public); composes with `fresh_when` — the directives ride the `200` and the preserved `304` (0.6.0, issue #1344). See `docs/guide/conditional-get.md` |
 
 When none of these fit, dropping to raw Axum (`.merge()`/`.nest()`/`.layer()`)
@@ -306,6 +307,46 @@ async fn ws() -> impl autumn_web::ws::WsHandler {
 
 Route functions are collected with `routes![...]`. Static routes also need
 `static_routes![...]` so `autumn build` can pre-render them.
+
+**Declare the `Content-Type` on a `#[static_get]` route that is not HTML
+(unreleased, #1832).** `autumn build` records the type each handler's response
+declares into `dist/manifest.json`, and the static-first middleware serves that
+value verbatim — it no longer guesses from the route slug, which it had to do
+because every non-root route is stored as `<route>/index.html`. So the handler's
+own header is the whole contract:
+
+```rust
+#[static_get("/sitemap.xml")]
+async fn sitemap() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/xml")], build_sitemap())
+}
+
+#[static_get("/feed")]                       // extensionless — no extension to infer from
+async fn feed() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/rss+xml")], build_feed())
+}
+```
+
+Only a type you *declare* is recorded. axum attaches one to every response, but
+for `String` (`text/plain; charset=utf-8`) and `Vec<u8>`
+(`application/octet-stream`) it comes from the return type, not from you — so on
+a route whose own extension says otherwise (`/theme.css`, `/logo.png`) those two
+exact values are ignored and the extension wins, which is what stops a `->
+String` stylesheet from being served as plain text and dropped by `nosniff`.
+The two are indistinguishable in the response, so if you genuinely want one of
+them on such a route, declare it distinctly (bare `text/plain`, or
+`application/octet-stream` with a parameter) and it is recorded; to force a
+download prefer `Content-Disposition: attachment`. Extensions outside Autumn's
+asset table (`.pdf`, `.zip`) are unaffected.
+
+Return `Markup` (or `Html<String>`) for HTML pages: on an extensionless route a
+handler returning a bare `String` declares `text/plain; charset=utf-8`, which is
+what will now be served.
+A `dist/` built before this release records nothing and keeps its previous derived
+type until the next `autumn build`. ISR refuses a regeneration whose handler
+declares a *different* type than the manifest recorded, so a stale-but-correctly
+-typed page is served instead of fresh bytes under the wrong header — re-run
+`autumn build` after changing a route's type.
 
 **Route-level SEO defaults (issue #1182, 0.7.0):** declare
 per-page meta tag values once on the route with a `seo(...)` argument instead of
@@ -2022,6 +2063,22 @@ Probes (`/health`, `/live`, `/ready`, `/startup`, actuator) are never shed;
 sheds increment `autumn_requests_shed_total`. See `docs/guide/resilience.md`
 and `docs/adr/0009-adopt-overload-protection-load-shedding.md`.
 
+The ceiling no longer has to be a guess. `autumn calibrate` measures what the
+build sustains and writes a committed `capacity.lock`; `autumn calibrate
+--check` gates rebuilds against it in CI, and pointing the runtime at it
+sources the ceiling from the proven envelope:
+
+```toml
+[server]
+capacity_contract = "capacity.lock"   # explicit max_concurrent_requests still wins
+```
+
+Each route in the contract also carries a resource shape (`db-bound`,
+`io-bound`, `compute-bound`) derived statically from the extractors its handler
+declares. Every contract failure — missing file, malformed document, a contract
+measured on a different host class — falls back to *unlimited*, never to a
+ceiling. See `docs/guide/capacity-contracts.md`.
+
 ## Sharding (0.6.0)
 
 Framework-native horizontal sharding: declare `[[database.shards]]` (each a
@@ -2258,6 +2315,8 @@ autumn canary status
 autumn canary promote
 autumn webhook sim generic http://localhost:3000/webhooks/test --secret mysecret --payload '{"ok":true}'
 autumn dev-loop-bench --dry-run
+autumn calibrate                 # measure the capacity envelope -> capacity.lock
+autumn calibrate --check         # CI gate: fail when a rebuild leaves the envelope
 autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin
 autumn plugin list
 autumn plugin add autumn-admin-plugin

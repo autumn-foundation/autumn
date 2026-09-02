@@ -165,16 +165,13 @@ fn static_file_layer_with_isr_coordinator_accepts_local() {
     let mut routes = HashMap::new();
     routes.insert(
         "/".to_owned(),
-        ManifestEntry {
-            file: "index.html".to_owned(),
-            revalidate: None,
-        },
+        // `ManifestEntry::new` is the non-breaking construction path (#1832):
+        // it keeps compiling as the entry gains fields.
+        ManifestEntry::new("index.html"),
     );
-    let manifest = StaticManifest {
-        generated_at: "2026-05-06T00:00:00Z".to_owned(),
-        autumn_version: "0.3.0".to_owned(),
-        routes,
-    };
+    // `StaticManifest` is `#[non_exhaustive]` (#1832): construct it through
+    // `new`, which is what keeps this compiling as the format grows.
+    let manifest = StaticManifest::new(routes).with_generated_at("2026-05-06T00:00:00Z");
     let json = serde_json::to_string(&manifest).unwrap();
     std::fs::write(dist.join("manifest.json"), json).unwrap();
 

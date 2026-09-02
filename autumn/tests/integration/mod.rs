@@ -299,6 +299,8 @@ mod sim_chaos_clock_skew_monotonic;
 mod sim_clock_drain;
 mod sim_delayed_enqueue;
 mod sim_deterministic_ids;
+mod sim_fault_plan;
+mod sim_fault_plan_pg;
 mod sim_job_clock;
 mod sim_llm_stub;
 mod sim_monotonic_clock;
