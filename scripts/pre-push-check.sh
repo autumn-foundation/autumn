@@ -77,6 +77,8 @@ step "./scripts/check-determinism-gate.sh   (self-test + seam gate; no toolchain
 ./scripts/check-determinism-gate.sh
 
 # ---------------------------------------------------------------------------
+# 1c. Plugin API surface gate (issue #1601)
+#
 # Mirrors ci.yml `migration-guides` job: `./scripts/check-plugin-surface.sh`.
 # Same reasoning as the two gates above — seconds, no toolchain, self-testing —
 # and it catches the two things a `cargo test -p <one-crate>` loop never will:

@@ -82,11 +82,12 @@ pub const PLUGIN_CONTRACT_MARKER: &str = "[autumn:plugin-contract] ";
 /// Stability tier of a plugin-facing API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum SurfaceTier {
     /// Covered by [`STABILITY.md`]'s `SemVer` promise. A break needs a version
     /// bump *and* a *Plugin authors* section in the release's migration guide.
     ///
-    /// [`STABILITY.md`]: https://github.com/autumn-foundation/autumn/blob/trunk/STABILITY.md
+    /// [`STABILITY.md`]: https://github.com/autumn-foundation/autumn/blob/trunk-dev/STABILITY.md
     Stable,
     /// May change in any release, including a patch. Plugins that use it should
     /// say so via [`PluginContract::uses_experimental`].
@@ -104,6 +105,7 @@ impl fmt::Display for SurfaceTier {
 
 /// One plugin-facing API, with the tier it is declared at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PluginSurface {
     /// Canonical name, as a plugin author would write it (`AppBuilder::nest`).
     pub name: &'static str,
@@ -135,6 +137,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         note: "Make routes mounted through an opaque `nest`/`merge` router visible to `autumn routes` and the conformance harness.",
     },
     PluginSurface {
+        name: "AppBuilder::error_pages",
+        tier: SurfaceTier::Stable,
+        note: "Replace the rendered error pages — a tier-1 subsystem seam (requires the `maud` feature). The plugin crate needs its own `maud` dependency: `html!` expands to absolute `::maud::` paths, which no re-export can satisfy.",
+    },
+    PluginSurface {
         name: "AppBuilder::merge",
         tier: SurfaceTier::Stable,
         note: "Merge a raw axum router at the root. Pair it with `declare_plugin_routes` so the routes stay attributable.",
@@ -160,9 +167,14 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         note: "Mount a plugin. Also the seam a cooperative plugin uses to mount a plugin of its own.",
     },
     PluginSurface {
+        name: "AppBuilder::plugin_contracts",
+        tier: SurfaceTier::Stable,
+        note: "Read the contracts declared by the plugins mounted on a builder — what the route dump and `autumn plugin-check` are built on.",
+    },
+    PluginSurface {
         name: "AppBuilder::plugin_migrations",
         tier: SurfaceTier::Stable,
-        note: "Contribute embedded database migrations tagged with the plugin's own name (requires the `db` feature).",
+        note: "Contribute embedded database migrations tagged with the plugin's own name. Needs `reexports::diesel_migrations` in scope, because `embed_migrations!` expands to unqualified paths (requires the `db` feature).",
     },
     PluginSurface {
         name: "AppBuilder::plugins",
@@ -182,7 +194,7 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
     PluginSurface {
         name: "AppBuilder::with_edge_kv",
         tier: SurfaceTier::Experimental,
-        note: "Edge-capsule KV binding. The whole edge lane (issue #1790) may change in any release; the capsule wire protocol carries its own version field.",
+        note: "Edge-capsule KV binding (requires the `edge` feature). The whole edge lane (issue #1790) may change in any release; the capsule wire protocol carries its own version field.",
     },
     PluginSurface {
         name: "AppBuilder::with_extension",
@@ -225,9 +237,19 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         note: "Reference edge-capsule host API. Experimental alongside the rest of the edge lane (issue #1790).",
     },
     PluginSurface {
+        name: "db::Pool",
+        tier: SurfaceTier::Stable,
+        note: "The pool type `DatabasePoolProvider::create_pool` returns, re-exported so a plugin need not depend on `diesel-async` itself (requires the `db` feature).",
+    },
+    PluginSurface {
         name: "plugin_conformance",
         tier: SurfaceTier::Stable,
         note: "The library-level conformance harness plugin authors run in their own test suite.",
+    },
+    PluginSurface {
+        name: "plugin_contract",
+        tier: SurfaceTier::Stable,
+        note: "This module: `PluginContract`, `PLUGIN_SURFACES`, `SurfaceTier`, `evaluate`, `lockstep_range`, and the `PLUGIN_CONTRACT_MARKER` dump protocol.",
     },
     PluginSurface {
         name: "route_listing::RouteInfo",
@@ -267,6 +289,7 @@ pub fn experimental_surface_names() -> impl Iterator<Item = &'static str> {
 /// optional: a plugin that declares nothing keeps working exactly as before
 /// ([`ContractVerdict::Undeclared`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PluginContract {
     /// The plugin's crate name, e.g. `"autumn-admin-plugin"`.
     pub plugin: String,
@@ -282,6 +305,19 @@ pub struct PluginContract {
     /// depends on. Reported by `autumn plugin-check`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub experimental_surfaces: Vec<String>,
+    /// The [`Plugin::name`](crate::plugin::Plugin::name) the plugin was
+    /// registered under, filled in by
+    /// [`AppBuilder::plugin`](crate::app::AppBuilder::plugin).
+    ///
+    /// **Not set by the plugin author.** It exists because
+    /// [`plugin`](Self::plugin) is the plugin's *crate* name while route
+    /// attribution keys on `Plugin::name()`, and the default `name()` is
+    /// [`std::any::type_name`] — so a plugin that declares
+    /// `env!("CARGO_PKG_NAME")` without overriding `name()` would otherwise be
+    /// unfindable by the one identifier `autumn plugin-check --plugin-name`
+    /// takes. Carrying both lets the CLI match on either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered_as: Option<String>,
 }
 
 impl PluginContract {
@@ -356,12 +392,23 @@ impl PluginContract {
 ///     .autumn_web(lockstep_range(env!("CARGO_PKG_VERSION")));
 /// ```
 ///
-/// A version this cannot split into `MAJOR.MINOR` is returned unchanged, which
-/// then surfaces as [`ContractVerdict::Unparseable`] rather than as a range
-/// that quietly means something else.
+/// # This is for lockstep crates only
+///
+/// A crate that versions **independently** of `autumn-web` must not use this:
+/// a third-party plugin at its own `1.2.0` would derive `"1"`, which excludes
+/// every `0.x` framework and makes every consuming app fail at registration.
+/// Write the range you actually support as a literal instead.
+///
+/// A version this cannot split into `MAJOR.MINOR` is returned trimmed but
+/// otherwise unchanged, so the malformed value reaches [`evaluate`] as written
+/// rather than being silently reshaped into a range that means something else.
+/// Note that some such strings — `"1"`, or the empty string — *are* valid
+/// Cargo requirements (`^1` and `*`), so a caller passing something other than
+/// `env!("CARGO_PKG_VERSION")` should validate it.
 #[must_use]
 pub fn lockstep_range(version: &str) -> String {
-    let mut parts = version.trim().split('.');
+    let version = version.trim();
+    let mut parts = version.split('.');
     let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
         return version.to_owned();
     };
@@ -381,6 +428,7 @@ pub fn lockstep_range(version: &str) -> String {
 
 /// The outcome of checking a [`PluginContract`] against a framework version.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContractVerdict {
     /// The plugin declares no `autumn-web` range. Nothing to enforce.
     Undeclared,
@@ -392,6 +440,7 @@ pub enum ContractVerdict {
     /// verdict is possible. Warned about at runtime and **failed** by
     /// `autumn plugin-check`: the author's gate is the place to catch a typo,
     /// not somebody else's application boot.
+    #[non_exhaustive]
     Unparseable {
         /// The requirement string as declared.
         requirement: String,
@@ -403,6 +452,7 @@ pub enum ContractVerdict {
 /// An incompatible plugin/framework pairing, rendered as the diagnostic a user
 /// sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PluginCompatibilityError {
     /// The plugin as it appears in the message (`name version`).
     pub plugin: String,
@@ -436,23 +486,22 @@ impl std::error::Error for PluginCompatibilityError {}
 ///
 /// # Prerelease handling
 ///
-/// `SemVer` excludes prereleases from a requirement that does not mention one, so
-/// a strict reading would call `autumn-web 0.7.0-rc.1` incompatible with a
+/// `SemVer` excludes prereleases from a requirement that does not mention one,
+/// so a strict reading would call `autumn-web 0.7.0-rc.1` incompatible with a
 /// plugin declaring `"0.7"`. That is the opposite of what an author means: an
 /// RC of the series *is* the series. The framework version's prerelease and
-/// build metadata are therefore stripped before matching.
+/// build metadata are therefore stripped before matching — **unless the
+/// requirement itself names a prerelease**, in which case the author is
+/// deliberately pinning one (`"=0.8.0-rc.1"`) and stripping it would make the
+/// pin fail against the exact build it names.
 #[must_use]
 pub fn evaluate(contract: &PluginContract, autumn_web_version: &str) -> ContractVerdict {
     let Some(requirement) = contract.autumn_web.as_deref() else {
         return ContractVerdict::Undeclared;
     };
 
-    let version = match Version::parse(autumn_web_version) {
-        Ok(v) => Version {
-            pre: Prerelease::EMPTY,
-            build: BuildMetadata::EMPTY,
-            ..v
-        },
+    let parsed = match Version::parse(autumn_web_version) {
+        Ok(v) => v,
         Err(e) => {
             return ContractVerdict::Unparseable {
                 requirement: requirement.to_owned(),
@@ -470,6 +519,17 @@ pub fn evaluate(contract: &PluginContract, autumn_web_version: &str) -> Contract
                 requirement: requirement.to_owned(),
                 reason: format!("`{requirement}` is not a Cargo version requirement: {e}"),
             };
+        }
+    };
+
+    let requirement_names_a_prerelease = req.comparators.iter().any(|c| !c.pre.is_empty());
+    let version = if requirement_names_a_prerelease {
+        parsed
+    } else {
+        Version {
+            pre: Prerelease::EMPTY,
+            build: BuildMetadata::EMPTY,
+            ..parsed
         }
     };
 

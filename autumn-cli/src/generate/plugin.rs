@@ -135,6 +135,14 @@ pub fn plan_plugin(
         .collect::<Vec<_>>()
         .join(".");
 
+    // The range the scaffolded plugin declares in `Plugin::contract` (issue
+    // #1601). Below 1.0 that is the minor series and from 1.0 on the major —
+    // the compatibility key `STABILITY.md` defines — which is *wider* than the
+    // `major_minor` dependency line above once past 1.0, and deliberately so:
+    // the dependency says what cargo resolves, the contract says what the
+    // plugin claims to work with.
+    let autumn_web_range = autumn_web::plugin_contract::lockstep_range(&cargo_version);
+
     let cargo_toml_content = format!(
         r#"[package]
 name = "autumn-{name_kebab}-plugin"
@@ -173,6 +181,20 @@ impl Default for {struct_name} {{
 impl Plugin for {struct_name} {{
     fn name(&self) -> Cow<'static, str> {{
         Cow::Borrowed("autumn-{name_kebab}-plugin")
+    }}
+
+    /// The `autumn-web` range this plugin supports (issue #1601).
+    ///
+    /// An app built on a framework outside this range fails at registration
+    /// with a diagnostic naming both versions, instead of misbehaving quietly.
+    /// Widen the range as you verify newer releases; `autumn plugin-check`
+    /// reports what you declare.
+    fn contract(&self) -> Option<autumn_web::plugin_contract::PluginContract> {{
+        Some(
+            autumn_web::plugin_contract::PluginContract::new(env!("CARGO_PKG_NAME"))
+                .plugin_version(env!("CARGO_PKG_VERSION"))
+                .autumn_web("{autumn_web_range}"),
+        )
     }}
 
     fn build(self, app: AppBuilder) -> AppBuilder {{
@@ -248,7 +270,10 @@ mod conformance_tests {{
 
         let config = ConformanceConfig::new("autumn-{name_kebab}-plugin")
             .prefix("/autumn-{name_kebab}-plugin")
-            .sensitive_route("/autumn-{name_kebab}-plugin", "Role: admin required");
+            .sensitive_route("/autumn-{name_kebab}-plugin", "Role: admin required")
+            // Pass the plugin's own contract so the `experimental-surface`
+            // check runs instead of being skipped (issue #1601).
+            .contract({struct_name}::new().contract().expect("a declared contract"));
 
         let report = run_conformance(&config, &routes);
         assert!(
@@ -411,6 +436,19 @@ mod tests {
         assert!(lib_content.contains("fn name(&self) -> Cow<'static, str>"));
         assert!(lib_content.contains("Cow::Borrowed(\"autumn-foo-plugin\")"));
         assert!(lib_content.contains("// let app = app.routes("));
+        // The scaffold must satisfy the CLI's own author gate: `autumn
+        // plugin-check`'s `plugin-contract` check fails a plugin that declares
+        // no contract, so a freshly generated plugin cannot ship without one
+        // (issue #1601).
+        assert!(lib_content.contains("fn contract(&self)"));
+        assert!(lib_content.contains("PluginContract::new(env!(\"CARGO_PKG_NAME\"))"));
+        assert!(
+            lib_content.contains(&format!(
+                ".autumn_web(\"{}\")",
+                autumn_web::plugin_contract::lockstep_range(env!("CARGO_PKG_VERSION"))
+            )),
+            "the declared range must track this CLI's own series"
+        );
         assert!(lib_content.contains("index"));
 
         // Check README.md content
@@ -444,6 +482,11 @@ mod tests {
         };
         assert!(conformance_content.contains("run_conformance"));
         assert!(conformance_content.contains("ConformanceConfig::new"));
+        assert!(
+            conformance_content.contains(".contract("),
+            "the generated conformance test must pass the plugin's contract, or the \
+             experimental-surface check is silently skipped"
+        );
 
         // Test non-empty directory collision check
         let collision_dir = project_root.join("autumn-bar-plugin");

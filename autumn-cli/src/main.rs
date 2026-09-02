@@ -1392,11 +1392,11 @@ enum Commands {
     /// Run conformance checks against a plugin's route contributions.
     ///
     /// Compiles the application (debug profile), introspects its route table,
-    /// and verifies that the named plugin satisfies seven checks: installability,
+    /// and verifies that the named plugin satisfies eight checks: installability,
     /// route attribution, route prefix, route collision, sensitive-surface
-    /// gating, and — from the contract the binary dumps (issue #1601) — that the
-    /// plugin declares a usable `autumn-web` range and which experimental
-    /// surface it depends on.  Exits 0 on pass, 1 on failure.
+    /// gating, duplicate registration, and — from the contract the binary dumps
+    /// (issue #1601) — that the plugin declares a usable `autumn-web` range and
+    /// which experimental surface it depends on.  Exits 0 on pass, 1 on failure.
     ///
     /// This is the AUTHOR-facing gate. To discover and install a plugin as a
     /// consumer, use `autumn plugin list` / `autumn plugin add`.
@@ -4887,7 +4887,7 @@ fn run_plugin_check_command(
         sensitive_routes: &sensitive_routes,
         format: fmt,
         // Populated by `run` from the built binary's contract dump.
-        contracts: None,
+        contracts: &plugin_check::ContractDump::Absent,
         deny_experimental,
     });
 }

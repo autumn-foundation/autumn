@@ -41,12 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `autumn plugin-check` gains two checks, `plugin-contract` and
   `experimental-surface`, reading the contract the built binary dumps; both skip
-  on a binary that predates the dump. `--deny-experimental` turns the
-  experimental report into a gate for authors who want one. The migration-guide
-  template gains a **Plugin authors** section, and
-  `scripts/check-plugin-surface.sh` fails a change to the declared surface that
-  does not fill it in. <!-- migration-guide-gate: additive; the "Plugin authors"
-  section it adds is about the gate itself, not a break -->
+  on a binary that predates the dump, and `--deny-experimental` fails closed
+  rather than becoming a silent no-op. `autumn generate plugin` now scaffolds
+  `Plugin::contract`. The migration-guide template gains a **Plugin authors**
+  section, and `scripts/check-plugin-surface.sh` fails a change to the declared
+  surface that does not fill it in. <!-- migration-guide-gate: the additive half
+  of #1601; its one break is declared separately under Changed -->
 
 - **Pin a worker tier to queues from the command line, and let `doctor` prove
   fleet-wide queue coverage (#1623):** per-queue `reserved`/`concurrency` pools
@@ -750,6 +750,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **plugin-conformance:** **Breaking:** `plugin_conformance::ConformanceConfig`
+  gains a `contract` field and is now `#[non_exhaustive]`, so it can no longer
+  be built with a struct literal — use `ConformanceConfig::new(name)` and the
+  fluent setters, which are unchanged. `#[non_exhaustive]` lands with the field
+  deliberately: it is what lets a later release add a check's configuration
+  without breaking every plugin's test suite again. `autumn plugin-check` also
+  now **fails** a plugin that declares no `Plugin::contract`; the plugin itself
+  compiles and runs unchanged. Part of #1601; see the
+  [migration guide](docs/migrations/next.md).
 - **The `Listening` log line now reports the address actually bound** rather
   than the one configured, so `server.port = 0` (and a socket inherited from an
   in-place upgrade) shows the real port instead of `0`. Issue #1674.

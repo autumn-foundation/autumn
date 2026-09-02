@@ -1523,12 +1523,23 @@ Three things to know before advising on it:
   `autumn-web = "<declared>"`). An unparseable requirement only warns at
   runtime — but `autumn plugin-check` fails on it, which is where the author
   sees it.
-- **`autumn plugin-check` gained two checks.** `plugin-contract` fails when the
-  plugin under check declares no usable range; `experimental-surface` *reports*
-  what it declares, failing only on a name that does not resolve to an
-  experimental entry in the registry. Both skip against a host binary built
-  before the contract existed. `--deny-experimental` turns the report into a
-  gate.
+- **`autumn plugin-check` gained two checks, and one of them is a break for
+  existing plugins.** `plugin-contract` **fails** when the plugin under check
+  declares no usable range — the plugin still compiles and runs unchanged, but
+  its CI goes red until `Plugin::contract` is implemented. `experimental-surface`
+  *reports* what it declares, failing only on a name that does not resolve to
+  an experimental entry in the registry. Both skip against a host binary built
+  before the contract existed; `--deny-experimental` fails closed in that case
+  rather than becoming a no-op. `autumn generate plugin` scaffolds the contract,
+  so new plugins are green out of the box.
+- **`--plugin-name` resolves against either identity.** A contract names the
+  *crate*; route attribution keys on `Plugin::name()`, which defaults to
+  `std::any::type_name`. The CLI matches both, so neither choice hides a plugin
+  from the check.
+- **A mismatch has an escape hatch.** The registration panic names
+  `AUTUMN_PLUGIN_CONTRACT=warn`, which downgrades it to a `WARN`. Reach for it
+  when a plugin's declared range is merely stale; the fix still belongs in the
+  plugin.
 - **The framework side is gated by compilation.** `autumn-plugin-reference`
   calls every declared stable surface and is built by the `plugin-contract` CI
   job, so a stable-surface break is a red check on the PR that causes it. Do

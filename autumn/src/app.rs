@@ -2754,8 +2754,14 @@ impl AppBuilder {
             );
             return self;
         }
-        if let Some(contract) = plugin.contract() {
+        if let Some(mut contract) = plugin.contract() {
             Self::enforce_plugin_contract(&contract);
+            // Route attribution keys on `Plugin::name()` while a contract names
+            // the plugin's CRATE; the default `name()` is `type_name`, so a
+            // plugin that declares `env!("CARGO_PKG_NAME")` without overriding
+            // `name()` has two identities. Carry both so
+            // `autumn plugin-check --plugin-name` finds it under either.
+            contract.registered_as = Some(name.as_ref().to_owned());
             self.plugin_contracts.push(contract);
         }
         let name_str = name.into_owned();
@@ -2810,13 +2816,40 @@ impl AppBuilder {
     /// author's* typo, and `autumn plugin-check` fails on it in their CI —
     /// hard-failing here would punish an application author for a mistake they
     /// cannot fix.
+    ///
+    /// # The escape hatch
+    ///
+    /// The one thing an application author *cannot* fix is a plugin whose
+    /// declared range is merely stale — cargo has already proven the two link
+    /// one `autumn-web`, so an over-tight literal in somebody else's crate
+    /// should not be able to strand a working deployment. Setting
+    /// `AUTUMN_PLUGIN_CONTRACT=warn` downgrades the panic to a `tracing::warn!`
+    /// carrying the same message. It is named in the panic text itself, so the
+    /// person who hits it does not have to find this doc first. Loud-by-default
+    /// is the point; unbootable-with-no-recourse is not.
+    ///
+    /// Note that a **duplicate** registration is skipped before its contract is
+    /// read, so enforcement applies to the first plugin registered under a
+    /// given name.
     #[track_caller]
     fn enforce_plugin_contract(contract: &crate::plugin_contract::PluginContract) {
         use crate::plugin_contract::{AUTUMN_WEB_VERSION, ContractVerdict, evaluate};
 
         match evaluate(contract, AUTUMN_WEB_VERSION) {
             ContractVerdict::Compatible | ContractVerdict::Undeclared => {}
-            ContractVerdict::Incompatible(err) => panic!("{err}"),
+            ContractVerdict::Incompatible(err) => {
+                if std::env::var("AUTUMN_PLUGIN_CONTRACT").as_deref() == Ok("warn") {
+                    tracing::warn!(
+                        plugin = contract.plugin.as_str(),
+                        "{err}\n  (demoted to a warning by AUTUMN_PLUGIN_CONTRACT=warn)"
+                    );
+                } else {
+                    panic!(
+                        "{err}\n  \u{2192} or, to boot anyway while you sort it out, set \
+                         AUTUMN_PLUGIN_CONTRACT=warn"
+                    );
+                }
+            }
             ContractVerdict::Unparseable {
                 requirement,
                 reason,

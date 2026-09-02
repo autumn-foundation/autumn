@@ -166,14 +166,9 @@ pub struct PluginCheckOptions<'a> {
     pub sensitive_routes: &'a [SensitiveRouteDecl],
     /// Output format.
     pub format: ReportFormat,
-    /// Plugin contracts dumped by the built binary (issue #1601).
-    ///
-    /// `None` means the binary emitted no
-    /// [`PLUGIN_CONTRACT_MARKER`](autumn_web::plugin_contract::PLUGIN_CONTRACT_MARKER)
-    /// line at all, which is what an app built against an older `autumn-web`
-    /// does. `Some(&[])` means it emitted the marker and declared nothing —
-    /// a real answer, and a different one.
-    pub contracts: Option<&'a [PluginContract]>,
+    /// What the built binary's stderr said about its plugin contracts
+    /// (issue #1601). See [`ContractDump`].
+    pub contracts: &'a ContractDump,
     /// Turn the `experimental-surface` report into a hard failure.
     ///
     /// Off by default: depending on experimental surface is an informed choice,
@@ -234,7 +229,7 @@ pub fn run(opts: &PluginCheckOptions<'_>) {
             expected_prefix: opts.expected_prefix,
             sensitive_routes: opts.sensitive_routes,
             format: opts.format.clone(),
-            contracts: contracts.as_deref(),
+            contracts: &contracts,
             deny_experimental: opts.deny_experimental,
         },
         &routes,
@@ -281,18 +276,17 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
     ));
     checks.push(check_duplicate_registration(opts.plugin_name, routes));
 
-    // `None` and `Some(&[])` mean different things: no marker at all (an older
-    // binary) versus a marker declaring nothing. Only the first is a skip.
-    let declared = opts
-        .contracts
-        .and_then(|all| all.iter().find(|c| c.plugin == opts.plugin_name));
+    let declared = match opts.contracts {
+        ContractDump::Present(all) => find_declared(all, opts.plugin_name),
+        ContractDump::Absent | ContractDump::Malformed(_) => None,
+    };
     checks.push(check_plugin_contract(
         opts.plugin_name,
         opts.contracts,
         declared,
     ));
     checks.push(check_experimental_surface(
-        opts.contracts.is_some(),
+        opts.contracts,
         declared,
         opts.deny_experimental,
     ));
@@ -303,22 +297,63 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
     }
 }
 
+/// What the child binary's stderr said about its plugin contracts.
+///
+/// Three outcomes, deliberately kept apart. Folding the third into the first
+/// would let `autumn plugin-check` report a green run for a plugin it never
+/// actually checked, which is the one thing an author gate must not do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContractDump {
+    /// No [`PLUGIN_CONTRACT_MARKER`] line at all — an application built against
+    /// an `autumn-web` that predates the contract.
+    Absent,
+    /// The marker was there and parsed. An empty `Vec` means the app declared
+    /// no contracts, which is a real answer and not the same as `Absent`.
+    Present(Vec<PluginContract>),
+    /// The marker was there and its payload could not be read: a truncated
+    /// pipe, or a `PluginContract` shape this CLI is too old to understand.
+    Malformed(String),
+}
+
 /// Parse the plugin-contract dump ([`PLUGIN_CONTRACT_MARKER`]) out of a child
 /// binary's stderr.
 ///
-/// Returns `None` when no marker line is present — an application built against
-/// an `autumn-web` that predates the contract — and `Some(vec![])` when the
-/// marker is there and the app declared nothing. The two are different answers
-/// and the checks treat them differently.
-///
 /// The **last** marker line wins, matching the security-config dump: a child
-/// that re-execs would otherwise be read from its first, stale dump.
-fn parse_plugin_contracts(stderr: &str) -> Option<Vec<PluginContract>> {
-    stderr
+/// that re-execs would otherwise be read from its first, stale dump. The last
+/// line is selected *before* parsing, so a malformed final dump reports
+/// [`ContractDump::Malformed`] rather than silently falling back to an earlier,
+/// stale one.
+fn parse_plugin_contracts(stderr: &str) -> ContractDump {
+    let Some(payload) = stderr
         .lines()
         .filter_map(|line| line.strip_prefix(PLUGIN_CONTRACT_MARKER))
-        .filter_map(|payload| serde_json::from_str::<Vec<PluginContract>>(payload.trim()).ok())
         .next_back()
+    else {
+        return ContractDump::Absent;
+    };
+
+    match serde_json::from_str::<Vec<PluginContract>>(payload.trim()) {
+        Ok(contracts) => ContractDump::Present(contracts),
+        Err(e) => ContractDump::Malformed(e.to_string()),
+    }
+}
+
+/// The contract the checked plugin declared, matched on either identity it has.
+///
+/// [`PluginContract::plugin`] is the plugin's *crate* name and
+/// [`PluginContract::registered_as`] is its
+/// [`Plugin::name`](autumn_web::plugin::Plugin::name) — which route attribution
+/// keys on, and which defaults to `std::any::type_name`. A plugin that declares
+/// `env!("CARGO_PKG_NAME")` without overriding `name()` therefore has two
+/// identities, and `--plugin-name` takes one string. Matching either means no
+/// plugin is unfindable for having picked the other.
+fn find_declared<'a>(
+    contracts: &'a [PluginContract],
+    plugin_name: &str,
+) -> Option<&'a PluginContract> {
+    contracts
+        .iter()
+        .find(|c| c.plugin == plugin_name || c.registered_as.as_deref() == Some(plugin_name))
 }
 
 /// Check that the plugin declares a usable `autumn-web` compatibility range.
@@ -330,24 +365,54 @@ fn parse_plugin_contracts(stderr: &str) -> Option<Vec<PluginContract>> {
 /// like it is armed.
 fn check_plugin_contract(
     plugin_name: &str,
-    all: Option<&[PluginContract]>,
+    dump: &ContractDump,
     declared: Option<&PluginContract>,
 ) -> CheckResult {
     let name = "plugin-contract".to_owned();
 
-    let Some(all) = all else {
-        return CheckResult {
-            name,
-            status: CheckStatus::Skip,
-            message: "the built binary emitted no plugin-contract dump; rebuild against \
-                      autumn-web 0.8 or newer to have the contract checked"
-                .to_owned(),
-            diagnostics: vec![],
-        };
+    let all = match dump {
+        ContractDump::Absent => {
+            return CheckResult {
+                name,
+                status: CheckStatus::Skip,
+                message: format!(
+                    "the built binary emitted no plugin-contract dump; rebuild against an \
+                     autumn-web newer than {} to have the contract checked",
+                    autumn_web::plugin_contract::AUTUMN_WEB_VERSION
+                ),
+                diagnostics: vec![],
+            };
+        }
+        ContractDump::Malformed(reason) => {
+            // NOT a skip. The binary answered and the answer was unreadable, so
+            // nothing about this plugin's contract has been verified — saying
+            // "skipped, too old" would be false and would read as green.
+            return CheckResult {
+                name,
+                status: CheckStatus::Fail,
+                message: "the built binary emitted a plugin-contract dump that could not be read"
+                    .to_owned(),
+                diagnostics: vec![
+                    reason.clone(),
+                    "the contract was NOT checked; this is not the same as a binary that \
+                     predates the dump"
+                        .to_owned(),
+                ],
+            };
+        }
+        ContractDump::Present(all) => all,
     };
 
     let Some(contract) = declared else {
-        let found: Vec<String> = all.iter().map(|c| c.plugin.clone()).collect();
+        let found: Vec<String> = all
+            .iter()
+            .map(|c| match &c.registered_as {
+                Some(registered) if registered != &c.plugin => {
+                    format!("{} (registered as `{registered}`)", c.plugin)
+                }
+                _ => c.plugin.clone(),
+            })
+            .collect();
         let mut diagnostics = vec![format!(
             "implement `Plugin::contract` on {plugin_name} and return \
              `PluginContract::new(env!(\"CARGO_PKG_NAME\")).autumn_web(\"<range>\")`"
@@ -356,8 +421,8 @@ fn check_plugin_contract(
             diagnostics.push("no plugin in this app declares a contract".to_owned());
         } else {
             diagnostics.push(format!(
-                "contracts found in this app: {} — a contract's `plugin` field must match the \
-                 `--plugin-name` being checked",
+                "contracts found in this app: {} — `--plugin-name` must match a contract's crate \
+                 name or the name the plugin registered under",
                 found.join(", ")
             ));
         }
@@ -381,11 +446,10 @@ fn check_plugin_contract(
         };
     };
 
-    // Evaluated against the plugin's own declared range using a version the
-    // requirement must at least be able to *parse*. The framework already
-    // enforced the real pairing at registration (the binary would not have got
-    // this far otherwise), so what is left to catch here is a requirement no
-    // parser can evaluate — which silently disables that enforcement.
+    // The framework already enforced the real pairing at registration (the
+    // binary would not have got this far otherwise), so what is left to catch
+    // here is a requirement no parser can evaluate — which silently disables
+    // that enforcement.
     match evaluate(contract, autumn_web::plugin_contract::AUTUMN_WEB_VERSION) {
         ContractVerdict::Unparseable { reason, .. } => CheckResult {
             name,
@@ -414,29 +478,48 @@ fn check_plugin_contract(
 /// `--deny-experimental` flag) turns a clean report into a hard failure for
 /// authors who want to forbid it in their own CI.
 fn check_experimental_surface(
-    marker_present: bool,
+    dump: &ContractDump,
     declared: Option<&PluginContract>,
     deny: bool,
 ) -> CheckResult {
     let name = "experimental-surface".to_owned();
 
-    if !marker_present {
-        return CheckResult {
-            name,
-            status: CheckStatus::Skip,
-            message: "the built binary emitted no plugin-contract dump".to_owned(),
-            diagnostics: vec![],
-        };
+    // `--deny-experimental` is a "forbid it" flag, so it fails closed: when the
+    // contract could not be read there is no evidence the plugin is clean, and
+    // a silent Skip would turn the gate into a no-op exactly when it matters.
+    let unevaluated = |message: String| CheckResult {
+        name: name.clone(),
+        status: if deny {
+            CheckStatus::Fail
+        } else {
+            CheckStatus::Skip
+        },
+        message: if deny {
+            format!("{message} — cannot honour --deny-experimental without it")
+        } else {
+            message
+        },
+        diagnostics: vec![],
+    };
+
+    match dump {
+        ContractDump::Absent => {
+            return unevaluated("the built binary emitted no plugin-contract dump".to_owned());
+        }
+        ContractDump::Malformed(_) => {
+            return unevaluated(
+                "the built binary's plugin-contract dump could not be read; see the \
+                 plugin-contract check"
+                    .to_owned(),
+            );
+        }
+        ContractDump::Present(_) => {}
     }
 
     let Some(contract) = declared else {
-        return CheckResult {
-            name,
-            status: CheckStatus::Skip,
-            message: "no contract declared for this plugin; see the plugin-contract check"
-                .to_owned(),
-            diagnostics: vec![],
-        };
+        return unevaluated(
+            "no contract declared for this plugin; see the plugin-contract check".to_owned(),
+        );
     };
 
     if contract.experimental_surfaces.is_empty() {
@@ -1202,7 +1285,7 @@ mod tests {
             expected_prefix: None,
             sensitive_routes: &[],
             format: ReportFormat::Text,
-            contracts: None,
+            contracts: &ContractDump::Absent,
             deny_experimental: false,
         };
         let routes = vec![make_route("GET", "/posts", "user")];
@@ -1219,7 +1302,7 @@ mod tests {
             expected_prefix: None,
             sensitive_routes: &[],
             format: ReportFormat::Text,
-            contracts: None,
+            contracts: &ContractDump::Absent,
             deny_experimental: false,
         };
         let report = build_report(&opts, &[]);
@@ -1235,7 +1318,7 @@ mod tests {
             expected_prefix: Some("/admin"),
             sensitive_routes: &[],
             format: ReportFormat::Text,
-            contracts: None,
+            contracts: &ContractDump::Absent,
             deny_experimental: false,
         };
         let routes = vec![make_route("GET", "/admin", "plugin:admin")];
@@ -1252,7 +1335,7 @@ mod tests {
             expected_prefix: None,
             sensitive_routes: &[],
             format: ReportFormat::Text,
-            contracts: None,
+            contracts: &ContractDump::Absent,
             deny_experimental: false,
         };
         let report = build_report(&opts, &[]);
@@ -1269,7 +1352,7 @@ mod contract_tests {
     use super::*;
     use autumn_web::plugin_contract::{PLUGIN_CONTRACT_MARKER, PluginContract};
 
-    fn opts(contracts: Option<&[PluginContract]>) -> PluginCheckOptions<'_> {
+    fn opts(contracts: &ContractDump) -> PluginCheckOptions<'_> {
         PluginCheckOptions {
             package: None,
             bin: None,
@@ -1280,6 +1363,10 @@ mod contract_tests {
             contracts,
             deny_experimental: false,
         }
+    }
+
+    fn present(contracts: Vec<PluginContract>) -> ContractDump {
+        ContractDump::Present(contracts)
     }
 
     fn route() -> RouteInfo {
@@ -1312,28 +1399,38 @@ mod contract_tests {
         let stderr = format!(
             "\u{1F342} autumn plugin-check\nsome warning\n{PLUGIN_CONTRACT_MARKER}[{{\"plugin\":\"autumn-plugin-demo\",\"autumn_web\":\"0.7\"}}]\ntrailing\n"
         );
-        let parsed = parse_plugin_contracts(&stderr).expect("marker present");
+        let ContractDump::Present(parsed) = parse_plugin_contracts(&stderr) else {
+            panic!("marker present");
+        };
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].plugin, "autumn-plugin-demo");
         assert_eq!(parsed[0].autumn_web.as_deref(), Some("0.7"));
     }
 
     #[test]
-    fn an_absent_marker_parses_as_none() {
-        assert!(parse_plugin_contracts("no marker here\n").is_none());
+    fn an_absent_marker_parses_as_absent() {
+        assert_eq!(
+            parse_plugin_contracts("no marker here\n"),
+            ContractDump::Absent
+        );
     }
 
     #[test]
-    fn an_empty_contract_array_parses_as_an_empty_vec_not_none() {
+    fn an_empty_contract_array_is_present_and_empty_not_absent() {
         let stderr = format!("{PLUGIN_CONTRACT_MARKER}[]\n");
-        let parsed = parse_plugin_contracts(&stderr).expect("marker present");
+        let ContractDump::Present(parsed) = parse_plugin_contracts(&stderr) else {
+            panic!("marker present");
+        };
         assert!(parsed.is_empty(), "the app declared no contracts");
     }
 
     #[test]
-    fn a_malformed_marker_payload_parses_as_none() {
+    fn a_malformed_marker_payload_is_distinguished_from_an_absent_one() {
         let stderr = format!("{PLUGIN_CONTRACT_MARKER}{{not json\n");
-        assert!(parse_plugin_contracts(&stderr).is_none());
+        assert!(
+            matches!(parse_plugin_contracts(&stderr), ContractDump::Malformed(_)),
+            "a marker the CLI cannot read is NOT the same as no marker"
+        );
     }
 
     #[test]
@@ -1341,7 +1438,9 @@ mod contract_tests {
         let stderr = format!(
             "{PLUGIN_CONTRACT_MARKER}[]\n{PLUGIN_CONTRACT_MARKER}[{{\"plugin\":\"second\"}}]\n"
         );
-        let parsed = parse_plugin_contracts(&stderr).expect("marker present");
+        let ContractDump::Present(parsed) = parse_plugin_contracts(&stderr) else {
+            panic!("marker present");
+        };
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].plugin, "second");
     }
@@ -1350,7 +1449,7 @@ mod contract_tests {
 
     #[test]
     fn a_binary_that_emits_no_marker_skips_the_contract_check() {
-        let report = build_report(&opts(None), &[route()]);
+        let report = build_report(&opts(&ContractDump::Absent), &[route()]);
         let result = find(&report, "plugin-contract");
         assert_eq!(result.status, CheckStatus::Skip);
     }
@@ -1358,7 +1457,7 @@ mod contract_tests {
     #[test]
     fn a_plugin_with_no_contract_fails_the_contract_check() {
         let others = vec![PluginContract::new("some-other-plugin").autumn_web("0.7")];
-        let report = build_report(&opts(Some(&others)), &[route()]);
+        let report = build_report(&opts(&present(others.clone())), &[route()]);
         let result = find(&report, "plugin-contract");
         assert_eq!(
             result.status,
@@ -1380,7 +1479,7 @@ mod contract_tests {
                 .plugin_version("1.2.3")
                 .autumn_web("0.7"),
         ];
-        let report = build_report(&opts(Some(&contracts)), &[route()]);
+        let report = build_report(&opts(&present(contracts.clone())), &[route()]);
         let result = find(&report, "plugin-contract");
         assert_eq!(result.status, CheckStatus::Pass);
         assert!(result.message.contains("0.7"), "{}", result.message);
@@ -1389,7 +1488,7 @@ mod contract_tests {
     #[test]
     fn an_unparseable_range_fails_the_contract_check() {
         let contracts = vec![PluginContract::new("autumn-plugin-demo").autumn_web("not a req")];
-        let report = build_report(&opts(Some(&contracts)), &[route()]);
+        let report = build_report(&opts(&present(contracts.clone())), &[route()]);
         let result = find(&report, "plugin-contract");
         assert_eq!(
             result.status,
@@ -1404,7 +1503,7 @@ mod contract_tests {
     #[test]
     fn a_stable_only_plugin_passes_the_experimental_check() {
         let contracts = vec![PluginContract::new("autumn-plugin-demo").autumn_web("0.7")];
-        let report = build_report(&opts(Some(&contracts)), &[route()]);
+        let report = build_report(&opts(&present(contracts.clone())), &[route()]);
         let result = find(&report, "experimental-surface");
         assert_eq!(result.status, CheckStatus::Pass);
         assert!(result.diagnostics.is_empty());
@@ -1417,7 +1516,7 @@ mod contract_tests {
                 .autumn_web("0.7")
                 .uses_experimental("AppBuilder::with_edge_kv"),
         ];
-        let report = build_report(&opts(Some(&contracts)), &[route()]);
+        let report = build_report(&opts(&present(contracts.clone())), &[route()]);
         let result = find(&report, "experimental-surface");
         assert_eq!(result.status, CheckStatus::Pass);
         assert!(
@@ -1438,7 +1537,8 @@ mod contract_tests {
                 .autumn_web("0.7")
                 .uses_experimental("AppBuilder::with_edge_kv"),
         ];
-        let mut o = opts(Some(&contracts));
+        let dump = present(contracts.clone());
+        let mut o = opts(&dump);
         o.deny_experimental = true;
         let report = build_report(&o, &[route()]);
         let result = find(&report, "experimental-surface");
@@ -1449,7 +1549,8 @@ mod contract_tests {
     #[test]
     fn deny_experimental_does_not_fail_a_stable_only_plugin() {
         let contracts = vec![PluginContract::new("autumn-plugin-demo").autumn_web("0.7")];
-        let mut o = opts(Some(&contracts));
+        let dump = present(contracts.clone());
+        let mut o = opts(&dump);
         o.deny_experimental = true;
         let report = build_report(&o, &[route()]);
         assert_eq!(
@@ -1466,7 +1567,7 @@ mod contract_tests {
                 .autumn_web("0.7")
                 .uses_experimental("AppBuilder::not_a_surface"),
         ];
-        let report = build_report(&opts(Some(&contracts)), &[route()]);
+        let report = build_report(&opts(&present(contracts.clone())), &[route()]);
         assert_eq!(
             find(&report, "experimental-surface").status,
             CheckStatus::Fail
@@ -1475,10 +1576,100 @@ mod contract_tests {
 
     #[test]
     fn the_experimental_check_is_skipped_when_the_binary_emits_no_marker() {
-        let report = build_report(&opts(None), &[route()]);
+        let report = build_report(&opts(&ContractDump::Absent), &[route()]);
         assert_eq!(
             find(&report, "experimental-surface").status,
             CheckStatus::Skip
+        );
+    }
+
+    /// A malformed FINAL dump must not silently fall back to an earlier, stale
+    /// one — which is exactly what parsing before selecting would do.
+    #[test]
+    fn a_malformed_last_dump_does_not_fall_back_to_an_earlier_one() {
+        let stderr = format!(
+            "{PLUGIN_CONTRACT_MARKER}[{{\"plugin\":\"stale\"}}]\n{PLUGIN_CONTRACT_MARKER}[{{\"plugin\":\"trunc\"\n"
+        );
+        assert!(
+            matches!(parse_plugin_contracts(&stderr), ContractDump::Malformed(_)),
+            "the stale first dump must not win"
+        );
+    }
+
+    #[test]
+    fn a_malformed_dump_fails_the_contract_check_rather_than_skipping_it() {
+        let dump = ContractDump::Malformed("expected value at line 1".to_owned());
+        let report = build_report(&opts(&dump), &[route()]);
+        let result = find(&report, "plugin-contract");
+        assert_eq!(
+            result.status,
+            CheckStatus::Fail,
+            "an unreadable answer is not the same as no answer"
+        );
+        assert!(!report.passed());
+    }
+
+    #[test]
+    fn deny_experimental_fails_closed_when_the_contract_cannot_be_read() {
+        for dump in [
+            ContractDump::Absent,
+            ContractDump::Malformed("bad".to_owned()),
+            ContractDump::Present(vec![]),
+        ] {
+            let mut o = opts(&dump);
+            o.deny_experimental = true;
+            let report = build_report(&o, &[route()]);
+            assert_eq!(
+                find(&report, "experimental-surface").status,
+                CheckStatus::Fail,
+                "--deny-experimental must not silently no-op for {dump:?}"
+            );
+        }
+    }
+
+    /// A plugin that declares `env!("CARGO_PKG_NAME")` but does not override
+    /// `Plugin::name()` has two identities. `--plugin-name` takes one string,
+    /// so both have to resolve or the plugin is unfindable.
+    #[test]
+    fn a_contract_is_found_under_the_name_the_plugin_registered_under() {
+        let mut contract = PluginContract::new("autumn-plugin-demo").autumn_web("0.7");
+        contract.registered_as = Some("demo_crate::DemoPlugin".to_owned());
+        let dump = present(vec![contract]);
+
+        for name in ["autumn-plugin-demo", "demo_crate::DemoPlugin"] {
+            let mut o = opts(&dump);
+            o.plugin_name = name;
+            let report = build_report(&o, &[route()]);
+            assert_eq!(
+                find(&report, "plugin-contract").status,
+                CheckStatus::Pass,
+                "--plugin-name {name} should resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn the_not_found_diagnostic_names_both_identities() {
+        let mut contract = PluginContract::new("autumn-plugin-demo").autumn_web("0.7");
+        contract.registered_as = Some("demo_crate::DemoPlugin".to_owned());
+        let dump = present(vec![contract]);
+        let mut o = opts(&dump);
+        o.plugin_name = "something-else";
+        let report = build_report(&o, &[route()]);
+        let joined = find(&report, "plugin-contract").diagnostics.join("\n");
+        assert!(joined.contains("autumn-plugin-demo"), "{joined}");
+        assert!(joined.contains("demo_crate::DemoPlugin"), "{joined}");
+    }
+
+    /// The skip message must not name a hard-coded future release: the version
+    /// this CLI links is the only one it can honestly speak about.
+    #[test]
+    fn the_older_binary_skip_message_names_this_builds_version() {
+        let report = build_report(&opts(&ContractDump::Absent), &[route()]);
+        let message = &find(&report, "plugin-contract").message;
+        assert!(
+            message.contains(autumn_web::plugin_contract::AUTUMN_WEB_VERSION),
+            "{message}"
         );
     }
 
@@ -1489,7 +1680,7 @@ mod contract_tests {
                 .autumn_web("0.7")
                 .uses_experimental("AppBuilder::with_edge_kv"),
         ];
-        let report = build_report(&opts(Some(&contracts)), &[route()]);
+        let report = build_report(&opts(&present(contracts.clone())), &[route()]);
         let text = report.to_text_report();
         assert!(text.contains("plugin-contract"), "{text}");
         assert!(text.contains("experimental-surface"), "{text}");

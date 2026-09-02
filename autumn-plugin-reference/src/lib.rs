@@ -30,6 +30,7 @@
 
 use autumn_web::app::AppBuilder;
 use autumn_web::plugin::Plugin;
+// surface: plugin_contract
 use autumn_web::plugin_contract::PluginContract;
 use autumn_web::prelude::*;
 // `embed_migrations!` expands to unqualified `diesel_migrations::…` paths, so
@@ -134,6 +135,9 @@ impl Plugin for ReferencePlugin {
         // surface: AppBuilder::merge
         let app = app.merge(autumn_web::reexports::axum::Router::new());
 
+        // surface: AppBuilder::error_pages
+        let app = app.error_pages(ReferenceErrorPages);
+
         // surface: AppBuilder::with_config_loader
         let app = app.with_config_loader(providers::ReferenceConfigLoader);
 
@@ -157,7 +161,20 @@ impl Plugin for ReferencePlugin {
         // A cooperative plugin mounts plugins of its own. Both spellings are
         // plugin-facing surface, so both are exercised.
         let app = app.plugin(CompanionPlugin);
-        app.plugins((SecondCompanionPlugin,))
+        let app = app.plugins((SecondCompanionPlugin,));
+
+        // surface: AppBuilder::plugin_contracts
+        //
+        // A cooperative plugin can read what the plugins around it declared —
+        // the same list the route dump emits for `autumn plugin-check`.
+        debug_assert!(
+            app.plugin_contracts()
+                .iter()
+                .any(|c| c.plugin == env!("CARGO_PKG_NAME")),
+            "the reference plugin's own contract should be recorded by now"
+        );
+
+        app
     }
 }
 
@@ -167,6 +184,16 @@ impl Plugin for ReferencePlugin {
 #[cfg(feature = "db")]
 pub const MIGRATIONS: autumn_web::migrate::EmbeddedMigrations =
     autumn_web::migrate::embed_migrations!("migrations");
+
+/// Renders error pages. Formats nothing interesting: the seam is what is under
+/// test, not the markup.
+pub struct ReferenceErrorPages;
+
+impl autumn_web::error_pages::ErrorPageRenderer for ReferenceErrorPages {
+    fn render_error(&self, ctx: &autumn_web::error_pages::ErrorContext) -> Markup {
+        html! { h1 { (ctx.status.as_u16()) } }
+    }
+}
 
 /// A typed value published into application state via `with_extension`.
 #[derive(Debug, Clone, Copy)]
@@ -269,6 +296,7 @@ pub mod providers {
 
     #[cfg(feature = "db")]
     impl autumn_web::db::DatabasePoolProvider for ReferencePoolProvider {
+        // surface: db::Pool
         async fn create_pool(
             &self,
             _config: &autumn_web::config::DatabaseConfig,
@@ -319,6 +347,13 @@ mod tests {
     /// A registry entry with no marker means Autumn promises stability for an
     /// API nothing in CI compiles. A marker with no registry entry means this
     /// crate is guarding something the contract never declared.
+    /// The marker scan is textual (`include_str!`), so it cannot see `#[cfg]`.
+    /// Two stable surfaces sit behind the `db` feature; with that feature off,
+    /// their markers would still be counted and the gate would claim coverage
+    /// it does not have. Compiling this assertion only when `db` is on keeps
+    /// the claim honest — and CI runs `--all-features`, so the gate always
+    /// runs where it matters.
+    #[cfg(feature = "db")]
     #[test]
     fn every_stable_surface_is_exercised_here() {
         let declared: BTreeSet<String> = stable_surface_names().map(ToOwned::to_owned).collect();

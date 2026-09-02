@@ -572,6 +572,7 @@ name = "autumn-plugin-reference"
 version = "0.7.0"
 dependencies = [
  "autumn-web",
+ "maud",
 ]
 
 [[package]]

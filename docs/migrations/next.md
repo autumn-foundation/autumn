@@ -411,16 +411,32 @@ normally deserialized from `autumn.toml`.
 ## Plugin authors
 
 This release **adds** plugin-facing surface and removes none, so no plugin that
-compiles today stops compiling. It is worth a read anyway: the surface a plugin
-may rely on is now declared, and declaring what your own plugin supports gets
-you a startup diagnostic instead of a mystery.
+compiles today stops compiling. Two things do change for you: `autumn
+plugin-check` gains a check your plugin has to satisfy (see the end of this
+section), and `ConformanceConfig` is now `#[non_exhaustive]`.
 
 See [`docs/plugins.md`](../plugins.md#the-plugin-api-contract) for the full
 contract and [`STABILITY.md`](../../STABILITY.md#the-plugin-api-surface-issue-1601)
 for the policy.
 
-- **Stable surface changed:** none. Nothing was removed, renamed, or
-  re-signatured. The surface that already existed is now *declared* stable in
+- **Stable surface changed:** one, and only for a construction style nothing
+  in this repository used. **Breaking:** `plugin_conformance::ConformanceConfig`
+  gains a `contract` field and is now `#[non_exhaustive]`, so a struct literal
+  (`ConformanceConfig { plugin_name, expected_prefix, .. }`) no longer compiles.
+  Build it the documented way instead — the fluent constructors are unchanged:
+
+  ```rust,ignore
+  let config = ConformanceConfig::new("autumn-plugin-mine")
+      .prefix("/mine")
+      .sensitive_route("/mine", "Role: admin required");
+  ```
+
+  `#[non_exhaustive]` lands with the field on purpose: it is what lets a later
+  release add a check's configuration without doing this to you twice. See the
+  [migration guide](next.md).
+
+  Nothing else was removed, renamed, or re-signatured. The surface that already
+  existed is now *declared* stable in
   `autumn_web::plugin_contract::PLUGIN_SURFACES` and compiled on every commit by
   the pinned `autumn-plugin-reference` crate.
 - **Experimental surface changed:** none. `AppBuilder::with_edge_kv` and
@@ -440,21 +456,35 @@ for the policy.
   - `autumn_web::db::Pool` and `autumn_web::reexports::diesel_migrations` — so a
     plugin implementing `DatabasePoolProvider` or shipping migrations through
     `AppBuilder::plugin_migrations` can name what those seams need without
-    taking its own `diesel-async` / `diesel-migrations` dependency.
-- **Declared range to move to:** `autumn-web 0.7` — add
-  `.autumn_web("0.7")` to your `Plugin::contract` and re-run
-  `autumn plugin-check --plugin-name <your-plugin>`. Adding it is optional; a
-  plugin that declares nothing keeps its current behaviour exactly.
+    taking its own `diesel-async` / `diesel-migrations` dependency. (Both were
+    found by writing the reference plugin: the seams were declared plugin-facing
+    and were not reachable from stable API.)
+- **Declared range to move to:** `autumn-web {X.Y}` — add
+  `.autumn_web("{X.Y}")` to your `Plugin::contract` and re-run
+  `autumn plugin-check --plugin-name <your-plugin>`. A plugin that releases in
+  lockstep with the framework can write
+  `.autumn_web(lockstep_range(env!("CARGO_PKG_VERSION")))` instead and never
+  touch the literal again.
 
-**New `autumn plugin-check` checks.** Two checks join the report:
-`plugin-contract` (fails when the plugin under check declares no usable
-`autumn-web` range) and `experimental-surface` (reports what the plugin
-declares, and fails only on a name that cannot be resolved against the
-registry). Both **skip** when the built binary predates the contract dump, so
-an older host app does not turn them red. If your CI runs
-`autumn plugin-check`, expect `plugin-contract` to fail until you implement
-`Plugin::contract` — that is the intended nudge, and
-`--deny-experimental` is available if you want experimental use gated too.
+**Breaking for the `plugin-check` command, and only for it.** Two checks join
+the report. `plugin-contract` **fails** when the plugin under check declares no
+usable `autumn-web` range; `experimental-surface` reports what the plugin
+declares and fails only on a name that cannot be resolved against the registry.
+
+So: your plugin still *compiles and runs* unchanged whether or not it declares
+a contract — that part is genuinely additive. But if your CI runs
+`autumn plugin-check --plugin-name <your-plugin>`, it goes red until you
+implement `Plugin::contract`. That is deliberate: this is the author-facing
+gate, and "you have not said which framework versions you support" is exactly
+what it exists to say. Implementing the four-line `contract()` above clears it.
+
+Both checks **skip** against a host binary built on an `autumn-web` that
+predates the contract dump, so an older host app does not turn them red — but
+`--deny-experimental` fails closed in that case rather than silently passing,
+because a flag that forbids something must not quietly become a no-op.
+
+`autumn generate plugin` now scaffolds `Plugin::contract` and a conformance
+test that passes it, so a freshly generated plugin is green out of the box.
 
 ## Compiler error cheat sheet
 

@@ -23,15 +23,36 @@
 #   4.  Reference-plugin coverage: every STABLE entry has a
 #       `// surface: <name>` marker in `autumn-plugin-reference/src/lib.rs`, and
 #       no marker names something the registry does not declare stable.
-#   5.  Ratchet: the stable-surface count may not fall below STABLE_FLOOR.
-#       Shrinking the declared contract has to be a deliberate edit here.
+#   5.  Ratchet over the SET of stable names, not their count
+#       (scripts/plugin-surface-baseline.txt). A count-only ratchet is defeated
+#       by a swap — demote one entry to experimental, add another, total
+#       unchanged — and the reference plugin stays green because the call site
+#       simply moves. Every baselined name must still exist AND still be
+#       stable.
 #   6.  `docs/migrations/TEMPLATE.md` still carries the `## Plugin authors`
 #       section, so it cannot be dropped from future guides.
 #   7.  Migration-guide coverage: when the diff against the base ref touches the
-#       declared surface, `docs/migrations/next.md` must carry a `## Plugin
-#       authors` section with real content under it.
+#       declared surface, the SAME diff must touch `docs/migrations/next.md`,
+#       and that file's `## Plugin authors` section must carry real content —
+#       not template placeholders. Requiring the file to be touched matters
+#       because `next.md` is a ROLLING draft: without it, one PR's section
+#       satisfies every later PR until release renames the file.
+#
+#       This check fails CLOSED. "I could not compute the diff" (a shallow
+#       clone with no merge base) is reported as a failure, not folded into
+#       "nothing changed" — the whole point is that a surface change cannot
+#       pass silently.
 #   8.  `autumn-plugin-reference` is a workspace member — otherwise CI never
 #       builds the thing check 4 is reasoning about.
+#
+# WHAT IT DOES NOT CATCH
+#   A signature change to a stable surface that the reference plugin's single
+#   call site still compiles against — narrowing `impl Into<String>` to
+#   `&'static str`, say, where the reference passes a literal. The compiler is
+#   the detector for that class and it can be fooled by an unrepresentative
+#   call site; check 7's trigger set is widened to the plugin-facing modules to
+#   raise the odds a reviewer is prompted, but this is a residual risk, not a
+#   proof.
 #
 # WHY NOT JUST THE RUST TESTS
 #   Checks 1, 2 and 4 are also asserted in Rust (`autumn`'s `plugin_contract`
@@ -59,11 +80,18 @@ TEMPLATE_FILE="docs/migrations/TEMPLATE.md"
 NEXT_GUIDE="docs/migrations/next.md"
 WORKSPACE_MANIFEST="Cargo.toml"
 REFERENCE_CRATE="autumn-plugin-reference"
+BASELINE_FILE="scripts/plugin-surface-baseline.txt"
 
-# Ratchet. Raise it when the declared stable surface grows; lowering it is the
-# deliberate act of shrinking Autumn's promise to plugin authors, and should
-# arrive with a migration guide section saying so.
-STABLE_FLOOR=20
+# Files whose change means "the plugin surface may have moved". The registry and
+# the reference plugin are the definitive two; the other two are the modules
+# whose signatures the registry points at, included so a `Plugin` or
+# `plugin_conformance` edit prompts a Plugin-authors note too.
+SURFACE_PATHS=(
+  "autumn/src/plugin_contract.rs"
+  "autumn/src/plugin.rs"
+  "autumn/src/plugin_conformance.rs"
+  "autumn-plugin-reference/src/lib.rs"
+)
 
 # The heading the migration guide uses for plugin-facing changes.
 PLUGIN_SECTION='## Plugin authors'
@@ -158,9 +186,12 @@ extract_docs_table() {
 }
 
 # Print every `// surface: <name>` marker in the reference plugin.
+# Exactly one space after the colon, matching the Rust side's
+# `strip_prefix("// surface: ")`. A looser pattern here would let the two gates
+# disagree about what counts as a marker.
 extract_markers() {
   local file="$1"
-  sed -n 's|^[[:space:]]*// surface: *\(.*[^ ]\) *$|\1|p' "$file"
+  sed -n 's|^[[:space:]]*// surface: \(.*[^ ]\) *$|\1|p' "$file"
 }
 
 # ── Checks ─────────────────────────────────────────────────────────────────
@@ -193,13 +224,54 @@ check_registry() {
 
   local stable_count
   stable_count="$(awk -F'\t' '$2 == "stable"' <<<"$registry" | wc -l | tr -d ' ')"
-  if [[ "$stable_count" -lt "$STABLE_FLOOR" ]]; then
-    fail "declared stable plugin surface shrank to $stable_count (floor is $STABLE_FLOOR). Shrinking Autumn's promise to plugin authors is a deliberate edit: lower STABLE_FLOOR in this script and say why in $NEXT_GUIDE."
-  fi
 
   if [[ "$failures" -eq 0 ]]; then
     pass "registry: $(wc -l <<<"$registry" | tr -d ' ') surfaces, $stable_count stable, sorted and noted"
   fi
+}
+
+# Ratchet over the SET of stable names, not their count. See the header.
+check_stable_baseline() {
+  local root="$1"
+
+  if [[ ! -f "$root/$BASELINE_FILE" ]]; then
+    fail "$BASELINE_FILE is missing; the stable-surface ratchet is disarmed"
+    return
+  fi
+
+  local stable baseline lost added baseline_sorted
+  stable="$(extract_registry "$root/$REGISTRY_FILE" | awk -F'\t' '$2 == "stable" { print $1 }' | LC_ALL=C sort)"
+  baseline="$(grep -v '^[[:space:]]*#' "$root/$BASELINE_FILE" | grep -v '^[[:space:]]*$' || true)"
+
+  if [[ -z "$baseline" ]]; then
+    fail "$BASELINE_FILE has no entries; emptying it would disarm the ratchet silently"
+    return
+  fi
+
+  baseline_sorted="$(LC_ALL=C sort -u <<<"$baseline")"
+  if [[ "$baseline" != "$baseline_sorted" ]]; then
+    fail "$BASELINE_FILE must be sorted and free of duplicates"
+    return
+  fi
+
+  # Present in the baseline but no longer STABLE in the registry — either
+  # removed outright, or demoted to experimental (the swap a count-only ratchet
+  # never sees).
+  lost="$(comm -23 <(echo "$baseline_sorted") <(echo "$stable"))"
+  if [[ -n "$lost" ]]; then
+    fail "these surfaces were declared STABLE and no longer are: $(tr '\n' ' ' <<<"$lost")"
+    fail "  removing or demoting a stable plugin surface is a break: say so under '$PLUGIN_SECTION' in $NEXT_GUIDE, then drop the line(s) from $BASELINE_FILE in the same change"
+    return
+  fi
+
+  added="$(comm -13 <(echo "$baseline_sorted") <(echo "$stable"))"
+  if [[ -n "$added" ]]; then
+    fail "these surfaces are declared STABLE but are not in $BASELINE_FILE: $(tr '\n' ' ' <<<"$added")"
+    fail "  add them (keeping the file sorted) so the ratchet covers them from now on"
+    return
+  fi
+
+  pass "ratchet: all $(wc -l <<<"$baseline_sorted" | tr -d ' ') baselined stable surfaces are still stable"
 }
 
 check_docs_parity() {
@@ -269,38 +341,89 @@ check_template_section() {
 
 # Does a file carry `## Plugin authors` with real content under it?
 #
-# "Real content" means at least one non-blank, non-heading line before the next
-# `## ` heading, ignoring HTML comments — an empty section is the failure mode
-# this exists to catch.
+# "Real content" is a non-blank line under the heading, before the next `## `
+# heading, that is none of:
+#   - an HTML comment, single- OR multi-line (`<!-- TODO -->` is not content,
+#     and neither is a comment spread across three lines);
+#   - a line whose only substance is a `{placeholder}` — the template ships
+#     those, and pasting one back is not saying what changed;
+#   - a line the TEMPLATE itself carries verbatim. This is the load-bearing
+#     one: the template's section opens with two paragraphs of guidance, so
+#     without it a straight copy-paste of the template satisfies the gate while
+#     telling a plugin author nothing.
+#
+# The heading is matched EXACTLY, so `### Plugin authors` or
+# `## Plugin authors (breaking)` is reported by the caller as a *missing*
+# section rather than an empty one, which is the accurate diagnostic.
+#
+# $1 = the guide to check, $2 = the template to compare against.
 guide_section_filled() {
-  local file="$1"
+  local file="$1" template="$2"
   awk -v heading="$PLUGIN_SECTION" '
-    $0 == heading { inside = 1; next }
+    function strip(line,   out) {
+      out = line
+      if (in_comment) {
+        if (out ~ /-->/) { sub(/^.*-->/, "", out); in_comment = 0 } else { return "" }
+      }
+      gsub(/<!--[^>]*-->/, "", out)
+      if (out ~ /<!--/) { sub(/<!--.*$/, "", out); in_comment = 1 }
+      return out
+    }
+    # Reduce a line to the substance a reader would take from it: drop the
+    # bullet marker, the bold label, every {placeholder}, and punctuation.
+    function substance(line,   out) {
+      out = line
+      sub(/^[[:space:]]*[-*][[:space:]]*/, "", out)
+      sub(/^\*\*[^*]*\*\*/, "", out)
+      gsub(/\{[^}]*\}/, "", out)
+      gsub(/[[:space:]]|[-*`:.,()\/]/, "", out)
+      return out
+    }
+    function key(line,   out) {
+      out = line
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", out)
+      return out
+    }
+    FNR == NR {
+      if ($0 == heading) { t_inside = 1; next }
+      if (t_inside && /^## /) { t_inside = 0 }
+      if (t_inside && length(key($0)) > 0) { template_line[key($0)] = 1 }
+      next
+    }
+    $0 == heading    { inside = 1; next }
     inside && /^## / { inside = 0 }
-    inside {
-      line = $0
-      gsub(/<!--.*-->/, "", line)
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
-      if (length(line) > 0) { found = 1 }
+    !inside          { next }
+    {
+      line = strip($0)
+      if (length(substance(line)) == 0) next
+      if (key(line) in template_line) next
+      found = 1
     }
     END { exit(found ? 0 : 1) }
-  ' "$file"
+  ' "$template" "$file"
 }
 
-# Did this branch's work touch the declared plugin surface?
+# Which of SURFACE_PATHS (and NEXT_GUIDE) this branch touched, one per line.
 #
 # Measured from the MERGE BASE with the base ref against the WORKING TREE, so it
 # sees committed and uncommitted changes alike — a contributor gets the answer
 # before they push, and CI (where everything is committed) gets the same one.
 # Untracked files count too: a brand-new reference plugin is exactly the kind of
 # surface change this is looking for, and `git diff` never mentions it.
-surface_changed_in_diff() {
-  local root="$1" base="$2" merge_base
-  merge_base="$(git -C "$root" merge-base "$base" HEAD 2>/dev/null)" || return 1
+#
+# Exit 2 means "could not compute" (no merge base — a shallow clone). The caller
+# treats that as a FAILURE, never as "nothing changed": the two must not share
+# an exit path, or a surface change passes silently on precisely the CI
+# configuration this gate runs in.
+changed_paths() {
+  local root="$1" base="$2" merge_base pattern
+  merge_base="$(git -C "$root" merge-base "$base" HEAD 2>/dev/null)" || return 2
+  [[ -n "$merge_base" ]] || return 2
+  pattern="$(printf '%s\n' "${SURFACE_PATHS[@]}" "$NEXT_GUIDE" | paste -sd'|' -)"
   {
     git -C "$root" diff --name-only "$merge_base" 2>/dev/null
     git -C "$root" ls-files --others --exclude-standard 2>/dev/null
-  } | grep -qE "^($REGISTRY_FILE|$REFERENCE_FILE)$"
+  } | grep -E "^($pattern)$" | LC_ALL=C sort -u
 }
 
 check_migration_guide() {
@@ -308,12 +431,37 @@ check_migration_guide() {
   local base="${BASE_REF:-origin/trunk-dev}"
 
   if ! git -C "$root" rev-parse --verify --quiet "$base" >/dev/null 2>&1; then
-    printf '\033[0;33m−\033[0m migration guide: base ref %s is unavailable; skipping the surface-change check\n' "$base"
+    printf '\033[0;33m\xe2\x88\x92\033[0m migration guide: base ref %s is unavailable; skipping the surface-change check\n' "$base"
     return
   fi
 
-  if ! surface_changed_in_diff "$root" "$base"; then
+  local touched rc path surface_touched=""
+  touched="$(changed_paths "$root" "$base")" && rc=0 || rc=$?
+  if [[ "$rc" -eq 2 ]]; then
+    fail "cannot compute a diff against $base (no merge base — a shallow clone?), so a plugin-surface change cannot be ruled out"
+    fail "  in CI, check out with 'fetch-depth: 0'; locally, run 'git fetch --unshallow origin'"
+    return
+  fi
+
+  for path in "${SURFACE_PATHS[@]}"; do
+    if grep -qxF "$path" <<<"$touched"; then
+      surface_touched="yes"
+      break
+    fi
+  done
+
+  if [[ -z "$surface_touched" ]]; then
     pass "migration guide: this change does not touch the declared plugin surface"
+    return
+  fi
+
+  # `next.md` is a ROLLING draft that survives across PRs, so "it contains a
+  # Plugin authors section" is satisfied forever by whichever PR wrote one
+  # first. Requiring THIS change to touch the file is what makes the gate bite
+  # on every subsequent surface change.
+  if ! grep -qxF "$NEXT_GUIDE" <<<"$touched"; then
+    fail "this change touches the declared plugin surface but does not touch $NEXT_GUIDE"
+    fail "  add what it means for plugin authors under '$PLUGIN_SECTION' (copy the section from $TEMPLATE_FILE)"
     return
   fi
 
@@ -322,13 +470,13 @@ check_migration_guide() {
     return
   fi
 
-  if ! grep -qF "$PLUGIN_SECTION" "$root/$NEXT_GUIDE"; then
-    fail "this change touches the declared plugin surface, so $NEXT_GUIDE needs a '$PLUGIN_SECTION' section (copy it from $TEMPLATE_FILE)"
+  if ! grep -qxF "$PLUGIN_SECTION" "$root/$NEXT_GUIDE"; then
+    fail "this change touches the declared plugin surface, so $NEXT_GUIDE needs a '$PLUGIN_SECTION' section, spelled exactly (copy it from $TEMPLATE_FILE)"
     return
   fi
 
-  if ! guide_section_filled "$root/$NEXT_GUIDE"; then
-    fail "$NEXT_GUIDE's '$PLUGIN_SECTION' section is empty; say what changed for plugin authors and what to do about it"
+  if ! guide_section_filled "$root/$NEXT_GUIDE" "$root/$TEMPLATE_FILE"; then
+    fail "$NEXT_GUIDE's '$PLUGIN_SECTION' section says nothing this change did not inherit from the template — only blanks, comments, placeholders, or the template's own words. Say what changed for plugin authors and what to do about it."
     return
   fi
 
@@ -338,6 +486,7 @@ check_migration_guide() {
 run_checks() {
   local root="$1"
   check_registry "$root"
+  check_stable_baseline "$root"
   check_docs_parity "$root"
   check_reference_coverage "$root"
   check_workspace_membership "$root"
@@ -360,7 +509,7 @@ trap cleanup EXIT
 
 make_fixture() {
   local dir="$1"
-  mkdir -p "$dir/autumn/src" "$dir/docs/migrations" "$dir/autumn-plugin-reference/src"
+  mkdir -p "$dir/autumn/src" "$dir/docs/migrations" "$dir/autumn-plugin-reference/src" "$dir/scripts"
 
   cat >"$dir/$REGISTRY_FILE" <<'EOF'
 pub const PLUGIN_SURFACES: &[PluginSurface] = &[
@@ -406,6 +555,7 @@ impl Plugin for ReferencePlugin {
 }
 EOF
 
+  printf 'AppBuilder::nest\nPlugin::build\n' >"$dir/$BASELINE_FILE"
   printf '## Plugin authors\n\nNothing changed for plugin authors.\n' >"$dir/$TEMPLATE_FILE"
   printf '## Plugin authors\n\n- **Stable surface changed:** none.\n' >"$dir/$NEXT_GUIDE"
   printf 'members = ["autumn", "autumn-plugin-reference"]\n' >"$dir/$WORKSPACE_MANIFEST"
@@ -415,8 +565,9 @@ EOF
 # size and the migration-guide check neutralised (fixtures are not git repos).
 self_test_run() {
   local dir="$1"
-  ( STABLE_FLOOR=2 BASE_REF="__no_such_ref__" failures=0
+  ( BASE_REF="__no_such_ref__" failures=0
     check_registry "$dir"
+    check_stable_baseline "$dir"
     check_docs_parity "$dir"
     check_reference_coverage "$dir"
     check_workspace_membership "$dir"
@@ -435,10 +586,11 @@ expect_fail() {
 expect_pass() {
   local label="$1" dir="$2"
   if ! self_test_run "$dir"; then
-    self_test_run "$dir" || true
-    ( STABLE_FLOOR=2 BASE_REF="__no_such_ref__" failures=0
-      check_registry "$dir"; check_docs_parity "$dir"; check_reference_coverage "$dir"
-      check_workspace_membership "$dir"; check_template_section "$dir" ) >&2 || true
+    printf '\033[0;31mself-test %s failed; the checks reported:\033[0m\n' "$label" >&2
+    ( BASE_REF="__no_such_ref__" failures=0
+      check_registry "$dir"; check_stable_baseline "$dir"; check_docs_parity "$dir"
+      check_reference_coverage "$dir"; check_workspace_membership "$dir"
+      check_template_section "$dir" ) >&2 || true
     die "self-test '$label' should have passed but failed"
   fi
 }
@@ -460,10 +612,8 @@ self_test() {
   expect_fail "docs table missing a registry entry" "$d"
 
   d="$SELF_TEST_DIR/docs-extra-row"; cp -r "$base" "$d"
-  sed -i.bak 's|^| `Plugin::build` | stable | Apply.*|&\n| `AppBuilder::ghost` | stable | Not in the registry. ||' "$d/$DOCS_FILE" 2>/dev/null || true
-  printf '| `AppBuilder::ghost` | stable | Not in the registry. |\n' >>"$d/$DOCS_FILE.rows"
   awk '/^\| `Plugin::build`/ { print; print "| `AppBuilder::ghost` | stable | Not in the registry. |"; next } { print }' \
-    "$d/$DOCS_FILE" >"$d/$DOCS_FILE.new" && mv "$d/$DOCS_FILE.new" "$d/$DOCS_FILE"
+    "$base/$DOCS_FILE" >"$d/$DOCS_FILE"
   expect_fail "docs table row the registry does not declare" "$d"
 
   d="$SELF_TEST_DIR/uncovered"; cp -r "$base" "$d"
@@ -473,10 +623,6 @@ self_test() {
   d="$SELF_TEST_DIR/extra-marker"; cp -r "$base" "$d"
   printf '    // surface: AppBuilder::ghost\n' >>"$d/$REFERENCE_FILE"
   expect_fail "reference-plugin marker the registry does not declare" "$d"
-
-  d="$SELF_TEST_DIR/pins-experimental"; cp -r "$base" "$d"
-  printf '    // surface: AppBuilder::with_edge_kv\n' >>"$d/$REFERENCE_FILE"
-  expect_fail "reference plugin pins an experimental surface" "$d"
 
   d="$SELF_TEST_DIR/no-markers"; cp -r "$base" "$d"
   sed -i.bak '/\/\/ surface:/d' "$d/$REFERENCE_FILE"
@@ -522,11 +668,75 @@ PY
   printf 'pub const SOMETHING_ELSE: u8 = 0;\n' >"$d/$REGISTRY_FILE"
   expect_fail "registry the parser cannot read" "$d"
 
-  d="$SELF_TEST_DIR/floor"; cp -r "$base" "$d"
-  awk '/name: "Plugin::build"/,/},/ { next } { print }' "$base/$REGISTRY_FILE" >"$d/$REGISTRY_FILE"
-  awk '!/`Plugin::build`/' "$base/$DOCS_FILE" >"$d/$DOCS_FILE"
-  awk '!/\/\/ surface: Plugin::build/' "$base/$REFERENCE_FILE" >"$d/$REFERENCE_FILE"
-  expect_fail "stable surface count below the ratchet floor" "$d"
+  # The swap a count-only ratchet never sees: demote one baselined stable
+  # surface to experimental and add another, leaving the total unchanged. Every
+  # other check stays green — the docs table matches, and the reference plugin
+  # still compiles because the call site simply moved.
+  d="$SELF_TEST_DIR/tier-demotion"; cp -r "$base" "$d"
+  cat >"$d/$REGISTRY_FILE" <<'FIXTURE'
+pub const PLUGIN_SURFACES: &[PluginSurface] = &[
+    PluginSurface {
+        name: "AppBuilder::merge",
+        tier: SurfaceTier::Stable,
+        note: "Merge a raw axum router at the root.",
+    },
+    PluginSurface {
+        name: "AppBuilder::nest",
+        tier: SurfaceTier::Experimental,
+        note: "Demoted; may change in any release.",
+    },
+    PluginSurface {
+        name: "AppBuilder::with_edge_kv",
+        tier: SurfaceTier::Experimental,
+        note: "Edge-capsule KV binding; may change in any release.",
+    },
+    PluginSurface {
+        name: "Plugin::build",
+        tier: SurfaceTier::Stable,
+        note: "Apply the plugin's wiring to the builder.",
+    },
+];
+FIXTURE
+  cat >"$d/$DOCS_FILE" <<'FIXTURE'
+# Autumn Plugins
+
+### The declared surface
+
+| API | Tier | Notes |
+|-----|------|-------|
+| `AppBuilder::merge` | stable | Merge a raw axum router at the root. |
+| `AppBuilder::nest` | experimental | Demoted; may change in any release. |
+| `AppBuilder::with_edge_kv` | experimental | Edge-capsule KV binding; may change in any release. |
+| `Plugin::build` | stable | Apply the plugin's wiring to the builder. |
+
+## Something else
+FIXTURE
+  cat >"$d/$REFERENCE_FILE" <<'FIXTURE'
+impl Plugin for ReferencePlugin {
+    // surface: Plugin::build
+    fn build(self, app: AppBuilder) -> AppBuilder {
+        // surface: AppBuilder::merge
+        app.merge(Router::new())
+    }
+}
+FIXTURE
+  expect_fail "a baselined stable surface demoted to experimental" "$d"
+
+  d="$SELF_TEST_DIR/baseline-removed"; cp -r "$base" "$d"
+  rm -f "$d/$BASELINE_FILE"
+  expect_fail "the stable-surface baseline file deleted" "$d"
+
+  d="$SELF_TEST_DIR/baseline-emptied"; cp -r "$base" "$d"
+  printf '# only comments\n' >"$d/$BASELINE_FILE"
+  expect_fail "the stable-surface baseline emptied" "$d"
+
+  d="$SELF_TEST_DIR/baseline-stale"; cp -r "$base" "$d"
+  printf 'AppBuilder::nest\n' >"$d/$BASELINE_FILE"
+  expect_fail "a stable surface missing from the baseline" "$d"
+
+  d="$SELF_TEST_DIR/baseline-unsorted"; cp -r "$base" "$d"
+  printf 'Plugin::build\nAppBuilder::nest\n' >"$d/$BASELINE_FILE"
+  expect_fail "an unsorted baseline" "$d"
 
   d="$SELF_TEST_DIR/not-a-member"; cp -r "$base" "$d"
   printf 'members = ["autumn"]\n' >"$d/$WORKSPACE_MANIFEST"
@@ -543,18 +753,41 @@ PY
   # `guide_section_filled` is exercised directly: it is the only part of the
   # migration-guide check that does not need a git history.
   local guide="$SELF_TEST_DIR/guide.md"
-  printf '## Plugin authors\n\n<!-- TODO -->\n\n## Next\n' >"$guide"
-  if guide_section_filled "$guide"; then
-    die "self-test 'empty Plugin authors section' PASSED but should have failed"
-  fi
-  printf '## Plugin authors\n\n- **Stable surface changed:** none.\n\n## Next\n' >"$guide"
-  guide_section_filled "$guide" || die "self-test 'filled Plugin authors section' should have passed"
-  printf '## Something\n\ntext\n' >"$guide"
-  if guide_section_filled "$guide"; then
-    die "self-test 'absent Plugin authors section' PASSED but should have failed"
-  fi
+  local template="$SELF_TEST_DIR/template.md"
+  cat >"$template" <<'FIXTURE'
+## Plugin authors
 
-  printf '\033[0;32m✓\033[0m self-test: every scenario behaved as expected\n'
+Everything here is addressed to someone maintaining a plugin crate.
+
+- **Stable surface changed:** {the API, what changed, and the replacement}
+- **New stable surface:** {additive APIs — or "none"}
+
+## Next
+FIXTURE
+
+  printf '## Plugin authors\n\n<!-- TODO -->\n\n## Next\n' >"$guide"
+  guide_section_filled "$guide" "$template" && die "self-test 'HTML-comment-only section' PASSED but should have failed"
+
+  printf '## Plugin authors\n\n<!--\nTODO\nlater\n-->\n\n## Next\n' >"$guide"
+  guide_section_filled "$guide" "$template" && die "self-test 'multi-line-comment-only section' PASSED but should have failed"
+
+  printf '## Plugin authors\n\n- **Stable surface changed:** {the API, what happened}\n\n## Next\n' >"$guide"
+  guide_section_filled "$guide" "$template" && die "self-test 'placeholder-only bullet' PASSED but should have failed"
+
+  # The one that matters: the template pasted back verbatim, prose and all.
+  cp "$template" "$guide"
+  guide_section_filled "$guide" "$template" && die "self-test 'template pasted verbatim' PASSED but should have failed"
+
+  printf '## Something\n\ntext\n' >"$guide"
+  guide_section_filled "$guide" "$template" && die "self-test 'absent Plugin authors section' PASSED but should have failed"
+
+  printf '## Plugin authors\n\n- **Stable surface changed:** none.\n\n## Next\n' >"$guide"
+  guide_section_filled "$guide" "$template" || die "self-test 'filled Plugin authors section' should have passed"
+
+  printf '## Plugin authors\n\nEverything here is addressed to someone maintaining a plugin crate.\n\n- **Stable surface changed:** `AppBuilder::nest` was removed.\n\n## Next\n' >"$guide"
+  guide_section_filled "$guide" "$template" || die "self-test 'real content beside template prose' should have passed"
+
+  printf '\033[0;32m\xe2\x9c\x93\033[0m self-test: every scenario behaved as expected\n'
 }
 
 # ── Entry point ────────────────────────────────────────────────────────────

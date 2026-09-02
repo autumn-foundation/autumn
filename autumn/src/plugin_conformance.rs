@@ -584,8 +584,6 @@ pub fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> 
 
 // ── Main entry point ───────────────────────────────────────────────────────
 
-/// Run all conformance checks and return a `ConformanceReport`.
-///
 /// Report which experimental plugin surfaces a plugin declares a dependency on
 /// (issue #1601).
 ///
@@ -675,6 +673,8 @@ pub fn check_experimental_surface(contract: Option<&PluginContract>) -> CheckRes
     }
 }
 
+/// Run all conformance checks and return a `ConformanceReport`.
+///
 /// Checks run:
 /// 1. `route-attribution` — plugin routes carry `plugin:<name>` source
 /// 2. `route-prefix` — plugin routes live under `config.expected_prefix` (if set)
