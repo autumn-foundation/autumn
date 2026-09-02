@@ -142,6 +142,9 @@ downstream of that draw won't reproduce from the printed seed (Codex review).
 
 ### Fault injection
 
+`Chaos` injects faults **probabilistically** — you give it a rate and the seed
+decides which operations get hit:
+
 ```rust
 use autumn_web::sim::Chaos;
 
@@ -157,7 +160,153 @@ Every fault decision is drawn from the seed, so enabling chaos never breaks
 reproducibility — the same seed replays the same fault schedule. See
 [`autumn_web::sim::Chaos`] for the full catalog (SMTP transport faults, a
 seeded LLM stub for agent retry paths, and mid-transaction kill/restart for
-durable-recovery proofs).
+durable-recovery proofs). When you want to *name* a fault rather than sample
+one — "fail the 3rd database checkout" — reach for `FaultPlan` in the next
+subsection instead.
+
+### Authored fault scenarios (`FaultPlan`)
+
+`Chaos` is a *rate*: "5% of checkouts fail", with the seed choosing which ones.
+That is the right shape for a sweep hunting rare interleavings, and the wrong
+shape for a regression test — because the sentence a post-mortem actually
+produces is "the **third** connection checkout failed while the **second**
+`send_invoice` execution was retrying", and no probability reproduces that on
+purpose. [`autumn_web::sim::FaultPlan`] lets you author that scenario directly,
+by ordinal rather than by rate, and hands back a serializable record of what
+happened that a test can assert on and CI can replay byte-for-byte.
+
+```rust
+use autumn_web::sim::{FaultPlan, Sim};
+use autumn_web::sim_test;
+use autumn_web::test::TestApp;
+
+#[sim_test]
+async fn the_third_checkout_and_the_second_invoice_fail(mut sim: Sim) {
+    let plan = FaultPlan::from_seed(sim.seed)
+        .fail_db_checkout(3)           // 3rd checkout on any pool (ordinals are 1-based)
+        .fail_job("send_invoice", 2);  // 2nd execution of that job by name
+
+    sim.build(
+        TestApp::new()
+            .routes(routes![checkout])
+            .plugin(InvoiceJobPlugin)
+            .with_fault_plan(plan),
+    );
+
+    for _ in 0..5 {
+        sim.client().post("/checkout").send().await;
+    }
+    sim.run_to_idle().await; // drains the job worker through the fault seam
+
+    let outcome = sim.client().fault_outcome().await;
+
+    assert_eq!(outcome.fired.len(), 2);
+    assert_eq!(outcome.fired[0].ordinal, 3);            // the checkout that failed
+    assert_eq!(outcome.server_errors[0].status, 503);   // captured through reporting
+    assert_eq!(outcome.final_state.db_checkouts, 5);    // every checkout, fired or not
+
+    // Canonical, byte-identical on every replay of this seed — commit it as a
+    // fixture and this scenario becomes a CI regression test.
+    assert_eq!(outcome.to_json_string(), include_str!("fixtures/invoice_scenario.json").trim_end());
+}
+```
+
+Ordinals are **1-based**, and `0` matches nothing (the same convention as
+`Chaos::smtp_faults`). `fail_db_checkout(n)` and `fail_job_execution(n)` count
+across every pool and every job name; `fail_db_checkout_on("replica", 2)` and
+`fail_job("send_invoice", 2)` count on that target's own counter. Duplicate
+entries collapse, so a plan is a set — `plan.planned()` returns the whole
+schedule sorted and `plan.describe()` prints it one fault per line, both before
+you run anything. A plan is pure data: clone it onto two apps and you get two
+independent ledgers.
+
+Faults can be confined to a window of virtual time, driven by the injected
+clock rather than wall time:
+
+```rust
+let plan = FaultPlan::from_seed(sim.seed)
+    .fail_job_execution(2)
+    .only_between(Duration::from_secs(5), Duration::from_secs(10));
+```
+
+The window is half-open (`from <= elapsed < to`) and `elapsed` is measured on
+the app's injected monotonic clock since the app started — so `sim.advance`
+moves it and no real time ever does. Outside the window the effect still
+consumes its ordinal, and the near-miss is recorded in `outcome.suppressed`
+rather than vanishing: a scenario that stopped firing because your timings
+shifted is visible in the outcome instead of silently passing.
+
+The seed earns its keep in the `random_*` lane, which spreads faults across a
+range instead of naming each one:
+
+```rust
+let plan = FaultPlan::from_seed(0x5EED).random_db_checkout_faults(2, 1..=8);
+```
+
+That picks 2 distinct checkout ordinals from `1..=8` using the plan's seed, and
+resolves them into explicit entries *at builder-call time* — so `planned()`
+still describes the schedule completely, a different seed picks different
+checkouts, and a plan built only from explicit `fail_*` calls draws no entropy
+at all.
+
+#### What the outcome record holds
+
+| Field | Contents |
+|---|---|
+| `seed` | the plan's seed, echoed so an outcome identifies its own replay |
+| `fired` | `Vec<FiredFault>` in fire order: `effect`, `target` (pool or job name), the global `ordinal`, the `target_ordinal`, `at` (injected wall clock) and `elapsed_ms` (injected monotonic) |
+| `suppressed` | matched an ordinal but fell outside `only_between` |
+| `unfired` | planned faults the run never reached, sorted — an empty list (together with an empty `suppressed`) is the proof your scenario actually exercised what it authored; a near-miss outside the window counts as reached, so check `suppressed` too |
+| `server_errors` | 5xx captured through `reporting.rs`, in report order: `status`, `method`, `route`, `message`, `problem_type`. Deliberately **no** request ID — it is entropy-minted, and the record has to stay comparable |
+| `final_state` | seam totals: `db_checkouts`, `job_executions`, `job_executions_failed`, `job_executions_succeeded` |
+
+`to_json_string()` is canonical (declaration-order fields, no maps, no floats),
+`fingerprint()` is an FNV-1a 64 over that string, and `FaultOutcome::from_json_str`
+round-trips it. `TestClient::fault_outcome()` is `async` because autumn
+dispatches error reports on a detached task: it settles those with bounded
+cooperative yields before snapshotting, and never advances the virtual clock
+while doing so. `TestClient::fault_ledger()` returns the same handle for an
+un-settled `outcome()` snapshot, and `None` when no plan was attached.
+
+#### The determinism contract
+
+The byte-identical-replay guarantee holds inside a specific box, and `build`
+enforces the parts it can:
+
+- **A paused, current-thread runtime** — `#[sim_test]`, or
+  `#[tokio::test(start_paused = true)]`. On a multi-threaded runtime concurrent
+  executions race for their ordinals and the ordering is not reproducible.
+- **The injected clock.** Window checks and every `at` / `elapsed_ms` read the
+  app's `ClockSource`, so no wall-clock read leaks into the record.
+- **Seeded entropy.** Attaching a plan defaults the app's entropy to
+  `SeededEntropy` derived from the plan's seed, so retry jitter and minted IDs
+  replay from it too. Unlike the rest of the sim this one *is* automatic — an
+  explicit `with_entropy` still wins.
+- **One job worker** (`jobs.workers = 1`), **reporting at
+  `sample_rate = 1.0`**, and **failure capture off** (the default). `build`
+  asserts all three when a plan is attached, rather than letting a second
+  worker, a sampled-out 5xx, or a capsule write that reporting awaits before
+  any reporter runs quietly break replay.
+
+#### What it does not cover
+
+- **Only two effect classes**: database connection checkout and job execution.
+  Mail, outbound HTTP and channels have no `FaultPlan` lane — for SMTP use
+  `Chaos::smtp_faults`, which already takes an explicit 1-based schedule.
+- **Test-only.** `FaultPlan` attaches to a `TestApp`; there is no production
+  fault injection, by design.
+- **`perform_enqueued_jobs` bypasses it.** `TestClient::perform_enqueued_jobs`
+  invokes handlers directly and never crosses the `intercept_execute` seam, so
+  job faults never fire under it. Drain with `sim.run_to_idle()` — plus
+  `sim.advance` to cross a retry backoff — instead.
+
+`autumn/tests/integration/sim_fault_plan.rs` carries the worked example, in the
+same before/after shape as the retry-storm bug above: a `charge_card` job and a
+plan that fails its first execution. With `max_attempts = 1` the charge is never
+recorded and the scenario's resilience assertion fails; with `max_attempts = 3`
+the retry lands it exactly once and the same plan passes — flip that one
+attribute back to reproduce the failure. See issue
+[#1680](https://github.com/autumn-foundation/autumn/issues/1680) for the design.
 
 ### `always!` / `sometimes!`
 
@@ -313,7 +462,7 @@ non-vacuity check rather than a sweep.
 | Elapsed / monotonic time (`state.monotonic()`, the `Clock` extractor's `.monotonic()`) | Virtual, driven by `Sim::advance` — but a raw `std::time::Instant` is **not** (see below) |
 | Scheduling of autumn's own background work (jobs, scheduler, commit hooks) | Deterministic, drained by `Sim::run_to_idle` |
 | Framework-minted IDs (job IDs, request IDs, idempotency keys, sessions) | Seeded via the `Entropy` seam |
-| Database | **Boundary** — real in-process SQLite, fault-injected at the connection level via `Chaos`, not simulated at the SQL-dialect level |
+| Database | **Boundary** — real in-process SQLite, fault-injected at the connection level via `Chaos` (by probability) or `FaultPlan` (by checkout ordinal), not simulated at the SQL-dialect level |
 | Third-party network (SMTP, LLM calls, outbound HTTP) | **Boundary** — mocked/fault-injected via `Chaos`/`sim::llm`, not a full network simulator |
 
 ### Keeping your own code deterministic

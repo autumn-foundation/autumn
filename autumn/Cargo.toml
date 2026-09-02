@@ -823,6 +823,19 @@ path = "tests/sim_sqlite_substrate.rs"
 name = "sim_chaos"
 path = "tests/sim_chaos.rs"
 
+# Authored fault-scenario DoD (issue #1680): the `FaultPlan` database lane —
+# ordinal-targeted DB checkout faults over the in-memory SQLite sim substrate,
+# plus the 100x byte-identical replay metric. Same isolated-binary rationale as
+# `sim_chaos` above — the Postgres-typed consolidated binary does not compile
+# under `sqlite`, and it needs `test-support` for the public `TestApp` harness,
+# so the file is `#![cfg(all(feature = "sqlite", feature = "test-support"))]`
+# and a default `cargo test` compiles it to an empty (passing) binary. Runs
+# without Docker. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_fault_plan_db`.
+[[test]]
+name = "sim_fault_plan_db"
+path = "tests/sim_fault_plan_db.rs"
+
 # W5.c crash-recovery DoD (issue #1797, item 7): kill-between-awaits + durable
 # repository commit-hook recovery over the in-memory SQLite sim substrate. Same
 # isolated-binary rationale as `sim_chaos` above — the Postgres-typed consolidated

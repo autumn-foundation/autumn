@@ -110,6 +110,11 @@ GATED_MODULES=(
   # ban enforce something rather than sit unreachable.
   autumn/src/session.rs:default
   autumn/src/middleware/request_id.rs:default
+  # The authored fault lane (#1680). Every fault timestamp and every window
+  # decision is read from the app's INJECTED clock — that is the whole point of
+  # `FaultPlan::only_between`, and a single `Utc::now()` here would make a
+  # replayed scenario's outcome record differ run to run.
+  autumn/src/sim/fault.rs:default
   # The embedded cluster control plane (#1762). Every node id comes from the
   # injected `Entropy`, every elapsed measurement and the boot incarnation come
   # from the injected `ClockSource` — the deterministic two-node suite in
@@ -136,7 +141,7 @@ GATED_MODULES=(
 )
 
 # The manifest is a ratchet: it may grow, never shrink.
-MODULE_COUNT_FLOOR=17
+MODULE_COUNT_FLOOR=18
 
 # Every lint the gate header must deny.
 REQUIRED_GATE_LINTS=(
