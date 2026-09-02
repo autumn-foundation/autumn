@@ -58,8 +58,19 @@ scheduled CI check with no other owner).
   `model.rs`, `autumn/Cargo.toml` `db = ["autumn-macros/db", …]` forwarding,
   and the no-DB `--daemon` scaffold (`autumn-cli/src/new.rs`,
   `DAEMON_NO_DB_FEATURES`) already omits `db`.
-- No open issue or PR revisits whether the merged fix actually worked — this
-  gap is what this assay closes.
+- **`651929b`'s own commit message and `CHANGELOG.md` already report a
+  controlled end-to-end measurement** (missed on first pass, added here):
+  `autumn dev-loop-bench --cold-start`, one run each against trunk-dev and the
+  fix branch, same 4-core box, same CLI binary —
+  trunk-dev **136,594ms** vs the fix branch **90,846ms** (**-45,748ms, -33%**).
+  The PR explicitly flagged the implication itself: *"It does not bring the
+  gate green on its own, so #2309's budget-recalibration question stays
+  open."* This confirms the fix's end-to-end mechanism works as intended —
+  the open question this assay actually closes is narrower than first framed:
+  not *whether* the fix helps, but whether the real weekly CI trajectory
+  matches the ~33% relative saving this controlled test already demonstrated.
+- No open issue or PR revisits the fix against real CI data since it
+  merged — that narrower gap is what this assay closes.
 
 ## 🧪 Apparatus
 
@@ -85,11 +96,16 @@ scheduled CI check with no other owner).
 | 2026-08-31, `ef61ae44` (post-fix, first run after `651929b`) | 97,482ms | 105,371ms | 105,371ms | FAIL (75% over p95) |
 
 Individual post-fix runs: 105,371 / 95,988 / 97,482 ms. Net change over the
-pre-fix baseline: **~12.5%** (120,422 → 105,371ms p95). This is a comparison
-across two different commits, a full week apart, on separate GitHub-hosted
-runners — not a controlled before/after of the fix alone, so intervening
-changes and runner variance are both live confounds; it should be read as
-"the net change over that week," not as the fix's isolated impact.
+pre-fix baseline: **~12.5%** (120,422 → 105,371ms p95) — well short of the
+**~33%** the fix's own controlled same-box test already demonstrated (see
+Prior Art). Applying that confirmed ~33% relative saving to the CI pre-fix
+baseline (120,422ms) predicts a post-fix p95 of roughly **80,100ms**; the
+actual post-fix CI run came in at 105,371ms, about **25,000ms higher** than
+what the already-confirmed fix would predict on this baseline. This is a
+comparison across two different commits, a full week apart, on separate
+GitHub-hosted runners (not the same box PR #2360 used) — not a controlled
+before/after of the fix alone, so intervening changes and runner variance are
+both live confounds for that ~25,000ms residual gap.
 
 The post-fix run's diagnosis line ("the first clean compile got heavier. A
 new default dependency or feature likely bloated the from-scratch build") is
@@ -128,19 +144,23 @@ crate-level number predicts.
 **Kill** — against the pre-set line: issue #2309 is **not resolved**. The
 Cold-Start Onboarding Gate has now failed all 10 of 10 scheduled runs since
 the workflow's creation, including the first run after the targeted fix
-merged. p95 105,371ms is still 75% over the 60,000ms budget.
+merged. p95 105,371ms is still 75% over the 60,000ms budget. This part is not
+surprising — PR #2360 itself already said the fix wouldn't bring the gate
+green on its own.
 
-The interesting finding is *why*: the crate-level fix works exactly as
-designed (~51.5s saved, verified directly and cleanly, in isolation), yet the
-net change in the full end-to-end build over the same week was only ~15s
-(120,422 → 105,371ms). That gap is real, but this assay cannot attribute it
-to a specific cause — the two CI numbers span a week of unrelated commits and
-runner-to-runner variance, and (per the correction above) CI's own diagnosis
-line is generic boilerplate, not a finding. The honest statement is: net
-improvement was far short of what the isolated fix predicts, and isolating
-why requires a controlled comparison this assay did not run — e.g. building
-the *same* commit with `autumn-macros` `db` on vs. off end-to-end, or a
-`cargo build --timings` bisection over the *full* comparison interval,
+The interesting finding is *how much* real usage undershot what was already
+confirmed: the fix's mechanism is not in doubt — its own controlled,
+same-box, same-binary comparison (see Prior Art) showed a genuine **-33%**
+end-to-end saving (136,594ms → 90,846ms), and this assay's isolated crate
+rebuild independently reproduces the underlying cause (~94% reduction in
+`autumn-macros`' own compile time, 54.8s → 3.34s). But the real weekly CI
+trajectory only moved **-12.5%** (120,422 → 105,371ms) — a ~25,000ms residual
+gap versus what the confirmed ~33% relative saving predicts on the CI
+baseline. This assay cannot attribute that gap to a specific cause: the two
+CI runs span a week of unrelated commits and a different runner than PR
+#2360's local box, both live confounds, and (per the correction above) CI's
+own diagnosis line is generic boilerplate, not a finding. Isolating it needs
+a `cargo build --timings` bisection over the *full* comparison interval,
 `d1ecb361..ef61ae44` (2026-08-24 → 2026-08-31 — the two runs' actual commits,
 not a narrower guess). Candidate commits worth checking first, because they
 touch default features/deps in that window: `1fd6245` Ledgered entities
