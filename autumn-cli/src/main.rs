@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod a11y;
+mod agents;
 mod alert;
 mod assets;
 mod build;
@@ -195,6 +196,71 @@ pub struct DataFlowArgs {
     /// release build. Run `--check` in CI under the profile you deploy.
     #[arg(long)]
     release: bool,
+}
+
+/// Arguments for `autumn agents manifest`.
+///
+/// A separate `Args` struct for the same reason as [`DataFlowArgs`]: clap's
+/// derive builds every inline variant field inside one
+/// `Commands::augment_subcommands` frame, which is already close to libtest's
+/// thread-stack limit.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct AgentsManifestArgs {
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Write the JSON agent-authority manifest to this file path.
+    #[arg(long, value_name = "PATH")]
+    manifest: Option<String>,
+    /// Emit the JSON manifest to stdout instead of the human report.
+    #[arg(long)]
+    json: bool,
+    /// Compare against a committed manifest and exit non-zero on drift, so a
+    /// widened authority envelope has to be reviewed rather than merged
+    /// silently.
+    #[arg(long, value_name = "PATH")]
+    check: Option<String>,
+    /// Let `--check` pass with MCP-exposed mutating tools that carry no
+    /// authority envelope.
+    ///
+    /// Adoption is incremental and `#[repository(api, mcp)]` generates CRUD
+    /// tools with no annotation site, so the hatch exists — but it is a flag,
+    /// never a default: a mutating tool an agent can call with nothing declared
+    /// about it is what this command exists to surface. Allowed tools are still
+    /// listed.
+    #[arg(long)]
+    allow_ungoverned: bool,
+    /// Cargo features to build the inspected binary with (repeatable; a
+    /// comma-separated list also works). An `#[agent_operable]` action or a
+    /// grant behind a feature the build does not enable is not compiled in, so
+    /// it cannot appear in the manifest.
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build the inspected binary with all Cargo features enabled.
+    #[arg(long)]
+    all_features: bool,
+    /// Build the inspected binary without default Cargo features.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Audit the release binary rather than the debug one.
+    ///
+    /// The manifest describes the binary that produced it, and a debug binary
+    /// is not the one that ships: an action or a grant behind
+    /// `#[cfg(not(debug_assertions))]` exists only in the release build. Run
+    /// `--check` in CI under the profile you deploy.
+    #[arg(long)]
+    release: bool,
+}
+
+/// Subcommands for `autumn agents`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum AgentsSubcommands {
+    /// Emit the agent-authority manifest (#1691) and check it for drift.
+    Manifest(AgentsManifestArgs),
 }
 
 /// Subcommands for `autumn cache`.
@@ -1501,6 +1567,24 @@ enum Commands {
     ///   autumn cache audit
     ///   autumn cache audit --manifest target/cache-coherence.json
     ///   autumn cache audit --strict -p blog
+    /// Agent-authority tooling — what an agent-operable handler may do (#1691).
+    ///
+    /// `autumn agents manifest` compiles the application, reads back the
+    /// manifest the framework assembles from every `#[agent_operable]` action
+    /// and every declared `authority_grant!`, joins it against the route table,
+    /// and writes the diffable record. `--check` fails on drift, and on any
+    /// MCP-exposed *mutating* tool with no envelope at all — the one thing the
+    /// compiler cannot catch, because a tool with no grant has no assertion to
+    /// fail.
+    ///
+    /// # Examples
+    ///
+    ///   autumn agents manifest
+    ///   autumn agents manifest --manifest agent-authority.json
+    ///   autumn agents manifest --check agent-authority.json --release
+    #[command(subcommand, verbatim_doc_comment)]
+    Agents(AgentsSubcommands),
+
     #[command(subcommand, verbatim_doc_comment)]
     Cache(CacheSubcommands),
     /// Emit the classified-data flow manifest (#1654).
@@ -4155,6 +4239,23 @@ fn run_command(command: Commands) {
                 assets::run_verify(&manifest_path, &static_dir);
             }
         },
+        Commands::Agents(AgentsSubcommands::Manifest(args)) => {
+            let features = routes::CargoFeatures {
+                features: args.features,
+                all: args.all_features,
+                no_default: args.no_default_features,
+            };
+            agents::run(&agents::AgentsManifestOptions {
+                package: args.package.as_deref(),
+                bin: args.bin.as_deref(),
+                manifest: args.manifest.as_deref(),
+                json: args.json,
+                check: args.check.as_deref(),
+                allow_ungoverned: args.allow_ungoverned,
+                features,
+                release: args.release,
+            });
+        }
         Commands::Cache(CacheSubcommands::Audit(args)) => {
             let features = routes::CargoFeatures {
                 features: args.features,

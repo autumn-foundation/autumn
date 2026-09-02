@@ -723,6 +723,11 @@ pub fn derive_tools(
             empty_body: doc.response.is_none()
                 && has_empty_body_contract(doc.success_status)
                 && !doc.mcp_stream,
+            // RED PHASE (#1691): not yet copied from `doc.agent_authority`.
+            // `derive_tools_carries_the_handler_authority_onto_the_tool` and
+            // `destructive_hint_follows_declared_reversibility` pin what this
+            // must become.
+            agent_authority: None,
         });
     }
     tools
@@ -745,6 +750,7 @@ pub struct McpToolInfo {
     has_query: bool,
     streams: bool,
     empty_body: bool,
+    agent_authority: Option<&'static crate::agent_authority::AgentAuthority>,
 }
 
 impl McpToolInfo {
@@ -791,6 +797,19 @@ impl McpToolInfo {
     #[must_use]
     pub const fn streams(&self) -> bool {
         self.streams
+    }
+
+    /// The build-time authority envelope proved for the handler behind this
+    /// tool by `#[agent_operable(grant = ...)]` (issue #1691), or `None` for an
+    /// **ungoverned** tool — one exposed to agents with no grant declared.
+    ///
+    /// Copied verbatim from [`ApiDoc::agent_authority`], so a tool is governed
+    /// exactly when its handler is. `tools/call` reads it to record the
+    /// compile-known grant and reversibility on the invocation's audit events,
+    /// and the manifest reads it to tell `actions` from `ungoverned_tools`.
+    #[must_use]
+    pub const fn agent_authority(&self) -> Option<&'static crate::agent_authority::AgentAuthority> {
+        self.agent_authority
     }
 }
 
@@ -2481,6 +2500,205 @@ mod tests {
         assert!(should_expose(&d, false));
         let tools = derive_tools(&[d], false, None);
         assert_eq!(tools.len(), 1, "opted-in 205 route must derive a tool");
+    }
+
+    // ── Agent authority carried onto derived tools (#1691) ──────────────────
+    //
+    // The authority envelope is what makes a `tools/call` auditable with a
+    // *compile-known* blast radius: the grant name, the effect set, and the
+    // reversibility all come from the const assertions the macro already made
+    // against the handler body. Losing it between `ApiDoc` and `McpToolInfo`
+    // would silently downgrade a governed tool to `reversibility=unknown` in
+    // the audit trail and to `ungoverned_tools` in the manifest.
+
+    /// One construction site for the test grants, so the shape of
+    /// [`crate::agent_authority::Grant`] is pinned in exactly one place here.
+    const fn test_grant(
+        name: &'static str,
+        reversibility: crate::agent_authority::Reversibility,
+    ) -> crate::agent_authority::Grant {
+        crate::agent_authority::Grant {
+            name,
+            writes: &[],
+            unbounded_writes: &[],
+            tenant_scope: crate::agent_authority::TenantScope::Scoped,
+            outbound: &[],
+            webhooks: &[],
+            jobs: &[],
+            rate: None,
+            spend: None,
+            reversibility,
+            location: "autumn/src/mcp.rs",
+        }
+    }
+
+    /// Likewise for [`crate::agent_authority::AgentAuthority`].
+    const fn test_authority(
+        action: &'static str,
+        grant: &'static crate::agent_authority::Grant,
+    ) -> crate::agent_authority::AgentAuthority {
+        crate::agent_authority::AgentAuthority {
+            action,
+            module_path: "autumn_web::mcp::tests",
+            location: "autumn/src/mcp.rs",
+            grant,
+            effects: &[],
+            asserted_effect_free_sites: 0,
+        }
+    }
+
+    static REVERSIBLE_GRANT: crate::agent_authority::Grant = test_grant(
+        "DraftOnly",
+        crate::agent_authority::Reversibility::Reversible,
+    );
+    static COMPENSABLE_GRANT: crate::agent_authority::Grant = test_grant(
+        "RefundDrafter",
+        crate::agent_authority::Reversibility::Compensable,
+    );
+    static IRREVERSIBLE_GRANT: crate::agent_authority::Grant = test_grant(
+        "PayoutSender",
+        crate::agent_authority::Reversibility::Irreversible,
+    );
+
+    static REVERSIBLE_AUTHORITY: crate::agent_authority::AgentAuthority =
+        test_authority("draft_note", &REVERSIBLE_GRANT);
+    static COMPENSABLE_AUTHORITY: crate::agent_authority::AgentAuthority =
+        test_authority("draft_refund", &COMPENSABLE_GRANT);
+    static IRREVERSIBLE_AUTHORITY: crate::agent_authority::AgentAuthority =
+        test_authority("send_payout", &IRREVERSIBLE_GRANT);
+
+    /// An opted-in tool doc carrying (or not carrying) an authority.
+    fn governed_doc(
+        method: &'static str,
+        op: &'static str,
+        authority: Option<&'static crate::agent_authority::AgentAuthority>,
+    ) -> ApiDoc {
+        let mut d = doc(method, "/api/refunds", op);
+        d.mcp_tool = true;
+        d.agent_authority = authority;
+        d
+    }
+
+    #[test]
+    fn derive_tools_carries_the_handler_authority_onto_the_tool() {
+        let tools = derive_tools(
+            &[governed_doc(
+                "POST",
+                "draft_refund",
+                Some(&COMPENSABLE_AUTHORITY),
+            )],
+            false,
+            None,
+        );
+        assert_eq!(tools.len(), 1, "the opted-in route must derive a tool");
+        let authority = tools[0]
+            .agent_authority()
+            .expect("a governed handler's tool must carry its authority envelope");
+        assert_eq!(authority.grant.name, "RefundDrafter");
+        assert_eq!(
+            authority.grant.reversibility,
+            crate::agent_authority::Reversibility::Compensable
+        );
+        assert_eq!(authority.action, "draft_refund");
+    }
+
+    #[test]
+    fn derive_tools_leaves_an_ungoverned_tool_without_an_authority() {
+        // `None` must stay `None`: it is the signal the manifest uses to list a
+        // mutating tool under `ungoverned_tools`, so inventing one here would
+        // hide exactly the gap that check exists to find.
+        let tools = derive_tools(&[governed_doc("POST", "draft_refund", None)], false, None);
+        assert_eq!(tools.len(), 1);
+        assert!(
+            tools[0].agent_authority().is_none(),
+            "a handler with no #[agent_operable] derives an ungoverned tool"
+        );
+    }
+
+    #[test]
+    fn destructive_hint_follows_declared_reversibility() {
+        let hint = |op, authority| {
+            let tools = derive_tools(&[governed_doc("POST", op, authority)], false, None);
+            tools[0].annotations().get("destructiveHint").cloned()
+        };
+
+        // A declared authority is a *proved* claim about the blast radius, so
+        // it answers the question the verb could only guess at.
+        assert_eq!(
+            hint("send_payout", Some(&IRREVERSIBLE_AUTHORITY)),
+            Some(json!(true)),
+            "an irreversible action is destructive"
+        );
+        assert_eq!(
+            hint("draft_refund", Some(&COMPENSABLE_AUTHORITY)),
+            Some(json!(true)),
+            "a compensable action still needs a compensating step, so warn"
+        );
+        assert_eq!(
+            hint("draft_note", Some(&REVERSIBLE_AUTHORITY)),
+            Some(json!(false)),
+            "a reversible action is explicitly NOT destructive"
+        );
+    }
+
+    #[test]
+    fn destructive_hint_falls_back_to_the_verb_rule_when_ungoverned() {
+        // Nothing changes for the ungoverned majority: POST carries no hint and
+        // DELETE stays flagged, exactly as before #1691.
+        let post = derive_tools(&[governed_doc("POST", "draft_refund", None)], false, None);
+        assert!(
+            post[0].annotations().get("destructiveHint").is_none(),
+            "an ungoverned POST keeps the verb rule's silence: {:?}",
+            post[0].annotations()
+        );
+
+        let delete = derive_tools(
+            &[governed_doc("DELETE", "delete_refund", None)],
+            false,
+            None,
+        );
+        assert_eq!(
+            delete[0].annotations().get("destructiveHint"),
+            Some(&json!(true)),
+            "DELETE stays the destructive verb when no authority is declared"
+        );
+    }
+
+    #[test]
+    fn declared_reversibility_overrides_the_delete_verb_guess() {
+        // The verb rule is a heuristic; a proved `reversible` grant on a DELETE
+        // (a soft delete, say) is better information and must win.
+        let tools = derive_tools(
+            &[governed_doc(
+                "DELETE",
+                "archive_note",
+                Some(&REVERSIBLE_AUTHORITY),
+            )],
+            false,
+            None,
+        );
+        assert_eq!(
+            tools[0].annotations().get("destructiveHint"),
+            Some(&json!(false)),
+            "a proved reversible grant overrides the DELETE guess: {:?}",
+            tools[0].annotations()
+        );
+    }
+
+    #[test]
+    fn read_only_hint_is_unaffected_by_the_authority() {
+        // `readOnlyHint` is a statement about the HTTP verb, not about how hard
+        // the effect is to undo — the two hints must not be conflated.
+        let tools = derive_tools(
+            &[governed_doc(
+                "POST",
+                "draft_refund",
+                Some(&REVERSIBLE_AUTHORITY),
+            )],
+            false,
+            None,
+        );
+        assert_eq!(tools[0].annotations()["readOnlyHint"], json!(false));
     }
 
     #[test]

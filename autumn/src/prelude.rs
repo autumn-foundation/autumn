@@ -35,6 +35,13 @@ pub use autumn_macros::{
     main, oauth2_callback, one_off_tasks, patch, paths, post, public, put, query_budget, routes,
     scheduled, secured, service, static_get, static_routes, step_up, task, tasks, throttle,
 };
+
+/// Declare a named agent authority envelope (#1691).
+pub use crate::authority_grant;
+// Declare a handler agent-operable and check its effects against a grant.
+//
+// TODO(#1691, agent A): uncomment once `autumn-macros` exports `agent_operable`.
+// pub use autumn_macros::agent_operable;
 #[cfg(feature = "mail")]
 pub use autumn_macros::{mail_previews, mailer, mailer_preview};
 

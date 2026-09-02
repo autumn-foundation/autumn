@@ -3203,6 +3203,20 @@ impl AppBuilder {
             return;
         }
 
+        // ── Agent-authority manifest dump mode ─────────────────────────
+        // When AUTUMN_DUMP_AGENT_AUTHORITY=1, print the agent-authority
+        // manifest (#1691) and exit. Triggered by `autumn agents manifest`,
+        // which needs the whole binary's registrations -- every
+        // `#[agent_operable]` action and every declared `authority_grant!`,
+        // across the app AND its plugins -- joined against this app's route
+        // table, because which actions an agent can actually reach is a fact
+        // about the mounted routes and not about the annotations alone. Runs
+        // before any database or port is touched.
+        if crate::agent_authority::manifest::is_dump_mode() {
+            self.run_dump_agent_authority_mode();
+            return;
+        }
+
         // ── Jobs manifest dump mode ────────────────────────────────────
         // When AUTUMN_DUMP_JOBS=1, print the effective drained-queue manifest
         // (TOML `queues = [...]`) and exit. Triggered by `autumn jobs manifest`
@@ -5674,6 +5688,36 @@ impl AppBuilder {
         crate::managed_pg::emergency_stop_async().await;
     }
 
+    /// Dump the agent-authority manifest as one marker-prefixed JSON line and
+    /// exit.
+    ///
+    /// Triggered when `AUTUMN_DUMP_AGENT_AUTHORITY=1` is set (by `autumn agents
+    /// manifest`). Takes `&self` rather than consuming the builder: it reads
+    /// the route table and the audit-sink status and touches nothing else, so
+    /// there is no database to open and no port to bind.
+    fn run_dump_agent_authority_mode(&self) {
+        // Whether agent invocations have anywhere to be recorded is a property
+        // of the deployment, not of any grant, and it belongs in the document
+        // rather than in a startup line nobody reads (#1691 R9).
+        let audit_sink_configured = self
+            .audit_logger
+            .as_ref()
+            .is_some_and(|logger| logger.is_enabled());
+        let routes: Vec<crate::agent_authority::manifest::RouteSummary> = self
+            .routes
+            .iter()
+            .chain(
+                self.scoped_groups
+                    .iter()
+                    .flat_map(|group| group.routes.iter()),
+            )
+            .map(agent_authority_route_summary)
+            .collect();
+        crate::agent_authority::manifest::print_manifest_dump(
+            &crate::agent_authority::manifest::build(&routes, audit_sink_configured),
+        );
+    }
+
     /// Dump the application's route listing as JSON and exit.
     ///
     /// Triggered when `AUTUMN_DUMP_ROUTES=1` is set (by `autumn routes`).
@@ -7066,6 +7110,28 @@ pub(crate) fn is_dump_security_mode() -> bool {
 
 pub(crate) fn is_dump_jobs_mode() -> bool {
     std::env::var("AUTUMN_DUMP_JOBS").as_deref() == Ok("1")
+}
+
+/// The slice of a [`Route`] the agent-authority manifest needs (#1691).
+///
+/// Built here rather than in `agent_authority::manifest` so that module needs
+/// no dependency on the router, and unconditionally rather than behind the
+/// `openapi` feature: which handlers an agent can reach is not an
+/// documentation concern.
+fn agent_authority_route_summary(route: &Route) -> crate::agent_authority::manifest::RouteSummary {
+    crate::agent_authority::manifest::RouteSummary {
+        method: route.method.to_string(),
+        path: route.path.to_string(),
+        handler: route.name,
+        module_path: route.api_doc.module_path,
+        // Exclusion always wins, exactly as it does for the MCP derivation
+        // itself -- a route opted out is not a tool, so it is not an agent's
+        // to call and not this document's business.
+        mcp_tool: route.api_doc.mcp_tool && !route.api_doc.mcp_exclude,
+        // Filled by the route macro from the handler's `#[agent_operable]`
+        // marker, in either attribute order.
+        agent_authority: route.api_doc.agent_authority,
+    }
 }
 
 pub(crate) fn is_list_one_off_tasks_mode() -> bool {

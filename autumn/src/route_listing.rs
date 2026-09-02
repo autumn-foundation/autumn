@@ -328,6 +328,16 @@ pub struct RouteInfo {
     /// `policy: true` and no bindings is therefore normal, not a defect.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub authorize_bindings: Vec<AuthorizeBindingInfo>,
+    /// Name of the authority grant proved for this handler by
+    /// `#[agent_operable(grant = ...)]` (issue #1691), so `autumn routes` shows
+    /// which endpoints an agent may drive and under what envelope.
+    ///
+    /// `None` means the handler declares no grant. For a *mutating*
+    /// MCP-exposed route that is the "ungoverned tool" case the authority
+    /// manifest reports; for everything else it simply means the endpoint is
+    /// not agent-operable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_grant: Option<String>,
 }
 
 /// `skip_serializing_if` helper: elide `false` booleans from JSON output.
@@ -475,6 +485,16 @@ fn authorize_bindings_of(
     bindings
 }
 
+/// Name of the authority grant proved for a handler by `#[agent_operable]`.
+///
+/// Read straight off [`crate::openapi::ApiDoc::agent_authority`], so the grant
+/// shown by `autumn routes` disappears exactly when the attribute does.
+fn agent_grant_of(api_doc: &crate::openapi::ApiDoc) -> Option<String> {
+    api_doc
+        .agent_authority
+        .map(|authority| authority.grant.name.to_owned())
+}
+
 /// Helper type alias representing version name, status string, and sunset opt-out flag.
 type RouteVersionInfo = (Option<String>, Option<String>, Option<bool>);
 
@@ -558,6 +578,7 @@ pub fn collect_route_infos(
             module: module_of(&route.api_doc),
             location: source_location_of(&route.api_doc),
             authorize_bindings,
+            agent_grant: agent_grant_of(&route.api_doc),
         });
     }
 
@@ -584,6 +605,7 @@ pub fn collect_route_infos(
                 module: module_of(&route.api_doc),
                 location: source_location_of(&route.api_doc),
                 authorize_bindings: authorize_bindings_of(&group.source, &route.api_doc),
+                agent_grant: agent_grant_of(&route.api_doc),
             });
         }
     }

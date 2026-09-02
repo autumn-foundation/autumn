@@ -720,6 +720,15 @@ fn generate_coherence_items(
             #[doc(hidden)]
             pub const __AUTUMN_MODEL_NAME: fn() -> &'static ::core::primitive::str =
                 || ::core::any::type_name::<#model_name>();
+
+            /// The model this repository writes, unqualified — the subject an
+            /// agent-authority grant names (#1691). `__AUTUMN_MODEL_NAME`
+            /// carries the full `type_name` path, which no grant can be
+            /// expected to spell; this is the last segment alone, readable in
+            /// const context so the authority assertion works across crates.
+            #[doc(hidden)]
+            pub const __AUTUMN_MODEL_IDENT: &'static ::core::primitive::str =
+                stringify!(#model_name);
         }
     };
 
