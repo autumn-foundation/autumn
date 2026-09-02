@@ -158,7 +158,13 @@ pub const ALLOWED_RESPONSE_HEADERS: &[&str] = &[
 /// different question than the one that matters: percent-encoded double-dot
 /// segments (`%2e%2e`) and ASCII tabs or newlines, which the client removes
 /// outright.
-fn redirect_target_allowed(target: &str, prefix: &str, owned: &OwnedRoutes) -> bool {
+fn redirect_target_allowed(
+    target: &str,
+    prefix: &str,
+    owned: &OwnedRoutes,
+    requested: &str,
+    status: u16,
+) -> bool {
     // A backslash is a path separator to some clients but not to this check,
     // so a target carrying one is refused rather than guessed at.
     if target.contains('\\') {
@@ -203,10 +209,11 @@ fn redirect_target_allowed(target: &str, prefix: &str, owned: &OwnedRoutes) -> b
     if path.split('/').any(is_double_dot_segment) {
         return false;
     }
-    // And the target must be a route this plugin actually serves. Staying under
-    // the prefix is not the same as being the plugin's to name — see
-    // [`OwnedRoutes`].
-    owned.owns(target.split(['?', '#']).next().unwrap_or_default())
+    // And the target must be a route this plugin actually serves, for every
+    // method the client might replay. Staying under the prefix is not the same
+    // as being the plugin's to name — see [`OwnedRoutes`].
+    let full = target.split(['?', '#']).next().unwrap_or_default();
+    redirect_lands_on_the_plugin(status, requested, full, owned)
 }
 
 /// The paths a plugin declared, matched the way the router matches them.
@@ -244,19 +251,66 @@ fn redirect_target_allowed(target: &str, prefix: &str, owned: &OwnedRoutes) -> b
 /// where both route sets are known.
 ///
 /// Built once per host: the set is fixed at load.
-pub struct OwnedRoutes(Vec<String>);
+/// A path alone is not the unit either. The exact-duplicate check keys on
+/// `(method, path)`, so a plugin's `GET /hello/transfer` and an application's
+/// `POST /hello/transfer` are two routes and both mount. Which one a redirect
+/// reaches depends on the method the client replays, and that depends on the
+/// status: 307 and 308 preserve the request's method, 303 rewrites it to GET,
+/// and 301 and 302 are the awkward pair — the specification says preserve,
+/// every browser rewrites POST to GET, so both have to be owned before the
+/// redirect is safe.
+pub struct OwnedRoutes(Vec<(String, String)>);
 
 impl OwnedRoutes {
-    /// Build the set from a manifest's declared paths.
+    /// Build the set from a manifest's declared `(method, path)` pairs.
     #[must_use]
-    pub fn from_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Self {
-        Self(paths.into_iter().map(str::to_owned).collect())
+    pub fn from_routes<'a>(routes: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        Self(
+            routes
+                .into_iter()
+                .map(|(method, path)| (method.to_ascii_uppercase(), path.to_owned()))
+                .collect(),
+        )
     }
 
-    /// Does this plugin declare this exact path?
+    /// Does this plugin serve this exact path for this exact method?
+    ///
+    /// A declared GET answers HEAD as well, because the mount does: the router
+    /// gives a GET route the implied HEAD, and `route_infos` reports it.
     #[must_use]
-    fn owns(&self, path: &str) -> bool {
-        self.0.iter().any(|declared| declared == path)
+    fn owns(&self, method: &str, path: &str) -> bool {
+        self.0.iter().any(|(declared_method, declared_path)| {
+            declared_path == path
+                && (declared_method.eq_ignore_ascii_case(method)
+                    || (method.eq_ignore_ascii_case("HEAD") && declared_method == "GET"))
+        })
+    }
+}
+
+/// Would every method this redirect might be replayed with land on the plugin?
+///
+/// The status decides which methods those are, so the question cannot be asked
+/// of the path alone:
+///
+/// - **307, 308** preserve the request's method and body, which is exactly what
+///   makes them the pair worth worrying about.
+/// - **303** rewrites to GET.
+/// - Any other redirect — 301 and 302 above all — is the awkward case: the
+///   specification says preserve, every browser rewrites POST to GET, and a
+///   client is free to do either. Both must be the plugin's before it is safe.
+/// - A non-redirect status carries no replay at all. A `Location` beside a 200
+///   is inert, so refusing it would strip a header on a question no client asks.
+fn redirect_lands_on_the_plugin(
+    status: u16,
+    requested: &str,
+    path: &str,
+    owned: &OwnedRoutes,
+) -> bool {
+    match status {
+        307 | 308 => owned.owns(requested, path),
+        303 => owned.owns("GET", path),
+        300..=399 => owned.owns(requested, path) && owned.owns("GET", path),
+        _ => true,
     }
 }
 
@@ -581,8 +635,16 @@ impl SandboxResponse {
     /// reaching for `Set-Cookie` is a thing an operator wants in their log,
     /// not something to silently drop.
     #[must_use]
-    pub fn sanitize(mut self, prefix: &str, owned: &OwnedRoutes) -> (Self, Vec<String>) {
+    pub fn sanitize(
+        mut self,
+        prefix: &str,
+        owned: &OwnedRoutes,
+        requested: &str,
+    ) -> (Self, Vec<String>) {
         let mut denied = Vec::new();
+        // Read before the retain borrows `self.headers`, and because the status
+        // is what decides which methods a redirect may be replayed with.
+        let status = self.status;
         self.headers.retain(|(name, value)| {
             // Matched against the borrowed name. Lower-casing first copied every
             // name to answer a question the allowlist can answer without one,
@@ -604,7 +666,7 @@ impl SandboxResponse {
             // the one it must not have. An absolute URL is refused by the same
             // rule, which closes the open-redirect half as well.
             if name.eq_ignore_ascii_case("location")
-                && !redirect_target_allowed(value, prefix, owned)
+                && !redirect_target_allowed(value, prefix, owned, requested, status)
             {
                 denied.push(denied_excerpt(name));
                 return false;
@@ -817,20 +879,104 @@ mod tests {
     /// them a plugin that owns the whole prefix keeps them measuring what they
     /// were written to measure; ownership has its own test.
     fn any_route_under_hello() -> OwnedRoutes {
-        OwnedRoutes::from_paths([
-            "/hello",
-            "/hello/..",
-            "/hello/.. ",
-            "/hello/a b",
-            "/hello/a%20b",
-            "/hello/greet",
+        OwnedRoutes::from_routes([
+            ("GET", "/hello"),
+            ("GET", "/hello/.."),
+            ("GET", "/hello/.. "),
+            ("GET", "/hello/a b"),
+            ("GET", "/hello/a%20b"),
+            ("GET", "/hello/greet"),
         ])
     }
 
     /// The route set the sanitation tests mount against: what a hello plugin
     /// declares, and nothing the application might also serve under `/hello`.
     fn hello_routes() -> OwnedRoutes {
-        OwnedRoutes::from_paths(["/hello", "/hello/greet", "/hello/items/{id}"])
+        OwnedRoutes::from_routes([
+            ("GET", "/hello"),
+            ("GET", "/hello/greet"),
+            ("GET", "/hello/items/{id}"),
+        ])
+    }
+
+    /// The path is not the unit of ownership either — the method is part of it.
+    ///
+    /// `router.rs` keys its duplicate check on `(method, path)`, so a plugin's
+    /// `GET /hello/transfer` and an application's `POST /hello/transfer` are two
+    /// routes and both mount. Which one a redirect reaches depends on the method
+    /// the client replays, and the status decides that: 307 and 308 keep the
+    /// request's method, 303 rewrites to GET, and 301 and 302 may do either.
+    #[test]
+    fn a_redirect_must_land_on_the_plugin_under_the_method_it_replays() {
+        // The plugin serves this path for GET only. The application may hold
+        // POST on it, and a 307 preserves the method — so a POST redirected
+        // here reaches the application, carrying the user's body and cookies.
+        let owned = OwnedRoutes::from_routes([("GET", "/hello"), ("GET", "/hello/transfer")]);
+        let preserved = SandboxResponse {
+            status: 307,
+            headers: vec![("location".to_owned(), "/hello/transfer".to_owned())],
+            body: Vec::new(),
+        };
+        let (clean, denied) = preserved.sanitize("/hello", &owned, "POST");
+        assert!(
+            clean.headers.is_empty(),
+            "a 307 replaying POST at a path the plugin serves only for GET must be refused",
+        );
+        assert_eq!(denied, vec!["location".to_owned()], "and recorded");
+
+        // The same redirect from a GET is the plugin's own route, and stays.
+        let same_method = SandboxResponse {
+            status: 307,
+            headers: vec![("location".to_owned(), "/hello/transfer".to_owned())],
+            body: Vec::new(),
+        };
+        let (clean, denied) = same_method.sanitize("/hello", &owned, "GET");
+        assert_eq!(
+            clean.headers.len(),
+            1,
+            "a 307 replaying GET lands on the plugin"
+        );
+        assert!(denied.is_empty());
+
+        // A 303 rewrites the method to GET whatever was requested, so the same
+        // POST is fine here — it is a GET that arrives.
+        let rewritten = SandboxResponse {
+            status: 303,
+            headers: vec![("location".to_owned(), "/hello/transfer".to_owned())],
+            body: Vec::new(),
+        };
+        let (clean, denied) = rewritten.sanitize("/hello", &owned, "POST");
+        assert_eq!(
+            clean.headers.len(),
+            1,
+            "a 303 arrives as GET, which the plugin serves"
+        );
+        assert!(denied.is_empty());
+
+        // 302 is the pair that may do either, so both must be the plugin's.
+        let ambiguous = SandboxResponse {
+            status: 302,
+            headers: vec![("location".to_owned(), "/hello/transfer".to_owned())],
+            body: Vec::new(),
+        };
+        let (clean, _) = ambiguous.sanitize("/hello", &owned, "POST");
+        assert!(
+            clean.headers.is_empty(),
+            "a 302 may be replayed as either method, so a POST it might preserve must be owned",
+        );
+
+        // And a declared GET answers HEAD, because the mount does.
+        let head = SandboxResponse {
+            status: 307,
+            headers: vec![("location".to_owned(), "/hello/transfer".to_owned())],
+            body: Vec::new(),
+        };
+        let (clean, _) = head.sanitize("/hello", &owned, "HEAD");
+        assert_eq!(
+            clean.headers.len(),
+            1,
+            "a GET route serves the HEAD the router implies"
+        );
     }
 
     /// A plugin declaring a dynamic route does not thereby own every literal
@@ -849,7 +995,7 @@ mod tests {
             headers: vec![("location".to_owned(), "/hello/items/7".to_owned())],
             body: Vec::new(),
         };
-        let (clean, denied) = shadowed.sanitize("/hello", &hello_routes());
+        let (clean, denied) = shadowed.sanitize("/hello", &hello_routes(), "GET");
         assert!(
             clean.headers.is_empty(),
             "a target reached only through the plugin's own template must be \
@@ -864,7 +1010,7 @@ mod tests {
             headers: vec![("location".to_owned(), "/hello/greet".to_owned())],
             body: Vec::new(),
         };
-        let (clean, denied) = declared.sanitize("/hello", &hello_routes());
+        let (clean, denied) = declared.sanitize("/hello", &hello_routes(), "GET");
         assert_eq!(clean.headers.len(), 1, "a declared literal must still pass");
         assert!(denied.is_empty());
     }
@@ -887,7 +1033,7 @@ mod tests {
             headers: vec![("location".to_owned(), "/hello/other".to_owned())],
             body: Vec::new(),
         };
-        let (clean, denied) = application_owned.sanitize("/hello", &hello_routes());
+        let (clean, denied) = application_owned.sanitize("/hello", &hello_routes(), "GET");
         assert!(
             clean.headers.is_empty(),
             "a redirect to a route the plugin does not serve must be stripped",
@@ -902,7 +1048,7 @@ mod tests {
                 headers: vec![("location".to_owned(), target.to_owned())],
                 body: Vec::new(),
             };
-            let (clean, denied) = own.sanitize("/hello", &hello_routes());
+            let (clean, denied) = own.sanitize("/hello", &hello_routes(), "GET");
             assert_eq!(
                 clean.headers.len(),
                 1,
@@ -920,7 +1066,7 @@ mod tests {
                 headers: vec![("location".to_owned(), target.to_owned())],
                 body: Vec::new(),
             };
-            let (clean, _) = escaping.sanitize("/hello", &hello_routes());
+            let (clean, _) = escaping.sanitize("/hello", &hello_routes(), "GET");
             assert!(clean.headers.is_empty(), "{target} must still be refused");
         }
     }
@@ -944,7 +1090,7 @@ mod tests {
             headers: vec![(huge.clone(), "v".to_owned())],
             body: Vec::new(),
         };
-        let (clean, denied) = response.sanitize("/hello", &hello_routes());
+        let (clean, denied) = response.sanitize("/hello", &hello_routes(), "GET");
 
         assert!(
             clean.headers.is_empty(),
@@ -970,7 +1116,7 @@ mod tests {
             headers: vec![("SET-COOKIE".to_owned(), "v".to_owned())],
             body: Vec::new(),
         };
-        let (clean, denied) = shouted.sanitize("/hello", &hello_routes());
+        let (clean, denied) = shouted.sanitize("/hello", &hello_routes(), "GET");
         assert!(
             clean.headers.is_empty(),
             "a shouted name must still be refused"
@@ -988,7 +1134,7 @@ mod tests {
             headers: vec![("Content-Type".to_owned(), "text/plain".to_owned())],
             body: Vec::new(),
         };
-        let (clean, denied) = fine.sanitize("/hello", &hello_routes());
+        let (clean, denied) = fine.sanitize("/hello", &hello_routes(), "GET");
         assert_eq!(clean.headers.len(), 1, "an allowed header must survive");
         assert!(denied.is_empty(), "nothing was denied");
     }
@@ -1015,7 +1161,7 @@ mod tests {
                 "the fixture must be the same redirect once the client trims it",
             );
             assert!(
-                !redirect_target_allowed(smuggled, "/hello", &any_route_under_hello()),
+                !redirect_target_allowed(smuggled, "/hello", &any_route_under_hello(), "GET", 307),
                 "{smuggled:?} was accepted, and resolves outside the prefix at the client",
             );
         }
@@ -1025,7 +1171,9 @@ mod tests {
         assert!(!redirect_target_allowed(
             "/hello/..",
             "/hello",
-            &any_route_under_hello()
+            &any_route_under_hello(),
+            "GET",
+            307,
         ));
 
         // A space is refused anywhere rather than only at the ends, so there is
@@ -1034,12 +1182,16 @@ mod tests {
         assert!(!redirect_target_allowed(
             "/hello/a b",
             "/hello",
-            &any_route_under_hello()
+            &any_route_under_hello(),
+            "GET",
+            307,
         ));
         assert!(redirect_target_allowed(
             "/hello/a%20b",
             "/hello",
-            &any_route_under_hello()
+            &any_route_under_hello(),
+            "GET",
+            307,
         ));
     }
 
@@ -1076,7 +1228,7 @@ mod tests {
                 "the fixture must be the same redirect once the client strips it",
             );
             assert!(
-                !redirect_target_allowed(smuggled, "/hello", &any_route_under_hello()),
+                !redirect_target_allowed(smuggled, "/hello", &any_route_under_hello(), "GET", 307),
                 "{smuggled:?} was accepted, and resolves to {plain} at the client",
             );
         }
@@ -1087,14 +1239,18 @@ mod tests {
         assert!(!redirect_target_allowed(
             plain,
             "/hello",
-            &any_route_under_hello()
+            &any_route_under_hello(),
+            "GET",
+            307,
         ));
 
         // And a target with no control characters is unaffected.
         assert!(redirect_target_allowed(
             "/hello/greet?page=2",
             "/hello",
-            &any_route_under_hello()
+            &any_route_under_hello(),
+            "GET",
+            307,
         ));
     }
 
@@ -1127,7 +1283,7 @@ mod tests {
                 headers: vec![("location".to_owned(), target.to_owned())],
                 body: Vec::new(),
             };
-            let (clean, denied) = response.sanitize("/hello", &hello_routes());
+            let (clean, denied) = response.sanitize("/hello", &hello_routes(), "GET");
             assert!(
                 !clean
                     .headers
@@ -1154,7 +1310,7 @@ mod tests {
                 headers: vec![("location".to_owned(), target.to_owned())],
                 body: Vec::new(),
             };
-            let (clean, _) = response.sanitize("/hello", &hello_routes());
+            let (clean, _) = response.sanitize("/hello", &hello_routes(), "GET");
             assert!(
                 clean
                     .headers
@@ -1330,7 +1486,7 @@ mod tests {
             ],
             body: vec![],
         };
-        let (clean, denied) = response.sanitize("/hello", &hello_routes());
+        let (clean, denied) = response.sanitize("/hello", &hello_routes(), "GET");
         assert_eq!(denied, vec!["set-cookie".to_owned()]);
         assert_eq!(
             clean.headers,
@@ -1356,7 +1512,7 @@ mod tests {
                 headers: vec![(name.to_owned(), "x".to_owned())],
                 body: vec![],
             };
-            let (clean, denied) = response.sanitize("/hello", &hello_routes());
+            let (clean, denied) = response.sanitize("/hello", &hello_routes(), "GET");
             assert_eq!(denied, vec![name.to_owned()], "{name} must be stripped");
             assert!(clean.headers.is_empty());
         }

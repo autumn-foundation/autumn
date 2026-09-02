@@ -1217,8 +1217,11 @@ impl SandboxHost {
             module,
             permits: Semaphore::new(manifest.limits.max_concurrency),
             instantiation_fuel: instantiation,
-            owned_routes: super::wire::OwnedRoutes::from_paths(
-                manifest.routes.iter().map(|route| route.path.as_str()),
+            owned_routes: super::wire::OwnedRoutes::from_routes(
+                manifest
+                    .routes
+                    .iter()
+                    .map(|route| (route.method.as_str(), route.path.as_str())),
             ),
             manifest,
         })
@@ -1278,6 +1281,11 @@ impl SandboxHost {
         let limits = self.manifest.limits;
         // Bounds where the response may redirect a client; see `sanitize`.
         let prefix = self.manifest.prefix.as_str();
+        let rules = ResponseRules {
+            prefix,
+            owned: &self.owned_routes,
+            requested: &request.method,
+        };
 
         if let Some(refusal) = refuse_oversized_request(request, limits) {
             return refusal;
@@ -1371,7 +1379,7 @@ impl SandboxHost {
             let failure = SandboxFailure::FuelExhausted {
                 budget: limits.fuel,
             };
-            return finish(store, limits, prefix, &self.owned_routes, Err(failure));
+            return finish(store, limits, &rules, Err(failure));
         };
         if let Err(err) = store.set_fuel(left) {
             return SandboxOutcome::refused(
@@ -1397,8 +1405,7 @@ impl SandboxHost {
                 return finish(
                     store,
                     limits,
-                    prefix,
-                    &self.owned_routes,
+                    &rules,
                     Err(instantiation_failure(&err, limits)),
                 );
             }
@@ -1408,13 +1415,7 @@ impl SandboxHost {
             // `from_module` already refused a module without `_start`; reaching
             // here would mean the export changed shape, which is still the
             // plugin's problem and not the host's.
-            return finish(
-                store,
-                limits,
-                &self.manifest.prefix,
-                &self.owned_routes,
-                Err(SandboxFailure::NoAnswer),
-            );
+            return finish(store, limits, &rules, Err(SandboxFailure::NoAnswer));
         };
 
         let trap = start.call(&mut store, ()).err();
@@ -1428,22 +1429,29 @@ impl SandboxHost {
             (None, None) if partial => Err(SandboxFailure::PartialFrame),
             (None, None) => Err(SandboxFailure::NoAnswer),
         };
-        finish(store, limits, prefix, &self.owned_routes, result)
+        finish(store, limits, &rules, result)
     }
 }
 
 /// Drain the store into an outcome, applying the response sanitation and the
 /// size ceiling that only the host can enforce.
+/// What a response may carry, gathered because the three travel together.
+///
+/// A `Location` is judged against all of them at once: it must stay under the
+/// prefix, name a route the plugin actually serves — an application route may
+/// sit under the prefix — and land on that route under the method the client
+/// will replay, which the status and the request's own method decide between
+/// them. Passing them as one argument keeps `run`'s exits readable.
+struct ResponseRules<'a> {
+    prefix: &'a str,
+    owned: &'a super::wire::OwnedRoutes,
+    requested: &'a str,
+}
+
 fn finish(
     store: Store<HostState>,
     limits: ResourceLimits,
-    // The plugin's declared prefix, which bounds where its response may
-    // redirect a client. See `SandboxResponse::sanitize`.
-    prefix: &str,
-    // And the routes it actually serves, which is the narrower question a
-    // redirect target has to answer — an application route may sit under the
-    // prefix. See `OwnedRoutes`.
-    owned: &super::wire::OwnedRoutes,
+    rules: &ResponseRules<'_>,
     result: Result<SandboxResponse, SandboxFailure>,
 ) -> SandboxOutcome {
     let fuel_used = store
@@ -1473,7 +1481,7 @@ fn finish(
 
     let result = match result {
         Ok(response) => {
-            let (response, denied) = response.sanitize(prefix, owned);
+            let (response, denied) = response.sanitize(rules.prefix, rules.owned, rules.requested);
             for name in denied {
                 // The name is the guest's, so it is as long and as hostile as
                 // the guest cares to make it — bounded only by the stdout line
