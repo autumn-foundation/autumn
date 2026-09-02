@@ -486,7 +486,10 @@ When a repository declares `dependent(...)`, **the repository attribute wins for
 that repository** and any model-side `dependent` on the same model is inert. That
 is deliberate — the repository form exists precisely to override — but a silently
 ignored declaration is a trap, so debug builds emit a `tracing::warn!` naming the
-model when both are present. Release builds pay nothing for the check.
+model when both are present. The warning rides the single-record delete path
+(`delete_by_id` / `destroy`) — an app whose only delete path is `delete_many`
+never sees it — and the check is a const-folded `if false` in release builds, so
+they pay nothing for it.
 
 Pick one site per model. Reach for the repository form only when the naming
 convention cannot reach the child.
@@ -495,25 +498,36 @@ convention cannot reach the child.
 
 | Action       | Effect on matched children                                                              |
 |--------------|-----------------------------------------------------------------------------------------|
-| `destroy`    | Deletes each child through its own delete path: fires the child's `before_delete` / `after_delete` hooks, honors the child's `soft_delete`, and recurses into the child's own dependents. |
+| `destroy`    | Deletes each child through its own delete path: fires the child's `before_delete` hook (and enqueues its `after_delete_commit` hook when the child repository declares `commit_hooks = true`), honors the child's `soft_delete`, and recurses into the child's own dependents. |
 | `delete_all` | One set-based delete of the matched children. No child hooks, **no recursion** — the cheap option for leaf rows. |
 | `nullify`    | Sets the child foreign key to `NULL`, leaving the rows. The child's FK column must be nullable (`Option<i64>`). |
 | `restrict`   | Refuses the delete with a typed `409 Conflict` if any child still references the parent. |
 
-`destroy` is soft-delete-aware in both directions: a soft-deleting parent
-soft-deletes its children (the live graph stays consistent, FKs stay valid), and
-a hard-deleting parent hard-deletes them, soft-deleted children included, so no
-row is left dangling behind a removed parent.
+`destroy` follows the parent's delete kind. A soft-deleting parent soft-deletes
+each child that is itself a `#[soft_delete]` model — the live graph stays
+consistent and FKs stay valid — and hard-deletes any child that is not, since
+there is nothing to soft-delete. A hard-deleting parent hard-deletes every
+child, already-soft-deleted rows included, so no row is left dangling behind a
+removed parent.
+
+The one child shape that refuses is a **ledgered** soft-delete child under a
+hard-deleting parent: hard-deleting it would destroy ledger history, so the
+cascade returns a typed conflict instead of removing the row.
 
 ### What the cascade guarantees
 
 - **One transaction.** The whole cascade — every level of it — and the parent's
-  own delete run inside a single `Db::tx`. Any failure, including a `restrict`
-  409, rolls the entire thing back.
+  own delete run inside a single database transaction. Any failure, including a
+  `restrict` 409, rolls the entire thing back. The generated delete acquires its
+  own connection and opens that transaction itself; it is not `Db::tx` and does
+  not nest inside one.
 - **`restrict` probes first.** Every `restrict` dependent is probed *before* any
   mutating action runs and before the parent's own `before_delete` hook fires.
   Mutating actions fire child hooks that a later rollback cannot retract, so a
-  blocked delete never touches one.
+  blocked delete never touches one. The probe follows the parent's delete kind:
+  a soft-deleting parent only counts *live* children, so an already-soft-deleted
+  child does not block it, while a hard-deleting parent counts soft-deleted
+  children too — they would still dangle.
 - **Both delete paths.** `delete_by_id` / `destroy` and the bulk `delete_many`
   both run the cascade. On `delete_many` the ordering is the same — restrict
   probes for the whole batch first (a 409 rolls the entire batch back), then the
@@ -539,6 +553,10 @@ row is left dangling behind a removed parent.
   never a silently ignored key.
 - `delete_all` does not recurse. If the rows it removes have children of their
   own, use `destroy` (or rely on a database-level `ON DELETE`).
+- The `delete_many` cascade is **per parent row**: children are cascaded once per
+  parent per association rather than in one set-based statement, so a batch of N
+  parents costs on the order of N times the per-parent cascade. The batch is
+  still one transaction; it is the statement count that scales.
 - `retention(...)` and `dependent(...)` cannot be combined on the same
   repository. The sweep mutates rows directly rather than going through the
   cascade-aware delete path, so it would orphan children or ignore a `restrict`

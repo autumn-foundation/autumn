@@ -619,8 +619,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/guide/macro-transparency.md` is corrected and links to it. Alongside it,
   a `dependent`/`on_delete` on a `through = <join_table>` association now spans
   the `dependent` key itself rather than the association's target ident, so the
-  caret lands on the thing the error tells you to remove. Model-declared
-  cascades on `#[has_one]` are now covered end to end, and the three directed
+  caret lands on the thing the error tells you to remove. The model-declared
+  `destroy` cascade on `#[has_one]` is now proven end to end, the precedence
+  between the two declaration sites is proven behaviourally, and the three directed
   compile errors (`dependent` on `#[belongs_to]`, on a `through =` association,
   and an unknown action) are pinned by trybuild fixtures.
 

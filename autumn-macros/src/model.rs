@@ -817,7 +817,9 @@ fn parse_assoc_attr(
             "`target_fk = <column>` requires `through = <join_table>`",
         ));
     }
-    if let (Some(_), Some((_, dependent_span))) = (explicit_through.as_ref(), dependent.as_ref()) {
+    if let Some((_, dependent_span)) = dependent.as_ref()
+        && explicit_through.is_some()
+    {
         // A `through = <join_table>` association's `fk` names a column on the
         // *join table*, not on the target model. The emitted cascade calls the
         // target repository's `__autumn_apply_dependent_on_conn`, whose SQL
