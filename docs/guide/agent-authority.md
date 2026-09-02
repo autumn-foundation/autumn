@@ -766,13 +766,19 @@ Metadata on all three:
 | `http_status` | the replayed request's status (neither the attempt nor a refusal can know it — nothing was dispatched yet, or ever) |
 | `request_id` | the pipeline's own `x-request-id` |
 | `stream_state` | **streaming tools only**: `completed`, `aborted` or `errored` |
+| `result` | **only when the body never reached the agent**: `body_overflow` or `body_error` |
 
-For a `#[api_doc(mcp, stream)]` tool the outcome is recorded when the *stream*
-ends, not when the handler answered — a streaming handler returns `200` before
-it has produced anything, so a record written then would durably claim success
-for a stream that later errored or was cut off by a client disconnect, and
-`stream_state` is what distinguishes the three endings (an abandoned stream is
-a `Failure` with `stream_state = "aborted"`).
+The outcome is recorded once the tool result actually exists, never from the
+status line alone. For a `#[api_doc(mcp, stream)]` tool that means when the
+*stream* ends — a streaming handler returns `200` before it has produced
+anything, so a record written then would durably claim success for a stream
+that later errored or was cut off by a client disconnect, and `stream_state`
+distinguishes the three endings (an abandoned stream is a `Failure` with
+`stream_state = "aborted"`). For an ordinary buffered tool it means after the
+handler's body has been read back and packaged: a body that overflows the
+10 MiB tool-result cap, or that errors mid-read, reaches the agent as a tool
+error, so the outcome is a `Failure` carrying `result` rather than a success
+nobody received.
 
 The `actor_id` is the authenticated identity's subject, or `agent:anonymous` —
 never empty. The `target_resource_id` is the route template, not the tool name.

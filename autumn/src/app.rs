@@ -5728,15 +5728,20 @@ impl AppBuilder {
         let expose_all = self.mcp.as_ref().is_some_and(|rt| rt.expose_all);
         #[cfg(not(feature = "mcp"))]
         let expose_all = false;
+        // Top-level routes carry their own path; a scoped group's children do
+        // not -- the group's prefix is applied at mount time, so the path on
+        // the `Route` is the child path alone. Passing that through would
+        // record `/items` for a tool an agent calls at `/api/v1/items`, and a
+        // scope rename would then produce no drift at all.
         let routes: Vec<crate::agent_authority::manifest::RouteSummary> = self
             .routes
             .iter()
-            .chain(
-                self.scoped_groups
-                    .iter()
-                    .flat_map(|group| group.routes.iter()),
-            )
-            .map(|route| agent_authority_route_summary(route, expose_all))
+            .map(|route| agent_authority_route_summary(route, None, expose_all))
+            .chain(self.scoped_groups.iter().flat_map(|group| {
+                group.routes.iter().map(move |route| {
+                    agent_authority_route_summary(route, Some(&group.prefix), expose_all)
+                })
+            }))
             .collect();
         crate::agent_authority::manifest::print_manifest_dump(
             &crate::agent_authority::manifest::build(&routes, audit_sink_configured),
@@ -7153,11 +7158,19 @@ pub(crate) fn is_dump_jobs_mode() -> bool {
 /// `#[api_doc(mcp)]` is no longer reported as a tool it will never become.
 fn agent_authority_route_summary(
     route: &Route,
+    scope_prefix: Option<&str>,
     expose_all: bool,
 ) -> crate::agent_authority::manifest::RouteSummary {
     // One string, used both for the row and for the predicate, so the two can
     // never disagree about a route's verb.
     let method = route.method.to_string();
+    // The path an agent actually calls. `join_nested_path` is the same helper
+    // the OpenAPI collector uses for scoped groups, so the manifest and the
+    // spec cannot disagree about where a route lives.
+    let path = scope_prefix.map_or_else(
+        || route.path.to_string(),
+        |prefix| crate::router::join_nested_path(prefix, &route.path),
+    );
     let exposed_by = crate::agent_authority::manifest::mcp_exposure(
         &crate::agent_authority::manifest::McpExposureInput {
             method: &method,
@@ -7172,7 +7185,7 @@ fn agent_authority_route_summary(
     );
     crate::agent_authority::manifest::RouteSummary {
         method,
-        path: route.path.to_string(),
+        path,
         handler: route.name,
         // The name an MCP client actually calls: `#[api_doc(operation_id =
         // "...")]` renames the tool without renaming the handler.
@@ -10823,6 +10836,90 @@ const fn is_mutating_method(method: &http::Method) -> bool {
 /// deployments that pick the long-form alias.
 fn is_production_profile(profile: &str) -> bool {
     matches!(profile, "prod" | "production")
+}
+
+#[cfg(test)]
+mod agent_authority_route_summary_tests {
+    use super::*;
+
+    fn route_with(path: &'static str, mcp_tool: bool) -> Route {
+        let mut api_doc = crate::openapi::ApiDoc {
+            method: "GET",
+            path,
+            operation_id: "list_items",
+            mcp_tool,
+            ..crate::openapi::ApiDoc::default()
+        };
+        // The exposure rule is JSON-out gated, so a route with no response
+        // schema is never a tool no matter what it is tagged with. Give it one.
+        api_doc.response = Some(crate::openapi::SchemaEntry {
+            name: "Item",
+            kind: crate::openapi::SchemaKind::Ref,
+            identity: None,
+        });
+        Route {
+            method: http::Method::GET,
+            path,
+            handler: axum::routing::any(|| async { "" }),
+            name: "list_items",
+            api_doc,
+            repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
+            api_version: None,
+            sunset_opt_out: false,
+        }
+    }
+
+    #[test]
+    fn a_scoped_route_records_the_path_an_agent_actually_calls() {
+        // A scoped group's children carry only the child path -- the prefix is
+        // applied at mount time. Recording `/items` for a tool served at
+        // `/api/v1/items` would make the manifest wrong about where the agent
+        // surface is, and a scope rename would produce no drift at all.
+        let route = route_with("/items", true);
+        let summary = agent_authority_route_summary(&route, Some("/api/v1"), false);
+        assert_eq!(summary.path, "/api/v1/items");
+        assert_eq!(summary.method, "GET");
+        assert!(summary.mcp_tool);
+
+        // A top-level route has no prefix and is unchanged.
+        let top = agent_authority_route_summary(&route, None, false);
+        assert_eq!(top.path, "/items");
+    }
+
+    #[test]
+    fn a_scoped_root_route_joins_the_way_the_openapi_collector_does() {
+        // Delegated to `join_nested_path` rather than string concatenation, so
+        // the manifest and the spec cannot disagree about trailing slashes.
+        let root = route_with("/", true);
+        let summary = agent_authority_route_summary(&root, Some("/api"), false);
+        assert_eq!(
+            summary.path,
+            crate::router::join_nested_path("/api", "/"),
+            "the manifest must join paths exactly as the spec does"
+        );
+    }
+
+    #[test]
+    fn the_operation_id_names_the_tool_and_exposure_says_why() {
+        use crate::agent_authority::manifest::McpExposedBy;
+
+        let tagged = agent_authority_route_summary(&route_with("/items", true), None, false);
+        assert_eq!(tagged.operation_id, "list_items");
+        assert_eq!(tagged.exposed_by, Some(McpExposedBy::Attribute));
+
+        // Untagged and no hatch: not a tool at all.
+        let plain = agent_authority_route_summary(&route_with("/items", false), None, false);
+        assert!(!plain.mcp_tool);
+        assert_eq!(plain.exposed_by, None);
+
+        // Untagged, but the whole-API hatch sweeps up a read-only verb.
+        let hatched = agent_authority_route_summary(&route_with("/items", false), None, true);
+        assert!(hatched.mcp_tool);
+        assert_eq!(hatched.exposed_by, Some(McpExposedBy::Hatch));
+    }
 }
 
 #[cfg(test)]

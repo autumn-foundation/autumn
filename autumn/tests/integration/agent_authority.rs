@@ -255,9 +255,9 @@ async fn void_refund(Json(_body): Json<RefundRequest>) -> AutumnResult<Json<Refu
     Err(AutumnError::not_found_msg("no such refund"))
 }
 
-/// A governed *streaming* tool. The audit path records the outcome before the
-/// SSE projection takes the response, so the pair must be complete even though
-/// the body is still being produced when the record is written.
+/// A governed *streaming* tool. Its outcome is recorded when the projection
+/// ends, not when the handler answered, so the pair is only complete once the
+/// body has been consumed to the end.
 #[get("/api/refund-feed")]
 #[api_doc(mcp, stream, summary = "Stream refund events")]
 async fn refund_feed() -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
@@ -281,6 +281,21 @@ async fn slow_refund_feed() -> Sse<impl Stream<Item = Result<Event, std::convert
         Some((Ok(Event::default().data(format!("refund {n}"))), n + 1))
     });
     Sse::new(stream)
+}
+
+/// A governed tool whose body blows past the MCP tool-result cap.
+///
+/// The handler itself succeeds — it answers `200` and starts writing — so the
+/// only place the failure becomes visible is when the buffered path tries to
+/// read the body back (issue #1691 review round 2).
+#[get("/api/oversized")]
+#[api_doc(mcp, summary = "Return more than the tool-result cap")]
+async fn oversized_report() -> String {
+    // One byte over the 10 MiB `MAX_TOOL_RESPONSE_BYTES`: the smallest body
+    // that makes the tool-result buffer refuse. `Accept-Encoding` is not among
+    // the headers the MCP replay forwards, so nothing compresses this back
+    // under the cap before it is measured.
+    "r".repeat(10 * 1024 * 1024 + 1)
 }
 
 /// Reversible twin of [`send_payout`]: a broken sink must NOT stop it.
@@ -788,14 +803,55 @@ async fn a_failing_handler_records_a_failure_outcome_with_its_status() {
     );
 }
 
+#[tokio::test]
+async fn a_body_that_overflows_the_tool_result_cap_records_a_failure() {
+    // The handler answered `200` and the dispatch mechanism worked, but the
+    // buffered path could not hand the body to the agent: the agent gets a tool
+    // error, so the audit row must not claim a success behind it (issue #1691
+    // review round 2).
+    let sink = RecordingSink::default();
+    let client = app_with_sink(
+        governed_by(routes![oversized_report], &DRAFT_REFUND_AUTHORITY),
+        Arc::new(sink.clone()),
+    );
+
+    let out = call_tool(&client, "oversized_report", serde_json::json!({})).await;
+    assert_eq!(
+        out["result"]["isError"], true,
+        "an unreadable body is a tool error: {out}"
+    );
+
+    let events = sink.agent_events();
+    assert_eq!(events.len(), 2, "an overflow is still a full pair");
+
+    let outcome = &events[1];
+    assert_eq!(meta(outcome, "phase"), "outcome");
+    assert_eq!(
+        outcome.status,
+        AuditStatus::Failure,
+        "a result the agent never received is not a successful action"
+    );
+    assert_eq!(meta(outcome, "result"), "body_overflow");
+    assert_eq!(
+        meta(outcome, "http_status"),
+        "200",
+        "the handler's own status is still recorded as the fact it is"
+    );
+    assert_eq!(
+        meta(outcome, "correlation_id"),
+        meta(&events[0], "correlation_id"),
+        "the overflow still joins to its attempt"
+    );
+}
+
 // ── 9: streaming tools are audited like any other ─────────────────────
 
 #[tokio::test]
 async fn a_streaming_tool_is_audited_without_disturbing_its_stream() {
-    // The outcome is recorded from the response status *before* the SSE
-    // projection consumes the body — so the pair has to be complete even
-    // though, at the moment it is written, the handler is still producing
-    // output.
+    // The outcome is recorded when the SSE projection *ends*, not from the
+    // `200` that opened it — so the pair is complete only after the body has
+    // been consumed, and the projection itself must be untouched by the audit
+    // riding along with it.
     let sink = RecordingSink::default();
     let client = app_with_sink(
         governed_by(routes![refund_feed], &DRAFT_REFUND_AUTHORITY),

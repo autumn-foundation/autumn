@@ -480,12 +480,27 @@ impl AgentAuthorityManifest {
         // identity rather than on pointer equality: a route carries the very
         // `&'static AgentAuthority` the descriptor published, and naming the
         // join in data keeps it checkable.
+        //
+        // MCP exposure wins over first-come. One handler can be mounted twice
+        // -- a plain HTTP route for people and an MCP route for agents -- and
+        // if the HTTP one merely registered first, taking it would label the
+        // action `http-route`, hide it from `non_reversible_actions()`, and
+        // let `--check` pass with no sink on an action an agent really can
+        // call. Among routes of equal exposure the first still wins, so the
+        // choice stays stable against link order.
         let mut route_for: BTreeMap<(&str, &str), &RouteSummary> = BTreeMap::new();
         for route in routes {
             if let Some(authority) = route.agent_authority {
-                route_for
-                    .entry((authority.module_path, authority.action))
-                    .or_insert(route);
+                match route_for.entry((authority.module_path, authority.action)) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(route);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut slot) => {
+                        if route.mcp_tool && !slot.get().mcp_tool {
+                            slot.insert(route);
+                        }
+                    }
+                }
             }
         }
 
@@ -946,9 +961,9 @@ pub fn method_is_mutating(method: &str) -> bool {
 
 /// The [`ActionRow::exposure`] value meaning "an agent can call this".
 ///
-/// Named because two things read it: [`exposure_of`], which writes it, and
-/// [`AgentAuthorityManifest::non_reversible_actions`], whose whole correctness
-/// rests on matching exactly what was written.
+/// Named because two things read it: `exposure_of`, the private helper that
+/// writes it, and [`AgentAuthorityManifest::non_reversible_actions`], whose
+/// whole correctness rests on matching exactly what was written.
 pub const MCP_TOOL_EXPOSURE: &str = "mcp-tool";
 
 /// How an action is reachable, as the row spells it.
@@ -1298,10 +1313,11 @@ mod tests {
 
     #[test]
     fn two_routes_reaching_one_action_keep_the_first() {
-        // A handler mounted at two paths is still one action. Which route the
-        // row names is arbitrary, so it must at least be *stable*: the routes
-        // are visited in order and the first wins, or `--check` would report
-        // link-order churn as drift.
+        // A handler mounted at two paths is still one action. Among routes of
+        // the *same* exposure the choice is arbitrary, so it must at least be
+        // stable: the routes are visited in order and the first wins, or
+        // `--check` would report link-order churn as drift. (When the
+        // exposures differ, the MCP one wins instead -- see below.)
         let manifest = AgentAuthorityManifest::from_parts(
             &[&DRAFT_REFUND],
             &[&REFUND_GRANT],
@@ -1323,6 +1339,67 @@ mod tests {
         assert_eq!(row.route.as_ref().expect("a route").path, "/refunds");
         // ...and the second route is not mistaken for an unregistered one.
         assert!(manifest.unregistered_authorities.is_empty());
+    }
+
+    #[test]
+    fn an_mcp_route_wins_the_join_over_a_plain_http_one_registered_first() {
+        // One handler, mounted twice: a plain HTTP route for people and an MCP
+        // route for agents. If mere registration order decided, the HTTP row
+        // would label the action `http-route`, `non_reversible_actions()`
+        // would skip it, and `--check` would pass with no sink on an action an
+        // agent really can call.
+        let http_first = AgentAuthorityManifest::from_parts(
+            &[&DRAFT_REFUND],
+            &[&REFUND_GRANT],
+            &[
+                route(
+                    "POST",
+                    "/internal/refunds",
+                    "draft_refund",
+                    "billing::refunds",
+                    false,
+                    Some(&DRAFT_REFUND),
+                ),
+                governed_route(),
+            ],
+            false,
+        );
+        let row = find(&http_first, "draft_refund");
+        assert_eq!(row.exposure, MCP_TOOL_EXPOSURE);
+        assert_eq!(
+            row.route.as_ref().expect("a route").path,
+            "/refunds",
+            "the row must name the route an agent actually calls"
+        );
+        assert_eq!(http_first.non_reversible_actions().len(), 1);
+        assert!(
+            http_first.unaudited_and_unrecoverable(),
+            "an agent can reach this and nothing records it"
+        );
+
+        // The other order agrees -- the rule is about exposure, not position.
+        let mcp_first = AgentAuthorityManifest::from_parts(
+            &[&DRAFT_REFUND],
+            &[&REFUND_GRANT],
+            &[
+                governed_route(),
+                route(
+                    "POST",
+                    "/internal/refunds",
+                    "draft_refund",
+                    "billing::refunds",
+                    false,
+                    Some(&DRAFT_REFUND),
+                ),
+            ],
+            false,
+        );
+        assert_eq!(find(&mcp_first, "draft_refund").exposure, MCP_TOOL_EXPOSURE);
+        assert_eq!(
+            find(&mcp_first, "draft_refund").route,
+            find(&http_first, "draft_refund").route,
+            "registration order must not change the document"
+        );
     }
 
     #[test]

