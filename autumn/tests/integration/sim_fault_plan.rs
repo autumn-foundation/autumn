@@ -49,6 +49,8 @@ use autumn_web::config::AutumnConfig;
 use autumn_web::job;
 use autumn_web::plugin::Plugin;
 use autumn_web::prelude::*;
+#[cfg(feature = "reporting")]
+use autumn_web::reporting::{ErrorEvent, ErrorReporter, ReportFuture};
 use autumn_web::sim::{Chaos, FaultEffect, FaultOutcome, FaultPlan, Sim};
 use autumn_web::sim_test;
 use autumn_web::test::TestApp;
@@ -1001,4 +1003,63 @@ async fn a_sampled_reporting_config_is_rejected_at_build_time() {
         .routes(routes![ping])
         .with_fault_plan(FaultPlan::from_seed(SEED).fail_job_execution(1))
         .build();
+}
+
+// ── Codex review round 1: the projector must not sit behind a stalled reporter ─
+
+/// An app-owned reporter whose future never resolves — the shape of a reporter
+/// that waits on a Tokio timer under a paused simulation.
+#[cfg(feature = "reporting")]
+struct StallingReporter;
+
+#[cfg(feature = "reporting")]
+impl ErrorReporter for StallingReporter {
+    fn report<'a>(&'a self, _event: &'a ErrorEvent) -> ReportFuture<'a> {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// A handler that fails with a 503 so the reporting layer emits one event.
+#[get("/boom")]
+async fn boom() -> AutumnResult<&'static str> {
+    Err(AutumnError::service_unavailable_msg("boom"))
+}
+
+/// Codex review (round 1, P2): `ReporterChain::report_all` awaits the
+/// registered reporters **sequentially**, so if the plan's 5xx projector were
+/// appended *after* a user reporter whose future stays pending, the projector
+/// would never run and the 5xx the client observed would be missing from
+/// `FaultOutcome::server_errors` — `fault_outcome()` only yields a bounded
+/// number of times before snapshotting. The projector is therefore placed
+/// first in the chain; this test pins that: with a never-resolving user
+/// reporter installed, the observed 503 still lands in `server_errors`.
+///
+/// AC4 hardening — the 5xx capture must be independent of the app's own
+/// reporters' progress.
+#[cfg(feature = "reporting")]
+#[sim_test]
+async fn a_stalled_user_reporter_does_not_starve_the_fault_projection(mut sim: Sim) {
+    sim.build(
+        TestApp::new()
+            .routes(routes![boom])
+            .with_error_reporter(StallingReporter)
+            .with_fault_plan(FaultPlan::from_seed(SEED)),
+    );
+
+    sim.client().get("/boom").send().await.assert_status(503);
+
+    let outcome = sim.client().fault_outcome().await;
+    assert_eq!(
+        outcome.server_errors.len(),
+        1,
+        "the observed 503 must reach the ledger even though the app's own \
+         reporter never completes; got {:?}",
+        outcome.server_errors
+    );
+    assert_eq!(outcome.server_errors[0].status, 503);
+    assert_eq!(outcome.server_errors[0].route.as_deref(), Some("/boom"));
+    assert!(
+        outcome.fired.is_empty() && outcome.unfired.is_empty(),
+        "an empty plan plans nothing and fires nothing"
+    );
 }

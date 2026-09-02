@@ -2218,17 +2218,23 @@ impl TestApp {
             initializer(&state);
         }
 
-        // Register the fault plan's 5xx projector the same way
-        // `with_error_reporter` does — appended to the registered chain, so the
-        // app's own reporters keep receiving every event. Must land before the
-        // router is built, which is where `ReportingLayer` reads the chain.
+        // Register the fault plan's 5xx projector alongside the app's own
+        // reporters (which keep receiving every event). It goes FIRST in the
+        // chain: `ReporterChain::report_all` awaits the reporters one after
+        // another, so a user reporter whose future stays pending (one waiting
+        // on a timer under a paused sim, say) would otherwise starve the
+        // projector and the observed 5xx would never reach
+        // `FaultOutcome::server_errors`. The projector records as its future is
+        // built and resolves immediately, so leading the chain delays nobody.
+        // Must land before the router is built, which is where
+        // `ReportingLayer` reads the chain.
         #[cfg(feature = "reporting")]
         if let Some(ledger) = fault_ledger.as_ref() {
             let mut reporters = state
                 .extension::<crate::reporting::RegisteredReporters>()
                 .map(|registered| registered.0.clone())
                 .unwrap_or_default();
-            reporters.push(ledger.reporter());
+            reporters.insert(0, ledger.reporter());
             state.insert_extension(crate::reporting::RegisteredReporters(reporters));
         }
 
