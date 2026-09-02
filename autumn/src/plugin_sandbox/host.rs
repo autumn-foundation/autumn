@@ -298,6 +298,22 @@ const fn is_line_separator(ch: char) -> bool {
     matches!(ch, '\u{2028}' | '\u{2029}')
 }
 
+/// The characters of a lossy UTF-8 decode, without decoding all of it first.
+///
+/// `String::from_utf8_lossy` answers the same question by building the whole
+/// replacement string, which is the one thing a caller keeping a bounded
+/// excerpt of guest bytes must not do. `utf8_chunks` yields each maximal
+/// invalid subpart separately, which is exactly the grouping `from_utf8_lossy`
+/// replaces one-for-one, so this produces the same characters lazily.
+fn lossy_chars(bytes: &[u8]) -> impl Iterator<Item = char> + '_ {
+    bytes.utf8_chunks().flat_map(|chunk| {
+        chunk
+            .valid()
+            .chars()
+            .chain((!chunk.invalid().is_empty()).then_some(char::REPLACEMENT_CHARACTER))
+    })
+}
+
 /// An import's `module::name`, bounded and escaped without ever being joined.
 ///
 /// Written down here rather than left to the review surface. The surface does
@@ -2676,13 +2692,29 @@ impl HostState {
     fn stderr_excerpt(&self) -> String {
         // Bounded *and* neutralised: truncation stops a flood, but a forged
         // record fits comfortably inside 512 characters.
-        let text = String::from_utf8_lossy(&self.stderr);
-        let trimmed = text.trim();
-        let kept = match trimmed.char_indices().nth(STDERR_EXCERPT) {
-            Some((index, _)) => trimmed.get(..index).unwrap_or_default(),
-            None => trimmed,
-        };
-        guest_text(kept)
+        //
+        // Decoded a chunk at a time rather than through `String::from_utf8_lossy`
+        // — the same reason the stdout frame is decoded strictly, one function
+        // up, and the sibling that argument was not applied to. Lossy decoding
+        // writes a three-byte replacement character per invalid subpart, so a
+        // guest that fills its 64 KiB stderr budget with invalid bytes
+        // materialises 192 KiB beside the still-live buffer, all to keep 512
+        // characters of it. The manifest footprint budgets the buffer, not that
+        // expansion, so it was 128 KiB per concurrent request outside the
+        // ceiling. Streaming keeps the peak at the excerpt itself.
+        let mut chars = lossy_chars(&self.stderr).skip_while(|ch| ch.is_whitespace());
+        let mut kept: String = chars.by_ref().take(STDERR_EXCERPT).collect();
+        if chars.next().is_none() {
+            // The window reached the end of the buffer, so trailing whitespace
+            // in it is the buffer's own and `trim` would have taken it. When
+            // more bytes follow, it is interior whitespace and `trim` would
+            // not have — truncating after the trim is what the two cases
+            // distinguish.
+            while kept.ends_with(char::is_whitespace) {
+                kept.pop();
+            }
+        }
+        guest_text(&kept)
     }
 
     /// `SplitMix64`: tiny, deterministic, and good enough for a shim whose
@@ -5478,6 +5510,68 @@ path = "/hello/greet"
                 "the attempt must survive as an escape, not be dropped: {split:?}",
             );
         }
+    }
+
+    #[test]
+    fn the_streamed_lossy_decode_says_what_from_utf8_lossy_says() {
+        // The excerpt is now decoded lazily so a 64 KiB stderr of invalid bytes
+        // never becomes a 192 KiB replacement string. That is only an
+        // improvement if it decodes to the same characters, and the sharp edge
+        // is *grouping*: `from_utf8_lossy` emits one U+FFFD per maximal invalid
+        // subpart, not per byte, so a truncated three-byte sequence is one
+        // replacement and two stray continuation bytes are two.
+        for case in [
+            b"".as_slice(),
+            b"plain ascii",
+            b"\xff",
+            b"\xff\xff\xff",
+            // A truncated 3-byte sequence: one maximal subpart.
+            b"\xe2\x82",
+            // The same, followed by a valid character.
+            b"\xe2\x82x",
+            // Stray continuation bytes: one subpart each.
+            b"\x80\x80",
+            // Valid multi-byte text either side of a bad byte.
+            "é日本".as_bytes(),
+            b"caf\xe9 latte",
+            // An overlong encoding, which is invalid however it looks.
+            b"\xc0\xaf",
+        ] {
+            let streamed: String = lossy_chars(case).collect();
+            assert_eq!(
+                streamed,
+                String::from_utf8_lossy(case),
+                "streamed decode diverged on {case:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_stderr_of_invalid_bytes_is_still_bounded_at_the_excerpt() {
+        // The flood the streaming exists for: a full budget of bytes that are
+        // each their own invalid subpart, so the lossy form is three times the
+        // buffer. What is kept is still one excerpt.
+        let mut state = HostState::new("hello".to_owned(), ResourceLimits::default(), b"");
+        state.write_stderr(&vec![0xff; STDERR_BUDGET_BYTES * 2]);
+        assert_eq!(
+            state.stderr.len(),
+            STDERR_BUDGET_BYTES,
+            "the buffer itself must still be capped",
+        );
+        let excerpt = state.stderr_excerpt();
+        assert!(
+            excerpt.chars().count() <= DETAIL_EXCERPT + " … (truncated)".len(),
+            "the excerpt outgrew its bound: {} characters",
+            excerpt.chars().count(),
+        );
+        // Kept verbatim rather than escaped, and deliberately so: U+FFFD is
+        // neither a control nor default-ignorable nor display-reordering — it
+        // is a visible glyph that says "there was a byte here that was not
+        // text", which is exactly what the operator should see.
+        assert!(
+            excerpt.contains(char::REPLACEMENT_CHARACTER),
+            "the replacement characters did not survive: {excerpt:?}",
+        );
     }
 
     #[test]

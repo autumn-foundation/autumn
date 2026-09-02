@@ -541,6 +541,14 @@ path = "tests/password_policy_alloc_gate.rs"
 name = "sandbox_header_alloc_gate"
 path = "tests/sandbox_header_alloc_gate.rs"
 
+# Allocation gate for the guest-stderr excerpt: a 64 KiB stderr of invalid
+# bytes must not be expanded into a 192 KiB replacement string to keep 512
+# characters of it. Its own binary for the same reason as the header gate —
+# `allocation-counter` installs a process-wide `#[global_allocator]`.
+[[test]]
+name = "sandbox_stderr_alloc_gate"
+path = "tests/sandbox_stderr_alloc_gate.rs"
+
 # Allocation gate for the scaffolded form-render helpers on the same 12-field
 # workload as `benches/form_render.rs` (Bolt follow-up to #2295/#2298, looking
 # at the per-field `error_id` allocation). Own binary for the same
