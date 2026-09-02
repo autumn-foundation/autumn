@@ -2918,9 +2918,22 @@ fn check_queue_coverage(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct FleetTopology {
     tiers: Vec<Vec<String>>,
+    /// `[jobs.fleet] tiers` was present but not a list of lists, so no topology
+    /// could be read from it. Reported as a failure rather than treated as
+    /// "nothing declared" — see [`resolve_fleet_topology`].
+    malformed: bool,
 }
 
 impl FleetTopology {
+    /// A topology that could not be parsed. Carries no tiers, so it can never be
+    /// mistaken for coverage.
+    const fn malformed() -> Self {
+        Self {
+            tiers: Vec::new(),
+            malformed: true,
+        }
+    }
+
     /// At least one declared tier runs job workers. A topology with no tiers
     /// declares nothing coverable, so it cannot prove a gap.
     const fn runs_any_worker(&self) -> bool {
@@ -2968,6 +2981,21 @@ fn check_queue_coverage_topology(
     // No topology declared → informational-only, exactly as today. The hard-fail
     // only activates once the operator supplies the topology that makes coverage
     // provable, so existing deployments never regress.
+    if let Some(fleet) = fleet.filter(|f| f.malformed) {
+        let _ = fleet;
+        return CheckResult {
+            name: "jobs_queue_coverage",
+            status: CheckStatus::Fail,
+            detail: Some(
+                "[jobs.fleet] tiers is present but is not a list of lists, so no fleet \
+                 topology could be read and topology-wide queue coverage cannot be checked"
+                    .to_string(),
+            ),
+            hint: Some(
+                "Write one list per worker tier, e.g. tiers = [[\"critical\"], [\"bulk\", \"default\"]] — a flat list like tiers = [\"critical\"] is a single tier's pin, not a topology",
+            ),
+        };
+    }
     let Some(fleet) = fleet.filter(|f| f.runs_any_worker()) else {
         return check_queue_coverage(role, configured_queues, pin);
     };
@@ -4160,27 +4188,53 @@ where
 /// table, so the topology lives beside them, is profile-aware, and is checked
 /// into the repo as one source of truth for the fleet.
 fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> {
-    let fleet = table
+    // A malformed `[jobs.fleet]` must NOT be silently dropped at ANY level.
+    // Every `?` here would otherwise return `None`, which the caller reads as
+    // "no topology declared" and answers with the informational-only report —
+    // quietly switching the AC6 hard-fail off, with nothing reporting it. The
+    // typed `JobFleetConfig` rejects each of these shapes at app boot, so a
+    // pre-deploy gate that passes them has the ordering exactly backwards.
+    let jobs = table
         .and_then(|t| t.get("jobs"))
-        .and_then(toml::Value::as_table)
-        .and_then(|j| j.get("fleet"))
         .and_then(toml::Value::as_table)?;
-    let tiers: Vec<Vec<String>> = fleet
-        .get("tiers")
-        .and_then(toml::Value::as_array)?
-        .iter()
-        .filter_map(toml::Value::as_array)
-        .map(|tier| {
-            tier.iter()
-                .filter_map(toml::Value::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<String>>()
-        })
-        .collect();
+    // Genuinely absent: nothing declared, nothing to check.
+    let fleet = jobs.get("fleet")?;
+    let Some(fleet) = fleet.as_table() else {
+        return Some(FleetTopology::malformed());
+    };
+    let declared = fleet.get("tiers")?;
+    // `tiers = "critical"` — a bare value rather than a list of lists.
+    let Some(declared) = declared.as_array() else {
+        return Some(FleetTopology::malformed());
+    };
+    // `tiers = ["critical", "bulk"]` — the flat shape `jobs.pin` uses, sitting a
+    // few lines above it in the same file, so an easy mistake to make.
+    let mut tiers: Vec<Vec<String>> = Vec::with_capacity(declared.len());
+    for entry in declared {
+        let Some(tier) = entry.as_array() else {
+            return Some(FleetTopology::malformed());
+        };
+        // Queue names must be strings. Dropping a non-string with `filter_map`
+        // is the worst variant of the same silent-pass bug: `tiers = [[1]]`
+        // collapses to an EMPTY tier, which `has_unpinned_tier` reads as a tier
+        // that drains everything — so coverage becomes total and the check
+        // passes unconditionally on a document the app refuses to boot with.
+        let mut names = Vec::with_capacity(tier.len());
+        for name in tier {
+            let Some(name) = name.as_str() else {
+                return Some(FleetTopology::malformed());
+            };
+            names.push(name.to_owned());
+        }
+        tiers.push(names);
+    }
     if tiers.is_empty() {
         return None;
     }
-    Some(FleetTopology { tiers })
+    Some(FleetTopology {
+        tiers,
+        malformed: false,
+    })
 }
 
 /// Resolve the compiled `#[job(queue = "…")]`-declared queue set for the
@@ -4192,6 +4246,12 @@ fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> 
 ///    `queues = [...]` array. This is the ground-truth set the runtime drains.
 /// 2. `[jobs.fleet] declared_queues = ["…"]` — an inline list the operator
 ///    maintains by hand (the MVP path when no manifest is emitted).
+///
+/// A manifest that reads and parses wins outright, **including** when its
+/// `queues` array is empty — that is the app answering "no job-declared queues",
+/// not failing to answer. Only a manifest that says nothing at all (absent path,
+/// unreadable, unparseable, or no `queues` array) falls through to the inline
+/// list.
 ///
 /// Returns an empty `Vec` when neither is present; an unknown declared set only
 /// shrinks the needed set, so it can never cause a false failure.
@@ -4213,23 +4273,27 @@ where
     };
 
     // 1. A jobs manifest the app emits: TOML `queues = [...]`.
+    //
+    // A manifest that reads and parses is authoritative even when its `queues`
+    // array is EMPTY — that is the app stating it declares no
+    // `#[job(queue = "…")]` queues beyond the configured set, which is a real
+    // answer, not a missing one. Falling through to `declared_queues` there
+    // would let a stale hand-maintained entry manufacture a coverage failure
+    // against the ground truth, and would contradict the documented precedence
+    // ("manifest wins when both are set").
+    //
+    // The fall-through is reserved for a manifest that genuinely says nothing:
+    // absent path, unreadable file, unparseable TOML, or no `queues` array.
     if let Some(path) = fleet.get("manifest").and_then(toml::Value::as_str)
         && let Some(contents) = read_file(path)
         && let Ok(manifest) = toml::from_str::<toml::Table>(&contents)
+        && let Some(queues) = manifest.get("queues").and_then(toml::Value::as_array)
     {
-        let queues: Vec<String> = manifest
-            .get("queues")
-            .and_then(toml::Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(toml::Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !queues.is_empty() {
-            return queues;
-        }
+        return queues
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .map(str::to_owned)
+            .collect();
     }
 
     // 2. Inline declared-queues list (MVP).
@@ -14411,6 +14475,7 @@ foo = "bar"
                 vec!["critical".to_string()],
                 vec!["bulk".to_string(), "default".to_string()],
             ],
+            malformed: false,
         };
         let result = check_queue_coverage_topology(
             ProcessRole::Combined,
@@ -14444,6 +14509,7 @@ foo = "bar"
                 vec!["critical".to_string()],
                 vec!["bulk".to_string(), "default".to_string()],
             ],
+            malformed: false,
         };
         // Run doctor as the critical tier (pin = critical): still Pass.
         let result = check_queue_coverage_topology(
@@ -14474,6 +14540,7 @@ foo = "bar"
         let fleet = FleetTopology {
             // No tier drains `bulk`.
             tiers: vec![vec!["critical".to_string()], vec!["default".to_string()]],
+            malformed: false,
         };
         let result = check_queue_coverage_topology(
             ProcessRole::Worker,
@@ -14506,6 +14573,7 @@ foo = "bar"
                 vec!["critical".to_string()],
                 Vec::new(), // unpinned tier: drains everything
             ],
+            malformed: false,
         };
         let result = check_queue_coverage_topology(
             ProcessRole::Worker,
@@ -14528,6 +14596,7 @@ foo = "bar"
         let declared = vec!["email".to_string()];
         let fleet = FleetTopology {
             tiers: vec![vec!["default".to_string(), "email".to_string()]],
+            malformed: false,
         };
         let result = check_queue_coverage_topology(
             ProcessRole::Worker,
@@ -14555,6 +14624,102 @@ foo = "bar"
         );
     }
 
+    /// Every `[jobs.fleet]` example in the jobs guide must be a config that
+    /// `autumn doctor` actually passes.
+    ///
+    /// The first draft of that section shipped a `declared_queues =
+    /// ["thumbnails"]` example whose `tiers` pinned no tier to `thumbnails` —
+    /// a reader who copied it verbatim got exit 1 from the very check the
+    /// section is teaching them to use. Prose review did not catch it because
+    /// the example reads correctly; only running it does. So run it: pull each
+    /// `[jobs.fleet]` TOML block straight out of the guide and push it through
+    /// the same resolvers and the same check `autumn doctor` uses.
+    #[test]
+    fn documented_fleet_topology_examples_pass_the_coverage_check() {
+        const GUIDE: &str = include_str!("../../docs/guide/jobs.md");
+        // The same example is mirrored in the `JobFleetConfig` rustdoc, where it
+        // is just as copy-pasteable; scan both so they cannot drift apart.
+        const CONFIG_RS: &str = include_str!("../../autumn/src/config.rs");
+
+        // The sources interleave `[jobs.queues]` and `[jobs.fleet]`; a block may
+        // carry either or both. Only blocks that declare a topology are checked
+        // — the rest have nothing for this check to act on. Rustdoc fences carry
+        // a `/// ` prefix on every line, so strip it.
+        let mut blocks: Vec<String> = GUIDE
+            .split("```toml")
+            .skip(1)
+            .filter_map(|rest| rest.split("```").next())
+            .filter(|block| block.contains("[jobs.fleet]"))
+            .map(str::to_owned)
+            .collect();
+        blocks.extend(
+            CONFIG_RS
+                .split("/// ```toml")
+                .skip(1)
+                .filter_map(|rest| rest.split("/// ```").next())
+                .filter(|block| block.contains("[jobs.fleet]"))
+                .map(|block| {
+                    block
+                        .lines()
+                        .map(|l| l.trim_start().trim_start_matches("///").trim_start())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }),
+        );
+        assert!(
+            blocks.len() >= 2,
+            "expected a [jobs.fleet] example in both docs/guide/jobs.md and the \
+             JobFleetConfig rustdoc, found {} — either an example was removed or the \
+             fence style changed (fix the extractor), but do not leave this test \
+             silently checking nothing",
+            blocks.len(),
+        );
+
+        for block in &blocks {
+            let block = block.as_str();
+            let table: toml::Table = toml::from_str(block).unwrap_or_else(|e| {
+                panic!("documented [jobs.fleet] example is not valid TOML: {e}\n{block}")
+            });
+            // The app must accept it too, or the example fails boot under
+            // `server.strict_config_enforce_all`.
+            let fleet_value = table
+                .get("jobs")
+                .and_then(|j| j.get("fleet"))
+                .cloned()
+                .expect("block was selected for containing [jobs.fleet]");
+            let _: autumn_web::config::JobFleetConfig =
+                fleet_value.try_into().unwrap_or_else(|e| {
+                    panic!("documented [jobs.fleet] example is not valid config: {e}\n{block}")
+                });
+
+            let fleet = resolve_fleet_topology(Some(&table))
+                .expect("a block containing [jobs.fleet] tiers declares a topology");
+            let declared = resolve_declared_queues_from_sources(|_| None, Some(&table));
+            let configured: Vec<String> = table
+                .get("jobs")
+                .and_then(|j| j.get("queues"))
+                .and_then(toml::Value::as_table)
+                .map(|q| q.keys().cloned().collect())
+                .unwrap_or_default();
+            // Read as the tier the example's first entry describes.
+            let pin = fleet.tiers.first().cloned().unwrap_or_default();
+
+            let result = check_queue_coverage_topology(
+                ProcessRole::Worker,
+                &configured,
+                &pin,
+                &declared,
+                Some(&fleet),
+            );
+            assert_eq!(
+                result.status,
+                CheckStatus::Pass,
+                "a [jobs.fleet] example in docs/guide/jobs.md fails `autumn doctor`: {:?}\n{block}",
+                result.detail,
+            );
+        }
+    }
+
     #[test]
     fn topology_declared_gap_on_job_declared_queue_fails() {
         // Once the declared set is known, a job-declared queue that NO tier drains
@@ -14565,6 +14730,7 @@ foo = "bar"
         let fleet = FleetTopology {
             // No tier pins `email`.
             tiers: vec![vec!["default".to_string()]],
+            malformed: false,
         };
         let result = check_queue_coverage_topology(
             ProcessRole::Worker,
@@ -14582,7 +14748,10 @@ foo = "bar"
         // A `[jobs.fleet]` with no tiers declares nothing coverable, so it must
         // not fail — it falls back to informational Pass.
         let queues = vec!["critical".to_string(), "bulk".to_string()];
-        let fleet = FleetTopology { tiers: Vec::new() };
+        let fleet = FleetTopology {
+            tiers: Vec::new(),
+            malformed: false,
+        };
         let result = check_queue_coverage_topology(
             ProcessRole::Worker,
             &queues,
@@ -14608,6 +14777,154 @@ foo = "bar"
             ]
         );
         assert!(fleet.has_unpinned_tier());
+    }
+
+    /// Anti-drift guard (#1623). `doctor` reads `[jobs.fleet]` out of the merged
+    /// raw TOML table (it needs profile-aware merging the typed loader doesn't
+    /// give it), while the app boots the same file through
+    /// `autumn_web::config::JobFleetConfig`. Two readers, one spelling: if either
+    /// side renames a key, the app rejects a topology doctor accepts (or the
+    /// reverse), and the AC6 hard-fail silently stops covering real deployments.
+    /// So parse one document both ways and require the same answer.
+    #[test]
+    fn doctor_and_app_agree_on_the_fleet_topology_spelling() {
+        const DOC: &str = "[jobs.fleet]\n\
+                           tiers = [[\"critical\"], [\"bulk\", \"default\"], []]\n\
+                           manifest = \"target/autumn-jobs.toml\"\n\
+                           declared_queues = [\"thumbnails\"]\n";
+
+        let table: toml::Table = toml::from_str(DOC).expect("parse toml");
+        let doctor_view = resolve_fleet_topology(Some(&table)).expect("topology declared");
+        let app_view: autumn_web::config::JobFleetConfig = toml::from_str::<toml::Table>(DOC)
+            .expect("parse toml")
+            .get("jobs")
+            .and_then(|j| j.get("fleet"))
+            .cloned()
+            .expect("jobs.fleet present")
+            .try_into()
+            .expect("app config accepts the same [jobs.fleet] doctor reads");
+
+        assert_eq!(
+            doctor_view.tiers, app_view.tiers,
+            "doctor and the app must read the same `tiers` from one autumn.toml",
+        );
+        assert_eq!(
+            resolve_declared_queues_from_sources(|_| None, Some(&table)),
+            app_view.declared_queues,
+            "doctor and the app must read the same `declared_queues`",
+        );
+        assert_eq!(
+            app_view.manifest.as_deref(),
+            Some("target/autumn-jobs.toml"),
+            "the app must accept the `manifest` key doctor resolves",
+        );
+    }
+
+    /// A `tiers` that is present but is not a list of lists — most likely the
+    /// flat `tiers = ["critical"]`, since `jobs.pin` uses exactly that shape a
+    /// few lines above it in the same file — must not be read as "no topology
+    /// declared". Doing so silently switches the AC6 hard-fail back off: the
+    /// check falls through to the informational-only report and passes, and
+    /// nothing anywhere says coverage is no longer being enforced. The app
+    /// rejects the same input at boot, so a pre-deploy gate that passes it has
+    /// the ordering exactly backwards.
+    #[test]
+    fn a_malformed_tiers_fails_instead_of_silently_disabling_the_check() {
+        // Every shape the app's typed `JobFleetConfig` rejects at boot. Each one
+        // must be reported here, not read as "no topology declared" — that would
+        // fall through to the informational-only report and pass, switching the
+        // AC6 hard-fail off with nothing saying so.
+        for doc in [
+            // The flat shape `jobs.pin` uses a few lines above it.
+            "[jobs.fleet]\ntiers = [\"critical\", \"bulk\"]\n",
+            // A bare value instead of a list at all.
+            "[jobs.fleet]\ntiers = \"critical\"\n",
+            "[jobs.fleet]\ntiers = 3\n",
+            // Mixed: one well-formed tier and one that is not.
+            "[jobs.fleet]\ntiers = [[\"critical\"], \"bulk\"]\n",
+            // A non-string queue name. `[[1]]` is the dangerous one: dropping
+            // the entry leaves an EMPTY tier, which reads as "drains
+            // everything" and would make the check pass unconditionally.
+            "[jobs.fleet]\ntiers = [[1]]\n",
+            "[jobs.fleet]\ntiers = [[\"critical\", 1]]\n",
+            "[jobs.fleet]\ntiers = [[\"critical\"], [[\"bulk\"]]]\n",
+        ] {
+            let table: toml::Table = toml::from_str(doc).expect("parse toml");
+            let fleet = resolve_fleet_topology(Some(&table)).unwrap_or_else(|| {
+                panic!("a present-but-malformed tiers must be reported, not dropped: {doc}")
+            });
+            assert!(fleet.malformed, "{doc}");
+
+            let result = check_queue_coverage_topology(
+                ProcessRole::Worker,
+                &["critical".to_string(), "bulk".to_string()],
+                &["critical".to_string()],
+                &[],
+                Some(&fleet),
+            );
+            assert_eq!(
+                result.status,
+                CheckStatus::Fail,
+                "{doc}: {:?}",
+                result.detail
+            );
+            assert!(
+                result.detail.unwrap_or_default().contains("list of lists"),
+                "the failure must say what is wrong with the value: {doc}",
+            );
+
+            // The app refuses the same document, so both gates agree.
+            let fleet_value = table
+                .get("jobs")
+                .and_then(|j| j.get("fleet"))
+                .cloned()
+                .expect("jobs.fleet present");
+            let parsed: Result<autumn_web::config::JobFleetConfig, _> = fleet_value.try_into();
+            assert!(
+                parsed.is_err(),
+                "the typed config must reject it too: {doc}"
+            );
+        }
+
+        // The specific hazard for `[[1]]`: silently dropping the non-string
+        // leaves an empty tier, and an empty tier is a *legitimate* declaration
+        // meaning "unpinned, drains everything" — so the check would have
+        // reported total coverage and passed. Pin that an empty tier really does
+        // mean that, which is why the non-string case can never be allowed to
+        // decay into one.
+        let unpinned = FleetTopology {
+            tiers: vec![Vec::new()],
+            malformed: false,
+        };
+        assert!(unpinned.has_unpinned_tier());
+        assert_eq!(
+            check_queue_coverage_topology(
+                ProcessRole::Worker,
+                &["critical".to_string(), "bulk".to_string()],
+                &[],
+                &[],
+                Some(&unpinned),
+            )
+            .status,
+            CheckStatus::Pass,
+            "an empty tier means 'drains everything' — so a malformed tier must never \
+             be allowed to collapse into one",
+        );
+
+        // `[jobs.fleet]` itself not a table is the same class of mistake.
+        let table: toml::Table =
+            toml::from_str("[jobs]\nfleet = \"critical\"\n").expect("parse toml");
+        let fleet = resolve_fleet_topology(Some(&table))
+            .expect("a present-but-malformed [jobs.fleet] must be reported");
+        assert!(fleet.malformed);
+
+        // …while a genuinely absent section stays "nothing declared".
+        let absent: toml::Table =
+            toml::from_str("[jobs]\npin = [\"critical\"]\n").expect("parse toml");
+        assert!(resolve_fleet_topology(Some(&absent)).is_none());
+        let no_tiers: toml::Table =
+            toml::from_str("[jobs.fleet]\ndeclared_queues = [\"a\"]\n").expect("parse toml");
+        assert!(resolve_fleet_topology(Some(&no_tiers)).is_none());
     }
 
     #[test]
@@ -14646,6 +14963,36 @@ foo = "bar"
             declared_from_manifest,
             vec!["critical".to_string(), "email".to_string()]
         );
+
+        // An EMPTY manifest array is the app answering "no job-declared queues",
+        // not failing to answer, so it wins over a stale inline list. Falling
+        // through here would let that stale entry manufacture a coverage failure
+        // against the ground truth — and would contradict the documented
+        // precedence.
+        let empty_manifest = resolve_declared_queues_from_sources(
+            |path| (path == "target/jobs-manifest.toml").then(|| "queues = []\n".to_string()),
+            Some(&with_manifest),
+        );
+        assert!(
+            empty_manifest.is_empty(),
+            "an empty manifest must win over declared_queues, got {empty_manifest:?}",
+        );
+
+        // A manifest that genuinely says nothing DOES fall through: unreadable
+        // file, unparseable TOML, or no `queues` array at all.
+        for (label, read) in [
+            ("unreadable", None::<String>),
+            ("unparseable", Some("this is not toml =".to_string())),
+            ("no queues key", Some("other = 1\n".to_string())),
+        ] {
+            let fell_through =
+                resolve_declared_queues_from_sources(|_| read.clone(), Some(&with_manifest));
+            assert_eq!(
+                fell_through,
+                vec!["stale".to_string()],
+                "a manifest that says nothing ({label}) must fall through to declared_queues",
+            );
+        }
 
         // No `[jobs.fleet]` → empty.
         let none: toml::Table =

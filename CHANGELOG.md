@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Pin a worker tier to queues from the command line, and let `doctor` prove
+  fleet-wide queue coverage (#1623):** per-queue `reserved`/`concurrency` pools
+  and `jobs.pin` already existed, but pinning could only be spelled in
+  `autumn.toml` or `AUTUMN_JOBS__PIN`, and the `[jobs.fleet]` topology that lets
+  `autumn doctor` hard-fail on an uncovered queue was absent from the config
+  schema — declaring it warned as an unknown key (and failed boot under
+  `server.strict_config_enforce_all`) — and went unmentioned in the jobs guide.
+
+  `autumn serve` now takes `--pin`, repeatable and comma-separated, forwarded to
+  the app as `AUTUMN_JOBS__PIN` and restored by `autumn serve restart` so a bare
+  restart can't silently turn a pinned worker tier into an unpinned one:
+
+  ```bash
+  autumn serve --role worker --pin critical
+  ```
+
+  `[jobs.fleet]` (`tiers`, `manifest`, `declared_queues`) is now a first-class,
+  validated config section. It is purely declarative — no process acts on it at
+  runtime — and an app that declares nothing keeps today's behavior exactly. See
+  [Background Jobs](docs/guide/jobs.md#per-queue-worker-pools-caps-and-pinning).
+
+  Also adds the end-to-end coverage the acceptance criteria asked for: a pinned
+  worker never claims an out-of-subset queue on **both** the Postgres and Redis
+  backends, a per-queue `concurrency` cap bounds in-flight jobs below the worker
+  count, and p95 enqueue-to-start latency on a queue with dedicated capacity
+  stays within 2x its unloaded baseline while another queue floods.
 - **A proven capacity contract that travels with the build (#1733):** autumn
   already shed load once too many requests were in flight, but the ceiling it
   enforced was a hand-tuned guess in `autumn.toml`, and nothing told an operator
