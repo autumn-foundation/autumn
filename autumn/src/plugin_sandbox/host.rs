@@ -2754,7 +2754,24 @@ impl HostState {
     }
 
     /// Pop up to `len` bytes of the pending request frame.
+    /// Hand the guest up to `len` bytes of its request frame.
+    ///
+    /// Bounded per call at `HOST_IO_CHUNK_BYTES`, the same scratch ceiling
+    /// `fd_write` and `random_get` hold themselves to and the one
+    /// [`FIXED_HOST_BUFFER_BYTES`] budgets. The length is the guest's to choose
+    /// — it is an iovec — and the copy comes out of a queue that keeps its
+    /// whole allocation as it drains, so one iovec spanning the frame put a
+    /// second copy of it beside the first. A frame is the request's metadata
+    /// and a base64 body with JSON escaping over both, which makes that copy
+    /// several times the raw request and none of it was in the footprint
+    /// `max_concurrency` is validated against.
+    ///
+    /// Returning less than was asked for is what this call already promises:
+    /// the caller breaks on a short chunk and reports the count, and the queue
+    /// running dry short-reads today, so a guest that does not loop is already
+    /// broken.
     fn take_stdin(&mut self, len: usize) -> Vec<u8> {
+        let len = len.min(HOST_IO_CHUNK_BYTES);
         let mut out = Vec::with_capacity(len.min(self.stdin.len()));
         while out.len() < len {
             match self.stdin.pop_front() {
@@ -3155,8 +3172,13 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                     if !in_bounds {
                         return Ok(errno::INVAL);
                     }
-                    charge_bytes(&mut caller, length)?;
-                    let chunk = caller.data_mut().take_stdin(length);
+                    // Charged for what is actually copied, not for what was
+                    // asked: `take_stdin` bounds the copy at
+                    // `HOST_IO_CHUNK_BYTES`, and pricing the whole iovec would
+                    // bill the guest for bytes it did not get.
+                    let take = HOST_IO_CHUNK_BYTES.min(length);
+                    charge_bytes(&mut caller, take)?;
+                    let chunk = caller.data_mut().take_stdin(take);
                     if memory.write(&mut caller, pointer, &chunk).is_err() {
                         return Ok(errno::INVAL);
                     }
@@ -5530,6 +5552,55 @@ path = "/hello/greet"
                 "the attempt must survive as an escape, not be dropped: {split:?}",
             );
         }
+    }
+
+    #[test]
+    fn one_read_cannot_copy_the_whole_frame_out_of_the_queue() {
+        // `fd_write` and `random_get` both bound their scratch to
+        // `HOST_IO_CHUNK_BYTES`, and `FIXED_HOST_BUFFER_BYTES` budgets exactly
+        // one such buffer. The read path did not: the iovec length is the
+        // guest's to choose, so one iovec spanning the whole frame made a
+        // second copy of it — live beside the queue it was copied out of, which
+        // keeps its allocation as it drains. A frame is metadata plus a base64
+        // body with JSON escaping over both, so that copy is several times the
+        // raw request, and none of it was in the footprint the concurrency
+        // product is validated against.
+        //
+        // Returning less than was asked for is what the call already promises:
+        // the queue running dry short-reads today, so a guest that does not
+        // loop is already broken.
+        let mut state = HostState::new("hello".to_owned(), ResourceLimits::default(), b"");
+        state.stdin = VecDeque::from(vec![b'x'; HOST_IO_CHUNK_BYTES * 4]);
+
+        let chunk = state.take_stdin(HOST_IO_CHUNK_BYTES * 4);
+        assert_eq!(
+            chunk.len(),
+            HOST_IO_CHUNK_BYTES,
+            "one read copied more than the scratch the footprint budgets",
+        );
+
+        // And the rest is still there to be read, one bounded chunk at a time,
+        // so bounding the copy did not lose the frame.
+        let mut drained = chunk.len();
+        while !state.stdin.is_empty() {
+            let next = state.take_stdin(HOST_IO_CHUNK_BYTES * 4);
+            assert!(
+                !next.is_empty(),
+                "the queue stopped yielding with bytes left"
+            );
+            drained += next.len();
+        }
+        assert_eq!(
+            drained,
+            HOST_IO_CHUNK_BYTES * 4,
+            "the frame did not survive being read in chunks",
+        );
+
+        // A read smaller than the bound is unaffected — the cap is a ceiling,
+        // not a quantum.
+        let mut small = HostState::new("hello".to_owned(), ResourceLimits::default(), b"");
+        small.stdin = VecDeque::from(b"{\"op\":\"request\"}".to_vec());
+        assert_eq!(small.take_stdin(4).len(), 4, "a short read must stay short");
     }
 
     #[test]
