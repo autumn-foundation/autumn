@@ -185,6 +185,25 @@ fn a_prerelease_framework_build_satisfies_its_own_series() {
     );
 }
 
+/// A requirement that names a prerelease is pinning one deliberately, so the
+/// framework version's prerelease must NOT be stripped — otherwise an exact pin
+/// fails against the very build it names.
+#[test]
+fn an_exact_prerelease_pin_matches_that_prerelease() {
+    let contract = PluginContract::new("autumn-plugin-demo").autumn_web("=0.8.0-rc.1");
+    assert!(matches!(
+        evaluate(&contract, "0.8.0-rc.1"),
+        ContractVerdict::Compatible
+    ));
+    assert!(
+        matches!(
+            evaluate(&contract, "0.8.0"),
+            ContractVerdict::Incompatible(_)
+        ),
+        "the pin still means only that build"
+    );
+}
+
 #[test]
 fn an_unparseable_requirement_is_reported_rather_than_silently_ignored() {
     let contract = PluginContract::new("autumn-plugin-demo").autumn_web("not a version req");
@@ -305,15 +324,19 @@ fn a_compatible_plugin_registers_and_its_contract_is_recorded() {
 #[test]
 #[should_panic(expected = "autumn-plugin-contract-fixture")]
 fn an_incompatible_plugin_fails_loudly_at_registration() {
-    let _ = autumn_web::app().plugin(ContractPlugin::supporting("0.0"));
+    with_contract_env(None, || {
+        let _ = autumn_web::app().plugin(ContractPlugin::supporting("0.0"));
+    });
 }
 
 #[test]
 fn the_registration_panic_names_the_framework_version_in_use() {
-    let panic = std::panic::catch_unwind(|| {
-        let _ = autumn_web::app().plugin(ContractPlugin::supporting("0.0"));
-    })
-    .expect_err("an incompatible plugin must not register");
+    let panic = with_contract_env(None, || {
+        std::panic::catch_unwind(|| {
+            let _ = autumn_web::app().plugin(ContractPlugin::supporting("0.0"));
+        })
+        .expect_err("an incompatible plugin must not register")
+    });
     let msg = panic
         .downcast_ref::<String>()
         .cloned()
@@ -321,6 +344,64 @@ fn the_registration_panic_names_the_framework_version_in_use() {
         .unwrap_or_default();
     assert!(msg.contains(AUTUMN_WEB_VERSION), "{msg}");
     assert!(msg.contains("0.0"), "{msg}");
+}
+
+/// The one thing an application author cannot fix is a stale literal in
+/// somebody else's crate, so the panic names its own escape hatch.
+///
+/// Serialised against the other env-reading tests in this file: `AppBuilder`
+/// reads the variable at registration, and the process environment is shared.
+#[test]
+fn the_escape_hatch_downgrades_the_panic_to_a_warning() {
+    let registered = with_contract_env(Some("warn"), || {
+        autumn_web::app()
+            .plugin(ContractPlugin::supporting("0.0"))
+            .has_plugin("autumn-plugin-contract-fixture")
+    });
+    assert!(
+        registered,
+        "AUTUMN_PLUGIN_CONTRACT=warn must let the plugin register"
+    );
+}
+
+#[test]
+fn any_other_value_of_the_escape_hatch_still_panics() {
+    let panicked = with_contract_env(Some("yes-please"), || {
+        std::panic::catch_unwind(|| {
+            let _ = autumn_web::app().plugin(ContractPlugin::supporting("0.0"));
+        })
+        .is_err()
+    });
+    assert!(panicked, "only the exact value `warn` opts out");
+}
+
+#[test]
+fn the_panic_text_names_the_escape_hatch() {
+    let panic = with_contract_env(None, || {
+        std::panic::catch_unwind(|| {
+            let _ = autumn_web::app().plugin(ContractPlugin::supporting("0.0"));
+        })
+        .expect_err("an incompatible plugin must not register")
+    });
+    let msg = panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_default();
+    assert!(msg.contains("AUTUMN_PLUGIN_CONTRACT=warn"), "{msg}");
+}
+
+/// `AppBuilder` fills this in from `Plugin::name()`, which is a different
+/// identity from the contract's crate name. `autumn plugin-check` matches on
+/// either, so both have to survive the dump.
+#[test]
+fn the_builder_records_the_name_the_plugin_registered_under() {
+    let builder = autumn_web::app().plugin(ContractPlugin::supporting(current_minor_series()));
+    let contracts = builder.plugin_contracts();
+    assert_eq!(
+        contracts[0].registered_as.as_deref(),
+        Some("autumn-plugin-contract-fixture")
+    );
 }
 
 #[test]
@@ -482,6 +563,30 @@ mod conformance {
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
+
+/// Serialises every test that depends on `AUTUMN_PLUGIN_CONTRACT` — the ones
+/// that set it *and* the ones that require it unset.
+///
+/// `temp_env` mutates the process environment, and this binary runs its tests
+/// concurrently, so without a lock a `should_panic` test could observe another
+/// test's `warn` (or lose its own). The crate is already a dev-dependency and
+/// keeps the `unsafe` out of a crate that forbids it.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    // A test that panics inside the lock poisons the mutex; the poison carries
+    // no state this cares about, so take the guard anyway.
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Run `body` with `AUTUMN_PLUGIN_CONTRACT` set to `value` (or removed for
+/// `None`), holding the serialising lock for its duration.
+fn with_contract_env<T>(value: Option<&str>, body: impl FnOnce() -> T) -> T {
+    let _lock = env_lock();
+    temp_env::with_var("AUTUMN_PLUGIN_CONTRACT", value, body)
+}
 
 /// The `MAJOR.MINOR` series of the framework this test binary links against —
 /// the requirement a lockstep first-party plugin declares.

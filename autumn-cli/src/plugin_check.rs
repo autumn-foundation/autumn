@@ -302,7 +302,7 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
 /// Three outcomes, deliberately kept apart. Folding the third into the first
 /// would let `autumn plugin-check` report a green run for a plugin it never
 /// actually checked, which is the one thing an author gate must not do.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContractDump {
     /// No [`PLUGIN_CONTRACT_MARKER`] line at all — an application built against
     /// an `autumn-web` that predates the contract.
@@ -1457,7 +1457,7 @@ mod contract_tests {
     #[test]
     fn a_plugin_with_no_contract_fails_the_contract_check() {
         let others = vec![PluginContract::new("some-other-plugin").autumn_web("0.7")];
-        let report = build_report(&opts(&present(others.clone())), &[route()]);
+        let report = build_report(&opts(&present(others)), &[route()]);
         let result = find(&report, "plugin-contract");
         assert_eq!(
             result.status,
@@ -1479,7 +1479,7 @@ mod contract_tests {
                 .plugin_version("1.2.3")
                 .autumn_web("0.7"),
         ];
-        let report = build_report(&opts(&present(contracts.clone())), &[route()]);
+        let report = build_report(&opts(&present(contracts)), &[route()]);
         let result = find(&report, "plugin-contract");
         assert_eq!(result.status, CheckStatus::Pass);
         assert!(result.message.contains("0.7"), "{}", result.message);
@@ -1488,7 +1488,7 @@ mod contract_tests {
     #[test]
     fn an_unparseable_range_fails_the_contract_check() {
         let contracts = vec![PluginContract::new("autumn-plugin-demo").autumn_web("not a req")];
-        let report = build_report(&opts(&present(contracts.clone())), &[route()]);
+        let report = build_report(&opts(&present(contracts)), &[route()]);
         let result = find(&report, "plugin-contract");
         assert_eq!(
             result.status,
@@ -1503,7 +1503,7 @@ mod contract_tests {
     #[test]
     fn a_stable_only_plugin_passes_the_experimental_check() {
         let contracts = vec![PluginContract::new("autumn-plugin-demo").autumn_web("0.7")];
-        let report = build_report(&opts(&present(contracts.clone())), &[route()]);
+        let report = build_report(&opts(&present(contracts)), &[route()]);
         let result = find(&report, "experimental-surface");
         assert_eq!(result.status, CheckStatus::Pass);
         assert!(result.diagnostics.is_empty());
@@ -1516,7 +1516,7 @@ mod contract_tests {
                 .autumn_web("0.7")
                 .uses_experimental("AppBuilder::with_edge_kv"),
         ];
-        let report = build_report(&opts(&present(contracts.clone())), &[route()]);
+        let report = build_report(&opts(&present(contracts)), &[route()]);
         let result = find(&report, "experimental-surface");
         assert_eq!(result.status, CheckStatus::Pass);
         assert!(
@@ -1537,7 +1537,7 @@ mod contract_tests {
                 .autumn_web("0.7")
                 .uses_experimental("AppBuilder::with_edge_kv"),
         ];
-        let dump = present(contracts.clone());
+        let dump = present(contracts);
         let mut o = opts(&dump);
         o.deny_experimental = true;
         let report = build_report(&o, &[route()]);
@@ -1549,7 +1549,7 @@ mod contract_tests {
     #[test]
     fn deny_experimental_does_not_fail_a_stable_only_plugin() {
         let contracts = vec![PluginContract::new("autumn-plugin-demo").autumn_web("0.7")];
-        let dump = present(contracts.clone());
+        let dump = present(contracts);
         let mut o = opts(&dump);
         o.deny_experimental = true;
         let report = build_report(&o, &[route()]);
@@ -1567,7 +1567,7 @@ mod contract_tests {
                 .autumn_web("0.7")
                 .uses_experimental("AppBuilder::not_a_surface"),
         ];
-        let report = build_report(&opts(&present(contracts.clone())), &[route()]);
+        let report = build_report(&opts(&present(contracts)), &[route()]);
         assert_eq!(
             find(&report, "experimental-surface").status,
             CheckStatus::Fail
@@ -1680,7 +1680,7 @@ mod contract_tests {
                 .autumn_web("0.7")
                 .uses_experimental("AppBuilder::with_edge_kv"),
         ];
-        let report = build_report(&opts(&present(contracts.clone())), &[route()]);
+        let report = build_report(&opts(&present(contracts)), &[route()]);
         let text = report.to_text_report();
         assert!(text.contains("plugin-contract"), "{text}");
         assert!(text.contains("experimental-surface"), "{text}");
