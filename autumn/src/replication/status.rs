@@ -241,8 +241,14 @@ impl ReplicationHealthIndicator {
             "pending_bytes".to_owned(),
             serde_json::Value::from(snapshot.pending_bytes),
         );
+        // Named for what it is. This is `lag_alert_after` — the threshold at
+        // which lag turns this check unhealthy, which `replication::build` sets
+        // to a multiple of the RPO. Publishing it as `rpo_seconds` reported 30
+        // for the default 10-second objective, telling operators and their
+        // monitoring the wrong number for the one thing this check exists to
+        // guard. (`autumn db replica status` reports the configured RPO itself.)
         details.insert(
-            "rpo_seconds".to_owned(),
+            "lag_alert_after_seconds".to_owned(),
             serde_json::Value::from(self.thresholds.lag_alert_after.as_secs()),
         );
         if let Some(at) = snapshot.last_verified_at {

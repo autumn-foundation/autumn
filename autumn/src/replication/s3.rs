@@ -124,8 +124,16 @@ pub struct S3Settings {
 /// What a request carries. A base snapshot streams from disk; everything else
 /// is small enough to sign and send from memory.
 enum RequestBody<'a> {
-    /// No body (GET / DELETE).
+    /// No body (GET / DELETE), for a request whose response is small.
     Empty,
+    /// No body, for a GET whose *response* is a whole base snapshot streamed to
+    /// disk. Same reasoning as `File` in the other direction: the total request
+    /// timeout is sized for small control-plane calls, and a multi-gigabyte
+    /// snapshot — or a slow link — legitimately needs longer than that. Leaving
+    /// it applied would fail every large restore and every periodic
+    /// verification at exactly the moment they matter. The connect timeout
+    /// still fails fast on a dead host.
+    EmptyStreamed,
     /// An in-memory body.
     Bytes(Vec<u8>),
     /// Stream this file, with the payload hash the caller computed for it.
@@ -264,7 +272,11 @@ impl S3Destination {
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date = now.format("%Y%m%d").to_string();
         let payload_hash = match &body {
-            RequestBody::Empty => sigv4::EMPTY_PAYLOAD_SHA256.to_owned(),
+            // Both send no body, so both sign the empty-payload hash; they
+            // differ only in the timeout applied to the response.
+            RequestBody::Empty | RequestBody::EmptyStreamed => {
+                sigv4::EMPTY_PAYLOAD_SHA256.to_owned()
+            }
             RequestBody::Bytes(bytes) => sigv4::sha256_hex(bytes),
             RequestBody::File { sha256_hex, .. } => (*sha256_hex).to_owned(),
         };
@@ -317,6 +329,7 @@ impl S3Destination {
             .header(reqwest::header::AUTHORIZATION, authorization);
         match body {
             RequestBody::Empty => request = request.timeout(REQUEST_TIMEOUT),
+            RequestBody::EmptyStreamed => {}
             RequestBody::Bytes(bytes) => {
                 request = request.timeout(REQUEST_TIMEOUT).body(bytes);
             }
@@ -568,7 +581,7 @@ impl ReplicaDestination for S3Destination {
             reqwest::Method::GET,
             key,
             "",
-            RequestBody::Empty,
+            RequestBody::EmptyStreamed,
         )?;
         // A base snapshot is the one object that can legitimately be large — up
         // to what a single `PutObject` accepted — so it streams to disk rather

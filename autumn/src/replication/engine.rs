@@ -686,6 +686,26 @@ impl Replicator {
     /// previous generation had already shipped. Checkpointing first makes the
     /// database file current by construction, and the new WAL starts empty at
     /// offset `0`, which is exactly where this generation's index `0` begins.
+    /// The greatest `created_ms` among the generations already at the
+    /// destination, or `None` when this is the first one.
+    ///
+    /// Only the id is parsed — no object is downloaded — so this costs the one
+    /// `list` that opening a generation can well afford next to the snapshot
+    /// upload that follows it. Incomplete generations count too: a generation
+    /// whose snapshot metadata never landed still owns its slice of the
+    /// ordering, and reusing its stamp would make two generations compare equal.
+    fn newest_generation_ms(&self) -> Result<Option<i64>, ReplicationError> {
+        let keys = self
+            .destination
+            .list(&segment::generations_prefix(&self.settings.root))?;
+        Ok(keys
+            .iter()
+            .filter_map(|key| segment::generation_of_key(&self.settings.root, key))
+            .filter_map(|id| segment::parse_generation_id(&id))
+            .map(|info| info.created_ms)
+            .max())
+    }
+
     fn start_generation(&mut self, db: &Path) -> Result<(), ReplicationError> {
         if let Some(conn) = self.connection.as_mut() {
             let outcome = sqlite::checkpoint_truncate(conn, db)?;
@@ -701,7 +721,24 @@ impl Replicator {
         // over-state the snapshot's age, which costs the restore an extra
         // generation of WAL replay and never correctness.
         let now = self.clock.now();
-        let created_ms = now.timestamp_millis();
+        // Generation ids order by this stamp, and both "restore the latest" and
+        // retention take the greatest one. A host clock that steps backward
+        // between generations would stamp the *newer* generation lower, so a
+        // latest-restore would silently select the older one and omit every
+        // write captured after the step until wall time caught up again. That is
+        // not a remote case here: `generation_expired` deliberately treats a
+        // negative elapsed duration as expiry, so a backward step is precisely
+        // when a new generation gets opened.
+        //
+        // The stamp is therefore floored one millisecond past the newest
+        // generation already at the destination. Reading the floor from the
+        // destination rather than from memory is what makes it durable: a
+        // process that restarts with an already-rolled-back clock still orders
+        // its new generation after the ones it finds offsite.
+        let floor_ms = self.newest_generation_ms()?;
+        let created_ms = now
+            .timestamp_millis()
+            .max(floor_ms.map_or(i64::MIN, |ms| ms.saturating_add(1)));
         let id = segment::generation_id(created_ms, rand::random::<u64>());
 
         let staging = staging_path(db);

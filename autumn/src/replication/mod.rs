@@ -659,11 +659,56 @@ mod tests {
         };
         assert_eq!(tight.sync_interval(), Duration::from_secs(1));
 
+        // An explicit override, within the RPO it has to meet — the pair the
+        // validator accepts. (Longer than the RPO is refused; see
+        // `a_sync_interval_longer_than_the_rpo_is_refused`.)
         let explicit = ReplicationConfig {
+            rpo_secs: 60,
             sync_interval_secs: Some(30),
             ..ReplicationConfig::default()
         };
         assert_eq!(explicit.sync_interval(), Duration::from_secs(30));
+    }
+
+    /// An explicit ship interval must be able to meet the RPO it sits next to.
+    ///
+    /// `rpo_secs = 10` with `sync_interval_secs = 60` ships once a minute and
+    /// can lose nearly a minute of committed writes, while every surface still
+    /// promises ten seconds. The pair is refused rather than silently making the
+    /// stricter-looking number the wrong one.
+    #[test]
+    fn a_sync_interval_longer_than_the_rpo_is_refused() {
+        let bad = ReplicationConfig {
+            enabled: true,
+            rpo_secs: 10,
+            sync_interval_secs: Some(60),
+            path: Some("/tmp/replica".to_owned()),
+            ..ReplicationConfig::default()
+        };
+        let errors = bad.validation_errors();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("sync_interval_secs") && e.contains("rpo_secs")),
+            "the pair must be rejected: {errors:?}"
+        );
+
+        // Equal is fine: shipping exactly at the objective still meets it, and
+        // so is the default, which derives the interval from the RPO.
+        let tight = ReplicationConfig {
+            enabled: true,
+            rpo_secs: 10,
+            sync_interval_secs: Some(10),
+            path: Some("/tmp/replica".to_owned()),
+            ..ReplicationConfig::default()
+        };
+        assert!(
+            !tight
+                .validation_errors()
+                .iter()
+                .any(|e| e.contains("sync_interval_secs")),
+            "an interval equal to the RPO is valid"
+        );
     }
 
     #[test]

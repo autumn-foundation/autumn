@@ -323,7 +323,7 @@ your replicas. Set `allow_shared_bucket = true` to opt in.
 | Setting | Default | What it bounds |
 | --- | --- | --- |
 | `rpo_secs` | `10` | Steady-state data loss if the machine dies right now. |
-| `sync_interval_secs` | `rpo_secs / 2` | How often committed frames are shipped. |
+| `sync_interval_secs` | `rpo_secs / 2` | How often committed frames are shipped. Must not exceed `rpo_secs`. |
 | `snapshot_interval_secs` | `3600` | How long one generation runs before a fresh base snapshot. |
 | `max_wal_bytes` | `16777216` | WAL size that forces a checkpoint (and the next WAL index). |
 | `retention_hours` | `168` | How far back a point-in-time restore can reach. |

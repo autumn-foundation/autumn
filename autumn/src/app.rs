@@ -4630,19 +4630,36 @@ impl AppBuilder {
         // blocking file, SQLite and HTTP work, which would pin a thread in
         // tokio's blocking pool (sized for short tasks) forever. It stops with
         // the server and ships one final time on the way out.
+        //
+        // Its token is deliberately NOT a child of `server_shutdown`. That token
+        // fires at phase 5, when the listener stops accepting — requests keep
+        // draining after it, and a request served in that window still commits.
+        // The loop's final tick must come after those commits, so the token is
+        // cancelled explicitly below, once the drain has finished. Same reasoning
+        // as the cluster's token, for the same class of silently-dropped write.
         #[cfg(feature = "db")]
-        let mut replication_thread: Option<std::thread::JoinHandle<()>> = None;
+        let replication_shutdown = tokio_util::sync::CancellationToken::new();
+        // Signals that `Replicator::run` has returned — i.e. the final flush is
+        // done. A channel rather than a `JoinHandle`: waiting on a join means
+        // blocking, and a blocking wait that times out cannot be cancelled, so a
+        // stuck upload would hold the runtime open past the shutdown budget it
+        // was supposed to be bounded by. Dropping this receiver abandons the
+        // thread instead, which is what the budget expiring is supposed to mean.
+        #[cfg(feature = "db")]
+        let mut replication_done: Option<tokio::sync::oneshot::Receiver<()>> = None;
         #[cfg(feature = "db")]
         if let Some(replicator) = replication_worker.take() {
-            let replication_shutdown = server_shutdown.child_token();
+            let replication_shutdown = replication_shutdown.clone();
+            let (finished, waiter) = tokio::sync::oneshot::channel();
             match std::thread::Builder::new()
                 .name("autumn-sqlite-replication".to_owned())
-                .spawn(move || replicator.run(&replication_shutdown))
-            {
-                // Kept, not detached: cancelling the token only *wakes* the
-                // loop, and the final flush that ships the last committed frames
-                // runs after that. Shutdown waits for it below.
-                Ok(handle) => replication_thread = Some(handle),
+                .spawn(move || {
+                    replicator.run(&replication_shutdown);
+                    // The receiver is gone when shutdown stopped waiting; the
+                    // flush still happened, so there is nothing to report.
+                    let _ = finished.send(());
+                }) {
+                Ok(_handle) => replication_done = Some(waiter),
                 // Serving on without the replicator is the worst of both
                 // worlds: the pool has already disabled auto-checkpointing for
                 // it, so the -wal would grow until the disk filled, and the
@@ -5246,24 +5263,22 @@ impl AppBuilder {
         // Overrunning it is loud rather than silent — the operator's RPO is
         // exactly what is at stake.
         #[cfg(feature = "db")]
-        if let Some(handle) = replication_thread.take() {
+        if let Some(waiter) = replication_done.take() {
+            // Only now: every request that will ever commit has committed, so
+            // the tick this releases is genuinely the last one.
+            replication_shutdown.cancel();
             let wait = shutdown_budget.saturating_sub(elapsed_since_drain_start());
-            // `join` blocks, so it goes to the blocking pool rather than parking
-            // this runtime thread.
-            let joined =
-                tokio::time::timeout(wait, tokio::task::spawn_blocking(move || handle.join()))
-                    .await;
-            match joined {
-                Ok(Ok(Ok(()))) => {
+            match tokio::time::timeout(wait, waiter).await {
+                Ok(Ok(())) => {
                     tracing::info!("shutdown: SQLite replication flushed and stopped");
                 }
-                Ok(Ok(Err(_))) => tracing::error!(
-                    "shutdown: the SQLite replication thread panicked; the frames committed \
-                     since the last successful tick may not be offsite"
+                Ok(Err(_)) => tracing::error!(
+                    "shutdown: the SQLite replication thread ended without finishing; the \
+                     frames committed since the last successful tick may not be offsite"
                 ),
-                Ok(Err(e)) => {
-                    tracing::warn!("shutdown: could not join the SQLite replication thread: {e}");
-                }
+                // The thread is left running and the process exits without it.
+                // Waiting further is what the budget exists to prevent, and a
+                // blocking join could not be abandoned at all.
                 Err(_) => tracing::warn!(
                     timeout_secs = wait.as_secs(),
                     "shutdown: SQLite replication did not finish its final flush within the \
@@ -12726,15 +12741,24 @@ mod tests {
         );
     }
 
-    /// The replication loop's final flush must be waited for, after the drain.
+    /// The replication loop's final flush must be *triggered* after the drain.
     ///
-    /// Cancelling `server_shutdown` only *wakes* the replication thread; the
-    /// tick that ships the last committed frames runs after it. A detached
-    /// handle therefore means a clean stop can still leave the tail of the WAL
-    /// on a machine that is about to go away — silently, since nothing observes
-    /// it. Source-order test in the house style, because the ordering is a
-    /// property of this function and nothing smaller: an app-level boot test
-    /// would need a `SQLite` runtime pool, which only exists in the `sqlite` lane.
+    /// Cancelling the token only *wakes* the replication thread; the tick that
+    /// ships the last committed frames runs immediately after it. So waiting
+    /// for the thread is not enough on its own — if the token fires at phase 5,
+    /// with `server_shutdown`, that final tick happens while requests are still
+    /// draining, and a request that commits during the drain is never
+    /// replicated even though the wait below succeeds and logs that replication
+    /// flushed. The token must therefore be independent of `server_shutdown`
+    /// and cancelled only once the drain has finished.
+    ///
+    /// The wait must also not be a blocking join: a blocked join cannot be
+    /// cancelled, so a stuck upload would hold the process open past the
+    /// shutdown budget that is supposed to bound it.
+    ///
+    /// Source-order test in the house style, because the ordering is a property
+    /// of this function and nothing smaller: an app-level boot test would need a
+    /// `SQLite` runtime pool, which only exists in the `sqlite` lane.
     #[cfg(feature = "db")]
     #[test]
     fn the_replication_final_flush_is_waited_for_after_the_drain() {
@@ -12750,23 +12774,38 @@ mod tests {
         let server_source = &source[server_start..build_mode_start];
 
         let spawn = server_source
-            .find("Ok(handle) => replication_thread = Some(handle),")
-            .expect("the replication thread's handle must be kept, not dropped");
+            .find("Ok(_handle) => replication_done = Some(waiter),")
+            .expect("the replication thread's completion signal must be kept, not dropped");
         let drain = server_source
             .find("let server_result = server_task.await")
             .expect("the normal server path should await the drain");
-        let join = server_source
-            .find("if let Some(handle) = replication_thread.take()")
+        let wait = server_source
+            .find("if let Some(waiter) = replication_done.take()")
             .expect("shutdown must wait for the replication thread");
+        let cancel = server_source
+            .find("replication_shutdown.cancel();")
+            .expect("shutdown must cancel the replication token explicitly");
 
         assert!(
-            spawn < drain && drain < join,
-            "the replication flush must be awaited AFTER the request drain \
-             (spawn={spawn}, drain={drain}, join={join})"
+            spawn < drain && drain < wait && drain < cancel,
+            "the final flush must be triggered AND awaited AFTER the request drain \
+             (spawn={spawn}, drain={drain}, wait={wait}, cancel={cancel})"
+        );
+        // The token that releases the final tick must not fire with the
+        // listener: that is the whole bug this ordering exists to prevent.
+        assert!(
+            server_source
+                .contains("let replication_shutdown = tokio_util::sync::CancellationToken::new();"),
+            "the replication token must be independent of `server_shutdown`, not a child of it"
         );
         assert!(
-            server_source[join..].contains("handle.join()"),
-            "the wait must actually join the replication thread"
+            !server_source[..wait].contains("let replication_shutdown = server_shutdown"),
+            "the replication token must not be derived from `server_shutdown`"
+        );
+        // A blocking join cannot be abandoned when the budget runs out.
+        assert!(
+            !server_source[wait..].contains("spawn_blocking"),
+            "the bounded wait must not block on a join it cannot cancel"
         );
     }
 

@@ -1192,6 +1192,22 @@ impl ReplicationConfig {
         if self.rpo_secs == 0 {
             errors.push("[replication] rpo_secs must be at least 1".to_owned());
         }
+        // An explicit override longer than the RPO quietly invalidates the
+        // objective it sits next to: `rpo_secs = 10` with
+        // `sync_interval_secs = 60` ships once a minute and can lose nearly a
+        // minute of committed writes, while every surface — the docs, the health
+        // detail, the restore report — still promises ten seconds. Refuse the
+        // pair rather than letting the stricter-looking number be the wrong one.
+        if let Some(interval) = self.sync_interval_secs
+            && self.rpo_secs > 0
+            && interval > self.rpo_secs
+        {
+            errors.push(format!(
+                "[replication] sync_interval_secs ({interval}) must not exceed rpo_secs \
+                 ({}): shipping less often than the objective cannot meet it",
+                self.rpo_secs
+            ));
+        }
         if self.retention_hours == 0 {
             errors.push("[replication] retention_hours must be at least 1".to_owned());
         }

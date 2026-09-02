@@ -714,6 +714,60 @@ fn an_expired_generation_takes_a_fresh_base_snapshot_at_the_next_checkpoint() {
     assert_eq!(values(&read_rows(&restored)), ["gen-one", "gen-two"]);
 }
 
+/// A host clock that steps backward must not hide the newest generation.
+///
+/// Generation ids order by their millisecond stamp, and a latest-restore takes
+/// the greatest. If a backward clock step let the newer generation be stamped
+/// lower, that restore would select the *older* one and silently drop every
+/// write captured after the step — and this is not a contrived pairing:
+/// `generation_expired` deliberately treats a negative elapsed duration as
+/// expiry, so a rollback is exactly the moment a new generation gets opened.
+#[test]
+fn a_backward_clock_step_does_not_hide_the_newest_generation() {
+    let mut h = Harness::new();
+    let mut tight = settings(&h.db);
+    tight.max_wal_bytes = 1;
+    tight.snapshot_interval = Duration::from_secs(1);
+    h.rebuild(tight);
+
+    // Two generations at a high wall clock.
+    prime(&mut h, 10_000);
+    insert(&mut h.conn, &["before-the-step"]);
+    tick_until_checkpointed(&mut h, 10_001);
+    let before = h.tick(20_000).expect("tick");
+    assert!(before.snapshot_taken, "the second generation should open");
+    let after_two = generations_on(&h);
+    assert!(after_two.len() >= 2, "two generations: {after_two:?}");
+
+    // The host clock steps back an hour — NTP correction, a VM restored from a
+    // snapshot, an operator fixing a wrong date — and a write lands after it.
+    insert(&mut h.conn, &["after-the-step"]);
+    tick_until_checkpointed(&mut h, 16_400);
+    let rolled_back = h.tick(16_401).expect("tick");
+    assert!(
+        rolled_back.snapshot_taken,
+        "a backward step expires the open generation, opening a new one"
+    );
+
+    let generations = generations_on(&h);
+    let newest = generations.iter().next_back().expect("a generation");
+    assert!(
+        !after_two.contains(newest),
+        "the generation opened after the clock step must sort newest, not behind \
+         the ones that preceded it (generations: {generations:?})"
+    );
+
+    // The property that ordering exists to protect: the latest restore has to
+    // carry the write that landed after the step.
+    h.destroy_database();
+    let restored = h.restore_to(None);
+    assert_eq!(
+        values(&read_rows(&restored)),
+        ["before-the-step", "after-the-step"],
+        "a latest restore must not regress past a backward clock step"
+    );
+}
+
 #[test]
 fn a_restore_spans_many_wal_indexes_in_one_generation() {
     let mut h = Harness::new();
