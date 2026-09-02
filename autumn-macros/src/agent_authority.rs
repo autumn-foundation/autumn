@@ -722,6 +722,23 @@ impl Parse for EffectSpec {
             }
         }
 
+        // `none` asserts the statement does nothing. A declared effect beside
+        // it asserts the opposite, and `scoped` answers a question an
+        // effect-free statement never asks — the walk would record the
+        // declaration while the manifest counted the site as effect-free, so
+        // the two readings ship a row that contradicts itself.
+        if spec.none && (!spec.effects.is_empty() || spec.scoped) {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                format!(
+                    "`#[agent_effect(none, ...)]` declares the statement effect-free; it cannot \
+                     be combined with a declared effect or `scoped`.\n\nDrop `none` and keep \
+                     the declaration of what the statement does, or drop the declaration and \
+                     keep `none`. {GUIDE}"
+                ),
+            ));
+        }
+
         if !saw_any {
             return Err(syn::Error::new(
                 Span::call_site(),
@@ -844,6 +861,54 @@ impl Analyzer {
     /// `cross_tenant` both allow it with no annotation, and only a `scoped`
     /// grant fails. `#[agent_effect(scoped, reason = "...")]` still answers
     /// the question at the statement.
+    /// Classify a raw-SQL statement reaching an executor.
+    ///
+    /// Returns whether the chain was a raw-SQL one (recorded or refused). The
+    /// tenant effect is recorded either way — a raw statement carries no
+    /// repository predicate whatever it does — but a statement that *writes*
+    /// also needs write authority, and reading only the chain recorded a
+    /// `DELETE` as a read that a `cross_tenant` grant waved through.
+    fn raw_sql_effect(&mut self, method: &ExprMethodCall, root: &Expr, verb: &str) -> bool {
+        let Some(call) = raw_sql_call(root) else {
+            return false;
+        };
+        let span = method.span();
+        let Some(statement) = call.args.first().and_then(literal_of) else {
+            self.refuse_raw_sql(span, "is not a literal");
+            return true;
+        };
+        match classify_sql(&statement) {
+            Some(SqlStatement::Read { table }) => {
+                self.record_raw_query(span, verb, table.as_deref().unwrap_or("sql_query"));
+            }
+            Some(SqlStatement::Write { table }) => {
+                self.record_raw_query(span, verb, &table);
+                self.record(
+                    Kind::UnboundedWrite,
+                    Subject::Lit(table),
+                    Provenance::Syntactic,
+                    span,
+                );
+            }
+            None => self.refuse_raw_sql(span, "names no statement this analysis can read"),
+        }
+        true
+    }
+
+    /// Refuse a raw statement whose kind — or whose table — cannot be read.
+    fn refuse_raw_sql(&mut self, span: Span, why: &str) {
+        let action = self.action.clone();
+        self.error(
+            span,
+            format!(
+                "agent authority: this raw SQL statement {why}, so whether `{action}` reads or \
+                 writes — and what it writes — cannot be proven.\n\nPass the statement as a \
+                 string literal, or declare the site with `#[agent_effect(unbounded_writes(\
+                 table), reason = \"...\")]` (or `writes(...)` for a bounded one). {GUIDE}"
+            ),
+        );
+    }
+
     fn record_raw_query(&mut self, span: Span, call: &str, target: &str) {
         if self.tenant_declared {
             return;
@@ -1176,63 +1241,16 @@ impl Analyzer {
     }
 
     fn rebind(&mut self, pat: &Pat, handle: Option<&Handle>) {
-        // `let (store, payouts) = repos;` takes the container apart, so each
-        // name keeps the element's own identity rather than the whole
-        // container — which would make every later call ambiguous.
-        if let Some(Handle::Container(parts)) = handle
-            && self.rebind_container(pat, parts)
-        {
-            return;
-        }
-        let mut names = HashSet::new();
-        collect_pat_idents(pat, &mut names);
-        for name in names {
+        for (name, handle) in pattern_bindings(pat, handle) {
             match handle {
                 Some(handle) => {
-                    self.handles.insert(name, handle.clone());
+                    self.handles.insert(name, handle);
                 }
                 None => {
                     self.handles.remove(&name);
                 }
             }
         }
-    }
-
-    /// Bind each element of a container handle to the pattern that takes it
-    /// apart. Returns whether the pattern was element-addressable; when it was
-    /// not, the caller broadcasts the container instead.
-    fn rebind_container(&mut self, pat: &Pat, parts: &[(Part, Handle)]) -> bool {
-        let elems: Vec<&Pat> = match pat {
-            Pat::Paren(p) => return self.rebind_container(&p.pat, parts),
-            Pat::Reference(r) => return self.rebind_container(&r.pat, parts),
-            // `Some((refunds, payments))` — a one-element constructor pattern
-            // is transparent, exactly as the constructor expression is.
-            Pat::TupleStruct(t) if t.elems.len() == 1 => {
-                let Some(only) = t.elems.first() else {
-                    return false;
-                };
-                return self.rebind_container(only, parts);
-            }
-            Pat::Struct(s) => {
-                for field in &s.fields {
-                    let named = part_of_member(&field.member);
-                    let handle = parts
-                        .iter()
-                        .find_map(|(key, h)| (*key == named).then_some(h));
-                    self.rebind(&field.pat, handle);
-                }
-                return true;
-            }
-            Pat::Tuple(t) => t.elems.iter().collect(),
-            Pat::TupleStruct(t) => t.elems.iter().collect(),
-            _ => return false,
-        };
-        for (index, element) in elems.into_iter().enumerate() {
-            let nth = Part::Index(index);
-            let handle = parts.iter().find_map(|(key, h)| (*key == nth).then_some(h));
-            self.rebind(element, handle);
-        }
-        true
     }
 
     /// Read an `#[agent_effect(...)]` statement annotation, reporting a
@@ -1806,6 +1824,13 @@ impl Analyzer {
                 continue;
             }
             if EXECUTORS.contains(&name.as_str()) {
+                // `diesel::sql_query("DELETE FROM payouts")` reaches an
+                // executor exactly as a builder chain does, but nothing in the
+                // chain says what the statement *does* — the SQL text is the
+                // only place that is written down.
+                if self.raw_sql_effect(method, root, &name) {
+                    continue;
+                }
                 // A raw diesel read or write handed the request's connection.
                 // The repository codegen is what adds the tenant predicate;
                 // this query has none by construction, so it reaches across
@@ -2646,6 +2671,155 @@ fn url_defect(url: &str) -> Option<&'static str> {
 }
 
 /// The table a diesel write names: `refunds::table` → `refunds`.
+/// Diesel's raw-statement constructors: the chain says "execute", and only the
+/// SQL text says what is executed.
+const RAW_SQL_FNS: &[&str] = &["sql_query", "sql", "execute_raw"];
+
+/// Leading keywords that only read.
+const SQL_READ_STATEMENTS: &[&str] = &["SELECT", "WITH"];
+
+/// Leading keywords that change rows or schema. Schema statements are folded
+/// in with the row writes: `DROP TABLE` is not a smaller authority than
+/// `DELETE`, and no grant should grant it by omission.
+const SQL_WRITE_STATEMENTS: &[&str] = &[
+    "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "DROP", "ALTER", "CREATE", "REPLACE",
+];
+
+/// What a raw statement does, once its text has been read.
+enum SqlStatement {
+    /// A query. The table is only for the tenant effect's subject.
+    Read { table: Option<String> },
+    /// A statement that writes, and the table it writes.
+    Write { table: String },
+}
+
+/// The raw-statement constructor a chain is rooted at, if it is one.
+fn raw_sql_call(root: &Expr) -> Option<&ExprCall> {
+    let Expr::Call(call) = strip_transparent(root) else {
+        return None;
+    };
+    let name = call_path_name(call)?;
+    RAW_SQL_FNS.contains(&name.as_str()).then_some(call)
+}
+
+/// Read a raw SQL statement's kind and table. `None` when neither can be read.
+fn classify_sql(sql: &str) -> Option<SqlStatement> {
+    let words = sql_words(sql);
+    let first = words.first()?.to_ascii_uppercase();
+    let write_at = |from: usize| {
+        words.iter().enumerate().skip(from).find_map(|(at, word)| {
+            SQL_WRITE_STATEMENTS
+                .contains(&word.to_ascii_uppercase().as_str())
+                .then_some(at)
+        })
+    };
+    if SQL_READ_STATEMENTS.contains(&first.as_str()) {
+        // A CTE is a read only until it is not: `WITH x AS (...) DELETE FROM
+        // payouts` is spelled like a query and erases a table. Quoting keeps a
+        // `'DELETE'` *value* out of this — the token still carries its quotes.
+        if let Some(at) = write_at(1) {
+            return sql_table(&words, at).map(|table| SqlStatement::Write { table });
+        }
+        return Some(SqlStatement::Read {
+            table: sql_table(&words, 0),
+        });
+    }
+    if SQL_WRITE_STATEMENTS.contains(&first.as_str()) {
+        return sql_table(&words, 0).map(|table| SqlStatement::Write { table });
+    }
+    None
+}
+
+/// The table a statement acts on, read forward from its governing keyword.
+fn sql_table(words: &[String], from: usize) -> Option<String> {
+    /// The keywords a table name follows.
+    const ANCHORS: &[&str] = &["INTO", "UPDATE", "FROM", "TABLE"];
+    /// Modifiers that sit between the anchor and the name.
+    const SKIP: &[&str] = &[
+        "IF",
+        "EXISTS",
+        "NOT",
+        "ONLY",
+        "CONCURRENTLY",
+        "TEMP",
+        "TEMPORARY",
+        "UNLOGGED",
+        "TABLE",
+    ];
+    let mut index = words
+        .iter()
+        .enumerate()
+        .skip(from)
+        .find_map(|(at, word)| {
+            ANCHORS
+                .contains(&word.to_ascii_uppercase().as_str())
+                .then_some(at + 1)
+        })
+        .unwrap_or(from + 1);
+    while words
+        .get(index)
+        .is_some_and(|word| SKIP.contains(&word.to_ascii_uppercase().as_str()))
+    {
+        index += 1;
+    }
+    normalise_table(words.get(index)?)
+}
+
+/// Strip quoting and any schema prefix: `"billing"."payouts"` is `payouts`.
+fn normalise_table(word: &str) -> Option<String> {
+    let cleaned: String = word
+        .chars()
+        .filter(|c| !matches!(c, '"' | '`' | '[' | ']' | ';' | '\''))
+        .collect();
+    let name = cleaned.rsplit('.').next()?.trim();
+    (!name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    .then(|| name.to_string())
+}
+
+/// Split a statement into words, with comments removed and punctuation that
+/// can abut a table name treated as a separator.
+fn sql_words(sql: &str) -> Vec<String> {
+    strip_sql_comments(sql)
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';'))
+        .filter(|word| !word.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Remove `--` line comments and `/* … */` blocks, so neither can hide the
+/// leading keyword.
+fn strip_sql_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(current) = chars.next() {
+        match (current, chars.peek()) {
+            ('-', Some('-')) => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+                out.push(' ');
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut previous = '\0';
+                for c in chars.by_ref() {
+                    if previous == '*' && c == '/' {
+                        break;
+                    }
+                    previous = c;
+                }
+                out.push(' ');
+            }
+            _ => out.push(current),
+        }
+    }
+    out
+}
+
 fn table_name_of(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Path(path) => {
@@ -2884,6 +3058,75 @@ fn part_of_member(member: &syn::Member) -> Part {
     }
 }
 
+/// Every name a pattern binds, paired with the handle that name takes.
+///
+/// A container handle is taken apart by the pattern that destructures it, so
+/// `let (store, payouts) = repos;` and `Extension((repo, _)): Extension<(R,
+/// C)>` each keep the element's own identity; anything the pattern cannot
+/// address element-wise takes the whole handle.
+fn pattern_bindings(pat: &Pat, handle: Option<&Handle>) -> Vec<(String, Option<Handle>)> {
+    if let Some(Handle::Container(parts)) = handle
+        && let Some(bindings) = container_bindings(pat, parts)
+    {
+        return bindings;
+    }
+    let mut names = HashSet::new();
+    collect_pat_idents(pat, &mut names);
+    names
+        .into_iter()
+        .map(|name| {
+            // A potential handle names itself in its diagnostic: "the
+            // parameter `store` is typed `dyn Trait`".
+            let taken = handle.map(|held| match held {
+                Handle::Potential(_) => Handle::Potential(name.clone()),
+                other => other.clone(),
+            });
+            (name, taken)
+        })
+        .collect()
+}
+
+/// Pair a container handle's elements with the pattern that takes it apart.
+///
+/// `None` when the pattern is not element-addressable — the caller then binds
+/// the container itself, and every later call through it is ambiguous.
+fn container_bindings(
+    pat: &Pat,
+    parts: &[(Part, Handle)],
+) -> Option<Vec<(String, Option<Handle>)>> {
+    let elems: Vec<&Pat> = match pat {
+        Pat::Paren(p) => return container_bindings(&p.pat, parts),
+        Pat::Reference(r) => return container_bindings(&r.pat, parts),
+        // `Extension((repo, cfg))` / `Some((refunds, payments))` — a
+        // one-element constructor pattern is transparent, exactly as the
+        // constructor expression and the wrapper type are.
+        Pat::TupleStruct(t) if t.elems.len() == 1 => {
+            return container_bindings(t.elems.first()?, parts);
+        }
+        Pat::Struct(st) => {
+            let mut out = Vec::new();
+            for field in &st.fields {
+                let named = part_of_member(&field.member);
+                let handle = parts
+                    .iter()
+                    .find_map(|(key, h)| (*key == named).then_some(h));
+                out.extend(pattern_bindings(&field.pat, handle));
+            }
+            return Some(out);
+        }
+        Pat::Tuple(t) => t.elems.iter().collect(),
+        Pat::TupleStruct(t) => t.elems.iter().collect(),
+        _ => return None,
+    };
+    let mut out = Vec::new();
+    for (index, element) in elems.into_iter().enumerate() {
+        let nth = Part::Index(index);
+        let handle = parts.iter().find_map(|(key, h)| (*key == nth).then_some(h));
+        out.extend(pattern_bindings(element, handle));
+    }
+    Some(out)
+}
+
 /// Select one element of a container handle.
 ///
 /// A handle that is *not* a container keeps its identity through a field
@@ -2979,6 +3222,20 @@ fn type_handle(ty: &Type, generics: &HashSet<String>) -> Option<Handle> {
         // `impl RefundStore` / `dyn RefundStore` — it may be an effect handle,
         // and the analysis cannot tell. Fail closed, narrowly (R10).
         Type::ImplTrait(_) | Type::TraitObject(_) => Some(Handle::Potential(String::new())),
+        // `(PgRefundRepository, Config)` — one parameter holding two things,
+        // tracked element-wise so the config element cannot be mistaken for
+        // the repository, and the repository cannot be mistaken for nothing.
+        Type::Tuple(tuple) => {
+            let parts: Vec<(Part, Handle)> = tuple
+                .elems
+                .iter()
+                .enumerate()
+                .filter_map(|(index, elem)| {
+                    type_handle(elem, generics).map(|handle| (Part::Index(index), handle))
+                })
+                .collect();
+            (!parts.is_empty()).then_some(Handle::Container(parts))
+        }
         Type::Path(path) => {
             let segment = path.path.segments.last()?;
             let name = segment.ident.to_string();
@@ -3070,16 +3327,10 @@ fn signature_handles(input_fn: &ItemFn) -> HashMap<String, Handle> {
         let Some(handle) = type_handle(&typed.ty, &generics) else {
             continue;
         };
-        let mut names = HashSet::new();
-        collect_pat_idents(&typed.pat, &mut names);
-        for name in names {
-            // A potential handle names itself in its diagnostic: "the
-            // parameter `store` is typed `dyn Trait`".
-            let handle = match &handle {
-                Handle::Potential(_) => Handle::Potential(name.clone()),
-                other => other.clone(),
-            };
-            handles.insert(name, handle);
+        for (name, handle) in pattern_bindings(&typed.pat, Some(&handle)) {
+            if let Some(handle) = handle {
+                handles.insert(name, handle);
+            }
         }
     }
     handles
@@ -4610,6 +4861,102 @@ mod tests {
             }",
         ),
         (
+            // The chain says "execute"; only the statement says "DELETE". The
+            // effect was recorded as a read, so a `cross_tenant` grant — or an
+            // `#[agent_effect(scoped)]` site — waved an unbounded erase past a
+            // grant that allows no write at all.
+            "raw SQL statement that deletes",
+            ExpectedKind::UnboundedWrite,
+            "payouts",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("DELETE FROM payouts").execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "raw SQL update on a schema-qualified table",
+            ExpectedKind::UnboundedWrite,
+            "payouts",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("UPDATE billing.payouts SET state = 'void'")
+                    .execute(&mut *db)
+                    .await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            // A CTE is spelled like a query and can still erase a table.
+            "raw SQL common table expression that deletes",
+            ExpectedKind::UnboundedWrite,
+            "payouts",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("WITH stale AS (SELECT id FROM payouts) DELETE FROM payouts")
+                    .execute(&mut *db)
+                    .await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "raw SQL statement built at runtime",
+            ExpectedKind::Rejected,
+            "raw SQL",
+            r"async fn h(mut db: Db, stmt: String) -> R {
+                diesel::sql_query(stmt).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            // The tuple's elements were invisible: the parameter's type is not
+            // a handle type, so nothing in the signature bound `repo`.
+            "repository inside a tuple behind an extractor",
+            ExpectedKind::UnboundedWrite,
+            "Refund",
+            r"async fn h(Extension((repo, _)): Extension<(PgRefundRepository, Config)>) -> R {
+                repo.delete_all().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "repository inside a bare tuple parameter",
+            ExpectedKind::UnboundedWrite,
+            "Refund",
+            r"async fn h((repo, cfg): (PgRefundRepository, Config)) -> R {
+                repo.truncate().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "element of a tuple parameter bound to a single name",
+            ExpectedKind::UnboundedWrite,
+            "Payout",
+            r"async fn h(pair: (PgRefundRepository, PgPayoutRepository)) -> R {
+                pair.1.delete_all().await?;
+                Ok(())
+            }",
+        ),
+        (
+            // `none` asserts the statement does nothing; the declaration beside
+            // it asserts the opposite, and the walk believed both.
+            "#[agent_effect(none)] combined with a declared effect",
+            ExpectedKind::Rejected,
+            "none",
+            r#"async fn h(mut db: Db) -> R {
+                #[agent_effect(none, writes(Payout), reason = "the helper writes the row")]
+                let out = crate::billing::issue(&mut db).await?;
+                Ok(out)
+            }"#,
+        ),
+        (
+            "#[agent_effect(none)] combined with scoped",
+            ExpectedKind::Rejected,
+            "scoped",
+            r#"async fn h(mut db: Db) -> R {
+                #[agent_effect(none, scoped, reason = "the view is already partitioned")]
+                let all: Vec<Refund> = refunds::table.load(&mut *db).await?;
+                Ok(all)
+            }"#,
+        ),
+        (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
             "reason",
@@ -4793,6 +5140,24 @@ mod tests {
                 let rows = repo.find_all().await?;
                 std::mem::drop(repo);
                 Ok(rows)
+            }",
+        ),
+        (
+            // The polarity check for the raw-SQL rule: a literal query is a
+            // read, and stays the tenant effect it always was — under a grant
+            // that allows leaving the tenant it needs no annotation at all.
+            "raw SQL query with no annotation",
+            r#"async fn h(mut db: Db) -> R {
+                let rows = diesel::sql_query("SELECT id FROM payouts").load(&mut *db).await?;
+                Ok(rows)
+            }"#,
+        ),
+        (
+            "tuple parameter whose elements are each used correctly",
+            r"async fn h((repo, payouts): (PgRefundRepository, PgPayoutRepository)) -> R {
+                let r = repo.create(&b).await?;
+                let seen = payouts.find_all().await?;
+                Ok((r, seen))
             }",
         ),
         (
