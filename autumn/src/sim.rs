@@ -44,6 +44,10 @@
 //! - **W5** turns [`Chaos`] into a public, seed-driven fault-injection builder
 //!   ([`Sim::chaos`]), installed at [`Sim::build`] and recorded into the
 //!   schedule read by [`Sim::__chaos_events`].
+//! - **#1680** adds [`FaultPlan`], the *authored* fault lane beside [`Chaos`]:
+//!   ordinal-targeted DB-checkout / job-execution faults driven from one seed,
+//!   attached with [`crate::test::TestApp::with_fault_plan`], producing a
+//!   serializable [`FaultOutcome`] a regression test can compare byte-for-byte.
 //! - **W6** adds the [`always!`](crate::always) / [`sometimes!`](crate::sometimes)
 //!   assertion macros ([`mod@assert`]) and, behind the `sim-testing` feature, a
 //!   property-based op-driver (`sim::op`) — `Sim::gen_ops`/`Sim::gen_ops_with` for
@@ -93,6 +97,18 @@ pub mod chaos;
 #[cfg(feature = "mail")]
 pub use chaos::MailFault;
 pub use chaos::{Chaos, ChaosEvent, ChaosHook};
+
+// The authored fault lane (issue #1680): `FaultPlan`, an ordinal-targeted,
+// seed-deterministic fault schedule installed through `TestApp::with_fault_plan`
+// (not through `Sim::chaos`), plus the serializable `FaultOutcome` a scenario
+// asserts on. Additive and opt-in — a `TestApp` with no plan is untouched. See
+// the module docs for the determinism contract and how it differs from `Chaos`.
+pub mod fault;
+
+pub use fault::{
+    FaultEffect, FaultLedger, FaultOutcome, FaultPlan, FinalState, FiredFault, PlannedFault,
+    ReportedError,
+};
 
 // The seeded LLM stub (W5.b, item 6, issue #1797): a deterministic fake
 // completion client — canned responses + a seeded fault/latency schedule — for
