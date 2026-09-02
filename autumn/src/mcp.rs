@@ -2106,6 +2106,22 @@ async fn serve_tools_call(
         .record_outcome(&server.state, status, request_id.as_deref(), None)
         .await;
 
+    buffered_tool_response(tool, id, status, is_event_stream, cookies, response).await
+}
+
+/// Repackage a fully-buffered handler response as the JSON-RPC tool result.
+///
+/// Split out of [`serve_tools_call`] so that function stays readable (and under
+/// clippy's `too_many_lines` ceiling): everything here runs only on the
+/// buffered path, after the outcome has already been recorded.
+async fn buffered_tool_response(
+    tool: &McpTool,
+    id: Value,
+    status: StatusCode,
+    is_event_stream: bool,
+    cookies: Vec<HeaderValue>,
+    response: Response,
+) -> Response {
     // Capture the dispatch clone's `Server-Timing` header (#1348) so its
     // non-`total` metrics can be forwarded onto the rebuilt response. The clone
     // runs the primary `ServerTimingLayer`, which builds the full metric set —
@@ -2114,8 +2130,8 @@ async fn serve_tools_call(
     // forwarding, a DB-backed `tools/call` would lose the query count. Only the
     // non-`total` metrics are forwarded (see the append below); the inner
     // `total` measured the dispatch clone alone and is dropped in favour of the
-    // outer fallback's real `/mcp` `total`. Captured before the body is
-    // consumed, like `Set-Cookie` above.
+    // outer fallback's real `/mcp` `total`. Captured before this function
+    // consumes the body, exactly as the caller captured `Set-Cookie`.
     let mut server_timings: Vec<HeaderValue> = Vec::new();
     for value in response.headers().get_all(&SERVER_TIMING) {
         server_timings.push(value.clone());
