@@ -84,22 +84,30 @@ BARE = r'(?:[^()\s]|\([^()\s]*\))+'
 # meant a link like `[x](missing.md 'why')` failed to match at all, so it was
 # skipped rather than checked — the gate reporting success on a broken link.
 TITLE = r'''(?:\s+(?:"[^"]*"|'[^']*'|\([^()]*\)))?'''
-INLINE = re.compile(
-    r'\[(?:[^\]]*)\]\(\s*(?:<([^<>]*)>|(' + BARE + r'))' + TITLE + r'\s*\)'
-)
+DEST = r'\(\s*(?:<([^<>]*)>|(' + BARE + r'))' + TITLE + r'\s*\)'
+# Two label shapes, because a linked image nests one link inside another:
+# `[![alt](img.png)](page.md)`. The flat label finds the inner image target,
+# the nesting one finds the outer click target. Matching only the flat form
+# checked the image and never the page it links to.
+INLINE = re.compile(r'\[[^\]]*\]' + DEST)
+NESTED = re.compile(r'\[(?:[^\[\]]|\[[^\[\]]*\])*\]' + DEST)
 REFDEF = re.compile(r'^ {0,3}\[[^\]]+\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
 
 
 def link_targets(text):
-    """Yield every link destination, angle brackets stripped."""
-    for pattern in (INLINE, REFDEF):
+    """Yield every link destination once, angle brackets stripped."""
+    seen = set()
+    for pattern in (INLINE, NESTED, REFDEF):
         for bracketed, bare in pattern.findall(text):
-            yield (bracketed or bare).strip()
+            t = (bracketed or bare).strip()
+            if t and t not in seen:
+                seen.add(t)
+                yield t
 # A rustdoc intra-doc path: two or more `::`-joined idents, no slashes.
 RUSTDOC = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+$')
 
 
-FENCE = re.compile(r'^([ \t]*)(`{3,}|~{3,})')
+FENCE = re.compile(r'^([ \t]*)(`{3,}|~{3,})(.*)$')
 LIST_ITEM = re.compile(r'^([ \t]*)(?:[-*+]|\d{1,9}[.)])([ \t]+)(?=\S)')
 INDENT = re.compile(r'^[ \t]*')
 # A block-quote marker may carry up to three spaces of indentation. Allowing
@@ -154,8 +162,9 @@ def strip_fences(text):
     underline, and deleting a fenced block would splice a paragraph onto a
     following `---` and invent a heading that is not there.
     """
-    out, opener, base = [], None, 0
+    out, opener, stack = [], None, []
     for line in text.splitlines():
+        base = stack[-1] if stack else 0
         # A fence inside a block quote (`> ```md`) is still a fence; the
         # corpus has 12 of them. Detection runs on the quote-stripped content
         # while the original line is what gets kept, so real links inside a
@@ -169,9 +178,19 @@ def strip_fences(text):
             # line dedented past it closes the item.
             item = LIST_ITEM.match(content)
             if item:
-                base = column(item.group(0))
-            elif content.strip() and column(INDENT.match(content).group(0)) < base:
-                base = 0
+                marker = column(item.group(1))
+                while stack and stack[-1] > marker:
+                    stack.pop()
+                stack.append(column(item.group(0)))
+            elif content.strip():
+                # Dedenting leaves the innermost items but stays inside any
+                # outer one, so pop back to the enclosing item's column rather
+                # than resetting to zero — a fence indented for the parent list
+                # is still a fence.
+                dedent = column(INDENT.match(content).group(0))
+                while stack and dedent < stack[-1]:
+                    stack.pop()
+            base = stack[-1] if stack else 0
             if m and indent <= base + 3:
                 opener = m.group(2)
                 out.append("")
@@ -184,13 +203,24 @@ def strip_fences(text):
                 and indent <= base + 3
                 and m.group(2)[0] == opener[0]
                 and len(m.group(2)) >= len(opener)
+                # A closing fence carries nothing but trailing whitespace.
+                # Accepting ```not-a-closer as the closer made the real closer
+                # an opener, hiding live prose to the end of the file.
+                and not m.group(3).strip()
             ):
                 opener = None
     return "\n".join(out)
 
 
+# A code span is delimited by a run of backticks and closed by an equal-length
+# run, so ``a [link](x.md) b`` is one span. Matching single backticks only
+# consumed the delimiters as two empty spans and left the contents exposed as
+# a live link.
+CODE_SPAN = re.compile(r'(`+)(?:(?!\1).)*?\1')
+
+
 def strip_code(text):
-    return re.sub(r'`[^`\n]*`', '', strip_fences(text))
+    return CODE_SPAN.sub('', strip_fences(text))
 
 
 def slugify(heading):
@@ -522,6 +552,44 @@ self_test() {
   printf 'See [phantom](jobs.md#second-line).\n' >> "$c23/docs/guide/mail.md"
   git -C "$c23" commit -qam multiline-setext-phantom
   check "last line alone is not a Setext anchor" fail "$c23"
+
+  # A linked image nests one link inside another; both destinations count.
+  # Checking only the inner one meant the page a reader actually clicks
+  # through to went unchecked — this is how README's `](LICENSE)` badge, whose
+  # target does not exist, went unnoticed.
+  local c24="$tmp/c24"; make_corpus "$c24"
+  printf 'x\n' > "$c24/docs/guide/diagram.png"
+  printf '\n[![diagram](diagram.png)](no-such-page.md)\n' >> "$c24/docs/guide/mail.md"
+  git -C "$c24" add -A && git -C "$c24" commit -qm linked-image-outer
+  check "outer target of a linked image is checked" fail "$c24"
+
+  local c25="$tmp/c25"; make_corpus "$c25"
+  printf '\n[![diagram](no-such-image.png)](jobs.md)\n' >> "$c25/docs/guide/mail.md"
+  git -C "$c25" commit -qam linked-image-inner
+  check "inner target of a linked image is still checked" fail "$c25"
+
+  # Dedenting out of a nested item stays inside the parent item, so a fence
+  # indented for the parent is still a fence.
+  local c26="$tmp/c26"; make_corpus "$c26"
+  printf '\n- outer\n\n  - inner item\n\n  back to outer content\n\n    ```md\n    [x](totally-made-up.md)\n    ```\n' \
+    >> "$c26/docs/guide/mail.md"
+  git -C "$c26" commit -qam parent-list-fence
+  check "fence indented for a parent list item is stripped" pass "$c26"
+
+  # A code span may be delimited by a run of backticks.
+  local c27="$tmp/c27"; make_corpus "$c27"
+  printf '\nSee ``a span with [x](totally-made-up.md) inside`` here.\n' \
+    >> "$c27/docs/guide/mail.md"
+  git -C "$c27" commit -qam multi-backtick-span
+  check "multi-backtick code span is stripped" pass "$c27"
+
+  # A closing fence carries only whitespace. Accepting ```text as a closer
+  # turns the real closer into an opener, hiding everything after it.
+  local c28="$tmp/c28"; make_corpus "$c28"
+  printf '\n```\n```not-a-closer\n```\n\nLive [bad](missing.md) after the block.\n' \
+    >> "$c28/docs/guide/mail.md"
+  git -C "$c28" commit -qam fence-trailing-text
+  check "text after a closing fence does not hide later links" fail "$c28"
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]]
