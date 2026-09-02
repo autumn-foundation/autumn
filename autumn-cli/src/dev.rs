@@ -151,6 +151,63 @@ const fn cooperative_stop_budget(drain_secs: u64) -> Duration {
     Duration::from_secs(drain_secs).saturating_add(COOPERATIVE_STOP_HOOK_HEADROOM)
 }
 
+/// The stop budget recorded when the currently-running child was spawned, in
+/// seconds. `0` means "nothing recorded".
+///
+/// `autumn.toml` is a watched file, so the stop that follows an edit runs
+/// against the NEW config while the child being stopped is still running under
+/// the old one. Recording at spawn keeps the two in step; re-resolving at stop
+/// would grade the outgoing child against config it never saw — and a half-saved
+/// `autumn.toml` would collapse to the defaults, force-killing an app that is
+/// still legitimately draining.
+static CHILD_STOP_BUDGET_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record the budget for the child about to be spawned.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn record_child_stop_budget(budget: Duration) {
+    CHILD_STOP_BUDGET_SECS.store(budget.as_secs(), Ordering::SeqCst);
+}
+
+/// The budget recorded at the last spawn, if any.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn recorded_child_stop_budget() -> Option<Duration> {
+    match CHILD_STOP_BUDGET_SECS.load(Ordering::SeqCst) {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    }
+}
+
+/// The budget to stop the running child with.
+///
+/// Prefers the value `recorded` when that child was spawned, and only resolves
+/// from config (`resolve_now`) when nothing was recorded. Split out as a pure
+/// function so the "must not re-read a just-edited config" rule is testable.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn stop_budget_for_running_child(
+    recorded: Option<Duration>,
+    resolve_now: impl FnOnce() -> Duration,
+) -> Duration {
+    recorded.unwrap_or_else(resolve_now)
+}
+
 /// This app's cooperative-stop budget, resolved from its own configuration.
 ///
 /// Delegates to the same profile-aware resolver `autumn serve stop` uses, so the
@@ -465,6 +522,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
     let binary = find_binary(package, false);
     let mut child = start_server(
         &binary,
+        package,
         reload_state.as_ref().map(DevReloadState::path),
         show_config,
     );
@@ -1048,9 +1106,14 @@ pub fn cargo_build(package: Option<&str>, release: bool) -> bool {
 /// Start the application binary. Returns the child process handle.
 fn start_server(
     binary: &Path,
+    package: Option<&str>,
     reload_state_path: Option<&Path>,
     show_config: bool,
 ) -> Option<Child> {
+    // Only the non-Unix stop path consults the recorded budget; on Unix the
+    // parameter is carried for a uniform signature.
+    #[cfg(unix)]
+    let _ = package;
     eprintln!("  Starting server...\n");
 
     // Resolve `.env` fresh right before each spawn so a hot-reload restart
@@ -1099,6 +1162,11 @@ fn start_server(
     if let Some(signal_path) = dev_shutdown_signal_path() {
         clear_cooperative_shutdown(signal_path);
         command.env(DEV_SHUTDOWN_SIGNAL_ENV, signal_path);
+        // Resolve the child's stop budget from the config it is about to boot
+        // with, and keep it for the stop. `autumn.toml` is watched, so by the
+        // time this child is stopped the file may say something different — and
+        // the child would still be draining on these numbers.
+        record_child_stop_budget(resolve_cooperative_stop_budget(package));
     }
 
     match command.spawn() {
@@ -1163,7 +1231,9 @@ fn stop_server_cooperative(child: &mut Option<Child>, package: Option<&str>) {
         *child = None;
         return;
     };
-    let budget = resolve_cooperative_stop_budget(package);
+    let budget = stop_budget_for_running_child(recorded_child_stop_budget(), || {
+        resolve_cooperative_stop_budget(package)
+    });
     match stop_child_cooperatively(child, signal_path, budget) {
         StopOutcome::Escalated => eprintln!("{}", escalation_warning(budget)),
         StopOutcome::Unreachable => eprintln!(
@@ -1395,7 +1465,7 @@ fn restart_server(
     show_config: bool,
 ) -> bool {
     let binary = find_binary(package, false);
-    *child = start_server(&binary, reload_state_path, show_config);
+    *child = start_server(&binary, package, reload_state_path, show_config);
     child.is_some()
 }
 
@@ -2008,6 +2078,48 @@ mod tests {
         assert!(budget >= Duration::from_secs(60), "{budget:?}");
     }
 
+    // ── The budget must belong to the RUNNING child (#1616, Codex round 3) ──
+    //
+    // `autumn.toml` is a watched file, so `execute_plan` reaches the stop only
+    // AFTER the edit that triggered it has landed. Resolving the budget there
+    // grades the outgoing child against the incoming config: lower
+    // `shutdown_timeout_secs` from 300 to 1 and the parent force-kills a child
+    // that is still legitimately inside its original 300s drain — and a
+    // half-saved (malformed) `autumn.toml` collapses to the defaults with the
+    // same effect. Either way the `on_shutdown` hooks are skipped and the
+    // managed cluster is orphaned, which is the bug this all exists to prevent.
+
+    #[test]
+    fn the_stop_budget_uses_the_value_recorded_when_the_child_was_spawned() {
+        let recorded = Some(Duration::from_secs(300));
+        let budget = stop_budget_for_running_child(recorded, || Duration::from_secs(95));
+        assert_eq!(budget, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn the_stop_budget_does_not_re_read_config_when_one_was_recorded() {
+        // Not just "returns the right number": it must not touch the config at
+        // all, or a malformed save mid-edit could still influence the stop.
+        let consulted = std::cell::Cell::new(false);
+        let _ = stop_budget_for_running_child(Some(Duration::from_secs(300)), || {
+            consulted.set(true);
+            Duration::from_secs(95)
+        });
+        assert!(
+            !consulted.get(),
+            "a recorded budget must not re-read the (possibly just-edited) config"
+        );
+    }
+
+    #[test]
+    fn the_stop_budget_falls_back_when_nothing_was_recorded() {
+        // No child was spawned through `start_server` this session (or the
+        // spawn predates the recording); resolving now is the best available
+        // answer and is still better than a fixed constant.
+        let budget = stop_budget_for_running_child(None, || Duration::from_secs(95));
+        assert_eq!(budget, Duration::from_secs(95));
+    }
+
     #[test]
     fn the_resolved_budget_covers_an_unconfigured_project() {
         // Resolving against a directory with no `autumn.toml` must still yield a
@@ -2506,14 +2618,14 @@ mod tests {
 
     #[test]
     fn start_server_returns_none_for_missing_binary() {
-        let result = start_server(Path::new("/nonexistent/binary/path"), None, false);
+        let result = start_server(Path::new("/nonexistent/binary/path"), None, None, false);
         assert!(result.is_none());
     }
 
     #[cfg(unix)]
     #[test]
     fn start_server_returns_child_for_valid_binary() {
-        let child = start_server(Path::new("/bin/sleep"), None, false);
+        let child = start_server(Path::new("/bin/sleep"), None, None, false);
         assert!(child.is_some());
         // Clean up
         let mut child = child.unwrap();
