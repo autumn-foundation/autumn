@@ -3189,9 +3189,16 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                     }
                     // Charged for what is actually copied, not for what was
                     // asked: `take_stdin` bounds the copy at
-                    // `HOST_IO_CHUNK_BYTES`, and pricing the whole iovec would
-                    // bill the guest for bytes it did not get.
-                    let take = HOST_IO_CHUNK_BYTES.min(length);
+                    // `HOST_IO_CHUNK_BYTES` and by what is left, and pricing
+                    // the whole iovec would bill the guest for bytes it did not
+                    // get. The queue's remaining length belongs in the minimum
+                    // for the same reason the chunk ceiling does — a guest
+                    // reading the tail of its frame through an ordinary large
+                    // buffer would otherwise pay a full chunk for a few bytes,
+                    // and a tight but sufficient budget could fail on it.
+                    let take = HOST_IO_CHUNK_BYTES
+                        .min(length)
+                        .min(caller.data().stdin.len());
                     charge_bytes(&mut caller, take)?;
                     let chunk = caller.data_mut().take_stdin(take);
                     if memory.write(&mut caller, pointer, &chunk).is_err() {

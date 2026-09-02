@@ -225,29 +225,38 @@ fn redirect_target_allowed(target: &str, prefix: &str, owned: &OwnedRoutes) -> b
 /// handler, chosen by the guest. The manifest is the mount, so the routes it
 /// declares are exactly the ones a redirect may name.
 ///
-/// Built once per host rather than per response: the paths are fixed at load,
-/// and the manifest validator has already proved they insert without
-/// conflicting.
-pub struct OwnedRoutes(matchit::Router<()>);
+/// Compared as *literals*, not as templates, and that is the whole subtlety.
+/// A template would answer the wrong question: matchit gives a literal route
+/// priority over a parameter at the same position, and the router's collision
+/// preflight only refuses `matchit::InsertError::Conflict`, which a literal
+/// beside a parameter is not. So an application `POST /hello/transfer` mounts
+/// happily beside a plugin's `POST /hello/{id}`, and matching the target
+/// against the plugin's template would call `/hello/transfer` the plugin's
+/// while routing hands it to the application — the very confusion this exists
+/// to prevent, restored one level down.
+///
+/// Answering "does the combined router send this to me?" needs the
+/// application's routes, which a host built from an artifact alone does not
+/// have. Literal equality is the conservative half that can be answered here:
+/// it is never wider than the truth. It costs a plugin the ability to redirect
+/// into its own dynamic route, which is worth saying out loud — closing that
+/// properly means reserving these overlaps against plugins in the router,
+/// where both route sets are known.
+///
+/// Built once per host: the set is fixed at load.
+pub struct OwnedRoutes(Vec<String>);
 
 impl OwnedRoutes {
-    /// Build the matcher from a manifest's declared paths.
+    /// Build the set from a manifest's declared paths.
     #[must_use]
     pub fn from_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Self {
-        let mut router = matchit::Router::new();
-        for path in paths {
-            // Two methods on one path is one template, and the validator has
-            // already refused a genuine conflict — so a repeat here is expected
-            // and the insert error is the right thing to drop.
-            drop(router.insert(path, ()));
-        }
-        Self(router)
+        Self(paths.into_iter().map(str::to_owned).collect())
     }
 
-    /// Does this plugin serve this exact path?
+    /// Does this plugin declare this exact path?
     #[must_use]
     fn owns(&self, path: &str) -> bool {
-        self.0.at(path).is_ok()
+        self.0.iter().any(|declared| declared == path)
     }
 }
 
@@ -808,13 +817,56 @@ mod tests {
     /// them a plugin that owns the whole prefix keeps them measuring what they
     /// were written to measure; ownership has its own test.
     fn any_route_under_hello() -> OwnedRoutes {
-        OwnedRoutes::from_paths(["/hello", "/hello/{*rest}"])
+        OwnedRoutes::from_paths([
+            "/hello",
+            "/hello/..",
+            "/hello/.. ",
+            "/hello/a b",
+            "/hello/a%20b",
+            "/hello/greet",
+        ])
     }
 
     /// The route set the sanitation tests mount against: what a hello plugin
     /// declares, and nothing the application might also serve under `/hello`.
     fn hello_routes() -> OwnedRoutes {
         OwnedRoutes::from_paths(["/hello", "/hello/greet", "/hello/items/{id}"])
+    }
+
+    /// A plugin declaring a dynamic route does not thereby own every literal
+    /// that route would match.
+    ///
+    /// matchit gives a literal priority over a parameter at the same position,
+    /// and the router's collision preflight only refuses a matchit `Conflict` —
+    /// which a literal beside a parameter is not. So an application
+    /// `/hello/items/7` can mount beside a plugin's `/hello/items/{id}`, and a
+    /// template-matching ownership test would call that path the plugin's while
+    /// routing hands it to the application.
+    #[test]
+    fn a_dynamic_declaration_does_not_own_the_literals_it_would_match() {
+        let shadowed = SandboxResponse {
+            status: 307,
+            headers: vec![("location".to_owned(), "/hello/items/7".to_owned())],
+            body: Vec::new(),
+        };
+        let (clean, denied) = shadowed.sanitize("/hello", &hello_routes());
+        assert!(
+            clean.headers.is_empty(),
+            "a target reached only through the plugin's own template must be \
+             refused: the application may hold the literal, and routing prefers it",
+        );
+        assert_eq!(denied, vec!["location".to_owned()], "and recorded");
+
+        // The declared literal beside it is unaffected, so this narrows what a
+        // template confers rather than what a plugin declared.
+        let declared = SandboxResponse {
+            status: 307,
+            headers: vec![("location".to_owned(), "/hello/greet".to_owned())],
+            body: Vec::new(),
+        };
+        let (clean, denied) = declared.sanitize("/hello", &hello_routes());
+        assert_eq!(clean.headers.len(), 1, "a declared literal must still pass");
+        assert!(denied.is_empty());
     }
 
     #[test]
@@ -844,12 +896,7 @@ mod tests {
 
         // Its own routes stay: a plugin redirecting within what it serves is
         // the case this rule exists to keep working.
-        for target in [
-            "/hello",
-            "/hello/greet",
-            "/hello/greet?x=1",
-            "/hello/items/7",
-        ] {
+        for target in ["/hello", "/hello/greet", "/hello/greet?x=1"] {
             let own = SandboxResponse {
                 status: 307,
                 headers: vec![("location".to_owned(), target.to_owned())],

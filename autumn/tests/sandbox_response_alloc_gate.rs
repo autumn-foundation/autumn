@@ -37,8 +37,11 @@ const VALUE_BYTES: usize = 512 * 1024;
 /// the value survives the check, so nothing about the outcome reveals what
 /// answering cost. A narrower route set would have it refused, and the gate
 /// would be measuring the refusal path instead.
-fn owns_the_prefix() -> OwnedRoutes {
-    OwnedRoutes::from_paths(["/hello", "/hello/{*rest}"])
+fn owns_the_prefix(long: &str) -> OwnedRoutes {
+    // Declared literally, because ownership is literal: a template would not
+    // confer it, and the redirect fixture has to stay permitted for the gate to
+    // measure what it was written to measure.
+    OwnedRoutes::from_paths(["/hello", "/hello/ok", long])
 }
 
 const fn response(headers: Vec<(String, String)>) -> SandboxResponse {
@@ -55,28 +58,27 @@ fn deciding_a_redirect_stays_in_the_prefix_does_not_copy_the_path() {
     // whole thing at once. It is a *permitted* redirect — inside the prefix,
     // no climbing — which is the point: the value survives, so nothing about
     // the outcome reveals that answering cost a copy of it.
-    let long = format!("/hello/{}", "a".repeat(VALUE_BYTES));
+    let long_path = format!("/hello/{}", "a".repeat(VALUE_BYTES));
     let small = "/hello/ok".to_owned();
 
-    let long_response = response(vec![("location".to_owned(), long)]);
+    let long_response = response(vec![("location".to_owned(), long_path.clone())]);
     let small_response = response(vec![("location".to_owned(), small)]);
+
+    // Built once, outside every window: the host builds it once per plugin, and
+    // building it inside would charge both measurements for a copy of the very
+    // path whose copying is the thing under test.
+    let owned = owns_the_prefix(&long_path);
 
     // Warm-up outside the windows: whatever the first call sets up, neither
     // measurement should be charged for.
-    drop(
-        small_response
-            .clone()
-            .sanitize("/hello", &owns_the_prefix()),
-    );
+    drop(small_response.clone().sanitize("/hello", &owned));
 
     let baseline = allocation_counter::measure(|| {
-        let out = small_response
-            .clone()
-            .sanitize("/hello", &owns_the_prefix());
+        let out = small_response.clone().sanitize("/hello", &owned);
         std::hint::black_box(&out);
     });
     let measured = allocation_counter::measure(|| {
-        let out = long_response.clone().sanitize("/hello", &owns_the_prefix());
+        let out = long_response.clone().sanitize("/hello", &owned);
         std::hint::black_box(&out);
     });
 
