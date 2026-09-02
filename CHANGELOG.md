@@ -9,6 +9,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A proven capacity contract that travels with the build (#1733):** autumn
+  already shed load once too many requests were in flight, but the ceiling it
+  enforced was a hand-tuned guess in `autumn.toml`, and nothing told an operator
+  what a given binary could actually sustain before they deployed it. Capacity
+  planning was a spreadsheet and a hope. Now it is a lockfile:
+
+  ```sh
+  autumn calibrate          # measure → capacity.lock
+  autumn calibrate --check  # gate a rebuild against the committed contract
+  ```
+
+  `autumn calibrate` builds the app in release mode, reads its route graph back
+  through the same `AUTUMN_DUMP_ROUTES` pipeline `autumn routes` uses, boots it
+  with admission control switched off (so the run measures the app, not a
+  ceiling it was already carrying), and walks a seeded concurrency ladder. The
+  **saturation knee** — the last rung where more concurrency still bought
+  materially more throughput — becomes the recorded envelope:
+
+  ```toml
+  [envelope]
+  sustained_rps = 4210.5
+  p99_latency_ms = 18.42
+  saturation_concurrency = 64
+  admission_limit = 128
+
+  [[routes]]
+  method = "GET"
+  path = "/posts"
+  shape = "db-bound"
+  pools = ["db"]
+  ```
+
+  Each route's `shape` is derived **statically**, at macro-expansion time, from
+  the extractors its handler declares — a provable subset, so a route reading
+  `compute-bound` means "no pool proven", never "no pool touched". Committing
+  the contract makes `autumn calibrate --check` a CI gate that fails with a
+  human-readable diff when a rebuild leaves the envelope, and pointing
+  `[server] capacity_contract` at it makes the binary admit against its own
+  proven edge instead of a guess:
+
+  ```toml
+  [server]
+  capacity_contract = "capacity.lock"
+  ```
+
+  The contract also records the workload that produced it — profile, Cargo
+  features, seed, ladder, rung duration and repeat count — and `--check`
+  replays all of it rather than its own defaults, since an envelope only means
+  something next to the experiment behind it. Each rung is measured three times
+  and the median kept: a single sample per rung spread by up to 20% across
+  no-op rebuilds of an identical build on a shared runner, which is wider than
+  the regression tolerance itself. Setting
+  `[server] capacity_contract` also makes `autumn deploy` ship the contract
+  alongside the manifest that names it.
+
+  Both the gate and the runtime refuse to compare envelopes across host classes,
+  and every failure along the contract path (missing file, malformed document,
+  a contract from another machine, a recorded limit of `0`) degrades to
+  *unlimited* with a warning rather than to a ceiling — failing closed would
+  mean a typo'd path sheds every request on the way up. An explicit
+  `server.max_concurrent_requests` always wins, including an explicit `0`. See
+  [docs/guide/capacity-contracts.md](docs/guide/capacity-contracts.md).
 - **Authored, seeded fault scenarios you can commit as regression tests
   (#1680):** the simulation harness could already inject faults, but only
   *probabilistically* — `Chaos::db_transient_errors(0.05)` says "5% of

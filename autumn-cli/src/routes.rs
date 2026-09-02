@@ -46,6 +46,16 @@ pub struct RouteInfo {
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sunset_opt_out: Option<bool>,
+    /// Statically derived resource character of the route (issue #1733).
+    ///
+    /// Carried so `autumn routes --format json` re-serializes the dump it read
+    /// instead of silently dropping a field `autumn calibrate` relies on —
+    /// two readers of the same dump must not disagree about its shape.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resource_shape: String,
+    /// Pool tags the route's handler provably touches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<String>,
 }
 
 /// Options controlling `autumn routes` behaviour.
@@ -503,6 +513,8 @@ mod tests {
             api_version: None,
             status: None,
             sunset_opt_out: None,
+            resource_shape: String::new(),
+            pools: Vec::new(),
         }
     }
 
@@ -703,6 +715,8 @@ mod tests {
             api_version: None,
             status: None,
             sunset_opt_out: None,
+            resource_shape: String::new(),
+            pools: Vec::new(),
         };
         let table = format_table(&[route]);
         assert!(table.contains("secured"), "missing middleware label");

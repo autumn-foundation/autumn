@@ -56,6 +56,7 @@
 //! | `AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS` | `server.upgrade.ready_timeout_secs` | `u64` |
 //! | `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS` | `server.timeouts.request_timeout_ms` | `u64` |
 //! | `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` | `usize` |
+//! | `AUTUMN_SERVER__CAPACITY_CONTRACT` | `server.capacity_contract` | `String` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` | `String` |
 //! | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` | `String` |
@@ -5228,6 +5229,11 @@ impl AutumnConfig {
             "AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS",
             &mut self.server.max_concurrent_requests,
         );
+        parse_env_option_string(
+            env,
+            "AUTUMN_SERVER__CAPACITY_CONTRACT",
+            &mut self.server.capacity_contract,
+        );
 
         // `[server.tls]` is a nested optional. Materialize it from the
         // environment when any of its keys are set (seeding an empty struct if
@@ -6542,6 +6548,25 @@ pub struct ServerConfig {
     /// Configured via `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS`.
     #[serde(default)]
     pub max_concurrent_requests: Option<usize>,
+
+    /// Path to the committed capacity contract (`capacity.lock`) this deploy
+    /// should admit against (issue #1733).
+    ///
+    /// When set — and [`Self::max_concurrent_requests`] is *not* — the
+    /// load-shedding ceiling is sourced from the contract's proven envelope
+    /// instead of a hand-tuned guess, so the binary sheds at the edge someone
+    /// actually measured. Relative paths resolve against the process working
+    /// directory.
+    ///
+    /// An explicit `max_concurrent_requests` always wins, and every failure
+    /// along the contract path (missing file, malformed document, a contract
+    /// measured on a different host class) degrades to *unlimited* with a
+    /// warning rather than to a ceiling — see
+    /// [`capacity::resolve_admission_limit`](crate::capacity::resolve_admission_limit).
+    ///
+    /// Configured via `AUTUMN_SERVER__CAPACITY_CONTRACT`.
+    #[serde(default)]
+    pub capacity_contract: Option<String>,
 
     /// Terminate HTTPS directly in the app process (issue #1603).
     ///
@@ -8663,6 +8688,7 @@ impl Default for ServerConfig {
             timeouts: RequestTimeoutsConfig::default(),
             unix_socket: None,
             max_concurrent_requests: None,
+            capacity_contract: None,
             tls: None,
         }
     }
@@ -14646,6 +14672,40 @@ path = "/healthz"
             "ops@example.com",
         ));
         assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    // ── server.capacity_contract (#1733) ───────────────────────────────
+
+    #[test]
+    fn server_config_defaults_capacity_contract_none() {
+        let config = AutumnConfig::default();
+        assert!(config.server.capacity_contract.is_none());
+    }
+
+    #[test]
+    fn capacity_contract_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server]
+            capacity_contract = "capacity.lock"
+            "#,
+        )
+        .expect("config with server.capacity_contract should parse");
+        assert_eq!(
+            config.server.capacity_contract.as_deref(),
+            Some("capacity.lock")
+        );
+    }
+
+    #[test]
+    fn env_override_server_capacity_contract() {
+        let env = MockEnv::new().with("AUTUMN_SERVER__CAPACITY_CONTRACT", "deploy/capacity.lock");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.server.capacity_contract.as_deref(),
+            Some("deploy/capacity.lock")
+        );
     }
 
     // ── server.max_concurrent_requests (#1006) ────────────────────
