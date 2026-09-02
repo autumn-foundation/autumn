@@ -162,7 +162,14 @@ fn replicate_two_batches(root_dir: &Path) -> PathBuf {
 
     // Machine A is now irrelevant: delete it outright so nothing below can
     // accidentally read from it.
+    //
+    // The replicator has to go first, and not just the test's own connection:
+    // it pins a connection of its own for the whole of its life (so SQLite
+    // never runs the "last connection closing" checkpoint behind its back), and
+    // Windows refuses to unlink a file that any handle still holds open. On
+    // Linux the unlink would quietly succeed and hide the leak.
     drop(conn);
+    drop(replicator);
     std::fs::remove_dir_all(&source_dir).expect("destroy machine A");
     replica
 }
