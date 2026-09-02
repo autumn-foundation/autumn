@@ -134,6 +134,7 @@ copy of the publish order.
 | `#[throttle]` | Per-route rate limit — inline (`limit`/`per`/`key`) or named (`#[throttle("login")]`) (**0.6.0**) |
 | `#[event]`, `#[listener]`, `listeners![...]` | Typed domain event bus (**0.6.0**) — publish via the `Events` extractor, register with `.listeners(...)` |
 | `#[query_budget(N)]` | Compile-time per-route database query ceiling — the build fails when a reachable path can exceed `N` (trunk-dev, #1667). Escape hatches: `#[query_budget(unbounded, reason = "…")]`, and `#[query_cost(N)]` / `#[query_exempt(reason = "…")]` on a statement |
+| `authority_grant! { pub Name { … } }`, `#[agent_operable(grant = Name)]` | Build-time agent authority envelope (trunk-dev, #1691). The grant declares `writes`, `unbounded_writes`, `tenant_scope: scoped \| cross_tenant \| none`, `outbound` (literal URL prefixes or `alias:<name>`), `webhooks`, `jobs`, `rate`, `spend`, and a required `reversibility: reversible \| compensable \| irreversible`; the attribute statically derives the handler's effect set and the build fails at the offending call when the grant does not cover it. `#[agent_effect(writes(Model), …, reason = "…")]` / `#[agent_effect(none, reason = "…")]` on a statement declares what the analysis cannot read — it never grants. Requires nothing at runtime; pairs with `#[api_doc(mcp)]` |
 
 Route macros accept a `seo(...)` argument declaring per-page meta tag defaults
 (0.7.0, #1182):
@@ -1014,7 +1015,8 @@ double-submits and replays.
 - Route macros: `get`, `post`, `put`, `patch`, `delete`, `routes`, `main`,
   `static_get`, `static_routes`, `scheduled`, `tasks`, `job`, `jobs`, `task`,
   `one_off_tasks`, `secured`, `authorize`, `service`, `cached`, `api_doc`,
-  `oauth2_callback`, `paths`, `step_up`, `query_budget`, `ws` (when `ws`
+  `oauth2_callback`, `paths`, `step_up`, `query_budget`, `agent_operable`,
+  `authority_grant` (#1691), `ws` (when `ws`
   feature enabled).
   **Note**: `#[model]` and `#[repository]` are NOT in the prelude — use
   `#[autumn_web::model]` and `#[autumn_web::repository]` (qualified paths).
