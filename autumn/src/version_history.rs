@@ -973,6 +973,7 @@ mod tests {
 
     /// `(label, before, after, sensitive)` cases exercised by both the
     /// borrowed and the owned diff path.
+    #[allow(clippy::too_many_lines)] // a case table; splitting it would only hide cases
     fn diff_parity_cases() -> Vec<(
         &'static str,
         serde_json::Value,

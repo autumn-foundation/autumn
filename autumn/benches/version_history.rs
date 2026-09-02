@@ -169,7 +169,10 @@ fn report_delta(name: &str, borrowed: Option<Timing>, owned: Option<Timing>) {
         "  {name}: {} -> {} ns/op ({pct:+.1}%, owned is {verdict})",
         borrowed.median, owned.median
     );
-    if owned.max > borrowed.min {
+    // Interval overlap needs *both* bounds: `owned.max > borrowed.min` alone is
+    // also true when owned is uniformly slower (borrowed 400-450, owned
+    // 600-650), which would file a conclusive regression as mere noise.
+    if owned.min <= borrowed.max && borrowed.min <= owned.max {
         println!(
             "    note: the two ranges overlap ({}-{} vs {}-{}); treat this row as indicative",
             borrowed.min, borrowed.max, owned.min, owned.max
