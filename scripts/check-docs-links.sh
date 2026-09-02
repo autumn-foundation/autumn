@@ -54,7 +54,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 run_check() {
   local dir="$1"
   python3 - "$dir" <<'PYEOF'
-import os, re, subprocess, sys, collections
+import os, re, subprocess, sys, collections, urllib.parse
 
 root = sys.argv[1]
 
@@ -94,7 +94,7 @@ DEST = r'\(\s*(?:<([^<>]*)>|(' + BARE + r'))' + TITLE + r'\s*\)'
 FLAT = r'(?:[^\[\]\\]|\\.)'
 INLINE = re.compile(r'\[' + FLAT + r'*\]' + DEST)
 NESTED = re.compile(r'\[(?:' + FLAT + r'|\[' + FLAT + r'*\])*\]' + DEST)
-REFDEF = re.compile(r'^ {0,3}\[[^\]]+\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
+REFDEF = re.compile(r'^ {0,3}\[' + FLAT + r'+\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
 
 
 # Markdown drops the backslash from an escaped ASCII punctuation character in
@@ -244,8 +244,17 @@ CODE_SPAN = re.compile(r'(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)')
 HTML_COMMENT = re.compile(r'<!--.*?-->', re.S)
 
 
+def blank_comments(text):
+    """Replace comments with as many newlines as they spanned.
+
+    Line positions must survive: Setext detection reads the line above an
+    underline, so collapsing a comment would splice unrelated lines together.
+    """
+    return HTML_COMMENT.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+
+
 def strip_code(text):
-    return CODE_SPAN.sub('', HTML_COMMENT.sub('', strip_fences(text)))
+    return CODE_SPAN.sub('', blank_comments(strip_fences(text)))
 
 
 def slugify(heading):
@@ -280,11 +289,19 @@ def read(path):
 
 
 anchors = {}
+undecodable = []
 for f in files:
     text = read(os.path.join(root, f))
     if text is None:
+        # Skipping in silence is the one outcome a gate must never have: the
+        # file stays in the corpus count while nothing in it is checked, so a
+        # broken link inside it reports success. Same failure as the
+        # whitespace-split path bug. Report it instead.
+        undecodable.append(f)
         continue
-    body = strip_fences(text)
+    # Comments are stripped here too: a `## Phantom` inside one renders no
+    # anchor, and indexing it would make a broken link look resolved.
+    body = blank_comments(strip_fences(text))
     lines = body.splitlines()
 
     # Skip YAML front matter. Its closing `---` sits directly under a content
@@ -343,7 +360,11 @@ for f in files:
         found.add(m.group(1))
     anchors[f] = found
 
-defects = []
+defects = [
+    f"{f}: cannot decode (not UTF-8, and no UTF-16/UTF-8 BOM) — nothing in "
+    f"this file was checked"
+    for f in undecodable
+]
 for f in files:
     text = read(os.path.join(root, f))
     if text is None:
@@ -365,7 +386,16 @@ for f in files:
         path = path.split("?")[0]
         if not path:
             continue
+        # A rendered link is a URL: `a%20b.md` addresses the file `a b.md`.
+        path = urllib.parse.unquote(path)
         resolved = os.path.normpath(os.path.join(os.path.dirname(os.path.join(root, f)), path))
+        # A destination that climbs out of the checkout resolves against the
+        # runner's filesystem, so `../../../../etc/passwd` "exists" and passes
+        # while the rendered link reaches nothing. Existence off-tree is not
+        # evidence of anything.
+        if resolved != root and not resolved.startswith(root + os.sep):
+            defects.append(f"{f}: link target escapes the repository: `{t}`")
+            continue
         if not os.path.exists(resolved):
             defects.append(f"{f}: link target does not exist: `{t}`")
             continue
@@ -675,6 +705,40 @@ self_test() {
   printf 'See [third](jobs.md#foo-1-1).\n' >> "$c35/docs/guide/mail.md"
   git -C "$c35" commit -qam slug-collision
   check "duplicate-slug suffix does not collide with a real heading" pass "$c35"
+
+  # A reference definition's label honours escapes like an inline one.
+  local c36="$tmp/c36"; make_corpus "$c36"
+  printf '\nSee [x][closing \\]].\n\n[closing \\]]: missing.md\n' >> "$c36/docs/guide/mail.md"
+  git -C "$c36" commit -qam refdef-escaped-label
+  check "escaped bracket in a reference definition is parsed" fail "$c36"
+
+  # Existence off-tree is not evidence: a link climbing out of the checkout
+  # resolves against the runner's filesystem and would otherwise "pass".
+  local c37="$tmp/c37"; make_corpus "$c37"
+  printf '\nSee [host](../../../../../../etc/passwd).\n' >> "$c37/docs/guide/mail.md"
+  git -C "$c37" commit -qam escapes-repository
+  check "link climbing out of the repository is rejected" fail "$c37"
+
+  # A file that cannot be decoded must be reported, never skipped in silence:
+  # it stays in the corpus count while nothing in it is checked.
+  local c38="$tmp/c38"; make_corpus "$c38"
+  printf '# Latin\n\nCaf\xe9 and [x](missing.md).\n' > "$c38/docs/guide/latin.md"
+  git -C "$c38" add -A && git -C "$c38" commit -qm undecodable
+  check "undecodable file is reported, not skipped" fail "$c38"
+
+  # A heading inside an HTML comment renders no anchor.
+  local c39="$tmp/c39"; make_corpus "$c39"
+  printf '\n<!--\n## Phantom\n-->\n' >> "$c39/docs/guide/jobs.md"
+  printf 'See [p](jobs.md#phantom).\n' >> "$c39/docs/guide/mail.md"
+  git -C "$c39" commit -qam commented-heading
+  check "heading inside an HTML comment is not an anchor" fail "$c39"
+
+  # A rendered link is a URL: `a%20b.md` addresses the file `a b.md`.
+  local c40="$tmp/c40"; make_corpus "$c40"
+  printf 'x\n' > "$c40/docs/guide/a b.md"
+  printf '\nSee [enc](a%%20b.md).\n' >> "$c40/docs/guide/mail.md"
+  git -C "$c40" add -A && git -C "$c40" commit -qm percent-encoded
+  check "percent-encoded destination resolves" pass "$c40"
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]]
