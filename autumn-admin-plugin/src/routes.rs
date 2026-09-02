@@ -807,14 +807,14 @@ async fn model_create(
     let submitted = strip_meta_fields(form_data, &fields, false);
     let form_data = match coerce_form_fields(submitted, &fields) {
         Ok(v) => v,
-        Err((partial, field_name, msg)) => {
+        Err((partial, field_names, msg)) => {
             return Ok(invalid_form_response(
                 &registry,
                 &slug,
                 model,
                 &fields,
                 &partial,
-                &[field_name],
+                &field_names,
                 msg,
                 None,
                 &csrf,
@@ -1101,7 +1101,7 @@ async fn model_update(
     let submitted = strip_meta_fields(form_data, &fields, true);
     let form_data = match coerce_form_fields(submitted, &fields) {
         Ok(v) => v,
-        Err((partial, field_name, msg)) => {
+        Err((partial, field_names, msg)) => {
             let display = merge_with_stored_record(model, &pool, id, &partial).await;
             return Ok(invalid_form_response(
                 &registry,
@@ -1109,7 +1109,7 @@ async fn model_update(
                 model,
                 &fields,
                 &display,
-                &[field_name],
+                &field_names,
                 msg,
                 Some(id),
                 &csrf,
@@ -1680,31 +1680,38 @@ fn strip_meta_fields(mut data: Value, fields: &[AdminField], for_update: bool) -
 
 /// Coerce every field's raw form-string value to its declared type.
 ///
-/// On the first field that fails to coerce (currently only possible for
-/// `Json`), stops and returns the partially-coerced `data` alongside the
-/// failing field's name and message — rather than discarding it — so a
-/// caller redisplaying the form after a validation failure can show every
-/// other field's value normally and single out just the one that didn't
-/// parse (see `render_form_widget`'s `raw_fields`).
+/// Attempts every field regardless of earlier failures (currently only
+/// possible for `Json`) — never stops at the first one — so a field
+/// declared after a malformed one still comes back properly typed rather
+/// than redisplaying with its pre-coercion raw string (e.g. a checked
+/// `Boolean` appearing unchecked, or a valid JSON object getting
+/// re-quoted). Returns the fully-attempted `data` alongside every failing
+/// field's name and a combined message on error — rather than discarding
+/// it — so a caller redisplaying the form after a validation failure can
+/// show every successfully coerced field normally and single out just the
+/// field(s) that didn't parse (see `render_form_widget`'s `raw_fields`;
+/// Codex review, PR #2422).
 fn coerce_form_fields(
     mut data: Value,
     fields: &[AdminField],
-) -> Result<Value, (Value, &'static str, String)> {
-    let mut failure: Option<(&'static str, String)> = None;
+) -> Result<Value, (Value, Vec<&'static str>, String)> {
+    let mut failed_names = Vec::new();
+    let mut messages = Vec::new();
     if let Some(obj) = data.as_object_mut() {
         for field in fields {
             let Some(value) = obj.get_mut(field.name) else {
                 continue;
             };
             if let Err(msg) = coerce_form_value(value, field) {
-                failure = Some((field.name, msg));
-                break;
+                failed_names.push(field.name);
+                messages.push(msg);
             }
         }
     }
-    match failure {
-        Some((field_name, msg)) => Err((data, field_name, msg)),
-        None => Ok(data),
+    if messages.is_empty() {
+        Ok(data)
+    } else {
+        Err((data, failed_names, messages.join("; ")))
     }
 }
 
@@ -1860,6 +1867,7 @@ mod tests {
                 AdminField::new("api_key", AdminFieldKind::Text)
                     .optional()
                     .encrypted(),
+                AdminField::new("published", AdminFieldKind::Boolean).optional(),
             ]
         }
         fn list(
@@ -2053,6 +2061,38 @@ mod tests {
         assert!(
             !html.contains("••••••••"),
             "encrypted field must not show the edit-only redaction mask on create: {html}"
+        );
+        // The admin's just-typed secret must not round-trip back into the
+        // response body (Codex review, PR #2422) — the control stays
+        // enabled and submittable, but blank, so they retype it.
+        assert!(
+            !html.contains("sk-live-123"),
+            "encrypted field's plaintext must not leak into the redisplayed HTML: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_create_malformed_json_keeps_other_fields_coerced() {
+        // Codex review, PR #2422: coercion used to stop at the first
+        // failure, leaving every later field's raw form string uncoerced —
+        // a checked Boolean would redisplay unchecked. `published` is
+        // declared after `metadata` on `FormTestModel`, so this exercises
+        // exactly that ordering.
+        let (status, html) = post_form(
+            form_test_app(),
+            "/widgets",
+            &[
+                ("name", "Widget X"),
+                ("metadata", "{broken"),
+                ("published", "true"),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "html: {html}");
+        assert!(
+            html.contains(r#"id="published" value="true" checked"#),
+            "a later field must still coerce and redisplay checked: {html}"
         );
     }
 
@@ -2314,11 +2354,12 @@ mod tests {
         // a raw string — so a malformed, non-blank submission must be rejected
         // here rather than silently persisted as a JSON string literal.
         let fields = vec![AdminField::new("settings", AdminFieldKind::Json)];
-        let (partial, field_name, msg) =
+        let (partial, field_names, msg) =
             coerce_form_fields(json!({"settings": "{broken"}), &fields)
                 .expect_err("malformed non-blank JSON must be rejected, not silently stored");
         assert_eq!(
-            field_name, "settings",
+            field_names,
+            vec!["settings"],
             "error should name the offending field"
         );
         assert!(msg.contains("settings"), "error message: {msg}");
@@ -2347,11 +2388,49 @@ mod tests {
             AdminField::new("count", AdminFieldKind::Integer),
             AdminField::new("settings", AdminFieldKind::Json),
         ];
-        let (partial, field_name, _msg) =
+        let (partial, field_names, _msg) =
             coerce_form_fields(json!({"count": "42", "settings": "{broken"}), &fields)
                 .expect_err("malformed JSON must be rejected");
-        assert_eq!(field_name, "settings");
+        assert_eq!(field_names, vec!["settings"]);
         assert_eq!(partial, json!({"count": 42, "settings": "{broken"}));
+    }
+
+    #[test]
+    fn coerce_form_fields_still_coerces_fields_declared_after_a_failure() {
+        // Codex review, PR #2422: stopping at the first failure left every
+        // LATER field's raw form string uncoerced too — a checked Boolean
+        // after a malformed Json field would redisplay unchecked, and if the
+        // admin didn't notice and resubmitted, that wrong value would be
+        // persisted. Coercion must keep going past a failure.
+        let fields = vec![
+            AdminField::new("settings", AdminFieldKind::Json),
+            AdminField::new("published", AdminFieldKind::Boolean),
+        ];
+        let (partial, field_names, _msg) =
+            coerce_form_fields(json!({"settings": "{broken", "published": "true"}), &fields)
+                .expect_err("malformed JSON must be rejected");
+        assert_eq!(field_names, vec!["settings"]);
+        assert_eq!(
+            partial,
+            json!({"settings": "{broken", "published": true}),
+            "a field declared after the failing one must still coerce"
+        );
+    }
+
+    #[test]
+    fn coerce_form_fields_collects_every_failing_field() {
+        // Two independently malformed Json fields must both be named and
+        // both kept as raw text — not just the first one encountered.
+        let fields = vec![
+            AdminField::new("a", AdminFieldKind::Json),
+            AdminField::new("b", AdminFieldKind::Json),
+        ];
+        let (partial, field_names, msg) =
+            coerce_form_fields(json!({"a": "{broken", "b": "[also-broken"}), &fields)
+                .expect_err("both malformed fields must be rejected");
+        assert_eq!(field_names, vec!["a", "b"]);
+        assert!(msg.contains('a') && msg.contains('b'), "message: {msg}");
+        assert_eq!(partial, json!({"a": "{broken", "b": "[also-broken"}));
     }
 
     #[test]

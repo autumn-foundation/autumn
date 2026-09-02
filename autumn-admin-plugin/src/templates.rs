@@ -2200,10 +2200,21 @@ fn render_form_widget(
                 title="Encrypted at rest — managed outside the admin";
         };
     }
-    let current_value = record
-        .and_then(|r| r.get(field.name))
-        .cloned()
-        .unwrap_or(Value::Null);
+    // An encrypted field that reaches here is CREATE (the EDIT branch above
+    // already returned). A create-validation-failure redisplay still passes
+    // `Some(record)` with the admin's just-typed plaintext in it — never
+    // echo that back into the response body; keep the control enabled and
+    // submittable (unlike EDIT) but blank, so the admin retypes it rather
+    // than the secret round-tripping through server-rendered HTML a second
+    // time (Codex review, PR #2422).
+    let current_value = if field.encrypted {
+        Value::Null
+    } else {
+        record
+            .and_then(|r| r.get(field.name))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
     let str_val = match &current_value {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
