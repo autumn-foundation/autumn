@@ -44,10 +44,6 @@
 //! - **W5** turns [`Chaos`] into a public, seed-driven fault-injection builder
 //!   ([`Sim::chaos`]), installed at [`Sim::build`] and recorded into the
 //!   schedule read by [`Sim::__chaos_events`].
-//! - **#1680** adds [`FaultPlan`], the *authored* fault lane beside [`Chaos`]:
-//!   ordinal-targeted DB-checkout / job-execution faults driven from one seed,
-//!   attached with [`crate::test::TestApp::with_fault_plan`], producing a
-//!   serializable [`FaultOutcome`] a regression test can compare byte-for-byte.
 //! - **W6** adds the [`always!`](crate::always) / [`sometimes!`](crate::sometimes)
 //!   assertion macros ([`mod@assert`]) and, behind the `sim-testing` feature, a
 //!   property-based op-driver (`sim::op`) — `Sim::gen_ops`/`Sim::gen_ops_with` for
@@ -55,6 +51,10 @@
 //!   plus a seed-sweep runner (`sim::sweep`): `sweep_proptest` runs
 //!   `Sim::run_proptest` sequentially across a batch of seeds, reporting the
 //!   first failing seed, driven in CI by the `sim-sweep` `[[bin]]`.
+//! - **#1680** adds [`FaultPlan`], the *authored* fault lane beside [`Chaos`]:
+//!   ordinal-targeted DB-checkout / job-execution faults driven from one seed,
+//!   attached with [`crate::test::TestApp::with_fault_plan`], producing a
+//!   serializable [`FaultOutcome`] a regression test can compare byte-for-byte.
 //!
 //! Everything here is designed to grow additively (builder-style) without
 //! breaking the frozen surface — hence the `#[non_exhaustive]` markers.

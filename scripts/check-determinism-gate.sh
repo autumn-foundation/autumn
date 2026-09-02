@@ -141,7 +141,7 @@ GATED_MODULES=(
 )
 
 # The manifest is a ratchet: it may grow, never shrink.
-MODULE_COUNT_FLOOR=17
+MODULE_COUNT_FLOOR=18
 
 # Every lint the gate header must deny.
 REQUIRED_GATE_LINTS=(

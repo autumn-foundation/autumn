@@ -299,7 +299,6 @@ mod sim_clock_drain;
 mod sim_delayed_enqueue;
 mod sim_deterministic_ids;
 mod sim_fault_plan;
-#[cfg(feature = "db")]
 mod sim_fault_plan_pg;
 mod sim_job_clock;
 mod sim_llm_stub;

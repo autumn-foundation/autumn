@@ -207,7 +207,7 @@ async fn the_third_checkout_and_the_second_invoice_fail(mut sim: Sim) {
 
     // Canonical, byte-identical on every replay of this seed — commit it as a
     // fixture and this scenario becomes a CI regression test.
-    assert_eq!(outcome.to_json_string(), include_str!("fixtures/invoice_scenario.json"));
+    assert_eq!(outcome.to_json_string(), include_str!("fixtures/invoice_scenario.json").trim_end());
 }
 ```
 
@@ -256,7 +256,7 @@ at all.
 | `seed` | the plan's seed, echoed so an outcome identifies its own replay |
 | `fired` | `Vec<FiredFault>` in fire order: `effect`, `target` (pool or job name), the global `ordinal`, the `target_ordinal`, `at` (injected wall clock) and `elapsed_ms` (injected monotonic) |
 | `suppressed` | matched an ordinal but fell outside `only_between` |
-| `unfired` | planned faults the run never reached, sorted — an empty list is the proof your scenario actually exercised what it authored |
+| `unfired` | planned faults the run never reached, sorted — an empty list (together with an empty `suppressed`) is the proof your scenario actually exercised what it authored; a near-miss outside the window counts as reached, so check `suppressed` too |
 | `server_errors` | 5xx captured through `reporting.rs`, in report order: `status`, `method`, `route`, `message`, `problem_type`. Deliberately **no** request ID — it is entropy-minted, and the record has to stay comparable |
 | `final_state` | seam totals: `db_checkouts`, `job_executions`, `job_executions_failed`, `job_executions_succeeded` |
 

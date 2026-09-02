@@ -47,7 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       assert_eq!(outcome.final_state.db_checkouts, 5);
 
       // Canonical JSON, byte-identical on every replay of this seed.
-      assert_eq!(outcome.to_json_string(), include_str!("fixtures/invoices.json"));
+      assert_eq!(outcome.to_json_string(), include_str!("fixtures/invoices.json").trim_end());
   }
   ```
 
