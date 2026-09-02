@@ -551,11 +551,21 @@ cascade returns a typed conflict instead of removing the row.
   time closes the batch case but not the sibling-association one, since a single
   parent's legs still run in order. Hoisting deeper probes into the up-front pass
   is tracked in [#2427](https://github.com/autumn-foundation/autumn/issues/2427).
-- **Both delete paths.** `delete_by_id` and the bulk `delete_many`
-  both run the cascade. On `delete_many` the ordering is the same — restrict
-  probes for the whole batch first (a 409 rolls the entire batch back), then the
-  children, then the bulk parent delete — so bulk-deleting parents neither
-  orphans children nor trips a foreign key.
+- **Both delete paths.** `delete_by_id` and the bulk `delete_many` both run the
+  cascade, and on both the children are handled before the parent row goes, so
+  bulk-deleting parents neither orphans children nor trips a foreign key. A batch
+  is all-or-nothing: a `restrict` 409 anywhere in it rolls back every parent.
+
+  The two paths do **not** interleave hooks identically, and only the database
+  effects are guaranteed to match. `delete_by_id` runs the parent's own
+  `before_delete` before cascading its children; a hooked `delete_many` cascades
+  the whole batch first and runs the parents' `before_delete` hooks after. So a
+  parent hook that rejects a bulk delete does so once child hooks have already
+  run. As above, the transaction still rolls back in full and a non-commit hook's
+  external side effects do not.
+
+  Treat the exact hook interleaving as unspecified beyond what is stated here —
+  #2427 tracks pinning it down.
 - **Multi-level.** A `destroy`d child runs its **own** dependents before its row
   goes, so `Post → Comment → Reply` cascades end to end. Grandchildren may be
   declared on either site.
