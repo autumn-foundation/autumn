@@ -188,7 +188,7 @@
     )
 )]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use axum::extract::{FromRequest, Request};
 use axum::response::IntoResponse;
@@ -551,17 +551,20 @@ where
     let child_nul_fields: BTreeMap<usize, Vec<String>> = child_groups
         .iter_mut()
         .map(|(idx, subfields)| {
-            let swept: Vec<String> = subfields
-                .iter_mut()
-                .filter(|(sub, _)| sub != DESTROY_SUBFIELD)
-                .filter_map(|(sub, value)| {
-                    value.as_bytes().contains(&0).then(|| {
-                        *value = crate::normalize::strip_nul(value);
-                        sub.clone()
-                    })
-                })
-                .collect();
-            (*idx, swept)
+            // Deduplicated for the same reason `strip_nul_from_pairs` is: a
+            // subfield may be submitted any number of times, and one message
+            // per *pair* would let a crafted body inflate a single row's error
+            // list without bound. One message per offending subfield.
+            let mut swept: BTreeSet<String> = BTreeSet::new();
+            for (sub, value) in subfields.iter_mut() {
+                if sub != DESTROY_SUBFIELD && value.as_bytes().contains(&0) {
+                    *value = crate::normalize::strip_nul(value);
+                    if !swept.contains(sub.as_str()) {
+                        swept.insert(sub.clone());
+                    }
+                }
+            }
+            (*idx, swept.into_iter().collect::<Vec<String>>())
         })
         .collect();
 
@@ -667,15 +670,36 @@ fn decode_child_row<C: NestedChild>(
     // all-blank row that also carries `_destroy` is dropped here too — the
     // same outcome as the destroy path.)
     //
-    // #2423: values were cleaned before this check, so a subfield whose only
-    // content was a NUL now reads as blank. That must not make the row *vanish*
-    // — the author did submit something, it just could not be stored — so a row
-    // that carried a NUL is reported even when nothing legible is left of it.
-    // A genuinely blank template row still drops, exactly as before.
-    if decode_pairs.iter().all(|(_, val)| val.trim().is_empty()) {
-        if nul_fields.is_empty() {
-            return ChildRow::Dropped;
-        }
+    let all_blank = decode_pairs.iter().all(|(_, val)| val.trim().is_empty());
+
+    // A genuinely blank template row drops, destroyed or not — unchanged.
+    if all_blank && nul_fields.is_empty() {
+        return ChildRow::Dropped;
+    }
+
+    // #2423: a destroyed row is never written, so there is nothing to reject
+    // there — the cleaned values are retained only so the row re-renders. This
+    // has to be decided *before* the NUL rejection below: a row whose only
+    // remaining content was an unstorable byte is still a row the author asked
+    // to delete, and rejecting it would block `into_valid` and leave them
+    // unable to remove it.
+    if destroyed {
+        return ChildRow::Bound {
+            row: NestedRow {
+                values,
+                errors: HashMap::new(),
+                destroyed,
+            },
+            child: None,
+        };
+    }
+
+    // #2423: values were cleaned before the blank check, so a subfield whose
+    // only content was a NUL now reads as blank. That must not make the row
+    // *vanish* — the author did submit something, it just could not be stored
+    // — so a row that carried a NUL is reported even when nothing legible is
+    // left of it.
+    if all_blank {
         let mut errors: HashMap<String, Vec<String>> = HashMap::new();
         for field in nul_fields {
             errors
@@ -688,19 +712,6 @@ fn decode_child_row<C: NestedChild>(
             errors,
             destroyed,
         });
-    }
-
-    // #2423: a destroyed row is never written, so there is nothing to reject
-    // there — the cleaned values are retained only so the row re-renders.
-    if destroyed {
-        return ChildRow::Bound {
-            row: NestedRow {
-                values,
-                errors: HashMap::new(),
-                destroyed,
-            },
-            child: None,
-        };
     }
 
     let mut errors: HashMap<String, Vec<String>> = HashMap::new();
@@ -1996,6 +2007,51 @@ mod tests {
             form.changeset.is_valid(),
             "renamed token fields must not produce unrenderable errors: {:?}",
             form.changeset.parent.errors()
+        );
+    }
+
+    /// A destroyed row is never written, so it must never be *rejected* —
+    /// otherwise the author cannot delete a row whose only remaining content
+    /// was an unstorable byte. The blank-and-NUL rejection must not run ahead
+    /// of the destroy check.
+    #[test]
+    fn a_destroyed_row_of_only_nul_bytes_is_not_rejected() {
+        let pairs = vec![
+            p("name", "Order 1"),
+            p("items[0][sku]", "\u{0}"),
+            p("items[0][quantity]", ""),
+            p("items[0][_destroy]", "1"),
+        ];
+        let cs = decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes");
+        assert!(
+            cs.is_valid(),
+            "a row the author asked to destroy must not block the submission"
+        );
+        assert!(
+            cs.into_valid().is_ok(),
+            "the parent must still be bindable so the destroy can be applied"
+        );
+    }
+
+    /// A repeated subfield carrying NULs contributes one message, not one per
+    /// occurrence — the same guarantee the flat sweep already makes. Without
+    /// it a crafted body inflates a single row's error list without bound.
+    #[test]
+    fn a_repeated_nul_subfield_in_a_row_reports_once() {
+        let pairs = vec![
+            p("name", "Order 1"),
+            p("items[0][sku]", "A-1"),
+            p("items[0][quantity]", "2"),
+            p("items[0][unknown]", "a\u{0}a"),
+            p("items[0][unknown]", "b\u{0}b"),
+            p("items[0][unknown]", "c\u{0}c"),
+        ];
+        let cs = decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes");
+        assert_eq!(cs.rows().len(), 1);
+        assert_eq!(
+            cs.rows()[0].errors_for("unknown").len(),
+            1,
+            "one message per offending subfield, not one per submitted pair"
         );
     }
 
