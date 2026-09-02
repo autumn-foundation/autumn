@@ -847,6 +847,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🧭 Wayfinder: text-safe warning/success colors in the admin plugin
+  (WCAG contrast 3.19:1 / 3.77:1 → 4.5:1+):** the Runtime Config page's
+  "overridden" status badge (`--warning` #d97706 on `--surface`, every
+  deployment's config page) and every model list page's boolean-field ✓
+  checkmark (`--success` #059669 on `--surface`, rendered for every boolean
+  column in every row) used their raw semantic color token directly as
+  small/normal foreground text — tokens calibrated for the 3:1 large-text/
+  border/icon uses they already had, not WCAG AA's 4.5:1 normal-text
+  threshold. New `--warning-text` (#92400e) and `--success-text` (#065f46)
+  tokens, matching the framework's existing flash-message foreground shades,
+  fix both sites without introducing a new color.
 - **Dependent cascades are documented where the guide already pointed, and the
   `through =` rejection points at the offending key (#1702):** the repositories
   guide had no dependent-cascade section at all, even though the counter-cache
