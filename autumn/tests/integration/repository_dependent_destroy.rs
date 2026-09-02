@@ -203,6 +203,74 @@ pub struct ModelDepPost {
 #[autumn_web::repository(ModelDepPost, table = "dep_posts")]
 pub trait ModelDepPostRepository {}
 
+// ── #1702: model-declared `#[has_one(..., dependent = ...)]` ─────────────────
+//
+// Issue #1702 scope item 1 names `has_one` alongside `has_many`. The parser and
+// the `Model::dependents()` codegen treat the two kinds identically (both put
+// the foreign key on the *target*), but until now only the `has_many` spelling
+// was proven end to end. This graph is `has_one`-only, on its own tables, so it
+// cannot perturb the shared `dep_*` counters the tests above assert on.
+//
+// `dep_ho_posts` has at most one `dep_ho_profiles` row; the profile HOOKS, so
+// the test also proves a `has_one` destroy fires the child's lifecycle hook.
+
+diesel::table! {
+    dep_ho_posts (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+diesel::table! {
+    dep_ho_profiles (id) {
+        id -> Int8,
+        post_id -> Int8,
+        bio -> Text,
+    }
+}
+
+pub static DESTROYED_HO_PROFILES: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Default)]
+pub struct DepHoProfileHooks;
+
+impl MutationHooks for DepHoProfileHooks {
+    type Model = DepHoProfile;
+    type NewModel = NewDepHoProfile;
+    type UpdateModel = UpdateDepHoProfile;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &DepHoProfile,
+    ) -> AutumnResult<()> {
+        DESTROYED_HO_PROFILES.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[autumn_web::model(table = "dep_ho_profiles")]
+pub struct DepHoProfile {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub bio: String,
+}
+
+#[autumn_web::repository(DepHoProfile, table = "dep_ho_profiles", hooks = DepHoProfileHooks)]
+pub trait DepHoProfileRepository {}
+
+#[autumn_web::model(table = "dep_ho_posts")]
+#[has_one(DepHoProfile, fk = "post_id", name = md_profile, dependent = destroy)]
+pub struct ModelDepHoPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(ModelDepHoPost, table = "dep_ho_posts")]
+pub trait ModelDepHoPostRepository {}
+
 // ── AC3: both-soft destroy graph (soft parent + soft children) ────────────────
 //
 // The parent is `#[soft_delete]` too, so `delete_by_id` soft-deletes the parent
@@ -1269,6 +1337,9 @@ async fn setup_pool() -> (
         // #1800 case 3: parent with a before_delete hook AND a restrict dependent.
         "CREATE TABLE ph_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
         "CREATE TABLE ph_guards (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES ph_posts(id), name TEXT NOT NULL)",
+        // #1702: model-declared `#[has_one(..., dependent = destroy)]` graph.
+        "CREATE TABLE dep_ho_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE dep_ho_profiles (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep_ho_posts(id), bio TEXT NOT NULL)",
     ] {
         diesel::sql_query(stmt)
             .execute(&mut conn)
@@ -1357,6 +1428,14 @@ fn dependent_repository_surface_is_generated() {
     // through `preload::FkKey`, so a nullable-FK association compiles.
     assert_is_fn(ModelDepPost::dependents);
     assert_eq!(ModelDepPost::dependents().len(), 4);
+    // #1702: `#[has_one(..., dependent = ...)]` drives the SAME runtime dispatch
+    // as `#[has_many]` — the kind issue #1702 names alongside it. Monomorphize the
+    // has_one parent's single- and bulk-delete paths and assert the model exposes
+    // exactly the one spec its single `has_one` leg declares.
+    assert_is_fn(<PgModelDepHoPostRepository as ModelDepHoPostRepository>::delete_by_id);
+    assert_is_fn(<PgModelDepHoPostRepository as ModelDepHoPostRepository>::delete_many);
+    assert_is_fn(PgDepHoProfileRepository::__autumn_apply_dependent_on_conn);
+    assert_eq!(ModelDepHoPost::dependents().len(), 1);
     // Codex P1: the fully model-side three-level graph monomorphizes. The key
     // new codegen is the intermediate `M3Comment`'s cascade leaf executor —
     // its Destroy arm now runtime-dispatches into `M3Comment::dependents()`
@@ -2487,6 +2566,78 @@ async fn model_declared_dependent_cascades_like_repository_attribute() {
         .await,
         0,
         "delete_all child rows removed via the model-declared cascade"
+    );
+}
+
+/// #1702: the model-declared cascade works on `#[has_one]`, not just
+/// `#[has_many]`. Deleting the parent destroys its single `has_one` child in the
+/// same transaction and fires that child's `before_delete` hook — the same
+/// runtime `Model::dependents()` dispatch the `has_many` spelling uses, proven
+/// end to end for the kind issue #1702 names alongside `has_many`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn model_declared_has_one_dependent_destroys_the_child() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_ho_posts (id, title) VALUES (1, 'has-one parent')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dep_ho_profiles (id, post_id, bio) VALUES (1, 1, 'bio')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // A second parent + profile that must be left completely untouched, so the
+    // cascade is proven to be keyed on the deleted parent rather than sweeping
+    // the child table.
+    diesel::sql_query("INSERT INTO dep_ho_posts (id, title) VALUES (2, 'bystander')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dep_ho_profiles (id, post_id, bio) VALUES (2, 2, 'keep me')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    DESTROYED_HO_PROFILES.store(0, Ordering::SeqCst);
+
+    let repo = PgModelDepHoPostRepository::with_pool_untracked(pool.clone());
+    repo.delete_by_id(1)
+        .await
+        .expect("model-declared has_one cascade must not FK-error");
+
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_ho_posts WHERE id = 1"
+        )
+        .await,
+        0,
+        "parent gone"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_ho_profiles WHERE post_id = 1"
+        )
+        .await,
+        0,
+        "the has_one child was destroyed by the model-declared cascade"
+    );
+    assert_eq!(
+        AtomicUsize::load(&DESTROYED_HO_PROFILES, Ordering::SeqCst),
+        1,
+        "the destroyed has_one child fired its before_delete hook exactly once"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_ho_profiles WHERE post_id = 2"
+        )
+        .await,
+        1,
+        "an unrelated parent's has_one child is untouched"
     );
 }
 
