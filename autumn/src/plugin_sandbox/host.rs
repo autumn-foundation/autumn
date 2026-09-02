@@ -3130,12 +3130,22 @@ fn instantiation_fuel(
 /// Returns the `OutOfFuel` trap when the budget cannot cover it, so a guest
 /// that tries to buy unbounded copying ends exactly as a guest that spins does:
 /// [`SandboxFailure::FuelExhausted`], and a 504 on its own prefix.
+/// Charge fuel for host work priced per byte *copied*.
+///
+/// [`BYTES_PER_FUEL`] is a bulk-copy rate: a memcpy moves many bytes for what
+/// one instruction costs, so 64 of them to a unit is honest. It is the wrong
+/// rate for work that computes each byte — see [`charge_units`].
 fn charge_bytes(caller: &mut Caller<'_, HostState>, bytes: usize) -> Result<(), wasmi::Error> {
     let units = u64::try_from(bytes)
         .unwrap_or(u64::MAX)
         .checked_div(BYTES_PER_FUEL)
         .unwrap_or(u64::MAX)
         .saturating_add(1);
+    charge_units(caller, units)
+}
+
+/// Charge fuel directly, for host work a byte count does not describe.
+fn charge_units(caller: &mut Caller<'_, HostState>, units: u64) -> Result<(), wasmi::Error> {
     let left = caller.get_fuel()?;
     let remaining = left
         .checked_sub(units)
@@ -3456,7 +3466,14 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                 let mut written = 0usize;
                 while written < len {
                     let take = HOST_IO_CHUNK_BYTES.min(len.saturating_sub(written));
-                    charge_bytes(&mut caller, take)?;
+                    // Priced per byte, not at the bulk-copy rate. Every byte
+                    // here is a whole `SplitMix64` step — an add, two
+                    // multiplies and four shift-XOR pairs — where `fd_write`'s
+                    // byte is a memcpy. Charging 64 of these to one unit let a
+                    // guest buy the mixer's work at a copy's price and hold a
+                    // blocking worker far longer than its declared ceiling
+                    // says it may.
+                    charge_units(&mut caller, u64::try_from(take).unwrap_or(u64::MAX))?;
                     let mut scratch = vec![0u8; take];
                     for slot in &mut scratch {
                         *slot = caller.data_mut().next_random_byte();
@@ -5582,6 +5599,48 @@ path = "/hello/greet"
                 "the attempt must survive as an escape, not be dropped: {split:?}",
             );
         }
+    }
+
+    #[test]
+    fn generating_a_random_byte_costs_more_than_copying_one() {
+        // `BYTES_PER_FUEL` is a bulk-copy rate — a memcpy moves 64 bytes for
+        // about what one instruction costs, so charging them to a unit is
+        // honest. `random_get` does not copy: every byte is a whole SplitMix64
+        // step, an add, two multiplies and four shift-XOR pairs. Billing that
+        // at the copy rate sold the mixer's work at a memcpy's price while the
+        // guest held a blocking worker for it.
+        //
+        // Measured through the fuel the host actually charges, because that is
+        // the thing that was wrong. An earlier version of this test compared
+        // two constants it computed itself and passed against its own revert —
+        // it never ran `random_get` at all.
+        fn drawing(bytes: u32) -> u64 {
+            let wat = format!(
+                r#"(module
+  (import "wasi_snapshot_preview1" "random_get" (func $random_get (param i32 i32) (result i32)))
+  (memory (export "memory") 2)
+  (func (export "_start")
+    (drop (call $random_get (i32.const 4096) (i32.const {bytes}))))
+)"#
+            );
+            // The guest never answers, which is fine: the outcome carries the
+            // fuel spent either way, and the answer is not what is being
+            // measured.
+            host(&wat).run(&request("GET", "/hello/greet")).fuel_used
+        }
+
+        let none = drawing(0);
+        let many = drawing(65536);
+        let charged = many.saturating_sub(none);
+
+        // At the copy rate 64 KiB is about 1,024 units; per byte it is 65,536.
+        // Halfway between separates them without pinning either rate.
+        assert!(
+            charged > 32768,
+            "drawing 64 KiB of entropy cost {charged} fuel — the bulk-copy rate \
+             would charge about 1,024, so the mixer's work is being sold at a \
+             memcpy's price",
+        );
     }
 
     #[test]

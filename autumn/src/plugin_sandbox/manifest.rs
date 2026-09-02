@@ -179,6 +179,22 @@ pub struct DeclaredRoute {
 
 // ── Resource limits ──────────────────────────────────────────────────────
 
+/// The most routes a manifest may declare.
+///
+/// Generous against anything an author writes by hand — a plugin serves a
+/// handful of endpoints, not hundreds — and it is the count rather than the
+/// bytes that has to be bounded here. A parsed artifact is already capped at
+/// `MAX_MANIFEST_BYTES`, but [`SandboxHost::from_module`](crate::plugin_sandbox::SandboxHost::from_module)
+/// is public and takes a `SandboxManifest` an embedder built in memory, where
+/// no byte ceiling applies.
+///
+/// Checked before the validation indexes are reserved and scanned, because
+/// those scans are linear per route and so quadratic over the list, and because
+/// an accepted list is cloned again into the host's owned-route set. Refusing
+/// first keeps load-time work bounded by this constant rather than by what a
+/// caller chose to hand over.
+pub const MAX_ROUTES: usize = 256;
+
 /// The per-request resource ceilings the host enforces for this plugin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -399,6 +415,13 @@ pub enum ManifestError {
     MissingCapability(SandboxCapability),
     /// The manifest declares no routes, so it could never serve anything.
     NoRoutes,
+    /// The manifest declares more than [`MAX_ROUTES`] routes.
+    TooManyRoutes {
+        /// How many it declared.
+        found: usize,
+        /// The ceiling.
+        max: usize,
+    },
     /// A declared route uses a method the sandbox will not mount.
     InvalidMethod(String),
     /// A declared route's path is malformed.
@@ -488,6 +511,12 @@ impl fmt::Display for ManifestError {
                 f,
                 "the manifest declares no `[[routes]]`; a sandboxed plugin serves exactly the \
                  routes it declares, so an empty list can never serve anything"
+            ),
+            Self::TooManyRoutes { found, max } => write!(
+                f,
+                "the manifest declares {found} routes, over the {max}-route ceiling; validating \
+                 a route list scans the routes already seen, so the work grows with the square \
+                 of the list, and the list is held again for the lifetime of the plugin"
             ),
             Self::InvalidMethod(method) => write!(
                 f,
@@ -742,6 +771,15 @@ impl SandboxManifest {
         validate_digest(&self.sha256)?;
         if self.routes.is_empty() {
             return Err(ManifestError::NoRoutes);
+        }
+        // Before the indexes below are reserved or scanned: both are linear per
+        // route and so quadratic over the list, and `with_capacity` would size
+        // them from a number the caller chose.
+        if self.routes.len() > MAX_ROUTES {
+            return Err(ManifestError::TooManyRoutes {
+                found: self.routes.len(),
+                max: MAX_ROUTES,
+            });
         }
         let mut seen: Vec<(&str, &str)> = Vec::with_capacity(self.routes.len());
         // The same engine the mount will use, so "these two are one route" is
@@ -1042,6 +1080,49 @@ max_concurrency = 8
 "#,
             digest = "a".repeat(64)
         )
+    }
+
+    #[test]
+    fn a_manifest_over_the_route_ceiling_is_refused_before_it_is_scanned() {
+        // `MAX_MANIFEST_BYTES` bounds a manifest that was *parsed*, but
+        // `SandboxHost::from_module` is public and takes a `SandboxManifest` an
+        // embedder built in memory, where no byte ceiling applies. Validation
+        // then scans the routes already seen for each new one, so the work
+        // grows with the square of the list, and an accepted list is held again
+        // for the lifetime of the plugin.
+        let mut manifest = SandboxManifest::parse(&valid_toml()).expect("valid manifest");
+        manifest.routes = (0..=MAX_ROUTES)
+            .map(|index| DeclaredRoute {
+                method: "GET".to_owned(),
+                path: format!("/hello/r{index}"),
+            })
+            .collect();
+        let err = manifest
+            .validate()
+            .expect_err("a manifest over the route ceiling must be refused");
+        assert!(
+            matches!(
+                err,
+                ManifestError::TooManyRoutes {
+                    max: MAX_ROUTES,
+                    ..
+                }
+            ),
+            "{err}",
+        );
+
+        // Exactly at the ceiling still validates, so this bounds the list
+        // rather than shrinking what a plugin may declare.
+        let mut at_ceiling = SandboxManifest::parse(&valid_toml()).expect("valid manifest");
+        at_ceiling.routes = (0..MAX_ROUTES)
+            .map(|index| DeclaredRoute {
+                method: "GET".to_owned(),
+                path: format!("/hello/r{index}"),
+            })
+            .collect();
+        at_ceiling
+            .validate()
+            .expect("a manifest at the ceiling must still validate");
     }
 
     #[test]
