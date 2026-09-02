@@ -1547,9 +1547,12 @@ items are added beside it.
    const __AUTUMN_AGENT_OPERABLE: &::core::primitive::str = "RefundDrafter";
    ```
 
-   This is what makes attribute order irrelevant: when `#[post]` expands first
-   and never sees `#[agent_operable]`, the route macro finds this marker in the
-   body and fills `ApiDoc::agent_authority` anyway.
+   This is what makes attribute order irrelevant: attributes expand
+   outermost-first, so with `#[agent_operable]` on top it expands first and
+   strips itself — and the route macro, running afterwards, finds this marker
+   in the body and fills `ApiDoc::agent_authority` anyway. (The other order
+   needs no marker: `#[post]` expands while the attribute is still there to
+   read.)
 
 2. One `const _: () = assert!(…)` per proved effect, **respanned onto the call
    that produced it** — which is why the error points at your write rather than

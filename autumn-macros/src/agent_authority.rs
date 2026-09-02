@@ -1857,20 +1857,40 @@ impl Analyzer {
             if self.ufcs_effect(call, &name) {
                 return;
             }
-            // An associated function is framework surface (`Post::published(&mut
-            // db)`), and a constructor (`Ok(conn)`, `Ctx(repo)`) only wraps
-            // what it is handed; a free function is another module's business.
-            if is_associated_fn_path(call) || is_constructor_call(call) {
+            // A constructor (`Ok(conn)`, `Ctx(repo)`) only wraps what it is
+            // handed, and a call that *produces* a handle (`Client::new(..)`,
+            // `diesel::update(..)`) is read where the chain reaches its verb.
+            //
+            // Nothing else is exempt. "The path starts with an uppercase
+            // segment" is not evidence of anything: `Billing::wipe(repo)` and
+            // `Post::published(&mut db)` are the same shape, and treating the
+            // shape as framework surface let an arbitrary associated helper
+            // perform `repo.delete_all()` under a grant that allows no write.
+            // A static finder on a `#[model]` really is a read — and it is
+            // indistinguishable from `Billing::wipe`, so it is refused too and
+            // discharged with `#[agent_effect(none, reason = "...")]`.
+            if is_constructor_call(call) || Self::call_handle(call).is_some() {
                 return;
             }
             let action = self.action.clone();
+            let handle = call
+                .args
+                .iter()
+                .find(|a| self.carries_handle(a))
+                .and_then(handle_arg_name)
+                .map_or_else(
+                    || "an effect handle".to_string(),
+                    |name| format!("the effect handle `{name}`"),
+                );
             self.error(
                 call.span(),
                 format!(
-                    "agent authority: `{name}` is handed an effect handle, and what it does with \
-                     it is another function's business — so `{action}`'s effects cannot be \
-                     proven.\n\nMove the effect into this handler, or declare the site with \
-                     `#[agent_effect(..., reason = \"...\")]`. {GUIDE}"
+                    "agent authority: `{name}` is handed {handle}, and what it does with it is \
+                     another function's business — so `{action}`'s effects cannot be \
+                     proven.\n\nMove the effect into this handler, declare what the call does \
+                     with `#[agent_effect(writes(Model), reason = \"...\")]`, or — if it is \
+                     verified to perform none — discharge it with `#[agent_effect(none, reason = \
+                     \"...\")]`. {GUIDE}"
                 ),
             );
         }
@@ -2529,18 +2549,6 @@ fn immediately_invoked_closure(func: &Expr) -> Option<&syn::ExprClosure> {
         Expr::Group(g) => immediately_invoked_closure(&g.expr),
         _ => None,
     }
-}
-
-fn is_associated_fn_path(call: &ExprCall) -> bool {
-    let Expr::Path(path) = &*call.func else {
-        return false;
-    };
-    let segments = &path.path.segments;
-    segments.len() >= 2
-        && segments
-            .iter()
-            .nth(segments.len() - 2)
-            .is_some_and(|s| s.ident.to_string().starts_with(char::is_uppercase))
 }
 
 /// Is this call an enum variant or tuple-struct constructor — `Ok(x)`,
@@ -4044,6 +4052,36 @@ mod tests {
             }",
         ),
         (
+            // "Uppercase path = framework surface" was a shape, not evidence:
+            // an arbitrary associated helper handed the repository can perform
+            // the write the grant refuses, and the handler expanded clean.
+            "associated helper handed a repository by value",
+            ExpectedKind::Rejected,
+            "wipe",
+            r"async fn h(repo: PgRefundRepository) -> R {
+                Billing::wipe(repo).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "associated helper handed a repository by reference",
+            ExpectedKind::Rejected,
+            "wipe",
+            r"async fn h(repo: PgRefundRepository) -> R {
+                Billing::wipe(&repo).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "trait-qualified associated helper handed a repository",
+            ExpectedKind::Rejected,
+            "wipe",
+            r"async fn h(repo: PgRefundRepository) -> R {
+                <Billing as Janitor>::wipe(&repo).await?;
+                Ok(())
+            }",
+        ),
+        (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
             "reason",
@@ -4144,6 +4182,17 @@ mod tests {
                     .await?;
                 Ok(())
             }",
+        ),
+        (
+            // A `#[model]` static finder really is a read — and it is the same
+            // shape as `Billing::wipe(repo)`, so it is refused like one and
+            // discharged where the author can vouch for it.
+            "static finder discharged with #[agent_effect(none)]",
+            r#"async fn h(mut db: Db) -> R {
+                #[agent_effect(none, reason = "generated finder; reads one row")]
+                let post = Post::find_published(&mut db).await?;
+                Ok(post)
+            }"#,
         ),
         (
             "relative URL under a configured client alias",

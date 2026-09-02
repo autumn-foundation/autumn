@@ -678,16 +678,29 @@ impl AgentAuthorityManifest {
             .collect()
     }
 
-    /// Every action whose grant does not promise the effects are undoable.
+    /// Every **agent-reachable** action whose grant does not promise the
+    /// effects are undoable.
     ///
     /// With no audit sink installed these are the invocations that leave no
     /// trace at all, which is what makes them the `--check` gate's business
     /// (#1691 P1-2).
+    ///
+    /// Restricted to `mcp-tool` exposure on purpose. A registered action that
+    /// no route mounts, or that this binary mounts only as a plain HTTP route,
+    /// is not something an agent can call — so it cannot produce the
+    /// unrecorded *agent* invocation this gate exists to prevent, and failing
+    /// on it would make a linked plugin's unused registration everybody's
+    /// problem. HTTP requests have their own audit story; this document is
+    /// about the agent surface, and the row's own `exposure` field is where it
+    /// says which one it is.
     #[must_use]
     pub fn non_reversible_actions(&self) -> Vec<&ActionRow> {
         self.actions
             .iter()
-            .filter(|row| row.grant.reversibility != Reversibility::Reversible)
+            .filter(|row| {
+                row.exposure == MCP_TOOL_EXPOSURE
+                    && row.grant.reversibility != Reversibility::Reversible
+            })
             .collect()
     }
 
@@ -699,6 +712,11 @@ impl AgentAuthorityManifest {
     /// survivable when it is recorded. Neither is survivable together — and
     /// the runtime cannot catch it, because with no sink installed the audit
     /// write trivially succeeds and the fail-closed refusal never fires.
+    ///
+    /// "Agent-reachable" is meant literally: only `mcp-tool` actions (see
+    /// [`Self::non_reversible_actions`]) and ungoverned *mutating* tools
+    /// count. An action nothing exposes to an agent is not this gate's
+    /// business.
     #[must_use]
     pub fn unaudited_and_unrecoverable(&self) -> bool {
         !self.audit.sink_configured
@@ -926,10 +944,17 @@ pub fn method_is_mutating(method: &str) -> bool {
     !method.eq_ignore_ascii_case("GET") && !method.eq_ignore_ascii_case("HEAD")
 }
 
+/// The [`ActionRow::exposure`] value meaning "an agent can call this".
+///
+/// Named because two things read it: [`exposure_of`], which writes it, and
+/// [`AgentAuthorityManifest::non_reversible_actions`], whose whole correctness
+/// rests on matching exactly what was written.
+pub const MCP_TOOL_EXPOSURE: &str = "mcp-tool";
+
 /// How an action is reachable, as the row spells it.
 const fn exposure_of(route: Option<&RouteSummary>) -> &'static str {
     match route {
-        Some(route) if route.mcp_tool => "mcp-tool",
+        Some(route) if route.mcp_tool => MCP_TOOL_EXPOSURE,
         Some(_) => "http-route",
         // Registered but unreachable: a plugin may register an action the host
         // does not mount. Reported, never a failure.
@@ -2128,11 +2153,16 @@ mod tests {
         // non-reversible action is survivable when it is recorded. Only the
         // conjunction is the state nothing can catch at runtime.
         let non_reversible = |sink| {
-            AgentAuthorityManifest::from_parts(&[&DRAFT_REFUND], &[&REFUND_GRANT], &[], sink)
-                .unaudited_and_unrecoverable()
+            AgentAuthorityManifest::from_parts(
+                &[&DRAFT_REFUND],
+                &[&REFUND_GRANT],
+                &[governed_route()],
+                sink,
+            )
+            .unaudited_and_unrecoverable()
         };
-        assert!(non_reversible(false), "compensable action, no sink");
-        assert!(!non_reversible(true), "compensable action, sink present");
+        assert!(non_reversible(false), "compensable tool, no sink");
+        assert!(!non_reversible(true), "compensable tool, sink present");
 
         // Reversible and unaudited is fine: nothing is lost that cannot be put
         // back.
@@ -2157,6 +2187,49 @@ mod tests {
             false,
         );
         assert!(with_tool.unaudited_and_unrecoverable());
+    }
+
+    #[test]
+    fn only_an_agent_reachable_action_trips_the_audit_gate() {
+        // The gate exists because an *agent* can take an action nothing
+        // records. A linked plugin can register an action this binary never
+        // mounts, or mounts as a plain HTTP route -- no agent can call either,
+        // so neither can produce the unrecorded agent invocation this is
+        // about. Failing on them would make an unrelated app's dependency
+        // everybody's `--allow-unaudited`.
+        let gate = |routes: &[RouteSummary]| {
+            AgentAuthorityManifest::from_parts(&[&DRAFT_REFUND], &[&REFUND_GRANT], routes, false)
+        };
+
+        // Registered by a plugin, mounted by nobody.
+        let unmounted = gate(&[]);
+        assert_eq!(find(&unmounted, "draft_refund").exposure, "not-exposed");
+        assert!(unmounted.non_reversible_actions().is_empty());
+        assert!(!unmounted.unaudited_and_unrecoverable());
+
+        // Mounted, but only for humans over HTTP. Requests there have their
+        // own audit story; this document is about the agent surface.
+        let http_only = gate(&[route(
+            "POST",
+            "/refunds",
+            "draft_refund",
+            "billing::refunds",
+            false,
+            Some(&DRAFT_REFUND),
+        )]);
+        assert_eq!(find(&http_only, "draft_refund").exposure, "http-route");
+        assert!(http_only.non_reversible_actions().is_empty());
+        assert!(!http_only.unaudited_and_unrecoverable());
+
+        // The very same action, exposed as a tool: now an agent can call it.
+        let as_tool = gate(&[governed_route()]);
+        assert_eq!(
+            find(&as_tool, "draft_refund").exposure,
+            MCP_TOOL_EXPOSURE,
+            "the fixture must actually be a tool, or this test proves nothing"
+        );
+        assert_eq!(as_tool.non_reversible_actions().len(), 1);
+        assert!(as_tool.unaudited_and_unrecoverable());
     }
 
     // ── Excluded dimensions ──────────────────────────────────────────

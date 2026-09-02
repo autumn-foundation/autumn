@@ -350,6 +350,11 @@ pub fn format_ungoverned_warning(manifest: &AgentAuthorityManifest) -> Option<St
 /// Both halves are required. A missing sink is survivable when every
 /// agent-reachable action is reversible, and a non-reversible action is
 /// survivable when it is recorded; the failure is their conjunction.
+///
+/// Only actions exposed as MCP tools count, plus ungoverned mutating tools. A
+/// linked plugin can register an action this binary never mounts, or mounts as
+/// a plain HTTP route: no agent can call it, so it is not this gate's business
+/// and must not cost an unrelated app an `--allow-unaudited`.
 #[must_use]
 pub fn format_unaudited_failure(
     manifest: &AgentAuthorityManifest,
@@ -363,8 +368,15 @@ pub fn format_unaudited_failure(
         .iter()
         .map(|row| {
             format!(
-                "  {}::{} under grant {} ({})",
-                row.module_path, row.action, row.grant.name, row.grant.reversibility
+                "  {}::{} under grant {} ({}){}",
+                row.module_path,
+                row.action,
+                row.grant.name,
+                row.grant.reversibility,
+                row.route.as_ref().map_or_else(String::new, |route| format!(
+                    " -- agent-callable at {} {}",
+                    route.method, route.path
+                ))
             )
         })
         .collect();
@@ -377,11 +389,12 @@ pub fn format_unaudited_failure(
     Some(format!(
         "\u{2717} No agent audit sink is configured, and this binary can still take {} action{} \
          that nothing can undo:\n{}\n\n\
-         Nothing records these. With no sink installed the audit write trivially succeeds, so the \
-         runtime's fail-closed refusal never fires -- the refusal protects a configured sink that \
-         is failing, not a missing one. Install a sink with `AppBuilder::with_audit_sink(..)`, \
-         make the actions `reversible`, or re-run with `--allow-unaudited` to accept it. \
-         See docs/guide/agent-authority.md",
+         Every one of these is reachable as an MCP tool, so an agent can call it. Nothing records \
+         them: with no sink installed the audit write trivially succeeds, so the runtime's \
+         fail-closed refusal never fires -- the refusal protects a configured sink that is \
+         failing, not a missing one. Install a sink with `AppBuilder::with_audit_sink(..)`, make \
+         the actions `reversible`, stop exposing them as tools, or re-run with \
+         `--allow-unaudited` to accept it. See docs/guide/agent-authority.md",
         listed.len(),
         if listed.len() == 1 { "" } else { "s" },
         listed.join("\n"),
@@ -1071,6 +1084,40 @@ mod tests {
     fn a_configured_sink_clears_the_gate() {
         let manifest = manifest_with_sink(&[&DRAFT_REFUND], &[governed_route(&DRAFT_REFUND)], true);
         assert!(format_unaudited_failure(&manifest, false).is_none());
+    }
+
+    #[test]
+    fn an_action_no_agent_can_reach_does_not_fail_the_check() {
+        // A linked plugin registers a compensable action this app mounts only
+        // as a plain HTTP route (or not at all). No agent can call it, so it
+        // cannot leave the unrecorded *agent* invocation this gate is about --
+        // and failing here would cost an unrelated app an `--allow-unaudited`
+        // for somebody else's dependency.
+        let http_only = manifest_with_sink(
+            &[&DRAFT_REFUND],
+            &[route(
+                "POST",
+                "/refunds",
+                "draft_refund",
+                "billing::refunds",
+                false,
+                Some(&DRAFT_REFUND),
+            )],
+            false,
+        );
+        assert!(format_unaudited_failure(&http_only, false).is_none());
+
+        let unmounted = manifest_with_sink(&[&DRAFT_REFUND], &[], false);
+        assert!(format_unaudited_failure(&unmounted, false).is_none());
+
+        // The same action as a tool does fail -- and the message says why it
+        // is the gate's business.
+        let as_tool = manifest_with_sink(&[&DRAFT_REFUND], &[governed_route(&DRAFT_REFUND)], false);
+        let failure = format_unaudited_failure(&as_tool, false).expect("must fail");
+        assert!(
+            failure.contains("agent-callable at POST /refunds"),
+            "{failure}"
+        );
     }
 
     #[test]

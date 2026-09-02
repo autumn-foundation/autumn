@@ -380,8 +380,14 @@ Anything the analysis cannot read is **reported**, never assumed effect-free.
 A false positive costs one annotation; a false negative ships an unbounded
 authority under a manifest that says otherwise.
 
-- **A helper handed a tracked handle** — `issue_refund(&mut db, id)`. Its body
-  is another function; the macro sees only the call.
+- **A helper handed a tracked handle** — `issue_refund(&mut db, id)`, and
+  equally the associated form `Billing::wipe(&repo)` or
+  `<Billing as Janitor>::wipe(&repo)`. Its body is another function; the macro
+  sees only the call. An uppercase path segment is a *shape*, not evidence
+  that the callee is framework surface — a generated static finder
+  (`Post::find_published(&mut db)`) is a read, and is spelled exactly like a
+  helper that erases the table, so both are refused and the read is discharged
+  with `#[agent_effect(none, reason = "...")]`.
 - **A non-inert macro naming a handle** — `refund_pipeline!(repo, 7)`. Note
   that `format!` and `vec!` are *not* inert here even though they are for
   [query budgets](query-budgets.md): `vec!` can carry a handle and `format!`
@@ -484,6 +490,7 @@ malformed annotation, or a grant key it will not silently drop.
 | `agent_authority_outbound_alias_dynamic_url` | `named("stripe").post(&url)` with a URL the analysis cannot read | `macro` — an alias names the *host*, so it cannot rescue an unreadable path; refused with or without one |
 | `agent_authority_job_not_listed` | free-function `enqueue("wire_transfer", …)` | `E0080` — a job outlives its request, so it is part of the envelope |
 | `agent_authority_opaque_helper` | helper handed a tracked handle | `macro` — never assumed effect-free; names the hatch |
+| `agent_authority_opaque_associated_helper` | `Billing::wipe(&repo)` | `macro` — an uppercase path is not framework surface; the helper can write what the grant refuses |
 | `agent_authority_bad_attr` | `#[agent_operable]` with no `grant = ...` | `macro` — one diagnostic, and no marker for a grant never named |
 | `agent_authority_blank_effect_reason` | `#[agent_effect(none, reason = "   ")]` | `macro` — the reason is what makes the assertion reviewable |
 | `agent_authority_stray_effect_on_fn` | `#[agent_effect]` on the handler | `macro` — the hatch is per statement, not a handler-wide licence |
@@ -665,8 +672,13 @@ An action registered but reachable from no route in this binary at all is
 register an action the host does not mount, so it never fails.
 
 `--check` also fails when the binary has **no audit sink configured** *and*
-can still take an action nothing can undo — a non-`reversible` action, or a
-mutating ungoverned tool. The two halves matter together: a missing sink is
+can still take an action nothing can undo — a non-`reversible` action **an
+agent can reach**, or a mutating ungoverned tool. Reachability is read from the
+same `exposure` field described above: only `mcp-tool` rows count, so a
+compensable action a linked plugin registers but this binary never mounts, or
+mounts only as an `http-route`, does not trip the gate and never costs you an
+`--allow-unaudited` for a dependency's registration. The two halves matter
+together: a missing sink is
 survivable when everything is reversible, and a non-reversible action is
 survivable when it is recorded. Only the conjunction is the state nothing
 catches at runtime, because with no sink installed the audit write trivially
@@ -753,6 +765,14 @@ Metadata on all three:
 |---|---|
 | `http_status` | the replayed request's status (neither the attempt nor a refusal can know it — nothing was dispatched yet, or ever) |
 | `request_id` | the pipeline's own `x-request-id` |
+| `stream_state` | **streaming tools only**: `completed`, `aborted` or `errored` |
+
+For a `#[api_doc(mcp, stream)]` tool the outcome is recorded when the *stream*
+ends, not when the handler answered — a streaming handler returns `200` before
+it has produced anything, so a record written then would durably claim success
+for a stream that later errored or was cut off by a client disconnect, and
+`stream_state` is what distinguishes the three endings (an abandoned stream is
+a `Failure` with `stream_state = "aborted"`).
 
 The `actor_id` is the authenticated identity's subject, or `agent:anonymous` —
 never empty. The `target_resource_id` is the route template, not the tool name.

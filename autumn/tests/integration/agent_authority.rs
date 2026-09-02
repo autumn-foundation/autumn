@@ -40,8 +40,9 @@ use autumn_web::prelude::*;
 use autumn_web::sse::{Event, Sse};
 use autumn_web::test::{TestApp, TestClient};
 use axum::extract::Extension;
-use futures::Stream;
+use futures::{Stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
+use tower::ServiceExt as _;
 
 // ── Authority fixtures ────────────────────────────────────────────────
 //
@@ -264,6 +265,21 @@ async fn refund_feed() -> Sse<impl Stream<Item = Result<Event, std::convert::Inf
         Ok(Event::default().data("refund 1")),
         Ok(Event::default().data("refund 2")),
     ]);
+    Sse::new(stream)
+}
+
+/// A governed streaming tool that pauses between events, so a test can drop the
+/// response while the handler still has output to give.
+#[get("/api/slow-feed")]
+#[api_doc(mcp, stream, summary = "Stream refund events slowly")]
+async fn slow_refund_feed() -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let stream = futures::stream::unfold(0_u32, |n| async move {
+        if n >= 6 {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        Some((Ok(Event::default().data(format!("refund {n}"))), n + 1))
+    });
     Sse::new(stream)
 }
 
@@ -832,10 +848,122 @@ async fn a_streaming_tool_is_audited_without_disturbing_its_stream() {
     );
     assert_eq!(events[0].action, "agent.tool.refund_feed.attempt");
     assert_eq!(meta(&events[0], "phase"), "attempt");
-    assert_eq!(events[1].action, "agent.tool.refund_feed");
-    assert_eq!(meta(&events[1], "phase"), "outcome");
-    assert_eq!(meta(&events[1], "http_status"), "200");
-    assert_eq!(meta(&events[1], "grant"), "RefundDrafter");
+
+    // The outcome is written when the *projection* ends, not when the handler
+    // answered `200` — a streaming handler returns that before it has produced
+    // anything. Reading the sink only now (after the body above was consumed to
+    // the end) is the point: an up-front record would have been sitting here
+    // claiming success before a single event was emitted.
+    let outcome = &events[1];
+    assert_eq!(outcome.action, "agent.tool.refund_feed");
+    assert_eq!(meta(outcome, "phase"), "outcome");
+    assert_eq!(outcome.status, AuditStatus::Success);
+    assert_eq!(meta(outcome, "http_status"), "200");
+    assert_eq!(meta(outcome, "grant"), "RefundDrafter");
+    assert_eq!(
+        meta(outcome, "stream_state"),
+        "completed",
+        "the handler's body ended normally"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_cut_off_mid_flight_is_recorded_as_aborted() {
+    // The failure the up-front record could not express: the handler answered
+    // `200`, emitted part of its output, and then the client went away. Nothing
+    // about the status line says that happened, so the outcome has to come from
+    // the projection's own fate (issue #1691 review round 1).
+    let sink = RecordingSink::default();
+    let client = app_with_sink(
+        governed_by(routes![slow_refund_feed], &DRAFT_REFUND_AUTHORITY),
+        Arc::new(sink.clone()),
+    );
+
+    // Driven through the router directly rather than `TestClient`: that helper
+    // drains the whole body with `to_bytes(.., usize::MAX)` before handing back
+    // a response, so it can never model a client that goes away mid-stream —
+    // which is precisely the case under test.
+    let router = client.into_router();
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "slow_refund_feed",
+                    "arguments": {},
+                    "_meta": { "progressToken": "tok-1" },
+                },
+            }))
+            .expect("serialize request"),
+        ))
+        .expect("build request");
+
+    let response = router.oneshot(request).await.expect("dispatch");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    // Take one projected frame so the handler is genuinely mid-stream — it
+    // sleeps between events — then hang up without draining the rest. The
+    // projection never reaches a terminal state, so the drop guard is the only
+    // thing left that can record the outcome.
+    let mut body = response.into_body().into_data_stream();
+    assert!(
+        body.next().await.is_some(),
+        "the projection should have emitted at least one frame"
+    );
+    drop(body);
+
+    // The guard cannot await inside `Drop`, so it spawns the write; give that
+    // task a turn.
+    for _ in 0..50 {
+        if sink
+            .agent_events()
+            .iter()
+            .any(|e| e.metadata.get("phase").map(String::as_str) == Some("outcome"))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let events = sink.agent_events();
+    let outcome = events
+        .iter()
+        .find(|e| e.metadata.get("phase").map(String::as_str) == Some("outcome"))
+        .unwrap_or_else(|| panic!("an abandoned stream must still record an outcome: {events:#?}"));
+
+    assert_eq!(outcome.action, "agent.tool.slow_refund_feed");
+    assert_eq!(
+        outcome.status,
+        AuditStatus::Failure,
+        "a stream that never finished is not a successful action"
+    );
+    assert_eq!(meta(outcome, "stream_state"), "aborted");
+    assert_eq!(
+        meta(outcome, "http_status"),
+        "200",
+        "the 200 is still a fact"
+    );
+    assert_eq!(
+        meta(outcome, "correlation_id"),
+        meta(&events[0], "correlation_id"),
+        "the abort still joins to its attempt"
+    );
+
+    // Exactly one outcome, however the projection ended.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.metadata.get("phase").map(String::as_str) == Some("outcome"))
+            .count(),
+        1,
+        "exactly one outcome per invocation: {events:#?}"
+    );
 }
 
 // ── 7: the invocation reaches the handler ─────────────────────────────

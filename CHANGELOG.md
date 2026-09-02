@@ -100,7 +100,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `POST`/`PATCH` the verb says nothing about, while never clearing the warning
   a `DELETE` already carries — and handlers can read the invocation through
   `Extension<AgentInvocation>`. `--check` additionally fails when a binary has
-  no audit sink *and* can still take an action nothing can undo
+  no audit sink *and* can still take an agent-reachable action nothing can undo
   (`--allow-unaudited` accepts it), and on a route naming an authority nothing
   registered.
 

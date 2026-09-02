@@ -286,6 +286,9 @@ const AGENT_AUTHORITY_FIXTURES: &[(&str, bool)] = &[
     ("agent_authority_job_not_listed", false),
     // A helper handed a tracked handle is opaque, never assumed effect-free.
     ("agent_authority_opaque_helper", false),
+    // Including an *associated* one: an uppercase path segment is a shape, not
+    // evidence that the callee is framework surface.
+    ("agent_authority_opaque_associated_helper", false),
     // `#[agent_operable]` with no `grant = ...`.
     ("agent_authority_bad_attr", false),
     // `#[agent_effect]`'s reason is what makes the assertion reviewable.

@@ -1459,11 +1459,16 @@ const AUDIT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// Everything both of an invocation's audit events share, resolved once before
 /// dispatch.
 ///
+/// `Clone` so a streaming projection's drop guard can hand a copy to a spawned
+/// task: `Drop` cannot await, and the outcome of an aborted stream still has to
+/// reach the sink.
+///
 /// Two events are written per `tools/call` — `agent.tool.<name>.attempt` before
 /// dispatch and `agent.tool.<name>` after it — because an invocation that never
 /// returns (a panic, a hang, a killed process) must still leave evidence that
 /// an agent reached for the action. They share a correlation id, minted here so
 /// it exists before anything can go wrong.
+#[derive(Clone)]
 struct AgentAudit {
     tool: String,
     path_template: String,
@@ -1569,13 +1574,16 @@ impl AgentAudit {
 
     /// Write one event under [`AUDIT_WRITE_TIMEOUT`], flattening an expiry into
     /// the same `Err` shape a sink failure produces.
+    ///
+    /// Takes the state rather than the server because the streaming drop guard
+    /// outlives the borrow of `McpServer` — it writes from a spawned task.
     async fn write_bounded(
-        server: &McpServer,
+        state: &crate::state::AppState,
         event: crate::audit::AuditEvent,
     ) -> Result<(), String> {
         match tokio::time::timeout(
             AUDIT_WRITE_TIMEOUT,
-            crate::audit::write_from_state(&server.state, event),
+            crate::audit::write_from_state(state, event),
         )
         .await
         {
@@ -1597,7 +1605,7 @@ impl AgentAudit {
     ///
     /// `Err` carries the tool-error text: the record could not be written and
     /// the action is not reversible, so it must not happen at all.
-    async fn record_attempt(&self, server: &McpServer) -> Result<(), &'static str> {
+    async fn record_attempt(&self, state: &crate::state::AppState) -> Result<(), &'static str> {
         let event = self.event(
             format!("agent.tool.{}.attempt", self.tool),
             // The *write* is what succeeded here; `phase` carries the fact that
@@ -1605,7 +1613,7 @@ impl AgentAudit {
             crate::audit::AuditStatus::Success,
             "attempt",
         );
-        let Err(error) = Self::write_bounded(server, event).await else {
+        let Err(error) = Self::write_bounded(state, event).await else {
             // Mirrored to the trace so an app with no sink installed still sees
             // both halves of every invocation, not just the outcome.
             tracing::info!(
@@ -1639,7 +1647,7 @@ impl AgentAudit {
                 "refusing an agent tool call: its attempt record could not be written \
                  and the action is not reversible"
             );
-            self.record_refusal(server, &error).await;
+            self.record_refusal(state, &error).await;
             return Err(UNAUDITABLE_REFUSAL);
         }
         tracing::warn!(
@@ -1665,7 +1673,7 @@ impl AgentAudit {
     /// happened. Its own failure is ignored on purpose: there is nowhere left to
     /// report it, the `tracing::error!` above already fired, and the refusal
     /// itself does not depend on this landing.
-    async fn record_refusal(&self, server: &McpServer, error: &str) {
+    async fn record_refusal(&self, state: &crate::state::AppState, error: &str) {
         let mut event = self.event(
             // Its own action, not the outcome action with a different `phase`:
             // a refusal and a completed call are different things, and an
@@ -1679,7 +1687,7 @@ impl AgentAudit {
         event
             .metadata
             .insert("refused_reason".to_owned(), error.to_owned());
-        let _ = Self::write_bounded(server, event).await;
+        let _ = Self::write_bounded(state, event).await;
     }
 
     /// Record how the invocation ended. Never alters the tool result: a broken
@@ -1687,11 +1695,16 @@ impl AgentAudit {
     /// happened.
     async fn record_outcome(
         &self,
-        server: &McpServer,
+        state: &crate::state::AppState,
         status: StatusCode,
         request_id: Option<&str>,
+        stream: Option<StreamState>,
     ) {
-        let audit_status = if status.is_success() {
+        // A streaming tool's HTTP status is settled the moment the handler
+        // answers, long before it has actually done anything — so for those the
+        // *projection's* fate decides success, not the 200 that opened it.
+        let succeeded = status.is_success() && stream.is_none_or(StreamState::is_success);
+        let audit_status = if succeeded {
             crate::audit::AuditStatus::Success
         } else {
             crate::audit::AuditStatus::Failure
@@ -1700,6 +1713,11 @@ impl AgentAudit {
         event
             .metadata
             .insert("http_status".to_owned(), status.as_u16().to_string());
+        if let Some(stream) = stream {
+            event
+                .metadata
+                .insert("stream_state".to_owned(), stream.as_str().to_owned());
+        }
         // The replayed pipeline's own id, so an audit row joins to the access
         // log line and the traces for the same dispatch.
         if let Some(request_id) = request_id {
@@ -1722,13 +1740,14 @@ impl AgentAudit {
             actor = %self.actor,
             target = %self.path_template,
             http_status = status.as_u16(),
+            stream_state = stream.map(StreamState::as_str),
             request_id = request_id,
             "agent tool call"
         );
         // Bounded like the attempt write: the handler has already run, so a
         // hanging sink here cannot change what happened — but it can still hold
         // the response open, and the caller is owed one.
-        if let Err(error) = Self::write_bounded(server, event).await {
+        if let Err(error) = Self::write_bounded(state, event).await {
             tracing::warn!(
                 target: "autumn.agent",
                 tool = %self.tool,
@@ -1737,6 +1756,103 @@ impl AgentAudit {
                 error = %error,
                 "agent tool outcome record could not be written"
             );
+        }
+    }
+}
+
+/// How a streaming tool's projection ended.
+///
+/// A streaming handler returns `200` before it has produced anything, so the
+/// status line says nothing about whether the work happened. Recording the
+/// outcome up front would durably claim success for a stream that then errored
+/// or was cut off by a client disconnect, with no later event to correct it
+/// (issue #1691 review round 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamState {
+    /// The handler's body ended normally: everything it meant to emit, it
+    /// emitted.
+    Completed,
+    /// The projection was dropped before the handler's body ended — a client
+    /// disconnect, or the response being discarded mid-flight.
+    Aborted,
+    /// The handler's body yielded a transport error part-way through.
+    Errored,
+}
+
+impl StreamState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Aborted => "aborted",
+            Self::Errored => "errored",
+        }
+    }
+
+    /// Only a stream that ran to the end counts as a successful action.
+    const fn is_success(self) -> bool {
+        matches!(self, Self::Completed)
+    }
+}
+
+/// Owns the one outcome record a streaming `tools/call` still owes.
+///
+/// The record is written when the projection reaches a terminal state — which
+/// may be "never", if the client hangs up. `Drop` is therefore the backstop:
+/// it cannot await, so it spawns the write instead. `recorded` makes the two
+/// paths mutually exclusive, so exactly one outcome reaches the sink per call.
+struct StreamAudit {
+    audit: AgentAudit,
+    state: crate::state::AppState,
+    status: StatusCode,
+    request_id: Option<String>,
+    recorded: bool,
+}
+
+impl StreamAudit {
+    /// Record the outcome inline, from the projection's own async context.
+    async fn record(&mut self, stream: StreamState) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        self.audit
+            .record_outcome(
+                &self.state,
+                self.status,
+                self.request_id.as_deref(),
+                Some(stream),
+            )
+            .await;
+    }
+}
+
+impl Drop for StreamAudit {
+    fn drop(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        // The projection never reached an end: the response body was dropped
+        // while the handler still had output to give. That is an aborted
+        // action, and the trail has to say so rather than stay silent.
+        let audit = self.audit.clone();
+        let state = self.state.clone();
+        let status = self.status;
+        let request_id = self.request_id.clone();
+        // `try_current` rather than `spawn`: during runtime shutdown there is
+        // no reactor left to spawn onto, and a panic in `Drop` would be far
+        // worse than a missing row on a process that is already going away.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                audit
+                    .record_outcome(
+                        &state,
+                        status,
+                        request_id.as_deref(),
+                        Some(StreamState::Aborted),
+                    )
+                    .await;
+            });
         }
     }
 }
@@ -1914,7 +2030,7 @@ async fn serve_tools_call(
 
     // The last thing before the action runs: if this record cannot be written
     // and the action is not provably reversible, it does not run.
-    if let Err(refusal) = audit.record_attempt(server).await {
+    if let Err(refusal) = audit.record_attempt(&server.state).await {
         return json_response(&success(id, tool_error(refusal)));
     }
 
@@ -1922,24 +2038,21 @@ async fn serve_tools_call(
         Ok(resp) => resp,
         Err(e) => {
             audit
-                .record_outcome(server, StatusCode::INTERNAL_SERVER_ERROR, None)
+                .record_outcome(&server.state, StatusCode::INTERNAL_SERVER_ERROR, None, None)
                 .await;
             return json_response(&success(id, tool_error(&format!("dispatch failed: {e}"))));
         }
     };
 
     let status = response.status();
-    // Recorded here — after the status is known, before the body is consumed or
-    // the SSE projection takes the response — so the streaming and buffered
-    // branches below share one outcome record instead of each growing their own.
+    // Captured before the body is consumed or the SSE projection takes the
+    // response; *when* the outcome is recorded then differs by branch (see
+    // below).
     let request_id = response
         .headers()
         .get("x-request-id")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    audit
-        .record_outcome(server, status, request_id.as_deref())
-        .await;
     let is_event_stream = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -1971,8 +2084,27 @@ async fn serve_tools_call(
     // read SSE) falls through to the buffered branch below — so the base #1117
     // path and non-SSE clients are entirely unaffected.
     if tool.streams && status.is_success() && is_event_stream && client_accepts_sse {
-        return stream_tool_result(id, &params, response, cookies);
+        // The outcome is NOT recorded here. A streaming handler answers `200`
+        // before it has produced anything, so recording now would durably claim
+        // success for a stream that then errors or is cut off by a client
+        // disconnect — with no later event to correct it. The guard travels
+        // with the projection and writes exactly one outcome when it reaches a
+        // terminal state, or from its `Drop` if the client hangs up first.
+        let stream_audit = StreamAudit {
+            audit,
+            state: server.state.clone(),
+            status,
+            request_id,
+            recorded: false,
+        };
+        return stream_tool_result(id, &params, response, cookies, stream_audit);
     }
+
+    // Buffered path: the handler has already run to completion behind this
+    // status, so the outcome is settled and recorded now.
+    audit
+        .record_outcome(&server.state, status, request_id.as_deref(), None)
+        .await;
 
     // Capture the dispatch clone's `Server-Timing` header (#1348) so its
     // non-`total` metrics can be forwarded onto the rebuilt response. The clone
@@ -2186,6 +2318,10 @@ struct StreamProjection {
     /// them to distinguish the final payload from incremental progress.
     result_parts: Vec<String>,
     phase: ProjectionPhase,
+    /// The invocation's outstanding outcome record. Dropped with the rest of
+    /// the projection when the client hangs up, which is how an aborted stream
+    /// still gets a row (#1691).
+    audit: StreamAudit,
 }
 
 /// Project a streaming handler's `Sse` response onto the MCP SSE channel.
@@ -2200,6 +2336,7 @@ fn stream_tool_result(
     params: &Value,
     response: Response,
     cookies: Vec<HeaderValue>,
+    audit: StreamAudit,
 ) -> Response {
     let progress_token = params
         .get("_meta")
@@ -2216,6 +2353,7 @@ fn stream_tool_result(
         progress_parts: Vec::new(),
         result_parts: Vec::new(),
         phase: ProjectionPhase::Streaming,
+        audit,
     };
 
     let stream = futures::stream::unfold(state, project_next);
@@ -2250,18 +2388,29 @@ async fn project_next(
                 st.phase = ProjectionPhase::Done;
                 return Some((Ok(Event::default().data(value.to_string())), st));
             }
-            ProjectionPhase::Streaming => {
-                if let Some(Ok(bytes)) = st.body.next().await {
+            ProjectionPhase::Streaming => match st.body.next().await {
+                Some(Ok(bytes)) => {
                     let events = st.parser.push(&bytes);
                     enqueue_projected(&mut st, events);
-                } else {
-                    // End of stream (or a body error): flush any trailing frame
-                    // and move on to the terminating result.
+                }
+                // The handler's body is finished — cleanly (`None`) or with a
+                // transport error (`Some(Err)`, the only `Some` left here).
+                // Either way this is the action's terminal state, so the
+                // outcome is recorded now rather than left to the drop guard:
+                // whatever the client does with the remaining projection, the
+                // handler has already done everything it was going to do.
+                terminal => {
+                    let outcome = if terminal.is_some() {
+                        StreamState::Errored
+                    } else {
+                        StreamState::Completed
+                    };
                     let trailing = st.parser.finish();
                     enqueue_projected(&mut st, trailing);
                     st.phase = ProjectionPhase::Final;
+                    st.audit.record(outcome).await;
                 }
-            }
+            },
         }
     }
 }
