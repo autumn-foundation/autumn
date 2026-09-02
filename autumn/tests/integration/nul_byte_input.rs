@@ -111,7 +111,7 @@ async fn clean_post_body_is_still_accepted() {
 /// Everything the form extractor never sees — a JSON API body, a hand-written
 /// query, a background job — still reaches Postgres raw. There the rejection
 /// is classified rather than blanket-500'd.
-#[cfg(all(feature = "db", any(feature = "test-support", test)))]
+#[cfg(feature = "db")]
 mod docker {
     use autumn_web::error::{AutumnError, is_nul_byte_violation};
     use autumn_web::reexports::axum::http::StatusCode;
@@ -143,6 +143,16 @@ mod docker {
         (container, pool)
     }
 
+    /// Insert `body` the way an ordinary handler would — `?` on the diesel
+    /// result, so the conversion under test is the blanket `From` impl.
+    async fn insert(conn: &mut AsyncPgConnection, body: &str) -> Result<(), AutumnError> {
+        diesel::sql_query("INSERT INTO nul_test (body) VALUES ($1)")
+            .bind::<diesel::sql_types::Text, _>(body)
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
+
     /// A real `INSERT` of a NUL-bearing `String` into a `TEXT` column: the
     /// server raises SQLSTATE `22021`, and the `?`-converted `AutumnError`
     /// carries `422`, not the `500` reported in #2423.
@@ -158,17 +168,6 @@ mod docker {
         .execute(&mut *conn)
         .await
         .expect("create table");
-
-        async fn insert(
-            conn: &mut AsyncPgConnection,
-            body: &str,
-        ) -> Result<(), autumn_web::error::AutumnError> {
-            diesel::sql_query("INSERT INTO nul_test (body) VALUES ($1)")
-                .bind::<diesel::sql_types::Text, _>(body)
-                .execute(conn)
-                .await?;
-            Ok(())
-        }
 
         // Sanity: the same statement with clean text succeeds, so the failure
         // below is the byte and not the fixture.
@@ -188,6 +187,13 @@ mod docker {
             err.status(),
             StatusCode::UNPROCESSABLE_ENTITY,
             "an embedded NUL is malformed client input, not a server bug"
+        );
+        // ...and the raw server message is not what the client would see: the
+        // 422 error page renders `message` where the 500 page redacts it.
+        assert_eq!(
+            err.to_string(),
+            autumn_web::error::NUL_BYTE_REJECTED_MESSAGE,
+            "the raw Postgres message must not become the client-facing one"
         );
     }
 }

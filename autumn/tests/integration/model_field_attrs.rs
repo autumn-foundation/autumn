@@ -153,6 +153,8 @@ fn normalize_is_idempotent() {
         n.normalize();
         n
     };
+    assert_eq!(once.bio, twice.bio, "strip_nul is idempotent (#2423)");
+    assert_eq!(once.bio, "xy");
     assert_eq!(once.email, twice.email);
     assert_eq!(once.display_name, twice.display_name);
     assert_eq!(twice.email, "foo@x.com");

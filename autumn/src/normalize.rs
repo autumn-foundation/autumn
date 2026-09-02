@@ -72,6 +72,12 @@ pub fn upcase(s: &str) -> String {
     s.to_uppercase()
 }
 
+/// Trim and collapse every internal run of whitespace to a single ASCII space.
+#[must_use]
+pub fn squish(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Remove every NUL (`U+0000`) character (issue #2423).
 ///
 /// A Postgres `TEXT`/`VARCHAR` column cannot hold `0x00`, so a value carrying
@@ -88,17 +94,7 @@ pub fn upcase(s: &str) -> String {
 /// error without any attribute.
 #[must_use]
 pub fn strip_nul(s: &str) -> String {
-    if s.as_bytes().contains(&0) {
-        s.replace('\u{0}', "")
-    } else {
-        s.to_owned()
-    }
-}
-
-/// Trim and collapse every internal run of whitespace to a single ASCII space.
-#[must_use]
-pub fn squish(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    s.replace('\u{0}', "")
 }
 
 /// A type whose `#[normalize]` columns can be canonicalized in place.

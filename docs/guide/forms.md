@@ -429,9 +429,10 @@ A real user can produce one without trying: a paste from a binary source, a
 misbehaving input method, a clipboard glitch. So this is a robustness question,
 not only an adversarial one.
 
-The framework handles it at the form boundary. `ChangesetForm` and
-`NestedChangesetForm` sweep every submitted **text** value before it is
-deserialized, and a field that carried a NUL gets an ordinary error:
+The framework handles it at the form boundary. The two extractors built for
+form round-trips — `ChangesetForm` and `NestedChangesetForm` — sweep every
+submitted **text** value before it is deserialized, and a field that carried a
+NUL gets an ordinary error:
 
 ```text
 Cannot contain the NUL character (0x00)
@@ -446,30 +447,40 @@ author's text with the byte removed, so the re-rendered form keeps their work
 succeeds.
 
 Framework plumbing fields are deliberately exempt — the CSRF token, the submit
-token, and the `_method` override. None is a form field any template renders, so
-an error keyed under one would leave the form invalid with nothing on screen to
-explain why, and none is ever written to a column. Each is still rejected on its
-own terms when malformed: `CsrfLayer` and the submit-token guard for the tokens,
-"not a known verb" for the override.
+token, and the `_method` override, under both their default names and whatever
+name you configured. None is a form field any template renders, so an error
+keyed under one would leave the form invalid with nothing on screen to explain
+why, and none is ever written to a column. Nothing about their own handling
+changes either: each is read from the raw body by its middleware, before any
+extractor runs, so a NUL-mangled `_csrf` is still a 403 and a NUL-mangled
+`_method` is still a 400. (A mangled `_submit_token` is not rejected — it simply
+matches no stored token and loses its at-most-once protection, exactly as it
+would have before.)
+
+`_destroy` on a nested child row is exempt for a different reason: it is read
+only for truthiness, and cleaning it would *change* it — `1\0` is falsy today
+and would become truthy — so the sweep leaves it alone entirely.
 
 An *unknown* key is not exempt. A submitted name that is not a field of your
 form type is normally ignored, but if it carries a NUL it is still reported —
-under that name. `error_summary` renders it; a hand-written `errors_for("...")`
-per field will not, so a form built that way rejects the submission with no
-visible message. In practice that takes a hand-crafted request: the values your
-own templates emit for non-form fields are server-generated, not pasted.
+under that name. Since no template renders that name, the submission is
+rejected with no message next to any input; `error_summary` will show the
+message, but without saying which input it belongs to. In practice that takes a
+hand-crafted request: the values your own templates emit for non-form fields
+are server-generated, not pasted.
 
 File parts of a `multipart/form-data` body are untouched — binary uploads are
 supposed to contain arbitrary bytes.
 
 ### The paths no form extractor sees
 
-A JSON API body, a hand-written query, a background job argument: these reach
-the database without passing a form extractor, so the byte still gets there. It
-is classified rather than blanket-500'd — the resulting `AutumnError` carries
-`422 Unprocessable Entity`, matching the status a validator would have produced,
-and `autumn_web::error::is_nul_byte_violation` recognizes it if you want to fold
-it back into a form:
+A JSON API body, a hand-written query, a background job argument, an
+`autumn_web::extract::Form` or `Valid<T>` extraction: these reach the database
+without passing one of the two round-trip extractors, so the byte still gets
+there. It is classified rather than blanket-500'd — the resulting `AutumnError`
+carries `422 Unprocessable Entity`, matching the status a validator would have
+produced, and `autumn_web::error::is_nul_byte_violation` recognizes it if you
+want to fold it back into a form:
 
 ```rust,ignore
 if let Err(err) = repo.save(&new_post).await
@@ -481,7 +492,12 @@ if let Err(err) = repo.save(&new_post).await
 ```
 
 This is a backstop, not the mechanism: rejecting at the form boundary is what
-gives the author something actionable.
+gives the author something actionable. Two limits come with that. The 422 names
+no field — nothing at the database boundary knows which one the byte came from,
+so `errors` is empty unless you fold it in yourself as above. And classification
+is by server message, anchored on the `: 0x00` the encoding rejection ends with;
+a NUL smuggled into a `JSONB` column fails with a different message entirely
+(`unsupported Unicode escape sequence`, SQLSTATE `22P05`) and is not classified.
 
 ### When you would rather clean than reject
 
@@ -500,6 +516,18 @@ Prefer rejecting wherever the author can see and fix the value — they get told
 what happened instead of having their input quietly altered. `strip_nul` removes
 only NUL; every other control character is storable and is left exactly as
 written.
+
+**It covers inserts and hooked updates only.** Per [Updates are not the same as
+inserts](#updates-are-not-the-same-as-inserts), a repository with no hooks, or
+one using `validate_on_update = fetch`, persists the raw patch and throws the
+normalized draft away — so an `update` through either of those still sends the
+NUL to Postgres and still fails the write, now as a 422 rather than a 500.
+
+The message is a fixed English string. Unlike a scaffold's `common.error.taken`,
+it is recorded inside the extractor, before any handler holds a `Locale`, so
+there is nowhere to look up a translation. A localized app that needs a
+localized message can rewrite it from the handler by matching
+`NUL_CHARACTER_FIELD_ERROR` in `changeset.errors()`.
 
 ---
 

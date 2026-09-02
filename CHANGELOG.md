@@ -867,25 +867,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-renders inline through the existing `ChangesetForm` round-trip. The
   retained value is the author's text minus the byte, so the re-rendered form
   keeps their work, never echoes a raw `0x00` into the HTML, and their next
-  submission succeeds. The CSRF and submit tokens are exempt (no template
-  renders them, so an error there would leave the form invalid with nothing on
-  screen); file parts of a multipart body are untouched.
+  submission succeeds. Framework plumbing fields are exempt under both their
+  default and configured names — `_csrf`, `_submit_token`, `_method`, and a
+  nested row's `_destroy` — because no template renders an error against one,
+  and cleaning `_destroy` would flip a falsy marker truthy. File parts of a
+  multipart body are untouched.
 
-  For the paths no form extractor sees — a JSON API body, a hand-written query,
-  a background job — the Postgres rejection is now classified instead of
+  For the paths neither round-trip extractor sees — a JSON API body, a
+  hand-written query, a background job, an `extract::Form` or `Valid<T>`
+  extraction — the Postgres rejection is now classified instead of
   blanket-500'd: the `AutumnError` carries `422 Unprocessable Entity`, and
   `autumn_web::error::is_nul_byte_violation` recognizes it (walking the
   `source()` chain) for handlers that want to fold it back into a form the way
   `unique_violation_field` is used for a uniqueness clash. Classification is by
   server message rather than SQLSTATE because `diesel-async` maps `22021` to
   `DatabaseErrorKind::Unknown` and diesel's `DatabaseErrorInformation` exposes
-  no code; the match requires both the byte literal and the encoding name, so a
-  message that merely mentions `0x00` keeps its 500.
+  no code; the match is anchored on the trailing `: 0x00` and the encoding name,
+  so a message that merely *contains* `0x00` — including one echoing text a
+  client submitted — keeps its 500 rather than being relabelled as the client's
+  fault. The classified error is also re-wrapped rather than merely restatused,
+  because the 422 error page renders the message where the 500 page redacts it:
+  the client sees a fixed sentence and the raw server message stays in the
+  `source()` chain for logs.
 
   New: `Changeset::add_error`, for folding a post-decode failure back into a
   form round-trip; `autumn_web::normalize::strip_nul` and
   `#[normalize(strip_nul)]`, for columns where dropping the byte silently beats
-  refusing the write. See `docs/guide/forms.md` — "Unstorable bytes: NUL".
+  refusing the write (insert and hooked-update paths only — the documented
+  normalize-vs-persist asymmetry still applies). See `docs/guide/forms.md` —
+  "Unstorable bytes: NUL", which also records what the backstop does not cover:
+  a 422 with no field name, and `JSONB`'s different SQLSTATE (`22P05`).
 
 - **ACME config: `autumn doctor` and the runtime now reject the same two
   spellings (#1874):** two low-severity parity gaps let `autumn doctor

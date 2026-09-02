@@ -364,15 +364,18 @@ pub const NUL_CHARACTER_FIELD_ERROR: &str = "Cannot contain the NUL character (0
 ///
 /// No template renders an error against one of these, so a
 /// [`NUL_CHARACTER_FIELD_ERROR`] keyed under one would leave the form invalid
-/// with nothing on screen to explain why. Each is already rejected on its own
-/// terms when malformed — a mangled `_method` simply fails to name a known
-/// verb — and none is ever written to a column.
+/// with nothing on screen to explain why — the failure the exemption exists to
+/// prevent. None is ever written to a column, so nothing is lost by cleaning
+/// one silently.
 ///
-/// Only the fixed names live here. The CSRF and submit-token field names are
-/// configurable, so the extractors pass those in from request extensions.
-const PLUMBING_FIELDS: &[&str] = &["_method"];
+/// These are the *default* names. Both token fields are configurable, so the
+/// extractors additionally exempt whatever name request extensions carry; the
+/// defaults are listed here as well so a direct caller of the public
+/// [`crate::nested_form::decode_nested_urlencoded`], which never sees those
+/// extensions, is covered for the common case.
+const PLUMBING_FIELDS: &[&str] = &["_method", "_csrf", "_submit_token"];
 
-/// Whether `name` is one of the fixed [`PLUMBING_FIELDS`].
+/// Whether `name` is one of the default [`PLUMBING_FIELDS`].
 pub(crate) fn is_plumbing_field(name: &str) -> bool {
     PLUMBING_FIELDS.contains(&name)
 }
@@ -397,17 +400,24 @@ pub(crate) fn is_plumbing_field(name: &str) -> bool {
 ///
 /// The returned names are deduplicated, so a repeated key (a multi-value
 /// field) contributes at most one message.
+///
+/// Deduplication goes through a `BTreeSet` rather than a linear scan of the
+/// names collected so far. That scan is O(n²) in the number of *distinct*
+/// offending keys, and the key count is bounded only by `DefaultBodyLimit` — a
+/// 32 MiB body of `k1=%00&k2=%00&…` is millions of distinct keys, which is
+/// minutes of CPU burned synchronously on a runtime worker thread. The set also
+/// gives the names a deterministic order.
 pub(crate) fn strip_nul_from_pairs(pairs: &mut [(String, String)]) -> Vec<String> {
-    let mut offenders: Vec<String> = Vec::new();
+    let mut offenders: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (key, value) in pairs {
         if value.as_bytes().contains(&0) {
             *value = crate::normalize::strip_nul(value);
-            if !offenders.iter().any(|name| name == key) {
-                offenders.push(key.clone());
+            if !offenders.contains(key.as_str()) {
+                offenders.insert(key.clone());
             }
         }
     }
-    offenders
+    offenders.into_iter().collect()
 }
 
 // ── IntoChangeset ──────────────────────────────────────────────────
@@ -697,18 +707,31 @@ where
             .extensions()
             .get::<crate::security::csrf::CsrfFormField>()
             .map_or_else(|| "_csrf".to_owned(), |f| f.0.clone());
+        // Read for the #2423 exemption only. `ChangesetForm` does not otherwise
+        // use the submit token — `SubmitTokenLayer` consumes it from the raw
+        // body upstream — but a scaffolded flat form does post the hidden
+        // field, so its name has to be exempt here exactly as the nested
+        // extractor exempts it.
+        let submit_field = req
+            .extensions()
+            .get::<crate::security::SubmitFormField>()
+            .map_or_else(|| "_submit_token".to_owned(), |f| f.0.clone());
 
         let (data, nul_fields) = decode_form_body::<T, S>(req, state).await?;
 
         let mut changeset = data.into_changeset();
         for field in nul_fields {
-            // The CSRF token and the method override are transport plumbing,
-            // not form fields: no template renders either, so an error keyed
-            // under one would make the form permanently invalid with nothing
-            // on screen to explain why. Each is rejected on its own terms when
-            // malformed — `CsrfLayer` for the token, "not a known verb" for
-            // the override — and neither is ever written to a column.
-            if field == csrf_field || PLUMBING_FIELDS.contains(&field.as_str()) {
+            // The two tokens and the method override are transport plumbing,
+            // not form fields: no template renders any of them, so an error
+            // keyed under one would make the form permanently invalid with
+            // nothing on screen to explain why, and none is ever written to a
+            // column. The configurable names come from request extensions; the
+            // defaults are in `PLUMBING_FIELDS` too, because `CsrfService`
+            // accepts the literal `_csrf` even when another name is configured.
+            if field == csrf_field
+                || field == submit_field
+                || PLUMBING_FIELDS.contains(&field.as_str())
+            {
                 continue;
             }
             changeset.add_error(field, NUL_CHARACTER_FIELD_ERROR);
@@ -6758,6 +6781,106 @@ mod tests {
             assert_body(resp, "valid=true errors=0").await;
         }
 
+        /// A scaffolded flat form posts the submit token as a hidden field, so
+        /// its name has to be exempt here too — the nested extractor already
+        /// exempted it, and the flat one must not diverge.
+        #[tokio::test]
+        async fn nul_byte_in_the_submit_token_is_not_a_form_error() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!("valid={} errors={}", form.is_valid(), form.errors().len())
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req(
+                    "/test",
+                    "_submit_token=to%00ken&name=Alice&body=ok",
+                ))
+                .await
+                .unwrap();
+            assert_body(resp, "valid=true errors=0").await;
+        }
+
+        /// The exemption follows the *configured* field name, not just the
+        /// default, so renaming `security.csrf.form_field` does not reintroduce
+        /// an unrenderable error.
+        #[tokio::test]
+        async fn nul_byte_in_a_renamed_csrf_field_is_not_a_form_error() {
+            let mut req = urlencoded_req("/test", "authenticity=to%00ken&name=Alice&body=ok");
+            req.extensions_mut()
+                .insert(crate::security::csrf::CsrfFormField(
+                    "authenticity".to_owned(),
+                ));
+
+            let form = ChangesetForm::<NulTestForm>::from_request(req, &())
+                .await
+                .expect("extraction should succeed");
+            assert!(form.is_valid(), "errors: {:?}", form.errors());
+        }
+
+        /// A submitted name that is not a field of `T` is normally ignored, but
+        /// a NUL in one is still reported — under that name. Documented in
+        /// `docs/guide/forms.md`; pinned here so the choice is deliberate
+        /// rather than incidental.
+        #[tokio::test]
+        async fn nul_byte_in_an_unknown_key_is_reported_under_that_key() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!(
+                    "valid={} unknown={}",
+                    form.is_valid(),
+                    form.errors_for("return_to").len()
+                )
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req(
+                    "/test",
+                    "return_to=a%00b&name=Alice&body=ok",
+                ))
+                .await
+                .unwrap();
+            assert_body(resp, "valid=false unknown=1").await;
+        }
+
+        /// A key submitted more than once contributes one message, not one per
+        /// occurrence. Repeating a key that *is* a field of `T` is a hard
+        /// `duplicate field` decode failure in `serde_urlencoded` (a 400 before
+        /// any of this runs), so the case that actually reaches the sweep is a
+        /// repeated key `T` does not declare — which is also the shape that
+        /// makes the dedupe load-bearing, since an unbounded body can repeat a
+        /// key arbitrarily many times.
+        #[tokio::test]
+        async fn a_repeated_key_reports_once() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!("errors={}", form.errors_for("return_to").len())
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req(
+                    "/test",
+                    "name=Alice&body=ok&return_to=a%00a&return_to=b%00b&return_to=c%00c",
+                ))
+                .await
+                .unwrap();
+            assert_body(resp, "errors=1").await;
+        }
+
+        /// Keys are deliberately never cleaned. Stripping a NUL out of a key
+        /// would rename it — potentially onto a real field of `T` — inventing a
+        /// submission the client never made.
+        #[tokio::test]
+        async fn a_nul_in_a_key_never_renames_it_onto_a_real_field() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!("valid={} body={:?}", form.is_valid(), form.data().body)
+            }
+            // `bod y` must NOT become `body`.
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&bod%00y=injected"))
+                .await
+                .unwrap();
+            assert_body(resp, r#"valid=true body="""#).await;
+        }
+
         /// A NUL in a *rule-violating* field adds to that field's messages
         /// rather than replacing the validator's own.
         #[tokio::test]
@@ -6792,6 +6915,69 @@ mod tests {
             let resp = Router::new()
                 .route("/test", post(handler))
                 .oneshot(urlencoded_req("/test", "_csrf=to%00ken&name=Alice&body=ok"))
+                .await
+                .unwrap();
+            assert_body(resp, "valid=true errors=0").await;
+        }
+
+        /// The multipart blank-optional retry re-deserializes from a filtered
+        /// pair set; the NUL report must survive that second attempt rather
+        /// than being dropped with the blank field.
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_nul_report_survives_the_blank_optional_retry() {
+            async fn handler(form: ChangesetForm<OptionalNumericForm>) -> String {
+                format!(
+                    "age={:?} name_errors={}",
+                    form.data().age,
+                    form.errors_for("name").len()
+                )
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(multipart_req_multi(
+                    "/test",
+                    // The blank `age` forces the retry path; the NUL is on
+                    // `name`, which the retry keeps.
+                    &[("name", "Ali\u{0}ce"), ("age", "")],
+                ))
+                .await
+                .unwrap();
+            assert_body(resp, "age=None name_errors=1").await;
+        }
+
+        /// A file part is binary by definition, so it is never swept and never
+        /// blocks the submission.
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_file_part_carrying_a_nul_is_untouched() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!("valid={} errors={}", form.is_valid(), form.errors().len())
+            }
+            let boundary = "----FormBoundary7MA4YWxkTrZu0gW";
+            let body = format!(
+                "--{boundary}\r\n\
+                 Content-Disposition: form-data; name=\"name\"\r\n\r\n\
+                 Alice\r\n\
+                 --{boundary}\r\n\
+                 Content-Disposition: form-data; name=\"avatar\"; filename=\"a.bin\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n\
+                 bin\u{0}ary\r\n\
+                 --{boundary}--\r\n"
+            );
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/test")
+                .header(
+                    "Content-Type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap();
+
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(req)
                 .await
                 .unwrap();
             assert_body(resp, "valid=true errors=0").await;

@@ -486,6 +486,17 @@ impl<P, C: NestedChild + serde::Serialize> NestedChangeset<P, C> {
 /// [`ChangesetForm`](crate::form::ChangesetForm) uses, so string→typed
 /// coercion (`quantity=5` → `i32`) comes for free.
 ///
+/// # Unstorable bytes
+///
+/// Submitted text values are swept for NUL (`U+0000`) before anything decodes
+/// them (issue #2423), and a parent field or child subfield that carried one
+/// gets [`NUL_CHARACTER_FIELD_ERROR`](crate::form::NUL_CHARACTER_FIELD_ERROR)
+/// alongside whatever the validators said. `_destroy` is excluded from the
+/// sweep — cleaning a marker read only for truthiness would change it — and so
+/// are the *default* names of the framework's plumbing fields, since this
+/// function takes raw pairs and never sees the request extensions that carry
+/// their configured names. [`NestedChangesetForm`] additionally exempts those.
+///
 /// # Errors
 ///
 /// Returns `Err(message)` when the **parent** fails to decode (a malformed,
@@ -524,10 +535,34 @@ where
     // and fails only at the database with an unhandled 500. Parent fields and
     // each row's subfields are swept separately because they are keyed
     // separately in the rendered form.
-    let parent_nul_fields = crate::form::strip_nul_from_pairs(&mut parent_pairs);
+    // `_destroy` is excluded from the sweep, not merely from the reporting.
+    // Cleaning it would rewrite the marker itself: `is_truthy` trims only
+    // whitespace, so `"1\u{0}"` reads as false today and would read as *true*
+    // after stripping — silently destroying a row the author submitted to keep.
+    // It is never written to a column, so leaving the byte in it costs nothing.
+    let parent_nul_fields: Vec<String> = crate::form::strip_nul_from_pairs(&mut parent_pairs)
+        .into_iter()
+        // A direct caller of this public function passes the raw pairs, tokens
+        // and all, and never sees the request extensions that carry the
+        // configurable field names — so exempt the defaults here. The
+        // extractor additionally exempts the configured names.
+        .filter(|field| !crate::form::is_plumbing_field(field))
+        .collect();
     let child_nul_fields: BTreeMap<usize, Vec<String>> = child_groups
         .iter_mut()
-        .map(|(idx, subfields)| (*idx, crate::form::strip_nul_from_pairs(subfields)))
+        .map(|(idx, subfields)| {
+            let swept: Vec<String> = subfields
+                .iter_mut()
+                .filter(|(sub, _)| sub != DESTROY_SUBFIELD)
+                .filter_map(|(sub, value)| {
+                    value.as_bytes().contains(&0).then(|| {
+                        *value = crate::normalize::strip_nul(value);
+                        sub.clone()
+                    })
+                })
+                .collect();
+            (*idx, swept)
+        })
         .collect();
 
     // Decode the parent through the shared blank-optional-dropping path.
@@ -611,7 +646,7 @@ fn decode_child_row<C: NestedChild>(
     let mut decode_pairs: Vec<(String, String)> = Vec::new();
     for (sub, val) in subfields {
         values.insert(sub.clone(), val.clone());
-        if sub == "_destroy" {
+        if sub == DESTROY_SUBFIELD {
             if is_truthy(val) {
                 destroyed = true;
             }
@@ -633,16 +668,30 @@ fn decode_child_row<C: NestedChild>(
     // same outcome as the destroy path.)
     //
     // #2423: values were cleaned before this check, so a subfield whose only
-    // content was a NUL now reads as blank. A row of nothing but NULs is
-    // therefore dropped like any other blank template row — nothing is written
-    // either way.
+    // content was a NUL now reads as blank. That must not make the row *vanish*
+    // — the author did submit something, it just could not be stored — so a row
+    // that carried a NUL is reported even when nothing legible is left of it.
+    // A genuinely blank template row still drops, exactly as before.
     if decode_pairs.iter().all(|(_, val)| val.trim().is_empty()) {
-        return ChildRow::Dropped;
+        if nul_fields.is_empty() {
+            return ChildRow::Dropped;
+        }
+        let mut errors: HashMap<String, Vec<String>> = HashMap::new();
+        for field in nul_fields {
+            errors
+                .entry(field.clone())
+                .or_default()
+                .push(crate::form::NUL_CHARACTER_FIELD_ERROR.to_owned());
+        }
+        return ChildRow::Rejected(NestedRow {
+            values,
+            errors,
+            destroyed,
+        });
     }
 
     // #2423: a destroyed row is never written, so there is nothing to reject
-    // there — `_destroy` itself is a marker read only for truthiness, never a
-    // stored column.
+    // there — the cleaned values are retained only so the row re-renders.
     if destroyed {
         return ChildRow::Bound {
             row: NestedRow {
@@ -688,9 +737,8 @@ fn decode_child_row<C: NestedChild>(
     }
 
     // #2423: a NUL byte in this row's text is a rejection in its own right,
-    // recorded alongside whatever the validators said. `_destroy` is skipped:
-    // it is a marker, not a stored column.
-    for field in nul_fields.iter().filter(|field| *field != "_destroy") {
+    // recorded alongside whatever the validators said.
+    for field in nul_fields {
         errors
             .entry(field.clone())
             .or_default()
@@ -854,6 +902,12 @@ fn recover_child_error_field<C: serde::de::DeserializeOwned>(
 }
 
 /// Whether a `_destroy` marker value counts as "destroy this row".
+/// The subfield name that marks a submitted child row for destruction.
+///
+/// Not a column: its value is only ever read for truthiness, so it is left out
+/// of the #2423 NUL sweep entirely (see `decode_nested_urlencoded`).
+const DESTROY_SUBFIELD: &str = "_destroy";
+
 fn is_truthy(value: &str) -> bool {
     let trimmed = value.trim();
     trimmed == "1" || trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("on")
@@ -1835,6 +1889,114 @@ mod tests {
         ];
         let cs = decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes");
         assert!(cs.into_valid().is_err());
+    }
+
+    /// `_destroy` is a marker read only for truthiness, never a stored column,
+    /// and `is_truthy` trims whitespace but not NUL. Cleaning it would rewrite
+    /// the marker: `"1\u{0}"` reads as *false* today and would read as true
+    /// after stripping, silently destroying a row the author submitted to keep.
+    /// So the sweep leaves it alone entirely.
+    #[test]
+    fn a_nul_in_the_destroy_marker_does_not_flip_it_truthy() {
+        let pairs = vec![
+            p("name", "Order 1"),
+            p("items[0][sku]", "A-1"),
+            p("items[0][quantity]", "2"),
+            p("items[0][_destroy]", "1\u{0}"),
+        ];
+        let cs = decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes");
+        assert_eq!(cs.rows().len(), 1);
+        assert!(
+            !cs.rows()[0].is_destroyed(),
+            "a NUL-mangled marker must stay falsy, not become a destroy"
+        );
+        assert!(cs.is_valid(), "and it is not an error either");
+    }
+
+    /// A row whose every legible subfield was nothing but NUL bytes must not
+    /// silently vanish the way a genuinely blank template row does — the author
+    /// submitted something, it just could not be stored.
+    #[test]
+    fn a_row_of_only_nul_bytes_is_reported_rather_than_dropped() {
+        let pairs = vec![
+            p("name", "Order 1"),
+            p("items[0][sku]", "\u{0}"),
+            p("items[0][quantity]", ""),
+        ];
+        let cs = decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes");
+        assert_eq!(cs.rows().len(), 1, "the row must survive for re-render");
+        assert_eq!(cs.rows()[0].errors_for("sku"), [NUL_CHARACTER_FIELD_ERROR]);
+        assert!(!cs.is_valid());
+    }
+
+    /// A genuinely blank template row still drops, unchanged.
+    #[test]
+    fn a_blank_template_row_still_drops() {
+        let pairs = vec![
+            p("name", "Order 1"),
+            p("items[0][sku]", ""),
+            p("items[0][quantity]", ""),
+        ];
+        let cs = decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes");
+        assert!(cs.rows().is_empty());
+        assert!(cs.is_valid());
+    }
+
+    /// `decode_nested_urlencoded` is public and takes the raw pairs — tokens
+    /// and all — so it applies the default plumbing exemption itself. A direct
+    /// caller must not get a parent error keyed `_csrf`, which no template
+    /// renders.
+    #[test]
+    fn default_plumbing_fields_are_exempt_for_direct_callers() {
+        for field in ["_csrf", "_submit_token", "_method"] {
+            let pairs = vec![
+                p("name", "Order 1"),
+                p(field, "to%00ken".replace("%00", "\u{0}").as_str()),
+                p("items[0][sku]", "A-1"),
+                p("items[0][quantity]", "2"),
+            ];
+            let cs = decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes");
+            assert!(
+                cs.is_valid(),
+                "`{field}` must not produce an unrenderable error: {:?}",
+                cs.errors_for(field)
+            );
+        }
+    }
+
+    /// The extractor is where the *configured* token field names are known, so
+    /// that is where they have to be exempted. `decode_nested_urlencoded`
+    /// covers only the defaults.
+    #[tokio::test]
+    async fn nested_extractor_exempts_the_configured_token_field_names() {
+        use axum::body::Body;
+        use axum::extract::FromRequest as _;
+
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/orders")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "authenticity=to%00ken&stamp=st%00amp&name=Order+1\
+                 &items%5B0%5D%5Bsku%5D=A-1&items%5B0%5D%5Bquantity%5D=2",
+            ))
+            .expect("build request");
+        req.extensions_mut()
+            .insert(crate::security::csrf::CsrfFormField(
+                "authenticity".to_owned(),
+            ));
+        req.extensions_mut()
+            .insert(crate::security::SubmitFormField("stamp".to_owned()));
+
+        let form = NestedChangesetForm::<Order, LineItem>::from_request(req, &())
+            .await
+            .expect("body decodes");
+
+        assert!(
+            form.changeset.is_valid(),
+            "renamed token fields must not produce unrenderable errors: {:?}",
+            form.changeset.parent.errors()
+        );
     }
 
     /// No false positives on the nested path either.
