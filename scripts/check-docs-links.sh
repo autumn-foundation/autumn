@@ -89,8 +89,11 @@ DEST = r'\(\s*(?:<([^<>]*)>|(' + BARE + r'))' + TITLE + r'\s*\)'
 # `[![alt](img.png)](page.md)`. The flat label finds the inner image target,
 # the nesting one finds the outer click target. Matching only the flat form
 # checked the image and never the page it links to.
-INLINE = re.compile(r'\[[^\]]*\]' + DEST)
-NESTED = re.compile(r'\[(?:[^\[\]]|\[[^\[\]]*\])*\]' + DEST)
+# `\.` keeps an escaped bracket inside the label instead of ending it, so
+# `[closing \]](page.md)` still yields its destination.
+FLAT = r'(?:[^\[\]\\]|\\.)'
+INLINE = re.compile(r'\[' + FLAT + r'*\]' + DEST)
+NESTED = re.compile(r'\[(?:' + FLAT + r'|\[' + FLAT + r'*\])*\]' + DEST)
 REFDEF = re.compile(r'^ {0,3}\[[^\]]+\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
 
 
@@ -216,11 +219,18 @@ def strip_fences(text):
 # run, so ``a [link](x.md) b`` is one span. Matching single backticks only
 # consumed the delimiters as two empty spans and left the contents exposed as
 # a live link.
-CODE_SPAN = re.compile(r'(`+)(?:(?!\1).)*?\1')
+# Both delimiters must be *complete* runs: a code span opened with one
+# backtick is not closed by the first tick of a ``-run. Without the boundary
+# assertions, `` `[x](missing.md)`` `` was treated as a span and its live
+# broken link stripped away.
+CODE_SPAN = re.compile(r'(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)')
+# Markdown parked in an HTML comment renders nowhere and is not a link, so a
+# commented-out draft must not fail the gate.
+HTML_COMMENT = re.compile(r'<!--.*?-->', re.S)
 
 
 def strip_code(text):
-    return CODE_SPAN.sub('', strip_fences(text))
+    return CODE_SPAN.sub('', HTML_COMMENT.sub('', strip_fences(text)))
 
 
 def slugify(heading):
@@ -590,6 +600,25 @@ self_test() {
     >> "$c28/docs/guide/mail.md"
   git -C "$c28" commit -qam fence-trailing-text
   check "text after a closing fence does not hide later links" fail "$c28"
+
+  # An opener of one backtick is not closed by the first tick of a ``-run, so
+  # no code span forms and the link inside is live.
+  local c29="$tmp/c29"; make_corpus "$c29"
+  printf '\nSee `[bad](missing.md)`` here.\n' >> "$c29/docs/guide/mail.md"
+  git -C "$c29" commit -qam unmatched-backtick-run
+  check "unmatched backtick run does not form a code span" fail "$c29"
+
+  # An escaped bracket belongs to the label, not the end of it.
+  local c30="$tmp/c30"; make_corpus "$c30"
+  printf '\nSee [closing \\]](missing.md).\n' >> "$c30/docs/guide/mail.md"
+  git -C "$c30" commit -qam escaped-bracket-label
+  check "escaped bracket in a label keeps the link checked" fail "$c30"
+
+  # Markdown parked in an HTML comment renders nowhere.
+  local c31="$tmp/c31"; make_corpus "$c31"
+  printf '\n<!-- [draft](totally-made-up.md) -->\n' >> "$c31/docs/guide/mail.md"
+  git -C "$c31" commit -qam html-comment
+  check "link inside an HTML comment is ignored" pass "$c31"
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]]
