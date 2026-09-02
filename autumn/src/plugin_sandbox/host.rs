@@ -225,6 +225,14 @@ const STDERR_EXCERPT: usize = 512;
 /// way into a log the operator trusts, so it cannot survive intact.
 const DETAIL_EXCERPT: usize = 512;
 
+/// What a bounded excerpt says when it had to leave something out.
+///
+/// Named because two places append it — [`bounded_guest_text`], which meets the
+/// bound while walking, and `stderr_excerpt`, which is handed a string already
+/// at it — and an excerpt that says it was cut in two different ways is worse
+/// than one that never says so.
+const TRUNCATION_MARKER: &str = " … (truncated)";
+
 /// Bound and neutralise a string the guest influenced.
 ///
 /// Two hazards, and the fix for one is not the fix for the other. *Length*: a
@@ -267,7 +275,7 @@ fn bounded_guest_text(chars: impl Iterator<Item = char>, hint: usize) -> String 
     let mut out = String::with_capacity(hint.min(DETAIL_EXCERPT));
     for (kept, ch) in chars.enumerate() {
         if kept == DETAIL_EXCERPT {
-            out.push_str(" … (truncated)");
+            out.push_str(TRUNCATION_MARKER);
             break;
         }
         if ch.is_control() || is_line_separator(ch) || super::manifest::is_display_reordering(ch) {
@@ -2704,7 +2712,8 @@ impl HostState {
         // ceiling. Streaming keeps the peak at the excerpt itself.
         let mut chars = lossy_chars(&self.stderr).skip_while(|ch| ch.is_whitespace());
         let mut kept: String = chars.by_ref().take(STDERR_EXCERPT).collect();
-        if chars.next().is_none() {
+        let cut = chars.next().is_some();
+        if !cut {
             // The window reached the end of the buffer, so trailing whitespace
             // in it is the buffer's own and `trim` would have taken it. When
             // more bytes follow, it is interior whitespace and `trim` would
@@ -2714,7 +2723,18 @@ impl HostState {
                 kept.pop();
             }
         }
-        guest_text(&kept)
+        // `guest_text` marks its own truncation, but only on meeting a 513th
+        // character — and this hands it 512 at most, so the marker could never
+        // fire here and a cut excerpt read as though the guest had stopped
+        // there. The suffix is usually the interesting part of a failure, so
+        // saying it was cut matters more than the characters the marker costs.
+        // Appended after escaping: inside `kept` it would be escaped as guest
+        // text, and would count against the bound it is reporting.
+        let mut excerpt = guest_text(&kept);
+        if cut {
+            excerpt.push_str(TRUNCATION_MARKER);
+        }
+        excerpt
     }
 
     /// `SplitMix64`: tiny, deterministic, and good enough for a shim whose
@@ -5510,6 +5530,33 @@ path = "/hello/greet"
                 "the attempt must survive as an escape, not be dropped: {split:?}",
             );
         }
+    }
+
+    #[test]
+    fn a_cut_stderr_excerpt_says_that_it_was_cut() {
+        // `guest_text` appends " … (truncated)" when it meets a 513th
+        // character, and `stderr_excerpt` hands it at most 512 — so on this
+        // path the marker could never fire, and a flood that lost its most
+        // recent output read as though the guest had simply stopped there. The
+        // suffix is usually the interesting part of a failure.
+        let mut state = HostState::new("hello".to_owned(), ResourceLimits::default(), b"");
+        state.write_stderr("a".repeat(STDERR_EXCERPT * 2).as_bytes());
+        let excerpt = state.stderr_excerpt();
+        assert!(
+            excerpt.ends_with(" … (truncated)"),
+            "a cut excerpt must say so: {:?}",
+            excerpt.get(excerpt.len().saturating_sub(40)..),
+        );
+
+        // And an excerpt that fits says nothing of the kind — the marker has to
+        // mean something.
+        let mut short = HostState::new("hello".to_owned(), ResourceLimits::default(), b"");
+        short.write_stderr(b"panicked at the disco");
+        let whole = short.stderr_excerpt();
+        assert_eq!(
+            whole, "panicked at the disco",
+            "an excerpt that fits is untouched"
+        );
     }
 
     #[test]
