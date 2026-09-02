@@ -438,6 +438,13 @@ fn invalid_form_response(
     model: &dyn AdminModel,
     fields: &[AdminField],
     submitted: &Value,
+    // Names of fields in `submitted` whose value is raw, unparsed form text
+    // (e.g. a `Json` field that failed to parse) rather than a genuinely
+    // typed value — forwarded to `model_form_page` so it skips round-tripping
+    // that one field through `Value::to_string()` and shows the raw text
+    // verbatim instead. Empty when `submitted` is fully coerced/typed (the
+    // `AdminError::Validation` case).
+    raw_fields: &[&str],
     error_message: String,
     id: Option<i64>,
     csrf: &AdminCsrf,
@@ -458,6 +465,7 @@ fn invalid_form_response(
         fields,
         Some(submitted),
         id,
+        raw_fields,
         &messages,
         csrf.token(),
         csrf.form_field(),
@@ -766,6 +774,7 @@ async fn model_new_form(
         &fields,
         None,
         None,
+        &[],
         &messages,
         csrf.token(),
         csrf.form_field(),
@@ -796,15 +805,16 @@ async fn model_create(
 
     let fields = model.fields();
     let submitted = strip_meta_fields(form_data, &fields, false);
-    let form_data = match coerce_form_fields(submitted.clone(), &fields) {
+    let form_data = match coerce_form_fields(submitted, &fields) {
         Ok(v) => v,
-        Err(msg) => {
+        Err((partial, field_name, msg)) => {
             return Ok(invalid_form_response(
                 &registry,
                 &slug,
                 model,
                 &fields,
-                &submitted,
+                &partial,
+                &[field_name],
                 msg,
                 None,
                 &csrf,
@@ -824,6 +834,7 @@ async fn model_create(
                 model,
                 &fields,
                 &form_data,
+                &[],
                 msg,
                 None,
                 &csrf,
@@ -1057,6 +1068,7 @@ async fn model_edit_form(
         &fields,
         Some(&record),
         Some(id),
+        &[],
         &messages,
         csrf.token(),
         csrf.form_field(),
@@ -1087,16 +1099,17 @@ async fn model_update(
 
     let fields = model.fields();
     let submitted = strip_meta_fields(form_data, &fields, true);
-    let form_data = match coerce_form_fields(submitted.clone(), &fields) {
+    let form_data = match coerce_form_fields(submitted, &fields) {
         Ok(v) => v,
-        Err(msg) => {
-            let display = merge_with_stored_record(model, &pool, id, &submitted).await;
+        Err((partial, field_name, msg)) => {
+            let display = merge_with_stored_record(model, &pool, id, &partial).await;
             return Ok(invalid_form_response(
                 &registry,
                 &slug,
                 model,
                 &fields,
                 &display,
+                &[field_name],
                 msg,
                 Some(id),
                 &csrf,
@@ -1116,6 +1129,7 @@ async fn model_update(
                 model,
                 &fields,
                 &display,
+                &[],
                 msg,
                 Some(id),
                 &csrf,
@@ -1664,19 +1678,34 @@ fn strip_meta_fields(mut data: Value, fields: &[AdminField], for_update: bool) -
     data
 }
 
-fn coerce_form_fields(mut data: Value, fields: &[AdminField]) -> Result<Value, String> {
-    let Some(obj) = data.as_object_mut() else {
-        return Ok(data);
-    };
-
-    for field in fields {
-        let Some(value) = obj.get_mut(field.name) else {
-            continue;
-        };
-        coerce_form_value(value, field)?;
+/// Coerce every field's raw form-string value to its declared type.
+///
+/// On the first field that fails to coerce (currently only possible for
+/// `Json`), stops and returns the partially-coerced `data` alongside the
+/// failing field's name and message — rather than discarding it — so a
+/// caller redisplaying the form after a validation failure can show every
+/// other field's value normally and single out just the one that didn't
+/// parse (see `render_form_widget`'s `raw_fields`).
+fn coerce_form_fields(
+    mut data: Value,
+    fields: &[AdminField],
+) -> Result<Value, (Value, &'static str, String)> {
+    let mut failure: Option<(&'static str, String)> = None;
+    if let Some(obj) = data.as_object_mut() {
+        for field in fields {
+            let Some(value) = obj.get_mut(field.name) else {
+                continue;
+            };
+            if let Err(msg) = coerce_form_value(value, field) {
+                failure = Some((field.name, msg));
+                break;
+            }
+        }
     }
-
-    Ok(data)
+    match failure {
+        Some((field_name, msg)) => Err((data, field_name, msg)),
+        None => Ok(data),
+    }
 }
 
 fn coerce_form_value(value: &mut Value, field: &AdminField) -> Result<(), String> {
@@ -1828,6 +1857,9 @@ mod tests {
                 AdminField::new("name", AdminFieldKind::Text),
                 AdminField::new("owner", AdminFieldKind::Text).create_only(),
                 AdminField::new("metadata", AdminFieldKind::Json),
+                AdminField::new("api_key", AdminFieldKind::Text)
+                    .optional()
+                    .encrypted(),
             ]
         }
         fn list(
@@ -1972,9 +2004,56 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "html: {html}");
         assert!(html.contains("New Widget"), "html: {html}");
         assert!(html.contains(r#"value="Widget X""#), "html: {html}");
-        assert!(html.contains("{broken"), "html: {html}");
         assert!(html.contains("invalid JSON"), "html: {html}");
         assert!(!html.contains("Go to homepage"), "html: {html}");
+        // The malformed text must reach the textarea VERBATIM — not
+        // round-tripped through `Value::to_string()`, which would wrap it in
+        // an extra pair of quotes (`"{broken"`) and risk silently persisting
+        // that as a valid-but-wrong JSON string on a blind resubmit (Codex
+        // review, PR #2422).
+        assert!(
+            html.contains(">{broken</textarea>"),
+            "malformed JSON must render raw, unquoted: {html}"
+        );
+        assert!(
+            !html.contains(r"&quot;{broken&quot;") && !html.contains(r#">"{broken"</textarea>"#),
+            "malformed JSON must not be re-quoted: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_create_malformed_json_keeps_encrypted_field_editable() {
+        // A validation failure on CREATE passes `Some(record)` to
+        // `model_form_page` (the resubmitted values) so they can be
+        // refilled — but the encrypted-field branch must still treat this
+        // as CREATE (no stored ciphertext to protect yet), not EDIT, or an
+        // encrypted field silently becomes a disabled, unsubmittable control
+        // and the admin can never get past validation for a model with a
+        // required encrypted column (Codex review, PR #2422).
+        let (status, html) = post_form(
+            form_test_app(),
+            "/widgets",
+            &[
+                ("name", "Widget X"),
+                ("metadata", "{broken"),
+                ("api_key", "sk-live-123"),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "html: {html}");
+        assert!(
+            html.contains(r#"name="api_key""#),
+            "encrypted field must stay submittable on a create failure: {html}"
+        );
+        // The redacted edit-only control has no `name=` attribute at all (so
+        // it never submits and can't overwrite the stored ciphertext) — the
+        // `name="api_key"` check above already rules it out; this pins down
+        // the other half of that control's shape.
+        assert!(
+            !html.contains("••••••••"),
+            "encrypted field must not show the edit-only redaction mask on create: {html}"
+        );
     }
 
     #[tokio::test]
@@ -2235,12 +2314,17 @@ mod tests {
         // a raw string — so a malformed, non-blank submission must be rejected
         // here rather than silently persisted as a JSON string literal.
         let fields = vec![AdminField::new("settings", AdminFieldKind::Json)];
-        let err = coerce_form_fields(json!({"settings": "{broken"}), &fields)
-            .expect_err("malformed non-blank JSON must be rejected, not silently stored");
-        assert!(
-            err.contains("settings"),
-            "error should name the offending field: {err}"
+        let (partial, field_name, msg) =
+            coerce_form_fields(json!({"settings": "{broken"}), &fields)
+                .expect_err("malformed non-blank JSON must be rejected, not silently stored");
+        assert_eq!(
+            field_name, "settings",
+            "error should name the offending field"
         );
+        assert!(msg.contains("settings"), "error message: {msg}");
+        // The raw, unparsed text survives in the partial result so the caller
+        // can redisplay exactly what the admin typed.
+        assert_eq!(partial, json!({"settings": "{broken"}));
 
         // Nullable columns are rejected the same way.
         let fields = vec![AdminField::new("settings", AdminFieldKind::Json).optional()];
@@ -2251,6 +2335,23 @@ mod tests {
         let fields = vec![AdminField::new("settings", AdminFieldKind::Json)];
         let out = coerce_form_fields(json!({"settings": "\"not broken\""}), &fields).unwrap();
         assert_eq!(out, json!({"settings": "not broken"}));
+    }
+
+    #[test]
+    fn coerce_form_fields_partial_result_keeps_earlier_fields_coerced() {
+        // A field ahead of the failing one in declaration order must still
+        // come back properly typed in the partial result — only the failing
+        // field itself is left as raw text (routes.rs's redisplay path
+        // relies on this: every other widget renders normally).
+        let fields = vec![
+            AdminField::new("count", AdminFieldKind::Integer),
+            AdminField::new("settings", AdminFieldKind::Json),
+        ];
+        let (partial, field_name, _msg) =
+            coerce_form_fields(json!({"count": "42", "settings": "{broken"}), &fields)
+                .expect_err("malformed JSON must be rejected");
+        assert_eq!(field_name, "settings");
+        assert_eq!(partial, json!({"count": 42, "settings": "{broken"}));
     }
 
     #[test]

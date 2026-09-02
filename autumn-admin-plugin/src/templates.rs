@@ -1639,6 +1639,12 @@ pub fn model_form_page(
     // Path-based ID from the handler on edit pages (`None` when rendering
     // the "new" form). Never trust the JSON payload for mutation routing.
     id: Option<i64>,
+    // Names of fields in `record` whose value is raw, unvalidated form
+    // input from a failed submission rather than a genuine stored/coerced
+    // value — see `render_form_widget`. Empty for every ordinary render
+    // (fresh "new" form, a real stored record, or a resubmission that
+    // failed for a reason unrelated to that field's own syntax).
+    raw_fields: &[&str],
     messages: &[FlashMessage],
     csrf_token: &str,
     csrf_form_field: &str,
@@ -1691,7 +1697,7 @@ pub fn model_form_page(
                                 // so the admin can see it but cannot change it.
                                 (render_readonly_display(field, record))
                             } @else {
-                                (render_form_widget(field, record))
+                                (render_form_widget(field, record, is_edit, raw_fields))
                             }
                         }
                     }
@@ -2160,16 +2166,35 @@ fn render_readonly_display(field: &AdminField, record: Option<&Value>) -> Markup
 }
 
 /// Render a form widget for a field.
-fn render_form_widget(field: &AdminField, record: Option<&Value>) -> Markup {
-    // Encrypted columns (#805). On EDIT (`record` is `Some`) we must never reveal
-    // or overwrite the stored ciphertext, so render a disabled, redacted control
-    // with no `name`: the plaintext never reaches the HTML and a save never
-    // submits (and thus never overwrites) it. On CREATE (`record` is `None`) there
-    // is no stored secret to protect and the generated `New*` DTO requires the
-    // value, so fall through to a normal editable input that captures the initial
-    // plaintext (the wrapper encrypts it on insert). The flag is per-field, so an
+///
+/// `is_edit` is the CREATE-vs-EDIT signal, taken from the caller's `id`
+/// (`None` on create) rather than inferred from `record.is_some()`: a
+/// validation-failure redisplay on CREATE passes `Some(record)` (the
+/// resubmitted values) with no `id`, which must still be treated as create
+/// for the encrypted-field branch below (Codex review, PR #2422).
+///
+/// `raw_fields` names the fields (by `AdminField::name`) whose `record`
+/// value is unvalidated form input straight from a failed submission —
+/// e.g. text that failed `Json` parsing — rather than a genuinely typed
+/// value from storage or a successful coercion. Only the `Json` branch
+/// consults it, to skip the JSON-round-trip serialization and show the raw
+/// text the admin typed instead (Codex review, PR #2422).
+#[allow(clippy::too_many_lines)]
+fn render_form_widget(
+    field: &AdminField,
+    record: Option<&Value>,
+    is_edit: bool,
+    raw_fields: &[&str],
+) -> Markup {
+    // Encrypted columns (#805). On EDIT we must never reveal or overwrite the
+    // stored ciphertext, so render a disabled, redacted control with no
+    // `name`: the plaintext never reaches the HTML and a save never submits
+    // (and thus never overwrites) it. On CREATE there is no stored secret to
+    // protect and the generated `New*` DTO requires the value, so fall
+    // through to a normal editable input that captures the initial plaintext
+    // (the wrapper encrypts it on insert). The flag is per-field, so an
     // unrelated same-named plaintext column stays editable.
-    if field.encrypted && record.is_some() {
+    if field.encrypted && is_edit {
         return html! {
             input type="text" class="form-input" value="••••••••" disabled
                 title="Encrypted at rest — managed outside the admin";
@@ -2275,10 +2300,21 @@ fn render_form_widget(field: &AdminField, record: Option<&Value>) -> Markup {
             // directly instead of reusing `current_value`, matching only a
             // genuinely nullable-and-null EDIT to blank (Codex review finding
             // on #1341).
-            let json_val = match record.and_then(|r| r.get(field.name)) {
-                None => String::new(),
-                Some(Value::Null) if !field.required => String::new(),
-                Some(v) => v.to_string(),
+            // A field named in `raw_fields` holds the exact text the admin
+            // typed, which failed to parse as JSON — show it verbatim so
+            // they can see and fix the mistake, rather than round-tripping
+            // it through `Value::to_string()` (which would wrap it in an
+            // extra pair of quotes, turning `{broken` into the seemingly
+            // valid JSON string `"{broken"` and risking a silent resave of
+            // the wrong data — Codex review, PR #2422).
+            let json_val = if raw_fields.contains(&field.name) {
+                str_val
+            } else {
+                match record.and_then(|r| r.get(field.name)) {
+                    None => String::new(),
+                    Some(Value::Null) if !field.required => String::new(),
+                    Some(v) => v.to_string(),
+                }
             };
             html! {
                 textarea class="form-input" name=(field.name) id=(field.name)
@@ -2573,7 +2609,7 @@ mod tests {
             AdminField::new("audit_note", AdminFieldKind::Text).encrypted_visible(),
         ] {
             let col = field.name;
-            let form = render_form_widget(&field, Some(&record)).into_string();
+            let form = render_form_widget(&field, Some(&record), true, &[]).into_string();
             assert!(
                 !form.contains("123-45-6789") && !form.contains("visible-note"),
                 "edit form must not pre-fill encrypted plaintext for {col}: {form}"
@@ -2595,7 +2631,7 @@ mod tests {
         // submittable, empty input — otherwise the default "New" flow can't create
         // a record with a required encrypted column (#805).
         let field = AdminField::new("ssn", AdminFieldKind::Text).encrypted();
-        let form = render_form_widget(&field, None).into_string();
+        let form = render_form_widget(&field, None, false, &[]).into_string();
         assert!(
             form.contains("name=\"ssn\""),
             "create control must submit the value: {form}"
@@ -2620,7 +2656,7 @@ mod tests {
         let field = AdminField::new("config", AdminFieldKind::Json);
 
         let record = serde_json::json!({ "config": "hello" });
-        let form = render_form_widget(&field, Some(&record)).into_string();
+        let form = render_form_widget(&field, Some(&record), true, &[]).into_string();
         assert!(
             form.contains("&quot;hello&quot;") || form.contains("\"hello\""),
             "stored JSON string must render with its quotes intact: {form}"
@@ -2629,7 +2665,7 @@ mod tests {
         // A string that looks like another JSON literal must round-trip as
         // the SAME string, not silently become that other type.
         let record = serde_json::json!({ "config": "true" });
-        let form = render_form_widget(&field, Some(&record)).into_string();
+        let form = render_form_widget(&field, Some(&record), true, &[]).into_string();
         assert!(
             form.contains("&quot;true&quot;") || form.contains("\"true\""),
             "a stored JSON string \"true\" must not render as the bare word true: {form}"
@@ -2637,7 +2673,7 @@ mod tests {
 
         // Object/array values were already correct — no regression.
         let record = serde_json::json!({ "config": {"a": 1} });
-        let form = render_form_widget(&field, Some(&record)).into_string();
+        let form = render_form_widget(&field, Some(&record), true, &[]).into_string();
         assert!(
             form.contains("{&quot;a&quot;:1}") || form.contains(r#"{"a":1}"#),
             "object values still render as JSON: {form}"
@@ -2647,7 +2683,7 @@ mod tests {
         // matching the existing "blank means no value" convention.
         let optional_field = AdminField::new("config", AdminFieldKind::Json).optional();
         let record = serde_json::json!({ "config": null });
-        let form = render_form_widget(&optional_field, Some(&record)).into_string();
+        let form = render_form_widget(&optional_field, Some(&record), true, &[]).into_string();
         assert!(
             !form.contains("null"),
             "an optional NULL json value should render blank, not the literal word null: {form}"
@@ -2662,7 +2698,7 @@ mod tests {
         // programmatic blank submission would coerce into `""` instead of
         // round-tripping back to `Value::Null` (Codex review finding on
         // #1341).
-        let form = render_form_widget(&field, Some(&record)).into_string();
+        let form = render_form_widget(&field, Some(&record), true, &[]).into_string();
         assert!(
             form.contains(">null<") || form.contains("null"),
             "a required NULL json value must render the literal `null`, not blank: {form}"
@@ -2678,7 +2714,7 @@ mod tests {
         // shared default, so the widget must distinguish "no record" from "a
         // null value in the record" directly.
         let field = AdminField::new("config", AdminFieldKind::Json);
-        let form = render_form_widget(&field, None).into_string();
+        let form = render_form_widget(&field, None, false, &[]).into_string();
         assert!(
             !form.contains("null"),
             "a brand-new required json field on the CREATE form must start blank, \
@@ -3127,6 +3163,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             "tok-xyz",
             "authenticity_token",
             "X-CSRF-Token",
@@ -3157,6 +3194,7 @@ mod tests {
             &fields,
             Some(&record),
             Some(1),
+            &[],
             &[],
             "t",
             "_csrf",
@@ -3192,6 +3230,7 @@ mod tests {
             &fields,
             Some(&record),
             Some(42),
+            &[],
             &[],
             "t",
             "_csrf",
