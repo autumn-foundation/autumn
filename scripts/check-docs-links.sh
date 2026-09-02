@@ -58,6 +58,9 @@ import os, re, subprocess, sys, collections, urllib.parse
 
 root = sys.argv[1]
 
+# `examples/<app>/content/...` — seed content served by an example app.
+EXAMPLE_CONTENT = re.compile(r'examples/[^/]+/content/')
+
 # NUL-delimited: a path containing whitespace (`docs/setup guide.md`) would
 # otherwise split into fragments, inflating the corpus count while silently
 # skipping the real file and every broken link in it. `-z` also stops git
@@ -67,8 +70,12 @@ files = [
     for f in subprocess.run(
         ["git", "ls-files", "-z", "*.md"], cwd=root, capture_output=True, text=True
     ).stdout.split("\0")
-    # Seed content for the wiki example app, resolved by that app's routes.
-    if f and "/content/" not in f
+    # Seed content for an example app, resolved by that app's own routes.
+    # Anchored to `examples/<app>/content/` rather than any path containing
+    # `/content/`: a substring test would silently drop a real docs tree such
+    # as `docs/content/`, leaving it uncheckable while CI reported the rest
+    # of the corpus clean.
+    if f and not EXAMPLE_CONTENT.match(f)
 ]
 
 # CommonMark also allows an angle-bracket destination — `[x](<target.md>)` —
@@ -917,6 +924,21 @@ self_test() {
     >> "$c54/docs/guide/mail.md"
   git -C "$c54" commit -qam fence-ends-with-list-item
   check "unclosed fence in a list item does not swallow later prose" fail "$c54"
+
+  # The seed-content exclusion is for `examples/<app>/content/` only; a real
+  # docs tree that happens to be named `content` must still be checked, or it
+  # would be silently uncheckable while CI reports the rest clean.
+  local c55="$tmp/c55"; make_corpus "$c55"
+  mkdir -p "$c55/docs/content"
+  printf '# Real docs\n\nSee [gone](does-not-exist.md).\n' > "$c55/docs/content/page.md"
+  git -C "$c55" add -A && git -C "$c55" commit -qm docs-content-tree
+  check "a docs tree named content is still checked" fail "$c55"
+
+  local c56="$tmp/c56"; make_corpus "$c56"
+  mkdir -p "$c56/examples/wiki/content"
+  printf '# Seed\n\nSee [route](/docs/configuration).\n' > "$c56/examples/wiki/content/a.md"
+  git -C "$c56" add -A && git -C "$c56" commit -qm example-seed-content
+  check "example app seed content is still excluded" pass "$c56"
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]]
