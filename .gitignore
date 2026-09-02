@@ -1,5 +1,7 @@
 /target
-.claude/
+.claude/*
+# ...but the run skill and its driver are shared tooling, not local state.
+!.claude/skills/
 .env
 mutants.out/
 mutants.out.old/
@@ -15,6 +17,7 @@ pr_description.md
 !scripts/*.sh
 !scripts/lib/*.sh
 !scripts/self-hosted-runner/*.sh
+!.claude/skills/**/*.sh
 
 # Failure capsules (docs/guide/failure-capsules.md). A capsule holds a real
 # request and, for a route that touches the database, real rows — treat the
