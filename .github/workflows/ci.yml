@@ -937,9 +937,18 @@ jobs:
           # between the scaffold template and the workspace would silently turn
           # this whole job into a gate on the last published release.
           # `scripts/check-quickstart.sh` makes the same assertion.
+          #
+          # Parse the `[[package]]` block whose name is `autumn-web` and check
+          # only ITS source. A dot-matching-newlines regex across the whole file
+          # would run past a correctly-patched (source-less) autumn-web entry to
+          # the next registry dependency and fail every green run.
           $lock = Get-Content 'Cargo.lock' -Raw
-          if ($lock -match '(?ms)name = "autumn-web".*?source = "registry') {
-            throw "autumn-web resolved from crates.io — the [patch.crates-io] override did not take"
+          $block = ($lock -split '\[\[package\]\]') |
+            Where-Object { $_ -match '(?m)^\s*name\s*=\s*"autumn-web"\s*$' } |
+            Select-Object -First 1
+          if (-not $block) { throw "autumn-web is not in Cargo.lock at all" }
+          if ($block -match '(?m)^\s*source\s*=') {
+            throw "autumn-web resolved from a registry — the [patch.crates-io] override did not take. Its lock entry: $block"
           }
 
       - name: "Journey: managed Postgres boots and shuts down cleanly"

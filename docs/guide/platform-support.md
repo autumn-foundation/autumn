@@ -60,9 +60,15 @@ terminating a process outright skips the app's `on_shutdown` hooks — which is
 how a managed Postgres cluster used to be orphaned on every hot reload. Instead
 `autumn dev` sets `AUTUMN_SHUTDOWN_SIGNAL_FILE` and creates that file to request
 a shutdown; the runtime drains through exactly the same graceful path a signal
-takes on Unix, so your hooks run and the cluster stops cleanly. If the app does
-not exit within ten seconds, `autumn dev` force-stops it **and prints a warning
-saying the hooks may not have run** — degraded, but never silent.
+takes on Unix, so your hooks run and the cluster stops cleanly.
+
+The wait is your app's **own** budget, not a fixed one: `autumn dev` reads the
+same profile-aware `prestop_grace_secs + shutdown_timeout_secs` that
+`autumn serve stop` uses, and adds 60 seconds of headroom for the `on_shutdown`
+hooks that run after the drain (sized to the managed-Postgres stop ceiling). So
+an app that legitimately takes 35 seconds to drain is not cut off at ten. Only
+once that budget elapses does `autumn dev` force-stop it — **and print a warning
+saying the hooks may not have run.** Degraded, but never silent.
 
 ## Tier 2 — supported via WSL2
 

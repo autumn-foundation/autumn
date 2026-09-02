@@ -1438,7 +1438,7 @@ fn resolved_stop_budget_secs(opts: &ServeOptions) -> u64 {
 /// The active profile: an explicit override (`profile_override`, e.g. a `restart`
 /// restoration), then the environment (`AUTUMN_ENV`/`AUTUMN_PROFILE`), then the
 /// app's build-mode default (`prod` for a release build, else `dev`).
-fn effective_profile(profile_override: Option<&str>, release: bool) -> String {
+pub fn effective_profile(profile_override: Option<&str>, release: bool) -> String {
     profile_override
         .map(ToOwned::to_owned)
         .or_else(env_profile)
@@ -1544,7 +1544,7 @@ fn effective_pin_from(
 /// Resolve `(prestop_grace_secs, shutdown_timeout_secs)` with the app's layering
 /// for the given active `profile`. Defaults match the prod/dev profile
 /// smart-defaults for these keys.
-fn resolve_shutdown_budget(base_dir: &Path, profile: Option<&str>) -> (u64, u64) {
+pub fn resolve_shutdown_budget(base_dir: &Path, profile: Option<&str>) -> (u64, u64) {
     let mut prestop = 5u64;
     let mut shutdown = 30u64;
 

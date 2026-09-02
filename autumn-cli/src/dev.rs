@@ -110,10 +110,14 @@ const DEV_SHUTDOWN_SIGNAL_PREFIX: &str = "dev-shutdown.";
 )]
 const DEV_SHUTDOWN_SIGNAL_SUFFIX: &str = ".signal";
 
-/// How long a cooperatively-stopped app gets to drain before `autumn dev`
-/// escalates to a hard kill. Generous enough for an app that closes a database
-/// pool and stops a managed Postgres cluster, short enough not to stall a hot
-/// reload when the app is wedged.
+/// Headroom added to the app's own drain budget before `autumn dev` escalates
+/// to a hard kill.
+///
+/// `on_shutdown` hooks run **after** the drain completes, so this — not the
+/// drain budget — is what has to cover them. Sized to the managed-Postgres stop
+/// ceiling (`STARTUP_TIMEOUT` in `autumn_web::managed_pg`, 60s, which
+/// `postgresql_embedded` applies to `pg_ctl stop` as well as start): that hook
+/// is the one this whole mechanism exists to let run.
 #[cfg_attr(
     unix,
     allow(
@@ -121,7 +125,54 @@ const DEV_SHUTDOWN_SIGNAL_SUFFIX: &str = ".signal";
         reason = "the non-Unix stop path, compiled and tested everywhere"
     )
 )]
-const COOPERATIVE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const COOPERATIVE_STOP_HOOK_HEADROOM: Duration = Duration::from_secs(60);
+
+/// The cooperative-stop budget for an app whose configured graceful-drain
+/// budget is `drain_secs` (`prestop_grace_secs + shutdown_timeout_secs`).
+///
+/// A fixed constant was wrong here. An external stop takes `DrainCause::Signal`,
+/// which runs the app's full lifecycle — readiness flip, prestop grace, drain —
+/// and only then its `on_shutdown` hooks. Under the prod defaults (grace 5 +
+/// timeout 30) an app is still legitimately shutting down at t=35s, so a
+/// ten-second kill would reintroduce the orphaned postmaster this change exists
+/// to fix, on a perfectly valid configuration.
+///
+/// Saturating: `drain_secs` comes from user config (`[server]` keys or
+/// `AUTUMN_SERVER__*`), and wrapping would produce a tiny budget that hard-kills
+/// instantly — the failure mode, arrived at by arithmetic.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const fn cooperative_stop_budget(drain_secs: u64) -> Duration {
+    Duration::from_secs(drain_secs).saturating_add(COOPERATIVE_STOP_HOOK_HEADROOM)
+}
+
+/// This app's cooperative-stop budget, resolved from its own configuration.
+///
+/// Delegates to the same profile-aware resolver `autumn serve stop` uses, so the
+/// two stop paths cannot disagree about how long the app is entitled to take.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn resolve_cooperative_stop_budget(package: Option<&str>) -> Duration {
+    let base_dir = package
+        .and_then(find_manifest_dir)
+        .unwrap_or_else(|| PathBuf::from("."));
+    // `autumn dev` is always a debug build, so the build-mode default is `dev`;
+    // an explicit `AUTUMN_ENV`/`AUTUMN_PROFILE` still wins, which is exactly the
+    // case (a prod-profile dev run) that the old fixed budget got wrong.
+    let profile = crate::serve::effective_profile(None, false);
+    let (prestop, shutdown) = crate::serve::resolve_shutdown_budget(&base_dir, Some(&profile));
+    cooperative_stop_budget(prestop.saturating_add(shutdown))
+}
 
 /// How the dev loop's app child was stopped.
 #[cfg_attr(
@@ -462,7 +513,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
         }
     }
 
-    stop_server(&mut child);
+    stop_server(&mut child, package);
 }
 
 /// Read `[dev]` from `autumn.toml`. Missing file or unparseable content
@@ -664,14 +715,14 @@ fn execute_plan(
         let stop_before_build = cfg!(windows);
 
         if stop_before_build {
-            stop_server(child);
+            stop_server(child, package);
         }
 
         let (built, diagnostics) = cargo_build_capturing(package);
 
         if built {
             if !stop_before_build {
-                stop_server(child);
+                stop_server(child, package);
             }
             if restart_server(
                 package,
@@ -708,7 +759,7 @@ fn execute_plan(
     }
 
     if plan.restart {
-        stop_server(child);
+        stop_server(child, package);
         if restart_server(
             package,
             child,
@@ -1045,11 +1096,14 @@ fn start_server(
 }
 
 /// Stop the running server process gracefully.
-fn stop_server(child: &mut Option<Child>) {
+fn stop_server(child: &mut Option<Child>, package: Option<&str>) {
     #[cfg(unix)]
-    stop_server_unix(child);
+    {
+        let _ = package;
+        stop_server_unix(child);
+    }
     #[cfg(not(unix))]
-    stop_server_cooperative(child);
+    stop_server_cooperative(child, package);
 }
 
 /// Unix stop: `SIGTERM`, then `SIGKILL` if the app misses its drain budget.
@@ -1079,7 +1133,7 @@ fn stop_server_unix(child: &mut Option<Child>) {
 /// Postgres child was orphaned on every rebuild (#1616). Ask the app to drain
 /// through the file it watches, and force-kill only if it will not.
 #[cfg(not(unix))]
-fn stop_server_cooperative(child: &mut Option<Child>) {
+fn stop_server_cooperative(child: &mut Option<Child>, package: Option<&str>) {
     let Some(signal_path) = dev_shutdown_signal_path() else {
         // `start_server` sets `AUTUMN_SHUTDOWN_SIGNAL_FILE` from this same
         // cached value, so with no path the child was never told to watch
@@ -1094,8 +1148,9 @@ fn stop_server_cooperative(child: &mut Option<Child>) {
         *child = None;
         return;
     };
-    match stop_child_cooperatively(child, signal_path, COOPERATIVE_STOP_TIMEOUT) {
-        StopOutcome::Escalated => eprintln!("{}", escalation_warning(COOPERATIVE_STOP_TIMEOUT)),
+    let budget = resolve_cooperative_stop_budget(package);
+    match stop_child_cooperatively(child, signal_path, budget) {
+        StopOutcome::Escalated => eprintln!("{}", escalation_warning(budget)),
         StopOutcome::Unreachable => eprintln!(
             "{}",
             unreachable_warning("the target directory is not writable")
@@ -1891,14 +1946,58 @@ mod tests {
         );
     }
 
+    // ── The stop budget must not undercut the app's own (#1616, Codex P1) ──
+    //
+    // A fixed ten seconds was wrong: `DrainCause::Signal` runs the app's full
+    // lifecycle — readiness flip, prestop grace, drain — and THEN its
+    // `on_shutdown` hooks. An app configured with the prod defaults (grace 5 +
+    // timeout 30) is still legitimately shutting down at t=35s, and a managed
+    // Postgres `pg_ctl stop` runs after that under its own 60s ceiling. Killing
+    // at t=10s reintroduces the orphaned postmaster this change exists to fix,
+    // on a perfectly valid configuration.
+
     #[test]
-    fn the_cooperative_stop_budget_outlasts_a_managed_postgres_teardown() {
-        // A managed cluster's `pg_ctl stop -m fast` plus pool drain routinely
-        // takes a few seconds on a cold Windows filesystem. Too short and every
-        // reload escalates (the bug this fixes); too long and a wedged app
-        // stalls the dev loop. Pin the budget so neither drifts in unnoticed.
-        assert!(COOPERATIVE_STOP_TIMEOUT >= Duration::from_secs(5));
-        assert!(COOPERATIVE_STOP_TIMEOUT <= Duration::from_secs(30));
+    fn the_stop_budget_never_undercuts_the_apps_configured_drain() {
+        for drain_secs in [0, 1, 10, 35, 120, 3600] {
+            let budget = cooperative_stop_budget(drain_secs);
+            assert!(
+                budget > Duration::from_secs(drain_secs),
+                "a {drain_secs}s drain must not be cut short by a {budget:?} budget"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stop_budget_covers_the_managed_postgres_stop_ceiling() {
+        // `on_shutdown` hooks run AFTER the drain, so the headroom — not the
+        // drain budget — is what has to cover a `pg_ctl stop`. autumn-web's
+        // provider gives that operation a 60s ceiling.
+        assert!(
+            cooperative_stop_budget(0) >= Duration::from_secs(60),
+            "the headroom must cover a managed-Postgres stop"
+        );
+    }
+
+    #[test]
+    fn the_stop_budget_grows_with_a_longer_configured_drain() {
+        assert!(cooperative_stop_budget(35) > cooperative_stop_budget(1));
+    }
+
+    #[test]
+    fn the_stop_budget_saturates_instead_of_overflowing() {
+        // The drain budget comes from user config (`[server]` keys, or
+        // `AUTUMN_SERVER__*`), so it is attacker-adjacent arithmetic: a
+        // `u64::MAX` timeout must clamp, not wrap to a tiny budget that would
+        // hard-kill instantly.
+        let budget = cooperative_stop_budget(u64::MAX);
+        assert!(budget >= Duration::from_secs(60), "{budget:?}");
+    }
+
+    #[test]
+    fn the_resolved_budget_covers_an_unconfigured_project() {
+        // Resolving against a directory with no `autumn.toml` must still yield a
+        // budget that outlasts a managed-Postgres teardown, not zero.
+        assert!(resolve_cooperative_stop_budget(None) >= COOPERATIVE_STOP_HOOK_HEADROOM);
     }
 
     #[test]
@@ -2592,7 +2691,7 @@ mod tests {
     #[test]
     fn stop_server_with_none_is_noop() {
         let mut child: Option<Child> = None;
-        stop_server(&mut child);
+        stop_server(&mut child, None);
         assert!(child.is_none());
     }
 
@@ -2607,7 +2706,7 @@ mod tests {
             .spawn()
             .expect("spawn sleep");
         let mut child = Some(proc);
-        stop_server(&mut child);
+        stop_server(&mut child, None);
         assert!(child.is_none());
     }
 

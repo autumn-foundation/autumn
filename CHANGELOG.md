@@ -32,8 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a cooperative shutdown request through `AUTUMN_SHUTDOWN_SIGNAL_FILE` (opt-in;
   unset changes nothing) and drains through the same graceful path a signal
   takes on Unix, so shutdown hooks run and the managed cluster stops cleanly. If
-  an app misses its ten-second budget, `autumn dev` force-stops it **and says
-  the hooks may not have run** — degraded, never silent.
+  an app misses that budget, `autumn dev` force-stops it **and says the hooks may
+  not have run** — degraded, never silent. The budget is the app's own
+  (`prestop_grace_secs + shutdown_timeout_secs`, resolved through the same
+  profile-aware reader `autumn serve stop` uses) plus headroom for the hooks
+  that run after the drain, so an app that legitimately takes 35 seconds to
+  shut down is not cut off early.
 
   `autumn doctor` gains a `platform_support` check reporting the platform's tier
   and the Windows prerequisites (the vcpkg/OpenSSL requirement for
