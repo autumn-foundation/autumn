@@ -85,7 +85,11 @@ async fn redis_backend_persists_tracked_job_and_expires_it() {
     // Query Redis directly, bypassing the JobTrackingStore abstraction, to
     // prove the config-selected backend really is Redis — not the in-memory
     // fallback, which would leave nothing here to find.
-    let client = redis::Client::open(redis_url.clone()).expect("open redis client");
+    // Through the guard, not `redis::Client::open`: this file is outside the
+    // `src/` scan in `autumn_web::redis_tls`, and a bare call left here is a
+    // copy-paste source for the very pattern that scan exists to eradicate
+    // (#2172).
+    let client = autumn_web::redis_tls::open_client(&redis_url).expect("open redis client");
     let mut conn = client
         .get_multiplexed_async_connection()
         .await

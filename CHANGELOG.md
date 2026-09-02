@@ -59,6 +59,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sinks keep compiling untouched. See the
   [migration guide](docs/migrations/next.md).
 
+- **SSG records each route's intended `Content-Type` at generation time
+  (#1832):** the static-first serve path used to reverse-engineer every cached
+  response's MIME type at *request* time, from the route slug plus the served
+  file name. Because `url_to_file_path` stores every non-root route as
+  `<route>/index.html`, both clues lie: `/sitemap.xml` lands at
+  `sitemap.xml/index.html`, whose file name says HTML. That guess needed three
+  consecutive corrections during review of #1819 — pre-compressed fonts,
+  generated `.txt`/`.xml` routes, and HTML pages whose slug merely contains a
+  dot (`/posts/release.v1`, `/users/alice@example.com`) — each round fixing a
+  case the previous one broke.
+
+  `render_static_routes` now records the `Content-Type` the handler declared on
+  each rendered page into a new optional `content_type` field on
+  `ManifestEntry`, and the static-first middleware serves that value directly
+  via the new `StaticFileLayer::resolve_entry`. The type is determined once,
+  where it is actually known, and never inferred again — which makes all three
+  edge cases impossible by construction and lets a route be served as a type no
+  file extension maps to (`application/rss+xml` from `/feed`, `text/calendar`
+  from `/calendar`), something the extension heuristic could never produce.
+
+  Existing `dist/` directories keep working untouched. `content_type` is
+  `#[serde(default)]`, so a manifest built before this change (or written by
+  hand) deserializes with the field absent, and `static_gen::resolved_content_type`
+  applies the pre-#1832 derivation byte-for-byte: recognized route extension,
+  then served file name, then `application/octet-stream`. Nothing is recorded
+  for a handler that declares no `Content-Type` either — a build-time guess
+  would only bake in the heuristic this change removes. That function also
+  rejects a recorded value that is not a legal header (a CR/LF injection
+  attempt from a tampered manifest) and falls back instead, returning a
+  `HeaderValue` so the request path cannot panic on a bad manifest.
+
+  ISR does not rewrite the manifest (it is immutable behind an `Arc`, with file
+  mtime driving staleness), so the header served for a route is fixed for the
+  process lifetime while the body on disk is not. A regeneration whose handler
+  declares a *different* type — or stops declaring one — is therefore refused
+  rather than written: the previous file stays, still matching its recorded
+  type, so the route degrades to stale-but-correct instead of serving fresh
+  bytes under a header that mislabels them. The refusal is logged; `autumn
+  build` re-records the type.
+
+  Only a type the handler *deliberately* declared is recorded. axum's blanket
+  `IntoResponse` impls always attach one — `text/plain; charset=utf-8` for
+  `String`, `application/octet-stream` for `Vec<u8>` — purely from the return
+  type, so recording those over a route that names its own extension would have
+  served `#[static_get("/theme.css")] async fn theme() -> String` as plain text
+  and let `X-Content-Type-Options: nosniff` drop the stylesheet outright. When a
+  declared type is one of those two generic defaults and the route's final
+  segment carries a recognized asset extension that disagrees, nothing is
+  recorded and the derivation runs as before. An explicit declaration still
+  wins, even against the slug (`/notes.txt` declaring `application/json`).
+
+  One neighbouring fix fell out of the same work: a manifest that is *present
+  but unparseable* now logs a warning instead of disabling static serving with
+  no trace at all (absent stays quiet — that is just an app with no static
+  build). `ManifestEntry::revalidate` also gained an explicit `#[serde(default)]`
+  to state that a hand-written entry may omit the key, though it changes
+  nothing on its own — serde's derive already maps a missing `Option` field to
+  `None`, so the shortest documented entry parsed before this release too.
+
+  **Breaking:** `ManifestEntry` and `StaticManifest` are now `#[non_exhaustive]`
+  and `ManifestEntry` gained a `content_type` field, so struct literals — and
+  exhaustive destructuring patterns like
+  `let ManifestEntry { file, revalidate } = entry;` — must
+  become `ManifestEntry::new(file).with_revalidate(..).with_content_type(..)`
+  and `StaticManifest::new(routes)`. Behaviourally, an *extensionless*
+  `#[static_get]` route whose handler returns a bare `String` is served as the
+  `text/plain; charset=utf-8` axum declares rather than the `text/html` the old
+  heuristic assumed — matching what that same handler already served on the
+  dynamic path. Return `Markup` or `Html<String>` for HTML. See
+  [the migration guide](docs/migrations/next.md).
+
 - **Ledger: a monotonic head outside the revision rows, and transaction time
   from the database (#2323):** the tamper-evident record ledger allocated each
   revision's sequence number from the rows that survived in
@@ -108,7 +179,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot mask a truncation. `LedgerBreak` is `#[non_exhaustive]` from here on,
   and `autumn db scrub` refuses to empty one of the two ledger tables without
   the other.
-
 
 - **SBOMs and signed provenance for framework and app releases (#1615):**
   Autumn could not answer "what exactly is in this artifact, and who built it?"
@@ -573,6 +643,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report a divergence against unchanged code; and outbound request and response
   headers are charged against `max_capsule_bytes`, which they had escaped.
 
+- **`autumn_web::redis_tls` (new public module):** `open_client` is the
+  Redis client constructor every Autumn subsystem now uses — it installs the
+  rustls `CryptoProvider` a `rediss://` URL needs before rustls can be asked
+  to resolve one. `ensure_tls_crypto_provider` exposes just that step for code
+  that builds a client another way, and `redact_url` masks the password in a
+  Redis URL before it is logged. `redis` is re-exported as
+  `autumn_web::reexports::redis` so callers can name the returned
+  `redis::Client` without adding their own dependency. Issue #2172.
+
 ### Fixed
 
 - **CI now rejects colliding migration versions:** app, framework and plugin
@@ -654,15 +733,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn_web::redis_tls::open_client`, which installs `ring` once,
   idempotently, and only when the URL is a TLS one — decided by asking the
   `redis` crate to parse it and checking whether it resolved to a TLS address,
-  so `rediss://`, Valkey's `valkeys://` and any case variant the URL parser
-  accepts are all covered without a scheme list to keep in sync. (The previous
-  `starts_with("rediss://")` check had already missed both.) A plaintext
+  rather than by keeping a second copy of that crate's scheme table. So
+  `rediss://`, Valkey's `valkeys://` and every case variant the URL parser
+  accepts are covered with nothing to re-check on a dependency bump, and
+  prefix lookalikes (`redisstore://`), `unix://` sockets and unparseable input
+  are classified exactly as the connector will classify them. A plaintext
   `redis://` URL deliberately does **not** claim the process-wide default, so
   it cannot pre-empt an application that installs `aws-lc-rs` for something
   else, and an already-installed provider is always kept rather than replaced.
   `autumn-cache-redis` now delegates to the same guard instead of carrying its
-  own copy, and a source scan in each crate keeps a future subsystem from
-  re-opening the hole with a bare `redis::Client::open`.
+  own copy, the `reddit-clone` example is wired through it too (examples get
+  copied), and a source scan in each of the three crates keeps a future
+  subsystem from re-opening the hole with a bare `redis::Client::open`.
+
+  Redis URLs are no longer logged verbatim. A managed Redis carries its access
+  key *inside* the URL, and the rate-limit backend echoed the configured URL
+  into a `WARN` on both of its fallback-to-memory paths — writing that key to
+  whatever log sink the app ships to. `autumn_web::redis_tls::redact_url`
+  masks the password, and deliberately over-redacts rather than under-redacts.
+  Every input it sees on that path is malformed by definition, and malformed
+  is exactly where a redactor gives up: an Azure access key is base64, whose
+  alphabet includes `/`, and an un-encoded `/` ends the URL's authority early
+  — which is both why the URL fails to parse and why the log line is reached.
+  A mistyped scheme delimiter (`rediss:/:key@host`) leaves nothing to split
+  on at all. Neither returns the input untouched. The invalid-URL branch now
+  also logs no URL whatsoever, redacted or not: the `redis` error names the
+  problem without echoing the value.
 
 - **A container that terminates TLS itself is no longer permanently
   `unhealthy`:** the Dockerfile `autumn release init` generates hardcoded its
@@ -1394,6 +1490,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every other decline, so the origin serves the request instead.
 
 ### Performance
+
+- **the DB-backed media-room reaper sweeps in one statement instead of one per
+  stale room:** `DbRoomStore::reap_stale`'s second phase — the sweep that drops
+  now-empty rooms, run every 60s by the background room reaper in any process
+  wiring in `room_store_backend = "db"` — loaded every stale-room candidate,
+  then issued a `SELECT COUNT(*)` per candidate and a `DELETE` per now-empty
+  one. That is O(n) statements per tick, where n is however many rooms went
+  stale since the last tick, so a busy multi-tenant deployment paid it in
+  proportion to its own traffic. The emptiness test is now a correlated
+  `NOT EXISTS` on the participants' composite key inside the delete itself, so
+  the whole phase is a single anti-join statement. Measured against an 8,704-row
+  production-shaped fixture with 8,002 stale candidates (`pg_stat_statements`,
+  testcontainer Postgres): phase-2 statements per tick 15,504 → **1**, phase-2
+  buffers 78,512 → 41,109 (**-47.6%**). No schema change, no new index. The
+  sweep keeps its exact reap set, its last-write-wins idempotence, and its
+  namespace isolation — and, being one atomic statement, no longer has a
+  per-candidate window between the occupancy check and the delete.
 
 - **a no-database app no longer compiles the framework's database codegen:**
   `autumn-macros` had no `[features]` section at all, so `model.rs` and

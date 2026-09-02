@@ -1762,6 +1762,11 @@ must *also* depend on the `autumn-cache-redis` crate and register
 silently never read — you'd pay for a Redis instance the app never talks to.
 See [Shared Cache](cloud-native.md#shared-cache) for the three steps.
 
+The generated cache sets `non_ssl_port_enabled = false`, so the URL it hands
+the app is always `rediss://`. That works out of the box — see [Redis over
+TLS](cloud-native.md#redis-over-tls-rediss) — and applies to any other
+subsystem you point at the same instance.
+
 **Resource names are sanitized, not verbatim.** A Cargo package name may
 contain underscores or uppercase letters (both invalid in Container App
 names), so every Container Apps-family resource name (the app, its
@@ -2237,6 +2242,10 @@ crate and register `.plugin(RedisCachePlugin::new())` in `main.rs`, or
 you'd pay for a Redis instance the app never talks to. See
 [Shared Cache](cloud-native.md#shared-cache) for the three steps.
 
+ElastiCache is provisioned with transit encryption on, so the URL is a
+`rediss://` one — see [Redis over
+TLS](cloud-native.md#redis-over-tls-rediss).
+
 **Resource names are sanitized, not verbatim** — the same scheme as Azure
 and App Runner, capped at 20 characters here so the longest suffixed name
 (the `-migrate-tg`-style target group name, if it existed) would still fit
@@ -2455,6 +2464,13 @@ vars alone does nothing: your application must *also* depend on the
 in `main.rs`, or the config is parsed and silently never read — you'd pay
 for a Redis instance the app never talks to. See
 [Shared Cache](cloud-native.md#shared-cache) for the three steps.
+
+Unlike the Azure and AWS targets, this one sets
+`transit_encryption_mode = "DISABLED"` and emits a plaintext `redis://` URL.
+That is deliberate: Memorystore presents a Google-internal CA that Autumn's
+Redis TLS — which trusts the public CA store — will not validate, so
+`SERVER_AUTHENTICATION` would hand the app a URL it can never connect to.
+The connection stays inside your VPC.
 
 **Secret access is scoped per secret, not project-wide.** The runtime
 service account is granted `roles/secretmanager.secretAccessor` on exactly
