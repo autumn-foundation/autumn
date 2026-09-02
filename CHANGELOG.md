@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`autumn_web::contains_letter_or_number(&str) -> bool` (#2424):** the
+  predicate to use when rejecting user input that will be slugified. `slugify`
+  never returns an empty string — input with nothing to slugify gets a stable
+  hash fallback token — so `slugify(input).is_empty()` is always `false` and
+  can only ever be dead code. This asks the question that check was reaching
+  for: does the input hold at least one letter or number, in any script?
+  (Precisely, any `char::is_alphanumeric`, so `"½"` and `"Ⅻ"` count too.) It is
+  deliberately broader than "`slugify` produced a real slug", so `"日本語"`
+  passes — real text, hashed URL segment — while `"***"` and `"🎉🔥💯"` do
+  not. It is a content check, not a spoofing defence: a handful of characters
+  are letters by Unicode yet render blank (the Hangul fillers), and filtering
+  those is the application's job. `slugify`'s own behavior is unchanged; its
+  doc comment now points here.
 - **Pin a worker tier to queues from the command line, and let `doctor` prove
   fleet-wide queue coverage (#1623):** per-queue `reserved`/`concurrency` pools
   and `jobs.pin` already existed, but pinning could only be spelled in
@@ -846,6 +859,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `redis::Client` without adding their own dependency. Issue #2172.
 
 ### Fixed
+
+- **Punctuation- and emoji-only titles no longer slip past the validator that
+  exists to stop them (#2424):** `examples/reddit-clone` rejects a post title
+  like `***`, `!!!???...:::` or `🎉🔥💯` with "Title must contain at least one
+  letter or number" — as its own doc comment always claimed it did. The check
+  had gone dead: it asked `slugify(value).is_empty()`, and `slugify` had since
+  been given a stable non-empty fallback token, so the condition could never
+  be true again. A content-free title was silently accepted and published under
+  a hash-looking URL (`/r/rust/comments/35/n1a3b8617ffb1dc4d`) with no feedback
+  to its author. Two sibling checks written the same way — the community name
+  in `subreddits::create` and the per-name skip in the post-tag parser — were
+  equally unreachable and are fixed with them.
+
+  The framework half is a new **`autumn_web::contains_letter_or_number`**
+  (described under *Added* above). Applying it narrows nothing that was
+  working: the dead check accepted everything, so a `"日本語"` or `"Привет"`
+  title was already accepted and stays accepted, taking `slugify`'s hash
+  fallback for its URL segment — exactly what that fallback is for. The rule
+  itself changes the outcome only for input carrying no letter or number at
+  all.
+
+  The same rule is now also applied in `PostHooks`, because the generated
+  `/api/posts` routes run the model's `#[validate]` attributes and the mutation
+  hooks — never the route-local validator — so `{"title": "***"}` could reach
+  the database through the API even with the form path fixed.
+
+  Two adjacent corrections in the same example, both surfaced while fixing the
+  above: the community-name length rule counted **bytes** (`str::len`) while
+  telling the user it counted characters, so an 11-character Japanese name was
+  rejected as over 32 and a 1-character one passed a rule requiring 2 — it now
+  counts characters, matching the post title's `validate(length(...))`. And
+  saving tags now reports how many names were ignored instead of returning
+  fewer tags than the author typed under a bare "Tags updated."
 
 - **ACME config: `autumn doctor` and the runtime now reject the same two
   spellings (#1874):** two low-severity parity gaps let `autumn doctor

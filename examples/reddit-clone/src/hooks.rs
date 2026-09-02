@@ -2,7 +2,23 @@ use autumn_web::AutumnResult;
 use autumn_web::hooks::{MutationContext, MutationHooks, UpdateDraft};
 
 use crate::models::{NewPost, Post, UpdatePost};
-use autumn_web::slugify;
+use autumn_web::{contains_letter_or_number, slugify};
+
+/// The title rule the HTML forms enforce inline (`routes::posts::
+/// validate_sluggable_title`), applied again here because the hooks are the
+/// only choke point the **generated `/api/posts` routes** pass through: those
+/// run the model's own `#[validate]` attributes and nothing else, so without
+/// this a `{"title": "***"}` create walks straight past #2424's fix and lands
+/// a post whose URL is a bare hash. The forms validate first and never reach
+/// this, so an author still gets the inline field error, not a 422 page.
+fn reject_content_free_title(title: &str) -> AutumnResult<()> {
+    if contains_letter_or_number(title) {
+        return Ok(());
+    }
+    Err(autumn_web::AutumnError::unprocessable_msg(
+        "Title must contain at least one letter or number",
+    ))
+}
 
 /// Mutation hooks for posts — auto-generate slug from title on
 /// create and re-slug on title change during update.
@@ -19,6 +35,8 @@ impl MutationHooks for PostHooks {
         _ctx: &mut MutationContext,
         new: &mut NewPost,
     ) -> AutumnResult<()> {
+        reject_content_free_title(&new.title)?;
+
         // Auto-generate slug from title if not already populated
         if new.slug.is_empty() {
             new.slug = slugify(&new.title);
@@ -32,6 +50,10 @@ impl MutationHooks for PostHooks {
         ctx: &mut MutationContext,
         draft: &mut UpdateDraft<Post>,
     ) -> AutumnResult<()> {
+        if draft.after.title != draft.before.title {
+            reject_content_free_title(&draft.after.title)?;
+        }
+
         // Re-slug if title changed and slug was not manually set in the changes
         if draft.after.title != draft.before.title && draft.after.slug == draft.before.slug {
             draft.after.slug = slugify(&draft.after.title);
@@ -101,6 +123,76 @@ mod tests {
             .single()
             .expect("valid timestamp");
         ctx
+    }
+
+    // ── Content-free titles through the generated API (#2424) ──────
+
+    #[tokio::test]
+    async fn before_create_rejects_a_title_with_no_letter_or_number() {
+        // `POST /api/posts` runs the model's `#[validate]` attributes and the
+        // hooks -- never `routes::posts::validate_sluggable_title` -- so this
+        // is the only thing standing between the API and a post whose URL is
+        // a bare hash.
+        for title in ["***", "!!!???...:::", "🎉🔥💯"] {
+            let mut ctx = MutationContext::new(MutationOp::Create);
+            let mut new = NewPost {
+                title: title.to_owned(),
+                slug: String::new(),
+                body: "Body".to_owned(),
+                url: None,
+                author_id: 1,
+                subreddit_id: 1,
+            };
+
+            let error = PostHooks
+                .before_create(&mut ctx, &mut new)
+                .await
+                .expect_err("a content-free title must not reach the database");
+
+            assert!(
+                error.to_string().contains("at least one letter or number"),
+                "{title:?} must explain itself; got: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn before_create_still_slugs_a_real_title_in_any_script() {
+        for title in ["Ferris arrives", "日本語"] {
+            let mut ctx = MutationContext::new(MutationOp::Create);
+            let mut new = NewPost {
+                title: title.to_owned(),
+                slug: String::new(),
+                body: "Body".to_owned(),
+                url: None,
+                author_id: 1,
+                subreddit_id: 1,
+            };
+
+            PostHooks
+                .before_create(&mut ctx, &mut new)
+                .await
+                .unwrap_or_else(|error| panic!("{title:?} is a real title: {error}"));
+
+            assert_eq!(new.slug, slugify(title));
+        }
+    }
+
+    #[tokio::test]
+    async fn before_update_rejects_retitling_to_nothing() {
+        let mut ctx = context_at(2026, 6, 2);
+        let mut draft = UpdateDraft::new(stale_post());
+        draft.after.title = "***".to_owned();
+
+        let error = PostHooks
+            .before_update(&mut ctx, &mut draft)
+            .await
+            .expect_err("an API retitle must not empty a post's title either");
+
+        assert!(
+            error.to_string().contains("at least one letter or number"),
+            "got: {error}"
+        );
     }
 
     #[tokio::test]

@@ -198,6 +198,28 @@ Reserve non-string field types for values a browser cannot get wrong, or for
 endpoints where a 400 is the right answer. `examples/reddit-clone`'s submit form
 is built this way, for exactly this reason.
 
+One custom validator is worth spelling out, because it is easy to write as dead
+code. To reject a title that carries no text — `"***"`, `"🎉🔥💯"` — ask
+`autumn_web::contains_letter_or_number`, **not** `slugify(value).is_empty()`:
+`slugify` never returns an empty string (input with nothing to slugify gets a
+stable hash fallback), so the `is_empty()` form is always `false` and rejects
+nothing. See [Generators](./generators.md#human-readable-urls-with-slugslugfrom)
+for the full contract.
+
+```rust,ignore
+fn validate_sluggable_title(value: &str) -> Result<(), ValidationError> {
+    if autumn_web::contains_letter_or_number(value) {
+        return Ok(());
+    }
+    Err(ValidationError::new("title")
+        .with_message("Title must contain at least one letter or number".into()))
+}
+```
+
+A route-local validator only runs on the route. If the same model is also
+written through generated API routes or a repository, put the rule in a
+mutation hook as well — the hooks are the choke point those paths share.
+
 ### `Valid<T>` — for endpoints a program is calling
 
 Invalid input is an **error**. `Valid` wraps another extractor, and a validation
@@ -591,6 +613,20 @@ res.assert_status(422)
 
 Test the *failure* path first. The success path is one insert; the failure path
 is the one with the round-trip, the ARIA wiring, and the CSRF token in it.
+
+Building a `ChangesetForm` by hand in a unit test has one trap:
+`ChangesetForm::without_csrf` and `ChangesetForm::blank` wrap the data in a
+*fresh, error-free* changeset — they never call `validate`. Only
+`IntoChangeset::into_changeset` runs the rules, so a test that wants to exercise
+them has to go through it:
+
+```rust,ignore
+// Renders, but proves nothing about the rules — `into_valid()` always succeeds.
+let form = ChangesetForm::without_csrf(SubmitPostForm { .. });
+
+// Runs the rules.
+let form = ChangesetForm::from_changeset(SubmitPostForm { .. }.into_changeset());
+```
 
 For normalization, assert on what was **stored**, not on what was accepted:
 

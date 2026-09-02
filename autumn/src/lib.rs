@@ -542,10 +542,13 @@ pub mod session;
 /// responses before cutover (issue #1653) — see
 /// `docs/guide/staged-deploys.md`.
 pub mod shadow;
-/// URL-safe slug generation (`slugify`), shared by the scaffold generator's
-/// `slug:slug{from:...}` DSL token and any hand-written app.
+/// URL-safe slug generation (`slugify`).
+///
+/// Shared by the scaffold generator's `slug:slug{from:...}` DSL token and any
+/// hand-written app. Also holds `contains_letter_or_number`, the input check
+/// `slugify` cannot answer because it never returns an empty string.
 pub mod slug;
-pub use slug::slugify;
+pub use slug::{contains_letter_or_number, slugify};
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
 pub mod sse;
