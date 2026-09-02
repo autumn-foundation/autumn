@@ -773,7 +773,7 @@ fn a_replica_missing_its_newest_segments_is_refused() {
         None,
         &h.replica_root
             .parent()
-            .unwrap_or(Path::new("."))
+            .unwrap_or_else(|| Path::new("."))
             .join("truncated.db"),
     )
     .expect_err("a truncated replica must be refused");
