@@ -238,3 +238,25 @@ manual composition must set for session-sourced tenancy, mirroring
 the same shape as those two methods.
 
 [`tenancy_middleware`]: ../../../autumn/src/tenancy.rs
+
+## Residual, tracked separately: alias not lock-protected before session persistence
+
+A fourth Codex pass identified a genuine but sub-floor gap: the in-flight lock
+acquired at request start covers only the *primary* (pre-switch) key.
+`SessionService::call`'s `dirty` branch calls `store.save()` — making the
+post-switch session visible to any request presenting the same (unrotated)
+session cookie — before `finalize_deferred_session_commit` writes the alias
+record and its own lock information. A genuinely concurrent second request on
+that same cookie, or a request arriving after a partial-write failure that
+left only the primary lock held, can resolve the post-switch tenant, find
+neither a cached record nor a lock on that key, and re-run the handler.
+
+Not folded into this PR: it's a duplicate-execution/reliability edge case (no
+tenant boundary is crossed — every execution still runs correctly scoped to a
+real tenant), it requires a genuinely concurrent request or a specific
+store-write failure using a session cookie the caller must already hold, and a
+correct fix means reserving the alias's lock *before* `store.save()` and
+holding it through the commit — a restructuring of the session/idempotency
+sequencing that deserves independent review and its own concurrency test.
+Tracked as
+[autumn-foundation/autumn#2455](https://github.com/autumn-foundation/autumn/issues/2455).
