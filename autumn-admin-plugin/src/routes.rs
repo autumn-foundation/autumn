@@ -1616,7 +1616,7 @@ fn parse_form_bool(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::SelectOption;
+    use crate::traits::{AdminFuture, ListResult, SelectOption};
     use autumn_web::job::{JobAdminBackendEntry, JobAdminMemoryBackend};
     use autumn_web::session::Session;
     use axum::body::Body;
@@ -1630,6 +1630,236 @@ mod tests {
             .cloned()
             .map(|(name, kind)| AdminField::new(name, kind))
             .collect()
+    }
+
+    // ── Validation-failure redisplay (form data loss on 400) ────────────
+    //
+    // Baseline (pre-fix): a validation failure on `POST /{slug}` or
+    // `POST /{slug}/{id}` — malformed JSON in a `Json` field, or the model
+    // rejecting the payload with `AdminError::Validation` — propagated as an
+    // `AutumnError`, which the framework's `ErrorPageFilter` renders as a
+    // full generic error page (status/title/"Go to homepage" link only).
+    // The admin lost every value they had typed; the only recovery step
+    // offered was navigating away. See PR description for the audit.
+    //
+    // A lazy pool that never connects: fine here because every scenario
+    // below fails validation before any handler reaches the database.
+    fn lazy_pool() -> Pool<::autumn_web::RuntimeConnection> {
+        let config = autumn_web::config::DatabaseConfig {
+            url: Some("postgres://localhost/unused".into()),
+            pool_size: 1,
+            ..Default::default()
+        };
+        autumn_web::db::create_pool(&config)
+            .expect("pool config")
+            .expect("pool")
+    }
+
+    /// Minimal `AdminModel` for exercising the create/update
+    /// validation-failure path without a real database. `name == "taken"`
+    /// simulates a model-level validation failure (e.g. a uniqueness
+    /// check); everything else succeeds. `owner` is `create_only` so it
+    /// renders read-only (and is never submitted) on the edit form —
+    /// exactly the case that needs the stored record merged back in on
+    /// redisplay.
+    struct FormTestModel;
+
+    impl AdminModel for FormTestModel {
+        fn slug(&self) -> &'static str {
+            "widgets"
+        }
+        fn display_name(&self) -> &'static str {
+            "Widget"
+        }
+        fn display_name_plural(&self) -> &'static str {
+            "Widgets"
+        }
+        fn fields(&self) -> Vec<AdminField> {
+            vec![
+                AdminField::new("name", AdminFieldKind::Text),
+                AdminField::new("owner", AdminFieldKind::Text).create_only(),
+                AdminField::new("metadata", AdminFieldKind::Json),
+            ]
+        }
+        fn list(
+            &self,
+            _pool: &Pool<::autumn_web::RuntimeConnection>,
+            _params: ListParams,
+        ) -> AdminFuture<'_, ListResult> {
+            Box::pin(async {
+                Ok(ListResult {
+                    records: vec![],
+                    total: 0,
+                    page: 1,
+                    per_page: 25,
+                })
+            })
+        }
+        fn get(
+            &self,
+            _pool: &Pool<::autumn_web::RuntimeConnection>,
+            id: i64,
+        ) -> AdminFuture<'_, Option<Value>> {
+            Box::pin(async move {
+                if id == 1 {
+                    Ok(Some(json!({
+                        "id": 1,
+                        "name": "Widget One",
+                        "owner": "alice",
+                        "metadata": {"a": 1},
+                    })))
+                } else {
+                    Ok(None)
+                }
+            })
+        }
+        fn create(
+            &self,
+            _pool: &Pool<::autumn_web::RuntimeConnection>,
+            data: Value,
+        ) -> AdminFuture<'_, Value> {
+            Box::pin(async move {
+                if data.get("name").and_then(Value::as_str) == Some("taken") {
+                    return Err(AdminError::Validation("name already taken".into()));
+                }
+                let mut record = data;
+                if let Some(obj) = record.as_object_mut() {
+                    obj.insert("id".into(), json!(2));
+                }
+                Ok(record)
+            })
+        }
+        fn update(
+            &self,
+            _pool: &Pool<::autumn_web::RuntimeConnection>,
+            _id: i64,
+            data: Value,
+        ) -> AdminFuture<'_, Value> {
+            Box::pin(async move {
+                if data.get("name").and_then(Value::as_str) == Some("taken") {
+                    return Err(AdminError::Validation("name already taken".into()));
+                }
+                Ok(data)
+            })
+        }
+        fn delete(
+            &self,
+            _pool: &Pool<::autumn_web::RuntimeConnection>,
+            _id: i64,
+        ) -> AdminFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn form_test_app() -> axum::Router {
+        let mut registry = AdminRegistry::new();
+        registry.register(FormTestModel);
+        let session = Session::new_for_test("sid".to_owned(), HashMap::new());
+        let state = AppState::for_test().with_pool(lazy_pool());
+        admin_router(
+            Arc::new(registry),
+            "/admin",
+            "/actuator".to_owned(),
+            "user_id".to_owned(),
+            None,
+            None,
+            false,
+            autumn_web::step_up::DEFAULT_MAX_AGE_SECS,
+            false,
+        )
+        .layer(axum::Extension(session))
+        .with_state(state)
+    }
+
+    async fn post_form(
+        app: axum::Router,
+        uri: &str,
+        pairs: &[(&str, &str)],
+    ) -> (StatusCode, String) {
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        for (k, v) in pairs {
+            ser.append_pair(k, v);
+        }
+        let body = ser.finish();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    // Real browser form-submit navigation always sends this —
+                    // exercise the same HTML error-page path a real admin hits,
+                    // not the JSON fallback an unspecified `Accept` would take.
+                    .header(header::ACCEPT, "text/html,application/xhtml+xml")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, String::from_utf8(bytes.to_vec()).expect("utf8"))
+    }
+
+    // BASELINE (measured on this commit, unfixed): a `POST /{slug}` or
+    // `POST /{slug}/{id}` that fails validation propagates as a bare
+    // `AutumnError`, which turns into a `application/problem+json` body —
+    // status 400, `{"type":...,"title":"Bad Request","detail":"...",...}`.
+    // No `<form>`, no re-rendered field, none of the other values the admin
+    // typed (e.g. `name=Widget X` here). Every one of the four error-path
+    // booleans fails: not adjacent to its cause (it isn't the form at all —
+    // it's a different content type), doesn't state a recovery step beyond
+    // "something was invalid", and every submitted value is gone.
+    #[tokio::test]
+    async fn model_create_malformed_json_discards_the_whole_form() {
+        let (status, body) = post_form(
+            form_test_app(),
+            "/widgets",
+            &[("name", "Widget X"), ("metadata", "{broken")],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(
+            body.contains(r#""status":400"#) && body.contains("invalid JSON"),
+            "body: {body}"
+        );
+        // The admin's `name` entry never appears anywhere in the response —
+        // it's simply gone.
+        assert!(!body.contains("Widget X"), "body: {body}");
+        assert!(!body.contains("<form"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn model_create_validation_error_discards_the_whole_form() {
+        let (status, body) = post_form(
+            form_test_app(),
+            "/widgets",
+            &[("name", "taken"), ("owner", "bob"), ("metadata", "{}")],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(body.contains("name already taken"), "body: {body}");
+        assert!(!body.contains("<form"), "body: {body}");
+        // The `owner` value the admin typed never appears anywhere either.
+        assert!(!body.contains("bob"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn model_update_validation_error_discards_the_whole_form() {
+        let (status, body) = post_form(
+            form_test_app(),
+            "/widgets/1",
+            &[("name", "taken"), ("metadata", "{}")],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(body.contains("name already taken"), "body: {body}");
+        assert!(!body.contains("<form"), "body: {body}");
     }
 
     #[tokio::test]
