@@ -56,6 +56,7 @@
 //! | `AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS` | `server.upgrade.ready_timeout_secs` | `u64` |
 //! | `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS` | `server.timeouts.request_timeout_ms` | `u64` |
 //! | `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` | `usize` |
+//! | `AUTUMN_SERVER__CAPACITY_CONTRACT` | `server.capacity_contract` | `String` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` | `String` |
 //! | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` | `String` |
@@ -3108,6 +3109,12 @@ pub struct JobConfig {
     /// ignored. Set from `AUTUMN_JOBS__PIN` (comma-separated) too.
     #[serde(default)]
     pub pin: Vec<String>,
+    /// Declared worker-fleet topology, read by `autumn doctor` to prove
+    /// topology-wide queue coverage (issue #1623, AC6). Purely declarative: the
+    /// running process never acts on it — it describes the *other* tiers, which
+    /// a single process cannot observe.
+    #[serde(default)]
+    pub fleet: JobFleetConfig,
     /// Redis backend options.
     #[serde(default)]
     pub redis: JobRedisConfig,
@@ -3129,6 +3136,7 @@ impl Default for JobConfig {
             initial_backoff_ms: default_job_backoff_ms(),
             queues: JobQueuesConfig::default(),
             pin: Vec::new(),
+            fleet: JobFleetConfig::default(),
             redis: JobRedisConfig::default(),
             postgres: JobPostgresConfig::default(),
             tracking: JobTrackingConfig::default(),
@@ -3397,6 +3405,57 @@ impl<'de> serde::Deserialize<'de> for JobQueuesConfig {
 
         d.deserialize_any(JobQueuesVisitor)
     }
+}
+
+/// Declared worker-fleet topology (`[jobs.fleet]` in `autumn.toml`).
+///
+/// A single process can see its own `jobs.pin` but not its siblings', so it can
+/// never tell a valid multi-tier split (one tier drains `critical`, another
+/// drains `bulk`) from a real coverage gap. Declaring every tier's pin here is
+/// what lets `autumn doctor --strict` *prove* that some queue is drained by no
+/// tier anywhere and hard-fail on it (issue #1623, AC6) instead of only
+/// reporting what this one process claims.
+///
+/// # Example `autumn.toml`
+///
+/// ```toml
+/// [jobs.fleet]
+/// # One entry per worker tier, each holding that tier's `jobs.pin`. Must list
+/// # every tier actually running: doctor can only reason about declared tiers,
+/// # so omitting one reports a coverage gap that does not exist.
+/// # An empty entry is an *unpinned* tier that drains every queue.
+/// tiers = [["critical"], ["bulk", "default", "thumbnails"]]
+/// # Optional: where the compiled `#[job(queue = "…")]` set comes from, so the
+/// # check also covers queues declared in code but absent from `[jobs.queues]`.
+/// # `manifest` (emitted by `autumn jobs manifest <path>`) wins when both are
+/// # set. Every queue they name must be covered by some tier above.
+/// manifest = "target/jobs-manifest.toml"
+/// declared_queues = ["thumbnails"]
+/// ```
+///
+/// The framework itself never reads this at runtime — it is operator-declared
+/// input for the `doctor` check, and an app that declares nothing keeps today's
+/// behavior exactly (the check stays informational-only).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct JobFleetConfig {
+    /// One entry per worker tier, each entry being that tier's `jobs.pin`. An
+    /// **empty** entry is an unpinned tier that drains every queue, which makes
+    /// topology-wide coverage total. Empty/unset declares no topology.
+    #[serde(default)]
+    pub tiers: Vec<Vec<String>>,
+
+    /// Path to a jobs manifest (a TOML file with a `queues = [...]` array) the
+    /// app emits, naming the queues `#[job(queue = "…")]` declares. Lets the
+    /// coverage check see queues that exist in code but not in `[jobs.queues]`.
+    /// Takes precedence over [`Self::declared_queues`].
+    #[serde(default)]
+    pub manifest: Option<String>,
+
+    /// Inline list of `#[job(queue = "…")]`-declared queue names, for operators
+    /// who don't emit a manifest. Only *adds* to the set of queues that must be
+    /// covered, so an incomplete list can never manufacture a false failure.
+    #[serde(default)]
+    pub declared_queues: Vec<String>,
 }
 
 /// Redis backend configuration options for the job runner.
@@ -5228,6 +5287,11 @@ impl AutumnConfig {
             "AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS",
             &mut self.server.max_concurrent_requests,
         );
+        parse_env_option_string(
+            env,
+            "AUTUMN_SERVER__CAPACITY_CONTRACT",
+            &mut self.server.capacity_contract,
+        );
 
         // `[server.tls]` is a nested optional. Materialize it from the
         // environment when any of its keys are set (seeding an empty struct if
@@ -6543,6 +6607,25 @@ pub struct ServerConfig {
     #[serde(default)]
     pub max_concurrent_requests: Option<usize>,
 
+    /// Path to the committed capacity contract (`capacity.lock`) this deploy
+    /// should admit against (issue #1733).
+    ///
+    /// When set — and [`Self::max_concurrent_requests`] is *not* — the
+    /// load-shedding ceiling is sourced from the contract's proven envelope
+    /// instead of a hand-tuned guess, so the binary sheds at the edge someone
+    /// actually measured. Relative paths resolve against the process working
+    /// directory.
+    ///
+    /// An explicit `max_concurrent_requests` always wins, and every failure
+    /// along the contract path (missing file, malformed document, a contract
+    /// measured on a different host class) degrades to *unlimited* with a
+    /// warning rather than to a ceiling — see
+    /// [`capacity::resolve_admission_limit`](crate::capacity::resolve_admission_limit).
+    ///
+    /// Configured via `AUTUMN_SERVER__CAPACITY_CONTRACT`.
+    #[serde(default)]
+    pub capacity_contract: Option<String>,
+
     /// Terminate HTTPS directly in the app process (issue #1603).
     ///
     /// When set, the server serves TLS on `host:port` using the configured
@@ -6853,6 +6936,22 @@ impl AcmeConfig {
                     "[server.tls.acme] wildcard domain `{trimmed}` is not supported: wildcards \
                      require the DNS-01 challenge, which is out of scope here (tracked in #1620). \
                      List explicit hostnames instead"
+                ));
+            }
+            // The checks above read `trimmed`, but the entry is stored — and used —
+            // UNTRIMMED: it becomes the certificate's SAN via `CertificateParams`,
+            // the placeholder key's `CertId`, and the ACME order's
+            // `Identifier::Dns`. A padded ` app.example.com ` is therefore a
+            // different identifier than the hostname the operator meant, and the
+            // failure surfaces as an opaque CA rejection mid-issuance. Reject the
+            // padding here instead of silently trimming, so the config file says
+            // exactly what will be requested.
+            if domain != trimmed {
+                return Err(format!(
+                    "[server.tls.acme] domain `{domain}` (entry at index {index}) has leading or \
+                     trailing whitespace: the entry is used verbatim as the certificate's SAN and \
+                     as the ACME order's DNS identifier, so the padded value would be requested \
+                     as-is. Write it as `{trimmed}`"
                 ));
             }
         }
@@ -8647,6 +8746,7 @@ impl Default for ServerConfig {
             timeouts: RequestTimeoutsConfig::default(),
             unix_socket: None,
             max_concurrent_requests: None,
+            capacity_contract: None,
             tls: None,
         }
     }
@@ -12956,6 +13056,112 @@ path = "/healthz"
         assert_eq!(config.jobs.pin, vec!["critical", "default"]);
     }
 
+    /// Issue #1623, AC6: `autumn doctor --strict` can only *prove* a zero-coverage
+    /// gap when the operator declares the fleet topology under `[jobs.fleet]
+    /// tiers` — every worker tier's `jobs.pin`. That key lives in the same
+    /// `autumn.toml` the app boots from, so the app's own schema must know it;
+    /// otherwise declaring the topology that makes the doctor check work is an
+    /// unknown config key that hard-fails boot under `strict_config_enforce_all`.
+    #[test]
+    fn jobs_fleet_tiers_parse_from_toml() {
+        let default = AutumnConfig::default();
+        assert!(
+            default.jobs.fleet.tiers.is_empty(),
+            "no fleet topology is declared by default (AC4)"
+        );
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [jobs.fleet]
+            tiers = [["critical"], ["bulk", "default"], []]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.jobs.fleet.tiers,
+            vec![
+                vec!["critical".to_owned()],
+                vec!["bulk".to_owned(), "default".to_owned()],
+                // An empty inner list is an *unpinned* tier that drains
+                // everything — a meaningful declaration, not a typo.
+                Vec::<String>::new(),
+            ],
+        );
+    }
+
+    /// The regression this closes: `[jobs.fleet]` is documented for
+    /// `autumn doctor`, so an operator who declares it must still be able to
+    /// boot the app with the strictest config validation turned on.
+    #[test]
+    fn declared_fleet_topology_boots_under_enforce_all() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+        std::fs::write(
+            &config_path,
+            "[server]\nstrict_config = true\nstrict_config_enforce_all = true\n\n\
+             [jobs]\npin = [\"critical\"]\n\n\
+             [jobs.fleet]\ntiers = [[\"critical\"], [\"bulk\", \"default\"]]\n",
+        )
+        .unwrap();
+
+        let env = FakeEnv(
+            [
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res = AutumnConfig::load_with_env(&env);
+        assert!(
+            res.is_ok(),
+            "a declared [jobs.fleet] topology must not be an unknown config key: {res:?}"
+        );
+        let config = res.unwrap();
+        assert_eq!(config.jobs.fleet.tiers.len(), 2);
+        assert_eq!(config.jobs.pin, vec!["critical".to_owned()]);
+    }
+
+    /// A typo *inside* `[jobs.fleet]` must still be caught — accepting the
+    /// section must not turn it into an opaque bag that swallows mistakes. The
+    /// crate catches unknown keys through the strict-config schema walk (not
+    /// `deny_unknown_fields`), so this asserts it there.
+    #[test]
+    fn jobs_fleet_typo_is_caught_by_strict_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+        std::fs::write(
+            &config_path,
+            "[server]\nstrict_config = true\nstrict_config_enforce_all = true\n\n\
+             [jobs.fleet]\nteirs = [[\"critical\"]]\n",
+        )
+        .unwrap();
+
+        let env = FakeEnv(
+            [
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res = AutumnConfig::load_with_env(&env);
+        assert!(
+            res.is_err(),
+            "a typo inside [jobs.fleet] must not be silently accepted"
+        );
+        let err_str = format!("{:?}", res.err().unwrap());
+        assert!(
+            err_str.contains("teirs"),
+            "error should name the typo: {err_str}"
+        );
+    }
+
     #[test]
     fn jobs_pin_env_override_is_comma_separated() {
         let env = MockEnv::new().with("AUTUMN_JOBS__PIN", "critical, bulk ,");
@@ -14463,6 +14669,108 @@ path = "/healthz"
         assert!(err.contains("blank entries"), "got: {err}");
     }
 
+    // The `autumn doctor` grader FAILs a malformed `http_challenge_port` /
+    // `renew_before_days` (#1608, #1874) on the premise that the runtime's TYPED
+    // deserialization rejects the same spellings before boot. Pin that premise
+    // here: if a future lenient `deserialize_with` ever made the runtime accept
+    // `"30"`, doctor would start FAILing a file that boots fine — the same parity
+    // bug in the opposite direction, and today nothing would catch it.
+    #[test]
+    fn acme_numeric_fields_reject_non_integer_toml_values() {
+        for key in ["http_challenge_port", "renew_before_days"] {
+            for bad in ["\"30\"", "30.5", "true", "-1", "4294967296"] {
+                let src = format!(
+                    "[server.tls.acme]\ndomains = [\"app.example.com\"]\n\
+                     contact_email = \"ops@example.com\"\n{key} = {bad}\n"
+                );
+                assert!(
+                    toml::from_str::<AutumnConfig>(&src).is_err(),
+                    "{key} = {bad} must fail to deserialize"
+                );
+            }
+            // ... while the plain unquoted integer the doctor grader treats as
+            // valid really is accepted.
+            let src = format!(
+                "[server.tls.acme]\ndomains = [\"app.example.com\"]\n\
+                 contact_email = \"ops@example.com\"\n{key} = 45\n"
+            );
+            assert!(
+                toml::from_str::<AutumnConfig>(&src).is_ok(),
+                "{key} = 45 must deserialize"
+            );
+        }
+    }
+
+    // Regression (#1874): a whitespace-padded domain (`" app.example.com "`)
+    // passed `validate()` — the blank and wildcard checks look at `domain.trim()`
+    // but the UNTRIMMED value is what is stored, so the padded string reached the
+    // placeholder/CSR builder and the ACME `Identifier::Dns` order. The CA then
+    // rejects (or mis-issues) an identifier that is not the hostname the operator
+    // meant, with a far less actionable error than a boot-time rejection.
+    #[test]
+    fn validate_acme_whitespace_padded_domain_rejected() {
+        for padded in [
+            " app.example.com",
+            "app.example.com ",
+            "\tapp.example.com\n",
+        ] {
+            let mut cfg = tls_static(None, None);
+            cfg.acme = Some(acme_cfg(&[padded], "ops@example.com"));
+            let err = cfg
+                .validate()
+                .expect_err("a whitespace-padded domain must be rejected");
+            assert!(
+                err.contains("whitespace"),
+                "message must name the problem: {err}"
+            );
+            assert!(
+                err.contains(&format!("`{padded}`")),
+                "message must echo the RAW padded entry, not only the trimmed \
+                 spelling it suggests: {err}"
+            );
+            assert!(
+                err.contains("`app.example.com`"),
+                "message must name the trimmed spelling to use: {err}"
+            );
+        }
+
+        // A padded entry is rejected even when a well-formed one precedes it, and
+        // the message points at the right index.
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(
+            &["app.example.com", " www.example.com "],
+            "ops@example.com",
+        ));
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("index 1"),
+            "message must name the index: {err}"
+        );
+
+        // The already-trimmed spelling of the same name still passes.
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&["app.example.com"], "ops@example.com"));
+        assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    // The padded-domain rule must not shadow the two more specific per-entry
+    // rules: a whitespace-only entry is still reported as blank, and a padded
+    // wildcard is still reported as a wildcard (the deeper problem, and the
+    // message operators already get today).
+    #[test]
+    fn validate_acme_padded_domain_rule_does_not_shadow_blank_or_wildcard() {
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&["   "], "ops@example.com"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("blank entries"), "got: {err}");
+
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&[" *.example.com "], "ops@example.com"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("wildcard"), "got: {err}");
+        assert!(err.contains("#1620"), "got: {err}");
+    }
+
     // Regression (#1608, Codex P2): `http_challenge_port = 0` binds an ephemeral
     // OS port the HTTP-01 validator (always port 80) can never reach, so every
     // issuance fails while the process stays up — `validate()` must reject it.
@@ -14528,6 +14836,40 @@ path = "/healthz"
             "ops@example.com",
         ));
         assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    // ── server.capacity_contract (#1733) ───────────────────────────────
+
+    #[test]
+    fn server_config_defaults_capacity_contract_none() {
+        let config = AutumnConfig::default();
+        assert!(config.server.capacity_contract.is_none());
+    }
+
+    #[test]
+    fn capacity_contract_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server]
+            capacity_contract = "capacity.lock"
+            "#,
+        )
+        .expect("config with server.capacity_contract should parse");
+        assert_eq!(
+            config.server.capacity_contract.as_deref(),
+            Some("capacity.lock")
+        );
+    }
+
+    #[test]
+    fn env_override_server_capacity_contract() {
+        let env = MockEnv::new().with("AUTUMN_SERVER__CAPACITY_CONTRACT", "deploy/capacity.lock");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.server.capacity_contract.as_deref(),
+            Some("deploy/capacity.lock")
+        );
     }
 
     // ── server.max_concurrent_requests (#1006) ────────────────────

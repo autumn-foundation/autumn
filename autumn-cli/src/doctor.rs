@@ -2918,9 +2918,22 @@ fn check_queue_coverage(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct FleetTopology {
     tiers: Vec<Vec<String>>,
+    /// `[jobs.fleet] tiers` was present but not a list of lists, so no topology
+    /// could be read from it. Reported as a failure rather than treated as
+    /// "nothing declared" — see [`resolve_fleet_topology`].
+    malformed: bool,
 }
 
 impl FleetTopology {
+    /// A topology that could not be parsed. Carries no tiers, so it can never be
+    /// mistaken for coverage.
+    const fn malformed() -> Self {
+        Self {
+            tiers: Vec::new(),
+            malformed: true,
+        }
+    }
+
     /// At least one declared tier runs job workers. A topology with no tiers
     /// declares nothing coverable, so it cannot prove a gap.
     const fn runs_any_worker(&self) -> bool {
@@ -2968,6 +2981,21 @@ fn check_queue_coverage_topology(
     // No topology declared → informational-only, exactly as today. The hard-fail
     // only activates once the operator supplies the topology that makes coverage
     // provable, so existing deployments never regress.
+    if let Some(fleet) = fleet.filter(|f| f.malformed) {
+        let _ = fleet;
+        return CheckResult {
+            name: "jobs_queue_coverage",
+            status: CheckStatus::Fail,
+            detail: Some(
+                "[jobs.fleet] tiers is present but is not a list of lists, so no fleet \
+                 topology could be read and topology-wide queue coverage cannot be checked"
+                    .to_string(),
+            ),
+            hint: Some(
+                "Write one list per worker tier, e.g. tiers = [[\"critical\"], [\"bulk\", \"default\"]] — a flat list like tiers = [\"critical\"] is a single tier's pin, not a topology",
+            ),
+        };
+    }
     let Some(fleet) = fleet.filter(|f| f.runs_any_worker()) else {
         return check_queue_coverage(role, configured_queues, pin);
     };
@@ -4160,27 +4188,53 @@ where
 /// table, so the topology lives beside them, is profile-aware, and is checked
 /// into the repo as one source of truth for the fleet.
 fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> {
-    let fleet = table
+    // A malformed `[jobs.fleet]` must NOT be silently dropped at ANY level.
+    // Every `?` here would otherwise return `None`, which the caller reads as
+    // "no topology declared" and answers with the informational-only report —
+    // quietly switching the AC6 hard-fail off, with nothing reporting it. The
+    // typed `JobFleetConfig` rejects each of these shapes at app boot, so a
+    // pre-deploy gate that passes them has the ordering exactly backwards.
+    let jobs = table
         .and_then(|t| t.get("jobs"))
-        .and_then(toml::Value::as_table)
-        .and_then(|j| j.get("fleet"))
         .and_then(toml::Value::as_table)?;
-    let tiers: Vec<Vec<String>> = fleet
-        .get("tiers")
-        .and_then(toml::Value::as_array)?
-        .iter()
-        .filter_map(toml::Value::as_array)
-        .map(|tier| {
-            tier.iter()
-                .filter_map(toml::Value::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<String>>()
-        })
-        .collect();
+    // Genuinely absent: nothing declared, nothing to check.
+    let fleet = jobs.get("fleet")?;
+    let Some(fleet) = fleet.as_table() else {
+        return Some(FleetTopology::malformed());
+    };
+    let declared = fleet.get("tiers")?;
+    // `tiers = "critical"` — a bare value rather than a list of lists.
+    let Some(declared) = declared.as_array() else {
+        return Some(FleetTopology::malformed());
+    };
+    // `tiers = ["critical", "bulk"]` — the flat shape `jobs.pin` uses, sitting a
+    // few lines above it in the same file, so an easy mistake to make.
+    let mut tiers: Vec<Vec<String>> = Vec::with_capacity(declared.len());
+    for entry in declared {
+        let Some(tier) = entry.as_array() else {
+            return Some(FleetTopology::malformed());
+        };
+        // Queue names must be strings. Dropping a non-string with `filter_map`
+        // is the worst variant of the same silent-pass bug: `tiers = [[1]]`
+        // collapses to an EMPTY tier, which `has_unpinned_tier` reads as a tier
+        // that drains everything — so coverage becomes total and the check
+        // passes unconditionally on a document the app refuses to boot with.
+        let mut names = Vec::with_capacity(tier.len());
+        for name in tier {
+            let Some(name) = name.as_str() else {
+                return Some(FleetTopology::malformed());
+            };
+            names.push(name.to_owned());
+        }
+        tiers.push(names);
+    }
     if tiers.is_empty() {
         return None;
     }
-    Some(FleetTopology { tiers })
+    Some(FleetTopology {
+        tiers,
+        malformed: false,
+    })
 }
 
 /// Resolve the compiled `#[job(queue = "…")]`-declared queue set for the
@@ -4192,6 +4246,12 @@ fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> 
 ///    `queues = [...]` array. This is the ground-truth set the runtime drains.
 /// 2. `[jobs.fleet] declared_queues = ["…"]` — an inline list the operator
 ///    maintains by hand (the MVP path when no manifest is emitted).
+///
+/// A manifest that reads and parses wins outright, **including** when its
+/// `queues` array is empty — that is the app answering "no job-declared queues",
+/// not failing to answer. Only a manifest that says nothing at all (absent path,
+/// unreadable, unparseable, or no `queues` array) falls through to the inline
+/// list.
 ///
 /// Returns an empty `Vec` when neither is present; an unknown declared set only
 /// shrinks the needed set, so it can never cause a false failure.
@@ -4213,23 +4273,27 @@ where
     };
 
     // 1. A jobs manifest the app emits: TOML `queues = [...]`.
+    //
+    // A manifest that reads and parses is authoritative even when its `queues`
+    // array is EMPTY — that is the app stating it declares no
+    // `#[job(queue = "…")]` queues beyond the configured set, which is a real
+    // answer, not a missing one. Falling through to `declared_queues` there
+    // would let a stale hand-maintained entry manufacture a coverage failure
+    // against the ground truth, and would contradict the documented precedence
+    // ("manifest wins when both are set").
+    //
+    // The fall-through is reserved for a manifest that genuinely says nothing:
+    // absent path, unreadable file, unparseable TOML, or no `queues` array.
     if let Some(path) = fleet.get("manifest").and_then(toml::Value::as_str)
         && let Some(contents) = read_file(path)
         && let Ok(manifest) = toml::from_str::<toml::Table>(&contents)
+        && let Some(queues) = manifest.get("queues").and_then(toml::Value::as_array)
     {
-        let queues: Vec<String> = manifest
-            .get("queues")
-            .and_then(toml::Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(toml::Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !queues.is_empty() {
-            return queues;
-        }
+        return queues
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .map(str::to_owned)
+            .collect();
     }
 
     // 2. Inline declared-queues list (MVP).
@@ -4991,6 +5055,19 @@ pub struct AcmeDoctorConfig {
     /// config. Recorded here so the grader surfaces it as an `acme_config` FAIL.
     /// `None` when every entry is a string (or `domains` is absent).
     pub domains_error: Option<String>,
+    /// The rendered invalid `acme.renew_before_days` value when the key is
+    /// PRESENT but does not deserialize as a `u32` the way the runtime's typed
+    /// `AcmeConfig` does (a quoted string like `"30"`, a float, a bool, a
+    /// negative, or an out-of-`u32`-range integer). Doctor's old `as_integer()`
+    /// chain treated a NON-INTEGER as ABSENT and silently defaulted to 30, so
+    /// `doctor --strict` passed a file the runtime refuses to boot on (#1874);
+    /// a negative / out-of-range integer did parse, but was clamped to
+    /// `u32::MAX` and reported against the `>= 90` renewal-window rule rather
+    /// than as the malformed value it is.
+    /// Mirrors the [`port_error`](Self::port_error) treatment. `None` when the
+    /// value is a valid `u32` or the key is absent (absent uses the runtime
+    /// default, 30).
+    pub renew_before_days_error: Option<String>,
 }
 
 /// Deserialize `[server.tls.acme] directory` exactly as the runtime does.
@@ -5014,6 +5091,32 @@ fn parse_acme_directory(acme: &toml::Table) -> Result<autumn_web::config::AcmeDi
     )
 }
 
+/// Deserialize one scalar `[server.tls.acme]` key exactly as the runtime's typed
+/// `AcmeConfig` does, keeping the offending value on failure.
+///
+/// Returns `default` when the key is absent (matching the runtime's `#[serde(default
+/// = ...)]`), the deserialized `T` when the value is one the runtime accepts, and
+/// otherwise the RENDERED invalid value — so the caller can surface it as an
+/// `acme_config` FAIL naming what the operator actually wrote, instead of
+/// silently falling back to the default and blessing a config the server refuses
+/// to boot on.
+fn parse_acme_scalar<T: serde::de::DeserializeOwned>(
+    acme: &toml::Table,
+    key: &str,
+    default: T,
+) -> Result<T, String> {
+    acme.get(key).cloned().map_or_else(
+        || Ok(default),
+        |value| {
+            // Render the value BEFORE `try_into` consumes it, for the FAIL message.
+            let rendered = value.to_string();
+            value
+                .try_into::<T>()
+                .map_err(|_| rendered.trim().to_owned())
+        },
+    )
+}
+
 /// Deserialize `[server.tls.acme] http_challenge_port` exactly as the runtime's
 /// typed `AcmeConfig` does.
 ///
@@ -5023,16 +5126,20 @@ fn parse_acme_directory(acme: &toml::Table) -> Result<autumn_web::config::AcmeDi
 /// an `acme_config` FAIL instead of silently falling back to the default `80`.
 /// An absent `http_challenge_port` key uses the runtime default (`80`).
 fn parse_acme_http_challenge_port(acme: &toml::Table) -> Result<u16, String> {
-    acme.get("http_challenge_port").cloned().map_or_else(
-        || Ok(80),
-        |value| {
-            // Render the value BEFORE `try_into` consumes it, for the FAIL message.
-            let rendered = value.to_string();
-            value
-                .try_into::<u16>()
-                .map_err(|_| rendered.trim().to_owned())
-        },
-    )
+    parse_acme_scalar(acme, "http_challenge_port", 80)
+}
+
+/// Deserialize `[server.tls.acme] renew_before_days` exactly as the runtime's
+/// typed `AcmeConfig` does.
+///
+/// Returns the parsed `u32`, or — on a value the runtime would fail to
+/// deserialize (negative, out of `u32` range, or a non-integer such as a quoted
+/// string, a float, or a bool) — the rendered invalid value, so the caller can
+/// surface it as an `acme_config` FAIL instead of silently falling back to the
+/// default `30`. An absent `renew_before_days` key uses the runtime default
+/// (`30`).
+fn parse_acme_renew_before_days(acme: &toml::Table) -> Result<u32, String> {
+    parse_acme_scalar(acme, "renew_before_days", 30)
 }
 
 /// The `FsAcmeStore` subdirectory label for a parsed `acme.directory`.
@@ -5120,12 +5227,13 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
     // does: an absent key defaults to 30, a valid in-range integer is preserved
     // (including a >= 90 value, so the acme-config grader FAILs it exactly as
     // `AcmeConfig::validate()` does), and a value the runtime would reject
-    // pre-boot (negative or out of `u32` range) is clamped to `u32::MAX` so it too
-    // trips the `>= 90` FAIL rather than silently falling back to the default.
-    let renew_before_days = acme
-        .get("renew_before_days")
-        .and_then(toml::Value::as_integer)
-        .map_or(30, |v| u32::try_from(v).unwrap_or(u32::MAX));
+    // pre-boot (negative, out of `u32` range, or a non-integer such as a quoted
+    // string) records the bad value so the grader FAILs rather than silently
+    // defaulting to 30.
+    let (renew_before_days, renew_before_days_error) = match parse_acme_renew_before_days(acme) {
+        Ok(days) => (days, None),
+        Err(bad_value) => (30, Some(bad_value)),
+    };
 
     let cache_dir = acme
         .get("cache_dir")
@@ -5162,7 +5270,89 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         ca_root_path,
         ca_root_error,
         domains_error,
+        renew_before_days_error,
     })
+}
+
+/// The shared `acme_config` Fail shape: every ACME-config violation reports the
+/// same check name and status, so each rule contributes only a detail + hint.
+///
+/// Returns the bare [`CheckResult`] rather than a `Some(..)`; the graders that
+/// call it return `Option<CheckResult>` (`None` meaning "this rule is satisfied")
+/// and wrap it themselves, so the "always Some" is theirs to state, not this
+/// constructor's.
+const fn acme_config_fail(detail: String, hint: &'static str) -> CheckResult {
+    CheckResult {
+        name: "acme_config",
+        status: CheckStatus::Fail,
+        detail: Some(detail),
+        hint: Some(hint),
+    }
+}
+
+/// Grade the `[server.tls.acme]` values that the runtime rejects while
+/// DESERIALIZING `AcmeConfig` — before `validate()` ever runs.
+///
+/// Each field here holds the rendered value the operator actually wrote (see
+/// [`AcmeDoctorConfig::port_error`] and siblings), recorded because the doctor's
+/// own lenient parse would otherwise substitute a default and bless a config the
+/// server refuses to boot on. Extracted from [`check_acme_config_impl`] so that
+/// grader stays within the line budget, and so this "the runtime cannot even
+/// parse this" tier reads as one unit.
+fn check_acme_deserialize_errors(config: &AcmeDoctorConfig) -> Option<CheckResult> {
+    let AcmeDoctorConfig {
+        directory_error,
+        port_error,
+        domains_error,
+        renew_before_days_error,
+        ..
+    } = config;
+
+    if let Some(bad_value) = domains_error {
+        return Some(acme_config_fail(
+            format!(
+                "[server.tls.acme] domains {bad_value}: every entry must be a string hostname. \
+                 The runtime deserializes domains as a list of strings and fails to boot on a \
+                 non-string entry"
+            ),
+            "List only string hostnames in [server.tls.acme] domains",
+        ));
+    }
+    if let Some(bad_value) = directory_error {
+        return Some(acme_config_fail(
+            format!(
+                "[server.tls.acme] directory value {bad_value} is not a valid ACME directory: use \
+                 \"staging\", \"production\", or a custom directory URL. The runtime fails to boot \
+                 on this value"
+            ),
+            "Set [server.tls.acme] directory to \"staging\", \"production\", or a custom directory \
+             URL",
+        ));
+    }
+    if let Some(bad_value) = port_error {
+        return Some(acme_config_fail(
+            format!(
+                "[server.tls.acme] http_challenge_port value {bad_value} is not a valid port: it \
+                 must be an integer in the range 0-65535 (the runtime fails to boot on an \
+                 out-of-range or non-integer value)"
+            ),
+            "Set [server.tls.acme] http_challenge_port to a valid port number (80, or the port a \
+             front-end forwards `:80` to)",
+        ));
+    }
+    if let Some(bad_value) = renew_before_days_error {
+        return Some(acme_config_fail(
+            format!(
+                "[server.tls.acme] renew_before_days value {bad_value} is not a valid renewal \
+                 window: it must be a whole number of days in the range 0-4294967295 (the runtime \
+                 fails to boot on a negative, out-of-range, or non-integer value such as a quoted \
+                 string)"
+            ),
+            "Set [server.tls.acme] renew_before_days to a whole number of days below 90 (default \
+             30), unquoted",
+        ));
+    }
+    None
 }
 
 /// Grade the resolved ACME config against the runtime's boot-time invariants,
@@ -5185,91 +5375,61 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
 /// This grader returns a `Fail` [`CheckResult`] for the first violated rule
 /// (messages mirror the runtime's), or `None` when the ACME config is valid.
 ///
-/// `directory_error` and `port_error` are the rendered invalid `directory` /
-/// `http_challenge_port` values (see [`AcmeDoctorConfig::directory_error`] /
-/// [`AcmeDoctorConfig::port_error`]); they are checked first because the runtime
-/// DESERIALIZES `AcmeConfig` — failing on a bad `directory` or an out-of-range /
-/// non-integer `http_challenge_port` — before it runs `validate()`.
+/// The recorded deserialize errors on `config` — [`domains_error`],
+/// [`directory_error`], [`port_error`] and [`renew_before_days_error`] — are
+/// checked FIRST, because the runtime DESERIALIZES `AcmeConfig` (failing on a
+/// non-string `domains` entry, a bad `directory`, or an out-of-range /
+/// non-integer `http_challenge_port` / `renew_before_days`) before it ever runs
+/// `validate()`. Each one is a rendered invalid value the operator wrote, so the
+/// FAIL can name it.
+///
+/// [`domains_error`]: AcmeDoctorConfig::domains_error
+/// [`directory_error`]: AcmeDoctorConfig::directory_error
+/// [`port_error`]: AcmeDoctorConfig::port_error
+/// [`renew_before_days_error`]: AcmeDoctorConfig::renew_before_days_error
 #[must_use]
-pub fn check_acme_config_impl(
-    domains: &[String],
-    contact_email: &str,
-    http_challenge_port: u16,
-    renew_before_days: u32,
-    directory_error: Option<&str>,
-    port_error: Option<&str>,
-    domains_error: Option<&str>,
-) -> Option<CheckResult> {
-    // All ACME-config violations share the same `acme_config` Fail shape; this
-    // collapses each branch to a detail + hint pair.
-    let fail = |detail: String, hint: &'static str| {
-        Some(CheckResult {
-            name: "acme_config",
-            status: CheckStatus::Fail,
-            detail: Some(detail),
-            hint: Some(hint),
-        })
-    };
+pub fn check_acme_config_impl(config: &AcmeDoctorConfig) -> Option<CheckResult> {
+    let AcmeDoctorConfig {
+        domains,
+        contact_email,
+        http_challenge_port,
+        renew_before_days,
+        ..
+    } = config;
 
-    if let Some(bad_value) = domains_error {
-        return fail(
-            format!(
-                "[server.tls.acme] domains {bad_value}: every entry must be a string hostname. \
-                 The runtime deserializes domains as a list of strings and fails to boot on a \
-                 non-string entry"
-            ),
-            "List only string hostnames in [server.tls.acme] domains",
-        );
+    // The runtime deserializes `AcmeConfig` before it validates it, so a value it
+    // cannot even parse is graded first.
+    if let Some(deserialize_fail) = check_acme_deserialize_errors(config) {
+        return Some(deserialize_fail);
     }
-    if let Some(bad_value) = directory_error {
-        return fail(
-            format!(
-                "[server.tls.acme] directory value {bad_value} is not a valid ACME directory: use \
-                 \"staging\", \"production\", or a custom directory URL. The runtime fails to boot \
-                 on this value"
-            ),
-            "Set [server.tls.acme] directory to \"staging\", \"production\", or a custom directory \
-             URL",
-        );
-    }
-    if let Some(bad_value) = port_error {
-        return fail(
-            format!(
-                "[server.tls.acme] http_challenge_port value {bad_value} is not a valid port: it \
-                 must be an integer in the range 0-65535 (the runtime fails to boot on an \
-                 out-of-range or non-integer value)"
-            ),
-            "Set [server.tls.acme] http_challenge_port to a valid port number (80, or the port a \
-             front-end forwards `:80` to)",
-        );
-    }
+
     if domains.is_empty() {
-        return fail(
+        return Some(acme_config_fail(
             "[server.tls.acme] domains must list at least one domain to request a certificate for"
                 .to_owned(),
             "Add at least one domain to [server.tls.acme] domains",
-        );
+        ));
     }
     if contact_email.trim().is_empty() {
-        return fail(
+        return Some(acme_config_fail(
             "[server.tls.acme] contact_email must be set (the ACME CA requires an account contact \
              for expiry notifications)"
                 .to_owned(),
             "Set [server.tls.acme] contact_email",
-        );
+        ));
     }
-    if http_challenge_port == 0 {
-        return fail(
+    if *http_challenge_port == 0 {
+        return Some(acme_config_fail(
             "[server.tls.acme] http_challenge_port must not be 0: port 0 binds an ephemeral \
              OS-assigned port that the ACME HTTP-01 validator (which always connects on port 80) \
              can never reach, so every issuance fails. Use 80, or the port a front-end forwards \
              `:80` to"
                 .to_owned(),
             "Set [server.tls.acme] http_challenge_port to 80 (or the port `:80` forwards to)",
-        );
+        ));
     }
-    if renew_before_days >= 90 {
-        return fail(
+    if *renew_before_days >= 90 {
+        return Some(acme_config_fail(
             format!(
                 "[server.tls.acme] renew_before_days ({renew_before_days}) must be less than 90: \
                  it is compared against the issued certificate's remaining validity, and \
@@ -5279,7 +5439,7 @@ pub fn check_acme_config_impl(
                  every hour and burn the CA's rate limits"
             ),
             "Set [server.tls.acme] renew_before_days below 90 (default 30)",
-        );
+        ));
     }
     check_acme_domain_entries(domains)
 }
@@ -5288,34 +5448,41 @@ pub fn check_acme_config_impl(
 /// mirroring `AcmeConfig::validate`'s per-entry rules. Extracted from
 /// [`check_acme_config_impl`] to keep that grader within the line budget.
 fn check_acme_domain_entries(domains: &[String]) -> Option<CheckResult> {
-    let fail = |detail: String, hint: &'static str| {
-        Some(CheckResult {
-            name: "acme_config",
-            status: CheckStatus::Fail,
-            detail: Some(detail),
-            hint: Some(hint),
-        })
-    };
     for (index, domain) in domains.iter().enumerate() {
         let trimmed = domain.trim();
         if trimmed.is_empty() {
-            return fail(
+            return Some(acme_config_fail(
                 format!(
                     "[server.tls.acme] domains must not contain blank entries (entry at index \
                      {index} is empty or whitespace-only)"
                 ),
                 "Remove blank/whitespace-only entries from [server.tls.acme] domains",
-            );
+            ));
         }
         if trimmed.starts_with("*.") {
-            return fail(
+            return Some(acme_config_fail(
                 format!(
                     "[server.tls.acme] wildcard domain `{trimmed}` is not supported: wildcards \
                      require the DNS-01 challenge, which is out of scope here (tracked in #1620). \
                      List explicit hostnames instead"
                 ),
                 "Remove wildcard domains; list explicit hostnames (DNS-01 tracked in #1620)",
-            );
+            ));
+        }
+        // The two rules above read `trimmed`, but the runtime stores and uses the
+        // entry UNTRIMMED — as the certificate's SAN and as the ACME order's DNS
+        // identifier — so `AcmeConfig::validate()` rejects a padded entry. Mirror
+        // that here, or `doctor --strict` passes a file the server won't boot on.
+        if domain != trimmed {
+            return Some(acme_config_fail(
+                format!(
+                    "[server.tls.acme] domain `{domain}` (entry at index {index}) has leading or \
+                     trailing whitespace: the entry is used verbatim as the certificate's SAN and \
+                     as the ACME order's DNS identifier, so the padded value would be requested \
+                     as-is. Write it as `{trimmed}`"
+                ),
+                "Remove the leading/trailing whitespace from the [server.tls.acme] domains entry",
+            ));
         }
     }
     None
@@ -7243,15 +7410,7 @@ pub fn run(opts: DoctorOptions) {
         // `acme_stored_cert` as Pass with no probes, blessing a config that exits
         // at boot. Emit the FAIL and SKIP the misleading stored-cert / online
         // probes when the config is invalid (there is nothing valid to inspect).
-        if let Some(config_fail) = check_acme_config_impl(
-            &acme.domains,
-            &acme.contact_email,
-            acme.http_challenge_port,
-            acme.renew_before_days,
-            acme.directory_error.as_deref(),
-            acme.port_error.as_deref(),
-            acme.domains_error.as_deref(),
-        ) {
+        if let Some(config_fail) = check_acme_config_impl(&acme) {
             tasks.push(Box::new(move || config_fail));
         } else {
             // Offline: stored certificate expiry (reuses the #1603 inspect path).
@@ -10573,12 +10732,33 @@ pub struct Vault {
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
+    /// A minimal, valid [`AcmeDoctorConfig`] for the pure `check_acme_config_impl`
+    /// tests, so each case names only the field it exercises. Mirrors the runtime
+    /// defaults an absent key resolves to (port 80, renew-before 30 days,
+    /// `config/acme`, staging) with no recorded deserialize errors.
+    fn acme_doctor_cfg(domains: &[&str], contact_email: &str) -> AcmeDoctorConfig {
+        AcmeDoctorConfig {
+            domains: domains.iter().map(|d| (*d).to_owned()).collect(),
+            contact_email: contact_email.to_owned(),
+            http_challenge_port: 80,
+            renew_before_days: 30,
+            cache_dir: std::path::PathBuf::from("config/acme"),
+            directory_label: "staging".to_owned(),
+            directory_error: None,
+            port_error: None,
+            ca_root_path: None,
+            ca_root_error: None,
+            domains_error: None,
+            renew_before_days_error: None,
+        }
+    }
+
     // Regression (#1608, Codex): doctor must mirror AcmeConfig::validate(). An
     // ACME config with no/empty `domains` is REJECTED by the runtime at boot, so
     // doctor must FAIL it rather than silently pass acme_stored_cert.
     #[test]
     fn acme_config_fail_when_domains_empty() {
-        let r = check_acme_config_impl(&[], "ops@example.com", 80, 30, None, None, None)
+        let r = check_acme_config_impl(&acme_doctor_cfg(&[], "ops@example.com"))
             .expect("empty domains must be a FAIL, not Pass");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "acme_config");
@@ -10586,31 +10766,15 @@ pub struct Vault {
 
     #[test]
     fn acme_config_fail_when_contact_email_blank() {
-        let r = check_acme_config_impl(
-            &["app.example.com".to_owned()],
-            "   ",
-            80,
-            30,
-            None,
-            None,
-            None,
-        )
-        .expect("blank contact_email must be a FAIL");
+        let r = check_acme_config_impl(&acme_doctor_cfg(&["app.example.com"], "   "))
+            .expect("blank contact_email must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
     }
 
     #[test]
     fn acme_config_fail_when_wildcard_domain() {
-        let r = check_acme_config_impl(
-            &["*.example.com".to_owned()],
-            "ops@example.com",
-            80,
-            30,
-            None,
-            None,
-            None,
-        )
-        .expect("wildcard domain must be a FAIL");
+        let r = check_acme_config_impl(&acme_doctor_cfg(&["*.example.com"], "ops@example.com"))
+            .expect("wildcard domain must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
         // Points the operator at the DNS-01 tracking issue, mirroring
         // AcmeConfig::validate().
@@ -10621,16 +10785,8 @@ pub struct Vault {
     fn acme_config_ok_when_valid() {
         // A valid ACME config produces no acme_config failure.
         assert!(
-            check_acme_config_impl(
-                &["app.example.com".to_owned()],
-                "ops@example.com",
-                80,
-                30,
-                None,
-                None,
-                None
-            )
-            .is_none(),
+            check_acme_config_impl(&acme_doctor_cfg(&["app.example.com"], "ops@example.com"))
+                .is_none(),
             "a valid ACME config must not raise an acme_config failure"
         );
     }
@@ -10641,16 +10797,8 @@ pub struct Vault {
     // identifier, so doctor must FAIL it rather than pass acme_stored_cert.
     #[test]
     fn acme_config_fail_when_domain_entry_blank() {
-        let r = check_acme_config_impl(
-            &[String::new()],
-            "ops@example.com",
-            80,
-            30,
-            None,
-            None,
-            None,
-        )
-        .expect("a blank domain entry must be a FAIL");
+        let r = check_acme_config_impl(&acme_doctor_cfg(&[""], "ops@example.com"))
+            .expect("a blank domain entry must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "acme_config");
         assert!(
@@ -10660,16 +10808,8 @@ pub struct Vault {
         );
 
         // Whitespace-only is rejected the same way.
-        let r = check_acme_config_impl(
-            &["   ".to_owned()],
-            "ops@example.com",
-            80,
-            30,
-            None,
-            None,
-            None,
-        )
-        .expect("a whitespace-only domain entry must be a FAIL");
+        let r = check_acme_config_impl(&acme_doctor_cfg(&["   "], "ops@example.com"))
+            .expect("a whitespace-only domain entry must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
     }
 
@@ -10679,16 +10819,9 @@ pub struct Vault {
     // the process stays up — doctor must FAIL it.
     #[test]
     fn acme_config_fail_when_http_challenge_port_zero() {
-        let r = check_acme_config_impl(
-            &["app.example.com".to_owned()],
-            "ops@example.com",
-            0,
-            30,
-            None,
-            None,
-            None,
-        )
-        .expect("http_challenge_port = 0 must be a FAIL");
+        let mut cfg = acme_doctor_cfg(&["app.example.com"], "ops@example.com");
+        cfg.http_challenge_port = 0;
+        let r = check_acme_config_impl(&cfg).expect("http_challenge_port = 0 must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "acme_config");
         assert!(
@@ -10725,16 +10858,8 @@ http_challenge_port = 70000
             acme.port_error.is_some(),
             "an out-of-range http_challenge_port must be recorded, not defaulted to 80"
         );
-        let r = check_acme_config_impl(
-            &acme.domains,
-            &acme.contact_email,
-            acme.http_challenge_port,
-            acme.renew_before_days,
-            acme.directory_error.as_deref(),
-            acme.port_error.as_deref(),
-            acme.domains_error.as_deref(),
-        )
-        .expect("an out-of-range http_challenge_port must be a FAIL, not silently 80");
+        let r = check_acme_config_impl(&acme)
+            .expect("an out-of-range http_challenge_port must be a FAIL, not silently 80");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "acme_config");
         let detail = r.detail.as_deref().unwrap_or_default();
@@ -10758,16 +10883,8 @@ http_challenge_port = \"80\"
             acme.port_error.is_some(),
             "a quoted-string http_challenge_port must be recorded, not defaulted to 80"
         );
-        let r = check_acme_config_impl(
-            &acme.domains,
-            &acme.contact_email,
-            acme.http_challenge_port,
-            acme.renew_before_days,
-            acme.directory_error.as_deref(),
-            acme.port_error.as_deref(),
-            acme.domains_error.as_deref(),
-        )
-        .expect("a non-integer http_challenge_port must be a FAIL");
+        let r = check_acme_config_impl(&acme)
+            .expect("a non-integer http_challenge_port must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "acme_config");
     }
@@ -10788,16 +10905,7 @@ http_challenge_port = 8080
         assert!(acme.port_error.is_none());
         assert_eq!(acme.http_challenge_port, 8080);
         assert!(
-            check_acme_config_impl(
-                &acme.domains,
-                &acme.contact_email,
-                acme.http_challenge_port,
-                acme.renew_before_days,
-                acme.directory_error.as_deref(),
-                acme.port_error.as_deref(),
-                acme.domains_error.as_deref(),
-            )
-            .is_none(),
+            check_acme_config_impl(&acme).is_none(),
             "a valid http_challenge_port must not raise an acme_config FAIL"
         );
     }
@@ -10820,16 +10928,7 @@ renew_before_days = 100
         .unwrap();
         let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
         assert_eq!(acme.renew_before_days, 100);
-        let r = check_acme_config_impl(
-            &acme.domains,
-            &acme.contact_email,
-            acme.http_challenge_port,
-            acme.renew_before_days,
-            acme.directory_error.as_deref(),
-            acme.port_error.as_deref(),
-            acme.domains_error.as_deref(),
-        )
-        .expect("renew_before_days >= 90 must be a FAIL");
+        let r = check_acme_config_impl(&acme).expect("renew_before_days >= 90 must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "acme_config");
         let detail = r.detail.as_deref().unwrap_or_default();
@@ -10851,18 +10950,259 @@ renew_before_days = 30
         let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
         assert_eq!(acme.renew_before_days, 30);
         assert!(
-            check_acme_config_impl(
-                &acme.domains,
-                &acme.contact_email,
-                acme.http_challenge_port,
-                acme.renew_before_days,
-                acme.directory_error.as_deref(),
-                acme.port_error.as_deref(),
-                acme.domains_error.as_deref(),
-            )
-            .is_none(),
+            check_acme_config_impl(&acme).is_none(),
             "a valid renew_before_days must not raise an acme_config FAIL"
         );
+    }
+
+    // Regression (#1874, item 1): a `renew_before_days` the runtime's typed
+    // `AcmeConfig` cannot deserialize as a `u32` — a quoted string, a float, a
+    // bool, a negative, or an out-of-`u32`-range integer — must FAIL, not silently
+    // default to 30. Doctor's `as_integer()` chain treated a non-integer as
+    // ABSENT, so `renew_before_days = "30"` graded Pass while the server exits at
+    // boot on the same file.
+    #[test]
+    fn acme_config_fail_when_renew_before_days_malformed() {
+        for (bad_line, needle) in [
+            // The QUOTING is the bug here, so the FAIL must echo it: a wrong fix
+            // that reused the `>= 90` detail would still contain a bare `30`.
+            ("renew_before_days = \"30\"", "\"30\""),
+            ("renew_before_days = 30.5", "30.5"),
+            ("renew_before_days = true", "true"),
+            ("renew_before_days = -1", "-1"),
+            ("renew_before_days = 4294967296", "4294967296"),
+        ] {
+            let raw: toml::Table = toml::from_str(&format!(
+                "\
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = \"ops@example.com\"
+{bad_line}
+"
+            ))
+            .unwrap();
+            let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+            assert!(
+                acme.renew_before_days_error.is_some(),
+                "`{bad_line}` must be recorded, not silently defaulted to 30"
+            );
+            let r = check_acme_config_impl(&acme)
+                .unwrap_or_else(|| panic!("`{bad_line}` must be an acme_config FAIL"));
+            assert!(matches!(r.status, CheckStatus::Fail));
+            assert_eq!(r.name, "acme_config");
+            let detail = r.detail.as_deref().unwrap_or_default();
+            assert!(
+                detail.contains("renew_before_days") && detail.contains(needle),
+                "detail must name the bad renew_before_days value: {detail}"
+            );
+            // The deserialize tier, not the `>= 90` renewal-window rule: the
+            // runtime never gets far enough to compare this against 90.
+            assert!(
+                detail.contains("is not a valid renewal window"),
+                "`{bad_line}` must FAIL as a malformed value, not as a >= 90 \
+                 renewal window: {detail}"
+            );
+        }
+    }
+
+    // Companion: a valid explicit `renew_before_days` records no error, and an
+    // absent key still falls back to the runtime default (30) with no FAIL.
+    #[test]
+    fn acme_config_ok_when_renew_before_days_valid_or_absent() {
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = \"ops@example.com\"
+renew_before_days = 45
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        assert!(acme.renew_before_days_error.is_none());
+        assert_eq!(acme.renew_before_days, 45);
+        assert!(check_acme_config_impl(&acme).is_none());
+
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = \"ops@example.com\"
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        assert!(acme.renew_before_days_error.is_none());
+        assert_eq!(
+            acme.renew_before_days, 30,
+            "absent key uses the runtime default"
+        );
+        assert!(check_acme_config_impl(&acme).is_none());
+    }
+
+    // Regression (#1874, item 2): doctor must mirror `AcmeConfig::validate()`'s
+    // rejection of a whitespace-padded domain. Without this, `doctor --strict`
+    // passes a config the runtime refuses to boot on — the same parity gap in the
+    // opposite direction.
+    #[test]
+    fn acme_config_fail_when_domain_entry_whitespace_padded() {
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\" app.example.com \"]
+contact_email = \"ops@example.com\"
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        let r = check_acme_config_impl(&acme)
+            .expect("a whitespace-padded domain must be an acme_config FAIL");
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert_eq!(r.name, "acme_config");
+        let detail = r.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("whitespace") && detail.contains("` app.example.com `"),
+            "detail must name the problem and echo the RAW padded entry (not just \
+             the trimmed spelling it suggests): {detail}"
+        );
+
+        // Leading-only, trailing-only and tab/newline padding are rejected too.
+        for line in [
+            "domains = [\" app.example.com\"]",
+            "domains = [\"app.example.com \"]",
+            "domains = [\"\\tapp.example.com\\n\"]",
+        ] {
+            let raw: toml::Table = toml::from_str(&format!(
+                "\
+[server.tls.acme]
+{line}
+contact_email = \"ops@example.com\"
+"
+            ))
+            .unwrap();
+            let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+            let r = check_acme_config_impl(&acme)
+                .unwrap_or_else(|| panic!("`{line}` must be an acme_config FAIL"));
+            assert!(
+                r.detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("whitespace"),
+                "`{line}` must FAIL on whitespace: {:?}",
+                r.detail
+            );
+        }
+
+        // A padded entry is caught behind a well-formed one, and the FAIL names
+        // the right index.
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\"app.example.com\", \" www.example.com\"]
+contact_email = \"ops@example.com\"
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        let r = check_acme_config_impl(&acme).expect("a padded entry at index 1 must FAIL");
+        assert!(
+            r.detail.as_deref().unwrap_or_default().contains("index 1"),
+            "detail must name the offending index: {:?}",
+            r.detail
+        );
+
+        // And, as in the runtime, the padded rule does not shadow the blank or
+        // wildcard rules.
+        for (line, needle) in [
+            ("domains = [\"   \"]", "blank entries"),
+            ("domains = [\" *.example.com \"]", "wildcard"),
+        ] {
+            let raw: toml::Table = toml::from_str(&format!(
+                "\
+[server.tls.acme]
+{line}
+contact_email = \"ops@example.com\"
+"
+            ))
+            .unwrap();
+            let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+            let r = check_acme_config_impl(&acme).expect("must FAIL");
+            let detail = r.detail.as_deref().unwrap_or_default();
+            assert!(
+                detail.contains(needle),
+                "`{line}` should report `{needle}`, got: {detail}"
+            );
+        }
+    }
+
+    // The doctor grader is a HAND-COPY of `AcmeConfig::validate()`, and the two
+    // have now drifted three times (#1608, and both items of #1874). Every other
+    // test here pins one side against a hard-coded expectation; this one pins the
+    // two sides against EACH OTHER, so the next divergence fails a test instead of
+    // shipping. Verdicts only — the messages deliberately differ in shape (doctor
+    // splits the runtime's closing advice into a separate `hint`).
+    //
+    // `ca_root_path` is excluded on purpose: `validate()` grades a blank one, but
+    // doctor routes the whole `ca_root_path` story through `check_acme_ca_root_impl`
+    // instead (see `check_acme_config_impl`'s docs).
+    #[test]
+    fn acme_config_grader_agrees_with_runtime_validate() {
+        let cases: &[(&[&str], &str, u16, u32)] = &[
+            (&["app.example.com"], "ops@example.com", 80, 30),
+            (
+                &["app.example.com", "www.example.com"],
+                "ops@example.com",
+                8080,
+                89,
+            ),
+            // Item 2 (#1874) and its neighbours: padded, wildcard, blank.
+            (&[" app.example.com "], "ops@example.com", 80, 30),
+            (&["app.example.com\t"], "ops@example.com", 80, 30),
+            (&["\u{a0}app.example.com"], "ops@example.com", 80, 30),
+            (&[" *.example.com "], "ops@example.com", 80, 30),
+            (&["   "], "ops@example.com", 80, 30),
+            (
+                &["app.example.com", " www.example.com"],
+                "ops@example.com",
+                80,
+                30,
+            ),
+            // The pre-existing invariants.
+            (&[], "ops@example.com", 80, 30),
+            (&["app.example.com"], "  ", 80, 30),
+            (&["app.example.com"], "ops@example.com", 0, 30),
+            (&["app.example.com"], "ops@example.com", 80, 0),
+            (&["app.example.com"], "ops@example.com", 80, 90),
+            (&["app.example.com"], "ops@example.com", 80, 100),
+            // Whitespace INSIDE a name is out of scope for both sides today; this
+            // row records that they agree about it rather than that it is allowed.
+            (&["app .example.com"], "ops@example.com", 80, 30),
+        ];
+
+        for (domains, contact_email, http_challenge_port, renew_before_days) in cases {
+            let mut doctor_cfg = acme_doctor_cfg(domains, contact_email);
+            doctor_cfg.http_challenge_port = *http_challenge_port;
+            doctor_cfg.renew_before_days = *renew_before_days;
+
+            let runtime_cfg = autumn_web::config::AcmeConfig {
+                domains: domains.iter().map(|d| (*d).to_owned()).collect(),
+                contact_email: (*contact_email).to_owned(),
+                directory: autumn_web::config::AcmeDirectory::Staging,
+                cache_dir: std::path::PathBuf::from("config/acme"),
+                http_challenge_port: *http_challenge_port,
+                renew_before_days: *renew_before_days,
+                ca_root_path: None,
+            };
+
+            assert_eq!(
+                check_acme_config_impl(&doctor_cfg).is_some(),
+                runtime_cfg.validate().is_err(),
+                "doctor and AcmeConfig::validate disagree on domains={domains:?} \
+                 contact_email={contact_email:?} port={http_challenge_port} \
+                 renew_before_days={renew_before_days} (runtime said {:?})",
+                runtime_cfg.validate()
+            );
+        }
     }
 
     // Regression (#1608, Codex P2): a NON-STRING entry in the `domains` array
@@ -10885,16 +11225,8 @@ contact_email = \"ops@example.com\"
             acme.domains_error.is_some(),
             "a non-string domain entry must be recorded, not silently dropped"
         );
-        let r = check_acme_config_impl(
-            &acme.domains,
-            &acme.contact_email,
-            acme.http_challenge_port,
-            acme.renew_before_days,
-            acme.directory_error.as_deref(),
-            acme.port_error.as_deref(),
-            acme.domains_error.as_deref(),
-        )
-        .expect("a non-string domain entry must be a FAIL, not silently dropped");
+        let r = check_acme_config_impl(&acme)
+            .expect("a non-string domain entry must be a FAIL, not silently dropped");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "acme_config");
         let detail = r.detail.as_deref().unwrap_or_default();
@@ -10928,16 +11260,8 @@ directory = \"prod\"
             acme.directory_error.is_some(),
             "a malformed `directory` must be recorded as an error, not defaulted"
         );
-        let r = check_acme_config_impl(
-            &acme.domains,
-            &acme.contact_email,
-            acme.http_challenge_port,
-            acme.renew_before_days,
-            acme.directory_error.as_deref(),
-            acme.port_error.as_deref(),
-            acme.domains_error.as_deref(),
-        )
-        .expect("an invalid `directory` must be a FAIL, not silently staging");
+        let r = check_acme_config_impl(&acme)
+            .expect("an invalid `directory` must be a FAIL, not silently staging");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "acme_config");
         // The FAIL names the offending value so the operator can fix it.
@@ -10986,16 +11310,7 @@ contact_email = \"ops@example.com\"
                 acme.directory_label
             );
             assert!(
-                check_acme_config_impl(
-                    &acme.domains,
-                    &acme.contact_email,
-                    acme.http_challenge_port,
-                    acme.renew_before_days,
-                    acme.directory_error.as_deref(),
-                    acme.port_error.as_deref(),
-                    acme.domains_error.as_deref(),
-                )
-                .is_none(),
+                check_acme_config_impl(&acme).is_none(),
                 "valid directory `{line}` must not raise an acme_config FAIL"
             );
         }
@@ -11311,19 +11626,8 @@ directory = \"production\"
     // unprobed domain. A 2-domain config must yield a port + DNS check per domain.
     #[test]
     fn online_probes_every_configured_domain() {
-        let config = AcmeDoctorConfig {
-            domains: vec!["ok.example.com".to_owned(), "bad.example.com".to_owned()],
-            contact_email: "ops@example.com".to_owned(),
-            http_challenge_port: 80,
-            renew_before_days: 30,
-            cache_dir: std::path::PathBuf::from("config/acme"),
-            directory_label: "production".to_owned(),
-            directory_error: None,
-            port_error: None,
-            ca_root_path: None,
-            ca_root_error: None,
-            domains_error: None,
-        };
+        let mut config = acme_doctor_cfg(&["ok.example.com", "bad.example.com"], "ops@example.com");
+        config.directory_label = "production".to_owned();
 
         // Every configured domain is scheduled for probing, not just the first.
         let domains = acme_online_probe_domains(&config);
@@ -14171,6 +14475,7 @@ foo = "bar"
                 vec!["critical".to_string()],
                 vec!["bulk".to_string(), "default".to_string()],
             ],
+            malformed: false,
         };
         let result = check_queue_coverage_topology(
             ProcessRole::Combined,
@@ -14204,6 +14509,7 @@ foo = "bar"
                 vec!["critical".to_string()],
                 vec!["bulk".to_string(), "default".to_string()],
             ],
+            malformed: false,
         };
         // Run doctor as the critical tier (pin = critical): still Pass.
         let result = check_queue_coverage_topology(
@@ -14234,6 +14540,7 @@ foo = "bar"
         let fleet = FleetTopology {
             // No tier drains `bulk`.
             tiers: vec![vec!["critical".to_string()], vec!["default".to_string()]],
+            malformed: false,
         };
         let result = check_queue_coverage_topology(
             ProcessRole::Worker,
@@ -14266,6 +14573,7 @@ foo = "bar"
                 vec!["critical".to_string()],
                 Vec::new(), // unpinned tier: drains everything
             ],
+            malformed: false,
         };
         let result = check_queue_coverage_topology(
             ProcessRole::Worker,
@@ -14288,6 +14596,7 @@ foo = "bar"
         let declared = vec!["email".to_string()];
         let fleet = FleetTopology {
             tiers: vec![vec!["default".to_string(), "email".to_string()]],
+            malformed: false,
         };
         let result = check_queue_coverage_topology(
             ProcessRole::Worker,
@@ -14315,6 +14624,102 @@ foo = "bar"
         );
     }
 
+    /// Every `[jobs.fleet]` example in the jobs guide must be a config that
+    /// `autumn doctor` actually passes.
+    ///
+    /// The first draft of that section shipped a `declared_queues =
+    /// ["thumbnails"]` example whose `tiers` pinned no tier to `thumbnails` —
+    /// a reader who copied it verbatim got exit 1 from the very check the
+    /// section is teaching them to use. Prose review did not catch it because
+    /// the example reads correctly; only running it does. So run it: pull each
+    /// `[jobs.fleet]` TOML block straight out of the guide and push it through
+    /// the same resolvers and the same check `autumn doctor` uses.
+    #[test]
+    fn documented_fleet_topology_examples_pass_the_coverage_check() {
+        const GUIDE: &str = include_str!("../../docs/guide/jobs.md");
+        // The same example is mirrored in the `JobFleetConfig` rustdoc, where it
+        // is just as copy-pasteable; scan both so they cannot drift apart.
+        const CONFIG_RS: &str = include_str!("../../autumn/src/config.rs");
+
+        // The sources interleave `[jobs.queues]` and `[jobs.fleet]`; a block may
+        // carry either or both. Only blocks that declare a topology are checked
+        // — the rest have nothing for this check to act on. Rustdoc fences carry
+        // a `/// ` prefix on every line, so strip it.
+        let mut blocks: Vec<String> = GUIDE
+            .split("```toml")
+            .skip(1)
+            .filter_map(|rest| rest.split("```").next())
+            .filter(|block| block.contains("[jobs.fleet]"))
+            .map(str::to_owned)
+            .collect();
+        blocks.extend(
+            CONFIG_RS
+                .split("/// ```toml")
+                .skip(1)
+                .filter_map(|rest| rest.split("/// ```").next())
+                .filter(|block| block.contains("[jobs.fleet]"))
+                .map(|block| {
+                    block
+                        .lines()
+                        .map(|l| l.trim_start().trim_start_matches("///").trim_start())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }),
+        );
+        assert!(
+            blocks.len() >= 2,
+            "expected a [jobs.fleet] example in both docs/guide/jobs.md and the \
+             JobFleetConfig rustdoc, found {} — either an example was removed or the \
+             fence style changed (fix the extractor), but do not leave this test \
+             silently checking nothing",
+            blocks.len(),
+        );
+
+        for block in &blocks {
+            let block = block.as_str();
+            let table: toml::Table = toml::from_str(block).unwrap_or_else(|e| {
+                panic!("documented [jobs.fleet] example is not valid TOML: {e}\n{block}")
+            });
+            // The app must accept it too, or the example fails boot under
+            // `server.strict_config_enforce_all`.
+            let fleet_value = table
+                .get("jobs")
+                .and_then(|j| j.get("fleet"))
+                .cloned()
+                .expect("block was selected for containing [jobs.fleet]");
+            let _: autumn_web::config::JobFleetConfig =
+                fleet_value.try_into().unwrap_or_else(|e| {
+                    panic!("documented [jobs.fleet] example is not valid config: {e}\n{block}")
+                });
+
+            let fleet = resolve_fleet_topology(Some(&table))
+                .expect("a block containing [jobs.fleet] tiers declares a topology");
+            let declared = resolve_declared_queues_from_sources(|_| None, Some(&table));
+            let configured: Vec<String> = table
+                .get("jobs")
+                .and_then(|j| j.get("queues"))
+                .and_then(toml::Value::as_table)
+                .map(|q| q.keys().cloned().collect())
+                .unwrap_or_default();
+            // Read as the tier the example's first entry describes.
+            let pin = fleet.tiers.first().cloned().unwrap_or_default();
+
+            let result = check_queue_coverage_topology(
+                ProcessRole::Worker,
+                &configured,
+                &pin,
+                &declared,
+                Some(&fleet),
+            );
+            assert_eq!(
+                result.status,
+                CheckStatus::Pass,
+                "a [jobs.fleet] example in docs/guide/jobs.md fails `autumn doctor`: {:?}\n{block}",
+                result.detail,
+            );
+        }
+    }
+
     #[test]
     fn topology_declared_gap_on_job_declared_queue_fails() {
         // Once the declared set is known, a job-declared queue that NO tier drains
@@ -14325,6 +14730,7 @@ foo = "bar"
         let fleet = FleetTopology {
             // No tier pins `email`.
             tiers: vec![vec!["default".to_string()]],
+            malformed: false,
         };
         let result = check_queue_coverage_topology(
             ProcessRole::Worker,
@@ -14342,7 +14748,10 @@ foo = "bar"
         // A `[jobs.fleet]` with no tiers declares nothing coverable, so it must
         // not fail — it falls back to informational Pass.
         let queues = vec!["critical".to_string(), "bulk".to_string()];
-        let fleet = FleetTopology { tiers: Vec::new() };
+        let fleet = FleetTopology {
+            tiers: Vec::new(),
+            malformed: false,
+        };
         let result = check_queue_coverage_topology(
             ProcessRole::Worker,
             &queues,
@@ -14368,6 +14777,154 @@ foo = "bar"
             ]
         );
         assert!(fleet.has_unpinned_tier());
+    }
+
+    /// Anti-drift guard (#1623). `doctor` reads `[jobs.fleet]` out of the merged
+    /// raw TOML table (it needs profile-aware merging the typed loader doesn't
+    /// give it), while the app boots the same file through
+    /// `autumn_web::config::JobFleetConfig`. Two readers, one spelling: if either
+    /// side renames a key, the app rejects a topology doctor accepts (or the
+    /// reverse), and the AC6 hard-fail silently stops covering real deployments.
+    /// So parse one document both ways and require the same answer.
+    #[test]
+    fn doctor_and_app_agree_on_the_fleet_topology_spelling() {
+        const DOC: &str = "[jobs.fleet]\n\
+                           tiers = [[\"critical\"], [\"bulk\", \"default\"], []]\n\
+                           manifest = \"target/autumn-jobs.toml\"\n\
+                           declared_queues = [\"thumbnails\"]\n";
+
+        let table: toml::Table = toml::from_str(DOC).expect("parse toml");
+        let doctor_view = resolve_fleet_topology(Some(&table)).expect("topology declared");
+        let app_view: autumn_web::config::JobFleetConfig = toml::from_str::<toml::Table>(DOC)
+            .expect("parse toml")
+            .get("jobs")
+            .and_then(|j| j.get("fleet"))
+            .cloned()
+            .expect("jobs.fleet present")
+            .try_into()
+            .expect("app config accepts the same [jobs.fleet] doctor reads");
+
+        assert_eq!(
+            doctor_view.tiers, app_view.tiers,
+            "doctor and the app must read the same `tiers` from one autumn.toml",
+        );
+        assert_eq!(
+            resolve_declared_queues_from_sources(|_| None, Some(&table)),
+            app_view.declared_queues,
+            "doctor and the app must read the same `declared_queues`",
+        );
+        assert_eq!(
+            app_view.manifest.as_deref(),
+            Some("target/autumn-jobs.toml"),
+            "the app must accept the `manifest` key doctor resolves",
+        );
+    }
+
+    /// A `tiers` that is present but is not a list of lists — most likely the
+    /// flat `tiers = ["critical"]`, since `jobs.pin` uses exactly that shape a
+    /// few lines above it in the same file — must not be read as "no topology
+    /// declared". Doing so silently switches the AC6 hard-fail back off: the
+    /// check falls through to the informational-only report and passes, and
+    /// nothing anywhere says coverage is no longer being enforced. The app
+    /// rejects the same input at boot, so a pre-deploy gate that passes it has
+    /// the ordering exactly backwards.
+    #[test]
+    fn a_malformed_tiers_fails_instead_of_silently_disabling_the_check() {
+        // Every shape the app's typed `JobFleetConfig` rejects at boot. Each one
+        // must be reported here, not read as "no topology declared" — that would
+        // fall through to the informational-only report and pass, switching the
+        // AC6 hard-fail off with nothing saying so.
+        for doc in [
+            // The flat shape `jobs.pin` uses a few lines above it.
+            "[jobs.fleet]\ntiers = [\"critical\", \"bulk\"]\n",
+            // A bare value instead of a list at all.
+            "[jobs.fleet]\ntiers = \"critical\"\n",
+            "[jobs.fleet]\ntiers = 3\n",
+            // Mixed: one well-formed tier and one that is not.
+            "[jobs.fleet]\ntiers = [[\"critical\"], \"bulk\"]\n",
+            // A non-string queue name. `[[1]]` is the dangerous one: dropping
+            // the entry leaves an EMPTY tier, which reads as "drains
+            // everything" and would make the check pass unconditionally.
+            "[jobs.fleet]\ntiers = [[1]]\n",
+            "[jobs.fleet]\ntiers = [[\"critical\", 1]]\n",
+            "[jobs.fleet]\ntiers = [[\"critical\"], [[\"bulk\"]]]\n",
+        ] {
+            let table: toml::Table = toml::from_str(doc).expect("parse toml");
+            let fleet = resolve_fleet_topology(Some(&table)).unwrap_or_else(|| {
+                panic!("a present-but-malformed tiers must be reported, not dropped: {doc}")
+            });
+            assert!(fleet.malformed, "{doc}");
+
+            let result = check_queue_coverage_topology(
+                ProcessRole::Worker,
+                &["critical".to_string(), "bulk".to_string()],
+                &["critical".to_string()],
+                &[],
+                Some(&fleet),
+            );
+            assert_eq!(
+                result.status,
+                CheckStatus::Fail,
+                "{doc}: {:?}",
+                result.detail
+            );
+            assert!(
+                result.detail.unwrap_or_default().contains("list of lists"),
+                "the failure must say what is wrong with the value: {doc}",
+            );
+
+            // The app refuses the same document, so both gates agree.
+            let fleet_value = table
+                .get("jobs")
+                .and_then(|j| j.get("fleet"))
+                .cloned()
+                .expect("jobs.fleet present");
+            let parsed: Result<autumn_web::config::JobFleetConfig, _> = fleet_value.try_into();
+            assert!(
+                parsed.is_err(),
+                "the typed config must reject it too: {doc}"
+            );
+        }
+
+        // The specific hazard for `[[1]]`: silently dropping the non-string
+        // leaves an empty tier, and an empty tier is a *legitimate* declaration
+        // meaning "unpinned, drains everything" — so the check would have
+        // reported total coverage and passed. Pin that an empty tier really does
+        // mean that, which is why the non-string case can never be allowed to
+        // decay into one.
+        let unpinned = FleetTopology {
+            tiers: vec![Vec::new()],
+            malformed: false,
+        };
+        assert!(unpinned.has_unpinned_tier());
+        assert_eq!(
+            check_queue_coverage_topology(
+                ProcessRole::Worker,
+                &["critical".to_string(), "bulk".to_string()],
+                &[],
+                &[],
+                Some(&unpinned),
+            )
+            .status,
+            CheckStatus::Pass,
+            "an empty tier means 'drains everything' — so a malformed tier must never \
+             be allowed to collapse into one",
+        );
+
+        // `[jobs.fleet]` itself not a table is the same class of mistake.
+        let table: toml::Table =
+            toml::from_str("[jobs]\nfleet = \"critical\"\n").expect("parse toml");
+        let fleet = resolve_fleet_topology(Some(&table))
+            .expect("a present-but-malformed [jobs.fleet] must be reported");
+        assert!(fleet.malformed);
+
+        // …while a genuinely absent section stays "nothing declared".
+        let absent: toml::Table =
+            toml::from_str("[jobs]\npin = [\"critical\"]\n").expect("parse toml");
+        assert!(resolve_fleet_topology(Some(&absent)).is_none());
+        let no_tiers: toml::Table =
+            toml::from_str("[jobs.fleet]\ndeclared_queues = [\"a\"]\n").expect("parse toml");
+        assert!(resolve_fleet_topology(Some(&no_tiers)).is_none());
     }
 
     #[test]
@@ -14406,6 +14963,36 @@ foo = "bar"
             declared_from_manifest,
             vec!["critical".to_string(), "email".to_string()]
         );
+
+        // An EMPTY manifest array is the app answering "no job-declared queues",
+        // not failing to answer, so it wins over a stale inline list. Falling
+        // through here would let that stale entry manufacture a coverage failure
+        // against the ground truth — and would contradict the documented
+        // precedence.
+        let empty_manifest = resolve_declared_queues_from_sources(
+            |path| (path == "target/jobs-manifest.toml").then(|| "queues = []\n".to_string()),
+            Some(&with_manifest),
+        );
+        assert!(
+            empty_manifest.is_empty(),
+            "an empty manifest must win over declared_queues, got {empty_manifest:?}",
+        );
+
+        // A manifest that genuinely says nothing DOES fall through: unreadable
+        // file, unparseable TOML, or no `queues` array at all.
+        for (label, read) in [
+            ("unreadable", None::<String>),
+            ("unparseable", Some("this is not toml =".to_string())),
+            ("no queues key", Some("other = 1\n".to_string())),
+        ] {
+            let fell_through =
+                resolve_declared_queues_from_sources(|_| read.clone(), Some(&with_manifest));
+            assert_eq!(
+                fell_through,
+                vec!["stale".to_string()],
+                "a manifest that says nothing ({label}) must fall through to declared_queues",
+            );
+        }
 
         // No `[jobs.fleet]` → empty.
         let none: toml::Table =

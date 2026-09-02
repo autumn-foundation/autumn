@@ -1097,6 +1097,30 @@ to a wall-clock jump in production.
 even inside a `#[sim_test]`. For a deadline whose counterparty is
 `tokio::time::sleep`, use `tokio::time::Instant`.
 
+## Authored fault scenarios (`autumn_web::sim::FaultPlan`, #1680)
+
+The authored lane beside the probabilistic `sim::Chaos` builder: name the exact
+effect that must fail, attach the plan to a `TestApp`, and assert on (or commit)
+the serializable record of what happened. Test-only; DB checkout and job
+execution only (SMTP faults stay on `Chaos::smtp_faults`).
+
+| API | Purpose |
+|---|---|
+| `FaultPlan::from_seed(u64)` | Start a plan; the seed drives only the `random_*` builders (and, by default, the app's entropy) |
+| `.fail_db_checkout(n)` / `.fail_db_checkout_on("replica", n)` | Fail the n-th checkout (1-based) on the global / per-pool counter (`db` feature) |
+| `.fail_job_execution(n)` / `.fail_job("send_invoice", n)` | Fail the n-th job execution on the global / per-name counter; the runtime's retry policy applies |
+| `.random_db_checkout_faults(count, 1..=k)` / `.random_job_execution_faults(count, 1..=k)` | Seed-derived distinct ordinals, resolved into explicit entries at builder time |
+| `.only_between(from, to)` | Half-open elapsed window on the app's **injected** clock; a match outside it is `suppressed`, not fired |
+| `.planned()` / `.describe()` / `.is_active()` | The full authored schedule (sorted), a printable rendering, whether anything is planned |
+| `TestApp::with_fault_plan(plan)` | Attach; composes with `with_job_interceptor` / `with_db_interceptor`, transactional isolation and `Sim::chaos` (fault innermost). Asserts `jobs.workers == 1`, `reporting.sample_rate == 1.0` and `failure_capture.enabled == false`; defaults entropy to `SeededEntropy(seed)` |
+| `TestClient::fault_outcome().await` | Settle the detached error-report tasks (bounded yields, no clock advance), then snapshot a `FaultOutcome` |
+| `TestClient::fault_ledger()` | The live handle (`Option`); `.outcome()` snapshots without settling |
+| `FaultOutcome { seed, fired, suppressed, unfired, server_errors, final_state }` | `Serialize + Deserialize + Eq`; `to_json_string()` is canonical, `fingerprint()` is FNV-1a 64, `from_json_str` parses a committed record |
+
+Ordinals are exact by construction; *which* pass is the n-th replays only under a
+paused current-thread runtime (`#[sim_test]`) with jobs drained by
+`Sim::run_to_idle` — `perform_enqueued_jobs` bypasses `intercept_execute`.
+
 ## SystemTest builder (`autumn_web::system_test`, feature `system-tests`)
 
 Browser-driven tests: boots the app on an ephemeral port, launches managed
@@ -1468,11 +1492,13 @@ In-process HTTPS termination on the same host:port (off by default).
 Automatic ACME certificate provisioning + renewal; builds on `tls`, off by
 default. Mutually exclusive with static `cert_path` / `key_path`.
 
-- `domains` (required, non-wildcard), `contact_email` (required).
+- `domains` (required, non-wildcard), `contact_email` (required). Each domain is
+  used verbatim as the certificate's SAN and the ACME order's DNS identifier, so
+  an entry with leading/trailing whitespace is rejected at startup (#1874).
 - `directory` — Let's Encrypt staging by default; `production` or a custom URL.
 - `cache_dir` (default `config/acme`).
 - `http_challenge_port` (default `80`).
-- `renew_before_days` (default `30`, must be `< 90`).
+- `renew_before_days` (default `30`, an unquoted whole number, must be `< 90`).
 - `ca_root_path` (unset) — PEM root that signs the ACME **directory's own HTTPS
   certificate**. Needed only for a private CA / Pebble reached through a custom
   `directory`: by default the client verifies the directory against the platform

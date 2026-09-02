@@ -105,6 +105,15 @@ pub use channels::{
     ChannelPublishError, ChannelStats, Channels, ChannelsBackend, LocalChannelsBackend,
 };
 pub mod canary;
+// Per-deploy capacity contract (`capacity.lock`): the proven envelope a build
+// sustains, and the admission limit it licenses. Ungated on purpose —
+// `route_listing` and `router` consult it on every boot.
+//
+// A plain comment, not a doc comment: an outer `///` block here merges with the
+// module's own `//!` docs, and the intra-doc links in those then resolve in the
+// crate root's scope instead of the module's (`-D rustdoc::broken_intra_doc_links`
+// catches it). The module documents itself.
+pub mod capacity;
 /// Deterministic replay capsules: record a failing request (redacted request,
 /// clock reads, database traffic, outcome) and replay it offline.
 ///

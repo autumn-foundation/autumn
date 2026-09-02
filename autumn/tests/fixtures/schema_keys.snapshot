@@ -182,6 +182,10 @@ idempotency.redis.url
 idempotency.ttl_secs
 jobs
 jobs.backend
+jobs.fleet
+jobs.fleet.declared_queues
+jobs.fleet.manifest
+jobs.fleet.tiers
 jobs.initial_backoff_ms
 jobs.max_attempts
 jobs.pin
@@ -353,6 +357,7 @@ seo.robots.additional_rules
 seo.robots.allow_all
 seo.robots.sitemap_url
 server
+server.capacity_contract
 server.host
 server.max_concurrent_requests
 server.port

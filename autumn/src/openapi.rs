@@ -137,6 +137,15 @@ pub struct ApiDoc {
     /// `__check_policy` call in the body, which carries no binding a macro can
     /// recover.
     pub authorize_bindings: &'static [AuthorizeBinding],
+    /// Pool tags the handler's declared extractors prove it holds for the
+    /// length of the request (`"db"`, `"mail"`, …), sorted and deduplicated.
+    ///
+    /// The statically derived half of the capacity contract (issue #1733):
+    /// `autumn calibrate` folds these into `capacity.lock` so a contract says
+    /// *why* a route costs what it costs, not just what the aggregate
+    /// envelope was. Empty is the honest default — it means "no pool proven",
+    /// not "no pool touched" (see `route_listing::RouteInfo::pools`).
+    pub pools: &'static [&'static str],
     /// True when the handler is explicitly declared public via `#[public]`.
     ///
     /// Populated by the route macros from the `#[public]` marker. Used by the
