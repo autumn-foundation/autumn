@@ -962,10 +962,33 @@ jobs:
 
       - name: "Journey: the app builds on Windows"
         run: |
-          $ErrorActionPreference = 'Stop'
+          # `Continue`, not `Stop`: cargo writes progress to stderr, and under
+          # `Stop` a piped native command turns that into a NativeCommandError.
+          $ErrorActionPreference = 'Continue'
           Set-Location "$env:JOURNEY_DIR\tier1_app"
-          cargo build
-          if ($LASTEXITCODE -ne 0) { throw "the scaffolded app did not build" }
+
+          # Free space before the build. A shared CARGO_TARGET_DIR holds both
+          # the workspace and the scaffold, and "no space left" surfaces as an
+          # unrelated-looking compiler error.
+          Get-PSDrive D | Format-Table Name, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}}, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} | Out-String | Write-Host
+
+          # Tee to a file so a failure can be reported IN THIS STEP and uploaded
+          # as an artifact. Without this the compiler error is only in the raw
+          # job log, which is exactly the spelunking this job exists to avoid —
+          # and it is out of reach of the Actions logs API, which truncates.
+          $buildLog = "$env:JOURNEY_DIR\app-build.log"
+          cargo build 2>&1 | Tee-Object -FilePath $buildLog
+          $code = $LASTEXITCODE
+
+          Get-PSDrive D | Format-Table Name, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}}, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} | Out-String | Write-Host
+
+          if ($code -ne 0) {
+            Write-Host "::group::cargo build output (last 150 lines)"
+            Get-Content $buildLog -Tail 150 -ErrorAction SilentlyContinue | Write-Host
+            Write-Host "::endgroup::"
+            Write-Host "::error::the scaffolded app did not build (cargo exit $code) — see the group above and the windows-tier1-logs artifact"
+            exit 1
+          }
           # Cargo does not fail on an unused `[patch.crates-io]` — it warns and
           # builds against the registry. Without this assertion a version skew
           # between the scaffold template and the workspace would silently turn
@@ -1186,6 +1209,7 @@ jobs:
           # (`.autumn-pg-superuser`) and its published URL (`.autumn-pg-url`)
           # live beside the data dir; a broader glob would publish them.
           path: |
+            ${{ runner.temp }}\journey\app-build.log
             ${{ runner.temp }}\journey\dev.log
             ${{ runner.temp }}\journey\dev.out
             ${{ runner.temp }}\journey\app.out
