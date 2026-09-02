@@ -501,38 +501,66 @@ mod tests {
         assert_eq!(ttl_millis_for_redis(std::time::Duration::ZERO), 1);
     }
 
-    /// This crate must not open its own Redis client: `RedisCache::connect`
+    /// This crate must not build its own Redis client: `RedisCache::connect`
     /// goes through `autumn_web::redis_tls::open_client`, which installs the
     /// process-level rustls `CryptoProvider` a `rediss://` URL needs before
-    /// rustls is asked to resolve one (#2172). Mirrors the identical scan in
-    /// `autumn_web::redis_tls` so the two crates cannot drift — a second,
-    /// hand-rolled install here is exactly how the `valkeys://` and
-    /// case-insensitivity gaps got fixed in one place and missed in another.
+    /// rustls is asked to resolve one (#2172). A second, hand-rolled install
+    /// here is exactly how one copy of this logic drifts from the other.
+    ///
+    /// Walks `src/` rather than scanning `lib.rs` alone: the crate is a
+    /// single file today, and a scan that silently stops covering the crate
+    /// the day a second module appears is the drift it exists to prevent.
     #[test]
-    fn the_cache_never_opens_a_redis_client_outside_the_shared_tls_guard() {
-        // Split so the needle does not match this test's own source line.
-        let needle = concat!("Client::", "open(");
-        let source = include_str!("lib.rs");
-        let offenders: Vec<_> = source
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| {
+    fn the_cache_never_builds_a_redis_client_outside_the_shared_tls_guard() {
+        // Split so the needles do not match this declaration.
+        let needles = [concat!("Client::", "open("), concat!("build_with", "_tls(")];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rust_sources(&src, &mut files);
+        assert!(!files.is_empty(), "no sources under {}", src.display());
+        files.sort();
+
+        let mut offenders = Vec::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file).expect("read source");
+            for (index, line) in source.lines().enumerate() {
                 let trimmed = line.trim_start();
-                !trimmed.starts_with("//") && !trimmed.starts_with('*') && line.contains(needle)
-            })
-            .map(|(index, line)| format!("lib.rs:{}: {}", index + 1, line.trim()))
-            .collect();
+                if trimmed.starts_with("//") || trimmed.starts_with('*') {
+                    continue;
+                }
+                if needles.iter().any(|needle| line.contains(needle)) {
+                    offenders.push(format!(
+                        "{}:{}: {}",
+                        file.strip_prefix(&src).unwrap_or(&file).display(),
+                        index + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
         assert!(
             offenders.is_empty(),
-            "open Redis clients through `autumn_web::redis_tls::open_client`, \
+            "build Redis clients through `autumn_web::redis_tls::open_client`, \
              not directly — a `rediss://` URL otherwise reaches rustls with no \
              process-level CryptoProvider installed and panics (#2172):\n{}",
             offenders.join("\n")
         );
     }
 
-    /// The TLS scheme classification itself is `autumn_web::redis_tls`'s
-    /// contract; this only pins that this crate is wired to the same one.
+    /// Recursively collect every `.rs` file under `dir`.
+    fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                collect_rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The TLS classification itself is `autumn_web::redis_tls`'s contract;
+    /// this only pins that this crate is wired to the same one.
     #[test]
     fn the_shared_guard_classifies_the_tls_schemes_this_cache_is_deployed_on() {
         assert!(autumn_web::redis_tls::url_needs_tls_crypto_provider(
