@@ -3859,10 +3859,10 @@ impl AppBuilder {
                 .flatten();
             #[cfg(not(feature = "storage"))]
             let storage_destination: Option<(String, Option<String>)> = None;
-            // The injected clock, not the wall clock: the replication health
-            // indicator measures its startup grace from here, and a test that
-            // freezes time must be able to move it (#1797).
-            let started_at = state.clock().now();
+            // The injected clock, not the wall clock: every artifact the
+            // replicator stamps, and the health indicator's startup grace, are
+            // read from it, so a test that freezes time moves them all (#1797).
+            let clock = state.clock_arc();
 
             let built = tokio::task::spawn_blocking(move || {
                 crate::replication::build(
@@ -3875,7 +3875,7 @@ impl AppBuilder {
                             endpoint: endpoint.as_deref(),
                         }
                     }),
-                    started_at,
+                    clock,
                 )
             })
             .await;
@@ -3900,8 +3900,6 @@ impl AppBuilder {
                     replication_worker = Some(runtime.replicator);
                 }
                 Ok(Err(crate::replication::SetupError::Disabled)) => {}
-                // A misconfigured durability story must not boot silently
-                // half-working.
                 // A misconfigured durability story must not boot silently
                 // half-working: the operator asked for replication and is not
                 // getting it, which is exactly the situation this feature exists
@@ -4633,20 +4631,29 @@ impl AppBuilder {
         // tokio's blocking pool (sized for short tasks) forever. It stops with
         // the server and ships one final time on the way out.
         #[cfg(feature = "db")]
+        let mut replication_thread: Option<std::thread::JoinHandle<()>> = None;
+        #[cfg(feature = "db")]
         if let Some(replicator) = replication_worker.take() {
             let replication_shutdown = server_shutdown.child_token();
-            if let Err(e) = std::thread::Builder::new()
+            match std::thread::Builder::new()
                 .name("autumn-sqlite-replication".to_owned())
                 .spawn(move || replicator.run(&replication_shutdown))
             {
-                // Serving on without the replicator is the worst of both worlds:
-                // the pool has already disabled auto-checkpointing for it, so the
-                // -wal would grow until the disk filled, and the operator would
-                // believe they were replicating. Fail loudly instead.
-                tracing::error!("Could not start the SQLite replication thread: {e}");
-                #[cfg(feature = "managed-pg")]
-                crate::managed_pg::emergency_stop_async().await;
-                std::process::exit(1);
+                // Kept, not detached: cancelling the token only *wakes* the
+                // loop, and the final flush that ships the last committed frames
+                // runs after that. Shutdown waits for it below.
+                Ok(handle) => replication_thread = Some(handle),
+                // Serving on without the replicator is the worst of both
+                // worlds: the pool has already disabled auto-checkpointing for
+                // it, so the -wal would grow until the disk filled, and the
+                // operator would believe they were replicating. Fail loudly
+                // instead.
+                Err(e) => {
+                    tracing::error!("Could not start the SQLite replication thread: {e}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
             }
         }
 
@@ -5224,6 +5231,46 @@ impl AppBuilder {
                 })
         };
         let shutdown_budget = std::time::Duration::from_secs(shutdown_timeout);
+
+        // Phase 6a: the replication loop's final flush. Cancelling the token at
+        // phase 5 only *wakes* that loop; the tick that ships the last committed
+        // frames runs after it, and nothing waits for that tick unless this
+        // does. Requests have drained, so no further transaction can commit and
+        // this flush is the last one there will ever be — the difference between
+        // a clean stop that loses nothing and one that leaves the tail of the WAL
+        // only on a machine that may be about to go away.
+        //
+        // Bounded by what the drain left of `shutdown_timeout_secs`, on the same
+        // budget as the departure and the hooks below: a destination that has
+        // gone away must not hold the process open past what a supervisor allows.
+        // Overrunning it is loud rather than silent — the operator's RPO is
+        // exactly what is at stake.
+        #[cfg(feature = "db")]
+        if let Some(handle) = replication_thread.take() {
+            let wait = shutdown_budget.saturating_sub(elapsed_since_drain_start());
+            // `join` blocks, so it goes to the blocking pool rather than parking
+            // this runtime thread.
+            let joined =
+                tokio::time::timeout(wait, tokio::task::spawn_blocking(move || handle.join()))
+                    .await;
+            match joined {
+                Ok(Ok(Ok(()))) => {
+                    tracing::info!("shutdown: SQLite replication flushed and stopped");
+                }
+                Ok(Ok(Err(_))) => tracing::error!(
+                    "shutdown: the SQLite replication thread panicked; the frames committed \
+                     since the last successful tick may not be offsite"
+                ),
+                Ok(Err(e)) => {
+                    tracing::warn!("shutdown: could not join the SQLite replication thread: {e}");
+                }
+                Err(_) => tracing::warn!(
+                    timeout_secs = wait.as_secs(),
+                    "shutdown: SQLite replication did not finish its final flush within the \
+                     shutdown budget; the last frames may not be offsite"
+                ),
+            }
+        }
 
         // Phase 6b: the cluster departs only now, once no request can still be
         // running — an increment accepted during the drain must have a push
@@ -12676,6 +12723,50 @@ mod tests {
         assert!(
             source.contains(shard_gate),
             "shard commit-hook workers must be gated on role.runs_workers()"
+        );
+    }
+
+    /// The replication loop's final flush must be waited for, after the drain.
+    ///
+    /// Cancelling `server_shutdown` only *wakes* the replication thread; the
+    /// tick that ships the last committed frames runs after it. A detached
+    /// handle therefore means a clean stop can still leave the tail of the WAL
+    /// on a machine that is about to go away — silently, since nothing observes
+    /// it. Source-order test in the house style, because the ordering is a
+    /// property of this function and nothing smaller: an app-level boot test
+    /// would need a `SQLite` runtime pool, which only exists in the `sqlite` lane.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_replication_final_flush_is_waited_for_after_the_drain() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let server_start = source
+            .find("pub async fn run(self)")
+            .expect("normal server path should exist");
+        // Bounded at the next path so the search cannot match this test's own
+        // source, which necessarily quotes the strings it is looking for.
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should follow server path");
+        let server_source = &source[server_start..build_mode_start];
+
+        let spawn = server_source
+            .find("Ok(handle) => replication_thread = Some(handle),")
+            .expect("the replication thread's handle must be kept, not dropped");
+        let drain = server_source
+            .find("let server_result = server_task.await")
+            .expect("the normal server path should await the drain");
+        let join = server_source
+            .find("if let Some(handle) = replication_thread.take()")
+            .expect("shutdown must wait for the replication thread");
+
+        assert!(
+            spawn < drain && drain < join,
+            "the replication flush must be awaited AFTER the request drain \
+             (spawn={spawn}, drain={drain}, join={join})"
+        );
+        assert!(
+            server_source[join..].contains("handle.join()"),
+            "the wait must actually join the replication thread"
         );
     }
 

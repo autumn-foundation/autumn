@@ -65,6 +65,7 @@ pub use status::{
 };
 
 use crate::config::ReplicationConfig;
+use crate::time::ClockSource;
 
 /// How much slack past the configured RPO the health indicator allows before
 /// reporting `Down`. Three RPOs absorbs one slow upload and one retried tick
@@ -364,7 +365,9 @@ pub fn build_destination(
 /// Resolve `[replication]` into a ready-to-run [`ReplicationRuntime`].
 ///
 /// `storage` is the app's own blob-storage destination when it has one, used
-/// only for the distinct-destination guard.
+/// only for the distinct-destination guard. `clock` is the app's injected wall
+/// clock: it dates every replicated artifact and anchors the health indicator's
+/// startup grace, so a test that controls time controls both.
 ///
 /// Must be called from a blocking thread (see [`build_destination`]).
 ///
@@ -378,7 +381,7 @@ pub fn build(
     database_url: &str,
     profile: &str,
     storage: Option<StorageDestination<'_>>,
-    started_at: chrono::DateTime<chrono::Utc>,
+    clock: Arc<dyn ClockSource>,
 ) -> Result<ReplicationRuntime, SetupError> {
     if !config.enabled {
         return Err(SetupError::Disabled);
@@ -406,6 +409,10 @@ pub fn build(
         retention: Duration::from_secs(config.retention_hours.max(1).saturating_mul(3600)),
         verify_interval: config.verify_interval(),
     };
+    // The startup grace runs from the injected clock, and so does every
+    // artifact the replicator stamps, so a test that freezes or steps time moves
+    // both together (#1797).
+    let started_at = clock.now();
     let indicator = Arc::new(ReplicationHealthIndicator::new(
         Arc::clone(&status),
         HealthThresholds {
@@ -418,7 +425,8 @@ pub fn build(
         settings.clone(),
         Arc::clone(&destination),
         Arc::clone(&status),
-    );
+    )
+    .with_clock(clock);
     Ok(ReplicationRuntime {
         replicator,
         status,
@@ -430,6 +438,12 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The clock `build` is handed in these tests: real time, since none of them
+    /// assert on a timestamp.
+    fn test_clock() -> Arc<dyn ClockSource> {
+        Arc::new(crate::time::SystemClock)
+    }
 
     #[test]
     fn database_file_understands_every_accepted_sqlite_spelling() {
@@ -478,7 +492,7 @@ mod tests {
     fn build_refuses_a_disabled_section() {
         let config = ReplicationConfig::default();
         assert!(matches!(
-            build(&config, "sqlite:app.db", "dev", None, chrono::Utc::now()),
+            build(&config, "sqlite:app.db", "dev", None, test_clock()),
             Err(SetupError::Disabled)
         ));
     }
@@ -493,12 +507,12 @@ mod tests {
                 "postgres://localhost/app",
                 "prod",
                 None,
-                chrono::Utc::now()
+                test_clock()
             ),
             Err(SetupError::NotSqlite { .. })
         ));
         assert!(matches!(
-            build(&config, "sqlite::memory:", "prod", None, chrono::Utc::now()),
+            build(&config, "sqlite::memory:", "prod", None, test_clock()),
             Err(SetupError::InMemory)
         ));
     }
@@ -509,8 +523,8 @@ mod tests {
             enabled: true,
             ..ReplicationConfig::default()
         };
-        let err = build(&config, "sqlite:app.db", "prod", None, chrono::Utc::now())
-            .expect_err("must refuse");
+        let err =
+            build(&config, "sqlite:app.db", "prod", None, test_clock()).expect_err("must refuse");
         assert!(
             format!("{err}").contains("no destination is configured"),
             "{err}"
@@ -530,8 +544,8 @@ mod tests {
             }),
             ..ReplicationConfig::default()
         };
-        let err = build(&config, "sqlite:app.db", "prod", None, chrono::Utc::now())
-            .expect_err("must refuse");
+        let err =
+            build(&config, "sqlite:app.db", "prod", None, test_clock()).expect_err("must refuse");
         assert!(
             format!("{err}").contains("pick exactly one destination"),
             "{err}"
@@ -546,14 +560,8 @@ mod tests {
         config.rpo_secs = 20;
         config.retention_hours = 2;
 
-        let runtime = build(
-            &config,
-            "sqlite:///srv/app.db",
-            "prod",
-            None,
-            chrono::Utc::now(),
-        )
-        .expect("runtime");
+        let runtime =
+            build(&config, "sqlite:///srv/app.db", "prod", None, test_clock()).expect("runtime");
         assert_eq!(runtime.settings.database_path, PathBuf::from("/srv/app.db"));
         assert_eq!(runtime.settings.root, "replicas/prod");
         assert_eq!(runtime.settings.sync_interval, Duration::from_secs(10));

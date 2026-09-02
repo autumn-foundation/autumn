@@ -31,6 +31,7 @@ use autumn_web::replication::{
     FileDestination, ReplicaDestination as _, ReplicationSettings, ReplicationStatus, Replicator,
     segment,
 };
+use autumn_web::time::ClockSource;
 use chrono::{DateTime, TimeZone as _, Utc};
 use diesel::connection::SimpleConnection as _;
 use diesel::sql_types::Text;
@@ -84,6 +85,29 @@ fn at(secs: i64) -> DateTime<Utc> {
         .expect("timestamp")
 }
 
+/// A clock the fixture steps by hand.
+///
+/// The replicator stamps every artifact from its own clock, at the moment that
+/// artifact's contents are fenced, so the instants a `--timestamp` restore
+/// selects on come from here rather than from a tick argument.
+struct StepClock(std::sync::Mutex<DateTime<Utc>>);
+
+impl StepClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(std::sync::Mutex::new(at(0))))
+    }
+
+    fn set(&self, now: DateTime<Utc>) {
+        *self.0.lock().expect("clock") = now;
+    }
+}
+
+impl ClockSource for StepClock {
+    fn now(&self) -> DateTime<Utc> {
+        *self.0.lock().expect("clock")
+    }
+}
+
 fn read_values(path: &Path) -> Vec<String> {
     let mut conn = SqliteConnection::establish(&path.to_string_lossy()).expect("open restored");
     sql_query("SELECT v FROM t ORDER BY id")
@@ -112,6 +136,7 @@ fn replicate_two_batches(root_dir: &Path) -> PathBuf {
     let replica = root_dir.join("replica");
     let destination = Arc::new(FileDestination::new(&replica).expect("destination"));
     let status = Arc::new(ReplicationStatus::new(destination.describe()));
+    let clock = StepClock::new();
     let mut replicator = Replicator::new(
         ReplicationSettings {
             database_path: db,
@@ -124,13 +149,16 @@ fn replicate_two_batches(root_dir: &Path) -> PathBuf {
         },
         destination,
         status,
-    );
+    )
+    .with_clock(Arc::clone(&clock) as Arc<dyn ClockSource>);
 
-    replicator.tick(at(100)).expect("first tick");
+    clock.set(at(100));
+    replicator.tick().expect("first tick");
     sql_query("INSERT INTO t (v) VALUES ('after-1')")
         .execute(&mut conn)
         .expect("insert");
-    replicator.tick(at(200)).expect("second tick");
+    clock.set(at(200));
+    replicator.tick().expect("second tick");
 
     // Machine A is now irrelevant: delete it outright so nothing below can
     // accidentally read from it.

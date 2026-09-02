@@ -347,7 +347,7 @@ impl S3Destination {
                 key: key.to_owned(),
             });
         }
-        let code = read_bounded(response, MAX_ERROR_DOCUMENT_BYTES)
+        let code = read_truncated(response, MAX_ERROR_DOCUMENT_BYTES)
             .ok()
             .and_then(|bytes| parse_error_code(&String::from_utf8_lossy(&bytes)))
             .map(|code| sanitize_error_code(&code));
@@ -395,8 +395,79 @@ fn validate_endpoint(endpoint: &str) -> Result<(), DestinationError> {
     Ok(())
 }
 
-/// Read at most `limit` bytes of a response body.
+/// Read a response body into memory, refusing one that exceeds `limit`.
+///
+/// Reads one byte past the limit so an oversized body is *rejected* rather than
+/// silently truncated: a short read of a gzip stream or an XML listing is
+/// indistinguishable from a complete one at the call site, and handing a
+/// truncated snapshot to the restore path is exactly the failure mode this
+/// module exists to rule out.
 fn read_bounded(
+    response: reqwest::blocking::Response,
+    limit: u64,
+) -> Result<Vec<u8>, DestinationError> {
+    read_bounded_from(response, limit)
+}
+
+/// The body of [`read_bounded`], over any reader so it can be tested without a
+/// live endpoint.
+fn read_bounded_from(source: impl std::io::Read, limit: u64) -> Result<Vec<u8>, DestinationError> {
+    use std::io::Read as _;
+    let mut buffer = Vec::new();
+    let mut reader = source.take(limit.saturating_add(1));
+    reader
+        .read_to_end(&mut buffer)
+        .map_err(DestinationError::io("read the response body"))?;
+    if buffer.len() as u64 > limit {
+        return Err(DestinationError::Rejected {
+            detail: format!("the response body exceeds the {limit}-byte limit for this request"),
+        });
+    }
+    Ok(buffer)
+}
+
+/// Stream `source` into `path`, refusing — and cleaning up after — a body that
+/// exceeds `limit`.
+///
+/// Split out from [`ReplicaDestination::get_to_file`] so the limit and the
+/// cleanup are provable without a live endpoint.
+fn stream_to_file(
+    source: impl std::io::Read,
+    path: &Path,
+    limit: u64,
+    what: &str,
+) -> Result<(), DestinationError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(DestinationError::io("create download directory"))?;
+    }
+    let mut file =
+        std::fs::File::create(path).map_err(DestinationError::io("create the download file"))?;
+    let mut reader = source.take(limit.saturating_add(1));
+    let outcome = match std::io::copy(&mut reader, &mut file) {
+        Ok(len) if len > limit => Err(DestinationError::Rejected {
+            detail: format!(
+                "the object at {what:?} exceeds the {limit}-byte ceiling this client can store"
+            ),
+        }),
+        Ok(_) => std::io::Write::flush(&mut file)
+            .map_err(DestinationError::io("flush the download file")),
+        Err(e) => Err(DestinationError::io("write download")(e)),
+    };
+    if outcome.is_err() {
+        drop(file);
+        // Never leave a partial body behind under the caller's path: the restore
+        // path would take it for a complete object.
+        let _ = std::fs::remove_file(path);
+    }
+    outcome
+}
+
+/// Read at most `limit` bytes of a response body, truncating a longer one.
+///
+/// Only for bodies read opportunistically — the provider error document, whose
+/// `<Code>` is a nicety on a request that has already failed.
+fn read_truncated(
     response: reqwest::blocking::Response,
     limit: u64,
 ) -> Result<Vec<u8>, DestinationError> {
@@ -491,12 +562,21 @@ impl ReplicaDestination for S3Destination {
     }
 
     fn get_to_file(&self, key: &str, path: &Path) -> Result<(), DestinationError> {
-        let bytes = self.get(key)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(DestinationError::io("create download directory"))?;
-        }
-        std::fs::write(path, &bytes).map_err(DestinationError::io("write download"))
+        validate_key(key)?;
+        let response = self.send(
+            "download",
+            reqwest::Method::GET,
+            key,
+            "",
+            RequestBody::Empty,
+        )?;
+        // A base snapshot is the one object that can legitimately be large — up
+        // to what a single `PutObject` accepted — so it streams to disk rather
+        // than through memory, and its limit is that upload ceiling rather than
+        // the in-memory one. One byte past the ceiling is a refusal, never a
+        // truncated file: a short gzip stream would restore as a "clean"
+        // database missing its tail.
+        stream_to_file(response, path, MAX_SINGLE_PUT, key)
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>, DestinationError> {
@@ -627,6 +707,49 @@ fn parse_error_code(xml: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A body over the limit is a *refusal*, not a short read.
+    ///
+    /// A truncated response is indistinguishable from a complete one at the call
+    /// site — a gzip stream cut short, an XML listing missing its tail — and the
+    /// restore path would take it for the real object.
+    #[test]
+    fn a_response_body_over_the_limit_is_refused_rather_than_truncated() {
+        let body = vec![b'x'; 128];
+        let read =
+            read_bounded_from(std::io::Cursor::new(body.clone()), 128).expect("at the limit");
+        assert_eq!(read.len(), 128);
+
+        let err = read_bounded_from(std::io::Cursor::new(body), 127)
+            .expect_err("one byte over the limit must be refused");
+        assert!(
+            matches!(err, DestinationError::Rejected { .. }),
+            "expected a refusal, got {err}"
+        );
+    }
+
+    /// The download path streams, and an object past the ceiling leaves no file
+    /// behind for the restore path to mistake for a complete one.
+    #[test]
+    fn a_streamed_download_over_the_ceiling_is_refused_and_leaves_no_partial_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("snapshot.db.gz");
+
+        stream_to_file(std::io::Cursor::new(vec![b'a'; 64]), &path, 64, "snapshot")
+            .expect("at the ceiling");
+        assert_eq!(std::fs::read(&path).expect("read back").len(), 64);
+
+        let err = stream_to_file(std::io::Cursor::new(vec![b'a'; 65]), &path, 64, "snapshot")
+            .expect_err("one byte over the ceiling must be refused");
+        assert!(
+            matches!(err, DestinationError::Rejected { .. }),
+            "expected a refusal, got {err}"
+        );
+        assert!(
+            !path.exists(),
+            "a refused download must not leave a partial file behind"
+        );
+    }
 
     fn destination(endpoint: Option<&str>, force_path_style: bool) -> S3Destination {
         S3Destination::new(

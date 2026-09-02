@@ -86,6 +86,7 @@ use super::segment::{self, SegmentError, SegmentHeader, SnapshotMeta};
 use super::sqlite::{self, CheckpointOutcome, SqliteError};
 use super::status::ReplicationStatus;
 use super::wal::{self, ScanCursor, WalError, WalHeader};
+use crate::time::{ClockSource, SystemClock};
 
 /// How long the loop sleeps between shutdown checks while waiting for the next
 /// tick. Short enough that shutdown is prompt, long enough to be free.
@@ -304,6 +305,9 @@ pub struct Replicator {
     /// Set while a verification restore is running on its own thread, so a slow
     /// verification cannot pile up behind itself.
     verifying: Arc<AtomicBool>,
+    /// The injected wall clock. Every artifact timestamp is read from here at
+    /// the moment that artifact's contents are fenced, never earlier.
+    clock: Arc<dyn ClockSource>,
 }
 
 impl fmt::Debug for Replicator {
@@ -332,7 +336,18 @@ impl Replicator {
             connection: None,
             state: None,
             verifying: Arc::new(AtomicBool::new(false)),
+            clock: Arc::new(SystemClock),
         }
+    }
+
+    /// Read time from `clock` instead of the system clock.
+    ///
+    /// The app wires in its injected clock, and a test wires in one it can step,
+    /// so a point-in-time restore can be exercised over a compressed timeline.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn ClockSource>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// The destination this replicator ships to.
@@ -346,10 +361,10 @@ impl Replicator {
     ///
     /// Blocking: call this on a dedicated thread, never on the async runtime.
     pub fn run(mut self, shutdown: &tokio_util::sync::CancellationToken) {
-        let mut last_verify = Utc::now();
+        let mut last_verify = self.clock.now();
         loop {
-            let now = Utc::now();
-            self.tick_and_record(now);
+            let now = self.clock.now();
+            self.tick_and_record();
 
             if let Some(interval) = self.settings.verify_interval {
                 let due = now
@@ -368,12 +383,12 @@ impl Replicator {
         }
         // Final flush: the app is stopping, so ship the last committed frames
         // before the process (and possibly the machine) goes away.
-        self.tick_and_record(Utc::now());
+        self.tick_and_record();
     }
 
     /// Run one tick, folding the outcome into the shared status.
-    fn tick_and_record(&mut self, now: DateTime<Utc>) {
-        match self.tick(now) {
+    fn tick_and_record(&mut self) {
+        match self.tick() {
             Ok(report) => {
                 if report.segments > 0 || report.snapshot_taken {
                     tracing::debug!(
@@ -402,17 +417,18 @@ impl Replicator {
     ///
     /// See [`ReplicationError`]. A failed tick never advances the replication
     /// point, so lag keeps growing until shipping works again.
-    pub fn tick(&mut self, now: DateTime<Utc>) -> Result<TickReport, ReplicationError> {
-        let result = self.tick_inner(now);
+    pub fn tick(&mut self) -> Result<TickReport, ReplicationError> {
+        let result = self.tick_inner();
         if let Err(e) = &result {
-            self.status.record_tick_error(e.to_string(), now);
+            self.status
+                .record_tick_error(e.to_string(), self.clock.now());
         }
         result
     }
 
     /// The tick body. Separated so [`tick`](Self::tick) can record the outcome
     /// on every path without threading the status through each `?`.
-    fn tick_inner(&mut self, now: DateTime<Utc>) -> Result<TickReport, ReplicationError> {
+    fn tick_inner(&mut self) -> Result<TickReport, ReplicationError> {
         let db = self.settings.database_path.clone();
         if !db.is_file() {
             return Err(ReplicationError::DatabaseMissing {
@@ -429,7 +445,7 @@ impl Replicator {
         let mut header = header;
         let mut wal_len = wal_len;
         if self.needs_new_generation(header.as_ref(), wal_len) {
-            self.start_generation(&db, now)?;
+            self.start_generation(&db)?;
             report.snapshot_taken = true;
             // The generation opened from a checkpointed database file, so the
             // WAL was reset underneath us; re-read it before shipping.
@@ -438,7 +454,7 @@ impl Replicator {
         }
 
         if let Some(header) = header {
-            let shipped = self.ship(&wal_path, &header, wal_len, now)?;
+            let shipped = self.ship(&wal_path, &header, wal_len)?;
             report.segments = shipped.0;
             report.bytes = shipped.1;
         }
@@ -449,6 +465,15 @@ impl Replicator {
             .map_or(0, |st| wal_len.saturating_sub(st.shipped_offset));
         report.pending_bytes = pending;
 
+        // Read *after* anything this tick may have opened or shipped, never
+        // before. Both judgements below compare this instant against a timestamp
+        // the tick itself may have just written — a generation's `started_at`,
+        // an artifact's creation instant — and each of those is sampled at the
+        // moment its contents were fenced, which is later than the top of the
+        // tick. A reading taken up there would sit *behind* them, and
+        // `generation_expired` reads a negative span as "expired": every fresh
+        // generation would be retired on the tick that opened it.
+        let now = self.clock.now();
         let mut index_rotated = false;
         report.checkpointed =
             self.maybe_checkpoint(&db, &wal_path, pending, now, &mut index_rotated)?;
@@ -464,7 +489,7 @@ impl Replicator {
             Err(e) => tracing::warn!(error = %e, "SQLite replica retention sweep failed"),
         }
 
-        self.status.record_tick_ok(pending, now);
+        self.status.record_tick_ok(pending, self.clock.now());
         Ok(report)
     }
 
@@ -581,6 +606,7 @@ impl Replicator {
         let verifying = Arc::clone(&self.verifying);
         let root = self.settings.root.clone();
         let database_path = self.settings.database_path.clone();
+        let clock = Arc::clone(&self.clock);
         let spawned = std::thread::Builder::new()
             .name("autumn-replica-verify".to_owned())
             .spawn(move || {
@@ -597,7 +623,7 @@ impl Replicator {
                         "SQLite replica verification FAILED — the replica may not be restorable"
                     );
                 }
-                status.record_verification(result, Utc::now());
+                status.record_verification(result, clock.now());
             });
         if let Err(e) = spawned {
             tracing::warn!("could not start the SQLite replica verification thread: {e}");
@@ -660,13 +686,21 @@ impl Replicator {
     /// previous generation had already shipped. Checkpointing first makes the
     /// database file current by construction, and the new WAL starts empty at
     /// offset `0`, which is exactly where this generation's index `0` begins.
-    fn start_generation(&mut self, db: &Path, now: DateTime<Utc>) -> Result<(), ReplicationError> {
+    fn start_generation(&mut self, db: &Path) -> Result<(), ReplicationError> {
         if let Some(conn) = self.connection.as_mut() {
             let outcome = sqlite::checkpoint_truncate(conn, db)?;
             if let CheckpointOutcome::Busy { wal_bytes } = outcome {
                 return Err(ReplicationError::CheckpointBlocked { wal_bytes });
             }
         }
+        // Stamped only now: the checkpoint is what fences the database file this
+        // snapshot copies. A reading taken before it would claim the snapshot
+        // holds a moment it does not yet cover, and a point-in-time restore
+        // landing in that window would replay a transaction from *after* the
+        // instant the operator asked for. Reading after the fence can only
+        // over-state the snapshot's age, which costs the restore an extra
+        // generation of WAL replay and never correctness.
+        let now = self.clock.now();
         let created_ms = now.timestamp_millis();
         let id = segment::generation_id(created_ms, rand::random::<u64>());
 
@@ -721,9 +755,9 @@ impl Replicator {
         wal_path: &Path,
         header: &WalHeader,
         wal_len: u64,
-        now: DateTime<Utc>,
     ) -> Result<(u64, u64), ReplicationError> {
         let root = self.settings.root.clone();
+        let clock = Arc::clone(&self.clock);
         let Some(state) = self.state.as_mut() else {
             return Ok((0, 0));
         };
@@ -763,6 +797,15 @@ impl Replicator {
             ),
         })?;
 
+        // Stamped only now, once the bytes this segment carries have been read
+        // out of the `-wal` and sliced at their commit boundary. `wal_len` is
+        // measured at the top of the tick and the read follows it, so a
+        // transaction can commit into that window and land in `raw`; a timestamp
+        // sampled before the read would date the segment earlier than a change
+        // it actually contains, and a restore to an instant in between would
+        // replay that change. Sampling after can only date the segment late,
+        // which excludes it from such a restore instead.
+        let now = clock.now();
         let segment_header = SegmentHeader {
             version: segment::LAYOUT_VERSION,
             index: state.index,

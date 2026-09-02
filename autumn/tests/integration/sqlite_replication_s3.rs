@@ -24,7 +24,8 @@ use autumn_web::replication::s3::{S3Credentials, S3Destination, S3Settings};
 use autumn_web::replication::{
     ReplicationSettings, ReplicationStatus, Replicator, restore, segment,
 };
-use chrono::{TimeZone as _, Utc};
+use autumn_web::time::ClockSource;
+use chrono::{DateTime, TimeZone as _, Utc};
 use diesel::connection::SimpleConnection as _;
 use diesel::sql_types::Text;
 use diesel::{Connection as _, QueryableByName, RunQueryDsl as _, SqliteConnection, sql_query};
@@ -106,6 +107,7 @@ async fn replicates_to_and_restores_from_a_real_s3_endpoint() {
 
         let root = segment::root_prefix(Some("db"), "prod");
         let status = Arc::new(ReplicationStatus::new(destination.describe()));
+        let clock = StepClock::new();
         let mut replicator = Replicator::new(
             ReplicationSettings {
                 database_path: db.clone(),
@@ -118,21 +120,19 @@ async fn replicates_to_and_restores_from_a_real_s3_endpoint() {
             },
             Arc::clone(&destination),
             Arc::clone(&status),
-        );
+        )
+        .with_clock(Arc::clone(&clock) as Arc<dyn ClockSource>);
 
-        let at = |secs: i64| {
-            Utc.timestamp_opt(1_700_000_000 + secs, 0)
-                .single()
-                .expect("timestamp")
-        };
-        let first = replicator.tick(at(0)).expect("first tick against MinIO");
+        clock.set(at(0));
+        let first = replicator.tick().expect("first tick against MinIO");
         assert!(first.snapshot_taken);
         assert_eq!(first.segments, 1);
 
         sql_query("INSERT INTO t (v) VALUES ('gamma')")
             .execute(&mut conn)
             .expect("insert");
-        assert_eq!(replicator.tick(at(10)).expect("second tick").segments, 1);
+        clock.set(at(10));
+        assert_eq!(replicator.tick().expect("second tick").segments, 1);
 
         // Listing must come back through the real ListObjectsV2 path.
         let keys = destination
@@ -158,11 +158,40 @@ async fn replicates_to_and_restores_from_a_real_s3_endpoint() {
 
         // A point-in-time restore against the same endpoint.
         let earlier = dir.path().join("earlier.db");
-        restore::restore(destination.as_ref(), &root, Some(at(0)), &earlier).expect("pitr");
+        restore::restore(destination.as_ref(), &root, Some(at(5)), &earlier).expect("pitr");
         assert_eq!(read_values(&earlier), ["alpha", "beta"]);
     })
     .await;
     result.expect("blocking replication task");
+}
+
+/// A fixture instant, deliberately in the past, so the point-in-time leg of this
+/// test does not depend on how long `MinIO` took to answer.
+fn at(secs: i64) -> DateTime<Utc> {
+    Utc.timestamp_opt(1_700_000_000 + secs, 0)
+        .single()
+        .expect("timestamp")
+}
+
+/// A clock this test steps by hand. The replicator stamps each artifact from its
+/// own clock at the moment that artifact's contents are fenced, so the instants a
+/// point-in-time restore selects on come from here.
+struct StepClock(std::sync::Mutex<DateTime<Utc>>);
+
+impl StepClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(std::sync::Mutex::new(at(0))))
+    }
+
+    fn set(&self, now: DateTime<Utc>) {
+        *self.0.lock().expect("clock") = now;
+    }
+}
+
+impl ClockSource for StepClock {
+    fn now(&self) -> DateTime<Utc> {
+        *self.0.lock().expect("clock")
+    }
 }
 
 /// Create a bucket with a bare signed PUT. `S3Destination` deliberately refuses

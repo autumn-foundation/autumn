@@ -334,6 +334,12 @@ is destroyed**, under normal write load. Only *committed transactions* are ever
 shipped — a segment always ends on a commit boundary, so a replica is never half
 a transaction.
 
+That bound covers the machine *disappearing*. A **planned** stop — a deploy, a
+restart, a `SIGTERM` — loses nothing: once in-flight requests have drained, the
+replicator ships one final time and shutdown waits for that flush inside the same
+`server.shutdown_timeout_secs` budget as the other shutdown phases. If the budget
+runs out first the process still exits, and says so in the log.
+
 Two surfaces report it, from two vantage points. `autumn db replica status`
 (add `--json` for monitoring) reads the **destination** and reports the current
 generation, how many segments it holds, the instant a restore would land on, and
