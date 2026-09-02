@@ -98,6 +98,10 @@ RUSTDOC = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+$')
 FENCE = re.compile(r'^([ \t]*)(`{3,}|~{3,})')
 LIST_ITEM = re.compile(r'^([ \t]*)(?:[-*+]|\d{1,9}[.)])([ \t]+)(?=\S)')
 INDENT = re.compile(r'^[ \t]*')
+BLOCKQUOTE = re.compile(r'^[ \t]*(?:>[ \t]?)+')
+# A Setext underline, and the paragraph line it may promote to a heading.
+SETEXT = re.compile(r'^ {0,3}(=+|-+)[ \t]*$')
+NOT_PARAGRAPH = re.compile(r'^(?: {0,3}[#>|]| {0,3}(?:[-*+=]|\d{1,9}[.)])[ \t]|\s*$|\s{4,})')
 
 
 def column(s):
@@ -135,31 +139,44 @@ def strip_fences(text):
     in that state today (`skills/autumn-web/SKILL.md`, whose ```` ```bash ````
     opener around line 2479 went missing); balancing it is a separate change,
     not this gate's business.
+
+    Fence lines are blanked rather than dropped so line positions survive:
+    Setext heading detection below needs to know what really preceded an
+    underline, and deleting a fenced block would splice a paragraph onto a
+    following `---` and invent a heading that is not there.
     """
     out, opener, base = [], None, 0
     for line in text.splitlines():
-        m = FENCE.match(line)
+        # A fence inside a block quote (`> ```md`) is still a fence; the
+        # corpus has 12 of them. Detection runs on the quote-stripped content
+        # while the original line is what gets kept, so real links inside a
+        # block quote stay in scope.
+        content = BLOCKQUOTE.sub("", line)
+        m = FENCE.match(content)
         indent = column(m.group(1)) if m else None
         if opener is None:
             # Track the innermost open list item: its content column is what
             # a fence's three-column allowance is measured against. A non-blank
             # line dedented past it closes the item.
-            item = LIST_ITEM.match(line)
+            item = LIST_ITEM.match(content)
             if item:
                 base = column(item.group(0))
-            elif line.strip() and column(INDENT.match(line).group(0)) < base:
+            elif content.strip() and column(INDENT.match(content).group(0)) < base:
                 base = 0
             if m and indent <= base + 3:
                 opener = m.group(2)
+                out.append("")
             else:
                 out.append(line)
-        elif (
-            m
-            and indent <= base + 3
-            and m.group(2)[0] == opener[0]
-            and len(m.group(2)) >= len(opener)
-        ):
-            opener = None
+        else:
+            out.append("")
+            if (
+                m
+                and indent <= base + 3
+                and m.group(2)[0] == opener[0]
+                and len(m.group(2)) >= len(opener)
+            ):
+                opener = None
     return "\n".join(out)
 
 
@@ -204,14 +221,40 @@ for f in files:
     if text is None:
         continue
     body = strip_fences(text)
+    lines = body.splitlines()
+
+    # Skip YAML front matter. Its closing `---` sits directly under a content
+    # line, which is exactly the shape of a Setext H2 — every `---` in this
+    # corpus that looks like a Setext underline is in fact a front-matter
+    # closer or lives inside a fence. Indexing those would mint anchors for
+    # text that is not a heading, and a phantom anchor is worse than a missing
+    # one: it makes a broken link look resolved.
+    start = 0
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                start = i + 1
+                break
+
     seen, found = collections.Counter(), set()
-    for m in re.finditer(r'^(#{1,6})\s+(.*)$', body, re.M):
-        s = slugify(m.group(2))
+
+    def add(title):
+        s = slugify(title)
         if not s:
-            continue
+            return
         n = seen[s]
         seen[s] += 1
         found.add(s if n == 0 else f"{s}-{n}")
+
+    for i in range(start, len(lines)):
+        line = lines[i]
+        atx = re.match(r'^ {0,3}(#{1,6})\s+(.*)$', line)
+        if atx:
+            add(atx.group(2))
+        elif SETEXT.match(line) and i > start and not NOT_PARAGRAPH.match(lines[i - 1]):
+            # A Setext underline promotes the paragraph line above it.
+            add(lines[i - 1])
+
     for m in re.finditer(r'<a\s+(?:id|name)="([^"]+)"', body):
         found.add(m.group(1))
     anchors[f] = found
@@ -393,6 +436,42 @@ self_test() {
   printf 'See [guide](guide(v2).md).\n' >> "$c15/docs/guide/mail.md"
   git -C "$c15" add -A && git -C "$c15" commit -qm balanced-parens
   check "balanced parentheses in a destination resolve" pass "$c15"
+
+  # A fence inside a block quote is still a fence (the corpus has 12).
+  local c16="$tmp/c16"; make_corpus "$c16"
+  printf '\n> A quoted sample:\n>\n> ```md\n> [sample](totally-made-up.md)\n> ```\n' \
+    >> "$c16/docs/guide/mail.md"
+  git -C "$c16" commit -qam blockquoted-fence
+  check "sample inside a blockquoted fence is ignored" pass "$c16"
+
+  # ...but quoted prose is not code: a real link inside a block quote must
+  # still be checked, or the fix above would blind the gate to whole sections.
+  local c17="$tmp/c17"; make_corpus "$c17"
+  printf '\n> A quoted broken link: [gone](no-such-file.md).\n' \
+    >> "$c17/docs/guide/mail.md"
+  git -C "$c17" commit -qam blockquoted-link
+  check "broken link in block-quoted prose is still caught" fail "$c17"
+
+  # Setext headings carry anchors just as ATX ones do.
+  local c18="$tmp/c18"; make_corpus "$c18"
+  printf '\nSetext title\n============\n\nSub heading\n-----------\n' >> "$c18/docs/guide/jobs.md"
+  printf 'See [one](jobs.md#setext-title) and [two](jobs.md#sub-heading).\n' \
+    >> "$c18/docs/guide/mail.md"
+  git -C "$c18" commit -qam setext
+  check "Setext heading anchors resolve" pass "$c18"
+
+  # The guard that makes the above safe: YAML front matter's closing `---`
+  # sits under a content line, which is exactly a Setext H2's shape. Indexing
+  # it would mint an anchor for text that is not a heading — and a phantom
+  # anchor is worse than a missing one, because it makes a broken link look
+  # resolved. Every `---` in this corpus that looks like a Setext underline
+  # is in fact a front-matter closer.
+  local c19="$tmp/c19"; make_corpus "$c19"
+  printf -- '---\ntitle: Jobs\ndescription: not a heading\n---\n\n# Jobs\n' \
+    > "$c19/docs/guide/jobs.md"
+  printf 'See [phantom](jobs.md#description-not-a-heading).\n' >> "$c19/docs/guide/mail.md"
+  git -C "$c19" commit -qam frontmatter-closer
+  check "front-matter closer is not a Setext heading" fail "$c19"
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]]
