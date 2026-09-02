@@ -255,7 +255,36 @@ pub const ALLOWED_RESPONSE_CONTENT_TYPES: &[&str] = &[
 /// Whether a plugin may set a response header of this (lower-cased) name.
 #[must_use]
 pub fn response_header_allowed(name: &str) -> bool {
-    ALLOWED_RESPONSE_HEADERS.contains(&name)
+    ALLOWED_RESPONSE_HEADERS
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(name))
+}
+
+/// What a denial records of a name the allowlist refused.
+///
+/// A response header name is the guest's, and bounded only by the stdout line
+/// ceiling — roughly twice the response ceiling. Lower-casing it to decide
+/// whether it is allowed copied all of that, and pushing it into the denial
+/// list *kept* the copy until the caller logged it, beside the parsed response
+/// and the clone `run` holds. `guest_text` bounds it at the log, which is the
+/// printing rather than the copy: the same place the import list used to bound
+/// its names, and for the same reason it no longer does.
+///
+/// The name still has to identify the header — a plugin reaching for
+/// `Set-Cookie` is what an operator wants to see — so this keeps enough to name
+/// it and says when it kept less.
+const DENIED_NAME_EXCERPT: usize = 128;
+
+fn denied_name_excerpt(name: &str) -> String {
+    let mut out = String::with_capacity(name.len().min(DENIED_NAME_EXCERPT));
+    for (kept, ch) in name.chars().enumerate() {
+        if kept == DENIED_NAME_EXCERPT {
+            out.push_str(super::host::TRUNCATION_MARKER);
+            break;
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
 }
 
 /// Something that could not be parsed out of, or encoded onto, the wire.
@@ -482,9 +511,13 @@ impl SandboxResponse {
     pub fn sanitize(mut self, prefix: &str) -> (Self, Vec<String>) {
         let mut denied = Vec::new();
         self.headers.retain(|(name, value)| {
-            let lower = name.to_ascii_lowercase();
-            if !response_header_allowed(&lower) {
-                denied.push(lower);
+            // Matched against the borrowed name. Lower-casing first copied every
+            // name to answer a question the allowlist can answer without one,
+            // and the copy of a *refused* name was then kept until it was
+            // logged — so the longer the name a guest chose, the more the host
+            // held to throw it away.
+            if !response_header_allowed(name) {
+                denied.push(denied_name_excerpt(name));
                 return false;
             }
             // `Location` is the one allowed header that makes the *client* act,
@@ -497,8 +530,8 @@ impl SandboxResponse {
             // redirect a plugin genuinely needs (its own routes) and takes away
             // the one it must not have. An absolute URL is refused by the same
             // rule, which closes the open-redirect half as well.
-            if lower == "location" && !redirect_target_allowed(value, prefix) {
-                denied.push(lower);
+            if name.eq_ignore_ascii_case("location") && !redirect_target_allowed(value, prefix) {
+                denied.push(denied_name_excerpt(name));
                 return false;
             }
             true
@@ -705,6 +738,74 @@ pub(crate) fn canonicalize_headers(headers: &[(String, String)]) -> Vec<(String,
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_denied_header_name_is_not_copied_whole_to_be_thrown_away() {
+        // `sanitize` lower-cased every name before deciding anything, so a name
+        // the allowlist refuses was copied in full on the way to being dropped.
+        // The guest chooses that length — it is bounded only by the stdout line
+        // ceiling — and the copy is then *kept* in `denied` until the caller
+        // logs it, beside the parsed response and the clone `run` holds. The
+        // request side already answers this: `request_header_allowed` compares
+        // the borrowed name case-insensitively and copies nothing.
+        //
+        // The name is still recorded, because a plugin reaching for
+        // `Set-Cookie` is exactly what an operator wants to see — just as an
+        // excerpt rather than as however many megabytes the guest chose.
+        let huge = format!("set-cookie{}", "x".repeat(64 * 1024));
+        let response = SandboxResponse {
+            status: 200,
+            headers: vec![(huge.clone(), "v".to_owned())],
+            body: Vec::new(),
+        };
+        let (clean, denied) = response.sanitize("/hello");
+
+        assert!(
+            clean.headers.is_empty(),
+            "the header must still be stripped"
+        );
+        assert_eq!(denied.len(), 1, "the strip must still be recorded");
+        assert!(
+            denied[0].len() < huge.len(),
+            "the whole name was carried into the denial: {} bytes",
+            denied[0].len(),
+        );
+        assert!(
+            denied[0].starts_with("set-cookie"),
+            "the excerpt must still name the header: {:?}",
+            denied[0].get(..40),
+        );
+
+        // Case-insensitive without allocating to find out: the allowlist is
+        // matched against the borrowed name now, so a shouted name is refused
+        // exactly as a quiet one is.
+        let shouted = SandboxResponse {
+            status: 200,
+            headers: vec![("SET-COOKIE".to_owned(), "v".to_owned())],
+            body: Vec::new(),
+        };
+        let (clean, denied) = shouted.sanitize("/hello");
+        assert!(
+            clean.headers.is_empty(),
+            "a shouted name must still be refused"
+        );
+        assert_eq!(
+            denied,
+            vec!["set-cookie".to_owned()],
+            "recorded lower-cased"
+        );
+
+        // And an allowed header still survives, whatever case it arrives in —
+        // the bound must not become a filter.
+        let fine = SandboxResponse {
+            status: 200,
+            headers: vec![("Content-Type".to_owned(), "text/plain".to_owned())],
+            body: Vec::new(),
+        };
+        let (clean, denied) = fine.sanitize("/hello");
+        assert_eq!(clean.headers.len(), 1, "an allowed header must survive");
+        assert!(denied.is_empty(), "nothing was denied");
+    }
 
     #[test]
     fn a_redirect_cannot_hide_its_climb_behind_a_space_the_client_trims() {

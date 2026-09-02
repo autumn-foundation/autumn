@@ -231,7 +231,7 @@ const DETAIL_EXCERPT: usize = 512;
 /// bound while walking, and `stderr_excerpt`, which is handed a string already
 /// at it — and an excerpt that says it was cut in two different ways is worse
 /// than one that never says so.
-const TRUNCATION_MARKER: &str = " … (truncated)";
+pub(super) const TRUNCATION_MARKER: &str = " … (truncated)";
 
 /// Bound and neutralise a string the guest influenced.
 ///
