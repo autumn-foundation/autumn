@@ -1452,11 +1452,15 @@ impl TestApp {
     /// database isolation is preserved, and [`Sim::chaos`](crate::sim::Sim::chaos)
     /// keeps working alongside. The fault decision is innermost of each chain.
     ///
+    /// Attaching a plan registers an error reporter of its own, which — exactly
+    /// like `with_error_reporter` — means the built-in `LogReporter` fallback is
+    /// no longer installed for that app.
+    ///
     /// ```rust,ignore
     /// use autumn_web::sim::FaultPlan;
     ///
     /// let client = TestApp::new()
-    ///     .jobs(jobs![charge_card])
+    ///     .plugin(ChargeCardJobs) // the plugin registering `charge_card`
     ///     .with_fault_plan(FaultPlan::from_seed(0x5EED).fail_job("charge_card", 1))
     ///     .build();
     /// ```
@@ -2996,10 +3000,32 @@ impl TestClient {
     /// The shared 5xx counter handed to each [`RequestBuilder`], or `None` when
     /// no [`crate::sim::FaultPlan`] is attached (so an ordinary test app never
     /// touches an atomic per request).
+    ///
+    /// Also `None` without the `reporting` feature: nothing can ever populate
+    /// `FaultOutcome::server_errors` then, so counting observed 5xx would only
+    /// make [`fault_outcome`](Self::fault_outcome) spin out its whole settle
+    /// budget against a list that stays empty by contract.
+    #[cfg_attr(
+        not(feature = "reporting"),
+        allow(
+            clippy::unused_self,
+            clippy::missing_const_for_fn,
+            reason = "without `reporting` the answer is a constant `None`, but the \
+                      signature has to stay one method so every request builder \
+                      keeps a single call site"
+        )
+    )]
     fn fault_error_counter(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
-        self.fault_ledger
-            .as_ref()
-            .map(|_| std::sync::Arc::clone(&self.observed_server_errors))
+        #[cfg(feature = "reporting")]
+        {
+            self.fault_ledger
+                .as_ref()
+                .map(|_| std::sync::Arc::clone(&self.observed_server_errors))
+        }
+        #[cfg(not(feature = "reporting"))]
+        {
+            None
+        }
     }
 
     /// The runtime ledger for the [`crate::sim::FaultPlan`] attached with
@@ -3017,7 +3043,7 @@ impl TestClient {
     /// Settle the reporting lane, then snapshot the
     /// [`FaultOutcome`](crate::sim::FaultOutcome) for this run.
     ///
-    /// [`reporting`](crate::reporting) dispatches on a **detached** task, so a
+    /// Autumn's error-reporting layer dispatches on a **detached** task, so a
     /// 5xx this client already saw on the wire may not have reached the ledger
     /// yet. This yields cooperatively (never sleeping and never advancing the
     /// virtual clock, which would corrupt a sim's timeline) until the ledger has

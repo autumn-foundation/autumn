@@ -10,6 +10,7 @@
 //! can assert on — or compare byte-for-byte across a hundred replays.
 //!
 //! ```rust,ignore
+//! # async fn scenario() {
 //! use autumn_web::sim::FaultPlan;
 //! use autumn_web::test::TestApp;
 //!
@@ -18,13 +19,16 @@
 //!     .fail_job("send_invoice", 2)          // the 2nd `send_invoice` execution
 //!     .random_job_execution_faults(2, 1..=10); // 2 seed-picked ordinals in 1..=10
 //!
-//! let client = TestApp::new().routes(routes![touch]).jobs(jobs![send_invoice])
+//! let client = TestApp::new()
+//!     .routes(routes![touch])
+//!     .plugin(InvoiceJobs)                  // the plugin registering `send_invoice`
 //!     .with_fault_plan(plan)
 //!     .build();
 //! // … drive requests / drain jobs …
 //! let outcome = client.fault_outcome().await;
-//! assert_eq!(outcome.fired.len(), 3);
+//! assert!(outcome.unfired.is_empty()); // every authored ordinal was reached
 //! let json = outcome.to_json_string(); // canonical, byte-comparable
+//! # }
 //! ```
 //!
 //! # How this differs from [`Chaos`](crate::sim::Chaos)
@@ -55,13 +59,17 @@
 //!   reproducible *by construction* — independent of the seed and of every other
 //!   fault lane's draws.
 //! * **The `random_*` builders draw once, at builder-call time**, from a
-//!   dedicated stream seeded `seed ^ FAULT_STREAM_SALT` — distinct from the
-//!   app-facing [`Entropy`] source and from every chaos salt, so a plan's draws
-//!   neither perturb nor are perturbed by the application's own identifier
-//!   stream. Each call re-derives that stream from the seed alone, so the picked
-//!   ordinals are a pure function of `(seed, count, within)`: where the call
-//!   sits in the builder chain does not matter. The picks are resolved
-//!   immediately into ordinary [`PlannedFault`] entries, so
+//!   dedicated stream seeded `seed ^ FAULT_STREAM_SALT ^ effect_salt` —
+//!   distinct from the app-facing [`Entropy`] source and from every chaos salt,
+//!   so a plan's draws neither perturb nor are perturbed by the application's
+//!   own identifier stream — and per-effect, so asking for random job-execution
+//!   ordinals and random checkout ordinals on one plan does not pick the same
+//!   numbers twice. Each call re-derives that stream from the seed and the
+//!   effect alone, so the picked ordinals are a pure function of
+//!   `(seed, effect, count, within)`: where the call sits in the builder chain
+//!   does not matter, and repeating the same call on one plan is a no-op (it
+//!   picks the same ordinals, and duplicate entries collapse). The picks are
+//!   resolved immediately into ordinary [`PlannedFault`] entries, so
 //!   [`FaultPlan::planned`] always describes the whole schedule.
 //! * **Fault timing reads only the app's injected [`ClockSource`]** —
 //!   [`FiredFault::at`] and [`FiredFault::elapsed_ms`] come from the clock
@@ -123,8 +131,10 @@ use crate::time::{ClockSource, MonotonicInstant};
 ///
 /// Kept distinct from the app-facing entropy seeding (the raw seed) and from
 /// every [`chaos`](crate::sim::chaos) salt, so choosing random ordinals never
-/// shifts another lane's schedule. An arbitrary fixed constant; its only
-/// requirement is being non-zero and unlike its neighbours.
+/// shifts another lane's schedule. `XOR`ed further with
+/// [`FaultEffect::stream_salt`] so each effect class draws its own stream. An
+/// arbitrary fixed constant; its only requirement is being non-zero and unlike
+/// its neighbours.
 const FAULT_STREAM_SALT: u64 = 0xFA17_0DEA_FA17_0DEA;
 
 /// FNV-1a 64-bit offset basis.
@@ -160,6 +170,20 @@ impl FaultEffect {
         match self {
             Self::DbCheckout => "db_checkout",
             Self::JobExecution => "job_execution",
+        }
+    }
+
+    /// Per-effect salt folded into the `random_*` sampling stream.
+    ///
+    /// Without it `random_job_execution_faults(2, 1..=6)` and
+    /// `random_db_checkout_faults(2, 1..=6)` on the same plan would draw from
+    /// one stream seeded only by `seed ^ FAULT_STREAM_SALT` and pick *identical*
+    /// ordinals — a correlation nobody authored. Arbitrary fixed constants;
+    /// their only requirement is being non-zero and distinct from each other.
+    const fn stream_salt(self) -> u64 {
+        match self {
+            Self::DbCheckout => 0xD8CE_4B07_D8CE_4B07,
+            Self::JobExecution => 0x70B5_EC07_70B5_EC07,
         }
     }
 }
@@ -261,10 +285,14 @@ impl FaultPlan {
     /// global job-execution counter), derived from this plan's seed.
     ///
     /// This is the one builder where the seed does the choosing. The draw
-    /// happens **now**, from a stream seeded `seed ^ FAULT_STREAM_SALT`, and is
-    /// resolved immediately into ordinary entries — so the result shows up in
+    /// happens **now**, from a stream seeded
+    /// `seed ^ FAULT_STREAM_SALT ^ effect_salt`, and is resolved immediately
+    /// into ordinary entries — so the result shows up in
     /// [`planned`](Self::planned) and replays byte-for-byte for a given
-    /// `(seed, count, within)`, wherever in the chain the call sits.
+    /// `(seed, effect, count, within)`, wherever in the chain the call sits.
+    /// Because the picks depend on nothing else, calling this twice with the
+    /// same arguments on one plan is a no-op: the second call picks the same
+    /// ordinals and the duplicate entries collapse.
     ///
     /// `count` is clamped to the length of `within`; a descending range picks
     /// nothing, and any ordinal `0` in range is skipped.
@@ -341,8 +369,9 @@ impl FaultPlan {
         self.entries.iter().cloned().collect()
     }
 
-    /// A human-readable, one-line-per-fault rendering of the schedule, used in
-    /// panic messages and docs.
+    /// A human-readable, one-line-per-fault rendering of the schedule.
+    ///
+    /// Intended for panic messages and debugging output.
     ///
     /// Stable for a given plan (the entries are sorted), so it is safe to assert
     /// on in a test.
@@ -415,7 +444,7 @@ impl FaultPlan {
         count: u32,
         within: &std::ops::RangeInclusive<u32>,
     ) -> Self {
-        for ordinal in sample_distinct(self.seed, count, within) {
+        for ordinal in sample_distinct(self.seed, effect, count, within) {
             if ordinal >= 1 {
                 self.entries.insert(PlannedFault {
                     effect,
@@ -429,19 +458,34 @@ impl FaultPlan {
 }
 
 /// Draw `count` distinct values from `within`, uniformly, from the stream seeded
-/// `seed ^ FAULT_STREAM_SALT`.
+/// `seed ^ FAULT_STREAM_SALT ^ effect.stream_salt()`.
+///
+/// Folding the effect into the stream keeps the lanes independent: without it
+/// `random_job_execution_faults(2, 1..=6)` and `random_db_checkout_faults(2,
+/// 1..=6)` on one plan would return the same ordinals.
 ///
 /// Floyd's sampling algorithm: exactly `min(count, |within|)` draws, no
 /// rejection loop, and therefore no unbounded work for a nearly-exhausted range.
 /// An inverted range yields nothing.
-fn sample_distinct(seed: u64, count: u32, within: &std::ops::RangeInclusive<u32>) -> Vec<u32> {
+///
+/// The `%` reduction below is very slightly biased towards the low end of the
+/// range (at most one extra chance in `2^64 / (j + 1)`, i.e. under 2⁻³² for any
+/// range that fits a `u32`). That is far below anything a fault schedule cares
+/// about, and the draw is reproducible either way — which is the property this
+/// module actually sells.
+fn sample_distinct(
+    seed: u64,
+    effect: FaultEffect,
+    count: u32,
+    within: &std::ops::RangeInclusive<u32>,
+) -> Vec<u32> {
     let (lo, hi) = (*within.start(), *within.end());
     if hi < lo || count == 0 {
         return Vec::new();
     }
     let len = u64::from(hi - lo) + 1;
     let take = u64::from(count).min(len);
-    let stream = SeededEntropy::new(seed ^ FAULT_STREAM_SALT);
+    let stream = SeededEntropy::new(seed ^ FAULT_STREAM_SALT ^ effect.stream_salt());
     let mut chosen: BTreeSet<u32> = BTreeSet::new();
     for j in (len - take)..len {
         // `j + 1 <= len <= 2^32`, so the modulus and the offset both fit u32.
@@ -481,7 +525,7 @@ pub struct FiredFault {
     pub elapsed_ms: u64,
 }
 
-/// A 5xx response captured through [`reporting`](crate::reporting), projected to
+/// A 5xx response captured through autumn's error-reporting layer, projected to
 /// the deterministic fields.
 ///
 /// Deliberately **no request id**: those are minted from the app's entropy, so
@@ -515,6 +559,12 @@ pub struct FinalState {
     pub job_executions: u64,
     /// Job executions that returned an error — injected **or** a genuine
     /// handler failure.
+    ///
+    /// A handler that **panics** counts here too: the panic unwinds through the
+    /// fault interceptor (the job runtime catches it further out), and the
+    /// interceptor records the pass as failed on the way out, so
+    /// `job_executions == job_executions_failed + job_executions_succeeded`
+    /// always holds.
     pub job_executions_failed: u64,
     /// Job executions that returned `Ok`.
     pub job_executions_succeeded: u64,
@@ -533,6 +583,12 @@ pub struct FaultOutcome {
     /// The seed of the plan that produced this run.
     pub seed: u64,
     /// Faults that were injected, in the order they fired.
+    ///
+    /// One entry per faulted effect **pass**, not per planned entry: a single
+    /// pass that matches both a global entry (`fail_job_execution(2)`) and a
+    /// per-target entry (`fail_job("probe", 2)`) fails the operation once and
+    /// is recorded here once, while marking **both** planned entries reached —
+    /// so neither of them shows up in [`unfired`](Self::unfired).
     pub fired: Vec<FiredFault>,
     /// Faults that matched an authored ordinal but fell outside
     /// [`FaultPlan::only_between`]'s window, in the order they matched. Their
@@ -540,7 +596,7 @@ pub struct FaultOutcome {
     pub suppressed: Vec<FiredFault>,
     /// Planned faults whose ordinal was never reached, sorted.
     pub unfired: Vec<PlannedFault>,
-    /// 5xx responses captured through [`reporting`](crate::reporting), in report
+    /// 5xx responses captured through autumn's error-reporting layer, in report
     /// order. Always present; empty when the `reporting` feature is off.
     pub server_errors: Vec<ReportedError>,
     /// Totals for the whole run.
@@ -596,8 +652,10 @@ enum Decision {
     /// No authored ordinal matched, or the match fell outside the window —
     /// run the real operation.
     Proceed,
-    /// Inject the fault; `ordinal` is the global ordinal for the message.
-    Fail { ordinal: u32 },
+    /// Inject the fault. Both ordinals travel with the decision so the injected
+    /// error message can name the pass on either counter — the global one and
+    /// the target's own — without re-reading (and re-racing) the ledger.
+    Fail { ordinal: u32, target_ordinal: u32 },
 }
 
 /// The mutable half of a run's record, behind one lock so `fired`,
@@ -676,17 +734,30 @@ impl FaultState {
 
     /// Count one pass of `effect` against `target` and decide what to do with
     /// it, recording the decision.
+    ///
+    /// At most **one** [`FiredFault`] is recorded per pass. A pass whose global
+    /// ordinal and per-target ordinal are *both* authored fires once, and marks
+    /// both planned entries reached — so neither lands in
+    /// [`FaultOutcome::unfired`].
+    ///
+    /// Holds no `.await` across the lock, so the plain `std::sync::Mutex` is
+    /// safe inside the async interceptors.
     fn observe(&self, effect: FaultEffect, target: &str) -> Decision {
         let counter = match effect {
             FaultEffect::DbCheckout => &self.db_checkout_seq,
             FaultEffect::JobExecution => &self.job_execution_seq,
         };
-        let ordinal = saturating_ordinal(counter.fetch_add(1, Ordering::SeqCst) + 1);
 
+        // The global ordinal is allocated INSIDE the `recorded` lock, together
+        // with the per-target one. Bumping the atomic before taking the lock
+        // let two passes on a multi-threaded runtime interleave and pair one
+        // pass's global ordinal with another's target ordinal in a single
+        // record. The counters stay atomics; the lock is what orders them.
         let mut recorded = self
             .recorded
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ordinal = saturating_ordinal(counter.fetch_add(1, Ordering::SeqCst) + 1);
         let target_ordinal = {
             let seq = recorded
                 .target_seq
@@ -739,7 +810,10 @@ impl FaultState {
             .is_none_or(|(from, to)| elapsed >= from && elapsed < to);
         if in_window {
             recorded.fired.push(record);
-            Decision::Fail { ordinal }
+            Decision::Fail {
+                ordinal,
+                target_ordinal,
+            }
         } else {
             recorded.suppressed.push(record);
             Decision::Proceed
@@ -821,6 +895,7 @@ fn saturating_ordinal(value: u64) -> u32 {
 ///
 /// Cloning a `FaultLedger` shares the same ledger. Reach one through
 /// [`TestClient::fault_ledger`](crate::test::TestClient::fault_ledger).
+#[non_exhaustive]
 #[derive(Clone)]
 pub struct FaultLedger(Arc<FaultState>);
 
@@ -895,6 +970,27 @@ impl FaultLedger {
 
 // ── Interceptors ─────────────────────────────────────────────────────────────
 
+/// Records a job execution that never returned — a panicking handler unwinding
+/// through `next.await`, or a cancelled execution future — as a failed pass.
+///
+/// Without it [`FinalState::job_executions`] would not equal
+/// `job_executions_failed + job_executions_succeeded`, because the counting
+/// statement after the await is simply never reached.
+struct RecordOnUnwind<'a> {
+    state: &'a FaultState,
+    /// Cleared once `next.await` has returned normally, so the real result is
+    /// recorded exactly once instead of twice.
+    armed: bool,
+}
+
+impl Drop for RecordOnUnwind<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state.record_execution_result(false);
+        }
+    }
+}
+
 /// Injects the plan's job-execution faults.
 ///
 /// `intercept_enqueue` is a pass-through: a plan targets *executions*, so
@@ -931,14 +1027,29 @@ impl crate::interceptor::JobInterceptor for FaultJobInterceptor {
     {
         Box::pin(async move {
             match self.state.observe(FaultEffect::JobExecution, name) {
-                Decision::Fail { ordinal } => {
+                Decision::Fail {
+                    ordinal,
+                    target_ordinal,
+                } => {
                     self.state.record_execution_result(false);
                     Err(crate::AutumnError::service_unavailable_msg(format!(
-                        "fault plan: injected job execution failure (execution #{ordinal} of `{name}`)"
+                        "fault plan: injected job execution failure \
+                         (execution #{ordinal} overall, #{target_ordinal} of `{name}`)"
                     )))
                 }
                 Decision::Proceed => {
+                    // A panicking handler unwinds straight through `next.await`
+                    // (the job runtime catches it outside this seam), so a bare
+                    // post-await count would drop the pass and leave
+                    // `job_executions != failed + succeeded`. The guard books
+                    // the unwind as a failure; the happy path disarms it and
+                    // records the real result.
+                    let mut guard = RecordOnUnwind {
+                        state: self.state.as_ref(),
+                        armed: true,
+                    };
                     let result = next.await;
+                    guard.armed = false;
                     self.state.record_execution_result(result.is_ok());
                     result
                 }
@@ -993,9 +1104,13 @@ impl crate::interceptor::DbConnectionInterceptor for FaultDbInterceptor {
             >,
         > = Box::pin(async move {
             match self.state.observe(FaultEffect::DbCheckout, &pool_name) {
-                Decision::Fail { ordinal } => Err(crate::AutumnError::service_unavailable_msg(
-                    format!("fault plan: injected database checkout failure (checkout #{ordinal})"),
-                )),
+                Decision::Fail {
+                    ordinal,
+                    target_ordinal,
+                } => Err(crate::AutumnError::service_unavailable_msg(format!(
+                    "fault plan: injected database checkout failure \
+                     (checkout #{ordinal} overall, #{target_ordinal} from `{pool_name}`)"
+                ))),
                 Decision::Proceed => next.await,
             }
         });
@@ -1046,10 +1161,31 @@ impl crate::reporting::ErrorReporter for FaultReporter {
 
 #[cfg(test)]
 mod tests {
-    use super::{FaultEffect, FaultOutcome, FaultPlan, FinalState, PlannedFault, sample_distinct};
+    use super::{
+        Decision, FaultEffect, FaultOutcome, FaultPlan, FaultState, FinalState, PlannedFault,
+        sample_distinct,
+    };
+    use crate::time::{ClockSource as _, TickingClock};
+    use std::sync::Arc;
     use std::time::Duration;
 
     const SEED: u64 = 0x5EED;
+
+    /// The sim epoch (`2020-01-01T00:00:00Z`), so the timings a windowed test
+    /// asserts on read like the ones a `#[sim_test]` produces.
+    fn epoch() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_577_836_800, 0).expect("valid timestamp")
+    }
+
+    /// A ledger state driven by a virtual clock the test still holds a handle
+    /// to — `TickingClock` clones share one instant, exactly as
+    /// `TestApp::with_clock` relies on.
+    fn ticking_state(plan: &FaultPlan) -> (TickingClock, FaultState) {
+        let clock = TickingClock::starting_at(epoch());
+        let started_at = clock.monotonic();
+        let state = FaultState::new(plan, Arc::new(clock.clone()), started_at);
+        (clock, state)
+    }
 
     #[test]
     fn a_fresh_plan_is_inactive_and_describes_itself() {
@@ -1172,12 +1308,20 @@ mod tests {
 
     #[test]
     fn degenerate_sampling_ranges_pick_nothing() {
-        assert!(sample_distinct(SEED, 0, &(1..=10)).is_empty(), "count 0");
+        let effect = FaultEffect::JobExecution;
         assert!(
-            sample_distinct(SEED, 3, &std::ops::RangeInclusive::new(10, 1)).is_empty(),
+            sample_distinct(SEED, effect, 0, &(1..=10)).is_empty(),
+            "count 0"
+        );
+        assert!(
+            sample_distinct(SEED, effect, 3, &std::ops::RangeInclusive::new(10, 1)).is_empty(),
             "inverted range"
         );
-        assert_eq!(sample_distinct(SEED, 3, &(7..=7)), vec![7], "single value");
+        assert_eq!(
+            sample_distinct(SEED, effect, 3, &(7..=7)),
+            vec![7],
+            "single value"
+        );
         // A range starting at 0 never yields a 0 ordinal in the plan.
         let planned = FaultPlan::from_seed(SEED)
             .random_job_execution_faults(1, 0..=0)
@@ -1185,18 +1329,123 @@ mod tests {
         assert!(planned.is_empty(), "ordinal 0 is filtered out of the plan");
     }
 
+    /// Drives the real `FaultState::observe` through a virtual clock rather
+    /// than re-implementing the predicate in the test (which would assert
+    /// nothing about production code).
     #[test]
-    fn the_window_is_half_open() {
+    fn the_window_is_half_open_on_the_injected_clock() {
         let window = (Duration::from_secs(5), Duration::from_secs(10));
         let plan = FaultPlan::from_seed(SEED)
             .fail_job_execution(1)
+            .fail_job_execution(2)
+            .fail_job_execution(3)
             .only_between(window.0, window.1);
         assert_eq!(plan.window(), Some(window));
-        let fires = |elapsed: Duration| elapsed >= window.0 && elapsed < window.1;
-        assert!(!fires(Duration::from_millis(4_999)), "before the window");
-        assert!(fires(Duration::from_secs(5)), "the start is inclusive");
-        assert!(fires(Duration::from_millis(9_999)));
-        assert!(!fires(Duration::from_secs(10)), "the end is exclusive");
+        let (clock, state) = ticking_state(&plan);
+
+        // t = 0 — before the window: the ordinal is consumed, nothing fires.
+        assert_eq!(
+            state.observe(FaultEffect::JobExecution, "probe"),
+            Decision::Proceed
+        );
+        let outcome = state.outcome();
+        assert!(outcome.fired.is_empty(), "before the window: {outcome:?}");
+        assert_eq!(outcome.suppressed.len(), 1);
+
+        // t = 5s — the start is inclusive.
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(
+            state.observe(FaultEffect::JobExecution, "probe"),
+            Decision::Fail {
+                ordinal: 2,
+                target_ordinal: 2,
+            },
+            "the window start is inclusive"
+        );
+        let outcome = state.outcome();
+        assert_eq!(outcome.fired.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.fired[0].elapsed_ms, 5_000);
+        assert_eq!(outcome.fired[0].at, epoch() + chrono::Duration::seconds(5));
+
+        // t = 10s — the end is exclusive.
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(
+            state.observe(FaultEffect::JobExecution, "probe"),
+            Decision::Proceed
+        );
+        let outcome = state.outcome();
+        assert_eq!(
+            outcome.fired.len(),
+            1,
+            "the window end is exclusive: {outcome:?}"
+        );
+        assert_eq!(outcome.suppressed.len(), 2);
+        assert!(
+            outcome.unfired.is_empty(),
+            "every authored ordinal was reached: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn an_inverted_window_suppresses_everything() {
+        let plan = FaultPlan::from_seed(SEED)
+            .fail_job_execution(1)
+            .fail_job_execution(2)
+            .fail_job_execution(3)
+            .only_between(Duration::from_secs(10), Duration::from_secs(5));
+        let (clock, state) = ticking_state(&plan);
+        for _ in 0..3 {
+            assert_eq!(
+                state.observe(FaultEffect::JobExecution, "probe"),
+                Decision::Proceed
+            );
+            clock.advance(Duration::from_secs(7));
+        }
+        let outcome = state.outcome();
+        assert!(
+            outcome.fired.is_empty(),
+            "`from >= to` contains no instant at all: {outcome:?}"
+        );
+        assert_eq!(outcome.suppressed.len(), 3);
+        assert!(outcome.unfired.is_empty());
+    }
+
+    /// One pass can satisfy two authored entries at once; it must fault the
+    /// operation once and retire both entries.
+    #[test]
+    fn a_pass_matching_a_global_and_a_target_entry_fires_once() {
+        let plan = FaultPlan::from_seed(SEED)
+            .fail_job_execution(2)
+            .fail_job("probe", 2);
+        assert_eq!(
+            plan.planned().len(),
+            2,
+            "two distinct entries were authored"
+        );
+        let (_clock, state) = ticking_state(&plan);
+
+        assert_eq!(
+            state.observe(FaultEffect::JobExecution, "probe"),
+            Decision::Proceed
+        );
+        assert_eq!(
+            state.observe(FaultEffect::JobExecution, "probe"),
+            Decision::Fail {
+                ordinal: 2,
+                target_ordinal: 2,
+            }
+        );
+
+        let outcome = state.outcome();
+        assert_eq!(
+            outcome.fired.len(),
+            1,
+            "one FiredFault per faulted pass, not per matched entry: {outcome:?}"
+        );
+        assert!(
+            outcome.unfired.is_empty(),
+            "both planned entries count as reached: {outcome:?}"
+        );
     }
 
     #[cfg(feature = "db")]
@@ -1218,6 +1467,29 @@ mod tests {
                 .any(|p| p.target.as_deref() == Some("replica"))
         );
         assert!(planned.len() >= 3);
+    }
+
+    /// The two `random_*` lanes must not shadow each other: before the
+    /// per-effect salt they drew from one stream and picked the same ordinals.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_random_lanes_draw_independent_ordinals() {
+        let planned = FaultPlan::from_seed(SEED)
+            .random_job_execution_faults(2, 1..=6)
+            .random_db_checkout_faults(2, 1..=6)
+            .planned();
+        let picks = |effect: FaultEffect| -> Vec<u32> {
+            planned
+                .iter()
+                .filter(|p| p.effect == effect)
+                .map(|p| p.ordinal)
+                .collect()
+        };
+        let jobs = picks(FaultEffect::JobExecution);
+        let dbs = picks(FaultEffect::DbCheckout);
+        assert_eq!(jobs.len(), 2, "{planned:?}");
+        assert_eq!(dbs.len(), 2, "{planned:?}");
+        assert_ne!(jobs, dbs, "each effect draws from its own salted stream");
     }
 
     fn sample_outcome() -> FaultOutcome {
