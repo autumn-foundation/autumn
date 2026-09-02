@@ -26,7 +26,14 @@ use crate::route_listing::{RouteInfo, RouteSource};
 // ── Configuration ──────────────────────────────────────────────────────────
 
 /// Configuration for a conformance run against a specific plugin.
+///
+/// `#[non_exhaustive]`: build one with [`ConformanceConfig::new`] and the
+/// fluent setters rather than a struct literal. The `contract` field added in
+/// #1601 was a `SemVer` break for anyone constructing this with a literal, and
+/// the annotation lands in the same release so that break happens once — a
+/// later check that needs configuration of its own can then be additive.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConformanceConfig {
     /// The documented plugin name (e.g. `"autumn-admin-plugin"`).
     pub plugin_name: String,

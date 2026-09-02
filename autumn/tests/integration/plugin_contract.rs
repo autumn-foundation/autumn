@@ -105,6 +105,113 @@ fn stable_surface_names_lists_exactly_the_stable_tier() {
     assert_eq!(listed, expected);
 }
 
+/// Does `decl` in `source` carry `#[non_exhaustive]`?
+///
+/// Walks back from the declaration over its other attributes, doc comments and
+/// blank lines, and stops at the first line that is none of those.
+fn carries_non_exhaustive(source: &str, decl: &str) -> Option<bool> {
+    let lines: Vec<&str> = source.lines().collect();
+    let idx = lines.iter().position(|l| l.trim_start() == decl)?;
+    for line in lines[..idx].iter().rev() {
+        let t = line.trim_start();
+        if t == "#[non_exhaustive]" {
+            return Some(true);
+        }
+        if t.starts_with("#[") || t.starts_with("///") || t.starts_with("//") || t.is_empty() {
+            continue;
+        }
+        break;
+    }
+    Some(false)
+}
+
+/// The scan above only means something if it can say *no*. A test that always
+/// passes is worse than no test, so prove both answers against synthetic input
+/// before trusting it on the real source.
+#[test]
+fn the_non_exhaustive_scan_can_fail() {
+    let annotated = "/// Docs.\n#[derive(Debug)]\n#[non_exhaustive]\npub enum Thing {\n}\n";
+    let bare = "/// Docs.\n#[derive(Debug)]\npub enum Thing {\n}\n";
+    let elsewhere =
+        "#[non_exhaustive]\npub enum Other {}\n\n#[derive(Debug)]\npub enum Thing {\n}\n";
+
+    assert_eq!(
+        carries_non_exhaustive(annotated, "pub enum Thing {"),
+        Some(true)
+    );
+    assert_eq!(
+        carries_non_exhaustive(bare, "pub enum Thing {"),
+        Some(false)
+    );
+    assert_eq!(
+        carries_non_exhaustive(elsewhere, "pub enum Thing {"),
+        Some(false),
+        "an attribute on a NEIGHBOURING item must not count"
+    );
+    assert_eq!(carries_non_exhaustive(bare, "pub enum Missing {"), None);
+}
+
+/// `CHANGELOG.md` and `docs/migrations/next.md` both tell plugin authors that
+/// the plugin-facing types are `#[non_exhaustive]`. That promise is what lets a
+/// later release add a verdict, a tier, or a check's configuration without
+/// breaking every plugin — so it has to be kept, and an annotation is exactly
+/// the kind of one-line edit that goes missing in a rebase without any test
+/// noticing. (One did, on this very branch, and a review caught it.)
+///
+/// Nothing inside `autumn-web` can notice on its own: `#[non_exhaustive]` has
+/// no effect in the defining crate, so an in-crate literal or exhaustive match
+/// compiles either way. The ideal guard is a `trybuild` fixture compiling from
+/// outside; its expected stderr is rustc-version-specific, though, and this
+/// repository builds on more than one toolchain. So this reads the source
+/// instead: weaker than a compile, but it catches the failure mode that
+/// actually happens — the annotation not being there at all — on every
+/// toolchain.
+#[test]
+fn every_type_the_docs_promise_as_non_exhaustive_carries_the_attribute() {
+    const CONTRACT_SRC: &str = include_str!("../../src/plugin_contract.rs");
+    const CONFORMANCE_SRC: &str = include_str!("../../src/plugin_conformance.rs");
+
+    let promised: &[(&str, &str, &str)] = &[
+        ("plugin_contract", CONTRACT_SRC, "pub enum SurfaceTier {"),
+        (
+            "plugin_contract",
+            CONTRACT_SRC,
+            "pub struct PluginSurface {",
+        ),
+        (
+            "plugin_contract",
+            CONTRACT_SRC,
+            "pub struct PluginContract {",
+        ),
+        (
+            "plugin_contract",
+            CONTRACT_SRC,
+            "pub enum ContractVerdict {",
+        ),
+        (
+            "plugin_contract",
+            CONTRACT_SRC,
+            "pub struct PluginCompatibilityError {",
+        ),
+        (
+            "plugin_conformance",
+            CONFORMANCE_SRC,
+            "pub struct ConformanceConfig {",
+        ),
+    ];
+
+    for (module, source, decl) in promised {
+        let carries = carries_non_exhaustive(source, decl)
+            .unwrap_or_else(|| panic!("`{decl}` not found in {module} — was it renamed?"));
+        assert!(
+            carries,
+            "`{decl}` in {module} is documented as #[non_exhaustive] but does not carry the \
+             attribute. Either add it back, or stop promising it in CHANGELOG.md and \
+             docs/migrations/next.md."
+        );
+    }
+}
+
 // ── 2. The compatibility contract ──────────────────────────────────────────
 
 #[test]
