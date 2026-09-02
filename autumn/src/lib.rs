@@ -384,7 +384,8 @@ pub use ledger::{
 pub mod version_history;
 pub use version_history::{
     ColumnChange, VersionEntry, VersionFilter, VersionOp, VersionPage, VersionedRecord,
-    compute_delete_changes, compute_diff, compute_insert_changes,
+    compute_delete_changes, compute_delete_changes_owned, compute_diff, compute_diff_owned,
+    compute_insert_changes, compute_insert_changes_owned,
 };
 
 /// Router construction and integration with Axum.

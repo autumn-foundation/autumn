@@ -1964,6 +1964,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   buffer apparently cost more than one allocation for some of these calls
   once it had to grow, not just the final `String`.
 
+- **the versioned-repository audit write path stops cloning every column
+  (#2429):** `compute_diff` / `compute_insert_changes` /
+  `compute_delete_changes` take `&serde_json::Value`, so each one had to clone
+  every retained column name and value into the `ColumnChange` it returns. The
+  only production caller — the `#[repository(versioned = true)]` codegen, which
+  every insert, update and delete of a versioned model funnels through — builds
+  those `Value`s fresh from `version_column_values()` per mutation and drops
+  them the moment the diff returns. Every retained field was therefore allocated
+  twice and dropped twice, for a value nobody would look at again.
+
+  Three owned-value siblings — `compute_diff_owned`,
+  `compute_insert_changes_owned`, `compute_delete_changes_owned` — take the
+  `Value` by value and move each key and value straight into its
+  `ColumnChange` (`Map::into_iter` / `Map::remove` instead of `.get().cloned()`
+  / `.clone()`). The codegen now calls those. The borrowed functions are
+  unchanged and stay public, for callers whose `Value` outlives the call.
+
+  Allocation blocks per mutation on a realistic 7-column record, measured by the
+  new `version_history_alloc_gate` (`allocation-counter`, deterministic across
+  runs). Each figure includes the throwaway `Value` materialization both paths
+  are charged for, so the delta is only what each does with the value it is
+  handed:
+
+  | Entry point | Borrowed | Owned | Delta |
+  |---|---|---|---|
+  | `compute_insert_changes` | 26 blocks | 14 blocks | **-46.2%** |
+  | `compute_delete_changes` | 26 blocks | 14 blocks | **-46.2%** |
+  | `compute_diff` | 34 blocks | 27 blocks | **-20.6%** |
+
+  Whole-process totals over the committed `autumn/benches/version_history.rs`
+  harness, one variant per process (`BIN borrowed` / `BIN owned`):
+
+  | Metric | Borrowed | Owned | Delta |
+  |---|---|---|---|
+  | Instructions (`valgrind --tool=callgrind`) | 2,275,350,133 | 1,547,245,235 | **-32.0%** |
+  | Allocation blocks (`valgrind --tool=dhat`) | 6,901,045 | 4,441,045 | **-35.6%** |
+  | Allocation bytes (same) | 422,257,918 | 393,179,915 | -6.9% |
+
+  Wall clock on the same harness moves with it — insert and delete land around
+  -33% (roughly 650 -> 420 ns/op), and the harness now reports median and
+  spread across alternating rounds so a figure inside the noise says so. The
+  `compute_diff` row is the small one either way: it only ever retained the
+  *changed* columns (3 of 7 in this workload), so it had the fewest clones to
+  drop.
+
+  This is an audit surface, so the changeset itself is held byte-identical
+  rather than eyeballed: each owned function is asserted equal to its borrowed
+  twin — as a `Vec<ColumnChange>` *and* as the serialized JSON that reaches the
+  `_autumn_version_history` row — over shared case matrices (25 diff cases, 10
+  insert/delete cases) covering sensitive-column redaction, columns present in
+  `after` but not `before`, columns dropped from the changeset, `null`-vs-
+  missing, non-object inputs, and key ordering. Separate tests assert pointer
+  identity between the input buffers and the emitted ones, so an `_owned`
+  function that quietly delegated to its borrowed twin would fail even though
+  its output is correct.
+
 ## [0.7.0] - 2026-08-23
 
 For a narrative tour of this release, see the

@@ -387,6 +387,108 @@ pub fn compute_delete_changes(record: &serde_json::Value, sensitive: &[&str]) ->
         .collect()
 }
 
+/// Owned-value twin of [`compute_diff`].
+///
+/// Produces the identical changeset — same entries, same order, same
+/// sensitive-column redaction. The only difference is ownership: taking
+/// `before`/`after` by value lets every retained column name and value be
+/// **moved** into its [`ColumnChange`] instead of cloned, so each retained
+/// field is allocated once and dropped once rather than twice.
+///
+/// Prefer this whenever the caller has a `Value` it will not use again. The
+/// `#[repository(versioned = true)]` codegen does exactly that: it builds a
+/// throwaway `Value` from [`VersionedRecord::version_column_values`] per
+/// mutation and drops it immediately after the diff (#2429).
+///
+/// Use [`compute_diff`] when the `Value` must outlive the call.
+#[must_use]
+pub fn compute_diff_owned(
+    before: serde_json::Value,
+    after: serde_json::Value,
+    sensitive: &[&str],
+) -> Vec<ColumnChange> {
+    let serde_json::Value::Object(after_obj) = after else {
+        return vec![];
+    };
+    // A non-object `before` (JSON `null` from a missing prior row, a scalar
+    // from a hand-rolled `VersionedRecord`) is treated as "no prior values",
+    // matching `compute_diff`, which resolves `before.as_object()` to `None`.
+    let mut before_obj = match before {
+        serde_json::Value::Object(obj) => Some(obj),
+        _ => None,
+    };
+
+    let mut changes = Vec::new();
+    for (col, after_val) in after_obj {
+        // `remove` both reads the prior value and takes ownership of it. Only
+        // the `after` map is being iterated, so mutating `before` here is
+        // sound, and a JSON object cannot repeat a key — each column is
+        // removed at most once.
+        let before_val = before_obj.as_mut().and_then(|obj| obj.remove(&col));
+        let did_change = before_val.as_ref() != Some(&after_val);
+        if !did_change {
+            continue;
+        }
+        // `remove` above already moved the prior value into `before_val`, so
+        // this decides only where it goes next: a redacted column's secret is
+        // never cloned and never reaches the entry — it is dropped when
+        // `before_val` falls out of scope at the end of this iteration, along
+        // with the `after` value beside it.
+        if sensitive.contains(&col.as_str()) {
+            changes.push(ColumnChange::sensitive(col));
+        } else {
+            changes.push(ColumnChange::new(col, before_val, Some(after_val)));
+        }
+    }
+    changes
+}
+
+/// Owned-value twin of [`compute_insert_changes`].
+///
+/// Same output; moves each column name and value into its [`ColumnChange`]
+/// instead of cloning it. See [`compute_diff_owned`] for when to prefer this.
+#[must_use]
+pub fn compute_insert_changes_owned(
+    record: serde_json::Value,
+    sensitive: &[&str],
+) -> Vec<ColumnChange> {
+    let serde_json::Value::Object(obj) = record else {
+        return vec![];
+    };
+    obj.into_iter()
+        .map(|(col, val)| {
+            if sensitive.contains(&col.as_str()) {
+                ColumnChange::sensitive(col)
+            } else {
+                ColumnChange::new(col, None, Some(val))
+            }
+        })
+        .collect()
+}
+
+/// Owned-value twin of [`compute_delete_changes`].
+///
+/// Same output; moves each column name and value into its [`ColumnChange`]
+/// instead of cloning it. See [`compute_diff_owned`] for when to prefer this.
+#[must_use]
+pub fn compute_delete_changes_owned(
+    record: serde_json::Value,
+    sensitive: &[&str],
+) -> Vec<ColumnChange> {
+    let serde_json::Value::Object(obj) = record else {
+        return vec![];
+    };
+    obj.into_iter()
+        .map(|(col, val)| {
+            if sensitive.contains(&col.as_str()) {
+                ColumnChange::sensitive(col)
+            } else {
+                ColumnChange::new(col, Some(val), None)
+            }
+        })
+        .collect()
+}
+
 // ── VersionedRecord trait ────────────────────────────────────────────
 
 /// Implemented by models that opt into automatic version history.
@@ -854,6 +956,481 @@ mod tests {
         assert!(secret.sensitive);
         assert!(secret.before.is_none());
         assert!(secret.after.is_none());
+    }
+
+    // ── owned-value siblings (#2429) ─────────────────────────────────
+    //
+    // The macro call site (`autumn-macros/src/repository.rs`, `vh_insert_ts`)
+    // builds each `Value` fresh and throws it away immediately, so the
+    // borrowed entry points clone every retained key and value for nothing.
+    // The `*_owned` siblings move those keys/values straight into the
+    // `ColumnChange`. Because this is the audit-trail write path, every
+    // owned function is held to **exact** output parity with its borrowed
+    // twin, over a case matrix the two share, rather than to hand-written
+    // expectations: any future divergence — a dropped sensitive redaction, a
+    // mishandled "present in `after` but not `before`" column, a reordered
+    // changeset — fails here.
+
+    /// `(label, before, after, sensitive)` cases exercised by both the
+    /// borrowed and the owned diff path.
+    fn diff_parity_cases() -> Vec<(
+        &'static str,
+        serde_json::Value,
+        serde_json::Value,
+        &'static [&'static str],
+    )> {
+        vec![
+            (
+                "typical update",
+                serde_json::json!({"id": 1, "title": "old", "body": "same", "published": false}),
+                serde_json::json!({"id": 1, "title": "new", "body": "same", "published": true}),
+                &[],
+            ),
+            (
+                "no changes",
+                serde_json::json!({"title": "same"}),
+                serde_json::json!({"title": "same"}),
+                &[],
+            ),
+            (
+                "sensitive column changed",
+                serde_json::json!({"title": "old", "password_digest": "hash1"}),
+                serde_json::json!({"title": "new", "password_digest": "hash2"}),
+                &["password_digest"],
+            ),
+            (
+                "sensitive column unchanged",
+                serde_json::json!({"title": "new", "password_digest": "same"}),
+                serde_json::json!({"title": "new", "password_digest": "same"}),
+                &["password_digest"],
+            ),
+            (
+                "multiple sensitive columns",
+                serde_json::json!({"a": 1, "password_digest": "h1", "reset_token": "t1"}),
+                serde_json::json!({"a": 2, "password_digest": "h2", "reset_token": "t2"}),
+                &["password_digest", "reset_token"],
+            ),
+            (
+                "sensitive column listed but absent",
+                serde_json::json!({"title": "old"}),
+                serde_json::json!({"title": "new"}),
+                &["password_digest"],
+            ),
+            (
+                "sensitive column present only in after",
+                serde_json::json!({"title": "old"}),
+                serde_json::json!({"title": "new", "password_digest": "h"}),
+                &["password_digest"],
+            ),
+            (
+                "sensitive column present only in before",
+                serde_json::json!({"title": "old", "password_digest": "h"}),
+                serde_json::json!({"title": "new"}),
+                &["password_digest"],
+            ),
+            (
+                "before and after share no keys",
+                serde_json::json!({"old_a": 1, "old_b": 2}),
+                serde_json::json!({"new_a": 3, "new_b": 4}),
+                &[],
+            ),
+            (
+                "before is JSON null",
+                serde_json::json!(null),
+                serde_json::json!({"title": "Hello"}),
+                &[],
+            ),
+            (
+                "before is a scalar",
+                serde_json::json!(42),
+                serde_json::json!({"title": "Hello"}),
+                &[],
+            ),
+            (
+                "before is an array",
+                serde_json::json!([1, 2, 3]),
+                serde_json::json!({"title": "Hello"}),
+                &[],
+            ),
+            (
+                "after is not an object",
+                serde_json::json!({"title": "Hello"}),
+                serde_json::json!(null),
+                &[],
+            ),
+            (
+                "after is an array",
+                serde_json::json!({"title": "Hello"}),
+                serde_json::json!(["title"]),
+                &[],
+            ),
+            (
+                "column only in after",
+                serde_json::json!({"title": "old"}),
+                serde_json::json!({"title": "old", "slug": "new-col"}),
+                &[],
+            ),
+            (
+                "column only in before is dropped from the changeset",
+                serde_json::json!({"title": "old", "legacy": "gone"}),
+                serde_json::json!({"title": "new"}),
+                &[],
+            ),
+            (
+                "null equals null",
+                serde_json::json!({"a": null}),
+                serde_json::json!({"a": null}),
+                &[],
+            ),
+            (
+                "missing before vs explicit null after",
+                serde_json::json!({}),
+                serde_json::json!({"a": null}),
+                &[],
+            ),
+            (
+                "null before to value after",
+                serde_json::json!({"a": null}),
+                serde_json::json!({"a": 1}),
+                &[],
+            ),
+            (
+                "value before to null after",
+                serde_json::json!({"a": 1}),
+                serde_json::json!({"a": null}),
+                &[],
+            ),
+            (
+                "empty after object",
+                serde_json::json!({"a": 1}),
+                serde_json::json!({}),
+                &[],
+            ),
+            (
+                "empty before object",
+                serde_json::json!({}),
+                serde_json::json!({"a": 1}),
+                &[],
+            ),
+            (
+                "nested object and array values",
+                serde_json::json!({"meta": {"k": [1, 2]}, "tags": ["a"]}),
+                serde_json::json!({"meta": {"k": [1, 3]}, "tags": ["a"]}),
+                &[],
+            ),
+            (
+                "numeric type change with equal display",
+                serde_json::json!({"n": 1}),
+                serde_json::json!({"n": 1.0}),
+                &[],
+            ),
+            (
+                "unicode and ordering",
+                serde_json::json!({"zeta": 1, "Alpha": 2, "émile": 3}),
+                serde_json::json!({"zeta": 9, "Alpha": 2, "émile": 8}),
+                &[],
+            ),
+        ]
+    }
+
+    /// `(label, record, sensitive)` cases exercised by both the borrowed and
+    /// the owned insert/delete paths.
+    fn record_parity_cases() -> Vec<(&'static str, serde_json::Value, &'static [&'static str])> {
+        vec![
+            (
+                "typical record",
+                serde_json::json!({"id": 1, "title": "Hello", "body": "World"}),
+                &[],
+            ),
+            (
+                "sensitive column",
+                serde_json::json!({"id": 1, "password_digest": "hashed"}),
+                &["password_digest"],
+            ),
+            (
+                "every column sensitive",
+                serde_json::json!({"password_digest": "h", "reset_token": "t"}),
+                &["password_digest", "reset_token"],
+            ),
+            (
+                "sensitive listed but absent",
+                serde_json::json!({"id": 1}),
+                &["password_digest"],
+            ),
+            ("empty object", serde_json::json!({}), &[]),
+            ("not an object", serde_json::json!(null), &[]),
+            ("scalar", serde_json::json!(7), &[]),
+            ("array", serde_json::json!([1, 2]), &[]),
+            (
+                "null and nested values",
+                serde_json::json!({"a": null, "meta": {"k": [1, 2]}}),
+                &[],
+            ),
+            (
+                "unicode and ordering",
+                serde_json::json!({"zeta": 1, "Alpha": 2, "émile": 3}),
+                &[],
+            ),
+        ]
+    }
+
+    #[test]
+    fn compute_diff_owned_matches_borrowed_exactly() {
+        for (label, before, after, sensitive) in diff_parity_cases() {
+            let borrowed = compute_diff(&before, &after, sensitive);
+            let owned = compute_diff_owned(before.clone(), after.clone(), sensitive);
+            assert_eq!(owned, borrowed, "compute_diff_owned diverged for {label:?}");
+        }
+    }
+
+    #[test]
+    fn compute_insert_changes_owned_matches_borrowed_exactly() {
+        for (label, record, sensitive) in record_parity_cases() {
+            let borrowed = compute_insert_changes(&record, sensitive);
+            let owned = compute_insert_changes_owned(record.clone(), sensitive);
+            assert_eq!(
+                owned, borrowed,
+                "compute_insert_changes_owned diverged for {label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_delete_changes_owned_matches_borrowed_exactly() {
+        for (label, record, sensitive) in record_parity_cases() {
+            let borrowed = compute_delete_changes(&record, sensitive);
+            let owned = compute_delete_changes_owned(record.clone(), sensitive);
+            assert_eq!(
+                owned, borrowed,
+                "compute_delete_changes_owned diverged for {label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_changesets_serialize_identically_to_borrowed() {
+        // The generated code serializes the changeset to a string before it
+        // reaches the `_autumn_version_history` row, so parity has to hold at
+        // the JSON level too — including key order inside each entry.
+        for (label, before, after, sensitive) in diff_parity_cases() {
+            let borrowed =
+                serde_json::to_string(&compute_diff(&before, &after, sensitive)).unwrap();
+            let owned =
+                serde_json::to_string(&compute_diff_owned(before, after, sensitive)).unwrap();
+            assert_eq!(owned, borrowed, "serialized diff diverged for {label:?}");
+        }
+        for (label, record, sensitive) in record_parity_cases() {
+            let borrowed =
+                serde_json::to_string(&compute_insert_changes(&record, sensitive)).unwrap();
+            let owned =
+                serde_json::to_string(&compute_insert_changes_owned(record.clone(), sensitive))
+                    .unwrap();
+            assert_eq!(owned, borrowed, "serialized insert diverged for {label:?}");
+
+            let borrowed =
+                serde_json::to_string(&compute_delete_changes(&record, sensitive)).unwrap();
+            let owned =
+                serde_json::to_string(&compute_delete_changes_owned(record, sensitive)).unwrap();
+            assert_eq!(owned, borrowed, "serialized delete diverged for {label:?}");
+        }
+    }
+
+    /// Assert the redaction contract on one changeset: the column still
+    /// appears (the timeline must stay complete, per [`ColumnChange`]), it is
+    /// flagged `sensitive`, both values are omitted, and no secret survives
+    /// into the serialized row that reaches the audit table.
+    ///
+    /// Both halves matter: without the first, an implementation that dropped
+    /// the entry entirely — or returned `vec![]` — would "pass" a leak test.
+    fn assert_redacted(changes: &[ColumnChange], secrets: &[&str]) {
+        let entry = changes
+            .iter()
+            .find(|c| c.column == "password_digest")
+            .expect("a changed sensitive column must still appear in the changeset");
+        assert!(entry.sensitive, "the entry must be flagged sensitive");
+        assert!(entry.before.is_none(), "sensitive before must be omitted");
+        assert!(entry.after.is_none(), "sensitive after must be omitted");
+
+        let json = serde_json::to_string(changes).unwrap();
+        for secret in secrets {
+            assert!(
+                !json.contains(secret),
+                "sensitive value {secret} leaked into the changeset: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_diff_owned_never_leaks_a_sensitive_value() {
+        // Adversarial: a `.remove()`-based implementation that forgot the
+        // sensitive check would move the secret into the entry instead of
+        // dropping it.
+        let before = serde_json::json!({"password_digest": "OLD_SECRET", "title": "t"});
+        let after = serde_json::json!({"password_digest": "NEW_SECRET", "title": "t2"});
+        assert_redacted(
+            &compute_diff_owned(before, after, &["password_digest"]),
+            &["OLD_SECRET", "NEW_SECRET"],
+        );
+
+        let record = serde_json::json!({"password_digest": "INSERT_SECRET"});
+        assert_redacted(
+            &compute_insert_changes_owned(record, &["password_digest"]),
+            &["INSERT_SECRET"],
+        );
+
+        let record = serde_json::json!({"password_digest": "DELETE_SECRET"});
+        assert_redacted(
+            &compute_delete_changes_owned(record, &["password_digest"]),
+            &["DELETE_SECRET"],
+        );
+    }
+
+    // The parity tests above prove the owned path is *correct*. These prove it
+    // is actually cheaper, by the strictest statement available: the heap
+    // buffer that comes out of the owned entry point is the same allocation
+    // that went in. An `_owned` function implemented by delegating to its
+    // borrowed twin would still pass every parity test above, and fails here.
+    //
+    // The aggregate, whole-record version of the same claim — allocation blocks
+    // per mutation, against a pinned ceiling — lives in
+    // `autumn/tests/version_history_alloc_gate.rs`, which needs its own binary
+    // because `allocation-counter` installs a process-wide global allocator.
+    // These stay here because they are exact rather than statistical: they name
+    // *which* buffer, and cost nothing to run in the consolidated suite.
+
+    /// Heap address of a column name inside a JSON object.
+    fn key_ptr(v: &serde_json::Value, col: &str) -> *const u8 {
+        v.as_object()
+            .unwrap()
+            .get_key_value(col)
+            .unwrap()
+            .0
+            .as_ptr()
+    }
+
+    /// Heap address of a string column's value inside a JSON object.
+    fn val_ptr(v: &serde_json::Value, col: &str) -> *const u8 {
+        v.as_object().unwrap()[col].as_str().unwrap().as_ptr()
+    }
+
+    #[test]
+    fn compute_diff_owned_moves_buffers_instead_of_cloning_them() {
+        let before = serde_json::json!({
+            "body": "the previous body text, long enough to be heap allocated"
+        });
+        let after = serde_json::json!({
+            "body": "the current body text, long enough to be heap allocated"
+        });
+
+        let col = key_ptr(&after, "body");
+        let old = val_ptr(&before, "body");
+        let new = val_ptr(&after, "body");
+
+        // Contrast: the borrowed entry point copies all three. `before`/`after`
+        // are still alive here, so the copies cannot reuse their addresses.
+        let borrowed = compute_diff(&before, &after, &[]);
+        assert_eq!(borrowed.len(), 1);
+        assert_ne!(borrowed[0].column.as_ptr(), col);
+        assert_ne!(
+            borrowed[0]
+                .before
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .as_ptr(),
+            old
+        );
+        assert_ne!(
+            borrowed[0]
+                .after
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .as_ptr(),
+            new
+        );
+
+        let owned = compute_diff_owned(before, after, &[]);
+        assert_eq!(owned, borrowed);
+        assert_eq!(
+            owned[0].column.as_ptr(),
+            col,
+            "the column name must be moved out of the `after` map, not cloned"
+        );
+        assert_eq!(
+            owned[0].before.as_ref().unwrap().as_str().unwrap().as_ptr(),
+            old,
+            "the before value must be moved out of the `before` map, not cloned"
+        );
+        assert_eq!(
+            owned[0].after.as_ref().unwrap().as_str().unwrap().as_ptr(),
+            new,
+            "the after value must be moved out of the `after` map, not cloned"
+        );
+    }
+
+    #[test]
+    fn compute_insert_changes_owned_moves_buffers_instead_of_cloning_them() {
+        let record = serde_json::json!({
+            "body": "an inserted body long enough to be heap allocated"
+        });
+        let col = key_ptr(&record, "body");
+        let val = val_ptr(&record, "body");
+
+        let borrowed = compute_insert_changes(&record, &[]);
+        assert_eq!(borrowed.len(), 1);
+        assert_ne!(borrowed[0].column.as_ptr(), col);
+        assert_ne!(
+            borrowed[0]
+                .after
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .as_ptr(),
+            val
+        );
+
+        let owned = compute_insert_changes_owned(record, &[]);
+        assert_eq!(owned, borrowed);
+        assert_eq!(owned[0].column.as_ptr(), col);
+        assert_eq!(
+            owned[0].after.as_ref().unwrap().as_str().unwrap().as_ptr(),
+            val
+        );
+    }
+
+    #[test]
+    fn compute_delete_changes_owned_moves_buffers_instead_of_cloning_them() {
+        let record = serde_json::json!({
+            "body": "a deleted body long enough to be heap allocated"
+        });
+        let col = key_ptr(&record, "body");
+        let val = val_ptr(&record, "body");
+
+        let borrowed = compute_delete_changes(&record, &[]);
+        assert_eq!(borrowed.len(), 1);
+        assert_ne!(borrowed[0].column.as_ptr(), col);
+        assert_ne!(
+            borrowed[0]
+                .before
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .as_ptr(),
+            val
+        );
+
+        let owned = compute_delete_changes_owned(record, &[]);
+        assert_eq!(owned, borrowed);
+        assert_eq!(owned[0].column.as_ptr(), col);
+        assert_eq!(
+            owned[0].before.as_ref().unwrap().as_str().unwrap().as_ptr(),
+            val
+        );
     }
 
     // ── VersionedRecord trait ────────────────────────────────────────
