@@ -484,24 +484,31 @@ fn invalid_form_response(
 /// through the form post. Merge the submitted edits onto the stored record so
 /// those columns keep showing their real value on redisplay instead of going
 /// blank.
+///
+/// A genuinely missing record (`Ok(None)` — e.g. deleted between the edit
+/// page loading and this submit) falls back to `submitted` alone, same as
+/// before: there is no stored record to merge with. A fetch error, though,
+/// is a real backend problem (e.g. `AdminError::Database`) unrelated to the
+/// admin's input — it must reach the caller so it renders the normal error
+/// response, not be swallowed into a 422 that quietly blanks out every
+/// `create_only` field and calls it a validation failure (Codex review,
+/// PR #2422).
 async fn merge_with_stored_record(
     model: &dyn AdminModel,
     pool: &Pool<::autumn_web::RuntimeConnection>,
     id: i64,
     submitted: &Value,
-) -> Value {
+) -> Result<Value, AdminError> {
     let mut base = model
         .get(pool, id)
-        .await
-        .ok()
-        .flatten()
+        .await?
         .unwrap_or_else(|| submitted.clone());
     if let (Some(obj), Some(sub)) = (base.as_object_mut(), submitted.as_object()) {
         for (k, v) in sub {
             obj.insert(k.clone(), v.clone());
         }
     }
-    base
+    Ok(base)
 }
 
 /// Extract the value of the `__autumn_reveal` cookie from request headers.
@@ -1102,7 +1109,10 @@ async fn model_update(
     let form_data = match coerce_form_fields(submitted, &fields) {
         Ok(v) => v,
         Err((partial, field_names, msg)) => {
-            let display = merge_with_stored_record(model, &pool, id, &partial).await;
+            let display = match merge_with_stored_record(model, &pool, id, &partial).await {
+                Ok(v) => v,
+                Err(e) => return Err(admin_err("Update failed", e)),
+            };
             return Ok(invalid_form_response(
                 &registry,
                 &slug,
@@ -1122,7 +1132,10 @@ async fn model_update(
     };
     if let Err(e) = model.update(&pool, id, form_data.clone()).await {
         if let AdminError::Validation(msg) = e {
-            let display = merge_with_stored_record(model, &pool, id, &form_data).await;
+            let display = match merge_with_stored_record(model, &pool, id, &form_data).await {
+                Ok(v) => v,
+                Err(e) => return Err(admin_err("Update failed", e)),
+            };
             return Ok(invalid_form_response(
                 &registry,
                 &slug,
@@ -1897,6 +1910,11 @@ mod tests {
                         "owner": "alice",
                         "metadata": {"a": 1},
                     })))
+                } else if id == 999 {
+                    // Sentinel id simulating a backend outage on the
+                    // refetch `merge_with_stored_record` does to redisplay
+                    // an update's `create_only` fields correctly.
+                    Err(AdminError::Database("simulated outage".into()))
                 } else {
                     Ok(None)
                 }
@@ -2130,6 +2148,30 @@ mod tests {
         // its stored value on redisplay instead of going blank.
         assert!(html.contains("alice"), "html: {html}");
         assert!(!html.contains("Go to homepage"), "html: {html}");
+    }
+
+    #[tokio::test]
+    async fn model_update_validation_error_propagates_a_refetch_backend_failure() {
+        // Codex review, PR #2422: `merge_with_stored_record`'s refetch (done
+        // purely to redisplay `create_only` fields correctly) used to turn
+        // ANY error from it — including a real backend outage — into a
+        // silent fallback, masking the outage as an ordinary 422 validation
+        // failure with blanked-out `create_only` fields. It must surface as
+        // the normal error response instead.
+        let (status, body) = post_form(
+            form_test_app(),
+            "/widgets/999",
+            &[("name", "taken"), ("metadata", "{}")],
+        )
+        .await;
+
+        assert_ne!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a backend outage on the refetch must not be reported as a validation failure: {body}"
+        );
+        assert!(status.is_server_error(), "status: {status}, body: {body}");
+        assert!(body.contains("simulated outage"), "body: {body}");
     }
 
     #[tokio::test]
