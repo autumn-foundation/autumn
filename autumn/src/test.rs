@@ -3034,7 +3034,7 @@ impl TestClient {
         const MAX_SETTLE_YIELDS: usize = 10_000;
 
         let ledger = self.fault_ledger.as_ref().expect(
-            "no fault plan attached to this TestApp; call              `TestApp::with_fault_plan(..)` before `build()`",
+            "no fault plan attached to this TestApp; call `TestApp::with_fault_plan(..)` before `build()`",
         );
         // Fully-qualified: a `diesel_async::RunQueryDsl` glob import in this
         // module also offers a `.load(..)` method by that name.
