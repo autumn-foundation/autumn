@@ -125,6 +125,12 @@ INDENT = re.compile(r'^[ \t]*')
 # turning a non-fence into a column-zero fence and reopening the swallowed-
 # paragraph bug the indent bound above exists to prevent.
 BLOCKQUOTE = re.compile(r'^ {0,3}(?:>[ \t]?)+')
+
+
+def quote_depth(line):
+    """How many block-quote markers open this line (0 if it is not quoted)."""
+    m = BLOCKQUOTE.match(line)
+    return m.group(0).count(">") if m else 0
 # A Setext underline, and the paragraph line it may promote to a heading.
 SETEXT = re.compile(r'^ {0,3}(=+|-+)[ \t]*$')
 NOT_PARAGRAPH = re.compile(r'^(?: {0,3}[#>|]| {0,3}(?:[-*+=]|\d{1,9}[.)])[ \t]|\s*$|\s{4,})')
@@ -171,15 +177,16 @@ def strip_fences(text):
     underline, and deleting a fenced block would splice a paragraph onto a
     following `---` and invent a heading that is not there.
     """
-    out, opener, stack, quoted = [], None, [], False
+    out, opener, stack, quoted = [], None, [], 0
     for line in text.splitlines():
         base = stack[-1] if stack else 0
-        in_quote = bool(BLOCKQUOTE.match(line))
-        # A fenced block inside a block quote ends when the quote does, so an
-        # unclosed quoted fence must not blank the ordinary prose that follows
-        # it all the way to EOF.
-        if opener is not None and quoted and line.strip() and not in_quote:
-            opener, quoted = None, False
+        depth = quote_depth(line)
+        # A fenced block inside a block quote ends when that quote ends, so an
+        # unclosed quoted fence must not blank the prose that follows it all
+        # the way to EOF. Depth, not a boolean: a fence opened in `> > ` ends
+        # when the line dedents to `> `, even though both are still quoted.
+        if opener is not None and quoted and line.strip() and depth < quoted:
+            opener, quoted = None, 0
         # A fence inside a block quote (`> ```md`) is still a fence; the
         # corpus has 12 of them. Detection runs on the quote-stripped content
         # while the original line is what gets kept, so real links inside a
@@ -210,7 +217,7 @@ def strip_fences(text):
             # backtick, so ```md`invalid is not an opener — accepting it would
             # open scanner state and blank live links until EOF.
             if m and indent <= base + 3 and not (m.group(2)[0] == "`" and "`" in m.group(3)):
-                opener, quoted = m.group(2), in_quote
+                opener, quoted = m.group(2), depth
                 out.append("")
             else:
                 out.append(line)
@@ -379,7 +386,9 @@ for f in files:
             )
             continue
         if t.startswith("#"):
-            if t[1:] and t[1:].lower() not in anchors.get(f, ()):
+            # The fragment is URL-encoded too: `#caf%C3%A9` addresses `#café`.
+            frag = urllib.parse.unquote(t[1:])
+            if frag and frag.lower() not in anchors.get(f, ()):
                 defects.append(f"{f}: no such heading anchor in this page: `{t}`")
             continue
         path, _, anchor = t.partition("#")
@@ -400,6 +409,7 @@ for f in files:
             defects.append(f"{f}: link target does not exist: `{t}`")
             continue
         rel = os.path.relpath(resolved, root)
+        anchor = urllib.parse.unquote(anchor)
         if anchor and rel in anchors and anchor.lower() not in anchors[rel]:
             defects.append(f"{f}: no such heading anchor in {rel}: `{t}`")
 
@@ -739,6 +749,23 @@ self_test() {
   printf '\nSee [enc](a%%20b.md).\n' >> "$c40/docs/guide/mail.md"
   git -C "$c40" add -A && git -C "$c40" commit -qm percent-encoded
   check "percent-encoded destination resolves" pass "$c40"
+
+  # A fragment is URL-encoded like the rest of the link: `#caf%C3%A9` is a
+  # valid way to address `## Café`.
+  local c41="$tmp/c41"; make_corpus "$c41"
+  printf '\n## Caf\xc3\xa9\n' >> "$c41/docs/guide/jobs.md"
+  printf 'See [a](jobs.md#caf%%C3%%A9) and [b](#caf%%C3%%A9).\n' >> "$c41/docs/guide/mail.md"
+  printf '\n## Caf\xc3\xa9\n' >> "$c41/docs/guide/mail.md"
+  git -C "$c41" commit -qam encoded-fragment
+  check "percent-encoded heading fragment resolves" pass "$c41"
+
+  # A fence opened in a doubly-quoted context ends when the line dedents to
+  # the outer quote — both lines are quoted, so a boolean cannot see it.
+  local c42="$tmp/c42"; make_corpus "$c42"
+  printf '\n> > ~~~md\n> > sample\n>\n> Live [bad](missing.md) in the outer quote.\n' \
+    >> "$c42/docs/guide/mail.md"
+  git -C "$c42" commit -qam nested-quoted-fence
+  check "nested quoted fence ends when its quote depth drops" fail "$c42"
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]]
