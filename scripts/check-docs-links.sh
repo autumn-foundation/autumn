@@ -97,12 +97,18 @@ NESTED = re.compile(r'\[(?:' + FLAT + r'|\[' + FLAT + r'*\])*\]' + DEST)
 REFDEF = re.compile(r'^ {0,3}\[[^\]]+\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
 
 
+# Markdown drops the backslash from an escaped ASCII punctuation character in
+# a destination, so `guide\(v2\).md` addresses the file `guide(v2).md`.
+# Keeping the backslashes would reject a link that resolves for the reader.
+ESCAPED_PUNCT = re.compile(r'\\([!-/:-@\[-`{-~])')
+
+
 def link_targets(text):
-    """Yield every link destination once, angle brackets stripped."""
+    """Yield every link destination once, unescaped and angle brackets removed."""
     seen = set()
     for pattern in (INLINE, NESTED, REFDEF):
         for bracketed, bare in pattern.findall(text):
-            t = (bracketed or bare).strip()
+            t = ESCAPED_PUNCT.sub(r'\1', (bracketed or bare).strip())
             if t and t not in seen:
                 seen.add(t)
                 yield t
@@ -165,9 +171,15 @@ def strip_fences(text):
     underline, and deleting a fenced block would splice a paragraph onto a
     following `---` and invent a heading that is not there.
     """
-    out, opener, stack = [], None, []
+    out, opener, stack, quoted = [], None, [], False
     for line in text.splitlines():
         base = stack[-1] if stack else 0
+        in_quote = bool(BLOCKQUOTE.match(line))
+        # A fenced block inside a block quote ends when the quote does, so an
+        # unclosed quoted fence must not blank the ordinary prose that follows
+        # it all the way to EOF.
+        if opener is not None and quoted and line.strip() and not in_quote:
+            opener, quoted = None, False
         # A fence inside a block quote (`> ```md`) is still a fence; the
         # corpus has 12 of them. Detection runs on the quote-stripped content
         # while the original line is what gets kept, so real links inside a
@@ -194,8 +206,11 @@ def strip_fences(text):
                 while stack and dedent < stack[-1]:
                     stack.pop()
             base = stack[-1] if stack else 0
-            if m and indent <= base + 3:
-                opener = m.group(2)
+            # A backtick fence's info string may not itself contain a
+            # backtick, so ```md`invalid is not an opener — accepting it would
+            # open scanner state and blank live links until EOF.
+            if m and indent <= base + 3 and not (m.group(2)[0] == "`" and "`" in m.group(3)):
+                opener, quoted = m.group(2), in_quote
                 out.append("")
             else:
                 out.append(line)
@@ -288,12 +303,24 @@ for f in files:
     seen, found = collections.Counter(), set()
 
     def add(title):
+        """Record a heading's anchor, disambiguating exactly as GitHub does.
+
+        The suffix must land on an id nothing else claimed: headings `Foo`,
+        `Foo`, `Foo-1` become `foo`, `foo-1`, `foo-1-1`, because the third
+        one's own slug is already taken. Handing out `foo-1` twice would
+        report a valid link to the third heading as broken.
+        """
         s = slugify(title)
         if not s:
             return
-        n = seen[s]
-        seen[s] += 1
-        found.add(s if n == 0 else f"{s}-{n}")
+        if s not in found:
+            found.add(s)
+            return
+        n = max(seen[s], 1)
+        while f"{s}-{n}" in found:
+            n += 1
+        seen[s] = n + 1
+        found.add(f"{s}-{n}")
 
     for i in range(start, len(lines)):
         line = lines[i]
@@ -619,6 +646,35 @@ self_test() {
   printf '\n<!-- [draft](totally-made-up.md) -->\n' >> "$c31/docs/guide/mail.md"
   git -C "$c31" commit -qam html-comment
   check "link inside an HTML comment is ignored" pass "$c31"
+
+  # A backtick fence's info string may not contain a backtick, so this is not
+  # an opener and must not blank everything after it.
+  local c32="$tmp/c32"; make_corpus "$c32"
+  printf '\n```md`invalid\n\nLive [bad](missing.md) after.\n' >> "$c32/docs/guide/mail.md"
+  git -C "$c32" commit -qam backtick-in-info-string
+  check "backtick in a fence info string does not open a fence" fail "$c32"
+
+  # A fenced block inside a block quote ends when the quote does.
+  local c33="$tmp/c33"; make_corpus "$c33"
+  printf '\n> ```md\n> sample\n\nLive [bad](missing.md) after the quote.\n' \
+    >> "$c33/docs/guide/mail.md"
+  git -C "$c33" commit -qam quoted-fence-ends-with-quote
+  check "unclosed quoted fence does not swallow later prose" fail "$c33"
+
+  # Markdown drops the backslash from escaped punctuation in a destination.
+  local c34="$tmp/c34"; make_corpus "$c34"
+  printf 'x\n' > "$c34/docs/guide/guide(v2).md"
+  printf '\nSee [guide](guide\\(v2\\).md).\n' >> "$c34/docs/guide/mail.md"
+  git -C "$c34" add -A && git -C "$c34" commit -qm escaped-destination
+  check "escaped punctuation in a destination resolves" pass "$c34"
+
+  # GitHub's disambiguating suffix must land on an unclaimed id: headings
+  # Foo / Foo / Foo-1 become foo / foo-1 / foo-1-1.
+  local c35="$tmp/c35"; make_corpus "$c35"
+  printf '\n## Foo\n\n## Foo\n\n## Foo-1\n' >> "$c35/docs/guide/jobs.md"
+  printf 'See [third](jobs.md#foo-1-1).\n' >> "$c35/docs/guide/mail.md"
+  git -C "$c35" commit -qam slug-collision
+  check "duplicate-slug suffix does not collide with a real heading" pass "$c35"
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]]
