@@ -339,6 +339,16 @@ fn conformance(manifest: &SandboxManifest) -> ConformanceReport {
             api_version: None,
             status: None,
             sunset_opt_out: None,
+            // Inert at this site, and deliberately left so. The capacity
+            // contract (#1733) derives these from a handler's declared
+            // extractors at macro-expansion time; a sandboxed route has no
+            // such handler, `build_report` reads neither field, and neither is
+            // serialized — `ConformanceReport` carries only the checks. Giving
+            // them a computed-looking value here would publish a claim nothing
+            // derived and nothing reads. Empty matches every other
+            // `RouteInfo` built by hand in this crate.
+            pools: Vec::new(),
+            resource_shape: String::new(),
         })
         .collect();
 
