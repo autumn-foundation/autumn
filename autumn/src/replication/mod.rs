@@ -21,17 +21,20 @@
 //!
 //! # Reading order
 //!
-//! * [`wal`] — `SQLite`'s WAL format: header, frame checksum chain, commit
-//!   boundaries. The byte-level truth everything else depends on.
-//! * [`segment`] — the destination's object namespace and the self-describing
-//!   segment payload.
-//! * [`destination`] — the object-store seam, plus the filesystem
-//!   implementation; [`s3`] is the S3-compatible one.
-//! * [`engine`] — the replication loop and the checkpoint interlock that makes
-//!   it safe.
-//! * [`restore`] — point-in-time restore, and the verification that refuses a
-//!   replica rather than handing `SQLite` a damaged WAL.
-//! * [`status`] — what the operator sees: lag, generation, verification, errors.
+//! * [`wal`](crate::replication::wal) — `SQLite`'s WAL format: header, frame
+//!   checksum chain, commit boundaries. The byte-level truth everything else
+//!   depends on.
+//! * [`segment`](crate::replication::segment) — the destination's object
+//!   namespace and the self-describing segment payload.
+//! * [`destination`](crate::replication::destination) — the object-store seam,
+//!   plus the filesystem implementation; `s3` is the S3-compatible one.
+//! * [`engine`](crate::replication::engine) — the replication loop and the
+//!   checkpoint interlock that makes it safe.
+//! * [`restore`](crate::replication::restore) — point-in-time restore, and the
+//!   verification that refuses a replica rather than handing `SQLite` a damaged
+//!   WAL.
+//! * [`status`](crate::replication::status) — what the operator sees: lag,
+//!   generation, verification, errors.
 //!
 //! # What this is not
 //!
@@ -292,7 +295,7 @@ fn credential_from_env(var: Option<&String>, field: &str) -> Result<String, Setu
 /// Build the destination named by `config`.
 ///
 /// Must be called from a blocking thread: the S3 destination uses a blocking
-/// HTTP client (see [`s3`]).
+/// HTTP client (see the `s3` module).
 ///
 /// # Errors
 ///

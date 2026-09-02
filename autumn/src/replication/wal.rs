@@ -310,10 +310,7 @@ pub fn scan_from(
     let mut last_commit_cursor = *cursor;
     let mut rest = bytes;
 
-    loop {
-        let Some(frame) = rest.get(..frame_len) else {
-            break;
-        };
+    while let Some(frame) = rest.get(..frame_len) {
         let (Some(pgno), Some(truncate), Some(salt1), Some(salt2), Some(c1), Some(c2)) = (
             be_u32(frame, 0),
             be_u32(frame, 4),
@@ -373,7 +370,7 @@ pub fn scan_from(
 /// partial block is ignored, matching the callers' fixed-size inputs.
 fn checksum_bytes(big_endian: bool, data: &[u8], seed: (u32, u32)) -> (u32, u32) {
     let (mut s1, mut s2) = seed;
-    for block in data.chunks_exact(8) {
+    for block in data.as_chunks::<8>().0 {
         let Some((first, rest)) = block.split_first_chunk::<4>() else {
             continue;
         };

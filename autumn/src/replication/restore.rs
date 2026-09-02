@@ -339,7 +339,7 @@ pub fn plan(
         .filter_map(|key| segment::parse_segment_key(&key).map(|r| (r, key)))
         .collect();
     // `SegmentRef` orders by (index, seq) — replication order.
-    refs.sort_by(|a, b| a.0.cmp(&b.0));
+    refs.sort_by_key(|entry| entry.0);
 
     let mut segments = Vec::new();
     // `None` until the first segment is seen, so a replica whose entire index 0
