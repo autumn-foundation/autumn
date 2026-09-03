@@ -1469,6 +1469,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A sandboxed plugin can no longer abort the application at boot:** the
+  duplicate-route preflight skips `nest` mounts because axum exposes no way to
+  enumerate a nested router — but a sandboxed plugin's manifest *is* its route
+  table, and `Router::nest` panics with `Overlapping method route` when a
+  declared path is one the host already serves. An untrusted artifact declaring
+  a plausible prefix (`/admin`, `/status`, `/api`) could therefore take down
+  every route in the application, not just its own — containment failing open
+  for exactly the input class the sandbox lane exists to distrust. Routes
+  declared via `AppBuilder::declare_plugin_routes` are now checked against the
+  application's own routes through the same `matchit` oracle axum routes
+  through, so a collision — exact path, shape clash (`/hello/{id}` against a
+  declared `/hello/{slug}`), or catch-all — is a `RouterBuildError` naming the
+  plugin and the contested path, raised before anything mounts. Paths that axum
+  accepts (disjoint siblings under a shared prefix, a route *at* the prefix, a
+  GET and its implied HEAD) are unaffected. `TestApp` carries these
+  declarations too, so a colliding plugin fails in tests rather than only in
+  production. Framework-mounted paths (probes, actuator, htmx assets, mail
+  previews, the story gallery, the tracked-job status route) are covered as
+  well: they are mounted outside the user route list, so a manifest declaring
+  `GET /health` would otherwise still have panicked. A framework path is
+  *refused* rather than yielded — a user route at a probe path legitimately
+  takes it over, but silently handing an unaudited artifact the endpoint
+  orchestrators read to decide whether the process is alive is worse than a
+  loud refusal. Only `GET` is refused there, because only `GET` clashes; a
+  declared `HEAD` or `POST` merges into the same `MethodRouter` cleanly. The
+  framework namespaces `/static` and `/_autumn` are reserved wholesale, for
+  every method: paths under them are not enumerable route-by-route (`ServeDir`
+  serves whatever is on disk), and a declared sub-path there does not even
+  panic — it mounts and *shadows* the framework, so an artifact declaring
+  `/static/app.js` would serve script from the host's own origin. Matching is
+  on segment boundaries, so `/staticky` is unaffected. Probe paths are claimed
+  only when `health.enabled`, matching the mount, so a plugin is never refused
+  over a collision that cannot happen. Framework paths are compared through the
+  same matchit oracle as user routes, not by string equality, so a framework
+  template carrying a capture (`/_stories/{slug}`, or an operator-configured
+  probe or actuator path) is not an exact-string miss and a startup panic. The
+  dev inspector's detail route (`{inspector_path}/requests/{id}`) is claimed
+  alongside its index — both now derive from `inspector_endpoint_paths`, so the
+  claim set cannot drift from what the router actually mounts.
 - **Punctuation- and emoji-only titles no longer slip past the validator that
   exists to stop them (#2424):** `examples/reddit-clone` rejects a post title
   like `***`, `!!!???...:::` or `🎉🔥💯` with "Title must contain at least one
@@ -1918,6 +1957,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     on `/actuator/prometheus` and under `/actuator/metrics`' `app` key with no
     database, and the Chromium smoke asserts the timer end-to-end against the
     real binary.
+
+- **Capability-sandboxed plugins — install an unaudited plugin without
+  installing its authority (#1609):** every Autumn plugin until now has been
+  full-trust native code. `Plugin::build(self, app)` hands over the entire
+  `AppBuilder`, which is the right trade for a first-party crate and the wrong
+  one for something found on crates.io ten minutes ago — a compromised
+  `autumn-plugin-*` can read your credentials, exfiltrate your database, or take
+  the process down, and dependency auditing catches only the vulnerabilities
+  someone has already named. The new non-default `plugin-sandbox` feature adds
+  the other lane. A sandboxed plugin ships as a `.autumn-plugin` artifact — a
+  `wasm32-wasip1` module plus a manifest declaring its route prefix, the exact
+  `(method, path)` pairs it mounts, its capabilities, and its per-request CPU
+  and memory ceilings — and the runtime enforces every word of it, refusing at load anything it cannot
+  fully understand — including a route path `axum::Router::route` would panic on,
+  which is validated through the same `matchit` engine axum routes through so a
+  manifest can never take the application down at boot.
+  Deny-by-default is structural rather than configured: the guest's whole
+  authority is the host-function table the shim registers, so filesystem,
+  network, environment and database access are not "off" but absent, each
+  attempt answered with `ENOTCAPABLE`/`EBADF` and recorded as a logged denial,
+  and an
+  import no host function defines is refused at load before the artifact runs
+  once. The manifest is the mount, not a description of it: the router is built
+  from its declared routes, so an undeclared path under the prefix is a 404 the
+  guest never sees. Fuel bounds CPU and a store limiter bounds memory, both
+  per request against a fresh instance, and the interpreter runs on a blocking
+  worker — so a spin, a memory bomb, a trap, a `proc_exit`, a malformed answer
+  or no answer at all is a 502/503/504 on the plugin's own prefix while every
+  other route keeps serving, and nothing a plugin does can abort the host
+  process. Credentials are stripped from the request before it crosses, and
+  `Set-Cookie`, framing headers and anything carrying `\r\n` are stripped or
+  refused on the way back, so a plugin cannot forge a session in your origin or
+  split your response. `autumn plugin package` binds a manifest to a module and
+  stamps the digest the author could not know; `autumn plugin inspect` is the
+  consent screen — the grant, the routes, the reviewed digest, every host
+  function imported, the classes of authority denied — and it loads the module
+  into the same sandbox the runtime uses and runs the existing route
+  conformance checks over the manifest, offline. The app still deploys as one
+  binary: `wasmi` is a pure-Rust interpreter, so there is no daemon, no
+  subprocess and no native codegen backend. Purely additive — the native
+  `Plugin` trait and every existing plugin are untouched, and the feature is not
+  in `autumn-web`'s default set. The declared budgets bound the host's own
+  work as well as the guest's: instantiating the module and encoding the request
+  frame are both charged against `fuel` before they are performed, and anything
+  the guest influenced — its error detail, its stderr, the interpreter's account
+  of a trap — is truncated and control-escaped before it is logged, so a plugin
+  cannot flood an operator's log or forge a record in it. First slice: request
+  handling under the declared prefix is the only capability that exists, so no
+  manifest can ask for a database, a session or an outbound call. See
+  `docs/guide/sandboxed-plugins.md`.
 
 - **UI/routing documentation and the flagship example that proves it (#2320):**
   the 0.7.0 docs audit found the UI/Routing block carrying the longest-standing
