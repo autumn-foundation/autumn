@@ -114,17 +114,21 @@ impl Route53Provider {
             }
             return Ok(id.to_owned());
         }
-        let candidates = zone_candidates(fqdn);
-        for candidate in &candidates {
-            if let Some(cached) = self
-                .zone_ids
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(candidate)
-            {
-                return Ok(cached.clone());
-            }
+        // Keyed on the whole challenge name, not on the suffix that turned out
+        // to be its zone. A suffix-keyed cache scanned across candidates hands
+        // back a cached PARENT before the more specific child has ever been
+        // queried, so once one order resolved `example.com`, a later name in the
+        // separately delegated `sub.example.com` would be written into the
+        // parent zone, where nothing is authoritative for it (issue #1620).
+        if let Some(cached) = self
+            .zone_ids
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(fqdn)
+        {
+            return Ok(cached.clone());
         }
+        let candidates = zone_candidates(fqdn);
         for candidate in &candidates {
             let body = self
                 .send(
@@ -145,7 +149,7 @@ impl Route53Provider {
                 self.zone_ids
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(candidate.clone(), id.clone());
+                    .insert(fqdn.to_owned(), id.clone());
                 return Ok(id);
             }
         }
@@ -760,6 +764,52 @@ mod tests {
             credentials(),
             transport as std::sync::Arc<dyn HttpTransport>,
         )
+    }
+
+    /// Regression (#1620): a cached PARENT hosted zone must not shadow a
+    /// separately delegated child — the same defect the Cloudflare provider had.
+    ///
+    /// The cache was keyed on the suffix that turned out to be the zone and read
+    /// by scanning every candidate, so once one order resolved `example.com`, a
+    /// later name in the delegated `sub.example.com` matched the cached parent
+    /// before the child was ever queried. The record then landed in the parent
+    /// zone, where nothing answers for it.
+    #[tokio::test]
+    async fn a_cached_parent_zone_does_not_shadow_a_delegated_child() {
+        fn zone(id: &str, name: &str) -> String {
+            format!(
+                "<ListHostedZonesByNameResponse><HostedZones>\
+                 <HostedZone><Id>/hostedzone/{id}</Id><Name>{name}.</Name>\
+                 <Config><PrivateZone>false</PrivateZone></Config></HostedZone>\
+                 </HostedZones></ListHostedZonesByNameResponse>"
+            )
+        }
+
+        let transport = RecordingTransport::new(&[(ZONE_LOOKUP, &zone("ZPARENT", "example.com"))])
+            .then(ZONE_LOOKUP, 200, &zone("ZCHILD", "sub.example.com"));
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        assert_eq!(
+            provider
+                .zone_id("_acme-challenge.example.com")
+                .await
+                .expect("the parent zone resolves"),
+            "ZPARENT"
+        );
+        assert_eq!(
+            provider
+                .zone_id("_acme-challenge.sub.example.com")
+                .await
+                .expect("the child zone resolves"),
+            "ZCHILD",
+            "a cached parent must not be returned for a name in a delegated child zone"
+        );
+
+        let asked: Vec<String> = transport.sent().iter().map(|r| r.url.clone()).collect();
+        assert!(
+            asked.iter().any(|u| u.contains("dnsname=sub.example.com.")),
+            "the more specific candidate must be queried before any cached suffix: {asked:?}"
+        );
     }
 
     /// Route 53 replaces a whole record set rather than adding to it, so the

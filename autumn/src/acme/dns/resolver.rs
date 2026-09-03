@@ -742,21 +742,34 @@ impl ProbeTargets {
         }
     }
 
-    /// Probe `servers` for `fqdn`, replacing any previous entry for it.
-    pub fn set(&mut self, fqdn: &str, servers: Vec<SocketAddr>) {
+    /// Probe `servers` — the zone's own authoritative nameservers — for `fqdn`,
+    /// replacing any previous entry for it.
+    pub fn set_authoritative(&mut self, fqdn: &str, servers: Vec<SocketAddr>) {
         match self.per_name.iter_mut().find(|(name, _)| name == fqdn) {
             Some((_, existing)) => *existing = servers,
             None => self.per_name.push((fqdn.to_owned(), servers)),
         }
     }
 
-    /// The servers to probe for `fqdn`: its own, else the fallback.
+    /// The servers to probe for `fqdn`, and whether they are authoritative for
+    /// it.
+    ///
+    /// The flag decides the query's recursion-desired bit, and getting it wrong
+    /// breaks the probe in one direction or the other. An authoritative server
+    /// answers for its own zone with RD=0, which is what this wants: it reads
+    /// the zone directly and cannot plant a negative cache entry. A *recursive*
+    /// resolver asked with RD=0 answers only from cache — so a fallback probe
+    /// with RD=0 gets an empty answer or `REFUSED` for a name nothing has looked
+    /// up yet, forever, and a correctly published record never appears
+    /// (issue #1620).
     #[must_use]
-    pub fn for_name(&self, fqdn: &str) -> &[SocketAddr] {
+    pub fn for_name(&self, fqdn: &str) -> (&[SocketAddr], bool) {
         self.per_name
             .iter()
             .find(|(name, _)| name == fqdn)
-            .map_or(self.fallback.as_slice(), |(_, servers)| servers.as_slice())
+            .map_or((self.fallback.as_slice(), false), |(_, servers)| {
+                (servers.as_slice(), true)
+            })
     }
 }
 
@@ -783,7 +796,7 @@ pub async fn wait_for_propagation(
     // server is possible while another has several.
     if let Some((fqdn, _)) = wanted
         .iter()
-        .find(|(fqdn, _)| targets.for_name(fqdn).is_empty())
+        .find(|(fqdn, _)| targets.for_name(fqdn).0.is_empty())
     {
         return Err(format!(
             "no nameserver to probe for {fqdn}, so DNS-01 propagation cannot be confirmed: \
@@ -798,29 +811,33 @@ pub async fn wait_for_propagation(
     loop {
         let mut all_visible = true;
         'round: for (fqdn, expected) in &wanted {
-            for resolver in targets.for_name(fqdn) {
-                // Recursion is deliberately NOT desired: `resolvers` here are
-                // the zone's authoritative servers whenever discovery succeeded,
-                // and they answer for the name directly. A recursive resolver
-                // used as a fallback answers a non-recursive query from its
-                // cache, which is the same thing this probe wants to read.
-                let (missing, observed) =
-                    match lookup.query(*resolver, fqdn, QTYPE_TXT, false).await {
-                        Ok(answer) => {
-                            let values = answer.txt_values(fqdn);
-                            let missing = missing_values(expected, &values);
-                            let observed = if answer.rcode == 3 {
-                                "the name does not exist there yet".to_owned()
-                            } else {
-                                format!("it currently returns {} TXT value(s)", values.len())
-                            };
-                            (missing, observed)
-                        }
-                        // A resolver error is a not-yet, not a hard failure: a
-                        // freshly-created name often SERVFAILs while the zone
-                        // catches up. It is recorded so the timeout can report it.
-                        Err(e) => (expected.clone(), e),
-                    };
+            let (servers, authoritative) = targets.for_name(fqdn);
+            for resolver in servers {
+                // Recursion is desired only on the FALLBACK path. An
+                // authoritative server answers for its own zone without it, and
+                // asking it to recurse is meaningless. A recursive resolver
+                // asked with RD=0 answers purely from cache, so a name it has
+                // never looked up comes back empty or REFUSED no matter how
+                // long the wait runs — the fallback must ask it to resolve.
+                let (missing, observed) = match lookup
+                    .query(*resolver, fqdn, QTYPE_TXT, !authoritative)
+                    .await
+                {
+                    Ok(answer) => {
+                        let values = answer.txt_values(fqdn);
+                        let missing = missing_values(expected, &values);
+                        let observed = if answer.rcode == 3 {
+                            "the name does not exist there yet".to_owned()
+                        } else {
+                            format!("it currently returns {} TXT value(s)", values.len())
+                        };
+                        (missing, observed)
+                    }
+                    // A resolver error is a not-yet, not a hard failure: a
+                    // freshly-created name often SERVFAILs while the zone
+                    // catches up. It is recorded so the timeout can report it.
+                    Err(e) => (expected.clone(), e),
+                };
                 if !missing.is_empty() {
                     last_gap = Some(PropagationTimeout {
                         fqdn: fqdn.clone(),
@@ -1608,6 +1625,82 @@ mod tests {
         .await
         .expect_err("times out");
         assert!(err.contains("SERVFAIL"), "got: {err}");
+    }
+
+    /// Regression (#1620): the recursion-desired bit must follow whether the
+    /// probed server is authoritative for the name.
+    ///
+    /// An authoritative server is asked with RD=0 — it reads its own zone, and a
+    /// non-recursive query cannot plant a negative cache entry. The *fallback*
+    /// path probes public recursive resolvers, and RD=0 there means "answer from
+    /// cache only": a `_acme-challenge` name nothing has ever looked up is not
+    /// in any cache, so the resolver returns an empty answer or REFUSED however
+    /// long the wait runs. That is the whole fallback path failing closed on a
+    /// correctly published record — including the IPv6-only authoritative set,
+    /// where discovery finds no A records and the fallback is all there is.
+    #[tokio::test]
+    async fn recursion_is_desired_only_when_probing_the_fallback_resolvers() {
+        struct RecordingLookup {
+            asked: Mutex<Vec<(SocketAddr, bool)>>,
+        }
+
+        impl DnsLookup for RecordingLookup {
+            fn query<'a>(
+                &'a self,
+                server: SocketAddr,
+                name: &'a str,
+                _qtype: u16,
+                recursion_desired: bool,
+            ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+                self.asked.lock().unwrap().push((server, recursion_desired));
+                let name = normalize_name(name);
+                Box::pin(async move {
+                    Ok(DnsAnswer {
+                        rcode: 0,
+                        records: vec![ResourceRecord {
+                            name,
+                            rtype: QTYPE_TXT,
+                            rdata: Rdata::Txt("v".to_owned()),
+                        }],
+                    })
+                })
+            }
+        }
+
+        let authoritative = resolver(53);
+        let recursive = resolver(5353);
+        let lookup = Arc::new(RecordingLookup {
+            asked: Mutex::new(Vec::new()),
+        });
+
+        // `myapp.com` has discovered authoritative servers; `other.com` did not,
+        // so it falls back to the configured recursive resolver.
+        let mut targets = ProbeTargets::flat(&[recursive]);
+        targets.set_authoritative("_acme-challenge.myapp.com", vec![authoritative]);
+
+        wait_for_propagation(
+            &[
+                TxtRecord::new("myapp.com", "v"),
+                TxtRecord::new("other.com", "v"),
+            ],
+            &targets,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+            lookup.as_ref(),
+        )
+        .await
+        .expect("both names are visible");
+
+        let asked = lookup.asked.lock().unwrap().clone();
+        assert!(
+            asked.contains(&(authoritative, false)),
+            "an authoritative server must be asked with RD=0: {asked:?}"
+        );
+        assert!(
+            asked.contains(&(recursive, true)),
+            "a fallback recursive resolver must be asked with RD=1, or it answers only from a \
+             cache that cannot hold a name nothing has looked up: {asked:?}"
+        );
     }
 
     #[tokio::test]

@@ -880,7 +880,7 @@ impl AcmeRenewalTask {
                 servers = authoritative.len(),
                 "probing the DNS-01 challenge zone's authoritative nameservers"
             );
-            targets.set(&record.fqdn, authoritative);
+            targets.set_authoritative(&record.fqdn, authoritative);
         }
         targets
     }
@@ -1324,12 +1324,12 @@ mod tests {
 
         assert_eq!(
             targets.for_name("_acme-challenge.myapp.com"),
-            [ns_a],
-            "the .com name must be probed at its own zone's nameserver"
+            ([ns_a].as_slice(), true),
+            "the .com name must be probed at its own zone's nameserver, authoritatively"
         );
         assert_eq!(
             targets.for_name("_acme-challenge.myapp.io"),
-            [ns_b],
+            ([ns_b].as_slice(), true),
             "the .io name must NOT inherit the first zone's nameserver — it is not \
              authoritative for .io and can only ever answer a referral"
         );
@@ -1403,13 +1403,14 @@ mod tests {
 
         assert_eq!(
             targets.for_name("_acme-challenge.myapp.com"),
-            [SocketAddr::from(([10, 0, 0, 1], 53))],
+            ([SocketAddr::from(([10, 0, 0, 1], 53))].as_slice(), true),
             "the discoverable zone keeps its authoritative servers"
         );
         assert_eq!(
             targets.for_name("_acme-challenge.myapp.io"),
-            [recursive],
-            "the undiscoverable zone falls back to the configured resolvers"
+            ([recursive].as_slice(), false),
+            "the undiscoverable zone falls back to the configured resolvers — and is \
+             marked non-authoritative, so its probe asks them to actually resolve"
         );
     }
 

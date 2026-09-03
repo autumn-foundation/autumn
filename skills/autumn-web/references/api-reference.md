@@ -1551,11 +1551,17 @@ provider = "cloudflare"
   public DNS; each entry an IP or `IP:port`, hostnames rejected). The resolvers
   DISCOVER the zone's authoritative nameservers; the propagation probe goes to
   those, because a recursive resolver caches a negative answer for longer than
-  the budget.
+  the budget. Discovery runs per distinct challenge name, so a multi-domain
+  order probes each zone through its own servers. Authoritative probes are sent
+  with recursion NOT desired; the fallback to the configured resolvers sets it,
+  since a recursive resolver asked without it answers from cache only.
 - `command` — the `exec` hook's argv array, run without a shell as
-  `hook -- present|cleanup <fqdn> <value>`. Required for `exec`, rejected for
-  the others. This is the escape hatch for any provider not listed (RFC 2136 via
-  `nsupdate`, a registrar CLI, a webhook shim).
+  `hook present|cleanup <fqdn> <value>` (exactly three appended arguments, no
+  `--` marker, so `$1` is the action). Required for `exec`, rejected for the
+  others. This is the escape hatch for any provider not listed (RFC 2136 via
+  `nsupdate`, a registrar CLI, a webhook shim). The hook's `stderr` is read
+  through a bounded buffer and scrubbed of credential-shaped environment values
+  before it reaches a log, an alert, or `/actuator/health`.
 - Under DNS-01 the CA never connects to this host, so a failure to bind
   `http_challenge_port` is a warning rather than a fatal error — the listener is
   then only the HTTP→HTTPS redirect.

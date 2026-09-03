@@ -67,18 +67,26 @@ impl CloudflareProvider {
     }
 
     /// Resolve the Cloudflare zone id that owns `fqdn`.
+    ///
+    /// The cache is keyed on the whole challenge name, not on the suffix that
+    /// turned out to be its zone. Keying it on the suffix looked equivalent and
+    /// is not: a scan of every candidate against a suffix-keyed cache returns a
+    /// cached PARENT before the more specific child has ever been queried. Once
+    /// one order resolved `example.com`, a later name in the separately
+    /// delegated `sub.example.com` would resolve to the parent zone, and the
+    /// challenge would be written where nothing is authoritative for it — a
+    /// record that exists, answers nowhere, and times out every renewal
+    /// (issue #1620).
     async fn zone_id(&self, fqdn: &str) -> Result<String, String> {
-        let candidates = zone_candidates(fqdn);
-        for candidate in &candidates {
-            if let Some(cached) = self
-                .zone_ids
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(candidate)
-            {
-                return Ok(cached.clone());
-            }
+        if let Some(cached) = self
+            .zone_ids
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(fqdn)
+        {
+            return Ok(cached.clone());
         }
+        let candidates = zone_candidates(fqdn);
         for candidate in &candidates {
             let body = self
                 .send(
@@ -96,7 +104,7 @@ impl CloudflareProvider {
                 self.zone_ids
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(candidate.clone(), id.clone());
+                    .insert(fqdn.to_owned(), id.clone());
                 return Ok(id);
             }
         }
@@ -316,6 +324,85 @@ mod tests {
             SecretString::new("cf-test-token"),
             transport as std::sync::Arc<dyn HttpTransport>,
         )
+    }
+
+    /// Regression (#1620): a cached PARENT zone must not shadow a separately
+    /// delegated child.
+    ///
+    /// The cache used to be keyed on the suffix that turned out to be the zone,
+    /// and looked up by scanning every candidate. Once any order resolved
+    /// `example.com`, a later name in `sub.example.com` — a real zone of its own,
+    /// delegated away — matched the cached parent on the second candidate and
+    /// returned it without ever asking Cloudflare about the child. The challenge
+    /// then went into the parent zone, which is not authoritative for the name:
+    /// the record exists, answers nowhere, and every renewal times out.
+    #[tokio::test]
+    async fn a_cached_parent_zone_does_not_shadow_a_delegated_child() {
+        // Two zone lookups, in the order a correct implementation makes them:
+        // `example.com` for the first name, then `sub.example.com` for the
+        // second — NOT the cached parent.
+        let transport = RecordingTransport::new(&[(
+            ZONE_LOOKUP,
+            r#"{"success":true,"errors":[],"result":[{"id":"zone-parent","name":"example.com"}]}"#,
+        )])
+        .then(
+            ZONE_LOOKUP,
+            200,
+            r#"{"success":true,"errors":[],"result":[{"id":"zone-child","name":"sub.example.com"}]}"#,
+        );
+        let provider = provider(std::sync::Arc::clone(&transport));
+
+        // First order populates the cache with the parent zone.
+        assert_eq!(
+            provider
+                .zone_id("_acme-challenge.example.com")
+                .await
+                .expect("the parent zone resolves"),
+            "zone-parent"
+        );
+
+        // A later name in the delegated child must resolve to the CHILD zone.
+        assert_eq!(
+            provider
+                .zone_id("_acme-challenge.sub.example.com")
+                .await
+                .expect("the child zone resolves"),
+            "zone-child",
+            "a cached parent must not be returned for a name in a delegated child zone"
+        );
+
+        // …and it must have actually asked, most-specific candidate first.
+        let asked: Vec<String> = transport.sent().iter().map(|r| r.url.clone()).collect();
+        assert!(
+            asked.iter().any(|u| u.contains("name=sub.example.com")),
+            "the more specific candidate must be queried before any cached suffix: {asked:?}"
+        );
+    }
+
+    /// The cache still does its job: resolving the same name twice asks once.
+    #[tokio::test]
+    async fn a_repeated_name_is_served_from_the_zone_cache() {
+        let transport = RecordingTransport::new(&[(ZONE_LOOKUP, zone_hit())]);
+        let provider = provider(std::sync::Arc::clone(&transport));
+
+        for _ in 0..3 {
+            assert_eq!(
+                provider
+                    .zone_id("_acme-challenge.myapp.com")
+                    .await
+                    .expect("resolves"),
+                "zone123"
+            );
+        }
+        assert_eq!(
+            transport
+                .calls()
+                .iter()
+                .filter(|c| c.as_str() == ZONE_LOOKUP)
+                .count(),
+            1,
+            "the zone lookup must be cached per challenge name"
+        );
     }
 
     /// The behaviour the apex+wildcard case depends on: publishing a SECOND

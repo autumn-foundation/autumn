@@ -564,10 +564,28 @@ $ /usr/local/bin/acme-dns-hook present _acme-challenge.myapp.com <txt-value>
 $ /usr/local/bin/acme-dns-hook cleanup _acme-challenge.myapp.com <txt-value>
 ```
 
+Exactly those three arguments are appended — no `--` marker, so `$1` is the
+action. (A hook that forwards `"$@"` on to another CLI should insert its own
+`--` there, since a challenge value is base64url and starts with `-` about once
+in sixty-four.)
+
 Exit `0` means the record was written (or removed); anything else fails the
 order, with the hook's `stderr` quoted in the message. `command` is an **argv
 array** run without a shell, so the record value is never interpreted as shell
-syntax. A hook that has not finished within 120 seconds is killed.
+syntax. A hook that has not finished within 120 seconds is killed, and its
+output is read through a bounded buffer, so a hook that never stops writing
+cannot grow the server.
+
+**Credentials.** The hook inherits autumn's environment — that is how an
+`nsupdate` or vendor-CLI hook is expected to authenticate, and autumn passes it
+no secret of its own. Because that `stderr` is published (in logs, in the
+operator alert, on `/actuator/health`), autumn scrubs it: every value the
+environment holds under a credential-shaped name (`*TOKEN*`, `*SECRET*`,
+`*KEY*`, `*PASSWORD*`, `*CREDENTIAL*`, `*AUTH*`) is replaced with `<redacted>`,
+as are the DNS credentials autumn itself holds. That is a backstop, not a
+guarantee — a credential in a variable named something like `MY_THING` is not
+recognisable as one — so a hook still should not trace its own secrets to
+`stderr`.
 
 An RFC 2136 hook is a five-line script:
 

@@ -12,22 +12,26 @@
 //! command = ["/usr/local/bin/acme-dns-hook"]
 //! ```
 //!
-//! Autumn runs `command` with three appended arguments:
+//! Autumn runs `command` with exactly three appended arguments:
 //!
 //! ```text
-//! /usr/local/bin/acme-dns-hook -- present _acme-challenge.myapp.com <txt-value>
-//! /usr/local/bin/acme-dns-hook -- cleanup _acme-challenge.myapp.com <txt-value>
+//! /usr/local/bin/acme-dns-hook present _acme-challenge.myapp.com <txt-value>
+//! /usr/local/bin/acme-dns-hook cleanup _acme-challenge.myapp.com <txt-value>
 //! ```
 //!
-//! The `--` is an end-of-options marker, and it is not optional: the TXT value
-//! is base64url, whose alphabet includes `-`, so roughly one challenge in
-//! sixty-four starts with one. Without the marker a hook using `getopts` — or
-//! one that forwards `"$@"` to a CLI — would read the value as an option
-//! cluster.
+//! No end-of-options `--` marker is inserted, because the action is always the
+//! first appended argument and is always the literal `present` or `cleanup`:
+//! `getopts` and every conventional argument parser stop at it, so the record
+//! value that follows can never be read as an option however it starts. Adding
+//! a marker would only shift every argument by one for the shell script that
+//! most hooks actually are — `[ "$1" = present ]` would silently be false on
+//! every publish. A hook that forwards `"$@"` on to another CLI should insert
+//! its own `--` there.
 //!
 //! A zero exit status means the record was written (or removed); any other
 //! status fails the order, with the hook's `stderr` carried into the message so
-//! the operator sees what their own tool said.
+//! the operator sees what their own tool said. That `stderr` is read through a
+//! bounded buffer and scrubbed of credentials before it is published.
 //!
 //! # No shell
 //!
@@ -45,6 +49,39 @@ use super::{DnsProvider, TxtRecord, sanitize_upstream};
 /// hangs must not park the renewal loop.
 const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How much of a hook's `stderr` is kept.
+///
+/// Only [`UPSTREAM_EXCERPT_CHARS`](super::UPSTREAM_EXCERPT_CHARS) of it is ever
+/// published, so this is generous — but it is a hard bound, because a hook stuck
+/// in a `yes`-style loop would otherwise grow this process's memory without
+/// limit: the 120s timeout caps how *long* a hook runs, not how much it writes.
+/// Bytes past the cap are read and discarded rather than left in the pipe, so a
+/// runaway hook still runs to its timeout instead of blocking on a full buffer.
+const MAX_STDERR_BYTES: usize = 8 * 1024;
+
+/// Substrings that mark an environment variable's *value* as a credential.
+///
+/// An `exec` hook authenticates itself from the inherited environment — that is
+/// the documented way to reach a provider autumn does not ship, and it means
+/// autumn cannot know the hook's credentials the way it knows its own. What it
+/// can do is refuse to republish anything the environment holds under a
+/// credential-shaped name. Matched case-insensitively as a substring, so
+/// `HETZNER_API_TOKEN`, `AWS_SECRET_ACCESS_KEY` and `tsig_password` all match.
+const SECRET_ENV_MARKERS: [&str; 7] = [
+    "TOKEN",
+    "SECRET",
+    "KEY",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "AUTH",
+];
+
+/// Environment values shorter than this are not scrubbed: they collide with
+/// ordinary words often enough to turn a diagnostic into noise, and a real API
+/// credential is never this short.
+const MIN_REDACTABLE_ENV_VALUE: usize = 8;
+
 /// The `exec` [`DnsProvider`].
 pub struct ExecProvider {
     command: Vec<String>,
@@ -52,6 +89,11 @@ pub struct ExecProvider {
     /// it is published. The hook inherits the process environment, so it can
     /// echo them even though autumn passes it none.
     secrets: Vec<super::SecretString>,
+    /// Where [`Self::secrets`] looks for *inherited* credentials. `None` reads
+    /// this process's real environment; tests inject pairs instead, because
+    /// mutating the process environment is `unsafe` (this crate forbids it) and
+    /// would race every other test in the binary.
+    env_override: Option<Vec<(String, String)>>,
 }
 
 impl ExecProvider {
@@ -61,6 +103,7 @@ impl ExecProvider {
         Self {
             command,
             secrets: Vec::new(),
+            env_override: None,
         }
     }
 
@@ -71,10 +114,29 @@ impl ExecProvider {
         self
     }
 
-    fn secrets(&self) -> Vec<&str> {
+    /// Read inherited credentials from `vars` instead of the process
+    /// environment. Test seam only.
+    #[cfg(test)]
+    fn with_env(mut self, vars: Vec<(String, String)>) -> Self {
+        self.env_override = Some(vars);
+        self
+    }
+
+    /// Every value that must not survive into a published error message: the
+    /// credentials autumn itself handed the provider, plus whatever the
+    /// inherited environment holds under a credential-shaped name.
+    fn secrets(&self) -> Vec<String> {
+        let inherited = match &self.env_override {
+            Some(vars) => secret_env_values(vars.iter().map(|(k, v)| (k.as_str(), v.as_str()))),
+            None => {
+                let vars: Vec<(String, String)> = std::env::vars().collect();
+                secret_env_values(vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            }
+        };
         self.secrets
             .iter()
-            .map(super::SecretString::expose)
+            .map(|s| super::SecretString::expose(s).to_owned())
+            .chain(inherited)
             .collect()
     }
 
@@ -86,51 +148,126 @@ impl ExecProvider {
 
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(leading)
-            // A `--` end-of-options marker before the three appended arguments.
-            // The TXT value is base64url, whose alphabet includes `-`, so it
-            // starts with one for roughly 1 in 64 challenges — and a hook using
-            // `getopts` (or forwarding `"$@"` to a CLI) would read that as an
-            // option cluster and write the wrong record. Documented in the guide
-            // so hook authors know to expect it.
-            .arg("--")
+            // Exactly the three documented arguments, with no end-of-options
+            // marker: the action is always first and always a bare literal, so
+            // an argument parser stops there before it can mistake the value
+            // that follows for an option. A `--` here would instead shift every
+            // argument by one for the shell scripts most hooks are, silently
+            // sending a publish down the cleanup branch.
             .arg(action)
             .arg(&record.fqdn)
             .arg(&record.value)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
+            // Nothing reads the hook's stdout, so it goes straight to /dev/null
+            // rather than into a buffer this process would have to hold.
+            .stdout(Stdio::null())
             .stderr(Stdio::piped())
             // The hook inherits the process environment, which may hold the
             // provider's own credentials — that is how an `nsupdate`/CLI hook is
-            // expected to authenticate. Autumn passes no secret of its own.
+            // expected to authenticate. Autumn passes no secret of its own, and
+            // scrubs credential-shaped environment values back out of `stderr`.
             .kill_on_drop(true);
 
-        let output = tokio::time::timeout(HOOK_TIMEOUT, cmd.output())
-            .await
-            .map_err(|_| {
-                format!(
-                    "the DNS-01 exec hook `{program}` did not finish within {}s while running \
-                     `{action}` for TXT {}; it was killed and the order failed",
-                    HOOK_TIMEOUT.as_secs(),
-                    record.fqdn
-                )
-            })?
-            .map_err(|e| {
-                format!(
-                    "could not run the DNS-01 exec hook `{program}`: {e}. Check that \
-                     [server.tls.acme.dns] command names an executable file this process can run"
-                )
-            })?;
+        let mut child = cmd.spawn().map_err(|e| {
+            format!(
+                "could not run the DNS-01 exec hook `{program}`: {e}. Check that \
+                 [server.tls.acme.dns] command names an executable file this process can run"
+            )
+        })?;
+        // Taken before `wait`, so draining the pipe and reaping the child can
+        // borrow the child disjointly and run concurrently. Without the
+        // concurrent drain a chatty hook deadlocks on a full pipe buffer.
+        let mut pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| format!("the DNS-01 exec hook `{program}` had no stderr pipe"))?;
 
-        if output.status.success() {
+        let finished = tokio::time::timeout(HOOK_TIMEOUT, async {
+            let mut stderr = Vec::new();
+            let drain = read_bounded(&mut pipe, &mut stderr, MAX_STDERR_BYTES);
+            let (_, status) = tokio::join!(drain, child.wait());
+            (stderr, status)
+        })
+        .await;
+
+        // On timeout the async block is dropped, releasing its borrow of
+        // `child`; `child` itself is dropped when `run` returns just below, and
+        // `kill_on_drop` kills the hook then.
+        let (stderr, status) = finished.map_err(|_| {
+            format!(
+                "the DNS-01 exec hook `{program}` did not finish within {}s while running \
+                 `{action}` for TXT {}; it was killed and the order failed",
+                HOOK_TIMEOUT.as_secs(),
+                record.fqdn
+            )
+        })?;
+        let status = status
+            .map_err(|e| format!("could not wait for the DNS-01 exec hook `{program}`: {e}"))?;
+
+        if status.success() {
             return Ok(());
         }
+        let secrets = self.secrets();
+        let borrowed: Vec<&str> = secrets.iter().map(String::as_str).collect();
         Err(format!(
             "the DNS-01 exec hook `{program}` failed `{action}` for TXT {} ({}){}",
             record.fqdn,
-            describe_status(output.status),
-            stderr_excerpt(&output.stderr, &self.secrets())
+            describe_status(status),
+            stderr_excerpt(&stderr, &borrowed)
         ))
     }
+}
+
+/// Read `pipe` to EOF, keeping at most `cap` bytes in `sink`.
+///
+/// Everything past `cap` is read and dropped rather than left unread: a hook
+/// that never stops writing must not be able to grow this process's memory, but
+/// it also must not block on a full pipe buffer, which would turn a runaway hook
+/// into a silent 120-second stall instead of the error it deserves.
+async fn read_bounded<R>(pipe: &mut R, sink: &mut Vec<u8>, cap: usize)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                let room = cap.saturating_sub(sink.len());
+                if room > 0 {
+                    sink.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+        }
+    }
+}
+
+/// The values in `vars` held under a credential-shaped name.
+///
+/// An `exec` hook authenticates itself from the inherited environment, so
+/// autumn cannot know its credentials by name the way it knows its own. This is
+/// the next best thing: anything held under a name matching
+/// [`SECRET_ENV_MARKERS`] is treated as a secret and scrubbed out of the hook's
+/// `stderr` before that `stderr` reaches a log, an alert, or
+/// `/actuator/health`. Read per invocation rather than cached, so a credential
+/// rotated into the environment is covered from the next order onward.
+///
+/// This is a backstop, not a guarantee: a credential in a variable named
+/// something like `MY_THING` is not recognisable as one. A hook that must not
+/// risk it should not trace its own credentials to `stderr` — which the guide
+/// says.
+fn secret_env_values<'a>(vars: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<String> {
+    vars.into_iter()
+        .filter(|(name, value)| {
+            value.len() >= MIN_REDACTABLE_ENV_VALUE && {
+                let name = name.to_ascii_uppercase();
+                SECRET_ENV_MARKERS.iter().any(|m| name.contains(m))
+            }
+        })
+        .map(|(_, value)| value.to_owned())
+        .collect()
 }
 
 /// Describe a process exit status, including a signal death (which has no code).
@@ -188,33 +325,84 @@ mod tests {
         assert!(provider.delete_txt(&record()).await.is_ok());
     }
 
+    /// Regression (#1620): the hook's argv must be exactly the three documented
+    /// arguments, with `$1` the action.
+    ///
+    /// An earlier revision inserted a `--` end-of-options marker first. That
+    /// broke the contract the guide advertises and the five-line `nsupdate`
+    /// script it ships: `[ "$1" = present ]` is false when `$1` is `--`, so
+    /// every publish silently took the *cleanup* branch and deleted a record
+    /// named `present`. `nsupdate` exits 0 on that, so nothing failed — issuance
+    /// just waited for a record that had never been written, until propagation
+    /// timed out.
     #[tokio::test]
     async fn the_hook_receives_action_fqdn_and_value_as_separate_arguments() {
-        // `sh -c '...' --` shifts the appended args into $1/$2/$3, so the hook
+        // `sh -c '...' hook` shifts the appended args into $1/$2/$3, so the hook
         // can assert on exactly what autumn passes.
         let provider = ExecProvider::new(vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            r#"test "$1" = -- && test "$2" = present && test "$3" = _acme-challenge.myapp.com && test "$4" = challenge-value"#
+            r#"test "$1" = present && test "$2" = _acme-challenge.myapp.com && test "$3" = challenge-value && test "$#" = 3"#
                 .to_owned(),
             "hook".to_owned(),
         ]);
         provider
             .upsert_txt(&record())
             .await
-            .expect("the hook must see present, the fqdn, and the value");
+            .expect("the hook must see exactly present, the fqdn, and the value");
 
         // …and `cleanup` for the removal.
         let provider = ExecProvider::new(vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            r#"test "$1" = -- && test "$2" = cleanup"#.to_owned(),
+            r#"test "$1" = cleanup && test "$#" = 3"#.to_owned(),
             "hook".to_owned(),
         ]);
         provider
             .delete_txt(&record())
             .await
             .expect("cleanup action");
+    }
+
+    /// The exact script the TLS guide ships must work when copied verbatim.
+    ///
+    /// It is the one piece of this feature an operator runs unmodified, so it is
+    /// pinned here rather than left to review: the assertion is that the
+    /// documented `$1 = present|cleanup, $2 = fqdn, $3 = value` contract holds.
+    /// An earlier revision inserted a `--` first, which made `[ "$1" = present ]`
+    /// false on every publish — the script then built a *delete* for a name
+    /// called `present`, `nsupdate` exited 0, and issuance waited for a record
+    /// that had never been written.
+    #[tokio::test]
+    async fn the_documented_hook_script_branches_correctly() {
+        // The guide's script, with `nsupdate` replaced by a branch assertion.
+        fn documented_hook(expect: &str) -> ExecProvider {
+            let script = format!(
+                r#"
+[ "$1" = present ] && ACTION="add $2. 60 TXT \"$3\"" || ACTION="delete $2. TXT \"$3\""
+case "$ACTION" in
+  '{expect}'*) exit 0 ;;
+  *) echo "took the wrong branch: $ACTION" >&2; exit 1 ;;
+esac
+"#
+            );
+            ExecProvider::new(vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                script,
+                "hook".to_owned(),
+            ])
+        }
+
+        documented_hook("add _acme-challenge.myapp.com. 60 TXT")
+            .upsert_txt(&record())
+            .await
+            .expect("the documented script must take the `add` branch on present");
+
+        documented_hook("delete _acme-challenge.myapp.com. TXT")
+            .delete_txt(&record())
+            .await
+            .expect("the documented script must take the `delete` branch on cleanup");
     }
 
     #[tokio::test]
@@ -252,7 +440,7 @@ mod tests {
         let provider = ExecProvider::new(vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            r#"test "$4" = '; touch /tmp/pwned`whoami`'"#.to_owned(),
+            r#"test "$3" = '; touch /tmp/pwned`whoami`'"#.to_owned(),
             "hook".to_owned(),
         ]);
         let hostile = TxtRecord::new("myapp.com", "; touch /tmp/pwned`whoami`");
@@ -297,23 +485,146 @@ mod tests {
     }
 
     // The TXT value is base64url, whose alphabet includes `-`, so ~1 in 64
-    // challenge values starts with one. Without an end-of-options marker a hook
-    // using `getopts` would read it as a flag and write the wrong record.
+    // challenge values starts with one. It still arrives as `$3`: the action
+    // precedes it and is not an option, so any conventional parser has already
+    // stopped by then — which is why no `--` marker is needed (or wanted, since
+    // one would shift the whole documented contract by an argument).
     #[tokio::test]
     async fn a_value_starting_with_a_dash_still_reaches_the_hook_as_a_value() {
-        // `sh -c '…' hook` shifts the appended args into $0.., so `--` is $1 and
-        // the three real arguments follow it.
         let provider = ExecProvider::new(vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            r#"test "$1" = -- && test "$2" = present && test "$4" = -A-leading-dash-value"#
-                .to_owned(),
+            r#"test "$1" = present && test "$3" = -A-leading-dash-value"#.to_owned(),
             "hook".to_owned(),
         ]);
         let dashed = TxtRecord::new("myapp.com", "-A-leading-dash-value");
         provider
             .upsert_txt(&dashed)
             .await
-            .expect("the `--` marker separates options from the record arguments");
+            .expect("a leading-dash value reaches the hook as the third argument");
+    }
+
+    /// Regression (#1620): a hook that authenticates from an *inherited*
+    /// environment variable — the documented way to reach a provider autumn does
+    /// not ship — must not be able to republish that value through its stderr.
+    ///
+    /// Autumn never sees this credential: it is not in the credentials store and
+    /// was never passed to `with_secrets`. It is recognised by the shape of its
+    /// variable name alone.
+    #[tokio::test]
+    async fn an_inherited_provider_credential_is_scrubbed_from_stderr() {
+        const TOKEN: &str = "hetzner-live-token-DO-NOT-LEAK-4c1d";
+
+        // A `set -x`-style hook tracing its own authenticated request. The token
+        // is written by the hook itself; autumn only ever learns it from the
+        // environment listing injected below.
+        let provider = ExecProvider::new(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!(r#"echo '+ curl -H "Authorization: Bearer {TOKEN}"' >&2; exit 7"#),
+            "hook".to_owned(),
+        ])
+        .with_env(vec![
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ("HETZNER_API_TOKEN".to_owned(), TOKEN.to_owned()),
+        ]);
+
+        let err = provider
+            .upsert_txt(&record())
+            .await
+            .expect_err("a failing hook fails the order");
+
+        assert!(
+            !err.contains(TOKEN),
+            "a credential autumn never handled leaked through the hook's stderr: {err}"
+        );
+        assert!(err.contains("<redacted>"), "got: {err}");
+        assert!(err.contains("exit status 7"), "got: {err}");
+    }
+
+    /// An ordinary environment variable is not mistaken for a credential — the
+    /// scrubber must not turn every diagnostic into `<redacted>` soup.
+    #[test]
+    fn only_credential_shaped_environment_names_are_scrubbed() {
+        let secrets = secret_env_values([
+            ("PLAIN_VALUE", "an-ordinary-configuration-value"),
+            ("HETZNER_API_TOKEN", "a-credential-shaped-value"),
+            ("AWS_SECRET_ACCESS_KEY", "another-credential-value"),
+            ("tsig_password", "lowercase-names-match-too"),
+            // Below the length floor: too short to scrub without eating words.
+            ("SHORT_KEY", "short"),
+            // The classic false positive: a path, not a credential.
+            ("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        ]);
+
+        for expected in [
+            "a-credential-shaped-value",
+            "another-credential-value",
+            "lowercase-names-match-too",
+        ] {
+            assert!(
+                secrets.iter().any(|s| s == expected),
+                "a credential-shaped name must be scrubbed: {expected}"
+            );
+        }
+        assert!(
+            !secrets
+                .iter()
+                .any(|s| s == "an-ordinary-configuration-value"),
+            "an ordinary variable must not be scrubbed"
+        );
+        assert!(
+            !secrets.iter().any(|s| s == "short"),
+            "a value below the length floor must not be scrubbed"
+        );
+    }
+
+    /// Regression (#1620): a hook that never stops writing must not be able to
+    /// grow this process's memory. The 120s timeout bounds how *long* a hook
+    /// runs, not how much it writes, so `stderr` is read through a fixed buffer
+    /// and the overflow discarded as it arrives.
+    #[tokio::test]
+    async fn a_runaway_hook_cannot_grow_this_process() {
+        // Writes far more than the cap, then fails so the excerpt path runs.
+        let provider = ExecProvider::new(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!(
+                "i=0; while [ $i -lt {} ]; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' >&2; \
+                 i=$((i+1)); done; exit 4",
+                MAX_STDERR_BYTES / 8
+            ),
+            "hook".to_owned(),
+        ]);
+        let err = provider
+            .upsert_txt(&record())
+            .await
+            .expect_err("a failing hook fails the order");
+
+        // The hook ran to completion (it was not blocked on a full pipe)…
+        assert!(err.contains("exit status 4"), "got: {err}");
+        // …and the published message is still bounded by the excerpt limit,
+        // nowhere near what the hook actually wrote.
+        assert!(
+            err.chars().count() <= super::super::UPSTREAM_EXCERPT_CHARS + 200,
+            "the published error grew with the hook's output: {} chars",
+            err.chars().count()
+        );
+    }
+
+    /// A hook writing a lot of stdout is never buffered at all: stdout goes to
+    /// `/dev/null`, so it cannot pressure this process either.
+    #[tokio::test]
+    async fn hook_stdout_is_discarded_rather_than_buffered() {
+        let provider = ExecProvider::new(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "i=0; while [ $i -lt 20000 ]; do echo 'noise on stdout'; i=$((i+1)); done".to_owned(),
+            "hook".to_owned(),
+        ]);
+        provider
+            .upsert_txt(&record())
+            .await
+            .expect("a chatty-but-successful hook still publishes the record");
     }
 }

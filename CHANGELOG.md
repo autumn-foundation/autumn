@@ -36,7 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `exec` — an argv-array hook program run as
     `hook present|cleanup <fqdn> <value>`, which reaches RFC 2136 through
     `nsupdate`, a registrar CLI, or a webhook shim. No shell is involved, so a
-    challenge value can never be read as shell syntax.
+    challenge value can never be read as shell syntax. The hook's `stderr` is
+    read through a bounded buffer and scrubbed before it is published: both the
+    credentials autumn holds and any the *inherited environment* holds under a
+    credential-shaped name, since an `exec` hook authenticates itself from that
+    environment and a `set -x` trace would otherwise republish its token.
+    Each provider resolves the zone for the whole challenge name rather than
+    caching by suffix, so a cached parent zone can never shadow a separately
+    delegated child.
   - **Secrets.** The section names a credentials-store *key*, never a token:
     there is no config field that could hold one, and the section rejects
     unknown keys, so an `api_token` written into `autumn.toml` is a startup
