@@ -2146,6 +2146,7 @@ impl RequestBuilder {
             self.body.as_ref(),
             &self.retry_policy,
             self.discard_response_body,
+            None,
         )
         .await
     }
@@ -2199,6 +2200,7 @@ impl RequestBuilder {
                 body.as_ref(),
                 &self.retry_policy,
                 self.discard_response_body,
+                None,
             )
             .await?;
 
@@ -2319,6 +2321,7 @@ impl RequestBuilder {
                 body.as_ref(),
                 &self.retry_policy,
                 self.discard_response_body,
+                Some(deadline),
             )
             .await?;
 
@@ -2471,6 +2474,32 @@ fn build_oneshot_client(
 /// Send a single request through `client` (no manual redirect following — the
 /// client's redirect policy governs that) with the same transient-error and
 /// 429/5xx retry behaviour as the shared path, and collect the [`Response`].
+///
+/// `deadline`, when set, bounds the *retry loop* — checked before each
+/// backoff sleep, so a retry that would start after the deadline is skipped
+/// in favour of failing the call immediately with a deadline error, rather
+/// than a stale response/error from an attempt that already ran. This exists
+/// for
+/// [`RequestBuilder::send_ssrf_safe`] (#2480 review, round 8): passing a
+/// shrunk per-hop `timeout` into `client`'s own reqwest-level timeout, as
+/// every other caller here already does, bounds one attempt's connect/
+/// response wait, but `client` is reused across every retry `send_one`
+/// itself performs — each gets that same per-attempt timeout again, and the
+/// backoff/`Retry-After` sleeps between attempts are outside it entirely, so
+/// a retried, timing-out SSRF-safe hop could still run well past the overall
+/// deadline the caller computed. Checked only before sleeping (never wrapped
+/// around an in-flight attempt), so it cannot race an attempt's own
+/// reqwest-level timeout the way an outer `tokio::time::timeout` would (see
+/// round 7's `ClientError::Request`/`.is_timeout()` regression) — the first
+/// attempt's error shape is always preserved unchanged. Other callers pass
+/// `None`, so their behavior is exactly as before this parameter existed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one seam shared by three call sites (plain custom path, follow_loop, send_ssrf_safe); \
+              splitting the request-shape fields into their own struct would still leave the \
+              retry/discard/deadline knobs alongside it, for no reduction in what a caller reasons \
+              about"
+)]
 async fn send_one(
     client: &reqwest::Client,
     method: &Method,
@@ -2479,6 +2508,7 @@ async fn send_one(
     body: Option<&Bytes>,
     retry_policy: &RetryPolicy,
     discard_response_body: bool,
+    deadline: Option<Instant>,
 ) -> Result<Response, ClientError> {
     let start = Instant::now();
     let max_attempts = if is_idempotent_method(method) || !retry_policy.retry_idempotent_only {
@@ -2489,6 +2519,9 @@ async fn send_one(
 
     for attempt in 0..max_attempts {
         if attempt > 0 {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(ssrf_safe_deadline_error(url));
+            }
             let exp = (attempt - 1).min(10);
             let delay = Duration::from_millis(100 * (1_u64 << exp));
             tokio::time::sleep(delay).await;
