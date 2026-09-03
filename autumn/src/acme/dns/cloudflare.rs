@@ -377,7 +377,9 @@ mod tests {
         // …and it must have actually asked, most-specific candidate first.
         let asked: Vec<String> = transport.sent().iter().map(|r| r.url.clone()).collect();
         assert!(
-            asked.iter().any(|u| u.contains("name=sub.example.com")),
+            asked
+                .iter()
+                .any(|u| u.contains("name=_acme-challenge.sub.example.com")),
             "the more specific candidate must be queried before any cached suffix: {asked:?}"
         );
     }
@@ -539,9 +541,12 @@ mod tests {
     #[tokio::test]
     async fn the_zone_walk_prefers_the_most_specific_zone() {
         let transport = RecordingTransport::new(&[
-            // `tenants.myapp.com` is not a zone…
+            // `_acme-challenge.tenants.myapp.com` is not a delegated zone…
             (ZONE_LOOKUP, empty_list()),
         ])
+        // …nor is `tenants.myapp.com`…
+        .then(ZONE_LOOKUP, 200, empty_list())
+        // …so the walk lands on the parent.
         .then(ZONE_LOOKUP, 200, zone_hit())
         .then(RECORDS, 200, empty_list())
         .then(
@@ -562,9 +567,15 @@ mod tests {
             .filter(|r| r.url.contains("/zones?"))
             .map(|r| r.url.clone())
             .collect();
-        assert_eq!(asked.len(), 2, "{asked:?}");
-        assert!(asked[0].contains("name=tenants.myapp.com"), "{asked:?}");
-        assert!(asked[1].contains("name=myapp.com"), "{asked:?}");
+        assert_eq!(asked.len(), 3, "{asked:?}");
+        // Most specific first: the challenge name itself can be a delegated
+        // zone, so it leads (#1620).
+        assert!(
+            asked[0].contains("name=_acme-challenge.tenants.myapp.com"),
+            "{asked:?}"
+        );
+        assert!(asked[1].contains("name=tenants.myapp.com"), "{asked:?}");
+        assert!(asked[2].contains("name=myapp.com"), "{asked:?}");
     }
 
     /// The bearer token goes on every request — and only as a header, never in a

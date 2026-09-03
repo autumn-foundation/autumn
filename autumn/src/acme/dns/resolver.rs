@@ -1352,18 +1352,17 @@ mod tests {
                 SocketAddr::from(([198, 51, 100, 7], 53)),
             ]
         );
-        // The `_acme-challenge` label is a record inside the zone, never a zone
-        // cut, so the NS question is asked about the zone itself.
+        // The challenge name is TRIED first — it can itself be a delegated zone
+        // (#1620) — and when it is not, the walk asks about the zone that
+        // actually holds the record.
         let asked = lookup.asked.lock().unwrap().clone();
         assert!(
             asked.contains(&("myapp.com".to_owned(), QTYPE_NS)),
             "got: {asked:?}"
         );
         assert!(
-            !asked
-                .iter()
-                .any(|(name, _)| name.starts_with("_acme-challenge")),
-            "the challenge label must be stripped before the NS lookup: {asked:?}"
+            asked.contains(&("_acme-challenge.myapp.com".to_owned(), QTYPE_NS)),
+            "the challenge name must be offered as the most specific zone candidate: {asked:?}"
         );
     }
 

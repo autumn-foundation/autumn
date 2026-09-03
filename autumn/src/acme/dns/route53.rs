@@ -958,7 +958,14 @@ mod tests {
             )
         }
 
-        let transport = RecordingTransport::new(&[(ZONE_LOOKUP, &zone("ZPARENT", "example.com"))])
+        const NO_ZONES: &str = "<ListHostedZonesByNameResponse><HostedZones></HostedZones>\
+             </ListHostedZonesByNameResponse>";
+
+        // Each walk asks the challenge name first (it could be a delegated zone
+        // of its own) and only then the suffix that actually is one.
+        let transport = RecordingTransport::new(&[(ZONE_LOOKUP, NO_ZONES)])
+            .then(ZONE_LOOKUP, 200, &zone("ZPARENT", "example.com"))
+            .then(ZONE_LOOKUP, 200, NO_ZONES)
             .then(ZONE_LOOKUP, 200, &zone("ZCHILD", "sub.example.com"));
         let provider = r53(std::sync::Arc::clone(&transport));
 
@@ -980,7 +987,9 @@ mod tests {
 
         let asked: Vec<String> = transport.sent().iter().map(|r| r.url.clone()).collect();
         assert!(
-            asked.iter().any(|u| u.contains("dnsname=sub.example.com.")),
+            asked
+                .iter()
+                .any(|u| u.contains("dnsname=_acme-challenge.sub.example.com.")),
             "the more specific candidate must be queried before any cached suffix: {asked:?}"
         );
     }
@@ -1278,14 +1287,17 @@ mod tests {
                 "the secret key must never reach a URL"
             );
         }
+        // One walk: `_acme-challenge.myapp.com` (not a delegated zone) then
+        // `myapp.com` (the zone). The SECOND record adds none — that is what
+        // "cached" means here.
         assert_eq!(
             transport
                 .calls()
                 .iter()
                 .filter(|c| *c == ZONE_LOOKUP)
                 .count(),
-            1,
-            "the hosted zone id must be cached across records"
+            2,
+            "the hosted zone id must be cached across records, so only the first record walks"
         );
     }
 
