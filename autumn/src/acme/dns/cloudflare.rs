@@ -310,7 +310,10 @@ mod tests {
     }
 
     fn provider(transport: std::sync::Arc<RecordingTransport>) -> CloudflareProvider {
-        CloudflareProvider::new(SecretString::new("cf-test-token"), transport)
+        CloudflareProvider::new(
+            SecretString::new("cf-test-token"),
+            transport as std::sync::Arc<dyn HttpTransport>,
+        )
     }
 
     /// The behaviour the apex+wildcard case depends on: publishing a SECOND

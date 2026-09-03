@@ -461,8 +461,8 @@ let task = AcmeRenewalTask {
 The new **output** types in `acme::dns` — the parsed DNS answer, its records,
 the propagation-timeout detail, the credential, and the HTTP request/response —
 are `#[non_exhaustive]` from the start, so fields can be added to those without
-a break. `AcmeConfig`, `AcmeRenewalTask` and `DnsChallenge` deliberately are
-not: callers construct them by struct literal and they have no constructor, so
+a break. `AcmeConfig`, `AcmeDnsConfig`, `AcmeRenewalTask` and `DnsChallenge`
+deliberately are not: callers construct them by struct literal and they have no constructor, so
 sealing them would make them unbuildable outside this crate. That is the same
 trade-off `config::ServerConfig` makes.
 

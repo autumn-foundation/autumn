@@ -671,7 +671,7 @@ mod tests {
     }
 
     fn r53(transport: std::sync::Arc<RecordingTransport>) -> Route53Provider {
-        Route53Provider::new(credentials(), transport)
+        Route53Provider::new(credentials(), transport as std::sync::Arc<dyn HttpTransport>)
     }
 
     /// Route 53 replaces a whole record set rather than adding to it, so the
@@ -845,7 +845,7 @@ mod tests {
             RecordingTransport::new(&[(RRSET_LIST, empty_rrset()), (RRSET_CHANGE, changed())]);
         let mut creds = credentials();
         creds.hosted_zone_id = Some("/hostedzone/ZPUBLIC".to_owned());
-        let provider = Route53Provider::new(creds, std::sync::Arc::clone(&transport));
+        let provider = Route53Provider::new(creds, std::sync::Arc::clone(&transport) as std::sync::Arc<dyn HttpTransport>);
         provider
             .upsert_txt(&TxtRecord::new("myapp.com", "v"))
             .await

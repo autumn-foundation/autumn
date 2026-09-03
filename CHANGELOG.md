@@ -74,7 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   either literally must add them (`None` preserves today's HTTP-01 behavior).
   The new *output* types in `acme::dns` (the parsed DNS answer, the propagation
   timeout, the credential, the HTTP request/response) are `#[non_exhaustive]`
-  from the start. `AcmeConfig`, `AcmeRenewalTask` and `DnsChallenge` are not:
+  from the start. `AcmeConfig`, `AcmeDnsConfig`, `AcmeRenewalTask` and
+  `DnsChallenge` are not:
   callers build them by struct literal and they have no constructor, so sealing
   them would make them unusable — the same reasoning that left `ServerConfig`
   open. See the [migration guide](docs/migrations/next.md).

@@ -7034,7 +7034,6 @@ impl AcmeConfig {
 /// ```
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-#[non_exhaustive]
 pub struct AcmeDnsConfig {
     /// Which DNS provider writes the `_acme-challenge` TXT records.
     pub provider: AcmeDnsProvider,
