@@ -192,6 +192,28 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-links.sh
+      - name: CLI drift gate
+        # The link gate above stops a reader being sent to a page that does not
+        # exist. This one stops them being handed a *command* that does not
+        # exist — the other thing they copy off a page. The CLI carries 174
+        # command paths and the reader-facing docs name them 2,400+ times, so a
+        # renamed or never-shipped subcommand leaves a line that looks exactly
+        # like a working one.
+        #
+        # The baseline run found `autumn migrate run` across three guide pages —
+        # a command `MigrateCommands` has never had (the run action is the bare
+        # `autumn migrate`) — one of them in a fenced shell block under "run the
+        # migration before deploying new workers", so the reader most likely to
+        # copy it was mid-production-upgrade. Clap answers `unrecognized
+        # subcommand 'run'`: a dead end, not a hint.
+        #
+        # The truth set is parsed from the clap derive input rather than a
+        # checked-in snapshot, so a rename moves the gate with it in the same
+        # commit and there is nothing to regenerate.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-cli.sh --self-test && ./scripts/check-docs-cli.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`

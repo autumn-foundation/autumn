@@ -357,6 +357,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that is not in the workspace, and four heading anchors that no longer
   match their headings. External links are deliberately out of scope
   (network-flaky, and not fixable in this repo).
+- **A CLI drift gate for the docs corpus [no-plugin]:** the link gate stops a
+  reader being sent to a page that does not exist; nothing stopped them being
+  handed a *command* that does not exist — the other thing they copy off a
+  page. `autumn-cli` carries 174 command paths and the reader-facing docs name
+  them 2,400+ times, so a renamed or never-shipped subcommand leaves behind a
+  line that looks exactly like a working one.
+  `scripts/check-docs-cli.sh` resolves every `autumn …` invocation in fenced
+  shell blocks and inline code spans against the command tree parsed from the
+  clap derive input, and now runs in CI's docs-only job. Its baseline found
+  **11 defects across 6 guide pages**, all closed here: eight occurrences of
+  `autumn migrate run` — a command `MigrateCommands` has never had (`status`,
+  `check`, `down`, `baseline`; the run action is the bare `autumn migrate`),
+  one of them in a fenced `shell` block in `cloud-native.md` under "run the
+  migration before deploying new workers", where clap answers `unrecognized
+  subcommand 'run'` to a reader mid-production-upgrade — plus
+  `autumn system-test check` sitting inside a runnable block in
+  `system-tests.md` as a planned command, now moved out of the block. The
+  truth set is parsed from `autumn-cli/src/**/*.rs` rather than a checked-in
+  snapshot, so a rename moves the gate with it in the same commit; a page that
+  deliberately names a command that does not exist (`autumn generate island`,
+  `autumn generate seed`) waives it inline with a stated reason. Flags are
+  deliberately out of scope, as are the changelog and `docs/plans/`, which
+  name commands that were true once or are not true yet.
 
 - **One retention policy for every table Autumn creates (#1605):** every
   deployed Autumn app accumulated framework-owned data forever by default —
