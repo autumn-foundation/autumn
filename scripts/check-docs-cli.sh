@@ -21,9 +21,16 @@
 # the exact moment they cannot afford one.
 #
 # WHAT IT CHECKS (single fast job, no Rust toolchain needed):
-#   1. The first token after `autumn` names a real top-level command.
+#   1. The first token after `autumn` names a real top-level command — including
+#      when the line is prefixed with environment assignments, which is how the
+#      guide writes most production commands (`AUTUMN_ENV=prod autumn db backup`).
 #   2. Each following token, while the command still has subcommands, names a
-#      real subcommand of the path resolved so far.
+#      real subcommand of the path resolved so far. Options are walked THROUGH,
+#      not treated as the end of the command, because clap accepts them before a
+#      subcommand (`autumn migrate --with-maintenance down`). Whether an option
+#      also eats the next token is read from the field's type in the derive —
+#      `--force` (bool) does not, `--shard NAME` (Option<String>) does — so a
+#      value is never mistaken for a subcommand, or a subcommand for a value.
 #
 # TRUTH SET: parsed from the clap derive input in `autumn-cli/src/**/*.rs`, not
 # from a checked-in snapshot. A snapshot is one forgotten regeneration away
@@ -37,10 +44,12 @@
 # `visible_alias`/`alias` (without which the real `autumn c` reads as drift).
 #
 # WHAT IT DELIBERATELY DOES NOT CHECK:
-#   - Flags. `--profile`, `--force` and friends are worth gating, but clap's
-#     `conflicts_with`/`value_enum`/global-arg forms make a source-parsed flag
-#     set far noisier than a command set, and a wrong flag usually fails
-#     loudly against a command that at least exists. Commands first.
+#   - Whether a flag EXISTS. Options are parsed — the walk has to know their
+#     value arity to find the subcommands written after them — but an option a
+#     command does not declare is not reported, only walked away from: clap's
+#     `conflicts_with`/`value_enum` forms make a source-parsed flag set far
+#     noisier than a command set, and a wrong flag at least fails against a
+#     command that exists. Commands first.
 #   - Tokens past the point where the resolved command has no subcommands.
 #     `autumn db pull posts` is a positional table name, not a subcommand, and
 #     the parser records which commands take positionals so those tokens are
@@ -224,6 +233,39 @@ def _has_positional(payload):
     return False
 
 
+# An option field: the `#[arg(…)]` attribute, the field name, and its type. The
+# type is what says whether the option eats the next token — `--force` (bool)
+# does not, `--shard NAME` (Option<String>) does — and getting that backwards in
+# either direction is a false positive: skip too little and `json` in
+# `autumn routes --format json` reads as a bad subcommand; skip too much and a
+# real subcommand after a boolean flag goes unchecked.
+_ARG_FIELD = re.compile(
+    r'#\[arg\(([^\]]*)\)\]\s*(?:pub\s+)?([a-z_0-9]+)\s*:\s*([A-Za-z0-9_:<>, ]+?)\s*,')
+
+
+def _options(payload):
+    """Map every option spelling on a variant to whether it takes a value."""
+    opts = {}
+    for m in _ARG_FIELD.finditer(payload):
+        attrs, field, ftype = m.group(1), m.group(2), m.group(3)
+        if not re.search(r'\b(long|short)\b', attrs):
+            continue                            # positional, not an option
+        takes_value = ftype.strip() != 'bool'
+        named = re.search(r'\blong\s*=\s*"([^"]+)"', attrs)
+        if named:
+            opts['--' + named.group(1)] = takes_value
+        elif re.search(r'\blong\b', attrs):
+            opts['--' + field.replace('_', '-')] = takes_value
+        for alias in re.findall(r'\balias\s*=\s*"([^"]+)"', attrs):
+            opts['--' + alias] = takes_value
+        short = re.search(r"\bshort\s*=\s*'(.)'", attrs)
+        if short:
+            opts['-' + short.group(1)] = takes_value
+        elif re.search(r'\bshort\b', attrs):
+            opts['-' + field[0]] = takes_value
+    return opts
+
+
 def build_surface(sources):
     text = "\n".join(sources)
     enums = _blocks(text, 'enum')
@@ -244,7 +286,7 @@ def build_surface(sources):
                     spellings.add(a)
                 for group in re.findall(r'\b(?:visible_)?aliases\s*=\s*\[([^\]]*)\]', attrs):
                     spellings.update(re.findall(r'"([^"]+)"', group))
-                node = {'children': {}, 'positionals': False}
+                node = {'children': {}, 'positionals': False, 'options': {}}
                 if kind == 'tuple':
                     inner = re.search(r'\(\s*(?:pub\s+)?([A-Za-z0-9_:]+)', payload)
                     if inner:
@@ -258,11 +300,13 @@ def build_surface(sources):
                             if st:
                                 node['children'] = build(st, seen)
                             node['positionals'] = _has_positional(structs[it])
+                            node['options'] = _options(structs[it])
                 elif kind == 'struct':
                     st = _subcommand_type(payload)
                     if st:
                         node['children'] = build(st, seen)
                     node['positionals'] = _has_positional(payload)
+                    node['options'] = _options(payload)
                 for spelling in spellings:
                     tree[spelling] = node
             return tree
@@ -277,7 +321,9 @@ def build_surface(sources):
         flat = {}
         for k, v in t.items():
             key = (prefix + ' ' + k).strip()
-            flat[key] = {'children': set(v['children']), 'positionals': v['positionals']}
+            flat[key] = {'children': set(v['children']),
+                         'positionals': v['positionals'],
+                         'options': v['options']}
             flat.update(flatten(v['children'], key))
         return flat
 
@@ -304,10 +350,14 @@ SHELL_LANGS = {'bash', 'sh', 'shell', 'console', 'zsh', 'terminal', 'text', ''}
 # only segments that then START with `autumn` are read as invocations.
 CHAIN = re.compile(r'&&|\|\||[;|&]')
 
-# `autumn` as the head of a segment, after any prompt or grouping punctuation.
+# `autumn` as the head of a segment, after any prompt or grouping punctuation,
+# and after any leading environment assignments — `AUTUMN_ENV=prod autumn db
+# backup` is how the guide writes most production commands, and requiring
+# `autumn` to head the segment skipped every one of them.
 # The `\s` after the name rejects `autumn-cli`, `autumn-web` and `autumn/src/…`;
 # anchoring to the segment start rejects `./autumn` and `cd autumn`.
-INVOCATION = re.compile(r'^[\s(]*\$?\s*autumn\s+(.+)$')
+INVOCATION = re.compile(
+    r'^[\s(]*\$?\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*autumn\s+(.+)$')
 
 # A token that could name a command. Anything else — a flag, a `<PLACEHOLDER>`,
 # a TOML `= "0.1.0"`, a box-drawing character from a diagram — ends the walk.
@@ -386,8 +436,17 @@ def blocks(text):
 def resolve(argv, surface):
     """Return the drifted command path, or None when the line resolves.
 
-    Walks token by token: each token is a subcommand of the path so far, an
-    argument (which ends the walk), or drift.
+    Walks token by token: each token is an option (skipped, along with its value
+    when it takes one), a subcommand of the path so far, an argument (which ends
+    the walk), or drift.
+
+    Options are walked THROUGH rather than treated as the end of the command,
+    because clap accepts them before a subcommand: `autumn migrate
+    --with-maintenance down` is real and appears in the guide, and stopping at
+    the first `-` left every subcommand written after an option unchecked.
+    Whether an option eats the next token is read from the field's type in the
+    derive, never guessed — guessing makes `json` in `autumn routes --format
+    json` look like a bad subcommand.
     """
     tokens = argv.split()
     if not tokens or not TOKEN.match(tokens[0]):
@@ -395,14 +454,32 @@ def resolve(argv, surface):
     if tokens[0] not in surface:
         return 'autumn ' + tokens[0]
     path = tokens[0]
-    for tok in tokens[1:]:
+    i = 1
+    while i < len(tokens):
+        tok = tokens[i]
+        node = surface[path]
+        if tok == '--':                         # everything after is arguments
+            return None
+        if tok.startswith('-') and len(tok) > 1:
+            name = tok.split('=', 1)[0]
+            if '=' in tok:                      # --name=value, self-contained
+                i += 1
+                continue
+            if name not in node['options']:
+                # An option this command does not declare. Flags are out of
+                # scope, so this is not reported — but it also cannot be walked
+                # past safely, since whether it consumes the next token is
+                # unknown. Stop rather than risk a false positive.
+                return None
+            i += 2 if node['options'][name] else 1
+            continue
         if not TOKEN.match(tok):
             return None
-        node = surface[path]
         if not node['children']:                # leaf: the rest are arguments
             return None
         if tok in node['children']:
             path = path + ' ' + tok
+            i += 1
             continue
         if node['positionals']:                 # unjudgeable: a value, not a name
             return None
@@ -461,6 +538,8 @@ def self_test():
             action: Option<MigrateCommands>,
             #[arg(long)]
             with_maintenance: bool,
+            #[arg(long, value_name = "NAME")]
+            shard: Option<String>,
         },
         #[command(visible_alias = "c")]
         Console,
@@ -527,6 +606,24 @@ def self_test():
     expect(resolve('$SOMETHING', surface) is None,
            'a non-command token must be ignored')
 
+    # --- options are walked through, not treated as the end of the command.
+    # Regression test for a version that stopped at the first `-` and left every
+    # subcommand written after an option unchecked.
+    expect(surface['migrate']['options'] == {'--with-maintenance': False, '--shard': True},
+           f"option value-taking must come from the field type, got {surface['migrate']['options']}")
+    expect(resolve('migrate --with-maintenance status', surface) is None,
+           'a boolean option must not hide the subcommand after it')
+    expect(resolve('migrate --with-maintenance nope', surface) == 'autumn migrate nope',
+           'drift after a boolean option must still be reported')
+    expect(resolve('migrate --shard eu status', surface) is None,
+           "a value-taking option's value must not be read as a subcommand")
+    expect(resolve('migrate --shard=eu status', surface) is None,
+           '--name=value is self-contained and consumes no extra token')
+    expect(resolve('migrate --unknown-option nope', surface) is None,
+           'an undeclared option stops the walk rather than risking a false positive')
+    expect(resolve('migrate -- nope', surface) is None,
+           'everything after `--` is arguments')
+
     # --- extraction
     doc = '\n'.join([
         '```shell',
@@ -553,6 +650,15 @@ def self_test():
            'a pipe into a non-autumn command must still yield the autumn one')
     expect(len(list(invocations("```bash\nautumn generate scaffold Post 'a:String{x;y}'\n```"))) == 1,
            'splitting must not manufacture invocations out of a quoted argument')
+
+    # --- environment-prefixed invocations. `AUTUMN_ENV=prod autumn db backup`
+    # is how the guide writes production commands; requiring `autumn` to head
+    # the segment skipped all 15 of them.
+    env_doc = '```bash\nAUTUMN_ENV=prod DATABASE_URL="postgres://x" autumn migrate run\n```'
+    expect([a for _, a, _ in invocations(env_doc)] == ['migrate run'],
+           f'env assignments must not hide the command: {list(invocations(env_doc))}')
+    expect(list(invocations('```bash\ncd autumn && ./autumn migrate\n```')) == [],
+           '`cd autumn` and `./autumn` are not invocations of the CLI')
 
     # --- waivers
     expect(WAIVER.search('<!-- cli-surface-allow: autumn generate island — planned #493 -->'),
@@ -587,7 +693,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f'self-test: {13 + 9 + 6 + 4 - len(failures)} passed, {len(failures)} failed')
+    print(f"self-test: {13 + 16 + 8 + 4 - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
