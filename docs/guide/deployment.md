@@ -104,7 +104,8 @@ tenant *N*'s first request and Let's Encrypt rate limits as an onboarding
 ceiling. A **wildcard** certificate covers every tenant, existing and future,
 and needs the DNS-01 challenge — which needs your DNS provider's API token.
 
-Zero to wildcard HTTPS, start to finish:
+Zero to wildcard HTTPS, start to finish — sixteen lines of configuration across
+three files, twelve of them in `autumn.toml`:
 
 ```console
 $ autumn new myapp --starter saas
@@ -142,7 +143,8 @@ acme = ["autumn-web/acme"]
 
 **4.** Edit `autumn.toml`. The starter already ships a `[server]` and a
 `[tenancy]` table, so change those in place rather than adding second ones, and
-append the two ACME tables. Thirteen lines in all:
+append the two ACME tables — twelve lines, of which four are the ACME wiring
+itself:
 
 ```toml
 [server]
