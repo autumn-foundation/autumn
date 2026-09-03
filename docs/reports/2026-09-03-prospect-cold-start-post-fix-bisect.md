@@ -184,12 +184,31 @@ per-commit correction below) changes the list:
   delta should **not** be discounted on this basis — if it's real, the
   cause is something else (or noise, per the significance discussion
   above).
-- `141f36ef` (a `base64` patch-version bump) and `61bdd9c2` (Web Push)
-  are **confirmed real**: `cargo tree` shows both `base64 v0.22.1` and
-  `v0.23.1` coexisting in this exact feature set (the bump adds a second
-  compiled version, not a swap), and `p256 v0.13.2` — the crate Web
-  Push's own commit message says gained a new `ecdh` feature flag — is in
-  the tree too.
+- `141f36ef` (a `base64` patch-version bump) — **retracted, a third
+  confirmed false positive** (Codex P2 on `cc91a56d`): the coexistence of
+  `base64 v0.22.1` and `v0.23.1` I cited as evidence isn't caused by this
+  commit — checking both `141f36ef^:Cargo.lock` and `141f36ef:Cargo.lock`
+  package-by-package (which package's `dependencies` list names which
+  `base64` version) shows `bcrypt` (an unconditional, direct dependency
+  of `autumn-web` — confirmed via `cargo tree -i bcrypt`) already
+  depended on `base64 0.23.1` **before** this commit, while `axum`,
+  `reqwest`, and everything else kept depending on `0.22.1` **after** it
+  unchanged. `141f36ef` only re-points `autumn-web`'s *own* direct edge
+  from `0.22.1` to `0.23.1` — a version that was already being compiled
+  for `bcrypt`'s sake regardless. No new compiled artifact, before or
+  after.
+- `61bdd9c2` (Web Push) — **confirmed real**, the one commit that
+  survives full scrutiny: its actual `Cargo.lock` diff is a single new
+  line, `autumn-web` gaining a direct dependency edge to `p256 0.13.2` — a
+  version already resolved (and already compiled) via `jsonwebtoken`'s
+  transitive dependency on it, so the crate itself isn't new. What is new
+  is the *feature set* Cargo resolves for it: the commit's own message
+  states it adds `p256`'s `ecdh` feature flag on that new direct edge,
+  and Cargo unifies features across every path to a shared dependency
+  within one build — so `p256` is compiled once, under the union of
+  features every consumer requests, meaning this edge's new feature
+  forces a real (if likely modest) recompile of `p256` that wouldn't
+  happen otherwise.
 - `bc99a4b8` (scaffold DSL constraints) — **retracted, a second confirmed
   false positive** (Codex P2 on `abea7490`, correcting my own prior
   verification, which was sloppy: I saw `reqwest` and `serde_urlencoded`
@@ -208,13 +227,13 @@ per-commit correction below) changes the list:
   `bc99a4b8`. My first correction (`abea7490`) was itself wrong to keep
   this flagged — reversed here.
 
-Net, after two rounds of verification: **2 of the 4** originally-flagged
-commits (`141f36ef`, `61bdd9c2`) are confirmed relevant to this feature
-set's resolved graph; `fec52215` and `bc99a4b8` are both confirmed false
-positives. **For the 2 confirmed commits, this report's deltas cannot be
-trusted as representative of their true, CI-relevant recurring
-contribution** — but not for a purely one-directional reason (see the
-next correction). It
+Net, after three rounds of verification: **only 1 of the 4**
+originally-flagged commits (`61bdd9c2`) is confirmed relevant to this
+feature set's resolved graph; `fec52215`, `bc99a4b8`, and `141f36ef` are
+all confirmed false positives. **For that one confirmed commit, this
+report's delta cannot be trusted as representative of its true,
+CI-relevant recurring contribution** — but not for a purely
+one-directional reason (see the next correction). It
 also means the "total window effect" and "this proxy's absolute saving vs.
 CI's" comparisons throughout Assay and Verdict are weaker than stated
 there: they are not just measuring a narrower workload (library-only, no
@@ -545,15 +564,18 @@ live report needs the map:
   sample (see Apparatus's fourth correction). This apparatus pays each
   external dependency's compile cost once per introduction; CI pays it on
   every sample, forever. Of the 4 non-fix commits that touched
-  `Cargo.lock`, only **2** (`141f36ef`, `61bdd9c2`) are confirmed via
-  version-specific `cargo tree` checks to actually affect this feature
-  set's resolved graph — `fec52215` and, after a second, more careful
-  check, `bc99a4b8` too are both confirmed false positives (see
-  Apparatus's fourth and fifth corrections). Their deltas cannot be
-  trusted as CI-representative, but not in a single, simple direction:
-  the apparatus likely *overcounts* each one's cost at its own
-  introducing checkpoint (charging the full fresh-compile cost rather
-  than CI's much smaller cold-vs-cold marginal difference) and
+  `Cargo.lock`, only **1** (`61bdd9c2`, confirmed via a package-by-package
+  `Cargo.lock` diff: a new direct edge to `p256` carrying a new feature
+  flag, forcing a real recompile under Cargo's feature unification) is
+  confirmed to actually affect this feature set's resolved graph.
+  `fec52215`, `bc99a4b8`, and `141f36ef` are all confirmed false
+  positives on closer inspection (see Apparatus's fourth through sixth
+  corrections — three separate rounds of "touches `Cargo.lock`" turning
+  out not to mean "changes this build's resolved graph"). That one
+  commit's delta cannot be trusted as CI-representative, but not in a
+  single, simple direction: the apparatus likely *overcounts* its cost at
+  its own introducing checkpoint (charging the full fresh-compile cost
+  rather than CI's much smaller cold-vs-cold marginal difference) and
   *undercounts* it at every checkpoint after (nothing shown where CI pays
   every sample). Which effect dominates for this window's total is not
   resolvable from this data. The parent report's CI/runner-variance
