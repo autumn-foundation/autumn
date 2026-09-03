@@ -743,6 +743,7 @@ pub struct SessionLayer<S: SessionStore> {
     config: Arc<SessionConfig>,
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
     entropy: Arc<dyn crate::entropy::Entropy>,
+    tenancy_session_key: Option<Arc<str>>,
 }
 
 impl<S: SessionStore> SessionLayer<S> {
@@ -753,6 +754,7 @@ impl<S: SessionStore> SessionLayer<S> {
             config: Arc::new(config),
             signing_keys: None,
             entropy: Arc::new(crate::entropy::OsEntropy),
+            tenancy_session_key: None,
         }
     }
 
@@ -781,6 +783,31 @@ impl<S: SessionStore> SessionLayer<S> {
         self.signing_keys = Some(keys);
         self
     }
+
+    /// Name of the session key `[tenancy] source = "session"` reads to
+    /// resolve the tenant (`[tenancy] session_key`, e.g. `"tenant_id"`).
+    ///
+    /// `AppBuilder` sets this automatically when `[tenancy] source ==
+    /// "session"`. An app that composes `SessionLayer`,
+    /// [`crate::tenancy::tenancy_middleware`] and
+    /// [`crate::idempotency::IdempotencyLayer`] directly as plain tower
+    /// layers, rather than through `AppBuilder`, must set it too if it also
+    /// uses session-sourced tenancy — otherwise this composition is
+    /// indistinguishable from one that doesn't use tenancy, and the deferred
+    /// idempotency alias falls back to the tenant captured before the handler
+    /// ran.
+    ///
+    /// When set, a request that mutates this key — an org switch, a
+    /// tenant-scoped login — has its deferred idempotency replay alias keyed
+    /// by the *finalized* value rather than the tenant resolved before the
+    /// handler ran. Without this, a retry presenting the rotated session
+    /// lands in the pre-mutation tenant's storage slot, misses the cached
+    /// response, and re-executes the mutation.
+    #[must_use]
+    pub fn with_tenancy_session_key(mut self, key: Option<Arc<str>>) -> Self {
+        self.tenancy_session_key = key;
+        self
+    }
 }
 
 impl<S: SessionStore + Clone, Inner> Layer<Inner> for SessionLayer<S> {
@@ -793,6 +820,7 @@ impl<S: SessionStore + Clone, Inner> Layer<Inner> for SessionLayer<S> {
             config: Arc::clone(&self.config),
             signing_keys: self.signing_keys.clone(),
             entropy: self.entropy.clone(),
+            tenancy_session_key: self.tenancy_session_key.clone(),
         }
     }
 }
@@ -805,6 +833,7 @@ pub struct SessionService<S: SessionStore, Inner> {
     config: Arc<SessionConfig>,
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
     entropy: Arc<dyn crate::entropy::Entropy>,
+    tenancy_session_key: Option<Arc<str>>,
 }
 
 /// `true` when the response was produced by the request-timeout layer
@@ -845,6 +874,7 @@ where
         let config = Arc::clone(&self.config);
         let signing_keys = self.signing_keys.clone();
         let entropy = self.entropy.clone();
+        let tenancy_session_key = self.tenancy_session_key.clone();
         let mut inner = self.inner.clone();
         // Swap to ensure correct poll_ready semantics
         std::mem::swap(&mut self.inner, &mut inner);
@@ -921,12 +951,21 @@ where
                     &response,
                     None,
                     inner_guard.cookie_backed,
+                    None,
                 );
             } else if inner_guard.dirty {
                 let data = inner_guard.data.clone();
                 let sid = inner_guard.id.clone();
                 let primary_replay_after_guard_denial =
                     inner_guard.cookie_backed && inner_guard.old_id.is_some();
+                // The tenant `[tenancy] source = "session"` will resolve for a
+                // retry presenting this finalized session — read live from the
+                // data just written rather than reusing the tenant captured
+                // before the handler ran, which a handler like an org switch
+                // may have just changed.
+                let finalized_tenant = tenancy_session_key
+                    .as_deref()
+                    .and_then(|key| data.get(key).cloned());
                 if let Some(ref old_id) = inner_guard.old_id
                     && let Err(error) = store.destroy(old_id).await
                 {
@@ -951,6 +990,7 @@ where
                     &response,
                     Some(&sid),
                     primary_replay_after_guard_denial,
+                    finalized_tenant.as_deref(),
                 );
             }
 
@@ -1006,6 +1046,7 @@ pub(crate) fn build_session_layer(
     custom_store: Option<Arc<dyn BoxedSessionStore>>,
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
     entropy: &Arc<dyn crate::entropy::Entropy>,
+    tenancy_session_key: Option<Arc<str>>,
 ) -> Result<SessionLayer<ArcSessionStore>, SessionBackendConfigError> {
     // Shared tail of all three arms: entropy is always injected (determinism
     // seam, #1797), signing keys only when the app configured a secret.
@@ -1014,8 +1055,11 @@ pub(crate) fn build_session_layer(
         config: &SessionConfig,
         signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
         entropy: &Arc<dyn crate::entropy::Entropy>,
+        tenancy_session_key: Option<Arc<str>>,
     ) -> SessionLayer<ArcSessionStore> {
-        let mut layer = SessionLayer::new(store, config.clone()).with_entropy(Arc::clone(entropy));
+        let mut layer = SessionLayer::new(store, config.clone())
+            .with_entropy(Arc::clone(entropy))
+            .with_tenancy_session_key(tenancy_session_key);
         if let Some(keys) = signing_keys {
             layer = layer.with_signing_keys(keys);
         }
@@ -1032,6 +1076,7 @@ pub(crate) fn build_session_layer(
             config,
             signing_keys,
             entropy,
+            tenancy_session_key,
         ));
     }
 
@@ -1048,6 +1093,7 @@ pub(crate) fn build_session_layer(
                 config,
                 signing_keys,
                 entropy,
+                tenancy_session_key,
             ))
         }
         SessionBackendPlan::Redis { .. } => {
@@ -1059,6 +1105,7 @@ pub(crate) fn build_session_layer(
                     config,
                     signing_keys,
                     entropy,
+                    tenancy_session_key,
                 ))
             }
 
