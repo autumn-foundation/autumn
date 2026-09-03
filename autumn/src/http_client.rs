@@ -2279,6 +2279,21 @@ const fn is_retryable_status(status: u16) -> bool {
     matches!(status, 502..=504)
 }
 
+/// Whether this task is replaying a failure capsule — the same check
+/// [`RequestBuilder::send`] makes before anything else, mirrored here for
+/// [`BreakerGuardedCall::begin`]. No-op twin for builds without `reporting`,
+/// the feature the whole `capsule` module (and therefore `current_tape`) is
+/// gated behind.
+#[cfg(feature = "reporting")]
+fn replay_tape_active() -> bool {
+    crate::capsule::effects::current_tape().is_some()
+}
+
+#[cfg(not(feature = "reporting"))]
+const fn replay_tape_active() -> bool {
+    false
+}
+
 /// Resolve (or create) the circuit breaker for `url`'s host, honouring a
 /// per-client `resilience_config` override exactly as [`RequestBuilder::send_recorded`]'s
 /// own breaker path does. Shared with [`BreakerGuardedCall`] so the two paths
@@ -2339,16 +2354,30 @@ fn breaker_for_url(
 /// eventually wedging the breaker in `HalfOpen` forever.
 pub(crate) struct BreakerGuardedCall {
     /// `None` when the client this call was `begin`-ed against has a mock
-    /// registry attached: `record` is then a no-op, matching the bypass
-    /// above.
+    /// registry attached, or a capsule replay is in progress on this task:
+    /// `record` is then a no-op, matching the bypasses above.
     guard: Option<crate::circuit_breaker::CircuitBreakerGuard>,
 }
 
 impl BreakerGuardedCall {
     /// Returns `Err(ClientError::CircuitBreakerOpen)` immediately, without
     /// touching the network, when the breaker for `url`'s host is open.
+    ///
+    /// Also bypassed — exactly like the mock case — when this task is
+    /// replaying a failure capsule: [`RequestBuilder::send`] answers such a
+    /// call from the capsule's recorded effect tape before it ever reaches
+    /// `send_recorded`'s breaker block (`#[cfg(feature = "reporting")] if let
+    /// Some(tape) = current_tape() { return replayed_response(...) }`, ahead
+    /// of everything else in `send`). A caller wrapping that call in
+    /// `BreakerGuardedCall` sits *outside* `send` and knows nothing about the
+    /// tape, so without this check it would gate the replay on live global
+    /// breaker state unrelated to the recorded run (an open breaker turns a
+    /// capsule that actually succeeded into a spurious `CircuitBreakerOpen`,
+    /// never consulting the tape at all) and, on a closed breaker, feed the
+    /// *replayed* outcome back into that same live state — historical replay
+    /// traffic contaminating a production breaker (#2480 review, round 3).
     pub(crate) fn begin(client: &Client, url: &str) -> Result<Self, ClientError> {
-        if client.mock.is_some() {
+        if client.mock.is_some() || replay_tape_active() {
             return Ok(Self { guard: None });
         }
         let breaker = breaker_for_url(client.resilience_config.as_ref(), url);
@@ -3238,6 +3267,32 @@ mod tests {
         // record() on the no-op guard must not panic and must not fabricate a
         // breaker entry for the host.
         call.record(&Err(ClientError::CircuitBreakerOpen));
+    }
+
+    // PR #2480 review, round 3 (P2): `BreakerGuardedCall` must also bypass the
+    // real breaker while this task is replaying a failure capsule — the same
+    // check `RequestBuilder::send` makes (`current_tape()`) before it ever
+    // reaches `send_recorded`'s breaker block, so a caller wrapping the call
+    // externally has to make the identical check or it gates/contaminates the
+    // live breaker with a replay that `send` itself never routed through it.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn breaker_guarded_call_is_a_noop_during_capsule_replay() {
+        let tape = crate::capsule::effects::ReplayEffects::new(
+            crate::capsule::schema::CapsuleEffects::default(),
+        );
+        let client = Client::new();
+
+        crate::capsule::effects::with_effect_tape(std::sync::Arc::new(tape), async {
+            let call = BreakerGuardedCall::begin(&client, "http://replay-target/hook")
+                .expect("a capsule replay must never see CircuitBreakerOpen from live state");
+            assert!(
+                call.guard.is_none(),
+                "begin() must not touch the real breaker during capsule replay"
+            );
+            call.record(&Err(ClientError::CircuitBreakerOpen));
+        })
+        .await;
     }
 
     // TEST 26: from_request_parts uses AutumnConfig.http when no HttpConfig extension.
