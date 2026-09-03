@@ -684,6 +684,59 @@ def tokenize(text):
         return None
 
 
+def _escaped(text, i):
+    """True when the character at `i` is escaped by a backslash.
+
+    PARITY, not presence: a backslash escapes the one after it, so a run of
+    them pairs off and only an ODD run leaves the next character escaped.
+    `"\\\\$(autumn …)"` is a literal backslash followed by a REAL substitution,
+    and testing only the immediate predecessor suppressed it. The same question
+    decides whether a trailing backslash continues a line and whether a `<<`
+    opens a heredoc, so all three ask it here.
+    """
+    run = 0
+    while i - run - 1 >= 0 and text[i - run - 1] == '\\':
+        run += 1
+    return run % 2 == 1
+
+
+def _open_quote(text, quote=None):
+    """The shell quote left OPEN at the end of `text`, or None.
+
+    A quote spans physical lines — `printf '%s\\n' '` opens a string that the
+    next line continues — so the lines inside one are string DATA, not commands
+    the reader runs. Reading each physical line on its own left the opener
+    untokenizable, fell back to whitespace splitting, and reported the text
+    inside the string as a runnable command on a correct page.
+    """
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote == "'":
+            # Single quotes are literal all the way to the next one; a
+            # backslash inside them escapes nothing.
+            if ch == "'":
+                quote = None
+        elif quote == '"':
+            if ch == '\\':
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+        else:
+            if ch == '\\':
+                i += 2
+                continue
+            # An unquoted `#` starts a comment, and the rest of the line —
+            # apostrophes in English included — is text.
+            if ch == '#' and (i == 0 or text[i - 1] in ' \t'):
+                return quote
+            if ch in '"\'':
+                quote = ch
+        i += 1
+    return quote
+
+
 def _paren_delta(tok):
     """Net parenthesis depth contributed by a token.
 
@@ -723,6 +776,14 @@ def _segments(tokens):
         # went unread. The three are rejoined rather than merely not split, so
         # the result is a single self-contained redirection token.
         if current and tok == '&' and current[-1].endswith(('>', '<')):
+            current[-1] += tok
+            prev = tok
+            continue
+        # `2>&-` CLOSES a descriptor, so the duplication target is `-` as well
+        # as a number. Accepting only digits left the `-` behind as its own
+        # token, and a leading `2>&-` made it the segment head with the real
+        # command behind it unread.
+        if current and tok in ('-',) and current[-1].endswith(('>&', '<&')):
             current[-1] += tok
             prev = tok
             continue
@@ -855,8 +916,14 @@ def _exec_command(tok):
     return bool(m) and _exe_path(tok[m.end():])
 
 
-# A flag whose value is a whole command line for another shell.
-_SHELL_C = re.compile(r'^(-c|-C|--command)$')
+# The flag whose value is a whole command line, PER PROGRAM — because the
+# letter is not shared. `bash -C` is noclobber, not a command string, and
+# accepting both spellings for every shell read a flag as a recipe.
+#
+# A short option may also be BUNDLED: `bash -lc 'autumn …'` runs the string,
+# and bash takes `c`'s value from the next word wherever `c` sits in the
+# cluster (`-lc` and `-cl` both work). Requiring the standalone spelling missed
+# the ordinary login-shell form.
 # Programs whose `-c` argument is a shell COMMAND STRING. Any other program's
 # `-c` means something else entirely — `echo -c 'autumn db'` prints its
 # arguments — and recursing into the value reported a page for a command that
@@ -866,8 +933,11 @@ _SHELL_C = re.compile(r'^(-c|-C|--command)$')
 # names a CIPHER and `kubectl -c` a container, so listing every program that
 # can reach a shell was the same over-broad reading one level down: what
 # matters is whose option it is AND what that option means to them.
-_SHELL_RUNNERS = {'sh', 'bash', 'zsh', 'ksh', 'dash', 'ash', 'busybox',
-                  'su', 'runuser', 'fly', 'flyctl'}
+_SHELL_C_OPTS = {'sh': 'c', 'bash': 'c', 'zsh': 'c', 'ksh': 'c', 'dash': 'c',
+                 'ash': 'c', 'busybox': 'c', 'su': 'c', 'runuser': 'c',
+                 # Fly spells it `-C`, which is why the letter is per-program.
+                 'fly': 'C', 'flyctl': 'C'}
+_SHELL_RUNNERS = set(_SHELL_C_OPTS)
 # …and the runtimes that take `--entrypoint`, for the same reason.
 _CONTAINER_RUNNERS = {'docker', 'podman', 'nerdctl'}
 
@@ -876,6 +946,21 @@ def _is_runner(segment, cmd, names):
     """True when the command at `cmd` is one of `names`."""
     return (cmd < len(segment)
             and segment[cmd].rsplit('/', 1)[-1] in names)
+
+
+def _shell_c(tok, owner):
+    """True when `tok` is `owner`'s command-string option.
+
+    Bundled or standalone, but only the letter this program actually spells it
+    with — see `_SHELL_C_OPTS`.
+    """
+    letter = _SHELL_C_OPTS.get(owner.rsplit('/', 1)[-1])
+    if letter is None:
+        return False
+    if tok == '--command':
+        return True
+    return (len(tok) > 1 and tok[0] == '-' and tok[1] != '-'
+            and tok[1:].isalpha() and letter in tok[1:])
 
 # A command key that carries no value on its own line, and the YAML list items
 # that follow it. A deployment recipe writes the container command either
@@ -1052,9 +1137,8 @@ def _nested_command(segment, j, tok, cmd=0):
     # sh's. Either the token before the option or the head may own it —
     # `fly ssh console -C '…'` is the second shape, where the option sits
     # several words after the program that defines it.
-    after_c = (bool(_SHELL_C.match(prev))
-               and (_is_runner(segment, j - 2, _SHELL_RUNNERS)
-                    or _is_runner(segment, cmd, _SHELL_RUNNERS)))
+    after_c = any(_shell_c(prev, segment[k]) for k in (j - 2, cmd)
+                  if 0 <= k < len(segment))
     if ' ' in tok:
         marked = after_c or bool(_COMMAND_KEY.match(prev))
         if not marked and prev == '=' and j > 1:
@@ -1173,10 +1257,11 @@ def _embedded_spans(tok):
         start = tok.find('$(', i)
         if start < 0:
             return
-        # `$((` is ARITHMETIC, not a command, and `\$(` is a literal dollar
-        # the shell prints. Reporting either rejected a page that runs no
-        # autumn at all.
-        if tok[start:start + 3] == '$((' or (start and tok[start - 1] == '\\'):
+        # `$((` is ARITHMETIC, not a command. Reporting it rejected a page
+        # that runs no autumn at all. Whether the `$` was ESCAPED is decided
+        # by the masked copy instead — see `_mask_single_quoted` — because
+        # tokenization destroys the backslash parity this would need.
+        if tok[start:start + 3] == '$((':
             i = start + 2
             continue
         depth, j, quote = 0, start + 1, None
@@ -1246,8 +1331,22 @@ def _mask_quoted(text, quotes="'\""):
 
 
 def _mask_single_quoted(text):
-    """The substitution reading: only single quotes stop `$( … )`."""
-    return _mask_quoted(text, "'")
+    """The substitution reading: only single quotes stop `$( … )`.
+
+    An ESCAPED `$(` is stopped too, and the decision has to be made HERE, on
+    the raw text, rather than on the token. shlex resolves `"\\\\$("` (a literal
+    backslash in front of a LIVE substitution) and `"\\$("` (an escaped dollar
+    the shell prints) to the same characters, so after tokenization the two are
+    indistinguishable — a parity test on the token suppressed the real one.
+    Blanking the dollar keeps the existing positional check as the single place
+    that decides.
+    """
+    masked = _mask_quoted(text, "'")
+    out = list(masked)
+    for m in re.finditer(r'\$\(', masked):
+        if _escaped(text, m.start()):
+            out[m.start()] = 'x'
+    return ''.join(out)
 
 
 def _in_substitutions(segment, masked=()):
@@ -1484,10 +1583,26 @@ def invocations(text):
     lang = None
     held = []          # parts of a backslash-continued line, oldest first
     held_at = None     # the line the continued command STARTED on
+    quoted = []        # physical lines inside a quote that spans them
+    quoted_at = None   # the line the open quote STARTED on
+    quote = None       # the quote character still open, or None
 
     def flush(line, lineno):
-        """Fold a backslash continuation into one logical line."""
-        nonlocal held, held_at
+        """Fold a backslash continuation and a multi-line quote into one line."""
+        nonlocal held, held_at, quoted, quoted_at, quote
+        # A quote that is still open runs on into the next physical line, so
+        # everything until it closes is string DATA. Only a SHELL fence gets
+        # this reading: an apostrophe in a `rust` fence is a lifetime and in a
+        # `toml` one a plain character, and folding on those would swallow the
+        # rest of the block — 173 spans across the corpus, against 4 here.
+        if quote:
+            quoted.append(line)
+            quote = _open_quote(line, quote)
+            if quote:
+                return None, None
+            line, lineno = '\n'.join(quoted), quoted_at
+            quoted, quoted_at = [], None
+            return line, lineno
         # A trailing backslash continues the line only when it is itself
         # UNESCAPED. `printf '%s' \\\\` prints one literal backslash and
         # continues nothing, and joining the next line onto it hid the command
@@ -1498,17 +1613,37 @@ def invocations(text):
         # next line into the comment, where shlex discarded it — a WRONG join,
         # not the missed one I had reasoned it would be.
         body = _strip_comment(line).rstrip()
-        if (len(body) - len(body.rstrip('\\'))) % 2 == 1:
+        if _escaped(body + ' ', len(body)):
             held.append(body[:-1])
             if held_at is None:
                 held_at = lineno
             return None, None
         if held:
-            joined = ' '.join(held) + ' ' + line
-            at = held_at
+            line = ' '.join(held) + ' ' + line
+            lineno = held_at
             held, held_at = [], None
-            return joined, at
+        if lang in _SHELL_LANGS:
+            quote = _open_quote(line)
+            if quote:
+                quoted, quoted_at = [line], lineno
+                return None, None
         return line, lineno
+
+    def close_quote():
+        """Read an unterminated quote's lines the way they were read before.
+
+        A fence ends the string whatever the shell would do, and a block that
+        opens a quote it never closes is a FRAGMENT of a larger file. Dropping
+        its lines would lose coverage silently, so each is scanned on its own —
+        exactly what this script did before the fold existed. No shell fence in
+        this corpus reaches here; it is the safety net for the one that does.
+        """
+        nonlocal quoted, quoted_at, quote
+        pending_lines, at = quoted, quoted_at
+        quoted, quoted_at, quote = [], None, None
+        for offset, held_line in enumerate(pending_lines):
+            for display, argv in commands(held_line):
+                yield (at or 0) + offset, display, argv, FENCED_COMMAND
 
     # Prose accumulates into paragraphs before its code spans are read, because
     # a markdown inline span may WRAP across source lines and still render as
@@ -1644,6 +1779,7 @@ def invocations(text):
         m = re.match(r'^\s*(?:>\s?)*(`{3,}|~{3,})\s*(.*)$', line)
         if m:
             held, held_at, heredocs = [], None, []   # a fence boundary ends any hold
+            yield from close_quote()            # …an unterminated quote
             yield from close_folded()           # …a folded scalar
             yield from close_pending()          # …and any list
             yield from emit_slots()
@@ -1840,6 +1976,12 @@ def invocations(text):
         # seen, so its body was scanned as commands.
         for opener in _HEREDOC.finditer(stripped):
             if masked_line[opener.start():opener.start() + 2] != '<<':
+                continue
+            # …and not an ESCAPED one. `echo \<<EOF` is a literal `<` followed
+            # by an ordinary input redirection, so nothing below it is heredoc
+            # data — but the operator was queued anyway and the command on the
+            # next line was consumed as the body.
+            if _escaped(stripped, opener.start()):
                 continue
             # `<<-` allows the terminator to be indented with TABS; a plain
             # `<<` requires it alone on the line. Accepting any indentation
@@ -3405,6 +3547,79 @@ def self_test():
         doc = f'```bash\n{form} autumn migrate status\n```'
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate status'], f'{form} takes no operand: {got}')
+
+    # A quote spans physical lines, so what is written inside one is string
+    # data. Read line by line the opener failed to tokenize, fell back to
+    # whitespace splitting, and the text inside the string was reported as a
+    # runnable command on a correct page.
+    for opener, closer in (("'", "'"), ('"', '"')):
+        doc = f'```bash\nprintf \'%s\' {opener}\nautumn db\n{closer}\n```'
+        expect(list(invocations(doc)) == [],
+               f'a {opener} spanning lines is data: {list(invocations(doc))}')
+    after = "```bash\nprintf '%s' '\ndata\n'; autumn nope\n```"
+    expect([d for _, d, _, _ in invocations(after)] == ['nope'],
+           f'a command after the closing quote still runs: '
+           f'{list(invocations(after))}')
+    # Only a SHELL fence gets this reading: an apostrophe is a lifetime in
+    # `rust` and an ordinary character in `toml`, and folding there would
+    # swallow the rest of the block.
+    rust_q = "```rust\nfn f<'a>(x: &'a str) {}\nlet _ = \"autumn nope\";\n```"
+    expect(list(invocations(rust_q)) == [],
+           f'a rust lifetime does not open a shell quote: '
+           f'{list(invocations(rust_q))}')
+    # A fence that opens a quote it never closes is a FRAGMENT: its lines are
+    # handed back and read one at a time rather than dropped.
+    frag = "```bash\nprintf '%s' '\nautumn nope\n```"
+    expect([d for _, d, _, _ in invocations(frag)] == ['nope'],
+           f'an unterminated quote falls back, it does not swallow: '
+           f'{list(invocations(frag))}')
+
+    # `2>&-` CLOSES a descriptor, so `-` is a duplication target like a digit.
+    # Accepting only digits left the `-` as its own token, and as a LEADING
+    # redirection it became the segment head with the command behind it unread.
+    for redir in ('2>&-', '2>&1', '1>&2'):
+        doc = f'```bash\n{redir} autumn nope\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'a leading {redir} is stepped over: {got}')
+
+    # A shell's command-string option may be BUNDLED, and bash takes `c`'s
+    # value from the next word wherever `c` sits in the cluster.
+    for form in ('bash -lc', 'bash -cl', 'sh -ec', 'bash -c', 'bash --command'):
+        doc = f"```bash\n{form} 'autumn nope'\n```"
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f"{form} runs its string: {got}")
+    # …and the LETTER is per-program, which is why it cannot be shared:
+    # `bash -C` is noclobber, `ssh -c` a cipher, `echo -c` nothing at all.
+    for quiet in ('bash -C', 'ssh -c aes256 host', 'echo -c', 'bash --check'):
+        doc = f"```bash\n{quiet} 'autumn nope'\n```"
+        expect(list(invocations(doc)) == [],
+               f'{quiet} does not run its argument: {list(invocations(doc))}')
+    fly = "```bash\nfly ssh console -C 'autumn nope'\n```"
+    expect([d for _, d, _, _ in invocations(fly)] == ['nope'],
+           f"fly spells it -C: {list(invocations(fly))}")
+
+    # `echo \\<<EOF` is a literal `<` and an ordinary input redirection, so
+    # nothing below it is heredoc data. Queueing the operator anyway consumed
+    # the command on the next line as the body.
+    esc_hd = '```bash\ntouch EOF; echo \\<<EOF\nautumn nope\n```'
+    expect([d for _, d, _, _ in invocations(esc_hd)] == ['nope'],
+           f'an escaped heredoc operator opens nothing: '
+           f'{list(invocations(esc_hd))}')
+    real_hd = '```bash\ncat <<EOF\nautumn db\nEOF\nautumn nope\n```'
+    expect([d for _, d, _, _ in invocations(real_hd)] == ['nope'],
+           f'a real heredoc still swallows its body only: '
+           f'{list(invocations(real_hd))}')
+
+    # PARITY, not presence, before a substitution: backslashes pair off, so an
+    # even run leaves `$(` live. This cannot be decided on the token — shlex
+    # resolves `"\\\\$("` and `"\\$("` to the same characters — so the masked
+    # copy decides it from the raw text.
+    for run, runs in ((1, False), (2, True), (3, False), (4, True)):
+        doc = '```bash\nprintf \'%s\' "' + '\\' * run + '$(autumn nope)"\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == (['nope'] if runs else []),
+               f'{run} backslash(es) before $( '
+               f'{"runs" if runs else "does not run"}: {got}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
