@@ -51,7 +51,10 @@ fn block_has_generated_replay_guard(block: &Block) -> bool {
             return true;
         }
 
-        if stmt_is_generated_auth_prologue(stmt) || stmt_is_generated_throttle_prologue(stmt) {
+        if stmt_is_generated_auth_prologue(stmt)
+            || stmt_is_generated_throttle_prologue(stmt)
+            || stmt_is_generated_sunset_check_prologue(stmt)
+        {
             index += 1;
             continue;
         }
@@ -127,6 +130,85 @@ fn stmt_is_generated_throttle_prologue(stmt: &Stmt) -> bool {
     };
 
     if_let_throttle_check_returns(expr_if)
+}
+
+/// Skips the version-sunset check `#[authorize]` emits between its policy
+/// check and its replay stop:
+/// `if let Some(Extension(meta)) = &__autumn_route_version { if let
+/// Some(resp) = check_sunset(&state, meta) { return resp; } }`. It carries
+/// real behaviour (an old route version can still reject a request), but
+/// nothing downstream of it depends on that outcome the way replay-serving
+/// does, so the scan must step over it to reach the replay guard that
+/// follows: an unrecognized statement here stops the walk, the replay guard
+/// reads as absent, and a gate macro stacked above `#[authorize]` would then
+/// claim replay ownership for a `FromRequestParts` extractor that runs
+/// BEFORE authorize's policy re-check ever does.
+fn stmt_is_generated_sunset_check_prologue(stmt: &Stmt) -> bool {
+    let Stmt::Expr(Expr::If(expr_if), _) = stmt else {
+        return false;
+    };
+
+    if_let_sunset_check(expr_if)
+}
+
+fn if_let_sunset_check(expr_if: &ExprIf) -> bool {
+    let Expr::Let(expr_let) = expr_if.cond.as_ref() else {
+        return false;
+    };
+
+    expr_if.else_branch.is_none()
+        && pat_is_some_route_version_extension(&expr_let.pat)
+        && expr_is_ref_to_ident(&expr_let.expr, "__autumn_route_version")
+        && block_is_sunset_check_body(&expr_if.then_branch)
+}
+
+fn pat_is_some_route_version_extension(pat: &Pat) -> bool {
+    let Pat::TupleStruct(tuple) = pat else {
+        return false;
+    };
+
+    path_matches(&tuple.path, &["core", "option", "Option", "Some"])
+        && tuple.elems.len() == 1
+        && pat_is_extension_binding(&tuple.elems[0], "__autumn_meta")
+}
+
+fn pat_is_extension_binding(pat: &Pat, expected: &str) -> bool {
+    let Pat::TupleStruct(tuple) = pat else {
+        return false;
+    };
+
+    path_ends_with(&tuple.path, "Extension")
+        && tuple.elems.len() == 1
+        && pat_binds_ident(&tuple.elems[0], expected)
+}
+
+fn block_is_sunset_check_body(block: &Block) -> bool {
+    match block.stmts.as_slice() {
+        [Stmt::Expr(Expr::If(inner_if), _)] => if_let_sunset_response_returns(inner_if),
+        _ => false,
+    }
+}
+
+fn if_let_sunset_response_returns(expr_if: &ExprIf) -> bool {
+    let Expr::Let(expr_let) = expr_if.cond.as_ref() else {
+        return false;
+    };
+
+    expr_if.else_branch.is_none()
+        && pat_is_some_replay_response(&expr_let.pat)
+        && expr_is_check_sunset_call(&expr_let.expr)
+        && block_returns_ident(&expr_if.then_branch, "__autumn_response")
+}
+
+fn expr_is_check_sunset_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(call) => {
+            path_expr_matches(&call.func, &["autumn_web", "__private", "check_sunset"])
+        }
+        Expr::Group(group) => expr_is_check_sunset_call(&group.expr),
+        Expr::Paren(paren) => expr_is_check_sunset_call(&paren.expr),
+        _ => false,
+    }
 }
 
 fn if_let_throttle_check_returns(expr_if: &ExprIf) -> bool {
@@ -587,7 +669,7 @@ fn path_ends_with(path: &syn::Path, expected: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::block_has_replay_guard;
+    use super::{block_has_replay_guard, should_own_replay};
 
     #[test]
     fn string_literal_does_not_count_as_replay_guard() {
@@ -992,13 +1074,9 @@ mod tests {
         //
         // Scope of this test: it pins the SKIP-LIST behavior on the
         // marker-plus-policy-check prologue prefix, via a reduced hand-written
-        // block. It deliberately does NOT run the walk over full real
-        // `#[authorize]` output: the walk already fails there on the
-        // unrecognized sunset-check statement the guard emits between the
-        // policy check and the replay stop — a pre-existing gap that predates
-        // the marker (and equally affects `#[secured]`'s UNAUTHORIZED-wrapped
-        // failure branch), tracked as its own follow-up because recognizing
-        // those statements changes replay-layer composition at runtime.
+        // block that stops short of the sunset-check statement `#[authorize]`
+        // emits next. `should_own_replay_defers_to_authorize_across_the_sunset_check`
+        // below exercises the real full expansion, sunset check included.
         let generated = crate::authorize::authorize_macro(
             quote::quote! { "update", resource = Post },
             quote::quote! {
@@ -1042,5 +1120,43 @@ mod tests {
         });
 
         assert!(block_has_replay_guard(&block));
+    }
+
+    #[test]
+    fn should_own_replay_defers_to_authorize_across_the_sunset_check() {
+        // Real stacking order `#[authorize("update", resource = Post)]` above
+        // `#[secured]`/`#[step_up]`/`#[throttle]`: authorize expands FIRST
+        // (it's topmost) and already owns replay-serving via its own in-body
+        // check. Between that check and its replay stop it also emits a
+        // sunset-version check — a statement the scan must see past, or it
+        // stops early, reports no replay guard, and lets the about-to-attach
+        // gate claim replay ownership for itself.
+        //
+        // That would no longer be the harmless redundancy it was pre-#1668:
+        // the gate is a `FromRequestParts` extractor that runs BEFORE the
+        // handler body — i.e. before `#[authorize]`'s policy re-check, which
+        // lives entirely inside the body. A gate that wrongly owns replay
+        // would serve a cached success response for a retried mutation
+        // without ever re-running that policy check, even after the
+        // requester's authorization has since been revoked.
+        let generated = crate::authorize::authorize_macro(
+            quote::quote! { "update", resource = Post },
+            quote::quote! {
+                async fn update_post(post: Post) -> &'static str { "ok" }
+            },
+        );
+        let generated_fn: syn::ItemFn =
+            syn::parse2(generated).expect("#[authorize] must emit a parseable function");
+
+        assert!(
+            block_has_replay_guard(&generated_fn.block),
+            "the real #[authorize] expansion already owns replay-serving; the scan must \
+             see past the sunset-check statement to find it"
+        );
+        assert!(
+            !should_own_replay(&generated_fn),
+            "a gate macro stacking on top of real #[authorize] output must defer replay \
+             ownership to authorize, not claim it for a pre-body gate"
+        );
     }
 }
