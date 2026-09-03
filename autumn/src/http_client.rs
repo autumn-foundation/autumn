@@ -2244,30 +2244,38 @@ impl RequestBuilder {
     /// default cap while every per-hop safety step (resolve→validate→pin,
     /// https→http downgrade block, sensitive-header stripping, method/body
     /// rewrite) still applies.
-    /// Runs the whole resolve→validate→pin→redirect operation under one
-    /// outer deadline, so it cannot exceed `timeout` in total.
+    /// Runs the whole resolve→validate→pin→redirect operation against one
+    /// deadline `timeout` from now, rather than handing every phase of every
+    /// hop a fresh `timeout`-length budget.
     ///
     /// Without this, `timeout` only bounded each hop's own connect/response
-    /// wait *inside* [`Self::send_ssrf_safe_inner`] — the DNS lookup in
-    /// [`resolve_and_validate`] has no timeout of its own, and a fresh
-    /// `timeout`-length budget is handed to *every* redirect hop rather than
-    /// the operation as a whole. A subscriber-controlled destination (the
-    /// motivating case: outbound webhook delivery, #2480 code review) with
-    /// stalled DNS or a slow multi-hop redirect chain could therefore occupy
-    /// a job worker for `timeout × (hops + 1)` plus unbounded DNS wait,
-    /// rather than the single `timeout` every other outbound call is bounded
-    /// by.
+    /// wait — the DNS lookup in [`resolve_and_validate`] had no timeout of
+    /// its own, and every redirect hop got a full fresh `timeout` regardless
+    /// of how long earlier hops already took. A subscriber-controlled
+    /// destination (the motivating case: outbound webhook delivery, #2480
+    /// code review) with stalled DNS or a slow multi-hop redirect chain
+    /// could therefore occupy a job worker for `timeout × (hops + 1)` plus
+    /// unbounded DNS wait, rather than the single `timeout` every other
+    /// outbound call is bounded by.
+    ///
+    /// The budget shrinks across two seams per hop — the DNS lookup, then
+    /// the connect/response reqwest performs — rather than being enforced by
+    /// one coarse outer `tokio::time::timeout` wrapping the whole call: a
+    /// coarse wrap would race the *same* duration against both this
+    /// operation's start and each hop's own reqwest-level timeout, and since
+    /// the outer clock always starts first it would almost always fire
+    /// first, silently reclassifying an ordinary single-hop stall from
+    /// `ClientError::Request` (a `reqwest::Error` callers can query with
+    /// `.is_timeout()`) into `ClientError::InvalidUrl` (#2480 review, round
+    /// 7). Shrinking the *reqwest* timeout instead means a connect/response
+    /// stall in the common (no-redirect) case still times out inside
+    /// reqwest itself and keeps that exact, already-documented error shape;
+    /// only a stall in the DNS lookup — which had no error shape of its own
+    /// to preserve, because it had no timeout at all before this fix —
+    /// surfaces as `InvalidUrl`, consistent with the DNS-failure case
+    /// immediately below reusing the same variant.
     async fn send_ssrf_safe(self, timeout: Duration) -> Result<Response, ClientError> {
-        tokio::time::timeout(timeout, self.send_ssrf_safe_inner(timeout))
-            .await
-            .unwrap_or_else(|_| {
-                Err(ClientError::InvalidUrl(format!(
-                    "SSRF-safe resolve/redirect operation exceeded the {timeout:?} deadline"
-                )))
-            })
-    }
-
-    async fn send_ssrf_safe_inner(self, timeout: Duration) -> Result<Response, ClientError> {
+        let deadline = std::time::Instant::now() + timeout;
         let (follow, max) = self.ssrf_redirect_plan();
         let original =
             url::Url::parse(&self.url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
@@ -2278,15 +2286,25 @@ impl RequestBuilder {
         let mut headers = self.extra_headers.clone();
         let mut body = self.body.clone();
         for hop in 0.. {
+            let remaining_for_lookup = deadline_remaining_or_timeout(deadline, &current)?;
             // Resolve host → ALL validated addresses (rejects if ANY resolved IP
             // is blocked), then pin the full set so reqwest cannot re-resolve but
             // can still fall back across the validated addresses in order.
-            let addrs = resolve_and_validate(&current).await?;
+            // Wrapped in the *remaining* budget, not the full per-request
+            // `timeout`: resolve_and_validate's DNS lookup previously had no
+            // timeout of its own at all.
+            let addrs = tokio::time::timeout(remaining_for_lookup, resolve_and_validate(&current))
+                .await
+                .map_err(|_| ssrf_safe_deadline_error(&current))??;
             let host = host_of(&current)?;
+            // Re-measured after the lookup, so a slow DNS response shrinks
+            // what's left for the connect/response phase below rather than
+            // that phase getting a fresh full `timeout` regardless.
+            let remaining_for_connect = deadline_remaining_or_timeout(deadline, &current)?;
             let client = build_oneshot_client(
                 Some((host, addrs)),
                 reqwest::redirect::Policy::none(),
-                timeout,
+                remaining_for_connect,
             )?;
             // On any post-origin hop, drop credential-bearing headers if the
             // current target is cross-origin (stays stripped once stripped).
@@ -2356,6 +2374,32 @@ const fn is_idempotent_method(method: &Method) -> bool {
 
 const fn is_retryable_status(status: u16) -> bool {
     matches!(status, 502..=504)
+}
+
+/// Time left until `deadline`, or the deadline error if it has already
+/// passed before this hop's next phase (DNS lookup or connect) even began.
+/// Used by [`RequestBuilder::send_ssrf_safe`] to shrink the budget handed to
+/// each successive phase rather than resetting it every hop.
+fn deadline_remaining_or_timeout(
+    deadline: std::time::Instant,
+    current: &str,
+) -> Result<Duration, ClientError> {
+    let now = std::time::Instant::now();
+    if now >= deadline {
+        return Err(ssrf_safe_deadline_error(current));
+    }
+    Ok(deadline - now)
+}
+
+/// The error [`RequestBuilder::send_ssrf_safe`] returns when its overall
+/// deadline is exhausted — reusing [`ClientError::InvalidUrl`] rather than a
+/// new variant (see that call site's doc comment for why), consistent with
+/// the adjacent DNS-lookup-failure case in [`resolve_and_validate`] already
+/// using the same variant for the same phase.
+fn ssrf_safe_deadline_error(current: &str) -> ClientError {
+    ClientError::InvalidUrl(format!(
+        "SSRF-safe resolve/redirect operation exceeded its deadline resolving {current}"
+    ))
 }
 
 /// Resolve (or create) the circuit breaker for `url`'s host, honouring a
