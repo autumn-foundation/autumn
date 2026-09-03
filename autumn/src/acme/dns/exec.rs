@@ -116,7 +116,11 @@ impl ExecProvider {
 
     /// Read inherited credentials from `vars` instead of the process
     /// environment. Test seam only.
-    #[cfg(test)]
+    ///
+    /// `unix` as well as `test`: its only caller drives a POSIX shell, so on
+    /// Windows this would be dead code and the `-D warnings` gate would reject
+    /// it.
+    #[cfg(all(test, unix))]
     fn with_env(mut self, vars: Vec<(String, String)>) -> Self {
         self.env_override = Some(vars);
         self
@@ -331,6 +335,10 @@ mod tests {
         TxtRecord::new("myapp.com", "challenge-value")
     }
 
+    // Drives a POSIX shell, which windows-latest does not have. The provider
+    // itself is portable — it spawns an argv array — but these assertions are
+    // about `/bin/sh` argument handling and stream behaviour.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_zero_exit_publishes_the_record() {
         // `true` ignores its arguments and exits 0 — the "hook worked" contract.
@@ -339,6 +347,10 @@ mod tests {
         assert!(provider.delete_txt(&record()).await.is_ok());
     }
 
+    // Drives a POSIX shell, which windows-latest does not have. The provider
+    // itself is portable — it spawns an argv array — but these assertions are
+    // about `/bin/sh` argument handling and stream behaviour.
+    #[cfg(unix)]
     /// Regression (#1620): the hook's argv must be exactly the three documented
     /// arguments, with `$1` the action.
     ///
@@ -378,6 +390,10 @@ mod tests {
             .expect("cleanup action");
     }
 
+    // Drives a POSIX shell, which windows-latest does not have. The provider
+    // itself is portable — it spawns an argv array — but these assertions are
+    // about `/bin/sh` argument handling and stream behaviour.
+    #[cfg(unix)]
     /// The exact script the TLS guide ships must work when copied verbatim.
     ///
     /// It is the one piece of this feature an operator runs unmodified, so it is
@@ -419,6 +435,10 @@ esac
             .expect("the documented script must take the `delete` branch on cleanup");
     }
 
+    // Drives a POSIX shell, which windows-latest does not have. The provider
+    // itself is portable — it spawns an argv array — but these assertions are
+    // about `/bin/sh` argument handling and stream behaviour.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_non_zero_exit_fails_the_order_and_quotes_stderr() {
         let provider = ExecProvider::new(vec![
@@ -447,6 +467,10 @@ esac
         assert!(err.contains("command"), "got: {err}");
     }
 
+    // Drives a POSIX shell, which windows-latest does not have. The provider
+    // itself is portable — it spawns an argv array — but these assertions are
+    // about `/bin/sh` argument handling and stream behaviour.
+    #[cfg(unix)]
     // The value is an argv entry, never shell syntax: a hook invoked with a
     // value containing `;` or backticks must still see it verbatim.
     #[tokio::test]
@@ -474,6 +498,10 @@ esac
         assert!(excerpt.chars().count() <= super::super::UPSTREAM_EXCERPT_CHARS + 3);
     }
 
+    // Drives a POSIX shell, which windows-latest does not have. The provider
+    // itself is portable — it spawns an argv array — but these assertions are
+    // about `/bin/sh` argument handling and stream behaviour.
+    #[cfg(unix)]
     // A hook written with `set -x` traces its own credentials to stderr, and
     // that stderr is published on `/actuator/health` and to the operator's alert
     // destination. It must not carry the token through.
@@ -498,6 +526,10 @@ esac
         assert!(err.contains("exit status 1"), "got: {err}");
     }
 
+    // Drives a POSIX shell, which windows-latest does not have. The provider
+    // itself is portable — it spawns an argv array — but these assertions are
+    // about `/bin/sh` argument handling and stream behaviour.
+    #[cfg(unix)]
     // The TXT value is base64url, whose alphabet includes `-`, so ~1 in 64
     // challenge values starts with one. It still arrives as `$3`: the action
     // precedes it and is not an option, so any conventional parser has already
@@ -518,6 +550,10 @@ esac
             .expect("a leading-dash value reaches the hook as the third argument");
     }
 
+    // Drives a POSIX shell, which windows-latest does not have. The provider
+    // itself is portable — it spawns an argv array — but these assertions are
+    // about `/bin/sh` argument handling and stream behaviour.
+    #[cfg(unix)]
     /// Regression (#1620): a hook that authenticates from an *inherited*
     /// environment variable — the documented way to reach a provider autumn does
     /// not ship — must not be able to republish that value through its stderr.
@@ -593,6 +629,10 @@ esac
         );
     }
 
+    // Drives a POSIX shell, which windows-latest does not have. The provider
+    // itself is portable — it spawns an argv array — but these assertions are
+    // about `/bin/sh` argument handling and stream behaviour.
+    #[cfg(unix)]
     /// Regression (#1620): a hook that never stops writing must not be able to
     /// grow this process's memory. The 120s timeout bounds how *long* a hook
     /// runs, not how much it writes, so `stderr` is read through a fixed buffer
@@ -626,6 +666,10 @@ esac
         );
     }
 
+    // Drives a POSIX shell, which windows-latest does not have. The provider
+    // itself is portable — it spawns an argv array — but these assertions are
+    // about `/bin/sh` argument handling and stream behaviour.
+    #[cfg(unix)]
     /// A hook writing a lot of stdout is never buffered at all: stdout goes to
     /// `/dev/null`, so it cannot pressure this process either.
     #[tokio::test]
