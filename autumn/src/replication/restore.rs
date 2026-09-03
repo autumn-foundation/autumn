@@ -586,8 +586,11 @@ fn displace_sidecars(output: &Path) -> Result<Vec<(PathBuf, PathBuf)>, RestoreEr
     let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     for sidecar in [wal::wal_path(output), wal::shm_path(output)] {
         let parked = displaced_path(&sidecar);
-        // `rename` refuses an existing destination on Windows, and a park left
-        // by an interrupted earlier run is not something to preserve.
+        // A park left by an interrupted earlier run is not something to
+        // preserve, and `rename` refuses an existing *directory* as its
+        // destination on every platform. (It does replace an existing file,
+        // Windows included: `fs::rename` is documented as "replacing the
+        // original file if `to` already exists".)
         if let Err(e) = std::fs::remove_file(&parked)
             && e.kind() != std::io::ErrorKind::NotFound
         {
