@@ -124,61 +124,61 @@ pub fn widening(findings: &[Finding]) -> Vec<&Finding> {
         .collect()
 }
 
-/// Index routes by `(path, method)`, keeping the **most open** entry when a
-/// manifest carries the same key twice.
+/// Index routes by `(path, method)`, **merging** duplicate keys into the widest
+/// posture their entries jointly describe.
 ///
-/// A manifest should never contain a duplicate key, but "should never" is not a
-/// guarantee about a file on disk. Letting the last one win would make the
-/// verdict depend on array order — and the order that hides a public route
-/// would be the one that passes.
-fn route_index(m: &PostureManifest) -> BTreeMap<RouteKey, &RouteEntry> {
-    let mut index: BTreeMap<RouteKey, &RouteEntry> = BTreeMap::new();
+/// A manifest should never carry the same key twice, but "should never" is not
+/// a guarantee about a file on disk, and letting either entry win makes the
+/// verdict depend on array order — with the order that hides the wider entry
+/// being the one that passes.
+///
+/// Picking a winner cannot work, because two postures can be *incomparable*:
+/// `roles: ["admin"]` and `roles: ["editor"]` neither contains the other, so
+/// any ranking of them is arbitrary and one of the two orders hides a newly
+/// admitted role. Merging has no such gap: the union of the two is at least as
+/// wide as either, so the diff can only ever over-report.
+fn route_index(m: &PostureManifest) -> BTreeMap<RouteKey, RouteEntry> {
+    let mut index: BTreeMap<RouteKey, RouteEntry> = BTreeMap::new();
     for entry in &m.dimensions.routes.entries {
         index
             .entry(entry.key())
-            .and_modify(|existing| {
-                if more_open(entry, existing) {
-                    *existing = entry;
-                }
-            })
-            .or_insert(entry);
+            .and_modify(|existing| *existing = widest_of(existing, entry))
+            .or_insert_with(|| entry.clone());
     }
     index
 }
 
-/// Whether `candidate` describes a wider posture than `current`, used only to
-/// break duplicate-key ties in the conservative direction.
-fn more_open(candidate: &RouteEntry, current: &RouteEntry) -> bool {
-    openness_key(candidate) > openness_key(current)
-}
-
-/// A comparable "how reachable is this route" key, higher meaning wider.
-///
-/// Every dimension the manifest proves, in the direction the framework's own
-/// semantics give it:
-///
-/// - an unguarded classification beats a guarded one;
-/// - **no** role requirement is the widest of all (`#[secured]` admits every
-///   authenticated session), and among non-empty lists more roles is wider,
-///   because roles are OR-ed;
-/// - fewer required scopes is wider, because scopes are AND-ed;
-/// - no record-level policy check is wider.
-///
-/// Leaving roles out of this — as the first cut did — meant two duplicate
-/// `gated` entries differing only in roles tied, and array order picked the
-/// winner. The order that hid the wider entry was the one that passed.
-fn openness_key(entry: &RouteEntry) -> (u8, usize, usize, u8) {
-    let roles = entry.role_set();
-    (
-        u8::from(is_open(&entry.classification)),
-        if roles.is_empty() {
-            usize::MAX
+/// The posture that admits every caller either of these two does, dimension by
+/// dimension, in the direction the framework's own semantics give it.
+fn widest_of(a: &RouteEntry, b: &RouteEntry) -> RouteEntry {
+    // Roles are OR-ed, so the union admits at least as many principals — and an
+    // *empty* list is widest of all, since `#[secured]` with no roles admits
+    // every authenticated session.
+    let roles = if a.roles.is_empty() || b.roles.is_empty() {
+        Vec::new()
+    } else {
+        a.role_set().union(&b.role_set()).cloned().collect()
+    };
+    // Scopes are AND-ed, so requiring only what both require admits at least as
+    // many tokens.
+    let scopes = a
+        .scope_set()
+        .intersection(&b.scope_set())
+        .cloned()
+        .collect();
+    RouteEntry {
+        path: a.path.clone(),
+        method: a.method.clone(),
+        classification: if is_open(&a.classification) {
+            a.classification.clone()
         } else {
-            roles.len()
+            b.classification.clone()
         },
-        usize::MAX - entry.scope_set().len(),
-        u8::from(!entry.policy),
-    )
+        roles,
+        scopes,
+        // A record-level check only holds if every entry claims it.
+        policy: a.policy && b.policy,
+    }
 }
 
 fn diff_routes(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Finding>) {
@@ -1388,7 +1388,7 @@ mod tests {
     /// the verdict would depend on array order — and the order that hides a
     /// public route would be the one that passes.
     #[test]
-    fn a_duplicate_route_key_resolves_to_the_most_open_entry_either_way() {
+    fn a_duplicate_route_key_merges_to_the_most_open_posture_either_way() {
         let base = routes_only(&route("/a", "GET", "gated", &["admin"], &[], false));
         let gated = route("/a", "GET", "gated", &["admin"], &[], false);
         let public = route("/a", "GET", "public", &[], &[], false);
@@ -1410,7 +1410,7 @@ mod tests {
     /// order decide: an empty role list admits every authenticated session,
     /// so it is the wider of the two and has to win either way.
     #[test]
-    fn a_duplicate_route_key_resolves_on_roles_too() {
+    fn a_duplicate_route_key_merges_roles_too() {
         let base = routes_only(&route("/a", "GET", "gated", &["admin"], &[], false));
         let with_role = route("/a", "GET", "gated", &["admin"], &[], false);
         let no_roles = route("/a", "GET", "gated", &[], &[], false);
@@ -1427,6 +1427,56 @@ mod tests {
             assert_eq!(f.severity, Severity::Widening);
         }
         assert_eq!(diff(&base, &role_first), diff(&base, &none_first));
+    }
+
+    /// Two duplicate entries can be *incomparable*: `["admin"]` and `["editor"]`
+    /// neither contains the other, so no ranking of them is principled and one
+    /// of the two array orders would hide the newly admitted role. Merging the
+    /// sets has no such gap.
+    #[test]
+    fn incomparable_duplicate_roles_merge_instead_of_racing() {
+        let base = routes_only(&route("/a", "GET", "gated", &["admin"], &[], false));
+        let admin = route("/a", "GET", "gated", &["admin"], &[], false);
+        let editor = route("/a", "GET", "gated", &["editor"], &[], false);
+
+        let admin_first = routes_only(&format!("{admin},{editor}"));
+        let editor_first = routes_only(&format!("{editor},{admin}"));
+
+        for head in [&admin_first, &editor_first] {
+            let f = only(diff(&base, head));
+            assert_eq!(f.kind, "roles_widened");
+            assert!(
+                f.detail.contains("editor"),
+                "the newly admitted role must be named whichever order it appears in: {f:?}"
+            );
+        }
+        assert_eq!(diff(&base, &admin_first), diff(&base, &editor_first));
+    }
+
+    /// The same, for the AND-ed dimension: requiring only what both entries
+    /// require is the wider reading.
+    #[test]
+    fn duplicate_scope_sets_merge_to_what_both_require() {
+        let base = routes_only(&route(
+            "/a",
+            "POST",
+            "gated",
+            &[],
+            &["read", "write"],
+            false,
+        ));
+        let read = route("/a", "POST", "gated", &[], &["read"], false);
+        let write = route("/a", "POST", "gated", &[], &["write"], false);
+
+        let read_first = routes_only(&format!("{read},{write}"));
+        let write_first = routes_only(&format!("{write},{read}"));
+
+        for head in [&read_first, &write_first] {
+            let f = only(diff(&base, head));
+            assert_eq!(f.kind, "scopes_widened");
+            assert_eq!(f.severity, Severity::Widening);
+        }
+        assert_eq!(diff(&base, &read_first), diff(&base, &write_first));
     }
 
     /// The acknowledgment digest must describe the *set* of widenings, not the
