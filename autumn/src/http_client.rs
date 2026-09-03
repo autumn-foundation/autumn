@@ -1870,7 +1870,7 @@ impl RequestBuilder {
             if self.breaker_scoped {
                 return self.send_custom_breaker_guarded().await;
             }
-            return self.send_custom().await;
+            return self.send_custom(false).await;
         }
 
         // ── Resilience / Circuit Breaker ──────────────────────────────────
@@ -1912,8 +1912,17 @@ impl RequestBuilder {
         if breaker.before_call().is_err() {
             return Err(ClientError::CircuitBreakerOpen);
         }
+        // Read before the breaker moves into the guard below. Mirrors the
+        // plain-path breaker block's own `is_half_open` (passed to
+        // `send_inner` to force a single attempt): a half-open probe is a
+        // budgeted, limited trial (`half_open_trial_count`), and letting
+        // `send_one`'s own retry loop turn one trial into several real
+        // network attempts spends that budget on one logical delivery
+        // instead of testing recovery with independent probes (#2480
+        // review, round 10).
+        let is_half_open = breaker.state() == crate::circuit_breaker::CircuitState::HalfOpen;
         let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker);
-        let res = self.send_custom().await;
+        let res = self.send_custom(is_half_open).await;
         match &res {
             Ok(resp) if resp.status().as_u16() < 500 => guard.success(),
             _ => guard.failure(),
@@ -2057,7 +2066,14 @@ impl RequestBuilder {
     }
 
     /// Dispatch to the appropriate custom send path. Consumes `self`.
-    async fn send_custom(self) -> Result<Response, ClientError> {
+    ///
+    /// `is_half_open`: `true` when this call is a circuit-breaker half-open
+    /// probe (only ever passed by [`Self::send_custom_breaker_guarded`]);
+    /// forces every `send_one` this dispatch reaches down to a single
+    /// attempt, exactly like the plain-path breaker block's own
+    /// `send_inner(is_half_open)` already does — see
+    /// `send_custom_breaker_guarded`'s doc comment.
+    async fn send_custom(self, is_half_open: bool) -> Result<Response, ClientError> {
         // Reject the incompatible `get_ssrf_safe` + `pin_to` combination up
         // front — deterministically, before any network I/O. `get_ssrf_safe`
         // routes through `send_ssrf_safe`, which runs its OWN per-hop
@@ -2115,7 +2131,7 @@ impl RequestBuilder {
             .unwrap_or_else(|| Duration::from_secs(30));
 
         if self.ssrf_safe {
-            return self.send_ssrf_safe(timeout).await;
+            return self.send_ssrf_safe(timeout, is_half_open).await;
         }
 
         // Extract the follow parameters (ending the borrow) before moving `self`.
@@ -2124,7 +2140,9 @@ impl RequestBuilder {
             RedirectMode::None | RedirectMode::Default => None,
         };
         if let Some((max, validator)) = follow {
-            return self.follow_loop(max, validator, timeout).await;
+            return self
+                .follow_loop(max, validator, timeout, is_half_open)
+                .await;
         }
 
         // Only `RedirectMode::None` (explicit `no_redirect`) and the pin-only
@@ -2147,6 +2165,7 @@ impl RequestBuilder {
             &self.retry_policy,
             self.discard_response_body,
             None,
+            is_half_open,
         )
         .await
     }
@@ -2167,6 +2186,7 @@ impl RequestBuilder {
         max: usize,
         validator: RedirectValidator,
         timeout: Duration,
+        is_half_open: bool,
     ) -> Result<Response, ClientError> {
         let original =
             url::Url::parse(&self.url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
@@ -2201,6 +2221,7 @@ impl RequestBuilder {
                 &self.retry_policy,
                 self.discard_response_body,
                 None,
+                is_half_open,
             )
             .await?;
 
@@ -2276,7 +2297,11 @@ impl RequestBuilder {
     /// to preserve, because it had no timeout at all before this fix —
     /// surfaces as `InvalidUrl`, consistent with the DNS-failure case
     /// immediately below reusing the same variant.
-    async fn send_ssrf_safe(self, timeout: Duration) -> Result<Response, ClientError> {
+    async fn send_ssrf_safe(
+        self,
+        timeout: Duration,
+        is_half_open: bool,
+    ) -> Result<Response, ClientError> {
         let deadline = std::time::Instant::now() + timeout;
         let (follow, max) = self.ssrf_redirect_plan();
         let original =
@@ -2322,6 +2347,7 @@ impl RequestBuilder {
                 &self.retry_policy,
                 self.discard_response_body,
                 Some(deadline),
+                is_half_open,
             )
             .await?;
 
@@ -2493,12 +2519,34 @@ fn build_oneshot_client(
 /// round 7's `ClientError::Request`/`.is_timeout()` regression) — the first
 /// attempt's error shape is always preserved unchanged. Other callers pass
 /// `None`, so their behavior is exactly as before this parameter existed.
+///
+/// Two more `deadline` seams round 9 found `send_ssrf_safe`'s own deadline
+/// fix had missed: `client`'s own reqwest-level timeout is fixed at
+/// build-hop-start, so a retry within the same hop still got the *original*
+/// per-attempt budget rather than what's actually left; and the 429
+/// `Retry-After` sleep is a second sleep, separate from the backoff sleep
+/// above, that the deadline check never covered at all. Both are fixed here:
+/// every attempt sends with an explicit per-request `.timeout()` recomputed
+/// from `deadline` (overriding `client`'s built-in one only when `deadline`
+/// is set, so non-SSRF-safe callers passing `None` are unaffected), and the
+/// `Retry-After` sleep is capped by the remaining budget and followed by the
+/// same deadline check the backoff sleep already has — falling through to
+/// return the 429 response as final, exactly like running out of
+/// `max_attempts` already does, rather than sleeping past the deadline first.
+///
+/// `suppress_retries`, when `true`, forces a single attempt regardless of
+/// `retry_policy` — the same thing [`RequestBuilder::send_inner`]'s own
+/// `suppress_retries` parameter does for the plain (non-custom) breaker path
+/// during a circuit-breaker half-open probe (#2480 review, round 10): a
+/// probe is a budgeted, limited trial, and letting this retry loop turn one
+/// trial into several real network attempts spends that budget on one
+/// logical delivery rather than testing recovery with independent probes.
 #[allow(
     clippy::too_many_arguments,
     reason = "one seam shared by three call sites (plain custom path, follow_loop, send_ssrf_safe); \
               splitting the request-shape fields into their own struct would still leave the \
-              retry/discard/deadline knobs alongside it, for no reduction in what a caller reasons \
-              about"
+              retry/discard/deadline/half-open knobs alongside it, for no reduction in what a \
+              caller reasons about"
 )]
 async fn send_one(
     client: &reqwest::Client,
@@ -2509,9 +2557,12 @@ async fn send_one(
     retry_policy: &RetryPolicy,
     discard_response_body: bool,
     deadline: Option<Instant>,
+    suppress_retries: bool,
 ) -> Result<Response, ClientError> {
     let start = Instant::now();
-    let max_attempts = if is_idempotent_method(method) || !retry_policy.retry_idempotent_only {
+    let max_attempts = if suppress_retries {
+        1
+    } else if is_idempotent_method(method) || !retry_policy.retry_idempotent_only {
         retry_policy.max_retries.saturating_add(1)
     } else {
         1
@@ -2528,6 +2579,14 @@ async fn send_one(
         }
 
         let mut req = client.request(method.clone(), url);
+        // Recomputed fresh every attempt (not just retries) rather than
+        // relying solely on `client`'s own timeout, which was fixed when the
+        // caller built it at hop-start: without this override, a retry deep
+        // into a hop's budget would still get the full original per-attempt
+        // timeout rather than what's actually left before `deadline`.
+        if let Some(d) = deadline {
+            req = req.timeout(d.saturating_duration_since(Instant::now()));
+        }
         req = inject_trace_context(req);
         for (name, value) in extra_headers {
             req = req.header(name.clone(), value.clone());
@@ -2549,10 +2608,23 @@ async fn send_one(
                     if let Some(req_timeout) = retry_policy.request_timeout {
                         sleep_delay = sleep_delay.min(req_timeout);
                     }
+                    if let Some(d) = deadline {
+                        sleep_delay = sleep_delay.min(d.saturating_duration_since(Instant::now()));
+                    }
                     tokio::time::sleep(sleep_delay).await;
-                    continue;
+                    if deadline.is_none_or(|d| Instant::now() < d) {
+                        continue;
+                    }
+                    // Deadline exceeded during (or because of) the
+                    // Retry-After wait — fall through and return this 429
+                    // response as the final outcome, exactly as running out
+                    // of max_attempts already does, instead of sleeping past
+                    // the deadline and only then giving up.
                 }
-                if is_retryable_status(status.as_u16()) && attempt + 1 < max_attempts {
+                if is_retryable_status(status.as_u16())
+                    && attempt + 1 < max_attempts
+                    && deadline.is_none_or(|d| Instant::now() < d)
+                {
                     continue;
                 }
 
