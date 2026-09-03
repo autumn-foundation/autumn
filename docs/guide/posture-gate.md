@@ -100,6 +100,31 @@ Deleting the committed manifest does not quietly turn the gate off either: a
 base branch that *had* a manifest and no longer does fails the check instead of
 bootstrapping.
 
+### If your app is a Cargo workspace member
+
+`autumn upgrade` will not write this workflow into a workspace *member*, for
+the same reason it does not write `ci.yml` there: GitHub only runs workflows
+from the repository root, so a member's `.github/workflows/` never executes at
+all, and seeding one would look like adoption while gating nothing.
+
+Adopt it by hand at the root instead — three edits to the scaffolded file:
+
+```yaml
+env:
+  # Point at the member's manifest.
+  POSTURE_MANIFEST: apps/my-app/security-posture.json
+
+# …in the `manifest` job:
+      - name: Build this commit's posture manifest
+        # Select the member package.
+        run: autumn routes audit -p my-app --manifest "$POSTURE_MANIFEST"
+```
+
+Everything else — the base read, the acknowledgment harvest, the diff, the
+verdict — works unchanged, because it only ever reads the manifest path.
+Teaching `autumn upgrade` to reconcile workspace-root files on a member's
+behalf is tracked separately.
+
 ---
 
 ## How a run works

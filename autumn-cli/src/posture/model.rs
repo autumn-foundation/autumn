@@ -356,20 +356,29 @@ pub fn escape_field(value: &str) -> String {
     out
 }
 
-/// Escape each element and join with a comma.
+/// Encode a list unambiguously: the element count, then the escaped elements.
 ///
-/// Role and scope names are unrestricted string literals — `#[secured("a,b")]`
-/// compiles — so joining first and escaping afterwards would make `["a,b"]` and
-/// `["a", "b"]` identical. Under OR semantics those are different postures:
-/// the second admits two roles. Every element is escaped on its own, so the
-/// only bare comma in the result is a separator.
+/// Two collisions this exists to prevent, both reachable from ordinary
+/// attribute syntax:
+///
+/// - Role and scope names are unrestricted string literals — `#[secured("a,b")]`
+///   compiles — so joining first and escaping afterwards would make `["a,b"]`
+///   and `["a", "b"]` identical. Under OR semantics those are different
+///   postures: the second admits two roles. Each element is escaped on its own,
+///   so the only bare comma in the result is a separator.
+/// - Joining escaped elements still encodes `[]` and `[""]` identically, and
+///   those are *also* different postures: `#[secured]` admits every
+///   authenticated session, while `#[secured("")]` compares the session's role
+///   against `""`. The count prefix separates them, and every other shape of
+///   emptiness with them.
 #[must_use]
 pub fn escape_list(items: &[String]) -> String {
-    items
+    let joined = items
         .iter()
         .map(|item| escape_field(item))
         .collect::<Vec<_>>()
-        .join(",")
+        .join(",");
+    format!("{}:{joined}", items.len())
 }
 
 /// Lower-case hex SHA-256 of `bytes`.
@@ -527,6 +536,54 @@ mod tests {
         )
         .unwrap();
         assert_ne!(one.posture_digest(), two.posture_digest());
+    }
+
+    /// `#[secured("")]` compiles, and it is *not* `#[secured]`: with a role
+    /// list of `[""]` the runtime compares the session's role against `""`,
+    /// while an empty list skips the comparison and admits every authenticated
+    /// session. Joining escaped elements encodes both as the empty string, so
+    /// the encoding needs to carry the element count.
+    #[test]
+    fn an_empty_role_list_is_not_a_list_holding_an_empty_role() {
+        let none = PostureManifest::parse(
+            &manifest(
+                r#"{"path":"/a","method":"GET","classification":"gated","roles":[],"scopes":[],"policy":false}"#,
+            ),
+            "a",
+        )
+        .unwrap();
+        let one_empty = PostureManifest::parse(
+            &manifest(
+                r#"{"path":"/a","method":"GET","classification":"gated","roles":[""],"scopes":[],"policy":false}"#,
+            ),
+            "b",
+        )
+        .unwrap();
+        assert_ne!(none.posture_digest(), one_empty.posture_digest());
+    }
+
+    #[test]
+    fn the_list_encoding_distinguishes_every_shape_of_emptiness() {
+        let empty: Vec<String> = vec![];
+        let one_empty = vec![String::new()];
+        let two_empty = vec![String::new(), String::new()];
+        let one_value = vec!["a".to_owned()];
+        let encodings = [
+            escape_list(&empty),
+            escape_list(&one_empty),
+            escape_list(&two_empty),
+            escape_list(&one_value),
+            escape_list(&["a,b".to_owned()]),
+            escape_list(&["a".to_owned(), "b".to_owned()]),
+        ];
+        for (i, a) in encodings.iter().enumerate() {
+            for (j, b) in encodings.iter().enumerate() {
+                assert!(
+                    i == j || a != b,
+                    "encodings {i} and {j} collide: {a:?} == {b:?}"
+                );
+            }
+        }
     }
 
     #[test]
