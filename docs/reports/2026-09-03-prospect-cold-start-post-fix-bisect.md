@@ -458,12 +458,20 @@ other checkpoint, then **re-measured** once the target directory is fully
 warm, and only the warm numbers are used in the table.
 
 ```bash
-# IMPORTANT: unshallow first. A shallow clone silently truncates git log
-# ranges and git merge-base --is-ancestor results without erroring — this
-# is exactly the bug that produced this report's first, wrong revision.
-git fetch --unshallow origin 2>/dev/null || true
-git rev-parse --is-shallow-repository   # must print "false" before continuing
+set -euo pipefail   # fail loudly, don't silently build the wrong commit
 
+# IMPORTANT: unshallow first, and treat failure as fatal. A shallow clone
+# silently truncates git log ranges and git merge-base --is-ancestor
+# results without erroring — this is exactly the bug that produced this
+# report's first, wrong revision. `|| true` here would suppress a fetch
+# failure and let the script carry on against a still-shallow repo.
+git fetch --unshallow origin
+if [ "$(git rev-parse --is-shallow-repository)" != "false" ]; then
+  echo "FATAL: repository is still shallow after fetch --unshallow" >&2
+  exit 1
+fi
+
+REPO_ROOT=$(pwd)   # so we can cd back out before removing a worktree
 git worktree add --detach /tmp/prospect-coldstart-wt2 d1ecb361
 cd /tmp/prospect-coldstart-wt2
 FEATURES=maud,htmx,tailwind,cache-moka,http-client,reporting
@@ -512,6 +520,9 @@ for c in d1ecb361 dc74ce43; do
   timed_build "${c}-warm"
 done
 
+cd "$REPO_ROOT"   # must leave the worktree before removing it, or the next
+                  # `git worktree add` fails with "Unable to read current
+                  # working directory"
 git worktree remove /tmp/prospect-coldstart-wt2 --force
 
 # Noise-floor calibration is a SEPARATE pass, in a fresh worktree (empty
@@ -526,5 +537,6 @@ cd /tmp/prospect-noise-wt
 for i in 1 2 3 4 5 6; do
   timed_build "ef61ae44-calibration-${i}"   # run 1 is the expected cold outlier — discard it
 done
+cd "$REPO_ROOT"
 git worktree remove /tmp/prospect-noise-wt --force
 ```
