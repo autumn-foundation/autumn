@@ -7875,9 +7875,8 @@ pub fn run(opts: DoctorOptions) {
             // Offline: does the certificate actually cover the tenant subdomains
             // `[tenancy] base_domain` will serve? A base domain the certificate
             // does not cover means every tenant host serves a name mismatch.
-            let tenancy_base = tenancy_base_domain.clone();
+            let tenancy_base = tenancy_base_domain;
             let tenancy_domains = acme.domains.clone();
-            #[allow(clippy::redundant_clone, reason = "moved into the boxed task below")]
             let covers = tenancy_base
                 .as_deref()
                 .is_some_and(|base| acme_covers_tenant_subdomains(base, &tenancy_domains));
@@ -10776,6 +10775,7 @@ pub struct Vault {
             "app.example.com",
             PortReachability::Open,
             PortReachability::Open,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -10804,6 +10804,7 @@ pub struct Vault {
             "app.example.com",
             PortReachability::Open,
             PortReachability::Refused,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
     }
@@ -12412,6 +12413,7 @@ directory = \"production\"
                 domain,
                 PortReachability::Open,
                 PortReachability::Open,
+                false,
             ));
             dns_checks.push(check_acme_dns_impl(domain, &DnsPointsHere::Matches));
         }
