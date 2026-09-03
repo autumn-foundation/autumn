@@ -1242,11 +1242,33 @@ fn crate_referenced_elsewhere_in_project(
     excluding: &[PathBuf],
     overrides: &HashMap<PathBuf, String>,
 ) -> bool {
+    crate_reference_site(project_root, crate_name, excluding, overrides).is_some()
+}
+
+/// The first file under `project_root`'s `src/`, `tests/`, or `benches/` tree
+/// that still names `crate_name`, or `None` when nothing does.
+///
+/// The site-returning half of [`crate_referenced_elsewhere_in_project`], with
+/// the same best-effort caveats. `autumn plugin remove` (issue #1631) uses it
+/// to decide whether stripping a plugin's dependency would break code the user
+/// wrote by hand — and, when it would, to say which file to look at.
+pub fn crate_reference_site(
+    project_root: &Path,
+    crate_name: &str,
+    excluding: &[PathBuf],
+    overrides: &HashMap<PathBuf, String>,
+) -> Option<PathBuf> {
     let ident = crate_name.replace('-', "_");
     let markers = [format!("{ident}::"), format!("use {ident}")];
-    ["src", "tests", "benches"]
+    // `examples` alongside the build targets: an example that uses the crate is
+    // a target that stops compiling when the dependency goes (issue #1631
+    // review). Erring toward retaining a dependency only ever costs an unused
+    // manifest line; erring the other way breaks a build.
+    ["src", "tests", "benches", "examples"]
         .iter()
-        .any(|dir| rs_tree_contains_marker(&project_root.join(dir), &markers, excluding, overrides))
+        .find_map(|dir| {
+            rs_tree_marker_site(&project_root.join(dir), &markers, excluding, overrides)
+        })
 }
 
 /// Text markers that reliably indicate `feature`'s autumn-web API surface
@@ -1399,14 +1421,31 @@ fn rs_tree_contains_marker(
     excluding: &[PathBuf],
     overrides: &HashMap<PathBuf, String>,
 ) -> bool {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return false;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
+    rs_tree_marker_site(dir, markers, excluding, overrides).is_some()
+}
+
+/// The first `.rs` file under `dir` containing any of `markers`, or `None`.
+///
+/// The site-returning half of [`rs_tree_contains_marker`]: `autumn plugin
+/// remove` (issue #1631) has to *name* the file that keeps a plugin
+/// dependency alive, because "kept the dependency" without "because
+/// `src/support.rs` still uses it" is an unactionable report.
+fn rs_tree_marker_site(
+    dir: &Path,
+    markers: &[String],
+    excluding: &[PathBuf],
+    overrides: &HashMap<PathBuf, String>,
+) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    // Sorted so the reported site is stable across runs and filesystems —
+    // `read_dir` order is not specified, and a report that names a different
+    // file on each run reads like a different finding.
+    let mut paths: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
         if path.is_dir() {
-            if rs_tree_contains_marker(&path, markers, excluding, overrides) {
-                return true;
+            if let Some(found) = rs_tree_marker_site(&path, markers, excluding, overrides) {
+                return Some(found);
             }
             continue;
         }
@@ -1421,10 +1460,10 @@ fn rs_tree_contains_marker(
             }
         });
         if content.is_some_and(|c| markers.iter().any(|m| c.contains(m.as_str()))) {
-            return true;
+            return Some(path);
         }
     }
-    false
+    None
 }
 
 /// Outcome of matching one plan-time migration directory (built with a
@@ -1801,7 +1840,7 @@ fn sync_mod_declarations_in(dir: &Path, shared_names: &[&str], project_root: &Pa
     }
 }
 
-fn relative_display(path: &Path, root: &Path) -> String {
+pub fn relative_display(path: &Path, root: &Path) -> String {
     let display = path
         .strip_prefix(root)
         .map_or_else(|_| path.display().to_string(), |p| p.display().to_string());

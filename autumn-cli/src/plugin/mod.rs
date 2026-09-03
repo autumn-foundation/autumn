@@ -11,11 +11,13 @@
 pub mod catalog;
 pub mod install;
 pub mod registry;
+pub mod remove;
 
 use std::path::Path;
 
 use catalog::CatalogEntry;
 use install::{AddOutcome, Compat, PluginError};
+use remove::{DataResidue, DependencyKept, RemoveOutcome, Wire};
 
 /// Where a listed plugin came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,9 +76,37 @@ pub enum Resolved {
     Community(String),
 }
 
+/// Options for `autumn plugin remove`.
+#[derive(Debug, Clone, Copy)]
+pub struct RemoveOptions<'a> {
+    /// Project root to remove from.
+    pub root: &'a Path,
+    /// Plugin crate name.
+    pub name: &'a str,
+    /// Print the plan without touching the filesystem.
+    pub dry_run: bool,
+    /// Also revert the plugin's declared migrations and drop its tables.
+    pub drop_data: bool,
+    /// Skip the interactive confirmation `--drop-data` otherwise requires.
+    pub yes: bool,
+}
+
 /// Exit code for the manual-fallback outcome: nothing was written, and the
 /// dependency line plus mount snippet were printed for the user to apply.
 pub const MANUAL_FALLBACK_EXIT_CODE: i32 = 2;
+
+/// Exit code for `plugin remove --dry-run` when there **is** something to
+/// change (AC #3).
+///
+/// A dry run that found nothing to do exits `0`, so a script can tell the two
+/// apart without parsing prose: `0` means the plugin is already gone, `3` means
+/// a real run would edit files. Deliberately distinct from
+/// [`MANUAL_FALLBACK_EXIT_CODE`], which still means "nothing can be changed
+/// automatically — here are the lines", dry run or not.
+///
+/// `plugin add --dry-run` keeps its issue-#1606 contract of always exiting `0`;
+/// this code is scoped to `remove`, whose AC asks for the distinction.
+pub const DRY_RUN_PENDING_EXIT_CODE: i32 = 3;
 
 /// The version of every first-party plugin: they are released in lockstep
 /// with `autumn-web` and with this CLI, so the CLI's own version is the one to
@@ -442,6 +472,557 @@ pub fn run_add(opts: &AddOptions<'_>) -> i32 {
     0
 }
 
+/// Render the report `plugin remove` prints for `outcome`.
+///
+/// `dry_run` only changes the wording: a dry run has printed the edits it
+/// *would* make, so claiming the plugin was removed would be a lie.
+#[must_use]
+pub fn render_remove(entry_name: &str, outcome: &RemoveOutcome, dry_run: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    match outcome {
+        RemoveOutcome::Removed {
+            removed,
+            missing,
+            dependency_retained,
+            residue,
+            ..
+        } => {
+            if dry_run {
+                let _ = writeln!(
+                    out,
+                    "\nDry run: nothing was written. `autumn plugin remove {entry_name}` would make the edits above."
+                );
+            } else if removed.is_empty() {
+                let _ = writeln!(out, "\n{entry_name}: nothing was left to unwire.");
+            } else {
+                let _ = writeln!(
+                    out,
+                    "\nRemoved {entry_name} — {}.",
+                    join_wires(removed, "and")
+                );
+            }
+            if let Some(kept) = dependency_retained {
+                let _ = writeln!(out, "\n{}.", kept.reason());
+            }
+            if !missing.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "\nCould not find {} — {} nothing to remove there.",
+                    join_wires(missing, "or"),
+                    if missing.len() == 1 {
+                        "so"
+                    } else {
+                        "so there was"
+                    }
+                );
+            }
+            append_residue(&mut out, entry_name, residue);
+        }
+        RemoveOutcome::NotInstalled { residue } => {
+            let _ = writeln!(
+                out,
+                "\n{entry_name} is not installed — nothing to do (neither the dependency nor the mount is present)."
+            );
+            append_residue(&mut out, entry_name, residue);
+        }
+        RemoveOutcome::Manual {
+            reason,
+            dependency_line,
+            mount_snippet,
+            residue,
+        } => {
+            let _ = writeln!(out, "\nNo files were changed: {reason}.");
+            if let Some(line) = dependency_line {
+                let _ = writeln!(out, "\nDelete from `[dependencies]` in Cargo.toml:\n");
+                let _ = writeln!(out, "  {line}");
+            }
+            let _ = writeln!(
+                out,
+                "\nDelete from your `autumn_web::app()` builder chain (this is the shape\n\
+                 `autumn plugin add` writes; yours may be configured differently):\n"
+            );
+            let _ = writeln!(out, "{mount_snippet}");
+            append_residue(&mut out, entry_name, residue);
+        }
+    }
+    out
+}
+
+/// Name a list of wires in prose: `the Cargo.toml dependency and the
+/// builder-chain mount`.
+fn join_wires(wires: &[Wire], conjunction: &str) -> String {
+    let labels: Vec<&str> = wires.iter().map(|wire| wire.label()).collect();
+    match labels.as_slice() {
+        [] => String::new(),
+        [only] => (*only).to_owned(),
+        [first, second] => format!("{first} {conjunction} {second}"),
+        [rest @ .., last] => format!("{}, {conjunction} {last}", rest.join(", ")),
+    }
+}
+
+/// Append the data-safety paragraph: what stayed in the database, and the one
+/// flag that would remove it (AC #2).
+///
+/// Silent when the plugin owns nothing — a data warning about a plugin with no
+/// data teaches the user to skip the paragraph that matters.
+fn append_residue(out: &mut String, entry_name: &str, residue: &DataResidue) {
+    use std::fmt::Write as _;
+
+    if residue.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "\nThe database was not touched. {entry_name} owns the following, and it is\nall still there:"
+    );
+    for migration in &residue.migrations {
+        let _ = writeln!(out, "  migration  {migration}");
+    }
+    for table in &residue.tables {
+        let _ = writeln!(out, "  table      {table}");
+    }
+    let _ = writeln!(
+        out,
+        "\nThese are left in place on purpose: unwiring code is reversible, dropping\n\
+         data is not. To revert those migrations and drop those tables, re-run with\n\
+         `--drop-data` (it asks for confirmation first, or pass `--yes`)."
+    );
+}
+
+/// Whether `outcome` would actually edit a file.
+///
+/// Reads the plan rather than the variant: a `Removed` outcome whose plan
+/// turned out to hold no action (a dependency declared in a shape the manifest
+/// rewriter leaves alone) has nothing to do, and must not report otherwise.
+#[must_use]
+pub fn removal_changes_files(outcome: &RemoveOutcome) -> bool {
+    match outcome {
+        RemoveOutcome::Removed { plan, .. } => !plan.actions.is_empty(),
+        RemoveOutcome::NotInstalled { .. } | RemoveOutcome::Manual { .. } => false,
+    }
+}
+
+/// The process exit code for a completed `plugin remove` (AC #3).
+#[must_use]
+pub fn remove_exit_code(outcome: &RemoveOutcome, dry_run: bool) -> i32 {
+    if matches!(outcome, RemoveOutcome::Manual { .. }) || leaves_a_hand_edit(outcome) {
+        return MANUAL_FALLBACK_EXIT_CODE;
+    }
+    if dry_run && removal_changes_files(outcome) {
+        return DRY_RUN_PENDING_EXIT_CODE;
+    }
+    0
+}
+
+/// Whether `outcome` finished with something still to do by hand.
+///
+/// Two shapes: a dependency declared in a form this command will not rewrite,
+/// and a run that removed nothing while a wire is still in place (a community
+/// crate whose hand-pasted mount keeps its dependency alive). Both mean
+/// `autumn plugin remove x && …` must NOT read as "x is gone" — the same
+/// reason [`RemoveOutcome::Manual`] exits [`MANUAL_FALLBACK_EXIT_CODE`].
+fn leaves_a_hand_edit(outcome: &RemoveOutcome) -> bool {
+    let RemoveOutcome::Removed {
+        removed,
+        dependency_retained,
+        ..
+    } = outcome
+    else {
+        return false;
+    };
+    dependency_retained.as_ref().is_some_and(|kept| {
+        kept.needs_a_hand_edit()
+            || (removed.is_empty() && matches!(kept, DependencyKept::StillUsed(_)))
+    })
+}
+
+/// Run `autumn plugin remove`. Returns the process exit code.
+#[must_use]
+pub fn run_remove(opts: &RemoveOptions<'_>) -> i32 {
+    let resolved = match resolve(opts.name) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            eprintln!("autumn plugin remove: {err}");
+            return 1;
+        }
+    };
+
+    // Refused BEFORE any planning, so `--drop-data` on a crate whose data this
+    // CLI cannot enumerate never gets as far as editing a file.
+    if opts.drop_data
+        && let Resolved::Community(crate_name) = &resolved
+    {
+        eprintln!(
+            "autumn plugin remove: --drop-data works from a plugin's declared migration and table list, which only first-party plugins carry — `{crate_name}` is a community crate, so check its README for what it owns and revert that by hand. No files were changed."
+        );
+        return 1;
+    }
+
+    let outcome = match &resolved {
+        Resolved::FirstParty(entry) => remove::plan_remove(opts.root, entry),
+        Resolved::Community(crate_name) => remove::plan_remove_community(opts.root, crate_name),
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            eprintln!("autumn plugin remove: {err}");
+            return 1;
+        }
+    };
+
+    // `--drop-data` is decided and CONFIRMED before a single file is written.
+    // Asking after the edits are on disk means a declined prompt leaves the app
+    // already unwired while the message says "Aborted" — the one ordering a
+    // destructive flag must not have.
+    let drop_plan = match &resolved {
+        Resolved::FirstParty(entry) if opts.drop_data => {
+            let absent = matches!(outcome, RemoveOutcome::NotInstalled { .. });
+            match prepare_drop_data(entry, opts, absent) {
+                Ok(plan) => plan,
+                Err(code) => return code,
+            }
+        }
+        _ => None,
+    };
+
+    let flags = crate::generate::Flags {
+        dry_run: opts.dry_run,
+        force: false,
+    };
+    if let RemoveOutcome::Removed { plan, .. } = &outcome
+        && let Err(err) = plan.execute(flags)
+    {
+        eprintln!("autumn plugin remove: {err}");
+        return 1;
+    }
+
+    let report = render_remove(opts.name, &outcome, opts.dry_run);
+    if matches!(outcome, RemoveOutcome::Manual { .. }) {
+        // A refusal, not a result — same contract as `plugin add`'s manual
+        // fallback: stderr, and an exit code a script can act on.
+        eprintln!("{report}");
+        return MANUAL_FALLBACK_EXIT_CODE;
+    }
+    println!("{report}");
+    if matches!(resolved, Resolved::Community(_)) {
+        println!(
+            "\n{} is a community crate: this CLI has no list of the migrations or tables it\nowns, so nothing here can tell you what it left in the database. Check the\ncrate's README before assuming the removal was complete.",
+            opts.name
+        );
+    }
+
+    if let Some(plan) = drop_plan {
+        let code = apply_drop_data(&plan);
+        if code != 0 {
+            return code;
+        }
+    }
+
+    remove_exit_code(&outcome, opts.dry_run)
+}
+
+/// A confirmed `--drop-data` step, ready to apply once the code edits land.
+#[derive(Debug)]
+struct ConfirmedDrop {
+    /// The database to apply the statements to.
+    url: String,
+    /// The statements, in application order.
+    statements: Vec<String>,
+    /// The plugin whose data they drop, for the closing message.
+    crate_name: &'static str,
+}
+
+/// Decide, print and confirm the `--drop-data` step — before anything is
+/// written.
+///
+/// `Ok(None)` means there is nothing left to do for `--drop-data` (nothing
+/// declared, or the statements were printed for the user to run). `Err(code)`
+/// is a refusal that aborts the whole command with **no** file changed.
+fn prepare_drop_data(
+    entry: &'static catalog::CatalogEntry,
+    opts: &RemoveOptions<'_>,
+    not_installed_here: bool,
+) -> Result<Option<ConfirmedDrop>, i32> {
+    use remove::DropDataDecision;
+
+    // The `.env`/config resolution `autumn migrate` uses, but WITHOUT
+    // `resolve_database_url`'s exit-on-missing: a missing URL is a reason to
+    // print the statements, not to fail a removal that can still proceed.
+    let url = crate::config::resolve_primary_database_url_with_env(&autumn_web::config::OsEnv);
+    match remove::decide_drop_data(entry, url.as_deref()) {
+        DropDataDecision::NothingToDrop => {
+            println!(
+                "\n--drop-data: {} declares no migrations and owns no tables, so there is\nnothing in the database to drop.",
+                entry.crate_name
+            );
+            Ok(None)
+        }
+        DropDataDecision::PrintOnly { reason, statements } => {
+            // Exit 2, not 0: the database was NOT changed, and a script reading
+            // `remove --drop-data && echo dropped` must not print "dropped".
+            // Same meaning `plugin add`/`remove` already give 2 — "nothing was
+            // changed automatically; apply the printed lines by hand".
+            eprintln!(
+                "\n--drop-data was not applied — {reason}.\nThe database is unchanged. Run these yourself, in this order:\n"
+            );
+            for statement in &statements {
+                eprintln!("  {statement}");
+            }
+            Err(MANUAL_FALLBACK_EXIT_CODE)
+        }
+        DropDataDecision::Run { url, statements } => {
+            if opts.dry_run {
+                println!(
+                    "\nDry run: the database was not touched. `--drop-data` would run these\nagainst {}, in this order:\n",
+                    redact_database_url(&url)
+                );
+                for statement in &statements {
+                    println!("  {statement}");
+                }
+                return Ok(None);
+            }
+            println!(
+                "\n--drop-data will run these against {}, in this order:\n",
+                redact_database_url(&url)
+            );
+            for statement in &statements {
+                println!("  {statement}");
+            }
+            if not_installed_here {
+                // The database URL can come from an ambient `DATABASE_URL` that
+                // outranks this project's own config, so "the plugin was never
+                // wired here" is worth saying out loud before a DROP.
+                eprintln!(
+                    "\nNote: {} is not wired into this project at all, so these statements\nwould drop data belonging to a plugin this app does not use.",
+                    entry.crate_name
+                );
+            }
+            if !confirm_drop_data(entry.crate_name, opts.yes) {
+                eprintln!("\nAborted: nothing was changed — not the code, not the database.");
+                return Err(1);
+            }
+            Ok(Some(ConfirmedDrop {
+                url,
+                statements,
+                crate_name: entry.crate_name,
+            }))
+        }
+    }
+}
+
+/// Apply a confirmed drop. Returns `0` on success.
+fn apply_drop_data(plan: &ConfirmedDrop) -> i32 {
+    match remove::execute_drop_data(&plan.url, &plan.statements) {
+        Ok(()) => {
+            println!("\nDropped {}'s data.", plan.crate_name);
+            0
+        }
+        Err(err) => {
+            eprintln!("\nautumn plugin remove --drop-data: {err}");
+            eprintln!(
+                "The code changes above were already applied; only the database step failed."
+            );
+            1
+        }
+    }
+}
+
+/// `url` with every password removed, so a confirmation prompt does not print
+/// credentials into a terminal scrollback or a CI log.
+///
+/// Two places carry one, and both are in shapes libpq accepts and this CLI's
+/// own URL resolution passes straight through: the userinfo component
+/// (`user:pass@host`) and the query string (`?password=`, `?sslpassword=`).
+/// The userinfo split is from the RIGHT, because a password may itself contain
+/// `@` — splitting from the left would print its tail verbatim.
+fn redact_database_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    // The authority ends at the first `/`, `?` or `#`; anything after that is
+    // path and query, where a `@` is not a userinfo separator.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let authority = match authority.rsplit_once('@') {
+        // Only mask what is actually there: turning `user@host` into
+        // `user:***@host` invents a password the URL does not carry.
+        Some((credentials, host)) => match credentials.split_once(':') {
+            Some((user, _)) => format!("{user}:***@{host}"),
+            None => authority.to_owned(),
+        },
+        None => authority.to_owned(),
+    };
+    format!("{scheme}://{authority}{}", redact_query_secrets(tail))
+}
+
+/// The path-and-query `tail` with the value of every secret-bearing query
+/// parameter replaced.
+fn redact_query_secrets(tail: &str) -> String {
+    /// Query keys libpq reads a secret from.
+    const SECRET_KEYS: &[&str] = &["password", "sslpassword"];
+
+    let Some((path, query)) = tail.split_once('?') else {
+        return tail.to_owned();
+    };
+    let redacted: Vec<String> = query
+        .split('&')
+        .map(|pair| {
+            let key = pair.split('=').next().unwrap_or(pair);
+            if SECRET_KEYS.contains(&key.to_ascii_lowercase().as_str()) {
+                format!("{key}=***")
+            } else {
+                pair.to_owned()
+            }
+        })
+        .collect();
+    format!("{path}?{}", redacted.join("&"))
+}
+
+/// Ask before dropping. `--yes` answers for the user; a non-interactive stdin
+/// with no `--yes` is a refusal, never an assumed yes.
+fn confirm_drop_data(crate_name: &str, assume_yes: bool) -> bool {
+    use std::io::{BufRead as _, IsTerminal as _, Write as _};
+
+    let stdin = std::io::stdin();
+    match crate::starters::confirm_mode(assume_yes, stdin.is_terminal()) {
+        crate::starters::ConfirmMode::Proceed => return true,
+        crate::starters::ConfirmMode::NeedsYesFlag => {
+            eprintln!(
+                "\n--drop-data needs a confirmation, and stdin is not a terminal. Re-run with\n`--yes` if you really mean to drop {crate_name}'s data."
+            );
+            return false;
+        }
+        crate::starters::ConfirmMode::Prompt => {}
+    }
+    // stderr, like every other refusal message here: under
+    // `autumn plugin remove … > log.txt` a stdout prompt is invisible and the
+    // command looks hung.
+    eprint!("Drop {crate_name}'s data? This cannot be undone. [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if stdin.lock().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// One plugin `autumn new --with` will wire into the app it scaffolds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScaffoldPlugin {
+    /// The crate name as the user typed it.
+    pub name: String,
+    /// What that name resolved to.
+    pub resolved: Resolved,
+    /// The version to install.
+    pub version: String,
+}
+
+/// Resolve and version-check every `--with` name.
+///
+/// # Errors
+///
+/// A message ready to print when a name is unknown, incompatible, or (for a
+/// community crate) has no resolvable version.
+pub fn preflight_scaffold_plugins(
+    names: &[String],
+    scaffold_autumn_web: &str,
+    resolve_community_version: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<ScaffoldPlugin>, String> {
+    let mut out: Vec<ScaffoldPlugin> = Vec::with_capacity(names.len());
+    for name in names {
+        // `--with X --with X` is a typo, not a conflict: the second one names
+        // the same install, and `plugin add` is idempotent regardless.
+        if out.iter().any(|already| &already.name == name) {
+            continue;
+        }
+        let resolved = resolve(name).map_err(|err| err.to_string())?;
+        let version = match &resolved {
+            Resolved::FirstParty(_) => first_party_version().to_owned(),
+            Resolved::Community(crate_name) => {
+                let version = resolve_community_version(crate_name).ok_or_else(|| {
+                    format!(
+                        "could not find `{crate_name}` on crates.io (or crates.io is unreachable) — no files were written"
+                    )
+                })?;
+                // The version is written verbatim into a manifest, so it is
+                // vetted the same way `plugin add` vets it.
+                if !install::is_plausible_version(&version) {
+                    return Err(format!(
+                        "crates.io reported version `{version}` for `{crate_name}`, which is not a usable version requirement — no files were written"
+                    ));
+                }
+                version
+            }
+        };
+        // A first-party plugin is released in lockstep with `autumn-web`, so
+        // this can only fail if the scaffold ever stops pinning the CLI's own
+        // series — which is exactly the regression worth catching before a
+        // project exists on disk. A community crate's range is not knowable,
+        // so it is not gated here (`Compat::Unknown` passes).
+        if matches!(resolved, Resolved::FirstParty(_))
+            && install::check_compat(scaffold_autumn_web, &version) == Compat::Incompatible
+        {
+            return Err(format!(
+                "`{name} {version}` supports autumn-web {}, but this scaffold pins autumn-web {scaffold_autumn_web} — no files were written.\nInstall the matching CLI series and try again.",
+                install::supported_range(&version)
+            ));
+        }
+        out.push(ScaffoldPlugin {
+            name: name.clone(),
+            resolved,
+            version,
+        });
+    }
+    Ok(out)
+}
+
+/// Wire every preflighted plugin into the freshly scaffolded app at `root`.
+///
+/// Returns the process exit code: `0` when every plugin was wired, or the
+/// worst code any single install produced. Runs only after
+/// [`preflight_scaffold_plugins`] has passed, so nothing here can be the first
+/// place a bad name is noticed.
+#[must_use]
+pub fn wire_scaffold_plugins(root: &Path, plugins: &[ScaffoldPlugin]) -> i32 {
+    let mut worst = 0;
+    for plugin in plugins {
+        let outcome = match &plugin.resolved {
+            Resolved::FirstParty(entry) => install::plan_add(root, entry, &plugin.version),
+            Resolved::Community(crate_name) => {
+                install::plan_add_community(root, crate_name, &plugin.version)
+            }
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                eprintln!("autumn new --with {}: {err}", plugin.name);
+                worst = worst.max(1);
+                continue;
+            }
+        };
+        match &outcome {
+            AddOutcome::Installed { plan, .. } | AddOutcome::DependencyOnly { plan, .. } => {
+                if let Err(err) = plan.execute(crate::generate::Flags::default()) {
+                    eprintln!("autumn new --with {}: {err}", plugin.name);
+                    worst = worst.max(1);
+                    continue;
+                }
+            }
+            AddOutcome::AlreadyInstalled | AddOutcome::Manual { .. } => {}
+        }
+        let report = render_add(&plugin.name, &outcome, false);
+        if matches!(outcome, AddOutcome::Manual { .. }) {
+            eprintln!("{report}");
+            worst = worst.max(MANUAL_FALLBACK_EXIT_CODE);
+        } else {
+            println!("{report}");
+        }
+    }
+    worst
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,5 +1260,343 @@ mod tests {
         assert!(out.contains("autumn-admin-plugin = \"0.7.0\""), "{out}");
         assert!(out.contains("AdminPlugin::new()"), "{out}");
         assert!(out.contains("could not find the builder chain"), "{out}");
+    }
+
+    // ── `autumn plugin remove` (issue #1631) ─────────────────────────────────
+
+    fn empty_plan() -> crate::generate::emit::Plan {
+        crate::generate::emit::Plan::new(".")
+    }
+
+    fn plan_with_one_edit() -> crate::generate::emit::Plan {
+        let mut plan = crate::generate::emit::Plan::new(".");
+        plan.modify("src/main.rs", "fn main() {}\n");
+        plan
+    }
+
+    fn removed(
+        plan: crate::generate::emit::Plan,
+        removed: Vec<Wire>,
+        missing: Vec<Wire>,
+    ) -> RemoveOutcome {
+        RemoveOutcome::Removed {
+            plan: Box::new(plan),
+            removed,
+            missing,
+            dependency_retained: None,
+            residue: DataResidue::default(),
+        }
+    }
+
+    /// AC #1: a full removal says both wires came out.
+    #[test]
+    fn the_remove_report_names_both_wires() {
+        let out = render_remove(
+            "autumn-admin-plugin",
+            &removed(
+                plan_with_one_edit(),
+                vec![Wire::Mount, Wire::Dependency],
+                Vec::new(),
+            ),
+            false,
+        );
+        assert!(out.contains("autumn-admin-plugin"), "{out}");
+        assert!(out.contains("dependency"), "{out}");
+        assert!(out.contains("mount"), "{out}");
+    }
+
+    /// AC #2: the default never touches the database, and says exactly what it
+    /// left behind and what would remove it.
+    #[test]
+    fn the_remove_report_lists_data_left_in_place_and_names_the_destructive_flag() {
+        let out = render_remove(
+            "autumn-media-plugin",
+            &RemoveOutcome::Removed {
+                plan: Box::new(plan_with_one_edit()),
+                removed: vec![Wire::Mount, Wire::Dependency],
+                missing: Vec::new(),
+                dependency_retained: None,
+                residue: DataResidue {
+                    migrations: vec!["20260720000000_media_rooms".to_owned()],
+                    tables: vec![
+                        "media_room_participants".to_owned(),
+                        "media_rooms".to_owned(),
+                    ],
+                },
+            },
+            false,
+        );
+        assert!(out.contains("20260720000000_media_rooms"), "{out}");
+        assert!(out.contains("media_rooms"), "{out}");
+        assert!(out.contains("--drop-data"), "{out}");
+        // The reassurance is the point: nothing in the database moved.
+        assert!(
+            out.contains("left in place") || out.contains("still there"),
+            "{out}"
+        );
+    }
+
+    /// A plugin that owns no database state must not invent a data warning.
+    #[test]
+    fn the_remove_report_stays_quiet_about_data_when_there_is_none() {
+        let out = render_remove(
+            "autumn-cache-redis",
+            &removed(plan_with_one_edit(), vec![Wire::Mount], Vec::new()),
+            false,
+        );
+        assert!(!out.contains("--drop-data"), "{out}");
+    }
+
+    /// AC #4: a partial install is unwired as far as it goes, and the report
+    /// names what it could not find.
+    #[test]
+    fn the_remove_report_names_the_wire_it_could_not_find() {
+        let out = render_remove(
+            "autumn-admin-plugin",
+            &removed(
+                plan_with_one_edit(),
+                vec![Wire::Dependency],
+                vec![Wire::Mount],
+            ),
+            false,
+        );
+        assert!(out.to_lowercase().contains("could not find"), "{out}");
+        assert!(out.contains("mount"), "{out}");
+    }
+
+    /// AC #4: a dependency kept because the app still uses the crate has to say
+    /// so, or the user reads a half-finished removal as a bug.
+    #[test]
+    fn the_remove_report_explains_a_retained_dependency() {
+        let out = render_remove(
+            "autumn-admin-plugin",
+            &RemoveOutcome::Removed {
+                plan: Box::new(plan_with_one_edit()),
+                removed: vec![Wire::Mount],
+                missing: Vec::new(),
+                dependency_retained: Some(DependencyKept::StillUsed(
+                    "The autumn-admin-plugin dependency was kept: src/support.rs still names it"
+                        .to_owned(),
+                )),
+                residue: DataResidue::default(),
+            },
+            false,
+        );
+        assert!(out.contains("src/support.rs"), "{out}");
+    }
+
+    /// AC #5: removing something that is not installed says so.
+    #[test]
+    fn the_not_installed_report_says_nothing_to_do() {
+        let out = render_remove(
+            "autumn-admin-plugin",
+            &RemoveOutcome::NotInstalled {
+                residue: DataResidue::default(),
+            },
+            false,
+        );
+        assert!(out.contains("not installed"), "{out}");
+        assert!(out.contains("nothing to do"), "{out}");
+    }
+
+    /// AC #4: the manual fallback prints the exact lines to delete.
+    #[test]
+    fn the_manual_remove_report_prints_the_lines_to_delete() {
+        let out = render_remove(
+            "autumn-admin-plugin",
+            &RemoveOutcome::Manual {
+                reason: "could not identify the mount".to_owned(),
+                dependency_line: Some("autumn-admin-plugin = \"0.7.0\"".to_owned()),
+                mount_snippet: "        .plugin(autumn_admin_plugin::AdminPlugin::new())"
+                    .to_owned(),
+                residue: DataResidue::default(),
+            },
+            false,
+        );
+        assert!(out.contains("No files were changed"), "{out}");
+        assert!(out.contains("autumn-admin-plugin = \"0.7.0\""), "{out}");
+        assert!(out.contains("AdminPlugin::new()"), "{out}");
+    }
+
+    /// A dry run must not claim the plugin was removed.
+    #[test]
+    fn the_dry_run_remove_report_does_not_claim_a_removal() {
+        let out = render_remove(
+            "autumn-admin-plugin",
+            &removed(plan_with_one_edit(), vec![Wire::Mount], Vec::new()),
+            true,
+        );
+        assert!(out.contains("Dry run"), "{out}");
+        assert!(!out.contains("Removed autumn-admin-plugin"), "{out}");
+    }
+
+    // ── AC #3: the dry-run exit-code contract ────────────────────────────────
+
+    #[test]
+    fn a_dry_run_with_pending_edits_exits_distinctly() {
+        let outcome = removed(plan_with_one_edit(), vec![Wire::Mount], Vec::new());
+        assert!(removal_changes_files(&outcome));
+        assert_eq!(remove_exit_code(&outcome, true), DRY_RUN_PENDING_EXIT_CODE);
+        // A real run of the same outcome is an ordinary success.
+        assert_eq!(remove_exit_code(&outcome, false), 0);
+    }
+
+    #[test]
+    fn a_dry_run_with_nothing_to_do_exits_zero() {
+        let outcome = RemoveOutcome::NotInstalled {
+            residue: DataResidue::default(),
+        };
+        assert!(!removal_changes_files(&outcome));
+        assert_eq!(remove_exit_code(&outcome, true), 0);
+        assert_eq!(remove_exit_code(&outcome, false), 0);
+    }
+
+    /// An outcome whose plan turns out to hold no action is "nothing to do"
+    /// too — the exit code follows the plan, not the variant.
+    #[test]
+    fn a_dry_run_whose_plan_is_empty_exits_zero() {
+        let outcome = removed(empty_plan(), Vec::new(), vec![Wire::Mount]);
+        assert!(!removal_changes_files(&outcome));
+        assert_eq!(remove_exit_code(&outcome, true), 0);
+    }
+
+    /// The manual fallback is a refusal in both modes: nothing can be changed
+    /// automatically, so a dry run of it is not "would change something".
+    #[test]
+    fn the_manual_fallback_keeps_its_exit_code_under_dry_run() {
+        let outcome = RemoveOutcome::Manual {
+            reason: "nope".to_owned(),
+            dependency_line: None,
+            mount_snippet: String::new(),
+            residue: DataResidue::default(),
+        };
+        assert_eq!(remove_exit_code(&outcome, true), MANUAL_FALLBACK_EXIT_CODE);
+        assert_eq!(remove_exit_code(&outcome, false), MANUAL_FALLBACK_EXIT_CODE);
+    }
+
+    /// A confirmation prompt must not print the database password into a
+    /// terminal scrollback or a CI log.
+    #[test]
+    fn the_confirmation_prompt_redacts_the_database_password() {
+        assert_eq!(
+            redact_database_url("postgres://app:s3cret@db.internal:5432/app"),
+            "postgres://app:***@db.internal:5432/app"
+        );
+        // Nothing to redact, nothing to mangle.
+        assert_eq!(
+            redact_database_url("postgres://localhost/app"),
+            "postgres://localhost/app"
+        );
+        assert_eq!(redact_database_url("not a url"), "not a url");
+        // A URL with a user but no password has nothing to mask, and must not
+        // grow a fake one.
+        assert_eq!(
+            redact_database_url("postgres://app@db.internal/app"),
+            "postgres://app@db.internal/app"
+        );
+    }
+
+    // ── AC #6: `autumn new --with <plugin>` ──────────────────────────────────
+
+    fn no_community(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn scaffold_preflight_resolves_first_party_plugins_in_order() {
+        let names = vec!["autumn-search".to_owned(), "autumn-admin-plugin".to_owned()];
+        let resolved =
+            preflight_scaffold_plugins(&names, first_party_version(), no_community).unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "autumn-search");
+        assert_eq!(resolved[1].name, "autumn-admin-plugin");
+        assert_eq!(resolved[0].version, first_party_version());
+    }
+
+    /// `--with X --with X` is a typo, not an error: the second one is the same
+    /// install, and `plugin add` is idempotent anyway.
+    #[test]
+    fn scaffold_preflight_deduplicates_repeated_names() {
+        let names = vec!["autumn-search".to_owned(), "autumn-search".to_owned()];
+        let resolved =
+            preflight_scaffold_plugins(&names, first_party_version(), no_community).unwrap();
+        assert_eq!(resolved.len(), 1);
+    }
+
+    /// An unknown name must fail here — before `autumn new` writes anything.
+    #[test]
+    fn scaffold_preflight_rejects_an_unknown_plugin() {
+        let names = vec!["tokio".to_owned()];
+        let err =
+            preflight_scaffold_plugins(&names, first_party_version(), no_community).unwrap_err();
+        assert!(err.contains("tokio"), "{err}");
+        assert!(err.contains("autumn plugin list"), "{err}");
+    }
+
+    /// AC #6: version compatibility is checked before any file is written.
+    #[test]
+    fn scaffold_preflight_refuses_an_incompatible_series() {
+        let names = vec!["autumn-admin-plugin".to_owned()];
+        let err = preflight_scaffold_plugins(&names, "0.1.0", no_community).unwrap_err();
+        assert!(err.contains("0.1.0"), "{err}");
+        assert!(err.contains(first_party_version()), "{err}");
+    }
+
+    /// A community crate goes through the same gate; its version comes from the
+    /// registry lookup, and an unresolvable one is refused rather than guessed.
+    #[test]
+    fn scaffold_preflight_resolves_a_community_version() {
+        let names = vec!["autumn-plugin-live-feed".to_owned()];
+        let resolved = preflight_scaffold_plugins(&names, first_party_version(), |name| {
+            (name == "autumn-plugin-live-feed").then(|| "0.3.1".to_owned())
+        })
+        .unwrap();
+        assert_eq!(resolved[0].version, "0.3.1");
+        assert!(matches!(resolved[0].resolved, Resolved::Community(_)));
+    }
+
+    #[test]
+    fn scaffold_preflight_refuses_an_unresolvable_community_version() {
+        let names = vec!["autumn-plugin-live-feed".to_owned()];
+        let err =
+            preflight_scaffold_plugins(&names, first_party_version(), no_community).unwrap_err();
+        assert!(err.contains("autumn-plugin-live-feed"), "{err}");
+    }
+
+    /// crates.io is not trusted to return something writable into a manifest.
+    #[test]
+    fn scaffold_preflight_refuses_an_implausible_community_version() {
+        let names = vec!["autumn-plugin-live-feed".to_owned()];
+        let err = preflight_scaffold_plugins(&names, first_party_version(), |_| {
+            Some("\"; rm -rf /".to_owned())
+        })
+        .unwrap_err();
+        assert!(err.to_lowercase().contains("version"), "{err}");
+    }
+
+    /// Review follow-up: a password in the query string (libpq's
+    /// `?password=`) and a `@` inside the password itself both used to be
+    /// printed verbatim into stdout — i.e. into a CI log.
+    #[test]
+    fn the_confirmation_prompt_redacts_every_password_shape() {
+        // `@` inside the password: the userinfo split must come from the right.
+        assert_eq!(
+            redact_database_url("postgres://app:p@ssw0rd@db.internal/app"),
+            "postgres://app:***@db.internal/app"
+        );
+        // libpq's query-parameter form, with no userinfo at all.
+        assert_eq!(
+            redact_database_url("postgres://db.internal/app?user=app&password=hunter2"),
+            "postgres://db.internal/app?user=app&password=***"
+        );
+        assert_eq!(
+            redact_database_url("postgres://app:s3cret@db/app?sslpassword=keysecret"),
+            "postgres://app:***@db/app?sslpassword=***"
+        );
+        // A `@` in the path or query is not a userinfo separator.
+        assert_eq!(
+            redact_database_url("postgres://db.internal/app?options=-c%20a@b"),
+            "postgres://db.internal/app?options=-c%20a@b"
+        );
     }
 }

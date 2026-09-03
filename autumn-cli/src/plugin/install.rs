@@ -409,22 +409,46 @@ pub fn unpatched_local_framework(root: &Path) -> bool {
 #[must_use]
 pub fn mount_present(main_rs: &str, entry: &CatalogEntry) -> bool {
     let masked = crate::rust_source::mask_non_code(main_rs);
-    if masked.contains(entry.constructor) {
-        return true;
-    }
+    masked.contains(entry.constructor)
+        || mount_call_span(&masked, entry, |argument| {
+            argument.contains(entry.mount_arg)
+        })
+        .is_some()
+}
+
+/// The `(`…`)` byte range of the first [`CatalogEntry::mount_call`] in `masked`
+/// whose argument `accept` approves, as `(open_paren, close_paren)`.
+///
+/// One scan, shared by the two commands that have to agree on what a mount
+/// *is*: `plugin add`'s [`mount_present`] (which asks only whether the type
+/// path appears in the argument) and `plugin remove`'s
+/// `remove::mount_span` (which additionally requires the argument to *begin*
+/// with it, so a plugin nested inside another plugin's constructor is never
+/// excised). Extracted so the two cannot drift: the whole manual-fallback
+/// contract rests on `remove` refusing exactly the mounts it cannot excise,
+/// and `add` seeing exactly the mounts that are there.
+///
+/// `masked` must be [`crate::rust_source::mask_non_code`] output, whose byte
+/// offsets are the original's.
+#[must_use]
+pub fn mount_call_span(
+    masked: &str,
+    entry: &CatalogEntry,
+    accept: impl Fn(&str) -> bool,
+) -> Option<(usize, usize)> {
     let mut from = 0usize;
     while let Some(found) = masked[from..].find(entry.mount_call) {
         // The `(` the call opens with is the last byte of `mount_call`.
         let open = from + found + entry.mount_call.len() - 1;
-        let Some(close) = crate::rust_source::balanced_close_paren(&masked, open) else {
-            return false;
-        };
-        if masked[open + 1..close].contains(entry.mount_arg) {
-            return true;
+        // Unbalanced: the source is mid-edit or unparseable, and nothing
+        // further can be read reliably.
+        let close = crate::rust_source::balanced_close_paren(masked, open)?;
+        if accept(&masked[open + 1..close]) {
+            return Some((open, close));
         }
         from = close;
     }
-    false
+    None
 }
 
 /// Byte offset just past the builder-opening `autumn_web::app()` **inside the

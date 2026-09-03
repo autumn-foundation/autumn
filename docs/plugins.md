@@ -67,6 +67,24 @@ unifies features across the graph — so the mount compiles without touching you
 manifest beyond the one dependency line. The manual path below spells the
 features out because a hand-written install may want them stated explicitly.
 
+### What an install brings with it
+
+`plugin add` and `new --with` write **code only** — a dependency line and a
+mount. Neither runs a migration or creates a table. What a plugin does to your
+database is its own business, and it happens later:
+
+| Plugin | Database footprint | When it appears |
+|---|---|---|
+| `autumn-media-plugin` | `media_rooms`, `media_room_participants` | its `migrations/20260720000000_media_rooms` — **you** apply it, and only if you set `[media] room_store_backend = "db"` |
+| `autumn-search` | `autumn_search_documents`, `autumn_search_deletes` | created at runtime by the Postgres engine (`CREATE TABLE IF NOT EXISTS`) the first time it starts |
+| `autumn-admin-plugin` | none of its own | reads framework-owned tables that `autumn-web`'s own migrations create |
+| `autumn-cache-redis` | none | entries live in Redis |
+| `autumn-storage-s3` | none | blobs live in the bucket |
+
+That table is the same list `autumn plugin remove` prints back to you, and it
+is the reason removal leaves the database alone by default — see
+[Removing a plugin](#removing-a-plugin).
+
 ### Community plugins
 
 A crate following the third-party `autumn-plugin-<name>` convention gets its
@@ -96,6 +114,130 @@ autumn_web::app()
     .run()
     .await;
 ```
+
+## Removing a plugin
+
+Installing a plugin is machine-applied, so removing one can be machine-reversed
+— the lifecycle runs in both directions:
+
+```bash
+autumn plugin remove autumn-admin-plugin            # unwire dependency + mount
+autumn plugin remove autumn-media-plugin --dry-run  # show every consequence first
+```
+
+`remove` deletes the `[dependencies]` line and the `.plugin(...)` /
+`.with_blob_store(...)` call — including the ``// added by `autumn plugin add` ``
+marker above it — and leaves everything else byte-identical. An app that was
+installed with `autumn plugin add` passes `cargo check` immediately afterwards.
+
+Like `add`, it is safe to re-run: removing a plugin that is not installed
+reports that and changes nothing.
+
+### What it refuses to do
+
+`remove` never leaves an app that does not compile, which means it declines
+three things rather than guessing:
+
+- **A builder chain it cannot read.** A plugin built into a variable
+  (`let panel = AdminPlugin::new(); … .plugin(panel)`), or a mount sharing its
+  line with other builder calls, cannot be excised by deleting lines. Nothing
+  is changed — not even the dependency — and the exact lines to delete are
+  printed instead. (Exit code `2`, the same "apply this by hand" signal `add`
+  uses.)
+- **A dependency the app still uses.** If any file under `src/`, `tests/`, or
+  `benches/` still names the crate after the mount comes out, the dependency
+  stays and the report says which file kept it. Delete that usage and re-run.
+- **A community mount.** `add` never writes one, so `remove` never deletes one.
+  The dependency comes back out once nothing references the crate.
+
+### Partially wired plugins
+
+A manual install (the path below) leaves a dependency with no mount, or a mount
+with no dependency. `remove` unwires whichever half it finds and names the half
+it did not — the app still ends up clean.
+
+### Data: the default is always "leave it"
+
+**`plugin remove` never touches the database.** Unwiring code is reversible;
+dropping data is not, so the two are never bundled. When a plugin declares
+migrations or owns tables, the report lists them and states that they are still
+there:
+
+```
+The database was not touched. autumn-media-plugin owns the following, and it is
+all still there:
+  migration  20260720000000_media_rooms
+  table      media_room_participants
+  table      media_rooms
+```
+
+To revert those migrations and drop those tables, ask for it explicitly:
+
+```bash
+autumn plugin remove autumn-media-plugin --drop-data          # asks first
+autumn plugin remove autumn-media-plugin --drop-data --yes    # non-interactive
+```
+
+`--drop-data` prints the exact statements it will run, then asks for
+confirmation (`--yes` answers for you; a non-interactive stdin without `--yes`
+is a refusal, never an assumed yes). It drives Postgres; with any other
+backend, or no database configured, it prints the statements for you to run
+yourself rather than failing after the prompt. It works from the plugin's
+**declared** migration list, because `__diesel_schema_migrations` has no source
+column — a migration applied before this feature shipped cannot be attributed
+to a plugin any other way.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Removed, or nothing to do |
+| `1` | Refused: unknown plugin, not an Autumn project, or the `--drop-data` step failed |
+| `2` | Nothing was changed automatically — apply the printed edits by hand. Also `--drop-data`'s answer when it printed the statements instead of running them (no database configured, or a non-Postgres backend), and when a dependency is declared in a shape the command will not rewrite |
+| `3` | `--dry-run` only: a real run **would** change something |
+
+`--dry-run` prints every file edit and every data consequence and writes
+nothing, so `3` versus `0` answers "is there anything left to remove?" without
+parsing prose.
+
+## Scaffolding an app with plugins
+
+`autumn new --with <plugin>` wires a plugin on day zero, so nothing has to be
+retrofitted:
+
+```bash
+autumn new my-app --with autumn-admin-plugin
+autumn new my-app --with autumn-admin-plugin --with autumn-search
+```
+
+`--with` is repeatable and takes the same names as `autumn plugin add`. Every
+name is resolved and version-checked **before the scaffold writes a byte**: an
+unknown or incompatible plugin leaves no half-built project behind. Repeating a
+name is a typo, not an error. The generated app compiles on the first try.
+
+Community `autumn-plugin-<name>` crates work here too, with the same
+dependency-only rule: the dependency is written, the mount is printed for you to
+paste.
+
+Scaffolding wires code, not data: exactly like `plugin add`, `--with` runs no
+migration and creates no table. See
+[What an install brings with it](#what-an-install-brings-with-it) for what each
+plugin puts in the database, and when.
+
+## Finding residue
+
+`autumn doctor` reports orphaned plugin wiring under its existing
+`--json`/`--strict` contract, as the `plugin_residue` check:
+
+| Finding | Status |
+|---|---|
+| Dependency declared, never mounted | warn |
+| Mounted, but not declared in `[dependencies]` (does not compile) | fail |
+| Plugin gone, but migrations it declares are still applied | warn |
+
+The migration finding is best effort: it needs a configured database and the
+`diesel` CLI to read the history. Without either, the two static findings still
+run.
 
 ## First-party plugin crates
 
