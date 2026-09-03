@@ -103,7 +103,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 # scripts/check-plugin-freshness.sh and scripts/check-docs-links.sh.
 run_py() {
   python3 - "$@" <<'PYEOF'
-import os, re, subprocess, sys, pathlib, collections
+import os, re, subprocess, sys, pathlib, collections, tempfile
 
 MODE = sys.argv[1]
 ROOT = pathlib.Path(sys.argv[2])
@@ -574,10 +574,12 @@ def self_test():
         '',
         'Unrelated later paragraph mentioning `autumn nope` by mistake.',
     ])
-    tmp = pathlib.Path(os.environ.get('TMPDIR', '/tmp')) / 'cli-surface-waiver-selftest.md'
-    tmp.write_text(waived_page)
-    found_defects, n_waived = scan(tmp.parent, surface, [tmp.name])
-    tmp.unlink()
+    # A real temp dir, not a fixed path under /tmp: the fixed name collided
+    # between concurrent runs and leaked the file whenever scan() raised.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = pathlib.Path(tmpdir) / 'waiver-selftest.md'
+        tmp.write_text(waived_page)
+        found_defects, n_waived = scan(tmp.parent, surface, [tmp.name])
     reported = sorted(lineno for _, lineno, _, _ in found_defects)
     expect(n_waived == 1, f'the sentence above the marker must be waived, got {n_waived}')
     expect(reported == [6, 9],
