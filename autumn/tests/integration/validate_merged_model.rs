@@ -237,8 +237,9 @@ fn from_patch_accepts_must_match_valid_once_merged() {
         password: Patch::Set("secret2".to_string()),
         password_confirm: Patch::Set("secret2".to_string()),
     };
-    let draft = <UpdateDraft<CrossFieldHost> as CrossFieldHostDraftExt>::from_patch(&current, &patch)
-        .expect("a matching password/password_confirm merge must pass validation");
+    let draft =
+        <UpdateDraft<CrossFieldHost> as CrossFieldHostDraftExt>::from_patch(&current, &patch)
+            .expect("a matching password/password_confirm merge must pass validation");
     assert_eq!(draft.after().password, "secret2");
 }
 

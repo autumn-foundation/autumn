@@ -12158,7 +12158,12 @@ mod tests {
                 .find('}')
                 .expect("NewSignup struct must close");
         let new_section = &generated[new_start..new_end];
-        for kept in ["length", "must_match", "credit_card", "non_control_character"] {
+        for kept in [
+            "length",
+            "must_match",
+            "credit_card",
+            "non_control_character",
+        ] {
             assert!(
                 new_section.contains(kept),
                 "NewSignup must keep the `{kept}` validator (enforced on create): {new_section}"
