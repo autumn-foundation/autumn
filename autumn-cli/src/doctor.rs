@@ -650,6 +650,60 @@ pub enum DnsPointsHere {
 /// "points here" unknowable from inside the host.
 #[must_use]
 pub fn check_acme_dns_impl(domain: &str, outcome: &DnsPointsHere) -> CheckResult {
+    check_acme_dns_for_challenge(domain, outcome, false)
+}
+
+/// As [`check_acme_dns_impl`], but told whether DNS-01 is in use (issue #1620).
+///
+/// "Does this domain resolve to THIS host" is an HTTP-01 question: the CA
+/// fetches the challenge token over `:80` from whatever the name resolves to, so
+/// a mismatch means issuance hits the wrong server. Under DNS-01 the CA never
+/// connects to this host at all — it reads a TXT record — so pointing the domain
+/// at a load balancer, a CDN edge, or any other front end is not merely allowed,
+/// it is the normal shape of the deployment this feature exists for. Grading it
+/// a **Fail** would make `doctor --online --strict` reject a correct wildcard
+/// deployment.
+///
+/// The check still runs, because where the name points is worth *reporting* —
+/// it is just not a failure. Under DNS-01 every inconclusive-or-elsewhere
+/// outcome is graded **Pass** with the addresses named.
+#[must_use]
+pub fn check_acme_dns_for_challenge(
+    domain: &str,
+    outcome: &DnsPointsHere,
+    dns01: bool,
+) -> CheckResult {
+    if dns01 {
+        return match outcome {
+            DnsPointsHere::Unresolved => CheckResult {
+                name: "acme_dns",
+                status: CheckStatus::Warn,
+                detail: Some(format!(
+                    "{domain} did not resolve to any address; DNS-01 issuance does not need it \
+                     to, but visitors will not reach the app until it does"
+                )),
+                hint: Some(
+                    "Publish A/AAAA records for the domain (and a wildcard record for tenant \
+                     subdomains) so traffic reaches this deployment",
+                ),
+            },
+            DnsPointsHere::Matches => CheckResult {
+                name: "acme_dns",
+                status: CheckStatus::Pass,
+                detail: Some(format!("{domain} resolves to this host")),
+                hint: None,
+            },
+            _ => CheckResult {
+                name: "acme_dns",
+                status: CheckStatus::Pass,
+                detail: Some(format!(
+                    "{domain} resolves somewhere other than this host, which DNS-01 does not \
+                     care about: the CA reads a TXT record rather than connecting here"
+                )),
+                hint: None,
+            },
+        };
+    }
     match outcome {
         DnsPointsHere::Matches => CheckResult {
             name: "acme_dns",
@@ -7901,7 +7955,7 @@ pub fn run(opts: DoctorOptions) {
                     let d_dns = domain;
                     tasks.push(Box::new(move || {
                         let outcome = resolve_dns_points_here(&d_dns);
-                        check_acme_dns_impl(&d_dns, &outcome)
+                        check_acme_dns_for_challenge(&d_dns, &outcome, dns01)
                     }));
                 }
 
@@ -11371,6 +11425,60 @@ pub struct Vault {
             "myapp.com",
             &["*.other.com".to_owned()]
         ));
+    }
+
+    // Regression (Codex, #1620): the port check was softened for DNS-01 but the
+    // address check was not, so a wildcard deployment behind a load balancer —
+    // the normal shape for this feature — still failed `--online --strict` on a
+    // rule that is HTTP-01-specific by construction.
+    #[test]
+    fn resolving_elsewhere_is_not_a_failure_under_dns01() {
+        let elsewhere = DnsPointsHere::ResolvesElsewhere {
+            resolved: vec!["203.0.113.10".to_owned()],
+        };
+
+        // HTTP-01: the CA fetches the token from whatever the name resolves to,
+        // so pointing elsewhere means issuance hits the wrong server.
+        assert_eq!(
+            check_acme_dns_for_challenge("myapp.com", &elsewhere, false).status,
+            CheckStatus::Fail
+        );
+
+        // DNS-01: the CA reads a TXT record and never connects here at all.
+        let dns01 = check_acme_dns_for_challenge("myapp.com", &elsewhere, true);
+        assert_eq!(dns01.status, CheckStatus::Pass);
+        assert!(
+            dns01.detail.unwrap().contains("TXT record"),
+            "the pass must say why the mismatch does not matter"
+        );
+
+        // A partial match and an unknowable local IP are the same story.
+        for inconclusive in [
+            DnsPointsHere::PartialMatch {
+                unmatched: vec!["203.0.113.10".to_owned()],
+            },
+            DnsPointsHere::LocalIpsUnknown,
+        ] {
+            assert_eq!(
+                check_acme_dns_for_challenge("myapp.com", &inconclusive, true).status,
+                CheckStatus::Pass
+            );
+        }
+
+        // A name that resolves nowhere is still worth a Warn: issuance would
+        // succeed, but no visitor could reach the app.
+        let unresolved =
+            check_acme_dns_for_challenge("myapp.com", &DnsPointsHere::Unresolved, true);
+        assert_eq!(unresolved.status, CheckStatus::Warn);
+        assert!(unresolved.detail.unwrap().contains("visitors"));
+
+        // Resolving here is a plain pass either way.
+        for dns01 in [false, true] {
+            assert_eq!(
+                check_acme_dns_for_challenge("myapp.com", &DnsPointsHere::Matches, dns01).status,
+                CheckStatus::Pass
+            );
+        }
     }
 
     // Under DNS-01 the CA never connects to :80, so an unreachable port 80 costs

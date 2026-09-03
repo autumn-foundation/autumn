@@ -285,6 +285,27 @@ impl DnsCredential {
     }
 }
 
+impl DnsCredential {
+    /// Every secret value this credential carries.
+    ///
+    /// Handed to the `exec` provider so anything a hook echoes — it inherits
+    /// this process's environment, so it can echo these even though autumn
+    /// passes it none — is redacted before the error reaches an operator.
+    #[must_use]
+    pub fn secret_values(&self) -> Vec<SecretString> {
+        [
+            self.api_token.as_ref(),
+            self.secret_access_key.as_ref(),
+            self.session_token.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|secret| !secret.is_blank())
+        .cloned()
+        .collect()
+    }
+}
+
 /// Read an environment variable from the real process environment.
 ///
 /// The default `env` argument for [`DnsCredential::resolve`] in production.
@@ -395,7 +416,17 @@ pub fn build_provider(
             },
             transport,
         )),
-        AcmeDnsProvider::Exec => Arc::new(exec::ExecProvider::new(dns_cfg.command.clone())),
+        // Every DNS secret this process holds, handed to the hook provider for
+        // redaction. Autumn passes the hook no credential of its own, but the
+        // hook INHERITS the process environment — so a script written with
+        // `set -x` traces `AUTUMN_ACME_DNS_API_TOKEN` (or whatever it reads) to
+        // stderr, and that stderr is copied into the issuance error, which is
+        // published on `/actuator/health` and pushed to the operator's alert
+        // destination.
+        AcmeDnsProvider::Exec => Arc::new(
+            exec::ExecProvider::new(dns_cfg.command.clone())
+                .with_secrets(credential.secret_values()),
+        ),
     })
 }
 
@@ -505,6 +536,33 @@ mod tests {
         assert_eq!(resolved.api_token.as_ref().unwrap().expose(), "from-env");
         assert_eq!(resolved.region.as_deref(), Some("eu-west-1"));
         assert!(resolved.access_key_id.is_none());
+    }
+
+    // Regression (Codex, #1620): `ExecProvider::with_secrets` existed but
+    // `build_provider` never called it, so the hook's redaction list was empty
+    // in production. A hook inherits the process environment, so a `set -x`
+    // script traces the very token this list exists to scrub.
+    #[test]
+    fn the_exec_provider_is_built_with_the_credentials_secrets() {
+        let credential = DnsCredential {
+            api_token: Some(SecretString::new("cf-live-token-DO-NOT-LEAK")),
+            secret_access_key: Some(SecretString::new("aws-secret-DO-NOT-LEAK")),
+            session_token: Some(SecretString::new("sts-token-DO-NOT-LEAK")),
+            // Not a secret, and not in the list.
+            access_key_id: Some("AKIAEXAMPLE".to_owned()),
+            ..DnsCredential::default()
+        };
+        let secrets = credential.secret_values();
+        assert_eq!(secrets.len(), 3, "every secret field must be redactable");
+        assert!(secrets.iter().all(|s| s.expose().contains("DO-NOT-LEAK")));
+
+        // A blank or absent field contributes nothing to redact — a short or
+        // empty pattern would blank out unrelated text.
+        let sparse = DnsCredential {
+            api_token: Some(SecretString::new("   ")),
+            ..DnsCredential::default()
+        };
+        assert!(sparse.secret_values().is_empty());
     }
 
     #[test]

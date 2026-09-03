@@ -172,7 +172,9 @@ probes, gated behind the CLI `acme` feature:
 - `acme_dns` — grades whether the configured `[server.tls.acme]` domains resolve
   to this host (`Matches` = pass, `PartialMatch` = warn, `ResolvesElsewhere` =
   fail). A `*.` entry is probed as the base domain it covers — a wildcard has no
-  address record of its own.
+  address record of its own. Under DNS-01 a name that resolves elsewhere is a
+  **Pass**: the CA reads a TXT record rather than connecting to this host, so
+  fronting the app with a load balancer or CDN is the normal shape (#1620).
 - `acme_dns_propagation` — whether public DNS can answer for
   `_acme-challenge.<domain>` at all. **Fail** on SERVFAIL/timeout: the CA reads
   the challenge record from public DNS, so a broken delegation defeats a
