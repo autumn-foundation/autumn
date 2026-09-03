@@ -103,6 +103,96 @@ pub trait BenchProductRepository {}
 const SEEDED_ROWS: i64 = 5_000;
 const PAGE_SIZE: u32 = 20;
 
+/// Whether `s` looks like a `postgres://`/`postgresql://` URL rather than a
+/// libpq keyword/value string. Mirrors `autumn::db::pg_conn_str::is_url`
+/// (`pub(crate)`, unreachable from a bench — duplicated rather than reused).
+fn is_url_connection_string(s: &str) -> bool {
+    s.starts_with("postgres://") || s.starts_with("postgresql://")
+}
+
+/// Parse a libpq-style `key = value` connection string into its pairs:
+/// whitespace is allowed around `=`, values may be single-quoted, and `\`
+/// escapes the next character both inside and outside quotes (matches
+/// tokio-postgres's own keyword/value parser, e.g. `host=db sslmode = require`
+/// or `sslmode='verify-full'`). Mirrors
+/// `autumn::db::pg_conn_str::keyword_value_pairs` (`pub(crate)`, unreachable
+/// from a bench — duplicated rather than reused; see that module for the full
+/// spec and its test cases, which this shares).
+fn keyword_value_pairs(s: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut it = s.chars().peekable();
+    loop {
+        while it.next_if(|c| c.is_whitespace()).is_some() {}
+        let mut key = String::new();
+        while let Some(&c) = it.peek() {
+            if c.is_whitespace() || c == '=' {
+                break;
+            }
+            key.push(c);
+            it.next();
+        }
+        if key.is_empty() {
+            return pairs;
+        }
+        while it.next_if(|c| c.is_whitespace()).is_some() {}
+        if it.next() != Some('=') {
+            return pairs;
+        }
+        while it.next_if(|c| c.is_whitespace()).is_some() {}
+        let mut value = String::new();
+        if it.next_if_eq(&'\'').is_some() {
+            loop {
+                match it.next() {
+                    Some('\'') | None => break,
+                    Some('\\') => {
+                        if let Some(escaped) = it.next() {
+                            value.push(escaped);
+                        }
+                    }
+                    Some(c) => value.push(c),
+                }
+            }
+        } else {
+            while let Some(&c) = it.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                it.next();
+                if c == '\\' {
+                    if let Some(c2) = it.next() {
+                        value.push(c2);
+                    }
+                } else {
+                    value.push(c);
+                }
+            }
+        }
+        pairs.push((key, value));
+    }
+}
+
+/// The connection string's effective `sslmode` (last occurrence wins,
+/// matching libpq/tokio-postgres), from either a URL's query string or
+/// libpq keyword/value syntax. `None` when absent.
+fn sslmode_of(database_url: &str) -> Option<String> {
+    let pairs: Vec<(String, String)> = if is_url_connection_string(database_url) {
+        url::Url::parse(database_url)
+            .map(|u| {
+                u.query_pairs()
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        keyword_value_pairs(database_url)
+    };
+    pairs
+        .into_iter()
+        .rev()
+        .find(|(k, _)| k == "sslmode")
+        .map(|(_, v)| v)
+}
+
 fn database_url() -> String {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5432/postgres".to_owned());
@@ -110,19 +200,21 @@ fn database_url() -> String {
     // the async pool in `main`) go through diesel's/diesel-async's stock,
     // `NoTls`-hardcoded establish path — neither reuses `autumn::db`'s rustls
     // setup callback, which is `pub(crate)` and unreachable from a bench (a
-    // separate crate). `sslmode=require`/`verify-full` would otherwise fail
-    // deep inside libpq/tokio-postgres with a connection-refused-shaped
-    // error that gives no hint why. Reject it here, at the one place both
-    // callers route through, with an error that says why (Codex review on
-    // #2486).
-    let lower = url.to_ascii_lowercase();
-    assert!(
-        !lower.contains("sslmode=require") && !lower.contains("sslmode=verify"),
-        "repository_crud is a local profiling harness: it connects with diesel's/diesel-async's \
-         stock NoTls establish path, not autumn::db's TLS-aware pool (that setup callback is \
-         crate-private). Point DATABASE_URL at a local/trusted Postgres with no `sslmode` (or \
-         sslmode=disable/prefer), not one requiring `sslmode=require`/`verify-full`."
-    );
+    // separate crate). `sslmode=require`/`verify-full`/`verify-ca` would
+    // otherwise fail deep inside libpq/tokio-postgres with a
+    // connection-refused-shaped error that gives no hint why. Reject it here,
+    // at the one place both callers route through, with an error that says
+    // why (Codex review on #2486; `sslmode_of` handles the spaced/quoted
+    // keyword-value forms a plain substring check misses, per its follow-up).
+    if let Some(mode) = sslmode_of(&url) {
+        assert!(
+            !matches!(mode.as_str(), "require" | "verify-full" | "verify-ca"),
+            "repository_crud is a local profiling harness: it connects with diesel's/\
+             diesel-async's stock NoTls establish path, not autumn::db's TLS-aware pool (that \
+             setup callback is crate-private). Point DATABASE_URL at a local/trusted Postgres \
+             with sslmode absent, disable, or prefer — not {mode:?}."
+        );
+    }
     url
 }
 
