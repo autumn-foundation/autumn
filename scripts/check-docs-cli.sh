@@ -548,6 +548,48 @@ _PROMPT = {'$', '('}
 _CONTROL = {'if', 'elif', 'while', 'until', 'then', 'else', 'do', 'done', 'fi',
             'time', '!', 'exec', 'command', 'nohup', 'sudo'}
 
+# A crontab line puts the command after a five-field schedule, so `autumn` is
+# not the segment head and the scan stopped on the minute field. The corpus
+# only ever writes the `0 2 * * *  cd /srv && … autumn …` form, where the `&&`
+# creates a fresh segment and the command was reached by accident — a reader
+# scheduling `autumn db backup` directly, which is the ordinary crontab line,
+# went ungated.
+#
+# A field is `*`, a number, a list, a range, a step, or a month/day name.
+# `@daily` and friends replace the whole schedule with one token.
+_CRON_FIELD = re.compile(r'^(?:\*|[0-9]{1,2}|[A-Za-z]{3})'
+                         r'(?:[-/,][0-9A-Za-z*]{1,3})*$')
+_CRON_SHORTCUT = re.compile(r'^@(?:reboot|yearly|annually|monthly|weekly|'
+                            r'daily|midnight|hourly)$')
+_CRON_USER = re.compile(r'^[a-z_][a-z0-9_-]{0,31}$')
+
+
+def _cron_prefix(segment):
+    """Index past a leading crontab schedule, or 0 when there is none.
+
+    Deliberately narrow. Five schedule fields in a row is a shape no shell
+    command line has, so consuming them cannot move the head of a real
+    command; and the head that follows still has to look like the binary
+    before anything is reported, so a misread here degrades to silence.
+
+    The system-crontab user field (`/etc/cron.d`: `0 2 * * * root autumn …`)
+    is indistinguishable from a command name in general, so it is stepped over
+    only when the token after it IS the binary. That cannot manufacture a
+    false positive: the schedule has already matched, and the invocation is
+    read from the executable itself either way.
+    """
+    if segment and _CRON_SHORTCUT.match(segment[0]):
+        i = 1
+    elif len(segment) > 5 and all(_CRON_FIELD.match(t) for t in segment[:5]):
+        i = 5
+    else:
+        return 0
+    if i < len(segment) and not _autumn_exe(segment[i]) \
+            and _CRON_USER.match(segment[i]) \
+            and i + 1 < len(segment) and _autumn_exe(segment[i + 1]):
+        i += 1
+    return i
+
 
 def tokenize(text):
     """Shell tokens for `text`, or None when it does not tokenize.
@@ -862,7 +904,7 @@ def commands(text):
 def _from_tokens(tokens):
     """The token half of `commands()`, so nested contexts can re-enter it."""
     for segment in _segments(tokens):
-        i = 0
+        i = _cron_prefix(segment)
         while i < len(segment) and (segment[i] in _PROMPT or segment[i] in _CONTROL
                                     or _ENV_TOKEN.match(segment[i])):
             # An assignment whose VALUE is the binary is itself the command
@@ -1292,12 +1334,19 @@ def self_test():
     '''
     surface = build_surface([fake])
     failures = []
+    checked = []
 
     def tk(argv):
         """Shell-tokenize a bare argv the way `commands()` would."""
         return tokenize(argv) or argv.split()
 
     def expect(cond, msg):
+        # The total is counted here rather than written down as a sum of
+        # section sizes. A hand-maintained count is a second source of truth
+        # that no test can fail on: assertions were added without it moving,
+        # so it under-reported the suite it was there to describe — the same
+        # drift this whole script exists to gate, in the gate's own output.
+        checked.append(msg)
         if not cond:
             failures.append(msg)
 
@@ -1671,6 +1720,29 @@ def self_test():
     cron = '```cron\n0 2 * * *  cd /srv && AUTUMN_ENV=prod autumn migrate run\n```'
     expect([d for _, d, _, _ in invocations(cron)] == ['migrate run'],
            f'a cron command line must be read: {list(invocations(cron))}')
+    # The corpus only writes the `cd … &&` form above, where the command is
+    # reached because `&&` starts a fresh segment. The bare crontab line — the
+    # ordinary one — put `autumn` after the schedule, where it was not a head.
+    bare_cron = '```cron\n0 3 * * * autumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(bare_cron)] == ['migrate run'],
+           f'a bare crontab line must be read: {list(invocations(bare_cron))}')
+    for sched in ('*/10 * * * *', '0 2 * * MON-FRI', '@daily'):
+        doc = f'```cron\n{sched} autumn migrate run\n```'
+        expect([d for _, d, _, _ in invocations(doc)] == ['migrate run'],
+               f'schedule {sched!r} must be stepped over: {list(invocations(doc))}')
+    cron_d = '```cron\n0 2 * * * root autumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(cron_d)] == ['migrate run'],
+           f'a /etc/cron.d user field must be stepped over: {list(invocations(cron_d))}')
+    # The user field is stepped over ONLY when the binary follows it, so a
+    # schedule running some other program stays what it is.
+    other = '```cron\n0 2 * * * root /usr/bin/backup autumn\n```'
+    expect(list(invocations(other)) == [],
+           f'a non-autumn cron command stays quiet: {list(invocations(other))}')
+    # Five schedule fields is a shape no command line has, but the head that
+    # follows still has to be the binary — a numeric argv must not be eaten.
+    numeric = '```bash\nautumn task backfill 1 2 3 4 5 nope\n```'
+    expect([d for _, d, _, _ in invocations(numeric)] == ['task backfill 1 2 3 4 5 nope'],
+           f'a numeric argv is not a cron schedule: {list(invocations(numeric))}')
     rust = '```rust\nlet m = "failed to build the in-process autumn server";\n```'
     expect(list(invocations(rust)) == [],
            'a code fence naming autumn outside command position stays quiet')
@@ -1714,7 +1786,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f"self-test: {13 + 47 + 74 + 4 - len(failures)} passed, {len(failures)} failed")
+    print(f"self-test: {len(checked) - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
