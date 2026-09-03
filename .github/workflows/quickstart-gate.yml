@@ -197,6 +197,18 @@ jobs:
     # days). This job does not gate anything else in this repo; it exists
     # to make that failure visible the moment it happens instead of
     # leaving it for whoever tries `cargo install --path autumn-cli` next.
+    #
+    # Skipped on workflow_dispatch: a dispatched run gates a specific
+    # release *candidate* pinned via `cli-version` (docs/release-checklist.md
+    # step 7 — "a red run is a release blocker"), always built against the
+    # candidate's own published crates. This job ignores `cli-version`
+    # entirely and tests the checked-out *source* CLI instead, which is
+    # expected to go red whenever trunk-dev carries unreleased drift —
+    # unrelated to whether the candidate being gated is healthy. Running it
+    # on push/schedule (where it belongs) and excluding it here keeps it
+    # from turning an otherwise-green candidate gate into a false release
+    # blocker.
+    if: github.event_name != 'workflow_dispatch'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

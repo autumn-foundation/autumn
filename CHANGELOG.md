@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A CI gate for the "local development" install path** (`local-dev-quickstart`
+  job in `.github/workflows/quickstart-gate.yml`): `cargo install --path
+  autumn-cli` from a source checkout, then `autumn new`, is a first-class path
+  in README.md and `docs/guide/getting-started.md`, but nothing in CI built
+  that exact pairing — a source-built (trunk-dev) CLI's scaffold against the
+  `autumn-web` actually **published** on crates.io. `autumn new` pins the
+  scaffolded `autumn-web` dependency to the CLI's own `CARGO_PKG_VERSION`,
+  which is frozen at the last release tag between releases (this repo's
+  policy: never bump the workspace version except at an explicit release), so
+  a source-built CLI can carry unreleased `autumn-web` API changes while
+  reporting the same version as the last published crate — and `autumn
+  doctor`'s `version_compat` check, a plain version-string comparison, cannot
+  see the difference. Confirmed live: commit 76c56b1 widened
+  `inject_consent_banner`'s `csrf_cookie_name` from `&str` to `Option<&str>`
+  and correctly updated the in-tree scaffold template, but three days later
+  (no release cut since) a freshly `autumn new`-ed project fails its first
+  `cargo build` against published `autumn-web` 0.7.0 with `error[E0308]`,
+  while `autumn doctor` still reports the versions as matching. The new
+  `generated_project_compiles_against_published_autumn_web` test
+  (`autumn-cli/tests/e2e.rs`) reproduces this without the
+  `[patch.crates-io]` override the existing (in-tree-pairing) e2e test
+  applies, and the new job runs it on every `trunk-dev` push and the
+  existing daily schedule — skipped on `workflow_dispatch` release-candidate
+  gating, since it tests trunk-dev source drift rather than the dispatched
+  candidate and would otherwise false-block a healthy release
+  (`docs/release-checklist.md` step 7). This is a harness addition, not a
+  fix: the underlying drift is real and current, and the job is expected to
+  go red between releases until a maintainer addresses `autumn doctor`'s
+  blind spot or the next release ships.
+
 - **`autumn_web::contains_letter_or_number(&str) -> bool` (#2424):** the
   predicate to use when rejecting user input that will be slugified. `slugify`
   never returns an empty string — input with nothing to slugify gets a stable
