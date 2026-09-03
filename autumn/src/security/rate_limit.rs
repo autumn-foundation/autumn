@@ -197,7 +197,7 @@ impl MemoryStore {
                 .unwrap_or(std::time::Duration::ZERO)
                 .as_secs_f64();
             bucket.tokens = elapsed.mul_add(refill_per_sec, bucket.tokens).min(burst);
-            bucket.last_refill = now;
+            bucket.last_refill = std::cmp::max(bucket.last_refill, now);
 
             let result = if bucket.tokens >= 1.0 {
                 bucket.tokens -= 1.0;

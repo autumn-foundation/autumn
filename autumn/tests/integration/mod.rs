@@ -34,6 +34,7 @@ mod chaos_channels_concurrent_loom;
 mod chaos_channels_loom;
 #[cfg(feature = "ws")]
 mod chaos_channels_proptest;
+mod chaos_channels_snapshot_loom;
 #[cfg(feature = "ws")]
 mod chaos_channels_subscribe_loom;
 mod chaos_job_client_loom;
