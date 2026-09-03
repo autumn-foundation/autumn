@@ -524,7 +524,10 @@ def cli_sources(root):
 #
 # Tokens, not text, are what the rest of the script reasons about, so a quoted
 # option value is ONE token however many spaces or `&&`s are inside it.
-_OPERATORS = {'&&', '||', ';', '|', '&', '\n'}
+# `;;` (and bash's `;&` / `;;&` fallthrough spellings) terminate a case ARM,
+# so they separate commands exactly as `;` does — without them the arm's argv
+# ran on into `;; esac`.
+_OPERATORS = {'&&', '||', ';', '|', '&', '\n', ';;', ';&', ';;&'}
 
 # An environment assignment standing before the command name.
 _ENV_TOKEN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
@@ -550,6 +553,9 @@ _PROMPT = {'$', '(', '{'}
 # migrate; then …` runs `autumn migrate` as the condition, and leaving `if` as
 # the segment head meant the scan never reached it.
 _CONTROL = {'if', 'elif', 'while', 'until', 'then', 'else', 'do', 'done', 'fi',
+            # `case … in` heads a construct whose ARMS hold the commands; the
+            # words between it and the arm are patterns, not a program.
+            'case', 'in', 'esac',
             'time', '!', 'exec', 'command', 'nohup', 'sudo', 'env', 'xargs',
             'timeout', 'nice', 'ssh',
             # …and the launchers that run a DIRECT command operand, not only
@@ -774,7 +780,7 @@ def _open_quote(text, quote=None):
                 continue
             # An unquoted `#` starts a comment, and the rest of the line —
             # apostrophes in English included — is text.
-            if ch == '#' and (i == 0 or text[i - 1] in ' \t'):
+            if ch == '#' and (i == 0 or text[i - 1] in _COMMENT_BEFORE):
                 return quote
             if ch in '"\'':
                 quote = ch
@@ -811,8 +817,15 @@ def _segments(tokens):
     """
     current, out, depth, prev = [], [], 0, ''
     for tok in tokens:
-        if tok.startswith('(') and prev.endswith('$'):
-            depth += _paren_delta(tok)          # `$(` opens a substitution
+        nested = depth > 0
+        # `<(` and `>(` are PROCESS substitutions and bracket their contents
+        # the same way `$(` does. Tracking only `$(` left their closing paren
+        # at depth zero, where the case-arm rule below took it for a boundary
+        # and reported the command inside them twice — once from the
+        # substitution walk and once as a segment head.
+        if tok.startswith('(') and prev.endswith(('$', '<', '>')):
+            depth += _paren_delta(tok)
+            nested = True
         elif depth:
             depth = max(0, depth + _paren_delta(tok))
         # `2>&1` is ONE redirection, but `&` is in the punctuation set so shlex
@@ -843,6 +856,15 @@ def _segments(tokens):
         # separator went unread. The parens are consumed for depth (already
         # done above) and what REMAINS is tested as the operator it is.
         rest = tok.lstrip('()') if tok and all(c in _PUNCTUATION for c in tok) else tok
+        # A `)` at depth zero ends a case ARM'S PATTERN — `case x in x) autumn
+        # …` runs the command after it — and it also closes a subshell, which
+        # is a boundary just the same. Inside a substitution the depth is
+        # non-zero, so its own parens never reach here.
+        if not depth and not nested and rest == '' and tok.startswith(')'):
+            out.append(current)
+            current = []
+            prev = tok
+            continue
         if not depth and (tok in _OPERATORS or rest in _OPERATORS):
             if tok is not rest and tok != rest:
                 current.append(tok[:len(tok) - len(rest)])
@@ -1172,6 +1194,15 @@ def _backticks(line):
         yield (not literal[m.start()]), m.group(1)
 
 
+# What may stand immediately before a `#` for it to open a COMMENT. A `#`
+# begins a comment only at the start of a WORD, which is why `echo ok#x` is
+# not one — but an operator ends the word before it, so `echo ok;# note` is,
+# and bash proves it by running the line after. Requiring whitespace missed
+# that: the comment's own trailing backslash was then read as a continuation
+# and the next line was joined INTO the comment and discarded.
+_COMMENT_BEFORE = ' \t;&|('
+
+
 def _strip_comment(text):
     """Drop a trailing YAML comment, which begins at an unquoted ` #`.
 
@@ -1197,7 +1228,7 @@ def _strip_comment(text):
                 quote = None
         elif ch in '"\'':
             quote = ch
-        elif ch == '#' and (i == 0 or text[i - 1] in ' \t'):
+        elif ch == '#' and (i == 0 or text[i - 1] in _COMMENT_BEFORE):
             return text[:i]
         i += 1
     return text
@@ -4336,6 +4367,57 @@ def self_test():
     ind = '```yaml\nrun: |2\n   autumn\\\n       nope\n```'
     expect([d for _, d, _, _ in invocations(ind)] == ['nope'],
            f'the indicator sets the column: {list(invocations(ind))}')
+
+    # A `#` opens a comment at the start of a WORD, and an operator ends the
+    # word before it: `echo ok;# note` is a comment and bash runs the line
+    # after. Requiring whitespace missed that, so the comment's own trailing
+    # backslash read as a continuation and the next line was joined INTO the
+    # comment and discarded.
+    for op in (';', '&'):
+        doc = f'```bash\ntrue {op}# comment \\\nautumn nope\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'a comment after {op!r} ends the command: {got}')
+    # …but a `#` INSIDE a word is not a comment, and one after whitespace
+    # already was, and a real continuation still continues.
+    expect([d for _, d, _, _ in invocations('```bash\necho ok#x\nautumn nope\n```')]
+           == ['nope'], 'a # inside a word is not a comment')
+    cont = '```bash\nautumn migrate \\\n  --shard x\n```'
+    expect([d for _, d, _, _ in invocations(cont)] == ['migrate --shard x'],
+           f'a real continuation still joins: {list(invocations(cont))}')
+    expect([d for _, d, _, _ in invocations('```bash\necho "a;#b"; autumn nope\n```')]
+           == ['nope'], 'a # inside quotes is data')
+
+    # `case … in pattern)` — the `)` ends the PATTERN and the arm's command
+    # follows it, but the whole line stayed in one segment headed by `case`.
+    # `;;` (and the `;&` fallthrough form) terminate an arm, so they separate
+    # commands as `;` does.
+    for arm, want in (('case x in x) autumn nope;; esac', ['nope']),
+                      ('case x in x) autumn migrate;; esac', ['migrate']),
+                      ('case x in a|b) autumn nope;; esac', ['nope']),
+                      ('case x in a) autumn nope;; b) autumn nada;; esac',
+                       ['nope', 'nada']),
+                      ('case x in a) autumn nope;& b) exit;; esac', ['nope'])):
+        doc = f'```bash\n{arm}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == want, f'{arm!r} -> {got} != {want}')
+    multi = ('```bash\ncase "$1" in\n  start) autumn nope ;;\n'
+             '  *) exit 1 ;;\nesac\n```')
+    expect([(ln, d) for ln, d, _, _ in invocations(multi)] == [(3, 'nope')],
+           f'a multi-line case reads its arm: {list(invocations(multi))}')
+    # The other parens must not become boundaries. A PROCESS substitution
+    # brackets its contents like `$(` does — tracking only `$(` left its
+    # closer at depth zero, where the arm rule took it for a boundary and the
+    # command inside was reported TWICE, once from the substitution walk and
+    # once as a segment head.
+    for doc, want in (
+            ('```bash\ndiff <(autumn migrate) <(autumn nope)\n```',
+             ['migrate', 'nope']),
+            ('```bash\ntee >(autumn nope)\n```', ['nope']),
+            ('```bash\n(autumn migrate && autumn nope)\n```', ['migrate', 'nope']),
+            ('```bash\nOUT=$(autumn nope)\n```', ['nope']),
+            ("```bash\nprintf '%s' 'x)'; autumn nope\n```", ['nope'])):
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == want, f'paren control: {got} != {want}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
