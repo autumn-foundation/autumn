@@ -100,6 +100,50 @@ pub trait DnsProvider: Send + Sync {
 
     /// Remove exactly the `(name, value)` pair in `record`.
     fn delete_txt<'a>(&'a self, record: &'a TxtRecord) -> BoxFuture<'a, Result<(), String>>;
+
+    /// Publish every record in `records`, which may share names.
+    ///
+    /// The default applies [`upsert_txt`](Self::upsert_txt) in order, which is
+    /// correct for a provider whose unit of write is one *record*. A provider
+    /// whose unit of write is the whole record **set** — Route 53's
+    /// `ChangeResourceRecordSets` replaces a record set wholesale, so publishing is
+    /// a read-modify-write — MUST override this and apply every value sharing a
+    /// name in a single change. Sequential read-modify-writes race: the read
+    /// backing the second change may still return the pre-change values, so the
+    /// second write would carry only its own value and silently drop the first
+    /// (issue #1620).
+    ///
+    /// On error the caller must assume every record in `records` may have been
+    /// written and clean all of them up; `delete_txt` for a value that was never
+    /// published is a no-op.
+    fn upsert_txt_batch<'a>(
+        &'a self,
+        records: &'a [TxtRecord],
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            for record in records {
+                self.upsert_txt(record).await?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Remove every `(name, value)` pair in `records`, which may share names.
+    ///
+    /// Same contract as [`upsert_txt_batch`](Self::upsert_txt_batch) in reverse:
+    /// a set-replacing provider must remove all values sharing a name in one
+    /// change, or the second removal's stale read resurrects the first value.
+    fn delete_txt_batch<'a>(
+        &'a self,
+        records: &'a [TxtRecord],
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            for record in records {
+                self.delete_txt(record).await?;
+            }
+            Ok(())
+        })
+    }
 }
 
 /// How much text copied from a DNS provider (an API error body, a hook's

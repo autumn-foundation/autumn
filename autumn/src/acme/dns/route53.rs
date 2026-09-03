@@ -206,6 +206,54 @@ impl Route53Provider {
         .await
         .map(|_| ())
     }
+
+    /// Apply every record in `records` to its zone, one read-modify-write per
+    /// distinct name — so two values at one name (an apex plus its wildcard)
+    /// become a single `ChangeResourceRecordSets`.
+    ///
+    /// `add` selects publish (union) or remove (difference). Distinct names are
+    /// distinct record sets and cannot clobber each other, so they stay separate
+    /// changes; only same-name values must share one.
+    async fn apply_batch(&self, records: &[TxtRecord], add: bool) -> Result<(), String> {
+        // Grouped in first-seen order rather than through a HashMap, so the
+        // request order a test observes is the order the caller asked for.
+        let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+        for record in records {
+            match groups.iter_mut().find(|(name, _)| *name == record.fqdn) {
+                Some((_, values)) => {
+                    if !values.contains(&record.value.as_str()) {
+                        values.push(&record.value);
+                    }
+                }
+                None => groups.push((&record.fqdn, vec![&record.value])),
+            }
+        }
+
+        for (fqdn, values) in groups {
+            let zone = self.zone_id(fqdn).await?;
+            let current = self.current_values(&zone, fqdn).await?;
+            let next: Vec<String> = if add {
+                let mut next = current.clone();
+                for value in &values {
+                    if !next.iter().any(|v| v == value) {
+                        next.push((*value).to_owned());
+                    }
+                }
+                next
+            } else {
+                current
+                    .iter()
+                    .filter(|v| !values.contains(&v.as_str()))
+                    .cloned()
+                    .collect()
+            };
+            if next == current {
+                continue;
+            }
+            self.write_values(&zone, fqdn, &next, &current).await?;
+        }
+        Ok(())
+    }
 }
 
 impl DnsProvider for Route53Provider {
@@ -242,6 +290,25 @@ impl DnsProvider for Route53Provider {
             self.write_values(&zone, &record.fqdn, &next, &current)
                 .await
         })
+    }
+
+    /// Route 53 replaces a whole record set, so values sharing a name must go in ONE
+    /// change: a second read-modify-write may read the pre-change values and
+    /// write back only its own, dropping the first (issue #1620).
+    fn upsert_txt_batch<'a>(
+        &'a self,
+        records: &'a [TxtRecord],
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(self.apply_batch(records, true))
+    }
+
+    /// The mirror of [`upsert_txt_batch`](Self::upsert_txt_batch): removing two
+    /// values at one name one at a time lets a stale read resurrect the first.
+    fn delete_txt_batch<'a>(
+        &'a self,
+        records: &'a [TxtRecord],
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(self.apply_batch(records, false))
     }
 }
 
@@ -740,6 +807,146 @@ mod tests {
             changes[1]
         );
         assert_eq!(changes[1].matches("<ResourceRecord>").count(), 2);
+    }
+
+    /// Regression (#1620): an apex plus its wildcard publish two values at ONE
+    /// name, and Route 53 replaces the whole record set. Doing that as two
+    /// sequential read-modify-writes races — Route 53 may keep serving the
+    /// pre-change values from `ListResourceRecordSets` until the first change
+    /// reaches `INSYNC`, so the second write carries only its own value and
+    /// silently drops the first, leaving one authorization unable to validate.
+    ///
+    /// The transport here models exactly that: every read answers "empty",
+    /// however many changes have been submitted. Batching must therefore emit a
+    /// SINGLE change carrying both values.
+    #[tokio::test]
+    async fn same_name_values_batch_into_one_change_despite_a_stale_read() {
+        let transport = RecordingTransport::new(&[
+            (ZONE_LOOKUP, zone_hit()),
+            // The last scripted response for a key is reused, so this read
+            // stays stale forever — the pathological case.
+            (RRSET_LIST, empty_rrset()),
+            (RRSET_CHANGE, changed()),
+        ]);
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        provider
+            .upsert_txt_batch(&[
+                TxtRecord::new("myapp.com", "value-apex"),
+                TxtRecord::new("myapp.com", "value-wildcard"),
+            ])
+            .await
+            .expect("both values publish");
+
+        let changes: Vec<String> = transport
+            .sent()
+            .iter()
+            .filter(|r| r.method == "POST")
+            .map(|r| r.body.clone())
+            .collect();
+        assert_eq!(
+            changes.len(),
+            1,
+            "values sharing a name must be one change, not one per value: {changes:?}"
+        );
+        assert_eq!(changes[0].matches("<ResourceRecord>").count(), 2);
+        assert!(
+            changes[0].contains("&quot;value-apex&quot;"),
+            "{}",
+            changes[0]
+        );
+        assert!(
+            changes[0].contains("&quot;value-wildcard&quot;"),
+            "{}",
+            changes[0]
+        );
+    }
+
+    /// Cleanup is the mirror: removing both values at one name is one DELETE of
+    /// the whole set, not two writes whose second read could resurrect the
+    /// first value.
+    #[tokio::test]
+    async fn same_name_removals_batch_into_one_change() {
+        let transport = RecordingTransport::new(&[
+            (ZONE_LOOKUP, zone_hit()),
+            (RRSET_LIST, &rrset_with(&["value-apex", "value-wildcard"])),
+            (RRSET_CHANGE, changed()),
+        ]);
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        provider
+            .delete_txt_batch(&[
+                TxtRecord::new("myapp.com", "value-apex"),
+                TxtRecord::new("myapp.com", "value-wildcard"),
+            ])
+            .await
+            .expect("both values are removed");
+
+        let changes: Vec<String> = transport
+            .sent()
+            .iter()
+            .filter(|r| r.method == "POST")
+            .map(|r| r.body.clone())
+            .collect();
+        assert_eq!(
+            changes.len(),
+            1,
+            "one change removes the whole set: {changes:?}"
+        );
+        assert!(
+            changes[0].contains("<Action>DELETE</Action>"),
+            "removing every value deletes the set: {}",
+            changes[0]
+        );
+        assert_eq!(
+            changes[0].matches("<ResourceRecord>").count(),
+            2,
+            "a Route 53 DELETE must carry the set exactly as it stands: {}",
+            changes[0]
+        );
+    }
+
+    /// Distinct names are distinct record sets and cannot clobber each other, so a
+    /// batch spanning two zones stays two changes — each with its own zone
+    /// lookup and read.
+    #[tokio::test]
+    async fn distinct_names_stay_separate_changes() {
+        let transport = RecordingTransport::new(&[
+            (ZONE_LOOKUP, zone_hit()),
+            (RRSET_LIST, empty_rrset()),
+            (RRSET_CHANGE, changed()),
+        ]);
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        provider
+            .upsert_txt_batch(&[
+                TxtRecord::new("myapp.com", "value-apex"),
+                TxtRecord::new("other.myapp.com", "value-other"),
+            ])
+            .await
+            .expect("both names publish");
+
+        let changes: Vec<String> = transport
+            .sent()
+            .iter()
+            .filter(|r| r.method == "POST")
+            .map(|r| r.body.clone())
+            .collect();
+        assert_eq!(
+            changes.len(),
+            2,
+            "one change per distinct name: {changes:?}"
+        );
+        assert!(
+            changes[0].contains("_acme-challenge.myapp.com."),
+            "{}",
+            changes[0]
+        );
+        assert!(
+            changes[1].contains("_acme-challenge.other.myapp.com."),
+            "{}",
+            changes[1]
+        );
     }
 
     /// Removing one of two values UPSERTs the remainder; removing the last one

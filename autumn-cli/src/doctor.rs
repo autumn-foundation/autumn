@@ -644,18 +644,13 @@ pub enum DnsPointsHere {
 
 /// Grade whether an ACME domain's DNS points at this host (pure; injectable).
 ///
-/// A clear mismatch is a **Fail** (HTTP-01 will hit the wrong host); an
-/// indeterminate result (can't resolve, or can't tell where "here" is) is a
-/// **Warn** rather than a hard failure, since split-horizon DNS and NAT make
-/// "points here" unknowable from inside the host.
-#[must_use]
-pub fn check_acme_dns_impl(domain: &str, outcome: &DnsPointsHere) -> CheckResult {
-    check_acme_dns_for_challenge(domain, outcome, false)
-}
-
-/// As [`check_acme_dns_impl`], but told whether DNS-01 is in use (issue #1620).
+/// Under HTTP-01 a clear mismatch is a **Fail** (the CA will hit the wrong
+/// host); an indeterminate result (can't resolve, or can't tell where "here"
+/// is) is a **Warn** rather than a hard failure, since split-horizon DNS and NAT
+/// make "points here" unknowable from inside the host.
 ///
-/// "Does this domain resolve to THIS host" is an HTTP-01 question: the CA
+/// `dns01` softens all of that (issue #1620). "Does this domain resolve to THIS
+/// host" is an HTTP-01 question: the CA
 /// fetches the challenge token over `:80` from whatever the name resolves to, so
 /// a mismatch means issuance hits the wrong server. Under DNS-01 the CA never
 /// connects to this host at all — it reads a TXT record — so pointing the domain
@@ -10865,17 +10860,18 @@ pub struct Vault {
 
     #[test]
     fn acme_dns_pass_when_points_here() {
-        let r = check_acme_dns_impl("app.example.com", &DnsPointsHere::Matches);
+        let r = check_acme_dns_for_challenge("app.example.com", &DnsPointsHere::Matches, false);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
     #[test]
     fn acme_dns_fail_when_resolves_elsewhere() {
-        let r = check_acme_dns_impl(
+        let r = check_acme_dns_for_challenge(
             "app.example.com",
             &DnsPointsHere::ResolvesElsewhere {
                 resolved: vec!["203.0.113.7".to_owned()],
             },
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Fail));
         assert!(r.detail.as_deref().unwrap().contains("203.0.113.7"));
@@ -10884,7 +10880,7 @@ pub struct Vault {
     #[test]
     fn acme_dns_warn_when_indeterminate() {
         for outcome in [DnsPointsHere::Unresolved, DnsPointsHere::LocalIpsUnknown] {
-            let r = check_acme_dns_impl("app.example.com", &outcome);
+            let r = check_acme_dns_for_challenge("app.example.com", &outcome, false);
             assert!(matches!(r.status, CheckStatus::Warn), "outcome={outcome:?}");
         }
     }
@@ -10969,7 +10965,7 @@ pub struct Vault {
         // And the check grades a partial match as a Warn that names the stray
         // address — not a clean Pass.
         let outcome = grade_dns_points_here(&resolved, &local);
-        let r = check_acme_dns_impl("app.example.com", &outcome);
+        let r = check_acme_dns_for_challenge("app.example.com", &outcome, false);
         assert!(
             matches!(r.status, CheckStatus::Warn),
             "a partial DNS match must be a Warn, not a clean Pass"
@@ -12523,7 +12519,11 @@ directory = \"production\"
                 PortReachability::Open,
                 false,
             ));
-            dns_checks.push(check_acme_dns_impl(domain, &DnsPointsHere::Matches));
+            dns_checks.push(check_acme_dns_for_challenge(
+                domain,
+                &DnsPointsHere::Matches,
+                false,
+            ));
         }
 
         assert_eq!(ports_checks.len(), 2, "one acme_ports check per domain");

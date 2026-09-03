@@ -4805,32 +4805,12 @@ impl AppBuilder {
                 };
             renewal_task.leadership_degraded = leadership_degraded;
 
-            // HTTP-01 ACME is single-host in this slice: the token map is
-            // per-process and the store is local disk. A distributed scheduler
-            // backend means a multi-replica deployment, where the CA's :80
-            // validation can hit a replica without the token (404) and
-            // non-leaders cannot adopt certs from the non-shared store. Warn
-            // loudly rather than silently mis-serving. See #1620.
-            //
-            // Keyed off the configured backend (operator intent) rather than the
-            // built coordinator, so the warning still fires when
-            // `coordinator_from_config` fell back to in-process after a Postgres
-            // error — exactly the case where the fleet is multi-replica but this
-            // process degraded. Exhaustive `matches!` is compiler-enforced if a
-            // new distributed backend variant is added.
-            if !matches!(
-                config.scheduler.backend,
-                crate::config::SchedulerBackend::InProcess
-            ) && !dns01
-            {
-                tracing::warn!(
-                    scheduler_backend = coordinator.backend(),
-                    "ACME HTTP-01 validation is not fleet-safe with the local on-disk token \
-                     store: behind a load balancer the CA's :80 challenge may reach a replica \
-                     without the token (404), and non-leader replicas cannot adopt issued \
-                     certificates from a non-shared store. Run ACME on a single host, or use a \
-                     shared token store / DNS-01 (#1620)"
-                );
+            // A distributed scheduler backend means a multi-replica deployment,
+            // where ACME is not fleet-safe: see `acme_fleet_warning` for the two
+            // hazards and why DNS-01 only retires one of them. Warn loudly
+            // rather than silently mis-serving (#1620).
+            if let Some(message) = acme_fleet_warning(config.scheduler.backend, dns01) {
+                tracing::warn!(scheduler_backend = coordinator.backend(), "{message}");
             }
 
             #[cfg(feature = "reporting")]
@@ -8636,6 +8616,51 @@ async fn build_acme_tls_listener(
     ))
 }
 
+/// The multi-replica ACME warning for this deployment, or `None` when the
+/// scheduler backend says the deployment is single-replica.
+///
+/// One condition guards two distinct hazards, and DNS-01 only removes the
+/// first:
+///
+/// 1. The HTTP-01 token map is per-process, so behind a load balancer the CA's
+///    `:80` request can land on a replica that never minted the token (404).
+/// 2. The certificate store is local disk, so replicas that did not win the
+///    renewal lease never see the issued certificate and keep serving the
+///    self-signed placeholder.
+///
+/// DNS-01 proves control through a TXT record, which retires (1) — but it does
+/// not distribute certificates, so (2) still mis-serves TLS on every replica
+/// but the leader. Warn either way; only the text differs (issue #1620).
+///
+/// Keyed off the *configured* backend (operator intent) rather than the built
+/// coordinator, so the warning still fires when `coordinator_from_config` fell
+/// back to in-process after a Postgres error — exactly the case where the fleet
+/// is multi-replica but this process degraded. The exhaustive `matches!` is
+/// compiler-enforced if a new distributed backend variant is added.
+#[cfg(feature = "acme")]
+const fn acme_fleet_warning(
+    backend: crate::config::SchedulerBackend,
+    dns01: bool,
+) -> Option<&'static str> {
+    if matches!(backend, crate::config::SchedulerBackend::InProcess) {
+        return None;
+    }
+    Some(if dns01 {
+        "ACME DNS-01 issuance is fleet-safe, but the on-disk certificate store is not: only \
+         the replica holding the renewal lease writes the issued certificate, and the others \
+         cannot adopt it from a non-shared store, so they keep serving the self-signed \
+         placeholder. Run ACME on a single host, or point [server.tls.acme] cache_dir at \
+         storage every replica shares (#1620)"
+    } else {
+        "ACME HTTP-01 validation is not fleet-safe with the local on-disk token store: behind \
+         a load balancer the CA's :80 challenge may reach a replica without the token (404), \
+         and non-leader replicas cannot adopt issued certificates from a non-shared store. Run \
+         ACME on a single host, or terminate TLS at a shared proxy. DNS-01 removes the :80 \
+         hazard but not the store one, so it needs a shared [server.tls.acme] cache_dir too \
+         (#1620)"
+    })
+}
+
 /// Build the DNS-01 challenge wiring for `[server.tls.acme.dns]`, if configured.
 ///
 /// The provider credential is read from the encrypted credentials store (or the
@@ -11082,6 +11107,7 @@ fn is_production_profile(profile: &str) -> bool {
 
 #[cfg(test)]
 mod agent_authority_route_summary_tests {
+
     use super::*;
 
     fn route_with(path: &'static str, mcp_tool: bool) -> Route {
@@ -11969,6 +11995,50 @@ async fn canary_rollback_signal(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+    /// Regression (#1620): DNS-01 must not silence the multi-replica warning.
+    ///
+    /// DNS-01 retires the HTTP-01 token-map hazard — the CA never connects to
+    /// this host — but it does not distribute certificates. A Postgres-backed
+    /// (i.e. multi-replica) fleet still has every non-leader replica serving the
+    /// self-signed placeholder off its own empty on-disk store, so it must still
+    /// warn, naming the certificate store rather than tokens.
+    #[cfg(feature = "acme")]
+    #[test]
+    fn acme_fleet_warning_covers_the_certificate_store_under_dns01() {
+        use crate::config::SchedulerBackend;
+
+        // Single-replica: silent under either challenge type.
+        assert!(super::acme_fleet_warning(SchedulerBackend::InProcess, false).is_none());
+        assert!(super::acme_fleet_warning(SchedulerBackend::InProcess, true).is_none());
+
+        // Multi-replica HTTP-01: both hazards named.
+        let http01 = super::acme_fleet_warning(SchedulerBackend::Postgres, false)
+            .expect("a distributed backend under HTTP-01 must warn");
+        assert!(
+            http01.contains("token"),
+            "HTTP-01 warning must name the token store: {http01}"
+        );
+
+        // Multi-replica DNS-01: still warns, about the certificate store.
+        let dns01 = super::acme_fleet_warning(SchedulerBackend::Postgres, true).expect(
+            "a distributed backend under DNS-01 must still warn: DNS-01 proves domain \
+                     control but does not share the certificate store",
+        );
+        assert!(
+            dns01.contains("certificate store"),
+            "DNS-01 warning must name the certificate store as the hazard: {dns01}"
+        );
+        assert!(
+            dns01.contains("cache_dir"),
+            "DNS-01 warning must name the config key an operator would change: {dns01}"
+        );
+        // …and must not repeat the HTTP-01 diagnosis, which does not apply.
+        assert!(
+            !dns01.contains("token") && !dns01.contains("404"),
+            "DNS-01 warning must not blame the HTTP-01 token map: {dns01}"
+        );
+    }
+
     /// A clock near the end of representable time must not kill the scheduler.
     ///
     /// `format_next_task_run_after` runs at the top of every fixed-delay loop.

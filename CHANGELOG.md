@@ -44,15 +44,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     encrypted store (`autumn credentials edit`) or the `AUTUMN_ACME_DNS_*`
     environment variables, and are held in a type that renders as `<redacted>`
     so they cannot reach a log, an error message, or actuator output.
-  - **Propagation.** After publishing, autumn waits until every configured
-    resolver returns every record before telling the CA to validate. The wait is
+  - **Propagation.** After publishing, autumn waits until every record is
+    visible before telling the CA to validate. The probe goes to each challenge
+    zone's *own* authoritative nameservers, discovered per order through the
+    configured resolvers — probing a public recursive right after the write
+    plants a negative-cache entry (RFC 2308; 900s on Route 53, 1800s on
+    Cloudflare) that outlives the propagation budget and can never clear. A
+    multi-domain order discovers nameservers per zone, since one zone's servers
+    never answer for another's names. The configured resolvers stay the fallback
+    for any zone whose authoritative set cannot be discovered. The wait is
     bounded (`propagation_timeout_secs`, default 300) and its timeout names the
     exact record, the value that never appeared, and the resolver that never saw
     it. Challenge records are removed after the order finishes, including when
     it fails.
   - **Two records, one name.** An apex + wildcard order publishes two different
     values at `_acme-challenge.<domain>`; every provider appends a value and
-    deletes by `(name, value)` rather than replacing the record set.
+    deletes by `(name, value)` rather than replacing the record set. Providers
+    whose unit of write is the whole record set rather than one record —
+    Route 53's `ChangeResourceRecordSets` — apply every value sharing a name in
+    a single change, because two sequential read-modify-writes race: the second
+    read can still return the pre-change values and write back only its own.
   - **Lifecycle.** Renewal, persistence, staging selection, hot-swap and health
     are #1608's, unchanged. A failed issuance or renewal now also raises
     #1610's `scheduled_task_failure` operator alert for `acme-renewal` — weeks
@@ -65,6 +76,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     covered by the configured certificate). An unreachable `:80` is now a Warn
     rather than a Fail when DNS-01 is configured, since the CA never connects to
     it, and a `*.` entry is probed as the base domain it covers.
+  - **Still single-host.** DNS-01 retires HTTP-01's per-process token map, but
+    it does not distribute certificates: the store is local disk, so only the
+    replica holding the renewal lease has the issued certificate. A distributed
+    `[scheduler]` backend therefore still warns at startup — now naming the
+    certificate store rather than the token map.
 
   See the [TLS guide](docs/guide/tls.md#wildcard-certificates-via-dns-01-servertlsacmedns)
   and the [deployment walkthrough](docs/guide/deployment.md#subdomain-per-tenant-wildcard-https-on-a-vps).

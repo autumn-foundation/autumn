@@ -791,18 +791,19 @@ impl AcmeRenewalTask {
         wanted: &[TxtRecord],
         published: &mut Vec<TxtRecord>,
     ) -> Result<(), String> {
-        for record in wanted {
-            dns.provider.upsert_txt(record).await.map_err(|e| {
-                format!(
-                    "failed to publish the DNS-01 TXT record {} via the {} provider: {e}",
-                    record.fqdn,
-                    dns.provider.name()
-                )
-            })?;
-            // Recorded only after the write succeeded, but before the next one —
-            // a failure on record two still cleans up record one.
-            published.push(record.clone());
-        }
+        // Recorded BEFORE the write, not after: a batch that fails partway may
+        // still have written some of these names, and the provider contract
+        // makes deleting a value that was never published a no-op. Publishing
+        // goes through the batch entry point because a set-replacing provider
+        // (Route 53) must apply every value sharing a name in one change —
+        // sequential read-modify-writes race and drop one of them (#1620).
+        published.extend(wanted.iter().cloned());
+        dns.provider.upsert_txt_batch(wanted).await.map_err(|e| {
+            format!(
+                "failed to publish the DNS-01 TXT records via the {} provider: {e}",
+                dns.provider.name()
+            )
+        })?;
 
         // Probe the zone's OWN nameservers, not the configured recursive
         // resolvers. Probing a public recursive immediately after the write
@@ -811,7 +812,7 @@ impl AcmeRenewalTask {
         // and every later renewal — reads the cached "not there" and the wait
         // can never succeed. The configured resolvers are how the authoritative
         // set is discovered, and the fallback when that fails.
-        let probe_targets = self.dns01_probe_targets(dns, wanted).await;
+        let probe_targets = Self::dns01_probe_targets(dns, wanted).await;
 
         crate::acme::dns::resolver::wait_for_propagation(
             wanted,
@@ -829,43 +830,59 @@ impl AcmeRenewalTask {
         self.await_order_ready(order).await
     }
 
-    /// The servers the propagation wait should probe: the zone's authoritative
-    /// nameservers when they can be discovered, else the configured resolvers.
+    /// The servers the propagation wait should probe for each challenge name:
+    /// that name's own authoritative nameservers when they can be discovered,
+    /// else the configured resolvers.
     ///
-    /// Discovery is per-order rather than per-boot because the zone's NS set can
-    /// change between renewals, and because a wildcard order's records all live
-    /// in one zone — so this costs one `NS` lookup plus one `A` lookup per
-    /// nameserver, once.
+    /// Discovery runs once per **distinct challenge name**, not once per order.
+    /// A wildcard order's records all share one name (`*.myapp.com` and
+    /// `myapp.com` both challenge `_acme-challenge.myapp.com`), so that common
+    /// case still costs a single `NS` lookup plus one `A` lookup per
+    /// nameserver. A multi-domain order spans several zones, and the first
+    /// zone's servers are not authoritative for the rest — probing them for
+    /// another zone's name can only ever time out, after which the caller
+    /// deletes every record. So each zone gets its own targets (issue #1620).
+    ///
+    /// Discovery is per-order rather than per-boot because a zone's NS set can
+    /// change between renewals.
     async fn dns01_probe_targets(
-        &self,
         dns: &DnsChallenge,
         wanted: &[TxtRecord],
-    ) -> Vec<std::net::SocketAddr> {
-        let Some(first) = wanted.first() else {
-            return dns.resolvers.clone();
-        };
-        let authoritative = crate::acme::dns::resolver::authoritative_resolvers(
-            &first.fqdn,
-            &dns.resolvers,
-            dns.lookup.as_ref(),
-        )
-        .await;
-        if authoritative.is_empty() {
-            tracing::warn!(
-                fqdn = first.fqdn,
-                "could not discover the authoritative nameservers for the DNS-01 challenge zone; \
-                 falling back to the configured resolvers. A recursive resolver can cache a \
-                 negative answer for longer than the propagation budget, so raise \
-                 [server.tls.acme.dns] propagation_timeout_secs if issuance times out"
+    ) -> crate::acme::dns::resolver::ProbeTargets {
+        let mut targets = crate::acme::dns::resolver::ProbeTargets::flat(&dns.resolvers);
+        let mut discovered: Vec<&str> = Vec::new();
+        for record in wanted {
+            if discovered.contains(&record.fqdn.as_str()) {
+                continue;
+            }
+            discovered.push(&record.fqdn);
+            let authoritative = crate::acme::dns::resolver::authoritative_resolvers(
+                &record.fqdn,
+                &dns.resolvers,
+                dns.lookup.as_ref(),
+            )
+            .await;
+            if authoritative.is_empty() {
+                // Fall back for THIS name only: one zone with a broken
+                // delegation must not drag the others onto recursive resolvers.
+                tracing::warn!(
+                    fqdn = record.fqdn,
+                    "could not discover the authoritative nameservers for the DNS-01 challenge \
+                     zone; falling back to the configured resolvers for this name. A recursive \
+                     resolver can cache a negative answer for longer than the propagation \
+                     budget, so raise [server.tls.acme.dns] propagation_timeout_secs if issuance \
+                     times out"
+                );
+                continue;
+            }
+            tracing::debug!(
+                fqdn = record.fqdn,
+                servers = authoritative.len(),
+                "probing the DNS-01 challenge zone's authoritative nameservers"
             );
-            return dns.resolvers.clone();
+            targets.set(&record.fqdn, authoritative);
         }
-        tracing::debug!(
-            fqdn = first.fqdn,
-            servers = authoritative.len(),
-            "probing the DNS-01 challenge zone's authoritative nameservers"
-        );
-        authoritative
+        targets
     }
 
     /// The TXT record each pending authorization needs, in order.
@@ -970,16 +987,19 @@ impl AcmeRenewalTask {
     /// because a leftover TXT record could not be deleted would be worse than
     /// the litter. The next order's publish is idempotent either way.
     async fn cleanup_dns01(dns: &DnsChallenge, published: &[TxtRecord]) {
-        for record in published {
-            if let Err(e) = dns.provider.delete_txt(record).await {
-                tracing::warn!(
-                    fqdn = record.fqdn,
-                    provider = dns.provider.name(),
-                    error = %e,
-                    "could not remove the DNS-01 challenge TXT record; it will be overwritten by \
-                     the next issuance but can be deleted by hand"
-                );
-            }
+        if published.is_empty() {
+            return;
+        }
+        // Batched for the same reason publishing is: removing two values at one
+        // name one at a time lets a set-replacing provider's stale read
+        // resurrect the value it just removed (#1620).
+        if let Err(e) = dns.provider.delete_txt_batch(published).await {
+            tracing::warn!(
+                provider = dns.provider.name(),
+                error = %e,
+                "could not remove the DNS-01 challenge TXT records; they will be overwritten by \
+                 the next issuance but can be deleted by hand"
+            );
         }
     }
 
@@ -1181,6 +1201,217 @@ fn now_unix() -> i64 {
 mod tests {
     use super::*;
     use crate::actuator::HealthStatus;
+
+    /// A [`DnsProvider`] that records nothing and writes nothing: these tests
+    /// exercise nameserver *discovery*, which never touches the provider.
+    struct NoopProvider;
+
+    impl crate::acme::dns::DnsProvider for NoopProvider {
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+        fn upsert_txt<'a>(
+            &'a self,
+            _record: &'a TxtRecord,
+        ) -> futures::future::BoxFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn delete_txt<'a>(
+            &'a self,
+            _record: &'a TxtRecord,
+        ) -> futures::future::BoxFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Regression (#1620): a multi-domain order spans several zones, and each
+    /// must be probed through its OWN authoritative nameservers.
+    ///
+    /// The bug this pins: discovering nameservers from `wanted.first()` alone
+    /// and probing every name at them. `ns-a.example` is not authoritative for
+    /// `myapp.io`, so it never answers with that zone's TXT value — the wait
+    /// spends its whole budget and the caller then deletes every record, so a
+    /// perfectly correct two-domain order fails on every attempt.
+    ///
+    /// A `ScriptedZoneLookup` answers `NS`/`A` per zone and refuses to answer
+    /// TXT for a name a server is not authoritative for, which is what a real
+    /// nameserver does.
+    #[tokio::test]
+    async fn probe_targets_are_discovered_per_zone() {
+        use crate::acme::dns::resolver::{DnsAnswer, DnsLookup, Rdata, ResourceRecord};
+        use std::net::SocketAddr;
+
+        /// `zone -> (nameserver name, nameserver address)`.
+        struct ScriptedZoneLookup {
+            zones: Vec<(&'static str, &'static str, SocketAddr)>,
+            asked: std::sync::Mutex<Vec<(SocketAddr, String, u16)>>,
+        }
+
+        impl DnsLookup for ScriptedZoneLookup {
+            fn query<'a>(
+                &'a self,
+                server: SocketAddr,
+                name: &'a str,
+                qtype: u16,
+                _recursion_desired: bool,
+            ) -> futures::future::BoxFuture<'a, Result<DnsAnswer, String>> {
+                self.asked
+                    .lock()
+                    .unwrap()
+                    .push((server, name.to_owned(), qtype));
+                let name = name.to_owned();
+                let zones = self.zones.clone();
+                Box::pin(async move {
+                    let records = match qtype {
+                        // NS: only for a zone this script knows.
+                        2 => zones
+                            .iter()
+                            .find(|(zone, ..)| *zone == name)
+                            .map(|(zone, ns, _)| ResourceRecord {
+                                name: (*zone).to_owned(),
+                                rtype: 2,
+                                rdata: Rdata::Name((*ns).to_owned()),
+                            })
+                            .into_iter()
+                            .collect::<Vec<_>>(),
+                        // A: resolve a nameserver's own name.
+                        1 => zones
+                            .iter()
+                            .find(|(_, ns, _)| *ns == name)
+                            .map(|(_, ns, addr)| ResourceRecord {
+                                name: (*ns).to_owned(),
+                                rtype: 1,
+                                rdata: Rdata::A(match addr.ip() {
+                                    std::net::IpAddr::V4(v4) => v4,
+                                    std::net::IpAddr::V6(_) => unreachable!("scripted as v4"),
+                                }),
+                            })
+                            .into_iter()
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    Ok(DnsAnswer { rcode: 0, records })
+                })
+            }
+        }
+
+        let ns_a: SocketAddr = "10.0.0.1:53".parse().unwrap();
+        let ns_b: SocketAddr = "10.0.0.2:53".parse().unwrap();
+        let recursive: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        let lookup = std::sync::Arc::new(ScriptedZoneLookup {
+            zones: vec![
+                ("myapp.com", "ns-a.example", ns_a),
+                ("myapp.io", "ns-b.example", ns_b),
+            ],
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let dns = DnsChallenge {
+            provider: std::sync::Arc::new(NoopProvider),
+            lookup: std::sync::Arc::clone(&lookup) as std::sync::Arc<dyn DnsLookup>,
+            resolvers: vec![recursive],
+            propagation_timeout: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(10),
+        };
+
+        // An apex+wildcard pair on .com (one shared name) plus a second domain.
+        let wanted = vec![
+            TxtRecord::new("myapp.com", "value-apex"),
+            TxtRecord::new("myapp.com", "value-wildcard"),
+            TxtRecord::new("myapp.io", "value-io"),
+        ];
+        let targets = AcmeRenewalTask::dns01_probe_targets(&dns, &wanted).await;
+
+        assert_eq!(
+            targets.for_name("_acme-challenge.myapp.com"),
+            [ns_a],
+            "the .com name must be probed at its own zone's nameserver"
+        );
+        assert_eq!(
+            targets.for_name("_acme-challenge.myapp.io"),
+            [ns_b],
+            "the .io name must NOT inherit the first zone's nameserver — it is not \
+             authoritative for .io and can only ever answer a referral"
+        );
+
+        // The shared name is discovered once, not once per value: the apex and
+        // its wildcard challenge the same record.
+        let ns_queries = lookup
+            .asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, name, qtype)| *qtype == 2 && name == "myapp.com")
+            .count();
+        assert_eq!(
+            ns_queries, 1,
+            "one NS discovery per distinct challenge name"
+        );
+    }
+
+    /// A zone whose nameservers cannot be discovered falls back to the
+    /// configured resolvers **for that name only** — a broken delegation on one
+    /// domain must not drag a working one onto recursive resolvers, where a
+    /// negative cache entry can outlive the propagation budget.
+    #[tokio::test]
+    async fn undiscoverable_zones_fall_back_without_affecting_their_neighbours() {
+        use crate::acme::dns::resolver::{DnsAnswer, DnsLookup, Rdata, ResourceRecord};
+        use std::net::SocketAddr;
+
+        struct OnlyComIsDiscoverable;
+        impl DnsLookup for OnlyComIsDiscoverable {
+            fn query<'a>(
+                &'a self,
+                _server: SocketAddr,
+                name: &'a str,
+                qtype: u16,
+                _recursion_desired: bool,
+            ) -> futures::future::BoxFuture<'a, Result<DnsAnswer, String>> {
+                let name = name.to_owned();
+                Box::pin(async move {
+                    let records = match (qtype, name.as_str()) {
+                        (2, "myapp.com") => vec![ResourceRecord {
+                            name: name.clone(),
+                            rtype: 2,
+                            rdata: Rdata::Name("ns-a.example".to_owned()),
+                        }],
+                        (1, "ns-a.example") => vec![ResourceRecord {
+                            name: name.clone(),
+                            rtype: 1,
+                            rdata: Rdata::A(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                        }],
+                        _ => Vec::new(),
+                    };
+                    Ok(DnsAnswer { rcode: 0, records })
+                })
+            }
+        }
+
+        let recursive: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        let dns = DnsChallenge {
+            provider: std::sync::Arc::new(NoopProvider),
+            lookup: std::sync::Arc::new(OnlyComIsDiscoverable),
+            resolvers: vec![recursive],
+            propagation_timeout: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(10),
+        };
+        let wanted = vec![
+            TxtRecord::new("myapp.com", "value-com"),
+            TxtRecord::new("myapp.io", "value-io"),
+        ];
+        let targets = AcmeRenewalTask::dns01_probe_targets(&dns, &wanted).await;
+
+        assert_eq!(
+            targets.for_name("_acme-challenge.myapp.com"),
+            [SocketAddr::from(([10, 0, 0, 1], 53))],
+            "the discoverable zone keeps its authoritative servers"
+        );
+        assert_eq!(
+            targets.for_name("_acme-challenge.myapp.io"),
+            [recursive],
+            "the undiscoverable zone falls back to the configured resolvers"
+        );
+    }
 
     const DAY: i64 = 86_400;
 

@@ -90,7 +90,9 @@ kamal-proxy if you use `autumn deploy` (see the note under
 [`autumn deploy`](#push-button-deploy-to-your-own-server-autumn-deploy) — do not
 combine the two). In-process ACME is a **single-host** feature: behind a load
 balancer the CA's challenge can land on a replica that never published the
-token. Terminate TLS at the proxy for multi-replica deployments.
+token, and the issued certificate is cached on one replica's local disk where
+the others cannot read it. DNS-01 fixes the first of those, not the second.
+Terminate TLS at the proxy for multi-replica deployments.
 
 Full reference, including the private-CA / Pebble setup and the renewal
 internals: [TLS & HTTPS guide](./tls.md).

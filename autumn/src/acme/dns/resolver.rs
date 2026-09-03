@@ -710,8 +710,58 @@ impl std::fmt::Display for PropagationTimeout {
     }
 }
 
-/// Wait until every record in `records` is visible at every resolver, or the
-/// budget runs out.
+/// Which nameservers to probe for each challenge name.
+///
+/// A multi-domain order spans as many zones as it has base domains, and one
+/// zone's authoritative nameservers are not authoritative for another: asked
+/// about a name they do not serve they answer REFUSED or a referral, never the
+/// TXT value. Probing every name at one zone's servers therefore cannot
+/// succeed — the wait burns its whole budget and then the caller deletes every
+/// record, so an otherwise-correct multi-domain order fails every time.
+///
+/// Targets are held per name, with a `fallback` (the configured recursive
+/// resolvers) used for any name whose authoritative set could not be
+/// discovered. Discovery failing for one zone must not drag the others down to
+/// the fallback (issue #1620).
+#[derive(Debug, Clone, Default)]
+pub struct ProbeTargets {
+    /// Per challenge FQDN, in first-seen order. A `Vec` rather than a map: an
+    /// order has a handful of names at most, and insertion order keeps the
+    /// probe sequence (and so any timeout message) predictable.
+    per_name: Vec<(String, Vec<SocketAddr>)>,
+    fallback: Vec<SocketAddr>,
+}
+
+impl ProbeTargets {
+    /// Targets that probe `fallback` for every name.
+    #[must_use]
+    pub fn flat(fallback: &[SocketAddr]) -> Self {
+        Self {
+            per_name: Vec::new(),
+            fallback: fallback.to_vec(),
+        }
+    }
+
+    /// Probe `servers` for `fqdn`, replacing any previous entry for it.
+    pub fn set(&mut self, fqdn: &str, servers: Vec<SocketAddr>) {
+        match self.per_name.iter_mut().find(|(name, _)| name == fqdn) {
+            Some((_, existing)) => *existing = servers,
+            None => self.per_name.push((fqdn.to_owned(), servers)),
+        }
+    }
+
+    /// The servers to probe for `fqdn`: its own, else the fallback.
+    #[must_use]
+    pub fn for_name(&self, fqdn: &str) -> &[SocketAddr] {
+        self.per_name
+            .iter()
+            .find(|(name, _)| name == fqdn)
+            .map_or(self.fallback.as_slice(), |(_, servers)| servers.as_slice())
+    }
+}
+
+/// Wait until every record in `records` is visible at every server probed for
+/// its name, or the budget runs out.
 ///
 /// # Errors
 ///
@@ -719,7 +769,7 @@ impl std::fmt::Display for PropagationTimeout {
 /// and resolver that never caught up.
 pub async fn wait_for_propagation(
     records: &[TxtRecord],
-    resolvers: &[SocketAddr],
+    targets: &ProbeTargets,
     timeout: Duration,
     poll_interval: Duration,
     lookup: &dyn DnsLookup,
@@ -727,13 +777,20 @@ pub async fn wait_for_propagation(
     if records.is_empty() {
         return Ok(());
     }
-    if resolvers.is_empty() {
-        return Err(
-            "[server.tls.acme.dns] resolvers is empty, so DNS-01 propagation cannot be confirmed"
-                .to_owned(),
-        );
-    }
     let wanted = group_by_name(records);
+    // Checked per name rather than once: a name can only be confirmed if
+    // *something* answers for it, and with per-zone targets one name having no
+    // server is possible while another has several.
+    if let Some((fqdn, _)) = wanted
+        .iter()
+        .find(|(fqdn, _)| targets.for_name(fqdn).is_empty())
+    {
+        return Err(format!(
+            "no nameserver to probe for {fqdn}, so DNS-01 propagation cannot be confirmed: \
+             the zone's authoritative servers could not be discovered and \
+             [server.tls.acme.dns] resolvers is empty"
+        ));
+    }
     let started = tokio::time::Instant::now();
     let deadline = started + timeout;
     let mut last_gap: Option<PropagationTimeout> = None;
@@ -741,7 +798,7 @@ pub async fn wait_for_propagation(
     loop {
         let mut all_visible = true;
         'round: for (fqdn, expected) in &wanted {
-            for resolver in resolvers {
+            for resolver in targets.for_name(fqdn) {
                 // Recursion is deliberately NOT desired: `resolvers` here are
                 // the zone's authoritative servers whenever discovery succeeded,
                 // and they answer for the name directly. A recursive resolver
@@ -1463,7 +1520,7 @@ mod tests {
         ];
         wait_for_propagation(
             &records,
-            &[resolver(53), resolver(5353)],
+            &ProbeTargets::flat(&[resolver(53), resolver(5353)]),
             Duration::from_secs(5),
             Duration::from_millis(10),
             lookup.as_ref(),
@@ -1483,7 +1540,7 @@ mod tests {
         let records = vec![TxtRecord::new("myapp.com", "value-apex")];
         let err = wait_for_propagation(
             &records,
-            &[resolver(5353)],
+            &ProbeTargets::flat(&[resolver(5353)]),
             Duration::from_millis(60),
             Duration::from_millis(10),
             lookup.as_ref(),
@@ -1522,7 +1579,7 @@ mod tests {
         ]);
         let err = wait_for_propagation(
             &[TxtRecord::new("myapp.com", "v")],
-            &[resolver(53), resolver(5353)],
+            &ProbeTargets::flat(&[resolver(53), resolver(5353)]),
             Duration::from_millis(40),
             Duration::from_millis(10),
             lookup.as_ref(),
@@ -1543,7 +1600,7 @@ mod tests {
         )]);
         let err = wait_for_propagation(
             &[TxtRecord::new("myapp.com", "v")],
-            &[resolver(53)],
+            &ProbeTargets::flat(&[resolver(53)]),
             Duration::from_millis(20),
             Duration::from_millis(10),
             lookup.as_ref(),
@@ -1559,7 +1616,7 @@ mod tests {
         assert!(
             wait_for_propagation(
                 &[],
-                &[],
+                &ProbeTargets::default(),
                 Duration::from_secs(1),
                 Duration::from_millis(1),
                 lookup.as_ref()
@@ -1569,7 +1626,7 @@ mod tests {
         );
         let err = wait_for_propagation(
             &[TxtRecord::new("myapp.com", "v")],
-            &[],
+            &ProbeTargets::default(),
             Duration::from_secs(1),
             Duration::from_millis(1),
             lookup.as_ref(),

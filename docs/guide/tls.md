@@ -426,11 +426,17 @@ Fields:
 > election only decides **which** instance orders a certificate; it does not make
 > multi-replica ACME work — the app logs a loud startup warning when a
 > distributed scheduler backend is configured. For multi-replica or clustered
-> deployments, terminate TLS at a shared reverse proxy / load balancer (or a
-> single dedicated TLS-terminating instance), or use
-> [DNS-01](#wildcard-certificates-via-dns-01-servertlsacmedns) — its challenge
-> record lives in your zone rather than in one replica's memory, so it does not
-> have this limitation.
+> deployments, terminate TLS at a shared reverse proxy / load balancer, or use a
+> single dedicated TLS-terminating instance.
+>
+> [DNS-01](#wildcard-certificates-via-dns-01-servertlsacmedns) removes **half**
+> of this: its challenge record lives in your zone rather than in one replica's
+> memory, so the `:80` routing problem goes away and the CA never connects to
+> your host at all. It does not distribute certificates. The store is still
+> local disk, so replicas that did not win the renewal lease never receive the
+> issued certificate and keep serving the self-signed placeholder — the startup
+> warning still fires under DNS-01, naming the certificate store. To run ACME
+> across replicas at all, `cache_dir` must be on storage every replica shares.
 
 ### Scope
 
@@ -590,6 +596,15 @@ propagation probe is sent to those directly. When discovery fails — a
 split-horizon setup, a resolver that will not answer `NS` — autumn falls back to
 probing `resolvers` directly and logs a warning.
 
+Discovery runs once per distinct challenge name, so an order spanning several
+domains probes each zone through *its own* nameservers. This matters: a
+nameserver answers only for the zones it is authoritative for, so probing
+`myapp.io`'s challenge record at `myapp.com`'s nameservers can never see the
+record, and the wait would time out on an order that is in fact correct. An
+apex + wildcard order challenges a single name, so the common case still costs
+one discovery. Fallback is per name too — one domain with a broken delegation
+does not pull the others onto recursive resolvers.
+
 `[server.tls.acme.dns]` fields:
 
 | Field | Default | Meaning |
@@ -623,6 +638,15 @@ values. Both must be live at validation time. Every provider here appends a
 value and deletes by `(name, value)`, never "replace the record set" — worth
 knowing if you write your own `exec` hook, because `nsupdate delete <name> TXT`
 without a value would remove its sibling and fail the order.
+
+Route 53 is the exception that proves the rule: its API has no "append", only
+`ChangeResourceRecordSets`, which replaces the whole set. Autumn therefore
+read-modify-writes — and applies **both** values in a *single* change, because
+Route 53 may keep serving the pre-change values until the first change reaches
+`INSYNC`, so a second read-modify-write could read the old set and write back
+only its own value, dropping the first. If your `exec` hook talks to an API
+shaped like that, batch the same way or make the hook idempotent under a stale
+read.
 
 ### What DNS-01 does *not* need
 
