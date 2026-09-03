@@ -1021,8 +1021,14 @@ _EXEC_KEY_LINE = re.compile(r'^\s*' + _QUALIFIED + r'(?:' + _EXEC_KEYS + r'):', 
 # empty slot, and the pair emitted a bare root on a correct recipe.
 #
 # The style is captured, because it decides whether the lines join.
+#
+# `args` belongs here too, even though it is not a command key: it carries the
+# other HALF of a Kubernetes argv, and its inline, block-list and plain-scalar
+# forms all fill their slot already. Leaving the block-scalar form out was the
+# same omission as the literal one above, one key over — `command: ["autumn"]`
+# beside `args: >` reported a bare root on a valid manifest.
 _FOLDED_KEY = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
-                         r'):\s*([>|])[-+]?([0-9]?)[-+]?\s*$', re.I)
+                         r'|args):\s*([>|])[-+]?([0-9]?)[-+]?\s*$', re.I)
 # Any mapping key, used only to spot where one object ends and its sibling
 # begins — Compose names its services this way rather than with list items.
 _MAPPING_KEY = re.compile(r'^(\s*)[A-Za-z_][\w.-]*:(\s|$)')
@@ -3784,6 +3790,30 @@ def self_test():
     expect([(ln, d) for ln, d, _, _ in invocations(paras)]
            == [(3, 'migrate'), (5, 'nope')],
            f'each paragraph reports its own line: {list(invocations(paras))}')
+
+    # `args:` carries the other HALF of a Kubernetes argv, and its inline,
+    # block-list and plain-scalar forms all filled their slot already — the
+    # BLOCK-SCALAR form did not, so `command: ["autumn"]` beside `args: >`
+    # reported a bare root on a valid manifest. Found by probing the literal
+    # scalar fix against its neighbours rather than by being told: it is the
+    # same omission, one key over.
+    for style in ('>', '|'):
+        pair = f'```yaml\ncommand: ["autumn"]\nargs: {style}\n  nope\n```'
+        got = [d for _, d, _, _ in invocations(pair)]
+        expect(got == ['nope'], f'args: {style} fills its slot: {got}')
+        # …in either write order, since a mapping has none.
+        rev = f'```yaml\nargs: {style}\n  nope\ncommand: ["autumn"]\n```'
+        got = [d for _, d, _, _ in invocations(rev)]
+        expect(got == ['nope'], f'args: {style} pairs written first: {got}')
+    # A folded `args:` still joins its lines, and a valid pair stays quiet.
+    ok_pair = '```yaml\ncommand: ["autumn"]\nargs: >\n  migrate\n  status\n```'
+    expect([d for _, d, _, _ in invocations(ok_pair)] == ['migrate status'],
+           f'a folded args: is one argv: {list(invocations(ok_pair))}')
+    # An `entrypoint:` with no command half is NOT a false positive — that
+    # recipe really does run `autumn` with no subcommand, which clap rejects.
+    alone = '```yaml\nentrypoint: ["autumn"]\n```'
+    expect([d for _, d, _, _ in invocations(alone)] == [''],
+           f'an unpaired entrypoint is a real bare root: {list(invocations(alone))}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
