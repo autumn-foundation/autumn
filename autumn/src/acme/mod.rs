@@ -43,6 +43,7 @@
 //! autumn-web uses — the workspace forbids a second crypto backend.
 
 pub mod challenge;
+pub mod dns;
 pub mod renewal;
 pub mod store;
 

@@ -3938,10 +3938,16 @@ impl AppBuilder {
             config.server.tls.as_ref().and_then(|t| t.acme.as_ref())
         {
             let status = crate::acme::renewal::AcmeStatus::new();
-            let indicator = std::sync::Arc::new(crate::acme::renewal::AcmeHealthIndicator::new(
-                status.clone(),
-                acme_cfg.renew_before_days,
-            ));
+            let indicator = std::sync::Arc::new(
+                crate::acme::renewal::AcmeHealthIndicator::new(
+                    status.clone(),
+                    acme_cfg.renew_before_days,
+                )
+                // Which challenge is in play (and, for DNS-01, which provider)
+                // is the first thing an operator needs when issuance is failing
+                // — and is safe to publish: it names no credential (#1620).
+                .with_dns_provider(acme_cfg.dns.as_ref().map(|dns| dns.provider.as_str())),
+            );
             if let Err(e) = state.health_indicator_registry.register(
                 "acme",
                 crate::actuator::IndicatorGroup::HealthOnly,
@@ -4462,6 +4468,7 @@ impl AppBuilder {
                             listener,
                             tls_cfg,
                             acme_cfg,
+                            &config.credentials,
                             https_port,
                             acme_status.clone(),
                             server_shutdown.child_token(),
@@ -4808,6 +4815,14 @@ impl AppBuilder {
             let reporter = make_acme_reporter(acme_reporters);
             #[cfg(not(feature = "reporting"))]
             let reporter = make_acme_reporter();
+            // Certificate renewal is a framework-scheduled operation, so a
+            // failed issuance/renewal raises #1610's `scheduled_task_failure`
+            // alert — reaching the operator's configured destination (email,
+            // Slack, PagerDuty) rather than only the error-reporting sink. The
+            // renew-before window (default 30 days) means this fires with weeks
+            // of validity left, not at expiry (#1620).
+            let reporter = compose_acme_alert_reporter(reporter, &state);
+            renewal_task.recovery = Some(make_acme_alert_recovery(&state));
             let renewal_shutdown = server_shutdown.child_token();
             tokio::spawn(async move {
                 renewal_task
@@ -8500,6 +8515,7 @@ async fn build_acme_tls_listener(
     tcp: tokio::net::TcpListener,
     tls_cfg: &crate::config::TlsConfig,
     acme_cfg: &crate::config::AcmeConfig,
+    credentials: &crate::credentials::CredentialsStore,
     https_port: u16,
     status: Option<crate::acme::renewal::AcmeStatus>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -8559,6 +8575,11 @@ async fn build_acme_tls_listener(
     let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout, shutdown);
 
     let tokens = crate::acme::challenge::Http01Tokens::new();
+    // `[server.tls.acme.dns]` selects DNS-01, the only challenge a CA will
+    // validate for a wildcard identifier (#1620). Built here, at bind time, so a
+    // missing or malformed provider credential fails startup with an actionable
+    // message instead of surfacing as a failed order 30 days later.
+    let dns = build_dns_challenge(acme_cfg, credentials)?;
     let renewal_task = crate::acme::renewal::AcmeRenewalTask {
         resolver,
         provider,
@@ -8572,6 +8593,10 @@ async fn build_acme_tls_listener(
         // been built and any distributed → in-process fallback is known.
         leadership_degraded: false,
         renew_window_misconfigured: std::sync::atomic::AtomicBool::new(false),
+        dns,
+        // Filled in at the renewal spawn site, where `AppState` (and so the
+        // operator alerter) is in scope.
+        recovery: None,
     };
     Ok((
         listener,
@@ -8582,6 +8607,43 @@ async fn build_acme_tls_listener(
             https_port,
         },
     ))
+}
+
+/// Build the DNS-01 challenge wiring for `[server.tls.acme.dns]`, if configured.
+///
+/// The provider credential is read from the encrypted credentials store (or the
+/// documented `AUTUMN_ACME_DNS_*` environment variables) — never from
+/// `autumn.toml`, which has no field that could hold one. A missing or blank
+/// credential is an error **here**, at bind time, rather than a failed order
+/// discovered when the certificate is already near expiry (issue #1620).
+#[cfg(feature = "acme")]
+fn build_dns_challenge(
+    acme_cfg: &crate::config::AcmeConfig,
+    credentials: &crate::credentials::CredentialsStore,
+) -> Result<Option<crate::acme::renewal::DnsChallenge>, String> {
+    use crate::acme::dns;
+
+    let Some(dns_cfg) = acme_cfg.dns.as_ref() else {
+        return Ok(None);
+    };
+    let resolvers = dns_cfg.resolver_addrs()?;
+    let credential = dns::DnsCredential::resolve(dns_cfg, credentials, &dns::process_env);
+    // One bounded HTTP timeout for the provider API and one for each DNS probe,
+    // so neither can park the renewal loop: the whole propagation wait is
+    // already bounded, and a black-holed provider API must not outlive it.
+    let transport: std::sync::Arc<dyn dns::http::HttpTransport> = std::sync::Arc::new(
+        dns::http::ReqwestTransport::new(std::time::Duration::from_secs(30))?,
+    );
+    let provider = dns::build_provider(dns_cfg, &credential, transport)?;
+    Ok(Some(crate::acme::renewal::DnsChallenge {
+        provider,
+        lookup: std::sync::Arc::new(dns::resolver::UdpTxtLookup::new(
+            std::time::Duration::from_secs(5),
+        )),
+        resolvers,
+        propagation_timeout: std::time::Duration::from_secs(dns_cfg.propagation_timeout_secs),
+        poll_interval: std::time::Duration::from_secs(dns_cfg.poll_interval_secs),
+    }))
 }
 
 /// Build a `CertifiedKey` from a fresh self-signed placeholder for `domains`.
@@ -8626,6 +8688,40 @@ fn make_acme_reporter(
                 reporter.report(&event).await;
             }
         });
+    })
+}
+
+/// The scheduled-operation name ACME renewal alerts are keyed on. Stable: the
+/// trigger and its recovery must share it, or the recovery cannot clear the
+/// outstanding alert.
+#[cfg(feature = "acme")]
+const ACME_RENEWAL_TASK_NAME: &str = "acme-renewal";
+
+/// Wrap `inner` so every ACME failure ALSO raises #1610's
+/// `scheduled_task_failure` operator alert.
+///
+/// Composition rather than replacement: the error-reporting chain (Sentry et al)
+/// still sees the failure, and the alerter is an independent destination an
+/// operator actually watches.
+#[cfg(feature = "acme")]
+fn compose_acme_alert_reporter(
+    inner: crate::acme::renewal::ReporterFn,
+    state: &AppState,
+) -> crate::acme::renewal::ReporterFn {
+    let state = state.clone();
+    std::sync::Arc::new(move |message: String| {
+        crate::alerts::notify_scheduled_task_failure(&state, ACME_RENEWAL_TASK_NAME, &message);
+        inner(message);
+    })
+}
+
+/// The callback that clears an outstanding ACME renewal alert once issuance
+/// succeeds again.
+#[cfg(feature = "acme")]
+fn make_acme_alert_recovery(state: &AppState) -> crate::acme::renewal::RecoveryFn {
+    let state = state.clone();
+    std::sync::Arc::new(move || {
+        crate::alerts::notify_scheduled_task_recovered(&state, ACME_RENEWAL_TASK_NAME);
     })
 }
 

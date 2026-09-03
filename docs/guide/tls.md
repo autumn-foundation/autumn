@@ -427,15 +427,208 @@ Fields:
 > multi-replica ACME work — the app logs a loud startup warning when a
 > distributed scheduler backend is configured. For multi-replica or clustered
 > deployments, terminate TLS at a shared reverse proxy / load balancer (or a
-> single dedicated TLS-terminating instance) instead of in-process ACME
-> ([#1620](https://github.com/autumn-foundation/autumn/issues/1620)).
+> single dedicated TLS-terminating instance), or use
+> [DNS-01](#wildcard-certificates-via-dns-01-servertlsacmedns) — its challenge
+> record lives in your zone rather than in one replica's memory, so it does not
+> have this limitation.
 
 ### Scope
 
-This is a **single-host** slice. Wildcard certificates and the DNS-01 challenge
-are out of scope (tracked in
-[#1620](https://github.com/autumn-foundation/autumn/issues/1620)). For multiple replicas
-behind a shared entry point, terminate TLS at the proxy instead — see below.
+HTTP-01 as described above is a **single-host** path: the challenge token lives
+in the process, so behind a load balancer the CA's `:80` probe can land on a
+replica that never published it. For a wildcard certificate — or for a
+multi-replica deployment — use **DNS-01**, next.
+
+---
+
+## Wildcard certificates via DNS-01 (`[server.tls.acme.dns]`)
+
+If you run subdomain-per-tenant (`tenant1.myapp.com`, `tenant2.myapp.com`, …),
+HTTP-01 is the wrong shape: it needs one issuance per hostname, so tenant *N*'s
+first request waits on a certificate order, and Let's Encrypt's rate limits
+become a ceiling on how fast you can onboard. A **wildcard** certificate for
+`*.myapp.com` covers every tenant that exists and every tenant that ever will —
+but no CA will validate a wildcard over HTTP-01. It requires **DNS-01**: proving
+you control the zone by publishing a `_acme-challenge` TXT record.
+
+Add a `[server.tls.acme.dns]` section naming your DNS provider, and list the
+wildcard in `domains`:
+
+```toml
+[server.tls.acme]
+domains = ["myapp.com", "*.myapp.com"]
+contact_email = "ops@myapp.com"
+directory = "production"
+
+[server.tls.acme.dns]
+provider = "cloudflare"
+```
+
+That is the whole configuration. Everything else — issuance on first boot,
+renewal before expiry with no restart, persistence across restarts, the staging
+directory, the health indicator — is the same lifecycle the HTTP-01 path above
+already has; only the challenge answer changes.
+
+Onboarding a tenant after that costs **zero** certificate work: no issuance, no
+restart, no config change. `tenant42.myapp.com` serves valid HTTPS from the
+moment it resolves to your host.
+
+### Supported providers
+
+| `provider` | Credential fields | Notes |
+|---|---|---|
+| `cloudflare` | `api_token` | A scoped API token with **Zone:DNS:Edit** on the zone. The zone is discovered from the record name. |
+| `route53` | `access_key_id`, `secret_access_key`, optionally `session_token`, `hosted_zone_id`, `region` | Needs `route53:ChangeResourceRecordSets` and `route53:ListResourceRecordSets` on the zone (plus `route53:ListHostedZonesByName` unless you set `hosted_zone_id`). |
+| `exec` | none — the hook authenticates itself | The escape hatch: any other provider. See below. |
+
+### Where the credential lives
+
+**Never in `autumn.toml`.** The section has no field that could hold a token,
+and it rejects unknown keys — so an `api_token = "..."` written into the config
+file is a startup error naming the key, not a plaintext secret nobody notices.
+
+Put it in the encrypted credentials store:
+
+```console
+$ autumn credentials edit
+```
+
+```toml
+# config/credentials/production.toml.enc (decrypted for editing)
+[acme_dns]
+api_token = "your-cloudflare-token"
+```
+
+The table name is the `credential` key from `[server.tls.acme.dns]`, which
+defaults to `acme_dns`. For Route 53 the same table carries the AWS fields:
+
+```toml
+[acme_dns]
+access_key_id = "AKIA..."
+secret_access_key = "..."
+# optional; skips the hosted-zone lookup
+hosted_zone_id = "Z0123456789ABCDEFGHIJ"
+```
+
+The store is decrypted with `AUTUMN_MASTER_KEY` (or `config/master.key`) exactly
+like every other credential — see the [credentials guide](./credentials.md).
+
+If you inject secrets through the environment instead, these variables override
+the store, field for field:
+
+| Variable | Field |
+|---|---|
+| `AUTUMN_ACME_DNS_API_TOKEN` | `api_token` |
+| `AUTUMN_ACME_DNS_ACCESS_KEY_ID` | `access_key_id` |
+| `AUTUMN_ACME_DNS_SECRET_ACCESS_KEY` | `secret_access_key` |
+| `AUTUMN_ACME_DNS_SESSION_TOKEN` | `session_token` |
+| `AUTUMN_ACME_DNS_HOSTED_ZONE_ID` | `hosted_zone_id` |
+| `AUTUMN_ACME_DNS_REGION` | `region` |
+
+Tokens never reach logs, error messages, or `/actuator` output: the secret type
+they are held in renders as `<redacted>`, and provider errors carry the API's
+own message and status, never the request headers.
+
+### The escape hatch: `provider = "exec"`
+
+Any provider autumn does not ship support for — RFC 2136 dynamic updates, a
+registrar's CLI, a webhook shim — is reachable through a hook program:
+
+```toml
+[server.tls.acme.dns]
+provider = "exec"
+command = ["/usr/local/bin/acme-dns-hook"]
+```
+
+Autumn runs it twice per challenge record, appending three arguments:
+
+```console
+$ /usr/local/bin/acme-dns-hook present _acme-challenge.myapp.com <txt-value>
+$ /usr/local/bin/acme-dns-hook cleanup _acme-challenge.myapp.com <txt-value>
+```
+
+Exit `0` means the record was written (or removed); anything else fails the
+order, with the hook's `stderr` quoted in the message. `command` is an **argv
+array** run without a shell, so the record value is never interpreted as shell
+syntax. A hook that has not finished within 120 seconds is killed.
+
+An RFC 2136 hook is a five-line script:
+
+```sh
+#!/bin/sh
+# $1 = present|cleanup, $2 = fqdn, $3 = value
+[ "$1" = present ] && ACTION="add $2. 60 TXT \"$3\"" || ACTION="delete $2. TXT \"$3\""
+printf 'server ns1.myapp.com\nupdate %s\nsend\n' "$ACTION" | nsupdate -k /etc/autumn/tsig.key
+```
+
+### Waiting for propagation
+
+After writing the records, autumn waits until **every** configured resolver
+returns them before telling the CA to validate — signalling early is how a
+DNS-01 authorization gets burnt. The wait is bounded:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `credential` | `acme_dns` | Key in the encrypted credentials store holding the provider credential. A key *name*, never a token. |
+| `propagation_timeout_secs` | `300` | Give up if the records are still not visible after this long. |
+| `poll_interval_secs` | `5` | Gap between propagation probes. |
+| `resolvers` | `["1.1.1.1:53", "8.8.8.8:53"]` | Resolvers that must all see the record. Each entry is an IP (port 53 implied) or `IP:port`; hostnames are rejected. |
+| `command` | — | The `exec` hook's argv array. Required for `exec`, rejected for the others. |
+
+A timeout names the exact record, the value that never appeared, and the
+resolver that never saw it:
+
+> DNS-01 propagation timed out after 300s: the TXT record
+> `_acme-challenge.myapp.com` still does not carry `LPJNul-w…` at resolver
+> `1.1.1.1:53` (the name does not exist yet). Check that the record was written
+> to the zone that actually serves this name and that its NS delegation is live,
+> then raise `[server.tls.acme.dns] propagation_timeout_secs` if the provider is
+> simply slow.
+
+Challenge records are removed after the order finishes — **including when it
+fails**, so a retrying deployment does not fill the zone with dead
+`_acme-challenge` entries.
+
+### Two records, one name
+
+An order for `myapp.com` **and** `*.myapp.com` produces two authorizations whose
+TXT records share the name `_acme-challenge.myapp.com` but carry different
+values. Both must be live at validation time. Every provider here appends a
+value and deletes by `(name, value)`, never "replace the record set" — worth
+knowing if you write your own `exec` hook, because `nsupdate delete <name> TXT`
+without a value would remove its sibling and fail the order.
+
+### What DNS-01 does *not* need
+
+- **Inbound port 80.** The CA never connects to your host for DNS-01. Autumn
+  still binds `http_challenge_port` for the HTTP→HTTPS redirect, and
+  `autumn doctor` grades an unreachable `:80` as a Warn rather than a failure
+  when DNS-01 is configured.
+- **A record for the wildcard.** `*.myapp.com` has no address record of its own;
+  the tenant subdomains point at your host (a wildcard `A`/`AAAA` record, or one
+  per tenant). Creating those is your one-time job — autumn only writes the
+  ephemeral challenge TXT records.
+
+### `autumn doctor` for DNS-01
+
+Three checks cover the failure classes DNS-01 adds:
+
+| Check | Grades |
+|---|---|
+| `acme_dns_credential` | The provider credential is readable and carries the fields the provider needs. **Fail** when missing — without it every issuance and renewal fails. |
+| `acme_dns_propagation` | (`--online`) Public DNS can answer for `_acme-challenge.<domain>` at all. **Fail** on `SERVFAIL`/timeout — a broken delegation defeats a correctly-written record. **Warn** on leftover records from an interrupted run. |
+| `acme_tenancy_domain` | `[tenancy] base_domain`'s subdomains are actually covered by `[server.tls.acme] domains`. **Fail** otherwise — every tenant host would serve a name mismatch. |
+
+### Failure surfaces through health and alerts
+
+A failed DNS-01 issuance or renewal — an expired provider token, a propagation
+timeout, a provider outage — is recorded on the `acme` health indicator (with
+`challenge: "dns-01"` and the provider name in its details, never a credential)
+and raises the operator-alert
+[`scheduled_task_failure`](./operator-alerts.md) condition for
+`acme-renewal`. Because renewal starts `renew_before_days` (default 30) ahead of
+expiry, that alert fires with weeks of validity left, and clears automatically
+on the first successful renewal.
 
 ---
 

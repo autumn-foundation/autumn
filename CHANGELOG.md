@@ -9,6 +9,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Wildcard certificates via DNS-01 for tenant subdomains (#1620):** autumn
+  already routes a tenant per subdomain and ships a multi-tenant SaaS starter,
+  but the ACME support in #1608 was HTTP-01 only — and no CA validates a
+  wildcard identifier over HTTP-01. A `*.myapp.com` deployment therefore meant
+  one certificate order per tenant (rate limits, and a cold-start stall on
+  tenant *N*'s first request) or going back behind Caddy/nginx, undoing the
+  single-binary story. A new `[server.tls.acme.dns]` section answers every
+  authorization over DNS-01 instead, so one wildcard covers every tenant that
+  exists and every tenant that ever will:
+
+  ```toml
+  [server.tls.acme]
+  domains = ["myapp.com", "*.myapp.com"]
+  contact_email = "ops@myapp.com"
+  directory = "production"
+
+  [server.tls.acme.dns]
+  provider = "cloudflare"
+  ```
+
+  Onboarding a tenant after that costs zero certificate work: no issuance, no
+  restart, no config change.
+
+  - **Providers.** `cloudflare` (scoped API token) and `route53` (SigV4), plus
+    `exec` — an argv-array hook program run as
+    `hook present|cleanup <fqdn> <value>`, which reaches RFC 2136 through
+    `nsupdate`, a registrar CLI, or a webhook shim. No shell is involved, so a
+    challenge value can never be read as shell syntax.
+  - **Secrets.** The section names a credentials-store *key*, never a token:
+    there is no config field that could hold one, and the section rejects
+    unknown keys, so an `api_token` written into `autumn.toml` is a startup
+    error naming it rather than a plaintext secret. Credentials come from the
+    encrypted store (`autumn credentials edit`) or the `AUTUMN_ACME_DNS_*`
+    environment variables, and are held in a type that renders as `<redacted>`
+    so they cannot reach a log, an error message, or actuator output.
+  - **Propagation.** After publishing, autumn waits until every configured
+    resolver returns every record before telling the CA to validate. The wait is
+    bounded (`propagation_timeout_secs`, default 300) and its timeout names the
+    exact record, the value that never appeared, and the resolver that never saw
+    it. Challenge records are removed after the order finishes, including when
+    it fails.
+  - **Two records, one name.** An apex + wildcard order publishes two different
+    values at `_acme-challenge.<domain>`; every provider appends a value and
+    deletes by `(name, value)` rather than replacing the record set.
+  - **Lifecycle.** Renewal, persistence, staging selection, hot-swap and health
+    are #1608's, unchanged. A failed issuance or renewal now also raises
+    #1610's `scheduled_task_failure` operator alert for `acme-renewal` — weeks
+    before expiry, thanks to the renew-before window — and clears it on the next
+    success. The `acme` health indicator reports `challenge` and `dns_provider`.
+  - **`autumn doctor`.** Three new checks: `acme_dns_credential` (the provider
+    credential is readable and complete), `acme_dns_propagation` (`--online`:
+    public DNS can answer for `_acme-challenge.<domain>` at all), and
+    `acme_tenancy_domain` (`[tenancy] base_domain`'s subdomains are actually
+    covered by the configured certificate). An unreachable `:80` is now a Warn
+    rather than a Fail when DNS-01 is configured, since the CA never connects to
+    it, and a `*.` entry is probed as the base domain it covers.
+
+  See the [TLS guide](docs/guide/tls.md#wildcard-certificates-via-dns-01-servertlsacmedns)
+  and the [deployment walkthrough](docs/guide/deployment.md#subdomain-per-tenant-wildcard-https-on-a-vps).
+
+  **Breaking (`acme` feature only):** `AcmeRenewalTask` gained the public fields
+  `dns` and `recovery`, and `AcmeConfig` gained `dns`; code that constructs
+  either literally must add them (`None` preserves today's HTTP-01 behavior).
+
 - **Build-time authority envelope for agent-operable handlers (#1691):** an
   endpoint exposed as an MCP tool is an action an autonomous agent can take
   with no human in the loop, and nothing said what that action was *allowed*
