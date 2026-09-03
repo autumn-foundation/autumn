@@ -195,6 +195,28 @@ pub struct DeclaredRoute {
 /// caller chose to hand over.
 pub const MAX_ROUTES: usize = 256;
 
+/// Upper bound on a path-shaped manifest field: the plugin's `prefix`, and each
+/// declared route's `path`.
+///
+/// [`MAX_ROUTES`] bounds how many paths a manifest may declare; this bounds how
+/// large any one of them may be, and the two together bound the aggregate at
+/// 256 KiB. Both ceilings exist for the same reason and neither substitutes for
+/// the other: `MAX_MANIFEST_BYTES` bounds a manifest *parsed* out of an
+/// artifact, while [`SandboxHost::from_module`](crate::plugin_sandbox::SandboxHost::from_module)
+/// is public and takes a `SandboxManifest` whose fields an embedder filled in
+/// by hand, where no byte bound applies at all. Without this one, a single
+/// route path of a caller's choosing is walked segment by segment, inserted
+/// into a `matchit` router, and then cloned again into the host's `OwnedRoutes`
+/// for the plugin's lifetime.
+///
+/// A kilobyte is far past anything an author writes: an axum route template
+/// long enough to reach it is already unreadable.
+pub const MAX_PATH_LEN: usize = 1024;
+
+// The refusal reasons below name this ceiling in prose, and a `&'static str`
+// cannot interpolate a constant. Asserted equal so the two cannot drift.
+const _: () = assert!(MAX_PATH_LEN == 1024);
+
 /// The per-request resource ceilings the host enforces for this plugin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -980,6 +1002,12 @@ fn validate_prefix(prefix: &str) -> Result<(), ManifestError> {
             reason,
         })
     };
+    // Before the scan below, and before anything clones it: a prefix is
+    // compared against every route path and then carried for the plugin's
+    // lifetime, and a direct `from_module` caller chose its length.
+    if prefix.len() > MAX_PATH_LEN {
+        return refuse("a prefix must be at most 1024 bytes");
+    }
     if !prefix.starts_with('/') {
         return refuse("a prefix must start with `/`");
     }
@@ -1028,6 +1056,12 @@ fn validate_route_path(path: &str) -> Result<(), ManifestError> {
             reason,
         })
     };
+    // Before the segment walk below and before the `matchit` insert that
+    // follows it — both of which are linear in this path — and before the
+    // accepted route is cloned into `OwnedRoutes`.
+    if path.len() > MAX_PATH_LEN {
+        return refuse("a route path must be at most 1024 bytes");
+    }
     if !path.starts_with('/') {
         return refuse("a route path must start with `/`");
     }
@@ -1167,6 +1201,64 @@ max_concurrency = 8
         at_ceiling
             .validate()
             .expect("a manifest at the ceiling must still validate");
+    }
+
+    #[test]
+    fn a_route_path_past_the_byte_ceiling_is_refused_before_it_is_scanned() {
+        // The count ceiling above bounds how many paths a manifest declares;
+        // this bounds how large any one of them may be. On the count thread I
+        // wrote that path length was "already bounded per route by
+        // `validate_route_path`" — it was not, and the review that pushed back
+        // on that was right: the function checked shape and never length, so a
+        // direct `from_module` caller chose how much work the segment walk, the
+        // `matchit` insert, and the `OwnedRoutes` clone each did.
+        let long = format!("/hello/{}", "a".repeat(MAX_PATH_LEN));
+        assert!(long.len() > MAX_PATH_LEN);
+        let mut manifest = SandboxManifest::parse(&valid_toml()).expect("valid manifest");
+        manifest.routes = vec![DeclaredRoute {
+            method: "GET".to_owned(),
+            path: long,
+        }];
+        let err = manifest
+            .validate()
+            .expect_err("a route path over the byte ceiling must be refused");
+        assert!(
+            matches!(err, ManifestError::InvalidRoutePath { .. }),
+            "{err}",
+        );
+
+        // The refusal carries a bounded excerpt rather than the path it
+        // objected to the size of — the whole point of `rejected`.
+        assert!(
+            err.to_string().len() < MAX_PATH_LEN,
+            "the refusal is as large as the thing it refused: {} bytes",
+            err.to_string().len(),
+        );
+
+        // Exactly at the ceiling still validates, so this bounds the path
+        // rather than quietly shrinking what a plugin may declare.
+        let mut at_ceiling = SandboxManifest::parse(&valid_toml()).expect("valid manifest");
+        let exact = format!("/hello/{}", "a".repeat(MAX_PATH_LEN - "/hello/".len()));
+        assert_eq!(exact.len(), MAX_PATH_LEN);
+        at_ceiling.routes = vec![DeclaredRoute {
+            method: "GET".to_owned(),
+            path: exact,
+        }];
+        at_ceiling
+            .validate()
+            .expect("a route path at the ceiling must still validate");
+    }
+
+    #[test]
+    fn a_prefix_past_the_byte_ceiling_is_refused_before_it_is_scanned() {
+        // Same ceiling, same reason: the prefix is compared against every
+        // declared route and then carried for the plugin's lifetime.
+        let mut manifest = SandboxManifest::parse(&valid_toml()).expect("valid manifest");
+        manifest.prefix = format!("/{}", "a".repeat(MAX_PATH_LEN));
+        let err = manifest
+            .validate()
+            .expect_err("a prefix over the byte ceiling must be refused");
+        assert!(matches!(err, ManifestError::InvalidPrefix { .. }), "{err}");
     }
 
     #[test]
