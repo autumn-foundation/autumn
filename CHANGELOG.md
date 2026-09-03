@@ -72,9 +72,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Breaking:** (`acme` feature only) `AcmeRenewalTask` gained the public fields
   `dns` and `recovery`, and `AcmeConfig` gained `dns`; code that constructs
   either literally must add them (`None` preserves today's HTTP-01 behavior).
-  Both structs — and every new struct in `acme::dns` — are now
-  `#[non_exhaustive]`, so this is the last time a field here is a break. See the
-  [migration guide](docs/migrations/next.md).
+  The new *output* types in `acme::dns` (the parsed DNS answer, the propagation
+  timeout, the credential, the HTTP request/response) are `#[non_exhaustive]`
+  from the start. `AcmeConfig`, `AcmeRenewalTask` and `DnsChallenge` are not:
+  callers build them by struct literal and they have no constructor, so sealing
+  them would make them unusable — the same reasoning that left `ServerConfig`
+  open. See the [migration guide](docs/migrations/next.md).
 
   `autumn-cli`'s `tls` feature now also enables `autumn-web/acme`: `autumn
   doctor` grades the DNS-01 credential with the runtime's own

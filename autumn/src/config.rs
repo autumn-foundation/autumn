@@ -6799,7 +6799,6 @@ impl TlsConfig {
 /// directory = "staging"
 /// ```
 #[derive(Debug, Clone, Deserialize)]
-#[non_exhaustive]
 pub struct AcmeConfig {
     /// Domains to include on the issued certificate (SANs). At least one is
     /// required. Wildcards (`*.example.com`) are rejected — they require the

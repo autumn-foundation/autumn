@@ -458,9 +458,13 @@ let task = AcmeRenewalTask {
 };
 ```
 
-Both structs are now `#[non_exhaustive]`, along with every new type in
-`acme::dns`, so this is the last time a field added here is a breaking change:
-from now on a literal must already end in `..` and a new field lands additively.
+The new **output** types in `acme::dns` — the parsed DNS answer, its records,
+the propagation-timeout detail, the credential, and the HTTP request/response —
+are `#[non_exhaustive]` from the start, so fields can be added to those without
+a break. `AcmeConfig`, `AcmeRenewalTask` and `DnsChallenge` deliberately are
+not: callers construct them by struct literal and they have no constructor, so
+sealing them would make them unbuildable outside this crate. That is the same
+trade-off `config::ServerConfig` makes.
 
 **Automation:** `manual` — `autumn upgrade` ships no codemod. The edit is two
 lines in a test harness, and a rewrite cannot tell an `AcmeRenewalTask` literal
