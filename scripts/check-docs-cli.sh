@@ -39,6 +39,16 @@
 #      (49 times in this corpus) and `autumn` alone is just the binary's name,
 #      so reporting those would bury the gate in false positives on correct
 #      pages — and a gate people learn to ignore has stopped working.
+#   4. The same, for a required POSITIONAL: `autumn replay` exits with "the
+#      following required arguments were not provided: <CAPSULE>". Required
+#      means only what clap cannot supply itself — a positional carrying
+#      `default_value` is not required, and reading it as required reported 28
+#      correct pages as broken (`autumn upgrade` defaults its `path` to "." and
+#      the guide runs it bare 20 times) before that was caught by measuring.
+#
+# Both `requires_sub` and `requires_arg` were validated against the built
+# binary's `--help` usage strings across all 173 command paths: exact agreement,
+# no mismatch in either direction.
 #
 # TRUTH SET: parsed from the clap derive input in `autumn-cli/src/**/*.rs`, not
 # from a checked-in snapshot. A snapshot is one forgotten regeneration away
@@ -289,17 +299,62 @@ def _subcommand_type(payload):
     return _last(m.group(2)), not m.group(1)
 
 
-def _has_positional(payload):
-    """True when a variant takes a bare value argument.
+def _positionals(payload):
+    """(takes_any, requires_one) for a variant's positional arguments.
 
-    Matters because a positional makes the next token in `autumn db pull posts`
-    unjudgeable — it is a table name, not a subcommand — so the walk stops
-    there rather than reporting drift it cannot prove.
+    `takes_any` matters because a positional makes the next token in `autumn db
+    pull posts` unjudgeable — it is a table name, not a subcommand — so the walk
+    stops there rather than reporting drift it cannot prove.
+
+    `requires_one` matters because clap rejects the command outright without it:
+    `autumn replay` exits with "the following required arguments were not
+    provided: <CAPSULE>". Required-ness is the field's type — a bare `String` is
+    required, `Option<T>` and `Vec<T>` are not — and the field carries no
+    `#[arg]` attribute at all in that case, which is why this walks fields
+    rather than matching attributes.
     """
-    for fm in re.finditer(r'#\[arg\(([^\]]*)\)\]\s*(?:pub\s+)?[a-z_0-9]+\s*:', payload):
-        if not re.search(r'\b(long|short)\b', fm.group(1)):
-            return True
-    return False
+    takes_any = requires_one = False
+    attrs = []
+    pending = ''
+    for raw in payload.split('\n'):
+        line = raw.strip()
+        if pending:                             # an attribute spanning lines
+            pending += ' ' + line
+            if pending.count('[') <= pending.count(']'):
+                attrs.append(pending)
+                pending = ''
+            continue
+        if not line or line.startswith('//') or line in '{}':
+            continue
+        if line.startswith('#['):
+            if line.count('[') > line.count(']'):
+                pending = line
+            else:
+                attrs.append(line)
+            continue
+        m = re.match(r'(?:pub\s+)?([a-z_][a-z_0-9]*)\s*:\s*(.+?),?\s*$', line)
+        attr_text = ' '.join(attrs)
+        attrs = []
+        if not m:
+            continue
+        if 'command(' in attr_text:             # the subcommand field, not an arg
+            continue
+        if re.search(r'\b(long|short)\b', attr_text):
+            continue                            # a named option, not a positional
+        takes_any = True
+        ftype = m.group(2).strip()
+        # Not required when clap can supply it: an explicit `default_value`
+        # (`autumn upgrade`'s `path: String` defaults to "." and the guide runs
+        # it bare 20 times), an `Option<>`, or a `Vec<>` that accepts none.
+        # `bool` is a flag, never a required positional. Getting this wrong is
+        # expensive in one direction only: a required-ness false positive fires
+        # on pages that are correct, which is how a gate loses its readers.
+        if (ftype in ('bool',)
+                or ftype.startswith(('Option<', 'Vec<'))
+                or re.search(r'\bdefault_value', attr_text)):
+            continue
+        requires_one = True
+    return takes_any, requires_one
 
 
 # An option field: the `#[arg(…)]` attribute, the field name, and its type. The
@@ -356,7 +411,7 @@ def build_surface(sources):
                 for group in re.findall(r'\b(?:visible_)?aliases\s*=\s*\[([^\]]*)\]', attrs):
                     spellings.update(re.findall(r'"([^"]+)"', group))
                 node = {'children': {}, 'positionals': False, 'options': {},
-                        'requires_sub': False}
+                        'requires_sub': False, 'requires_arg': False}
                 if kind == 'tuple':
                     inner = re.search(r'\(\s*(?:pub\s+)?([A-Za-z0-9_:]+)', payload)
                     if inner:
@@ -374,14 +429,14 @@ def build_surface(sources):
                             if st:
                                 node['children'] = build(st, seen)
                                 node['requires_sub'] = required and bool(node['children'])
-                            node['positionals'] = _has_positional(structs[it])
+                            node['positionals'], node['requires_arg'] = _positionals(structs[it])
                             node['options'] = _options(structs[it])
                 elif kind == 'struct':
                     st, required = _subcommand_type(payload)
                     if st:
                         node['children'] = build(st, seen)
                         node['requires_sub'] = required and bool(node['children'])
-                    node['positionals'] = _has_positional(payload)
+                    node['positionals'], node['requires_arg'] = _positionals(payload)
                     node['options'] = _options(payload)
                 for spelling in spellings:
                     tree[spelling] = node
@@ -400,7 +455,8 @@ def build_surface(sources):
             flat[key] = {'children': set(v['children']),
                          'positionals': v['positionals'],
                          'options': v['options'],
-                         'requires_sub': v['requires_sub']}
+                         'requires_sub': v['requires_sub'],
+                         'requires_arg': v['requires_arg']}
             flat.update(flatten(v['children'], key))
         return flat
 
@@ -417,7 +473,26 @@ def cli_sources(root):
 # Fences whose contents are shell input. `text` is included because a handful
 # of pages fence terminal transcripts without a language; lines inside them
 # still start with the command being demonstrated.
-SHELL_LANGS = {'bash', 'sh', 'shell', 'console', 'zsh', 'terminal', 'text', ''}
+# EVERY fenced block is read, whatever language it is tagged with. A fence tag
+# says what SYNTAX the block is, not whether the block contains commands a
+# reader runs, and the corpus makes that distinction constantly: a GitHub
+# Actions `run: |` step in a `yaml` fence (`data-scrubbing.md`), a nightly
+# backup in a `cron` fence (`daemon.md`), a starter's post-scaffold notes
+# inside a `toml` string (`starters.md`). Those are copyable recipes, and an
+# allowlist of "shell-ish" tags skipped all of them.
+#
+# What discriminates is COMMAND POSITION, not the tag — `commands()` requires
+# `autumn` to head a command, and that rejects the code and prose that sharing a
+# fence with real commands would otherwise drag in. Measured on this corpus:
+# reading every fence rather than an allowlist adds zero false positives, and a
+# `rust` fence's `"…in-process autumn server"` string is skipped because
+# `autumn` there is not in command position.
+#
+# The residual risk is a quoted string in a code fence that begins with
+# `autumn ` and reads as a real command. Nothing in the corpus does, and a
+# waiver deliberately cannot silence a fence (see WAIVERS), so the remedy would
+# be to fix the page — which is the right outcome for a line that looks exactly
+# like a command a reader could run.
 
 # HOW A LINE IS TURNED INTO COMMANDS
 #
@@ -633,25 +708,24 @@ def invocations(text):
                 add_prose(line, lineno)
             continue
 
-        if lang in SHELL_LANGS:
-            # Continuations are shell syntax, so they are joined before
-            # scanning — `autumn maintenance on \` + `--reason "…"` is one
-            # command, and the guide writes five of them on that page alone.
-            # Scanning the physical lines instead yields the argv `\`, and the
-            # command path split across the break goes unchecked.
-            logical, at = flush(line, lineno)
-            if logical is None:
-                continue
-            # Operator splitting happens inside `commands()`, on tokens rather
-            # than on the raw text, so an operator inside a quoted value cannot
-            # cut a command in half.
-            for display, argv in commands(logical):
-                yield at, display, argv, True
-            # A span inside a fence (a hint line quoting a command back) is
-            # still a span, and cannot wrap: the fence preserves line breaks.
-            for span in re.findall(r'`([^`\n]+)`', line):
-                for display, argv in commands(span):
-                    yield lineno, display, argv, False
+        # Inside a fence, whatever the tag. Continuations are joined before
+        # scanning — `autumn maintenance on \` + `--reason "…"` is one command,
+        # and the guide writes five of them on that page alone. Scanning the
+        # physical lines instead yields the argv `\`, and the command path split
+        # across the break goes unchecked.
+        logical, at = flush(line, lineno)
+        if logical is None:
+            continue
+        # Operator splitting happens inside `commands()`, on tokens rather than
+        # on the raw text, so an operator inside a quoted value cannot cut a
+        # command in half.
+        for display, argv in commands(logical):
+            yield at, display, argv, True
+        # A span inside a fence (a hint line quoting a command back) is still a
+        # span, and cannot wrap: the fence preserves line breaks.
+        for span in re.findall(r'`([^`\n]+)`', line):
+            for display, argv in commands(span):
+                yield lineno, display, argv, False
 
     yield from _spans(take_paragraph(), commands)
 
@@ -760,6 +834,13 @@ def resolve(tokens, surface, runnable=False):
     # telling anyone to run it bare.
     if runnable and surface[path]['requires_sub']:
         return 'autumn ' + path
+
+    # Same shape one level down: `autumn replay` exits with "the following
+    # required arguments were not provided: <CAPSULE>". The walk only reaches
+    # here having consumed no positional — supplying one ends the walk earlier,
+    # since a value cannot be told from a subcommand name.
+    if runnable and surface[path]['requires_arg']:
+        return 'autumn ' + path
     return None
 
 
@@ -828,6 +909,15 @@ def self_test():
             action: schema::SchemaAction,
         },
         Upgrade(UpgradeArgs),
+        Replay {
+            /// Path to the capsule to replay.
+            capsule: String,
+            #[arg(short, long)]
+            package: Option<String>,
+        },
+        New {
+            name: Option<String>,
+        },
     }
     enum MigrateCommands { Status, Check, Down }
     enum DbCommands {
@@ -843,6 +933,8 @@ def self_test():
     struct UpgradeArgs {
         #[command(subcommand)]
         action: Option<UpgradeCommands>,
+        #[arg(value_name = "PATH", default_value = ".")]
+        path: String,
     }
     enum UpgradeCommands { Apply }
     '''
@@ -1022,6 +1114,39 @@ def self_test():
            'takes a required subcommand and exits 2')
     expect(resolve([], surface, runnable=False) is None,
            'prose naming the binary `autumn` must NOT be reported')
+
+    # --- required POSITIONALS, the same shape one level down. The first
+    # version of this reported 28 false positives on correct pages, because it
+    # read a positional carrying `default_value` as required — `autumn upgrade`
+    # takes `path: String` defaulting to "." and the guide runs it bare 20
+    # times. Required-ness is only what clap cannot supply itself.
+    expect(surface['replay']['requires_arg'],
+           'a bare `capsule: String` field is a required positional')
+    expect(not surface['upgrade']['requires_arg'],
+           'a positional with default_value is NOT required')
+    expect(not surface['db pull']['requires_arg'], 'a Vec<> positional is not required')
+    expect(not surface['new']['requires_arg'], 'an Option<> positional is not required')
+    expect(resolve(tk('replay'), surface, runnable=True) == 'autumn replay',
+           'a runnable line missing a required positional must be reported')
+    expect(resolve(tk('replay capsule.json'), surface, runnable=True) is None,
+           'supplying the positional resolves')
+    expect(resolve(tk('replay'), surface, runnable=False) is None,
+           'prose naming the command must NOT be reported')
+    expect(resolve(tk('upgrade'), surface, runnable=True) is None,
+           'a defaulted positional means the bare command runs')
+
+    # --- every fence is read, whatever its tag: a YAML `run: |` step and a
+    # cron line are copyable recipes, and command position keeps a code fence
+    # from becoming noise.
+    yaml_run = '```yaml\n- name: check\n  run: |\n    autumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(yaml_run)] == ['migrate run'],
+           f'a command in a YAML run: block must be read: {list(invocations(yaml_run))}')
+    cron = '```cron\n0 2 * * *  cd /srv && AUTUMN_ENV=prod autumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(cron)] == ['migrate run'],
+           f'a cron command line must be read: {list(invocations(cron))}')
+    rust = '```rust\nlet m = "failed to build the in-process autumn server";\n```'
+    expect(list(invocations(rust)) == [],
+           'a code fence naming autumn outside command position stays quiet')
     # The quote rule must require `autumn` immediately inside the quote, or
     # every apostrophe in prose becomes a command position.
     expect(list(invocations("```bash\n# don't run autumn migrate here\n```")) == [],
@@ -1062,7 +1187,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f"self-test: {13 + 31 + 26 + 4 - len(failures)} passed, {len(failures)} failed")
+    print(f"self-test: {13 + 39 + 29 + 4 - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
@@ -1090,9 +1215,14 @@ def main():
     if defects:
         print()
         for f, lineno, bad, argv in defects:
-            note = ('needs a subcommand'
-                    if bad == 'autumn' or bad[len('autumn '):] in surface
-                    else 'is not a command')
+            path = bad[len('autumn '):]
+            if bad != 'autumn' and path not in surface:
+                note = 'is not a command'
+            elif bad != 'autumn' and surface[path]['requires_arg'] \
+                    and not surface[path]['requires_sub']:
+                note = 'needs an argument'
+            else:
+                note = 'needs a subcommand'
             line = ('autumn ' + argv).strip()
             print(f'{f}:{lineno}: `{bad}` {note}  (line: {line})')
         print()
