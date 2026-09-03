@@ -805,7 +805,7 @@ def _paren_delta(tok):
     return 0
 
 
-def _segments(tokens):
+def _segments(tokens, classify=None):
     """Split a token list on shell operators into one list per command.
 
     An operator inside a COMMAND SUBSTITUTION does not separate commands:
@@ -815,25 +815,33 @@ def _segments(tokens):
     plain subshell — `(autumn migrate && autumn seed)` really does hold two
     commands, and both should still be judged.
     """
+    # Which token DECIDES an operator or a paren may differ from the token
+    # that is kept: posix shlex strips quotes, so a quoted `';'` arrives
+    # looking exactly like a separator and started a new command — reporting
+    # the words after it as an invocation on a page that only prints them.
+    # `classify` is the same line with every quoted run blanked, tokenized in
+    # parallel, so the decision is positional while the argv stays real.
+    if classify is None or len(classify) != len(tokens):
+        classify = tokens
     current, out, depth, prev = [], [], 0, ''
-    for tok in tokens:
+    for tok, cls in zip(tokens, classify):
         nested = depth > 0
         # `<(` and `>(` are PROCESS substitutions and bracket their contents
         # the same way `$(` does. Tracking only `$(` left their closing paren
         # at depth zero, where the case-arm rule below took it for a boundary
         # and reported the command inside them twice — once from the
         # substitution walk and once as a segment head.
-        if tok.startswith('(') and prev.endswith(('$', '<', '>')):
-            depth += _paren_delta(tok)
+        if cls.startswith('(') and prev.endswith(('$', '<', '>')):
+            depth += _paren_delta(cls)
             nested = True
         elif depth:
-            depth = max(0, depth + _paren_delta(tok))
+            depth = max(0, depth + _paren_delta(cls))
         # `2>&1` is ONE redirection, but `&` is in the punctuation set so shlex
         # hands back `2>` `&` `1`. Splitting there made the command after a
         # leading `2>&1` start a new segment headed by `1`, and the whole line
         # went unread. The three are rejoined rather than merely not split, so
         # the result is a single self-contained redirection token.
-        if current and tok == '&' and current[-1].endswith(('>', '<')):
+        if current and cls == '&' and current[-1].endswith(('>', '<')):
             current[-1] += tok
             prev = tok
             continue
@@ -841,11 +849,11 @@ def _segments(tokens):
         # as a number. Accepting only digits left the `-` behind as its own
         # token, and a leading `2>&-` made it the segment head with the real
         # command behind it unread.
-        if current and tok in ('-',) and current[-1].endswith(('>&', '<&')):
+        if current and cls in ('-',) and current[-1].endswith(('>&', '<&')):
             current[-1] += tok
             prev = tok
             continue
-        if current and tok.isdigit() and current[-1].endswith(('>&', '<&')):
+        if current and cls.isdigit() and current[-1].endswith(('>&', '<&')):
             current[-1] += tok
             prev = tok
             continue
@@ -855,24 +863,28 @@ def _segments(tokens):
         # matched neither half, the line never split, and the command after the
         # separator went unread. The parens are consumed for depth (already
         # done above) and what REMAINS is tested as the operator it is.
-        rest = tok.lstrip('()') if tok and all(c in _PUNCTUATION for c in tok) else tok
+        rest = cls.lstrip('()') if cls and all(c in _PUNCTUATION for c in cls) else cls
         # A `)` at depth zero ends a case ARM'S PATTERN — `case x in x) autumn
         # …` runs the command after it — and it also closes a subshell, which
         # is a boundary just the same. Inside a substitution the depth is
         # non-zero, so its own parens never reach here.
-        if not depth and not nested and rest == '' and tok.startswith(')'):
+        # `name() { … }` coalesces to a single `()` token, so the test is that
+        # the punctuation CONTAINS a closer, not that it starts with one —
+        # otherwise the declaration stayed in one segment headed by the
+        # function's name and its body was never reached.
+        if not depth and not nested and rest == '' and ')' in cls:
             out.append(current)
             current = []
             prev = tok
             continue
-        if not depth and (tok in _OPERATORS or rest in _OPERATORS):
-            if tok is not rest and tok != rest:
+        if not depth and (cls in _OPERATORS or rest in _OPERATORS):
+            if cls != rest:
                 current.append(tok[:len(tok) - len(rest)])
             out.append(current)
             current = []
         else:
             current.append(tok)
-        prev = tok
+        prev = cls
     out.append(current)
     # Grouping parens bracket a segment, they are not part of the command:
     # `(autumn migrate && autumn dev)` ends with a `)` that would otherwise ride
@@ -1018,7 +1030,12 @@ def _exec_command(tok):
 _SHELL_C_OPTS = {'sh': 'c', 'bash': 'c', 'zsh': 'c', 'ksh': 'c', 'dash': 'c',
                  'ash': 'c', 'busybox': 'c', 'su': 'c', 'runuser': 'c',
                  # Fly spells it `-C`, which is why the letter is per-program.
-                 'fly': 'C', 'flyctl': 'C'}
+                 'fly': 'C', 'flyctl': 'C',
+                 # `flock [options] <file> -c <command>` runs its string
+                 # through a shell, which is why the option is here as well as
+                 # in the wrapper table: one says how to WALK past it, this
+                 # says what it MEANS.
+                 'flock': 'c'}
 _SHELL_RUNNERS = set(_SHELL_C_OPTS)
 # …and the runtimes that take `--entrypoint`, for the same reason.
 _CONTAINER_RUNNERS = {'docker', 'podman', 'nerdctl'}
@@ -1163,7 +1180,7 @@ def _heredoc_delim(text, i):
 # only the bracketed form left the pair half-assembled, so a valid recipe
 # reported a bare root. Block indicators (`>`, `|`) and anchors are excluded:
 # those are handled before this, or are not values at all.
-_KEY_SCALAR = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
+_KEY_SCALAR = re.compile(r'^(\s*(?:-\s+)?)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
                          r'|args):\s*(?![>|&*\[])(\S.*)$', re.I)
 _ENTRY_KEY_LINE = re.compile(r'^\s*(?:-\s+)?' + _QUALIFIED + r'(?:' + _ENTRY_KEYS + r'):', re.I)
 _ARGS_KEY_LINE = re.compile(r'^\s*(?:-\s+)?' + _QUALIFIED + r'args:', re.I)
@@ -1294,7 +1311,10 @@ def _nested_command(segment, j, tok, cmd=0):
     # sh's. Either the token before the option or the head may own it —
     # `fly ssh console -C '…'` is the second shape, where the option sits
     # several words after the program that defines it.
-    after_c = any(_shell_c(prev, segment[k]) for k in (j - 2, cmd)
+    # …and the SEGMENT HEAD owns it too. `flock <file> -c '…'` puts the option
+    # after flock's operand, so neither the preceding word nor the command
+    # position names the program whose option it is — the head does.
+    after_c = any(_shell_c(prev, segment[k]) for k in (j - 2, cmd, 0)
                   if 0 <= k < len(segment))
     if ' ' in tok:
         marked = after_c or bool(_COMMAND_KEY.match(prev))
@@ -1653,17 +1673,20 @@ def commands(text):
     if tokens is None:
         tokens = text.split()
     masked = tokenize(_mask_single_quoted(text))
-    yield from _from_tokens(tokens, masked)
+    # A SECOND mask, for a second question. Substitutions run inside double
+    # quotes, so only single ones are blanked above; an OPERATOR is data
+    # inside either, so this one blanks both.
+    yield from _from_tokens(tokens, masked, tokenize(_mask_quoted(text)))
 
 
-def _from_tokens(tokens, masked=None):
+def _from_tokens(tokens, masked=None, classify=None):
     """The token half of `commands()`, so nested contexts can re-enter it."""
-    segments = _segments(tokens)
+    segments = _segments(tokens, classify)
     # The masked copy is tokenized and segmented in parallel. Masking replaces
     # only characters INSIDE single quotes, leaving every delimiter and
     # operator in place, so the two shapes agree — and when they somehow do
     # not, the masked view is dropped rather than trusted.
-    masked_segments = _segments(masked) if masked is not None else None
+    masked_segments = _segments(masked, classify) if masked is not None else None
     if masked_segments is None or len(masked_segments) != len(segments) \
             or any(len(a) != len(b) for a, b in zip(segments, masked_segments)):
         masked_segments = segments
@@ -2049,7 +2072,12 @@ def invocations(text):
         # ordinary fence a leading `>` is a redirection, not a quote marker.
         if fence is not None and quoted_fence:
             line = _BLOCKQUOTE.sub('', line, count=1)
-        m = re.match(r'^( *)(?:>\s?)*( *)(`{3,}|~{3,})\s*(.*)$', line)
+        # A fence may open on a LIST ITEM's own line — `- ```bash` — with its
+        # body and closer indented under the item. The marker is counted as
+        # indent, so the closer's relative bound still measures from the
+        # column the fence really starts at.
+        m = re.match(r'^( *)(?:>\s?)*( *(?:[-*+]\s+|\d+[.)]\s+)?)'
+                     r'(`{3,}|~{3,})\s*(.*)$', line)
         # A line that LOOKS like a fence marker is only a boundary if it can
         # actually open or close one. Deciding that first matters: the state
         # reset below is what a boundary does, and running it on a marker that
@@ -4418,6 +4446,66 @@ def self_test():
             ("```bash\nprintf '%s' 'x)'; autumn nope\n```", ['nope'])):
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == want, f'paren control: {got} != {want}')
+
+    # posix shlex STRIPS quotes, so a quoted `';'` arrives looking exactly
+    # like a separator: the line split there and the words after it were
+    # reported as a command on a page that only prints them. The decision is
+    # made on a copy with every quoted run blanked, so it is positional.
+    for quiet in ("printf '%s\\n' ';' autumn nope", 'echo ";" autumn nope',
+                  "echo '&&' autumn nope", 'echo "|" autumn nope'):
+        doc = f'```bash\n{quiet}\n```'
+        expect(list(invocations(doc)) == [],
+               f'a quoted operator is data: {quiet!r} -> {list(invocations(doc))}')
+    # …and every real separator still separates.
+    for real in ('echo x; autumn nope', 'echo x && autumn nope',
+                 'echo x | autumn nope', 'echo $(date); autumn nope',
+                 'case x in a) autumn nope;; esac'):
+        doc = f'```bash\n{real}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{real!r} still splits: {got}')
+
+    # `flock [options] <file> -c <command>` puts the option AFTER its operand,
+    # so neither the preceding word nor the command position names the program
+    # whose option it is — the segment head does.
+    for form in ("flock /tmp/lock -c 'autumn nope'",
+                 "flock -c 'autumn nope' /tmp/lock",
+                 "flock --command 'autumn nope' /tmp/lock",
+                 "flock -w 5 /tmp/lock -c 'autumn nope'"):
+        doc = f'```bash\n{form}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{form} runs its string: {got}')
+    # …and the head owning an option must not make every program own one.
+    expect(list(invocations("```bash\necho -c 'autumn nope'\n```")) == [],
+           'echo does not own a -c')
+    expect([d for _, d, _, _ in invocations(
+        '```bash\nssh -c aes256 host autumn nope\n```')] == ['nope'],
+        "ssh's -c is still a cipher")
+
+    # The compact sequence marker belongs on the PLAIN SCALAR key too — it was
+    # added to the inline-list and block-scalar patterns and missed here, so
+    # `- command: autumn` with `args:` under it still reported a bare root.
+    for half, want in (('migrate', 'migrate'), ('nope', 'nope')):
+        doc = f'```yaml\n- command: autumn\n  args: {half}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == [want], f'a compact scalar pair assembles: {got}')
+
+    # A fence may OPEN on a list item's own line, with its body and closer
+    # indented under the item. Only spaces and block-quote markers were
+    # accepted, so the whole block read as prose and its commands were never
+    # judged as runnable.
+    for marker in ('-', '*', '+', '1.'):
+        pad = ' ' * (len(marker) + 1)
+        doc = f'{marker} ```bash\n{pad}autumn nope\n{pad}```\n'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'a fence opened by {marker!r} is read: {got}')
+
+    # `name() { … }` coalesces to a single `()` token, so the declaration
+    # stayed in one segment headed by the function's name and its body was
+    # never reached.
+    for doc in ('```bash\nf() { autumn nope; }; f\n```',
+                '```bash\ndeploy() {\n  autumn nope\n}\ndeploy\n```'):
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'a function body is scanned: {got}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
