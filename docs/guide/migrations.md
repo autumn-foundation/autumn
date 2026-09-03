@@ -1,7 +1,7 @@
 # Migrations
 
 Autumn embeds [Diesel](https://diesel.rs/) migrations in the compiled binary and
-runs them at startup (dev) or via `autumn migrate run` (production). This guide
+runs them at startup (dev) or via `autumn migrate` (production). This guide
 covers the advisory-lock serialisation that prevents schema divergence during
 rolling deploys, how to monitor contention, and what to expect on non-Postgres
 backends.
@@ -10,7 +10,7 @@ backends.
 
 ## Advisory lock serialisation
 
-When several replicas boot at the same time or when `autumn migrate run` is
+When several replicas boot at the same time or when `autumn migrate` is
 called from multiple deployment steps concurrently, every instance would
 naively race to apply the same pending migrations. Diesel wraps each migration
 in a transaction, so two processes applying the same migration can deadlock,
@@ -24,7 +24,7 @@ re-read the migration table, find no pending work, and exit successfully.
 The lock covers:
 
 * The embedded application migrations run by `AppBuilder::migrations(…)`.
-* The Autumn framework migrations run by `autumn migrate run`.
+* The Autumn framework migrations run by `autumn migrate`.
 
 ---
 
@@ -97,7 +97,7 @@ run_pending_locked(database_url, MIGRATIONS, None)?;
 run_pending_locked(database_url, MIGRATIONS, Some(Duration::from_secs(120)))?;
 ```
 
-For the `autumn migrate run` CLI the timeout is always the default.
+For the `autumn migrate` CLI the timeout is always the default.
 
 ---
 
@@ -115,7 +115,7 @@ let _guard = hold_migration_lock(database_url, DEFAULT_LOCK_WAIT_TIMEOUT)?;
 // Lock is released when `_guard` drops.
 ```
 
-This is exactly what `autumn migrate run` does internally before shelling out
+This is exactly what `autumn migrate` does internally before shelling out
 to the `diesel` CLI.
 
 ---
@@ -167,15 +167,15 @@ never delete or rename an applied migration; add a new migration instead.
 > **Note:** startup auto-migrate validation is **best-effort** and requires the
 > `migrations/` directory to be present on disk at runtime (production binaries
 > often ship without the source tree, in which case startup validation is
-> skipped rather than failing); authoritative enforcement is `autumn migrate
-> run` / `autumn migrate status` in CI or your deploy job, which check against
+> skipped rather than failing); authoritative enforcement is `autumn migrate` /
+> `autumn migrate status` in CI or your deploy job, which check against
 > an explicit migrations directory.
 >
 > Startup auto-migrate only **validates** on-disk content against recorded
 > hashes; it does **not** record new checksums. It applies the embedded SQL
 > compiled into the binary, which may differ from the on-disk files, so
 > recording those disk bytes could store a hash for content that was never
-> applied. Authoritative recording happens via `autumn migrate run` and `autumn
+> applied. Authoritative recording happens via `autumn migrate` and `autumn
 > migrate baseline`, where the applied bytes are exactly the on-disk `up.sql`.
 > An app that only ever startup-auto-migrates will therefore leave its
 > migrations `unrecorded` until one of those CLI commands runs.

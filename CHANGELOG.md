@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A CI gate for the "local development" install path [no-plugin]:** nothing
+  here is agent-facing — it's a CI/test-harness addition, not new framework
+  surface (`local-dev-quickstart` job in
+  `.github/workflows/quickstart-gate.yml`). `cargo install --path
+  autumn-cli` from a source checkout, then `autumn new`, is a first-class path
+  in README.md and `docs/guide/getting-started.md`, but nothing in CI built
+  that exact pairing — a source-built (trunk-dev) CLI's scaffold against the
+  `autumn-web` actually **published** on crates.io. `autumn new` pins the
+  scaffolded `autumn-web` dependency to the CLI's own `CARGO_PKG_VERSION`,
+  which is frozen at the last release tag between releases (this repo's
+  policy: never bump the workspace version except at an explicit release), so
+  a source-built CLI can carry unreleased `autumn-web` API changes while
+  reporting the same version as the last published crate — and `autumn
+  doctor`'s `version_compat` check, a plain version-string comparison, cannot
+  see the difference. Confirmed live: commit 76c56b1 widened
+  `inject_consent_banner`'s `csrf_cookie_name` from `&str` to `Option<&str>`
+  and correctly updated the in-tree scaffold template, but three days later
+  (no release cut since) a freshly `autumn new`-ed project fails its first
+  `cargo build` against published `autumn-web` 0.7.0 with `error[E0308]`,
+  while `autumn doctor` still reports the versions as matching. The new
+  `generated_project_compiles_against_published_autumn_web` test
+  (`autumn-cli/tests/e2e.rs`) reproduces this without the
+  `[patch.crates-io]` override the existing (in-tree-pairing) e2e test
+  applies, and the new job runs it on every `trunk-dev` push and the
+  existing daily schedule — skipped on `workflow_dispatch` release-candidate
+  gating, since it tests trunk-dev source drift rather than the dispatched
+  candidate and would otherwise false-block a healthy release
+  (`docs/release-checklist.md` step 7). This is a harness addition, not a
+  fix: the underlying drift is real and current, and the job is expected to
+  go red between releases until a maintainer addresses `autumn doctor`'s
+  blind spot or the next release ships.
+
 - **Continuous SQLite replication with point-in-time restore (#1628):** the
   zero-ops SQLite tier (#1614) had snapshot backups (#1595/#1619) and nothing
   finer, so a dead VPS cost everything written since the last snapshot — hours.
@@ -666,6 +698,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that is not in the workspace, and four heading anchors that no longer
   match their headings. External links are deliberately out of scope
   (network-flaky, and not fixable in this repo).
+- **A CLI drift gate for the docs corpus [no-plugin]:** the link gate stops a
+  reader being sent to a page that does not exist; nothing stopped them being
+  handed a *command* that does not exist — the other thing they copy off a
+  page. `autumn-cli` carries 174 command paths and the reader-facing docs name
+  them 2,400+ times, so a renamed or never-shipped subcommand leaves behind a
+  line that looks exactly like a working one.
+  `scripts/check-docs-cli.sh` resolves every `autumn …` invocation in fenced
+  shell blocks and inline code spans against the command tree parsed from the
+  clap derive input, and now runs in CI's docs-only job. Its baseline found
+  **11 defects across 6 guide pages**, all closed here: eight occurrences of
+  `autumn migrate run` — a command `MigrateCommands` has never had (`status`,
+  `check`, `down`, `baseline`; the run action is the bare `autumn migrate`),
+  one of them in a fenced `shell` block in `cloud-native.md` under "run the
+  migration before deploying new workers", where clap answers `unrecognized
+  subcommand 'run'` to a reader mid-production-upgrade — plus
+  `autumn system-test check` sitting inside a runnable block in
+  `system-tests.md` as a planned command, now moved out of the block. The
+  truth set is parsed from `autumn-cli/src/**/*.rs` rather than a checked-in
+  snapshot, so a rename moves the gate with it in the same commit; a page that
+  deliberately names a command that does not exist (`autumn generate island`,
+  `autumn generate seed`) waives it inline with a stated reason. Flags are
+  deliberately out of scope, as are the changelog and `docs/plans/`, which
+  name commands that were true once or are not true yet.
 
 - **One retention policy for every table Autumn creates (#1605):** every
   deployed Autumn app accumulated framework-owned data forever by default —
@@ -1411,6 +1466,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handler ran, so a retry after such a switch still replays instead of
   re-running the mutation. See
   `docs/security/2026-09-02-idempotency-tenant-scope/`.
+- **Outbound webhook delivery now dials `target_url` through the SSRF-safe
+  path:** `WebhookSubscription::target_url` is a subscriber-chosen
+  destination — the outbound-webhooks guide describes it as "a consumer's
+  registered endpoint" — and the `autumn_webhook_delivery` background job
+  posted to it with a plain `Client::post()`, which carries none of the
+  private/loopback/link-local/CGNAT/cloud-metadata deny-list
+  `Client::get_ssrf_safe()` already enforces elsewhere in the framework. An
+  app following the documented pattern (letting its own users register a
+  webhook receiver URL) let any such user point delivery at an internal
+  service, the app's own database host, or a cloud metadata endpoint, with
+  Autumn's own backend making the request on their behalf. `get_ssrf_safe`
+  itself only ever built a `GET`; the fix adds a general
+  `RequestBuilder::ssrf_safe()` chainable on any verb (`get_ssrf_safe` is now
+  defined in terms of it, unchanged in behavior) and applies it to the
+  webhook delivery request. Delivery to a blocked destination now fails
+  closed with `SsrfBlocked` before any socket opens and is recorded/retried/
+  DLQ'd exactly like any other transport failure. **Compatibility note:** an
+  app relying on `target_url` reaching a private address (e.g. an
+  internal-only receiver during development) will see those deliveries start
+  failing after upgrade — this is the intended effect of closing the gap. See
+  `docs/security/2026-09-03-webhook-ssrf/`.
 
 ### Fixed
 
@@ -1434,6 +1510,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proves the whole scaffold compiles — the gap the original report called out:
   no test had ever compiled this flag's output before.
 
+- **A sandboxed plugin can no longer abort the application at boot:** the
+  duplicate-route preflight skips `nest` mounts because axum exposes no way to
+  enumerate a nested router — but a sandboxed plugin's manifest *is* its route
+  table, and `Router::nest` panics with `Overlapping method route` when a
+  declared path is one the host already serves. An untrusted artifact declaring
+  a plausible prefix (`/admin`, `/status`, `/api`) could therefore take down
+  every route in the application, not just its own — containment failing open
+  for exactly the input class the sandbox lane exists to distrust. Routes
+  declared via `AppBuilder::declare_plugin_routes` are now checked against the
+  application's own routes through the same `matchit` oracle axum routes
+  through, so a collision — exact path, shape clash (`/hello/{id}` against a
+  declared `/hello/{slug}`), or catch-all — is a `RouterBuildError` naming the
+  plugin and the contested path, raised before anything mounts. Paths that axum
+  accepts (disjoint siblings under a shared prefix, a route *at* the prefix, a
+  GET and its implied HEAD) are unaffected. `TestApp` carries these
+  declarations too, so a colliding plugin fails in tests rather than only in
+  production. Framework-mounted paths (probes, actuator, htmx assets, mail
+  previews, the story gallery, the tracked-job status route) are covered as
+  well: they are mounted outside the user route list, so a manifest declaring
+  `GET /health` would otherwise still have panicked. A framework path is
+  *refused* rather than yielded — a user route at a probe path legitimately
+  takes it over, but silently handing an unaudited artifact the endpoint
+  orchestrators read to decide whether the process is alive is worse than a
+  loud refusal. Only `GET` is refused there, because only `GET` clashes; a
+  declared `HEAD` or `POST` merges into the same `MethodRouter` cleanly. The
+  framework namespaces `/static` and `/_autumn` are reserved wholesale, for
+  every method: paths under them are not enumerable route-by-route (`ServeDir`
+  serves whatever is on disk), and a declared sub-path there does not even
+  panic — it mounts and *shadows* the framework, so an artifact declaring
+  `/static/app.js` would serve script from the host's own origin. Matching is
+  on segment boundaries, so `/staticky` is unaffected. Probe paths are claimed
+  only when `health.enabled`, matching the mount, so a plugin is never refused
+  over a collision that cannot happen. Framework paths are compared through the
+  same matchit oracle as user routes, not by string equality, so a framework
+  template carrying a capture (`/_stories/{slug}`, or an operator-configured
+  probe or actuator path) is not an exact-string miss and a startup panic. The
+  dev inspector's detail route (`{inspector_path}/requests/{id}`) is claimed
+  alongside its index — both now derive from `inspector_endpoint_paths`, so the
+  claim set cannot drift from what the router actually mounts.
 - **Punctuation- and emoji-only titles no longer slip past the validator that
   exists to stop them (#2424):** `examples/reddit-clone` rejects a post title
   like `***`, `!!!???...:::` or `🎉🔥💯` with "Title must contain at least one
@@ -1883,6 +1998,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     on `/actuator/prometheus` and under `/actuator/metrics`' `app` key with no
     database, and the Chromium smoke asserts the timer end-to-end against the
     real binary.
+
+- **Capability-sandboxed plugins — install an unaudited plugin without
+  installing its authority (#1609):** every Autumn plugin until now has been
+  full-trust native code. `Plugin::build(self, app)` hands over the entire
+  `AppBuilder`, which is the right trade for a first-party crate and the wrong
+  one for something found on crates.io ten minutes ago — a compromised
+  `autumn-plugin-*` can read your credentials, exfiltrate your database, or take
+  the process down, and dependency auditing catches only the vulnerabilities
+  someone has already named. The new non-default `plugin-sandbox` feature adds
+  the other lane. A sandboxed plugin ships as a `.autumn-plugin` artifact — a
+  `wasm32-wasip1` module plus a manifest declaring its route prefix, the exact
+  `(method, path)` pairs it mounts, its capabilities, and its per-request CPU
+  and memory ceilings — and the runtime enforces every word of it, refusing at load anything it cannot
+  fully understand — including a route path `axum::Router::route` would panic on,
+  which is validated through the same `matchit` engine axum routes through so a
+  manifest can never take the application down at boot.
+  Deny-by-default is structural rather than configured: the guest's whole
+  authority is the host-function table the shim registers, so filesystem,
+  network, environment and database access are not "off" but absent, each
+  attempt answered with `ENOTCAPABLE`/`EBADF` and recorded as a logged denial,
+  and an
+  import no host function defines is refused at load before the artifact runs
+  once. The manifest is the mount, not a description of it: the router is built
+  from its declared routes, so an undeclared path under the prefix is a 404 the
+  guest never sees. Fuel bounds CPU and a store limiter bounds memory, both
+  per request against a fresh instance, and the interpreter runs on a blocking
+  worker — so a spin, a memory bomb, a trap, a `proc_exit`, a malformed answer
+  or no answer at all is a 502/503/504 on the plugin's own prefix while every
+  other route keeps serving, and nothing a plugin does can abort the host
+  process. Credentials are stripped from the request before it crosses, and
+  `Set-Cookie`, framing headers and anything carrying `\r\n` are stripped or
+  refused on the way back, so a plugin cannot forge a session in your origin or
+  split your response. `autumn plugin package` binds a manifest to a module and
+  stamps the digest the author could not know; `autumn plugin inspect` is the
+  consent screen — the grant, the routes, the reviewed digest, every host
+  function imported, the classes of authority denied — and it loads the module
+  into the same sandbox the runtime uses and runs the existing route
+  conformance checks over the manifest, offline. The app still deploys as one
+  binary: `wasmi` is a pure-Rust interpreter, so there is no daemon, no
+  subprocess and no native codegen backend. Purely additive — the native
+  `Plugin` trait and every existing plugin are untouched, and the feature is not
+  in `autumn-web`'s default set. The declared budgets bound the host's own
+  work as well as the guest's: instantiating the module and encoding the request
+  frame are both charged against `fuel` before they are performed, and anything
+  the guest influenced — its error detail, its stderr, the interpreter's account
+  of a trap — is truncated and control-escaped before it is logged, so a plugin
+  cannot flood an operator's log or forge a record in it. First slice: request
+  handling under the declared prefix is the only capability that exists, so no
+  manifest can ask for a database, a session or an outbound call. See
+  `docs/guide/sandboxed-plugins.md`.
 
 - **UI/routing documentation and the flagship example that proves it (#2320):**
   the 0.7.0 docs audit found the UI/Routing block carrying the longest-standing

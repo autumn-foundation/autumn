@@ -271,6 +271,26 @@ run.
 | `autumn-cache-redis` | Redis-backed shared cache | [Cache stampede](./guide/cache-stampede.md) |
 | `autumn-search` | Keyword **and** vector search with lifecycle-synced indexes | [Search](./guide/search.md) |
 
+## Trust model: native plugins are full-trust
+
+A plugin's `build(self, app)` receives the entire `AppBuilder`, so a plugin can
+register migrations, install subsystem replacements, read configuration and
+credentials, open sockets, and take the process down. Everything on this page
+assumes that is what you want — it is the right trade for a plugin you wrote or
+a first-party crate you already trust.
+
+For a plugin you have **not** audited, Autumn has a second lane. A
+[sandboxed plugin](./guide/sandboxed-plugins.md) ships as a portable
+`wasm32-wasip1` artifact with a capability manifest, and the runtime enforces
+that manifest: it serves HTTP under one declared prefix and nothing else, it has
+no filesystem, network, environment or database, it runs under hard per-request
+CPU and memory ceilings, and a trap or an infinite loop inside it is a 5xx on
+its own prefix rather than a dead process. It is slower than a native plugin and
+its capability vocabulary is deliberately tiny; what it buys is that installing
+it is a decision you can make from one page of TOML.
+
+Native plugins are not deprecated by that lane and are not going anywhere.
+
 ## Naming conventions
 
 | Kind | Crate name | Struct name |
