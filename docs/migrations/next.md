@@ -550,7 +550,7 @@ for the policy.
   - `Plugin::contract` — declare the `autumn-web` range your plugin supports.
     Defaults to `None`, so implementing it is optional.
   - `autumn_web::plugin_contract` — `PluginContract`, `PLUGIN_SURFACES`,
-    `SurfaceTier`, `evaluate`, `lockstep_range`, and the
+    `SurfaceTier`, `evaluate`, `lockstep_range`, `lockstep_contract`, and the
     `PLUGIN_CONTRACT_MARKER` dump protocol.
   - `AppBuilder::plugin_contracts()` — the contracts declared by the plugins
     mounted on a builder.
@@ -568,7 +568,11 @@ for the policy.
   `autumn plugin-check --plugin-name <your-plugin>`. A plugin that releases in
   lockstep with the framework can write
   `.autumn_web(lockstep_range(env!("CARGO_PKG_VERSION")))` instead and never
-  touch the literal again.
+  touch the literal again — or write the whole `Plugin::contract` body in one
+  call with the new `lockstep_contract(env!("CARGO_PKG_NAME"),
+  env!("CARGO_PKG_VERSION"))`, which every first-party plugin in this
+  repository now does (previously each wrote out the three-call construction
+  by hand).
 
 **Breaking for the `plugin-check` command, and only for it.** Two checks join
 the report. `plugin-contract` **fails** when the plugin under check declares no
