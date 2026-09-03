@@ -1590,6 +1590,40 @@ plugin crate already carries the features its mount needs and Cargo unifies
 them. `autumn plugin-check` is the separate, author-facing conformance gate;
 `autumn generate plugin` scaffolds a new plugin crate.
 
+## Removing a plugin, and installing one on day zero (unreleased, issue #1631)
+
+The lifecycle runs both ways, and a plugin can be wired at scaffold time:
+
+```bash
+autumn new my-app --with autumn-admin-plugin --with autumn-search  # repeatable
+autumn plugin remove autumn-admin-plugin
+autumn plugin remove autumn-media-plugin --dry-run                 # every consequence, no writes
+autumn plugin remove autumn-media-plugin --drop-data --yes         # destructive, opt-in
+```
+
+`remove` is the exact reverse of `add` and refuses in the same spirit:
+
+- **It never touches the database.** A plugin that declares migrations or owns
+  tables gets them listed with a statement that they are still there.
+  `--drop-data` reverts them in one transaction, printing the statements and
+  confirming *before any file is written*; a non-interactive stdin without
+  `--yes` is a refusal, never an assumed yes.
+- **It declines rather than guesses.** A mount it cannot read as a single
+  builder call (built into a variable, sharing a line, or nested inside another
+  plugin's constructor) changes nothing and prints the lines to delete, exit 2.
+  So does a dependency not written as a plain `name = "…"` line.
+- **It keeps a dependency the app still uses**, naming the file under `src/`,
+  `tests/`, `benches/`, `examples/` or `build.rs` that kept it.
+- **Idempotent**, like `add`: removing what is not installed says so and
+  changes nothing.
+- **Exit codes**: `0` removed or nothing to do, `1` refused, `2` nothing was
+  changed automatically (apply the printed lines by hand), `3` `--dry-run`
+  found something a real run would change.
+
+`autumn new --with` resolves and version-checks every name *before* the
+scaffold writes a byte, so a typo leaves no half-built project. `autumn doctor`
+reports leftovers as `plugin_residue` — see the doctor skill.
+
 ## File storage and cache plugins
 
 For local or pluggable file storage:
@@ -2027,6 +2061,48 @@ build?", "where did this binary come from?", or for compliance/audit evidence.
 See `docs/guide/supply-chain.md` for the end-to-end walkthrough, including the
 negative case (tamper with a byte, watch verification fail).
 
+## Dependency advisories — the audit gate (unreleased, issue #1600)
+
+Every app `autumn new` generates audits its whole dependency tree on each push
+and pull request: the scaffolded `.github/workflows/ci.yml` installs a pinned
+cargo-deny and runs `cargo deny check advisories` against a `deny.toml` at the
+project root. A known RustSec advisory that `deny.toml` does not waive fails
+the build.
+
+- **Never "fix" a failing audit by weakening the gate.** `continue-on-error`,
+  `|| true`, and deleting the step turn a security control into a decoration —
+  and an integration test in the framework fails if the generated workflow does
+  any of them. If asked to get CI green, fix or waive the advisory instead.
+- Prefer a real fix: `cargo update -p <crate>` when a patched version is
+  compatible, else bump the direct dependency that pulls it in. Read the
+  dependency path cargo-deny prints bottom-up — the crate to bump is the
+  highest entry in that chain the app controls.
+- Waive only when no fix exists ("no safe upgrade is available") or the
+  vulnerable path is unreachable, by adding to `deny.toml`:
+  `{ id = "RUSTSEC-…", reason = "why this is acceptable here; review-by <date>" }`.
+  A waiver lets exactly one id through; the gate stays on and every other
+  advisory still fails.
+- A fresh scaffold ships one waiver already — RUSTSEC-2023-0071 (`rsa`, reached
+  through the unconditional `jsonwebtoken` dependency, no patched release
+  exists) — which is why day-one CI is green. Do not remove it without checking
+  whether a fixed `rsa` has shipped. `--bundled-pg` apps get a second waiver
+  (RUSTSEC-2024-0384, `instant`, via the embedded-Postgres build stack); other
+  flavors deliberately do not, so an unused-waiver warning still means one of
+  the app author's own waivers went stale.
+- An app upgraded from a release before this gate existed receives the workflow
+  but not `deny.toml` (the policy is the app's, so `autumn upgrade` never
+  writes it). The audit step says so and stops; copy the file from a freshly
+  generated app rather than removing the step.
+- When the advisory database is unreachable the gate **fails closed**: the
+  fetch is a separate step retried 3× with backoff, and the audit then runs
+  `--offline` against it, so a failure in the audit step is always a real
+  advisory rather than a network blip.
+- The framework gates itself the same way in PR CI and the Publish Gate:
+  `./scripts/check-advisories.sh` (and `--self-test`, which proves the gate can
+  still reject an injected known-vulnerable dependency).
+
+`docs/guide/supply-chain.md` "Part 3a" has the failure-reading walkthrough.
+
 ## Observability defaults
 
 Published 0.5.0 behavior:
@@ -2443,6 +2519,8 @@ autumn deploy status --json --strict          # read-only per-host state + versi
 autumn deploy maintenance on --message "…"    # maintenance mode on EVERY deploy host over SSH; `off` reverses (#1621)
 autumn plugin list               # installable plugins + the version compatible with this app's autumn-web; --json, --offline (#1606)
 autumn plugin add autumn-admin-plugin   # dependency + builder-chain mount + post-install steps; idempotent, version-gated, --dry-run (#1606)
+autumn plugin remove autumn-admin-plugin   # reverses both wires; never touches the database (--drop-data does, with confirmation); --dry-run exits 3 when it would change something (#1631)
+autumn new my-app --with autumn-admin-plugin   # scaffold with plugins already wired; repeatable, resolved and version-checked before any file is written (#1631)
 autumn data-flow                 # classified-data flow manifest: one row per `#[classified]` column and every sink a declared declassification boundary releases it to; empty reachable set = the column cannot leave the process (#1654)
 autumn data-flow --manifest data-flow-manifest.json --check data-flow-manifest.json   # write it, and fail on drift from the committed copy so a new release edge is reviewed
 autumn data-flow --release --check data-flow-manifest.json   # audit the profile you deploy: a boundary behind `#[cfg(not(debug_assertions))]` exists only in the release build, so a debug-built manifest would certify edges the shipped binary does not have (and miss the ones it does)

@@ -409,22 +409,46 @@ pub fn unpatched_local_framework(root: &Path) -> bool {
 #[must_use]
 pub fn mount_present(main_rs: &str, entry: &CatalogEntry) -> bool {
     let masked = crate::rust_source::mask_non_code(main_rs);
-    if masked.contains(entry.constructor) {
-        return true;
-    }
+    masked.contains(entry.constructor)
+        || mount_call_span(&masked, entry, |argument| {
+            argument.contains(entry.mount_arg)
+        })
+        .is_some()
+}
+
+/// The `(`…`)` byte range of the first [`CatalogEntry::mount_call`] in `masked`
+/// whose argument `accept` approves, as `(open_paren, close_paren)`.
+///
+/// One scan, shared by the two commands that have to agree on what a mount
+/// *is*: `plugin add`'s [`mount_present`] (which asks only whether the type
+/// path appears in the argument) and `plugin remove`'s
+/// `remove::mount_span` (which additionally requires the argument to *begin*
+/// with it, so a plugin nested inside another plugin's constructor is never
+/// excised). Extracted so the two cannot drift: the whole manual-fallback
+/// contract rests on `remove` refusing exactly the mounts it cannot excise,
+/// and `add` seeing exactly the mounts that are there.
+///
+/// `masked` must be [`crate::rust_source::mask_non_code`] output, whose byte
+/// offsets are the original's.
+#[must_use]
+pub fn mount_call_span(
+    masked: &str,
+    entry: &CatalogEntry,
+    accept: impl Fn(&str) -> bool,
+) -> Option<(usize, usize)> {
     let mut from = 0usize;
     while let Some(found) = masked[from..].find(entry.mount_call) {
         // The `(` the call opens with is the last byte of `mount_call`.
         let open = from + found + entry.mount_call.len() - 1;
-        let Some(close) = crate::rust_source::balanced_close_paren(&masked, open) else {
-            return false;
-        };
-        if masked[open + 1..close].contains(entry.mount_arg) {
-            return true;
+        // Unbalanced: the source is mid-edit or unparseable, and nothing
+        // further can be read reliably.
+        let close = crate::rust_source::balanced_close_paren(masked, open)?;
+        if accept(&masked[open + 1..close]) {
+            return Some((open, close));
         }
         from = close;
     }
-    false
+    None
 }
 
 /// Byte offset just past the builder-opening `autumn_web::app()` **inside the
@@ -669,6 +693,106 @@ pub fn plan_add_community(
         dependency_line: dependency_line(crate_name, version),
         mount_snippet: snippet,
     })
+}
+
+/// Every Rust source file a Cargo target in `root` is built from, *outside*
+/// the conventional `src`/`tests`/`benches`/`examples` trees.
+///
+/// Cargo lets a target live anywhere: `[[bin]] path = "cmd/server.rs"` is
+/// valid, and invisible to a scan of the conventional directories. Two
+/// commands need to see those files, for mirror-image reasons — `plugin
+/// remove` must not strip a dependency such a target still uses, and `autumn
+/// doctor` must not report a plugin mounted there as "declared but never
+/// mounted" (which would fail `--strict` on a perfectly valid project). One
+/// definition, so the two cannot disagree about where an app's code lives.
+///
+/// Returns the file each target names, plus every `.rs` file in that file's
+/// own directory tree — a target's sibling modules (`cmd/routes.rs`) are part
+/// of it. The tree sweep is deliberately skipped for a file sitting directly
+/// at the project root, where "the whole tree" would mean the entire checkout,
+/// `target/` included; the conventional sweep already covers what matters
+/// there.
+#[must_use]
+pub fn explicit_target_sources(root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for named in explicit_target_paths(root) {
+        push_unique(&mut out, named.clone());
+        match named.parent() {
+            Some(parent) if parent != root => {
+                for file in rs_files_under(parent) {
+                    push_unique(&mut out, file);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Push `path` unless it is already there — the same file can be reached from
+/// two targets (a `[[bin]]` and its `[[test]]` sharing a directory).
+fn push_unique(out: &mut Vec<PathBuf>, path: PathBuf) {
+    if !out.contains(&path) {
+        out.push(path);
+    }
+}
+
+/// Every source path `root`'s manifest names explicitly: the build script and
+/// any `path` on a `[lib]`, `[[bin]]`, `[[example]]`, `[[test]]` or
+/// `[[bench]]` target.
+fn explicit_target_paths(root: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![root.join("build.rs")];
+    let Ok(manifest) = std::fs::read_to_string(manifest_path(root)) else {
+        return paths;
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(&manifest) else {
+        return paths;
+    };
+    // A custom build-script path (`[package] build = "…"`) replaces `build.rs`.
+    if let Some(build) = table
+        .get("package")
+        .and_then(|package| package.get("build"))
+        .and_then(toml::Value::as_str)
+    {
+        paths.push(root.join(build));
+    }
+    let mut push_path = |value: &toml::Value| {
+        if let Some(path) = value.get("path").and_then(toml::Value::as_str) {
+            paths.push(root.join(path));
+        }
+    };
+    if let Some(lib) = table.get("lib") {
+        push_path(lib);
+    }
+    for kind in ["bin", "example", "test", "bench"] {
+        if let Some(targets) = table.get(kind).and_then(toml::Value::as_array) {
+            for target in targets {
+                push_path(target);
+            }
+        }
+    }
+    paths
+}
+
+/// Every `.rs` file under `dir`, recursively, in a stable order.
+#[must_use]
+pub fn rs_files_under(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    // Sorted: `read_dir` order is unspecified, and both callers report or
+    // concatenate what they find.
+    let mut paths: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+    paths.sort();
+    let mut out = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            out.extend(rs_files_under(&path));
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+    out
 }
 
 /// `root`'s `Cargo.toml`.

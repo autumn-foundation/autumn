@@ -445,6 +445,11 @@ pub mod __fuzz {
     // Cookie / signed-session decode.
     pub use crate::session::__fuzz_decode_cookie as decode_cookie;
 
+    // DNS wire-format parsing for the ACME DNS-01 propagation probe (#1620).
+    // The bytes come off a UDP socket, so anyone on-path can shape them.
+    #[cfg(feature = "acme")]
+    pub use crate::acme::dns::resolver::parse_response as parse_dns_response;
+
     // Body handling: form-urlencoded (always) + inbound-mail MIME (feature-gated).
     pub use crate::form::__fuzz_decode_urlencoded as decode_urlencoded_form;
     #[cfg(feature = "inbound-mail")]

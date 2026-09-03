@@ -42,6 +42,7 @@ mod new;
 mod overload_driver;
 mod paths;
 mod pg;
+mod platform;
 mod plugin;
 mod plugin_check;
 mod process;
@@ -460,6 +461,35 @@ pub enum PluginSubcommands {
         #[arg(long)]
         offline: bool,
     },
+    /// Remove a plugin: dependency and builder-chain mount. Never the database.
+    ///
+    /// The exact reverse of `add`, and safe in the same ways: it refuses to
+    /// edit a builder chain it cannot read (printing the lines to delete
+    /// instead), keeps a dependency the app still names elsewhere, and never
+    /// touches the database — it lists what the plugin owns there and leaves
+    /// it in place unless `--drop-data` is given.
+    ///
+    /// Examples:
+    ///   autumn plugin remove autumn-admin-plugin
+    ///   autumn plugin remove autumn-media-plugin --dry-run
+    ///   autumn plugin remove autumn-media-plugin --drop-data --yes
+    Remove {
+        /// Plugin crate name, e.g. `autumn-admin-plugin`.
+        name: String,
+        /// Print every file edit and every data consequence without writing
+        /// anything. Exits 3 when there is something to change, 0 when there
+        /// is not.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also revert the plugin's declared migrations and drop the tables it
+        /// owns. Destructive and irreversible; asks for confirmation first.
+        #[arg(long)]
+        drop_data: bool,
+        /// Answer the `--drop-data` confirmation with "yes". Required to drop
+        /// data non-interactively.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Subcommands for `autumn jobs`.
@@ -623,6 +653,14 @@ enum Commands {
         /// and --with-seed; not combinable with --daemon or --bundled-pg.
         #[arg(long)]
         api: bool,
+        /// Scaffold the app with this plugin already wired (repeatable).
+        ///
+        /// Takes the same names as `autumn plugin add`: a first-party plugin,
+        /// or a community `autumn-plugin-<name>` crate. Every name is resolved
+        /// and version-checked BEFORE any file is written, so an unknown or
+        /// incompatible plugin leaves no half-scaffolded project behind.
+        #[arg(long = "with", value_name = "PLUGIN", conflicts_with = "list_starters")]
+        with: Vec<String>,
     },
     /// Pre-render static routes to dist/
     Build {
@@ -4295,6 +4333,7 @@ fn run_command(command: Commands) {
             daemon,
             bundled_pg,
             api,
+            with,
         } => {
             if list_starters {
                 starters::print_list();
@@ -4318,6 +4357,10 @@ fn run_command(command: Commands) {
                     );
                     std::process::exit(1);
                 }
+                // AC #6: every `--with` name is resolved and version-checked
+                // BEFORE the scaffold writes a byte, so a typo or an
+                // incompatible plugin never leaves a half-built project behind.
+                let plugins = resolve_scaffold_plugins(&with, None);
                 starters::run(
                     &name,
                     &starter,
@@ -4325,7 +4368,9 @@ fn run_command(command: Commands) {
                     yes,
                     generate::Flags::default(),
                 );
+                wire_scaffold_plugins_into(&name, &plugins);
             } else {
+                let plugins = resolve_scaffold_plugins(&with, Some(plugin::first_party_version()));
                 new::run(
                     &name,
                     new::GenerateOptions {
@@ -4337,6 +4382,7 @@ fn run_command(command: Commands) {
                         with_api: api,
                     },
                 );
+                wire_scaffold_plugins_into(&name, &plugins);
             }
         }
 
@@ -4825,6 +4871,18 @@ fn run_command(command: Commands) {
                     dry_run,
                     offline,
                 }),
+                PluginSubcommands::Remove {
+                    name,
+                    dry_run,
+                    drop_data,
+                    yes,
+                } => plugin::run_remove(&plugin::RemoveOptions {
+                    root,
+                    name: &name,
+                    dry_run,
+                    drop_data,
+                    yes,
+                }),
             };
             if code != 0 {
                 std::process::exit(code);
@@ -5072,6 +5130,57 @@ fn run_task_command(
         name,
         args,
     });
+}
+
+/// Resolve every `autumn new --with` name, exiting before the scaffold runs if
+/// any of them cannot be installed (issue #1631, AC #6).
+///
+/// The whole point of doing this here is ordering: `autumn new` creates a
+/// directory tree, and a project that exists but is missing the plugin the user
+/// asked for is worse than no project at all.
+///
+/// `scaffold_autumn_web` is the `autumn-web` the scaffold will pin, or `None`
+/// when that is not knowable yet. `autumn new`'s own template pins this CLI's
+/// version, so the gate is exact there. A `--starter` brings its own manifest,
+/// which does not exist until the starter is fetched — so only the half that
+/// IS knowable (does this name resolve at all, and to what version) runs
+/// before the write, and the compatibility answer comes from
+/// `plugin::wire_scaffold_plugins` reading the starter's real manifest
+/// afterwards.
+fn resolve_scaffold_plugins(
+    names: &[String],
+    scaffold_autumn_web: Option<&str>,
+) -> Vec<plugin::ScaffoldPlugin> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    match plugin::preflight_scaffold_plugins(
+        names,
+        scaffold_autumn_web,
+        plugin::registry::latest_version,
+    ) {
+        Ok(plugins) => plugins,
+        Err(err) => {
+            eprintln!("autumn new: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Wire the preflighted plugins into the project `autumn new` just created.
+fn wire_scaffold_plugins_into(project_name: &str, plugins: &[plugin::ScaffoldPlugin]) {
+    if plugins.is_empty() {
+        return;
+    }
+    // Built the same way the scaffolders build it (`new::run` joins onto
+    // `current_dir`), rather than leaning on the process CWD staying put.
+    let root = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(project_name);
+    let code = plugin::wire_scaffold_plugins(&root, plugins);
+    if code != 0 {
+        std::process::exit(code);
+    }
 }
 
 fn run_plugin_check_command(

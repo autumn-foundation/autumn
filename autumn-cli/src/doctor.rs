@@ -121,6 +121,317 @@ pub struct DoctorDeprecation {
     pub remove_in: String,
 }
 
+/// One plugin's wiring state, as `autumn doctor` can see it from the project's
+/// `Cargo.toml`, `src/main.rs`, and (best effort) its migration history.
+/// Input to [`check_plugin_residue_impl`] (issue #1631).
+// Four independent yes/no facts about one plugin, each read from a different
+// place (the manifest, the source tree, the source tree again with a stricter
+// probe, the catalog). Folding them into an enum would mean enumerating the
+// combinations, which is exactly what `check_plugin_residue_impl` does.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone)]
+pub struct PluginWiring {
+    /// The plugin's crate name.
+    pub crate_name: String,
+    /// Whether this is a community `autumn-plugin-*` crate. `plugin add` is
+    /// dependency-only for those BY DESIGN — it never writes their mount — so
+    /// "run `autumn plugin add` to finish the install" is wrong advice for
+    /// them, and the finding has to say something else.
+    pub community: bool,
+    /// Whether `[dependencies]` declares it.
+    pub dependency: bool,
+    /// Whether anything in the app's sources looks like a mount of it —
+    /// including a bare `<Name>Plugin::new(` with no crate path, which is
+    /// enough to stop this check nagging about a plugin that IS wired.
+    pub mount: bool,
+    /// Whether a mount names the plugin's fully-qualified type path. Only this
+    /// proves the app is reaching into *this* crate; a bare constructor could
+    /// be the app's own same-named type, which is why the "mounted but not
+    /// declared, so this does not compile" failure needs the stronger signal.
+    pub mount_qualified: bool,
+    /// Migration versions this plugin declares that the database still records
+    /// as applied. Only meaningful when the plugin is otherwise gone; empty
+    /// whenever the migration history could not be read.
+    pub orphaned_migrations: Vec<String>,
+}
+
+/// Check for orphaned plugin residue: a half-install in either direction, or
+/// migrations applied by a plugin that is no longer in the app (issue #1631).
+///
+/// Pure and injectable, like every other `_impl` check here, so the three
+/// findings can be tested without a project on disk or a database.
+pub fn check_plugin_residue_impl(wirings: &[PluginWiring]) -> CheckResult {
+    let mut failures: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Two independent findings per plugin, not one match: a wiring asymmetry
+    // and an orphaned migration are different residue, and an arm ordering
+    // that reports one can silently drop the other. `check_plugin_residue_impl`
+    // is `pub` and injectable, so the invariant cannot live in its caller.
+    for wiring in wirings {
+        let name = &wiring.crate_name;
+        match (wiring.dependency, wiring.mount) {
+            // A mount with no dependency does not compile. That is not a
+            // matter of taste for `--strict` to decide — but it is only sound
+            // on the QUALIFIED signal: a bare `SearchPlugin::new(` may be the
+            // app's own type, and asserting a compile failure on a substring
+            // collision would be a hard `Fail` this check has not earned.
+            (false, true) if wiring.mount_qualified => failures.push(format!(
+                "{name} is mounted in the builder chain but not declared in [dependencies] — this app does not compile; run `autumn plugin add {name}`, or delete the mount"
+            )),
+            (true, false) => warnings.push(format!(
+                "{name} is declared in [dependencies] but never mounted — {}, or run `autumn plugin remove {name}` to take the dependency back",
+                if wiring.community {
+                    // `plugin add` is dependency-only for a community crate BY
+                    // DESIGN — it never writes their mount — so "finish the
+                    // install" is advice that would go nowhere.
+                    "`autumn plugin add` writes no mount for a community crate, so add the `.plugin(...)` call from its README".to_owned()
+                } else {
+                    format!("run `autumn plugin add {name}` to finish the install")
+                }
+            )),
+            // Unqualified evidence only, both wires agreeing, or neither
+            // present: nothing to say about the wiring.
+            (false, true | false) | (true, true) => {}
+        }
+        // Residue in the database is only residue once the plugin is gone from
+        // the code; while it is installed, applied migrations are just a
+        // working install.
+        if !wiring.dependency && !wiring.mount && !wiring.orphaned_migrations.is_empty() {
+            warnings.push(format!(
+                "{name} is not installed, but migrations it declares are still recorded as applied: {} — the tables they created are still in the database; `autumn plugin remove {name} --drop-data` reverts them",
+                wiring.orphaned_migrations.join(", ")
+            ));
+        }
+    }
+
+    let status = if failures.is_empty() {
+        if warnings.is_empty() {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warn
+        }
+    } else {
+        CheckStatus::Fail
+    };
+    if status == CheckStatus::Pass {
+        return CheckResult {
+            name: "plugin_residue",
+            status,
+            detail: Some("no orphaned plugin wiring or migrations".into()),
+            hint: None,
+        };
+    }
+    // Failures first, then warnings: a non-compiling app is the finding to act
+    // on, and every other finding is still listed alongside it.
+    let detail = failures
+        .into_iter()
+        .chain(warnings)
+        .collect::<Vec<_>>()
+        .join("\n");
+    CheckResult {
+        name: "plugin_residue",
+        status,
+        detail: Some(detail),
+        hint: Some(
+            "`autumn plugin list` shows what is installable; `autumn plugin remove <name>` unwires a plugin cleanly",
+        ),
+    }
+}
+
+/// Every migration version the `diesel migration list` output records as
+/// applied, oldest first.
+///
+/// The sibling of [`parse_latest_applied_migration_version`], which only needs
+/// the newest: an orphaned plugin migration can sit anywhere in the history,
+/// so the residue check needs the whole set.
+fn parse_applied_migration_versions(output: &str) -> Vec<String> {
+    parse_applied_migration_tokens(output)
+        .map(|token| {
+            // `20260720000000_media_rooms` and a bare `20260720000000` both
+            // reduce to the version key `__diesel_schema_migrations` uses.
+            token
+                .split_once('_')
+                .map_or(token, |(head, _)| head)
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Every `[X] <token>` entry in a `diesel migration list` listing, verbatim.
+///
+/// Shared by [`parse_applied_migration_versions`] and
+/// [`parse_latest_applied_migration_version`] so the two cannot disagree about
+/// what "applied" looks like in that output.
+fn parse_applied_migration_tokens(output: &str) -> impl Iterator<Item = &str> {
+    output.lines().filter_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("[X]")
+            .or_else(|| trimmed.strip_prefix("[x]"))?
+            .split_whitespace()
+            .next()
+    })
+}
+
+/// Every applied migration version in the database at `database_url`.
+///
+/// Best effort, exactly like [`latest_applied_migration_version`]: no `diesel`
+/// binary, no database, or a failed invocation all read as "nothing known",
+/// which makes the orphaned-migration finding impossible rather than wrong.
+fn applied_migration_versions(database_url: &str) -> Vec<String> {
+    diesel_migration_list(database_url)
+        .as_deref()
+        .map_or_else(Vec::new, parse_applied_migration_versions)
+}
+
+/// The wiring state of every first-party plugin (and every community
+/// `autumn-plugin-*` dependency) in the project rooted at `root`.
+///
+/// Everything is read from disk; `applied` is whatever migration history the
+/// caller could obtain, and may be empty.
+fn resolve_plugin_wirings(
+    root: &std::path::Path,
+    applied: impl FnOnce() -> Vec<String>,
+) -> Vec<PluginWiring> {
+    let Ok(manifest) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    // The WHOLE `src` tree, not just `main.rs`: an app whose builder lives in
+    // `src/app.rs` — the shape `plugin add`'s own manual fallback produces,
+    // since it prints the mount for the user to paste wherever their chain is —
+    // is correctly wired, and must not be warned at (nor failed under
+    // `--strict`) for it. Plus every target the manifest gives an explicit path
+    // to (`[[bin]] path = "cmd/server.rs"`), because a builder chain living
+    // there is just as real, and calling it "never mounted" would fail
+    // `--strict` on a valid project. Same scan `plugin remove` uses to decide
+    // whether a dependency is still needed.
+    let main_src = read_app_sources(root);
+    let masked = crate::rust_source::mask_non_code(&main_src);
+
+    let mut wirings: Vec<PluginWiring> = crate::plugin::catalog::FIRST_PARTY
+        .iter()
+        .map(|entry| PluginWiring {
+            crate_name: entry.crate_name.to_owned(),
+            community: false,
+            dependency: crate::plugin::install::dependency_present(&manifest, entry.crate_name),
+            mount: crate::plugin::install::mount_present(&main_src, entry),
+            mount_qualified: crate::plugin::install::mount_call_span(&masked, entry, |argument| {
+                argument.contains(entry.mount_arg)
+            })
+            .is_some(),
+            orphaned_migrations: Vec::new(),
+        })
+        .collect();
+
+    // Reading the migration history costs a `diesel` subprocess and a database
+    // round trip, so it happens ONLY when the answer could change something:
+    // some plugin is absent from the code *and* declares migrations that could
+    // still be applied. On the overwhelmingly common project — no departed
+    // plugin, or none that owns schema — `autumn doctor` pays nothing for this
+    // check beyond the file reads it already did.
+    let candidates: Vec<(usize, Vec<String>)> = wirings
+        .iter()
+        .enumerate()
+        .filter(|(_, wiring)| !wiring.dependency && !wiring.mount)
+        .filter_map(|(index, wiring)| {
+            let entry = crate::plugin::catalog::lookup(&wiring.crate_name)?;
+            if entry.migrations.is_empty() {
+                return None;
+            }
+            Some((
+                index,
+                entry
+                    .migrations
+                    .iter()
+                    .map(|version| {
+                        version
+                            .split_once('_')
+                            .map_or(*version, |(head, _)| head)
+                            .to_owned()
+                    })
+                    .collect(),
+            ))
+        })
+        .collect();
+    if !candidates.is_empty() {
+        let applied = applied();
+        for (index, declared) in candidates {
+            wirings[index].orphaned_migrations = declared
+                .into_iter()
+                .filter(|version| applied.contains(version))
+                .collect();
+        }
+    }
+
+    // Community crates: the dependency names them, and the convention names the
+    // struct their mount must build, so the dependency-without-mount half of
+    // the check works for them too. The reverse (a mount with no dependency)
+    // is not detectable — there is nothing to enumerate from.
+    for crate_name in community_dependencies(&manifest) {
+        let Some(struct_name) = crate::plugin::catalog::community_struct_name(&crate_name) else {
+            continue;
+        };
+        let mount = masked.contains(&struct_name);
+        wirings.push(PluginWiring {
+            mount,
+            // A community crate has no catalog entry to give a qualified type
+            // path, so there is nothing stronger to check — and with
+            // `dependency: true` always set here, the `Fail` arm is
+            // unreachable for them anyway.
+            mount_qualified: mount,
+            crate_name,
+            community: true,
+            dependency: true,
+            orphaned_migrations: Vec::new(),
+        });
+    }
+    wirings
+}
+
+/// Every Rust source file a Cargo target in `root` is built from,
+/// concatenated: the `src/` tree plus every explicitly-pathed target.
+///
+/// Cheap and good enough for a presence probe: the caller only asks whether a
+/// mount appears anywhere in the app's own sources, and concatenation cannot
+/// invent one that is not in some file. Files are read in a stable order and
+/// each is newline-terminated, so a probe can never straddle two of them.
+fn read_app_sources(root: &std::path::Path) -> String {
+    let mut out = String::new();
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    let conventional = crate::plugin::install::rs_files_under(&root.join("src"));
+    let explicit = crate::plugin::install::explicit_target_sources(root);
+    for path in conventional.into_iter().chain(explicit) {
+        if seen.contains(&path) {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            out.push_str(&content);
+            out.push('\n');
+        }
+        seen.push(path);
+    }
+    out
+}
+
+/// Every `[dependencies]` entry following the community `autumn-plugin-<name>`
+/// convention.
+fn community_dependencies(manifest: &str) -> Vec<String> {
+    let Ok(table) = toml::from_str::<toml::Table>(manifest) else {
+        return Vec::new();
+    };
+    table
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .map(|deps| {
+            deps.keys()
+                .filter(|name| crate::plugin::catalog::is_community_name(name))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Check for deprecated config key usage (pure, injectable for tests).
 ///
 /// Emits one `⚠️ deprecated_keys` check with one line of `detail` per offending
@@ -551,25 +862,48 @@ pub enum PortReachability {
 /// HTTP-01 validation requires the CA to reach `:80`, so a refused/timed-out
 /// `:80` is a **Fail**. `:443` merely being down yet is a **Warn** (the listener
 /// may not be up during preflight).
+///
+/// Under DNS-01 the CA never connects to `:80` — domain control is proved by a
+/// TXT record — so an unreachable `:80` costs only the HTTP→HTTPS redirect for
+/// visitors who type `http://`. Grading it a **Fail** would make `doctor
+/// --online --strict` reject a perfectly correct wildcard deployment on a host
+/// that deliberately exposes only `:443`.
 #[must_use]
-pub fn check_acme_ports_impl(
+pub fn check_acme_ports_for_challenge(
     domain: &str,
     port_80: PortReachability,
     port_443: PortReachability,
+    dns01: bool,
 ) -> CheckResult {
     match port_80 {
         PortReachability::Refused | PortReachability::TimedOut | PortReachability::Error => {
-            return CheckResult {
-                name: "acme_ports",
-                status: CheckStatus::Fail,
-                detail: Some(format!(
-                    "port 80 on {domain} is not reachable ({port_80:?}); the ACME CA validates \
-                     HTTP-01 over port 80"
-                )),
-                hint: Some(
-                    "Open inbound TCP/80 to this host (or forward it) so Let's Encrypt can reach \
-                     the HTTP-01 challenge",
-                ),
+            return if dns01 {
+                CheckResult {
+                    name: "acme_ports",
+                    status: CheckStatus::Warn,
+                    detail: Some(format!(
+                        "port 80 on {domain} is not reachable ({port_80:?}); DNS-01 issuance does \
+                         not need it, but visitors who type http:// will not be redirected to \
+                         HTTPS"
+                    )),
+                    hint: Some(
+                        "Optional under DNS-01: open inbound TCP/80 only if you want the \
+                         HTTP→HTTPS redirect",
+                    ),
+                }
+            } else {
+                CheckResult {
+                    name: "acme_ports",
+                    status: CheckStatus::Fail,
+                    detail: Some(format!(
+                        "port 80 on {domain} is not reachable ({port_80:?}); the ACME CA validates \
+                         HTTP-01 over port 80"
+                    )),
+                    hint: Some(
+                        "Open inbound TCP/80 to this host (or forward it) so Let's Encrypt can \
+                         reach the HTTP-01 challenge",
+                    ),
+                }
             };
         }
         PortReachability::Open => {}
@@ -621,12 +955,61 @@ pub enum DnsPointsHere {
 
 /// Grade whether an ACME domain's DNS points at this host (pure; injectable).
 ///
-/// A clear mismatch is a **Fail** (HTTP-01 will hit the wrong host); an
-/// indeterminate result (can't resolve, or can't tell where "here" is) is a
-/// **Warn** rather than a hard failure, since split-horizon DNS and NAT make
-/// "points here" unknowable from inside the host.
+/// Under HTTP-01 a clear mismatch is a **Fail** (the CA will hit the wrong
+/// host); an indeterminate result (can't resolve, or can't tell where "here"
+/// is) is a **Warn** rather than a hard failure, since split-horizon DNS and NAT
+/// make "points here" unknowable from inside the host.
+///
+/// `dns01` softens all of that (issue #1620). "Does this domain resolve to THIS
+/// host" is an HTTP-01 question: the CA
+/// fetches the challenge token over `:80` from whatever the name resolves to, so
+/// a mismatch means issuance hits the wrong server. Under DNS-01 the CA never
+/// connects to this host at all — it reads a TXT record — so pointing the domain
+/// at a load balancer, a CDN edge, or any other front end is not merely allowed,
+/// it is the normal shape of the deployment this feature exists for. Grading it
+/// a **Fail** would make `doctor --online --strict` reject a correct wildcard
+/// deployment.
+///
+/// The check still runs, because where the name points is worth *reporting* —
+/// it is just not a failure. Under DNS-01 every inconclusive-or-elsewhere
+/// outcome is graded **Pass** with the addresses named.
 #[must_use]
-pub fn check_acme_dns_impl(domain: &str, outcome: &DnsPointsHere) -> CheckResult {
+pub fn check_acme_dns_for_challenge(
+    domain: &str,
+    outcome: &DnsPointsHere,
+    dns01: bool,
+) -> CheckResult {
+    if dns01 {
+        return match outcome {
+            DnsPointsHere::Unresolved => CheckResult {
+                name: "acme_dns",
+                status: CheckStatus::Warn,
+                detail: Some(format!(
+                    "{domain} did not resolve to any address; DNS-01 issuance does not need it \
+                     to, but visitors will not reach the app until it does"
+                )),
+                hint: Some(
+                    "Publish A/AAAA records for the domain (and a wildcard record for tenant \
+                     subdomains) so traffic reaches this deployment",
+                ),
+            },
+            DnsPointsHere::Matches => CheckResult {
+                name: "acme_dns",
+                status: CheckStatus::Pass,
+                detail: Some(format!("{domain} resolves to this host")),
+                hint: None,
+            },
+            _ => CheckResult {
+                name: "acme_dns",
+                status: CheckStatus::Pass,
+                detail: Some(format!(
+                    "{domain} resolves somewhere other than this host, which DNS-01 does not \
+                     care about: the CA reads a TXT record rather than connecting here"
+                )),
+                hint: None,
+            },
+        };
+    }
     match outcome {
         DnsPointsHere::Matches => CheckResult {
             name: "acme_dns",
@@ -678,6 +1061,289 @@ pub fn check_acme_dns_impl(domain: &str, outcome: &DnsPointsHere) -> CheckResult
             hint: None,
         },
     }
+}
+
+// ── DNS-01 / wildcard preflight checks (issue #1620) ─────────────────────────
+//
+// DNS-01 introduces exactly three failure classes HTTP-01 does not have, and
+// each one costs an operator a failed issuance to discover the hard way:
+// a credential the app cannot read, a zone whose `_acme-challenge` name public
+// DNS cannot answer for, and a certificate that does not actually cover the
+// tenant subdomains `tenancy.base_domain` will serve. Each is graded by a pure
+// function of injected inputs, exactly like the #1608 ACME graders above.
+
+/// What the DNS provider credential lookup found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsCredentialOutcome {
+    /// No `[server.tls.acme.dns]` section — HTTP-01 issuance, nothing to grade.
+    NotConfigured,
+    /// The section is present but does not deserialize (an unknown provider, or
+    /// an inline secret the runtime refuses). Carries the rendered error.
+    Malformed(String),
+    /// The credential carries everything the provider needs.
+    Usable {
+        /// The provider name, for the message.
+        provider: String,
+        /// The credentials-store key it was read from.
+        key: String,
+    },
+    /// The credential is missing or incomplete. Carries the runtime's own
+    /// message, which names the missing field and where to put it.
+    Unusable(String),
+}
+
+/// Grade the DNS-01 provider credential (pure; injectable).
+///
+/// A **Fail**: without a usable credential the app cannot write a single
+/// challenge record, so every issuance and every renewal fails — and, unlike a
+/// wrong hostname, nothing about the running app reveals it until the
+/// certificate is already expiring.
+#[must_use]
+pub fn check_acme_dns_credential_impl(outcome: &DnsCredentialOutcome) -> CheckResult {
+    match outcome {
+        DnsCredentialOutcome::NotConfigured => CheckResult {
+            name: "acme_dns_credential",
+            status: CheckStatus::Pass,
+            detail: Some(
+                "no [server.tls.acme.dns] section: issuance uses HTTP-01, which needs no DNS \
+                 provider credential"
+                    .to_owned(),
+            ),
+            hint: None,
+        },
+        DnsCredentialOutcome::Malformed(error) => CheckResult {
+            name: "acme_dns_credential",
+            status: CheckStatus::Fail,
+            detail: Some(format!("[server.tls.acme.dns] does not load: {error}")),
+            hint: Some(
+                "Fix the section: `provider` must be one of cloudflare/route53/exec, and API \
+                 tokens belong in the encrypted credentials store (`autumn credentials edit`) or \
+                 an AUTUMN_ACME_DNS_* environment variable — never in autumn.toml",
+            ),
+        },
+        DnsCredentialOutcome::Usable { provider, key } => CheckResult {
+            name: "acme_dns_credential",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "the {provider} DNS-01 credential `{key}` carries the fields it needs"
+            )),
+            hint: None,
+        },
+        DnsCredentialOutcome::Unusable(message) => CheckResult {
+            name: "acme_dns_credential",
+            status: CheckStatus::Fail,
+            detail: Some(message.clone()),
+            hint: Some(
+                "Without it no _acme-challenge record can be written, so every issuance and \
+                 renewal fails. Run `autumn credentials edit` to add the credential",
+            ),
+        },
+    }
+}
+
+/// Read the DNS provider credential the way the runtime does and grade it.
+///
+/// Reads the encrypted credentials store for `profile`, overlaid with the
+/// documented `AUTUMN_ACME_DNS_*` environment variables — the same resolution
+/// order `build_dns_challenge` uses at boot, so a Pass here means the app will
+/// find the same credential.
+#[cfg(feature = "tls")]
+#[must_use]
+pub fn resolve_acme_dns_credential(
+    config: &AcmeDoctorConfig,
+    profile: &str,
+    base_dir: &std::path::Path,
+) -> DnsCredentialOutcome {
+    use autumn_web::acme::dns::{DnsCredential, process_env, validate_credential};
+
+    if let Some(error) = &config.dns_error {
+        return DnsCredentialOutcome::Malformed(error.clone());
+    }
+    let Some(dns) = config.dns.as_ref() else {
+        return DnsCredentialOutcome::NotConfigured;
+    };
+    let store = autumn_web::credentials::load_credentials(profile, base_dir).unwrap_or_default();
+    let credential = DnsCredential::resolve(dns, &store, &process_env);
+    let key = dns.credential.trim().to_owned();
+    match validate_credential(dns.provider, &key, &credential) {
+        Ok(()) => DnsCredentialOutcome::Usable {
+            provider: dns.provider.as_str().to_owned(),
+            key,
+        },
+        Err(message) => DnsCredentialOutcome::Unusable(message),
+    }
+}
+
+/// What public DNS said about a zone's `_acme-challenge` name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChallengeDnsVisibility {
+    /// Public DNS answers authoritatively for the name (whether or not a record
+    /// is currently published there).
+    Answered {
+        /// How many TXT values are currently visible — normally `0` between
+        /// issuances.
+        values: usize,
+    },
+    /// A record is still published from an earlier run.
+    Stale {
+        /// How many leftover TXT values are visible.
+        values: usize,
+    },
+    /// The resolver could not answer for the name.
+    Unanswerable(String),
+}
+
+/// Grade whether a DNS-01 challenge TXT record would be visible in public DNS
+/// (pure; injectable).
+///
+/// A name public DNS cannot answer for is a **Fail**: the CA queries public DNS,
+/// so a broken or missing delegation means every DNS-01 validation fails no
+/// matter how correctly the record is written. Leftover records are a **Warn** —
+/// harmless for issuance, but the fingerprint of an earlier run that died before
+/// cleanup.
+#[must_use]
+pub fn check_acme_dns_propagation_impl(
+    fqdn: &str,
+    visibility: &ChallengeDnsVisibility,
+) -> CheckResult {
+    match visibility {
+        ChallengeDnsVisibility::Answered { .. } => CheckResult {
+            name: "acme_dns_propagation",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "public DNS answers for {fqdn}, so a published DNS-01 challenge record will be \
+                 visible to the CA"
+            )),
+            hint: None,
+        },
+        ChallengeDnsVisibility::Stale { values } => CheckResult {
+            name: "acme_dns_propagation",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{values} leftover TXT record(s) are still published at {fqdn}; an earlier \
+                 issuance did not clean up"
+            )),
+            hint: Some(
+                "Harmless for issuance, but worth removing: they are the fingerprint of an order \
+                 that failed or was interrupted before cleanup",
+            ),
+        },
+        ChallengeDnsVisibility::Unanswerable(reason) => CheckResult {
+            name: "acme_dns_propagation",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "public DNS could not answer for {fqdn}: {reason}. The ACME CA reads the DNS-01 \
+                 challenge record from public DNS, so no wildcard certificate can be issued while \
+                 this name is unanswerable"
+            )),
+            hint: Some(
+                "Check that the zone's NS delegation is live and that its nameservers answer for \
+                 the _acme-challenge name (a `dig TXT _acme-challenge.<domain>` from off-network \
+                 should return NOERROR or NXDOMAIN, never SERVFAIL)",
+            ),
+        },
+    }
+}
+
+/// Query the configured resolvers for a zone's `_acme-challenge` name.
+///
+/// Bounded and only run under `--online`, like the other active ACME probes. A
+/// name that answers on ANY configured resolver is answerable; only a name no
+/// resolver can answer for is graded a failure, so one flaky resolver does not
+/// fail the check.
+#[cfg(feature = "tls")]
+#[must_use]
+pub fn resolve_challenge_dns_visibility(
+    fqdn: &str,
+    resolvers: &[std::net::SocketAddr],
+) -> ChallengeDnsVisibility {
+    use autumn_web::acme::dns::resolver::lookup_txt_blocking;
+
+    let mut last_error = "no resolvers were configured".to_owned();
+    for resolver in resolvers {
+        match lookup_txt_blocking(*resolver, fqdn, std::time::Duration::from_secs(3)) {
+            Ok(answer) if answer.values.is_empty() => {
+                return ChallengeDnsVisibility::Answered { values: 0 };
+            }
+            Ok(answer) => {
+                return ChallengeDnsVisibility::Stale {
+                    values: answer.values.len(),
+                };
+            }
+            Err(e) => last_error = e,
+        }
+    }
+    ChallengeDnsVisibility::Unanswerable(last_error)
+}
+
+/// Grade whether the configured certificate covers `tenancy.base_domain`
+/// (pure; injectable).
+///
+/// A **Fail** when it does not: subdomain-per-tenant routing resolves a tenant
+/// from the Host header, so every tenant subdomain would serve a certificate
+/// name mismatch — the browser error that looks like the whole product is
+/// broken. This is the check that catches `base_domain = "myapp.com"` with
+/// `domains = ["myapp.com"]` and no wildcard.
+#[must_use]
+pub fn check_acme_tenancy_domain_impl(
+    base_domain: Option<&str>,
+    domains: &[String],
+    covers_subdomains: bool,
+) -> CheckResult {
+    let Some(base) = base_domain.map(str::trim).filter(|b| !b.is_empty()) else {
+        return CheckResult {
+            name: "acme_tenancy_domain",
+            status: CheckStatus::Pass,
+            detail: Some(
+                "no [tenancy] base_domain configured, so no tenant subdomains need certificate \
+                 coverage"
+                    .to_owned(),
+            ),
+            hint: None,
+        };
+    };
+    if covers_subdomains {
+        return CheckResult {
+            name: "acme_tenancy_domain",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "the configured certificate covers every subdomain of the [tenancy] base_domain \
+                 {base}"
+            )),
+            hint: None,
+        };
+    }
+    CheckResult {
+        name: "acme_tenancy_domain",
+        status: CheckStatus::Fail,
+        detail: Some(format!(
+            "[tenancy] base_domain is {base}, but [server.tls.acme] domains ({}) do not cover its \
+             subdomains: every tenant host would serve a certificate name mismatch",
+            domains.join(", ")
+        )),
+        hint: Some(
+            "Add the wildcard `*.<base_domain>` to [server.tls.acme] domains and configure \
+             [server.tls.acme.dns] — a wildcard can only be issued over DNS-01",
+        ),
+    }
+}
+
+/// Whether `domains` covers subdomains of `base_domain`, using the runtime's own
+/// RFC 6125 matcher against a probe host no explicit SAN could plausibly name.
+///
+/// A certificate "covers tenant subdomains" only if an ARBITRARY one matches, so
+/// the probe is a random-looking label: an explicit `tenant1.myapp.com` SAN must
+/// not read as coverage for tenant 2.
+#[must_use]
+pub fn acme_covers_tenant_subdomains(base_domain: &str, domains: &[String]) -> bool {
+    let base = base_domain.trim().trim_end_matches('.');
+    if base.is_empty() {
+        return false;
+    }
+    let probe = format!("autumn-doctor-probe-tenant.{base}");
+    domains
+        .iter()
+        .any(|san| autumn_web::config::san_covers_host(san, &probe))
 }
 
 /// Thin bounded I/O wrapper: probe a TCP port on `domain` with a 2s connect
@@ -1827,6 +2493,158 @@ fn is_valid_alert_mailbox_doctor(value: &str) -> bool {
             !local.is_empty() && !domain.is_empty() && domain.contains('.')
         }
         _ => false,
+    }
+}
+
+// ─── Platform support tier (issue #1616) ─────────────────────────────────────
+
+/// Report this platform's support tier, and on Windows the prerequisites and
+/// WSL2-only journeys a developer would otherwise discover by hitting them.
+///
+/// Takes the OS family as a string so the Windows branch is exercised by tests
+/// on every host — the branch that matters here is the one this CI never runs.
+/// Both branches read [`crate::platform::POLICY`], so doctor cannot describe a
+/// policy different from the one the commands enforce.
+#[must_use]
+pub fn check_platform_support_impl(os: &str) -> CheckResult {
+    use crate::platform::{SupportTier, WINDOWS_PREREQUISITES, commands_in_tier};
+
+    if os != "windows" {
+        return CheckResult {
+            name: "platform_support",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "{os}: every autumn journey runs natively on this platform"
+            )),
+            hint: None,
+        };
+    }
+
+    let tier_one = commands_in_tier(SupportTier::Native).join(", ");
+    let tier_two = commands_in_tier(SupportTier::Wsl2).join(", ");
+    let prerequisites = WINDOWS_PREREQUISITES
+        .iter()
+        .map(|p| format!("{} needs {}", p.subject, p.requirement))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    CheckResult {
+        name: "platform_support",
+        // Pass, not Warn. Windows is a supported development platform and the
+        // Tier 2 journeys are documented with a working answer (WSL2), so
+        // nothing here is a defect. It matters concretely: `exit_code` treats
+        // any warning as a failure under `--strict`, so warning unconditionally
+        // would make `autumn doctor --strict` — itself a Tier 1 command — exit 1
+        // forever on every Windows machine.
+        status: CheckStatus::Pass,
+        detail: Some(format!(
+            "windows: Tier 1 (native) — {tier_one}. Tier 2 (WSL2), run these from a \
+             WSL2 shell — {tier_two}. Prerequisites: {prerequisites}. Policy: \
+             docs/guide/platform-support.md"
+        )),
+        // `format_check_line` prints a hint only on warn/fail, so the pointer to
+        // the policy lives in the detail above rather than being silently
+        // dropped here.
+        hint: None,
+    }
+}
+
+#[cfg(test)]
+mod platform_support_tests {
+    use super::{CheckStatus, check_platform_support_impl};
+    use crate::platform::{SupportTier, WINDOWS_PREREQUISITES};
+
+    #[test]
+    fn windows_reports_tier_status_and_flags_prerequisites() {
+        let detail = check_platform_support_impl("windows")
+            .detail
+            .expect("a detail line");
+        // AC: doctor "reports the platform's tier status".
+        assert!(detail.contains("Tier 1"), "{detail}");
+        assert!(detail.contains("Tier 2"), "{detail}");
+        // AC: "flags known Windows-specific prerequisites (e.g. the
+        // vcpkg/OpenSSL requirement for `generate auth --passkeys`)".
+        assert!(detail.contains("vcpkg"), "{detail}");
+        assert!(detail.contains("--passkeys"), "{detail}");
+        for prerequisite in WINDOWS_PREREQUISITES {
+            assert!(
+                detail.contains(prerequisite.subject),
+                "prerequisite `{}` is not reported: {detail}",
+                prerequisite.subject
+            );
+        }
+    }
+
+    #[test]
+    fn windows_names_every_tier_two_command_so_nothing_is_a_surprise() {
+        let detail = check_platform_support_impl("windows")
+            .detail
+            .expect("a detail line");
+        for command in crate::platform::commands_in_tier(SupportTier::Wsl2) {
+            assert!(
+                detail.contains(command),
+                "Tier 2 command `{command}` missing from doctor output: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn unix_platforms_pass_with_every_journey_native() {
+        for os in ["linux", "macos"] {
+            let result = check_platform_support_impl(os);
+            assert_eq!(result.status, CheckStatus::Pass, "{os} should pass");
+            let detail = result.detail.unwrap_or_default();
+            assert!(
+                detail.contains("natively"),
+                "{os} detail should say every journey is native: {detail}"
+            );
+            assert!(
+                !detail.contains("WSL2"),
+                "{os} must not mention WSL2: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_check_is_named_so_json_consumers_can_key_on_it() {
+        assert_eq!(
+            check_platform_support_impl("windows").name,
+            "platform_support"
+        );
+        assert_eq!(
+            check_platform_support_impl("linux").name,
+            "platform_support"
+        );
+    }
+
+    #[test]
+    fn windows_does_not_fail_doctor_strict() {
+        // Windows is a supported development platform, so `autumn doctor
+        // --strict` must not reject a machine for being a Windows one — and
+        // `doctor` is itself a Tier 1 command in this very policy.
+        //
+        // A `Warn` is not enough: `exit_code` treats ANY warning as a failure
+        // under `--strict`, so an always-warning check makes `--strict` exit 1
+        // forever on Windows. The tier is information, not a defect.
+        let result = check_platform_support_impl("windows");
+        assert_eq!(result.status, CheckStatus::Pass);
+        let summary = super::compute_summary(std::slice::from_ref(&result));
+        assert_eq!(
+            super::exit_code(&summary, true),
+            0,
+            "platform_support must not fail `doctor --strict` on Windows"
+        );
+    }
+
+    #[test]
+    fn the_windows_detail_carries_the_policy_pointer_itself() {
+        // `format_check_line` prints a check's `hint` only on warn/fail, so a
+        // passing check's pointer to the guide has to live in the detail or it
+        // is never shown at all.
+        let detail = check_platform_support_impl("windows")
+            .detail
+            .expect("a detail line");
+        assert!(detail.contains("platform-support.md"), "{detail}");
     }
 }
 
@@ -3366,32 +4184,31 @@ fn check_replica_migrations(
 }
 
 fn latest_applied_migration_version(database_url: &str) -> Option<String> {
+    parse_latest_applied_migration_version(&diesel_migration_list(database_url)?)
+}
+
+/// The `diesel migration list` output for `database_url`, or `None` when the
+/// binary is absent, the database is unreachable, or the command failed.
+///
+/// Best effort by design: every caller treats "nothing known" as "raise no
+/// finding", which makes a missing `diesel` CLI impossible to mistake for a
+/// clean database.
+fn diesel_migration_list(database_url: &str) -> Option<String> {
     let output = std::process::Command::new("diesel")
         .args(["migration", "list"])
         .env("DATABASE_URL", database_url)
         .output()
         .ok()?;
-
     if !output.status.success() {
         return None;
     }
-
-    parse_latest_applied_migration_version(&String::from_utf8_lossy(&output.stdout))
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn parse_latest_applied_migration_version(output: &str) -> Option<String> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            let version = trimmed
-                .strip_prefix("[X]")
-                .or_else(|| trimmed.strip_prefix("[x]"))?
-                .split_whitespace()
-                .next()?;
-            Some(version.to_owned())
-        })
+    parse_applied_migration_tokens(output)
         .max()
+        .map(std::borrow::ToOwned::to_owned)
 }
 
 /// Parse (host, port) from a Postgres connection URL.
@@ -5068,6 +5885,19 @@ pub struct AcmeDoctorConfig {
     /// value is a valid `u32` or the key is absent (absent uses the runtime
     /// default, 30).
     pub renew_before_days_error: Option<String>,
+    /// The `[server.tls.acme.dns]` section (issue #1620), when configured, as the
+    /// runtime's typed `AcmeDnsConfig` sees it. `None` when the section is absent
+    /// (HTTP-01 issuance) or when it does not deserialize — see
+    /// [`dns_error`](Self::dns_error).
+    pub dns: Option<autumn_web::config::AcmeDnsConfig>,
+    /// The rendered deserialization error for a PRESENT but malformed
+    /// `[server.tls.acme.dns]` section — an unknown provider name, or (most
+    /// usefully) an inline `api_token`, which the runtime rejects outright
+    /// because DNS credentials never belong in `autumn.toml`. Recorded so the
+    /// grader FAILs rather than reporting "no DNS provider configured" for a
+    /// config the server refuses to boot on. `None` when the section is valid or
+    /// absent.
+    pub dns_error: Option<String>,
 }
 
 /// Deserialize `[server.tls.acme] directory` exactly as the runtime does.
@@ -5258,6 +6088,19 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         Some(other) => (None, Some(other.to_string())),
     };
 
+    // Deserialize `[server.tls.acme.dns]` the way the runtime's typed
+    // `AcmeDnsConfig` does. Its `deny_unknown_fields` is the point: an operator
+    // who pastes `api_token = "..."` into `autumn.toml` gets a FAIL naming the
+    // key, not a silently-ignored secret sitting in a plaintext file (#1620).
+    let (dns, dns_error) =
+        acme.get("dns").map_or((None, None), |value| match value
+            .clone()
+            .try_into::<autumn_web::config::AcmeDnsConfig>(
+        ) {
+            Ok(dns) => (Some(dns), None),
+            Err(e) => (None, Some(e.to_string())),
+        });
+
     Some(AcmeDoctorConfig {
         domains,
         contact_email,
@@ -5271,6 +6114,8 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         ca_root_error,
         domains_error,
         renew_before_days_error,
+        dns,
+        dns_error,
     })
 }
 
@@ -5362,8 +6207,10 @@ fn check_acme_deserialize_errors(config: &AcmeDoctorConfig) -> Option<CheckResul
 /// The runtime `TlsConfig::validate()` / `AcmeConfig::validate()` REJECTS an ACME
 /// config that (a) has a `directory` value that fails to deserialize as
 /// [`autumn_web::config::AcmeDirectory`], (b) lists no `domains`, (c) has a blank
-/// `contact_email`, or (d) includes a wildcard `*.` domain (wildcards require
-/// DNS-01, tracked in #1620) — the server exits at boot. `validate()`'s fifth
+/// `contact_email`, (d) includes a wildcard domain with no
+/// `[server.tls.acme.dns]` section (or a malformed one), or (e) has a
+/// `[server.tls.acme.dns]` section its own `validate()` rejects — the server
+/// exits at boot in every case. `validate()`'s fifth
 /// rule, a blank `ca_root_path`, is graded by
 /// [`check_acme_ca_root_impl`] instead: the whole `ca_root_path` story (blank,
 /// non-string, unreadable, unusable, a bundle, or redundant against a public
@@ -5441,13 +6288,30 @@ pub fn check_acme_config_impl(config: &AcmeDoctorConfig) -> Option<CheckResult> 
             "Set [server.tls.acme] renew_before_days below 90 (default 30)",
         ));
     }
-    check_acme_domain_entries(domains)
+    if let Some(fail) = check_acme_domain_entries(domains, config.dns.is_some()) {
+        return Some(fail);
+    }
+    // Mirror `AcmeDnsConfig::validate()` too: a DNS section the runtime rejects
+    // (an exec provider with no command, a zero propagation budget, an
+    // unparseable resolver) exits at boot exactly like a bad `domains` entry.
+    config.dns.as_ref().and_then(|dns| {
+        dns.validate().err().map(|message| {
+            acme_config_fail(
+                message,
+                "Fix the [server.tls.acme.dns] section; the server refuses to boot on it",
+            )
+        })
+    })
 }
 
-/// Grade individual `[server.tls.acme] domains` entries (blank / wildcard),
-/// mirroring `AcmeConfig::validate`'s per-entry rules. Extracted from
+/// Grade individual `[server.tls.acme] domains` entries (blank / wildcard /
+/// padded), mirroring `AcmeConfig::validate`'s per-entry rules. Extracted from
 /// [`check_acme_config_impl`] to keep that grader within the line budget.
-fn check_acme_domain_entries(domains: &[String]) -> Option<CheckResult> {
+///
+/// `dns_configured` is whether `[server.tls.acme.dns]` is present: since #1620 a
+/// wildcard is valid exactly when it is, because only DNS-01 can validate a
+/// wildcard identifier.
+fn check_acme_domain_entries(domains: &[String], dns_configured: bool) -> Option<CheckResult> {
     for (index, domain) in domains.iter().enumerate() {
         let trimmed = domain.trim();
         if trimmed.is_empty() {
@@ -5459,15 +6323,39 @@ fn check_acme_domain_entries(domains: &[String]) -> Option<CheckResult> {
                 "Remove blank/whitespace-only entries from [server.tls.acme] domains",
             ));
         }
-        if trimmed.starts_with("*.") {
-            return Some(acme_config_fail(
-                format!(
-                    "[server.tls.acme] wildcard domain `{trimmed}` is not supported: wildcards \
-                     require the DNS-01 challenge, which is out of scope here (tracked in #1620). \
-                     List explicit hostnames instead"
-                ),
-                "Remove wildcard domains; list explicit hostnames (DNS-01 tracked in #1620)",
-            ));
+        if trimmed.contains('*') {
+            if !dns_configured {
+                return Some(acme_config_fail(
+                    format!(
+                        "[server.tls.acme] wildcard domain `{trimmed}` needs the DNS-01 \
+                         challenge: an ACME CA will not validate a wildcard identifier over \
+                         HTTP-01. Add a [server.tls.acme.dns] section naming your DNS provider \
+                         (and the credentials-store key holding its API token), or list explicit \
+                         hostnames instead"
+                    ),
+                    "Add a [server.tls.acme.dns] section, or list explicit hostnames",
+                ));
+            }
+            let Some(base) = trimmed.strip_prefix("*.") else {
+                return Some(acme_config_fail(
+                    format!(
+                        "[server.tls.acme] domain `{trimmed}` is not a usable wildcard: a \
+                         wildcard SAN must be written as `*.` followed by the base domain (e.g. \
+                         `*.myapp.com`) — a `*` anywhere else is not matched by any client"
+                    ),
+                    "Write the wildcard as `*.<base domain>`",
+                ));
+            };
+            if base.is_empty() || base.contains('*') {
+                return Some(acme_config_fail(
+                    format!(
+                        "[server.tls.acme] domain `{trimmed}` is not a usable wildcard: exactly \
+                         one leading `*.` is allowed and the base domain after it must be \
+                         non-empty (e.g. `*.myapp.com`)"
+                    ),
+                    "Write the wildcard as `*.<base domain>`, with exactly one leading `*.`",
+                ));
+            }
         }
         // The two rules above read `trimmed`, but the runtime stores and uses the
         // entry UNTRIMMED — as the certificate's SAN and as the ACME order's DNS
@@ -5497,7 +6385,19 @@ fn check_acme_domain_entries(domains: &[String]) -> Option<CheckResult> {
 /// unit-testable without real network I/O — `run()` enqueues one bounded port
 /// task and one DNS task for each domain returned here.
 fn acme_online_probe_domains(config: &AcmeDoctorConfig) -> Vec<String> {
-    config.domains.clone()
+    // A `*.myapp.com` entry has no address record of its own, so probing it
+    // literally would resolve to nothing and report a permanent, meaningless
+    // Warn on every wildcard deployment. Probe the base domain it covers
+    // instead — that IS the host tenants' subdomains point at — and drop the
+    // duplicate when the apex is also listed explicitly (#1620).
+    let mut probed: Vec<String> = Vec::new();
+    for domain in &config.domains {
+        let target = domain.strip_prefix("*.").unwrap_or(domain).to_owned();
+        if !target.is_empty() && !probed.contains(&target) {
+            probed.push(target);
+        }
+    }
+    probed
 }
 
 /// Inspect the stored ACME certificate for the CONFIGURED domains under the
@@ -6772,6 +7672,13 @@ pub fn run(opts: DoctorOptions) {
     // ── Phase 2: build tasks in display order ────────────────────────────────
     let mut tasks: Vec<Task> = Vec::new();
 
+    // 0. Platform support tier (#1616). First, because it frames every check
+    // below: on Windows a developer needs to know which journeys are native
+    // before they read a warning about one that is not.
+    tasks.push(Box::new(|| {
+        check_platform_support_impl(std::env::consts::OS)
+    }));
+
     // 1. Rust toolchain
     tasks.push(Box::new(move || check_rust_toolchain(&msrv)));
 
@@ -7358,6 +8265,26 @@ pub fn run(opts: DoctorOptions) {
     let (acme_canonical, acme_selected, _) = resolve_active_profiles();
     let merged_acme_toml = get_merged_toml_table_runtime(&acme_canonical, &acme_selected);
     let acme_config = resolve_acme_doctor_config(Some(&merged_acme_toml));
+    // The profile whose encrypted credentials file the runtime would read, and
+    // the tenancy base domain tenant subdomains are resolved against — both read
+    // from the SAME merged, profile-layered view the ACME config comes from, so
+    // the DNS-01 checks below grade exactly what the app will see (#1620).
+    // The CANONICAL profile, not the raw environment variable: the runtime maps
+    // `production` → `prod` before loading `config/credentials/<profile>.toml.enc`
+    // (`normalize_profile_name`), so grading the raw spelling would read a
+    // different file than the server does — and report "no credential found" for
+    // a deployment that is correctly configured, or the reverse.
+    let acme_credentials_profile = if acme_canonical.trim().is_empty() {
+        "dev".to_owned()
+    } else {
+        acme_canonical.trim().to_ascii_lowercase()
+    };
+    let tenancy_base_domain = merged_acme_toml
+        .get("tenancy")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("base_domain"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
 
     // XOR inputs mirror `TlsConfig::validate`, which keys static-mode on
     // `cert_path.is_some()` / `key_path.is_some()`: base them on whether the
@@ -7430,24 +8357,87 @@ pub fn run(opts: DoctorOptions) {
             );
             tasks.push(Box::new(move || check_acme_ca_root_impl(&ca_root)));
 
+            // Offline: the DNS-01 provider credential (issue #1620). Read the
+            // same way the runtime reads it — encrypted credentials store,
+            // overlaid with AUTUMN_ACME_DNS_* — so a Pass here means the app
+            // will find the same credential at boot.
+            // Reading the credential needs the runtime's own resolution +
+            // validation, which live behind autumn-web's `acme` feature (pulled
+            // in by this crate's `tls` feature). Without it the check reports a
+            // Warn rather than silently passing an unverified credential.
+            #[cfg(feature = "tls")]
+            {
+                let credential = resolve_acme_dns_credential(
+                    &acme,
+                    &acme_credentials_profile,
+                    std::path::Path::new("."),
+                );
+                tasks.push(Box::new(move || {
+                    check_acme_dns_credential_impl(&credential)
+                }));
+            }
+            #[cfg(not(feature = "tls"))]
+            if acme.dns.is_some() || acme.dns_error.is_some() {
+                tasks.push(Box::new(|| CheckResult {
+                    name: "acme_dns_credential",
+                    status: CheckStatus::Warn,
+                    detail: Some(
+                        "this autumn binary was built without the `tls` feature, so the DNS-01 \
+                         provider credential cannot be read or validated"
+                            .to_owned(),
+                    ),
+                    hint: Some("Rebuild the CLI with the `tls` feature to run this check"),
+                }));
+            }
+
+            // Offline: does the certificate actually cover the tenant subdomains
+            // `[tenancy] base_domain` will serve? A base domain the certificate
+            // does not cover means every tenant host serves a name mismatch.
+            let tenancy_base = tenancy_base_domain;
+            let tenancy_domains = acme.domains.clone();
+            let covers = tenancy_base
+                .as_deref()
+                .is_some_and(|base| acme_covers_tenant_subdomains(base, &tenancy_domains));
+            tasks.push(Box::new(move || {
+                check_acme_tenancy_domain_impl(tenancy_base.as_deref(), &tenancy_domains, covers)
+            }));
+
             // Probe EVERY configured domain: issuance orders authorizations for
             // all `config.domains`, so a probe of only the first name can pass
             // doctor while issuance fails on an unprobed domain. One port + DNS
             // check per domain, each labeled with the domain in its detail; still
             // bounded and gated behind --online.
             if opts.online {
+                let dns01 = acme.dns.is_some();
                 for domain in acme_online_probe_domains(&acme) {
                     let d80 = domain.clone();
                     tasks.push(Box::new(move || {
                         let p80 = probe_port(&d80, 80);
                         let p443 = probe_port(&d80, 443);
-                        check_acme_ports_impl(&d80, p80, p443)
+                        check_acme_ports_for_challenge(&d80, p80, p443, dns01)
                     }));
                     let d_dns = domain;
                     tasks.push(Box::new(move || {
                         let outcome = resolve_dns_points_here(&d_dns);
-                        check_acme_dns_impl(&d_dns, &outcome)
+                        check_acme_dns_for_challenge(&d_dns, &outcome, dns01)
                     }));
+                }
+
+                // Online: can public DNS answer for the zone's _acme-challenge
+                // name at all? The CA reads the challenge record from public
+                // DNS, so a broken delegation fails every DNS-01 order however
+                // correctly the record is written (#1620).
+                #[cfg(feature = "tls")]
+                if let Some(dns_cfg) = acme.dns.clone() {
+                    let resolvers = dns_cfg.resolver_addrs().unwrap_or_default();
+                    for domain in acme_online_probe_domains(&acme) {
+                        let fqdn = autumn_web::acme::dns::challenge_fqdn(&domain);
+                        let resolvers = resolvers.clone();
+                        tasks.push(Box::new(move || {
+                            let visibility = resolve_challenge_dns_visibility(&fqdn, &resolvers);
+                            check_acme_dns_propagation_impl(&fqdn, &visibility)
+                        }));
+                    }
                 }
             }
         }
@@ -7701,6 +8691,24 @@ pub fn run(opts: DoctorOptions) {
         let scan = crate::edge_scan::resolve_edge_scan(std::path::Path::new("."));
         let capsule_bin_exists = std::path::Path::new(EDGE_CAPSULE_BIN).exists();
         check_edge_routes_impl(&scan, capsule_bin_exists)
+    }));
+
+    // 18. Orphaned plugin residue (issue #1631): a dependency with no mount, a
+    //     mount with no dependency, or migrations still applied for a plugin
+    //     that is no longer in the app. The migration half is best effort —
+    //     `__diesel_schema_migrations` has no source column, so the only way to
+    //     attribute a version to a plugin is the plugin's own declared list,
+    //     and reading the history at all needs a configured database plus the
+    //     `diesel` CLI. Without either, the check still reports the two static
+    //     findings and simply never raises the third.
+    let residue_database_url = db_topology.primary_url.clone().or(db_topology.legacy_url);
+    tasks.push(Box::new(move || {
+        let wirings = resolve_plugin_wirings(std::path::Path::new("."), || {
+            residue_database_url
+                .as_deref()
+                .map_or_else(Vec::new, applied_migration_versions)
+        });
+        check_plugin_residue_impl(&wirings)
     }));
 
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
@@ -10299,10 +11307,11 @@ pub struct Vault {
 
     #[test]
     fn acme_ports_pass_when_both_open() {
-        let r = check_acme_ports_impl(
+        let r = check_acme_ports_for_challenge(
             "app.example.com",
             PortReachability::Open,
             PortReachability::Open,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -10314,7 +11323,12 @@ pub struct Vault {
             PortReachability::TimedOut,
             PortReachability::Error,
         ] {
-            let r = check_acme_ports_impl("app.example.com", p80, PortReachability::Open);
+            let r = check_acme_ports_for_challenge(
+                "app.example.com",
+                p80,
+                PortReachability::Open,
+                false,
+            );
             assert!(matches!(r.status, CheckStatus::Fail), "port80={p80:?}");
             assert!(r.detail.as_deref().unwrap().contains("port 80"));
         }
@@ -10322,27 +11336,29 @@ pub struct Vault {
 
     #[test]
     fn acme_ports_warn_when_only_443_down() {
-        let r = check_acme_ports_impl(
+        let r = check_acme_ports_for_challenge(
             "app.example.com",
             PortReachability::Open,
             PortReachability::Refused,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
     }
 
     #[test]
     fn acme_dns_pass_when_points_here() {
-        let r = check_acme_dns_impl("app.example.com", &DnsPointsHere::Matches);
+        let r = check_acme_dns_for_challenge("app.example.com", &DnsPointsHere::Matches, false);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
     #[test]
     fn acme_dns_fail_when_resolves_elsewhere() {
-        let r = check_acme_dns_impl(
+        let r = check_acme_dns_for_challenge(
             "app.example.com",
             &DnsPointsHere::ResolvesElsewhere {
                 resolved: vec!["203.0.113.7".to_owned()],
             },
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Fail));
         assert!(r.detail.as_deref().unwrap().contains("203.0.113.7"));
@@ -10351,7 +11367,7 @@ pub struct Vault {
     #[test]
     fn acme_dns_warn_when_indeterminate() {
         for outcome in [DnsPointsHere::Unresolved, DnsPointsHere::LocalIpsUnknown] {
-            let r = check_acme_dns_impl("app.example.com", &outcome);
+            let r = check_acme_dns_for_challenge("app.example.com", &outcome, false);
             assert!(matches!(r.status, CheckStatus::Warn), "outcome={outcome:?}");
         }
     }
@@ -10436,7 +11452,7 @@ pub struct Vault {
         // And the check grades a partial match as a Warn that names the stray
         // address — not a clean Pass.
         let outcome = grade_dns_points_here(&resolved, &local);
-        let r = check_acme_dns_impl("app.example.com", &outcome);
+        let r = check_acme_dns_for_challenge("app.example.com", &outcome, false);
         assert!(
             matches!(r.status, CheckStatus::Warn),
             "a partial DNS match must be a Warn, not a clean Pass"
@@ -10750,7 +11766,273 @@ pub struct Vault {
             ca_root_error: None,
             domains_error: None,
             renew_before_days_error: None,
+            dns: None,
+            dns_error: None,
         }
+    }
+
+    // ── DNS-01 / wildcard preflight (issue #1620) ─────────────────────────────
+
+    fn acme_dns_cfg(
+        provider: autumn_web::config::AcmeDnsProvider,
+    ) -> autumn_web::config::AcmeDnsConfig {
+        toml::from_str(&format!("provider = \"{}\"\n", provider.as_str()))
+            .expect("the minimal DNS section parses")
+    }
+
+    #[test]
+    fn dns_credential_check_passes_when_no_dns_section_is_configured() {
+        let result = check_acme_dns_credential_impl(&DnsCredentialOutcome::NotConfigured);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(
+            result.detail.unwrap().contains("HTTP-01"),
+            "the pass must explain why no credential is needed"
+        );
+    }
+
+    // AC7: "`autumn doctor` diagnoses … missing or invalid provider credential".
+    // A Fail, not a Warn: without it every issuance and renewal fails, and
+    // nothing about the running app reveals that until expiry.
+    #[test]
+    fn a_missing_dns_credential_fails_and_says_where_to_put_it() {
+        let outcome = DnsCredentialOutcome::Unusable(
+            "no Cloudflare API token found for [server.tls.acme.dns] credential `acme_dns`: add \
+             it under `[acme_dns]` in the encrypted credentials store (`autumn credentials edit`) \
+             as `api_token = \"...\"`, or set the AUTUMN_ACME_DNS_API_TOKEN environment variable"
+                .to_owned(),
+        );
+        let result = check_acme_dns_credential_impl(&outcome);
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap();
+        assert!(detail.contains("api_token"), "got: {detail}");
+        assert!(detail.contains("autumn credentials edit"), "got: {detail}");
+    }
+
+    // The runtime refuses to boot on a `[server.tls.acme.dns]` that does not
+    // deserialize — most usefully, one carrying an inline `api_token`. Doctor
+    // must FAIL that rather than report "no DNS provider configured".
+    #[test]
+    fn a_malformed_dns_section_fails_and_names_the_problem() {
+        let result = check_acme_dns_credential_impl(&DnsCredentialOutcome::Malformed(
+            "unknown field `api_token`".to_owned(),
+        ));
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.detail.unwrap().contains("api_token"));
+        assert!(result.hint.unwrap().contains("never in autumn.toml"));
+    }
+
+    #[test]
+    fn a_usable_dns_credential_passes_and_names_the_provider_and_key() {
+        let result = check_acme_dns_credential_impl(&DnsCredentialOutcome::Usable {
+            provider: "cloudflare".to_owned(),
+            key: "acme_dns".to_owned(),
+        });
+        assert_eq!(result.status, CheckStatus::Pass);
+        let detail = result.detail.unwrap();
+        assert!(detail.contains("cloudflare"), "got: {detail}");
+        assert!(detail.contains("acme_dns"), "got: {detail}");
+    }
+
+    // AC7: "challenge TXT record not visible in public DNS". A name the resolvers
+    // cannot answer for at all defeats a correctly-written record, so it is a
+    // Fail; leftover records are only a Warn.
+    #[test]
+    fn challenge_dns_visibility_grades_answerability_then_leftovers() {
+        let fqdn = "_acme-challenge.myapp.com";
+
+        let pass =
+            check_acme_dns_propagation_impl(fqdn, &ChallengeDnsVisibility::Answered { values: 0 });
+        assert_eq!(pass.status, CheckStatus::Pass);
+
+        let warn =
+            check_acme_dns_propagation_impl(fqdn, &ChallengeDnsVisibility::Stale { values: 2 });
+        assert_eq!(warn.status, CheckStatus::Warn);
+        assert!(warn.detail.unwrap().contains('2'));
+
+        let fail = check_acme_dns_propagation_impl(
+            fqdn,
+            &ChallengeDnsVisibility::Unanswerable(
+                "SERVFAIL — the zone's nameservers did not answer".to_owned(),
+            ),
+        );
+        assert_eq!(fail.status, CheckStatus::Fail);
+        let detail = fail.detail.unwrap();
+        assert!(
+            detail.contains(fqdn),
+            "the message must name the record: {detail}"
+        );
+        assert!(detail.contains("SERVFAIL"), "got: {detail}");
+    }
+
+    // AC7: "a `tenancy.base_domain` that the configured certificate domain does
+    // not cover" — the check that catches a subdomain-per-tenant deployment with
+    // a single-hostname certificate, where every tenant serves a name mismatch.
+    #[test]
+    fn tenancy_base_domain_must_be_covered_by_the_certificate() {
+        let single = vec!["myapp.com".to_owned()];
+        let covers = acme_covers_tenant_subdomains("myapp.com", &single);
+        assert!(!covers, "an apex-only certificate covers no subdomain");
+        let result = check_acme_tenancy_domain_impl(Some("myapp.com"), &single, covers);
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap();
+        assert!(detail.contains("myapp.com"), "got: {detail}");
+        assert!(result.hint.unwrap().contains("*.<base_domain>"));
+
+        let wildcard = vec!["myapp.com".to_owned(), "*.myapp.com".to_owned()];
+        let covers = acme_covers_tenant_subdomains("myapp.com", &wildcard);
+        assert!(covers);
+        assert_eq!(
+            check_acme_tenancy_domain_impl(Some("myapp.com"), &wildcard, covers).status,
+            CheckStatus::Pass
+        );
+
+        // No tenancy configured: nothing to cover.
+        assert_eq!(
+            check_acme_tenancy_domain_impl(None, &single, false).status,
+            CheckStatus::Pass
+        );
+        assert_eq!(
+            check_acme_tenancy_domain_impl(Some("   "), &single, false).status,
+            CheckStatus::Pass
+        );
+    }
+
+    // An explicitly-listed tenant hostname is NOT coverage for tenant N+1 — the
+    // probe host must be one no explicit SAN could plausibly name.
+    #[test]
+    fn one_explicit_tenant_san_is_not_subdomain_coverage() {
+        let explicit = vec!["myapp.com".to_owned(), "tenant1.myapp.com".to_owned()];
+        assert!(!acme_covers_tenant_subdomains("myapp.com", &explicit));
+        // …and a wildcard for a DIFFERENT zone is not coverage either.
+        assert!(!acme_covers_tenant_subdomains(
+            "myapp.com",
+            &["*.other.com".to_owned()]
+        ));
+    }
+
+    // Regression (Codex, #1620): the port check was softened for DNS-01 but the
+    // address check was not, so a wildcard deployment behind a load balancer —
+    // the normal shape for this feature — still failed `--online --strict` on a
+    // rule that is HTTP-01-specific by construction.
+    #[test]
+    fn resolving_elsewhere_is_not_a_failure_under_dns01() {
+        let elsewhere = DnsPointsHere::ResolvesElsewhere {
+            resolved: vec!["203.0.113.10".to_owned()],
+        };
+
+        // HTTP-01: the CA fetches the token from whatever the name resolves to,
+        // so pointing elsewhere means issuance hits the wrong server.
+        assert_eq!(
+            check_acme_dns_for_challenge("myapp.com", &elsewhere, false).status,
+            CheckStatus::Fail
+        );
+
+        // DNS-01: the CA reads a TXT record and never connects here at all.
+        let dns01 = check_acme_dns_for_challenge("myapp.com", &elsewhere, true);
+        assert_eq!(dns01.status, CheckStatus::Pass);
+        assert!(
+            dns01.detail.unwrap().contains("TXT record"),
+            "the pass must say why the mismatch does not matter"
+        );
+
+        // A partial match and an unknowable local IP are the same story.
+        for inconclusive in [
+            DnsPointsHere::PartialMatch {
+                unmatched: vec!["203.0.113.10".to_owned()],
+            },
+            DnsPointsHere::LocalIpsUnknown,
+        ] {
+            assert_eq!(
+                check_acme_dns_for_challenge("myapp.com", &inconclusive, true).status,
+                CheckStatus::Pass
+            );
+        }
+
+        // A name that resolves nowhere is still worth a Warn: issuance would
+        // succeed, but no visitor could reach the app.
+        let unresolved =
+            check_acme_dns_for_challenge("myapp.com", &DnsPointsHere::Unresolved, true);
+        assert_eq!(unresolved.status, CheckStatus::Warn);
+        assert!(unresolved.detail.unwrap().contains("visitors"));
+
+        // Resolving here is a plain pass either way.
+        for dns01 in [false, true] {
+            assert_eq!(
+                check_acme_dns_for_challenge("myapp.com", &DnsPointsHere::Matches, dns01).status,
+                CheckStatus::Pass
+            );
+        }
+    }
+
+    // Under DNS-01 the CA never connects to :80, so an unreachable port 80 costs
+    // only the HTTP→HTTPS redirect. Failing it would make `doctor --online
+    // --strict` reject a correct wildcard deployment on a :443-only host.
+    #[test]
+    fn port_80_is_only_a_warning_under_dns01() {
+        let http01 = check_acme_ports_for_challenge(
+            "myapp.com",
+            PortReachability::Refused,
+            PortReachability::Open,
+            false,
+        );
+        assert_eq!(http01.status, CheckStatus::Fail);
+
+        let dns01 = check_acme_ports_for_challenge(
+            "myapp.com",
+            PortReachability::Refused,
+            PortReachability::Open,
+            true,
+        );
+        assert_eq!(dns01.status, CheckStatus::Warn);
+        assert!(
+            dns01.detail.unwrap().contains("redirect"),
+            "the warning must say what is actually lost"
+        );
+
+        // With both ports open the grading is identical either way.
+        for dns in [false, true] {
+            assert_eq!(
+                check_acme_ports_for_challenge(
+                    "myapp.com",
+                    PortReachability::Open,
+                    PortReachability::Open,
+                    dns
+                )
+                .status,
+                CheckStatus::Pass
+            );
+        }
+    }
+
+    // A `*.myapp.com` entry has no address record of its own: probing it
+    // literally would report a permanent, meaningless Warn on every wildcard
+    // deployment. It is probed as the base domain it covers, deduplicated
+    // against an explicitly-listed apex.
+    #[test]
+    fn wildcard_domains_are_probed_as_their_base_domain() {
+        let mut cfg = acme_doctor_cfg(&["myapp.com", "*.myapp.com"], "ops@myapp.com");
+        cfg.dns = Some(acme_dns_cfg(
+            autumn_web::config::AcmeDnsProvider::Cloudflare,
+        ));
+        assert_eq!(
+            acme_online_probe_domains(&cfg),
+            vec!["myapp.com".to_owned()],
+            "the apex is probed once, and the wildcard resolves to it"
+        );
+
+        // A wildcard with no explicit apex still probes the base domain.
+        let cfg = acme_doctor_cfg(&["*.myapp.com"], "ops@myapp.com");
+        assert_eq!(
+            acme_online_probe_domains(&cfg),
+            vec!["myapp.com".to_owned()]
+        );
+
+        // Non-wildcard configs are unchanged.
+        let cfg = acme_doctor_cfg(&["a.example.com", "b.example.com"], "ops@example.com");
+        assert_eq!(
+            acme_online_probe_domains(&cfg),
+            vec!["a.example.com".to_owned(), "b.example.com".to_owned()]
+        );
     }
 
     // Regression (#1608, Codex): doctor must mirror AcmeConfig::validate(). An
@@ -10772,13 +12054,25 @@ pub struct Vault {
     }
 
     #[test]
-    fn acme_config_fail_when_wildcard_domain() {
+    fn acme_config_fail_when_wildcard_domain_has_no_dns_provider() {
         let r = check_acme_config_impl(&acme_doctor_cfg(&["*.example.com"], "ops@example.com"))
-            .expect("wildcard domain must be a FAIL");
+            .expect("a wildcard with no DNS-01 provider must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
-        // Points the operator at the DNS-01 tracking issue, mirroring
-        // AcmeConfig::validate().
-        assert!(r.detail.as_deref().unwrap_or_default().contains("#1620"));
+        // Names the section that fixes it, mirroring AcmeConfig::validate().
+        let detail = r.detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("[server.tls.acme.dns]"), "got: {detail}");
+        assert!(detail.contains("DNS-01"), "got: {detail}");
+
+        // …and with the section present the same config is accepted, because
+        // DNS-01 is exactly what makes a wildcard issuable (#1620).
+        let mut cfg = acme_doctor_cfg(&["*.example.com"], "ops@example.com");
+        cfg.dns = Some(acme_dns_cfg(
+            autumn_web::config::AcmeDnsProvider::Cloudflare,
+        ));
+        assert!(
+            check_acme_config_impl(&cfg).is_none(),
+            "a wildcard WITH a DNS-01 provider is a valid config"
+        );
     }
 
     #[test]
@@ -11179,29 +12473,93 @@ contact_email = \"ops@example.com\"
             (&["app .example.com"], "ops@example.com", 80, 30),
         ];
 
+        // Every case is run BOTH with and without a `[server.tls.acme.dns]`
+        // section, because since #1620 the section is what decides whether a
+        // wildcard entry is valid — so a doctor that ignored it would pass a
+        // wildcard config the server refuses (or fail one it accepts).
         for (domains, contact_email, http_challenge_port, renew_before_days) in cases {
-            let mut doctor_cfg = acme_doctor_cfg(domains, contact_email);
-            doctor_cfg.http_challenge_port = *http_challenge_port;
-            doctor_cfg.renew_before_days = *renew_before_days;
+            for dns in [
+                None,
+                Some(acme_dns_cfg(
+                    autumn_web::config::AcmeDnsProvider::Cloudflare,
+                )),
+                // A DNS section the runtime itself rejects: `exec` with no
+                // command. Doctor must fail it too.
+                Some(
+                    toml::from_str::<autumn_web::config::AcmeDnsConfig>("provider = \"exec\"\n")
+                        .expect("parses; validate() is what rejects it"),
+                ),
+            ] {
+                let mut doctor_cfg = acme_doctor_cfg(domains, contact_email);
+                doctor_cfg.http_challenge_port = *http_challenge_port;
+                doctor_cfg.renew_before_days = *renew_before_days;
+                doctor_cfg.dns = dns.clone();
 
-            let runtime_cfg = autumn_web::config::AcmeConfig {
-                domains: domains.iter().map(|d| (*d).to_owned()).collect(),
-                contact_email: (*contact_email).to_owned(),
-                directory: autumn_web::config::AcmeDirectory::Staging,
-                cache_dir: std::path::PathBuf::from("config/acme"),
-                http_challenge_port: *http_challenge_port,
-                renew_before_days: *renew_before_days,
-                ca_root_path: None,
-            };
+                let runtime_cfg = autumn_web::config::AcmeConfig {
+                    domains: domains.iter().map(|d| (*d).to_owned()).collect(),
+                    contact_email: (*contact_email).to_owned(),
+                    directory: autumn_web::config::AcmeDirectory::Staging,
+                    cache_dir: std::path::PathBuf::from("config/acme"),
+                    http_challenge_port: *http_challenge_port,
+                    renew_before_days: *renew_before_days,
+                    ca_root_path: None,
+                    dns: dns.clone(),
+                };
 
-            assert_eq!(
-                check_acme_config_impl(&doctor_cfg).is_some(),
-                runtime_cfg.validate().is_err(),
-                "doctor and AcmeConfig::validate disagree on domains={domains:?} \
-                 contact_email={contact_email:?} port={http_challenge_port} \
-                 renew_before_days={renew_before_days} (runtime said {:?})",
-                runtime_cfg.validate()
-            );
+                assert_eq!(
+                    check_acme_config_impl(&doctor_cfg).is_some(),
+                    runtime_cfg.validate().is_err(),
+                    "doctor and AcmeConfig::validate disagree on domains={domains:?} \
+                     contact_email={contact_email:?} port={http_challenge_port} \
+                     renew_before_days={renew_before_days} dns={:?} (runtime said {:?})",
+                    dns.as_ref().map(|d| d.provider),
+                    runtime_cfg.validate()
+                );
+            }
+        }
+    }
+
+    // #1620's own rows for the parity test above: a wildcard is valid exactly
+    // when a DNS-01 provider is configured, and a malformed one never is.
+    #[test]
+    fn wildcard_domain_parity_depends_on_the_dns_section() {
+        let wildcard_cases: &[&[&str]] = &[
+            &["*.myapp.com"],
+            &["myapp.com", "*.myapp.com"],
+            &["*"],
+            &["*."],
+            &["*myapp.com"],
+            &["app.*.myapp.com"],
+            &["*.*.myapp.com"],
+        ];
+        for domains in wildcard_cases {
+            for dns in [
+                None,
+                Some(acme_dns_cfg(
+                    autumn_web::config::AcmeDnsProvider::Cloudflare,
+                )),
+            ] {
+                let mut doctor_cfg = acme_doctor_cfg(domains, "ops@myapp.com");
+                doctor_cfg.dns = dns.clone();
+                let runtime_cfg = autumn_web::config::AcmeConfig {
+                    domains: domains.iter().map(|d| (*d).to_owned()).collect(),
+                    contact_email: "ops@myapp.com".to_owned(),
+                    directory: autumn_web::config::AcmeDirectory::Staging,
+                    cache_dir: std::path::PathBuf::from("config/acme"),
+                    http_challenge_port: 80,
+                    renew_before_days: 30,
+                    ca_root_path: None,
+                    dns: dns.clone(),
+                };
+                assert_eq!(
+                    check_acme_config_impl(&doctor_cfg).is_some(),
+                    runtime_cfg.validate().is_err(),
+                    "doctor and AcmeConfig::validate disagree on domains={domains:?} with \
+                     dns={} (runtime said {:?})",
+                    dns.is_some(),
+                    runtime_cfg.validate()
+                );
+            }
         }
     }
 
@@ -11642,12 +13000,17 @@ directory = \"production\"
         let mut ports_checks = Vec::new();
         let mut dns_checks = Vec::new();
         for domain in &domains {
-            ports_checks.push(check_acme_ports_impl(
+            ports_checks.push(check_acme_ports_for_challenge(
                 domain,
                 PortReachability::Open,
                 PortReachability::Open,
+                false,
             ));
-            dns_checks.push(check_acme_dns_impl(domain, &DnsPointsHere::Matches));
+            dns_checks.push(check_acme_dns_for_challenge(
+                domain,
+                &DnsPointsHere::Matches,
+                false,
+            ));
         }
 
         assert_eq!(ports_checks.len(), 2, "one acme_ports check per domain");
@@ -17204,5 +18567,278 @@ redirect_uri = "http://localhost/callback"
             check.expect("negative keep_releases must fail").status,
             CheckStatus::Fail
         );
+    }
+    // ── `plugin_residue` (issue #1631, AC #7) ────────────────────────────────
+
+    fn wiring(crate_name: &str, dependency: bool, mount: bool) -> PluginWiring {
+        PluginWiring {
+            crate_name: crate_name.to_owned(),
+            community: false,
+            dependency,
+            mount,
+            mount_qualified: mount,
+            orphaned_migrations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn plugin_residue_passes_when_every_plugin_is_wired_consistently() {
+        let result = check_plugin_residue_impl(&[
+            wiring("autumn-admin-plugin", true, true),
+            wiring("autumn-search", false, false),
+        ]);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(result.name, "plugin_residue");
+    }
+
+    /// A dependency with no mount is the residue `plugin remove` exists to
+    /// prevent, and what a half-finished manual install leaves behind.
+    #[test]
+    fn plugin_residue_warns_on_a_dependency_with_no_mount() {
+        let result = check_plugin_residue_impl(&[wiring("autumn-admin-plugin", true, false)]);
+        assert_eq!(result.status, CheckStatus::Warn);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("autumn-admin-plugin"), "{detail}");
+        assert!(detail.contains("mount"), "{detail}");
+    }
+
+    /// A mount with no dependency does not compile — that is a failure, not a
+    /// warning, whatever `--strict` is set to.
+    #[test]
+    fn plugin_residue_fails_on_a_mount_with_no_dependency() {
+        let result = check_plugin_residue_impl(&[wiring("autumn-search", false, true)]);
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("autumn-search"), "{detail}");
+    }
+
+    /// The third residue kind: the plugin is gone from the code, but its
+    /// migrations are still recorded as applied.
+    #[test]
+    fn plugin_residue_warns_on_migrations_whose_plugin_is_gone() {
+        let result = check_plugin_residue_impl(&[PluginWiring {
+            crate_name: "autumn-media-plugin".to_owned(),
+            community: false,
+            dependency: false,
+            mount: false,
+            mount_qualified: false,
+            orphaned_migrations: vec!["20260720000000".to_owned()],
+        }]);
+        assert_eq!(result.status, CheckStatus::Warn);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("20260720000000"), "{detail}");
+        assert!(detail.contains("autumn-media-plugin"), "{detail}");
+    }
+
+    /// A plugin that is still installed is not residue, however many of its
+    /// migrations are applied — that is just a working install.
+    #[test]
+    fn plugin_residue_ignores_migrations_of_an_installed_plugin() {
+        let result = check_plugin_residue_impl(&[PluginWiring {
+            crate_name: "autumn-media-plugin".to_owned(),
+            community: false,
+            dependency: true,
+            mount: true,
+            mount_qualified: true,
+            orphaned_migrations: vec!["20260720000000".to_owned()],
+        }]);
+        assert_eq!(result.status, CheckStatus::Pass);
+    }
+
+    /// The worst finding decides the status, and every finding is reported —
+    /// a fail must not hide the warnings alongside it.
+    #[test]
+    fn plugin_residue_reports_every_finding_and_takes_the_worst_status() {
+        let result = check_plugin_residue_impl(&[
+            wiring("autumn-admin-plugin", true, false),
+            wiring("autumn-search", false, true),
+        ]);
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("autumn-admin-plugin"), "{detail}");
+        assert!(detail.contains("autumn-search"), "{detail}");
+    }
+
+    /// The residue check has to survive the `--json` contract like every other
+    /// check: a name, a status, and a detail string.
+    #[test]
+    fn plugin_residue_serializes_under_the_json_contract() {
+        let results = vec![check_plugin_residue_impl(&[wiring(
+            "autumn-admin-plugin",
+            true,
+            false,
+        )])];
+        let summary = compute_summary(&results);
+        let json = to_json_output(&results, &summary);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let check = value["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .find(|c| c["name"] == "plugin_residue")
+            .expect("plugin_residue row");
+        assert_eq!(check["status"], "warn");
+        assert!(check["detail"].as_str().is_some_and(|d| !d.is_empty()));
+    }
+
+    /// `--strict` turns the dependency-without-mount warning into a failing
+    /// run; that is the contract AC #7 asks the check to inherit.
+    #[test]
+    fn plugin_residue_warnings_are_strict_failures() {
+        let results = vec![check_plugin_residue_impl(&[wiring(
+            "autumn-admin-plugin",
+            true,
+            false,
+        )])];
+        let summary = compute_summary(&results);
+        assert_eq!(summary.warned, 1);
+        assert_eq!(summary.failed, 0);
+        // The contract is the exit code, not the counts: `--strict` turns this
+        // warning into a failing run, and a plain run leaves it advisory.
+        assert_eq!(exit_code(&summary, true), 1);
+        assert_eq!(exit_code(&summary, false), 0);
+    }
+
+    /// A community `autumn-plugin-*` dependency with no mount is residue too —
+    /// but `plugin add` never writes a community mount, so the advice has to
+    /// be different from a first-party plugin's.
+    #[test]
+    fn plugin_residue_gives_community_crates_their_own_advice() {
+        let result = check_plugin_residue_impl(&[PluginWiring {
+            crate_name: "autumn-plugin-live-feed".to_owned(),
+            community: true,
+            dependency: true,
+            mount: false,
+            mount_qualified: false,
+            orphaned_migrations: Vec::new(),
+        }]);
+        assert_eq!(result.status, CheckStatus::Warn);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("README"), "{detail}");
+        assert!(!detail.contains("to finish the install"), "{detail}");
+    }
+
+    /// The `Fail` says "this app does not compile", so it needs evidence that
+    /// the app really reaches into THIS crate. A bare `SearchPlugin::new(` may
+    /// be the app's own same-named type, and a hard failure on a substring
+    /// collision is a verdict this check has not earned.
+    #[test]
+    fn plugin_residue_does_not_fail_on_an_unqualified_constructor_collision() {
+        let result = check_plugin_residue_impl(&[PluginWiring {
+            crate_name: "autumn-search".to_owned(),
+            community: false,
+            dependency: false,
+            mount: true,
+            mount_qualified: false,
+            orphaned_migrations: Vec::new(),
+        }]);
+        assert_eq!(result.status, CheckStatus::Pass);
+    }
+
+    /// The disk glue, end to end: a dependency declared with no mount anywhere
+    /// in `src/` is residue, and a mount that lives OUTSIDE `src/main.rs` is
+    /// not — the shape `plugin add`'s manual fallback tells users to write.
+    #[test]
+    fn plugin_wirings_are_resolved_from_the_whole_src_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = \"0.7.0\"\nautumn-admin-plugin = \"0.7.0\"\nautumn-plugin-live-feed = \"0.3.1\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() { app::build(); }\n").unwrap();
+        // The builder lives in a sibling module, not in `main.rs`.
+        std::fs::write(
+            root.join("src/app.rs"),
+            "pub fn build() {\n    autumn_web::app().plugin(autumn_admin_plugin::AdminPlugin::new());\n}\n",
+        )
+        .unwrap();
+
+        let wirings = resolve_plugin_wirings(root, Vec::new);
+        let admin = wirings
+            .iter()
+            .find(|w| w.crate_name == "autumn-admin-plugin")
+            .expect("admin wiring");
+        assert!(admin.dependency && admin.mount, "{admin:?}");
+        assert!(admin.mount_qualified, "{admin:?}");
+
+        let feed = wirings
+            .iter()
+            .find(|w| w.crate_name == "autumn-plugin-live-feed")
+            .expect("community wiring");
+        assert!(feed.community && feed.dependency, "{feed:?}");
+        assert!(!feed.mount, "{feed:?}");
+
+        assert_eq!(
+            check_plugin_residue_impl(&wirings).status,
+            CheckStatus::Warn,
+            "the unmounted community crate is the only finding"
+        );
+    }
+
+    /// A declared migration still recorded as applied, for a plugin that is
+    /// gone from the code — and the version key is matched after the
+    /// `_name` suffix is stripped, the way `diesel migration list` prints it.
+    #[test]
+    fn plugin_wirings_match_declared_migrations_against_applied_versions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = \"0.7.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let wirings = resolve_plugin_wirings(root, || vec!["20260720000000".to_owned()]);
+        let media = wirings
+            .iter()
+            .find(|w| w.crate_name == "autumn-media-plugin")
+            .expect("media wiring");
+        assert_eq!(media.orphaned_migrations, vec!["20260720000000".to_owned()]);
+        assert_eq!(
+            check_plugin_residue_impl(&wirings).status,
+            CheckStatus::Warn
+        );
+    }
+
+    /// The migration history costs a subprocess and a database round trip, so
+    /// it must not be read when no departed plugin could possibly have left
+    /// one — which is every ordinary project.
+    #[test]
+    fn plugin_wirings_do_not_read_the_migration_history_without_a_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = \"0.7.0\"\nautumn-media-plugin = \"0.7.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/main.rs"),
+            "fn main() { autumn_web::app().plugin(autumn_media_plugin::MediaPlugin::new()); }\n",
+        )
+        .unwrap();
+
+        // The closure panics if called: the plugin is installed, so there is
+        // no orphan to look for.
+        let wirings = resolve_plugin_wirings(root, || panic!("must not query the database"));
+        assert_eq!(
+            check_plugin_residue_impl(&wirings).status,
+            CheckStatus::Pass
+        );
+    }
+
+    /// Every applied version is needed, not just the newest: an orphan can sit
+    /// anywhere in the history.
+    #[test]
+    fn applied_migration_versions_are_parsed_from_the_diesel_listing() {
+        let output = "Migrations:\n  [X] 20260101000000_create_users\n  [ ] 20260202000000_pending\n  [X] 20260720000000_media_rooms\n";
+        let versions = parse_applied_migration_versions(output);
+        assert_eq!(versions, vec!["20260101000000", "20260720000000"]);
     }
 }

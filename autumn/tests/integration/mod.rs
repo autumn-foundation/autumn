@@ -2,6 +2,8 @@
 mod a11y;
 mod access_log;
 #[cfg(feature = "acme")]
+mod acme_dns01;
+#[cfg(feature = "acme")]
 mod acme_end_to_end;
 #[cfg(feature = "acme")]
 mod acme_fake_ca;

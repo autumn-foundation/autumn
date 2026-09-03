@@ -7249,6 +7249,16 @@ pub struct AcmeConfig {
     /// the config file.
     #[serde(default)]
     pub ca_root_path: Option<PathBuf>,
+
+    /// DNS-01 challenge settings (issue #1620). Present under
+    /// `[server.tls.acme.dns]`.
+    ///
+    /// When set, every authorization in an order is answered over **DNS-01**
+    /// instead of HTTP-01, which is the only challenge type a CA will accept for
+    /// a **wildcard** identifier — so `domains` may list `*.example.com`. When
+    /// absent, issuance stays on #1608's HTTP-01 path and wildcards are rejected.
+    #[serde(default)]
+    pub dns: Option<AcmeDnsConfig>,
 }
 
 impl AcmeConfig {
@@ -7320,12 +7330,34 @@ impl AcmeConfig {
                      {index} is empty or whitespace-only)"
                 ));
             }
-            if trimmed.starts_with("*.") {
-                return Err(format!(
-                    "[server.tls.acme] wildcard domain `{trimmed}` is not supported: wildcards \
-                     require the DNS-01 challenge, which is out of scope here (tracked in #1620). \
-                     List explicit hostnames instead"
-                ));
+            // A wildcard identifier can only ever be validated over DNS-01, so it
+            // is accepted exactly when `[server.tls.acme.dns]` is configured —
+            // and its shape is checked here rather than surfacing later as an
+            // opaque CA rejection mid-issuance.
+            if trimmed.contains('*') {
+                if self.dns.is_none() {
+                    return Err(format!(
+                        "[server.tls.acme] wildcard domain `{trimmed}` needs the DNS-01 \
+                         challenge: an ACME CA will not validate a wildcard identifier over \
+                         HTTP-01. Add a [server.tls.acme.dns] section naming your DNS provider \
+                         (and the credentials-store key holding its API token), or list explicit \
+                         hostnames instead"
+                    ));
+                }
+                let Some(base) = trimmed.strip_prefix("*.") else {
+                    return Err(format!(
+                        "[server.tls.acme] domain `{trimmed}` is not a usable wildcard: a \
+                         wildcard SAN must be written as `*.` followed by the base domain (e.g. \
+                         `*.myapp.com`) — a `*` anywhere else is not matched by any client"
+                    ));
+                };
+                if base.is_empty() || base.contains('*') {
+                    return Err(format!(
+                        "[server.tls.acme] domain `{trimmed}` is not a usable wildcard: exactly \
+                         one leading `*.` is allowed and the base domain after it must be \
+                         non-empty (e.g. `*.myapp.com`)"
+                    ));
+                }
             }
             // The checks above read `trimmed`, but the entry is stored — and used —
             // UNTRIMMED: it becomes the certificate's SAN via `CertificateParams`,
@@ -7344,8 +7376,276 @@ impl AcmeConfig {
                 ));
             }
         }
+        if let Some(dns) = &self.dns {
+            dns.validate()?;
+        }
         Ok(())
     }
+
+    /// Whether the configured certificate would cover `host`.
+    ///
+    /// Applies RFC 6125 wildcard matching across every entry in
+    /// [`domains`](Self::domains), so a `*.myapp.com` SAN covers
+    /// `tenant42.myapp.com` but not the apex and not a deeper label. Used by
+    /// `autumn doctor` to check a `tenancy.base_domain` against the certificate
+    /// (issue #1620).
+    #[must_use]
+    pub fn covers_host(&self, host: &str) -> bool {
+        self.domains.iter().any(|san| san_covers_host(san, host))
+    }
+}
+
+/// DNS-01 challenge settings for wildcard (and multi-replica) ACME issuance
+/// (issue #1620). Present under `[server.tls.acme.dns]`.
+///
+/// # Secrets never live here
+///
+/// This section names a **credential reference**, never a token. The provider's
+/// API credential is read from the encrypted credentials store
+/// (`autumn credentials edit`, `config/credentials/<env>.toml.enc`) under the
+/// [`credential`](Self::credential) key, or from the documented environment
+/// variables. There is deliberately no field to hold a token, and the section is
+/// `deny_unknown_fields`, so an `api_token = "..."` written into `autumn.toml`
+/// is a **load-time error** rather than a plaintext secret that silently works.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [server.tls.acme]
+/// domains = ["myapp.com", "*.myapp.com"]
+/// contact_email = "ops@myapp.com"
+/// directory = "production"
+///
+/// [server.tls.acme.dns]
+/// provider = "cloudflare"
+/// # optional; the credentials-store key holding the token. Default: "acme_dns".
+/// credential = "acme_dns"
+/// ```
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeDnsConfig {
+    /// Which DNS provider writes the `_acme-challenge` TXT records.
+    pub provider: AcmeDnsProvider,
+
+    /// Key in the encrypted credentials store holding this provider's
+    /// credential. Default: `acme_dns`. Never the credential itself.
+    #[serde(default = "default_acme_dns_credential")]
+    pub credential: String,
+
+    /// How long, in seconds, to wait for a published TXT record to become
+    /// visible on every configured resolver before failing the order.
+    /// Default: `300`.
+    #[serde(default = "default_acme_dns_propagation_timeout_secs")]
+    pub propagation_timeout_secs: u64,
+
+    /// Seconds between propagation probes. Default: `5`.
+    #[serde(default = "default_acme_dns_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+
+    /// Resolvers queried to confirm propagation. Each entry is `IP` (port 53
+    /// implied) or `IP:port`. Default: Cloudflare and Google public DNS.
+    #[serde(default = "default_acme_dns_resolvers")]
+    pub resolvers: Vec<String>,
+
+    /// The hook program for [`AcmeDnsProvider::Exec`], as an **argv array**
+    /// (never a shell string). Autumn appends `present|cleanup`, the record
+    /// FQDN, and the TXT value as three further arguments, so nothing is
+    /// interpolated into a shell. Required for `exec`, rejected for every other
+    /// provider.
+    #[serde(default)]
+    pub command: Vec<String>,
+}
+
+impl AcmeDnsConfig {
+    /// Parse [`resolvers`](Self::resolvers) into socket addresses, defaulting a
+    /// bare IP to port 53.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the first unparseable entry.
+    pub fn resolver_addrs(&self) -> Result<Vec<std::net::SocketAddr>, String> {
+        self.resolvers
+            .iter()
+            .map(|entry| parse_resolver_addr(entry))
+            .collect()
+    }
+
+    /// Validate the DNS-01 wiring.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message describing the first problem found.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.credential.trim().is_empty() {
+            return Err(
+                "[server.tls.acme.dns] credential must name the key in the encrypted \
+                 credentials store that holds the DNS provider's API credential (run \
+                 `autumn credentials edit`). It is a key NAME, never the token itself"
+                    .to_owned(),
+            );
+        }
+        match self.provider {
+            AcmeDnsProvider::Exec => {
+                if self
+                    .command
+                    .first()
+                    .is_some_and(|program| !program.trim().is_empty() && program != program.trim())
+                {
+                    return Err(format!(
+                        "[server.tls.acme.dns] command's program `{}` has leading or trailing \
+                         whitespace: it is passed to the OS verbatim, so the padded value would \
+                         fail to execute. Write it without the padding",
+                        self.command[0]
+                    ));
+                }
+                if self.command.first().is_none_or(|p| p.trim().is_empty()) {
+                    return Err(
+                        "[server.tls.acme.dns] provider = \"exec\" requires a non-empty `command` \
+                         argv array (e.g. command = [\"/usr/local/bin/dns-hook\"]); autumn appends \
+                         `present`/`cleanup`, the record FQDN and the TXT value as further \
+                         arguments"
+                            .to_owned(),
+                    );
+                }
+            }
+            AcmeDnsProvider::Cloudflare | AcmeDnsProvider::Route53 => {
+                if !self.command.is_empty() {
+                    return Err(format!(
+                        "[server.tls.acme.dns] command is set but provider is \"{}\": the command \
+                         would never run. Remove it, or set provider = \"exec\" to use the \
+                         external-hook escape hatch",
+                        self.provider.as_str()
+                    ));
+                }
+            }
+        }
+        if self.propagation_timeout_secs == 0 {
+            return Err(
+                "[server.tls.acme.dns] propagation_timeout_secs must not be 0: a zero budget \
+                 fails every order before a freshly-written TXT record could ever be visible. \
+                 Use the default (300) or a larger value for a slow-propagating zone"
+                    .to_owned(),
+            );
+        }
+        if self.poll_interval_secs == 0 {
+            return Err(
+                "[server.tls.acme.dns] poll_interval_secs must not be 0: it would busy-loop the \
+                 configured resolvers. Use the default (5)"
+                    .to_owned(),
+            );
+        }
+        if self.propagation_timeout_secs > MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS {
+            return Err(format!(
+                "[server.tls.acme.dns] propagation_timeout_secs ({}) must be at most {}: the wait \
+                 is computed as an instant `now + timeout`, and an unbounded value overflows that \
+                 and panics the renewal task, leaving the self-signed placeholder served \
+                 indefinitely. An hour is far past any real provider's propagation time",
+                self.propagation_timeout_secs, MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS
+            ));
+        }
+        if self.poll_interval_secs > self.propagation_timeout_secs {
+            return Err(format!(
+                "[server.tls.acme.dns] poll_interval_secs ({}) is greater than \
+                 propagation_timeout_secs ({}): the record would be probed once and the wait \
+                 would time out without ever re-checking. Lower poll_interval_secs",
+                self.poll_interval_secs, self.propagation_timeout_secs
+            ));
+        }
+        if self.resolvers.is_empty() {
+            return Err(
+                "[server.tls.acme.dns] resolvers must list at least one DNS resolver to confirm \
+                 TXT propagation against (default: 1.1.1.1:53 and 8.8.8.8:53)"
+                    .to_owned(),
+            );
+        }
+        self.resolver_addrs()?;
+        Ok(())
+    }
+}
+
+/// Parse one `[server.tls.acme.dns] resolvers` entry into a socket address,
+/// defaulting a bare IP address to port 53.
+fn parse_resolver_addr(entry: &str) -> Result<std::net::SocketAddr, String> {
+    let trimmed = entry.trim();
+    if let Ok(addr) = trimmed.parse::<std::net::SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, 53));
+    }
+    Err(format!(
+        "[server.tls.acme.dns] resolvers entry `{entry}` is not a resolver address: write it as \
+         an IP (`1.1.1.1`, port 53 implied) or `IP:port` (`1.1.1.1:53`). Hostnames are not \
+         accepted — resolving the resolver would defeat the purpose of the propagation check"
+    ))
+}
+
+/// Which DNS provider writes the ACME DNS-01 `_acme-challenge` TXT records.
+///
+/// The curated set is deliberately small; [`Exec`](Self::Exec) is the documented
+/// escape hatch for everything else (RFC 2136 via `nsupdate`, a registrar CLI, a
+/// webhook shim).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AcmeDnsProvider {
+    /// Cloudflare DNS, via the v4 REST API with a scoped API token.
+    Cloudflare,
+    /// Amazon Route 53, via `ChangeResourceRecordSets` with `SigV4` credentials.
+    Route53,
+    /// An operator-provided hook program — the escape hatch for any other
+    /// provider.
+    Exec,
+}
+
+impl AcmeDnsProvider {
+    /// The provider's stable config spelling (also used in health details).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cloudflare => "cloudflare",
+            Self::Route53 => "route53",
+            Self::Exec => "exec",
+        }
+    }
+}
+
+impl std::fmt::Display for AcmeDnsProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Whether a certificate SAN entry covers `host`, using RFC 6125 wildcard rules.
+///
+/// A `*.example.com` SAN covers exactly one label — `tenant1.example.com` but
+/// neither `a.b.example.com` nor the bare apex `example.com`. Matching is
+/// case-insensitive and tolerates a trailing dot on `host`.
+///
+/// Used by `autumn doctor` to tell an operator that their `tenancy.base_domain`
+/// is not covered by the configured certificate (issue #1620).
+#[must_use]
+pub fn san_covers_host(san: &str, host: &str) -> bool {
+    let san = san.trim().trim_end_matches('.').to_ascii_lowercase();
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if san.is_empty() || host.is_empty() {
+        return false;
+    }
+    let Some(suffix) = san.strip_prefix("*.") else {
+        return san == host;
+    };
+    if suffix.is_empty() {
+        return false;
+    }
+    // Exactly one label may stand in for the `*`: strip the suffix and require
+    // what remains to be a single non-empty, dot-free label.
+    let Some(label) = host
+        .strip_suffix(&suffix)
+        .and_then(|prefix| prefix.strip_suffix('.'))
+    else {
+        return false;
+    };
+    !label.is_empty() && !label.contains('.')
 }
 
 /// Which ACME directory endpoint to provision against.
@@ -9081,6 +9381,40 @@ const fn default_acme_http_challenge_port() -> u16 {
 /// leaves ample slack for retries.
 const fn default_acme_renew_before_days() -> u32 {
     30
+}
+
+/// Default credentials-store key holding the DNS provider credential
+/// (`[server.tls.acme.dns] credential`).
+fn default_acme_dns_credential() -> String {
+    "acme_dns".to_owned()
+}
+
+/// Default bound on the DNS-01 TXT propagation wait, in seconds
+/// (`[server.tls.acme.dns] propagation_timeout_secs`). Five minutes covers the
+/// slow tail of public-resolver caches without parking a renewal indefinitely.
+const fn default_acme_dns_propagation_timeout_secs() -> u64 {
+    300
+}
+
+/// Default gap between propagation probes, in seconds
+/// (`[server.tls.acme.dns] poll_interval_secs`).
+const fn default_acme_dns_poll_interval_secs() -> u64 {
+    5
+}
+
+/// Upper bound on `[server.tls.acme.dns] propagation_timeout_secs`.
+///
+/// The wait is computed as `Instant::now() + Duration::from_secs(timeout)`, which
+/// **panics** on overflow — inside the spawned renewal task, where the panic
+/// silently kills the loop and leaves the self-signed placeholder served
+/// forever. An hour is far past any real provider's propagation time.
+const MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS: u64 = 3600;
+
+/// Default public resolvers the propagation wait queries
+/// (`[server.tls.acme.dns] resolvers`). Two independent operators, so one
+/// operator's stale cache cannot alone declare a record propagated.
+fn default_acme_dns_resolvers() -> Vec<String> {
+    vec!["1.1.1.1:53".to_owned(), "8.8.8.8:53".to_owned()]
 }
 
 const fn default_health_enabled() -> bool {
@@ -15108,6 +15442,7 @@ path = "/healthz"
             http_challenge_port: default_acme_http_challenge_port(),
             renew_before_days: default_acme_renew_before_days(),
             ca_root_path: None,
+            dns: None,
         }
     }
 
@@ -15241,11 +15576,11 @@ path = "/healthz"
     }
 
     #[test]
-    fn validate_acme_wildcard_domain_rejected_mentions_1620() {
+    fn validate_acme_wildcard_domain_without_dns_provider_rejected() {
         let mut cfg = tls_static(None, None);
         cfg.acme = Some(acme_cfg(&["*.example.com"], "ops@example.com"));
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("#1620"), "got: {err}");
+        assert!(err.contains("[server.tls.acme.dns]"), "got: {err}");
         assert!(err.contains("wildcard"), "got: {err}");
     }
 
@@ -15365,7 +15700,7 @@ path = "/healthz"
         cfg.acme = Some(acme_cfg(&[" *.example.com "], "ops@example.com"));
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("wildcard"), "got: {err}");
-        assert!(err.contains("#1620"), "got: {err}");
+        assert!(err.contains("[server.tls.acme.dns]"), "got: {err}");
     }
 
     // Regression (#1608, Codex P2): `http_challenge_port = 0` binds an ephemeral
@@ -15421,6 +15756,324 @@ path = "/healthz"
         acme.renew_before_days = 89;
         cfg.acme = Some(acme);
         assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    // ── DNS-01 / wildcard config surface (issue #1620) ───────────────────────
+
+    fn acme_dns_cfg(provider: AcmeDnsProvider) -> AcmeDnsConfig {
+        AcmeDnsConfig {
+            provider,
+            credential: default_acme_dns_credential(),
+            propagation_timeout_secs: default_acme_dns_propagation_timeout_secs(),
+            poll_interval_secs: default_acme_dns_poll_interval_secs(),
+            resolvers: default_acme_dns_resolvers(),
+            command: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn acme_dns_section_parses_with_defaults() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls.acme]
+            domains = ["myapp.com", "*.myapp.com"]
+            contact_email = "ops@myapp.com"
+
+            [server.tls.acme.dns]
+            provider = "cloudflare"
+            "#,
+        )
+        .expect("[server.tls.acme.dns] should parse");
+        let tls = config.server.tls.expect("tls configured");
+        let acme = tls.acme.as_ref().expect("acme configured");
+        let dns = acme.dns.as_ref().expect("dns configured");
+        assert_eq!(dns.provider, AcmeDnsProvider::Cloudflare);
+        // The credential is a NAME in the encrypted credentials store, never a token.
+        assert_eq!(dns.credential, "acme_dns");
+        assert_eq!(dns.propagation_timeout_secs, 300);
+        assert_eq!(dns.poll_interval_secs, 5);
+        assert!(!dns.resolvers.is_empty());
+        assert!(tls.validate().is_ok(), "got: {:?}", tls.validate());
+    }
+
+    #[test]
+    fn acme_dns_provider_names_round_trip() {
+        for (spelling, expected) in [
+            ("cloudflare", AcmeDnsProvider::Cloudflare),
+            ("route53", AcmeDnsProvider::Route53),
+            ("exec", AcmeDnsProvider::Exec),
+        ] {
+            let extra = if expected == AcmeDnsProvider::Exec {
+                "\ncommand = [\"/usr/local/bin/dns-hook\"]"
+            } else {
+                ""
+            };
+            let src = format!(
+                "[server.tls.acme]\ndomains = [\"*.myapp.com\"]\n\
+                 contact_email = \"ops@myapp.com\"\n\
+                 [server.tls.acme.dns]\nprovider = \"{spelling}\"{extra}\n"
+            );
+            let config: AutumnConfig =
+                toml::from_str(&src).unwrap_or_else(|e| panic!("{spelling} should parse: {e}"));
+            let acme = config.server.tls.unwrap().acme.unwrap();
+            assert_eq!(acme.dns.as_ref().unwrap().provider, expected);
+            assert!(acme.validate().is_ok(), "{spelling}: {:?}", acme.validate());
+        }
+    }
+
+    // AC3: DNS provider API tokens are NEVER supplied in plaintext `autumn.toml`.
+    // The section has no field to hold one, and `deny_unknown_fields` turns an
+    // operator's attempt into a load-time error rather than a silently-ignored key
+    // that leaves them wondering why the token "did not work".
+    #[test]
+    fn acme_dns_section_rejects_an_inline_secret() {
+        for secret_key in [
+            "api_token",
+            "token",
+            "secret_access_key",
+            "access_key_id",
+            "api_key",
+        ] {
+            let src = format!(
+                "[server.tls.acme]\ndomains = [\"*.myapp.com\"]\n\
+                 contact_email = \"ops@myapp.com\"\n\
+                 [server.tls.acme.dns]\nprovider = \"cloudflare\"\n{secret_key} = \"s3cret\"\n"
+            );
+            let err = toml::from_str::<AutumnConfig>(&src)
+                .err()
+                .unwrap_or_else(|| panic!("{secret_key} in autumn.toml must be rejected"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(secret_key),
+                "the rejection must name the offending key: {msg}"
+            );
+        }
+    }
+
+    // AC1: a wildcard domain is accepted once — and only once — a DNS-01 provider
+    // is configured, because only DNS-01 can validate a wildcard identifier.
+    #[test]
+    fn validate_acme_wildcard_requires_a_dns_provider() {
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&["*.myapp.com"], "ops@myapp.com"));
+        let err = cfg
+            .validate()
+            .expect_err("a wildcard without [server.tls.acme.dns] must be rejected");
+        assert!(err.contains("wildcard"), "got: {err}");
+        assert!(
+            err.contains("[server.tls.acme.dns]"),
+            "the message must name the section that fixes it: {err}"
+        );
+        assert!(err.contains("DNS-01"), "got: {err}");
+
+        // With the section present it is accepted.
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["myapp.com", "*.myapp.com"], "ops@myapp.com");
+        acme.dns = Some(acme_dns_cfg(AcmeDnsProvider::Cloudflare));
+        cfg.acme = Some(acme);
+        assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    // A malformed wildcard never reaches the CA as an opaque rejection.
+    #[test]
+    fn validate_acme_rejects_malformed_wildcards() {
+        for bad in ["*", "*.", "*myapp.com", "app.*.myapp.com", "*.*.myapp.com"] {
+            let mut cfg = tls_static(None, None);
+            let mut acme = acme_cfg(&[bad], "ops@myapp.com");
+            acme.dns = Some(acme_dns_cfg(AcmeDnsProvider::Cloudflare));
+            cfg.acme = Some(acme);
+            let err = cfg.validate().expect_err(&format!(
+                "`{bad}` is not a usable wildcard and must be rejected"
+            ));
+            assert!(
+                err.contains(bad),
+                "the message must echo the offending entry `{bad}`: {err}"
+            );
+        }
+
+        // The one well-formed shape stays accepted.
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        acme.dns = Some(acme_dns_cfg(AcmeDnsProvider::Cloudflare));
+        cfg.acme = Some(acme);
+        assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    #[test]
+    fn validate_acme_dns_exec_requires_a_command() {
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        acme.dns = Some(acme_dns_cfg(AcmeDnsProvider::Exec));
+        cfg.acme = Some(acme);
+        let err = cfg
+            .validate()
+            .expect_err("provider = \"exec\" with no command must be rejected");
+        assert!(err.contains("command"), "got: {err}");
+
+        // …and a command on a non-exec provider is a misconfiguration too: it
+        // would be silently ignored while the operator believes it runs.
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.command = vec!["/usr/local/bin/dns-hook".to_owned()];
+        acme.dns = Some(dns);
+        cfg.acme = Some(acme);
+        let err = cfg
+            .validate()
+            .expect_err("command on cloudflare is invalid");
+        assert!(err.contains("command"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_acme_dns_rejects_unusable_propagation_bounds() {
+        // A zero timeout would fail every order before a record could ever appear.
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.propagation_timeout_secs = 0;
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("zero timeout is invalid");
+        assert!(err.contains("propagation_timeout_secs"), "got: {err}");
+
+        // A zero poll interval would busy-loop the resolver.
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.poll_interval_secs = 0;
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("zero poll interval is invalid");
+        assert!(err.contains("poll_interval_secs"), "got: {err}");
+
+        // A poll interval longer than the whole budget means exactly one probe.
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.poll_interval_secs = 600;
+        dns.propagation_timeout_secs = 60;
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("interval > timeout is invalid");
+        assert!(err.contains("poll_interval_secs"), "got: {err}");
+    }
+
+    // An unbounded budget reaches `Instant::now() + Duration::from_secs(..)`,
+    // which PANICS on overflow — inside the spawned renewal task, where the
+    // panic kills the loop silently and the placeholder is served forever.
+    #[test]
+    fn validate_acme_dns_rejects_an_unbounded_propagation_timeout() {
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.propagation_timeout_secs = u64::MAX;
+        acme.dns = Some(dns);
+        let err = acme
+            .validate()
+            .expect_err("an unbounded propagation budget is invalid");
+        assert!(err.contains("propagation_timeout_secs"), "got: {err}");
+
+        // The documented ceiling itself is accepted.
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.propagation_timeout_secs = MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS;
+        acme.dns = Some(dns);
+        assert!(acme.validate().is_ok(), "got: {:?}", acme.validate());
+    }
+
+    // `command[0]` is handed to the OS verbatim, so a blank or padded program
+    // would fail at order time with an opaque ENOENT rather than at boot.
+    #[test]
+    fn validate_acme_dns_rejects_an_unusable_exec_program() {
+        for bad in [
+            vec![String::new()],
+            vec!["   ".to_owned(), "arg".to_owned()],
+        ] {
+            let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+            let mut dns = acme_dns_cfg(AcmeDnsProvider::Exec);
+            dns.command = bad.clone();
+            acme.dns = Some(dns);
+            let err = acme
+                .validate()
+                .expect_err(&format!("`{bad:?}` is not a usable exec command"));
+            assert!(err.contains("command"), "got: {err}");
+        }
+
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Exec);
+        dns.command = vec![" /usr/local/bin/hook ".to_owned()];
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("a padded program is invalid");
+        assert!(err.contains("whitespace"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_acme_dns_rejects_a_blank_or_unparseable_resolver() {
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.resolvers = Vec::new();
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("no resolvers is invalid");
+        assert!(err.contains("resolvers"), "got: {err}");
+
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.resolvers = vec!["not a resolver".to_owned()];
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("garbage resolver is invalid");
+        assert!(err.contains("resolvers"), "got: {err}");
+    }
+
+    #[test]
+    fn acme_dns_resolver_addresses_accept_bare_ips_and_explicit_ports() {
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.resolvers = vec!["1.1.1.1".to_owned(), "9.9.9.9:5353".to_owned()];
+        let addrs = dns.resolver_addrs().expect("resolvers parse");
+        assert_eq!(addrs[0].port(), 53, "a bare IP defaults to port 53");
+        assert_eq!(addrs[1].port(), 5353);
+    }
+
+    #[test]
+    fn validate_acme_dns_rejects_a_blank_credential_reference() {
+        for blank in ["", "   "] {
+            let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+            let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+            dns.credential = blank.to_owned();
+            acme.dns = Some(dns);
+            let err = acme.validate().expect_err("a blank credential is invalid");
+            assert!(err.contains("credential"), "got: {err}");
+        }
+    }
+
+    // AC7 support: the grader `autumn doctor` uses to tell an operator that their
+    // `tenancy.base_domain` is not covered by the certificate.
+    #[test]
+    fn san_covers_host_matches_rfc6125_wildcard_rules() {
+        // Exact match.
+        assert!(san_covers_host("myapp.com", "myapp.com"));
+        assert!(
+            san_covers_host("MyApp.COM", "myapp.com"),
+            "case-insensitive"
+        );
+        assert!(!san_covers_host("myapp.com", "tenant1.myapp.com"));
+
+        // A wildcard covers exactly ONE label.
+        assert!(san_covers_host("*.myapp.com", "tenant1.myapp.com"));
+        assert!(
+            !san_covers_host("*.myapp.com", "a.b.myapp.com"),
+            "a wildcard must not span a dot"
+        );
+        assert!(
+            !san_covers_host("*.myapp.com", "myapp.com"),
+            "a wildcard does not cover the apex"
+        );
+        assert!(!san_covers_host("*.myapp.com", "myapp.com.evil.com"));
+        assert!(!san_covers_host("*.myapp.com", ""));
+
+        // A trailing dot on the queried host is the same name.
+        assert!(san_covers_host("*.myapp.com", "tenant1.myapp.com."));
+    }
+
+    #[test]
+    fn acme_config_covers_host_uses_every_san() {
+        let acme = acme_cfg(&["myapp.com", "*.myapp.com"], "ops@myapp.com");
+        assert!(acme.covers_host("myapp.com"));
+        assert!(acme.covers_host("tenant42.myapp.com"));
+        assert!(!acme.covers_host("other.example.com"));
+        assert!(!acme.covers_host("deep.tenant42.myapp.com"));
     }
 
     // Companion: a valid domain list plus the default challenge port is unaffected
