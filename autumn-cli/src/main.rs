@@ -42,6 +42,7 @@ mod new;
 mod overload_driver;
 mod paths;
 mod pg;
+mod platform;
 mod plugin;
 mod plugin_check;
 mod process;
