@@ -365,6 +365,24 @@ carried into the Verdict.
   freshly-created worktree, hit the same cold-dependency-compile artifact
   described above — 82,156ms — and is excluded for the same reason). See
   Assay for the result and its consequence for the verdict.
+- **A seventh limitation, also confirmed (Codex P2 on `269afeb8`): the
+  timed feature set isn't an exact match for what CI's own scaffold
+  builds, either.** `DAEMON_NO_DB_FEATURES` (this report's feature list)
+  omits `flash`, and `autumn-cli/src/new.rs` writes the generated app's
+  `autumn-web` dependency line with `default-features = false, features =
+  [DAEMON_NO_DB_FEATURES]` accordingly — but the generated scaffold's
+  *own* `Cargo.toml` (`autumn-cli/src/templates/Cargo.toml.tmpl`)
+  separately declares `default = ["flash"]` / `flash =
+  ["autumn-web/flash"]`, and `cold_start_driver.rs`'s `cold_build` runs a
+  bare `cargo build` with no `--no-default-features` flag of its own.
+  Cargo feature unification then turns `autumn-web/flash` on for the real
+  scaffold build regardless of the dependency line's explicit feature
+  list. This report's exact command (`--features
+  maud,htmx,tailwind,cache-moka,http-client,reporting`) never enables
+  `flash`, so it measures a library configuration close to, but not
+  identical with, what CI actually compiles. Not corrected by re-running
+  (compounds with, doesn't replace, the narrower-workload and
+  warm-vs-cold-target limitations already disclosed).
 
 ## 📊 Assay
 
@@ -599,14 +617,20 @@ live report needs the map:
   specific commit.** Telescoping means a sum over a contiguous span
   carries *zero* information about which intermediate commit(s) caused
   the change — mathematically true independent of the noise-scale
-  question above. Individually, `6a6610c4` (+4,990ms) is the largest
-  single delta at ≈3.3σ against the tight calibration's per-delta noise
-  (lower, and further from significant, under the inflated estimate) — a
-  real single-comparison signal at best, but also the largest of 31
-  candidate deltas, and the expected maximum of 31 independent noise
-  draws is itself around 2.5-2.9σ even under the tight estimate. No
-  commit in this dataset clears a confident attribution bar under either
-  noise scale.
+  question above, and this is the load-bearing reason no commit can be
+  named, not the multiple-comparisons point that follows (corrected,
+  Codex P2 on `269afeb8`: a simulation of 31 standard-normal draws gives
+  an expected one-sided maximum of ≈2.06σ, ≈2.34σ for the maximum
+  absolute value — not the ≈2.5-2.9σ an earlier revision claimed, which
+  was closer to a ~95th-percentile value than an expectation). Against
+  the correct number, `6a6610c4` (+4,990ms, ≈3.3σ against the tight
+  calibration's per-delta noise) sits *above* the expected maximum of 31
+  draws, not comfortably within it — a simulated `P(max ≥ 3.3σ)` of only
+  ≈1.5%, which doesn't clear a confident attribution bar on its own but
+  is weaker cover for "just noise" than the earlier, incorrect number
+  suggested. What still rules it out is the telescoping argument above
+  and the confirmed, unrelated calibration and warm-cache-bias issues
+  elsewhere in this report — not this multiple-comparisons calculation.
 - **This proxy's ≈−13,000ms is not directly comparable to CI's −15,051ms
   at all, and this report previously overstated how close a match that
   was** (Codex P1 on `39ae17a1`). Two compounding reasons, not one: this
@@ -666,9 +690,12 @@ here):**
    fully cold builds instead of one warm chain; each of the confirmed
    cold-build samples in this report took 60-120s, so a fully-cold
    32-checkpoint pass could run 30-60+ minutes on its own) — but without
-   it, any commit touching `Cargo.lock` (4 of 31 here) cannot be trusted,
-   and neither can this proxy's total-window comparison to CI's absolute
-   saving.
+   it, any commit that actually changes this feature set's resolved
+   dependency graph (not merely "touches `Cargo.lock`" — confirmed real
+   for only 3 of the ~13 candidates checked, `61bdd9c2`/`9d99d980`/
+   `9c1ede1e`, with several more `Cargo.toml`-touching commits unchecked;
+   see Apparatus) cannot be trusted, and neither can this proxy's
+   total-window comparison to CI's absolute saving.
 
 ## 💰 Cost to productionize
 
