@@ -632,10 +632,15 @@ def _ungrouped(segment):
 # right about arbitrary prefixes and wrong to lump these in with them: `command`
 # and `run` are not arbitrary, they are the keys that mean "this is a command".
 _COMMAND_KEYS = r'command|run|entrypoint|cmd|exec|script'
-_COMMAND_KEY = re.compile(r'^(' + _COMMAND_KEYS + r'):$', re.I)
-# The same keys in TOML, where the value is quoted after an `=`:
-# `command = "autumn migrate --with-maintenance"` (maintenance-mode.md).
-_COMMAND_KEY_BARE = re.compile(r'^(' + _COMMAND_KEYS + r')$', re.I)
+# A qualifier may precede the key word: Fly writes `release_command = "autumn
+# migrate"`, which is executed on every deploy. Anchoring the key to the whole
+# token missed both live uses of it (deployment.md, maintenance-mode.md) — and
+# a synthetic `command = "…"` test passed while the real `release_command`
+# lines went ungated, which is how the gap survived a round of review.
+_QUALIFIED = r'(?:[A-Za-z0-9]+[_-])*'
+_COMMAND_KEY = re.compile(r'^' + _QUALIFIED + r'(' + _COMMAND_KEYS + r'):$', re.I)
+# The same keys in TOML, where the value is quoted after an `=`.
+_COMMAND_KEY_BARE = re.compile(r'^' + _QUALIFIED + r'(' + _COMMAND_KEYS + r')$', re.I)
 
 
 def _autumn_exe(tok):
@@ -1478,6 +1483,19 @@ def self_test():
            'a skill instruction `Run:` must be read, case-insensitively')
     expect(list(invocations('```yaml\n  image: autumn-cli:1.2\n```')) == [],
            'a key outside the bounded set is not a command position')
+    # A qualifier may precede the key word — Fly's `release_command` runs on
+    # every deploy. Anchoring to the whole token missed both live uses of it,
+    # and a synthetic bare `command = "…"` test passed while the real lines
+    # went ungated.
+    fly = '```toml\nrelease_command = "autumn migrate run"\n```'
+    expect([d for _, d, _, _ in invocations(fly)] == ['migrate run'],
+           f'a qualified command key must be read: {list(invocations(fly))}')
+    expect(_COMMAND_KEY_BARE.match('release_command')
+           and _COMMAND_KEY.match('pre-run:'),
+           'a `_`- or `-`-separated qualifier is allowed before the key word')
+    expect(not _COMMAND_KEY_BARE.match('commandeer')
+           and not _COMMAND_KEY_BARE.match('rerun'),
+           'the key word must be a whole segment, not a suffix of a longer word')
 
     cfgs = ('```bash\nAUTUMN_CLUSTER__CLUSTER_NAME=autumn\n'
             'AUTUMN_ALERTS__WEBHOOK_URL=https://alerts.example.com/hooks/autumn\n```')
@@ -1638,7 +1656,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f"self-test: {13 + 47 + 65 + 4 - len(failures)} passed, {len(failures)} failed")
+    print(f"self-test: {13 + 47 + 68 + 4 - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
