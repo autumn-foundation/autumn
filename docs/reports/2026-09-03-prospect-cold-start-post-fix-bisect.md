@@ -496,21 +496,33 @@ for c in "${COMMITS[@]}"; do
   timed_build "$c"
 done
 
+# This same pass also includes one same-commit repeat of the final
+# checkpoint, taken immediately (still in this same warm worktree) —
+# this is the 35th build of the main pass, and one of the 7 calibration
+# samples (see the separate calibration pass below).
+timed_build "ef61ae44-repeat-in-pass"
+
 # Re-measure d1ecb361 and dc74ce43 now that target/ is fully warm from the
 # pass above — these two (and only these two) replace their earlier numbers.
+# Main pass total: 32 + 1 + 2 = 35 builds.
 for c in d1ecb361 dc74ce43; do
   git checkout --detach "$c" --quiet
   timed_build "${c}-warm"
 done
 
-# Noise-floor calibration: the COMMITS loop above already measured ef61ae44
-# once (that IS the "window end" sample in the table). Six MORE repeats here
-# gives 7 total warm-condition samples, matching this report's calibration —
-# don't add a 7th here or you'll have 8, not 7.
-git checkout --detach ef61ae44 --quiet
-for i in 1 2 3 4 5 6; do
-  timed_build "ef61ae44-repeat-${i}"
-done
+git worktree remove /tmp/prospect-coldstart-wt2 --force
 
-git worktree remove /tmp/prospect-coldstart-wt2 --force   # dismantle
+# Noise-floor calibration is a SEPARATE pass, in a fresh worktree (empty
+# target/, same cold-build artifact as the main pass's first checkpoint —
+# that's why run 1 below is expected to be an outlier and gets discarded,
+# not because anything is wrong with it). 6 builds here + the 2 ef61ae44
+# samples already produced by the main pass above (the "window end"
+# checkpoint and the in-pass repeat) = 7 total calibration samples,
+# matching this report's numbers.
+git worktree add --detach /tmp/prospect-noise-wt ef61ae44
+cd /tmp/prospect-noise-wt
+for i in 1 2 3 4 5 6; do
+  timed_build "ef61ae44-calibration-${i}"   # run 1 is the expected cold outlier — discard it
+done
+git worktree remove /tmp/prospect-noise-wt --force
 ```
