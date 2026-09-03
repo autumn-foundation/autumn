@@ -104,9 +104,10 @@ impl ExecProvider {
 
 /// Describe a process exit status, including a signal death (which has no code).
 fn describe_status(status: &std::process::ExitStatus) -> String {
-    status
-        .code()
-        .map_or_else(|| "terminated by a signal".to_owned(), |c| format!("exit status {c}"))
+    status.code().map_or_else(
+        || "terminated by a signal".to_owned(),
+        |c| format!("exit status {c}"),
+    )
 }
 
 /// The hook's `stderr`, trimmed and truncated for an error message.
@@ -176,7 +177,10 @@ mod tests {
             r#"test "$1" = cleanup"#.to_owned(),
             "hook".to_owned(),
         ]);
-        provider.delete_txt(&record()).await.expect("cleanup action");
+        provider
+            .delete_txt(&record())
+            .await
+            .expect("cleanup action");
     }
 
     #[tokio::test]

@@ -15256,9 +15256,9 @@ path = "/healthz"
             let mut acme = acme_cfg(&[bad], "ops@myapp.com");
             acme.dns = Some(acme_dns_cfg(AcmeDnsProvider::Cloudflare));
             cfg.acme = Some(acme);
-            let err = cfg
-                .validate()
-                .expect_err(&format!("`{bad}` is not a usable wildcard and must be rejected"));
+            let err = cfg.validate().expect_err(&format!(
+                "`{bad}` is not a usable wildcard and must be rejected"
+            ));
             assert!(
                 err.contains(bad),
                 "the message must echo the offending entry `{bad}`: {err}"
@@ -15292,7 +15292,9 @@ path = "/healthz"
         dns.command = vec!["/usr/local/bin/dns-hook".to_owned()];
         acme.dns = Some(dns);
         cfg.acme = Some(acme);
-        let err = cfg.validate().expect_err("command on cloudflare is invalid");
+        let err = cfg
+            .validate()
+            .expect_err("command on cloudflare is invalid");
         assert!(err.contains("command"), "got: {err}");
     }
 
@@ -15368,7 +15370,10 @@ path = "/healthz"
     fn san_covers_host_matches_rfc6125_wildcard_rules() {
         // Exact match.
         assert!(san_covers_host("myapp.com", "myapp.com"));
-        assert!(san_covers_host("MyApp.COM", "myapp.com"), "case-insensitive");
+        assert!(
+            san_covers_host("MyApp.COM", "myapp.com"),
+            "case-insensitive"
+        );
         assert!(!san_covers_host("myapp.com", "tenant1.myapp.com"));
 
         // A wildcard covers exactly ONE label.

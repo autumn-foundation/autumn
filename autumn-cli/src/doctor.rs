@@ -5593,7 +5593,10 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
     // key, not a silently-ignored secret sitting in a plaintext file (#1620).
     let (dns, dns_error) = match acme.get("dns") {
         None => (None, None),
-        Some(value) => match value.clone().try_into::<autumn_web::config::AcmeDnsConfig>() {
+        Some(value) => match value
+            .clone()
+            .try_into::<autumn_web::config::AcmeDnsConfig>()
+        {
             Ok(dns) => (Some(dns), None),
             Err(e) => (None, Some(e.to_string())),
         },
@@ -11234,7 +11237,9 @@ pub struct Vault {
 
     // ── DNS-01 / wildcard preflight (issue #1620) ─────────────────────────────
 
-    fn acme_dns_cfg(provider: autumn_web::config::AcmeDnsProvider) -> autumn_web::config::AcmeDnsConfig {
+    fn acme_dns_cfg(
+        provider: autumn_web::config::AcmeDnsProvider,
+    ) -> autumn_web::config::AcmeDnsConfig {
         toml::from_str(&format!("provider = \"{}\"\n", provider.as_str()))
             .expect("the minimal DNS section parses")
     }
@@ -11299,10 +11304,12 @@ pub struct Vault {
     fn challenge_dns_visibility_grades_answerability_then_leftovers() {
         let fqdn = "_acme-challenge.myapp.com";
 
-        let pass = check_acme_dns_propagation_impl(&fqdn, &ChallengeDnsVisibility::Answered { values: 0 });
+        let pass =
+            check_acme_dns_propagation_impl(&fqdn, &ChallengeDnsVisibility::Answered { values: 0 });
         assert_eq!(pass.status, CheckStatus::Pass);
 
-        let warn = check_acme_dns_propagation_impl(&fqdn, &ChallengeDnsVisibility::Stale { values: 2 });
+        let warn =
+            check_acme_dns_propagation_impl(&fqdn, &ChallengeDnsVisibility::Stale { values: 2 });
         assert_eq!(warn.status, CheckStatus::Warn);
         assert!(warn.detail.unwrap().contains('2'));
 
@@ -11314,7 +11321,10 @@ pub struct Vault {
         );
         assert_eq!(fail.status, CheckStatus::Fail);
         let detail = fail.detail.unwrap();
-        assert!(detail.contains(fqdn), "the message must name the record: {detail}");
+        assert!(
+            detail.contains(fqdn),
+            "the message must name the record: {detail}"
+        );
         assert!(detail.contains("SERVFAIL"), "got: {detail}");
     }
 
@@ -11411,7 +11421,9 @@ pub struct Vault {
     #[test]
     fn wildcard_domains_are_probed_as_their_base_domain() {
         let mut cfg = acme_doctor_cfg(&["myapp.com", "*.myapp.com"], "ops@myapp.com");
-        cfg.dns = Some(acme_dns_cfg(autumn_web::config::AcmeDnsProvider::Cloudflare));
+        cfg.dns = Some(acme_dns_cfg(
+            autumn_web::config::AcmeDnsProvider::Cloudflare,
+        ));
         assert_eq!(
             acme_online_probe_domains(&cfg),
             vec!["myapp.com".to_owned()],
@@ -11420,7 +11432,10 @@ pub struct Vault {
 
         // A wildcard with no explicit apex still probes the base domain.
         let cfg = acme_doctor_cfg(&["*.myapp.com"], "ops@myapp.com");
-        assert_eq!(acme_online_probe_domains(&cfg), vec!["myapp.com".to_owned()]);
+        assert_eq!(
+            acme_online_probe_domains(&cfg),
+            vec!["myapp.com".to_owned()]
+        );
 
         // Non-wildcard configs are unchanged.
         let cfg = acme_doctor_cfg(&["a.example.com", "b.example.com"], "ops@example.com");
@@ -11461,7 +11476,9 @@ pub struct Vault {
         // …and with the section present the same config is accepted, because
         // DNS-01 is exactly what makes a wildcard issuable (#1620).
         let mut cfg = acme_doctor_cfg(&["*.example.com"], "ops@example.com");
-        cfg.dns = Some(acme_dns_cfg(autumn_web::config::AcmeDnsProvider::Cloudflare));
+        cfg.dns = Some(acme_dns_cfg(
+            autumn_web::config::AcmeDnsProvider::Cloudflare,
+        ));
         assert!(
             check_acme_config_impl(&cfg).is_none(),
             "a wildcard WITH a DNS-01 provider is a valid config"
@@ -11873,7 +11890,9 @@ contact_email = \"ops@example.com\"
         for (domains, contact_email, http_challenge_port, renew_before_days) in cases {
             for dns in [
                 None,
-                Some(acme_dns_cfg(autumn_web::config::AcmeDnsProvider::Cloudflare)),
+                Some(acme_dns_cfg(
+                    autumn_web::config::AcmeDnsProvider::Cloudflare,
+                )),
                 // A DNS section the runtime itself rejects: `exec` with no
                 // command. Doctor must fail it too.
                 Some(
@@ -11926,7 +11945,9 @@ contact_email = \"ops@example.com\"
         for domains in wildcard_cases {
             for dns in [
                 None,
-                Some(acme_dns_cfg(autumn_web::config::AcmeDnsProvider::Cloudflare)),
+                Some(acme_dns_cfg(
+                    autumn_web::config::AcmeDnsProvider::Cloudflare,
+                )),
             ] {
                 let mut doctor_cfg = acme_doctor_cfg(domains, "ops@myapp.com");
                 doctor_cfg.dns = dns.clone();

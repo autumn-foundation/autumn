@@ -191,7 +191,10 @@ mod tests {
             .body("{\"type\":\"TXT\"}");
         let rendered = format!("{request:?}");
         assert!(!rendered.contains("DO-NOT-LEAK"), "leaked: {rendered}");
-        assert!(!rendered.contains("sts-session-secret"), "leaked: {rendered}");
+        assert!(
+            !rendered.contains("sts-session-secret"),
+            "leaked: {rendered}"
+        );
         assert_eq!(rendered.matches("<redacted>").count(), 2, "{rendered}");
         // …while everything an operator actually needs is still there.
         assert!(rendered.contains("application/json"), "{rendered}");
@@ -201,7 +204,14 @@ mod tests {
 
     #[test]
     fn success_is_2xx_only() {
-        for (status, expected) in [(200, true), (201, true), (299, true), (300, false), (403, false), (500, false)] {
+        for (status, expected) in [
+            (200, true),
+            (201, true),
+            (299, true),
+            (300, false),
+            (403, false),
+            (500, false),
+        ] {
             let response = HttpResponse {
                 status,
                 body: String::new(),

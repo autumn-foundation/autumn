@@ -266,20 +266,18 @@ pub fn validate_credential(
         )
     };
     match provider {
-        AcmeDnsProvider::Cloudflare => {
-            match &credential.api_token {
-                Some(token) if !token.is_blank() => Ok(()),
-                Some(_) => Err(format!(
-                    "the Cloudflare DNS credential `{credential_key}` has a blank `api_token`: {}",
-                    where_to_put("api_token", ENV_API_TOKEN)
-                )),
-                None => Err(format!(
-                    "no Cloudflare API token found for [server.tls.acme.dns] credential \
+        AcmeDnsProvider::Cloudflare => match &credential.api_token {
+            Some(token) if !token.is_blank() => Ok(()),
+            Some(_) => Err(format!(
+                "the Cloudflare DNS credential `{credential_key}` has a blank `api_token`: {}",
+                where_to_put("api_token", ENV_API_TOKEN)
+            )),
+            None => Err(format!(
+                "no Cloudflare API token found for [server.tls.acme.dns] credential \
                      `{credential_key}`: {}",
-                    where_to_put("api_token", ENV_API_TOKEN)
-                )),
-            }
-        }
+                where_to_put("api_token", ENV_API_TOKEN)
+            )),
+        },
         AcmeDnsProvider::Route53 => {
             let id_ok = credential
                 .access_key_id

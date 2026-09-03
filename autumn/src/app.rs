@@ -3934,31 +3934,30 @@ impl AppBuilder {
         // so it is baked into `/actuator/health`; the same `AcmeStatus` handle is
         // reused by the renewal task spawned at bind time below.
         #[cfg(feature = "acme")]
-        let acme_status: Option<crate::acme::renewal::AcmeStatus> = if let Some(acme_cfg) =
-            config.server.tls.as_ref().and_then(|t| t.acme.as_ref())
-        {
-            let status = crate::acme::renewal::AcmeStatus::new();
-            let indicator = std::sync::Arc::new(
-                crate::acme::renewal::AcmeHealthIndicator::new(
-                    status.clone(),
-                    acme_cfg.renew_before_days,
-                )
-                // Which challenge is in play (and, for DNS-01, which provider)
-                // is the first thing an operator needs when issuance is failing
-                // — and is safe to publish: it names no credential (#1620).
-                .with_dns_provider(acme_cfg.dns.as_ref().map(|dns| dns.provider.as_str())),
-            );
-            if let Err(e) = state.health_indicator_registry.register(
-                "acme",
-                crate::actuator::IndicatorGroup::HealthOnly,
-                indicator,
-            ) {
-                tracing::warn!("{e}");
-            }
-            Some(status)
-        } else {
-            None
-        };
+        let acme_status: Option<crate::acme::renewal::AcmeStatus> =
+            if let Some(acme_cfg) = config.server.tls.as_ref().and_then(|t| t.acme.as_ref()) {
+                let status = crate::acme::renewal::AcmeStatus::new();
+                let indicator = std::sync::Arc::new(
+                    crate::acme::renewal::AcmeHealthIndicator::new(
+                        status.clone(),
+                        acme_cfg.renew_before_days,
+                    )
+                    // Which challenge is in play (and, for DNS-01, which provider)
+                    // is the first thing an operator needs when issuance is failing
+                    // — and is safe to publish: it names no credential (#1620).
+                    .with_dns_provider(acme_cfg.dns.as_ref().map(|dns| dns.provider.as_str())),
+                );
+                if let Err(e) = state.health_indicator_registry.register(
+                    "acme",
+                    crate::actuator::IndicatorGroup::HealthOnly,
+                    indicator,
+                ) {
+                    tracing::warn!("{e}");
+                }
+                Some(status)
+            } else {
+                None
+            };
 
         #[cfg(feature = "db")]
         configure_replica_migration_check(&state, replica_migration_check);

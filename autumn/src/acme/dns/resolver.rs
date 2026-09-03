@@ -171,9 +171,9 @@ pub fn lookup_txt_blocking(
         .send(&query)
         .map_err(|e| format!("could not send a TXT query for {name} to {resolver}: {e}"))?;
     let mut buf = vec![0_u8; MAX_RESPONSE];
-    let read = socket.recv(&mut buf).map_err(|e| {
-        format!("resolver {resolver} did not answer a TXT query for {name}: {e}")
-    })?;
+    let read = socket
+        .recv(&mut buf)
+        .map_err(|e| format!("resolver {resolver} did not answer a TXT query for {name}: {e}"))?;
     parse_txt_response(id, name, &buf[..read])
         .map_err(|e| format!("resolver {resolver} answered a TXT query for {name}: {e}"))
 }
@@ -228,7 +228,9 @@ pub fn encode_txt_query(id: u16, name: &str) -> Result<Vec<u8>, String> {
         out.extend_from_slice(label.as_bytes());
     }
     if encoded_len > 255 {
-        return Err(format!("DNS name `{name}` is longer than 255 bytes encoded"));
+        return Err(format!(
+            "DNS name `{name}` is longer than 255 bytes encoded"
+        ));
     }
     out.push(0); // root label
     out.extend_from_slice(&QTYPE_TXT.to_be_bytes());
@@ -573,7 +575,12 @@ mod tests {
     #[test]
     fn a_response_with_a_compression_pointer_parses() {
         let id = 0xABCD;
-        let msg = txt_response(id, "_acme-challenge.myapp.com", &["value-one", "value-two"], 0);
+        let msg = txt_response(
+            id,
+            "_acme-challenge.myapp.com",
+            &["value-one", "value-two"],
+            0,
+        );
         let answer = parse_txt_response(id, "_acme-challenge.myapp.com", &msg).expect("parses");
         assert_eq!(answer.rcode, 0);
         assert_eq!(answer.values, vec!["value-one", "value-two"]);
@@ -644,7 +651,9 @@ mod tests {
     #[test]
     fn missing_values_compares_sets() {
         let expected = vec!["a".to_owned(), "b".to_owned()];
-        assert!(missing_values(&expected, &["a".to_owned(), "b".to_owned(), "z".to_owned()]).is_empty());
+        assert!(
+            missing_values(&expected, &["a".to_owned(), "b".to_owned(), "z".to_owned()]).is_empty()
+        );
         assert_eq!(
             missing_values(&expected, &["a".to_owned()]),
             vec!["b".to_owned()]
@@ -730,10 +739,8 @@ mod tests {
                 rcode: 0,
             })
         };
-        let lookup = ScriptedLookup::new(vec![
-            (resolver(53), visible()),
-            (resolver(5353), visible()),
-        ]);
+        let lookup =
+            ScriptedLookup::new(vec![(resolver(53), visible()), (resolver(5353), visible())]);
         let records = vec![
             TxtRecord::new("myapp.com", "value-apex"),
             TxtRecord::new("myapp.com", "value-wildcard"),

@@ -155,7 +155,10 @@ impl DnsProvider for CloudflareProvider {
                 .await?;
             for id in find_record_ids(&listed) {
                 self.send(
-                    HttpRequest::new("DELETE", format!("{API_BASE}/zones/{zone}/dns_records/{id}")),
+                    HttpRequest::new(
+                        "DELETE",
+                        format!("{API_BASE}/zones/{zone}/dns_records/{id}"),
+                    ),
                     "delete the Cloudflare TXT record",
                 )
                 .await?;
@@ -216,11 +219,7 @@ fn zone_candidates(fqdn: &str) -> Vec<String> {
 /// non-2xx status and `success: false` both mean failure. The message carries
 /// the status and Cloudflare's own error text — never the request headers, so
 /// the bearer token cannot ride along.
-fn parse_api_response(
-    response: &HttpResponse,
-    what: &str,
-    url: &str,
-) -> Result<Value, String> {
+fn parse_api_response(response: &HttpResponse, what: &str, url: &str) -> Result<Value, String> {
     let redacted_url = url.split('?').next().unwrap_or(url);
     let parsed: Value = serde_json::from_str(&response.body).unwrap_or(Value::Null);
     if !response.is_success() || parsed.get("success") == Some(&Value::Bool(false)) {
@@ -313,9 +312,16 @@ mod tests {
             body: r#"{"success":false,"errors":[{"code":9109,"message":"Invalid access token"}]}"#
                 .to_owned(),
         };
-        let err = parse_api_response(&response, "create the Cloudflare TXT record", "https://api.cloudflare.com/client/v4/zones/z/dns_records")
-            .expect_err("403 is a failure");
-        assert!(err.contains("create the Cloudflare TXT record"), "got: {err}");
+        let err = parse_api_response(
+            &response,
+            "create the Cloudflare TXT record",
+            "https://api.cloudflare.com/client/v4/zones/z/dns_records",
+        )
+        .expect_err("403 is a failure");
+        assert!(
+            err.contains("create the Cloudflare TXT record"),
+            "got: {err}"
+        );
         assert!(err.contains("403"), "got: {err}");
         assert!(err.contains("Invalid access token"), "got: {err}");
     }

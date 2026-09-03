@@ -197,7 +197,8 @@ impl DnsProvider for Route53Provider {
             }
             let mut next = current.clone();
             next.push(record.value.clone());
-            self.write_values(&zone, &record.fqdn, &next, &current).await
+            self.write_values(&zone, &record.fqdn, &next, &current)
+                .await
         })
     }
 
@@ -213,7 +214,8 @@ impl DnsProvider for Route53Provider {
                 .filter(|v| **v != record.value)
                 .cloned()
                 .collect();
-            self.write_values(&zone, &record.fqdn, &next, &current).await
+            self.write_values(&zone, &record.fqdn, &next, &current)
+                .await
         })
     }
 }
@@ -301,13 +303,15 @@ fn strip_zone_prefix(id: &str) -> &str {
 /// that does not host it would silently return the *next* zone.
 fn hosted_zone_id_for(xml: &str, candidate: &str) -> Option<String> {
     let wanted = format!("{}.", candidate.trim_end_matches('.').to_ascii_lowercase());
-    xml_elements(xml, "HostedZone").into_iter().find_map(|zone| {
-        let name = xml_element(zone, "Name")?.to_ascii_lowercase();
-        if name != wanted {
-            return None;
-        }
-        Some(strip_zone_prefix(xml_element(zone, "Id")?).to_owned())
-    })
+    xml_elements(xml, "HostedZone")
+        .into_iter()
+        .find_map(|zone| {
+            let name = xml_element(zone, "Name")?.to_ascii_lowercase();
+            if name != wanted {
+                return None;
+            }
+            Some(strip_zone_prefix(xml_element(zone, "Id")?).to_owned())
+        })
 }
 
 /// The TXT values of the `ResourceRecordSet` for `fqdn` in a
@@ -588,10 +592,12 @@ mod tests {
             auth.contains("Credential=AKIDEXAMPLE/20150830/us-east-1/route53/aws4_request"),
             "got: {auth}"
         );
-        assert!(auth.contains("SignedHeaders=host;x-amz-date"), "got: {auth}");
+        assert!(
+            auth.contains("SignedHeaders=host;x-amz-date"),
+            "got: {auth}"
+        );
         // The full canonical request AWS documents for this case.
-        let expected_canonical =
-            "GET\n/\n\nhost:example.amazonaws.com\nx-amz-date:20150830T123600Z\n\n\
+        let expected_canonical = "GET\n/\n\nhost:example.amazonaws.com\nx-amz-date:20150830T123600Z\n\n\
              host;x-amz-date\n\
              e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         assert_eq!(
@@ -621,8 +627,11 @@ mod tests {
     #[test]
     fn signing_never_puts_the_secret_in_the_request() {
         let signed = sign_request(
-            HttpRequest::new("POST", "https://route53.amazonaws.com/2013-04-01/hostedzone/Z1/rrset/")
-                .body("<x/>"),
+            HttpRequest::new(
+                "POST",
+                "https://route53.amazonaws.com/2013-04-01/hostedzone/Z1/rrset/",
+            )
+            .body("<x/>"),
             &credentials(),
             "20150830T123600Z".to_owned(),
         )
@@ -641,12 +650,18 @@ mod tests {
         let mut creds = credentials();
         creds.session_token = Some(SecretString::new("session-token-value"));
         let signed = sign_request(
-            HttpRequest::new("GET", "https://route53.amazonaws.com/2013-04-01/hostedzonesbyname"),
+            HttpRequest::new(
+                "GET",
+                "https://route53.amazonaws.com/2013-04-01/hostedzonesbyname",
+            ),
             &creds,
             "20150830T123600Z".to_owned(),
         )
         .expect("signs");
-        assert_eq!(signed.headers["x-amz-security-token"], "session-token-value");
+        assert_eq!(
+            signed.headers["x-amz-security-token"],
+            "session-token-value"
+        );
         assert!(
             signed.headers["authorization"].contains("x-amz-security-token"),
             "the token header must be part of SignedHeaders or AWS rejects the request"
@@ -655,12 +670,12 @@ mod tests {
 
     #[test]
     fn canonical_query_is_sorted_and_encoded() {
-        let (path, query) =
-            split_url("https://route53.amazonaws.com/2013-04-01/hostedzone/Z1/rrset?type=TXT&name=_acme-challenge.myapp.com.&maxitems=1");
+        let (path, query) = split_url(
+            "https://route53.amazonaws.com/2013-04-01/hostedzone/Z1/rrset?type=TXT&name=_acme-challenge.myapp.com.&maxitems=1",
+        );
         assert_eq!(path, "/2013-04-01/hostedzone/Z1/rrset");
         assert_eq!(
-            query,
-            "maxitems=1&name=_acme-challenge.myapp.com.&type=TXT",
+            query, "maxitems=1&name=_acme-challenge.myapp.com.&type=TXT",
             "query parameters must be sorted by encoded key"
         );
     }
@@ -684,7 +699,10 @@ mod tests {
             &["value-one".to_owned(), "value-two".to_owned()],
         );
         assert!(xml.contains("<Action>UPSERT</Action>"), "{xml}");
-        assert!(xml.contains("<Name>_acme-challenge.myapp.com.</Name>"), "{xml}");
+        assert!(
+            xml.contains("<Name>_acme-challenge.myapp.com.</Name>"),
+            "{xml}"
+        );
         assert!(xml.contains("&quot;value-one&quot;"), "{xml}");
         assert!(xml.contains("&quot;value-two&quot;"), "{xml}");
         assert_eq!(xml.matches("<ResourceRecord>").count(), 2, "{xml}");
@@ -695,7 +713,10 @@ mod tests {
         let xml = r"<ListHostedZonesByNameResponse><HostedZones>
             <HostedZone><Id>/hostedzone/Z0001</Id><Name>myapp.com.</Name></HostedZone>
             </HostedZones></ListHostedZonesByNameResponse>";
-        assert_eq!(hosted_zone_id_for(xml, "myapp.com").as_deref(), Some("Z0001"));
+        assert_eq!(
+            hosted_zone_id_for(xml, "myapp.com").as_deref(),
+            Some("Z0001")
+        );
 
         // Route 53 answers with the NEXT zone lexicographically when the asked-for
         // one does not exist; returning it would write the challenge into a

@@ -328,7 +328,8 @@ async fn boot_app(initial: &StoredCert) -> WildcardApp {
         .await
         .expect("bind challenge");
     let challenge_addr = challenge_tcp.local_addr().expect("challenge local_addr");
-    let challenge = autumn_web::acme::challenge::challenge_router(tokens.clone(), https_addr.port());
+    let challenge =
+        autumn_web::acme::challenge::challenge_router(tokens.clone(), https_addr.port());
     let serve_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let _ = axum::serve(challenge_tcp, challenge)
@@ -400,8 +401,13 @@ fn renewal_task(
     serving_stored_cert: bool,
     recovery: Option<autumn_web::acme::renewal::RecoveryFn>,
 ) -> AcmeRenewalTask {
-    let propagation_timeout =
-        Duration::from_secs(config.dns.as_ref().expect("dns configured").propagation_timeout_secs);
+    let propagation_timeout = Duration::from_secs(
+        config
+            .dns
+            .as_ref()
+            .expect("dns configured")
+            .propagation_timeout_secs,
+    );
     AcmeRenewalTask {
         resolver: Arc::clone(&app.resolver),
         provider: crypto_provider(),
@@ -518,8 +524,8 @@ fn served_sans(resolver: &ReloadableCertResolver) -> Vec<String> {
     use x509_parser::prelude::FromDer as _;
     let certified = resolver.current();
     let leaf = certified.cert.first().expect("a leaf is served");
-    let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(leaf)
-        .expect("the served leaf parses");
+    let (_, parsed) =
+        x509_parser::certificate::X509Certificate::from_der(leaf).expect("the served leaf parses");
     parsed
         .subject_alternative_name()
         .ok()
@@ -561,7 +567,8 @@ async fn build_rig(propagation_delay: Duration) -> Rig {
     let app = boot_app(&placeholder).await;
     let ca = acme_fake_ca::start(app.challenge_addr).await;
     let zone = FakeZone::new(propagation_delay);
-    ca.state.set_dns_zone(Arc::clone(&zone) as Arc<dyn TxtZoneView>);
+    ca.state
+        .set_dns_zone(Arc::clone(&zone) as Arc<dyn TxtZoneView>);
     let shutdown = CancellationToken::new();
     let dns_addr = serve_zone(Arc::clone(&zone), shutdown.child_token()).await;
     let ca_root = write_ca_root(&app, &ca);
@@ -629,7 +636,10 @@ async fn first_boot_issues_a_wildcard_and_serves_every_tenant_subdomain() {
         2,
         "both the apex and the wildcard authorization must validate over DNS-01"
     );
-    assert_eq!(rig.ca.state.dns_validations_failed.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        rig.ca.state.dns_validations_failed.load(Ordering::SeqCst),
+        0
+    );
 
     let sans = served_sans(&rig.app.resolver);
     assert!(
@@ -701,9 +711,15 @@ async fn apex_and_wildcard_publish_two_values_at_one_name() {
 
     // The CA looked for two DISTINCT values at the one name.
     let lookups = rig.ca.state.dns_lookups();
-    assert_eq!(lookups.len(), 2, "two authorizations, two lookups: {lookups:?}");
+    assert_eq!(
+        lookups.len(),
+        2,
+        "two authorizations, two lookups: {lookups:?}"
+    );
     assert!(
-        lookups.iter().all(|(fqdn, _)| *fqdn == rig.challenge_fqdn()),
+        lookups
+            .iter()
+            .all(|(fqdn, _)| *fqdn == rig.challenge_fqdn()),
         "both records share the base domain's challenge name: {lookups:?}"
     );
     assert_ne!(
@@ -736,7 +752,10 @@ async fn propagation_is_awaited_before_the_ca_is_told_to_validate() {
         rig.status.snapshot().last_failure
     );
     assert!(lock(&reported).is_empty());
-    assert_eq!(rig.ca.state.dns_validations_failed.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        rig.ca.state.dns_validations_failed.load(Ordering::SeqCst),
+        0
+    );
     assert!(
         started.elapsed() >= Duration::from_millis(600),
         "the order cannot have completed before the records became visible"
@@ -815,7 +834,10 @@ async fn challenge_records_are_removed_after_a_failed_order() {
 #[tokio::test]
 async fn challenge_records_survive_until_the_order_settles() {
     let rig = build_rig(Duration::ZERO).await;
-    rig.ca.state.deferred_validation.store(true, Ordering::SeqCst);
+    rig.ca
+        .state
+        .deferred_validation
+        .store(true, Ordering::SeqCst);
     let (reporter, reported) = recording_reporter();
 
     run_one_boot(rig.task(false), &rig.status, reporter).await;
@@ -831,7 +853,10 @@ async fn challenge_records_survive_until_the_order_settles() {
         2,
         "both records were still published when the CA finally looked"
     );
-    assert_eq!(rig.ca.state.dns_validations_failed.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        rig.ca.state.dns_validations_failed.load(Ordering::SeqCst),
+        0
+    );
     // …and they are cleaned up once the order is done.
     assert_eq!(
         rig.zone.written(&rig.challenge_fqdn()),
@@ -896,8 +921,8 @@ async fn a_dns01_failure_surfaces_in_health_and_names_the_provider() {
     assert!(message.contains("Invalid access token"), "got: {message}");
     assert!(!lock(&reported).is_empty(), "the failure must be reported");
 
-    let indicator = AcmeHealthIndicator::new(rig.status.clone(), 30)
-        .with_dns_provider(Some("cloudflare"));
+    let indicator =
+        AcmeHealthIndicator::new(rig.status.clone(), 30).with_dns_provider(Some("cloudflare"));
     let graded = indicator.grade(now_unix());
     assert_eq!(
         graded.status,
@@ -921,15 +946,16 @@ async fn a_provider_failure_never_leaks_the_api_token() {
     let rig = build_rig(Duration::ZERO).await;
     // A provider that fails the way a real one does: with the API's message, not
     // with its own credentials pasted in.
-    *lock(&rig.provider.fail_with) =
-        Some("could not create the Cloudflare TXT record (HTTP 403): Invalid access token".to_owned());
+    *lock(&rig.provider.fail_with) = Some(
+        "could not create the Cloudflare TXT record (HTTP 403): Invalid access token".to_owned(),
+    );
     let (reporter, reported) = recording_reporter();
 
     run_one_boot(rig.task(false), &rig.status, reporter).await;
 
     let snapshot = rig.status.snapshot();
-    let indicator = AcmeHealthIndicator::new(rig.status.clone(), 30)
-        .with_dns_provider(Some("cloudflare"));
+    let indicator =
+        AcmeHealthIndicator::new(rig.status.clone(), 30).with_dns_provider(Some("cloudflare"));
     let surfaces = [
         format!("{:?}", snapshot.last_failure),
         format!("{:?}", lock(&reported).clone()),
@@ -970,7 +996,10 @@ async fn a_near_expiry_wildcard_renews_in_place() {
     let (reporter, reported) = recording_reporter();
     run_one_boot(rig.task(true), &rig.status, reporter).await;
 
-    assert!(lock(&reported).is_empty(), "renewal must not report failures");
+    assert!(
+        lock(&reported).is_empty(),
+        "renewal must not report failures"
+    );
     let renewed = rig.app.resolver.current();
     assert!(
         !Arc::ptr_eq(&first, &renewed),
@@ -1060,8 +1089,9 @@ async fn a_restart_reuses_the_stored_wildcard_certificate() {
 async fn a_recovered_renewal_clears_the_operator_alert() {
     let recoveries = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&recoveries);
-    let recovery: autumn_web::acme::renewal::RecoveryFn =
-        Arc::new(move || { counter.fetch_add(1, Ordering::SeqCst); });
+    let recovery: autumn_web::acme::renewal::RecoveryFn = Arc::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
 
     let rig = build_rig(Duration::ZERO).await;
     *lock(&rig.provider.fail_with) = Some("provider outage".to_owned());

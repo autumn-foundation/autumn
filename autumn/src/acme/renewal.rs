@@ -561,9 +561,7 @@ impl AcmeRenewalTask {
                 // so a steady-state renewal does not re-notify every cycle.
                 let recovered_from_failure = self.status.snapshot().last_failure.is_some();
                 self.status.record_success(now_unix(), not_after);
-                if recovered_from_failure
-                    && let Some(recovery) = &self.recovery
-                {
+                if recovered_from_failure && let Some(recovery) = &self.recovery {
                     recovery();
                 }
                 tracing::info!(
@@ -848,7 +846,10 @@ impl AcmeRenewalTask {
                      cannot be issued without it"
                 )
             })?;
-            records.push(TxtRecord::new(&domain, challenge.key_authorization().dns_value()));
+            records.push(TxtRecord::new(
+                &domain,
+                challenge.key_authorization().dns_value(),
+            ));
         }
         Ok(records)
     }
@@ -915,10 +916,7 @@ impl AcmeRenewalTask {
 
     /// Finalize the ready order, persist the issued pair, and hot-swap it into
     /// the live resolver. Returns the leaf's `notAfter`.
-    async fn finalize_and_install(
-        &self,
-        order: &mut instant_acme::Order,
-    ) -> Result<i64, String> {
+    async fn finalize_and_install(&self, order: &mut instant_acme::Order) -> Result<i64, String> {
         use instant_acme::RetryPolicy;
 
         // Finalize with a FRESH rcgen keypair + CSR for exactly these domains.
