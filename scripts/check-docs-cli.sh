@@ -824,12 +824,40 @@ _KEY_INLINE = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
 _ARGS_ONLY = re.compile(r'^(\s*)' + _QUALIFIED + r'args:\s*$', re.I)
 _ARGS_INLINE = re.compile(r'^(\s*)' + _QUALIFIED + r'args:\s*\[(.*)\]\s*$', re.I)
 _EXEC_KEY_LINE = re.compile(r'^\s*' + _QUALIFIED + r'(?:' + _EXEC_KEYS + r'):', re.I)
+# A FOLDED block scalar joins its lines with spaces, so a command written
+# across two of them is one command. Scanning the physical lines instead let
+# the first resolve on its own and dropped the rest, which is where the drift
+# was. The literal form (`|`) keeps its lines separate and is already right,
+# so only `>` is folded here.
+_FOLDED_KEY = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
+                         r'):\s*>[-+]?\s*$', re.I)
 _ENTRY_KEY_LINE = re.compile(r'^\s*' + _QUALIFIED + r'(?:' + _ENTRY_KEYS + r'):', re.I)
+
+
+def _strip_comment(text):
+    """Drop a trailing YAML comment, which begins at an unquoted ` #`.
+
+    An annotated array is ordinary — `- definitely-not-a-command # typo` — and
+    keeping the annotation in the argv made the element resolve to nothing at
+    all, so the drift it was annotating went unreported. Quoting is tracked so
+    a `#` inside a value survives, and YAML's own rule (a comment needs
+    whitespace before it, or the start of the line) keeps `--tag=#1` intact.
+    """
+    quote = None
+    for i, ch in enumerate(text):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in '"\'':
+            quote = ch
+        elif ch == '#' and (i == 0 or text[i - 1] in ' \t'):
+            return text[:i]
+    return text
 
 
 def _list_value(text):
     """One list item, stripped of the quoting and separators YAML/JSON add."""
-    return text.strip().rstrip(',').strip().strip('\'"')
+    return _strip_comment(text).strip().rstrip(',').strip().strip('\'"')
 
 
 def _inline_items(body):
@@ -1209,6 +1237,20 @@ def invocations(text):
         for display, argv in _from_tokens(items):
             yield at, display, argv, FENCED_COMMAND
 
+    folded = None           # lines of a folded (`>`) block scalar
+    folded_at = None
+    folded_indent = 0
+
+    def close_folded():
+        """Join a folded scalar's lines with spaces and read them as one."""
+        nonlocal folded, folded_at
+        parts, at = folded, folded_at
+        folded, folded_at = None, None
+        if not parts:
+            return
+        for display, argv in commands(' '.join(parts)):
+            yield at, display, argv, FENCED_COMMAND
+
     def close_pending():
         """Finish the list being collected: fill a slot, or run script lines."""
         nonlocal pending, pending_kind, pending_at
@@ -1243,6 +1285,7 @@ def invocations(text):
         m = re.match(r'^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)', line)
         if m:
             held, held_at = [], None            # a fence boundary ends any hold
+            yield from close_folded()           # …a folded scalar
             yield from close_pending()          # …and any list
             yield from emit_slots()
             yield from _spans(take_paragraph(), commands)
@@ -1264,6 +1307,20 @@ def invocations(text):
         # and the guide writes five of them on that page alone. Scanning the
         # physical lines instead yields the argv `\`, and the command path split
         # across the break goes unchecked.
+        # A folded scalar swallows every more-indented line below its key.
+        if folded is not None:
+            if not line.strip():
+                continue
+            if len(line) - len(line.lstrip()) > folded_indent:
+                folded.append(line.strip())
+                continue
+            yield from close_folded()
+        fold = _FOLDED_KEY.match(line)
+        if fold:
+            folded, folded_at = [], lineno
+            folded_indent = len(fold.group(1))
+            continue
+
         # A command key opens a list — inline on its own line, or as the block
         # of items below it. Anything else closes it.
         item = _LIST_ITEM.match(line)
@@ -1328,6 +1385,7 @@ def invocations(text):
                 yield lineno, display, argv, (FENCED_COMMAND if runnable
                                               else FENCED_SPAN)
 
+    yield from close_folded()
     yield from close_pending()
     yield from emit_slots()
     yield from _spans(take_paragraph(), commands)
@@ -2205,6 +2263,39 @@ def self_test():
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate --shard eu west status'],
                f'a spaced exec element ({label}) stays one argv: {got}')
+    # --- a FOLDED block scalar joins its lines with spaces, so a command
+    # written across two of them is one command. Scanning the physical lines
+    # let the first resolve alone and dropped the rest, which is where the
+    # drift was. The literal form keeps its lines separate and is already
+    # right, so it must NOT be folded.
+    for label, doc in [
+        ('>', '```yaml\ncommand: >\n  autumn migrate\n  run\n```'),
+        ('>-', '```yaml\ncommand: >-\n  autumn migrate\n  run\n```'),
+        ('script: >', '```yaml\nscript: >\n  autumn migrate\n  run\n```'),
+    ]:
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'], f'a folded scalar ({label}) is one command: {got}')
+    literal = '```yaml\nrun: |\n  autumn migrate\n  cargo test\n```'
+    expect([d for _, d, _, _ in invocations(literal)] == ['migrate'],
+           f'a literal scalar keeps its lines apart: {list(invocations(literal))}')
+    ends = '```yaml\ncommand: >\n  autumn migrate\nimage: a:1\n```'
+    expect([d for _, d, _, _ in invocations(ends)] == ['migrate'],
+           f'a folded scalar ends at the next key: {list(invocations(ends))}')
+
+    # --- an annotated array is ordinary, and keeping the annotation in the
+    # argv made the element resolve to nothing, hiding the drift beside it.
+    noted = '```yaml\ncommand:\n  - autumn\n  - migrate\n  - run # typo\n```'
+    expect([d for _, d, _, _ in invocations(noted)] == ['migrate run'],
+           f'a YAML comment must not ride along in the argv: {list(invocations(noted))}')
+    for label, doc in [
+        ('quoted', '```yaml\ncommand:\n  - autumn\n  - migrate\n  - "--tag=#1"\n```'),
+        # YAML needs whitespace before a `#` for it to start a comment.
+        ('attached', '```yaml\ncommand:\n  - autumn\n  - migrate\n  - --tag=#1\n```'),
+    ]:
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate --tag=#1'],
+               f'a # that is not a comment ({label}) survives: {got}')
+
     # --- a container's argv comes from up to three keys, and every runtime
     # spells them differently: Docker/Compose concatenate ENTRYPOINT + CMD,
     # Kubernetes concatenates command + args. Reading any single key as the
