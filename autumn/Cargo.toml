@@ -510,6 +510,15 @@ path = "tests/password_policy_alloc_gate.rs"
 name = "form_render_alloc_gate"
 path = "tests/form_render_alloc_gate.rs"
 
+# Allocation gate for the version-history diff entry points on the same
+# 7-column record as `benches/version_history.rs` (#2429, proving the owned
+# entry points the versioned-repository codegen calls move column names and
+# values instead of cloning them). Own binary for the same `allocation-counter`
+# global-allocator reason as `config_alloc_gate` above.
+[[test]]
+name = "version_history_alloc_gate"
+path = "tests/version_history_alloc_gate.rs"
+
 # SQLite runtime-lane boot+serve proof (issue #1614, PR2). Only meaningful under
 # `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
 # `cargo test` compiles it to an empty (passing) binary. Run explicitly:

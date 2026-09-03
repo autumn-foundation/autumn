@@ -41,6 +41,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   go red between releases until a maintainer addresses `autumn doctor`'s
   blind spot or the next release ships.
 
+- **Build-time authority envelope for agent-operable handlers (#1691):** an
+  endpoint exposed as an MCP tool is an action an autonomous agent can take
+  with no human in the loop, and nothing said what that action was *allowed*
+  to do. `#[api_doc(mcp)]` published a description; the blast radius — which
+  models the handler writes, whether it can erase a table, whether it can leave
+  the tenant it was invoked for, which hosts it reaches, which jobs it starts,
+  how hard the whole thing is to undo — lived in the reviewer's head and
+  drifted the first time someone added a line to the body. Autumn now makes it
+  a declared value the compiler checks. `authority_grant!` declares a named
+  `const Grant`, and `#[agent_operable(grant = RefundDrafter)]` walks the
+  handler body, derives the effect set it can prove, and emits one const-eval
+  coverage assertion per proved effect, respanned onto the offending call:
+
+  ```rust
+  use autumn_web::prelude::*;
+
+  authority_grant! {
+      pub RefundDrafter {
+          writes: [Refund],
+          tenant_scope: scoped,
+          outbound: ["https://api.stripe.com/v1/refunds"],
+          jobs: [NotifyFinanceJob],
+          rate: "10/min",
+          spend: "500.00 USD",
+          reversibility: compensable,
+      }
+  }
+
+  #[post("/api/refunds")]
+  #[api_doc(mcp, summary = "Draft a refund")]
+  #[agent_operable(grant = RefundDrafter)]
+  pub async fn draft_refund(/* … */) -> AutumnResult<Json<Refund>> { /* … */ }
+  ```
+
+  Adding `payouts.create(&p).await?` to that body fails `cargo build` at the
+  write, on every branch, whether or not a test exercises it — and because the
+  check is const-evaluated against the linked `Grant` rather than against
+  tokens, it holds when the grant is declared in another crate. Six effect
+  kinds are recognised: bounded writes, unbounded writes (`delete_all`,
+  `truncate`, an unfiltered `diesel::update` — never implied by `writes`,
+  because one row and all of them are different authorities), cross-tenant
+  access, outbound HTTP, webhook topics and job enqueues. A raw diesel
+  `SELECT`/`UPDATE`/`DELETE` run on the request's connection carries none of
+  the tenant predicate the repository codegen applies, so it is recorded as a
+  cross-tenant effect (`raw_query:<table>`) and refused under the default
+  `tenant_scope: scoped` — route it through a repository, declare the statement
+  `#[agent_effect(scoped, reason = "…")]`, or declare `tenant_scope:
+  cross_tenant`; an `INSERT` has no `WHERE` to scope and is exempt. Declared
+  `reversibility` has a floor the proved effects impose: a job, a webhook, an
+  outbound call or an unbounded write cannot be undone by writing the previous
+  rows back, so none of them may be declared `reversible`. (A cross-tenant read
+  can be, so it carries no floor of its own; a cross-tenant write still carries
+  its write effect's.) The analysis is fail-closed where it has no chokepoint
+  to rely on: `job::enqueue` reaches a global client, `Client::new()` is
+  constructible from nothing, and a webhook fans out to subscriber-supplied
+  URLs, so those verbs are effects wherever they appear and their subject must
+  be a literal. Anything opaque — a helper handed a tracked handle, a
+  `format!`-built URL, a non-literal job name or webhook topic, a
+  `dyn`/`impl Trait` handle, a `tokio::spawn` that detaches the effect from the
+  request it is audited under — is a diagnostic naming the call site and the
+  annotation that discharges it, never a silent zero. The one escape hatch,
+  `#[agent_effect(writes(Refund), reason = "…")]` on a statement (`writes`,
+  `unbounded_writes`, `cross_tenant`, `outbound`, `webhooks`, `jobs`, `scoped`,
+  `none`, and a mandatory non-blank `reason`), declares what the analysis
+  cannot read — and declared effects are checked against the grant exactly like
+  proved ones, because the hatch declares, it never grants.
+
+  `autumn agents manifest` builds the app and reads back the diffable record:
+  one row per action with its envelope, its proved effects and the grant
+  entries nothing exercises, every declared grant including unused ones, and —
+  the completeness half — every MCP-exposed tool with *no* envelope at all.
+  `--check` fails on drift and on any ungoverned **mutating** tool unless
+  `--allow-ungoverned` is passed, which is the one gap the compiler cannot
+  catch: a tool with no grant has no assertion to fail. Every MCP `tools/call`
+  now writes two audit events with zero per-handler wiring —
+  `agent.tool.<name>.attempt` before dispatch and `agent.tool.<name>` after —
+  sharing a correlation id and carrying a `phase` (`attempt` / `outcome` /
+  `refused`), the transport, the grant, the compile-known reversibility, the
+  proved effect set and the argument *names* — only the keys the tool declares,
+  any others counted as `+N unknown`, never their values — with the outcome
+  additionally carrying the HTTP status and the pipeline's own `x-request-id`.
+  An ungoverned tool is audited too, with `reversibility = "unknown"`. Every
+  write is bounded by a 2-second timeout; if the attempt record cannot be
+  written or times out and the action is not `reversible`, the tool fails
+  closed, the handler never runs, and a best-effort
+  `agent.tool.<name>.refused` (status Failure, carrying a `refused_reason`)
+  records that it was turned away. `destructiveHint` now takes the declared
+  reversibility as an input the HTTP verb alone could not supply — raising a
+  `POST`/`PATCH` the verb says nothing about, while never clearing the warning
+  a `DELETE` already carries — and handlers can read the invocation through
+  `Extension<AgentInvocation>`. `--check` additionally fails when a binary has
+  no audit sink *and* can still take an agent-reachable action nothing can undo
+  (`--allow-unaudited` accepts it), and on a route naming an authority nothing
+  registered.
+
+  The first slice is deliberately narrow and says so in the manifest itself:
+  `rate` and `spend` are validated for grammar and recorded but **not enforced
+  at runtime** — there is no metering in this slice; generated
+  `#[repository(api, mcp)]` CRUD tools have no annotation site and therefore
+  surface as ungoverned rather than being gated; and `dependent(...)` cascades
+  are not folded into write sets, so `writes: [Post]` does not imply the
+  comments a delete takes with it. Each of those is named in the document's
+  `excluded` list with its caveat, rather than left to the guide. See
+  `docs/guide/agent-authority.md`.
 - **`autumn_web::contains_letter_or_number(&str) -> bool` (#2424):** the
   predicate to use when rejecting user input that will be slugified. `slugify`
   never returns an empty string — input with nothing to slugify gets a stable
@@ -1002,6 +1106,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Redis URL before it is logged. `redis` is re-exported as
   `autumn_web::reexports::redis` so callers can name the returned
   `redis::Client` without adding their own dependency. Issue #2172.
+
+### Security
+
+- **The idempotency cache is now partitioned by the resolved tenant:** an app
+  that turned on Autumn's multi-tenancy (`[tenancy] enabled = true`) *and*
+  `AppBuilder::idempotent()` shared one cache slot between tenants. The storage
+  key namespaced by method, request target and a cookie-session principal
+  digest — and for `header`, `subdomain` or `jwt` tenancy two requests from
+  different tenants differ in none of those (the tenant header and `Host` are
+  deliberately excluded from the key, and a token-authenticated API has no
+  cookie session). A request that resolved to tenant B, carrying the same
+  `Idempotency-Key` and body as an earlier tenant-A mutation, was answered with
+  **tenant A's stored response**: macro-generated routes replay *through* their
+  own guards, which check roles and scopes but never tenant identity, so the
+  handler — and every `tenant_scoped` repository predicate inside it — never
+  ran, and tenant B's own write was silently suppressed. The router already
+  forced the fail-closed replay path whenever an app resolved tenants in its own
+  `AppBuilder::layer`; the framework's own tenancy middleware was not covered by
+  that check. The key now carries the tenant as the tenancy middleware resolved
+  it (from the `CURRENT_TENANT` task-local, not from the wire, so a legitimate
+  same-tenant retry still replays). Apps that do not use tenancy compute
+  byte-identical keys to before, so no cached entry is invalidated on upgrade.
+  For `[tenancy] source = "session"`, a handler that itself changes the
+  session's tenancy key (an organization switch) now has its deferred replay
+  alias keyed by the *finalized* tenant rather than the one resolved before the
+  handler ran, so a retry after such a switch still replays instead of
+  re-running the mutation. See
+  `docs/security/2026-09-02-idempotency-tenant-scope/`.
 
 ### Fixed
 
@@ -2242,6 +2374,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   12-call-site count alone would suggest — `format!`'s unsized starting
   buffer apparently cost more than one allocation for some of these calls
   once it had to grow, not just the final `String`.
+
+- **the versioned-repository audit write path stops cloning every column
+  (#2429):** `compute_diff` / `compute_insert_changes` /
+  `compute_delete_changes` take `&serde_json::Value`, so each one had to clone
+  every retained column name and value into the `ColumnChange` it returns. The
+  only production caller — the `#[repository(versioned = true)]` codegen, which
+  every insert, update and delete of a versioned model funnels through — builds
+  those `Value`s fresh from `version_column_values()` per mutation and drops
+  them the moment the diff returns. Every retained field was therefore allocated
+  twice and dropped twice, for a value nobody would look at again.
+
+  Three owned-value siblings — `compute_diff_owned`,
+  `compute_insert_changes_owned`, `compute_delete_changes_owned` — take the
+  `Value` by value and move each key and value straight into its
+  `ColumnChange` (`Map::into_iter` / `Map::remove` instead of `.get().cloned()`
+  / `.clone()`). The codegen now calls those. The borrowed functions are
+  unchanged and stay public, for callers whose `Value` outlives the call.
+
+  Allocation blocks per mutation on a realistic 7-column record, measured by the
+  new `version_history_alloc_gate` (`allocation-counter`, deterministic across
+  runs). Each figure includes the throwaway `Value` materialization both paths
+  are charged for, so the delta is only what each does with the value it is
+  handed:
+
+  | Entry point | Borrowed | Owned | Delta |
+  |---|---|---|---|
+  | `compute_insert_changes` | 26 blocks | 14 blocks | **-46.2%** |
+  | `compute_delete_changes` | 26 blocks | 14 blocks | **-46.2%** |
+  | `compute_diff` | 34 blocks | 27 blocks | **-20.6%** |
+
+  Whole-process totals over the committed `autumn/benches/version_history.rs`
+  harness, one variant per process (`BIN borrowed` / `BIN owned`):
+
+  | Metric | Borrowed | Owned | Delta |
+  |---|---|---|---|
+  | Instructions (`valgrind --tool=callgrind`) | 2,275,350,133 | 1,547,245,235 | **-32.0%** |
+  | Allocation blocks (`valgrind --tool=dhat`) | 6,901,045 | 4,441,045 | **-35.6%** |
+  | Allocation bytes (same) | 422,257,918 | 393,179,915 | -6.9% |
+
+  Wall clock on the same harness moves with it — insert and delete land around
+  -33% (roughly 650 -> 420 ns/op), and the harness now reports median and
+  spread across alternating rounds so a figure inside the noise says so. The
+  `compute_diff` row is the small one either way: it only ever retained the
+  *changed* columns (3 of 7 in this workload), so it had the fewest clones to
+  drop.
+
+  This is an audit surface, so the changeset itself is held byte-identical
+  rather than eyeballed: each owned function is asserted equal to its borrowed
+  twin — as a `Vec<ColumnChange>` *and* as the serialized JSON that reaches the
+  `_autumn_version_history` row — over shared case matrices (25 diff cases, 10
+  insert/delete cases) covering sensitive-column redaction, columns present in
+  `after` but not `before`, columns dropped from the changeset, `null`-vs-
+  missing, non-object inputs, and key ordering. Separate tests assert pointer
+  identity between the input buffers and the emitted ones, so an `_owned`
+  function that quietly delegated to its borrowed twin would fail even though
+  its output is correct.
 
 ## [0.7.0] - 2026-08-23
 

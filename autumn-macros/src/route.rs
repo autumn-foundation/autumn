@@ -233,6 +233,15 @@ pub fn route_macro(
     // when it projects these onto the wire.
     let authorize_bindings =
         api_doc::emit_authorize_binding_slice(&api_doc::extract_authorize_bindings(&input_fn));
+    // `#[agent_operable]` names the authority static after the handler, so the
+    // route macro only needs to know *whether* the handler is governed — the
+    // grant, the proved effects and the const assertions are the analyser's.
+    let agent_authority = if api_doc::extract_agent_authority(&input_fn) {
+        let authority_static = format_ident!("__AUTUMN_AGENT_AUTHORITY_{}", fn_name);
+        quote! { ::core::option::Option::Some(&#authority_static) }
+    } else {
+        quote! { ::core::option::Option::None }
+    };
     let seo_defaults = route_args.seo.emit();
 
     // ── Path helper ─────────────────────────────────────────────
@@ -283,6 +292,7 @@ pub fn route_macro(
                     module_path: ::core::module_path!(),
                     source_file: ::core::file!(),
                     source_line: ::core::line!(),
+                    agent_authority: #agent_authority,
                     #api_doc_fields
                 },
                 repository: ::core::option::Option::None,
@@ -323,6 +333,13 @@ const EDGE_EXTENSION_ERROR: &str = "`#[edge]` handlers cannot take `Extension<..
                                     would be served as a 500 instead of falling through; use \
                                     `EdgeCache`, or serve this route from the origin";
 
+/// Compile error for `#[edge]` stacked with `#[agent_operable]`.
+const EDGE_AGENT_OPERABLE_ERROR: &str = "`#[edge]` cannot be combined with `#[agent_operable(...)]` — the edge lane is \
+     read-only, and the capsule has no audit sink or `AppState` to record an agent \
+     invocation against, so a governed action would run there unaudited; serve this \
+     route from the origin.\n\nServe the route from the origin, or drop \
+     `#[agent_operable]`. See docs/guide/agent-authority.md.";
+
 /// Marker consts the auth/rate guards inject into a handler body. A guard that
 /// expanded *before* this route macro left one of these behind instead of an
 /// attribute, and missing it would ship a guarded route to the unauthenticated
@@ -333,6 +350,7 @@ const GUARD_MARKERS: &[&str] = &[
     "__AUTUMN_STEP_UP_MAX_AGE",
     "__AUTUMN_THROTTLE_ROUTE_ID",
     "__AUTUMN_AUTHORIZE_BINDINGS",
+    "__AUTUMN_AGENT_OPERABLE",
 ];
 
 /// Reject an `#[edge]` route the edge lane cannot serve, spanning the error at
@@ -345,6 +363,13 @@ fn reject_ineligible_edge_route(
 ) -> Option<TokenStream> {
     if http_method != "GET" {
         return Some(syn::Error::new(span, EDGE_METHOD_ERROR).to_compile_error());
+    }
+    // Checked before the generic auth/rate guard sweep below: the marker is in
+    // `GUARD_MARKERS` too (so a governed handler can never slip past that
+    // sweep), but its own diagnostic names the real reason — the edge lane is
+    // read-only — instead of talking about session state.
+    if crate::api_doc::extract_agent_authority(input_fn) {
+        return Some(syn::Error::new(span, EDGE_AGENT_OPERABLE_ERROR).to_compile_error());
     }
     if has_auth_or_rate_guard(input_fn) {
         return Some(syn::Error::new(span, EDGE_GUARD_ERROR).to_compile_error());
@@ -2180,6 +2205,174 @@ mod tests {
         assert!(
             generated.contains("authorize_bindings : & []"),
             "a string literal must not be mistaken for a generated binding marker: {generated}"
+        );
+    }
+
+    // ── `#[agent_operable]` recorded in ApiDoc (#1691) ──────────────────────
+    //
+    // The route macro must fill `ApiDoc::agent_authority` from EITHER stacking
+    // order, exactly like `#[secured]`/`#[authorize]`/`#[edge]`: the attribute
+    // when it is still live below the route macro, the body marker const when
+    // `#[agent_operable]` expanded above it and deleted its own attribute.
+    // Losing it in one order would silently ship a governed handler as an
+    // *ungoverned* MCP tool — audited with `reversibility=unknown` and missing
+    // from the authority manifest's `actions` — with no diff anywhere.
+
+    /// The `Some(&…)` initializer the route macro must emit for a handler
+    /// governed by `#[agent_operable(grant = RefundDrafter)]`.
+    const DRAFT_REFUND_AUTHORITY: &str = "agent_authority : :: core :: option :: Option :: Some (& __AUTUMN_AGENT_AUTHORITY_draft_refund)";
+
+    #[test]
+    fn route_macro_sets_agent_authority_from_live_attribute() {
+        // Ordering A: `#[post]` outermost, `#[agent_operable]` still an
+        // attribute below it, so the route macro reads it straight off the
+        // unexpanded attribute.
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/refunds" },
+            quote! {
+                #[agent_operable(grant = RefundDrafter)]
+                async fn draft_refund() -> &'static str { "drafted" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains(DRAFT_REFUND_AUTHORITY),
+            "a live #[agent_operable] attribute must point ApiDoc at the handler's \
+             authority static: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_sets_agent_authority_from_body_marker() {
+        // Ordering B: `#[agent_operable]` written ABOVE `#[post]`, so it
+        // expanded first, removed its own attribute and left only the marker
+        // const in the body. The marker names the grant, and the authority
+        // static is named after the handler either way.
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/refunds" },
+            quote! {
+                async fn draft_refund() -> &'static str {
+                    #[allow(dead_code)]
+                    const __AUTUMN_AGENT_OPERABLE: &str = "RefundDrafter";
+                    "drafted"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains(DRAFT_REFUND_AUTHORITY),
+            "an already-expanded #[agent_operable] must still point ApiDoc at the \
+             authority static: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_without_agent_operable_emits_none() {
+        // The default must stay `None`: `Some` here is a claim that the body
+        // was walked and every effect const-asserted against a grant, so an
+        // ungoverned handler must never accidentally assert one.
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/refunds" },
+            quote! { async fn draft_refund() -> &'static str { "drafted" } },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("agent_authority : :: core :: option :: Option :: None"),
+            "a handler with no #[agent_operable] records no authority: {generated}"
+        );
+        assert!(
+            !generated.contains("__AUTUMN_AGENT_AUTHORITY_"),
+            "…and must not reference an authority static that was never emitted: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_string_literal_agent_operable_marker_is_not_an_authority() {
+        // Handler *text* that merely spells the marker const must not opt the
+        // route into a governed authority: the marker is decoded structurally,
+        // never scanned for as a string.
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/refunds" },
+            quote! {
+                async fn draft_refund() -> &'static str {
+                    let _ = "const __AUTUMN_AGENT_OPERABLE: &str = \"RefundDrafter\";";
+                    "drafted"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("agent_authority : :: core :: option :: Option :: None"),
+            "a string literal must not be mistaken for the generated marker: {generated}"
+        );
+    }
+
+    #[test]
+    fn edge_rejects_agent_operable() {
+        // The edge lane is read-only and has no session, audit sink or state
+        // to record an agent invocation against, so a governed handler must
+        // never be served from it. Both stacking orders are refused — the
+        // marker is in `GUARD_MARKERS` for exactly this reason.
+
+        // Ordering A: both attributes still live below `#[get]`.
+        let attribute_form = route_macro(
+            "GET",
+            "get",
+            quote! { "/refunds" },
+            quote! {
+                #[edge]
+                #[agent_operable(grant = RefundDrafter)]
+                async fn draft_refund() -> &'static str { "drafted" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            attribute_form.contains("compile_error"),
+            "#[edge] + #[agent_operable] must be rejected: {attribute_form}"
+        );
+        assert!(
+            attribute_form.contains("read-only"),
+            "the error must say the edge lane is read-only: {attribute_form}"
+        );
+
+        // Ordering B: `#[agent_operable]` expanded above `#[get]`, leaving only
+        // its marker const in the body.
+        let marker_form = route_macro(
+            "GET",
+            "get",
+            quote! { "/refunds" },
+            quote! {
+                #[edge]
+                async fn draft_refund() -> &'static str {
+                    #[allow(dead_code)]
+                    const __AUTUMN_AGENT_OPERABLE: &str = "RefundDrafter";
+                    "drafted"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            marker_form.contains("compile_error"),
+            "an already-expanded #[agent_operable] must still be detected next to \
+             #[edge]: {marker_form}"
+        );
+        assert!(
+            marker_form.contains("read-only"),
+            "the error must say the edge lane is read-only: {marker_form}"
         );
     }
 

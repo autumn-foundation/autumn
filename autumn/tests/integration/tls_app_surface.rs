@@ -110,6 +110,22 @@ fn with_request_timeout(ms: u64) -> AutumnConfig {
     config
 }
 
+/// The two probe bodies being compared are fetched one after the other, and
+/// `/actuator/health` reports a wall-clock `uptime` rounded to whole seconds
+/// -- so on a slow runner the pair can straddle a second boundary and differ
+/// only in that field. The comparison is about the *surface* being identical
+/// under TLS, not about the clock, so drop `uptime` from a JSON object body
+/// before comparing; a non-JSON body is compared verbatim.
+fn body_modulo_uptime(body: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(serde_json::Value::Object(mut object)) => {
+            object.remove("uptime");
+            serde_json::Value::Object(object).to_string()
+        }
+        _ => body.to_owned(),
+    }
+}
+
 // ── AC4: probes behave identically under TLS ─────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -143,7 +159,8 @@ async fn framework_probes_are_identical_over_tls_and_plain_http() {
             over_tls.status, over_tls.body
         );
         assert_eq!(
-            over_tls.body, over_http.body,
+            body_modulo_uptime(&over_tls.body),
+            body_modulo_uptime(&over_http.body),
             "{path}: body differs between TLS and plain HTTP"
         );
         assert_eq!(

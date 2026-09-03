@@ -7,6 +7,8 @@ mod acme_end_to_end;
 mod acme_fake_ca;
 mod acting_as_integration;
 mod after_commit_integration;
+#[cfg(feature = "mcp")]
+mod agent_authority;
 mod alerts;
 mod api_versioning_integration;
 #[cfg(feature = "openapi")]
@@ -129,6 +131,7 @@ mod htmx_serving;
 #[cfg(feature = "i18n")]
 mod i18n_integration;
 mod idempotency_middleware;
+mod idempotency_tenant_scope;
 mod impersonation;
 #[cfg(feature = "db")]
 mod impersonation_versioned_db;
