@@ -408,6 +408,84 @@ addition. Direct struct-literal construction of all three types is rare outside
 the framework: `ApiDoc` and `RouteInfo` are macro-emitted, and `ServerConfig` is
 normally deserialized from `autumn.toml`.
 
+## Plugin authors
+
+This release **adds** plugin-facing surface and removes none, so no plugin that
+compiles today stops compiling. Two things do change for you: `autumn
+plugin-check` gains a check your plugin has to satisfy (see the end of this
+section), and `ConformanceConfig` is now `#[non_exhaustive]`.
+
+See [`docs/plugins.md`](../plugins.md#the-plugin-api-contract) for the full
+contract and [`STABILITY.md`](../../STABILITY.md#the-plugin-api-surface-issue-1601)
+for the policy.
+
+- **Stable surface changed:** one, and only for a construction style nothing
+  in this repository used. **Breaking:** `plugin_conformance::ConformanceConfig`
+  gains a `contract` field and is now `#[non_exhaustive]`, so a struct literal
+  (`ConformanceConfig { plugin_name, expected_prefix, .. }`) no longer compiles.
+  Build it the documented way instead — the fluent constructors are unchanged:
+
+  ```rust,ignore
+  let config = ConformanceConfig::new("autumn-plugin-mine")
+      .prefix("/mine")
+      .sensitive_route("/mine", "Role: admin required");
+  ```
+
+  `#[non_exhaustive]` lands with the field on purpose: it is what lets a later
+  release add a check's configuration without doing this to you twice. See the
+  [migration guide](next.md).
+
+  Nothing else was removed, renamed, or re-signatured. The surface that already
+  existed is now *declared* stable in
+  `autumn_web::plugin_contract::PLUGIN_SURFACES` and compiled on every commit by
+  the pinned `autumn-plugin-reference` crate.
+- **Experimental surface changed:** none. `AppBuilder::with_edge_kv` and
+  `autumn_edge::host` are now labelled experimental, matching what
+  `STABILITY.md` already said about the edge capsule lane (issue #1790).
+- **New stable surface:**
+  - `Plugin::contract` — declare the `autumn-web` range your plugin supports.
+    Defaults to `None`, so implementing it is optional.
+  - `autumn_web::plugin_contract` — `PluginContract`, `PLUGIN_SURFACES`,
+    `SurfaceTier`, `evaluate`, `lockstep_range`, and the
+    `PLUGIN_CONTRACT_MARKER` dump protocol.
+  - `AppBuilder::plugin_contracts()` — the contracts declared by the plugins
+    mounted on a builder.
+  - `ConformanceConfig::contract(...)` and
+    `plugin_conformance::check_experimental_surface(...)` — the
+    `experimental-surface` check, runnable from your own test suite.
+  - `autumn_web::db::Pool` and `autumn_web::reexports::diesel_migrations` — so a
+    plugin implementing `DatabasePoolProvider` or shipping migrations through
+    `AppBuilder::plugin_migrations` can name what those seams need without
+    taking its own `diesel-async` / `diesel-migrations` dependency. (Both were
+    found by writing the reference plugin: the seams were declared plugin-facing
+    and were not reachable from stable API.)
+- **Declared range to move to:** `autumn-web {X.Y}` — add
+  `.autumn_web("{X.Y}")` to your `Plugin::contract` and re-run
+  `autumn plugin-check --plugin-name <your-plugin>`. A plugin that releases in
+  lockstep with the framework can write
+  `.autumn_web(lockstep_range(env!("CARGO_PKG_VERSION")))` instead and never
+  touch the literal again.
+
+**Breaking for the `plugin-check` command, and only for it.** Two checks join
+the report. `plugin-contract` **fails** when the plugin under check declares no
+usable `autumn-web` range; `experimental-surface` reports what the plugin
+declares and fails only on a name that cannot be resolved against the registry.
+
+So: your plugin still *compiles and runs* unchanged whether or not it declares
+a contract — that part is genuinely additive. But if your CI runs
+`autumn plugin-check --plugin-name <your-plugin>`, it goes red until you
+implement `Plugin::contract`. That is deliberate: this is the author-facing
+gate, and "you have not said which framework versions you support" is exactly
+what it exists to say. Implementing the four-line `contract()` above clears it.
+
+Both checks **skip** against a host binary built on an `autumn-web` that
+predates the contract dump, so an older host app does not turn them red — but
+`--deny-experimental` fails closed in that case rather than silently passing,
+because a flag that forbids something must not quietly become a no-op.
+
+`autumn generate plugin` now scaffolds `Plugin::contract` and a conformance
+test that passes it, so a freshly generated plugin is green out of the box.
+
 ## Compiler error cheat sheet
 
 Paste the most common errors a user will hit and the fix. This is the

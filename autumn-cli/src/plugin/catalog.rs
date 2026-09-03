@@ -243,16 +243,65 @@ pub fn community_mount_snippet(crate_name: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Workspace members that are not plugin crates: the framework itself,
-    /// its macros, this CLI, the schema core, and the edge runtime (none of
-    /// which appear in `docs/plugins.md`'s first-party plugin table).
+    /// Workspace members that are not *installable* plugin crates: the
+    /// framework itself, its macros, this CLI, the schema core, the edge
+    /// runtime, and the pinned plugin-surface reference (issue #1601) — none of
+    /// which appear in `docs/plugins.md`'s first-party plugin table.
+    ///
+    /// `autumn-plugin-reference` really is a `Plugin`, which is the point of
+    /// it: it exists so CI compiles the declared stable plugin surface on every
+    /// change. It is never published, so `autumn plugin add` could not install
+    /// it if it were listed. `every_excluded_member_is_unpublishable_or_core`
+    /// below keeps that from becoming a way to hide a real plugin.
     const NON_PLUGIN_MEMBERS: &[&str] = &[
         "autumn",
         "autumn-macros",
         "autumn-cli",
         "autumn-schema-core",
         "autumn-edge",
+        "autumn-plugin-reference",
     ];
+
+    /// Crates in [`NON_PLUGIN_MEMBERS`] that ARE published, and so are excluded
+    /// for being core rather than for being uninstallable.
+    const PUBLISHED_NON_PLUGIN_MEMBERS: &[&str] = &[
+        "autumn",
+        "autumn-macros",
+        "autumn-cli",
+        "autumn-schema-core",
+        "autumn-edge",
+    ];
+
+    /// The exclusion list above is the one way a genuinely installable
+    /// first-party plugin could be dropped from `autumn plugin list` without
+    /// the coverage test noticing. So every entry has to earn its place: it is
+    /// either one of the named core crates, or it is `publish = false` and
+    /// therefore not installable at all.
+    #[test]
+    fn every_excluded_member_is_unpublishable_or_core() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        for member in NON_PLUGIN_MEMBERS {
+            if PUBLISHED_NON_PLUGIN_MEMBERS.contains(member) {
+                continue;
+            }
+            let manifest = workspace.join(member).join("Cargo.toml");
+            let content = std::fs::read_to_string(&manifest)
+                .unwrap_or_else(|e| panic!("{}: {e}", manifest.display()));
+            let table: toml::Table = toml::from_str(&content).expect("parse manifest");
+            let publish = table
+                .get("package")
+                .and_then(|p| p.get("publish"))
+                .and_then(toml::Value::as_bool);
+            assert_eq!(
+                publish,
+                Some(false),
+                "{member} is excluded from the plugin catalog but is publishable; either list it \
+                 in the catalog or add it to PUBLISHED_NON_PLUGIN_MEMBERS with a reason"
+            );
+        }
+    }
 
     /// AC #1: the listing covers **all** first-party plugins in this
     /// workspace, not just the three `plugin add` is spelled out for.

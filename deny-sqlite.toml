@@ -26,7 +26,7 @@ features = ["autumn-web/sqlite"]
 # always denied, and unmaintained + unsound are set explicitly to "all" rather
 # than relying on cargo-deny's version-dependent default scope, so no advisory
 # anywhere in the tree can slip past this gate. Yanked crates stay at the
-# default `warn` (currently spin 0.9.8 / 0.10.0, transitive) — tracked but
+# default `warn` (currently chacha20 0.10.1, transitive) — tracked but
 # non-blocking.
 # The RUSTSEC-2024-0384 (instant) ignore enters only via managed-pg-bundled,
 # which is not in the sqlite graph, so it is legitimately unused here — don't
@@ -43,11 +43,6 @@ ignore = [
     # RSA private-key decryption oracle, so real exposure is limited. Tracked by
     # issue #1600. Review-by: 2026-10-01 (or when a fixed rsa ships).
     { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; RSA-JWT path only via jsonwebtoken; tracked in #1600; review-by 2026-10-01" },
-    # RUSTSEC-2026-0173 — proc-macro-error2 unmaintained. Build-time proc-macro
-    # only, pulled transitively by validator_derive -> validator 0.20. Not a
-    # runtime vulnerability and no safe upgrade. Review-by: 2026-10-01 (drop when
-    # validator ships a release that migrates off proc-macro-error2).
-    { id = "RUSTSEC-2026-0173", reason = "unmaintained build-time proc-macro via validator 0.20; no safe upgrade; review-by 2026-10-01" },
     # RUSTSEC-2024-0384 — instant unmaintained. Build-time, transitive, and only
     # pulled in by the managed-pg-bundled feature scanned above:
     # instant -> parking_lot -> reqwest-retry -> postgresql_archive ->
