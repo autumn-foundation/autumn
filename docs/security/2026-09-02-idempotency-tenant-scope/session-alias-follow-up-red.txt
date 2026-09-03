@@ -1,0 +1,10 @@
+$ cargo test -p autumn-web --test integration_tests session_tenancy_alias_uses_finalized_tenant_after_switch -- --nocapture
+
+running 1 test
+
+thread 'integration::idempotency_tenant_scope::session_tenancy_alias_uses_finalized_tenant_after_switch' panicked at autumn/tests/integration/idempotency_tenant_scope.rs:227:5:
+assertion `left == right` failed: a retry after an org switch must replay the cached response instead of re-running the handler under the tenant it switched *to*
+  left: "switched-2"
+ right: "switched-1"
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1789 filtered out; finished in 0.34s

@@ -24,7 +24,7 @@ in `autumn-macros/src/*.rs` and by trybuild/integration tests.
   - [Repositories](#repositories) — `#[repository(Model)]` and its advanced surface
   - [Services](#services) — `#[service]`
   - [Background Work: Scheduled Tasks, Jobs, Events, Listeners, One-off Tasks](#background-work-scheduled-tasks-jobs-events-listeners-one-off-tasks) — `#[scheduled]` + `tasks![]`, `#[job]` + `jobs![]`, `#[event]`, `#[listener]` + `listeners![]`, `#[task]` + `one_off_tasks![]`, `#[cached]`
-  - [Guards & Rate Limiting](#guards--rate-limiting) — `#[secured]`, `#[authorize]`, `#[step_up]`, `#[feature_flag]`, `#[throttle]`, `#[query_budget]`
+  - [Guards & Rate Limiting](#guards--rate-limiting) — `#[secured]`, `#[authorize]`, `#[step_up]`, `#[feature_flag]`, `#[throttle]`, `#[query_budget]`, `#[agent_operable]`
   - [Mail](#mail) — `#[mailer]`, `#[mailer_preview]` + `mail_previews![]`, `#[inbound_mail]`
   - [i18n, Stories & Path Helpers](#i18n-stories--path-helpers) — `t!`, `story!`, `paths![]`
 - [The Companion Function Pattern](#the-companion-function-pattern)
@@ -605,10 +605,10 @@ saying why. A `#[repository]` recording version history or a ledger serializes
 the whole model, which a classified model cannot do; gating those sinks is a
 follow-up slice. See [Data Classification](./data-classification.md).
 
-#### `#[normalize(trim, downcase, upcase, squish, with = path)]`
+#### `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path)]`
 
 Runs an ordered normalizer chain over the owned `String` before every insert
-and update. Built-ins (`trim`, `downcase`, `upcase`, `squish`) are
+and update. Built-ins (`trim`, `downcase`, `upcase`, `squish`, `strip_nul`) are
 `fn(&str) -> String` in `autumn_web::normalize`; `with = path` calls your own
 function with the same signature. Normalizers apply left-to-right.
 
@@ -1523,6 +1523,111 @@ verbatim. Keep the method attribute outermost anyway, matching `#[throttle]` /
 OpenAPI response schema.
 
 See [Compile-Time Query Budgets](./query-budgets.md).
+
+### `#[agent_operable(grant = G)]`
+
+Also a **build-time** gate: it walks the handler's AST, derives the side effects
+it can prove — row writes, unbounded writes, cross-tenant access, outbound
+hosts, webhook topics, job enqueues — and fails the compile when the named
+grant does not allow one of them. Unlike `#[query_budget]`, it *does* add items
+to your code, so it is worth knowing exactly which.
+
+**You write:**
+
+```rust
+use autumn_web::prelude::*;
+
+authority_grant! {
+    pub RefundDrafter {
+        writes: [Refund],
+        tenant_scope: scoped,
+        reversibility: compensable,
+    }
+}
+
+#[post("/api/refunds")]
+#[agent_operable(grant = RefundDrafter)]
+async fn draft_refund(repo: PgRefundRepository) -> AutumnResult<Json<Refund>> {
+    let refund = repo.create(&body).await?;
+    Ok(Json(refund))
+}
+```
+
+**Effect:** the handler's *body* is emitted with one added statement, and three
+items are added beside it.
+
+1. A marker const, injected as the **first statement of the body**:
+
+   ```rust
+   #[allow(dead_code, non_upper_case_globals)]
+   const __AUTUMN_AGENT_OPERABLE: &::core::primitive::str = "RefundDrafter";
+   ```
+
+   This is what makes attribute order irrelevant: attributes expand
+   outermost-first, so with `#[agent_operable]` on top it expands first and
+   strips itself — and the route macro, running afterwards, finds this marker
+   in the body and fills `ApiDoc::agent_authority` anyway. (The other order
+   needs no marker: `#[post]` expands while the attribute is still there to
+   read.)
+
+2. One `const _: () = assert!(…)` per proved effect, **respanned onto the call
+   that produced it** — which is why the error points at your write rather than
+   at the attribute:
+
+   ```rust
+   const _: () = ::core::assert!(
+       RefundDrafter.allows_write(PgRefundRepository::__AUTUMN_MODEL_IDENT),
+       "agent authority: `draft_refund` writes `Refund`, which grant … "
+   );
+   ```
+
+   Const-eval reads the linked `Grant`, not tokens, so the check holds when the
+   grant is declared in another crate. A reversibility-floor assertion is added
+   the same way when any effect requires one.
+
+3. A `static` recording what was proved, and its manifest registration:
+
+   ```rust
+   #[doc(hidden)]
+   #[allow(non_upper_case_globals, dead_code)]
+   static __AUTUMN_AGENT_AUTHORITY_draft_refund:
+       ::autumn_web::agent_authority::AgentAuthority = /* action, grant, effects, … */;
+
+   ::autumn_web::reexports::inventory::submit! {
+       ::autumn_web::agent_authority::AgentAuthorityDescriptor(&__AUTUMN_AGENT_AUTHORITY_draft_refund)
+   }
+   ```
+
+   It takes the handler's own visibility, and carries every proved effect with
+   its `file:line`, plus one `AssertedEffectFree { location, reason }` per
+   `#[agent_effect(none, …)]` site — so a reviewer reads not just *that* a
+   hatch was used but where and why. `inventory` is what lets
+   `autumn agents manifest` see every action in the linked binary, including
+   ones declared in plugins. Any plain `#[cfg]` on the handler is replayed onto
+   both (a `cfg_attr` is not — it applies an attribute written for a function),
+   so a handler that does not exist in this build contributes no row and leaves
+   no dangling reference.
+
+   For a method taking `self`, **all three** of these are withheld — the
+   marker included, so no route macro can reference a static that was not
+   emitted. A trait impl would reject an associated item the trait never
+   declared. The analysis still runs.
+
+One statement-level annotation, `#[agent_effect(...)]`, is this macro's own
+vocabulary: it reads it and **strips it from the emitted function**, so it
+never reaches rustc — and so it is meaningless outside an
+`#[agent_operable]`-annotated function.
+
+`authority_grant!` itself expands to a `pub const G: Grant = …` plus its own
+`inventory::submit!`, so a declared-but-unused envelope still appears in the
+manifest.
+
+**Attribute ordering:** either order works, via the marker in (1). Keep the
+method attribute outermost anyway, as elsewhere. `#[edge]` is the one attribute
+this cannot be combined with, and that is a compile error rather than a silent
+skip.
+
+See [The Agent Authority Envelope](./agent-authority.md).
 
 ---
 

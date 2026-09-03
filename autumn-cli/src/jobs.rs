@@ -35,12 +35,13 @@ pub fn run(opts: &ManifestOptions<'_>) {
 
     let output = Command::new(&binary)
         .env("AUTUMN_DUMP_JOBS", "1")
-        // `Command` inherits this process's environment, and
-        // `AUTUMN_DUMP_DATA_FLOW` is dispatched *earlier* than
-        // `AUTUMN_DUMP_JOBS` in `AppBuilder::run`: one left over in the
-        // CLI's own environment would answer this command with the
-        // data-flow manifest instead of the jobs one.
+        // `Command` inherits this process's environment, and both
+        // `AUTUMN_DUMP_DATA_FLOW` and `AUTUMN_DUMP_AGENT_AUTHORITY` are
+        // dispatched *earlier* than `AUTUMN_DUMP_JOBS` in `AppBuilder::run`:
+        // one left over in the CLI's own environment would answer this command
+        // with that manifest instead of the jobs one.
         .env_remove(crate::data_flow::DUMP_ENV)
+        .env_remove(crate::agents::DUMP_ENV)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .output()

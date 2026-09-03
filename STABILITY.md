@@ -13,6 +13,7 @@ framework without destroying the applications that depend on it.
 
 - [Versioning (SemVer)](#versioning-semver)
 - [The Public API Surface](#the-public-api-surface)
+- [The plugin API surface](#the-plugin-api-surface-issue-1601)
 - [What counts as a breaking change](#what-counts-as-a-breaking-change)
 - [What does *not* count as a breaking change](#what-does-not-count-as-a-breaking-change)
 - [Minimum Supported Rust Version (MSRV) policy](#minimum-supported-rust-version-msrv-policy)
@@ -120,6 +121,36 @@ When in doubt: if `cargo doc --no-deps` doesn't list it, it is not part of
 the public API.
 
 [`AppBuilder::run`]: https://docs.rs/autumn-web/latest/autumn_web/app/struct.AppBuilder.html
+
+### The plugin API surface (issue #1601)
+
+Plugins get a contract of their own, narrower and more strongly enforced than
+the crate-wide promise above. Every plugin-facing API is declared **stable** or
+**experimental** in
+[`autumn_web::plugin_contract::PLUGIN_SURFACES`](autumn/src/plugin_contract.rs),
+rendered in [`docs/plugins.md`](docs/plugins.md#the-plugin-api-contract), and
+kept honest by three gates:
+
+- **A pinned reference plugin.** `autumn-plugin-reference` implements `Plugin`
+  and calls every *stable* surface. It is built by the `plugin-contract` CI job
+  on every change, so removing, renaming, or re-signaturing a stable plugin API
+  is a red build here rather than a surprise in a plugin author's.
+- **A registry that cannot outrun its proof.** A stable entry with no call site
+  in the reference plugin fails the same job — the list cannot promise
+  stability for something nothing compiles.
+- **A guide section that must be filled.** A change to the declared surface
+  requires a **Plugin authors** section in
+  [`docs/migrations/next.md`](docs/migrations/next.md), enforced by
+  `scripts/check-plugin-surface.sh`.
+
+A **stable** plugin surface follows this document's SemVer policy exactly. An
+**experimental** one may change in any release, patch included; a plugin
+declares its use of one via `PluginContract::uses_experimental`, and
+`autumn plugin-check` reports it.
+
+Separately, a plugin declares the `autumn-web` range it supports through
+`Plugin::contract`. An excluded pairing fails at registration with a diagnostic
+naming both versions and both remedies, so a mismatch is never silent.
 
 ### The edge capsule's byte-identity claim
 

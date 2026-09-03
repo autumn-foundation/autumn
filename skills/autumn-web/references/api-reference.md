@@ -33,6 +33,14 @@ copy of the publish order.
 ### Functions
 
 - `autumn_web::app() -> AppBuilder`
+- `autumn_web::slugify(&str) -> String` — URL-safe slug. **Never returns
+  `""`**: input with nothing to slugify (empty, all punctuation, un-folded
+  non-Latin) gets a stable, deterministic hash fallback token instead.
+- `autumn_web::contains_letter_or_number(&str) -> bool` (unreleased, #2424) —
+  the input check `slugify` cannot answer. Reach for it to reject content-free
+  user input (`"***"`, `"🎉🔥💯"`); **never** `slugify(x).is_empty()`, which is
+  always `false` and so is dead code. Deliberately broader than "`slugify`
+  produced a real slug": `"日本語"` passes — real text, hashed URL segment.
 
 ### Common types
 
@@ -134,6 +142,7 @@ copy of the publish order.
 | `#[throttle]` | Per-route rate limit — inline (`limit`/`per`/`key`) or named (`#[throttle("login")]`) (**0.6.0**) |
 | `#[event]`, `#[listener]`, `listeners![...]` | Typed domain event bus (**0.6.0**) — publish via the `Events` extractor, register with `.listeners(...)` |
 | `#[query_budget(N)]` | Compile-time per-route database query ceiling — the build fails when a reachable path can exceed `N` (trunk-dev, #1667). Escape hatches: `#[query_budget(unbounded, reason = "…")]`, and `#[query_cost(N)]` / `#[query_exempt(reason = "…")]` on a statement |
+| `authority_grant! { pub Name { … } }`, `#[agent_operable(grant = Name)]` | Build-time agent authority envelope (trunk-dev, #1691). The grant declares `writes`, `unbounded_writes`, `tenant_scope: scoped \| cross_tenant \| none`, `outbound` (literal URL prefixes or `alias:<name>`), `webhooks`, `jobs`, `rate`, `spend`, and a required `reversibility: reversible \| compensable \| irreversible`; the attribute statically derives the handler's effect set and the build fails at the offending call when the grant does not cover it. `#[agent_effect(writes(Model), …, reason = "…")]` / `#[agent_effect(none, reason = "…")]` on a statement declares what the analysis cannot read — it never grants. Requires nothing at runtime; pairs with `#[api_doc(mcp)]` |
 
 Route macros accept a `seo(...)` argument declaring per-page meta tag defaults
 (0.7.0, #1182):
@@ -289,10 +298,10 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `classify::manifest::ClassifiedFieldDescriptor` inventory registration, and
   `Model::__AUTUMN_CLASSIFIED_COLUMNS`. `autumn data-flow` emits the manifest.
   See `docs/guide/data-classification.md`.
-- `#[normalize(trim, downcase, upcase, squish, with = path::to::fn)]` (issue
+- `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path::to::fn)]` (issue
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`
-  (`trim`/`downcase`/`upcase`/`squish`); `with = path` calls a user
+  (`trim`/`downcase`/`upcase`/`squish`/`strip_nul`); `with = path` calls a user
   `fn(&str) -> String`. Runs on the **write** path (`save`/`save_many` insert;
   `update` via `UpdateDraft::from_patch`) *before* the `before_create` /
   `before_update` hooks and the DB write, and on derived `#[repository]`
@@ -1014,7 +1023,8 @@ double-submits and replays.
 - Route macros: `get`, `post`, `put`, `patch`, `delete`, `routes`, `main`,
   `static_get`, `static_routes`, `scheduled`, `tasks`, `job`, `jobs`, `task`,
   `one_off_tasks`, `secured`, `authorize`, `service`, `cached`, `api_doc`,
-  `oauth2_callback`, `paths`, `step_up`, `query_budget`, `ws` (when `ws`
+  `oauth2_callback`, `paths`, `step_up`, `query_budget`, `agent_operable`,
+  `authority_grant` (#1691), `ws` (when `ws`
   feature enabled).
   **Note**: `#[model]` and `#[repository]` are NOT in the prelude — use
   `#[autumn_web::model]` and `#[autumn_web::repository]` (qualified paths).

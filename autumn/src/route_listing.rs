@@ -330,6 +330,16 @@ pub struct RouteInfo {
     /// `policy: true` and no bindings is therefore normal, not a defect.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub authorize_bindings: Vec<AuthorizeBindingInfo>,
+    /// Name of the authority grant proved for this handler by
+    /// `#[agent_operable(grant = ...)]` (issue #1691), so `autumn routes` shows
+    /// which endpoints an agent may drive and under what envelope.
+    ///
+    /// `None` means the handler declares no grant. For a *mutating*
+    /// MCP-exposed route that is the "ungoverned tool" case the authority
+    /// manifest reports; for everything else it simply means the endpoint is
+    /// not agent-operable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_grant: Option<String>,
     /// Statically derived resource character of the route — the capacity
     /// contract's per-route shape (issue #1733). Computed from [`Self::pools`]
     /// by [`ResourceShape::from_pools`], so the classification rule lives in
@@ -493,6 +503,16 @@ fn authorize_bindings_of(
     bindings
 }
 
+/// Name of the authority grant proved for a handler by `#[agent_operable]`.
+///
+/// Read straight off [`crate::openapi::ApiDoc::agent_authority`], so the grant
+/// shown by `autumn routes` disappears exactly when the attribute does.
+fn agent_grant_of(api_doc: &crate::openapi::ApiDoc) -> Option<String> {
+    api_doc
+        .agent_authority
+        .map(|authority| authority.grant.name.to_owned())
+}
+
 /// Helper type alias representing version name, status string, and sunset opt-out flag.
 type RouteVersionInfo = (Option<String>, Option<String>, Option<bool>);
 
@@ -596,6 +616,7 @@ pub fn collect_route_infos(
             module: module_of(&route.api_doc),
             location: source_location_of(&route.api_doc),
             authorize_bindings,
+            agent_grant: agent_grant_of(&route.api_doc),
             resource_shape: ResourceShape::from_pools(&pools),
             pools,
         });
@@ -625,6 +646,7 @@ pub fn collect_route_infos(
                 module: module_of(&route.api_doc),
                 location: source_location_of(&route.api_doc),
                 authorize_bindings: authorize_bindings_of(&group.source, &route.api_doc),
+                agent_grant: agent_grant_of(&route.api_doc),
                 resource_shape: ResourceShape::from_pools(&pools),
                 pools,
             });
@@ -1353,6 +1375,87 @@ mod tests {
 
         assert_eq!(infos[0].authorize_bindings, vec![binding("update", "Note")]);
         assert!(infos[0].policy, "a bound route is still policy-guarded");
+    }
+
+    // ── `agent_grant` (#1691) ───────────────────────────────────────────
+
+    /// One hand-built authority, standing in for what `#[agent_operable]`
+    /// emits. `autumn routes` only ever reads the grant's *name* off it.
+    fn refund_authority() -> &'static crate::agent_authority::AgentAuthority {
+        static GRANT: crate::agent_authority::Grant = crate::agent_authority::Grant {
+            name: "RefundDrafter",
+            writes: &["Refund"],
+            unbounded_writes: &[],
+            tenant_scope: crate::agent_authority::TenantScope::Scoped,
+            outbound: &[],
+            webhooks: &[],
+            jobs: &[],
+            rate: None,
+            spend: None,
+            reversibility: crate::agent_authority::Reversibility::Compensable,
+            location: "autumn/src/route_listing.rs",
+        };
+        static AUTHORITY: crate::agent_authority::AgentAuthority =
+            crate::agent_authority::AgentAuthority {
+                action: "draft_refund",
+                module_path: "autumn_web::route_listing::tests",
+                location: "autumn/src/route_listing.rs",
+                grant: &GRANT,
+                effects: &[],
+                asserted_effect_free_sites: 0,
+                asserted_effect_free: &[],
+            };
+        &AUTHORITY
+    }
+
+    #[test]
+    fn collect_carries_the_agent_grant_name() {
+        let api_doc = crate::openapi::ApiDoc {
+            agent_authority: Some(refund_authority()),
+            ..dummy_api_doc()
+        };
+        let route = make_route_with(Method::POST, "/api/refunds", "draft_refund", api_doc);
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
+
+        assert_eq!(infos[0].agent_grant.as_deref(), Some("RefundDrafter"));
+    }
+
+    #[test]
+    fn collect_leaves_an_ungoverned_route_without_a_grant() {
+        // `None` is the signal the authority manifest keys `ungoverned_tools`
+        // off, so inventing one here would hide the gap the listing exists to
+        // show.
+        let route = make_route_with(Method::POST, "/api/notes", "write_note", dummy_api_doc());
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
+
+        assert_eq!(infos[0].agent_grant, None);
+    }
+
+    #[test]
+    fn route_info_elides_an_absent_agent_grant() {
+        // Same compatibility convention as the fields before it: elided when
+        // absent, so an existing dump entry stays byte-stable for an older
+        // consumer.
+        let info = RouteInfo {
+            method: "POST".to_owned(),
+            path: "/api/notes".to_owned(),
+            handler: "write_note".to_owned(),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&info).unwrap();
+        assert!(
+            value.get("agent_grant").is_none(),
+            "an absent grant must not be serialized: {value}"
+        );
+
+        let governed = RouteInfo {
+            agent_grant: Some("RefundDrafter".to_owned()),
+            ..info
+        };
+        let value = serde_json::to_value(&governed).unwrap();
+        assert_eq!(value["agent_grant"], "RefundDrafter");
+        let decoded: RouteInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.agent_grant.as_deref(), Some("RefundDrafter"));
     }
 
     /// Field 15 follows the field 9-14 convention: elided when empty, so the

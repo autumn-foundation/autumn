@@ -3670,11 +3670,15 @@ enum Normalizer {
     Upcase,
     /// `squish` — trim and collapse internal whitespace runs to one space.
     Squish,
+    /// `strip_nul` — remove every NUL (`U+0000`), which a Postgres
+    /// `TEXT`/`VARCHAR` column cannot store (#2423).
+    StripNul,
     /// `with = path::to::fn` — user escape hatch (`fn(&str) -> String`).
     With(syn::Path),
 }
 
-/// Parse a field's `#[normalize(trim, downcase, upcase, squish, with = path)]`
+/// Parse a field's
+/// `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path)]`
 /// attribute into an ordered list of normalizers. Returns an empty list when
 /// the field has no `#[normalize]` attribute.
 fn parse_field_normalize(field: &syn::Field) -> syn::Result<Vec<Normalizer>> {
@@ -3706,13 +3710,16 @@ fn parse_field_normalize(field: &syn::Field) -> syn::Result<Vec<Normalizer>> {
                 ops.push(Normalizer::Upcase);
             } else if meta.path.is_ident("squish") {
                 ops.push(Normalizer::Squish);
+            } else if meta.path.is_ident("strip_nul") {
+                ops.push(Normalizer::StripNul);
             } else if meta.path.is_ident("with") {
                 let path: syn::Path = meta.value()?.parse()?;
                 ops.push(Normalizer::With(path));
             } else {
                 return Err(meta.error(
                     "unsupported `#[normalize]` option; expected one of \
-                     `trim`, `downcase`, `upcase`, `squish`, or `with = path`",
+                     `trim`, `downcase`, `upcase`, `squish`, `strip_nul`, or \
+                     `with = path`",
                 ));
             }
             Ok(())
@@ -3762,6 +3769,9 @@ fn emit_normalize_expr(ops: &[Normalizer], value_expr: &TokenStream) -> TokenStr
         }
         Normalizer::Squish => {
             quote! { __autumn_n = ::autumn_web::normalize::squish(&__autumn_n); }
+        }
+        Normalizer::StripNul => {
+            quote! { __autumn_n = ::autumn_web::normalize::strip_nul(&__autumn_n); }
         }
         Normalizer::With(path) => quote! { __autumn_n = #path(&__autumn_n); },
     });

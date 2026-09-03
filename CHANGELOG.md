@@ -9,6 +9,162 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Build-time authority envelope for agent-operable handlers (#1691):** an
+  endpoint exposed as an MCP tool is an action an autonomous agent can take
+  with no human in the loop, and nothing said what that action was *allowed*
+  to do. `#[api_doc(mcp)]` published a description; the blast radius — which
+  models the handler writes, whether it can erase a table, whether it can leave
+  the tenant it was invoked for, which hosts it reaches, which jobs it starts,
+  how hard the whole thing is to undo — lived in the reviewer's head and
+  drifted the first time someone added a line to the body. Autumn now makes it
+  a declared value the compiler checks. `authority_grant!` declares a named
+  `const Grant`, and `#[agent_operable(grant = RefundDrafter)]` walks the
+  handler body, derives the effect set it can prove, and emits one const-eval
+  coverage assertion per proved effect, respanned onto the offending call:
+
+  ```rust
+  use autumn_web::prelude::*;
+
+  authority_grant! {
+      pub RefundDrafter {
+          writes: [Refund],
+          tenant_scope: scoped,
+          outbound: ["https://api.stripe.com/v1/refunds"],
+          jobs: [NotifyFinanceJob],
+          rate: "10/min",
+          spend: "500.00 USD",
+          reversibility: compensable,
+      }
+  }
+
+  #[post("/api/refunds")]
+  #[api_doc(mcp, summary = "Draft a refund")]
+  #[agent_operable(grant = RefundDrafter)]
+  pub async fn draft_refund(/* … */) -> AutumnResult<Json<Refund>> { /* … */ }
+  ```
+
+  Adding `payouts.create(&p).await?` to that body fails `cargo build` at the
+  write, on every branch, whether or not a test exercises it — and because the
+  check is const-evaluated against the linked `Grant` rather than against
+  tokens, it holds when the grant is declared in another crate. Six effect
+  kinds are recognised: bounded writes, unbounded writes (`delete_all`,
+  `truncate`, an unfiltered `diesel::update` — never implied by `writes`,
+  because one row and all of them are different authorities), cross-tenant
+  access, outbound HTTP, webhook topics and job enqueues. A raw diesel
+  `SELECT`/`UPDATE`/`DELETE` run on the request's connection carries none of
+  the tenant predicate the repository codegen applies, so it is recorded as a
+  cross-tenant effect (`raw_query:<table>`) and refused under the default
+  `tenant_scope: scoped` — route it through a repository, declare the statement
+  `#[agent_effect(scoped, reason = "…")]`, or declare `tenant_scope:
+  cross_tenant`; an `INSERT` has no `WHERE` to scope and is exempt. Declared
+  `reversibility` has a floor the proved effects impose: a job, a webhook, an
+  outbound call or an unbounded write cannot be undone by writing the previous
+  rows back, so none of them may be declared `reversible`. (A cross-tenant read
+  can be, so it carries no floor of its own; a cross-tenant write still carries
+  its write effect's.) The analysis is fail-closed where it has no chokepoint
+  to rely on: `job::enqueue` reaches a global client, `Client::new()` is
+  constructible from nothing, and a webhook fans out to subscriber-supplied
+  URLs, so those verbs are effects wherever they appear and their subject must
+  be a literal. Anything opaque — a helper handed a tracked handle, a
+  `format!`-built URL, a non-literal job name or webhook topic, a
+  `dyn`/`impl Trait` handle, a `tokio::spawn` that detaches the effect from the
+  request it is audited under — is a diagnostic naming the call site and the
+  annotation that discharges it, never a silent zero. The one escape hatch,
+  `#[agent_effect(writes(Refund), reason = "…")]` on a statement (`writes`,
+  `unbounded_writes`, `cross_tenant`, `outbound`, `webhooks`, `jobs`, `scoped`,
+  `none`, and a mandatory non-blank `reason`), declares what the analysis
+  cannot read — and declared effects are checked against the grant exactly like
+  proved ones, because the hatch declares, it never grants.
+
+  `autumn agents manifest` builds the app and reads back the diffable record:
+  one row per action with its envelope, its proved effects and the grant
+  entries nothing exercises, every declared grant including unused ones, and —
+  the completeness half — every MCP-exposed tool with *no* envelope at all.
+  `--check` fails on drift and on any ungoverned **mutating** tool unless
+  `--allow-ungoverned` is passed, which is the one gap the compiler cannot
+  catch: a tool with no grant has no assertion to fail. Every MCP `tools/call`
+  now writes two audit events with zero per-handler wiring —
+  `agent.tool.<name>.attempt` before dispatch and `agent.tool.<name>` after —
+  sharing a correlation id and carrying a `phase` (`attempt` / `outcome` /
+  `refused`), the transport, the grant, the compile-known reversibility, the
+  proved effect set and the argument *names* — only the keys the tool declares,
+  any others counted as `+N unknown`, never their values — with the outcome
+  additionally carrying the HTTP status and the pipeline's own `x-request-id`.
+  An ungoverned tool is audited too, with `reversibility = "unknown"`. Every
+  write is bounded by a 2-second timeout; if the attempt record cannot be
+  written or times out and the action is not `reversible`, the tool fails
+  closed, the handler never runs, and a best-effort
+  `agent.tool.<name>.refused` (status Failure, carrying a `refused_reason`)
+  records that it was turned away. `destructiveHint` now takes the declared
+  reversibility as an input the HTTP verb alone could not supply — raising a
+  `POST`/`PATCH` the verb says nothing about, while never clearing the warning
+  a `DELETE` already carries — and handlers can read the invocation through
+  `Extension<AgentInvocation>`. `--check` additionally fails when a binary has
+  no audit sink *and* can still take an agent-reachable action nothing can undo
+  (`--allow-unaudited` accepts it), and on a route naming an authority nothing
+  registered.
+
+  The first slice is deliberately narrow and says so in the manifest itself:
+  `rate` and `spend` are validated for grammar and recorded but **not enforced
+  at runtime** — there is no metering in this slice; generated
+  `#[repository(api, mcp)]` CRUD tools have no annotation site and therefore
+  surface as ungoverned rather than being gated; and `dependent(...)` cascades
+  are not folded into write sets, so `writes: [Post]` does not imply the
+  comments a delete takes with it. Each of those is named in the document's
+  `excluded` list with its caveat, rather than left to the guide. See
+  `docs/guide/agent-authority.md`.
+- **`autumn_web::contains_letter_or_number(&str) -> bool` (#2424):** the
+  predicate to use when rejecting user input that will be slugified. `slugify`
+  never returns an empty string — input with nothing to slugify gets a stable
+  hash fallback token — so `slugify(input).is_empty()` is always `false` and
+  can only ever be dead code. This asks the question that check was reaching
+  for: does the input hold at least one letter or number, in any script?
+  (Precisely, any `char::is_alphanumeric`, so `"½"` and `"Ⅻ"` count too.) It is
+  deliberately broader than "`slugify` produced a real slug", so `"日本語"`
+  passes — real text, hashed URL segment — while `"***"` and `"🎉🔥💯"` do
+  not. It is a content check, not a spoofing defence: a handful of characters
+  are letters by Unicode yet render blank (the Hangul fillers), and filtering
+  those is the application's job. `slugify`'s own behavior is unchanged; its
+  doc comment now points here.
+- **A versioned stability contract for the plugin API (#1601):** Autumn shipped a
+  real plugin system — the `Plugin` trait, a conformance harness, a flagship
+  first-party plugin, authoring docs — and no compatibility contract to go with
+  it. Nothing said which plugin-facing APIs were stable, a plugin could not
+  state which `autumn-web` versions it supported, and no CI gate was specific to
+  the plugin surface, so every release was a potential silent break for anyone
+  building on it. Non-breaking: every new API is additive, and a plugin that
+  declares nothing behaves exactly as it does today.
+
+  Plugin-facing APIs are now declared `stable` or `experimental` in
+  `autumn_web::plugin_contract::PLUGIN_SURFACES`, with the SemVer promise each
+  tier carries written down in [`STABILITY.md`](STABILITY.md#the-plugin-api-surface-issue-1601)
+  and the table rendered in [the plugin guide](docs/plugins.md#the-plugin-api-contract).
+
+  A plugin declares the framework range it supports, and an excluded pairing
+  fails at registration naming both versions and both remedies:
+
+  ```rust
+  fn contract(&self) -> Option<PluginContract> {
+      Some(PluginContract::new(env!("CARGO_PKG_NAME")).autumn_web("0.7"))
+  }
+  ```
+
+  The framework side is gated by compilation: `autumn-plugin-reference` is a
+  pinned reference plugin that calls every declared stable surface, built by the
+  new `plugin-contract` CI job on every change — so removing, renaming, or
+  re-signaturing one is a red check on the PR that causes it. A stable entry
+  with no call site in that crate fails the same job, so the registry cannot
+  promise what nothing compiles.
+
+  `autumn plugin-check` gains two checks, `plugin-contract` and
+  `experimental-surface`, reading the contract the built binary dumps; both skip
+  on a binary that predates the dump, and `--deny-experimental` fails closed
+  rather than becoming a silent no-op. `autumn generate plugin` now scaffolds
+  `Plugin::contract`. The migration-guide template gains a **Plugin authors**
+  section, and `scripts/check-plugin-surface.sh` fails a change to the declared
+  surface that does not fill it in. <!-- migration-guide-gate: the additive half
+  of #1601; its one break is declared separately under Changed -->
+
 - **Pin a worker tier to queues from the command line, and let `doctor` prove
   fleet-wide queue coverage (#1623):** per-queue `reserved`/`concurrency` pools
   and `jobs.pin` already existed, but pinning could only be spelled in
@@ -711,6 +867,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **plugin-conformance:** **Breaking:** `plugin_conformance::ConformanceConfig`
+  gains a `contract` field and is now `#[non_exhaustive]`, so it can no longer
+  be built with a struct literal — use `ConformanceConfig::new(name)` and the
+  fluent setters, which are unchanged. `#[non_exhaustive]` lands with the field
+  deliberately: it is what lets a later release add a check's configuration
+  without breaking every plugin's test suite again. `autumn plugin-check` also
+  now **fails** a plugin that declares no `Plugin::contract`; the plugin itself
+  compiles and runs unchanged. Part of #1601; see the
+  [migration guide](docs/migrations/next.md).
+- **`#[repository]`'s write paths are no longer re-emitted at every call site,
+  cutting a ledgered repository's expansion by 65%:** the `db` gate (#2309)
+  removed `autumn-macros`'s own compile time for a no-database app, but a
+  DB-backed app re-enables `db` and pays none of it back — its cost is in
+  compiling what the macros *emit*, once per `#[repository]`, in every crate
+  that declares one. Measured per invocation, a plain repository expanded to
+  ~72 KB of Rust and a `ledgered` one to ~508 KB; autumn's own consolidated
+  `integration_tests` binary compiles 60 of them. In a release build a
+  `#[repository]` costs roughly three times what a `#[model]` does.
+
+  Three write paths that never depended on the model have moved into the runtime,
+  where they compile once for the whole program instead of once per repository:
+
+  * `autumn_web::version_history::append_version_history` — the version-history
+    INSERT and its pg/`SQLite` fork (#1996), previously inlined at each of the
+    macro's ~30 mutation sites;
+  * `autumn_web::ledger::append_revision` — the whole ledger append: the
+    chain-state read, the #2323 high-water cross-checks, the sequence
+    allocation, the hash and the two writes. Each call site had been expanding a
+    chain-state struct and two `QueryableByName` derives of its own;
+  * `autumn_web::repository::{dependent_restrict, dependent_nullify,
+    dependent_delete_all}` — three of the four `dependent(...)` cascade arms
+    (#1369), which were already pure dynamic SQL over a table name and a foreign
+    key held in runtime `&str`s.
+
+  Alongside them, `autumn_web::__private::maybe_immediate_transaction` replaces
+  the `const HAS_COUNTER_CACHES` guard pattern that emitted the **whole mutation
+  body twice** — once transactional, once bare — at seven sites per repository
+  (#1325). It takes the const as a runtime flag and opens a transaction only when
+  it is set, so the body is emitted once. Nothing changes at runtime: a model with
+  no counter cache still issues its single statement with no `BEGIN`/`COMMIT`.
+
+  Resulting expansion per `#[repository]`:
+
+  | declaration | before | after |
+  | --- | --- | --- |
+  | plain | 72.7 KB | 68.9 KB (-5%) |
+  | `soft_delete` | 82.0 KB | 77.2 KB (-6%) |
+  | `tenant_scoped` | 94.0 KB | 89.3 KB (-5%) |
+  | `versioned` | 144.3 KB | 110.7 KB (-23%) |
+  | `ledgered` | 508.5 KB | 174.6 KB (-66%) |
+
+  What deliberately stays generated is the typed CRUD — `find_by_id`, `save`,
+  `update`, `page`, `list`, and the `dependent = destroy` cascade arm. Diesel's
+  typed DSL is what checks those queries against the app's `schema.rs` at compile
+  time; rewriting them as dynamic SQL would trade the framework's main
+  correctness guarantee for build speed. Only code that was *already* dynamic
+  SQL, or already erased its per-column typing behind `&'static` specs and `fn`
+  pointers the way `counter_cache_after_insert` does, was moved.
+
+  No API changes and no behaviour changes — same statements, same order, same
+  transactions, same errors. A new `repository_expansion_stays_within_budget`
+  test asserts a per-declaration ceiling on the expansion so a statement inlined
+  back into a per-call-site fragment fails the build rather than quietly
+  regressing; the SQL-shape assertions that used to live in `autumn-macros` moved
+  to `version_history` and `ledger`, next to the statements they describe.
+
+  [no-plugin] — nothing here is agent-facing. Every function this adds is
+  `#[doc(hidden)]` and documented as semver-exempt ("a runtime support function
+  for code generated by Autumn proc macros; do not call it directly"), and the
+  `ledgered` / `dependent(...)` surface the plugin does document — the attribute
+  spelling, the methods it generates, the tables it writes — is unchanged. What
+  moved is where the framework emits the code from, not what an app writes or
+  what it does.
+
 - **The `Listening` log line now reports the address actually bound** rather
   than the one configured, so `server.port = 0` (and a socket inherited from an
   in-place upgrade) shows the real port instead of `0`. Issue #1674.
@@ -845,6 +1075,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn_web::reexports::redis` so callers can name the returned
   `redis::Client` without adding their own dependency. Issue #2172.
 
+### Security
+
+- **The idempotency cache is now partitioned by the resolved tenant:** an app
+  that turned on Autumn's multi-tenancy (`[tenancy] enabled = true`) *and*
+  `AppBuilder::idempotent()` shared one cache slot between tenants. The storage
+  key namespaced by method, request target and a cookie-session principal
+  digest — and for `header`, `subdomain` or `jwt` tenancy two requests from
+  different tenants differ in none of those (the tenant header and `Host` are
+  deliberately excluded from the key, and a token-authenticated API has no
+  cookie session). A request that resolved to tenant B, carrying the same
+  `Idempotency-Key` and body as an earlier tenant-A mutation, was answered with
+  **tenant A's stored response**: macro-generated routes replay *through* their
+  own guards, which check roles and scopes but never tenant identity, so the
+  handler — and every `tenant_scoped` repository predicate inside it — never
+  ran, and tenant B's own write was silently suppressed. The router already
+  forced the fail-closed replay path whenever an app resolved tenants in its own
+  `AppBuilder::layer`; the framework's own tenancy middleware was not covered by
+  that check. The key now carries the tenant as the tenancy middleware resolved
+  it (from the `CURRENT_TENANT` task-local, not from the wire, so a legitimate
+  same-tenant retry still replays). Apps that do not use tenancy compute
+  byte-identical keys to before, so no cached entry is invalidated on upgrade.
+  For `[tenancy] source = "session"`, a handler that itself changes the
+  session's tenancy key (an organization switch) now has its deferred replay
+  alias keyed by the *finalized* tenant rather than the one resolved before the
+  handler ran, so a retry after such a switch still replays instead of
+  re-running the mutation. See
+  `docs/security/2026-09-02-idempotency-tenant-scope/`.
+
 ### Fixed
 
 - **A sandboxed plugin can no longer abort the application at boot:** the
@@ -886,6 +1144,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dev inspector's detail route (`{inspector_path}/requests/{id}`) is claimed
   alongside its index — both now derive from `inspector_endpoint_paths`, so the
   claim set cannot drift from what the router actually mounts.
+- **Punctuation- and emoji-only titles no longer slip past the validator that
+  exists to stop them (#2424):** `examples/reddit-clone` rejects a post title
+  like `***`, `!!!???...:::` or `🎉🔥💯` with "Title must contain at least one
+  letter or number" — as its own doc comment always claimed it did. The check
+  had gone dead: it asked `slugify(value).is_empty()`, and `slugify` had since
+  been given a stable non-empty fallback token, so the condition could never
+  be true again. A content-free title was silently accepted and published under
+  a hash-looking URL (`/r/rust/comments/35/n1a3b8617ffb1dc4d`) with no feedback
+  to its author. Two sibling checks written the same way — the community name
+  in `subreddits::create` and the per-name skip in the post-tag parser — were
+  equally unreachable and are fixed with them.
+
+  The framework half is a new **`autumn_web::contains_letter_or_number`**
+  (described under *Added* above). Applying it narrows nothing that was
+  working: the dead check accepted everything, so a `"日本語"` or `"Привет"`
+  title was already accepted and stays accepted, taking `slugify`'s hash
+  fallback for its URL segment — exactly what that fallback is for. The rule
+  itself changes the outcome only for input carrying no letter or number at
+  all.
+
+  The same rule is now also applied in `PostHooks` and a new `SubredditHooks`,
+  because the generated `/api/posts` and `/api/subreddits` routes run the
+  model's `#[validate]` attributes and the mutation hooks — never the
+  route-local validator — so `{"title": "***"}` could reach the database
+  through the API even with the form path fixed. A model-level
+  `#[validate(custom(...))]` would not have been enough: `#[model]`
+  deliberately drops `custom` from the `UpdateModel` PATCH path (`Patch<T>`
+  implements only the declarative per-field traits), so it would have covered
+  an API create and left an API rename to `"***"` open. A hook sees the merged
+  model on both.
+
+  Two adjacent corrections in the same example, both surfaced while fixing the
+  above: the community-name length rule counted **bytes** (`str::len`) while
+  telling the user it counted characters, so an 11-character Japanese name was
+  rejected as over 32 and a 1-character one passed a rule requiring 2 — it now
+  counts characters, matching the post title's `validate(length(...))`. And
+  saving tags now reports how many names were ignored instead of returning
+  fewer tags than the author typed under a bare "Tags updated."
 - **🧭 Wayfinder: text-safe warning/success colors in the admin plugin
   (WCAG contrast 3.19:1 / 3.77:1 → 4.5:1+):** the Runtime Config page's
   "overridden" status badge (`--warning` #d97706 on `--surface`, every
@@ -917,6 +1213,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   between the two declaration sites is proven behaviourally, and the three directed
   compile errors (`dependent` on `#[belongs_to]`, on a `through =` association,
   and an unknown action) are pinned by trybuild fixtures.
+
+- **A NUL byte in a form field is a validation error, not a 500 (#2423):** a
+  Postgres `TEXT`/`VARCHAR` column cannot hold `0x00`, but nothing between the
+  form body and the `INSERT` could say so. An embedded NUL — which a real user
+  can produce by pasting from a binary source or through an input-method glitch,
+  not only deliberately — decoded cleanly, satisfied every `#[validate(...)]`
+  rule (the value is a perfectly good Rust `String`), and failed only when the
+  driver handed the byte to the server: `invalid byte sequence for encoding
+  "UTF8": 0x00`, surfacing as an uncaught `AutumnError` and a `500`. By the
+  framework's own error-class convention that reads as a server bug, when it is
+  malformed client input.
+
+  `ChangesetForm` and `NestedChangesetForm` now sweep every submitted **text**
+  value before it is deserialized — the only point where the offending field is
+  still identifiable by name — and record
+  `autumn_web::form::NUL_CHARACTER_FIELD_ERROR` ("Cannot contain the NUL
+  character (0x00)") against the field or child subfield that carried one.
+  Handlers need no change: it is an ordinary field error, so the form
+  re-renders inline through the existing `ChangesetForm` round-trip. The
+  retained value is the author's text minus the byte, so the re-rendered form
+  keeps their work, never echoes a raw `0x00` into the HTML, and their next
+  submission succeeds. Framework plumbing fields are exempt under both their
+  default and configured names — `_csrf`, `_submit_token`, `_method`, and a
+  nested row's `_destroy` — because no template renders an error against one,
+  and cleaning `_destroy` would flip a falsy marker truthy. File parts of a
+  multipart body are untouched.
+
+  For the paths neither round-trip extractor sees — a JSON API body, a
+  hand-written query, a background job, an `extract::Form` or `Valid<T>`
+  extraction — the Postgres rejection is now classified instead of
+  blanket-500'd: the `AutumnError` carries `422 Unprocessable Entity`, and
+  `autumn_web::error::is_nul_byte_violation` recognizes it (walking the
+  `source()` chain) for handlers that want to fold it back into a form the way
+  `unique_violation_field` is used for a uniqueness clash. Classification is by
+  server message rather than SQLSTATE because `diesel-async` maps `22021` to
+  `DatabaseErrorKind::Unknown` and diesel's `DatabaseErrorInformation` exposes
+  no code; the match is anchored on the trailing `: 0x00` and the encoding name,
+  so a message that merely *contains* `0x00` — including one echoing text a
+  client submitted — keeps its 500 rather than being relabelled as the client's
+  fault. The classified error is also re-wrapped rather than merely restatused,
+  because the 422 error page renders the message where the 500 page redacts it:
+  the client sees a fixed sentence and the raw server message stays in the
+  `source()` chain for logs.
+
+  New: `Changeset::add_error`, for folding a post-decode failure back into a
+  form round-trip; `autumn_web::normalize::strip_nul` and
+  `#[normalize(strip_nul)]`, for columns where dropping the byte silently beats
+  refusing the write (insert and hooked-update paths only — the documented
+  normalize-vs-persist asymmetry still applies). See `docs/guide/forms.md` —
+  "Unstorable bytes: NUL", which also records what the backstop does not cover:
+  a 422 with no field name, and `JSONB`'s different SQLSTATE (`22P05`).
 
 - **ACME config: `autumn doctor` and the runtime now reject the same two
   spellings (#1874):** two low-severity parity gaps let `autumn doctor
@@ -2084,6 +2431,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   12-call-site count alone would suggest — `format!`'s unsized starting
   buffer apparently cost more than one allocation for some of these calls
   once it had to grow, not just the final `String`.
+
+- **the versioned-repository audit write path stops cloning every column
+  (#2429):** `compute_diff` / `compute_insert_changes` /
+  `compute_delete_changes` take `&serde_json::Value`, so each one had to clone
+  every retained column name and value into the `ColumnChange` it returns. The
+  only production caller — the `#[repository(versioned = true)]` codegen, which
+  every insert, update and delete of a versioned model funnels through — builds
+  those `Value`s fresh from `version_column_values()` per mutation and drops
+  them the moment the diff returns. Every retained field was therefore allocated
+  twice and dropped twice, for a value nobody would look at again.
+
+  Three owned-value siblings — `compute_diff_owned`,
+  `compute_insert_changes_owned`, `compute_delete_changes_owned` — take the
+  `Value` by value and move each key and value straight into its
+  `ColumnChange` (`Map::into_iter` / `Map::remove` instead of `.get().cloned()`
+  / `.clone()`). The codegen now calls those. The borrowed functions are
+  unchanged and stay public, for callers whose `Value` outlives the call.
+
+  Allocation blocks per mutation on a realistic 7-column record, measured by the
+  new `version_history_alloc_gate` (`allocation-counter`, deterministic across
+  runs). Each figure includes the throwaway `Value` materialization both paths
+  are charged for, so the delta is only what each does with the value it is
+  handed:
+
+  | Entry point | Borrowed | Owned | Delta |
+  |---|---|---|---|
+  | `compute_insert_changes` | 26 blocks | 14 blocks | **-46.2%** |
+  | `compute_delete_changes` | 26 blocks | 14 blocks | **-46.2%** |
+  | `compute_diff` | 34 blocks | 27 blocks | **-20.6%** |
+
+  Whole-process totals over the committed `autumn/benches/version_history.rs`
+  harness, one variant per process (`BIN borrowed` / `BIN owned`):
+
+  | Metric | Borrowed | Owned | Delta |
+  |---|---|---|---|
+  | Instructions (`valgrind --tool=callgrind`) | 2,275,350,133 | 1,547,245,235 | **-32.0%** |
+  | Allocation blocks (`valgrind --tool=dhat`) | 6,901,045 | 4,441,045 | **-35.6%** |
+  | Allocation bytes (same) | 422,257,918 | 393,179,915 | -6.9% |
+
+  Wall clock on the same harness moves with it — insert and delete land around
+  -33% (roughly 650 -> 420 ns/op), and the harness now reports median and
+  spread across alternating rounds so a figure inside the noise says so. The
+  `compute_diff` row is the small one either way: it only ever retained the
+  *changed* columns (3 of 7 in this workload), so it had the fewest clones to
+  drop.
+
+  This is an audit surface, so the changeset itself is held byte-identical
+  rather than eyeballed: each owned function is asserted equal to its borrowed
+  twin — as a `Vec<ColumnChange>` *and* as the serialized JSON that reaches the
+  `_autumn_version_history` row — over shared case matrices (25 diff cases, 10
+  insert/delete cases) covering sensitive-column redaction, columns present in
+  `after` but not `before`, columns dropped from the changeset, `null`-vs-
+  missing, non-object inputs, and key ordering. Separate tests assert pointer
+  identity between the input buffers and the emitted ones, so an `_owned`
+  function that quietly delegated to its borrowed twin would fail even though
+  its output is correct.
 
 ## [0.7.0] - 2026-08-23
 

@@ -198,6 +198,28 @@ Reserve non-string field types for values a browser cannot get wrong, or for
 endpoints where a 400 is the right answer. `examples/reddit-clone`'s submit form
 is built this way, for exactly this reason.
 
+One custom validator is worth spelling out, because it is easy to write as dead
+code. To reject a title that carries no text — `"***"`, `"🎉🔥💯"` — ask
+`autumn_web::contains_letter_or_number`, **not** `slugify(value).is_empty()`:
+`slugify` never returns an empty string (input with nothing to slugify gets a
+stable hash fallback), so the `is_empty()` form is always `false` and rejects
+nothing. See [Generators](./generators.md#human-readable-urls-with-slugslugfrom)
+for the full contract.
+
+```rust,ignore
+fn validate_sluggable_title(value: &str) -> Result<(), ValidationError> {
+    if autumn_web::contains_letter_or_number(value) {
+        return Ok(());
+    }
+    Err(ValidationError::new("title")
+        .with_message("Title must contain at least one letter or number".into()))
+}
+```
+
+A route-local validator only runs on the route. If the same model is also
+written through generated API routes or a repository, put the rule in a
+mutation hook as well — the hooks are the choke point those paths share.
+
 ### `Valid<T>` — for endpoints a program is calling
 
 Invalid input is an **error**. `Valid` wraps another extractor, and a validation
@@ -331,6 +353,7 @@ Built-in normalizers, applied **left to right in the order you write them**:
 | `downcase` | lowercase |
 | `upcase` | uppercase |
 | `squish` | trim, and collapse every internal run of whitespace to one space |
+| `strip_nul` | remove every NUL (`U+0000`) — see [Unstorable bytes](#unstorable-bytes-nul) |
 | `with = path::to::fn` | your own `fn(&str) -> String` |
 
 All the built-ins are **idempotent** — normalizing an already-normal value
@@ -413,6 +436,120 @@ this attribute exists to remove.
   they cannot see inside a per-locale column set.
 - **It does not rewrite history.** Adding `#[normalize]` to an existing column
   canonicalizes future writes only. Backfill existing rows with a migration.
+
+---
+
+## Unstorable bytes: NUL
+
+A Postgres `TEXT` or `VARCHAR` column cannot hold a NUL byte (`0x00`). This is
+not a length or a format rule that `#[validate(...)]` could express — the value
+is a perfectly good Rust `String`, and every validator you can write on it
+passes. It fails much later, when the driver hands the byte to the server, which
+answers `invalid byte sequence for encoding "UTF8": 0x00`.
+
+A real user can produce one without trying: a paste from a binary source, a
+misbehaving input method, a clipboard glitch. So this is a robustness question,
+not only an adversarial one.
+
+The framework handles it at the form boundary. The two extractors built for
+form round-trips — `ChangesetForm` and `NestedChangesetForm` — sweep every
+submitted **text** value before it is deserialized, and a field that carried a
+NUL gets an ordinary error:
+
+```text
+Cannot contain the NUL character (0x00)
+```
+
+The message is available as `autumn_web::form::NUL_CHARACTER_FIELD_ERROR`.
+Nothing in your handler changes — it is a field error like any other, so the
+form re-renders inline with your existing `errors_for(...)` markup and whatever
+4xx you already return for a rejected changeset. The retained value is the
+author's text with the byte removed, so the re-rendered form keeps their work
+(and never echoes a raw `0x00` back into the HTML), and their next submission
+succeeds.
+
+Framework plumbing fields are deliberately exempt — the CSRF token, the submit
+token, and the `_method` override, under both their default names and whatever
+name you configured. None is a form field any template renders, so an error
+keyed under one would leave the form invalid with nothing on screen to explain
+why, and none is ever written to a column. Nothing about their own handling
+changes either: each is read from the raw body by its middleware, before any
+extractor runs, so a NUL-mangled `_csrf` is still a 403 and a NUL-mangled
+`_method` is still a 400. (A mangled `_submit_token` is not rejected — it simply
+matches no stored token and loses its at-most-once protection, exactly as it
+would have before.)
+
+`_destroy` on a nested child row is exempt for a different reason: it is read
+only for truthiness, and cleaning it would *change* it — `1\0` is falsy today
+and would become truthy — so the sweep leaves it alone entirely.
+
+An *unknown* key is not exempt. A submitted name that is not a field of your
+form type is normally ignored, but if it carries a NUL it is still reported —
+under that name. Since no template renders that name, the submission is
+rejected with no message next to any input; `error_summary` will show the
+message, but without saying which input it belongs to. In practice that takes a
+hand-crafted request: the values your own templates emit for non-form fields
+are server-generated, not pasted.
+
+File parts of a `multipart/form-data` body are untouched — binary uploads are
+supposed to contain arbitrary bytes.
+
+### The paths no form extractor sees
+
+A JSON API body, a hand-written query, a background job argument, an
+`autumn_web::extract::Form` or `Valid<T>` extraction: these reach the database
+without passing one of the two round-trip extractors, so the byte still gets
+there. It is classified rather than blanket-500'd — the resulting `AutumnError`
+carries `422 Unprocessable Entity`, matching the status a validator would have
+produced, and `autumn_web::error::is_nul_byte_violation` recognizes it if you
+want to fold it back into a form:
+
+```rust,ignore
+if let Err(err) = repo.save(&new_post).await
+    && is_nul_byte_violation(&err)
+{
+    changeset.add_error("body", NUL_CHARACTER_FIELD_ERROR);
+    return Ok(render_rejected(changeset));
+}
+```
+
+This is a backstop, not the mechanism: rejecting at the form boundary is what
+gives the author something actionable. Two limits come with that. The 422 names
+no field — nothing at the database boundary knows which one the byte came from,
+so `errors` is empty unless you fold it in yourself as above. And classification
+is by server message, anchored on the `: 0x00` the encoding rejection ends with;
+a NUL smuggled into a `JSONB` column fails with a different message entirely
+(`unsupported Unicode escape sequence`, SQLSTATE `22P05`) and is not classified.
+
+### When you would rather clean than reject
+
+On a column fed by paste-prone input, where dropping the byte silently is
+better than refusing the write, use the normalizer:
+
+```rust,ignore
+#[model]
+pub struct Profile {
+    #[normalize(strip_nul)]
+    pub bio: String,
+}
+```
+
+Prefer rejecting wherever the author can see and fix the value — they get told
+what happened instead of having their input quietly altered. `strip_nul` removes
+only NUL; every other control character is storable and is left exactly as
+written.
+
+**It covers inserts and hooked updates only.** Per [Updates are not the same as
+inserts](#updates-are-not-the-same-as-inserts), a repository with no hooks, or
+one using `validate_on_update = fetch`, persists the raw patch and throws the
+normalized draft away — so an `update` through either of those still sends the
+NUL to Postgres and still fails the write, now as a 422 rather than a 500.
+
+The message is a fixed English string. Unlike a scaffold's `common.error.taken`,
+it is recorded inside the extractor, before any handler holds a `Locale`, so
+there is nowhere to look up a translation. A localized app that needs a
+localized message can rewrite it from the handler by matching
+`NUL_CHARACTER_FIELD_ERROR` in `changeset.errors()`.
 
 ---
 
@@ -591,6 +728,20 @@ res.assert_status(422)
 
 Test the *failure* path first. The success path is one insert; the failure path
 is the one with the round-trip, the ARIA wiring, and the CSRF token in it.
+
+Building a `ChangesetForm` by hand in a unit test has one trap:
+`ChangesetForm::without_csrf` and `ChangesetForm::blank` wrap the data in a
+*fresh, error-free* changeset — they never call `validate`. Only
+`IntoChangeset::into_changeset` runs the rules, so a test that wants to exercise
+them has to go through it:
+
+```rust,ignore
+// Renders, but proves nothing about the rules — `into_valid()` always succeeds.
+let form = ChangesetForm::without_csrf(SubmitPostForm { .. });
+
+// Runs the rules.
+let form = ChangesetForm::from_changeset(SubmitPostForm { .. }.into_changeset());
+```
 
 For normalization, assert on what was **stored**, not on what was accepted:
 

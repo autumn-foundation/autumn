@@ -378,6 +378,20 @@ fn conformance(manifest: &SandboxManifest) -> ConformanceReport {
             expected_prefix: Some(&manifest.prefix),
             sensitive_routes: &sensitive,
             format: ReportFormat::Text,
+            // `Absent`, and deliberately so. A `ContractDump` reports what a
+            // built binary wrote to its stderr (#1601) — and this path never
+            // builds or runs one: a sandboxed plugin is a `.wasm` artifact, and
+            // the report is derived from its manifest alone. `Present(vec![])`
+            // would be the stronger claim that the plugin declared no
+            // contracts, which is not something anything here established.
+            // Both contract checks resolve to `Skip` on `Absent`, which is the
+            // honest verdict for a check that could not be evaluated.
+            contracts: &plugin_check::ContractDump::Absent,
+            // The sandbox lane exposes no `--deny-experimental`, and the flag
+            // fails closed on an unread contract — passing `true` would hard
+            // fail every sandboxed artifact over a contract that cannot exist
+            // for one. `false` leaves the check a `Skip`.
+            deny_experimental: false,
         },
         &routes,
     )

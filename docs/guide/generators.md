@@ -444,6 +444,18 @@ This wires up, end to end:
   trimming leading/trailing `-`. An input that slugifies to nothing (empty,
   or entirely punctuation/non-Latin) falls back to a stable, deterministic
   non-empty token rather than ever returning `""`.
+
+  Because of that fallback, **`slugify(input).is_empty()` is always `false`**
+  and can never be used as a validation check. To reject input that carries no
+  text at all — a post title of `"***"` or `"🎉🔥💯"` — use
+  `autumn_web::contains_letter_or_number(&str) -> bool`, which asks whether the
+  input holds at least one letter or number *in any script*. It deliberately
+  accepts `"日本語"`: that has no ASCII fold and gets the hash fallback for its
+  URL segment, but it is real text the author typed, and the fallback exists so
+  such a page is still reachable. The generated scaffold does **not** apply
+  this check — it only derives the slug — so wire it into your own form
+  validation if a content-free source value matters to you. See
+  [Forms](forms.md#changesetformt--for-pages-a-human-is-looking-at).
 - **A `NOT NULL` column with its own `UNIQUE INDEX`** in the migration — a
   `slug` field is implicitly `unique`, so it reuses the exact `CREATE UNIQUE
   INDEX` codegen a `:unique` modifier produces on any other field.

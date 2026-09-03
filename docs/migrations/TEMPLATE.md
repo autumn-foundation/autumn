@@ -7,8 +7,10 @@
 > **Delete this banner block in the copy** — and replace every `{placeholder}`
 > with concrete content. `scripts/check-migration-guides.sh` fails on both.
 >
-> Delete sections that do not apply, **except** these six, which the gate
-> requires and which must each have content under them:
+> Delete sections that do not apply — including *Plugin authors*, which is
+> required only when the release changes the declared plugin surface (issue
+> #1601) — **except** these six, which the gate requires and which must each
+> have content under them:
 > *At a glance*, *Summary*, *Before you start*, *Breaking changes*,
 > *How to verify*, *Guide-only upgrade walkthrough*.
 >
@@ -110,6 +112,30 @@ fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
 ---
+
+## Plugin authors
+
+**Required whenever this release changes the declared stable plugin surface**
+(`autumn_web::plugin_contract::PLUGIN_SURFACES`) — `scripts/check-plugin-surface.sh`
+fails a surface change that leaves this section empty or unwritten. Delete the
+section entirely when the plugin surface did not change.
+
+Everything here is addressed to someone maintaining an `autumn-plugin-*` /
+`autumn-*-plugin` crate, not to an application author. See
+[`docs/plugins.md`](../plugins.md#the-plugin-api-contract) for the tiers.
+
+- **Stable surface changed:** {the API, what changed, and the replacement — or
+  "none". Every entry here is a `**Breaking:**` change in the changelog and
+  needs its own section under *Breaking changes* above.}
+- **Experimental surface changed:** {the API and what changed — or "none".
+  Experimental surface may change in any release, so this is a courtesy, not a
+  promise. Plugins that declared it with `uses_experimental` are the audience.}
+- **New stable surface:** {additive APIs plugin authors can now rely on — or
+  "none". These are not breaking; they are why a plugin author reads this
+  section for the good news too.}
+- **Declared range to move to:** `autumn-web {X.Z}` — update
+  `Plugin::contract`'s `.autumn_web("…")` and re-run
+  `autumn plugin-check --plugin-name <your-plugin>`.
 
 ## Compiler error cheat sheet
 

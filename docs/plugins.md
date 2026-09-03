@@ -286,6 +286,200 @@ endpoint that should be MCP-exposable.
 
 ---
 
+## The plugin API contract
+
+Autumn declares which plugin-facing APIs are **stable** and which are
+**experimental**, so a plugin author knows what they may build on and what may
+move under them. The declaration is machine-readable — it lives in
+[`autumn_web::plugin_contract::PLUGIN_SURFACES`](https://docs.rs/autumn-web/latest/autumn_web/plugin_contract/constant.PLUGIN_SURFACES.html)
+— and the table below mirrors it, entry for entry.
+`scripts/check-plugin-surface.sh` fails CI when the two disagree, so this page
+cannot quietly go stale.
+
+### The tiers, and what each promises
+
+| Tier | Promise | How a change reaches you |
+|------|---------|--------------------------|
+| **stable** | Covered by the [Stability Policy](../STABILITY.md). Below `1.0` a break requires a minor bump, a [migration guide](migrations/README.md), and a filled **Plugin authors** section in it; from `1.0` on it requires a major bump and a deprecation cycle. | A compiler error with a named upgrade path, announced in the release's migration guide before you hit it. |
+| **experimental** | May change in **any** release, including a patch. Declare your use of it with `PluginContract::uses_experimental` so `autumn plugin-check` reports it. | A compiler error you opted into. Not guaranteed a guide section. |
+
+Anything **not** in the table is neither: it is ordinary `autumn-web` public
+API, covered by the crate-wide SemVer promise in
+[`STABILITY.md`](../STABILITY.md) but not singled out as part of the plugin
+contract. The distinction matters because the plugin surface is the part CI
+proves on every commit, by compiling a pinned reference plugin against the
+framework (see [The framework-side gate](#the-framework-side-gate)).
+
+### The declared surface
+
+| API | Tier | Notes |
+|-----|------|-------|
+| `AppBuilder::config_section` | stable | Declare a plugin-owned top-level config root so `server.strict_config` treats it as known-and-opaque. |
+| `AppBuilder::declare_plugin_routes` | stable | Make routes mounted through an opaque `nest`/`merge` router visible to `autumn routes` and the conformance harness. |
+| `AppBuilder::error_pages` | stable | Replace the rendered error pages — a tier-1 subsystem seam (requires the `maud` feature). The plugin crate needs its own `maud` dependency: `html!` expands to absolute `::maud::` paths, which no re-export can satisfy. |
+| `AppBuilder::merge` | stable | Merge a raw axum router at the root. Pair it with `declare_plugin_routes` so the routes stay attributable. |
+| `AppBuilder::nest` | stable | Mount a raw axum router under a prefix. Pair it with `declare_plugin_routes` so the routes stay attributable. |
+| `AppBuilder::on_shutdown` | stable | Register an async shutdown hook that runs during graceful drain. |
+| `AppBuilder::on_startup` | stable | Register an async startup hook that runs once before the server binds. |
+| `AppBuilder::plugin` | stable | Mount a plugin. Also the seam a cooperative plugin uses to mount a plugin of its own. |
+| `AppBuilder::plugin_contracts` | stable | Read the contracts declared by the plugins mounted on a builder — what the route dump and `autumn plugin-check` are built on. |
+| `AppBuilder::plugin_migrations` | stable | Contribute embedded database migrations tagged with the plugin's own name. Needs `reexports::diesel_migrations` in scope, because `embed_migrations!` expands to unqualified paths (requires the `db` feature). |
+| `AppBuilder::plugins` | stable | Mount a tuple of up to eight plugins in declaration order. |
+| `AppBuilder::routes` | stable | Register typed routes from `routes![]`. Plugin routes registered this way are attributed automatically. |
+| `AppBuilder::with_config_loader` | stable | Replace the tier-1 configuration loader (e.g. a secrets-manager backend). |
+| `AppBuilder::with_edge_kv` | experimental | Edge-capsule KV binding (requires the `edge` feature). The whole edge lane (issue #1790) may change in any release; the capsule wire protocol carries its own version field. |
+| `AppBuilder::with_extension` | stable | Publish a typed value into application state for handlers to extract. |
+| `AppBuilder::with_pool_provider` | stable | Replace the tier-1 database pool provider (requires the `db` feature). |
+| `AppBuilder::with_session_store` | stable | Replace the tier-1 session store. |
+| `AppBuilder::with_telemetry_provider` | stable | Replace the tier-1 telemetry provider. |
+| `Plugin::build` | stable | The one required method: apply the plugin's wiring to the builder. Runs exactly once per app. |
+| `Plugin::contract` | stable | Declare the `autumn-web` range this plugin supports and any experimental surface it uses. |
+| `Plugin::name` | stable | Stable identifier used for duplicate-registration detection and route attribution. |
+| `autumn_edge::host` | experimental | Reference edge-capsule host API. Experimental alongside the rest of the edge lane (issue #1790). |
+| `db::Pool` | stable | The pool type `DatabasePoolProvider::create_pool` returns, re-exported so a plugin need not depend on `diesel-async` itself (requires the `db` feature). |
+| `plugin_conformance` | stable | The library-level conformance harness plugin authors run in their own test suite. |
+| `plugin_contract` | stable | This module: `PluginContract`, `PLUGIN_SURFACES`, `SurfaceTier`, `evaluate`, `lockstep_range`, and the `PLUGIN_CONTRACT_MARKER` dump protocol. |
+| `route_listing::RouteInfo` | stable | The route manifest type the conformance harness and `autumn routes --format json` share. |
+
+### Declaring what your plugin supports
+
+A plugin declares the `autumn-web` range it works with by implementing
+`Plugin::contract`:
+
+```rust,ignore
+use autumn_web::plugin_contract::PluginContract;
+
+impl Plugin for MyPlugin {
+    fn contract(&self) -> Option<PluginContract> {
+        Some(
+            PluginContract::new(env!("CARGO_PKG_NAME"))
+                .plugin_version(env!("CARGO_PKG_VERSION"))
+                .autumn_web("0.7"),
+        )
+    }
+
+    fn build(self, app: AppBuilder) -> AppBuilder { /* ... */ app }
+}
+```
+
+`autumn_web(...)` takes a Cargo version requirement: `"0.7"` for a single minor
+series, `">=0.6, <0.9"` for a range, `"=0.7.1"` for an exact pin. Below `1.0`
+every minor bump is breaking, so declare the minor series; from `1.0` on, the
+major. Declare the range you have actually verified — a stale narrow literal is
+the one thing that makes this fail on an app that would otherwise work.
+
+A plugin released **in lockstep** with the framework (every first-party crate
+in this repository) can derive the range instead of writing it, so a version
+bump cannot leave it behind:
+
+```rust,ignore
+use autumn_web::plugin_contract::lockstep_range;
+
+PluginContract::new(env!("CARGO_PKG_NAME"))
+    .autumn_web(lockstep_range(env!("CARGO_PKG_VERSION")))
+```
+
+Do **not** reach for that if your crate versions independently: a third-party
+plugin at its own `1.2.0` would derive `"1"`, which excludes every `0.x`
+framework.
+
+Reading `env!("CARGO_PKG_NAME")` and `env!("CARGO_PKG_VERSION")` rather than
+literals keeps the contract from drifting away from the crate it describes.
+
+**Two names, one flag.** A contract names your *crate*, while route attribution
+keys on [`Plugin::name`](#authoring-a-plugin) — which defaults to
+`std::any::type_name`, not the crate name. `autumn plugin-check --plugin-name`
+takes one string, and it resolves against **either**, so neither choice leaves
+your plugin unfindable. Overriding `name()` to your crate name anyway is worth
+doing: it is what shows up in `autumn routes` output as `plugin:<name>`.
+
+**Declaring nothing still compiles and runs.** `Plugin::contract` defaults to
+`None`, and a plugin that returns `None` behaves at runtime exactly as it did
+before the contract existed — it just gets no diagnostic when it is mounted
+into a framework it was not written for.
+
+It does **not** pass `autumn plugin-check`, though: the `plugin-contract` check
+fails a plugin that declares no usable range. That is the author-facing gate
+doing its job — "you have not said which framework versions you support" is the
+finding — and the four lines above clear it. `autumn generate plugin`
+scaffolds them for you.
+
+### What an incompatible pairing looks like
+
+`AppBuilder::plugin` evaluates the contract when the plugin is registered — at
+application startup, before anything binds — and **panics** on a range that
+excludes the framework in the build:
+
+```text
+plugin `autumn-plugin-example 0.6.2` supports autumn-web 0.6, but this application builds against autumn-web 0.7.0.
+  → upgrade the plugin to a release built for autumn-web 0.7.0 (`cargo update -p autumn-plugin-example`), or
+  → pin the framework the plugin supports: autumn-web = "0.6"
+  → or, to boot anyway while you sort it out, set AUTUMN_PLUGIN_CONTRACT=warn
+```
+
+The last line is the escape hatch. Cargo has already proven the app and the
+plugin link one `autumn-web` — otherwise there would be two copies and a
+compile error — so a mismatch here means the plugin's *declared* range is
+narrower than what actually resolved, usually a stale literal. That is the
+plugin author's to fix, and an app author should not be stuck on a
+non-booting deployment waiting for them: `AUTUMN_PLUGIN_CONTRACT=warn`
+downgrades the panic to a `WARN` log carrying the same text.
+
+Both versions and both remedies are in the message, which is the whole point:
+the alternative is a subtly wrong runtime, or a compiler error several layers
+removed from its cause.
+
+A requirement string that cannot be parsed only *warns* at startup — it is the
+plugin author's typo, and an application author cannot fix it — but
+`autumn plugin-check` **fails** on it, which is where the author will see it.
+
+### Depending on experimental surface
+
+If your plugin uses an API declared `experimental` above, say so:
+
+```rust,ignore
+PluginContract::new(env!("CARGO_PKG_NAME"))
+    .autumn_web("0.7")
+    .uses_experimental("AppBuilder::with_edge_kv")
+```
+
+`autumn plugin-check` then reports it (it does not fail — building on
+experimental surface is an informed choice):
+
+```text
+✓ [PASS] experimental-surface: depends on 1 experimental surface(s); these may change in any release
+  → AppBuilder::with_edge_kv: Edge-capsule KV binding. The whole edge lane (issue #1790) may change in any release; …
+```
+
+Two things *do* fail the check, because both make the declaration meaningless:
+a name that is not in the registry at all (a typo), and a name that is in the
+registry at the **stable** tier (which overstates your exposure).
+
+Pass `--deny-experimental` to turn the report into a gate in your own CI:
+
+```bash
+autumn plugin-check --plugin-name autumn-plugin-mine --deny-experimental
+```
+
+### The framework-side gate
+
+The contract runs in both directions. On Autumn's side, the
+`autumn-plugin-reference` crate is a real `Plugin` implementation that calls
+**every** stable surface in the table above, built by the `plugin-contract` CI
+job on every change to the framework. Removing, renaming, or re-signaturing a
+stable plugin API breaks that build — in Autumn's CI, before it reaches yours.
+
+A registry entry that no reference-plugin call site exercises fails the same
+job, so the table cannot list a promise nothing checks.
+
+When a release does change the stable plugin surface, its migration guide
+carries a **Plugin authors** section saying what changed and what to do —
+enforced by `scripts/check-plugin-surface.sh`, which fails a change to the
+declared surface that does not update
+[`docs/migrations/next.md`](migrations/next.md).
+
+---
+
 ## Plugin conformance and publishing checklist
 
 Before publishing a plugin crate to crates.io, run the Autumn conformance
@@ -313,6 +507,8 @@ This checks:
 | `route-collision` | No two routes share (method, path); names the conflicting handlers and sources |
 | `sensitive-surfaces` | Routes with admin/debug/credential/operator/secret/metrics paths are declared with auth mechanisms |
 | `duplicate-registration` | No plugin route appears more than once, which would indicate the plugin was installed twice |
+| `plugin-contract` | The plugin declares a parseable `autumn-web` range via `Plugin::contract` |
+| `experimental-surface` | Which experimental plugin API the plugin declares a dependency on |
 
 Add `--format json` to produce a machine-readable report suitable for CI:
 
@@ -331,8 +527,11 @@ binary step:
 ```rust
 #[cfg(test)]
 mod conformance_tests {
+    use autumn_web::plugin::Plugin;
     use autumn_web::plugin_conformance::{ConformanceConfig, run_conformance};
     use autumn_web::route_listing::{RouteInfo, RouteSource};
+
+    use crate::MyPlugin;
 
     #[test]
     fn plugin_passes_conformance() {
@@ -349,7 +548,15 @@ mod conformance_tests {
 
         let config = ConformanceConfig::new("autumn-myplugin-plugin")
             .prefix("/my-prefix")
-            .sensitive_route("/my-prefix", "Role: myadmin required");
+            .sensitive_route("/my-prefix", "Role: myadmin required")
+            // Pass the plugin's own contract so the `experimental-surface`
+            // check runs instead of being skipped. `Plugin` must be in scope
+            // for the `contract()` call.
+            .contract(
+                MyPlugin::new()
+                    .contract()
+                    .expect("MyPlugin declares a contract"),
+            );
 
         let report = run_conformance(&config, &routes);
         assert!(report.passed(), "conformance failed:\n{}", report.to_text_report());
@@ -372,6 +579,9 @@ Work through this list before `cargo publish`:
   uses `AppBuilder::nest()` (whose routes are opaque to the listing), call
   `AppBuilder::declare_plugin_routes(routes)` alongside `nest()` to make
   those routes visible.
+- [ ] **Compatibility contract** — `Plugin::contract` declares the supported
+  `autumn-web` range, and any experimental surface the plugin uses is declared
+  with `uses_experimental` (see [The plugin API contract](#the-plugin-api-contract))
 - [ ] **Production exposure gates** — if the plugin mounts admin, debug,
   credential, operator, secret, or metrics surfaces, the README documents
   the auth/profile gating mechanism and conformance passes with

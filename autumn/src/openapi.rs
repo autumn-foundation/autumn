@@ -182,6 +182,22 @@ pub struct ApiDoc {
     /// schema, this flag also exempts the tool from the JSON-out eligibility
     /// gate that otherwise excludes schema-less routes.
     pub mcp_stream: bool,
+    /// Build-time authority envelope proved for this handler by
+    /// `#[agent_operable(grant = ...)]` (issue #1691), or `None` for a handler
+    /// that declares none.
+    ///
+    /// Always compiled — the field is metadata about the *handler*, not about
+    /// any particular transport, so the agent-authority manifest and the
+    /// `autumn routes` listing can read it without the `mcp` feature. The MCP
+    /// endpoint copies it onto the derived tool so `tools/call` can record the
+    /// compile-known reversibility in its audit trail and derive
+    /// `destructiveHint` from the grant instead of guessing from the verb.
+    ///
+    /// A `Some` here is a *proved* envelope: the macro walked the handler body,
+    /// const-asserted every detected effect against the named grant, and
+    /// refused to expand when an effect could not be proven. `None` therefore
+    /// means "ungoverned", never "no effects".
+    pub agent_authority: Option<&'static crate::agent_authority::AgentAuthority>,
 }
 
 /// A record-level authorization binding declared by `#[authorize]`.

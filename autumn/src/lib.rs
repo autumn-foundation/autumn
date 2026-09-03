@@ -87,6 +87,16 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+// The build-time agent authority envelope (issue #1691): what an MCP-exposed,
+// agent-operable handler is allowed to do -- which models it writes, whether it
+// leaves the tenant, which hosts it calls, which jobs it enqueues, how
+// reversible the whole thing is -- declared as a `Grant` and checked by the
+// compiler at each proved effect.
+//
+// A plain comment, not a doc comment, for the same reason `classify` carries
+// one: an outer `///` here is merged with the module's `//!` docs and the whole
+// block then resolves its intra-doc links in *this* scope.
+pub mod agent_authority;
 pub mod batches;
 /// Locating a usable Chromium/Chrome binary on the host.
 ///
@@ -221,6 +231,7 @@ pub mod plugin;
 /// that forwards it.
 pub use router::RouterBuildError;
 pub mod plugin_conformance;
+pub mod plugin_contract;
 #[cfg(feature = "plugin-sandbox")]
 pub mod plugin_sandbox;
 pub mod probe;
@@ -394,7 +405,8 @@ pub use ledger::{
 pub mod version_history;
 pub use version_history::{
     ColumnChange, VersionEntry, VersionFilter, VersionOp, VersionPage, VersionedRecord,
-    compute_delete_changes, compute_diff, compute_insert_changes,
+    compute_delete_changes, compute_delete_changes_owned, compute_diff, compute_diff_owned,
+    compute_insert_changes, compute_insert_changes_owned,
 };
 
 /// Router construction and integration with Axum.
@@ -563,10 +575,13 @@ pub mod session;
 /// responses before cutover (issue #1653) — see
 /// `docs/guide/staged-deploys.md`.
 pub mod shadow;
-/// URL-safe slug generation (`slugify`), shared by the scaffold generator's
-/// `slug:slug{from:...}` DSL token and any hand-written app.
+/// URL-safe slug generation (`slugify`).
+///
+/// Shared by the scaffold generator's `slug:slug{from:...}` DSL token and any
+/// hand-written app. Also holds `contains_letter_or_number`, the input check
+/// `slugify` cannot answer because it never returns an empty string.
 pub mod slug;
-pub use slug::slugify;
+pub use slug::{contains_letter_or_number, slugify};
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
 pub mod sse;
@@ -688,6 +703,8 @@ pub mod ws;
 pub mod __private {
     #[cfg(feature = "db")]
     pub use crate::db::is_retryable_txn_error;
+    #[cfg(feature = "db")]
+    pub use crate::db::maybe_immediate_transaction;
     #[cfg(feature = "db")]
     pub use crate::db::scoped_immediate_transaction;
     #[cfg(feature = "db")]
@@ -1394,6 +1411,41 @@ pub use autumn_macros::throttle;
 /// leaves behind, and `docs/guide/query-budgets.md` for the guide.
 pub use autumn_macros::query_budget;
 
+/// Declare what an agent-operable handler is allowed to do, and check it.
+///
+/// `#[agent_operable(grant = TheGrant)]` derives the handler's static effect
+/// set — bounded and unbounded writes, cross-tenant queries, outbound calls,
+/// webhook dispatches, job enqueues — and fails the build at the offending call
+/// when the declared [`agent_authority::Grant`] does not cover it. Effects it
+/// cannot prove are errors, not silence; `#[agent_effect(...)]` on the
+/// statement is the escape hatch, and it declares effects that are checked
+/// exactly like proved ones.
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+///
+/// autumn_web::authority_grant! {
+///     pub RefundDrafter {
+///         writes: [Refund],
+///         reversibility: compensable,
+///     }
+/// }
+///
+/// #[post("/refunds")]
+/// #[api_doc(mcp, summary = "Draft a refund")]
+/// #[agent_operable(grant = RefundDrafter)]
+/// async fn draft_refund(
+///     repo: PgRefundRepository,
+///     Json(body): Json<NewRefund>,
+/// ) -> AutumnResult<Json<Refund>> {
+///     Ok(Json(repo.create(&body).await?)) // allowed: `writes: [Refund]`
+/// }
+/// ```
+///
+/// See [`agent_authority`] for the vocabulary and
+/// `docs/guide/agent-authority.md` for the guide.
+pub use autumn_macros::agent_operable;
+
 /// Gate a route handler on a named feature flag. If the flag is disabled for
 /// the current actor the handler responds with `404 Not Found` (default) or
 /// delegates to a custom fallback specified with `fallback = my_fn`.
@@ -1823,6 +1875,14 @@ pub mod reexports {
     pub use diesel;
     #[cfg(feature = "db")]
     pub use diesel_async;
+    /// Re-exported because `embed_migrations!` — re-exported from
+    /// [`crate::migrate`] — expands to unqualified `diesel_migrations::…`
+    /// paths. A plugin shipping migrations through the stable
+    /// [`AppBuilder::plugin_migrations`](crate::app::AppBuilder::plugin_migrations)
+    /// seam (issue #1601) can bring this into scope instead of taking its own
+    /// `diesel-migrations` dependency at a matching major.
+    #[cfg(feature = "db")]
+    pub use diesel_migrations;
     pub use http;
     pub use inventory;
     #[cfg(feature = "mail")]
