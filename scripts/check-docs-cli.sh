@@ -3621,6 +3621,52 @@ def self_test():
                f'{run} backslash(es) before $( '
                f'{"runs" if runs else "does not run"}: {got}')
 
+    # The fold's NEIGHBOURS, probed rather than waited for. An apostrophe is
+    # ordinary English, and a shell fence is full of it: a contraction in a
+    # comment or in quoted program output opens a quote that never closes, and
+    # if that swallowed the rest of the block the gate would go quiet on a page
+    # it is meant to check. Each shape below keeps reading the command after it.
+    neighbours = [
+        ("a heredoc body",
+         "```bash\ncat <<EOF\ndon't do this\nEOF\nautumn nope\n```", 5),
+        ("a whole-line comment",
+         "```bash\n# don't run this\nautumn nope\n```", 3),
+        ("a trailing comment",
+         "```bash\necho ok  # it's fine\nautumn nope\n```", 3),
+        # No quote closes this one, so it takes the fragment path — and the
+        # line numbers have to survive it, not just the readings.
+        ("quoted program output",
+         "```sh\nls\nwon't work\nautumn nope\n```", 4),
+        ("a block-quoted fence",
+         "> ```bash\n> printf '%s' '\n> a\n> '\n> autumn nope\n> ```", 5),
+        ("a backtick run after a fold",
+         "```bash\nprintf '%s' '\na\n'\nOUT=`autumn nope`\n```", 5),
+        # `<<EOF` written INSIDE a string opens no heredoc, so the line below
+        # the string is a command and not its body.
+        ("a heredoc opener inside a string",
+         "```bash\nprintf '%s' '\ncat <<EOF\n'\nautumn nope\n```", 5),
+    ]
+    for label, doc, at in neighbours:
+        got = [(ln, d) for ln, d, _, _ in invocations(doc)]
+        expect(got == [(at, 'nope')],
+               f'{label} must not swallow the command after it: {got}')
+    # …and a command written INSIDE the string is data, not a command.
+    inside = "```bash\nprintf '%s' '\n`autumn nope`\n'\n```"
+    expect(list(invocations(inside)) == [],
+           f'a backtick run inside the string is data: {list(invocations(inside))}')
+
+    # The `-c` reading travels through every wrapper, and stops at every
+    # program that does not spell a command string that way.
+    for wrapper in ('timeout 5', 'sudo -u deploy', 'kubectl exec pod --',
+                    'docker run img', 'env'):
+        doc = f"```bash\n{wrapper} bash -lc 'autumn nope'\n```"
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{wrapper} reaches a bundled -c: {got}')
+    for quiet in ('bash -x', 'bash -l', 'tar -cf a.tar'):
+        doc = f"```bash\n{quiet} 'autumn nope'\n```"
+        expect(list(invocations(doc)) == [],
+               f'{quiet} carries no command string: {list(invocations(doc))}')
+
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
     print(f"self-test: {len(checked) - len(failures)} passed, {len(failures)} failed")
