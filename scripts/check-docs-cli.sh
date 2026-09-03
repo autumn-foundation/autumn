@@ -1646,30 +1646,105 @@ def _body_expansions(text):
 
 
 def _body_balanced(text):
-    """True when a heredoc-body fragment leaves no `$(` or backtick open.
+    """True when a heredoc-body fragment leaves no `$( … )` or backtick open.
 
     A command substitution in a body may span newlines, so a fragment ending
     mid-`$( … )` has to be held and joined with the lines below it before it is
-    scanned. A backslash quotes `$` and a backtick in a body, so an escaped
-    opener does not count toward the balance.
+    scanned. The paren count is QUOTE-AWARE inside a substitution — a `)`
+    written `printf ')'` does not close it, exactly as `_embedded_spans`
+    decides — otherwise a quoted paren flushed the fragment early and the
+    command below it was left as data. In body TEXT (depth 0) quotes are
+    literal, so they are tracked only once a `$(` has opened; a backslash there
+    quotes `$` and a backtick, so an escaped opener does not count.
     """
-    depth, bt, i, n = 0, 0, 0, len(text)
+    depth, bt, quote, i, n = 0, 0, None, 0, len(text)
     while i < n:
-        if text[i] == '\\':
+        ch = text[i]
+        if bt:                              # inside a backtick run: ` ends it
+            if ch == '\\':
+                i += 2
+                continue
+            if ch == '`':
+                bt = 0
+            i += 1
+            continue
+        if depth == 0:                      # body text: quotes are literal here
+            if ch == '\\':
+                i += 2                       # quotes `$` / backtick in a body
+                continue
+            if ch == '`':
+                bt = 1
+            elif text[i:i + 2] == '$(' and text[i:i + 3] != '$((':
+                depth += 1
+                i += 2
+                continue
+            i += 1
+            continue
+        if quote:                           # inside a substitution: shell rules
+            if ch == '\\' and quote == '"':
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == '\\':
             i += 2
             continue
-        if text[i] == '`':
-            bt ^= 1
-        elif bt:
-            pass                            # inside a backtick run, ` decides
+        if ch in '"\'':
+            quote = ch
+        elif ch == '`':
+            bt = 1
         elif text[i:i + 2] == '$(':
             depth += 1
             i += 2
             continue
-        elif text[i] == ')' and depth:
+        elif ch == ')':
             depth -= 1
         i += 1
     return depth == 0 and bt == 0
+
+
+def _split_shell_lines(text):
+    """Split shell code on command-separating newlines, quote- and paren-aware.
+
+    A newline inside `$( … )` separates commands, so the interior of a
+    multiline substitution is several command lines, not one — and `commands()`
+    cannot see that because shlex eats newlines as whitespace. Splitting here
+    lets each be resolved. A newline inside a QUOTE or a nested substitution is
+    not a separator (bash keeps reading), so it is not cut: cutting there would
+    invent a command from `echo "a` — the false positive this guards against.
+    """
+    out, start, depth, quote, i, n = [], 0, 0, None, 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == '\\' and quote == '"':
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == '\\':
+            i += 2
+            continue
+        if ch in '"\'':
+            quote = ch
+        elif text[i:i + 2] == '$(':
+            depth += 1
+            i += 2
+            continue
+        elif ch == '(' and depth:
+            depth += 1
+        elif ch == ')' and depth:
+            depth -= 1
+        elif ch == '\n' and depth == 0:
+            out.append(text[start:i])
+            start = i + 1
+        i += 1
+    out.append(text[start:])
+    return out
 
 
 def _body_commands(buf, lineno, text):
@@ -1713,7 +1788,10 @@ def _script_lines(lines):
                 heredoc_buf = []            # drop any unclosed fragment
             elif expands:
                 for at, inner in _body_commands(heredoc_buf, lineno, text):
-                    yield at, inner
+                    # A newline inside the substitution separates commands, so
+                    # its interior is several command lines, not one.
+                    for cmd_line in _split_shell_lines(inner):
+                        yield at, cmd_line
             continue
         if quote:
             quoted.append(text)
@@ -2325,8 +2403,10 @@ def invocations(text):
                 # rules `_body_expansions` states, and a `$( … )` that spans
                 # body lines is held by `_body_commands` until it closes.
                 for at, inner in _body_commands(heredoc_buf, lineno, line):
-                    for display, argv in commands(inner):
-                        yield at, display, argv, FENCED_COMMAND
+                    # A newline inside the substitution separates commands.
+                    for cmd_line in _split_shell_lines(inner):
+                        for display, argv in commands(cmd_line):
+                            yield at, display, argv, FENCED_COMMAND
             continue
 
         # A trailing comment is valid on a key line, and these patterns are
@@ -2378,10 +2458,17 @@ def invocations(text):
                     # Stripping it concatenated them into one unreadable
                     # token and the drift went unreported. The block's own
                     # column comes off; anything past it is content.
-                    text = (line[folded_base:].rstrip()
-                            if folded_cont and folded_base is not None
-                            and not line[:folded_base].strip()
-                            else line.strip())
+                    # A LITERAL scalar loses only its BLOCK's base indent, not
+                    # all of it: the relative indentation is content the shell
+                    # sees. `.strip()` here made an indented heredoc terminator
+                    # (`    EOF` under a `run: |`) look like the real one at the
+                    # base column, closing the heredoc early and reporting its
+                    # body as a command. A continuation keeps its indent for the
+                    # same reason — the whitespace separates the joined words.
+                    keep_indent = ((folded_literal or folded_cont)
+                                   and folded_base is not None
+                                   and not line[:folded_base].strip())
+                    text = line[folded_base:].rstrip() if keep_indent else line.strip()
                     body = _strip_comment(text).rstrip()
                     cont = _escaped(body + ' ', len(body))
                     if cont:
@@ -4832,15 +4919,27 @@ def self_test():
 
     # A command substitution in a heredoc body may span physical lines. Read
     # line by line, `$(` on one line and `)` on another was never seen whole,
-    # so the command between them was left as body data.
+    # so the command between them was left as body data. A NEWLINE inside the
+    # substitution separates commands, so `$(autumn\nnope)` is `autumn` (a bare
+    # root) then `nope` (not an autumn command at all) — two commands, one
+    # defect — not the single `autumn nope` a newline-eating tokenizer saw.
     for doc, want in (
             ('```bash\ncat <<EOF\n$(autumn nope\n)\nEOF\n```', ['nope']),
-            ('```bash\ncat <<EOF\n$(autumn\nnope\n)\nEOF\n```', ['nope']),
-            ('```bash\ncat <<EOF\n`autumn\nnope`\nEOF\n```', ['nope']),
+            ('```bash\ncat <<EOF\n$(autumn\nnope\n)\nEOF\n```', ['']),
+            ('```bash\ncat <<EOF\n`autumn\nnope`\nEOF\n```', ['']),
             ('```yaml\nrun: |\n  cat <<EOF\n  $(autumn nope\n  )\n  EOF\n```',
              ['nope'])):
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == want, f'a multiline body substitution is read: {got}')
+    # A quoted `)` inside a body substitution does not close it, and a newline
+    # inside a quoted argument is not a command separator — the two shapes the
+    # balance and the split each have to get right.
+    qp = '```bash\ncat <<EOF\n$(printf \')\'\nautumn nope\n)\nEOF\n```'
+    expect([d for _, d, _, _ in invocations(qp)] == ['nope'],
+           f'a quoted paren does not flush the fragment early: {list(invocations(qp))}')
+    qn = '```bash\ncat <<EOF\n$(echo "a\nautumn nope")\nEOF\n```'
+    expect(list(invocations(qn)) == [],
+           f'a newline inside a quoted arg is not a command: {list(invocations(qn))}')
     # Two separate single-line substitutions stay two, each on its own line.
     two = '```bash\ncat <<EOF\n$(autumn nope)\n$(autumn nada)\nEOF\n```'
     expect([(ln, d) for ln, d, _, _ in invocations(two)]
@@ -4854,6 +4953,20 @@ def self_test():
             ('```bash\ncat <<EOF\n$(autumn nope\nEOF\nautumn after\n```', ['after'])):
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == want, f'multiline body edge case: {got} != {want}')
+
+    # A literal `run: |` loses only its block's BASE indent, not all of it, so
+    # an indented heredoc terminator is not mistaken for the real one at the
+    # base column. `.strip()`-ing every line made `    EOF` match the delimiter,
+    # closed the heredoc early, and reported its body as a command.
+    indented_term = ('```yaml\nrun: |\n  cat <<EOF\n    EOF\n'
+                     '    autumn nope\n  EOF\n```')
+    expect(list(invocations(indented_term)) == [],
+           f'an indented heredoc terminator is body data: '
+           f'{list(invocations(indented_term))}')
+    base_term = '```yaml\nrun: |\n  cat <<EOF\n  data\n  EOF\n  autumn nope\n```'
+    expect([(ln, d) for ln, d, _, _ in invocations(base_term)] == [(6, 'nope')],
+           f'the terminator at the base column still closes: '
+           f'{list(invocations(base_term))}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
