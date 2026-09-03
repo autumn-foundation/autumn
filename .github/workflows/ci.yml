@@ -120,6 +120,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Full history. The plugin-surface gate below asks "did THIS change
+          # touch the declared plugin surface?", which needs a merge base with
+          # the target branch. At the default depth 1 there is none, and a gate
+          # that cannot compute its own question is a gate that fails — so
+          # without this the job goes red rather than silently green. Cheap: no
+          # toolchain, no cache, docs-only checks.
+          fetch-depth: 0
       - name: Migration guide coverage gate
         # Pre-1.0, most releases can break existing apps, and the only prior
         # check keyed off a `### Breaking` CHANGELOG heading this repo has
@@ -184,6 +192,57 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-links.sh
+      - name: Plugin surface gate
+        # The declared plugin API surface (issue #1601) has a compiled half —
+        # the `plugin-contract` job below builds `autumn-plugin-reference`
+        # against the changed framework — and a documentary half this step
+        # guards: the docs table matching `PLUGIN_SURFACES`, the ratchet on the
+        # stable count, and the rule that a change to the declared surface
+        # updates `docs/migrations/next.md`'s "Plugin authors" section.
+        #
+        # Needs the merge base with the target branch, which is why this job's
+        # checkout sets `fetch-depth: 0` above. The gate fails rather than
+        # skipping when it cannot compute that — a surface change must not be
+        # able to pass by being unmeasurable.
+        #
+        # Shares this docs-only job for the same reason as the gates above: no
+        # toolchain, no cache, reports in seconds. Self-tests first.
+        env:
+          # On a pull_request this is the branch being merged into; on a push to
+          # trunk-dev there is no base_ref, and the merge base with trunk-dev is
+          # HEAD itself, so the surface-change question correctly answers "no".
+          BASE_REF: origin/${{ github.base_ref || 'trunk-dev' }}
+        run: ./scripts/check-plugin-surface.sh
+
+  plugin-contract:
+    name: Plugin API contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Compile the pinned reference plugin against this framework
+        # `autumn-plugin-reference` calls every surface declared
+        # `SurfaceTier::Stable` in `autumn/src/plugin_contract.rs`. Removing,
+        # renaming, or re-signaturing one breaks THIS build — which is the
+        # whole gate (issue #1601): a plugin-surface break becomes a red check
+        # on the PR that causes it, instead of a broken build in somebody's
+        # plugin crate after they upgrade.
+        #
+        # Its own job rather than a step in `test`: the point is that it
+        # reports under its own name, so "did this break plugins?" is
+        # answerable at a glance rather than buried in the workspace suite.
+        #
+        # Cost: the crate itself is tiny, but it depends on autumn-web with
+        # DEFAULT features, so a cold cache is a full framework build (tens of
+        # minutes), and this job name gets its own `rust-cache` entry against
+        # the repo's shared cache budget. Warm runs are a couple of minutes.
+        run: cargo test -p autumn-plugin-reference --all-features
+      - name: Check the flagship first-party plugin still builds
+        # The success metric in issue #1601 names both the reference plugin and
+        # autumn-admin-plugin. The reference plugin proves the DECLARED surface;
+        # the admin plugin proves a real, non-trivial consumer of it.
+        run: cargo check -p autumn-admin-plugin --all-targets
 
   supply-chain:
     name: Supply chain (cargo-deny)

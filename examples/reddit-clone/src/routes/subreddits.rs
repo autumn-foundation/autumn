@@ -11,8 +11,8 @@ use diesel_async::RunQueryDsl;
 use crate::models::{NewSubreddit, Subreddit, SubredditComments as _};
 use crate::repositories::{PgSubredditRepository, SubredditRepository};
 use crate::schema::users;
-use autumn_web::slugify;
 use autumn_web::widgets::{CommentThread, CommentView, comment_thread};
+use autumn_web::{contains_letter_or_number, slugify};
 
 use super::layout::{layout, layout_with_seo, time_ago};
 
@@ -140,6 +140,33 @@ pub struct CreateSubredditForm {
     pub description: String,
 }
 
+/// The community-name rules, factored out of the handler so they can be
+/// exercised without a database.
+///
+/// The content rule asks `contains_letter_or_number`, not `slugify(name)
+/// .is_empty()`: `slugify` never returns an empty string, so the check this
+/// replaces was unreachable and a community called `"***"` was created with a
+/// hash slug (the same bug as the post title, issue #2424).
+fn validate_community_name(name: &str) -> Result<(), AutumnError> {
+    // Characters, not bytes: `str::len()` counts UTF-8 bytes, so it told an
+    // 11-character Japanese name it was over 32 "characters" and let a
+    // 1-character one past a rule that exists to require 2. The post title's
+    // `length(min = 1, max = 300)` already counts characters, so this also
+    // makes the app's two length rules mean the same thing.
+    let length = name.chars().count();
+    if !(2..=32).contains(&length) {
+        return Err(AutumnError::unprocessable_msg(
+            "Community name must be 2-32 characters",
+        ));
+    }
+    if !contains_letter_or_number(name) {
+        return Err(AutumnError::unprocessable_msg(
+            "Community name must contain at least one letter or number",
+        ));
+    }
+    Ok(())
+}
+
 #[secured]
 #[post("/r/create")]
 pub async fn create(
@@ -155,17 +182,8 @@ pub async fn create(
         .map_err(|_| AutumnError::bad_request_msg("Invalid session"))?;
 
     let name = form.0.name.trim().to_string();
-    if name.len() < 2 || name.len() > 32 {
-        return Err(AutumnError::unprocessable_msg(
-            "Community name must be 2-32 characters",
-        ));
-    }
+    validate_community_name(&name)?;
     let slug = slugify(&name);
-    if slug.is_empty() {
-        return Err(AutumnError::unprocessable_msg(
-            "Community name must contain at least one letter or number",
-        ));
-    }
 
     let new_sub = NewSubreddit {
         name: name.clone(),
@@ -465,3 +483,69 @@ pub async fn show(
 }
 
 autumn_web::paths![list, create_form, create, show];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_community_name_with_no_letter_or_number_is_rejected() {
+        // The same dead-guard bug as the post title (#2424): `slugify` grew a
+        // non-empty fallback, so `slugify(&name).is_empty()` could never fire.
+        for name in ["***", "!!!???...:::", "🎉🔥💯", "----"] {
+            assert!(
+                !slugify(name).is_empty(),
+                "slugify({name:?}) is non-empty -- that is why the old guard was dead"
+            );
+            let Err(error) = validate_community_name(name) else {
+                panic!("{name:?} must be rejected")
+            };
+            assert!(
+                error.to_string().contains("at least one letter or number"),
+                "{name:?} must explain itself; got: {error}"
+            );
+        }
+    }
+
+    /// These are the *server's* rules. The shipped form is deliberately
+    /// narrower — `create_form`'s input carries `pattern="[a-zA-Z0-9_]+"`, so
+    /// a browser will not send `"web dev"` or `"日本語"` in the first place.
+    /// Widening that pattern is a separate UI change; what matters here is
+    /// that the server does not reject real text out of hand.
+    #[test]
+    fn a_community_name_with_a_letter_or_number_in_any_script_is_accepted() {
+        for name in ["rust", "web dev", "42", "日本語", "Привет"] {
+            assert!(
+                validate_community_name(name).is_ok(),
+                "{name:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_length_rule_still_applies_and_counts_characters() {
+        for name in ["r", "", "日"] {
+            let Err(error) = validate_community_name(name) else {
+                panic!("{name:?} is too short")
+            };
+            assert!(
+                error.to_string().contains("2-32 characters"),
+                "got: {error}"
+            );
+        }
+        let long = "r".repeat(33);
+        let Err(error) = validate_community_name(&long) else {
+            panic!("a 33-character name is too long")
+        };
+        assert!(
+            error.to_string().contains("2-32 characters"),
+            "got: {error}"
+        );
+
+        // 11 characters, 33 bytes: a byte-counting rule called this too long.
+        assert!(
+            validate_community_name(&"日".repeat(11)).is_ok(),
+            "an 11-character name is within a 32-character limit"
+        );
+    }
+}

@@ -1465,9 +1465,565 @@ impl LedgerValidTimeValue for Option<chrono::NaiveDateTime> {
     }
 }
 
+// ── Runtime append (issue #2309 follow-up) ───────────────────────────
+//
+// `#[repository(ledgered)]` used to expand this entire read-then-write —
+// including a local chain-state struct and two `QueryableByName` derives — at
+// every one of the ~30 mutation sites `vh_insert_ts` covers. That alone took a
+// ledgered repository's generated source from 72 KB to 508 KB, and none of it
+// was model-specific: `RuntimeConnection` is a concrete type alias and every
+// bound value is a primitive or a `serde_json::Value` the caller already built.
+//
+// Hoisted here it compiles once per program instead of once per repository.
+// The generated code keeps only the parts that genuinely need the model — the
+// durable per-field snapshot codec, the typed `deleted_at` read-back on the
+// soft-delete path, and `LedgeredRecord::ledger_valid_from` — and calls this.
+
+/// Everything the append reads before it can decide its own sequence number and
+/// transaction time.
+///
+/// Backend-neutral: each arm below decodes its own `QueryableByName` row into
+/// this, because the clock and the two instants come back as different SQL
+/// types on each tier.
+#[cfg(feature = "db")]
+struct ChainState {
+    db_now: DateTime<Utc>,
+    head_seq: Option<i64>,
+    head_hash: Option<String>,
+    head_recorded_at: Option<DateTime<Utc>>,
+    mark_seq: Option<i64>,
+    mark_hash: Option<String>,
+    mark_recorded_at: Option<DateTime<Utc>>,
+}
+
+/// One ledger revision, as the generated repository has computed it.
+///
+/// `snapshot` is owned because the soft-delete path rewrites it before handing
+/// it over; everything else is borrowed from locals the caller already holds.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct LedgerAppend<'a> {
+    /// Physical table the ledgered record lives in.
+    pub table_name: &'static str,
+    /// Active tenant for a `tenant_scoped` repository, else `None`.
+    pub tenant_id: Option<&'a str>,
+    /// Primary key of the record this revision describes.
+    pub record_id: i64,
+    /// Which mutation produced this revision.
+    pub op: VersionOp,
+    /// Resolved actor for the write.
+    pub actor: &'a str,
+    /// Originating request id, when one is in scope.
+    pub request_id: Option<&'a str>,
+    /// Full row snapshot, already through the model's durable per-field codec.
+    pub snapshot: serde_json::Value,
+    /// The model's own valid-time instant, when it declares one. `None` falls
+    /// back to the revision's transaction time.
+    pub valid_from: Option<DateTime<Utc>>,
+}
+
+/// Read the record's chain head, its out-of-band high-water mark and the
+/// database's own clock, in one statement.
+///
+/// Two LEFT JOINs off a one-row anchor rather than three round trips — and the
+/// anchor is what makes the row come back even when neither side has anything,
+/// so the clock read is never lost with the head.
+///
+/// `SQLite` documents that every `'now'` inside one `sqlite3_step` sees the same
+/// value, so its clock is coherent with the head it rides along with; Postgres
+/// reads `clock_timestamp()` rather than `now()` because the latter is the
+/// transaction's *start*, which two overlapping transactions can observe out of
+/// commit order.
+///
+/// `$1`/`$2`/`$3` are each referenced more than once and only three binds are
+/// supplied. That is ordinary on Postgres, which numbers *parameters*; on
+/// `SQLite` `$1` is a **named** parameter of the `$AAAA` family whose index is
+/// assigned by FIRST APPEARANCE, not by the digits in the name. So the first
+/// appearance of `$1`, `$2` and `$3` must stay in that order in the statement
+/// text, matching the bind order below.
+#[cfg(feature = "db")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one backend-forked statement: each arm carries its own \
+              `QueryableByName` row because the clock and the two instants come \
+              back as different SQL types per tier. Splitting it would separate \
+              the SQL from the row shape it decodes into"
+)]
+async fn read_chain_state(
+    conn: &mut crate::db::RuntimeConnection,
+    table_name: &str,
+    record_id: i64,
+    tenant_id: Option<&str>,
+) -> crate::AutumnResult<ChainState> {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    use diesel_async::RunQueryDsl;
+
+    let unreadable = |detail: String| {
+        crate::AutumnError::internal_server_error(LedgerError::ChainUnreadable {
+            table: table_name.to_string(),
+            record_id,
+            detail,
+        })
+    };
+
+    #[cfg(not(feature = "sqlite"))]
+    {
+        use diesel::sql_types::Timestamptz;
+
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = Timestamptz)]
+            db_now: DateTime<Utc>,
+            #[diesel(sql_type = Nullable<BigInt>)]
+            head_seq: Option<i64>,
+            #[diesel(sql_type = Nullable<Text>)]
+            head_hash: Option<String>,
+            #[diesel(sql_type = Nullable<Timestamptz>)]
+            head_recorded_at: Option<DateTime<Utc>>,
+            #[diesel(sql_type = Nullable<BigInt>)]
+            mark_seq: Option<i64>,
+            #[diesel(sql_type = Nullable<Text>)]
+            mark_hash: Option<String>,
+            #[diesel(sql_type = Nullable<Timestamptz>)]
+            mark_recorded_at: Option<DateTime<Utc>>,
+        }
+
+        let row: Row = diesel::sql_query(
+            "SELECT clock_timestamp() AS db_now, \
+                    __head.seq AS head_seq, \
+                    __head.hash AS head_hash, \
+                    __head.recorded_at AS head_recorded_at, \
+                    __mark.high_seq AS mark_seq, \
+                    __mark.head_hash AS mark_hash, \
+                    __mark.recorded_at AS mark_recorded_at \
+             FROM (SELECT 1 AS anchor) AS __anchor \
+             LEFT JOIN ( \
+                 SELECT seq, hash, recorded_at FROM _autumn_ledger_revisions \
+                 WHERE table_name = $1 AND record_id = $2 \
+                 AND COALESCE(tenant_id, '') = COALESCE($3::text, '') \
+                 ORDER BY seq DESC LIMIT 1 \
+             ) AS __head ON 1 = 1 \
+             LEFT JOIN _autumn_ledger_high_water AS __mark \
+             ON __mark.table_name = $1 AND __mark.record_id = $2 \
+             AND __mark.tenant_key = COALESCE($3::text, '')",
+        )
+        .bind::<Text, _>(table_name)
+        .bind::<BigInt, _>(record_id)
+        .bind::<Nullable<Text>, _>(tenant_id)
+        .get_results::<Row>(conn)
+        .await
+        .map_err(crate::AutumnError::from)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| unreadable("the chain-state read returned no row".to_string()))?;
+
+        Ok(ChainState {
+            db_now: row.db_now,
+            head_seq: row.head_seq,
+            head_hash: row.head_hash,
+            head_recorded_at: row.head_recorded_at,
+            mark_seq: row.mark_seq,
+            mark_hash: row.mark_hash,
+            mark_recorded_at: row.mark_recorded_at,
+        })
+    }
+
+    #[cfg(feature = "sqlite")]
+    {
+        use diesel::sql_types::TimestamptzSqlite;
+
+        // `db_now` comes back as the `strftime` text rather than a bound
+        // timestamp: the accepted encoding is then pinned by
+        // `parse_sqlite_instant`'s own test in this crate instead of by
+        // whichever format list Diesel's SQLite decoder carries.
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = Text)]
+            db_now: String,
+            #[diesel(sql_type = Nullable<BigInt>)]
+            head_seq: Option<i64>,
+            #[diesel(sql_type = Nullable<Text>)]
+            head_hash: Option<String>,
+            #[diesel(sql_type = Nullable<TimestamptzSqlite>)]
+            head_recorded_at: Option<DateTime<Utc>>,
+            #[diesel(sql_type = Nullable<BigInt>)]
+            mark_seq: Option<i64>,
+            #[diesel(sql_type = Nullable<Text>)]
+            mark_hash: Option<String>,
+            #[diesel(sql_type = Nullable<TimestamptzSqlite>)]
+            mark_recorded_at: Option<DateTime<Utc>>,
+        }
+
+        let row: Row = diesel::sql_query(
+            "SELECT strftime('%Y-%m-%d %H:%M:%f', 'now') AS db_now, \
+                    __head.seq AS head_seq, \
+                    __head.hash AS head_hash, \
+                    __head.recorded_at AS head_recorded_at, \
+                    __mark.high_seq AS mark_seq, \
+                    __mark.head_hash AS mark_hash, \
+                    __mark.recorded_at AS mark_recorded_at \
+             FROM (SELECT 1 AS anchor) AS __anchor \
+             LEFT JOIN ( \
+                 SELECT seq, hash, recorded_at FROM _autumn_ledger_revisions \
+                 WHERE table_name = $1 AND record_id = $2 \
+                 AND COALESCE(tenant_id, '') = COALESCE($3, '') \
+                 ORDER BY seq DESC LIMIT 1 \
+             ) AS __head ON 1 = 1 \
+             LEFT JOIN _autumn_ledger_high_water AS __mark \
+             ON __mark.table_name = $1 AND __mark.record_id = $2 \
+             AND __mark.tenant_key = COALESCE($3, '')",
+        )
+        .bind::<Text, _>(table_name)
+        .bind::<BigInt, _>(record_id)
+        .bind::<Nullable<Text>, _>(tenant_id)
+        .get_results::<Row>(conn)
+        .await
+        .map_err(crate::AutumnError::from)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| unreadable("the chain-state read returned no row".to_string()))?;
+
+        let db_now = parse_sqlite_instant(&row.db_now).ok_or_else(|| {
+            unreadable(format!(
+                "the database clock read back as {:?}, which is not the encoding the \
+                 ledger expects",
+                row.db_now,
+            ))
+        })?;
+
+        Ok(ChainState {
+            db_now,
+            head_seq: row.head_seq,
+            head_hash: row.head_hash,
+            head_recorded_at: row.head_recorded_at,
+            mark_seq: row.mark_seq,
+            mark_hash: row.mark_hash,
+            mark_recorded_at: row.mark_recorded_at,
+        })
+    }
+}
+
+/// Append one [`LedgerRevision`] inside the caller's already-open transaction,
+/// so the revision and the row it describes commit together or not at all.
+///
+/// The append is a read-then-write: [`read_chain_state`] reads the record's
+/// chain head, its high-water mark and the database's clock, then two
+/// statements insert the revision and raise the mark. All of them run under the
+/// write transaction's row lock on the record, and the migration's
+/// `(table_name, COALESCE(tenant_id, ''), record_id, seq)` unique index turns
+/// any race that slips past that lock into a hard error rather than a silently
+/// forked chain.
+///
+/// # Errors
+///
+/// Returns [`LedgerError::ChainUnreadable`] when the chain state cannot be read
+/// or disagrees with its high-water mark in a way that appending would erase
+/// (see the inline rules), and the database error when either write fails.
+/// The revision INSERT.
+///
+/// `$8` is bound as TEXT, not cast to `jsonb`: `jsonb` parses each number into
+/// `numeric` and re-renders it on output, so a float `serde_json` writes as
+/// `1e16` comes back as `10000000000000000` and re-canonicalizes to different
+/// bytes than the ones that were hashed — `ledger_verify` would report
+/// `HashMismatch` on an untampered chain. A tamper-evident store has to hand
+/// back exactly the bytes it was given.
+#[cfg(feature = "db")]
+pub(crate) const REVISION_INSERT_SQL: &str = "INSERT INTO _autumn_ledger_revisions \
+     (table_name, tenant_id, record_id, seq, op, actor, request_id, \
+      snapshot, valid_from, recorded_at, prev_hash, hash) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)";
+
+/// The high-water upsert.
+///
+/// `WHERE ... high_seq < EXCLUDED.high_seq` is what makes the mark monotonic in
+/// the database rather than merely in the code above it: a writer that somehow
+/// computed a lower sequence number cannot lower the mark, it can only fail to
+/// raise it — and then the mark disagrees with the head it is supposed to name,
+/// which `ledger_verify` reports.
+///
+/// Raised in the same transaction as the revision itself: the mark and the row
+/// it names commit together or not at all, so the two can never disagree because
+/// of a crash.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+pub(crate) const HIGH_WATER_UPSERT_SQL: &str = "INSERT INTO _autumn_ledger_high_water \
+     (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) \
+     VALUES ($1, COALESCE($2::text, ''), $3, $4, $5, $6) \
+     ON CONFLICT (table_name, tenant_key, record_id) DO UPDATE SET \
+     high_seq = EXCLUDED.high_seq, \
+     head_hash = EXCLUDED.head_hash, \
+     recorded_at = EXCLUDED.recorded_at \
+     WHERE _autumn_ledger_high_water.high_seq < EXCLUDED.high_seq";
+
+/// `SQLite` form of [`HIGH_WATER_UPSERT_SQL`]. See that constant for the
+/// monotonicity contract; only the `COALESCE` cast and the `excluded` spelling
+/// differ.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+pub(crate) const HIGH_WATER_UPSERT_SQL: &str = "INSERT INTO _autumn_ledger_high_water \
+     (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) \
+     VALUES ($1, COALESCE($2, ''), $3, $4, $5, $6) \
+     ON CONFLICT (table_name, tenant_key, record_id) DO UPDATE SET \
+     high_seq = excluded.high_seq, \
+     head_hash = excluded.head_hash, \
+     recorded_at = excluded.recorded_at \
+     WHERE _autumn_ledger_high_water.high_seq < excluded.high_seq";
+
+/// The SQL type both ledger instants bind as.
+///
+/// Backend-forked exactly as the generated code was (#1996): Postgres binds
+/// `Timestamptz`; `SQLite` binds `TimestamptzSqlite` (there is no
+/// `FromSql<Timestamptz, Sqlite>`).
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+type Instant = diesel::sql_types::Timestamptz;
+/// See the Postgres definition.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+type Instant = diesel::sql_types::TimestamptzSqlite;
+
+#[cfg(feature = "db")]
+#[doc(hidden)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the #2323 high-water cross-checks, the sequence allocation and the \
+              transaction-time clamp are one indivisible decision: each rule's \
+              rationale is stated where it is enforced, and splitting them would \
+              scatter the argument for why an append is allowed to proceed"
+)]
+pub async fn append_revision(
+    conn: &mut crate::db::RuntimeConnection,
+    append: LedgerAppend<'_>,
+) -> crate::AutumnResult<()> {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    use diesel_async::RunQueryDsl;
+
+    let LedgerAppend {
+        table_name,
+        tenant_id,
+        record_id,
+        op,
+        actor,
+        request_id,
+        snapshot,
+        valid_from,
+    } = append;
+
+    let unreadable = |detail: String| {
+        crate::AutumnError::internal_server_error(LedgerError::ChainUnreadable {
+            table: table_name.to_string(),
+            record_id,
+            detail,
+        })
+    };
+
+    let state = read_chain_state(conn, table_name, record_id, tenant_id).await?;
+
+    // #2323: the mark is cross-checked on the WRITE path too, not only by
+    // `ledger_verify`. Without this the append is a free repair — delete the
+    // newest revision *and* the mark, wait for ordinary traffic, and the append
+    // would re-create both consistently, which is exactly the laundering this
+    // issue exists to stop.
+    //
+    // One rule decides which disagreements refuse: **refuse where appending
+    // would destroy the evidence, allow where the evidence survives the
+    // append.**
+    //
+    //   * mark gone beside a live chain, and mark describing a different
+    //     revision (a different hash *or* a different instant) at the head's own
+    //     sequence number — the append would overwrite the mark and the
+    //     disagreement with it. Refuse. The second test is kept identical to the
+    //     one `head_versus_mark` reports `HighWaterMismatch` on, so nothing
+    //     verify can see is something an ordinary write can erase.
+    //   * mark *behind* the head — legitimate: a pre-#2323 node in a
+    //     mixed-version fleet appends without raising the mark. Allow; the write
+    //     heals it, as `HighWaterBehind`'s docs promise.
+    //   * mark *ahead* of the head (a deleted tail) — the append allocates past
+    //     the gap, which is permanent. Allow.
+    //   * mark present with no chain at all (a wholly erased chain) — the append
+    //     starts above seq 1, which `verify` reports as a `MissingRevision`
+    //     forever. Allow: bricking the record would buy no evidence that is not
+    //     already permanent.
+    if state.head_seq.is_some() && state.mark_seq.is_none() {
+        return Err(unreadable(
+            "the record has revisions but no high-water mark; the mark that makes a \
+             deleted revision permanent evidence is itself missing. Appending here \
+             would re-create it over whatever is left. Run `ledger_verify` and \
+             re-apply the high-water migration's backfill once you know what happened"
+                .to_string(),
+        ));
+    }
+    // A mark names a real revision, so its sequence number starts at 1. Below
+    // that it contributes nothing to the `max` below — the append would allocate
+    // as if no mark existed and then raise the mark over the top of it, erasing
+    // an accusation `ledger_verify` had already made (`MissingRevision` beside
+    // an empty chain, `HighWaterBehind` beside a live one). Both schemas carry a
+    // `CHECK (high_seq >= 1)` so the row cannot be written in the first place;
+    // this is the second lock on the same door, for a database whose constraint
+    // was dropped.
+    if state.mark_seq.is_some_and(|seq| seq < 1) {
+        return Err(unreadable(
+            "the record's high-water mark carries a sequence number below 1, which \
+             names no revision. Appending would allocate as though the mark were \
+             absent and then overwrite it — run `ledger_verify`, and check whether \
+             the mark table's CHECK constraint is still in place"
+                .to_string(),
+        ));
+    }
+    // Deliberately the same condition `head_versus_mark` reports
+    // `HighWaterMismatch` on, `recorded_at` included. Anything verify calls a
+    // mismatch and the writer overwrites anyway is an accusation ordinary
+    // traffic launders away — the mark's instant carries no hash of its own, so
+    // rewriting only that field would otherwise be reported once and then
+    // quietly erased by the next append.
+    if state.mark_seq == state.head_seq
+        && (state.mark_hash.as_deref() != state.head_hash.as_deref()
+            || state.mark_recorded_at != state.head_recorded_at)
+    {
+        return Err(unreadable(
+            "the high-water mark and the chain head carry the same sequence number \
+             but describe different revisions; one of the two was rewritten out of \
+             band. Appending here would settle the disagreement in the writer's \
+             favour and erase it — run `ledger_verify` instead"
+                .to_string(),
+        ));
+    }
+
+    // The sequence number is allocated from the greater of the surviving chain
+    // head and the out-of-band high-water mark, never from the chain alone.
+    // Deleting the newest revision and letting an ordinary write land therefore
+    // leaves a gap where the deleted revision was, instead of quietly re-using
+    // its number.
+    let seq_base: i64 = state.head_seq.unwrap_or(0).max(state.mark_seq.unwrap_or(0));
+    if seq_base == i64::MAX {
+        // Saturating here would allocate `i64::MAX` a second time and fail on
+        // the chain unique index with an opaque constraint error, once per
+        // attempt, forever. Say what actually happened.
+        return Err(unreadable(
+            "the record's chain is at i64::MAX and cannot be continued; no further \
+             revision can be numbered"
+                .to_string(),
+        ));
+    }
+    let seq: i64 = seq_base.saturating_add(1);
+    // The chain still links to the revision that is actually there.
+    let prev_hash: Option<String> = state.head_hash;
+
+    // Transaction time, sourced from the database rather than this host's clock
+    // and clamped so it can never precede the revision it follows. Truncated to
+    // microseconds, the precision both storage tiers keep, so the value that is
+    // hashed is the value that comes back on read and `ledger_verify` stays
+    // true.
+    //
+    // The mark's instant is used as a floor only when the mark reaches PAST the
+    // head — the truncation case, where the revision that carried the real
+    // instant is gone. Otherwise the head's own instant, which its hash covers,
+    // is the floor: the mark's carries no hash of its own, so trusting it in the
+    // ordinary case would let one out-of-band UPDATE ratchet the record's
+    // transaction time forward for good. `Option`'s ordering puts `None` below
+    // every `Some`, so `max` picks whichever floor exists.
+    let floor = if state.mark_seq > state.head_seq {
+        state.head_recorded_at.max(state.mark_recorded_at)
+    } else {
+        state.head_recorded_at
+    };
+    let recorded_at = monotonic_recorded_at(state.db_now, floor).ok_or_else(|| {
+        unreadable(format!(
+            "the record's transaction-time floor is more than {LEDGER_MAX_CLOCK_SKEW_SECS}s \
+             ahead of the database's own clock; writing behind it would hash that instant \
+             into the chain and make every as-of query miss the revision. Refusing rather \
+             than ratcheting",
+        ))
+    })?;
+    // Valid time: the model's own instant when it declares one, else the
+    // transaction time (the fact became true when the database learned it).
+    let valid_from = valid_from.map_or(recorded_at, truncate_to_micros);
+
+    let hash: String = revision_hash(&RevisionHashInput {
+        prev_hash: prev_hash.as_deref(),
+        table_name,
+        tenant_id,
+        record_id,
+        seq,
+        op,
+        actor,
+        request_id,
+        snapshot: &snapshot,
+        valid_from,
+        recorded_at,
+    });
+    let snapshot_str: String = canonical_json(&snapshot);
+
+    diesel::sql_query(REVISION_INSERT_SQL)
+        .bind::<Text, _>(table_name)
+        .bind::<Nullable<Text>, _>(tenant_id)
+        .bind::<BigInt, _>(record_id)
+        .bind::<BigInt, _>(seq)
+        .bind::<Text, _>(op.as_str())
+        .bind::<Text, _>(actor)
+        .bind::<Nullable<Text>, _>(request_id)
+        .bind::<Text, _>(snapshot_str)
+        .bind::<Instant, _>(valid_from)
+        .bind::<Instant, _>(recorded_at)
+        .bind::<Nullable<Text>, _>(prev_hash.as_deref())
+        .bind::<Text, _>(hash.as_str())
+        .execute(conn)
+        .await
+        .map_err(crate::AutumnError::from)?;
+
+    diesel::sql_query(HIGH_WATER_UPSERT_SQL)
+        .bind::<Text, _>(table_name)
+        .bind::<Nullable<Text>, _>(tenant_id)
+        .bind::<BigInt, _>(record_id)
+        .bind::<BigInt, _>(seq)
+        .bind::<Text, _>(hash.as_str())
+        .bind::<Instant, _>(recorded_at)
+        .execute(conn)
+        .await
+        .map_err(crate::AutumnError::from)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two statements [`append_revision`] writes (#1699, #2323).
+    ///
+    /// These used to be inlined at every generated write site, where a macro
+    /// test could count them for parity. They compile once now, so their shape
+    /// is asserted next to them; the macro keeps only the parity check that no
+    /// write path skips the append.
+    #[cfg(feature = "db")]
+    #[test]
+    fn ledger_append_statements_keep_their_contract() {
+        // The snapshot is stored as TEXT. A `::jsonb` cast would re-render every
+        // number through `numeric` and hand back different bytes than were
+        // hashed, so `ledger_verify` would report `HashMismatch` on an
+        // untampered chain.
+        assert!(
+            !REVISION_INSERT_SQL.contains("::jsonb"),
+            "the snapshot must not be cast to jsonb: {REVISION_INSERT_SQL}"
+        );
+        assert!(
+            REVISION_INSERT_SQL.contains(
+                "(table_name, tenant_id, record_id, seq, op, actor, request_id, \
+                 snapshot, valid_from, recorded_at, prev_hash, hash)"
+            ),
+            "the revision insert must name all twelve columns: {REVISION_INSERT_SQL}"
+        );
+
+        // The mark can be raised but never lowered — that guard is what makes it
+        // monotonic in the database rather than merely in the code above it.
+        assert!(
+            HIGH_WATER_UPSERT_SQL.contains("ON CONFLICT (table_name, tenant_key, record_id)"),
+            "the mark is keyed per (table, tenant, record): {HIGH_WATER_UPSERT_SQL}"
+        );
+        assert!(
+            HIGH_WATER_UPSERT_SQL
+                .to_ascii_lowercase()
+                .contains("where _autumn_ledger_high_water.high_seq < excluded.high_seq"),
+            "the mark must refuse to move backwards: {HIGH_WATER_UPSERT_SQL}"
+        );
+    }
     use chrono::TimeZone as _;
     use serde_json::json;
 

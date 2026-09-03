@@ -675,7 +675,11 @@ fn parse_assoc_attr(
         let mut explicit_name: Option<String> = None;
         let mut explicit_through: Option<String> = None;
         let mut explicit_target_fk: Option<String> = None;
-        let mut dependent: Option<DependentAction> = None;
+        // The key's span rides along so a later cross-key rejection (the
+        // `through =` combination below) can point its caret at the offending
+        // `dependent`/`on_delete` key — the thing the fix removes — rather than
+        // at the association's target ident.
+        let mut dependent: Option<(DependentAction, proc_macro2::Span)> = None;
         let mut explicit_helper: Option<String> = None;
         let mut counter_cache: Option<CounterCacheDecl> = None;
         let mut counter_cache_tenant: Option<(String, proc_macro2::Span)> = None;
@@ -725,7 +729,7 @@ fn parse_assoc_attr(
             } else if key == "helper" {
                 explicit_helper = Some(value);
             } else if key == "dependent" || key == "on_delete" {
-                dependent = Some(parse_dependent_action(kind, &key, &value)?);
+                dependent = Some((parse_dependent_action(kind, &key, &value)?, key.span()));
             } else {
                 return Err(syn::Error::new_spanned(
                     &key,
@@ -813,7 +817,9 @@ fn parse_assoc_attr(
             "`target_fk = <column>` requires `through = <join_table>`",
         ));
     }
-    if explicit_through.is_some() && dependent.is_some() {
+    if let Some((_, dependent_span)) = dependent.as_ref()
+        && explicit_through.is_some()
+    {
         // A `through = <join_table>` association's `fk` names a column on the
         // *join table*, not on the target model. The emitted cascade calls the
         // target repository's `__autumn_apply_dependent_on_conn`, whose SQL
@@ -822,8 +828,8 @@ fn parse_assoc_attr(
         // Reject the combination directed rather than silently mis-cascading.
         // (Generating a real join-table cascade is a possible future
         // enhancement; a clean reject is the correct minimal behavior.)
-        return Err(syn::Error::new_spanned(
-            &target,
+        return Err(syn::Error::new(
+            *dependent_span,
             "`dependent`/`on_delete` cascade is not supported on a `through = \
              <join_table>` (many-to-many) association: its foreign key names a \
              column on the join table, not on the target model, so the cascade \
@@ -858,7 +864,7 @@ fn parse_assoc_attr(
         fk,
         name,
         through,
-        dependent,
+        dependent: dependent.map(|(action, _span)| action),
         helper: explicit_helper,
         counter_cache,
     })
@@ -3664,11 +3670,15 @@ enum Normalizer {
     Upcase,
     /// `squish` — trim and collapse internal whitespace runs to one space.
     Squish,
+    /// `strip_nul` — remove every NUL (`U+0000`), which a Postgres
+    /// `TEXT`/`VARCHAR` column cannot store (#2423).
+    StripNul,
     /// `with = path::to::fn` — user escape hatch (`fn(&str) -> String`).
     With(syn::Path),
 }
 
-/// Parse a field's `#[normalize(trim, downcase, upcase, squish, with = path)]`
+/// Parse a field's
+/// `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path)]`
 /// attribute into an ordered list of normalizers. Returns an empty list when
 /// the field has no `#[normalize]` attribute.
 fn parse_field_normalize(field: &syn::Field) -> syn::Result<Vec<Normalizer>> {
@@ -3700,13 +3710,16 @@ fn parse_field_normalize(field: &syn::Field) -> syn::Result<Vec<Normalizer>> {
                 ops.push(Normalizer::Upcase);
             } else if meta.path.is_ident("squish") {
                 ops.push(Normalizer::Squish);
+            } else if meta.path.is_ident("strip_nul") {
+                ops.push(Normalizer::StripNul);
             } else if meta.path.is_ident("with") {
                 let path: syn::Path = meta.value()?.parse()?;
                 ops.push(Normalizer::With(path));
             } else {
                 return Err(meta.error(
                     "unsupported `#[normalize]` option; expected one of \
-                     `trim`, `downcase`, `upcase`, `squish`, or `with = path`",
+                     `trim`, `downcase`, `upcase`, `squish`, `strip_nul`, or \
+                     `with = path`",
                 ));
             }
             Ok(())
@@ -3756,6 +3769,9 @@ fn emit_normalize_expr(ops: &[Normalizer], value_expr: &TokenStream) -> TokenStr
         }
         Normalizer::Squish => {
             quote! { __autumn_n = ::autumn_web::normalize::squish(&__autumn_n); }
+        }
+        Normalizer::StripNul => {
+            quote! { __autumn_n = ::autumn_web::normalize::strip_nul(&__autumn_n); }
         }
         Normalizer::With(path) => quote! { __autumn_n = #path(&__autumn_n); },
     });
