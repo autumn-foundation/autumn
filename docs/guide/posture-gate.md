@@ -97,8 +97,11 @@ Two settings finish the job:
   on their own, reviewed by someone who owns that path.
 
 Deleting the committed manifest does not quietly turn the gate off either: a
-base branch that *had* a manifest and no longer does fails the check instead of
-bootstrapping.
+pull request that removes it fails the check, because a merged deletion would
+disarm the gate for every pull request after it. And a build that fails does
+not turn it off by omission — the verdict job runs even when the manifest job
+does not, and fails closed rather than being skipped (GitHub counts a skipped
+required check as satisfied).
 
 ### If your app is a Cargo workspace member
 

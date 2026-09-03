@@ -124,12 +124,27 @@ jobs:
     name: Security posture diff
     runs-on: ubuntu-latest
     needs: manifest
+    # `always()` on purpose. Without it, a failing `manifest` job SKIPS this
+    # one — and GitHub counts a skipped required check as satisfied, so a pull
+    # request could pass the gate by making the manifest build fail. The first
+    # step below turns that into a failure instead.
+    if: always()
     permissions:
       contents: read
       # To post the posture diff as a comment. Nothing else here writes.
       pull-requests: write
 
     steps:
+      # Fail closed when the posture could not be established at all. This is
+      # the step that makes `if: always()` above safe rather than permissive.
+      - name: Require the manifest job to have succeeded
+        if: needs.manifest.result != 'success'
+        run: |
+          echo "::error::the posture manifest job finished as '${MANIFEST_RESULT}', so this commit's security posture could not be established. The gate fails closed."
+          exit 1
+        env:
+          MANIFEST_RESULT: ${{ needs.manifest.result }}
+
       # The base branch's copy of the manifest is read out of git below, so the
       # base ref has to be in the checkout. `fetch-depth: 0` is what puts
       # `origin/<base>` there — do not lower it. The working tree is only ever
@@ -179,6 +194,14 @@ jobs:
         run: |
           set -euo pipefail
           if ! git ls-files --error-unmatch "$POSTURE_MANIFEST" >/dev/null 2>&1; then
+            # Absent here, but present on the base branch, means this pull
+            # request DELETES the baseline. That is how you would disarm the
+            # gate — and it would also brick it for everyone else once merged,
+            # since later runs would have nothing to diff against.
+            if git cat-file -e "origin/${BASE_REF}:${POSTURE_MANIFEST}" 2>/dev/null; then
+              echo "::error file=$POSTURE_MANIFEST::this pull request deletes the committed posture baseline. Restore it, or land its removal as an explicit, separately reviewed change."
+              exit 1
+            fi
             echo "::notice::no posture baseline is committed yet — commit $POSTURE_MANIFEST so the next pull request can be diffed against it"
             exit 0
           fi
@@ -189,6 +212,8 @@ jobs:
             echo "::error file=$POSTURE_MANIFEST::the committed posture manifest describes a different security posture than this commit builds ($COMMITTED vs $FRESH) — run \`autumn routes audit --manifest $POSTURE_MANIFEST\` and commit the result"
             exit 1
           fi
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
 
       # The previously accepted posture. Absent on the first run, or when the
       # base branch predates the gate — both bootstrap cases. A base ref that is
@@ -205,11 +230,14 @@ jobs:
           if git cat-file -e "origin/${BASE_REF}:${POSTURE_MANIFEST}" 2>/dev/null; then
             git show "origin/${BASE_REF}:${POSTURE_MANIFEST}" > base-posture.json
           elif git log --oneline -1 "origin/${BASE_REF}" -- "${POSTURE_MANIFEST}" | grep -q .; then
-            # The base branch HAD a manifest and no longer does. Deleting the
-            # baseline is exactly how you would disarm this gate, so it is a
-            # failure, not a bootstrap.
-            echo "::error::${POSTURE_MANIFEST} existed on origin/${BASE_REF} and is gone. Restore it, or land its removal as an explicit, separately reviewed change."
-            exit 1
+            # The base branch HAD a manifest and no longer does. The deletion is
+            # refused at the pull request that makes it (see the step above), so
+            # reaching here means it went missing another way — a force-push, a
+            # merge that bypassed this gate. Warn loudly and bootstrap: failing
+            # here would lock the repository out of its own gate, including the
+            # pull request that restores the file.
+            rm -f base-posture.json
+            echo "::warning::${POSTURE_MANIFEST} existed on origin/${BASE_REF} and is gone, so this run has no baseline. Restore it in a reviewed change to re-arm the gate."
           else
             rm -f base-posture.json
             echo "::notice::no posture manifest on origin/${BASE_REF} — nothing to diff against yet"

@@ -2910,10 +2910,23 @@ mod tests {
             workflow.contains("adding the security posture gate for the first time"),
             "the adoption pull request must not be refused by the gate it adds: {workflow}"
         );
-        // Deleting the baseline to make every later run bootstrap.
+        // Deleting the baseline in this pull request, to disarm the gate — and
+        // to brick it for everyone afterwards.
         assert!(
-            workflow.contains("existed on origin/${BASE_REF} and is gone"),
-            "a vanished baseline must fail, not bootstrap: {workflow}"
+            workflow.contains("this pull request deletes the committed posture baseline"),
+            "deleting the baseline must fail here: {workflow}"
+        );
+        // …but a baseline that went missing some other way must not lock the
+        // repository out, including the pull request that restores it.
+        assert!(
+            workflow.contains("::warning::${POSTURE_MANIFEST} existed on origin/"),
+            "a baseline missing for other reasons warns and bootstraps: {workflow}"
+        );
+        // A failing build must not skip the verdict: GitHub counts a skipped
+        // required check as satisfied.
+        assert!(
+            workflow.contains("if: always()") && workflow.contains("needs.manifest.result"),
+            "the verdict job runs even when the manifest job fails: {workflow}"
         );
         // A base ref that is not in the checkout at all.
         assert!(workflow.contains("git rev-parse --verify"));
