@@ -1425,10 +1425,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordering). Each guard already binds the pre-rewrite type as
   `let __autumn_inner: T = …` around the guarded body; the route macro now
   recovers the original type from that binding — matched by its exact
-  structural shape, not merely its name, so an unrelated handler-local that
-  happens to share it is never mistaken for the marker — recursing to the
-  innermost binding when guards stack, instead of trusting `sig.output`
-  alone. The generated schema no longer depends on attribute order. The
+  structural shape and the presence of the guard's own marker const earlier
+  in the same block, not merely the binding's name or position, so neither
+  an unrelated handler-local nor a coincidentally-shaped fragment of the
+  handler's own body is ever mistaken for a real guard's binding — recursing
+  to the innermost binding when guards stack, instead of trusting
+  `sig.output` alone. The generated schema no longer depends on attribute
+  order. The
   previously-recommended method-attribute-outermost workaround, documented
   on `#[throttle]`'s rustdoc and in `docs/guide/rate-limiting.md`, is no
   longer necessary.
