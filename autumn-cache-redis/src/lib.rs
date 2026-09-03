@@ -505,6 +505,20 @@ mod tests {
     use testcontainers_modules::redis::Redis as RedisImage;
 
     #[test]
+    fn contract_declares_lockstep_with_own_crate() {
+        use autumn_web::plugin::Plugin;
+
+        let contract = RedisCachePlugin::new().contract().expect("a contract");
+        assert_eq!(contract.plugin, env!("CARGO_PKG_NAME"));
+        assert_eq!(contract.plugin_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            contract.autumn_web.as_deref(),
+            Some(autumn_web::plugin_contract::lockstep_range(env!("CARGO_PKG_VERSION")).as_str())
+        );
+        assert!(contract.experimental_surfaces.is_empty());
+    }
+
+    #[test]
     fn redis_ttl_millis_preserves_subsecond_precision() {
         assert_eq!(
             ttl_millis_for_redis(std::time::Duration::from_millis(100)),
