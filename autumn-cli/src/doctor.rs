@@ -551,16 +551,6 @@ pub enum PortReachability {
 /// HTTP-01 validation requires the CA to reach `:80`, so a refused/timed-out
 /// `:80` is a **Fail**. `:443` merely being down yet is a **Warn** (the listener
 /// may not be up during preflight).
-#[must_use]
-pub fn check_acme_ports_impl(
-    domain: &str,
-    port_80: PortReachability,
-    port_443: PortReachability,
-) -> CheckResult {
-    check_acme_ports_for_challenge(domain, port_80, port_443, false)
-}
-
-/// As [`check_acme_ports_impl`], but told whether DNS-01 is in use (issue #1620).
 ///
 /// Under DNS-01 the CA never connects to `:80` — domain control is proved by a
 /// TXT record — so an unreachable `:80` costs only the HTTP→HTTPS redirect for
@@ -5591,16 +5581,14 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
     // `AcmeDnsConfig` does. Its `deny_unknown_fields` is the point: an operator
     // who pastes `api_token = "..."` into `autumn.toml` gets a FAIL naming the
     // key, not a silently-ignored secret sitting in a plaintext file (#1620).
-    let (dns, dns_error) = match acme.get("dns") {
-        None => (None, None),
-        Some(value) => match value
+    let (dns, dns_error) =
+        acme.get("dns").map_or((None, None), |value| match value
             .clone()
-            .try_into::<autumn_web::config::AcmeDnsConfig>()
-        {
+            .try_into::<autumn_web::config::AcmeDnsConfig>(
+        ) {
             Ok(dns) => (Some(dns), None),
             Err(e) => (None, Some(e.to_string())),
-        },
-    };
+        });
 
     Some(AcmeDoctorConfig {
         domains,
@@ -7889,6 +7877,7 @@ pub fn run(opts: DoctorOptions) {
             // does not cover means every tenant host serves a name mismatch.
             let tenancy_base = tenancy_base_domain.clone();
             let tenancy_domains = acme.domains.clone();
+            #[allow(clippy::redundant_clone, reason = "moved into the boxed task below")]
             let covers = tenancy_base
                 .as_deref()
                 .is_some_and(|base| acme_covers_tenant_subdomains(base, &tenancy_domains));
@@ -10783,7 +10772,7 @@ pub struct Vault {
 
     #[test]
     fn acme_ports_pass_when_both_open() {
-        let r = check_acme_ports_impl(
+        let r = check_acme_ports_for_challenge(
             "app.example.com",
             PortReachability::Open,
             PortReachability::Open,
@@ -10798,7 +10787,12 @@ pub struct Vault {
             PortReachability::TimedOut,
             PortReachability::Error,
         ] {
-            let r = check_acme_ports_impl("app.example.com", p80, PortReachability::Open);
+            let r = check_acme_ports_for_challenge(
+                "app.example.com",
+                p80,
+                PortReachability::Open,
+                false,
+            );
             assert!(matches!(r.status, CheckStatus::Fail), "port80={p80:?}");
             assert!(r.detail.as_deref().unwrap().contains("port 80"));
         }
@@ -10806,7 +10800,7 @@ pub struct Vault {
 
     #[test]
     fn acme_ports_warn_when_only_443_down() {
-        let r = check_acme_ports_impl(
+        let r = check_acme_ports_for_challenge(
             "app.example.com",
             PortReachability::Open,
             PortReachability::Refused,
@@ -11318,7 +11312,7 @@ pub struct Vault {
         assert!(warn.detail.unwrap().contains('2'));
 
         let fail = check_acme_dns_propagation_impl(
-            &fqdn,
+            fqdn,
             &ChallengeDnsVisibility::Unanswerable(
                 "SERVFAIL — the zone's nameservers did not answer".to_owned(),
             ),
@@ -12414,7 +12408,7 @@ directory = \"production\"
         let mut ports_checks = Vec::new();
         let mut dns_checks = Vec::new();
         for domain in &domains {
-            ports_checks.push(check_acme_ports_impl(
+            ports_checks.push(check_acme_ports_for_challenge(
                 domain,
                 PortReachability::Open,
                 PortReachability::Open,

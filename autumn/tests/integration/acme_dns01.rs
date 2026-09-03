@@ -106,6 +106,7 @@ impl FakeZone {
         let mut records = lock(&self.records);
         let entries = records.entry(fqdn.to_ascii_lowercase()).or_default();
         if entries.iter().any(|e| e.value == value) {
+            drop(records);
             return;
         }
         entries.push(ZoneValue {
@@ -255,7 +256,8 @@ impl DnsProvider for ZoneProvider {
     fn upsert_txt<'a>(&'a self, record: &'a TxtRecord) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             self.upserts.fetch_add(1, Ordering::SeqCst);
-            if let Some(message) = lock(&self.fail_with).clone() {
+            let failure = lock(&self.fail_with).clone();
+            if let Some(message) = failure {
                 return Err(message);
             }
             self.zone.upsert(&record.fqdn, &record.value);
@@ -601,7 +603,7 @@ impl Rig {
         )
     }
 
-    fn challenge_fqdn(&self) -> String {
+    fn challenge_fqdn() -> String {
         format!("_acme-challenge.{BASE_DOMAIN}")
     }
 }
@@ -617,7 +619,7 @@ impl Rig {
 #[tokio::test]
 async fn first_boot_issues_a_wildcard_and_serves_every_tenant_subdomain() {
     let rig = build_rig(Duration::ZERO).await;
-    let (reporter, reported) = recording_reporter();
+    let (reporter, failures) = recording_reporter();
 
     run_one_boot(rig.task(false), &rig.status, reporter).await;
 
@@ -628,7 +630,7 @@ async fn first_boot_issues_a_wildcard_and_serves_every_tenant_subdomain() {
         snap.last_failure
     );
     assert!(snap.last_success_unix.is_some(), "no success recorded");
-    assert!(lock(&reported).is_empty(), "unexpected failure reports");
+    assert!(lock(&failures).is_empty(), "unexpected failure reports");
 
     // The CA really validated DNS-01 — twice, once per authorization.
     assert_eq!(
@@ -719,7 +721,7 @@ async fn apex_and_wildcard_publish_two_values_at_one_name() {
     assert!(
         lookups
             .iter()
-            .all(|(fqdn, _)| *fqdn == rig.challenge_fqdn()),
+            .all(|(fqdn, _)| *fqdn == Rig::challenge_fqdn()),
         "both records share the base domain's challenge name: {lookups:?}"
     );
     assert_ne!(
@@ -741,7 +743,7 @@ async fn apex_and_wildcard_publish_two_values_at_one_name() {
 #[tokio::test]
 async fn propagation_is_awaited_before_the_ca_is_told_to_validate() {
     let rig = build_rig(Duration::from_millis(600)).await;
-    let (reporter, reported) = recording_reporter();
+    let (reporter, failures) = recording_reporter();
     let started = Instant::now();
 
     run_one_boot(rig.task(false), &rig.status, reporter).await;
@@ -751,7 +753,7 @@ async fn propagation_is_awaited_before_the_ca_is_told_to_validate() {
         "issuance must survive a slow zone: {:?}",
         rig.status.snapshot().last_failure
     );
-    assert!(lock(&reported).is_empty());
+    assert!(lock(&failures).is_empty());
     assert_eq!(
         rig.ca.state.dns_validations_failed.load(Ordering::SeqCst),
         0
@@ -772,7 +774,7 @@ async fn challenge_records_are_removed_after_a_successful_order() {
 
     assert!(rig.status.snapshot().last_success_unix.is_some());
     assert_eq!(
-        rig.zone.written(&rig.challenge_fqdn()),
+        rig.zone.written(&Rig::challenge_fqdn()),
         Vec::<String>::new(),
         "every published challenge record must be cleaned up"
     );
@@ -796,7 +798,7 @@ async fn challenge_records_are_removed_after_a_failed_order() {
         .as_mut()
         .expect("dns configured")
         .propagation_timeout_secs = 1;
-    let (reporter, reported) = recording_reporter();
+    let (reporter, failures) = recording_reporter();
 
     run_one_boot(rig.task(false), &rig.status, reporter).await;
 
@@ -806,13 +808,13 @@ async fn challenge_records_are_removed_after_a_failed_order() {
         .last_failure
         .expect("a propagation timeout must be recorded");
     assert!(failure.1.contains("propagation"), "got: {}", failure.1);
-    assert!(!lock(&reported).is_empty(), "the failure must be reported");
+    assert!(!lock(&failures).is_empty(), "the failure must be reported");
     assert!(
         rig.provider.upserts.load(Ordering::SeqCst) > 0,
         "the records really were published before the wait timed out"
     );
     assert_eq!(
-        rig.zone.written(&rig.challenge_fqdn()),
+        rig.zone.written(&Rig::challenge_fqdn()),
         Vec::<String>::new(),
         "a failed order must not leave challenge records behind"
     );
@@ -838,7 +840,7 @@ async fn challenge_records_survive_until_the_order_settles() {
         .state
         .deferred_validation
         .store(true, Ordering::SeqCst);
-    let (reporter, reported) = recording_reporter();
+    let (reporter, failures) = recording_reporter();
 
     run_one_boot(rig.task(false), &rig.status, reporter).await;
 
@@ -847,7 +849,7 @@ async fn challenge_records_survive_until_the_order_settles() {
         "issuance must survive a CA that validates lazily: {:?}",
         rig.status.snapshot().last_failure
     );
-    assert!(lock(&reported).is_empty());
+    assert!(lock(&failures).is_empty());
     assert_eq!(
         rig.ca.state.dns_validations_ok.load(Ordering::SeqCst),
         2,
@@ -859,7 +861,7 @@ async fn challenge_records_survive_until_the_order_settles() {
     );
     // …and they are cleaned up once the order is done.
     assert_eq!(
-        rig.zone.written(&rig.challenge_fqdn()),
+        rig.zone.written(&Rig::challenge_fqdn()),
         Vec::<String>::new()
     );
 }
@@ -874,7 +876,7 @@ async fn a_propagation_timeout_names_the_exact_record() {
         .as_mut()
         .expect("dns configured")
         .propagation_timeout_secs = 1;
-    let (reporter, reported) = recording_reporter();
+    let (reporter, failures) = recording_reporter();
 
     run_one_boot(rig.task(false), &rig.status, reporter).await;
 
@@ -884,16 +886,16 @@ async fn a_propagation_timeout_names_the_exact_record() {
         .last_failure
         .expect("the wait must time out");
     assert!(
-        message.contains(&rig.challenge_fqdn()),
+        message.contains(&Rig::challenge_fqdn()),
         "the message must name the record: {message}"
     );
     assert!(
         message.contains("propagation_timeout_secs"),
         "the message must name the knob that extends the wait: {message}"
     );
-    let reports = lock(&reported).clone();
+    let reports = lock(&failures).clone();
     assert!(
-        reports.iter().any(|r| r.contains(&rig.challenge_fqdn())),
+        reports.iter().any(|r| r.contains(&Rig::challenge_fqdn())),
         "the same detail must reach the reporter/alert seam: {reports:?}"
     );
 }
@@ -909,7 +911,7 @@ async fn a_dns01_failure_surfaces_in_health_and_names_the_provider() {
          https://api.cloudflare.com/client/v4/zones/z/dns_records): Invalid access token"
             .to_owned(),
     );
-    let (reporter, reported) = recording_reporter();
+    let (reporter, failures) = recording_reporter();
 
     run_one_boot(rig.task(false), &rig.status, reporter).await;
 
@@ -919,7 +921,7 @@ async fn a_dns01_failure_surfaces_in_health_and_names_the_provider() {
         .last_failure
         .expect("a provider failure must be recorded");
     assert!(message.contains("Invalid access token"), "got: {message}");
-    assert!(!lock(&reported).is_empty(), "the failure must be reported");
+    assert!(!lock(&failures).is_empty(), "the failure must be reported");
 
     let indicator =
         AcmeHealthIndicator::new(rig.status.clone(), 30).with_dns_provider(Some("cloudflare"));
@@ -949,7 +951,7 @@ async fn a_provider_failure_never_leaks_the_api_token() {
     *lock(&rig.provider.fail_with) = Some(
         "could not create the Cloudflare TXT record (HTTP 403): Invalid access token".to_owned(),
     );
-    let (reporter, reported) = recording_reporter();
+    let (reporter, failures) = recording_reporter();
 
     run_one_boot(rig.task(false), &rig.status, reporter).await;
 
@@ -958,7 +960,7 @@ async fn a_provider_failure_never_leaks_the_api_token() {
         AcmeHealthIndicator::new(rig.status.clone(), 30).with_dns_provider(Some("cloudflare"));
     let surfaces = [
         format!("{:?}", snapshot.last_failure),
-        format!("{:?}", lock(&reported).clone()),
+        format!("{:?}", lock(&failures).clone()),
         serde_json::to_string(&indicator.grade(now_unix()).details).expect("details serialize"),
     ];
     for surface in &surfaces {
@@ -993,11 +995,11 @@ async fn a_near_expiry_wildcard_renews_in_place() {
 
     // A second boot over the same store renews, because the stored leaf is due.
     rig.ca.state.cert_lifetime_days.store(90, Ordering::SeqCst);
-    let (reporter, reported) = recording_reporter();
+    let (reporter, failures) = recording_reporter();
     run_one_boot(rig.task(true), &rig.status, reporter).await;
 
     assert!(
-        lock(&reported).is_empty(),
+        lock(&failures).is_empty(),
         "renewal must not report failures"
     );
     let renewed = rig.app.resolver.current();
@@ -1058,13 +1060,13 @@ async fn a_restart_reuses_the_stored_wildcard_certificate() {
     let coordinator: Arc<dyn SchedulerCoordinator> =
         Arc::new(InProcessSchedulerCoordinator::new("test-replica"));
     let shutdown = CancellationToken::new();
-    let (reporter, reported) = recording_reporter();
+    let (reporter, failures) = recording_reporter();
     let handle = tokio::spawn(task.run(coordinator, reporter, shutdown.clone()));
     tokio::time::sleep(Duration::from_millis(500)).await;
     shutdown.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 
-    assert!(lock(&reported).is_empty(), "a restart must not fail");
+    assert!(lock(&failures).is_empty(), "a restart must not fail");
     assert_eq!(
         rig.ca.state.orders_created.load(Ordering::SeqCst),
         orders,
