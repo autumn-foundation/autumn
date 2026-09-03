@@ -97,7 +97,7 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
         }
         match (fence, fence_run(trimmed)) {
             // A fence closes only with the same character, at least as long,
-            // and nothing after it — CommonMark's rule.
+            // and nothing after it — `CommonMark`'s rule.
             (Some((open_char, open_len)), Some((c, len, bare)))
                 if c == open_char && len >= open_len && bare =>
             {
@@ -286,7 +286,7 @@ mod tests {
     /// because the report already contains a three-backtick block. Toggling on
     /// any fence line lets the inner three-backtick line close the outer
     /// four-backtick one, so the quoted marker becomes live and the reviewer
-    /// acknowledges a widening they were only discussing. Per CommonMark, a
+    /// acknowledges a widening they were only discussing. Per `CommonMark`, a
     /// fence closes only with the same character, at least as long.
     #[test]
     fn a_nested_fence_does_not_reopen_the_block_it_sits_in() {
