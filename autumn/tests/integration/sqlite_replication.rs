@@ -1437,3 +1437,37 @@ fn a_failed_publish_leaves_the_existing_databases_wal_intact() {
         "the parked sidecar must not be left behind"
     );
 }
+
+#[test]
+fn a_sidecar_that_cannot_be_displaced_refuses_the_restore() {
+    let mut h = Harness::new();
+    insert(&mut h.conn, &["one", "two", "three"]);
+    h.tick(0).expect("tick");
+
+    let output = h.replica_root.join("../blocked.db");
+    let existing = b"the existing database";
+    std::fs::write(&output, existing).expect("existing database");
+    let wal_path = autumn_web::replication::wal::wal_path(&output);
+    let commits = b"commits that live only in the WAL";
+    std::fs::write(&wal_path, commits).expect("existing WAL");
+
+    // A directory where the sidecar must be parked: `remove_file` cannot clear
+    // it, so the sidecar cannot be moved out of the way. Skipping it would
+    // publish the restored database next to a foreign WAL, and SQLite would
+    // recover that WAL over it — losing the restore, not just the sidecar.
+    std::fs::create_dir_all(format!("{}.displaced", wal_path.display())).expect("block the park");
+
+    let err = restore::restore(h.destination().as_ref(), &h.root, None, &output)
+        .expect_err("a sidecar that cannot be displaced must refuse the restore");
+
+    assert_eq!(
+        std::fs::read(&output).expect("the existing database must still be there"),
+        existing,
+        "publishing must not proceed past a sidecar that could not be displaced ({err})"
+    );
+    assert_eq!(
+        std::fs::read(&wal_path).expect("the existing WAL must still be there"),
+        commits,
+        "a refused restore must leave the WAL exactly where it found it"
+    );
+}

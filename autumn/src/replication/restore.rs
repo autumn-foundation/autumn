@@ -514,13 +514,17 @@ pub fn apply(
     // database's newest commits, and a restore that fails must leave behind what
     // it found rather than the wreckage of a half-finished publish.
     let staged_db = staging.join("restored.db");
-    let displaced = displace_sidecars(output);
+    let displaced = match displace_sidecars(output) {
+        Ok(displaced) => displaced,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
     if let Err(e) = move_file(&staged_db, output) {
         // The existing database is still the one on disk. Without its sidecars
         // it would silently lose every commit not yet checkpointed into it.
-        for (sidecar, parked) in &displaced {
-            let _ = std::fs::rename(parked, sidecar);
-        }
+        restore_sidecars(&displaced);
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
     }
@@ -567,34 +571,80 @@ fn displaced_path(sidecar: &Path) -> PathBuf {
 }
 
 /// Move `output`'s WAL sidecars aside, returning the `(sidecar, parked)` pairs
-/// that were actually moved so a failed publish can put them back.
+/// that were moved so a failed publish can put them back.
 ///
 /// They are parked beside the output rather than inside the staging directory,
 /// which can legitimately sit on another filesystem, so the rename never has to
 /// cross one.
-fn displace_sidecars(output: &Path) -> Vec<(PathBuf, PathBuf)> {
-    let mut moved = Vec::new();
+///
+/// A sidecar that exists but cannot be moved aborts the restore rather than
+/// being skipped: publishing would leave the new database beside a foreign WAL,
+/// and `SQLite` would then recover that WAL over the freshly restored file —
+/// losing the restore itself, not merely the sidecar. Only "there was nothing
+/// there" is allowed to pass silently.
+fn displace_sidecars(output: &Path) -> Result<Vec<(PathBuf, PathBuf)>, RestoreError> {
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     for sidecar in [wal::wal_path(output), wal::shm_path(output)] {
         let parked = displaced_path(&sidecar);
         // `rename` refuses an existing destination on Windows, and a park left
         // by an interrupted earlier run is not something to preserve.
-        let _ = std::fs::remove_file(&parked);
-        if std::fs::rename(&sidecar, &parked).is_ok() {
-            moved.push((sidecar, parked));
+        if let Err(e) = std::fs::remove_file(&parked)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            restore_sidecars(&moved);
+            return Err(RestoreError::io("clear a stale displaced sidecar")(e));
+        }
+        match std::fs::rename(&sidecar, &parked) {
+            Ok(()) => moved.push((sidecar, parked)),
+            // The ordinary case: a cleanly closed database has no sidecars.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                restore_sidecars(&moved);
+                return Err(RestoreError::io("displace an existing WAL sidecar")(e));
+            }
         }
     }
-    moved
+    Ok(moved)
 }
 
-/// Rename `from` to `to`, falling back to copy+remove across filesystems.
+/// Put displaced sidecars back beside the database they belong to.
+fn restore_sidecars(displaced: &[(PathBuf, PathBuf)]) {
+    for (sidecar, parked) in displaced {
+        let _ = std::fs::rename(parked, sidecar);
+    }
+}
+
+/// Move `from` onto `to`, atomically wherever the filesystem allows it.
 fn move_file(from: &Path, to: &Path) -> Result<(), RestoreError> {
     if std::fs::rename(from, to).is_ok() {
         return Ok(());
     }
     // A rename across filesystems fails with EXDEV; the staging directory and
-    // the output can legitimately live on different mounts.
-    std::fs::copy(from, to).map_err(RestoreError::io("publish restored database"))?;
+    // the output can legitimately live on different mounts. Copying straight
+    // onto `to` would truncate the database already sitting there before
+    // writing a byte, so a copy that then hit a full disk or an I/O error would
+    // leave it destroyed — the very failure this path exists to avoid. Land the
+    // bytes beside the target first, then rename, which is atomic within the
+    // single filesystem they now share.
+    let mut name = to.as_os_str().to_os_string();
+    name.push(".incoming");
+    let incoming = PathBuf::from(name);
+    let _ = std::fs::remove_file(&incoming);
+    if let Err(e) = copy_and_sync(from, &incoming) {
+        let _ = std::fs::remove_file(&incoming);
+        return Err(e);
+    }
+    std::fs::rename(&incoming, to).map_err(RestoreError::io("publish restored database"))?;
     std::fs::remove_file(from).map_err(RestoreError::io("clean up staging"))
+}
+
+/// Copy `from` to `to` and flush it, so the rename that follows publishes bytes
+/// that are actually on the disk.
+fn copy_and_sync(from: &Path, to: &Path) -> Result<(), RestoreError> {
+    std::fs::copy(from, to).map_err(RestoreError::io("publish restored database"))?;
+    let file = std::fs::File::open(to).map_err(RestoreError::io("publish restored database"))?;
+    file.sync_all()
+        .map_err(RestoreError::io("publish restored database"))
 }
 
 /// Reassemble and verify inside `staging`, returning everything but the final
