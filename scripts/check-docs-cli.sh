@@ -675,6 +675,19 @@ def _segments(tokens):
             depth += _paren_delta(tok)          # `$(` opens a substitution
         elif depth:
             depth = max(0, depth + _paren_delta(tok))
+        # `2>&1` is ONE redirection, but `&` is in the punctuation set so shlex
+        # hands back `2>` `&` `1`. Splitting there made the command after a
+        # leading `2>&1` start a new segment headed by `1`, and the whole line
+        # went unread. The three are rejoined rather than merely not split, so
+        # the result is a single self-contained redirection token.
+        if current and tok == '&' and current[-1].endswith(('>', '<')):
+            current[-1] += tok
+            prev = tok
+            continue
+        if current and tok.isdigit() and current[-1].endswith(('>&', '<&')):
+            current[-1] += tok
+            prev = tok
+            continue
         if not depth and tok in _OPERATORS:
             out.append(current)
             current = []
@@ -838,6 +851,11 @@ _FOLDED_KEY = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
 # Any mapping key, used only to spot where one object ends and its sibling
 # begins — Compose names its services this way rather than with list items.
 _MAPPING_KEY = re.compile(r'^(\s*)[A-Za-z_][\w.-]*:(\s|$)')
+# A heredoc's body is DATA the shell writes, not commands it runs. A page
+# showing `cat > file <<'EOF'` around some example text was having that text
+# scanned as if it were runnable, so an illustrative `autumn db` inside one
+# failed the gate.
+_HEREDOC = re.compile(r'<<-?\s*(?:"([^"]+)"|\'([^\']+)\'|([A-Za-z_][\w-]*))')
 # A slot key whose value is a plain scalar on the same line. Compose mixes the
 # forms freely — `entrypoint: ["autumn"]` with `command: migrate` — and reading
 # only the bracketed form left the pair half-assembled, so a valid recipe
@@ -1092,7 +1110,27 @@ def _embedded_substitutions(tok):
         i = j + 1
 
 
-def _in_substitutions(segment):
+def _single_quoted(text):
+    """The substrings of `text` that sit inside single quotes.
+
+    shlex removes the quote delimiters before anything downstream can ask, so
+    a literal `'$(autumn db)'` reached the substitution recursion looking
+    exactly like a real one and a `printf` of that text was reported as a
+    command. Single quotes only: double quotes do not stop substitution.
+    """
+    out, i = [], 0
+    while True:
+        start = text.find("'", i)
+        if start < 0:
+            return out
+        end = text.find("'", start + 1)
+        if end < 0:
+            return out
+        out.append(text[start + 1:end])
+        i = end + 1
+
+
+def _in_substitutions(segment, literals=()):
     """Yield the commands written INSIDE `$( … )` in a segment.
 
     Re-enters the same parser on the substitution's own tokens, so a chain or
@@ -1115,6 +1153,10 @@ def _in_substitutions(segment):
         # substitution inside ONE token and the `$` / `(` never sit adjacent.
         # The text between `$(` and its matching `)` is still a command line.
         for text in _embedded_substitutions(segment[i]):
+            # …unless the whole substitution was written inside single quotes,
+            # where the shell prints it rather than running it.
+            if any(text in lit for lit in literals):
+                continue
             yield from commands(text)
         i += 1
 
@@ -1140,10 +1182,10 @@ def commands(text):
     tokens = tokenize(text)
     if tokens is None:
         tokens = text.split()
-    yield from _from_tokens(tokens)
+    yield from _from_tokens(tokens, _single_quoted(text))
 
 
-def _from_tokens(tokens):
+def _from_tokens(tokens, literals=()):
     """The token half of `commands()`, so nested contexts can re-enter it."""
     for segment in _segments(tokens):
         i = _cron_prefix(segment)
@@ -1230,7 +1272,7 @@ def _from_tokens(tokens):
         # A command substitution is a command line too. Stepping over it to
         # reach what follows the assignment is only half the job —
         # `OUT=$(autumn migrate)` runs a command that nothing was reading.
-        yield from _in_substitutions(segment)
+        yield from _in_substitutions(segment, literals)
 
 
 # A token that could name a command. Anything else — a flag, a `<PLACEHOLDER>`,
@@ -1247,7 +1289,7 @@ TOKEN = re.compile(r'^[a-z][a-z0-9-]*$')
 # A placeholder is told apart by its shape rather than by position: `<new>`
 # closes its own bracket, and no redirection target does.
 _PLACEHOLDER = re.compile(r'^<[^<>\s]*>$')
-_REDIRECT = re.compile(r'^(?:[0-9]+|&)?(?:>>?|<<?<?)(?:&[0-9]+-?)?(.*)$')
+_REDIRECT = re.compile(r'^(?:[0-9]+|&)?(?:>>?|<<?<?)(.*)$')
 
 
 def _redirect(tok):
@@ -1360,6 +1402,7 @@ def invocations(text):
         for display, argv in _from_tokens(items):
             yield at, display, argv, FENCED_COMMAND
 
+    heredoc = None          # the terminator of a heredoc being consumed
     folded = None           # paragraphs of a folded (`>`) block scalar
     folded_at = None
     folded_indent = 0
@@ -1415,7 +1458,7 @@ def invocations(text):
     for lineno, line in enumerate(text.split('\n'), 1):
         m = re.match(r'^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)', line)
         if m:
-            held, held_at = [], None            # a fence boundary ends any hold
+            held, held_at, heredoc = [], None, None   # a fence boundary ends any hold
             yield from close_folded()           # …a folded scalar
             yield from close_pending()          # …and any list
             yield from emit_slots()
@@ -1438,6 +1481,12 @@ def invocations(text):
         # and the guide writes five of them on that page alone. Scanning the
         # physical lines instead yields the argv `\`, and the command path split
         # across the break goes unchecked.
+        # Inside a heredoc the shell is writing data, not running it.
+        if heredoc is not None:
+            if line.strip() == heredoc:
+                heredoc = None
+            continue
+
         # A trailing comment is valid on a key line, and these patterns are
         # end-anchored, so the key is matched against the line without it.
         # `run: > # folded for readability` is an ordinary thing to write.
@@ -1458,9 +1507,18 @@ def invocations(text):
                 # `autumn migrate autumn routes` from two valid lines.
                 if folded_base is None:
                     folded_base = depth
-                elif depth != folded_base:
+                if depth > folded_base:
+                    # A more-indented block keeps EVERY newline inside it, not
+                    # just the ones at its edges: each of its lines is its own
+                    # command. Breaking only when the depth changed still
+                    # joined two such lines, and because the first accepts
+                    # arguments the second vanished into it.
+                    folded.append([line.strip()])
                     folded.append([])
+                    continue
+                if depth < folded_base:
                     folded_base = depth
+                    folded.append([])
                 folded[-1].append(line.strip())
                 continue
             yield from close_folded()
@@ -1509,7 +1567,14 @@ def invocations(text):
             else:
                 kind = None         # `script:`/`run:` — one whole shell line,
             if kind:                # which the ordinary line scan reads.
+                # YAML's own quoting comes off FIRST. Left on, the whole
+                # command became one shell token — `command: "autumn migrate"`
+                # tokenized to a single `autumn migrate` that matched no
+                # executable — so quoting a scalar silently disabled the check
+                # while the identical unquoted line was read.
                 value = scalar.group(2)
+                if len(value) > 1 and value[0] == value[-1] and value[0] in '"\'':
+                    value = value[1:-1]
                 pending_kind, pending_at = kind, lineno
                 pending_indent = len(scalar.group(1))
                 pending = tokenize(value) or value.split()
@@ -1541,6 +1606,11 @@ def invocations(text):
         # command in half.
         for display, argv in commands(logical):
             yield at, display, argv, FENCED_COMMAND
+        # …and a line that OPENS a heredoc is itself a command, but everything
+        # after it until the terminator is the data it writes.
+        opener = _HEREDOC.search(logical)
+        if opener:
+            heredoc = next(g for g in opener.groups() if g)
         # Backticks inside a fence are not markdown spans. In a shell block
         # they are legacy command substitution — `` OUT=`autumn migrate` `` is
         # a command the reader runs — and elsewhere they are a line quoting a
@@ -2115,6 +2185,34 @@ def self_test():
     got = [resolve(a, surface, runnable=w == FENCED_COMMAND)
            for _, _, a, w in invocations(lead_bare)]
     expect(got == ['autumn db'], f'…and the command is still judged complete: {got}')
+    # `2>&1` is ONE redirection, but `&` is punctuation, so shlex hands back
+    # three tokens. They are rejoined — merely declining to SPLIT there left
+    # `1` as the segment head and the command after it went unread.
+    for dup in ('2>&1', '1>&2', '>&2'):
+        doc = f'```bash\n{dup} autumn migrate run\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'], f'a leading {dup} must be one token: {got}')
+        trail = f'```bash\nautumn db {dup}\n```'
+        got = [resolve(a, surface, runnable=w == FENCED_COMMAND)
+               for _, _, a, w in invocations(trail)]
+        expect(got == ['autumn db'], f'…and a trailing {dup} is not an argument: {got}')
+    # …while a real `&` still separates commands.
+    amp = '```bash\nautumn migrate & autumn db\n```'
+    got = [resolve(a, surface, runnable=w == FENCED_COMMAND)
+           for _, _, a, w in invocations(amp)]
+    expect(got == [None, 'autumn db'], f'`&` still separates two commands: {got}')
+
+    # --- a heredoc body is DATA the shell writes, not commands it runs.
+    for opener in ("<<'EOF'", '<<"EOF"', '<<EOF', '<<-EOF'):
+        doc = f'```bash\ncat >/tmp/x {opener}\nautumn db\nEOF\nautumn migrate run\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'],
+               f'a heredoc body ({opener}) is not scanned, and the line after it is: {got}')
+    # An unterminated heredoc must not swallow the rest of the FILE.
+    unterminated = ('```bash\ncat <<EOF\nautumn db\n```\n\n'
+                    '```bash\nautumn migrate run\n```')
+    expect([d for _, d, _, _ in invocations(unterminated)] == ['migrate run'],
+           f'a fence boundary ends a heredoc: {list(invocations(unterminated))}')
 
     # --- a brace group runs the commands inside it, so `{` stands in front of
     # a command the way a subshell's `(` does.
@@ -2576,6 +2674,13 @@ def self_test():
     ind_drift = '```yaml\nrun: >\n  autumn migrate\n    autumn run\n```'
     expect([d for _, d, _, _ in invocations(ind_drift)] == ['migrate', 'run'],
            f'drift in a more-indented block is read: {list(invocations(ind_drift))}')
+    # A more-indented block keeps EVERY newline inside it, not just the ones at
+    # its edges. Breaking only on a change of depth still joined two of its
+    # lines, and since the first accepts arguments the second vanished into it.
+    ind_pair = ('```yaml\nrun: >\n  autumn migrate\n    autumn routes\n'
+                '    autumn run\n```')
+    expect([d for _, d, _, _ in invocations(ind_pair)] == ['migrate', 'routes', 'run'],
+           f'each more-indented line is its own command: {list(invocations(ind_pair))}')
     # A trailing comment is valid on a key line, and these patterns are
     # end-anchored, so the key must be matched without it.
     for label, doc in [
@@ -2647,6 +2752,16 @@ def self_test():
     ]:
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate'], f'a scalar slot ({label}) must assemble: {got}')
+    # YAML's quoting comes off before the value is shell-tokenized. Left on,
+    # the whole command became ONE token that matched no executable, so
+    # quoting a scalar silently disabled the check.
+    for label, doc in [
+        ('double', '```yaml\ncommand: "autumn migrate run"\n```'),
+        ('single', "```yaml\ncommand: 'autumn migrate run'\n```"),
+        ('bare', '```yaml\ncommand: autumn migrate run\n```'),
+    ]:
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'], f'a {label} scalar reads the same: {got}')
     sdrift = '```yaml\nentrypoint: ["autumn"]\ncommand: "run"\n```'
     expect([d for _, d, _, _ in invocations(sdrift)] == ['run'],
            f'drift in a scalar slot is read: {list(invocations(sdrift))}')
@@ -2765,6 +2880,17 @@ def self_test():
     expect([w for _, _, _, w in invocations('```bash\necho "`autumn db`"\n```')]
            == [FENCED_COMMAND],
            'a double-quoted backtick still runs')
+    # The same rule for `$( … )`: shlex strips the quote delimiters, so a
+    # literal substitution reached the recursion looking like a real one and a
+    # `printf` of that text was reported as a command.
+    lit_sub = "```bash\nprintf '%s\\n' '$(autumn db)'\n```"
+    bad = [d for _, d, a, w in invocations(lit_sub)
+           if resolve(a, surface, runnable=w == FENCED_COMMAND)]
+    expect(bad == [], f'a single-quoted $( ) is printed, not run: {bad}')
+    for real in ('OUT=$(autumn migrate run)', 'OUT="$(autumn migrate run)"'):
+        doc = f'```bash\n{real}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'], f'a real substitution still runs: {real} -> {got}')
     # …and drift inside a literal run is still reported, just not as a command.
     lit_drift = "```bash\nprintf '%s\\n' '`autumn nope`'\n```"
     bad = [d for _, d, a, w in invocations(lit_drift)
