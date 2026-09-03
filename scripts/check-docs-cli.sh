@@ -836,7 +836,16 @@ def _segments(tokens):
             current[-1] += tok
             prev = tok
             continue
-        if not depth and tok in _OPERATORS:
+        # shlex COALESCES a run of punctuation, so a substitution's closer and
+        # the operator after it arrive as one token: `echo $(date); autumn …`
+        # hands back `);`. Testing the whole token against the operator set
+        # matched neither half, the line never split, and the command after the
+        # separator went unread. The parens are consumed for depth (already
+        # done above) and what REMAINS is tested as the operator it is.
+        rest = tok.lstrip('()') if tok and all(c in _PUNCTUATION for c in tok) else tok
+        if not depth and (tok in _OPERATORS or rest in _OPERATORS):
+            if tok is not rest and tok != rest:
+                current.append(tok[:len(tok) - len(rest)])
             out.append(current)
             current = []
         else:
@@ -2110,7 +2119,17 @@ def invocations(text):
                     # first at the backslash and left the second with no
                     # executable, so `autumn \` / `definitely-not-a-command`
                     # resolved to nothing and the drift went unreported.
-                    text = line.strip()
+                    # A continuation keeps the next line's RELATIVE
+                    # indentation, because that whitespace is what separates
+                    # the words once bash removes the backslash-newline:
+                    # `autumn\` + `    nope` is `autumn    nope`, two words.
+                    # Stripping it concatenated them into one unreadable
+                    # token and the drift went unreported. The block's own
+                    # column comes off; anything past it is content.
+                    text = (line[folded_base:].rstrip()
+                            if folded_cont and folded_base is not None
+                            and not line[:folded_base].strip()
+                            else line.strip())
                     body = _strip_comment(text).rstrip()
                     cont = _escaped(body + ' ', len(body))
                     if cont:
@@ -4271,6 +4290,52 @@ def self_test():
     both = '```bash\necho $((1 << 2)); cat <<EOF\nautumn db\nEOF\nautumn nope\n```'
     expect([(ln, d) for ln, d, _, _ in invocations(both)] == [(5, 'nope')],
            f'a shift beside a real heredoc: {list(invocations(both))}')
+
+    # shlex COALESCES a run of punctuation, so a substitution's closing paren
+    # and the operator after it arrive as ONE token — `);`, `)&&`, `));`.
+    # Testing the whole token against the operator set matched neither half,
+    # the line never split, and the command after the separator went unread.
+    for line in ('echo $(date); autumn nope', 'echo $(date)&& autumn nope',
+                 'echo $(date)|| autumn nope', 'echo $(date)| autumn nope',
+                 'echo $(date)& autumn nope', 'echo $(a $(b)); autumn nope'):
+        doc = f'```bash\n{line}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{line!r} splits at the operator: {got}')
+    # The spaced spellings, which already worked, must keep working…
+    for line in ('echo $(date) && autumn nope', 'echo $(date) | autumn nope'):
+        doc = f'```bash\n{line}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{line!r} still splits: {got}')
+    # …and an operator that is DATA must still not split a line. A `;` inside
+    # quotes is text, and a substitution's own operators belong to it.
+    for quiet in ('echo "a;b"; autumn nope', "printf '%s' '$(x);'; autumn nope"):
+        doc = f'```bash\n{quiet}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{quiet!r} splits only at the real one: {got}')
+    both = '```bash\nOUT=$(autumn migrate); autumn nope\n```'
+    expect([d for _, d, _, _ in invocations(both)] == ['migrate', 'nope'],
+           f'a substitution and the command after it are both read: '
+           f'{list(invocations(both))}')
+
+    # A continuation keeps the next line's RELATIVE indentation, because that
+    # whitespace is what separates the words once bash removes the
+    # backslash-newline. Stripping it concatenated `autumn\` and `    nope`
+    # into one unreadable token and the drift went unreported — the limit I
+    # wrote down as acceptable one round earlier, which it was not.
+    for style, want in (('  autumn\\\n      nope', 'nope'),
+                        ('  autumn\\\n      migrate', 'migrate'),
+                        ('  autumn mig\\\n  rate', 'migrate'),
+                        ('  autumn\\\n      migrate\\\n      status',
+                         'migrate status')):
+        doc = f'```yaml\nrun: |\n{style}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == [want], f'a literal continuation keeps its indent: '
+                              f'{got} != {[want]}')
+    # …including under an explicit indentation indicator, which SETS the column
+    # the relative indent is measured from.
+    ind = '```yaml\nrun: |2\n   autumn\\\n       nope\n```'
+    expect([d for _, d, _, _ in invocations(ind)] == ['nope'],
+           f'the indicator sets the column: {list(invocations(ind))}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
