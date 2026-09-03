@@ -564,6 +564,39 @@ def _segments(tokens):
     return out
 
 
+def _autumn_exe(tok):
+    """True when the token names the autumn binary, however it is spelled.
+
+    `autumn`, `./autumn`, `/usr/local/bin/autumn` (how `daemon.md`'s systemd
+    units write it), `target/debug/autumn`. NOT `autumn-cli`, `autumn-web` or
+    `autumn/src/…`, whose basenames differ — and NOT `cd autumn`, which is a
+    directory and is excluded by command position rather than by spelling.
+
+    Two spellings are excluded that a plain basename test accepts, both of which
+    reported correct pages as broken when this was first written: a URL whose
+    last path segment happens to be `autumn`
+    (`AUTUMN_ALERTS__WEBHOOK_URL=https://…/hooks/autumn`), and an assignment
+    token, which the caller handles separately so that
+    `AUTUMN_CLUSTER__CLUSTER_NAME=autumn` stays a cluster's name.
+    """
+    if '://' in tok or '=' in tok:
+        return False
+    if tok == 'autumn':
+        return True
+    return '/' in tok and tok.rsplit('/', 1)[-1] == 'autumn'
+
+
+def _exe_path(value):
+    """True when an assignment's VALUE is a PATH to the autumn binary.
+
+    Stricter than `_autumn_exe` on purpose: `ExecStart=/usr/local/bin/autumn` is
+    a command, but `AUTUMN_CLUSTER__CLUSTER_NAME=autumn` is a cluster's name and
+    reading the bare word as an executable reported a correct page as broken.
+    A value has to look like a path before it can look like a program.
+    """
+    return '/' in value and _autumn_exe(value)
+
+
 def _after_image(segment, k):
     """Yield the argv following a container IMAGE.
 
@@ -599,8 +632,10 @@ def commands(text):
         wrapper argument tokenizes (`fly ssh console -C "autumn migrate"`).
         Re-tokenizing that token gets the argv exactly, with no quote left
         glued to the last word.
-    Anything else — prose, a path, `./autumn`, `cd autumn` — is not a command
-    position and is skipped.
+    The binary is recognised however it is spelled — `autumn`, `./autumn`,
+    `/usr/local/bin/autumn` — because a path-qualified executable is still an
+    invocation. `cd autumn` is excluded by POSITION (it is not a command head),
+    not by spelling, and `autumn-cli` / `autumn/src/…` by basename.
     """
     tokens = tokenize(text)
     if tokens is None:
@@ -608,6 +643,13 @@ def commands(text):
     for segment in _segments(tokens):
         i = 0
         while i < len(segment) and (segment[i] in _PROMPT or _ENV_TOKEN.match(segment[i])):
+            # An assignment whose VALUE is the binary is itself the command
+            # head, not something to step over: a systemd unit writes
+            # `ExecStart=/usr/local/bin/autumn db backup …`, and skipping it as
+            # an environment prefix left the whole recipe ungated.
+            assign = _ENV_TOKEN.match(segment[i])
+            if assign and _exe_path(segment[i][assign.end():]):
+                break
             # `NAME=$(cat file)` tokenizes as `NAME=$` `(` `cat` `file` `)`, so
             # a command substitution in the value has to be stepped over as a
             # unit — otherwise the scan stops on `cat` and never reaches the
@@ -626,13 +668,22 @@ def commands(text):
                     i += 1
                 continue
             i += 1
-        if i < len(segment) and segment[i] == 'autumn':
+        head = None
+        if i < len(segment):
+            assign = _ENV_TOKEN.match(segment[i])
+            if _autumn_exe(segment[i]):
+                head = i
+            elif assign and _exe_path(segment[i][assign.end():]):
+                head = i
+        if head is not None:
+            i = head
+        if i < len(segment) and head is not None:
             yield ' '.join(segment[i + 1:]), segment[i + 1:]
         for j, tok in enumerate(segment):
-            if tok == '--' and j + 1 < len(segment) and segment[j + 1] == 'autumn':
+            if tok == '--' and j + 1 < len(segment) and _autumn_exe(segment[j + 1]):
                 yield ' '.join(segment[j + 2:]), segment[j + 2:]
             elif tok == '--entrypoint' and j + 2 < len(segment) \
-                    and segment[j + 1] == 'autumn':
+                    and _autumn_exe(segment[j + 1]):
                 yield from _after_image(segment, j + 2)
             elif tok == '--entrypoint=autumn':
                 yield from _after_image(segment, j + 1)
@@ -1116,8 +1167,32 @@ def self_test():
     env_doc = '```bash\nAUTUMN_ENV=prod DATABASE_URL="postgres://x" autumn migrate run\n```'
     expect([d for _, d, _, _ in invocations(env_doc)] == ['migrate run'],
            f'env assignments must not hide the command: {list(invocations(env_doc))}')
-    expect(list(invocations('```bash\ncd autumn && ./autumn migrate\n```')) == [],
-           '`cd autumn` and `./autumn` are not invocations of the CLI')
+    # `cd autumn` is a directory; `./autumn` is the binary. Conflating the two
+    # is how this assertion was originally written, and it encoded the wrong
+    # belief: a path-qualified executable IS an invocation.
+    expect([d for _, d, _, _ in invocations('```bash\ncd autumn && ./autumn migrate\n```')]
+           == ['migrate'],
+           '`cd autumn` is a directory, but `./autumn` is the binary')
+    expect(_autumn_exe('autumn') and _autumn_exe('./autumn')
+           and _autumn_exe('/usr/local/bin/autumn'),
+           'the binary is recognised however its path is spelled')
+    expect(not _autumn_exe('autumn-cli') and not _autumn_exe('autumn/src/lib.rs'),
+           'a different basename is not the binary')
+    expect(not _autumn_exe('https://alerts.example.com/hooks/autumn'),
+           'a URL ending in /autumn is not an executable')
+    expect(not _autumn_exe('AUTUMN_CLUSTER__CLUSTER_NAME=autumn'),
+           'an assignment token is not itself the binary')
+    expect(_exe_path('/usr/local/bin/autumn') and not _exe_path('autumn'),
+           "an assignment's VALUE must be a PATH before it is a program")
+
+    # A systemd unit writes the command as an assignment to a path.
+    unit = '```ini\n[Service]\nExecStart=/usr/local/bin/autumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(unit)] == ['migrate run'],
+           f'a systemd ExecStart= recipe must be read: {list(invocations(unit))}')
+    cfgs = ('```bash\nAUTUMN_CLUSTER__CLUSTER_NAME=autumn\n'
+            'AUTUMN_ALERTS__WEBHOOK_URL=https://alerts.example.com/hooks/autumn\n```')
+    expect(list(invocations(cfgs)) == [],
+           f'config values are not commands: {list(invocations(cfgs))}')
     subst = '```bash\nAUTUMN_MASTER_KEY=$(cat config/master.key) autumn migrate run\n```'
     expect([d for _, d, _, _ in invocations(subst)] == ['migrate run'],
            'an env value may be a command substitution containing spaces')
@@ -1273,7 +1348,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f"self-test: {13 + 47 + 32 + 4 - len(failures)} passed, {len(failures)} failed")
+    print(f"self-test: {13 + 47 + 40 + 4 - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
