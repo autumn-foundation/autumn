@@ -673,8 +673,22 @@ def _skip_wrapper_options(segment, i, value_opts):
         if not tok.startswith('-') or len(tok) < 2:
             break
         i += 1
-        if '=' not in tok and tok in value_opts:
-            i += 1                              # its value is the next token
+        if tok.startswith('--'):
+            if '=' not in tok and tok in value_opts:
+                i += 1                          # separated value
+        else:
+            # A short CLUSTER: `ssh -vp 22` is `-v` (flag) then `-p` (value).
+            # Testing the whole `-vp` against the value set found nothing and
+            # treated it as one flag, so `22` was read as the destination and
+            # the command behind it was lost. Only the LAST letter can take a
+            # SEPARATE token; a value-taking letter before the end carries its
+            # value attached and ends the cluster. A letter the table does not
+            # list is a flag, the same assumption the whole-token test made.
+            for pos in range(1, len(tok)):
+                if ('-' + tok[pos]) in value_opts:
+                    if pos == len(tok) - 1:
+                        i += 1                  # value is the next token
+                    break                       # attached value ends the group
     return i
 
 # A crontab line puts the command after a five-field schedule, so `autumn` is
@@ -1170,7 +1184,17 @@ def _heredoc_delim(text, i):
             j = i + 1
             while j < n:
                 if ch == '"' and text[j] == '\\' and j + 1 < n:
-                    out.append(text[j + 1])
+                    # Inside double quotes a backslash quotes only a SPECIAL
+                    # character; before anything else it is a literal
+                    # backslash and stays in the word. `<<"END\q"` terminates
+                    # on `END\q`, so dropping the backslash recorded the wrong
+                    # delimiter, the terminator never matched, and the body was
+                    # swallowed. `\"` still escapes the closing quote.
+                    if text[j + 1] in '$`"\\':
+                        out.append(text[j + 1])
+                    else:
+                        out.append(text[j])
+                        out.append(text[j + 1])
                     j += 2
                     continue
                 if text[j] == ch:
@@ -1335,8 +1359,19 @@ def _nested_command(segment, j, tok, cmd=0):
     # the real command and once for an empty argv.
     eval_owns = (prev == 'eval' or (cmd < j and segment[cmd] == 'eval')
                  or (j > 0 and segment[0] == 'eval'))
+    # `env -S 'autumn …'` / `--split-string` splits the value into an argv and
+    # runs its first word, so the value is a command line — owned by env, the
+    # same ownership question as a shell's `-c`. (The attached spellings
+    # `-S'…'` and `--split-string=…` carry the value inside the token and are
+    # handled at the call site, where the part after the option can be split
+    # off before recursing.)
+    env_split = (prev in ('-S', '--split-string')
+                 and any(0 <= k < len(segment)
+                         and segment[k].rsplit('/', 1)[-1] == 'env'
+                         for k in (j - 2, cmd, 0)))
     if ' ' in tok:
-        marked = after_c or eval_owns or bool(_COMMAND_KEY.match(prev))
+        marked = (after_c or eval_owns or env_split
+                  or bool(_COMMAND_KEY.match(prev)))
         if not marked and prev == '=' and j > 1:
             marked = bool(_COMMAND_KEY_BARE.match(segment[j - 2]))
         return marked
@@ -1349,7 +1384,7 @@ def _nested_command(segment, j, tok, cmd=0):
     # yielded a second, empty invocation that reported the page as broken.
     if not _autumn_exe(tok):
         return False
-    if after_c:
+    if after_c or env_split:
         return True
     return prev == '=' and j > 1 and bool(_COMMAND_KEY_BARE.match(segment[j - 2]))
 
@@ -1841,6 +1876,21 @@ def _from_tokens(tokens, masked=None, classify=None):
                 # the whole token against one spelling accepted only the bare
                 # word, so the path-qualified recipe went unread.
                 yield from _after_image(segment, j + 1)
+            elif (tok.startswith('--split-string=')
+                  or (tok.startswith('-S') and not tok.startswith('--')
+                      and len(tok) > 2)) \
+                    and any(segment[k].rsplit('/', 1)[-1] == 'env'
+                            for k in range(j)):
+                # The ATTACHED split-string spellings carry the command inside
+                # the token — `env --split-string='autumn …'` and `env
+                # -S'autumn …'` — so the part after the option is split off and
+                # re-entered, the same way the separated form is marked in
+                # `_nested_command`. env owns it wherever it stands in the
+                # prefix: the wrapper walk has already stepped `cmd_at` past
+                # this option by the time the branch runs, so the head is not
+                # where env is.
+                value = tok.split('=', 1)[1] if tok.startswith('--') else tok[2:]
+                yield from commands(value)
             elif _nested_command(segment, j, tok, cmd_at):
                 # A nested command line is RE-ENTERED, not re-implemented. It
                 # gets environment prefixes, chains, path-qualified spellings
@@ -4674,6 +4724,43 @@ def self_test():
         doc = f'```bash\n{line}\n```'
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == want, f'command line {line!r} -> {got} != {want}')
+
+    # A wrapper's short options may be BUNDLED. `ssh -vp 22` is `-v` (flag)
+    # then `-p` (value); testing the whole `-vp` against the value set found
+    # nothing, so `22` was read as the destination and the command after it
+    # was lost. Only the last letter of a cluster takes a separate token.
+    for form in ('ssh -vp 22 host', 'ssh -4vp 22 host', 'ssh -v host',
+                 'ssh -p 22 host', 'ssh host'):
+        doc = f'```bash\n{form} autumn nope\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{form} reaches its remote command: {got}')
+
+    # Inside DOUBLE quotes a backslash quotes only a special character; before
+    # anything else it is literal and stays in the delimiter word. `<<"END\\q"`
+    # terminates on `END\\q`, so dropping the backslash recorded `ENDq`, the
+    # terminator never matched, and the body was swallowed.
+    lit = 'cat <<"END\\q"\nautumn db\nEND\\q\nautumn nope'
+    expect([d for _, d, _, _ in invocations(f'```bash\n{lit}\n```')] == ['nope'],
+           f'a literal backslash in a delimiter is kept: '
+           f'{list(invocations(chr(96)*3 + "bash" + chr(10) + lit + chr(10) + chr(96)*3))}')
+    # …and a backslash before a SPECIAL char still quotes it, so `END\\$X`
+    # terminates on `END$X`.
+    spec = 'cat <<"END\\$X"\nautumn db\nEND$X\nautumn nope'
+    expect([d for _, d, _, _ in invocations(f'```bash\n{spec}\n```')] == ['nope'],
+           'a backslash before $ still quotes it in a delimiter')
+
+    # `env -S '…'` / `--split-string` splits the value into an argv and runs
+    # its first word, so the value is a command line env owns — every spelling.
+    for form in ("env -S 'autumn nope'", "env --split-string='autumn nope'",
+                 "env -S'autumn nope'", "env -u X -S 'autumn nope'",
+                 "sudo env -S 'autumn nope'"):
+        doc = f'```bash\n{form}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{form} runs its split string: {got}')
+    # …but only env owns it: the same option on another program is an ordinary
+    # value.
+    expect(list(invocations("```bash\necho --split-string='autumn nope'\n```")) == [],
+           'a split-string option on echo runs nothing')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
