@@ -1,0 +1,5 @@
+error: #[validate(nested)] is not supported on `#[model]` fields (field `shipping_address`): it collides with this workspace's own `autumn_web::prelude::ValidateExt`, which also implements `validate` for every `validator::Validate` type -- any module that imports the prelude alongside this model fails to compile with `E0034: multiple applicable items in scope` on the generated nested-validation call. Validate the nested type's fields directly with declarative validators on this model, or enforce the rule with `#[validate(custom(function = "..."))]` instead (see issue #1751).
+  --> tests/compile-fail/model_validate_nested_rejected.rs:18:16
+   |
+18 |     #[validate(nested)]
+   |                ^^^^^^
