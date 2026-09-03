@@ -1386,6 +1386,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`#[secured]`, `#[step_up]`, and `#[throttle]` now reject a request before
+  its body is ever parsed (#1668):** all three guard checks used to run as
+  statements inside the generated handler body, which Axum only invokes after
+  every extractor — including the body extractor (`Json`/`Form`/`Multipart`)
+  — has already succeeded. An over-limit or unauthenticated request with a
+  malformed body got the extractor's `400`/`422` instead of the guard's
+  intended `429`/`401`/`403`, masking the guard's outcome, and the server paid
+  the cost of parsing and buffering the body (worst for uploads) before a
+  `#[throttle]`-gated route ever got to shed the load. Each macro now emits a
+  `FromRequestParts` gate — a small generated type inserted as the handler's
+  first parameter — so the check runs and can reject the request before
+  Axum's extractor pipeline ever reaches the body extractor, relying on
+  Axum's guarantee that every `FromRequestParts` extractor resolves,
+  left-to-right, strictly before the trailing `FromRequest` one. The macro
+  invocation syntax and handler signatures at call sites are unchanged; a
+  route's role/scope markers still surface in the generated OpenAPI document
+  exactly as before. Fixing this also surfaced a related idempotency-replay
+  gap: when `#[authorize]` is written above one of these guards, a stale scan
+  could let the guard's new pre-body gate wrongly claim replay-serving for
+  itself, which — now that the gate runs before the body — would have let a
+  retried mutation replay its cached response without `#[authorize]`'s policy
+  check ever re-running. That gap is closed in the same change.
+
 - **The idempotency cache is now partitioned by the resolved tenant:** an app
   that turned on Autumn's multi-tenancy (`[tenancy] enabled = true`) *and*
   `AppBuilder::idempotent()` shared one cache slot between tenants. The storage
