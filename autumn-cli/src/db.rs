@@ -33,6 +33,11 @@ pub mod s3;
 /// production guard ([`guard_destructive`]) and identifier-quoting verbatim.
 pub mod scrub;
 
+/// `autumn db replica` — restore, inspect and verify a continuously replicated
+/// SQLite database (issue #1628). A submodule so it can reuse this module's
+/// production guard ([`guard_destructive`]) verbatim.
+pub mod replica;
+
 /// `autumn db retention` — report, dry-run, and on-demand purge of the
 /// unified data-retention policy for framework-owned data (issue #1605).
 /// A submodule for namespacing only: it drives the app binary rather than
@@ -228,6 +233,12 @@ fn resolve_url(profile: Option<&str>) -> Result<String, DbError> {
 /// `dev`/`test` (and their aliases) are always allowed; any other profile —
 /// including custom ones — requires `--force`, matching the issue's
 /// "refuse-by-default outside dev/test" posture.
+/// The production guard as a plain predicate, for submodules that carry their
+/// own error type ([`replica`]). `Err(())` means "refused; needs `--force`".
+pub fn guard_destructive_public(profile: &str, force: bool) -> Result<(), ()> {
+    guard_destructive(profile, force).map_err(|_| ())
+}
+
 fn guard_destructive(profile: &str, force: bool) -> Result<(), DbError> {
     if force || is_safe_destructive_profile(profile) {
         Ok(())

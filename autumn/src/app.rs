@@ -3929,6 +3929,102 @@ impl AppBuilder {
             }
         }
 
+        // Continuous SQLite replication (#1628). Resolved here, next to the other
+        // indicator registrations, so lag and verification are baked into
+        // `/actuator/health` — and so an indicator that stays non-healthy past
+        // the grace period is escalated by the existing #1610 alerter with no
+        // bespoke alert condition of its own. The destination is built on a
+        // BLOCKING thread: its HTTP client must never be constructed inside the
+        // async runtime. The loop itself is spawned at bind time below.
+        #[cfg(feature = "db")]
+        let mut replication_worker: Option<crate::replication::Replicator> = None;
+        #[cfg(feature = "db")]
+        if let Some(replication_config) = config.replication.clone() {
+            let database_url = config
+                .database
+                .primary_url
+                .clone()
+                .or_else(|| config.database.url.clone())
+                .unwrap_or_default();
+            let profile = config.profile.clone().unwrap_or_else(|| "dev".to_owned());
+            // Only a genuinely S3-backed app has a blob-storage bucket to clash
+            // with; a leftover `[storage.s3]` bucket on the local backend is
+            // inert and must not trip the distinct-destination guard (the same
+            // rule #1619's offsite upload applies).
+            #[cfg(feature = "storage")]
+            let storage_destination = (config.storage.backend
+                == crate::storage::StorageBackend::S3)
+                .then(|| {
+                    config
+                        .storage
+                        .s3
+                        .bucket
+                        .clone()
+                        .map(|bucket| (bucket, config.storage.s3.endpoint.clone()))
+                })
+                .flatten();
+            #[cfg(not(feature = "storage"))]
+            let storage_destination: Option<(String, Option<String>)> = None;
+            // The injected clock, not the wall clock: every artifact the
+            // replicator stamps, and the health indicator's startup grace, are
+            // read from it, so a test that freezes time moves them all (#1797).
+            let clock = state.clock_arc();
+
+            let built = tokio::task::spawn_blocking(move || {
+                crate::replication::build(
+                    &replication_config,
+                    &database_url,
+                    &profile,
+                    storage_destination.as_ref().map(|(bucket, endpoint)| {
+                        crate::replication::StorageDestination {
+                            bucket,
+                            endpoint: endpoint.as_deref(),
+                        }
+                    }),
+                    clock,
+                )
+            })
+            .await;
+
+            match built {
+                Ok(Ok(runtime)) => {
+                    tracing::info!(
+                        database = %runtime.settings.database_path.display(),
+                        destination = %runtime.status.snapshot().destination,
+                        prefix = %runtime.settings.root,
+                        sync_interval_secs = runtime.settings.sync_interval.as_secs(),
+                        "continuous SQLite replication is enabled"
+                    );
+                    if let Err(e) = state.health_indicator_registry.register(
+                        crate::replication::INDICATOR_NAME,
+                        crate::actuator::IndicatorGroup::HealthOnly,
+                        std::sync::Arc::clone(&runtime.indicator)
+                            as std::sync::Arc<dyn crate::actuator::HealthIndicator>,
+                    ) {
+                        tracing::warn!("{e}");
+                    }
+                    replication_worker = Some(runtime.replicator);
+                }
+                Ok(Err(crate::replication::SetupError::Disabled)) => {}
+                // A misconfigured durability story must not boot silently
+                // half-working: the operator asked for replication and is not
+                // getting it, which is exactly the situation this feature exists
+                // to prevent.
+                Ok(Err(e)) => {
+                    tracing::error!("Continuous SQLite replication could not start: {e}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    tracing::error!("Continuous SQLite replication setup panicked: {e}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+            }
+        }
+
         // When ACME is configured, register a `HealthOnly` indicator backed by a
         // shared status the renewal task writes. Built here (before the router)
         // so it is baked into `/actuator/health`; the same `AcmeStatus` handle is
@@ -4659,6 +4755,55 @@ impl AppBuilder {
             );
         }
 
+        // The replication loop runs on a DEDICATED OS thread, not a
+        // `spawn_blocking` task: it lives for the whole process and does
+        // blocking file, SQLite and HTTP work, which would pin a thread in
+        // tokio's blocking pool (sized for short tasks) forever. It stops with
+        // the server and ships one final time on the way out.
+        //
+        // Its token is deliberately NOT a child of `server_shutdown`. That token
+        // fires at phase 5, when the listener stops accepting — requests keep
+        // draining after it, and a request served in that window still commits.
+        // The loop's final tick must come after those commits, so the token is
+        // cancelled explicitly below, once the drain has finished. Same reasoning
+        // as the cluster's token, for the same class of silently-dropped write.
+        #[cfg(feature = "db")]
+        let replication_shutdown = tokio_util::sync::CancellationToken::new();
+        // Signals that `Replicator::run` has returned — i.e. the final flush is
+        // done. A channel rather than a `JoinHandle`: waiting on a join means
+        // blocking, and a blocking wait that times out cannot be cancelled, so a
+        // stuck upload would hold the runtime open past the shutdown budget it
+        // was supposed to be bounded by. Dropping this receiver abandons the
+        // thread instead, which is what the budget expiring is supposed to mean.
+        #[cfg(feature = "db")]
+        let mut replication_done: Option<tokio::sync::oneshot::Receiver<()>> = None;
+        #[cfg(feature = "db")]
+        if let Some(replicator) = replication_worker.take() {
+            let replication_shutdown = replication_shutdown.clone();
+            let (finished, waiter) = tokio::sync::oneshot::channel();
+            match std::thread::Builder::new()
+                .name("autumn-sqlite-replication".to_owned())
+                .spawn(move || {
+                    replicator.run(&replication_shutdown);
+                    // The receiver is gone when shutdown stopped waiting; the
+                    // flush still happened, so there is nothing to report.
+                    let _ = finished.send(());
+                }) {
+                Ok(_handle) => replication_done = Some(waiter),
+                // Serving on without the replicator is the worst of both
+                // worlds: the pool has already disabled auto-checkpointing for
+                // it, so the -wal would grow until the disk filled, and the
+                // operator would believe they were replicating. Fail loudly
+                // instead.
+                Err(e) => {
+                    tracing::error!("Could not start the SQLite replication thread: {e}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+            }
+        }
+
         #[cfg(feature = "presence")]
         {
             let presence = state.presence().clone();
@@ -5244,6 +5389,44 @@ impl AppBuilder {
                 })
         };
         let shutdown_budget = std::time::Duration::from_secs(shutdown_timeout);
+
+        // Phase 6a: the replication loop's final flush. Cancelling the token at
+        // phase 5 only *wakes* that loop; the tick that ships the last committed
+        // frames runs after it, and nothing waits for that tick unless this
+        // does. Requests have drained, so no further transaction can commit and
+        // this flush is the last one there will ever be — the difference between
+        // a clean stop that loses nothing and one that leaves the tail of the WAL
+        // only on a machine that may be about to go away.
+        //
+        // Bounded by what the drain left of `shutdown_timeout_secs`, on the same
+        // budget as the departure and the hooks below: a destination that has
+        // gone away must not hold the process open past what a supervisor allows.
+        // Overrunning it is loud rather than silent — the operator's RPO is
+        // exactly what is at stake.
+        #[cfg(feature = "db")]
+        if let Some(waiter) = replication_done.take() {
+            // Only now: every request that will ever commit has committed, so
+            // the tick this releases is genuinely the last one.
+            replication_shutdown.cancel();
+            let wait = shutdown_budget.saturating_sub(elapsed_since_drain_start());
+            match tokio::time::timeout(wait, waiter).await {
+                Ok(Ok(())) => {
+                    tracing::info!("shutdown: SQLite replication flushed and stopped");
+                }
+                Ok(Err(_)) => tracing::error!(
+                    "shutdown: the SQLite replication thread ended without finishing; the \
+                     frames committed since the last successful tick may not be offsite"
+                ),
+                // The thread is left running and the process exits without it.
+                // Waiting further is what the budget exists to prevent, and a
+                // blocking join could not be abandoned at all.
+                Err(_) => tracing::warn!(
+                    timeout_secs = wait.as_secs(),
+                    "shutdown: SQLite replication did not finish its final flush within the \
+                     shutdown budget; the last frames may not be offsite"
+                ),
+            }
+        }
 
         // Phase 6b: the cluster departs only now, once no request can still be
         // running — an increment accepted during the drain must have a push
@@ -9767,6 +9950,13 @@ async fn setup_database(
     directory_shard_router: bool,
     hook_queue_migration_mode: RepositoryCommitHookQueueMigrationMode,
 ) -> Result<DatabaseBootstrap, String> {
+    // #1628: declare replication BEFORE any pool exists, so every pooled SQLite
+    // connection is created with `wal_autocheckpoint = 0` and the replicator is
+    // the only component that ever checkpoints. The flag latches on and is never
+    // cleared — see `set_sqlite_replication_active`.
+    if config.replication.as_ref().is_some_and(|r| r.enabled) {
+        crate::db::set_sqlite_replication_active();
+    }
     let migrations = migrations_with_repository_framework_migrations(
         migrations,
         crate::repository_commit_hooks::has_repository_commit_hook_descriptors(),
@@ -13274,6 +13464,74 @@ mod tests {
         assert!(
             source.contains(shard_gate),
             "shard commit-hook workers must be gated on role.runs_workers()"
+        );
+    }
+
+    /// The replication loop's final flush must be *triggered* after the drain.
+    ///
+    /// Cancelling the token only *wakes* the replication thread; the tick that
+    /// ships the last committed frames runs immediately after it. So waiting
+    /// for the thread is not enough on its own — if the token fires at phase 5,
+    /// with `server_shutdown`, that final tick happens while requests are still
+    /// draining, and a request that commits during the drain is never
+    /// replicated even though the wait below succeeds and logs that replication
+    /// flushed. The token must therefore be independent of `server_shutdown`
+    /// and cancelled only once the drain has finished.
+    ///
+    /// The wait must also not be a blocking join: a blocked join cannot be
+    /// cancelled, so a stuck upload would hold the process open past the
+    /// shutdown budget that is supposed to bound it.
+    ///
+    /// Source-order test in the house style, because the ordering is a property
+    /// of this function and nothing smaller: an app-level boot test would need a
+    /// `SQLite` runtime pool, which only exists in the `sqlite` lane.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_replication_final_flush_is_waited_for_after_the_drain() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let server_start = source
+            .find("pub async fn run(self)")
+            .expect("normal server path should exist");
+        // Bounded at the next path so the search cannot match this test's own
+        // source, which necessarily quotes the strings it is looking for.
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should follow server path");
+        let server_source = &source[server_start..build_mode_start];
+
+        let spawn = server_source
+            .find("Ok(_handle) => replication_done = Some(waiter),")
+            .expect("the replication thread's completion signal must be kept, not dropped");
+        let drain = server_source
+            .find("let server_result = server_task.await")
+            .expect("the normal server path should await the drain");
+        let wait = server_source
+            .find("if let Some(waiter) = replication_done.take()")
+            .expect("shutdown must wait for the replication thread");
+        let cancel = server_source
+            .find("replication_shutdown.cancel();")
+            .expect("shutdown must cancel the replication token explicitly");
+
+        assert!(
+            spawn < drain && drain < wait && drain < cancel,
+            "the final flush must be triggered AND awaited AFTER the request drain \
+             (spawn={spawn}, drain={drain}, wait={wait}, cancel={cancel})"
+        );
+        // The token that releases the final tick must not fire with the
+        // listener: that is the whole bug this ordering exists to prevent.
+        assert!(
+            server_source
+                .contains("let replication_shutdown = tokio_util::sync::CancellationToken::new();"),
+            "the replication token must be independent of `server_shutdown`, not a child of it"
+        );
+        assert!(
+            !server_source[..wait].contains("let replication_shutdown = server_shutdown"),
+            "the replication token must not be derived from `server_shutdown`"
+        );
+        // A blocking join cannot be abandoned when the budget runs out.
+        assert!(
+            !server_source[wait..].contains("spawn_blocking"),
+            "the bounded wait must not block on a join it cannot cancel"
         );
     }
 

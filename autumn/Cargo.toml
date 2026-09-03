@@ -38,8 +38,18 @@ mcp = ["openapi"]
 # allowlist HTML sanitizer `markdown::render_user_content` runs its output
 # through, so a content app can accept user Markdown without stored XSS.
 markdown = ["dep:pulldown-cmark", "dep:ammonia"]
+# `reqwest?/blocking` powers the replication S3 destination (#1628), which needs
+# BOTH `db` and `http-client`. The `?` means it is enabled only when something
+# else already pulled reqwest in, so an app on `http-client` alone (no database,
+# and therefore no replication) does not compile the blocking client. The
+# replication loop runs on its own OS thread — file, SQLite and network I/O all
+# off the reactor — and `autumn db replica restore` is a synchronous CLI with no
+# runtime at all, so a blocking client is the one shape both can share. It is
+# constructed, used and dropped only on those threads, never inside the async
+# runtime.
 db = [
     "autumn-macros/db",
+    "reqwest?/blocking",
     "dep:deadpool",
     "dep:diesel",
     "dep:diesel-async",
