@@ -833,6 +833,8 @@ fn plan_scaffold_with_options_impl(
                     contents,
                     &pascal_name,
                     &n.parent_pascal,
+                    &n.parent_snake,
+                    &n.parent_plural,
                 );
             }
         }
@@ -23378,6 +23380,24 @@ exempt_paths = [
         assert!(
             model.contains("#[belongs_to(Post, counter_cache)]"),
             "the child model must carry the attribute that drives the maintenance: {model}"
+        );
+        // Issue #2431: a substring check alone let a build-breaking ordering
+        // bug ship — `#[belongs_to(...)]` is a helper attribute that only
+        // `#[autumn_web::model]`'s own expansion understands, so rustc
+        // accepts it only BELOW `#[model]`; emitted above, `cargo check`
+        // fails with `cannot find attribute belongs_to in this scope` on
+        // every real scaffold (which always has at least a blank line
+        // between the doc header and `#[model]`, unlike this test's old
+        // bare fixture).
+        let model_pos = model
+            .find("#[autumn_web::model]")
+            .expect("model attribute present");
+        let belongs_to_pos = model
+            .find("#[belongs_to(Post, counter_cache)]")
+            .expect("belongs_to attribute present");
+        assert!(
+            model_pos < belongs_to_pos,
+            "#[belongs_to] must be emitted below #[autumn_web::model], not above it: {model}"
         );
     }
 
