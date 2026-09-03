@@ -470,6 +470,17 @@ harness = false
 name = "form_render"
 harness = false
 
+# Real DB-backed CRUD workload for profilers, driving the `#[repository]`
+# macro's generated save/find_by_id/page methods against a live Postgres
+# connection — the query-building/row-mapping layer `request_pipeline`
+# deliberately excludes (its handlers are trivial and non-DB by design).
+# `required-features` since it needs a real database connection, unlike the
+# other benches in this crate.
+[[bench]]
+name = "repository_crud"
+harness = false
+required-features = ["db"]
+
 # W6 PR3 seed-sweep runner (issue #1797): CI-facing driver for
 # `sim::sweep::sweep_proptest`. `required-features` (not a `#![cfg(...)]` file
 # guard, since a `[[bin]]` target — unlike a `[[test]]` — is simply skipped by
