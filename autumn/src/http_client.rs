@@ -2567,11 +2567,19 @@ async fn send_one(
     } else {
         1
     };
+    let mut last_transient_err: Option<reqwest::Error> = None;
 
     for attempt in 0..max_attempts {
         if attempt > 0 {
             if deadline.is_some_and(|d| Instant::now() >= d) {
-                return Err(ssrf_safe_deadline_error(url));
+                // A prior attempt's own connect/timeout error may be why the
+                // deadline is already gone — surface that error (preserving
+                // `ClientError::Request(e).is_timeout()` for callers) instead
+                // of masking it as an unrelated `InvalidUrl`.
+                return Err(last_transient_err.take().map_or_else(
+                    || ssrf_safe_deadline_error(url),
+                    |e| ClientError::Request(e.without_url()),
+                ));
             }
             let exp = (attempt - 1).min(10);
             let delay = Duration::from_millis(100 * (1_u64 << exp));
@@ -2650,7 +2658,9 @@ async fn send_one(
                     url: Some(url_used),
                 });
             }
-            Err(e) if (e.is_connect() || e.is_timeout()) && attempt + 1 < max_attempts => {}
+            Err(e) if (e.is_connect() || e.is_timeout()) && attempt + 1 < max_attempts => {
+                last_transient_err = Some(e);
+            }
             Err(e) => return Err(ClientError::Request(e.without_url())),
         }
     }
