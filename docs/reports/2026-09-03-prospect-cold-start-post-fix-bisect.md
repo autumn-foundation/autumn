@@ -227,13 +227,47 @@ per-commit correction below) changes the list:
   `bc99a4b8`. My first correction (`abea7490`) was itself wrong to keep
   this flagged — reversed here.
 
-Net, after three rounds of verification: **only 1 of the 4**
-originally-flagged commits (`61bdd9c2`) is confirmed relevant to this
+Net, after three rounds of verification against `Cargo.lock`: **1 of the
+4** originally-flagged commits (`61bdd9c2`) is confirmed relevant to this
 feature set's resolved graph; `fec52215`, `bc99a4b8`, and `141f36ef` are
-all confirmed false positives. **For that one confirmed commit, this
-report's delta cannot be trusted as representative of its true,
-CI-relevant recurring contribution** — but not for a purely
-one-directional reason (see the next correction). It
+confirmed false positives.
+
+**But the audit's scope was itself wrong** (Codex P2 on `a54423f1`,
+found not by rechecking a candidate but by pointing out an entire
+*category* of change this report never looked for): `Cargo.lock` records
+resolved *versions*, not enabled *features* — a workspace `Cargo.toml`
+edit that changes which Cargo features a dependency compiles with never
+touches `Cargo.lock` at all, yet triggers exactly the same warm-cache
+bias this section is about. Checked directly: `9d99d980` changes the
+workspace's `syn = { features = [...] }` declaration from `["full"]` to
+`["full", "visit-mut"]`, and `9c1ede1e` extends it again to `["full",
+"visit", "visit-mut"]` — confirmed via `git show <sha> -- Cargo.toml` on
+both. `autumn-macros` declares `syn.workspace = true` (confirmed:
+`autumn-macros/Cargo.toml`) and is compiled by the timed command, so both
+commits force a real `syn` recompile under a newly-expanded feature set —
+two more confirmed cases, found by a completely different method than
+the `Cargo.lock` audit above, which missed both.
+
+`git log --name-only -- '**/Cargo.toml' Cargo.toml` over the window shows
+roughly 9 of the 31 non-fix commits touch *some* `Cargo.toml` (not just
+the 4 that touched `Cargo.lock`) — but, as the `bc99a4b8` and `141f36ef`
+retractions above already demonstrated, "touches the manifest" is no more
+reliable a proxy than "touches the lockfile" was; each one needs the same
+package-by-package, before/after verification those two retractions
+required, which is not a small check. **Auditing all ~9 is out of this
+session's remaining time box.** The honest position is not "1 of 4" or
+even "3 of 31" — it is: **at least 3 non-fix commits in this window
+(`61bdd9c2`, `9d99d980`, `9c1ede1e`) are confirmed to trigger this
+apparatus's warm-cache bias, the true count is unknown and could be
+higher, and no exhaustive accounting was completed.** For every commit
+this bias touches, confirmed or not yet checked, this report's delta
+cannot be trusted as representative of its true, CI-relevant recurring
+contribution — not for a purely one-directional reason (see the next
+correction). This uncertainty compounds with, rather than replaces, the
+open noise-floor question in Assay: individual per-commit deltas in this
+dataset are less interpretable on *two* independent axes now, both
+pointing the same way — toward the undetermined verdict, not away from
+it. It
 also means the "total window effect" and "this proxy's absolute saving vs.
 CI's" comparisons throughout Assay and Verdict are weaker than stated
 there: they are not just measuring a narrower workload (library-only, no
@@ -584,19 +618,26 @@ live report needs the map:
   **empty** `target/` and no compiler-wrapper cache on every single
   sample (see Apparatus's fourth correction). This apparatus pays each
   external dependency's compile cost once per introduction; CI pays it on
-  every sample, forever. Of the 4 non-fix commits that touched
-  `Cargo.lock`, only **1** (`61bdd9c2`, confirmed via a package-by-package
-  `Cargo.lock` diff: a new direct edge to `p256` carrying a new feature
-  flag, forcing a real recompile under Cargo's feature unification) is
-  confirmed to actually affect this feature set's resolved graph.
-  `fec52215`, `bc99a4b8`, and `141f36ef` are all confirmed false
-  positives on closer inspection (see Apparatus's fourth through sixth
-  corrections — three separate rounds of "touches `Cargo.lock`" turning
-  out not to mean "changes this build's resolved graph"). That one
-  commit's delta cannot be trusted as CI-representative, but not in a
-  single, simple direction: the apparatus likely *overcounts* its cost at
-  its own introducing checkpoint (charging the full fresh-compile cost
-  rather than CI's much smaller cold-vs-cold marginal difference) and
+  every sample, forever. Auditing this by "touched `Cargo.lock`" alone
+  (the original approach) found only **1** of the 4 candidates confirmed
+  real (`61bdd9c2`; `fec52215`, `bc99a4b8`, `141f36ef` all confirmed
+  false positives after three separate rounds of package-by-package
+  verification) — but `Cargo.lock` doesn't record *enabled features*,
+  only resolved versions, so that audit was itself scoped too narrowly.
+  A workspace `Cargo.toml` feature-flag change is invisible to it and
+  triggers the identical bias: confirmed directly for `9d99d980` and
+  `9c1ede1e` (both change the workspace's `syn` feature set;
+  `autumn-macros` inherits it via `syn.workspace = true` and is compiled
+  by this build). **At least 3 non-fix commits in this window are
+  confirmed to trigger this bias** (`61bdd9c2`, `9d99d980`, `9c1ede1e`);
+  roughly 9 of the 31 touch *some* `Cargo.toml`, each needing the same
+  depth of verification the retractions above required, which a full
+  audit of all of them was not completed in this session's time box — so
+  the true count is unknown and plausibly higher. Every affected commit's
+  delta cannot be trusted as CI-representative, but not in a single,
+  simple direction: the apparatus likely *overcounts* its cost at its own
+  introducing checkpoint (charging the full fresh-compile cost rather
+  than CI's much smaller cold-vs-cold marginal difference) and
   *undercounts* it at every checkpoint after (nothing shown where CI pays
   every sample). Which effect dominates for this window's total is not
   resolvable from this data. The parent report's CI/runner-variance
