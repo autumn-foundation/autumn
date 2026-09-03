@@ -556,6 +556,9 @@ fn the_advisory_gate_rejects_an_injected_known_vulnerable_dependency() {
     let out = Command::new(workspace_root().join("scripts/check-advisories.sh"))
         .arg("--self-test")
         .current_dir(workspace_root())
+        // One attempt: a host without network should reach the skip below in a
+        // second, not after two rounds of backoff.
+        .env("ADVISORY_DB_FETCH_RETRIES", "1")
         .output()
         .expect("failed to run check-advisories.sh --self-test");
     let combined = format!(
@@ -563,6 +566,17 @@ fn the_advisory_gate_rejects_an_injected_known_vulnerable_dependency() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    // cargo-deny being installed does not mean the host can reach crates.io and
+    // the RustSec database. Reporting an offline developer's machine as a
+    // security regression trains people to ignore this suite, so the gate's own
+    // fail-closed messages — the ones it prints when it could not fetch —
+    // become a skip here. A real regression fails some other way, loudly.
+    for offline in ["failing closed", "could not fetch the self-test fixture"] {
+        if combined.contains(offline) {
+            eprintln!("skipping: this host cannot reach the advisory database\n{combined}");
+            return;
+        }
+    }
     assert!(
         out.status.success(),
         "the advisory gate self-test failed:\n{combined}"
