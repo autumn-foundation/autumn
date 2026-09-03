@@ -1490,6 +1490,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--counter-cache` scaffolds compiled clean now (#2431):** `autumn generate
+  scaffold Comment ... --belongs-to Post --counter-cache` — the documented,
+  only way to use the flag — generated a child model that failed `cargo check`
+  outright, every time. `#[belongs_to(Post, counter_cache)]` landed ABOVE
+  `#[autumn_web::model]` instead of below it: that attribute is a helper only
+  `#[model]`'s own expansion understands, so rustc rejected it as an unknown
+  standalone macro (`cannot find attribute belongs_to in this scope`) whenever
+  the generated file had so much as a blank line before `#[model]` — which
+  every real scaffold does (the `use crate::schema::...;` line that always
+  precedes it). Fixing the position surfaced a second, previously-unreachable
+  gap: the eager-loading codegen a `#[belongs_to]` attribute drives references
+  the parent's type and its Diesel schema module directly, and neither was
+  ever imported into the child's model file — `--counter-cache` was the first
+  feature to put an attribute-driven association on a generated model at all.
+  Both are now added automatically (`use crate::schema::{parents};` and `use
+  crate::models::{parent}::{Parent};`, alongside the child's own), and a new
+  `cargo check`-backed test (`generated_counter_cache_scaffold_cargo_checks`)
+  proves the whole scaffold compiles — the gap the original report called out:
+  no test had ever compiled this flag's output before.
+
 - **A sandboxed plugin can no longer abort the application at boot:** the
   duplicate-route preflight skips `nest` mounts because axum exposes no way to
   enumerate a nested router — but a sandboxed plugin's manifest *is* its route
