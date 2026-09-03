@@ -9,7 +9,9 @@
 #![allow(dead_code, clippy::missing_const_for_fn)]
 
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
+// Not `cfg(unix)`-gated: `wait_with_timeout` is compiled on every platform so
+// `autumn dev`'s non-Unix cooperative stop (#1616) can share the same bounded
+// wait the Unix `SIGTERM` path uses.
 use std::process::Child;
 use std::time::Duration;
 
@@ -444,7 +446,10 @@ pub fn stop_record(_record: &PidRecord, _timeout: Duration, _socket: &Path) -> b
 /// # Errors
 ///
 /// Returns `Err(())` on timeout or if the child cannot be reaped.
-#[cfg(unix)]
+///
+/// Built only on `try_wait`, which is portable, so this is compiled on every
+/// platform: `autumn dev`'s Windows cooperative-stop path (#1616) needs the same
+/// bounded wait the Unix `SIGTERM` path uses.
 pub fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<(), ()> {
     let start = std::time::Instant::now();
     loop {

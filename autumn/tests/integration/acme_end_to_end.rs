@@ -171,6 +171,9 @@ fn acme_config(app: &AcmeApp, ca: &FakeCa, ca_root: Option<std::path::PathBuf>) 
         http_challenge_port: app.challenge_addr.port(),
         renew_before_days: 30,
         ca_root_path: ca_root,
+        // HTTP-01: these tests are the #1608 path, untouched by #1620's DNS-01
+        // addition. The wildcard/DNS-01 counterparts live in `acme_dns01`.
+        dns: None,
     }
 }
 
@@ -200,6 +203,8 @@ fn renewal_task(
         serving_stored_cert,
         leadership_degraded: false,
         renew_window_misconfigured: AtomicBool::new(false),
+        dns: None,
+        recovery: None,
     }
 }
 

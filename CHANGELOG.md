@@ -41,6 +41,315 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   go red between releases until a maintainer addresses `autumn doctor`'s
   blind spot or the next release ships.
 
+- **Continuous SQLite replication with point-in-time restore (#1628):** the
+  zero-ops SQLite tier (#1614) had snapshot backups (#1595/#1619) and nothing
+  finer, so a dead VPS cost everything written since the last snapshot — hours.
+  A running app now ships its write-ahead log to an offsite destination
+  continuously, from inside the process it already runs: no sidecar to install
+  and supervise, no external tools, no new credential conventions.
+
+  ```toml
+  [replication]
+  enabled = true
+
+  [replication.s3]
+  bucket = "myapp-replicas"
+  region = "auto"
+  endpoint = "https://<account-id>.r2.cloudflarestorage.com"
+  access_key_id_env = "AUTUMN_REPLICA_ACCESS_KEY_ID"
+  secret_access_key_env = "AUTUMN_REPLICA_SECRET_ACCESS_KEY"
+  force_path_style = true
+  ```
+
+  The contract is **at most `rpo_secs` (default 10) of committed writes lost**
+  when the machine is destroyed. Only complete transactions ship — a segment
+  always ends on a commit boundary — and a checkpoint is attempted only once
+  everything in the WAL is already offsite, so an unreachable destination costs
+  disk, never data. Steady-state upload is the size of your *writes*, not of your
+  database: a checkpoint opens the next WAL index inside the current generation,
+  and a full base snapshot is taken once per `snapshot_interval_secs` (hourly by
+  default), which is also what bounds how much WAL a restore replays.
+
+  `[replication]` reuses #1619's destination conventions — its own config
+  section, profile overlays, `AUTUMN_REPLICATION__*` overrides, env-var-indirected
+  credentials, and a refusal to share the app's blob-storage bucket + endpoint
+  without `allow_shared_bucket = true`. A `path` destination replicates to a
+  directory (second disk, NFS/SSHFS mount, bind-mounted volume) instead.
+
+  Recovery is one command on a fresh box that has only the binary, `autumn.toml`
+  and the credentials:
+
+  ```bash
+  autumn db replica status                     # how fresh is it?
+  autumn db replica restore --force            # latest state, fresh box
+  autumn db replica restore --timestamp 2026-09-02T14:29:00Z --force --overwrite
+  ```
+
+  Restore **refuses** rather than best-efforts: a hole in the segment sequence, a
+  payload whose SHA-256 does not match, a segment that does not continue the
+  previous one, or a rebuilt database that fails `PRAGMA integrity_check` is an
+  error — handing SQLite a damaged WAL would have looked like a clean restore
+  that was merely missing the last few minutes. Nothing is published until those
+  checks pass, and the same production guard / `--force` protocol as #1595
+  applies — `--force` for the production-profile guard, and a separate
+  `--overwrite` to replace a database file that is already there, so a drill that
+  always passes `--force` cannot silently destroy one.
+
+  Lag, the current generation and the last successful verification are on
+  `/actuator/health` under the `sqlite-replication` indicator and in
+  `autumn db replica status`. Verification is a **real restore** on an interval,
+  not a checksum, so "uploaded" is never mistaken for "restorable"; a
+  verification failure or lag beyond three RPOs takes the indicator `DOWN`, which
+  the existing #1610 alerter escalates on every configured channel. See
+  [SQLite in production → Durability](docs/guide/sqlite-in-production.md#durability-continuous-replication-and-point-in-time-restore).
+
+  **Breaking:** `AutumnConfig` gains a public `replication` field, so a
+  struct-literal construction needs `..AutumnConfig::default()` — see
+  [the migration guide](docs/migrations/next.md#config-autumnconfig-gains-a-replication-field).
+- **Wildcard certificates via DNS-01 for tenant subdomains (#1620):** autumn
+  already routes a tenant per subdomain and ships a multi-tenant SaaS starter,
+  but the ACME support in #1608 was HTTP-01 only — and no CA validates a
+  wildcard identifier over HTTP-01. A `*.myapp.com` deployment therefore meant
+  one certificate order per tenant (rate limits, and a cold-start stall on
+  tenant *N*'s first request) or going back behind Caddy/nginx, undoing the
+  single-binary story. A new `[server.tls.acme.dns]` section answers every
+  authorization over DNS-01 instead, so one wildcard covers every tenant that
+  exists and every tenant that ever will:
+
+  ```toml
+  [server.tls.acme]
+  domains = ["myapp.com", "*.myapp.com"]
+  contact_email = "ops@myapp.com"
+  directory = "production"
+
+  [server.tls.acme.dns]
+  provider = "cloudflare"
+  ```
+
+  Onboarding a tenant after that costs zero certificate work: no issuance, no
+  restart, no config change.
+
+  - **Providers.** `cloudflare` (scoped API token) and `route53` (SigV4), plus
+    `exec` — an argv-array hook program run as
+    `hook present|cleanup <fqdn> <value>`, which reaches RFC 2136 through
+    `nsupdate`, a registrar CLI, or a webhook shim. No shell is involved, so a
+    challenge value can never be read as shell syntax. The hook's `stderr` is
+    read through a bounded buffer and scrubbed before it is published: both the
+    credentials autumn holds and any the *inherited environment* holds under a
+    credential-shaped name, since an `exec` hook authenticates itself from that
+    environment and a `set -x` trace would otherwise republish its token.
+    Each provider resolves the zone for the whole challenge name rather than
+    caching by suffix, so a cached parent zone can never shadow a separately
+    delegated child.
+  - **Secrets.** The section names a credentials-store *key*, never a token:
+    there is no config field that could hold one, and the section rejects
+    unknown keys, so an `api_token` written into `autumn.toml` is a startup
+    error naming it rather than a plaintext secret. Credentials come from the
+    encrypted store (`autumn credentials edit`) or the `AUTUMN_ACME_DNS_*`
+    environment variables, and are held in a type that renders as `<redacted>`
+    so they cannot reach a log, an error message, or actuator output.
+  - **Propagation.** After publishing, autumn waits until every record is
+    visible before telling the CA to validate. The probe goes to each challenge
+    zone's *own* authoritative nameservers, discovered per order through the
+    configured resolvers — probing a public recursive right after the write
+    plants a negative-cache entry (RFC 2308; 900s on Route 53, 1800s on
+    Cloudflare) that outlives the propagation budget and can never clear. A
+    multi-domain order discovers nameservers per zone, since one zone's servers
+    never answer for another's names. The configured resolvers stay the fallback
+    for any zone whose authoritative set cannot be discovered. The wait is
+    bounded (`propagation_timeout_secs`, default 300) and its timeout names the
+    exact record, the value that never appeared, and the resolver that never saw
+    it. Challenge records are removed after the order finishes, including when
+    it fails.
+  - **Two records, one name.** An apex + wildcard order publishes two different
+    values at `_acme-challenge.<domain>`; every provider appends a value and
+    deletes by `(name, value)` rather than replacing the record set. Providers
+    whose unit of write is the whole record set rather than one record —
+    Route 53's `ChangeResourceRecordSets` — apply every value sharing a name in
+    a single change, because two sequential read-modify-writes race: the second
+    read can still return the pre-change values and write back only its own.
+    Such a write also carries the existing set's **TTL** back out unchanged —
+    the name can be shared with another ACME client, so autumn's own 60s
+    challenge TTL applies only to a set it creates, and Route 53 rejects a
+    `DELETE` whose TTL does not match the live set, which would otherwise leave
+    cleanup unable to remove anything.
+  - **Lifecycle.** Renewal, persistence, staging selection, hot-swap and health
+    are #1608's, unchanged. A failed issuance or renewal now also raises
+    #1610's `scheduled_task_failure` operator alert for `acme-renewal` — weeks
+    before expiry, thanks to the renew-before window — and clears it on the next
+    success. The `acme` health indicator reports `challenge` and `dns_provider`.
+  - **`autumn doctor`.** Three new checks: `acme_dns_credential` (the provider
+    credential is readable and complete), `acme_dns_propagation` (`--online`:
+    public DNS can answer for `_acme-challenge.<domain>` at all), and
+    `acme_tenancy_domain` (`[tenancy] base_domain`'s subdomains are actually
+    covered by the configured certificate). An unreachable `:80` is now a Warn
+    rather than a Fail when DNS-01 is configured, since the CA never connects to
+    it, and a `*.` entry is probed as the base domain it covers.
+  - **Still single-host.** DNS-01 retires HTTP-01's per-process token map, but
+    it does not distribute certificates: the store is local disk, so only the
+    replica holding the renewal lease has the issued certificate. A distributed
+    `[scheduler]` backend therefore still warns at startup — now naming the
+    certificate store rather than the token map.
+
+  See the [TLS guide](docs/guide/tls.md#wildcard-certificates-via-dns-01-servertlsacmedns)
+  and the [deployment walkthrough](docs/guide/deployment.md#subdomain-per-tenant-wildcard-https-on-a-vps).
+
+  **Breaking:** (`acme` feature only) `AcmeRenewalTask` gained the public fields
+  `dns` and `recovery`, and `AcmeConfig` gained `dns`; code that constructs
+  either literally must add them (`None` preserves today's HTTP-01 behavior).
+  The new *output* types in `acme::dns` (the parsed DNS answer, the propagation
+  timeout, the credential, the HTTP request/response) are `#[non_exhaustive]`
+  from the start. `AcmeConfig`, `AcmeDnsConfig`, `AcmeRenewalTask` and
+  `DnsChallenge` are not:
+  callers build them by struct literal and they have no constructor, so sealing
+  them would make them unusable — the same reasoning that left `ServerConfig`
+  open. See the [migration guide](docs/migrations/next.md).
+
+  `autumn-cli`'s `tls` feature now also enables `autumn-web/acme`: `autumn
+  doctor` grades the DNS-01 credential with the runtime's own
+  `validate_credential` and probes `_acme-challenge` visibility with the
+  runtime's own resolver, so the check and the server cannot disagree about what
+  a usable configuration is. Additive — the resolved feature set is a superset
+  of what `tls` already selected.
+- **`autumn plugin remove` and scaffold-time `--with` plugin flags (#1631):**
+  `autumn plugin add` (#1606) made installing a plugin one command, but the
+  lifecycle only ran one way — a repo-wide grep found no uninstall story at
+  all, and `autumn new` had no plugin flag, so every plugin was a retrofit even
+  when the user knew at day zero they wanted one. Because the install is
+  machine-applied, the removal can be machine-reversed:
+
+  ```bash
+  autumn new my-app --with autumn-admin-plugin   # wired on day zero
+  autumn plugin remove autumn-admin-plugin       # both wires back out
+  ```
+
+  `plugin remove` deletes the `[dependencies]` line and excises the
+  `.plugin(...)` / `.with_blob_store(...)` call — marker comment included — as
+  a balanced-paren span, so a mount configured across several lines comes out
+  whole. An app installed with `plugin add` is byte-identical afterwards and
+  passes `cargo check` on the first try.
+
+  It declines rather than guesses, in the three places a guess would leave an
+  app that does not compile: a mount it cannot read as a single builder call
+  (a plugin built into a variable, or a one-line chain) changes **nothing** and
+  prints the lines to delete; a dependency still named anywhere under `src/`,
+  `tests/`, or `benches/` is kept, with the file that kept it named; a
+  community mount is never deleted, because `add` never wrote one. Partially
+  wired plugins — the shape a manual README install leaves — are unwired as far
+  as they go, with the missing half reported, and removing a plugin that is not
+  installed is an idempotent no-op.
+
+  **The database is never touched by default.** A plugin that declares
+  migrations or owns tables gets them listed, with a statement that they are
+  still there; `--drop-data` reverts them, printing the exact statements and
+  asking for confirmation first (`--yes` for CI; a non-interactive stdin
+  without it is a refusal, not an assumed yes). `--dry-run` writes nothing and
+  distinguishes its answer in the exit code: `3` when a real run would change
+  something — pending *database* work included, so an already-unwired plugin
+  whose tables remain still answers `3` — and `0` when there is nothing to do.
+  `--drop-data` is refused outright when the mount cannot be unwired: dropping
+  what a still-mounted plugin owns would break the running app, so nothing is
+  asked and nothing is changed.
+
+  `autumn new --with <plugin>` is repeatable and resolves every name — curated
+  catalog first, crates.io fallback — and version-checks it **before the
+  scaffold writes a byte**, so a typo never leaves a half-built project behind.
+  With `--starter`, whose own `autumn-web` pin is not knowable until the starter
+  is fetched, names are still resolved up front and the version answer arrives
+  afterwards as "the app was created, the plugin was not wired" (exit 2) rather
+  than as a failed `autumn new`.
+  `autumn doctor` gains a `plugin_residue` check under the existing
+  `--json`/`--strict` contract: a dependency with no mount warns, a mount with
+  no dependency fails (it does not compile), and migrations left applied by a
+  plugin that is gone warn. A CI gate round-trips every first-party plugin
+  through `new --with` → `cargo check` → `plugin remove` → `cargo check` →
+  zero doctor residue.
+
+- **Dependency-advisory gate, on by default, for scaffolded apps and Autumn's
+  own releases (#1600):** the CI workflow `autumn new` generates relegated
+  vulnerability auditing to a comment ("Optional extensions… Audit: `cargo
+  install cargo-audit`"), which almost nobody enabled, so apps shipped with
+  known-vulnerable transitive dependencies and found out from a pentest rather
+  than from CI. A generated app now audits its whole dependency tree on every
+  push and pull request, and a known RustSec advisory fails the build:
+
+  - `.github/workflows/ci.yml` installs a pinned cargo-deny and runs `cargo deny
+    check advisories`, reading the new **`deny.toml`** the scaffold writes at
+    the project root. Waive an advisory by adding an `ignore` entry there with
+    its id, a `reason`, and a review-by date — the gate stays on and lets
+    exactly that one id through; an unwaived advisory still fails.
+  - Day-one CI is green for every flavor: the scaffold ships documented
+    waivers for the advisories its own tree cannot avoid — RUSTSEC-2023-0071
+    (`rsa` via the unconditional `jsonwebtoken` dependency, no patched release
+    exists) everywhere, plus RUSTSEC-2024-0384 (`instant`, via the
+    embedded-Postgres build stack) for `--bundled-pg` apps and only those.
+    Autumn's own CI re-audits autumn-web's tree — with every feature a scaffold
+    flavor can enable — against that exact policy on every run, so the waiver
+    set cannot quietly stop covering what the scaffold ships.
+  - An app upgraded from an older release receives the workflow but not the
+    policy (`deny.toml` is the app's file, never reconciled): the audit step
+    detects that and says which file to add, rather than auditing under
+    cargo-deny's unwaived default. See `docs/migrations/next.md`.
+  - When the advisory database is unreachable the gate **fails closed**: the
+    fetch is its own step, retried three times with backoff, and the audit then
+    runs `--offline` against it — no hang, no silent skip, and a failure in the
+    audit step always names a real advisory.
+  - Autumn's own release path is gated the same way: `scripts/check-advisories.sh`
+    runs in PR CI *and* in the Publish Gate (a `prepare-release` dependency), so
+    a release with an unwaived advisory in its tree cannot be tagged. Its
+    `--self-test` proves the gate can still go red by auditing an injected
+    known-vulnerable dependency (`time 0.1.45`, RUSTSEC-2020-0071) and requiring
+    rejection, then acceptance once that id is waived.
+  - Docs: [supply-chain guide](docs/guide/supply-chain.md) covers what the gate
+    checks, how to read a failure, and how to waive an advisory.
+
+- **A published Windows support policy, enforced by a `windows-latest` journey
+  gate (#1616):** the PRD promised "developers build on macOS and Windows", but
+  nothing said what a Windows developer could actually expect, and the native
+  journey degraded silently. `autumn dev` stopped the app with
+  `TerminateProcess`, which skips `on_shutdown` hooks — so a managed Postgres
+  cluster was orphaned on every hot reload — and `autumn deploy up` staged
+  secrets without the `0600` its Unix path applies.
+
+  There are now two tiers, published in
+  [Platform support](docs/guide/platform-support.md) and in the README. **Tier 1
+  works natively on Windows**: `new`, `doctor`, `setup`, `dev`, `test`,
+  foreground `serve`, managed Postgres, and the local-only `deploy check` /
+  `deploy plan`. **Tier 2 is supported via WSL2**: the `serve --daemon`
+  lifecycle, the `deploy` actions that reach a host over SSH (`up`, `rollback`,
+  `status`, `maintenance`), and the bash contributor gate scripts. Tier 2
+  commands now **fail fast** on native Windows with an error
+  naming the tier, the reason, and the policy — instead of half-working. (The
+  two script-shaped Tier 2 entries — `scripts/*.sh` and the browser
+  `SystemTest` suites — have no autumn entry point to refuse from, so for those
+  the tier is documentation.)
+
+  The `dev` teardown is fixed rather than documented away. The runtime accepts
+  a cooperative shutdown request through `AUTUMN_SHUTDOWN_SIGNAL_FILE` (opt-in;
+  unset changes nothing) and drains through the same graceful path a signal
+  takes on Unix, so shutdown hooks run and the managed cluster stops cleanly. If
+  an app misses that budget, `autumn dev` force-stops it **and says the hooks may
+  not have run** — degraded, never silent. The budget is the app's own
+  (`prestop_grace_secs + shutdown_timeout_secs`, resolved through the same
+  profile-aware reader `autumn serve stop` uses) plus headroom for the hooks
+  that run after the drain, so an app that legitimately takes 35 seconds to
+  shut down is not cut off early.
+
+  `autumn doctor` gains a `platform_support` check reporting the platform's tier
+  and the Windows prerequisites (the vcpkg/OpenSSL requirement for
+  `generate auth --passkeys`). The tier table lives in one place
+  (`autumn-cli/src/platform.rs`); the doctor check and every fail-fast message
+  read from it, and a parity test fails the build when the guide's two tier
+  tables are not exactly the table's two tiers — moving one row between tiers in
+  either file turns it red. A `windows-tier1` CI job walks the whole Tier 1
+  journey — scaffold, `doctor`, `setup`, dev-loop edit/rebuild/reload, managed
+  Postgres boot and clean shutdown — on every pull request into `trunk-dev`. On
+  its first run the gate immediately earned its keep, surfacing a Windows-only
+  link failure (`LNK4319`, the PDB public-symbol limit) that a debug build of a
+  `--bundled-pg` scaffold hits and that the pre-existing `cargo test
+  --workspace` Windows leg could never see, because it never builds a
+  scaffolded app. The workaround is documented in the platform-support guide;
+  the product-level fix is tracked separately.
 - **Build-time authority envelope for agent-operable handlers (#1691):** an
   endpoint exposed as an MCP tool is an action an autonomous agent can take
   with no human in the loop, and nothing said what that action was *allowed*
@@ -389,6 +698,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that is not in the workspace, and four heading anchors that no longer
   match their headings. External links are deliberately out of scope
   (network-flaky, and not fixable in this repo).
+- **A CLI drift gate for the docs corpus [no-plugin]:** the link gate stops a
+  reader being sent to a page that does not exist; nothing stopped them being
+  handed a *command* that does not exist — the other thing they copy off a
+  page. `autumn-cli` carries 174 command paths and the reader-facing docs name
+  them 2,400+ times, so a renamed or never-shipped subcommand leaves behind a
+  line that looks exactly like a working one.
+  `scripts/check-docs-cli.sh` resolves every `autumn …` invocation in fenced
+  shell blocks and inline code spans against the command tree parsed from the
+  clap derive input, and now runs in CI's docs-only job. Its baseline found
+  **11 defects across 6 guide pages**, all closed here: eight occurrences of
+  `autumn migrate run` — a command `MigrateCommands` has never had (`status`,
+  `check`, `down`, `baseline`; the run action is the bare `autumn migrate`),
+  one of them in a fenced `shell` block in `cloud-native.md` under "run the
+  migration before deploying new workers", where clap answers `unrecognized
+  subcommand 'run'` to a reader mid-production-upgrade — plus
+  `autumn system-test check` sitting inside a runnable block in
+  `system-tests.md` as a planned command, now moved out of the block. The
+  truth set is parsed from `autumn-cli/src/**/*.rs` rather than a checked-in
+  snapshot, so a rename moves the gate with it in the same commit; a page that
+  deliberately names a command that does not exist (`autumn generate island`,
+  `autumn generate seed`) waives it inline with a stated reason. Flags are
+  deliberately out of scope, as are the changelog and `docs/plans/`, which
+  name commands that were true once or are not true yet.
 
 - **One retention policy for every table Autumn creates (#1605):** every
   deployed Autumn app accumulated framework-owned data forever by default —

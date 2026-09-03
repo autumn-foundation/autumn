@@ -338,10 +338,16 @@ pub(crate) mod counter_cache;
 #[cfg(feature = "db")]
 pub mod commentable;
 
+/// Continuous SQLite replication with point-in-time restore (issue #1628).
+#[cfg(feature = "db")]
+pub mod replication;
 #[cfg(feature = "db")]
 pub mod repository;
 #[cfg(feature = "db")]
 pub(crate) mod repository_commit_hooks;
+/// AWS Signature Version 4 request signing, shared by the replication and
+/// offsite-backup S3 clients (issues #1628 / #1619).
+pub mod sigv4;
 #[cfg(feature = "db")]
 pub use repository::RepositoryError;
 #[cfg(feature = "db")]
@@ -438,6 +444,11 @@ pub mod __fuzz {
 
     // Cookie / signed-session decode.
     pub use crate::session::__fuzz_decode_cookie as decode_cookie;
+
+    // DNS wire-format parsing for the ACME DNS-01 propagation probe (#1620).
+    // The bytes come off a UDP socket, so anyone on-path can shape them.
+    #[cfg(feature = "acme")]
+    pub use crate::acme::dns::resolver::parse_response as parse_dns_response;
 
     // Body handling: form-urlencoded (always) + inbound-mail MIME (feature-gated).
     pub use crate::form::__fuzz_decode_urlencoded as decode_urlencoded_form;

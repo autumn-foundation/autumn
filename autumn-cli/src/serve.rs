@@ -21,6 +21,16 @@ use std::time::Duration;
 /// `autumn_web::managed_pg::MANAGED_PG_DATA_DIR_ENV`; redefined here because the
 /// CLI doesn't build the `managed-pg` feature and so can't reference the const.
 pub const MANAGED_PG_DATA_DIR_ENV: &str = "AUTUMN_MANAGED_PG_DATA_DIR";
+
+/// Environment variable naming the file an app writes when startup completes.
+///
+/// Its contents are the app's *resolved* graceful-drain budget in seconds
+/// (`prestop_grace_secs + shutdown_timeout_secs`) — see
+/// `autumn_web::app::signal_serve_ready`. Both `autumn serve` and `autumn dev`
+/// pass it, so a supervisor waits for the budget the app will ACTUALLY drain
+/// for, including one a custom `with_config_loader` resolved, instead of
+/// reconstructing it from TOML/env.
+pub const SERVE_READY_FILE_ENV: &str = "AUTUMN_SERVE_READY_FILE";
 /// Env var that makes the provider *attach* to an already-running cluster at the
 /// given URL instead of starting its own. Mirrors
 /// `autumn_web::managed_pg::MANAGED_PG_ATTACH_URL_ENV`.
@@ -146,6 +156,20 @@ pub fn run(action: Option<ServeAction>, opts: &ServeOptions) {
     std::process::exit(code);
 }
 
+/// The refusal printed when the daemon lifecycle is invoked on a non-Unix host.
+///
+/// Built from [`crate::platform`] so the tier name, the reason, and the policy
+/// link match `autumn doctor` and the published guide exactly. Compiled on every
+/// platform (not just the one that prints it) so its wording is covered by tests
+/// on Linux/macOS CI rather than only on a Windows runner.
+fn daemon_unsupported_message() -> String {
+    format!(
+        "autumn serve: {}\n  Plain `autumn serve` (foreground) is Tier 1 and runs \
+         natively here.",
+        crate::platform::tier_two_windows_error("autumn serve --daemon / stop / status / restart")
+    )
+}
+
 /// Non-Unix entry point. The background-daemon lifecycle (`--daemon`, `stop`,
 /// `status`, `restart`) is built on Unix domain sockets and POSIX signals and is
 /// not supported here, but a plain foreground `autumn serve` still works: it
@@ -153,11 +177,7 @@ pub fn run(action: Option<ServeAction>, opts: &ServeOptions) {
 #[cfg(not(unix))]
 fn run_non_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
     if action.is_some() || opts.daemon {
-        eprintln!(
-            "autumn serve: daemon mode (--daemon, stop, status, restart) is \
-             currently supported on Unix only (Linux/macOS). Plain `autumn serve` \
-             runs the app in the foreground on this platform."
-        );
+        eprintln!("{}", daemon_unsupported_message());
         return 1;
     }
     // Plain foreground server: builds and runs on the configured transport,
@@ -694,7 +714,7 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
         cmd.env("AUTUMN_SERVE_FORCE_UNIX_SOCKET", paths.socket_file());
         // The app creates this file right after startup completes; the
         // supervisor polls it to detect readiness without an HTTP probe.
-        cmd.env("AUTUMN_SERVE_READY_FILE", paths.ready_file());
+        cmd.env(SERVE_READY_FILE_ENV, paths.ready_file());
     }
     if opts.bundled_pg
         && let Some(paths) = paths
@@ -1431,7 +1451,7 @@ fn resolved_stop_budget_secs(opts: &ServeOptions) -> u64 {
 /// The active profile: an explicit override (`profile_override`, e.g. a `restart`
 /// restoration), then the environment (`AUTUMN_ENV`/`AUTUMN_PROFILE`), then the
 /// app's build-mode default (`prod` for a release build, else `dev`).
-fn effective_profile(profile_override: Option<&str>, release: bool) -> String {
+pub fn effective_profile(profile_override: Option<&str>, release: bool) -> String {
     profile_override
         .map(ToOwned::to_owned)
         .or_else(env_profile)
@@ -1537,7 +1557,26 @@ fn effective_pin_from(
 /// Resolve `(prestop_grace_secs, shutdown_timeout_secs)` with the app's layering
 /// for the given active `profile`. Defaults match the prod/dev profile
 /// smart-defaults for these keys.
-fn resolve_shutdown_budget(base_dir: &Path, profile: Option<&str>) -> (u64, u64) {
+pub fn resolve_shutdown_budget(base_dir: &Path, profile: Option<&str>) -> (u64, u64) {
+    resolve_shutdown_budget_from(base_dir, profile, &|key| std::env::var(key).ok())
+}
+
+/// [`resolve_shutdown_budget`] with the environment layer supplied by the
+/// caller.
+///
+/// `autumn dev` needs this: it injects a project `.env` into the app child
+/// (`start_server`) but deliberately never mutates its own environment, so a
+/// budget resolved against `std::env` alone misses an `AUTUMN_SERVER__*`
+/// override the child will actually honor — and the parent then force-kills the
+/// app in the middle of a valid shutdown, skipping the managed-Postgres teardown
+/// this whole mechanism exists to protect (#1616). It passes a `.env`-overlaid
+/// lookup instead. Injecting the environment also makes the layering testable
+/// without mutating process-global state.
+pub fn resolve_shutdown_budget_from(
+    base_dir: &Path,
+    profile: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> (u64, u64) {
     let mut prestop = 5u64;
     let mut shutdown = 30u64;
 
@@ -1572,11 +1611,13 @@ fn resolve_shutdown_budget(base_dir: &Path, profile: Option<&str>) -> (u64, u64)
         }
     }
 
-    // Env overrides win (highest priority; read identically by the daemon).
-    if let Some(v) = env_u64("AUTUMN_SERVER__PRESTOP_GRACE_SECS") {
+    // Env overrides win (highest priority; read identically by the daemon). A
+    // malformed or blank value is ignored rather than collapsing the budget to
+    // zero, which would hard-kill the app instantly.
+    if let Some(v) = env_u64_from(env, "AUTUMN_SERVER__PRESTOP_GRACE_SECS") {
         prestop = v;
     }
-    if let Some(v) = env_u64("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS") {
+    if let Some(v) = env_u64_from(env, "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS") {
         shutdown = v;
     }
 
@@ -1629,7 +1670,12 @@ fn profile_file_lookup(raw_profile: &str) -> Vec<String> {
 
 /// Parse a `u64` env var, ignoring empty or invalid values.
 fn env_u64(key: &str) -> Option<u64> {
-    std::env::var(key).ok()?.trim().parse::<u64>().ok()
+    env_u64_from(&|k| std::env::var(k).ok(), key)
+}
+
+/// `env_u64` against a caller-supplied environment.
+fn env_u64_from(env: &dyn Fn(&str) -> Option<String>, key: &str) -> Option<u64> {
+    env(key)?.trim().parse::<u64>().ok()
 }
 
 /// Report daemon status. Exit code 0 = running, 3 = stopped.
@@ -1706,6 +1752,34 @@ fn remove_socket_if_not_live(_socket: &Path) {}
 
 #[cfg(test)]
 mod tests {
+    // ── Tier 2 fail-fast on Windows (issue #1616) ──────────────────────────
+    //
+    // The daemon lifecycle is Unix domain sockets plus POSIX signals, so it is
+    // Tier 2 (WSL2). The refusal is compiled on every platform and tested here
+    // so the wording cannot rot on a host that never runs it.
+
+    #[test]
+    fn daemon_refusal_names_the_tier_the_reason_and_the_policy() {
+        let message = daemon_unsupported_message();
+        assert!(message.contains("Tier 2 (WSL2)"), "{message}");
+        assert!(message.contains("Unix domain sockets"), "{message}");
+        assert!(
+            message.contains(crate::platform::POLICY_DOC_URL),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn daemon_refusal_still_points_at_the_native_alternative() {
+        // Foreground `autumn serve` IS Tier 1, and a developer who just hit
+        // this wall needs to know that before reaching for WSL2.
+        let message = daemon_unsupported_message();
+        assert!(
+            message.contains("autumn serve") && message.contains("foreground"),
+            "{message}"
+        );
+    }
+
     use super::*;
 
     fn sample(transport: &str, address: &str, managed_pg: bool) -> AddrFile {
@@ -1977,6 +2051,74 @@ mod tests {
         .expect("write");
         temp_env::with_vars(clear_shutdown_env(), || {
             assert_eq!(resolve_shutdown_budget(dir.path(), None), (10, 100));
+        });
+    }
+
+    #[test]
+    fn shutdown_budget_consults_an_injected_env_source() {
+        // `autumn dev` injects a project `.env` into the app child but never
+        // loads it into its own process environment, so a budget resolved
+        // against `std::env` alone misses an `AUTUMN_SERVER__*` override the
+        // child will actually honor — and the parent then force-kills the app
+        // mid-shutdown (#1616, Codex round 2). The resolver therefore takes its
+        // environment as a parameter.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\nprestop_grace_secs = 10\nshutdown_timeout_secs = 100\n",
+        )
+        .expect("write");
+        let injected = |key: &str| match key {
+            "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS" => Some("250".to_owned()),
+            _ => None,
+        };
+        temp_env::with_vars(clear_shutdown_env(), || {
+            assert_eq!(
+                resolve_shutdown_budget_from(dir.path(), None, &injected),
+                (10, 250),
+                "the injected env must override the TOML value"
+            );
+        });
+    }
+
+    #[test]
+    fn shutdown_budget_from_falls_back_to_toml_when_the_env_source_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\nprestop_grace_secs = 10\nshutdown_timeout_secs = 100\n",
+        )
+        .expect("write");
+        let empty = |_: &str| None;
+        temp_env::with_vars(clear_shutdown_env(), || {
+            assert_eq!(
+                resolve_shutdown_budget_from(dir.path(), None, &empty),
+                (10, 100)
+            );
+        });
+    }
+
+    #[test]
+    fn shutdown_budget_from_ignores_a_malformed_injected_value() {
+        // A `.env` line like `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS=soon` must
+        // leave the configured value alone rather than collapsing to zero,
+        // which would hard-kill the app instantly.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\nprestop_grace_secs = 10\nshutdown_timeout_secs = 100\n",
+        )
+        .expect("write");
+        let junk = |key: &str| match key {
+            "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS" => Some("soon".to_owned()),
+            "AUTUMN_SERVER__PRESTOP_GRACE_SECS" => Some(String::new()),
+            _ => None,
+        };
+        temp_env::with_vars(clear_shutdown_env(), || {
+            assert_eq!(
+                resolve_shutdown_budget_from(dir.path(), None, &junk),
+                (10, 100)
+            );
         });
     }
 
