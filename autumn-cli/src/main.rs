@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod a11y;
+mod agents;
 mod alert;
 mod assets;
 mod build;
@@ -197,6 +198,97 @@ pub struct DataFlowArgs {
     /// release build. Run `--check` in CI under the profile you deploy.
     #[arg(long)]
     release: bool,
+}
+
+/// Arguments for `autumn agents manifest`.
+///
+/// A separate `Args` struct for the same reason as [`DataFlowArgs`]: clap's
+/// derive builds every inline variant field inside one
+/// `Commands::augment_subcommands` frame, which is already close to libtest's
+/// thread-stack limit.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct AgentsManifestArgs {
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Write the JSON agent-authority manifest to this file path.
+    #[arg(long, value_name = "PATH")]
+    manifest: Option<String>,
+    /// Emit the JSON manifest to stdout instead of the human report.
+    #[arg(long)]
+    json: bool,
+    /// Compare against a committed manifest and exit non-zero on drift, so a
+    /// widened authority envelope has to be reviewed rather than merged
+    /// silently.
+    ///
+    /// This is the CI gate. Every check this command performs beyond the
+    /// compiler's own — drift, mutating tools with no envelope, actions nothing
+    /// can undo and nothing records, and routes naming an authority nothing
+    /// registered — runs only under `--check`. Without it the command reports
+    /// and warns but never fails, so a run that does not pass `--check` proves
+    /// nothing. Wire `autumn agents manifest --check <path>` into CI next to
+    /// `autumn data-flow --check`, and commit the manifest it writes with
+    /// `--manifest <path>`.
+    #[arg(long, value_name = "PATH")]
+    check: Option<String>,
+    /// Let `--check` pass with MCP-exposed mutating tools that carry no
+    /// authority envelope.
+    ///
+    /// Adoption is incremental and `#[repository(api, mcp)]` generates CRUD
+    /// tools with no annotation site, so the hatch exists — but it is a flag,
+    /// never a default: a mutating tool an agent can call with nothing declared
+    /// about it is what this command exists to surface. Allowed tools are still
+    /// listed.
+    ///
+    /// `requires = "check"`: the gate it relaxes only runs under `--check`, so
+    /// passing it alone means nothing. Saying so is better than accepting it
+    /// silently and leaving the author believing a gate was waived.
+    #[arg(long, requires = "check")]
+    allow_ungoverned: bool,
+    /// Let `--check` pass when no agent audit sink is configured even though
+    /// the binary can take an action nothing can undo.
+    ///
+    /// The one combination the runtime cannot catch: with no sink installed the
+    /// audit write trivially succeeds, so the fail-closed refusal never fires
+    /// and the invocation leaves no trace at all. A development binary
+    /// legitimately has no sink, so the hatch exists — but the default is to
+    /// fail, because "irreversible and unrecorded" is not a state to discover
+    /// afterwards.
+    ///
+    /// `requires = "check"`, for the same reason as `--allow-ungoverned`.
+    #[arg(long, requires = "check")]
+    allow_unaudited: bool,
+    /// Cargo features to build the inspected binary with (repeatable; a
+    /// comma-separated list also works). An `#[agent_operable]` action or a
+    /// grant behind a feature the build does not enable is not compiled in, so
+    /// it cannot appear in the manifest.
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build the inspected binary with all Cargo features enabled.
+    #[arg(long)]
+    all_features: bool,
+    /// Build the inspected binary without default Cargo features.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Audit the release binary rather than the debug one.
+    ///
+    /// The manifest describes the binary that produced it, and a debug binary
+    /// is not the one that ships: an action or a grant behind
+    /// `#[cfg(not(debug_assertions))]` exists only in the release build. Run
+    /// `--check` in CI under the profile you deploy.
+    #[arg(long)]
+    release: bool,
+}
+
+/// Subcommands for `autumn agents`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum AgentsSubcommands {
+    /// Emit the agent-authority manifest (#1691) and check it for drift.
+    Manifest(AgentsManifestArgs),
 }
 
 /// Subcommands for `autumn cache`.
@@ -1392,9 +1484,11 @@ enum Commands {
     /// Run conformance checks against a plugin's route contributions.
     ///
     /// Compiles the application (debug profile), introspects its route table,
-    /// and verifies that the named plugin satisfies five checks: installability,
-    /// route attribution, route prefix, route collision, and sensitive-surface
-    /// gating.  Exits 0 on pass, 1 on failure.
+    /// and verifies that the named plugin satisfies eight checks: installability,
+    /// route attribution, route prefix, route collision, sensitive-surface
+    /// gating, duplicate registration, and — from the contract the binary dumps
+    /// (issue #1601) — that the plugin declares a usable `autumn-web` range and
+    /// which experimental surface it depends on.  Exits 0 on pass, 1 on failure.
     ///
     /// This is the AUTHOR-facing gate. To discover and install a plugin as a
     /// consumer, use `autumn plugin list` / `autumn plugin add`.
@@ -1403,6 +1497,7 @@ enum Commands {
     ///
     ///   autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin \
     ///       --sensitive-route /admin:"Role: admin required"
+    ///   autumn plugin-check --plugin-name autumn-admin-plugin --deny-experimental
     #[command(verbatim_doc_comment)]
     PluginCheck {
         /// Package to build (for workspaces).
@@ -1425,6 +1520,14 @@ enum Commands {
         /// Output format: `text` (default) or `json`.
         #[arg(long, default_value = "text", value_name = "FORMAT")]
         format: String,
+        /// Fail the run when the plugin declares any dependency on
+        /// experimental plugin surface (issue #1601).
+        ///
+        /// Off by default: the `experimental-surface` check reports what a
+        /// plugin leans on, and leaning on it is an informed choice. Set this
+        /// in a plugin's own CI to forbid it.
+        #[arg(long)]
+        deny_experimental: bool,
     },
 
     /// Inspect and mutate live runtime configuration values.
@@ -1498,6 +1601,25 @@ enum Commands {
     ///   autumn canary status
     #[command(subcommand, verbatim_doc_comment)]
     Canary(CanaryCommands),
+
+    /// Agent-authority tooling — what an agent-operable handler may do (#1691).
+    ///
+    /// `autumn agents manifest` compiles the application, reads back the
+    /// manifest the framework assembles from every `#[agent_operable]` action
+    /// and every declared `authority_grant!`, joins it against the route table,
+    /// and writes the diffable record. `--check` is the CI gate: it fails on
+    /// drift, on an MCP-exposed *mutating* tool with no envelope, on a binary
+    /// that can act irreversibly with no audit sink, and on a route naming an
+    /// authority nothing registered — none of which the compiler can catch,
+    /// because a tool with no grant has no assertion to fail.
+    ///
+    /// # Examples
+    ///
+    ///   autumn agents manifest
+    ///   autumn agents manifest --manifest agent-authority.json
+    ///   autumn agents manifest --check agent-authority.json --release
+    #[command(subcommand, verbatim_doc_comment)]
+    Agents(AgentsSubcommands),
 
     /// Cache-coherence tooling — prove no write can leave a cached read stale.
     ///
@@ -4346,6 +4468,24 @@ fn run_command(command: Commands) {
                 assets::run_verify(&manifest_path, &static_dir);
             }
         },
+        Commands::Agents(AgentsSubcommands::Manifest(args)) => {
+            let features = routes::CargoFeatures {
+                features: args.features,
+                all: args.all_features,
+                no_default: args.no_default_features,
+            };
+            agents::run(&agents::AgentsManifestOptions {
+                package: args.package.as_deref(),
+                bin: args.bin.as_deref(),
+                manifest: args.manifest.as_deref(),
+                json: args.json,
+                check: args.check.as_deref(),
+                allow_ungoverned: args.allow_ungoverned,
+                allow_unaudited: args.allow_unaudited,
+                features,
+                release: args.release,
+            });
+        }
         Commands::Cache(CacheSubcommands::Audit(args)) => {
             let features = routes::CargoFeatures {
                 features: args.features,
@@ -4697,6 +4837,7 @@ fn run_command(command: Commands) {
             prefix,
             sensitive_route,
             format,
+            deny_experimental,
         } => {
             run_plugin_check_command(
                 package.as_deref(),
@@ -4705,6 +4846,7 @@ fn run_command(command: Commands) {
                 prefix.as_deref(),
                 &sensitive_route,
                 &format,
+                deny_experimental,
             );
         }
         Commands::Generate(cmd) => run_generate_command(cmd, ApplyMode::Generate),
@@ -4939,6 +5081,7 @@ fn run_plugin_check_command(
     prefix: Option<&str>,
     sensitive_route_args: &[String],
     format: &str,
+    deny_experimental: bool,
 ) {
     let fmt = format.parse().unwrap_or_else(|e| {
         eprintln!("autumn plugin-check: {e}");
@@ -4967,6 +5110,9 @@ fn run_plugin_check_command(
         expected_prefix: prefix,
         sensitive_routes: &sensitive_routes,
         format: fmt,
+        // Populated by `run` from the built binary's contract dump.
+        contracts: &plugin_check::ContractDump::Absent,
+        deny_experimental,
     });
 }
 
@@ -8597,6 +8743,38 @@ mod tests {
         }
     }
 
+    /// `--deny-experimental` turns the `experimental-surface` report into a
+    /// gate (issue #1601). It has to be opt-in, so the default is asserted too.
+    #[test]
+    fn parse_plugin_check_deny_experimental_flag() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin-check",
+            "--plugin-name",
+            "myplugin",
+            "--deny-experimental",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::PluginCheck {
+                deny_experimental, ..
+            } => assert!(deny_experimental),
+            _ => panic!("expected PluginCheck"),
+        }
+
+        let default =
+            Cli::try_parse_from(["autumn", "plugin-check", "--plugin-name", "myplugin"]).unwrap();
+        match default.command {
+            Commands::PluginCheck {
+                deny_experimental, ..
+            } => assert!(
+                !deny_experimental,
+                "experimental use is reported, not gated"
+            ),
+            _ => panic!("expected PluginCheck"),
+        }
+    }
+
     #[test]
     fn parse_plugin_check_default_format_is_text() {
         let cli =
@@ -8699,7 +8877,9 @@ mod tests {
                 prefix,
                 sensitive_route,
                 format,
+                deny_experimental,
             } => {
+                assert!(!deny_experimental, "the flag defaults off");
                 assert_eq!(package.as_deref(), Some("my-app"));
                 assert_eq!(bin.as_deref(), Some("server"));
                 assert_eq!(plugin_name, "autumn-admin-plugin");

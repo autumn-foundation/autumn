@@ -95,6 +95,7 @@ pub fn app() -> AppBuilder {
         shutdown_hooks: Vec::new(),
         extensions: HashMap::new(),
         registered_plugins: HashSet::new(),
+        plugin_contracts: Vec::new(),
         plugin_config_roots: BTreeSet::new(),
         #[cfg(feature = "maud")]
         error_page_renderer: None,
@@ -345,6 +346,12 @@ pub struct AppBuilder {
     pub(crate) extensions: HashMap<TypeId, Box<dyn Any + Send>>,
     /// Plugin names that have already been applied, for duplicate detection.
     pub(crate) registered_plugins: HashSet<String>,
+    /// Compatibility contracts declared by the plugins applied to this builder
+    /// (issue #1601), in registration order. Emitted after
+    /// [`PLUGIN_CONTRACT_MARKER`](crate::plugin_contract::PLUGIN_CONTRACT_MARKER)
+    /// by the route dump so `autumn plugin-check` can report experimental
+    /// surface use without linking the plugin itself.
+    pub(crate) plugin_contracts: Vec<crate::plugin_contract::PluginContract>,
     /// Top-level config roots plugins have declared as their own opaque config
     /// sections via [`config_section`](AppBuilder::config_section). Threaded into
     /// the default config loader so `server.strict_config` treats them as
@@ -2747,6 +2754,16 @@ impl AppBuilder {
             );
             return self;
         }
+        if let Some(mut contract) = plugin.contract() {
+            Self::enforce_plugin_contract(&contract);
+            // Route attribution keys on `Plugin::name()` while a contract names
+            // the plugin's CRATE; the default `name()` is `type_name`, so a
+            // plugin that declares `env!("CARGO_PKG_NAME")` without overriding
+            // `name()` has two identities. Carry both so
+            // `autumn plugin-check --plugin-name` finds it under either.
+            contract.registered_as = Some(name.as_ref().to_owned());
+            self.plugin_contracts.push(contract);
+        }
         let name_str = name.into_owned();
         self.registered_plugins.insert(name_str.clone());
         // Save outer plugin context so nested plugin() calls don't permanently
@@ -2772,6 +2789,80 @@ impl AppBuilder {
     #[must_use]
     pub fn has_plugin(&self, name: &str) -> bool {
         self.registered_plugins.contains(name)
+    }
+
+    /// The compatibility contracts declared by the plugins applied so far
+    /// (issue #1601), in registration order.
+    ///
+    /// A plugin that returns `None` from
+    /// [`Plugin::contract`](crate::plugin::Plugin::contract) contributes
+    /// nothing here, and a duplicate registration contributes once — the
+    /// duplicate is skipped before its contract is read.
+    #[must_use]
+    pub fn plugin_contracts(&self) -> &[crate::plugin_contract::PluginContract] {
+        &self.plugin_contracts
+    }
+
+    /// Check one plugin's declared `autumn-web` range against the framework it
+    /// is actually compiled into.
+    ///
+    /// An incompatible pairing **panics** at registration: the plugin is about
+    /// to wire itself into an application built on a framework it does not
+    /// claim to support, and the whole point of the contract is that this stops
+    /// being a silent surprise. The message names both versions and both
+    /// remedies.
+    ///
+    /// A requirement that cannot be parsed only warns. It is the *plugin
+    /// author's* typo, and `autumn plugin-check` fails on it in their CI —
+    /// hard-failing here would punish an application author for a mistake they
+    /// cannot fix.
+    ///
+    /// # The escape hatch
+    ///
+    /// The one thing an application author *cannot* fix is a plugin whose
+    /// declared range is merely stale — cargo has already proven the two link
+    /// one `autumn-web`, so an over-tight literal in somebody else's crate
+    /// should not be able to strand a working deployment. Setting
+    /// `AUTUMN_PLUGIN_CONTRACT=warn` downgrades the panic to a `tracing::warn!`
+    /// carrying the same message. It is named in the panic text itself, so the
+    /// person who hits it does not have to find this doc first. Loud-by-default
+    /// is the point; unbootable-with-no-recourse is not.
+    ///
+    /// Note that a **duplicate** registration is skipped before its contract is
+    /// read, so enforcement applies to the first plugin registered under a
+    /// given name.
+    #[track_caller]
+    fn enforce_plugin_contract(contract: &crate::plugin_contract::PluginContract) {
+        use crate::plugin_contract::{AUTUMN_WEB_VERSION, ContractVerdict, evaluate};
+
+        match evaluate(contract, AUTUMN_WEB_VERSION) {
+            ContractVerdict::Compatible | ContractVerdict::Undeclared => {}
+            ContractVerdict::Incompatible(err) => {
+                if std::env::var("AUTUMN_PLUGIN_CONTRACT").as_deref() == Ok("warn") {
+                    tracing::warn!(
+                        plugin = contract.plugin.as_str(),
+                        "{err}\n  (demoted to a warning by AUTUMN_PLUGIN_CONTRACT=warn)"
+                    );
+                } else {
+                    panic!(
+                        "{err}\n  \u{2192} or, to boot anyway while you sort it out, set \
+                         AUTUMN_PLUGIN_CONTRACT=warn"
+                    );
+                }
+            }
+            ContractVerdict::Unparseable {
+                requirement,
+                reason,
+            } => {
+                tracing::warn!(
+                    plugin = contract.plugin.as_str(),
+                    requirement = requirement.as_str(),
+                    reason = reason.as_str(),
+                    "plugin declares an autumn-web requirement that cannot be evaluated; \
+                     compatibility was NOT checked (run `autumn plugin-check` on the plugin)"
+                );
+            }
+        }
     }
 
     /// Declare a plugin-owned top-level config section so it coexists with
@@ -3203,6 +3294,20 @@ impl AppBuilder {
             return;
         }
 
+        // ── Agent-authority manifest dump mode ─────────────────────────
+        // When AUTUMN_DUMP_AGENT_AUTHORITY=1, print the agent-authority
+        // manifest (#1691) and exit. Triggered by `autumn agents manifest`,
+        // which needs the whole binary's registrations -- every
+        // `#[agent_operable]` action and every declared `authority_grant!`,
+        // across the app AND its plugins -- joined against this app's route
+        // table, because which actions an agent can actually reach is a fact
+        // about the mounted routes and not about the annotations alone. Runs
+        // before any database or port is touched.
+        if crate::agent_authority::manifest::is_dump_mode() {
+            self.run_dump_agent_authority_mode();
+            return;
+        }
+
         // ── Jobs manifest dump mode ────────────────────────────────────
         // When AUTUMN_DUMP_JOBS=1, print the effective drained-queue manifest
         // (TOML `queues = [...]`) and exit. Triggered by `autumn jobs manifest`
@@ -3324,6 +3429,7 @@ impl AppBuilder {
             shutdown_hooks,
             extensions: _,
             registered_plugins: _,
+            plugin_contracts: _,
             plugin_config_roots,
             #[cfg(feature = "maud")]
             error_page_renderer,
@@ -4013,6 +4119,24 @@ impl AppBuilder {
         // configured. Installed after the mailer so the mail channel can bind
         // to the live `Mailer` extension.
         crate::alerts::install_from_config(&state, &config.alerts, alert_channels);
+        // An MCP endpoint with no audit sink still serves tools; what it does
+        // not do is leave a record that an agent called one. That is a property
+        // of the deployment rather than of any grant, so it is said once, here,
+        // where both are known -- and it is also carried in the agent-authority
+        // manifest's `audit.sink_configured` (#1691 R9).
+        #[cfg(feature = "mcp")]
+        if mcp.is_some()
+            && !audit_logger
+                .as_ref()
+                .is_some_and(|logger| logger.is_enabled())
+        {
+            tracing::warn!(
+                target: "autumn.agent",
+                "MCP is mounted with no audit sink installed: agent tool calls will be traced \
+                 but not recorded. Install one with `AppBuilder::with_audit_sink(..)`. \
+                 See docs/guide/agent-authority.md"
+            );
+        }
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -5373,6 +5497,7 @@ impl AppBuilder {
             shutdown_hooks: _,
             extensions: _,
             registered_plugins: _,
+            plugin_contracts: _,
             plugin_config_roots,
             #[cfg(feature = "maud")]
                 error_page_renderer: _,
@@ -5857,6 +5982,48 @@ impl AppBuilder {
         crate::managed_pg::emergency_stop_async().await;
     }
 
+    /// Dump the agent-authority manifest as one marker-prefixed JSON line and
+    /// exit.
+    ///
+    /// Triggered when `AUTUMN_DUMP_AGENT_AUTHORITY=1` is set (by `autumn agents
+    /// manifest`). Takes `&self` rather than consuming the builder: it reads
+    /// the route table and the audit-sink status and touches nothing else, so
+    /// there is no database to open and no port to bind.
+    fn run_dump_agent_authority_mode(&self) {
+        // Whether agent invocations have anywhere to be recorded is a property
+        // of the deployment, not of any grant, and it belongs in the document
+        // rather than in a startup line nobody reads (#1691 R9).
+        let audit_sink_configured = self
+            .audit_logger
+            .as_ref()
+            .is_some_and(|logger| logger.is_enabled());
+        // The whole-API MCP hatch, when the `mcp` feature is compiled in and
+        // the app opted into it. Without it every route `expose_all_as_mcp()`
+        // exposes would be missing from the document entirely.
+        #[cfg(feature = "mcp")]
+        let expose_all = self.mcp.as_ref().is_some_and(|rt| rt.expose_all);
+        #[cfg(not(feature = "mcp"))]
+        let expose_all = false;
+        // Top-level routes carry their own path; a scoped group's children do
+        // not -- the group's prefix is applied at mount time, so the path on
+        // the `Route` is the child path alone. Passing that through would
+        // record `/items` for a tool an agent calls at `/api/v1/items`, and a
+        // scope rename would then produce no drift at all.
+        let routes: Vec<crate::agent_authority::manifest::RouteSummary> = self
+            .routes
+            .iter()
+            .map(|route| agent_authority_route_summary(route, None, expose_all))
+            .chain(self.scoped_groups.iter().flat_map(|group| {
+                group.routes.iter().map(move |route| {
+                    agent_authority_route_summary(route, Some(&group.prefix), expose_all)
+                })
+            }))
+            .collect();
+        crate::agent_authority::manifest::print_manifest_dump(
+            &crate::agent_authority::manifest::build(&routes, audit_sink_configured),
+        );
+    }
+
     /// Dump the application's route listing as JSON and exit.
     ///
     /// Triggered when `AUTUMN_DUMP_ROUTES=1` is set (by `autumn routes`).
@@ -5877,6 +6044,7 @@ impl AppBuilder {
             #[cfg(feature = "openapi")]
             openapi,
             plugin_config_roots,
+            plugin_contracts,
             ..
         } = self;
 
@@ -5958,6 +6126,21 @@ impl AppBuilder {
                     marker = crate::route_listing::SECURITY_CONFIG_MARKER
                 ),
                 Err(e) => eprintln!("Failed to serialize security config: {e}"),
+            }
+        }
+
+        // Emit the plugin compatibility contracts declared by this app's
+        // plugins (issue #1601). Gated on `AUTUMN_DUMP_PLUGIN_CONTRACT` so only
+        // `autumn plugin-check` sees it, and emitted even when the array is
+        // empty: the CLI distinguishes "this binary declares no contracts" from
+        // "this binary predates the marker" by the line's presence.
+        if is_dump_plugin_contract_mode() {
+            match serde_json::to_string(&plugin_contracts) {
+                Ok(json) => eprintln!(
+                    "{marker}{json}",
+                    marker = crate::plugin_contract::PLUGIN_CONTRACT_MARKER
+                ),
+                Err(e) => eprintln!("Failed to serialize plugin contracts: {e}"),
             }
         }
 
@@ -7237,6 +7420,16 @@ pub(crate) fn is_dump_routes_mode() -> bool {
     std::env::var("AUTUMN_DUMP_ROUTES").as_deref() == Ok("1")
 }
 
+/// Whether the dump should also emit the declared plugin contracts
+/// ([`PLUGIN_CONTRACT_MARKER`](crate::plugin_contract::PLUGIN_CONTRACT_MARKER)).
+///
+/// Set by `autumn plugin-check`, which needs the contracts to report
+/// experimental-surface use. The plain `autumn routes` listing does not set it,
+/// so its stderr is unchanged.
+pub(crate) fn is_dump_plugin_contract_mode() -> bool {
+    std::env::var("AUTUMN_DUMP_PLUGIN_CONTRACT").as_deref() == Ok("1")
+}
+
 /// Whether the dump should also emit the resolved security configuration
 /// ([`SECURITY_CONFIG_MARKER`](crate::route_listing::SECURITY_CONFIG_MARKER)).
 ///
@@ -7249,6 +7442,63 @@ pub(crate) fn is_dump_security_mode() -> bool {
 
 pub(crate) fn is_dump_jobs_mode() -> bool {
     std::env::var("AUTUMN_DUMP_JOBS").as_deref() == Ok("1")
+}
+
+/// The slice of a [`Route`] the agent-authority manifest needs (#1691).
+///
+/// Built here rather than in `agent_authority::manifest` so that module needs
+/// no dependency on the router, and unconditionally rather than behind the
+/// `openapi` feature: which handlers an agent can reach is not an
+/// documentation concern.
+///
+/// `expose_all` is the app's whole-API MCP hatch. It has to be threaded in:
+/// deriving tool-ness from `#[api_doc(mcp)]` alone made every route
+/// `expose_all_as_mcp()` swept up invisible to this document — in neither
+/// `actions` nor `ungoverned_tools` — while the document's own `excluded`
+/// section claimed they surfaced there (#1691 P2-6). The same call also
+/// applies the JSON-out eligibility gate, so an HTML route someone tagged
+/// `#[api_doc(mcp)]` is no longer reported as a tool it will never become.
+fn agent_authority_route_summary(
+    route: &Route,
+    scope_prefix: Option<&str>,
+    expose_all: bool,
+) -> crate::agent_authority::manifest::RouteSummary {
+    // One string, used both for the row and for the predicate, so the two can
+    // never disagree about a route's verb.
+    let method = route.method.to_string();
+    // The path an agent actually calls. `join_nested_path` is the same helper
+    // the OpenAPI collector uses for scoped groups, so the manifest and the
+    // spec cannot disagree about where a route lives.
+    let path = scope_prefix.map_or_else(
+        || route.path.to_string(),
+        |prefix| crate::router::join_nested_path(prefix, route.path),
+    );
+    let exposed_by = crate::agent_authority::manifest::mcp_exposure(
+        &crate::agent_authority::manifest::McpExposureInput {
+            method: &method,
+            hidden: route.api_doc.hidden,
+            mcp_tool: route.api_doc.mcp_tool,
+            mcp_exclude: route.api_doc.mcp_exclude,
+            mcp_stream: route.api_doc.mcp_stream,
+            has_response_schema: route.api_doc.response.is_some(),
+            success_status: route.api_doc.success_status,
+            expose_all,
+        },
+    );
+    crate::agent_authority::manifest::RouteSummary {
+        method,
+        path,
+        handler: route.name,
+        // The name an MCP client actually calls: `#[api_doc(operation_id =
+        // "...")]` renames the tool without renaming the handler.
+        operation_id: route.api_doc.operation_id,
+        module_path: route.api_doc.module_path,
+        mcp_tool: exposed_by.is_some(),
+        exposed_by,
+        // Filled by the route macro from the handler's `#[agent_operable]`
+        // marker, in either attribute order.
+        agent_authority: route.api_doc.agent_authority,
+    }
 }
 
 pub(crate) fn is_list_one_off_tasks_mode() -> bool {
@@ -10898,6 +11148,90 @@ fn is_production_profile(profile: &str) -> bool {
 }
 
 #[cfg(test)]
+mod agent_authority_route_summary_tests {
+    use super::*;
+
+    fn route_with(path: &'static str, mcp_tool: bool) -> Route {
+        let mut api_doc = crate::openapi::ApiDoc {
+            method: "GET",
+            path,
+            operation_id: "list_items",
+            mcp_tool,
+            ..crate::openapi::ApiDoc::default()
+        };
+        // The exposure rule is JSON-out gated, so a route with no response
+        // schema is never a tool no matter what it is tagged with. Give it one.
+        api_doc.response = Some(crate::openapi::SchemaEntry {
+            name: "Item",
+            kind: crate::openapi::SchemaKind::Ref,
+            identity: None,
+        });
+        Route {
+            method: http::Method::GET,
+            path,
+            handler: axum::routing::any(|| async { "" }),
+            name: "list_items",
+            api_doc,
+            repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
+            api_version: None,
+            sunset_opt_out: false,
+        }
+    }
+
+    #[test]
+    fn a_scoped_route_records_the_path_an_agent_actually_calls() {
+        // A scoped group's children carry only the child path -- the prefix is
+        // applied at mount time. Recording `/items` for a tool served at
+        // `/api/v1/items` would make the manifest wrong about where the agent
+        // surface is, and a scope rename would produce no drift at all.
+        let route = route_with("/items", true);
+        let summary = agent_authority_route_summary(&route, Some("/api/v1"), false);
+        assert_eq!(summary.path, "/api/v1/items");
+        assert_eq!(summary.method, "GET");
+        assert!(summary.mcp_tool);
+
+        // A top-level route has no prefix and is unchanged.
+        let top = agent_authority_route_summary(&route, None, false);
+        assert_eq!(top.path, "/items");
+    }
+
+    #[test]
+    fn a_scoped_root_route_joins_the_way_the_openapi_collector_does() {
+        // Delegated to `join_nested_path` rather than string concatenation, so
+        // the manifest and the spec cannot disagree about trailing slashes.
+        let root = route_with("/", true);
+        let summary = agent_authority_route_summary(&root, Some("/api"), false);
+        assert_eq!(
+            summary.path,
+            crate::router::join_nested_path("/api", "/"),
+            "the manifest must join paths exactly as the spec does"
+        );
+    }
+
+    #[test]
+    fn the_operation_id_names_the_tool_and_exposure_says_why() {
+        use crate::agent_authority::manifest::McpExposedBy;
+
+        let tagged = agent_authority_route_summary(&route_with("/items", true), None, false);
+        assert_eq!(tagged.operation_id, "list_items");
+        assert_eq!(tagged.exposed_by, Some(McpExposedBy::Attribute));
+
+        // Untagged and no hatch: not a tool at all.
+        let plain = agent_authority_route_summary(&route_with("/items", false), None, false);
+        assert!(!plain.mcp_tool);
+        assert_eq!(plain.exposed_by, None);
+
+        // Untagged, but the whole-API hatch sweeps up a read-only verb.
+        let hatched = agent_authority_route_summary(&route_with("/items", false), None, true);
+        assert!(hatched.mcp_tool);
+        assert_eq!(hatched.exposed_by, Some(McpExposedBy::Hatch));
+    }
+}
+
+#[cfg(test)]
 mod validate_repository_api_policies_tests {
     use super::*;
     use crate::RepositoryApiMeta;
@@ -12202,42 +12536,8 @@ mod tests {
     pub fn test_router(routes: Vec<Route>) -> axum::Router {
         let config = AutumnConfig::default();
         let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            #[cfg(all(feature = "db", feature = "reporting"))]
-            db_capture_gap: None,
-            profile: None,
-            role: crate::config::ProcessRole::Combined,
-            started_at: crate::time::monotonic_now(),
             health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".into(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-            app_id: AppState::next_app_id(),
+            ..AppState::test_default()
         };
         crate::router::build_router(routes, &config, state)
     }
@@ -14545,46 +14845,7 @@ mod tests {
     async fn build_router_mounts_health_check_at_custom_path() {
         let mut config = AutumnConfig::default();
         config.health.path = "/healthz".to_owned();
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            #[cfg(all(feature = "db", feature = "reporting"))]
-            db_capture_gap: None,
-            profile: None,
-            role: crate::config::ProcessRole::Combined,
-            started_at: crate::time::monotonic_now(),
-            health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".into(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-            app_id: AppState::next_app_id(),
-        };
-        let router =
-            crate::router::build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
+        let router = test_router_with_config(vec![test_get_route("/dummy", "dummy")], &config);
 
         let response = router
             .oneshot(
@@ -14662,46 +14923,7 @@ mod tests {
             api_version: None,
             sunset_opt_out: false,
         }];
-        let config = AutumnConfig::default();
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            #[cfg(all(feature = "db", feature = "reporting"))]
-            db_capture_gap: None,
-            profile: None,
-            role: crate::config::ProcessRole::Combined,
-            started_at: crate::time::monotonic_now(),
-            health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".into(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-            app_id: AppState::next_app_id(),
-        };
-        let router = crate::router::build_router(post_routes, &config, state);
+        let router = test_router(post_routes);
 
         let response = router
             .oneshot(
@@ -15017,42 +15239,8 @@ mod tests {
         // No dynamic route for /docs — only a static file.
         let config = AutumnConfig::default();
         let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            #[cfg(all(feature = "db", feature = "reporting"))]
-            db_capture_gap: None,
-            profile: None,
-            role: crate::config::ProcessRole::Combined,
-            started_at: crate::time::monotonic_now(),
             health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".into(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-            app_id: AppState::next_app_id(),
+            ..AppState::test_default()
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/other", "other_page")],
@@ -15402,42 +15590,8 @@ mod tests {
     /// Helper to build a test router with custom config.
     pub fn test_router_with_config(routes: Vec<Route>, config: &AutumnConfig) -> axum::Router {
         let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            #[cfg(all(feature = "db", feature = "reporting"))]
-            db_capture_gap: None,
-            profile: None,
-            role: crate::config::ProcessRole::Combined,
-            started_at: crate::time::monotonic_now(),
             health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".into(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-            app_id: AppState::next_app_id(),
+            ..AppState::test_default()
         };
         crate::router::build_router(routes, config, state)
     }
@@ -15560,42 +15714,8 @@ mod tests {
 
         let config = AutumnConfig::default();
         let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            #[cfg(all(feature = "db", feature = "reporting"))]
-            db_capture_gap: None,
-            profile: None,
-            role: crate::config::ProcessRole::Combined,
-            started_at: crate::time::monotonic_now(),
             health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".into(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-            app_id: AppState::next_app_id(),
+            ..AppState::test_default()
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -15616,42 +15736,8 @@ mod tests {
         // When dist_dir is None, return the app router directly.
         let config = AutumnConfig::default();
         let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            #[cfg(all(feature = "db", feature = "reporting"))]
-            db_capture_gap: None,
-            profile: None,
-            role: crate::config::ProcessRole::Combined,
-            started_at: crate::time::monotonic_now(),
             health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".into(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-            app_id: AppState::next_app_id(),
+            ..AppState::test_default()
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -15882,40 +15968,8 @@ mod tests {
     #[tokio::test]
     async fn start_task_scheduler_broadcasts_events() {
         let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            #[cfg(all(feature = "db", feature = "reporting"))]
-            db_capture_gap: None,
-            profile: None,
-            role: crate::config::ProcessRole::Combined,
-            started_at: crate::time::monotonic_now(),
             health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".into(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-            app_id: AppState::next_app_id(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
+            ..AppState::test_default()
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");
@@ -15962,40 +16016,8 @@ mod tests {
     #[tokio::test]
     async fn start_task_scheduler_broadcasts_failure_events() {
         let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            #[cfg(all(feature = "db", feature = "reporting"))]
-            db_capture_gap: None,
-            profile: None,
-            role: crate::config::ProcessRole::Combined,
-            started_at: crate::time::monotonic_now(),
             health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".into(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-            app_id: AppState::next_app_id(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
+            ..AppState::test_default()
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");

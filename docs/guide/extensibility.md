@@ -177,6 +177,36 @@ See [`autumn/src/plugin.rs`](../../autumn/src/plugin.rs) for the trait
 definition and naming conventions for first-party vs third-party plugin
 crates.
 
+### The stability contract you get, and the one you owe
+
+Once you are distributing to someone else, the question stops being "can I
+reach this API" and becomes "will it still be here next release". Autumn
+answers that explicitly (issue #1601):
+
+- **What Autumn owes you.** Every plugin-facing API — including the four tier-1
+  seams above — is declared `stable` or `experimental` in
+  [the plugin API contract](../plugins.md#the-plugin-api-contract). A stable
+  one follows [`STABILITY.md`](../../STABILITY.md)'s SemVer promise, is
+  compiled on every commit by a pinned reference plugin, and cannot break
+  without a **Plugin authors** section in that release's migration guide.
+- **What you owe your users.** Implement `Plugin::contract` to declare the
+  `autumn-web` range you support. An app on a framework outside it then fails
+  at registration with a message naming both versions, instead of misbehaving
+  in a way nobody can trace back to a version mismatch.
+
+```rust,ignore
+fn contract(&self) -> Option<autumn_web::plugin_contract::PluginContract> {
+    Some(
+        autumn_web::plugin_contract::PluginContract::new(env!("CARGO_PKG_NAME"))
+            .plugin_version(env!("CARGO_PKG_VERSION"))
+            .autumn_web("0.7"),
+    )
+}
+```
+
+`autumn generate plugin` scaffolds this, and
+`autumn plugin-check --plugin-name <your-plugin>` verifies it.
+
 ---
 
 ## Choosing between tiers — a quick decision tree
@@ -202,6 +232,9 @@ issue — adding one is mechanical and we generally welcome the patch.
   Secrets Manager, or a JSON/YAML file instead of five-layer TOML.
 - [`autumn/src/plugin.rs`](../../autumn/src/plugin.rs) — `Plugin` trait
   documentation, including the naming conventions for distributed plugins.
+- [`plugins.md`](../plugins.md#the-plugin-api-contract) — which plugin-facing
+  APIs are stable versus experimental, the SemVer policy for each tier, and how
+  a plugin declares the `autumn-web` range it supports.
 
 ---
 

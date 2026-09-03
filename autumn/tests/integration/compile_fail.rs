@@ -121,6 +121,18 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_counter_cache_duplicate_column.rs");
 
+    // Model-declared dependent cascades (#1702): `dependent = <action>` /
+    // `on_delete = <action>` is a `has_many`/`has_one` option, only the four
+    // documented actions are accepted, and it cannot ride on a `through =`
+    // association (whose fk names a join-table column, not one on the target).
+    // Each is a directed compile error rather than a silently-inert key.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_dependent_on_belongs_to.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_dependent_unknown_action.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_dependent_on_through.rs");
+
     // Declarative-schema markers (#1975, slice 3.5): the `#[model]` macro
     // ACCEPTS `#[model(managed)]` / `#[unique]` / `#[references(...)]` but
     // rejects malformed shapes with a clear, actionable `compile_error!`.
@@ -261,6 +273,88 @@ fn query_budget_compile_fail_tests() {
     // The same N+1, against the real generated repository surface.
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/query_budget_repository_n_plus_one.rs");
+}
+
+/// Every `#[agent_operable]` / `authority_grant!` compile-fail fixture, with
+/// whether it needs the `db` feature. Shared with the guide-drift test below,
+/// so the guide's violation matrix is pinned against the fixtures that
+/// actually run rather than a hand-maintained copy of the list (#1691).
+const AGENT_AUTHORITY_FIXTURES: &[(&str, bool)] = &[
+    // A write to a model the grant never names.
+    ("agent_authority_unlisted_write", false),
+    // `writes: [X]` never implies the authority to erase the table.
+    ("agent_authority_unbounded_write", false),
+    // `tenant_scope: scoped` means the action stays in its tenant.
+    ("agent_authority_cross_tenant", false),
+    // A literal URL outside the outbound allowlist.
+    ("agent_authority_outbound_not_allowlisted", false),
+    // A `format!`-built URL proves nothing about the host reached.
+    ("agent_authority_outbound_dynamic_url", false),
+    // A client alias stands in for a relative literal, never for a URL the
+    // analysis cannot read — the exfiltration shape the alias branch hid.
+    ("agent_authority_outbound_alias_dynamic_url", false),
+    // A job the grant does not list, enqueued through the free function that
+    // has no signature handle to key on.
+    ("agent_authority_job_not_listed", false),
+    // A helper handed a tracked handle is opaque, never assumed effect-free.
+    ("agent_authority_opaque_helper", false),
+    // Including an *associated* one: an uppercase path segment is a shape, not
+    // evidence that the callee is framework surface.
+    ("agent_authority_opaque_associated_helper", false),
+    // `#[agent_operable]` with no `grant = ...`.
+    ("agent_authority_bad_attr", false),
+    // `#[agent_effect]`'s reason is what makes the assertion reviewable.
+    ("agent_authority_blank_effect_reason", false),
+    // The statement hatch is not a handler-wide licence.
+    ("agent_authority_stray_effect_on_fn", false),
+    // `reversibility` is the one required grant key.
+    ("agent_authority_missing_reversibility", false),
+    // A declared cap that no reader can interpret is not a cap.
+    ("agent_authority_bad_rate", false),
+    // The hatch declares, it never grants.
+    ("agent_authority_declared_effect_outside_grant", false),
+    // The edge lane is read-only; an audited agent action cannot run there.
+    ("agent_authority_edge_with_agent_operable", false),
+    // An invented grant key is refused rather than silently dropped.
+    ("agent_authority_unknown_grant_key", false),
+    // The same unlisted write against the real generated repository surface,
+    // where the model subject is resolved through the repository type.
+    ("agent_authority_repository_unlisted_write", true),
+];
+
+/// The `#[agent_operable]` fixtures get their own `TestCases` for the same
+/// reason `#[query_budget]` does: a self-contained feature (#1691) worth being
+/// able to run on its own, and one fewer line in the umbrella registry.
+#[test]
+fn agent_authority_compile_fail_tests() {
+    let t = trybuild::TestCases::new();
+
+    // Build-time authority envelopes (#1691). Mostly always-available: the
+    // analysis is syntactic, so the fixtures name local stand-in types rather
+    // than a database surface. The one exception is gated on `db`.
+    for (fixture, needs_db) in AGENT_AUTHORITY_FIXTURES {
+        if *needs_db && !cfg!(feature = "db") {
+            continue;
+        }
+        t.compile_fail(format!("tests/compile-fail/{fixture}.rs"));
+    }
+}
+
+/// The `#[agent_operable]` compile-*pass* half (#1691), for the reason its
+/// compile-fail sibling has its own test: a self-contained feature worth
+/// running on its own, and two fewer lines in a `compile_pass_tests` that is
+/// already over the line limit.
+#[test]
+fn agent_authority_compile_pass_tests() {
+    let t = trybuild::TestCases::new();
+
+    // Every proved effect, both hatch forms, and the effect-free handler —
+    // the fixture asserts its own manifest rows in `main`.
+    t.pass("tests/compile-pass/agent_authority_valid.rs");
+    // The same analysis against the real route/`#[repository]` surface, with
+    // the attribute stacked in both orders and under `#[secured]`.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/agent_authority_route.rs");
 }
 
 /// Build-time cache coherence (#1716). Its own `TestCases` for the same
@@ -539,6 +633,111 @@ fn query_budget_guide_matches_the_real_diagnostics() {
     for fixture in [
         "autumn/tests/compile-fail/query_budget_n_plus_one.rs",
         "autumn/tests/compile-pass/query_budget_valid.rs",
+    ] {
+        assert!(
+            guide.contains(fixture),
+            "guide no longer references {fixture}"
+        );
+        assert!(
+            root.join(fixture).exists(),
+            "guide references a fixture that does not exist: {fixture}"
+        );
+    }
+}
+
+/// The `#[agent_operable]` guide is the reference a developer reaches for when
+/// a grant violation stops the build, so the diagnostic it prints has to be
+/// the diagnostic the macro actually emits (#1691). Pins the guide against the
+/// trybuild golden, and against the fixtures the suite registers.
+#[test]
+fn agent_authority_guide_matches_the_real_diagnostics() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let guide = std::fs::read_to_string(root.join("docs/guide/agent-authority.md"))
+        .expect("docs/guide/agent-authority.md exists");
+    let golden = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/compile-fail/agent_authority_unlisted_write.stderr"),
+    )
+    .expect("unlisted-write golden exists");
+
+    // The guide reproduces the message verbatim; compare on collapsed
+    // whitespace so the two wrappings (markdown block vs. rustc gutter) don't
+    // matter. Only the message itself is pinned, never const-eval's own
+    // framing around it — that text changes with the toolchain.
+    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let guide_flat = collapse(&guide);
+    let golden_flat = collapse(&golden);
+
+    let message_start = golden_flat
+        .find("agent authority:")
+        .expect("golden carries the authority diagnostic");
+    let message_end = golden_flat[message_start..]
+        .find("docs/guide/agent-authority.md")
+        .map(|end| message_start + end + "docs/guide/agent-authority.md".len())
+        .expect("golden's diagnostic ends with the guide link");
+    let message = &golden_flat[message_start..message_end];
+
+    assert!(
+        guide_flat.contains(message),
+        "docs/guide/agent-authority.md has drifted from the real diagnostic.\n\n\
+         expected the guide to contain:\n{message}\n\n\
+         Regenerate with TRYBUILD=overwrite and copy the message into the guide."
+    );
+
+    // The guide's violation matrix is the table a reviewer reads to find out
+    // what the gate refuses. One row per registered fixture: a fixture missing
+    // from it is a refusal nobody documented, and a row naming a fixture that
+    // no longer exists is a promise the suite stopped keeping.
+    //
+    // The row's *label* is checked too. `E0080` (a failing const assertion:
+    // the effect was proved and the grant did not cover it) and `macro` (the
+    // macro refusing a site it cannot prove) are different promises to a
+    // reader — one says "widen the grant", the other says "the analysis cannot
+    // read this" — and a mislabelled row sends them to the wrong fix.
+    for (fixture, needs_db) in AGENT_AUTHORITY_FIXTURES {
+        assert!(
+            guide.contains(fixture),
+            "the guide's violation matrix has no row for {fixture}"
+        );
+        assert!(
+            root.join(format!("autumn/tests/compile-fail/{fixture}.rs"))
+                .exists(),
+            "the fixture registry names a fixture that does not exist: {fixture}"
+        );
+        if *needs_db && !cfg!(feature = "db") {
+            continue;
+        }
+        let golden = std::fs::read_to_string(
+            root.join(format!("autumn/tests/compile-fail/{fixture}.stderr")),
+        )
+        .unwrap_or_else(|_| panic!("{fixture} has a committed golden"));
+        let first_error = golden
+            .lines()
+            .find(|line| line.starts_with("error"))
+            .unwrap_or_else(|| panic!("{fixture}'s golden opens with an error"));
+        let row = guide
+            .lines()
+            .find(|line| line.starts_with('|') && line.contains(fixture))
+            .unwrap_or_else(|| panic!("the guide's matrix row for {fixture} is not a table row"));
+        let labelled_e0080 = row.contains("`E0080`");
+        let labelled_macro = row.contains("`macro`");
+        assert!(
+            labelled_e0080 != labelled_macro,
+            "the guide's row for {fixture} must carry exactly one of `E0080` / `macro`: {row}"
+        );
+        assert_eq!(
+            labelled_e0080,
+            first_error.starts_with("error[E0080]"),
+            "the guide labels {fixture} wrongly.\n\nrow: {row}\ngolden: {first_error}"
+        );
+    }
+
+    // Every fixture the guide points at must exist.
+    for fixture in [
+        "autumn/tests/compile-fail/agent_authority_unlisted_write.rs",
+        "autumn/tests/compile-pass/agent_authority_valid.rs",
     ] {
         assert!(
             guide.contains(fixture),

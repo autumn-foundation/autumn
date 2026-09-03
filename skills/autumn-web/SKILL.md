@@ -1489,6 +1489,64 @@ that already gates migrations, `#[scheduled]` leader election, and ISR.
 See `docs/guide/distributed-locks.md` and
 `docs/adr/0010-app-facing-distributed-lock.md`.
 
+## The plugin API stability contract (unreleased, issue #1601)
+
+**When advising a plugin author, start here.** Autumn declares which
+plugin-facing APIs are stable and which are experimental, and a plugin declares
+which `autumn-web` versions it supports.
+
+The registry is `autumn_web::plugin_contract::PLUGIN_SURFACES`; the rendered
+table lives in [`docs/plugins.md`](../../docs/plugins.md#the-plugin-api-contract).
+**stable** follows [`STABILITY.md`](../../STABILITY.md)'s SemVer promise and a
+break ships with a migration-guide *Plugin authors* section; **experimental**
+(today: `AppBuilder::with_edge_kv`, `autumn_edge::host`) may change in any
+release, patch included.
+
+A plugin declares its range by implementing `Plugin::contract` — optional, and
+`None` (the default) keeps today's behaviour exactly:
+
+```rust
+fn contract(&self) -> Option<PluginContract> {
+    Some(
+        PluginContract::new(env!("CARGO_PKG_NAME"))
+            .plugin_version(env!("CARGO_PKG_VERSION"))
+            .autumn_web("0.7")            // Cargo requirement: "0.7", ">=0.6, <0.9", "=0.7.1"
+            .uses_experimental("AppBuilder::with_edge_kv"),  // only if you actually do
+    )
+}
+```
+
+Three things to know before advising on it:
+
+- **A mismatch panics at registration**, not later, with a message naming both
+  versions and both remedies (`cargo update -p <plugin>`, or pin
+  `autumn-web = "<declared>"`). An unparseable requirement only warns at
+  runtime — but `autumn plugin-check` fails on it, which is where the author
+  sees it.
+- **`autumn plugin-check` gained two checks, and one of them is a break for
+  existing plugins.** `plugin-contract` **fails** when the plugin under check
+  declares no usable range — the plugin still compiles and runs unchanged, but
+  its CI goes red until `Plugin::contract` is implemented. `experimental-surface`
+  *reports* what it declares, failing only on a name that does not resolve to
+  an experimental entry in the registry. Both skip against a host binary built
+  before the contract existed; `--deny-experimental` fails closed in that case
+  rather than becoming a no-op. `autumn generate plugin` scaffolds the contract,
+  so new plugins are green out of the box.
+- **`--plugin-name` resolves against either identity.** A contract names the
+  *crate*; route attribution keys on `Plugin::name()`, which defaults to
+  `std::any::type_name`. The CLI matches both, so neither choice hides a plugin
+  from the check.
+- **A mismatch has an escape hatch.** The registration panic names
+  `AUTUMN_PLUGIN_CONTRACT=warn`, which downgrades it to a `WARN`. Reach for it
+  when a plugin's declared range is merely stale; the fix still belongs in the
+  plugin.
+- **The framework side is gated by compilation.** `autumn-plugin-reference`
+  calls every declared stable surface and is built by the `plugin-contract` CI
+  job, so a stable-surface break is a red check on the PR that causes it. Do
+  not add a registry entry without a matching call site there —
+  `scripts/check-plugin-surface.sh` fails on it, and on a `docs/plugins.md`
+  table that has drifted from the registry.
+
 ## Installing a plugin — `autumn plugin add` (unreleased, issue #1606)
 
 **Reach for this instead of hand-editing `Cargo.toml` and the builder chain.**
@@ -2388,6 +2446,8 @@ autumn plugin add autumn-admin-plugin   # dependency + builder-chain mount + pos
 autumn data-flow                 # classified-data flow manifest: one row per `#[classified]` column and every sink a declared declassification boundary releases it to; empty reachable set = the column cannot leave the process (#1654)
 autumn data-flow --manifest data-flow-manifest.json --check data-flow-manifest.json   # write it, and fail on drift from the committed copy so a new release edge is reviewed
 autumn data-flow --release --check data-flow-manifest.json   # audit the profile you deploy: a boundary behind `#[cfg(not(debug_assertions))]` exists only in the release build, so a debug-built manifest would certify edges the shipped binary does not have (and miss the ones it does)
+autumn agents manifest           # agent authority manifest: one row per `#[agent_operable]` action with its grant, proved effects (writes, unbounded writes, cross-tenant reach, outbound, webhooks, jobs), provenance, and unused grant entries; plus every MCP-exposed tool with no envelope (#1691)
+autumn agents manifest --manifest agent-authority.json --check agent-authority.json   # write it, and fail on drift, on any ungoverned mutating MCP tool (`--allow-ungoverned`), or on an unaudited deployment that can act irreversibly (`--allow-unaudited`)
 ```
 
 ### Upgrading an app across releases — `autumn upgrade` (0.7.0, issues #1629 and #1593)

@@ -1,0 +1,37 @@
+$ cargo test -p autumn-web --test integration_tests idempotency_tenant_scope
+# on trunk (commit 922305e), before the fix
+
+running 3 tests
+test integration::idempotency_tenant_scope::same_tenant_retry_still_replays ... ok
+test integration::idempotency_tenant_scope::subdomain_tenancy_does_not_replay_across_tenants ... FAILED
+test integration::idempotency_tenant_scope::header_tenancy_does_not_replay_across_tenants ... FAILED
+
+failures:
+
+---- integration::idempotency_tenant_scope::subdomain_tenancy_does_not_replay_across_tenants stdout ----
+
+thread 'integration::idempotency_tenant_scope::subdomain_tenancy_does_not_replay_across_tenants' (1849) panicked at autumn/tests/integration/idempotency_tenant_scope.rs:122:5:
+tenant B received tenant A's cached response body: "order-for-tenant-a-sentinel" (status 200 OK)
+stack backtrace:
+             at ./tests/integration/idempotency_tenant_scope.rs:122:5
+             at ./tests/integration/idempotency_tenant_scope.rs:127:6
+             at ./tests/integration/idempotency_tenant_scope.rs:97:60
+
+---- integration::idempotency_tenant_scope::header_tenancy_does_not_replay_across_tenants stdout ----
+
+thread 'integration::idempotency_tenant_scope::header_tenancy_does_not_replay_across_tenants' (1847) panicked at autumn/tests/integration/idempotency_tenant_scope.rs:80:5:
+tenant B received tenant A's cached response body: "order-for-tenant-a-sentinel" (status 200 OK)
+stack backtrace:
+             at ./tests/integration/idempotency_tenant_scope.rs:80:5
+             at ./tests/integration/idempotency_tenant_scope.rs:90:6
+             at ./tests/integration/idempotency_tenant_scope.rs:51:57
+
+
+failures:
+    integration::idempotency_tenant_scope::header_tenancy_does_not_replay_across_tenants
+    integration::idempotency_tenant_scope::subdomain_tenancy_does_not_replay_across_tenants
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 1786 filtered out; finished in 0.36s
+
+error: test failed, to rerun pass `-p autumn-web --test integration_tests`
+EXIT=101

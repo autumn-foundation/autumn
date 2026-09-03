@@ -451,6 +451,26 @@ impl Default for RedisCachePlugin {
 }
 
 impl autumn_web::plugin::Plugin for RedisCachePlugin {
+    /// The compatibility contract this plugin declares (issue #1601).
+    ///
+    /// First-party plugins ship in lockstep with `autumn-web`, so the declared
+    /// range is this crate's own minor series — the two versions are the same
+    /// number by construction. Below `1.0` a minor bump is breaking (see
+    /// `STABILITY.md`), which is exactly what the `MAJOR.MINOR` requirement
+    /// says.
+    ///
+    /// Nothing experimental is declared: this plugin is built entirely on the
+    /// stable plugin surface.
+    fn contract(&self) -> Option<autumn_web::plugin_contract::PluginContract> {
+        Some(
+            autumn_web::plugin_contract::PluginContract::new(env!("CARGO_PKG_NAME"))
+                .plugin_version(env!("CARGO_PKG_VERSION"))
+                .autumn_web(autumn_web::plugin_contract::lockstep_range(env!(
+                    "CARGO_PKG_VERSION"
+                ))),
+        )
+    }
+
     fn build(self, app: autumn_web::app::AppBuilder) -> autumn_web::app::AppBuilder {
         app.on_startup(|state| async move {
             // Read the config the framework already stored as an extension.

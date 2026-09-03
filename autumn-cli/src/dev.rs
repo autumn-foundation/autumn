@@ -923,10 +923,11 @@ fn start_server(
 
     let mut command = Command::new(binary);
     command.envs(dotenv_vars);
-    // See `serve::base_command`: this one-shot mode is dispatched before the
+    // See `serve::base_command`: these one-shot modes are dispatched before the
     // server starts, so an inherited flag would turn every hot-reload restart
     // into a manifest dump that exits cleanly and never serves.
     command.env_remove(crate::data_flow::DUMP_ENV);
+    command.env_remove(crate::agents::DUMP_ENV);
     // Same reasoning, worse outcome (#1605): `AUTUMN_DB_RETENTION=report|purge`
     // is dispatched before the server starts, so an inherited one would make
     // every hot-reload restart enforce the retention policy and exit -- deleting

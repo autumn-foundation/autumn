@@ -841,6 +841,10 @@ fn build_router_pre_state(
             // a tools/call must mark its replay exempt (avoiding double-
             // counting against the same in-flight counter).
             envelope_load_shed: mcp_load_shed_layer.is_some(),
+            // The agent-authority audit path (#1691) writes through the app's
+            // installed `AuditLogger` and mints its correlation id from the
+            // injected entropy seam, both reached from state.
+            state: state.clone(),
         };
         let mut mcp_router =
             crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
@@ -4720,12 +4724,19 @@ fn apply_middleware(
     // `SessionLayer<ArcSessionStore>` so it joins the merged tuple below; see
     // that function for the boxed-future-per-store-op cost that buys the
     // nesting level back.
+    // Only when tenancy resolves the tenant from the session itself: a
+    // handler that mutates that session key (an org switch, a tenant-scoped
+    // login) needs its deferred idempotency alias keyed by the finalized
+    // tenant, not the one resolved before the handler ran.
+    let tenancy_session_key = (config.tenancy.enabled && config.tenancy.source == "session")
+        .then(|| Arc::<str>::from(config.tenancy.session_key.as_str()));
     let session_layer = crate::session::build_session_layer(
         &config.session,
         config.profile.as_deref(),
         session_store,
         signing_keys_opt,
         &state.entropy_arc(),
+        tenancy_session_key,
     )?;
     tracing::debug!(backend = ?config.session.backend, "Session management enabled");
 
@@ -6279,42 +6290,8 @@ mod tests {
 
     fn test_state() -> AppState {
         AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            #[cfg(all(feature = "db", feature = "reporting"))]
-            db_capture_gap: None,
             profile: Some("test".into()),
-            role: crate::config::ProcessRole::Combined,
-            started_at: crate::time::monotonic_now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".into(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-            app_id: crate::state::AppState::next_app_id(),
+            ..AppState::test_default()
         }
     }
 
@@ -7246,6 +7223,7 @@ mod tests {
             csrf_header: "x-csrf-token".to_owned(),
             envelope_rate_limited: false,
             envelope_load_shed: false,
+            state: test_state(),
         };
         let mcp_router =
             crate::mcp::build_mcp_router("/mcp", Vec::new(), axum::Router::new(), wiring, None);

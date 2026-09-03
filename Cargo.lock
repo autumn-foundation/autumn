@@ -568,6 +568,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "autumn-plugin-reference"
+version = "0.7.0"
+dependencies = [
+ "autumn-web",
+ "maud",
+]
+
+[[package]]
 name = "autumn-schema-core"
 version = "0.7.0"
 dependencies = [
@@ -687,6 +695,7 @@ dependencies = [
  "rusty-fork",
  "scoped-futures",
  "secrecy",
+ "semver",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -1760,9 +1769,9 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "chacha20"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",

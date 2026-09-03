@@ -18,6 +18,15 @@
 # against the prebuilt `autumn` CLI installed mid-job.
 #
 # Optional extensions (not required for green CI on a fresh scaffold):
+#   - Agent authority (issue #1691): once any handler carries
+#     `#[agent_operable]` or the app mounts MCP, commit a manifest with
+#     `autumn agents manifest --manifest agent-authority-manifest.json` and add
+#     a `autumn agents manifest --check agent-authority-manifest.json` step
+#     here. `--check` is the gate: it is the only invocation that fails on
+#     drift, on a mutating MCP tool with no envelope, and on a binary that can
+#     act irreversibly with no audit sink. It is not enabled by default because
+#     it needs a committed baseline, which a freshly scaffolded app does not
+#     have yet.
 #   - Tailwind: add `autumn setup --tailwind` and run the downloaded binary
 #     before `cargo build` to compile CSS in CI.
 #   - Coverage: install cargo-llvm-cov and upload to Codecov.
