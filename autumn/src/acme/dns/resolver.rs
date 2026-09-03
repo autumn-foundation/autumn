@@ -107,12 +107,7 @@ impl TxtLookup for UdpTxtLookup {
         Box::pin(async move {
             let id = query_id();
             let query = encode_txt_query(id, name)?;
-            let bind: SocketAddr = if resolver.is_ipv4() {
-                "0.0.0.0:0".parse().expect("valid v4 bind address")
-            } else {
-                "[::]:0".parse().expect("valid v6 bind address")
-            };
-            let socket = tokio::net::UdpSocket::bind(bind)
+            let socket = tokio::net::UdpSocket::bind(unspecified_bind(resolver))
                 .await
                 .map_err(|e| format!("could not open a UDP socket to query {resolver}: {e}"))?;
             socket
@@ -154,12 +149,7 @@ pub fn lookup_txt_blocking(
 ) -> Result<TxtAnswer, String> {
     let id = query_id();
     let query = encode_txt_query(id, name)?;
-    let bind: SocketAddr = if resolver.is_ipv4() {
-        "0.0.0.0:0".parse().expect("valid v4 bind address")
-    } else {
-        "[::]:0".parse().expect("valid v6 bind address")
-    };
-    let socket = std::net::UdpSocket::bind(bind)
+    let socket = std::net::UdpSocket::bind(unspecified_bind(resolver))
         .map_err(|e| format!("could not open a UDP socket to query {resolver}: {e}"))?;
     socket
         .set_read_timeout(Some(timeout))
@@ -178,6 +168,22 @@ pub fn lookup_txt_blocking(
         .map_err(|e| format!("resolver {resolver} answered a TXT query for {name}: {e}"))
 }
 
+/// The wildcard local address to bind before querying `resolver`, matching its
+/// address family.
+///
+/// Built rather than parsed, so there is no fallible step and no `# Panics`
+/// caveat on the query functions.
+const fn unspecified_bind(resolver: SocketAddr) -> SocketAddr {
+    match resolver {
+        SocketAddr::V4(_) => {
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+        }
+        SocketAddr::V6(_) => {
+            SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
+        }
+    }
+}
+
 /// A per-query transaction id.
 ///
 /// Not a security boundary — the query goes to an explicitly configured resolver
@@ -191,7 +197,7 @@ fn query_id() -> u16 {
     let counter = NEXT.fetch_add(1, Ordering::Relaxed);
     let clock = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos() as u16);
+        .map_or(0, |d| u16::try_from(d.subsec_nanos() & 0xFFFF).unwrap_or(0));
     counter ^ clock
 }
 
@@ -491,11 +497,10 @@ pub async fn wait_for_propagation(
         if now >= deadline {
             break;
         }
+        // Loop back for another round even when the sleep crossed the deadline:
+        // the budget is spent on probing, and the deadline check at the top of
+        // the next iteration is what ends the wait.
         tokio::time::sleep(poll_interval.min(deadline - now)).await;
-        if tokio::time::Instant::now() >= deadline {
-            // One last round after the final sleep, so the full budget is used.
-            continue;
-        }
     }
 
     Err(last_gap.map_or_else(
@@ -526,15 +531,14 @@ mod tests {
     /// Build a TXT answer for `name` carrying `values`, using a compression
     /// pointer for the answer's owner name — exactly what a real resolver sends.
     fn txt_response(id: u16, name: &str, values: &[&str], rcode: u8) -> Vec<u8> {
-        let question = encode_txt_query(id, name).expect("question encodes");
-        let mut msg = question.clone();
+        let mut msg = encode_txt_query(id, name).expect("question encodes");
         let flags: u16 = 0x8180 | u16::from(rcode);
         msg[2..4].copy_from_slice(&flags.to_be_bytes());
         let ancount = u16::try_from(values.len()).unwrap();
         msg[6..8].copy_from_slice(&ancount.to_be_bytes());
         for value in values {
             // Owner name as a compression pointer to the question's name.
-            msg.extend_from_slice(&[0xC0, HEADER_LEN as u8]);
+            msg.extend_from_slice(&[0xC0, u8::try_from(HEADER_LEN).expect("header fits u8")]);
             msg.extend_from_slice(&QTYPE_TXT.to_be_bytes());
             msg.extend_from_slice(&QCLASS_IN.to_be_bytes());
             msg.extend_from_slice(&60_u32.to_be_bytes());
@@ -629,7 +633,7 @@ mod tests {
             let _ = parse_txt_response(4, "x.myapp.com", &good[..len]);
         }
         // A record claiming more RDATA than is present.
-        let mut lying = good.clone();
+        let mut lying = good;
         let rdlen_at = lying.len() - 1 - 1 - "v".len();
         lying[rdlen_at..rdlen_at + 2].copy_from_slice(&9999_u16.to_be_bytes());
         assert!(parse_txt_response(4, "x.myapp.com", &lying).is_err());

@@ -7181,7 +7181,7 @@ fn parse_resolver_addr(entry: &str) -> Result<std::net::SocketAddr, String> {
 pub enum AcmeDnsProvider {
     /// Cloudflare DNS, via the v4 REST API with a scoped API token.
     Cloudflare,
-    /// Amazon Route 53, via `ChangeResourceRecordSets` with SigV4 credentials.
+    /// Amazon Route 53, via `ChangeResourceRecordSets` with `SigV4` credentials.
     Route53,
     /// An operator-provided hook program — the escape hatch for any other
     /// provider.

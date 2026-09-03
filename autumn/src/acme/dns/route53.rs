@@ -12,7 +12,7 @@
 //! The SDK's default HTTPS client pulls `aws-lc-rs` into the graph, and the
 //! workspace pins a single `ring` crypto backend everywhere (see the [`acme`]
 //! module docs). Route 53 here is three signed requests against a documented
-//! XML API, so it is spelled out directly: SigV4 over the `hmac`/`sha2` crates
+//! XML API, so it is spelled out directly: `SigV4` over the `hmac`/`sha2` crates
 //! already in the graph, pinned in tests to AWS's own published signing test
 //! vector.
 //!
@@ -31,7 +31,7 @@ use super::{DnsProvider, SecretString, TxtRecord};
 const API_HOST: &str = "route53.amazonaws.com";
 /// The Route 53 API version prefix.
 const API_PREFIX: &str = "/2013-04-01";
-/// SigV4 service name.
+/// `SigV4` service name.
 const SERVICE: &str = "route53";
 /// TTL for the ephemeral challenge record set.
 const CHALLENGE_TTL_SECS: u32 = 60;
@@ -45,7 +45,7 @@ pub struct Route53Credentials {
     pub secret_access_key: SecretString,
     /// Session token, for temporary (STS/role) credentials.
     pub session_token: Option<SecretString>,
-    /// Region used for SigV4 signing. Route 53 signs against `us-east-1` in the
+    /// Region used for `SigV4` signing. Route 53 signs against `us-east-1` in the
     /// commercial partition.
     pub region: String,
     /// An explicit hosted zone id, skipping the `ListHostedZonesByName` lookup.
@@ -59,7 +59,7 @@ pub struct Route53Provider {
     /// Resolved `zone name → hosted zone id`, so publishing two records for one
     /// zone does not repeat the lookup.
     zone_ids: RwLock<std::collections::HashMap<String, String>>,
-    /// Injectable clock, so the SigV4 timestamp is deterministic in tests.
+    /// Injectable clock, so the `SigV4` timestamp is deterministic in tests.
     now: fn() -> std::time::SystemTime,
 }
 
@@ -76,7 +76,7 @@ impl Route53Provider {
     }
 
     async fn send(&self, request: HttpRequest, what: &str) -> Result<String, String> {
-        let signed = sign_request(request, &self.credentials, amz_date((self.now)()))?;
+        let signed = sign_request(request, &self.credentials, &amz_date((self.now)()))?;
         let url = signed.url.clone();
         let response = self.transport.send(signed).await?;
         check_response(&response, what, &url)
@@ -225,15 +225,15 @@ impl DnsProvider for Route53Provider {
 /// Build a `ChangeResourceRecordSets` body applying `action` to `fqdn` with
 /// exactly `values`.
 fn change_batch_xml(action: &str, fqdn: &str, values: &[String]) -> String {
-    let records: String = values
-        .iter()
-        .map(|v| {
-            format!(
-                "<ResourceRecord><Value>&quot;{}&quot;</Value></ResourceRecord>",
-                xml_escape(v)
-            )
-        })
-        .collect();
+    let mut records = String::new();
+    for value in values {
+        use std::fmt::Write as _;
+        let _ = write!(
+            records,
+            "<ResourceRecord><Value>&quot;{}&quot;</Value></ResourceRecord>",
+            xml_escape(value)
+        );
+    }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <ChangeResourceRecordSetsRequest \
@@ -358,8 +358,7 @@ fn check_response(response: &HttpResponse, what: &str, url: &str) -> Result<Stri
         return Ok(response.body.clone());
     }
     let detail = xml_element(&response.body, "Message")
-        .map(xml_unescape)
-        .unwrap_or_else(|| "no error detail returned".to_owned());
+        .map_or_else(|| "no error detail returned".to_owned(), xml_unescape);
     let redacted_url = url.split('?').next().unwrap_or(url);
     Err(format!(
         "could not {what} (HTTP {} from {redacted_url}): {detail}",
@@ -369,7 +368,7 @@ fn check_response(response: &HttpResponse, what: &str, url: &str) -> Result<Stri
 
 // ── AWS Signature Version 4 ──────────────────────────────────────────────────
 
-/// A SigV4 timestamp (`YYYYMMDDTHHMMSSZ`) for `at`.
+/// A `SigV4` timestamp (`YYYYMMDDTHHMMSSZ`) for `at`.
 fn amz_date(at: std::time::SystemTime) -> String {
     let secs = at
         .duration_since(std::time::UNIX_EPOCH)
@@ -421,7 +420,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-/// Percent-encode per SigV4 rules. `encode_slash = false` keeps `/` literal, as
+/// Percent-encode per `SigV4` rules. `encode_slash = false` keeps `/` literal, as
 /// the canonical URI requires.
 fn uri_encode(value: &str, encode_slash: bool) -> String {
     let mut out = String::with_capacity(value.len());
@@ -466,7 +465,7 @@ fn split_url(url: &str) -> (String, String) {
     (uri_encode(path, false), canonical_query)
 }
 
-/// Sign `request` with SigV4, returning it with the `authorization`,
+/// Sign `request` with `SigV4`, returning it with the `authorization`,
 /// `x-amz-date`, `host` (and, when present, `x-amz-security-token`) headers set.
 ///
 /// `timestamp` is the `YYYYMMDDTHHMMSSZ` signing time, injected so the signature
@@ -478,7 +477,7 @@ fn split_url(url: &str) -> (String, String) {
 fn sign_request(
     mut request: HttpRequest,
     credentials: &Route53Credentials,
-    timestamp: String,
+    timestamp: &str,
 ) -> Result<HttpRequest, String> {
     let host = request
         .url
@@ -495,7 +494,7 @@ fn sign_request(
     request.headers.insert("host".to_owned(), host);
     request
         .headers
-        .insert("x-amz-date".to_owned(), timestamp.clone());
+        .insert("x-amz-date".to_owned(), timestamp.to_owned());
     if let Some(token) = &credentials.session_token {
         request
             .headers
@@ -505,11 +504,16 @@ fn sign_request(
     let (canonical_uri, canonical_query) = split_url(&request.url);
     // `BTreeMap` already holds the headers sorted by name, which is what the
     // canonical request and `SignedHeaders` both require.
-    let canonical_headers: String = request
-        .headers
-        .iter()
-        .map(|(name, value)| format!("{}:{}\n", name.to_ascii_lowercase(), value.trim()))
-        .collect();
+    let mut canonical_headers = String::new();
+    for (name, value) in &request.headers {
+        use std::fmt::Write as _;
+        let _ = write!(
+            canonical_headers,
+            "{}:{}\n",
+            name.to_ascii_lowercase(),
+            value.trim()
+        );
+    }
     let signed_headers = request
         .headers
         .keys()
@@ -565,7 +569,7 @@ mod tests {
         }
     }
 
-    /// AWS's published `get-vanilla` SigV4 test-suite case. Hand-rolled signing
+    /// AWS's published `get-vanilla` `SigV4` test-suite case. Hand-rolled signing
     /// is only trustworthy if it reproduces the vendor's own vector, so this
     /// test is the contract: a change to canonicalisation that still "looks
     /// right" fails here.
@@ -573,13 +577,11 @@ mod tests {
     fn sigv4_matches_the_aws_get_vanilla_test_vector() {
         let signed = sign_request(
             HttpRequest::new("GET", "https://example.amazonaws.com/"),
-            &Route53Credentials {
-                // The vector signs for service `service`, not `route53`; assert
-                // on the parts that do not depend on the service name, plus the
-                // canonical request itself, which is where the bugs live.
-                ..credentials()
-            },
-            "20150830T123600Z".to_owned(),
+            // The vector signs for service `service`, not `route53`; assert on
+            // the parts that do not depend on the service name, plus the
+            // canonical request itself, which is where the bugs live.
+            &credentials(),
+            "20150830T123600Z",
         )
         .expect("signs");
         let (uri, query) = split_url("https://example.amazonaws.com/");
@@ -633,7 +635,7 @@ mod tests {
             )
             .body("<x/>"),
             &credentials(),
-            "20150830T123600Z".to_owned(),
+            "20150830T123600Z",
         )
         .expect("signs");
         let rendered = format!("{signed:?}");
@@ -655,7 +657,7 @@ mod tests {
                 "https://route53.amazonaws.com/2013-04-01/hostedzonesbyname",
             ),
             &creds,
-            "20150830T123600Z".to_owned(),
+            "20150830T123600Z",
         )
         .expect("signs");
         assert_eq!(
@@ -729,14 +731,14 @@ mod tests {
 
     #[test]
     fn txt_values_are_read_unquoted_from_the_matching_record_set() {
-        let xml = r#"<ListResourceRecordSetsResponse><ResourceRecordSets>
+        let xml = r"<ListResourceRecordSetsResponse><ResourceRecordSets>
             <ResourceRecordSet><Name>_acme-challenge.myapp.com.</Name><Type>TXT</Type><TTL>60</TTL>
               <ResourceRecords>
                 <ResourceRecord><Value>&quot;value-one&quot;</Value></ResourceRecord>
                 <ResourceRecord><Value>&quot;value-two&quot;</Value></ResourceRecord>
               </ResourceRecords>
             </ResourceRecordSet>
-            </ResourceRecordSets></ListResourceRecordSetsResponse>"#;
+            </ResourceRecordSets></ListResourceRecordSetsResponse>";
         assert_eq!(
             txt_values_for(xml, "_acme-challenge.myapp.com"),
             vec!["value-one".to_owned(), "value-two".to_owned()]
@@ -751,11 +753,11 @@ mod tests {
     // publish clobber an unrelated record.
     #[test]
     fn a_cursor_result_for_another_name_reads_as_empty() {
-        let xml = r#"<ListResourceRecordSetsResponse><ResourceRecordSets>
+        let xml = r"<ListResourceRecordSetsResponse><ResourceRecordSets>
             <ResourceRecordSet><Name>www.myapp.com.</Name><Type>TXT</Type><TTL>300</TTL>
               <ResourceRecords><ResourceRecord><Value>&quot;unrelated&quot;</Value></ResourceRecord></ResourceRecords>
             </ResourceRecordSet>
-            </ResourceRecordSets></ListResourceRecordSetsResponse>"#;
+            </ResourceRecordSets></ListResourceRecordSetsResponse>";
         assert!(txt_values_for(xml, "_acme-challenge.myapp.com").is_empty());
     }
 

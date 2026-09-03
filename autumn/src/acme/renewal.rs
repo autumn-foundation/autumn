@@ -686,14 +686,13 @@ impl AcmeRenewalTask {
         // the CA to *queue* validation, so a token or TXT record removed before
         // the order reaches `ready` is removed while the CA is still looking at
         // it.
-        match &self.dns {
-            Some(dns) => self.answer_dns01(&mut order, dns).await?,
-            None => {
-                let published = self.answer_http01(&mut order).await?;
-                let ready = self.await_order_ready(&mut order).await;
-                drop(published);
-                ready?;
-            }
+        if let Some(dns) = &self.dns {
+            self.answer_dns01(&mut order, dns).await?;
+        } else {
+            let published = self.answer_http01(&mut order).await?;
+            let ready = self.await_order_ready(&mut order).await;
+            drop(published);
+            ready?;
         }
         self.finalize_and_install(&mut order).await
     }

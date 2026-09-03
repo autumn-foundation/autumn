@@ -163,7 +163,7 @@ pub struct DnsCredential {
     pub session_token: Option<SecretString>,
     /// Explicit Route 53 hosted zone id, skipping the zone lookup.
     pub hosted_zone_id: Option<String>,
-    /// AWS region used for SigV4 signing. Route 53 is global; defaults to
+    /// AWS region used for `SigV4` signing. Route 53 is global; defaults to
     /// `us-east-1`.
     pub region: Option<String>,
 }

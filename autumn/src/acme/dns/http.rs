@@ -22,7 +22,7 @@ pub struct HttpRequest {
     /// Absolute URL.
     pub url: String,
     /// Request headers. A `BTreeMap` so the order is deterministic — Route 53's
-    /// SigV4 canonical request depends on sorted header names.
+    /// `SigV4` canonical request depends on sorted header names.
     pub headers: BTreeMap<String, String>,
     /// Request body (empty for `GET`/`DELETE`).
     pub body: String,
@@ -113,7 +113,7 @@ pub trait HttpTransport: Send + Sync {
     ///
     /// Returns a transport-level message (DNS failure, TLS failure, timeout).
     /// A non-2xx status is a successful send, not an error.
-    fn send<'a>(&'a self, request: HttpRequest) -> BoxFuture<'a, Result<HttpResponse, String>>;
+    fn send(&self, request: HttpRequest) -> BoxFuture<'_, Result<HttpResponse, String>>;
 }
 
 /// The production [`HttpTransport`], over `reqwest`.
@@ -140,7 +140,7 @@ impl ReqwestTransport {
 }
 
 impl HttpTransport for ReqwestTransport {
-    fn send<'a>(&'a self, request: HttpRequest) -> BoxFuture<'a, Result<HttpResponse, String>> {
+    fn send(&self, request: HttpRequest) -> BoxFuture<'_, Result<HttpResponse, String>> {
         Box::pin(async move {
             let method = reqwest::Method::from_bytes(request.method.as_bytes())
                 .map_err(|e| format!("invalid HTTP method {}: {e}", request.method))?;

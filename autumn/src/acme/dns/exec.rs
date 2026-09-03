@@ -50,7 +50,7 @@ pub struct ExecProvider {
 impl ExecProvider {
     /// Build a provider running `command` (an argv array).
     #[must_use]
-    pub fn new(command: Vec<String>) -> Self {
+    pub const fn new(command: Vec<String>) -> Self {
         Self { command }
     }
 
@@ -96,14 +96,14 @@ impl ExecProvider {
         Err(format!(
             "the DNS-01 exec hook `{program}` failed `{action}` for TXT {} ({}){}",
             record.fqdn,
-            describe_status(&output.status),
+            describe_status(output.status),
             stderr_excerpt(&output.stderr)
         ))
     }
 }
 
 /// Describe a process exit status, including a signal death (which has no code).
-fn describe_status(status: &std::process::ExitStatus) -> String {
+fn describe_status(status: std::process::ExitStatus) -> String {
     status.code().map_or_else(
         || "terminated by a signal".to_owned(),
         |c| format!("exit status {c}"),
