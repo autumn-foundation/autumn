@@ -36,7 +36,7 @@ pub mod templates {
     pub const CI_WORKFLOW: &str = include_str!("templates/.github/workflows/ci.yml.tmpl");
     /// Dependency advisory policy read by the generated CI's `cargo deny check
     /// advisories` gate (issue #1600). Deliberately *not* framework-owned — see
-    /// [`framework_owned_files`].
+    /// [`super::framework_owned_files`].
     pub const DENY_TOML: &str = include_str!("templates/deny.toml.tmpl");
     pub const RUST_TOOLCHAIN: &str = include_str!("templates/rust-toolchain.toml.tmpl");
     pub const RUSTFMT: &str = include_str!("templates/rustfmt.toml.tmpl");
