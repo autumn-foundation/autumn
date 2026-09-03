@@ -71,7 +71,12 @@ jobs:
     name: Security posture gate (examples)
     runs-on: ubuntu-latest
     steps:
+      # Full history: the script resolves each example's *accepted* posture from
+      # the base revision, so that refreshing a committed baseline in the same
+      # change cannot make both sides of the diff agree.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run the posture gate over the example apps

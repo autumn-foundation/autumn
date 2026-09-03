@@ -146,21 +146,39 @@ fn route_index(m: &PostureManifest) -> BTreeMap<RouteKey, &RouteEntry> {
     index
 }
 
-/// Whether `candidate` describes a strictly wider posture than `current`, used
-/// only to break duplicate-key ties in the conservative direction.
+/// Whether `candidate` describes a wider posture than `current`, used only to
+/// break duplicate-key ties in the conservative direction.
 fn more_open(candidate: &RouteEntry, current: &RouteEntry) -> bool {
-    match (
-        is_open(&candidate.classification),
-        is_open(&current.classification),
-    ) {
-        (true, false) => true,
-        (false, true) => false,
-        // Same openness: fewer scopes and no policy check is the wider one.
-        _ => {
-            (candidate.scope_set().len(), usize::from(candidate.policy))
-                < (current.scope_set().len(), usize::from(current.policy))
-        }
-    }
+    openness_key(candidate) > openness_key(current)
+}
+
+/// A comparable "how reachable is this route" key, higher meaning wider.
+///
+/// Every dimension the manifest proves, in the direction the framework's own
+/// semantics give it:
+///
+/// - an unguarded classification beats a guarded one;
+/// - **no** role requirement is the widest of all (`#[secured]` admits every
+///   authenticated session), and among non-empty lists more roles is wider,
+///   because roles are OR-ed;
+/// - fewer required scopes is wider, because scopes are AND-ed;
+/// - no record-level policy check is wider.
+///
+/// Leaving roles out of this — as the first cut did — meant two duplicate
+/// `gated` entries differing only in roles tied, and array order picked the
+/// winner. The order that hid the wider entry was the one that passed.
+fn openness_key(entry: &RouteEntry) -> (u8, usize, usize, u8) {
+    let roles = entry.role_set();
+    (
+        u8::from(is_open(&entry.classification)),
+        if roles.is_empty() {
+            usize::MAX
+        } else {
+            roles.len()
+        },
+        usize::MAX - entry.scope_set().len(),
+        u8::from(!entry.policy),
+    )
 }
 
 fn diff_routes(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Finding>) {
@@ -1386,6 +1404,29 @@ mod tests {
             );
         }
         assert_eq!(diff(&base, &gated_first), diff(&base, &public_first));
+    }
+
+    /// Two duplicate `gated` entries differing only in roles must not let array
+    /// order decide: an empty role list admits every authenticated session,
+    /// so it is the wider of the two and has to win either way.
+    #[test]
+    fn a_duplicate_route_key_resolves_on_roles_too() {
+        let base = routes_only(&route("/a", "GET", "gated", &["admin"], &[], false));
+        let with_role = route("/a", "GET", "gated", &["admin"], &[], false);
+        let no_roles = route("/a", "GET", "gated", &[], &[], false);
+
+        let role_first = routes_only(&format!("{with_role},{no_roles}"));
+        let none_first = routes_only(&format!("{no_roles},{with_role}"));
+
+        for head in [&role_first, &none_first] {
+            let f = only(diff(&base, head));
+            assert_eq!(
+                f.kind, "roles_cleared",
+                "the entry admitting every authenticated session must win"
+            );
+            assert_eq!(f.severity, Severity::Widening);
+        }
+        assert_eq!(diff(&base, &role_first), diff(&base, &none_first));
     }
 
     /// The acknowledgment digest must describe the *set* of widenings, not the

@@ -9,9 +9,11 @@
 #   1. Build each example's posture manifest with `autumn routes audit`. That
 #      is the head side, and it also enforces #1604's default-deny rule — an
 #      unclassified route fails here before any diffing happens.
-#   2. Diff it against the manifest committed next to the example. Widening —
-#      a route becoming reachable by more callers, a guard removed or loosened —
-#      fails this script. Narrowing and neutral changes are printed and pass.
+#   2. Diff it against the baseline as of the BASE REVISION — not the working
+#      tree. A change that widens an example and refreshes its committed
+#      manifest in the same commit would otherwise compare identical sides and
+#      pass, which is precisely the change the gate exists to catch. Widening
+#      fails this script; narrowing and neutral changes are printed and pass.
 #
 # Drift between the committed manifest and the freshly built one is reported,
 # not failed: unlike an app repository, this one *is* the framework, so the
@@ -50,6 +52,20 @@ case "${1:-}" in
 esac
 
 ACK="${AUTUMN_POSTURE_ACK:-}"
+
+# The revision whose committed manifests count as the accepted posture. In CI
+# this is the pull request's base branch; locally it defaults to the upstream
+# trunk, and falls back to HEAD (with a notice) when neither is fetched — a
+# working-tree comparison is still useful when you have not touched the
+# baseline, and the CI run is the one that must be strict.
+POSTURE_BASE_REF="${POSTURE_BASE_REF:-}"
+if [ -z "$POSTURE_BASE_REF" ]; then
+  if [ -n "${GITHUB_BASE_REF:-}" ]; then
+    POSTURE_BASE_REF="origin/${GITHUB_BASE_REF}"
+  else
+    POSTURE_BASE_REF="origin/trunk-dev"
+  fi
+fi
 
 die() {
   echo "error: $*" >&2
@@ -102,7 +118,33 @@ for example in "${EXAMPLES[@]}"; do
     die "$example: no committed baseline at $baseline — run $0 --update"
   fi
 
-  args=(routes posture diff --base "$baseline" --head "$fresh" --format text)
+  # Resolve the base side from the base revision, so refreshing the committed
+  # manifest in the same change cannot make both sides agree.
+  accepted="$work/$example.base.json"
+  bootstrap=0
+  if ! git rev-parse --verify --quiet "$POSTURE_BASE_REF^{commit}" >/dev/null; then
+    # No base revision in this checkout (a shallow clone, or a local clone with
+    # no remote). Comparing against the working tree still catches a widening
+    # you have not also written into the baseline; the CI run, which does have
+    # the base ref, is the strict one.
+    cp "$baseline" "$accepted"
+    note "$example: $POSTURE_BASE_REF is not in this checkout — comparing against"
+    note "$example: the working tree's $baseline (CI resolves the base ref)"
+  elif git cat-file -e "$POSTURE_BASE_REF:$baseline" 2>/dev/null; then
+    git show "$POSTURE_BASE_REF:$baseline" > "$accepted"
+    note "$example: comparing against $POSTURE_BASE_REF:$baseline"
+  else
+    # The baseline is new on this branch: there is no previously accepted
+    # posture to compare against, which is a bootstrap, not a clean bill.
+    bootstrap=1
+    accepted="$work/$example.absent.json"
+    note "$example: no baseline on $POSTURE_BASE_REF yet — bootstrapping"
+  fi
+
+  args=(routes posture diff --base "$accepted" --head "$fresh" --format text)
+  if [ "$bootstrap" = "1" ]; then
+    args+=(--allow-missing-base)
+  fi
   if [ -n "$ACK" ]; then
     args+=(--ack "$ACK")
     note "$example: acknowledgment supplied via AUTUMN_POSTURE_ACK"

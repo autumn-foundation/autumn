@@ -108,12 +108,20 @@ jobs:
 
       # Compiles the app and reads back its macro-expanded auth posture.
       - name: Build this commit's posture manifest
-        run: autumn routes audit --manifest "$POSTURE_MANIFEST"
+        run: |
+          set -euo pipefail
+          autumn routes audit --manifest "$POSTURE_MANIFEST"
+          # Hand it over under a fixed, flat name. `upload-artifact` makes the
+          # common ancestor of its search path the artifact root, so uploading
+          # `apps/my-app/security-posture.json` directly would arrive as
+          # `security-posture.json` and the download path would depend on how
+          # deep the manifest sits in the repository.
+          cp "$POSTURE_MANIFEST" posture-manifest.json
 
       - uses: actions/upload-artifact@v4
         with:
           name: posture-manifest
-          path: ${{ env.POSTURE_MANIFEST }}
+          path: posture-manifest.json
           retention-days: 7
           if-no-files-found: error
 
@@ -206,7 +214,7 @@ jobs:
             exit 0
           fi
           git show "HEAD:${POSTURE_MANIFEST}" > committed-posture.json
-          FRESH=$(autumn routes posture digest --manifest "head-posture/${POSTURE_MANIFEST}")
+          FRESH=$(autumn routes posture digest --manifest head-posture/posture-manifest.json)
           COMMITTED=$(autumn routes posture digest --manifest committed-posture.json)
           if [ "$FRESH" != "$COMMITTED" ]; then
             echo "::error file=$POSTURE_MANIFEST::the committed posture manifest describes a different security posture than this commit builds ($COMMITTED vs $FRESH) — run \`autumn routes audit --manifest $POSTURE_MANIFEST\` and commit the result"
@@ -291,7 +299,7 @@ jobs:
           set +e
           autumn routes posture diff \
             --base base-posture.json \
-            --head "head-posture/${POSTURE_MANIFEST}" \
+            --head head-posture/posture-manifest.json \
             --allow-missing-base \
             --ack-file acks.txt \
             --format markdown \
