@@ -31,6 +31,12 @@
 #      also eats the next token is read from the field's type in the derive —
 #      `--force` (bool) does not, `--shard NAME` (Option<String>) does — so a
 #      value is never mistaken for a subcommand, or a subcommand for a value.
+#   3. A group whose subcommand clap REQUIRES is not left bare in a runnable
+#      line: `autumn db` exits with an error, while `autumn migrate` (an
+#      `Option<>` subcommand) is fine. Checked only inside a fence — in prose,
+#      `autumn deploy` is how English names the command family, 49 times in this
+#      corpus, and reporting those would bury the gate in false positives on
+#      correct pages.
 #
 # TRUTH SET: parsed from the clap derive input in `autumn-cli/src/**/*.rs`, not
 # from a checked-in snapshot. A snapshot is one forgotten regeneration away
@@ -73,10 +79,11 @@
 #     hostage to the CLI's argument spelling.
 #   - Shell comments inside a block. `shlex` strips them, so `# Run migrations
 #     first (autumn seed will error …)` is prose behind a `#`, not a command.
-#   - A command split across a PROSE line wrap (`… roll ONE back with `autumn
-#     deploy` / `rollback --only <host>``). Unlike a backslash continuation,
-#     which is shell syntax and IS folded before scanning, a prose wrap has no
-#     marker saying the sentence continues into a command.
+#   - A command split across a prose line wrap OUTSIDE a code span (`… roll ONE
+#     back with `autumn deploy` / `rollback --only <host>``, where the wrap
+#     falls between two separate spans). A span that wraps INSIDE its backticks
+#     is read — markdown renders it as one span, and missing that hid a live
+#     `autumn migrate run` in migrations.md behind a `\n> ` break.
 #   - Instructional prefixes in `skills/` (`2. Run: autumn migrate`). Reading
 #     after an arbitrary prose prefix is the heuristic most likely to start
 #     reporting sentences; the same skills name commands in code spans
@@ -264,11 +271,20 @@ def _last(path):
 
 
 def _subcommand_type(payload):
+    """(type, required) for a variant's `#[command(subcommand)]` field.
+
+    `required` is what says whether the bare group is runnable: clap rejects
+    `autumn db` outright (the field is `DbCommands`) but accepts `autumn
+    migrate` (the field is `Option<MigrateCommands>`), and the CLI's own tests
+    assert both.
+    """
     m = re.search(
         r'#\[command\([^\]]*\bsubcommand\b[^\]]*\)\]\s*(?:pub\s+)?\w+\s*:\s*'
-        r'(?:Option\s*<\s*)?([A-Za-z0-9_:]+)',
+        r'(Option\s*<\s*)?([A-Za-z0-9_:]+)',
         payload)
-    return _last(m.group(1)) if m else None
+    if not m:
+        return None, False
+    return _last(m.group(2)), not m.group(1)
 
 
 def _has_positional(payload):
@@ -337,32 +353,39 @@ def build_surface(sources):
                     spellings.add(a)
                 for group in re.findall(r'\b(?:visible_)?aliases\s*=\s*\[([^\]]*)\]', attrs):
                     spellings.update(re.findall(r'"([^"]+)"', group))
-                node = {'children': {}, 'positionals': False, 'options': {}}
+                node = {'children': {}, 'positionals': False, 'options': {},
+                        'requires_sub': False}
                 if kind == 'tuple':
                     inner = re.search(r'\(\s*(?:pub\s+)?([A-Za-z0-9_:]+)', payload)
                     if inner:
                         it = _last(inner.group(1))
                         if 'subcommand' in attrs:
+                            # `#[command(subcommand)] Variant(SomeCommands)` —
+                            # a tuple payload is never Option, so the group
+                            # cannot be run bare.
                             node['children'] = build(it, seen)
+                            node['requires_sub'] = bool(node['children'])
                         elif it in structs:
                             # `Variant(SomeArgs)` — a flattened args struct that
                             # may itself carry the subcommand (`Upgrade(UpgradeArgs)`).
-                            st = _subcommand_type(structs[it])
+                            st, required = _subcommand_type(structs[it])
                             if st:
                                 node['children'] = build(st, seen)
+                                node['requires_sub'] = required and bool(node['children'])
                             node['positionals'] = _has_positional(structs[it])
                             node['options'] = _options(structs[it])
                 elif kind == 'struct':
-                    st = _subcommand_type(payload)
+                    st, required = _subcommand_type(payload)
                     if st:
                         node['children'] = build(st, seen)
+                        node['requires_sub'] = required and bool(node['children'])
                     node['positionals'] = _has_positional(payload)
                     node['options'] = _options(payload)
                 for spelling in spellings:
                     tree[spelling] = node
             return tree
         if tname in structs:
-            st = _subcommand_type(structs[tname])
+            st, _ = _subcommand_type(structs[tname])
             return build(st, seen) if st else {}
         return {}
 
@@ -374,7 +397,8 @@ def build_surface(sources):
             key = (prefix + ' ' + k).strip()
             flat[key] = {'children': set(v['children']),
                          'positionals': v['positionals'],
-                         'options': v['options']}
+                         'options': v['options'],
+                         'requires_sub': v['requires_sub']}
             flat.update(flatten(v['children'], key))
         return flat
 
@@ -499,8 +523,13 @@ def commands(text):
             if tok == '--' and j + 1 < len(segment) and segment[j + 1] == 'autumn':
                 yield ' '.join(segment[j + 2:]), segment[j + 2:]
             elif tok.startswith('autumn ') and (inner := tokenize(tok)):
-                if inner[0] == 'autumn' and len(inner) > 1:
-                    yield ' '.join(inner[1:]), inner[1:]
+                # The inner command line goes through the SAME segment split as
+                # the outer one: `-C "autumn migrate && autumn nope"` is a chain
+                # too, and yielding it as one argv left everything after the
+                # first operator unjudged.
+                for part in _segments(inner):
+                    if part and part[0] == 'autumn' and len(part) > 1:
+                        yield ' '.join(part[1:]), part[1:]
 
 
 # A token that could name a command. Anything else — a flag, a `<PLACEHOLDER>`,
@@ -553,18 +582,56 @@ def invocations(text):
             return joined, at
         return line, lineno
 
+    # Prose accumulates into paragraphs before its code spans are read, because
+    # a markdown inline span may WRAP across source lines and still render as
+    # one span. Reading prose line by line missed every wrapped one — 72 of
+    # them in this corpus — including `autumn migrate\n> run` in
+    # `migrations.md`, which rendered as `autumn migrate run`: the same phantom
+    # subcommand this gate was written to remove, left behind by a text
+    # substitution that could not match across the break either.
+    para = []          # (offset_in_joined, lineno, text) for the current paragraph
+    para_len = 0
+
+    def take_paragraph():
+        """Read the code spans out of the accumulated prose, then clear it."""
+        nonlocal para, para_len
+        if not para:
+            return
+        joined = ' '.join(part for _, _, part in para)
+        for m in re.finditer(r'`([^`]+)`', joined):
+            at = para[0][1]
+            for offset, ln, _ in para:          # map the span back to its line
+                if offset <= m.start():
+                    at = ln
+            yield at, m.group(1)
+        para, para_len = [], 0
+
+    def add_prose(line, lineno):
+        """Accumulate one prose line, with any blockquote marker stripped."""
+        nonlocal para_len
+        stripped = re.sub(r'^\s*>+\s?', '', line)
+        para.append((para_len, lineno, stripped))
+        para_len += len(stripped) + 1
+
     for lineno, line in enumerate(text.split('\n'), 1):
         m = re.match(r'^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)', line)
         if m:
             held, held_at = [], None            # a fence boundary ends any hold
+            yield from _spans(take_paragraph(), commands)
             if fence is None:
                 fence, lang = m.group(1)[0], m.group(2).lower()
             elif line.strip().startswith(fence * 3):
                 fence, lang = None, None
             continue
-        candidates = []
-        report_at = lineno
-        if fence is not None and lang in SHELL_LANGS:
+
+        if fence is None:
+            if not line.strip():                # a blank line ends a paragraph
+                yield from _spans(take_paragraph(), commands)
+            else:
+                add_prose(line, lineno)
+            continue
+
+        if lang in SHELL_LANGS:
             # Continuations are shell syntax, so they are joined before
             # scanning — `autumn maintenance on \` + `--reason "…"` is one
             # command, and the guide writes five of them on that page alone.
@@ -573,16 +640,25 @@ def invocations(text):
             logical, at = flush(line, lineno)
             if logical is None:
                 continue
-            candidates.append((logical, True))
-            report_at = at
-        # Inline spans are bounded by their backticks, so they never continue.
-        candidates.extend((span, False) for span in re.findall(r'`([^`\n]+)`', line))
-        for text_, in_fence in candidates:
             # Operator splitting happens inside `commands()`, on tokens rather
             # than on the raw text, so an operator inside a quoted value cannot
             # cut a command in half.
-            for display, argv in commands(text_):
-                yield (report_at if in_fence else lineno), display, argv, in_fence
+            for display, argv in commands(logical):
+                yield at, display, argv, True
+            # A span inside a fence (a hint line quoting a command back) is
+            # still a span, and cannot wrap: the fence preserves line breaks.
+            for span in re.findall(r'`([^`\n]+)`', line):
+                for display, argv in commands(span):
+                    yield lineno, display, argv, False
+
+    yield from _spans(take_paragraph(), commands)
+
+
+def _spans(pairs, commands):
+    """Turn (lineno, span_text) pairs into invocation tuples."""
+    for lineno, span in pairs:
+        for display, argv in commands(span):
+            yield lineno, display, argv, False
 
 
 def blocks(text):
@@ -608,7 +684,7 @@ def blocks(text):
     return index
 
 
-def resolve(tokens, surface):
+def resolve(tokens, surface, runnable=False):
     """Return the drifted command path, or None when the command resolves.
 
     Takes SHELL TOKENS, not a string to be split on whitespace: a quoted option
@@ -663,6 +739,19 @@ def resolve(tokens, surface):
         if node['positionals']:                 # unjudgeable: a value, not a name
             return None
         return 'autumn ' + path + ' ' + tok
+
+    # Tokens exhausted on a group whose subcommand clap requires: `autumn db`
+    # exits with an error, so a fenced block containing it hands the reader a
+    # line that cannot run.
+    #
+    # ONLY inside a fence. In prose, `autumn deploy` is how English names the
+    # command family — "every host `autumn deploy` manages" — and the corpus
+    # does that 49 times for `deploy` alone and 15 for `generate`. Reporting
+    # those would bury the gate in false positives on correct pages, which is a
+    # worse outcome than the gap: a page that names a command group is not
+    # telling anyone to run it bare.
+    if runnable and surface[path]['requires_sub']:
+        return 'autumn ' + path
     return None
 
 
@@ -686,7 +775,7 @@ def scan(root, surface, files):
             allowed[m.group(1).strip()].update({marker_block, marker_block - 1})
 
         for lineno, display, argv, in_fence in invocations(text):
-            bad = resolve(argv, surface)
+            bad = resolve(argv, surface, runnable=in_fence)
             if bad is None:
                 continue
             command = bad[len('autumn '):]
@@ -888,6 +977,38 @@ def self_test():
            f'{list(invocations(cont))}')
     expect(list(invocations('```bash\nautumn migrate \\\n```')) == [],
            'a hold left open at the fence boundary must not leak into the next block')
+
+    # --- an inline span may WRAP across source lines and still render as one
+    # span. Missing that hid a live `autumn migrate run` in migrations.md — the
+    # very phantom this gate was built to remove — behind a `\n> ` break.
+    wrapped = 'Enforcement is `autumn migrate\nrun` in CI.'
+    expect([d for _, d, _, _ in invocations(wrapped)] == ['migrate run'],
+           f'a wrapped inline span must be read as one span: {list(invocations(wrapped))}')
+    quoted_bq = '> Recording happens via `autumn migrate\n> run` and nothing else.'
+    expect([d for _, d, _, _ in invocations(quoted_bq)] == ['migrate run'],
+           f'a blockquote marker must not break a wrapped span: {list(invocations(quoted_bq))}')
+    expect([n for n, _, _, _ in invocations(wrapped)] == [1],
+           'a wrapped span is reported at the line it starts on')
+    expect(list(invocations('One paragraph with `autumn\n\nmigrate` split by a blank line.')) == [],
+           'a blank line ends a paragraph, so a span cannot span two of them')
+
+    # --- a chain inside a quoted wrapper is still a chain.
+    inner_chain = '```bash\nfly ssh -C "autumn migrate && autumn nope"\n```'
+    expect([d for _, d, _, _ in invocations(inner_chain)] == ['migrate', 'nope'],
+           f'the inner command line must be segmented too: {list(invocations(inner_chain))}')
+
+    # --- groups whose subcommand clap requires. Only a RUNNABLE line is judged:
+    # in prose `autumn db` is how English names the command family.
+    expect(surface['db']['requires_sub'], 'a tuple subcommand payload is required')
+    expect(not surface['migrate']['requires_sub'], 'an Option<> subcommand is not required')
+    expect(not surface['upgrade']['requires_sub'],
+           'an Option<> subcommand inside an args struct is not required')
+    expect(resolve(tk('db'), surface, runnable=True) == 'autumn db',
+           'a fenced bare required group must be reported')
+    expect(resolve(tk('db'), surface, runnable=False) is None,
+           'the same group named in prose must NOT be reported')
+    expect(resolve(tk('migrate'), surface, runnable=True) is None,
+           'a bare group with an optional subcommand runs fine')
     # The quote rule must require `autumn` immediately inside the quote, or
     # every apostrophe in prose becomes a command position.
     expect(list(invocations("```bash\n# don't run autumn migrate here\n```")) == [],
@@ -928,7 +1049,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f"self-test: {13 + 23 + 19 + 4 - len(failures)} passed, {len(failures)} failed")
+    print(f"self-test: {13 + 29 + 26 + 4 - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
@@ -956,7 +1077,9 @@ def main():
     if defects:
         print()
         for f, lineno, bad, argv in defects:
-            print(f'{f}:{lineno}: `{bad}` is not a command  (line: autumn {argv})')
+            note = ('needs a subcommand' if bad[len('autumn '):] in surface
+                    else 'is not a command')
+            print(f'{f}:{lineno}: `{bad}` {note}  (line: autumn {argv})')
         print()
         print('Each line above tells a reader to run something the CLI will '
               'reject. Fix the page, or — if the page is deliberately naming a '

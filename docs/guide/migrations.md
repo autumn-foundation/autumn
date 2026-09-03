@@ -167,8 +167,8 @@ never delete or rename an applied migration; add a new migration instead.
 > **Note:** startup auto-migrate validation is **best-effort** and requires the
 > `migrations/` directory to be present on disk at runtime (production binaries
 > often ship without the source tree, in which case startup validation is
-> skipped rather than failing); authoritative enforcement is `autumn migrate
-> run` / `autumn migrate status` in CI or your deploy job, which check against
+> skipped rather than failing); authoritative enforcement is `autumn migrate` /
+> `autumn migrate status` in CI or your deploy job, which check against
 > an explicit migrations directory.
 >
 > Startup auto-migrate only **validates** on-disk content against recorded
