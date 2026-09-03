@@ -83,6 +83,12 @@ pub fn layout_with_seo(
                 script src=(asset_url("js/htmx.min.js")) {}
             }
             body class="bg-stone-50 min-h-screen font-sans text-stone-800 antialiased" {
+                a href="#main-content"
+                  class="skip-link sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 \
+                         focus:z-50 focus:px-4 focus:py-2 focus:bg-white focus:text-gray-900 \
+                         focus:border focus:border-gray-300 focus:rounded focus:shadow" {
+                    "Skip to main content"
+                }
                 // Navigation
                 nav class="border-b border-stone-200 bg-white/80 backdrop-blur-sm sticky top-0 z-10" {
                     div class="max-w-3xl mx-auto px-6 py-4 flex items-center justify-between" {
@@ -114,7 +120,7 @@ pub fn layout_with_seo(
                 }
 
                 // Main content
-                main class="max-w-3xl mx-auto py-10 px-6" {
+                main id="main-content" class="max-w-3xl mx-auto py-10 px-6" {
                     (content)
                 }
 
