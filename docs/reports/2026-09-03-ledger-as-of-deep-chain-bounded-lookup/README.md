@@ -23,7 +23,7 @@ reviewer asking about **recent** history far more often than about the
 record's very first state.
 
 Both generated methods are pure functions
-([`snapshot_as_of`](../../autumn/src/ledger.rs)) over whatever
+([`snapshot_as_of`](../../../autumn/src/ledger.rs)) over whatever
 `ledger_revisions(record_id)` returns, and `ledger_revisions` has exactly one
 SQL shape:
 
