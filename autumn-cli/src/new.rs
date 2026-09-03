@@ -2846,6 +2846,54 @@ mod tests {
         );
     }
 
+    /// The job that compiles the pull request holds no write permission and
+    /// reaches no verdict; the job that decides never runs application code.
+    /// A malicious build script therefore cannot replace the binary that later
+    /// computes the diff, resolves acknowledgments, and sets the exit code.
+    #[test]
+    fn the_gate_decides_in_a_job_that_never_compiles_the_pull_request() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        let (build_job, verdict_job) = workflow
+            .split_once("  posture:")
+            .expect("two jobs: the build and the verdict");
+
+        assert!(
+            build_job.contains("autumn routes audit --manifest"),
+            "the build job is the one that compiles: {build_job}"
+        );
+        assert!(
+            !build_job.contains("pull-requests: write"),
+            "the job that runs the pull request's build scripts gets no write token"
+        );
+        assert!(
+            !build_job.contains("routes posture diff"),
+            "and reaches no verdict"
+        );
+
+        // Structural, not textual: the verdict job's comments and diagnostics
+        // legitimately *mention* `autumn routes audit`. What it must not do is
+        // set up a toolchain or run the build step.
+        assert!(
+            !verdict_job.contains("dtolnay/rust-toolchain")
+                && !verdict_job.contains("Swatinem/rust-cache")
+                && !verdict_job.contains("Build this commit's posture manifest"),
+            "the verdict job must never compile the pull request: {verdict_job}"
+        );
+        assert!(verdict_job.contains("routes posture diff"));
+        assert!(
+            verdict_job.contains("download-artifact"),
+            "it reads the manifest as data"
+        );
+        assert!(
+            verdict_job.contains("Install the autumn CLI"),
+            "with a CLI it installs itself, not one the build job left behind"
+        );
+    }
+
     /// Bypasses the review found, each pinned by the thing that closes it.
     #[test]
     fn the_scaffolded_gate_closes_its_own_bypasses() {

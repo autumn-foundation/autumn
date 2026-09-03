@@ -49,6 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself, and fails rather than bootstrapping when a committed baseline
   disappears from the base branch.
 
+  The scaffolded workflow is two jobs: one compiles the pull request and emits
+  its manifest with no write permission and no verdict, and one that never
+  compiles anything downloads that manifest, diffs it, and decides — so a build
+  script in the diff cannot replace the binary that computes the verdict.
+
   `autumn new` scaffolds `.github/workflows/posture-gate.yml` by default;
   existing apps adopt it with `autumn upgrade --apply`. The scaffolded deploy
   workflows attest `security-posture.json` with

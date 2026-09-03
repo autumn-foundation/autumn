@@ -104,8 +104,27 @@ bootstrapping.
 
 ## How a run works
 
+The workflow is two jobs, and the split is the point:
+
+- **`manifest`** compiles the pull request and emits its posture manifest.
+  Compiling runs the pull request's own build scripts and procedural macros, so
+  this job is treated as untrusted: it holds no write permission and reaches no
+  verdict.
+- **`posture`** never compiles anything. It downloads that manifest, diffs it
+  with a CLI it installs itself, resolves acknowledgments, posts the comment,
+  and decides.
+
+So the machinery that decides — the diff, the acknowledgment check, the exit
+code — cannot be replaced by code the pull request ships. What that does *not*
+buy: the manifest itself is derived from building that code, and a build script
+can make an app dump whatever route list it likes. A build-derived manifest is
+only ever as trustworthy as your review of the build scripts and macros in the
+diff; no gate can assert that away.
+
+Step by step:
+
 1. `autumn routes audit --manifest security-posture.json` builds this commit's
-   manifest. That is the only build the job pays for.
+   manifest. That is the only build the gate pays for.
 2. The workflow fails if the committed `security-posture.json` describes a
    different *posture* than the one just built — a stale committed manifest
    would make the diff lie. The comparison is by posture digest, not by bytes,
@@ -275,6 +294,11 @@ doesn't. It inherits every boundary of
 - **Middleware-imposed guards.** A route protected by a `RequireApiToken` layer
   rather than by `#[secured]` is `unclassified` to `routes audit`, so it never
   reaches this gate in the first place — `routes audit` fails on it first.
+- **A build that lies.** The manifest comes from compiling the pull request, so
+  a build script or procedural macro in the diff can influence what the app
+  reports about itself. The gate isolates the *verdict* from that code (see
+  "How a run works"), not the *measurement*. Review build scripts as the
+  privileged code they are.
 
 ---
 

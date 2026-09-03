@@ -23,7 +23,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::model::{PostureManifest, RouteEntry, RouteKey, escape_field, hex_digest, is_open};
+use super::model::{
+    PostureManifest, RouteEntry, RouteKey, escape_field, escape_list, hex_digest, is_open,
+};
 
 /// Which way a change moves the security surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -325,7 +327,7 @@ fn compare_roles(
             path: after.path.clone(),
             before: label_before.to_owned(),
             after: label_after.to_owned(),
-            fingerprint: format!("roles-cleared:{}", removed.join(",")),
+            fingerprint: format!("roles-cleared:{}", escape_list(&removed)),
             detail: format!(
                 "role requirement dropped ({}) — any authenticated session now passes",
                 removed.join(", ")
@@ -343,7 +345,7 @@ fn compare_roles(
             path: after.path.clone(),
             before: label_before.to_owned(),
             after: label_after.to_owned(),
-            fingerprint: format!("roles-first:{}", added.join(",")),
+            fingerprint: format!("roles-first:{}", escape_list(&added)),
             detail: format!(
                 "route now requires role{} {} — previously any authenticated session passed",
                 plural(added.len()),
@@ -360,7 +362,7 @@ fn compare_roles(
             path: after.path.clone(),
             before: label_before.to_owned(),
             after: label_after.to_owned(),
-            fingerprint: format!("roles+{}", added.join(",")),
+            fingerprint: format!("roles+{}", escape_list(&added)),
             detail: format!(
                 "role{} {} now also admitted",
                 plural(added.len()),
@@ -376,7 +378,7 @@ fn compare_roles(
             path: after.path.clone(),
             before: label_before.to_owned(),
             after: label_after.to_owned(),
-            fingerprint: format!("roles-{}", removed.join(",")),
+            fingerprint: format!("roles-{}", escape_list(&removed)),
             detail: format!(
                 "role{} {} no longer admitted",
                 plural(removed.len()),
@@ -411,7 +413,7 @@ fn compare_scopes(
             path: after.path.clone(),
             before: label_before.to_owned(),
             after: label_after.to_owned(),
-            fingerprint: format!("scopes-{}", removed.join(",")),
+            fingerprint: format!("scopes-{}", escape_list(&removed)),
             detail: format!(
                 "scope{} {} no longer required",
                 plural(removed.len()),
@@ -427,7 +429,7 @@ fn compare_scopes(
             path: after.path.clone(),
             before: label_before.to_owned(),
             after: label_after.to_owned(),
-            fingerprint: format!("scopes+{}", added.join(",")),
+            fingerprint: format!("scopes+{}", escape_list(&added)),
             detail: format!(
                 "scope{} {} now required",
                 plural(added.len()),
@@ -514,7 +516,11 @@ fn diff_authorization_policies(
             path: path.clone(),
             before: format!("authorize({action}, {resource})"),
             after: "none".to_owned(),
-            fingerprint: format!("authz-removed:{action}:{resource}"),
+            fingerprint: format!(
+                "authz-removed:{}:{}",
+                escape_field(action),
+                escape_field(resource)
+            ),
             detail,
         });
     }
@@ -526,7 +532,11 @@ fn diff_authorization_policies(
             path: path.clone(),
             before: "none".to_owned(),
             after: format!("authorize({action}, {resource})"),
-            fingerprint: format!("authz-added:{action}:{resource}"),
+            fingerprint: format!(
+                "authz-added:{}:{}",
+                escape_field(action),
+                escape_field(resource)
+            ),
             detail: format!("record-level authorization `{action}` on `{resource}` now checked"),
         });
     }
@@ -600,7 +610,7 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
             // an acknowledgment for one set would silently cover another.
             fingerprint: format!(
                 "csrf-disabled:{}",
-                &hex_digest(routes.join("\n").as_bytes())[..16]
+                &hex_digest(escape_list(&routes).as_bytes())[..16]
             ),
             detail: format!(
                 "CSRF enforcement lost on all {} mutating routes: {}",

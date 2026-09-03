@@ -284,8 +284,8 @@ impl PostureManifest {
                 escape_field(&r.path),
                 escape_field(&r.method),
                 escape_field(&r.classification),
-                escape_field(&roles.join(",")),
-                escape_field(&scopes.join(",")),
+                escape_list(&roles),
+                escape_list(&scopes),
                 r.policy
             ));
         }
@@ -347,10 +347,29 @@ pub fn escape_field(value: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
+            // The list separator too, so `escape_list` below can join with a
+            // bare comma and stay unambiguous.
+            ',' => out.push_str("\\,"),
             other => out.push(other),
         }
     }
     out
+}
+
+/// Escape each element and join with a comma.
+///
+/// Role and scope names are unrestricted string literals — `#[secured("a,b")]`
+/// compiles — so joining first and escaping afterwards would make `["a,b"]` and
+/// `["a", "b"]` identical. Under OR semantics those are different postures:
+/// the second admits two roles. Every element is escaped on its own, so the
+/// only bare comma in the result is a separator.
+#[must_use]
+pub fn escape_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| escape_field(item))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Lower-case hex SHA-256 of `bytes`.
@@ -466,6 +485,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a.posture_digest(), b.posture_digest());
+    }
+
+    /// `#[secured("a,b")]` is legal — role and scope names are unrestricted
+    /// string literals — so joining a list with commas and escaping only the
+    /// joined string makes `["a,b"]` and `["a", "b"]` hash identically. Under OR
+    /// semantics those are different postures: the second admits two roles.
+    #[test]
+    fn a_comma_inside_a_role_name_does_not_forge_a_second_role() {
+        let one_odd_role = PostureManifest::parse(
+            &manifest(
+                r#"{"path":"/a","method":"GET","classification":"gated","roles":["a,b"],"scopes":[],"policy":false}"#,
+            ),
+            "a",
+        )
+        .unwrap();
+        let two_roles = PostureManifest::parse(
+            &manifest(
+                r#"{"path":"/a","method":"GET","classification":"gated","roles":["a","b"],"scopes":[],"policy":false}"#,
+            ),
+            "b",
+        )
+        .unwrap();
+        assert_ne!(one_odd_role.posture_digest(), two_roles.posture_digest());
+    }
+
+    #[test]
+    fn a_comma_inside_a_scope_name_does_not_forge_a_second_scope() {
+        let one = PostureManifest::parse(
+            &manifest(
+                r#"{"path":"/a","method":"GET","classification":"gated","roles":[],"scopes":["x,y"],"policy":false}"#,
+            ),
+            "a",
+        )
+        .unwrap();
+        let two = PostureManifest::parse(
+            &manifest(
+                r#"{"path":"/a","method":"GET","classification":"gated","roles":[],"scopes":["x","y"],"policy":false}"#,
+            ),
+            "b",
+        )
+        .unwrap();
+        assert_ne!(one.posture_digest(), two.posture_digest());
+    }
+
+    #[test]
+    fn escaping_is_reversible_enough_to_keep_fields_distinct() {
+        // The pairs that would collide under a weaker scheme.
+        assert_ne!(escape_field("a\tb"), escape_field("a\\tb"));
+        assert_ne!(escape_field("a,b"), escape_list(&["a".into(), "b".into()]));
+        assert_ne!(
+            escape_list(&["a,b".into()]),
+            escape_list(&["a".into(), "b".into()])
+        );
     }
 
     #[test]

@@ -4,19 +4,36 @@
 # workflow answers the next question on every pull request: what did the change
 # DO to it, and did a human agree?
 #
-# How it works:
+# Two jobs, and the split is deliberate:
 #
-#   1. Build this commit's posture manifest (`autumn routes audit --manifest`).
-#   2. Check the committed `security-posture.json` still describes the same
-#      posture — a stale committed manifest would make the diff below lie.
-#      Compared by posture digest, not by bytes, so a moved line number or a
-#      renamed handler does not fail your CI.
-#   3. Read the base branch's committed manifest out of git (no second build).
-#   4. Diff the two. Widening changes — a new public route, a gate removed or
-#      loosened, a classification downgraded — fail this check. Narrowing and
-#      neutral changes annotate and never block. No posture change posts
-#      nothing at all.
-#   5. Post (or update) one comment carrying the diff.
+#   `manifest` — compiles the pull request and emits its posture manifest.
+#                Compiling runs the pull request's own build scripts and
+#                procedural macros, so this job is treated as untrusted: it
+#                holds no write permission and reaches no verdict.
+#   `posture`  — never compiles anything. It downloads that manifest, diffs it
+#                against the base branch's committed one with a freshly
+#                installed CLI, resolves acknowledgments, posts the comment,
+#                and decides.
+#
+# What that buys, and what it does not: the machinery that decides — the diff,
+# the acknowledgment check, the exit code — cannot be replaced by code the pull
+# request ships. The *manifest itself* is still derived from building that code,
+# and a build script can make an app dump whatever route list it likes, so a
+# posture manifest is only ever as trustworthy as your review of the build
+# scripts and macros in the diff. That is a property of every build-derived
+# manifest, not something a gate can assert away.
+#
+# The rest of the pipeline:
+#
+#   1. Check the committed `security-posture.json` still describes the same
+#      posture — a stale committed manifest would make the diff lie. Compared
+#      by posture digest, not by bytes, so a moved line number or a renamed
+#      handler does not fail your CI.
+#   2. Read the base branch's committed manifest out of git (no second build).
+#   3. Diff. Widening changes — a new public route, a gate removed or loosened,
+#      a classification downgraded — fail this check. Narrowing and neutral
+#      changes annotate and never block. No posture change posts nothing.
+#   4. Post (or update) one comment carrying the diff.
 #
 # Unblocking a widening you meant to make — the escape hatch, and the only one
 # this workflow provides: comment on the pull request with the line the report
@@ -24,10 +41,10 @@
 #
 #     /ack-posture <digest>  the reason this is intended
 #
-# from an account with write access (the harvest step below checks the
-# repository permission of each commenter, not just their org affiliation).
-# The digest names that exact set of widenings: pushing unrelated commits keeps
-# the acknowledgment valid, and a NEW widening needs a new one.
+# from an account with write access (the harvest step checks the repository
+# permission of each commenter, not just their org affiliation). The digest
+# names that exact set of widenings: pushing unrelated commits keeps the
+# acknowledgment valid, and a NEW widening needs a new one.
 #
 # NOTE: commenting does not re-run this workflow — `pull_request` does not fire
 # on comments. After posting the marker, re-run the check (Checks → the
@@ -54,8 +71,6 @@ on:
 
 permissions:
   contents: read
-  # To post the posture diff as a comment. Nothing else in this workflow writes.
-  pull-requests: write
 
 concurrency:
   # Two pushes in quick succession would otherwise each post their own comment.
@@ -69,17 +84,17 @@ env:
   POSTURE_MANIFEST: security-posture.json
 
 jobs:
-  posture:
-    name: Security posture diff
+  # ── Untrusted half: compiles the pull request ───────────────────────────────
+  # No write permission, no verdict, no acknowledgment handling. Everything this
+  # job produces is treated as data by the job below.
+  manifest:
+    name: Build the posture manifest
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
-      # The base branch's copy of the manifest is read out of git below, so the
-      # base ref has to be in the checkout. `fetch-depth: 0` is what puts
-      # `origin/<base>` there — do not lower it.
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@{{rust_version}}
 
@@ -90,6 +105,49 @@ jobs:
           curl -fsSL "https://raw.githubusercontent.com/autumn-foundation/autumn/v{{autumn_version}}/scripts/install.sh" \
             | sh -s -- --version "v{{autumn_version}}"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Compiles the app and reads back its macro-expanded auth posture.
+      - name: Build this commit's posture manifest
+        run: autumn routes audit --manifest "$POSTURE_MANIFEST"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: posture-manifest
+          path: ${{ env.POSTURE_MANIFEST }}
+          retention-days: 7
+          if-no-files-found: error
+
+  # ── Trusted half: decides ──────────────────────────────────────────────────
+  # Runs no application code — no `cargo`, no build scripts, no macros. It reads
+  # JSON with a CLI it installs itself.
+  posture:
+    name: Security posture diff
+    runs-on: ubuntu-latest
+    needs: manifest
+    permissions:
+      contents: read
+      # To post the posture diff as a comment. Nothing else here writes.
+      pull-requests: write
+
+    steps:
+      # The base branch's copy of the manifest is read out of git below, so the
+      # base ref has to be in the checkout. `fetch-depth: 0` is what puts
+      # `origin/<base>` there — do not lower it. The working tree is only ever
+      # read here; nothing in it is executed.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install the autumn CLI
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/autumn-foundation/autumn/v{{autumn_version}}/scripts/install.sh" \
+            | sh -s -- --version "v{{autumn_version}}"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: posture-manifest
+          path: head-posture
 
       # This workflow decides whether the pull request may merge, and it runs
       # from the pull request's own copy of itself. Editing it in the same
@@ -112,11 +170,6 @@ jobs:
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
 
-      # Compiles the app and reads back its macro-expanded auth posture. This is
-      # the only build this job pays for: the base side is a file read.
-      - name: Build this commit's posture manifest
-        run: autumn routes audit --manifest "$POSTURE_MANIFEST"
-
       # A committed manifest that no longer describes this commit's posture
       # would make the diff below describe a posture this commit does not have.
       # Compared by digest: the posture digest deliberately excludes handler
@@ -130,7 +183,7 @@ jobs:
             exit 0
           fi
           git show "HEAD:${POSTURE_MANIFEST}" > committed-posture.json
-          FRESH=$(autumn routes posture digest --manifest "$POSTURE_MANIFEST")
+          FRESH=$(autumn routes posture digest --manifest "head-posture/${POSTURE_MANIFEST}")
           COMMITTED=$(autumn routes posture digest --manifest committed-posture.json)
           if [ "$FRESH" != "$COMMITTED" ]; then
             echo "::error file=$POSTURE_MANIFEST::the committed posture manifest describes a different security posture than this commit builds ($COMMITTED vs $FRESH) — run \`autumn routes audit --manifest $POSTURE_MANIFEST\` and commit the result"
@@ -210,7 +263,7 @@ jobs:
           set +e
           autumn routes posture diff \
             --base base-posture.json \
-            --head "$POSTURE_MANIFEST" \
+            --head "head-posture/${POSTURE_MANIFEST}" \
             --allow-missing-base \
             --ack-file acks.txt \
             --format markdown \
