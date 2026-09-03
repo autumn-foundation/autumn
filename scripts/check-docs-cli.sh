@@ -59,6 +59,33 @@
 #     sentence is not a copyable line, and scanning prose drags in every
 #     "autumn is", "autumn never", "the autumn crate".
 #
+# WHAT IS NOT EXTRACTED, ON PURPOSE. The corpus was swept for every line in a
+# copyable context naming `autumn <word>` that this script yields nothing for.
+# 38 lines remain, and every one of them was resolved by hand against the parsed
+# surface: none names a command that does not exist. So the list below is a
+# latent gap, not a live defect, and widening the pattern to reach it would add
+# regex surface and false-positive risk for zero defects found today:
+#   - Program output quoted back at the reader: banner lines (`🍂 autumn
+#     doctor`), log records (`[autumn routes] warning: …`), `--help` transcripts
+#     (`Scaffold one with:   autumn new <name> --starter …`), tree diagrams
+#     (`└─ autumn build --embed`). These are what the tool PRINTED, not what the
+#     reader types, and gating them would make every log line in the guide a
+#     hostage to the CLI's argument spelling.
+#   - Shell comments inside a block (`# Run migrations first (autumn seed will
+#     error …)`). Prose that happens to sit behind a `#`.
+#   - A command split across a prose line wrap (`… roll ONE back with `autumn
+#     deploy` / `rollback --only <host>``), which no line-oriented scan can
+#     reassemble.
+#   - Instructional prefixes in `skills/` (`2. Run: autumn migrate`). Reading
+#     after an arbitrary prose prefix is the heuristic most likely to start
+#     reporting sentences; the same skills name commands in code spans
+#     elsewhere, and those ARE gated.
+# Wrapper forms that ARE extracted, because they are unambiguous command
+# positions rather than prose: after a `--` separator (`kubectl exec deploy/app
+# -- autumn …`), inside a quoted wrapper argument (`fly ssh console -C "autumn
+# …"`), and after env assignments whose value is a command substitution
+# (`AUTUMN_MASTER_KEY=$(cat config/master.key) autumn …`).
+#
 # CHAINS: a line may hold several commands (`autumn migrate && autumn seed &&
 # autumn dev` appears in the guide). Every command in the chain is resolved, not
 # just the first — checking only the head would leave the tail of every chained
@@ -356,8 +383,20 @@ CHAIN = re.compile(r'&&|\|\||[;|&]')
 # `autumn` to head the segment skipped every one of them.
 # The `\s` after the name rejects `autumn-cli`, `autumn-web` and `autumn/src/…`;
 # anchoring to the segment start rejects `./autumn` and `cd autumn`.
+# An env-assignment value may itself be a command substitution containing
+# spaces (`AUTUMN_MASTER_KEY=$(cat config/master.key.new) autumn credentials
+# edit`), so `\S*` alone is not enough to step over it.
+_ENV_ASSIGN = r'[A-Za-z_][A-Za-z0-9_]*=(?:\$\([^)]*\)|\S)*\s+'
+
+# A wrapper may hand the command to a remote shell, either after an explicit
+# `--` separator (`kubectl exec deploy/app -- autumn canary rollback`) or inside
+# a quoted argument (`fly ssh console -C "autumn canary rollback"`). Both are
+# unambiguous command positions, unlike the prose and program output the head
+# comment lists as out of scope.
+_WRAPPER = r'(?:.*?\s--\s+|.*?["\'])'
+
 INVOCATION = re.compile(
-    r'^[\s(]*\$?\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*autumn\s+(.+)$')
+    r'^(?:[\s(]*\$?\s*|' + _WRAPPER + r')(?:' + _ENV_ASSIGN + r')*autumn\s+(.+)$')
 
 # A token that could name a command. Anything else — a flag, a `<PLACEHOLDER>`,
 # a TOML `= "0.1.0"`, a box-drawing character from a diagram — ends the walk.
@@ -659,6 +698,23 @@ def self_test():
            f'env assignments must not hide the command: {list(invocations(env_doc))}')
     expect(list(invocations('```bash\ncd autumn && ./autumn migrate\n```')) == [],
            '`cd autumn` and `./autumn` are not invocations of the CLI')
+    subst = '```bash\nAUTUMN_MASTER_KEY=$(cat config/master.key) autumn migrate run\n```'
+    expect([a for _, a, _ in invocations(subst)] == ['migrate run'],
+           'an env value may be a command substitution containing spaces')
+
+    # --- wrappers handing the command to a remote shell.
+    wrapped = '```bash\nkubectl exec deploy/app -- autumn migrate run\n```'
+    expect([a for _, a, _ in invocations(wrapped)] == ['migrate run'],
+           f'a command after a `--` separator must be read: {list(invocations(wrapped))}')
+    quoted = '```bash\nfly ssh console -C "autumn migrate run"\n```'
+    expect([a for _, a, _ in invocations(quoted)] == ['migrate run"'],
+           f'a command inside a quoted wrapper argument must be read: {list(invocations(quoted))}')
+    # The quote rule must require `autumn` immediately inside the quote, or
+    # every apostrophe in prose becomes a command position.
+    expect(list(invocations("```bash\n# don't run autumn migrate here\n```")) == [],
+           'an apostrophe elsewhere in the line is not a command position')
+    expect(list(invocations('```bash\n# set the mode to "autumn" first\n```')) == [],
+           'a quoted bare word that is not followed by a command is not an invocation')
 
     # --- waivers
     expect(WAIVER.search('<!-- cli-surface-allow: autumn generate island — planned #493 -->'),
@@ -693,7 +749,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f"self-test: {13 + 16 + 8 + 4 - len(failures)} passed, {len(failures)} failed")
+    print(f"self-test: {13 + 16 + 14 + 4 - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
