@@ -71,8 +71,8 @@
 #     (`└─ autumn build --embed`). These are what the tool PRINTED, not what the
 #     reader types, and gating them would make every log line in the guide a
 #     hostage to the CLI's argument spelling.
-#   - Shell comments inside a block (`# Run migrations first (autumn seed will
-#     error …)`). Prose that happens to sit behind a `#`.
+#   - Shell comments inside a block. `shlex` strips them, so `# Run migrations
+#     first (autumn seed will error …)` is prose behind a `#`, not a command.
 #   - A command split across a PROSE line wrap (`… roll ONE back with `autumn
 #     deploy` / `rollback --only <host>``). Unlike a backslash continuation,
 #     which is shell syntax and IS folded before scanning, a prose wrap has no
@@ -87,24 +87,34 @@
 # …"`), and after env assignments whose value is a command substitution
 # (`AUTUMN_MASTER_KEY=$(cat config/master.key) autumn …`).
 #
-# HOW A LINE IS READ. `commands()` scans for each `autumn` standing in a command
-# position rather than matching one anchored pattern, because that pattern was
-# widened four times — chains, environment prefixes, `--` separators, quoted
-# wrappers — and each widening had to re-state the ones before it. The three
-# admissible positions are now independent of each other:
-#   - the head of a segment, after a prompt, an opening paren, or any number of
-#     environment assignments (whose values may be quoted or `$(…)`);
-#   - after a `--` separator (`kubectl exec deploy/app -- autumn …`);
-#   - immediately inside a quote (`fly ssh console -C "autumn …"`), where the
-#     argv ENDS at the closing quote. An anchored `(.+)$` could not express that
-#     and swallowed the quote into the last token, which then stopped looking
-#     like a command name — so the quoted form the gate claimed to cover
-#     accepted anything.
-# Before that scan, a line is split on shell operators, so every command in
-# `autumn migrate && autumn seed && autumn dev` is resolved rather than just the
-# head; and backslash continuations inside a fence are folded into one logical
-# line, so a command path broken across a line break is still read (the defect
-# is reported at the line the command starts on).
+# HOW A LINE IS READ. The line is TOKENIZED as shell (`shlex`), then reasoned
+# about as tokens. It got there the hard way: the extraction started as one
+# anchored regex and was widened five times — chains, environment prefixes,
+# `--` separators, quoted wrappers, continuations — with each widening having to
+# re-state the ones before it, and the fifth silently breaking the fourth. Every
+# remaining defect after that was the same root cause, ad-hoc shell parsing:
+# an operator inside a quoted value cut a command in half, a space inside one
+# ended validation early, a closing quote stayed glued to the last word. `shlex`
+# is in the standard library and settles the class, so quoting is no longer a
+# case this file reasons about at all.
+#
+# On the token stream:
+#   - operators (`&&`, `||`, `;`, `|`, `&`) separate commands — and cannot do so
+#     from inside a quoted value, which is the point;
+#   - a quoted option value is ONE token however many spaces it contains, so a
+#     subcommand written after it is still judged;
+#   - `#` starts a comment, so a shell comment naming a command needs no special
+#     case;
+#   - a command is recognised at the head of a segment (after any prompt and any
+#     environment assignments, whose values may be quoted or `$(…)`), after a
+#     `--` separator, or as a single token that is itself a command line — which
+#     is how a quoted wrapper argument (`-C "autumn …"`) tokenizes.
+# Before tokenizing, backslash continuations inside a fence are folded into one
+# logical line, so a command path broken across a line break is still read (the
+# defect is reported at the line the command starts on). A line that does not
+# tokenize — an apostrophe in prose, an unbalanced quote in a transcript — falls
+# back to whitespace splitting rather than being dropped: less accurate, never
+# worse than before.
 #
 # CORPUS SCOPE: reader-facing task docs only — `docs/guide/`, `docs/migrations/`,
 # `skills/`, `agents/`, and the root `README.md` / `EXAMPLES.md` /
@@ -153,7 +163,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 # scripts/check-plugin-freshness.sh and scripts/check-docs-links.sh.
 run_py() {
   python3 - "$@" <<'PYEOF'
-import os, re, subprocess, sys, pathlib, collections, tempfile
+import os, re, shlex, subprocess, sys, pathlib, collections, tempfile
 
 MODE = sys.argv[1]
 ROOT = pathlib.Path(sys.argv[2])
@@ -383,67 +393,115 @@ def cli_sources(root):
 # still start with the command being demonstrated.
 SHELL_LANGS = {'bash', 'sh', 'shell', 'console', 'zsh', 'terminal', 'text', ''}
 
-# A line may chain several commands — `autumn migrate && autumn seed && autumn
-# dev` is real, and appears in the guide. Splitting on shell operators first and
-# then matching each segment is what makes the later commands in a chain
-# checkable; a single regex over the whole line yields only the first, and the
-# rest ride in free. Splitting is safe even inside a quoted argument, because
-# only segments that then START with `autumn` are read as invocations.
-CHAIN = re.compile(r'&&|\|\||[;|&]')
+# HOW A LINE IS TURNED INTO COMMANDS
+#
+# The line is TOKENIZED as shell, not split with regexes. Three review rounds
+# of this gate were spent on the consequences of not doing that — operators and
+# spaces inside a quoted value, a closing quote glued to the last token — and
+# each ad-hoc fix left the next one waiting. `shlex` is in the standard library
+# and settles the whole class: quotes bind, operators outside them separate
+# commands, and `#` starts a comment (which is why a shell comment naming a
+# command is no longer a special case in this file).
+#
+# Tokens, not text, are what the rest of the script reasons about, so a quoted
+# option value is ONE token however many spaces or `&&`s are inside it.
+_OPERATORS = {'&&', '||', ';', '|', '&', '\n'}
 
-# An environment assignment standing before the command. The VALUE is the
-# fiddly part: it may be bare, double- or single-quoted with spaces inside
-# (`RUSTFLAGS="-C opt-level=3" autumn …`), or a command substitution
-# (`AUTUMN_MASTER_KEY=$(cat config/master.key) autumn …`). A value pattern that
-# stops at the first space swallows the command along with the rest of the line.
-_ENV_VALUE = r'(?:"[^"]*"|\'[^\']*\'|\$\([^)]*\)|[^\s"\'])*'
-_ENV_ASSIGN = r'[A-Za-z_][A-Za-z0-9_]*=' + _ENV_VALUE + r'\s+'
+# An environment assignment standing before the command name.
+_ENV_TOKEN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 
-# What may stand between the start of a segment and the command: a prompt, an
-# opening paren, and any number of environment assignments.
-_LEAD = re.compile(r'[\s(]*\$?\s*(?:' + _ENV_ASSIGN + r')*')
+# Shell metacharacters that separate tokens. Deliberately NOT shlex's default
+# set, which also includes `<` and `>`: in a shell those are redirections, but
+# in documentation `<name>` is overwhelmingly a placeholder, and splitting it
+# turned `autumn migrate --shard <new>` into an option value of `<` followed by
+# a bare `new` that read as a phantom subcommand. A redirection target is not a
+# command position, so nothing is lost by leaving them inside the token.
+_PUNCTUATION = '();&|'
 
-# A wrapper handing the command to a remote shell, before which `autumn` is
-# still in command position: an explicit `--` separator (`kubectl exec
-# deploy/app -- autumn …`).
-_SEPARATOR = re.compile(r'.*\s--\s+(?:' + _ENV_ASSIGN + r')*', re.S)
-
-# `autumn` as a command name: the trailing `\s` rejects `autumn-cli`,
-# `autumn-web` and `autumn/src/…`.
-_NAME = re.compile(r'autumn\s+')
+# Prompts and grouping that may precede a command in a transcript. `#` is not
+# here because shlex treats it as starting a comment, which is also why a shell
+# comment naming a command needs no special case any more.
+_PROMPT = {'$', '('}
 
 
-def commands(segment):
-    """Yield the argv of every `autumn …` standing in a command position.
+def tokenize(text):
+    """Shell tokens for `text`, or None when it does not tokenize.
 
-    Written as a position scan rather than one anchored pattern because the
-    pattern had by now been widened four times — for chains, for environment
-    prefixes, for `--` separators, for quoted wrappers — and each widening had
-    to re-state the ones before it. Asking "is THIS occurrence in command
-    position?" keeps the three admissible positions independent, and lets the
-    quoted case bound its argv at the closing quote, which an anchored `(.+)$`
-    could not: `-C "autumn migrate nope"` captured the closing quote into the
-    last token, which then failed to look like a command name and was silently
-    accepted — a form the gate claimed to cover and did not.
+    Returns None for unbalanced quotes — common in prose spans and in a
+    `--help` transcript quoted into a fence. The caller falls back to plain
+    whitespace splitting there, which is what this script did everywhere
+    before: strictly less accurate, but never worse than the old behaviour.
     """
-    for m in _NAME.finditer(segment):
-        before, quote = segment[:m.start()], None
-        if _LEAD.fullmatch(before) or _SEPARATOR.fullmatch(before):
-            pass
-        elif before and before[-1] in '"\'':
-            quote = before[-1]                  # inside a quoted wrapper argument
+    lex = shlex.shlex(text, posix=True, punctuation_chars=_PUNCTUATION)
+    lex.whitespace_split = True
+    try:
+        return list(lex)
+    except ValueError:
+        return None
+
+
+def _segments(tokens):
+    """Split a token list on shell operators into one list per command."""
+    current, out = [], []
+    for tok in tokens:
+        if tok in _OPERATORS:
+            out.append(current)
+            current = []
         else:
-            continue                            # prose, a path, a comment
-        rest = segment[m.end():]
-        if quote:
-            end = rest.find(quote)
-            if end >= 0:
-                rest = rest[:end]
-        # Collapse runs of whitespace: joining a continuation keeps the next
-        # line's indentation, and the argv is echoed back in the defect report.
-        argv = ' '.join(rest.split())
-        if argv:
-            yield argv
+            current.append(tok)
+    out.append(current)
+    return out
+
+
+def commands(text):
+    """Yield (display, argv_tokens) for every `autumn …` in command position.
+
+    The three admissible positions are independent of one another, which is
+    what keeps adding a fourth from breaking the other three:
+      - the head of a command, after any prompt and any environment
+        assignments;
+      - immediately after a `--` separator (`kubectl exec deploy/app --
+        autumn …`);
+      - a single token that is itself a command line, which is how a quoted
+        wrapper argument tokenizes (`fly ssh console -C "autumn migrate"`).
+        Re-tokenizing that token gets the argv exactly, with no quote left
+        glued to the last word.
+    Anything else — prose, a path, `./autumn`, `cd autumn` — is not a command
+    position and is skipped.
+    """
+    tokens = tokenize(text)
+    if tokens is None:
+        tokens = text.split()
+    for segment in _segments(tokens):
+        i = 0
+        while i < len(segment) and (segment[i] in _PROMPT or _ENV_TOKEN.match(segment[i])):
+            # `NAME=$(cat file)` tokenizes as `NAME=$` `(` `cat` `file` `)`, so
+            # a command substitution in the value has to be stepped over as a
+            # unit — otherwise the scan stops on `cat` and never reaches the
+            # command the assignment was standing in front of.
+            if segment[i].endswith('$') and i + 1 < len(segment) and segment[i + 1] == '(':
+                depth = 0
+                i += 1
+                while i < len(segment):
+                    if segment[i] == '(':
+                        depth += 1
+                    elif segment[i] == ')':
+                        depth -= 1
+                        if depth == 0:
+                            i += 1
+                            break
+                    i += 1
+                continue
+            i += 1
+        if i < len(segment) and segment[i] == 'autumn':
+            yield ' '.join(segment[i + 1:]), segment[i + 1:]
+        for j, tok in enumerate(segment):
+            if tok == '--' and j + 1 < len(segment) and segment[j + 1] == 'autumn':
+                yield ' '.join(segment[j + 2:]), segment[j + 2:]
+            elif tok.startswith('autumn ') and (inner := tokenize(tok)):
+                if inner[0] == 'autumn' and len(inner) > 1:
+                    yield ' '.join(inner[1:]), inner[1:]
+
 
 # A token that could name a command. Anything else — a flag, a `<PLACEHOLDER>`,
 # a TOML `= "0.1.0"`, a box-drawing character from a diagram — ends the walk.
@@ -520,9 +578,11 @@ def invocations(text):
         # Inline spans are bounded by their backticks, so they never continue.
         candidates.extend((span, False) for span in re.findall(r'`([^`\n]+)`', line))
         for text_, in_fence in candidates:
-            for segment in CHAIN.split(text_):
-                for argv in commands(segment):
-                    yield (report_at if in_fence else lineno), argv, in_fence
+            # Operator splitting happens inside `commands()`, on tokens rather
+            # than on the raw text, so an operator inside a quoted value cannot
+            # cut a command in half.
+            for display, argv in commands(text_):
+                yield (report_at if in_fence else lineno), display, argv, in_fence
 
 
 def blocks(text):
@@ -548,8 +608,13 @@ def blocks(text):
     return index
 
 
-def resolve(argv, surface):
-    """Return the drifted command path, or None when the line resolves.
+def resolve(tokens, surface):
+    """Return the drifted command path, or None when the command resolves.
+
+    Takes SHELL TOKENS, not a string to be split on whitespace: a quoted option
+    value is one token however many spaces are inside it. Splitting on
+    whitespace made `--shard "eu west" nope` consume `"eu` as the value and
+    then stop at `west"`, so the phantom subcommand behind it was never judged.
 
     Walks token by token: each token is an option (skipped, along with its value
     when it takes one), a subcommand of the path so far, an argument (which ends
@@ -563,7 +628,6 @@ def resolve(argv, surface):
     derive, never guessed — guessing makes `json` in `autumn routes --format
     json` look like a bad subcommand.
     """
-    tokens = argv.split()
     if not tokens or not TOKEN.match(tokens[0]):
         return None
     if tokens[0] not in surface:
@@ -621,7 +685,7 @@ def scan(root, surface, files):
             marker_block = line_block[marker_line]
             allowed[m.group(1).strip()].update({marker_block, marker_block - 1})
 
-        for lineno, argv, in_fence in invocations(text):
+        for lineno, display, argv, in_fence in invocations(text):
             bad = resolve(argv, surface)
             if bad is None:
                 continue
@@ -631,7 +695,7 @@ def scan(root, surface, files):
             if not in_fence and line_block[lineno] in allowed.get(command, ()):
                 waived += 1
                 continue
-            defects.append((f, lineno, bad, argv))
+            defects.append((f, lineno, bad, display))
     return defects, waived
 
 
@@ -688,6 +752,10 @@ def self_test():
     surface = build_surface([fake])
     failures = []
 
+    def tk(argv):
+        """Shell-tokenize a bare argv the way `commands()` would."""
+        return tokenize(argv) or argv.split()
+
     def expect(cond, msg):
         if not cond:
             failures.append(msg)
@@ -703,22 +771,22 @@ def self_test():
     expect(not surface['migrate']['positionals'], 'a long-only field is not a positional')
 
     # --- the walk
-    expect(resolve('migrate run', surface) == 'autumn migrate run',
+    expect(resolve(tk('migrate run'), surface) == 'autumn migrate run',
            'a phantom subcommand must be reported')
-    expect(resolve('migrate', surface) is None,
+    expect(resolve(tk('migrate'), surface) is None,
            'a command with an OPTIONAL subcommand is valid bare')
-    expect(resolve('migrate --with-maintenance', surface) is None,
+    expect(resolve(tk('migrate --with-maintenance'), surface) is None,
            'a flag must not be read as a subcommand')
-    expect(resolve('db pull posts', surface) is None,
+    expect(resolve(tk('db pull posts'), surface) is None,
            'a positional value must not be read as a subcommand')
-    expect(resolve('db pull posts --dry-run', surface) is None,
+    expect(resolve(tk('db pull posts --dry-run'), surface) is None,
            'positional plus flag must resolve')
-    expect(resolve('c', surface) is None, 'an alias must resolve')
-    expect(resolve('nope', surface) == 'autumn nope',
+    expect(resolve(tk('c'), surface) is None, 'an alias must resolve')
+    expect(resolve(tk('nope'), surface) == 'autumn nope',
            'an unknown top-level command must be reported')
-    expect(resolve('console extra', surface) is None,
+    expect(resolve(tk('console extra'), surface) is None,
            'a leaf command consumes its remaining tokens as arguments')
-    expect(resolve('$SOMETHING', surface) is None,
+    expect(resolve(tk('$SOMETHING'), surface) is None,
            'a non-command token must be ignored')
 
     # --- options are walked through, not treated as the end of the command.
@@ -726,18 +794,38 @@ def self_test():
     # subcommand written after an option unchecked.
     expect(surface['migrate']['options'] == {'--with-maintenance': False, '--shard': True},
            f"option value-taking must come from the field type, got {surface['migrate']['options']}")
-    expect(resolve('migrate --with-maintenance status', surface) is None,
+    expect(resolve(tk('migrate --with-maintenance status'), surface) is None,
            'a boolean option must not hide the subcommand after it')
-    expect(resolve('migrate --with-maintenance nope', surface) == 'autumn migrate nope',
+    expect(resolve(tk('migrate --with-maintenance nope'), surface) == 'autumn migrate nope',
            'drift after a boolean option must still be reported')
-    expect(resolve('migrate --shard eu status', surface) is None,
+    expect(resolve(tk('migrate --shard eu status'), surface) is None,
            "a value-taking option's value must not be read as a subcommand")
-    expect(resolve('migrate --shard=eu status', surface) is None,
+    expect(resolve(tk('migrate --shard=eu status'), surface) is None,
            '--name=value is self-contained and consumes no extra token')
-    expect(resolve('migrate --unknown-option nope', surface) is None,
+    expect(resolve(tk('migrate --unknown-option nope'), surface) is None,
            'an undeclared option stops the walk rather than risking a false positive')
-    expect(resolve('migrate -- nope', surface) is None,
+    expect(resolve(tk('migrate -- nope'), surface) is None,
            'everything after `--` is arguments')
+
+    # --- quoting. These are what shell-aware tokenization buys: splitting on
+    # whitespace consumed `"eu` as the option value and then stopped at `west"`,
+    # so the phantom subcommand behind a quoted value was never judged.
+    expect(resolve(tk('migrate --shard "eu west" nope'), surface) == 'autumn migrate nope',
+           'a quoted option value is ONE token, so drift behind it is still judged')
+    expect(resolve(tk('migrate --shard "eu west" status'), surface) is None,
+           'a real subcommand behind a quoted value must still resolve')
+    expect([a for _, a in commands('autumn migrate --shard "eu&&us" nope')]
+           == [['migrate', '--shard', 'eu&&us', 'nope']],
+           'an operator INSIDE a quoted value must not split the command')
+    expect([a for _, a in commands('autumn migrate --shard <new>')]
+           == [['migrate', '--shard', '<new>']],
+           'a `<placeholder>` must stay one token — splitting it made the '
+           'placeholder name read as a phantom subcommand')
+
+    # --- tokenization falls back rather than dropping the line.
+    expect(tokenize("don't") is None, 'an unbalanced quote must report as untokenizable')
+    expect([a for _, a in commands("autumn migrate don't")][0][:2] == ['migrate', "don't"],
+           'an untokenizable line falls back to whitespace splitting, not silence')
 
     # --- extraction
     doc = '\n'.join([
@@ -752,14 +840,14 @@ def self_test():
     ])
     found = list(invocations(doc))
     expect(len(found) == 2, f'expected 2 copyable invocations, got {len(found)}: {found}')
-    expect(all(a == 'migrate run' for _, a, _ in found), f'bad argv extraction: {found}')
-    expect([fenced for _, _, fenced in found] == [True, False],
+    expect(all(d == 'migrate run' for _, d, _, _ in found), f'bad argv extraction: {found}')
+    expect([fenced for _, _, _, fenced in found] == [True, False],
            'a fenced command and an inline one must be told apart')
 
     # --- chains: every command on the line, not just the head. Regression test
     # for a version that matched the line once and let the tail ride in free.
     chained = list(invocations('```bash\nautumn migrate && autumn nope ; autumn c\n```'))
-    expect([a for _, a, _ in chained] == ['migrate', 'nope', 'c'],
+    expect([d for _, d, _, _ in chained] == ['migrate', 'nope', 'c'],
            f'every command in a chain must be extracted, got {chained}')
     expect(list(invocations('```bash\nautumn routes | grep GET\n```'))[0][1] == 'routes',
            'a pipe into a non-autumn command must still yield the autumn one')
@@ -770,32 +858,32 @@ def self_test():
     # is how the guide writes production commands; requiring `autumn` to head
     # the segment skipped all 15 of them.
     env_doc = '```bash\nAUTUMN_ENV=prod DATABASE_URL="postgres://x" autumn migrate run\n```'
-    expect([a for _, a, _ in invocations(env_doc)] == ['migrate run'],
+    expect([d for _, d, _, _ in invocations(env_doc)] == ['migrate run'],
            f'env assignments must not hide the command: {list(invocations(env_doc))}')
     expect(list(invocations('```bash\ncd autumn && ./autumn migrate\n```')) == [],
            '`cd autumn` and `./autumn` are not invocations of the CLI')
     subst = '```bash\nAUTUMN_MASTER_KEY=$(cat config/master.key) autumn migrate run\n```'
-    expect([a for _, a, _ in invocations(subst)] == ['migrate run'],
+    expect([d for _, d, _, _ in invocations(subst)] == ['migrate run'],
            'an env value may be a command substitution containing spaces')
 
     # --- wrappers handing the command to a remote shell.
     wrapped = '```bash\nkubectl exec deploy/app -- autumn migrate run\n```'
-    expect([a for _, a, _ in invocations(wrapped)] == ['migrate run'],
+    expect([d for _, d, _, _ in invocations(wrapped)] == ['migrate run'],
            f'a command after a `--` separator must be read: {list(invocations(wrapped))}')
     quoted = '```bash\nfly ssh console -C "autumn migrate run"\n```'
-    expect([a for _, a, _ in invocations(quoted)] == ['migrate run'],
+    expect([d for _, d, _, _ in invocations(quoted)] == ['migrate run'],
            f'a quoted wrapper argv must END at the closing quote, not swallow it — '
            f'otherwise the last token stops looking like a command name and drift '
            f'there is silently accepted: {list(invocations(quoted))}')
     qenv = '```bash\nRUSTFLAGS="-C opt-level=3" autumn migrate run\n```'
-    expect([a for _, a, _ in invocations(qenv)] == ['migrate run'],
+    expect([d for _, d, _, _ in invocations(qenv)] == ['migrate run'],
            f'a quoted env value containing spaces must not swallow the command: '
            f'{list(invocations(qenv))}')
 
     # --- backslash continuations are shell syntax and are folded into one
     # logical line; the defect is reported where the command STARTS.
     cont = '```bash\nautumn migrate \\\n    run\n```'
-    expect([(n, a) for n, a, _ in invocations(cont)] == [(2, 'migrate run')],
+    expect([(n, d) for n, d, _, _ in invocations(cont)] == [(2, 'migrate run')],
            f'a continued command must be joined and reported at its first line: '
            f'{list(invocations(cont))}')
     expect(list(invocations('```bash\nautumn migrate \\\n```')) == [],
@@ -840,7 +928,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f"self-test: {13 + 16 + 19 + 4 - len(failures)} passed, {len(failures)} failed")
+    print(f"self-test: {13 + 23 + 19 + 4 - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
