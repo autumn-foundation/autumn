@@ -1397,3 +1397,43 @@ fn a_snapshot_corrupted_together_with_its_digest_is_still_refused() {
         "a refused restore must not publish the corrupt database"
     );
 }
+
+#[test]
+fn a_failed_publish_leaves_the_existing_databases_wal_intact() {
+    let mut h = Harness::new();
+    insert(&mut h.conn, &["one", "two", "three"]);
+    h.tick(0).expect("tick");
+
+    // Publishing over an existing *directory* fails: neither the rename nor the
+    // cross-filesystem copy fallback can replace one with a file. That is the
+    // cheapest deterministic way to fail the publish after the replica has been
+    // fully rebuilt and verified in staging.
+    let output = h.replica_root.join("../occupied.db");
+    std::fs::create_dir_all(&output).expect("occupy the output path");
+
+    // Stands in for a live database's un-checkpointed commits: the bytes that
+    // exist *only* in the sidecar until something checkpoints them.
+    let wal_path = autumn_web::replication::wal::wal_path(&output);
+    let commits = b"the existing database's newest commits";
+    std::fs::write(&wal_path, commits).expect("write the existing WAL");
+
+    let err = restore::restore(h.destination().as_ref(), &h.root, None, &output)
+        .expect_err("publishing onto a directory must fail");
+
+    // The contract is failure atomicity: an error leaves what it found. Before
+    // the sidecars were displaced rather than deleted, this restore returned an
+    // error having already destroyed the database's newest commits.
+    assert_eq!(
+        std::fs::read(&wal_path).expect("the existing WAL must survive a failed publish"),
+        commits,
+        "a failed publish ({err}) must not consume the existing database's WAL",
+    );
+    assert!(
+        !autumn_web::replication::wal::shm_path(&output).exists(),
+        "no sidecar should be invented for a database that had none"
+    );
+    assert!(
+        !std::fs::exists(format!("{}.displaced", wal_path.display())).unwrap_or(false),
+        "the parked sidecar must not be left behind"
+    );
+}

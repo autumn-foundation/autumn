@@ -126,7 +126,14 @@ async fn replicates_to_and_restores_from_a_real_s3_endpoint() {
         clock.set(at(0));
         let first = replicator.tick().expect("first tick against MinIO");
         assert!(first.snapshot_taken);
-        assert_eq!(first.segments, 1);
+        // The opening tick checkpoints *before* it snapshots, so the base is
+        // never behind the WAL — and everything written so far is already inside
+        // the database file it just copied, leaving nothing to ship. The local
+        // suite pins the same expectation in `prime`.
+        assert_eq!(
+            first.segments, 0,
+            "a generation opens from a freshly checkpointed WAL, so it has nothing to ship"
+        );
 
         sql_query("INSERT INTO t (v) VALUES ('gamma')")
             .execute(&mut conn)

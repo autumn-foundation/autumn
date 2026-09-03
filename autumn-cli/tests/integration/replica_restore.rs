@@ -180,14 +180,46 @@ fn write_machine_b(dir: &Path, replica: &Path, database: &Path) {
     std::fs::create_dir_all(dir).expect("machine-b");
     std::fs::write(
         dir.join("autumn.toml"),
+        // TOML *literal* strings (single quotes) do no escape processing, so a
+        // Windows path interpolates verbatim. In a basic string the backslashes
+        // of `C:\Users\...` are escape sequences and `\U` starts a unicode
+        // escape, which is a parse error — invisible on Linux, fatal on Windows.
         format!(
-            "[database]\nurl = \"sqlite://{database}\"\n\n\
-             [replication]\nenabled = true\nprefix = \"db\"\npath = \"{replica}\"\n",
+            "[database]\nurl = 'sqlite://{database}'\n\n\
+             [replication]\nenabled = true\nprefix = \"db\"\npath = '{replica}'\n",
             database = database.display(),
             replica = replica.display(),
         ),
     )
     .expect("write autumn.toml");
+}
+
+#[test]
+fn machine_bs_config_parses_when_the_paths_are_windows_shaped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A backslash is an ordinary filename character on Linux, so this reproduces
+    // the Windows-only failure on every platform: interpolated into a *basic*
+    // TOML string, the `\U` of `C:\Users\...` opens a unicode escape and the
+    // whole config fails to parse — taking all seven CLI tests with it.
+    let database = Path::new(r"C:\Users\RUNNER~1\AppData\Local\Temp\machine-b\app.db");
+    let replica = Path::new(r"C:\Users\RUNNER~1\AppData\Local\Temp\replica");
+    write_machine_b(dir.path(), replica, database);
+
+    let raw = std::fs::read_to_string(dir.path().join("autumn.toml")).expect("read autumn.toml");
+    // `toml::Value`'s `FromStr` parses a single *value*, not a document, so a
+    // whole config has to go through `from_str` into a table.
+    let parsed: toml::Table =
+        toml::from_str(&raw).expect("machine B's autumn.toml must be valid TOML on every platform");
+    assert_eq!(
+        parsed["database"]["url"].as_str(),
+        Some(r"sqlite://C:\Users\RUNNER~1\AppData\Local\Temp\machine-b\app.db"),
+        "the database path must reach the config byte for byte"
+    );
+    assert_eq!(
+        parsed["replication"]["path"].as_str(),
+        Some(r"C:\Users\RUNNER~1\AppData\Local\Temp\replica"),
+        "the replica path must reach the config byte for byte"
+    );
 }
 
 #[test]

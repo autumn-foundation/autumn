@@ -507,13 +507,26 @@ pub fn apply(
     if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(RestoreError::io("create output directory"))?;
     }
-    // The staged database is checkpointed, so its sidecars carry nothing; drop
-    // any stale ones next to the output so SQLite cannot recover an old WAL over
-    // the freshly restored file.
-    let _ = std::fs::remove_file(wal::wal_path(output));
-    let _ = std::fs::remove_file(wal::shm_path(output));
+    // The staged database is checkpointed, so its sidecars carry nothing, and a
+    // stale one left next to the output would let SQLite recover an old WAL over
+    // the freshly restored file. They are moved aside rather than deleted:
+    // until the new database is actually in place they are still the *existing*
+    // database's newest commits, and a restore that fails must leave behind what
+    // it found rather than the wreckage of a half-finished publish.
     let staged_db = staging.join("restored.db");
-    move_file(&staged_db, output)?;
+    let displaced = displace_sidecars(output);
+    if let Err(e) = move_file(&staged_db, output) {
+        // The existing database is still the one on disk. Without its sidecars
+        // it would silently lose every commit not yet checkpointed into it.
+        for (sidecar, parked) in &displaced {
+            let _ = std::fs::rename(parked, sidecar);
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    for (_, parked) in &displaced {
+        let _ = std::fs::remove_file(parked);
+    }
     let _ = std::fs::remove_dir_all(&staging);
 
     let bytes = std::fs::metadata(output).map_or(outcome.bytes, |m| m.len());
@@ -544,6 +557,33 @@ fn staging_dir(output: &Path) -> PathBuf {
     let mut name = output.as_os_str().to_os_string();
     name.push(".restore-staging");
     PathBuf::from(name)
+}
+
+/// The path a displaced WAL sidecar is parked at while a restore publishes.
+fn displaced_path(sidecar: &Path) -> PathBuf {
+    let mut name = sidecar.as_os_str().to_os_string();
+    name.push(".displaced");
+    PathBuf::from(name)
+}
+
+/// Move `output`'s WAL sidecars aside, returning the `(sidecar, parked)` pairs
+/// that were actually moved so a failed publish can put them back.
+///
+/// They are parked beside the output rather than inside the staging directory,
+/// which can legitimately sit on another filesystem, so the rename never has to
+/// cross one.
+fn displace_sidecars(output: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let mut moved = Vec::new();
+    for sidecar in [wal::wal_path(output), wal::shm_path(output)] {
+        let parked = displaced_path(&sidecar);
+        // `rename` refuses an existing destination on Windows, and a park left
+        // by an interrupted earlier run is not something to preserve.
+        let _ = std::fs::remove_file(&parked);
+        if std::fs::rename(&sidecar, &parked).is_ok() {
+            moved.push((sidecar, parked));
+        }
+    }
+    moved
 }
 
 /// Rename `from` to `to`, falling back to copy+remove across filesystems.
