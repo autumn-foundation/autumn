@@ -273,6 +273,13 @@ const LEDGER_UP: &str = include_str!(
     "../version_history_migrations_sqlite/20260826000000_create_ledger_revisions/up.sql"
 );
 
+/// The #2323 high-water marks, from the same shipped migration set.
+///
+/// Applied after `LEDGER_UP` because its backfill reads the revisions table.
+const LEDGER_HIGH_WATER_UP: &str = include_str!(
+    "../version_history_migrations_sqlite/20260901213107_create_ledger_high_water/up.sql"
+);
+
 /// A `ledgered` repository implies `versioned`, so both tables must exist for a
 /// write to succeed.
 const VERSION_HISTORY_UP: &str = include_str!(
@@ -301,7 +308,20 @@ fn install_encryption_keys() {
     });
 }
 
+/// The full schema, including the #2323 high-water table.
 async fn boot_pool(db_name: &str) -> SqlitePool {
+    let pool = boot_pool_without_high_water(db_name).await;
+    {
+        let mut conn = pool.get().await.expect("checkout a sqlite connection");
+        conn.batch_execute(LEDGER_HIGH_WATER_UP)
+            .await
+            .expect("apply the high-water migration");
+    }
+    pool
+}
+
+/// The revisions-only schema `boot_pool` layers the high-water table onto.
+async fn boot_pool_without_high_water(db_name: &str) -> SqlitePool {
     install_encryption_keys();
     let config = DatabaseConfig {
         url: Some(format!("sqlite://file:{db_name}?mode=memory&cache=shared")),
@@ -384,7 +404,42 @@ fn assert_same_record<T: serde::Serialize>(left: &T, right: &T, context: &str) {
     );
 }
 
-/// Wall-clock instant, matching the write path's own clock read.
+/// Rewrite a record's #2323 high-water mark to agree with whatever revisions
+/// survive, or remove it when none do.
+///
+/// The mark turns a deleted tail into permanent evidence, which is the whole
+/// point of it — so a test that wants to exercise a *later* layer (the live-row
+/// cross-check, or a pinned head) has to model the adversary the threat model
+/// actually concedes: one who holds `DELETE` on the revisions table and on the
+/// mark table alike, and covers their tracks in both. Everything the ledger can
+/// still see after that is what these tests pin.
+async fn resync_high_water_mark(pool: &SqlitePool, table: &str, record_id: i64) {
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query(
+        "DELETE FROM _autumn_ledger_high_water WHERE table_name = ? AND record_id = ?",
+    )
+    .bind::<diesel::sql_types::Text, _>(table)
+    .bind::<diesel::sql_types::BigInt, _>(record_id)
+    .execute(&mut *conn)
+    .await
+    .expect("clear the mark");
+    diesel::sql_query(
+        "INSERT INTO _autumn_ledger_high_water \
+         (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) \
+         SELECT table_name, COALESCE(tenant_id, ''), record_id, seq, hash, recorded_at \
+         FROM _autumn_ledger_revisions \
+         WHERE table_name = ? AND record_id = ? ORDER BY seq DESC LIMIT 1",
+    )
+    .bind::<diesel::sql_types::Text, _>(table)
+    .bind::<diesel::sql_types::BigInt, _>(record_id)
+    .execute(&mut *conn)
+    .await
+    .expect("re-establish the mark over the surviving chain");
+}
+
+/// Host wall-clock instant, for spacing writes and for building the floors these
+/// tests inject. The write path itself reads the *database's* clock (#2323); on
+/// this tier that is the same process's clock, so the two stay comparable.
 #[allow(
     clippy::disallowed_methods,
     reason = "test asserts against real recorded_at values"
@@ -823,6 +878,130 @@ async fn duplicate_sequence_numbers_are_rejected_by_the_database() {
     );
 }
 
+/// The #2323 mark is monotonic in the *database*, not merely in the code above
+/// it: the append's upsert refuses to lower `high_seq`, so a writer that somehow
+/// computed a stale sequence number cannot roll the mark back to make a later
+/// truncation look clean. It can only fail to raise it — and a mark that no
+/// longer describes the head it names is itself reported.
+#[tokio::test]
+async fn the_high_water_mark_upsert_refuses_to_move_backwards() {
+    let pool = boot_pool("lg_mark_monotonic").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    {
+        let mut conn = pool.get().await.expect("conn");
+        // Byte-for-byte the statement the write path runs, with a stale seq.
+        diesel::sql_query(
+            "INSERT INTO _autumn_ledger_high_water \
+             (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) \
+             VALUES ('lg_invoices', '', ?, 1, 'stale', ?) \
+             ON CONFLICT (table_name, tenant_key, record_id) DO UPDATE SET \
+             high_seq = excluded.high_seq, \
+             head_hash = excluded.head_hash, \
+             recorded_at = excluded.recorded_at \
+             WHERE _autumn_ledger_high_water.high_seq < excluded.high_seq",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(now())
+        .execute(&mut *conn)
+        .await
+        .expect("the upsert itself must succeed — it simply must not lower the mark");
+    }
+
+    let mark = repo
+        .ledger_high_water(id)
+        .await
+        .expect("mark")
+        .expect("mark");
+    assert_eq!(
+        mark.seq, 3,
+        "a stale writer must not be able to lower the mark"
+    );
+    assert_ne!(mark.hash, "stale");
+    assert!(repo.ledger_verify(id).await.expect("verify").is_intact());
+}
+
+/// A ledgered write is one transaction: the revision and the mark it raises
+/// commit together or not at all.
+///
+/// Driven from the mark's side, because that is the statement #2323 added: the
+/// revision INSERT has already run by the time the upsert does, so if the two
+/// were not one transaction a refused upsert would leave a revision behind with
+/// no mark naming it — which is itself a state `ledger_verify` calls tampering.
+#[tokio::test]
+async fn a_failed_mark_upsert_rolls_the_whole_append_back() {
+    let pool = boot_pool("lg_mark_rollback").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "CREATE TRIGGER lg_freeze_mark BEFORE UPDATE ON _autumn_ledger_high_water \
+             BEGIN SELECT RAISE(ABORT, 'mark frozen'); END",
+        )
+        .await
+        .expect("freeze the mark");
+    }
+
+    let result = repo
+        .update(
+            id,
+            &UpdateLgInvoice {
+                amount_cents: Patch::Set(99),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "an append whose mark cannot be raised must fail rather than proceed"
+    );
+
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    assert_eq!(
+        revisions.len(),
+        3,
+        "the revision must roll back with the mark, not survive it: {:?}",
+        revisions.iter().map(|r| r.seq).collect::<Vec<_>>()
+    );
+    let mark = repo
+        .ledger_high_water(id)
+        .await
+        .expect("mark")
+        .expect("mark");
+    assert_eq!(mark.seq, 3);
+    assert!(repo.ledger_verify(id).await.expect("verify").is_intact());
+
+    // Unfreeze: the next ordinary write advances both together again.
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute("DROP TRIGGER lg_freeze_mark")
+            .await
+            .expect("unfreeze the mark");
+    }
+    repo.update(
+        id,
+        &UpdateLgInvoice {
+            amount_cents: Patch::Set(99),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update");
+    let mark = repo
+        .ledger_high_water(id)
+        .await
+        .expect("mark")
+        .expect("mark");
+    assert_eq!(
+        mark.seq, 4,
+        "the rolled-back attempt burned no sequence number"
+    );
+    assert!(repo.ledger_verify(id).await.expect("verify").is_intact());
+}
+
 // ── Tenant isolation (adversarial) ───────────────────────────────────
 
 #[tokio::test]
@@ -917,10 +1096,12 @@ async fn restore_records_a_revision_and_keeps_as_of_true() {
     assert!(repo.ledger_verify(id).await.expect("verify").is_intact());
 }
 
-/// A truncated tail leaves a chain that is internally perfect. Only the live row
-/// exposes it — which is what makes the cross-check worth its extra read.
+/// A truncated tail leaves a chain that is internally perfect. Two independent
+/// layers still see it: the #2323 high-water mark, which names the sequence
+/// number that is gone, and — once the mark has been covered up too — the
+/// live-row cross-check.
 #[tokio::test]
-async fn verify_detects_a_truncated_tail_against_the_live_row() {
+async fn verify_detects_a_truncated_tail() {
     let pool = boot_pool("lg_truncate").await;
     let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
     let id = write_three_revisions(&repo).await;
@@ -937,17 +1118,273 @@ async fn verify_detects_a_truncated_tail_against_the_live_row() {
         .expect("lop off the newest revision");
     }
 
-    let report = repo.ledger_verify(id).await.expect("verify");
-    let broken = report.broken.expect("a truncated tail must be detected");
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("a truncated tail must be detected");
+    assert_eq!(
+        broken.kind,
+        LedgerBreak::MissingRevision,
+        "the mark outlives the row it names, so the break is the absent revision \
+         rather than merely a live row that disagrees"
+    );
+    assert_eq!(
+        broken.seq, 3,
+        "reported at the sequence number that is gone"
+    );
+
+    // Cover the mark up as well, and the live-row cross-check still holds the line.
+    resync_high_water_mark(&pool, "lg_invoices", id).await;
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("the live row must still expose the truncation");
     assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
     assert_eq!(broken.seq, 2, "reported at the surviving head");
 }
 
-/// A row with no chain at all is the documented state of every row that predates
-/// the day its model was ledgered, so it must not be reported as tampering — even
-/// though a wholly erased chain looks identical from inside the database. The
-/// emptiness is still visible on the report, and a pinned head covers the erasure
-/// case; see #2323.
+/// The issue's headline case: delete the newest revision, then let an **ordinary
+/// application write** land. Before #2323 the append re-used the deleted
+/// sequence number, chained cleanly onto its predecessor and matched the live
+/// row — so both the chain walk and the live-row cross-check reported intact and
+/// the deleted state left no trace. The mark makes the append allocate past the
+/// gap instead, and the gap is permanent.
+#[tokio::test]
+async fn a_post_truncation_append_leaves_a_gap_verify_reports() {
+    let pool = boot_pool("lg_truncate_then_append").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = 3",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("lop off the newest revision");
+    }
+
+    // Ordinary traffic — nothing about this write knows a truncation happened.
+    repo.update(
+        id,
+        &UpdateLgInvoice {
+            amount_cents: Patch::Set(4_242),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("an ordinary write lands after the truncation");
+
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    assert_eq!(
+        revisions.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![1, 2, 4],
+        "the append must allocate past the deleted sequence number, not re-use it"
+    );
+
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("the gap the append left must be reported");
+    assert_eq!(broken.kind, LedgerBreak::MissingRevision);
+    assert_eq!(broken.seq, 3);
+
+    // And it stays reported: further ordinary writes never fill the hole.
+    repo.update(
+        id,
+        &UpdateLgInvoice {
+            amount_cents: Patch::Set(4_343),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("more ordinary traffic");
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("the gap must not heal");
+    assert_eq!(broken.kind, LedgerBreak::MissingRevision);
+    assert_eq!(broken.seq, 3);
+}
+
+/// `ledger_pin` is what an audit posture actually calls: the head and the mark
+/// from one statement, so a concurrent append cannot hand an auditor a head at
+/// `N` beside a mark at `N+1` and be read as a truncation.
+#[tokio::test]
+async fn ledger_pin_returns_the_head_and_the_mark_from_one_snapshot() {
+    let pool = boot_pool("lg_pin").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+
+    // A record with no chain yet: neither half exists, and that is not an error.
+    let empty = repo.ledger_pin(9_999).await.expect("pin");
+    assert!(empty.head.is_none() && empty.high_water.is_none());
+
+    let id = write_three_revisions(&repo).await;
+    let pin = repo.ledger_pin(id).await.expect("pin");
+    let head = pin.head.expect("a written record has a head");
+    let mark = pin.high_water.expect("and a mark");
+    assert_eq!(head.seq, 3);
+    assert_eq!(
+        mark.seq, head.seq,
+        "the pair agrees because it is one snapshot"
+    );
+    assert_eq!(mark.hash, head.hash);
+    assert_eq!(mark.recorded_at, head.recorded_at);
+
+    // The single-value accessors are the same statement projected.
+    assert_eq!(repo.ledger_head(id).await.expect("head"), Some(head));
+    assert_eq!(repo.ledger_high_water(id).await.expect("mark"), Some(mark));
+
+    // And it reports the truncation the mark exists for, in one read.
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = 3",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("lop off the newest revision");
+    }
+    let pin = repo.ledger_pin(id).await.expect("pin");
+    assert_eq!(pin.head.expect("head").seq, 2);
+    assert_eq!(
+        pin.high_water.expect("mark").seq,
+        3,
+        "the mark outlives the revision it names, and the pair shows it"
+    );
+}
+
+/// The mark is not a second source of truth to be believed: rolling it back,
+/// rewriting it or deleting it is itself what `ledger_verify` reports.
+#[tokio::test]
+async fn tampering_with_the_high_water_mark_is_itself_detected() {
+    let pool = boot_pool("lg_mark_tamper").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    let mark = repo
+        .ledger_high_water(id)
+        .await
+        .expect("mark")
+        .expect("a written record has a mark");
+    assert_eq!(mark.seq, 3, "the mark tracks every append");
+    let head = repo
+        .ledger_head(id)
+        .await
+        .expect("head")
+        .expect("a written record has a head");
+    assert_eq!(mark.hash, head.hash, "the mark names the head revision");
+
+    // Rolled back, so a later truncation would look clean.
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_high_water SET high_seq = 1 \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("roll the mark back");
+    }
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("a rolled-back mark must be detected");
+    assert_eq!(broken.kind, LedgerBreak::HighWaterBehind);
+
+    // Rewritten to name a different revision at the same sequence number.
+    resync_high_water_mark(&pool, "lg_invoices", id).await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_high_water SET head_hash = 'deadbeef' \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("rewrite the mark's hash");
+    }
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("a rewritten mark must be detected");
+    assert_eq!(broken.kind, LedgerBreak::HighWaterMismatch);
+
+    // Deleted outright — the obvious way to restore the original attack.
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_high_water \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("delete the mark");
+    }
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("a deleted mark must be detected");
+    assert_eq!(broken.kind, LedgerBreak::HighWaterMissing);
+
+    // Restored, and the accusation stops: no false positive once it agrees again.
+    resync_high_water_mark(&pool, "lg_invoices", id).await;
+    assert!(repo.ledger_verify(id).await.expect("verify").is_intact());
+}
+
+/// A wholly erased chain used to be indistinguishable from a row that predates
+/// ledgering, so it could not be reported. The #2323 mark outlives the rows and
+/// tells the two apart, so erasure is now an accusation.
+#[tokio::test]
+async fn a_wholly_erased_chain_is_reported_against_its_surviving_mark() {
+    let pool = boot_pool("lg_erased_marked").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("erase the whole chain");
+    }
+
+    let report = repo.ledger_verify(id).await.expect("verify");
+    assert_eq!(report.revisions_checked, 0);
+    let broken = report.broken.expect("an erased chain must be reported");
+    assert_eq!(broken.kind, LedgerBreak::MissingRevision);
+    assert_eq!(broken.seq, 1);
+}
+
+/// A row with no chain **and no mark** is the documented state of every row that
+/// predates the day its model was ledgered, so it must not be reported as
+/// tampering. The emptiness is still visible on the report.
 #[tokio::test]
 async fn a_row_with_no_chain_is_not_reported_as_tampering() {
     let pool = boot_pool("lg_erased").await;
@@ -965,6 +1402,9 @@ async fn a_row_with_no_chain_is_not_reported_as_tampering() {
         .await
         .expect("leave the record with no chain");
     }
+    // No revisions and no mark: exactly the shape of a row written before its
+    // model was ledgered.
+    resync_high_water_mark(&pool, "lg_invoices", id).await;
 
     let report = repo.ledger_verify(id).await.expect("verify");
     assert!(report.is_intact(), "{report:?}");
@@ -989,9 +1429,11 @@ async fn a_row_with_no_chain_is_not_reported_as_tampering() {
     assert_eq!(report.revisions_checked, 1);
 }
 
-/// A correctly-hashed appended forgery is undetectable from inside the chain —
-/// the hashing rule is public. A pinned head is the defence, so prove the pin
-/// actually disagrees.
+/// A correctly-hashed appended forgery is caught by the #2323 mark, which the
+/// forger did not raise. Cover the mark up too — the adversary the threat model
+/// concedes, with write access to both tables — and the forgery becomes
+/// undetectable from inside the chain, because the hashing rule is public. A
+/// pinned head is the defence there, so prove the pin actually disagrees.
 #[tokio::test]
 async fn a_pinned_head_detects_a_correctly_hashed_forgery() {
     let pool = boot_pool("lg_pinned_head").await;
@@ -1054,10 +1496,25 @@ async fn a_pinned_head_detects_a_correctly_hashed_forgery() {
             .expect("rewrite the live row to match");
     }
 
-    // Verification alone cannot see it — this is the documented limit.
+    // The mark still names revision 3, so the appended revision 4 is exposed
+    // without any pin at all. Note this is `HighWaterBehind`, which the record's
+    // next ordinary write heals — the pin below is what survives that.
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("an append the mark did not authorise must be detected");
+    assert_eq!(broken.kind, LedgerBreak::HighWaterBehind);
+    assert_eq!(broken.seq, head_revision.seq + 1);
+
+    // Now Mallory raises the mark too. Verification alone cannot see it any
+    // more — this is the documented limit the pin exists for.
+    resync_high_water_mark(&pool, "lg_invoices", id).await;
     assert!(
         repo.ledger_verify(id).await.expect("verify").is_intact(),
-        "a correctly-hashed, live-consistent append is invisible from inside the chain"
+        "a correctly-hashed, live-consistent, mark-consistent append is invisible \
+         from inside the database"
     );
 
     // The pin does.
@@ -1067,6 +1524,942 @@ async fn a_pinned_head_detects_a_correctly_hashed_forgery() {
         "a head pinned outside the database must disagree after a forgery"
     );
     assert_eq!(now_head.seq, pinned.seq + 1);
+}
+
+// ── transaction time comes from the database (#2323) ─────────────────
+
+/// `recorded_at` used to be `Utc::now()` on the writing node, so clock skew
+/// across nodes — or a single host clock adjustment — could give a later
+/// sequence an earlier instant, and `snapshot_as_of` would then answer a
+/// transaction-time query with a revision that was not yet current. The write
+/// path now reads the instant from the database and clamps it against the chain
+/// it is extending, so a regression cannot be written at all.
+#[tokio::test]
+async fn transaction_time_never_moves_backwards_along_a_chain() {
+    let pool = boot_pool("lg_txn_time_monotonic").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    let recorded: Vec<DateTime<Utc>> = repo
+        .ledger_revisions(id)
+        .await
+        .expect("revisions")
+        .iter()
+        .map(|r| r.recorded_at)
+        .collect();
+    assert!(
+        recorded.windows(2).all(|w| w[0] <= w[1]),
+        "transaction time must be non-decreasing along a chain: {recorded:?}"
+    );
+
+    // The mark's instant is the floor only where it is the *only* floor: after
+    // the revision that carried the real instant is gone. Lop the head off and
+    // push the mark forward, as a host whose clock ran fast would have left it.
+    let ahead = autumn_web::ledger::truncate_to_micros(now() + Duration::minutes(30));
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = 3",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("lop off the newest revision");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_high_water SET recorded_at = ? \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(ahead)
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("move the record's transaction-time floor forward");
+    }
+
+    repo.update(
+        id,
+        &UpdateLgInvoice {
+            amount_cents: Patch::Set(7),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update");
+
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    let head = revisions.last().expect("head");
+    assert!(
+        head.recorded_at >= ahead,
+        "a write behind the chain's floor must be clamped up to it, not written \
+         behind it: {} < {ahead}",
+        head.recorded_at
+    );
+    let recorded: Vec<DateTime<Utc>> = revisions.iter().map(|r| r.recorded_at).collect();
+    assert!(
+        recorded.windows(2).all(|w| w[0] <= w[1]),
+        "still non-decreasing across the gap the deleted revision left: {recorded:?}"
+    );
+    // The clamped instant is the one that was hashed *and* the one that was
+    // stored — the reason the write path truncates to microseconds before doing
+    // either. A drift between the two would surface as a `HashMismatch` on an
+    // untampered chain.
+    assert_eq!(
+        head.compute_hash(),
+        head.hash,
+        "the stored transaction time must be the value that was hashed"
+    );
+}
+
+/// The floor is a clamp, not a ratchet. The mark's instant carries no hash of
+/// its own, so an unbounded `max` would let one out-of-band `UPDATE` push a
+/// record's transaction time arbitrarily far forward — every later revision
+/// would hash a far-future instant *correctly*, so `ledger_verify` could not
+/// object, while `ledger_as_of` quietly stopped returning any of them. Past the
+/// tolerated skew the write is refused instead.
+#[tokio::test]
+async fn a_transaction_time_floor_far_ahead_of_the_database_refuses_the_write() {
+    let pool = boot_pool("lg_txn_time_ratchet").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    let far = autumn_web::ledger::truncate_to_micros(now() + Duration::days(365 * 900));
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = 3",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("lop off the newest revision");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_high_water SET recorded_at = ? \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(far)
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("poison the record's transaction-time floor");
+    }
+
+    let result = repo
+        .update(
+            id,
+            &UpdateLgInvoice {
+                amount_cents: Patch::Set(7),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a poisoned floor must refuse the write rather than hash a far-future \
+         instant into the chain"
+    );
+
+    // Nothing was written, so nothing was destroyed: the surviving revisions
+    // still carry real instants and the truncation is still reported.
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    assert_eq!(revisions.len(), 2);
+    assert!(revisions.iter().all(|r| r.recorded_at < far));
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("the truncation is still reported");
+    assert_eq!(broken.kind, LedgerBreak::MissingRevision);
+}
+
+/// Rewriting *only* the mark's instant is a mark rewrite like any other: it is
+/// what `ledger_verify` calls `HighWaterMismatch`, so the write path refuses it
+/// on exactly the same condition. Anything verify can see must not be something
+/// an ordinary write erases.
+#[tokio::test]
+async fn a_rewritten_mark_instant_is_refused_like_any_other_mark_rewrite() {
+    let pool = boot_pool("lg_txn_time_mark_rewrite").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    let ahead = autumn_web::ledger::truncate_to_micros(now() + Duration::minutes(45));
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_high_water SET recorded_at = ? \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(ahead)
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("rewrite the mark's instant, leaving seq and hash alone");
+    }
+
+    assert_eq!(
+        repo.ledger_verify(id)
+            .await
+            .expect("verify")
+            .broken
+            .expect("reported")
+            .kind,
+        LedgerBreak::HighWaterMismatch
+    );
+
+    assert!(
+        repo.update(
+            id,
+            &UpdateLgInvoice {
+                amount_cents: Patch::Set(11),
+                ..Default::default()
+            },
+        )
+        .await
+        .is_err(),
+        "the append must refuse rather than overwrite the mark and launder the \
+         accusation away"
+    );
+
+    // Still reported afterwards, and nothing was written.
+    assert_eq!(repo.ledger_revisions(id).await.expect("revisions").len(), 3);
+    assert_eq!(
+        repo.ledger_verify(id)
+            .await
+            .expect("verify")
+            .broken
+            .expect("still reported")
+            .kind,
+        LedgerBreak::HighWaterMismatch
+    );
+}
+
+/// While the head revision is present its own instant — which its hash covers —
+/// is the floor, and the mark's is ignored. Shown in the one state where a
+/// disagreeing mark still writes: a mark *behind* the head, which is what a
+/// pre-#2323 node in a mixed-version fleet leaves.
+#[tokio::test]
+async fn a_mark_behind_the_head_cannot_steer_the_next_revisions_time() {
+    let pool = boot_pool("lg_txn_time_mark_ignored").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    let ahead = autumn_web::ledger::truncate_to_micros(now() + Duration::minutes(45));
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_high_water SET high_seq = 2, \
+             head_hash = (SELECT hash FROM _autumn_ledger_revisions \
+                          WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = 2), \
+             recorded_at = ? \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(ahead)
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("leave the mark behind, carrying a bogus instant");
+    }
+
+    repo.update(
+        id,
+        &UpdateLgInvoice {
+            amount_cents: Patch::Set(11),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a mark behind the head must not block writes");
+
+    let head = repo
+        .ledger_revisions(id)
+        .await
+        .expect("revisions")
+        .pop()
+        .expect("head");
+    assert!(
+        head.recorded_at < ahead,
+        "the mark's unhashed instant must not become the floor while the head \
+         revision that carries a hashed one is still there: {} >= {ahead}",
+        head.recorded_at
+    );
+    assert!(repo.ledger_verify(id).await.expect("verify").is_intact());
+}
+
+/// The as-of guarantee that rests on it: a transaction-time query at `t` is
+/// answered by the newest revision recorded at or before `t`, and never by one
+/// recorded after it.
+///
+/// Asserted through `ledger_as_of` — the API an auditor actually calls — rather
+/// than by re-deriving the answer from the same filter the implementation uses.
+#[tokio::test]
+async fn an_as_of_query_never_returns_a_revision_recorded_after_the_instant() {
+    let pool = boot_pool("lg_txn_time_as_of").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+
+    let created = repo
+        .save(&NewLgInvoice {
+            reference: "INV-AS-OF".to_string(),
+            amount_cents: 1,
+            amount_rate: 1.5,
+            metadata: "{}".to_string(),
+        })
+        .await
+        .expect("insert");
+    for step in 2..=4 {
+        tick().await;
+        repo.update(
+            created.id,
+            &UpdateLgInvoice {
+                amount_cents: Patch::Set(step),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update");
+    }
+
+    let revisions = repo.ledger_revisions(created.id).await.expect("revisions");
+    assert_eq!(revisions.len(), 4);
+    // The premise the guarantee rests on. Without it the walk below would be
+    // asking a question with no well-defined answer.
+    assert!(
+        revisions
+            .windows(2)
+            .all(|w| w[0].recorded_at < w[1].recorded_at),
+        "the writes are spaced, so each revision has its own instant"
+    );
+
+    for (index, revision) in revisions.iter().enumerate() {
+        // At a revision's own instant, that revision is the answer.
+        let at_instant = repo
+            .ledger_as_of(created.id, revision.recorded_at)
+            .await
+            .expect("as-of")
+            .expect("the record existed");
+        assert_eq!(
+            serde_json::json!(at_instant.amount_cents),
+            revision.snapshot["amount_cents"],
+            "as-of at revision {}'s own instant must return revision {}",
+            revision.seq,
+            revision.seq,
+        );
+
+        // One microsecond earlier it cannot be: the answer is the *previous*
+        // revision, or nothing at all before the insert.
+        let just_before = revision.recorded_at - Duration::microseconds(1);
+        let earlier = repo
+            .ledger_as_of(created.id, just_before)
+            .await
+            .expect("as-of");
+        match index.checked_sub(1).and_then(|prev| revisions.get(prev)) {
+            None => assert!(
+                earlier.is_none(),
+                "before the insert the record did not exist yet"
+            ),
+            Some(previous) => {
+                let earlier = earlier.expect("the record existed");
+                assert_eq!(
+                    serde_json::json!(earlier.amount_cents),
+                    previous.snapshot["amount_cents"],
+                    "as-of just before revision {} must return revision {}, never a \
+                     revision recorded after the instant asked about",
+                    revision.seq,
+                    previous.seq,
+                );
+            }
+        }
+    }
+}
+
+/// A stored chain whose transaction time moves backwards is a forgery, or a
+/// chain written before #2323 across a host clock step. Either way it is now
+/// reported rather than walked past in `seq` order.
+#[tokio::test]
+async fn verify_detects_a_transaction_time_that_moves_backwards() {
+    let pool = boot_pool("lg_txn_time_regression").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    let head = revisions.last().expect("head");
+    let backdated = revisions[1].recorded_at - Duration::seconds(1);
+    // Re-hash so the row still hashes to its stored digest: the point is that a
+    // regression survives every *other* check and needs one of its own.
+    let rehashed = autumn_web::ledger::revision_hash(&autumn_web::ledger::RevisionHashInput {
+        prev_hash: head.prev_hash.as_deref(),
+        table_name: "lg_invoices",
+        tenant_id: None,
+        record_id: id,
+        seq: head.seq,
+        op: head.op,
+        actor: head.actor.as_str(),
+        request_id: head.request_id.as_deref(),
+        snapshot: &head.snapshot,
+        valid_from: head.valid_from,
+        recorded_at: backdated,
+    });
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_revisions SET recorded_at = ?, hash = ? \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = ?",
+        )
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(backdated)
+        .bind::<diesel::sql_types::Text, _>(rehashed)
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .bind::<diesel::sql_types::BigInt, _>(head.seq)
+        .execute(&mut *conn)
+        .await
+        .expect("back-date the newest revision");
+    }
+    // Cover the mark up too, so nothing but the regression check can fire.
+    resync_high_water_mark(&pool, "lg_invoices", id).await;
+
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("a backwards transaction time must be detected");
+    assert_eq!(broken.kind, LedgerBreak::RecordedAtRegression);
+    assert_eq!(broken.seq, head.seq);
+}
+
+// ── the mark is cross-checked on the write path too (#2323) ──────────
+
+/// The obvious way to restore the pre-#2323 attack is to delete the revision
+/// *and* the mark, then wait for ordinary traffic to re-create both. The append
+/// refuses instead, so the evidence outlives the attacker's patience.
+#[tokio::test]
+async fn an_append_refuses_to_re_create_a_deleted_high_water_mark() {
+    let pool = boot_pool("lg_mark_recreate").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    {
+        let mut conn = pool.get().await.expect("conn");
+        for sql in [
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = 3",
+            "DELETE FROM _autumn_ledger_high_water \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        ] {
+            diesel::sql_query(sql)
+                .bind::<diesel::sql_types::BigInt, _>(id)
+                .execute(&mut *conn)
+                .await
+                .expect("cover both tables");
+        }
+    }
+
+    let result = repo
+        .update(
+            id,
+            &UpdateLgInvoice {
+                amount_cents: Patch::Set(1),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "an append over a chain whose mark is gone must refuse rather than \
+         re-create the mark and launder the truncation away"
+    );
+
+    // Nothing moved, and the accusation stands.
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    assert_eq!(revisions.len(), 2);
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("the missing mark is still reported");
+    assert_eq!(broken.kind, LedgerBreak::HighWaterMissing);
+}
+
+/// A mark that names the head's sequence number but a different revision means
+/// one of the two tables was rewritten. Appending would settle that in the
+/// writer's favour, so it is refused.
+#[tokio::test]
+async fn an_append_refuses_when_the_mark_and_the_head_disagree() {
+    let pool = boot_pool("lg_mark_disagree").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_high_water SET head_hash = 'deadbeef' \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("rewrite the mark");
+    }
+
+    let result = repo
+        .update(
+            id,
+            &UpdateLgInvoice {
+                amount_cents: Patch::Set(1),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(result.is_err(), "the disagreement must stop the write");
+    assert_eq!(
+        repo.ledger_verify(id)
+            .await
+            .expect("verify")
+            .broken
+            .expect("still reported")
+            .kind,
+        LedgerBreak::HighWaterMismatch
+    );
+}
+
+/// A wholly erased chain whose mark survived is *not* refused: the append
+/// allocates above the mark, so the chain starts past sequence 1 and
+/// `ledger_verify` reports the erasure forever. Refusing would brick the record
+/// without buying evidence that is not already permanent.
+#[tokio::test]
+async fn a_write_after_a_wholly_erased_chain_leaves_permanent_evidence() {
+    let pool = boot_pool("lg_erased_then_write").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("erase the whole chain");
+    }
+
+    repo.update(
+        id,
+        &UpdateLgInvoice {
+            amount_cents: Patch::Set(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("ordinary traffic continues");
+
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    assert_eq!(
+        revisions.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![4],
+        "the append allocates above the surviving mark, not from 1"
+    );
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("the erasure must still be reported after the write");
+    assert_eq!(broken.kind, LedgerBreak::MissingRevision);
+    assert_eq!(broken.seq, 1);
+}
+
+/// A mark below sequence 1 names no revision, so the append would allocate as
+/// though it were absent and then raise the mark over the top of it — laundering
+/// the accusation `ledger_verify` had already made. Both schemas forbid the row,
+/// and the writer refuses it even where the constraint has been dropped.
+#[tokio::test]
+async fn a_non_positive_high_water_mark_is_refused_rather_than_overwritten() {
+    let pool = boot_pool("lg_mark_non_positive").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    // The schema is the first lock: the row cannot be written at all.
+    {
+        let mut conn = pool.get().await.expect("conn");
+        let refused = diesel::sql_query(
+            "INSERT INTO _autumn_ledger_high_water \
+             (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) \
+             VALUES ('lg_invoices', '', 424242, 0, 'planted', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&mut *conn)
+        .await;
+        assert!(
+            refused.is_err(),
+            "CHECK (high_seq >= 1) must make a non-positive mark unrepresentable"
+        );
+    }
+
+    // The writer is the second, for a database whose constraint was dropped.
+    // SQLite cannot drop a CHECK in place, so rebuild the table without it.
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "ALTER TABLE _autumn_ledger_high_water RENAME TO _hw_old; \
+             CREATE TABLE _autumn_ledger_high_water ( \
+                 table_name TEXT NOT NULL, tenant_key TEXT NOT NULL, \
+                 record_id BIGINT NOT NULL, high_seq BIGINT NOT NULL, \
+                 head_hash TEXT NOT NULL, recorded_at TEXT NOT NULL, \
+                 PRIMARY KEY (table_name, tenant_key, record_id)); \
+             INSERT INTO _autumn_ledger_high_water SELECT * FROM _hw_old; \
+             DROP TABLE _hw_old;",
+        )
+        .await
+        .expect("rebuild the mark table without its CHECK");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_high_water SET high_seq = 0 \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("plant a non-positive mark");
+    }
+
+    // `ledger_verify` sees it, so an ordinary write must not erase it.
+    assert!(
+        repo.ledger_verify(id)
+            .await
+            .expect("verify")
+            .broken
+            .is_some(),
+        "a mark below the chain head is reported"
+    );
+    assert!(
+        repo.update(
+            id,
+            &UpdateLgInvoice {
+                amount_cents: Patch::Set(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .is_err(),
+        "the append must refuse rather than allocate past the mark and raise it"
+    );
+    assert_eq!(
+        repo.ledger_revisions(id).await.expect("revisions").len(),
+        3,
+        "nothing was written"
+    );
+    assert!(
+        repo.ledger_verify(id)
+            .await
+            .expect("verify")
+            .broken
+            .is_some(),
+        "and the accusation survives"
+    );
+}
+
+/// A mark *behind* the head is the mixed-version rolling-deploy case — a
+/// pre-#2323 node appends without raising the mark — so it must NOT refuse. It
+/// is reported, and the record's next write heals it.
+#[tokio::test]
+async fn a_mark_behind_the_head_is_reported_but_still_writable() {
+    let pool = boot_pool("lg_mark_behind").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_high_water SET high_seq = 2, \
+             head_hash = (SELECT hash FROM _autumn_ledger_revisions \
+                          WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = 2), \
+             recorded_at = (SELECT recorded_at FROM _autumn_ledger_revisions \
+                            WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = 2) \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("leave the mark one behind, as an old writer would");
+    }
+
+    assert_eq!(
+        repo.ledger_verify(id)
+            .await
+            .expect("verify")
+            .broken
+            .expect("reported")
+            .kind,
+        LedgerBreak::HighWaterBehind
+    );
+
+    repo.update(
+        id,
+        &UpdateLgInvoice {
+            amount_cents: Patch::Set(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a mark behind the head must not block writes");
+
+    assert!(
+        repo.ledger_verify(id).await.expect("verify").is_intact(),
+        "the record's next write re-establishes the mark above both"
+    );
+}
+
+/// The residual this change does **not** close, pinned so nobody mistakes the
+/// guarantee for a stronger one: an attacker who can DELETE from the revisions
+/// table *and* UPDATE the mark to agree with what survives leaves a state that
+/// is internally consistent, and ordinary traffic then continues from it.
+/// Only a head pinned outside the database catches that.
+#[tokio::test]
+async fn a_truncation_covered_up_in_both_tables_is_only_caught_by_a_pinned_head() {
+    let pool = boot_pool("lg_residual").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    let pinned = repo
+        .ledger_head(id)
+        .await
+        .expect("head")
+        .expect("head")
+        .hash;
+
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = 3",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("delete the newest revision");
+    }
+    resync_high_water_mark(&pool, "lg_invoices", id).await;
+
+    repo.update(
+        id,
+        &UpdateLgInvoice {
+            amount_cents: Patch::Set(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("ordinary traffic continues");
+
+    assert!(
+        repo.ledger_verify(id).await.expect("verify").is_intact(),
+        "documented residual: consistent tampering across both tables is not \
+         visible from inside the database"
+    );
+    let now_head = repo.ledger_head(id).await.expect("head").expect("head");
+    assert_ne!(
+        now_head.hash, pinned,
+        "a head pinned outside the database is what still disagrees"
+    );
+}
+
+// ── adoption: the migration backfills existing chains (#2323) ────────
+
+/// The mark table arrives *after* the revisions table in a real deployment, so
+/// its migration has to leave every chain that already exists marked. Without
+/// the backfill, `HighWaterMissing` would fire on every record on upgrade day —
+/// and the write path would refuse every subsequent write.
+#[tokio::test]
+async fn the_migration_backfills_a_mark_for_every_chain_that_already_exists() {
+    let pool = boot_pool("lg_backfill").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+
+    // Two records with chains of different lengths, written before the mark
+    // table exists at all.
+    let mut ids = Vec::new();
+    for n in 0..2 {
+        let created = repo
+            .save(&NewLgInvoice {
+                reference: format!("PRE-{n}"),
+                amount_cents: 1,
+                amount_rate: 1.0,
+                metadata: "{}".to_string(),
+            })
+            .await
+            .expect("insert");
+        for step in 0..=n {
+            repo.update(
+                created.id,
+                &UpdateLgInvoice {
+                    amount_cents: Patch::Set(i64::from(step) + 2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update");
+        }
+        ids.push(created.id);
+    }
+
+    // Drop every mark, leaving exactly what a pre-#2323 ledger looks like: real
+    // chains, no marks. Then re-apply the shipped migration — its DDL is
+    // `IF NOT EXISTS` and its backfill is `ON CONFLICT DO NOTHING`, so what runs
+    // here is the backfill statement itself, over real chains rather than the
+    // empty table every other test's boot sees.
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute("DELETE FROM _autumn_ledger_high_water")
+            .await
+            .expect("un-mark every chain");
+        conn.batch_execute(LEDGER_HIGH_WATER_UP)
+            .await
+            .expect("apply the high-water migration over an existing ledger");
+    }
+
+    for (n, id) in ids.iter().enumerate() {
+        let mark = repo
+            .ledger_high_water(*id)
+            .await
+            .expect("mark")
+            .expect("the backfill must have marked this chain");
+        let head = repo.ledger_head(*id).await.expect("head").expect("head");
+        assert_eq!(mark.seq, head.seq, "record {id} ({n})");
+        assert_eq!(mark.hash, head.hash);
+        assert_eq!(mark.recorded_at, head.recorded_at);
+        assert!(
+            repo.ledger_verify(*id).await.expect("verify").is_intact(),
+            "a backfilled chain must not be accused"
+        );
+    }
+
+    // And ordinary writes continue from there, without a gap.
+    repo.update(
+        ids[0],
+        &UpdateLgInvoice {
+            amount_cents: Patch::Set(99),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update after the backfill");
+    assert!(
+        repo.ledger_verify(ids[0])
+            .await
+            .expect("verify")
+            .is_intact()
+    );
+}
+
+// ── tenant isolation of the mark (#2323) ─────────────────────────────
+
+/// Two tenants' rows may share a `record_id`, which is exactly why the mark is
+/// keyed on `tenant_key` as well. Prove their marks stay separate — and that a
+/// tenant-scoped `ledger_verify` reads its own.
+#[tokio::test]
+async fn high_water_marks_are_per_tenant() {
+    let pool = boot_pool("lg_tenant_mark").await;
+    let repo = PgLgTenantInvoiceRepository::with_pool_untracked(pool.clone());
+
+    let a_id = with_tenant("tenant-a".to_string(), async {
+        let created = repo
+            .save(&NewLgTenantInvoice {
+                reference: "A-1".to_string(),
+            })
+            .await
+            .expect("insert as tenant-a");
+        for step in 0..2 {
+            repo.update(
+                created.id,
+                &UpdateLgTenantInvoice {
+                    reference: Patch::Set(format!("A-1-{step}")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update as tenant-a");
+        }
+        created.id
+    })
+    .await;
+
+    let b_id = with_tenant("tenant-b".to_string(), async {
+        repo.save(&NewLgTenantInvoice {
+            reference: "B-1".to_string(),
+        })
+        .await
+        .expect("insert as tenant-b")
+        .id
+    })
+    .await;
+
+    with_tenant("tenant-a".to_string(), async {
+        let mark = repo
+            .ledger_high_water(a_id)
+            .await
+            .expect("mark")
+            .expect("tenant-a has a mark");
+        assert_eq!(mark.seq, 3, "tenant-a's own chain length, not tenant-b's");
+        assert!(repo.ledger_verify(a_id).await.expect("verify").is_intact());
+    })
+    .await;
+
+    with_tenant("tenant-b".to_string(), async {
+        let mark = repo
+            .ledger_high_water(b_id)
+            .await
+            .expect("mark")
+            .expect("tenant-b has a mark");
+        assert_eq!(mark.seq, 1);
+        assert!(repo.ledger_verify(b_id).await.expect("verify").is_intact());
+
+        // Tenant b's read of tenant a's record id must not reach tenant a's
+        // mark, even where the ids collide.
+        if a_id == b_id {
+            assert_eq!(
+                repo.ledger_high_water(a_id)
+                    .await
+                    .expect("mark")
+                    .unwrap()
+                    .seq,
+                1
+            );
+        }
+    })
+    .await;
+
+    // And a tenant-scoped truncation is reported inside its own scope.
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_tenant_invoices' AND tenant_id = 'tenant-a' \
+             AND record_id = ? AND seq = 3",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(a_id)
+        .execute(&mut *conn)
+        .await
+        .expect("truncate tenant-a's chain");
+    }
+    with_tenant("tenant-a".to_string(), async {
+        let broken = repo
+            .ledger_verify(a_id)
+            .await
+            .expect("verify")
+            .broken
+            .expect("tenant-a's truncation must be reported");
+        assert_eq!(broken.kind, LedgerBreak::MissingRevision);
+        assert_eq!(broken.seq, 3);
+    })
+    .await;
+    with_tenant("tenant-b".to_string(), async {
+        assert!(
+            repo.ledger_verify(b_id).await.expect("verify").is_intact(),
+            "tenant-b must not inherit tenant-a's accusation"
+        );
+    })
+    .await;
 }
 
 /// Bulk writes are where a per-row chain read is most likely to go wrong.
@@ -1185,6 +2578,9 @@ async fn a_truncated_tail_is_detected_when_only_an_encrypted_column_changed() {
         .await
         .expect("lop off the revision that changed only the encrypted column");
     }
+    // Cover the #2323 mark up too, so the truncation reaches the live-row
+    // cross-check this test exists to exercise rather than stopping at the mark.
+    resync_high_water_mark(&pool, "lg_vault_notes", created.id).await;
 
     let broken = repo
         .ledger_verify(created.id)
@@ -1356,6 +2752,9 @@ async fn a_truncated_tail_is_detected_when_only_a_hidden_column_changed() {
         .await
         .expect("lop off the revision that changed only the hidden column");
     }
+    // Cover the #2323 mark up too, so the truncation reaches the live-row
+    // cross-check this test exists to exercise rather than stopping at the mark.
+    resync_high_water_mark(&pool, "lg_secret_notes", created.id).await;
 
     let broken = repo
         .ledger_verify(created.id)

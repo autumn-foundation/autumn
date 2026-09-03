@@ -1484,9 +1484,11 @@ enum Commands {
     /// Run conformance checks against a plugin's route contributions.
     ///
     /// Compiles the application (debug profile), introspects its route table,
-    /// and verifies that the named plugin satisfies five checks: installability,
-    /// route attribution, route prefix, route collision, and sensitive-surface
-    /// gating.  Exits 0 on pass, 1 on failure.
+    /// and verifies that the named plugin satisfies eight checks: installability,
+    /// route attribution, route prefix, route collision, sensitive-surface
+    /// gating, duplicate registration, and — from the contract the binary dumps
+    /// (issue #1601) — that the plugin declares a usable `autumn-web` range and
+    /// which experimental surface it depends on.  Exits 0 on pass, 1 on failure.
     ///
     /// This is the AUTHOR-facing gate. To discover and install a plugin as a
     /// consumer, use `autumn plugin list` / `autumn plugin add`.
@@ -1495,6 +1497,7 @@ enum Commands {
     ///
     ///   autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin \
     ///       --sensitive-route /admin:"Role: admin required"
+    ///   autumn plugin-check --plugin-name autumn-admin-plugin --deny-experimental
     #[command(verbatim_doc_comment)]
     PluginCheck {
         /// Package to build (for workspaces).
@@ -1517,6 +1520,14 @@ enum Commands {
         /// Output format: `text` (default) or `json`.
         #[arg(long, default_value = "text", value_name = "FORMAT")]
         format: String,
+        /// Fail the run when the plugin declares any dependency on
+        /// experimental plugin surface (issue #1601).
+        ///
+        /// Off by default: the `experimental-surface` check reports what a
+        /// plugin leans on, and leaning on it is an informed choice. Set this
+        /// in a plugin's own CI to forbid it.
+        #[arg(long)]
+        deny_experimental: bool,
     },
 
     /// Inspect and mutate live runtime configuration values.
@@ -4731,6 +4742,7 @@ fn run_command(command: Commands) {
             prefix,
             sensitive_route,
             format,
+            deny_experimental,
         } => {
             run_plugin_check_command(
                 package.as_deref(),
@@ -4739,6 +4751,7 @@ fn run_command(command: Commands) {
                 prefix.as_deref(),
                 &sensitive_route,
                 &format,
+                deny_experimental,
             );
         }
         Commands::Generate(cmd) => run_generate_command(cmd, ApplyMode::Generate),
@@ -4973,6 +4986,7 @@ fn run_plugin_check_command(
     prefix: Option<&str>,
     sensitive_route_args: &[String],
     format: &str,
+    deny_experimental: bool,
 ) {
     let fmt = format.parse().unwrap_or_else(|e| {
         eprintln!("autumn plugin-check: {e}");
@@ -5001,6 +5015,9 @@ fn run_plugin_check_command(
         expected_prefix: prefix,
         sensitive_routes: &sensitive_routes,
         format: fmt,
+        // Populated by `run` from the built binary's contract dump.
+        contracts: &plugin_check::ContractDump::Absent,
+        deny_experimental,
     });
 }
 
@@ -8631,6 +8648,38 @@ mod tests {
         }
     }
 
+    /// `--deny-experimental` turns the `experimental-surface` report into a
+    /// gate (issue #1601). It has to be opt-in, so the default is asserted too.
+    #[test]
+    fn parse_plugin_check_deny_experimental_flag() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin-check",
+            "--plugin-name",
+            "myplugin",
+            "--deny-experimental",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::PluginCheck {
+                deny_experimental, ..
+            } => assert!(deny_experimental),
+            _ => panic!("expected PluginCheck"),
+        }
+
+        let default =
+            Cli::try_parse_from(["autumn", "plugin-check", "--plugin-name", "myplugin"]).unwrap();
+        match default.command {
+            Commands::PluginCheck {
+                deny_experimental, ..
+            } => assert!(
+                !deny_experimental,
+                "experimental use is reported, not gated"
+            ),
+            _ => panic!("expected PluginCheck"),
+        }
+    }
+
     #[test]
     fn parse_plugin_check_default_format_is_text() {
         let cli =
@@ -8733,7 +8782,9 @@ mod tests {
                 prefix,
                 sensitive_route,
                 format,
+                deny_experimental,
             } => {
+                assert!(!deny_experimental, "the flag defaults off");
                 assert_eq!(package.as_deref(), Some("my-app"));
                 assert_eq!(bin.as_deref(), Some("server"));
                 assert_eq!(plugin_name, "autumn-admin-plugin");

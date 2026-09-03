@@ -33,6 +33,14 @@ copy of the publish order.
 ### Functions
 
 - `autumn_web::app() -> AppBuilder`
+- `autumn_web::slugify(&str) -> String` — URL-safe slug. **Never returns
+  `""`**: input with nothing to slugify (empty, all punctuation, un-folded
+  non-Latin) gets a stable, deterministic hash fallback token instead.
+- `autumn_web::contains_letter_or_number(&str) -> bool` (unreleased, #2424) —
+  the input check `slugify` cannot answer. Reach for it to reject content-free
+  user input (`"***"`, `"🎉🔥💯"`); **never** `slugify(x).is_empty()`, which is
+  always `false` and so is dead code. Deliberately broader than "`slugify`
+  produced a real slug": `"日本語"` passes — real text, hashed URL segment.
 
 ### Common types
 
@@ -290,10 +298,10 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `classify::manifest::ClassifiedFieldDescriptor` inventory registration, and
   `Model::__AUTUMN_CLASSIFIED_COLUMNS`. `autumn data-flow` emits the manifest.
   See `docs/guide/data-classification.md`.
-- `#[normalize(trim, downcase, upcase, squish, with = path::to::fn)]` (issue
+- `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path::to::fn)]` (issue
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`
-  (`trim`/`downcase`/`upcase`/`squish`); `with = path` calls a user
+  (`trim`/`downcase`/`upcase`/`squish`/`strip_nul`); `with = path` calls a user
   `fn(&str) -> String`. Runs on the **write** path (`save`/`save_many` insert;
   `update` via `UpdateDraft::from_patch`) *before* the `before_create` /
   `before_update` hooks and the DB write, and on derived `#[repository]`

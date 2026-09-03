@@ -605,10 +605,10 @@ saying why. A `#[repository]` recording version history or a ledger serializes
 the whole model, which a classified model cannot do; gating those sinks is a
 follow-up slice. See [Data Classification](./data-classification.md).
 
-#### `#[normalize(trim, downcase, upcase, squish, with = path)]`
+#### `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path)]`
 
 Runs an ordered normalizer chain over the owned `String` before every insert
-and update. Built-ins (`trim`, `downcase`, `upcase`, `squish`) are
+and update. Built-ins (`trim`, `downcase`, `upcase`, `squish`, `strip_nul`) are
 `fn(&str) -> String` in `autumn_web::normalize`; `with = path` calls your own
 function with the same signature. Normalizers apply left-to-right.
 
@@ -896,12 +896,28 @@ the aggregate per shard via `from_shard(...)` instead. Grouping/filtering on an
 #### `dependent(...)` cascades
 
 `dependent(ChildRepository, fk = "col", on_delete = destroy | delete_all |
-nullify | restrict)` makes `delete_by_id` cascade into the child repository's
-delete path within one transaction (overriding the plain `delete_by_id`).
+nullify | restrict)` makes both `delete_by_id` and the bulk `delete_many`
+cascade into the child repository's delete path within one transaction
+(overriding the plain delete bodies).
 
-**Gotcha:** the cascade is **single-level** — it applies this model's deletion
-to each directly-matched child but does *not* recurse into the child's own
-`dependent(...)` declarations, so grandchildren are not handled.
+The same cascade can be declared on the model instead — `#[has_many(Comment,
+dependent = destroy)]` / `#[has_one(...)]`, which resolves the child repository
+by the `Pg{Child}Repository` convention and drives it through a generated
+`Model::dependents()` table. When a repository declares `dependent(...)`, the
+repository attribute wins and a debug-only `tracing::warn!` names the inert
+model-side declaration.
+
+A `destroy`d child runs its **own** dependents before its row is removed, so
+multi-level graphs (`Post -> Comment -> Reply`) cascade end to end, with a
+`(table, id)` guard so self- and mutually-referential graphs terminate.
+
+**Gotcha:** `delete_all` is the one action that stays **single-level** — it is a
+set-based delete that fires no child hooks and does not recurse, so rows it
+removes must not have dependents of their own.
+
+Full treatment — the action table, ordering guarantees, precedence, and the
+rejected combinations — is in the
+[repositories guide](repositories.md#9-dependent-cascades-dependent--action).
 
 #### `cursor_page` (keyset pagination)
 

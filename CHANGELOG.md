@@ -113,6 +113,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comments a delete takes with it. Each of those is named in the document's
   `excluded` list with its caveat, rather than left to the guide. See
   `docs/guide/agent-authority.md`.
+- **`autumn_web::contains_letter_or_number(&str) -> bool` (#2424):** the
+  predicate to use when rejecting user input that will be slugified. `slugify`
+  never returns an empty string — input with nothing to slugify gets a stable
+  hash fallback token — so `slugify(input).is_empty()` is always `false` and
+  can only ever be dead code. This asks the question that check was reaching
+  for: does the input hold at least one letter or number, in any script?
+  (Precisely, any `char::is_alphanumeric`, so `"½"` and `"Ⅻ"` count too.) It is
+  deliberately broader than "`slugify` produced a real slug", so `"日本語"`
+  passes — real text, hashed URL segment — while `"***"` and `"🎉🔥💯"` do
+  not. It is a content check, not a spoofing defence: a handful of characters
+  are letters by Unicode yet render blank (the Hangul fillers), and filtering
+  those is the application's job. `slugify`'s own behavior is unchanged; its
+  doc comment now points here.
+- **A versioned stability contract for the plugin API (#1601):** Autumn shipped a
+  real plugin system — the `Plugin` trait, a conformance harness, a flagship
+  first-party plugin, authoring docs — and no compatibility contract to go with
+  it. Nothing said which plugin-facing APIs were stable, a plugin could not
+  state which `autumn-web` versions it supported, and no CI gate was specific to
+  the plugin surface, so every release was a potential silent break for anyone
+  building on it. Non-breaking: every new API is additive, and a plugin that
+  declares nothing behaves exactly as it does today.
+
+  Plugin-facing APIs are now declared `stable` or `experimental` in
+  `autumn_web::plugin_contract::PLUGIN_SURFACES`, with the SemVer promise each
+  tier carries written down in [`STABILITY.md`](STABILITY.md#the-plugin-api-surface-issue-1601)
+  and the table rendered in [the plugin guide](docs/plugins.md#the-plugin-api-contract).
+
+  A plugin declares the framework range it supports, and an excluded pairing
+  fails at registration naming both versions and both remedies:
+
+  ```rust
+  fn contract(&self) -> Option<PluginContract> {
+      Some(PluginContract::new(env!("CARGO_PKG_NAME")).autumn_web("0.7"))
+  }
+  ```
+
+  The framework side is gated by compilation: `autumn-plugin-reference` is a
+  pinned reference plugin that calls every declared stable surface, built by the
+  new `plugin-contract` CI job on every change — so removing, renaming, or
+  re-signaturing one is a red check on the PR that causes it. A stable entry
+  with no call site in that crate fails the same job, so the registry cannot
+  promise what nothing compiles.
+
+  `autumn plugin-check` gains two checks, `plugin-contract` and
+  `experimental-surface`, reading the contract the built binary dumps; both skip
+  on a binary that predates the dump, and `--deny-experimental` fails closed
+  rather than becoming a silent no-op. `autumn generate plugin` now scaffolds
+  `Plugin::contract`. The migration-guide template gains a **Plugin authors**
+  section, and `scripts/check-plugin-surface.sh` fails a change to the declared
+  surface that does not fill it in. <!-- migration-guide-gate: the additive half
+  of #1601; its one break is declared separately under Changed -->
+
 - **Pin a worker tier to queues from the command line, and let `doctor` prove
   fleet-wide queue coverage (#1623):** per-queue `reserved`/`concurrency` pools
   and `jobs.pin` already existed, but pinning could only be spelled in
@@ -426,6 +478,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   heuristic assumed — matching what that same handler already served on the
   dynamic path. Return `Markup` or `Html<String>` for HTML. See
   [the migration guide](docs/migrations/next.md).
+
+- **Ledger: a monotonic head outside the revision rows, and transaction time
+  from the database (#2323):** the tamper-evident record ledger allocated each
+  revision's sequence number from the rows that survived in
+  `_autumn_ledger_revisions`, which left an attacker a window they could close
+  themselves. Delete the newest revision, then wait for a *normal* application
+  write: the append read `N-1`, re-allocated `N`, chained cleanly onto its
+  predecessor and matched the live row, so both the chain walk and the live-row
+  cross-check reported intact and the deleted state left no trace.
+
+  A new framework table, `_autumn_ledger_high_water`, keeps a per-record
+  high-water mark where deleting a revision cannot reach it. Every append now
+  allocates `max(chain head, high-water mark) + 1` and raises the mark in the
+  same transaction, so the same attack allocates `N+1` and leaves a **permanent
+  gap** that `ledger_verify` reports as `MissingRevision` — whenever it runs,
+  not only in the window before the next write. The same mark tells a *wholly
+  erased* chain apart from a row that predates ledgering, which the first slice
+  had to stay silent about.
+
+  The mark is cross-checked, never believed — on both paths. `ledger_verify`
+  compares it with the chain in both directions, so rolling it back
+  (`HighWaterBehind`), rewriting it (`HighWaterMismatch`) or deleting its row
+  (`HighWaterMissing`) is itself the accusation; and an append that finds the two
+  in a state no framework code path can produce **refuses** rather than
+  overwriting the evidence. Without that second half, deleting a revision *and*
+  the mark and then waiting for ordinary traffic would have the append quietly
+  re-create both. A mark merely *behind* the head still writes: that is what a
+  pre-#2323 node in a mixed-version fleet leaves, and the next write heals it.
+  It raises the bar rather than closing the class — an attacker who can delete
+  revisions and rewrite the mark to agree with what survives is still invisible
+  from inside the database — so pinning `ledger_head` outside it remains
+  required for an audit posture. `ledger_high_water` exports the mark beside it,
+  from the same statement. The migration backfills a mark for every chain that
+  already exists, so adoption is a plain `autumn migrate` — run it *before*
+  rolling out the new binary.
+
+  `recorded_at` no longer comes from the writing host's clock. It is read from
+  the database (`clock_timestamp()` on Postgres, `strftime(…, 'now')` on SQLite)
+  at the point the append has already read the record's chain head, and clamped
+  against the chain's own floor — so transaction time is **non-decreasing along
+  a chain by construction**, across node clock skew and host clock steps alike,
+  and an as-of query is no longer answered by a revision recorded after the
+  instant asked about (up to the commit-visibility lag the guide documents). The
+  clamp is bounded: a floor more than an hour ahead of the database's clock
+  refuses the write instead of ratcheting the record's transaction time forward
+  for good. A chain where transaction time does move backwards is now reported
+  as `RecordedAtRegression`, ranked last so a chain written before this change
+  cannot mask a truncation. `LedgerBreak` is `#[non_exhaustive]` from here on,
+  and `autumn db scrub` refuses to empty one of the two ledger tables without
+  the other.
 
 - **SBOMs and signed provenance for framework and app releases (#1615):**
   Autumn could not answer "what exactly is in this artifact, and who built it?"
@@ -765,6 +867,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **plugin-conformance:** **Breaking:** `plugin_conformance::ConformanceConfig`
+  gains a `contract` field and is now `#[non_exhaustive]`, so it can no longer
+  be built with a struct literal — use `ConformanceConfig::new(name)` and the
+  fluent setters, which are unchanged. `#[non_exhaustive]` lands with the field
+  deliberately: it is what lets a later release add a check's configuration
+  without breaking every plugin's test suite again. `autumn plugin-check` also
+  now **fails** a plugin that declares no `Plugin::contract`; the plugin itself
+  compiles and runs unchanged. Part of #1601; see the
+  [migration guide](docs/migrations/next.md).
+- **`#[repository]`'s write paths are no longer re-emitted at every call site,
+  cutting a ledgered repository's expansion by 65%:** the `db` gate (#2309)
+  removed `autumn-macros`'s own compile time for a no-database app, but a
+  DB-backed app re-enables `db` and pays none of it back — its cost is in
+  compiling what the macros *emit*, once per `#[repository]`, in every crate
+  that declares one. Measured per invocation, a plain repository expanded to
+  ~72 KB of Rust and a `ledgered` one to ~508 KB; autumn's own consolidated
+  `integration_tests` binary compiles 60 of them. In a release build a
+  `#[repository]` costs roughly three times what a `#[model]` does.
+
+  Three write paths that never depended on the model have moved into the runtime,
+  where they compile once for the whole program instead of once per repository:
+
+  * `autumn_web::version_history::append_version_history` — the version-history
+    INSERT and its pg/`SQLite` fork (#1996), previously inlined at each of the
+    macro's ~30 mutation sites;
+  * `autumn_web::ledger::append_revision` — the whole ledger append: the
+    chain-state read, the #2323 high-water cross-checks, the sequence
+    allocation, the hash and the two writes. Each call site had been expanding a
+    chain-state struct and two `QueryableByName` derives of its own;
+  * `autumn_web::repository::{dependent_restrict, dependent_nullify,
+    dependent_delete_all}` — three of the four `dependent(...)` cascade arms
+    (#1369), which were already pure dynamic SQL over a table name and a foreign
+    key held in runtime `&str`s.
+
+  Alongside them, `autumn_web::__private::maybe_immediate_transaction` replaces
+  the `const HAS_COUNTER_CACHES` guard pattern that emitted the **whole mutation
+  body twice** — once transactional, once bare — at seven sites per repository
+  (#1325). It takes the const as a runtime flag and opens a transaction only when
+  it is set, so the body is emitted once. Nothing changes at runtime: a model with
+  no counter cache still issues its single statement with no `BEGIN`/`COMMIT`.
+
+  Resulting expansion per `#[repository]`:
+
+  | declaration | before | after |
+  | --- | --- | --- |
+  | plain | 72.7 KB | 68.9 KB (-5%) |
+  | `soft_delete` | 82.0 KB | 77.2 KB (-6%) |
+  | `tenant_scoped` | 94.0 KB | 89.3 KB (-5%) |
+  | `versioned` | 144.3 KB | 110.7 KB (-23%) |
+  | `ledgered` | 508.5 KB | 174.6 KB (-66%) |
+
+  What deliberately stays generated is the typed CRUD — `find_by_id`, `save`,
+  `update`, `page`, `list`, and the `dependent = destroy` cascade arm. Diesel's
+  typed DSL is what checks those queries against the app's `schema.rs` at compile
+  time; rewriting them as dynamic SQL would trade the framework's main
+  correctness guarantee for build speed. Only code that was *already* dynamic
+  SQL, or already erased its per-column typing behind `&'static` specs and `fn`
+  pointers the way `counter_cache_after_insert` does, was moved.
+
+  No API changes and no behaviour changes — same statements, same order, same
+  transactions, same errors. A new `repository_expansion_stays_within_budget`
+  test asserts a per-declaration ceiling on the expansion so a statement inlined
+  back into a per-call-site fragment fails the build rather than quietly
+  regressing; the SQL-shape assertions that used to live in `autumn-macros` moved
+  to `version_history` and `ledger`, next to the statements they describe.
+
+  [no-plugin] — nothing here is agent-facing. Every function this adds is
+  `#[doc(hidden)]` and documented as semver-exempt ("a runtime support function
+  for code generated by Autumn proc macros; do not call it directly"), and the
+  `ledgered` / `dependent(...)` surface the plugin does document — the attribute
+  spelling, the methods it generates, the tables it writes — is unchanged. What
+  moved is where the framework emits the code from, not what an app writes or
+  what it does.
+
 - **The `Listening` log line now reports the address actually bound** rather
   than the one configured, so `server.port = 0` (and a socket inherited from an
   in-place upgrade) shows the real port instead of `0`. Issue #1674.
@@ -900,6 +1076,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `redis::Client` without adding their own dependency. Issue #2172.
 
 ### Fixed
+
+- **Punctuation- and emoji-only titles no longer slip past the validator that
+  exists to stop them (#2424):** `examples/reddit-clone` rejects a post title
+  like `***`, `!!!???...:::` or `🎉🔥💯` with "Title must contain at least one
+  letter or number" — as its own doc comment always claimed it did. The check
+  had gone dead: it asked `slugify(value).is_empty()`, and `slugify` had since
+  been given a stable non-empty fallback token, so the condition could never
+  be true again. A content-free title was silently accepted and published under
+  a hash-looking URL (`/r/rust/comments/35/n1a3b8617ffb1dc4d`) with no feedback
+  to its author. Two sibling checks written the same way — the community name
+  in `subreddits::create` and the per-name skip in the post-tag parser — were
+  equally unreachable and are fixed with them.
+
+  The framework half is a new **`autumn_web::contains_letter_or_number`**
+  (described under *Added* above). Applying it narrows nothing that was
+  working: the dead check accepted everything, so a `"日本語"` or `"Привет"`
+  title was already accepted and stays accepted, taking `slugify`'s hash
+  fallback for its URL segment — exactly what that fallback is for. The rule
+  itself changes the outcome only for input carrying no letter or number at
+  all.
+
+  The same rule is now also applied in `PostHooks` and a new `SubredditHooks`,
+  because the generated `/api/posts` and `/api/subreddits` routes run the
+  model's `#[validate]` attributes and the mutation hooks — never the
+  route-local validator — so `{"title": "***"}` could reach the database
+  through the API even with the form path fixed. A model-level
+  `#[validate(custom(...))]` would not have been enough: `#[model]`
+  deliberately drops `custom` from the `UpdateModel` PATCH path (`Patch<T>`
+  implements only the declarative per-field traits), so it would have covered
+  an API create and left an API rename to `"***"` open. A hook sees the merged
+  model on both.
+
+  Two adjacent corrections in the same example, both surfaced while fixing the
+  above: the community-name length rule counted **bytes** (`str::len`) while
+  telling the user it counted characters, so an 11-character Japanese name was
+  rejected as over 32 and a 1-character one passed a rule requiring 2 — it now
+  counts characters, matching the post title's `validate(length(...))`. And
+  saving tags now reports how many names were ignored instead of returning
+  fewer tags than the author typed under a bare "Tags updated."
+- **🧭 Wayfinder: text-safe warning/success colors in the admin plugin
+  (WCAG contrast 3.19:1 / 3.77:1 → 4.5:1+):** the Runtime Config page's
+  "overridden" status badge (`--warning` #d97706 on `--surface`, every
+  deployment's config page) and every model list page's boolean-field ✓
+  checkmark (`--success` #059669 on `--surface`, rendered for every boolean
+  column in every row) used their raw semantic color token directly as
+  small/normal foreground text — tokens calibrated for the 3:1 large-text/
+  border/icon uses they already had, not WCAG AA's 4.5:1 normal-text
+  threshold. New `--warning-text` (#92400e) and `--success-text` (#065f46)
+  tokens, matching the framework's existing flash-message foreground shades,
+  fix both sites without introducing a new color.
+- **Dependent cascades are documented where the guide already pointed, and the
+  `through =` rejection points at the offending key (#1702):** the repositories
+  guide had no dependent-cascade section at all, even though the counter-cache
+  guide sent readers there for it, and the macro-transparency guide still
+  described the cascade as **single-level with grandchildren unhandled** and as
+  `delete_by_id`-only — both untrue since the cascade became recursive (#1739)
+  and bulk-aware (#1740). `docs/guide/repositories.md` now carries the canonical
+  treatment: both declaration sites (`#[has_many(Child, dependent = <action>)]`
+  on the model, `dependent(PgChildRepository, fk = "...", on_delete = ...)` on
+  the repository as the escape hatch for children outside the
+  `Pg{Child}Repository` convention), the precedence rule between them, the four
+  actions, the transactional/ordering guarantees, and the rejected combinations;
+  `docs/guide/macro-transparency.md` is corrected and links to it. Alongside it,
+  a `dependent`/`on_delete` on a `through = <join_table>` association now spans
+  the `dependent` key itself rather than the association's target ident, so the
+  caret lands on the thing the error tells you to remove. The model-declared
+  `destroy` cascade on `#[has_one]` is now proven end to end, the precedence
+  between the two declaration sites is proven behaviourally, and the three directed
+  compile errors (`dependent` on `#[belongs_to]`, on a `through =` association,
+  and an unknown action) are pinned by trybuild fixtures.
+
+- **A NUL byte in a form field is a validation error, not a 500 (#2423):** a
+  Postgres `TEXT`/`VARCHAR` column cannot hold `0x00`, but nothing between the
+  form body and the `INSERT` could say so. An embedded NUL — which a real user
+  can produce by pasting from a binary source or through an input-method glitch,
+  not only deliberately — decoded cleanly, satisfied every `#[validate(...)]`
+  rule (the value is a perfectly good Rust `String`), and failed only when the
+  driver handed the byte to the server: `invalid byte sequence for encoding
+  "UTF8": 0x00`, surfacing as an uncaught `AutumnError` and a `500`. By the
+  framework's own error-class convention that reads as a server bug, when it is
+  malformed client input.
+
+  `ChangesetForm` and `NestedChangesetForm` now sweep every submitted **text**
+  value before it is deserialized — the only point where the offending field is
+  still identifiable by name — and record
+  `autumn_web::form::NUL_CHARACTER_FIELD_ERROR` ("Cannot contain the NUL
+  character (0x00)") against the field or child subfield that carried one.
+  Handlers need no change: it is an ordinary field error, so the form
+  re-renders inline through the existing `ChangesetForm` round-trip. The
+  retained value is the author's text minus the byte, so the re-rendered form
+  keeps their work, never echoes a raw `0x00` into the HTML, and their next
+  submission succeeds. Framework plumbing fields are exempt under both their
+  default and configured names — `_csrf`, `_submit_token`, `_method`, and a
+  nested row's `_destroy` — because no template renders an error against one,
+  and cleaning `_destroy` would flip a falsy marker truthy. File parts of a
+  multipart body are untouched.
+
+  For the paths neither round-trip extractor sees — a JSON API body, a
+  hand-written query, a background job, an `extract::Form` or `Valid<T>`
+  extraction — the Postgres rejection is now classified instead of
+  blanket-500'd: the `AutumnError` carries `422 Unprocessable Entity`, and
+  `autumn_web::error::is_nul_byte_violation` recognizes it (walking the
+  `source()` chain) for handlers that want to fold it back into a form the way
+  `unique_violation_field` is used for a uniqueness clash. Classification is by
+  server message rather than SQLSTATE because `diesel-async` maps `22021` to
+  `DatabaseErrorKind::Unknown` and diesel's `DatabaseErrorInformation` exposes
+  no code; the match is anchored on the trailing `: 0x00` and the encoding name,
+  so a message that merely *contains* `0x00` — including one echoing text a
+  client submitted — keeps its 500 rather than being relabelled as the client's
+  fault. The classified error is also re-wrapped rather than merely restatused,
+  because the 422 error page renders the message where the 500 page redacts it:
+  the client sees a fixed sentence and the raw server message stays in the
+  `source()` chain for logs.
+
+  New: `Changeset::add_error`, for folding a post-decode failure back into a
+  form round-trip; `autumn_web::normalize::strip_nul` and
+  `#[normalize(strip_nul)]`, for columns where dropping the byte silently beats
+  refusing the write (insert and hooked-update paths only — the documented
+  normalize-vs-persist asymmetry still applies). See `docs/guide/forms.md` —
+  "Unstorable bytes: NUL", which also records what the backstop does not cover:
+  a 422 with no field name, and `JSONB`'s different SQLSTATE (`22P05`).
 
 - **ACME config: `autumn doctor` and the runtime now reject the same two
   spellings (#1874):** two low-severity parity gaps let `autumn doctor
@@ -1829,6 +2126,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count from one-per-document to one-per-backfill-batch. Every per-field SQL
   expression is unchanged; only how many round trips carry it changed. See
   `docs/reports/2026-08-25-ledger-search-write-documents-batch/`.
+
+- **the admin panel's bulk "delete" action now issues one `UPDATE` instead
+  of one per selected row:** `AdminModel::execute_action`'s trait default
+  (what `POST /admin/{slug}/actions` calls for every model that doesn't
+  override it) looped over the submitted ids and called `delete()` once
+  per id — a full connection checkout plus a single-row `UPDATE` per id, so
+  an operator selecting hundreds of rows in the admin list and clicking
+  "Delete selected" cost hundreds of round trips. `TokenAdminModel` (the
+  built-in `/admin/api-tokens/` model) now overrides `execute_action` for
+  `"delete"` to batch every id into one
+  `UPDATE api_tokens SET revoked_at = ... WHERE id = ANY($1) AND revoked_at IS NULL`
+  round trip; the returned count and end state are unchanged (a duplicate,
+  already-revoked, or nonexistent id is still a silent no-op, still counted
+  as "applied"). Measured against a 50,000-row fixture with a 2,050-id bulk
+  action: revoke statement calls 2,050 → 1. See
+  `docs/reports/2026-08-31-ledger-admin-bulk-delete-batch/`.
 
 - **scaffolded form helpers no longer re-escape their own constant HTML at
   render time:** `text_input`, `password_input`, `textarea_input`,

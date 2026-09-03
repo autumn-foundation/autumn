@@ -121,6 +121,18 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_counter_cache_duplicate_column.rs");
 
+    // Model-declared dependent cascades (#1702): `dependent = <action>` /
+    // `on_delete = <action>` is a `has_many`/`has_one` option, only the four
+    // documented actions are accepted, and it cannot ride on a `through =`
+    // association (whose fk names a join-table column, not one on the target).
+    // Each is a directed compile error rather than a silently-inert key.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_dependent_on_belongs_to.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_dependent_unknown_action.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_dependent_on_through.rs");
+
     // Declarative-schema markers (#1975, slice 3.5): the `#[model]` macro
     // ACCEPTS `#[model(managed)]` / `#[unique]` / `#[references(...)]` but
     // rejects malformed shapes with a clear, actionable `compile_error!`.

@@ -41,8 +41,8 @@ use crate::models::{
 };
 use crate::repositories::{PgPostRepository, PgVoteRepository, PostRepository};
 use crate::schema::{posts, subreddits, tags};
-use autumn_web::slugify;
 use autumn_web::widgets::{CommentThread, CommentView, comment_thread as comment_thread_widget};
+use autumn_web::{contains_letter_or_number, slugify};
 
 fn posts_per_page() -> i64 {
     crate::config_svc()
@@ -654,10 +654,22 @@ fn validate_subreddit_choice(value: &str) -> Result<(), validator::ValidationErr
     }
 }
 
-/// A title has to survive `slugify` — "***" is 3 characters long and still
-/// produces an empty slug, which would give the post an unreachable URL.
+/// A title has to carry some actual text — `"***"` is 3 characters long and
+/// contains nothing a reader (or a URL) can use.
+///
+/// This deliberately does *not* ask `slugify` (issue #2424). `slugify` never
+/// returns an empty string: input with nothing to slugify gets a stable hash
+/// fallback token instead, so the `slugify(value).is_empty()` this check used
+/// to make had become unreachable, and `"***"` silently became a post with a
+/// `n1a3b8617ffb1dc4d` URL and no feedback to its author.
+///
+/// `contains_letter_or_number` asks the question the message promises:
+/// is there a letter or a digit here, in any script? A title of `"日本語"`
+/// passes — it has no ASCII fold, so it too gets the hash fallback for its URL
+/// segment, but it is real text the author typed, and that fallback exists so
+/// such a post is still reachable. `"***"` and `"🎉🔥💯"` are not.
 fn validate_sluggable_title(value: &str) -> Result<(), validator::ValidationError> {
-    if slugify(value).is_empty() {
+    if !contains_letter_or_number(value) {
         return Err(validator::ValidationError::new("title")
             .with_message("Title must contain at least one letter or number".into()));
     }
@@ -1384,6 +1396,51 @@ pub struct ManageTagsForm {
     pub tags: String,
 }
 
+/// What `parse_tag_names` made of the author's free-text tag field.
+struct ParsedTags {
+    /// Tag slugs in first-seen order.
+    slug_order: Vec<String>,
+    /// Display name for each slug — the last spelling the author used wins.
+    name_by_slug: HashMap<String, String>,
+    /// How many names the author actually typed were dropped for carrying no
+    /// letter or number. Counted so the handler can say so instead of
+    /// silently returning fewer tags than were asked for. Stray empty pieces
+    /// (a trailing comma) are not counted: nobody meant to type those.
+    dropped: usize,
+}
+
+/// Split raw tag input into slugs (first-seen order) and their display names.
+///
+/// Pure, so the parsing rules can be tested without a database.
+fn parse_tag_names(raw: &str) -> ParsedTags {
+    let mut slug_order: Vec<String> = Vec::new();
+    let mut name_by_slug: HashMap<String, String> = HashMap::new();
+    let mut dropped = 0_usize;
+    for piece in raw.split([',', '\n']) {
+        let name = piece.trim();
+        if name.is_empty() {
+            continue;
+        }
+        // Not `slugify(name).is_empty()`: that can never be true (#2424), so
+        // this used to keep every `***`/`🎉` the author typed as a tag whose
+        // only visible form was its hash slug.
+        if !contains_letter_or_number(name) {
+            dropped += 1;
+            continue;
+        }
+        let slug = slugify(name);
+        if !name_by_slug.contains_key(&slug) {
+            slug_order.push(slug.clone());
+        }
+        name_by_slug.insert(slug, name.to_string());
+    }
+    ParsedTags {
+        slug_order,
+        name_by_slug,
+        dropped,
+    }
+}
+
 /// Resolve free-text tag names to ids, creating any tag that doesn't exist
 /// yet. Batched to at most one lookup, one insert, and one lookup for any
 /// insert that lost a create race to a concurrent request (find-then-insert;
@@ -1391,25 +1448,18 @@ pub struct ManageTagsForm {
 /// in which case the already-created row is looked up instead — the same
 /// shape the DB layer as a whole already handles via other unique
 /// constraints in this app) — 1-3 round trips total, not per tag name.
-async fn resolve_or_create_tag_ids(raw: &str, db: &mut Db) -> AutumnResult<Vec<i64>> {
-    let mut slug_order: Vec<String> = Vec::new();
-    let mut name_by_slug: HashMap<String, String> = HashMap::new();
-    for piece in raw.split([',', '\n']) {
-        let name = piece.trim();
-        if name.is_empty() {
-            continue;
-        }
-        let slug = slugify(name);
-        if slug.is_empty() {
-            continue;
-        }
-        if !name_by_slug.contains_key(&slug) {
-            slug_order.push(slug.clone());
-        }
-        name_by_slug.insert(slug, name.to_string());
-    }
+///
+/// Returns the resolved ids alongside the number of names dropped for holding
+/// no letter or number, so the caller can tell the author rather than quietly
+/// saving fewer tags than they asked for.
+async fn resolve_or_create_tag_ids(raw: &str, db: &mut Db) -> AutumnResult<(Vec<i64>, usize)> {
+    let ParsedTags {
+        slug_order,
+        name_by_slug,
+        dropped,
+    } = parse_tag_names(raw);
     if slug_order.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), dropped));
     }
 
     let mut id_by_slug: HashMap<String, i64> = tags::table
@@ -1465,7 +1515,25 @@ async fn resolve_or_create_tag_ids(raw: &str, db: &mut Db) -> AutumnResult<Vec<i
         })?;
         ids.push(id);
     }
-    Ok(ids)
+    Ok((ids, dropped))
+}
+
+/// What to tell the author after saving tags.
+///
+/// A dropped name is the author's own input disappearing, so it does not get
+/// to hide behind an unqualified "Tags updated." (#2424). Pure, so the
+/// sentence is testable without a database.
+fn tags_updated_notice(dropped: usize) -> String {
+    match dropped {
+        0 => "Tags updated.".to_owned(),
+        1 => "Tags updated. 1 tag name was ignored — a tag needs at least one \
+              letter or number."
+            .to_owned(),
+        n => format!(
+            "Tags updated. {n} tag names were ignored — a tag needs at least \
+             one letter or number."
+        ),
+    }
 }
 
 /// Replace a post's tags with the free-text `tags` field, creating any new
@@ -1485,11 +1553,11 @@ pub async fn manage_tags(
     let post =
         load_post_and_authorize(&state, &session, &mut db, &sub_slug, &post_slug, "update").await?;
 
-    let tag_ids = resolve_or_create_tag_ids(&form.0.tags, &mut db).await?;
+    let (tag_ids, dropped) = resolve_or_create_tag_ids(&form.0.tags, &mut db).await?;
     drop(db);
     repo.set_tags(post.id, &tag_ids).await?;
 
-    flash.success("Tags updated.").await;
+    flash.success(tags_updated_notice(dropped)).await;
     Ok(Redirect::to(&paths::show(&sub_slug, &post_slug)))
 }
 
@@ -1625,22 +1693,93 @@ mod tests {
         );
     }
 
+    // ── #2423: a NUL byte is an inline field error, not a 500 ──────
+
+    /// The reported repro, on the reported form: `body=before%00after` used to
+    /// decode cleanly, pass every `#[validate(...)]` rule on `SubmitPostForm`,
+    /// and fail only when Diesel handed the byte to Postgres — an unhandled
+    /// 500. It is now an ordinary field error, so `submit` takes its existing
+    /// 422 re-render branch with no change to this route.
+    #[tokio::test]
+    async fn a_nul_byte_in_the_body_is_an_inline_field_error() {
+        use autumn_web::form::NUL_CHARACTER_FIELD_ERROR;
+        use autumn_web::reexports::axum::body::Body;
+        use autumn_web::reexports::axum::extract::FromRequest as _;
+
+        let req = http::Request::builder()
+            .method("POST")
+            .uri(paths::submit())
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "title=nul-test&url=&subreddit_id=1&body=before%00after",
+            ))
+            .expect("build request");
+
+        let form = ChangesetForm::<SubmitPostForm>::from_request(req, &())
+            .await
+            .expect("the body still decodes — this is a validation failure, not a 400");
+
+        // Rejected, so `submit`'s `form.into_valid()` takes the 422 branch...
+        assert!(!form.is_valid());
+        assert_eq!(form.errors_for("body"), [NUL_CHARACTER_FIELD_ERROR]);
+        // ...and only the field that carried the byte is flagged.
+        assert!(form.errors_for("title").is_empty());
+
+        // The re-rendered form carries the message inline and keeps the
+        // author's text, minus the byte it could never have stored.
+        let rendered = submit_form_markup(&form, &[], None).into_string();
+        assert!(
+            rendered.contains("Cannot contain the NUL character"),
+            "the message must render next to the field; rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("beforeafter"),
+            "the author's text must survive the round-trip; rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains('\u{0}'),
+            "a raw NUL must never be echoed back into the HTML"
+        );
+    }
+
     // ── Typed a11y form primitives (#1706) ─────────────────────────
 
     fn blank_submit_form() -> ChangesetForm<SubmitPostForm> {
         ChangesetForm::without_csrf(SubmitPostForm::default())
     }
 
+    /// `ChangesetForm::without_csrf` wraps data in a fresh, error-free
+    /// changeset — it never calls `validate`. Going through `into_changeset`
+    /// is what actually runs the rules, so every test that means to exercise
+    /// them has to build the form this way (#2424).
+    fn validated(form: SubmitPostForm) -> ChangesetForm<SubmitPostForm> {
+        ChangesetForm::from_changeset(form.into_changeset())
+    }
+
+    /// The same rule, for the edit form.
+    fn validated_edit(form: EditPostForm) -> ChangesetForm<EditPostForm> {
+        ChangesetForm::from_changeset(form.into_changeset())
+    }
+
+    /// A submission that is valid apart from whatever `title` is given.
+    fn submission_titled(title: &str) -> SubmitPostForm {
+        SubmitPostForm {
+            subreddit_id: "7".to_owned(),
+            title: title.to_owned(),
+            url: String::new(),
+            body: "kept".to_owned(),
+        }
+    }
+
     fn rejected_submit_form() -> ChangesetForm<SubmitPostForm> {
-        // A submission that fails every rule: no community, a title that
-        // slugifies to nothing, and a URL that is not http(s).
-        let submitted = SubmitPostForm {
+        // A submission that fails every rule: no community, a title with no
+        // letter or number in it, and a URL that is not http(s).
+        validated(SubmitPostForm {
             subreddit_id: String::new(),
             title: "***".to_owned(),
             url: "javascript:alert(1)".to_owned(),
             body: "kept".to_owned(),
-        };
-        ChangesetForm::from_changeset(submitted.into_changeset())
+        })
     }
 
     #[test]
@@ -1750,7 +1889,7 @@ mod tests {
             url: "https://example.com/ferris".to_owned(),
             body: "Hello".to_owned(),
         };
-        let valid = ChangesetForm::without_csrf(form)
+        let valid = validated(form)
             .into_valid()
             .unwrap_or_else(|_| panic!("this submission is valid"));
 
@@ -1766,11 +1905,228 @@ mod tests {
             url: "   ".to_owned(),
             body: "Body".to_owned(),
         };
-        let valid = ChangesetForm::without_csrf(form)
+        let valid = validated(form)
             .into_valid()
             .unwrap_or_else(|_| panic!("an optional URL may be blank"));
 
         assert!(valid.url().is_none());
+    }
+
+    // ── Content-free titles and tags (#2424) ───────────────────────
+
+    /// The premise the whole fix rests on: `slugify` grew a non-empty
+    /// fallback token, so the old `slugify(value).is_empty()` guard in this
+    /// file could never fire again. If this ever fails, the guard could go
+    /// back to asking `slugify` directly.
+    #[test]
+    fn slugify_never_reports_a_title_as_unsluggable() {
+        for title in ["***", "!!!???...:::", "🎉🔥💯"] {
+            assert!(
+                !slugify(title).is_empty(),
+                "slugify({title:?}) is non-empty, so `.is_empty()` is dead code"
+            );
+        }
+    }
+
+    #[test]
+    fn a_title_with_no_letter_or_number_is_rejected() {
+        for title in ["***", "!!!???...:::", "🎉🔥💯", "---", "   "] {
+            let Err(error) = validate_sluggable_title(title) else {
+                panic!("{title:?} must be rejected")
+            };
+            assert_eq!(
+                error.message.as_deref(),
+                Some("Title must contain at least one letter or number"),
+                "{title:?} must explain itself to the author"
+            );
+        }
+    }
+
+    #[test]
+    fn a_title_with_a_letter_or_number_in_any_script_is_accepted() {
+        // A non-Latin title has no ASCII fold and gets `slugify`'s stable
+        // fallback token for its URL segment -- which is a reachable URL, and
+        // exactly what that fallback was added for. Rejecting it would trade
+        // this bug for an i18n one.
+        for title in ["Ferris arrives", "42", "Café", "日本語", "Привет", "a!"] {
+            assert!(
+                validate_sluggable_title(title).is_ok(),
+                "{title:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_title_length_boundaries_count_characters_not_bytes() {
+        // The community-name rule was corrected to `chars().count()` on the
+        // strength of `validator`'s `length` already counting characters.
+        // Nothing pinned that, so this does.
+        for (title, ok) in [
+            ("a".to_owned(), true),
+            ("x".repeat(300), true),
+            ("x".repeat(301), false),
+            // 300 characters, 900 bytes: a byte-counting rule would reject it.
+            ("あ".repeat(300), true),
+            (String::new(), false),
+        ] {
+            let rendered_len = title.chars().count();
+            let accepted = validated(submission_titled(&title)).into_valid().is_ok();
+            assert_eq!(
+                accepted,
+                ok,
+                "a {rendered_len}-character title should {}be accepted",
+                if ok { "" } else { "not " }
+            );
+        }
+    }
+
+    #[test]
+    fn a_whitespace_only_title_does_not_become_a_post() {
+        let rejected = validated(submission_titled("   "))
+            .into_valid()
+            .err()
+            .expect("whitespace is not a title");
+
+        assert!(
+            rejected
+                .errors_for("title")
+                .iter()
+                .any(|m| m.contains("at least one letter or number")),
+            "got: {:?}",
+            rejected.errors_for("title")
+        );
+    }
+
+    #[test]
+    fn a_padded_title_is_accepted_and_trimmed_after_validation() {
+        // The handler trims *after* `into_valid` (see `submit`), so the rules
+        // run against the untrimmed string. A title that is only padding-plus-
+        // text must still pass.
+        let valid = validated(submission_titled("  Ferris arrives  "))
+            .into_valid()
+            .unwrap_or_else(|_| panic!("padding is not a validation failure"));
+
+        assert_eq!(valid.title.trim(), "Ferris arrives");
+    }
+
+    #[test]
+    fn a_punctuation_only_submission_is_rejected_with_its_draft_intact() {
+        let submitted = SubmitPostForm {
+            subreddit_id: "7".to_owned(),
+            title: "***".to_owned(),
+            url: String::new(),
+            body: "kept".to_owned(),
+        };
+        let rejected = validated(submitted)
+            .into_valid()
+            .err()
+            .expect("a title of `***` must not create a post");
+
+        let messages = rejected.errors_for("title");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("at least one letter or number")),
+            "the author must be told why; got: {messages:?}"
+        );
+
+        let rendered = submit_form_markup(&rejected, &[], None).into_string();
+        assert!(
+            rendered.contains("Title must contain at least one letter or number"),
+            "the message must reach the page; rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("kept"),
+            "the draft must survive the rejection; rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_emoji_only_edit_is_rejected_too() {
+        let submitted = EditPostForm {
+            title: "🎉🔥💯".to_owned(),
+            body: "kept".to_owned(),
+        };
+        let rejected = validated_edit(submitted)
+            .into_valid()
+            .err()
+            .expect("an emoji-only title must not survive an edit either");
+
+        assert!(
+            rejected
+                .errors_for("title")
+                .iter()
+                .any(|m| m.contains("at least one letter or number")),
+            "the edit form must reject it for the same stated reason"
+        );
+    }
+
+    #[test]
+    fn tag_names_with_no_letter_or_number_are_skipped_and_counted() {
+        let parsed = parse_tag_names("rust, ***, 🎉, , webdev");
+
+        assert_eq!(
+            parsed.slug_order,
+            vec!["rust".to_owned(), "webdev".to_owned()],
+            "content-free tag names must not become tags"
+        );
+        assert_eq!(
+            parsed.name_by_slug.get("rust").map(String::as_str),
+            Some("rust")
+        );
+        assert_eq!(
+            parsed.name_by_slug.get("webdev").map(String::as_str),
+            Some("webdev")
+        );
+        // The two the author typed are reported; the stray empty piece from
+        // the double comma is not — nobody meant to type that.
+        assert_eq!(parsed.dropped, 2);
+    }
+
+    #[test]
+    fn tag_names_keep_first_seen_order_and_collapse_duplicates() {
+        let parsed = parse_tag_names("Rust\nweb dev, rust");
+
+        assert_eq!(
+            parsed.slug_order,
+            vec!["rust".to_owned(), "web-dev".to_owned()]
+        );
+        // The last spelling wins the display name, as before.
+        assert_eq!(
+            parsed.name_by_slug.get("rust").map(String::as_str),
+            Some("rust")
+        );
+        assert_eq!(parsed.dropped, 0);
+    }
+
+    #[test]
+    fn the_tag_notice_says_how_many_names_were_ignored() {
+        assert_eq!(tags_updated_notice(0), "Tags updated.");
+
+        let one = tags_updated_notice(1);
+        assert!(one.contains("1 tag name was ignored"), "got: {one}");
+        assert!(one.contains("at least one letter or number"), "got: {one}");
+
+        let many = tags_updated_notice(3);
+        assert!(many.contains("3 tag names were ignored"), "got: {many}");
+    }
+
+    #[test]
+    fn a_non_latin_tag_name_is_kept() {
+        // It has no ASCII fold, so its slug is `slugify`'s hash fallback --
+        // but it is a real tag name, not junk, and the row keeps the name the
+        // author typed.
+        let parsed = parse_tag_names("日本語");
+
+        assert_eq!(parsed.slug_order.len(), 1);
+        assert_eq!(
+            parsed
+                .name_by_slug
+                .get(&parsed.slug_order[0])
+                .map(String::as_str),
+            Some("日本語")
+        );
+        assert_eq!(parsed.dropped, 0);
     }
 
     // ── Rich text (#1255) ──────────────────────────────────────────

@@ -223,6 +223,7 @@ pub mod migrate;
 pub(crate) mod pg_conn_str;
 pub mod plugin;
 pub mod plugin_conformance;
+pub mod plugin_contract;
 pub mod probe;
 pub mod query_string;
 
@@ -379,9 +380,13 @@ pub mod sync;
 ///
 /// See [`ledger`] module documentation for the full API (issue #1699).
 pub mod ledger;
+// The data types a caller handles. The two *evidence* enums the verification
+// entry point takes — `LedgerLiveState` and `LedgerHighWaterState` — are
+// deliberately not re-exported: they are arguments to one `ledger::` function,
+// and a caller reaching for them is already inside that module.
 pub use ledger::{
     LedgerAsOf, LedgerBreak, LedgerBreakReport, LedgerDiff, LedgerError, LedgerHead,
-    LedgerRevision, LedgerVerification, LedgeredRecord,
+    LedgerHighWater, LedgerPin, LedgerRevision, LedgerVerification, LedgeredRecord,
 };
 
 /// Automatic record version history for `#[repository]` writes.
@@ -548,10 +553,13 @@ pub mod session;
 /// responses before cutover (issue #1653) — see
 /// `docs/guide/staged-deploys.md`.
 pub mod shadow;
-/// URL-safe slug generation (`slugify`), shared by the scaffold generator's
-/// `slug:slug{from:...}` DSL token and any hand-written app.
+/// URL-safe slug generation (`slugify`).
+///
+/// Shared by the scaffold generator's `slug:slug{from:...}` DSL token and any
+/// hand-written app. Also holds `contains_letter_or_number`, the input check
+/// `slugify` cannot answer because it never returns an empty string.
 pub mod slug;
-pub use slug::slugify;
+pub use slug::{contains_letter_or_number, slugify};
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
 pub mod sse;
@@ -673,6 +681,8 @@ pub mod ws;
 pub mod __private {
     #[cfg(feature = "db")]
     pub use crate::db::is_retryable_txn_error;
+    #[cfg(feature = "db")]
+    pub use crate::db::maybe_immediate_transaction;
     #[cfg(feature = "db")]
     pub use crate::db::scoped_immediate_transaction;
     #[cfg(feature = "db")]
@@ -1843,6 +1853,14 @@ pub mod reexports {
     pub use diesel;
     #[cfg(feature = "db")]
     pub use diesel_async;
+    /// Re-exported because `embed_migrations!` — re-exported from
+    /// [`crate::migrate`] — expands to unqualified `diesel_migrations::…`
+    /// paths. A plugin shipping migrations through the stable
+    /// [`AppBuilder::plugin_migrations`](crate::app::AppBuilder::plugin_migrations)
+    /// seam (issue #1601) can bring this into scope instead of taking its own
+    /// `diesel-migrations` dependency at a matching major.
+    #[cfg(feature = "db")]
+    pub use diesel_migrations;
     pub use http;
     pub use inventory;
     #[cfg(feature = "mail")]
