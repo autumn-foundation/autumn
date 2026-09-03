@@ -436,9 +436,11 @@ here):**
 
 N/A — undetermined verdict, no build to productionize. Build wall-clock
 across all passes: ~11 minutes (first, shallow-clone-invalidated pass) +
-~34 minutes (corrected 32-checkpoint pass + 2 warm re-measurements) + ~7
-minutes (noise-floor calibration, 7 valid + 1 discarded cold-artifact run)
-≈ 52 minutes total, against the pre-registered ≤60-minute *per-pass* box.
+~34 minutes (main 35-build pass: 32 chronological checkpoints + 1 in-pass
+repeat + 2 warm re-measurements) + ~7 minutes (separate noise-floor pass:
+6 builds, 5 valid + 1 discarded cold-artifact, contributing 5 of the
+calibration's 7 total samples — the other 2 come from the main pass) ≈ 52
+minutes total, against the pre-registered ≤60-minute *per-pass* box.
 Two real costs stand out for anyone scoping a repeat: (1) `git fetch
 --unshallow` before any window-derivation command, always — a shallow
 clone fails silently, not loudly; (2) a single-run-per-checkpoint design
