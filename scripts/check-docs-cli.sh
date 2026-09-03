@@ -1830,12 +1830,18 @@ def _mask_single_quoted(text):
     return ''.join(out)
 
 
-def _in_substitutions(segment, masked=()):
+def _in_substitutions(segment, masked=(), both=None):
     """Yield the commands written INSIDE `$( … )` or `<( … )` in a segment.
 
     Re-enters the same parser on the substitution's own tokens, so a chain or
     an environment prefix inside one is handled exactly as it is outside.
+
+    `both` is the segment masked in BOTH quotes: the depth walk counts parens
+    on it, because a `)` written `printf ')'` is a bare `)` token once shlex
+    has stripped the quotes and would otherwise close the substitution early.
     """
+    if both is None or len(both) != len(segment):
+        both = segment
     i = 0
     while i < len(segment):
         # `<(` and `>(` are PROCESS SUBSTITUTION: bash runs the list inside
@@ -1846,7 +1852,7 @@ def _in_substitutions(segment, masked=()):
             depth, start = 0, i + 1
             i += 1
             while i < len(segment):
-                depth += _paren_delta(segment[i])
+                depth += _paren_delta(both[i])
                 i += 1
                 if depth <= 0:
                     break
@@ -1909,11 +1915,29 @@ def _from_tokens(tokens, masked=None, classify=None):
     if masked_segments is None or len(masked_segments) != len(segments) \
             or any(len(a) != len(b) for a, b in zip(segments, masked_segments)):
         masked_segments = segments
-    for segment, masked_segment in zip(segments, masked_segments):
+    # A THIRD view, masked in BOTH quotes, for counting `$( … )` depth. shlex
+    # strips quotes, so a `)` written `printf ')'` becomes a bare `)` token and
+    # the paren walks below closed the substitution early — `OUT=$(printf ')';
+    # autumn …)` stopped at the quoted paren and never reached the command.
+    # `_segments` already balances on this copy; these inner walks did not.
+    both_segments = _segments(classify, classify) if classify is not None else None
+    if both_segments is None or len(both_segments) != len(segments) \
+            or any(len(a) != len(b) for a, b in zip(segments, both_segments)):
+        both_segments = segments
+    for segment, masked_segment, both in zip(segments, masked_segments,
+                                             both_segments):
         inspecting = False
         i = _cron_prefix(segment)
         while i < len(segment) and (segment[i] in _PROMPT or segment[i] in _CONTROL
+                                    or segment[i] == 'function'
                                     or _ENV_TOKEN.match(segment[i])):
+            # `function NAME { … }` is bash's other way to declare a function,
+            # so the keyword AND the name are stepped over to reach the body's
+            # `{`. Without this the segment stayed headed by `function` and the
+            # body — `function f { autumn … }` — was never scanned.
+            if segment[i] == 'function':
+                i += 2 if i + 1 < len(segment) else 1
+                continue
             # A service directive whose VALUE is the binary is itself the
             # command head, not something to step over: a systemd unit writes
             # `ExecStart=/usr/local/bin/autumn db backup …`, and skipping it as
@@ -1930,7 +1954,8 @@ def _from_tokens(tokens, masked=None, classify=None):
                 depth = 0
                 i += 1
                 while i < len(segment):
-                    depth += _paren_delta(segment[i])
+                    depth += _paren_delta(both[i] if i < len(both)
+                                          else segment[i])
                     i += 1
                     if depth <= 0:              # a coalesced `))` closes both
                         break
@@ -2027,7 +2052,7 @@ def _from_tokens(tokens, masked=None, classify=None):
         # A command substitution is a command line too. Stepping over it to
         # reach what follows the assignment is only half the job —
         # `OUT=$(autumn migrate)` runs a command that nothing was reading.
-        yield from _in_substitutions(segment, masked_segment)
+        yield from _in_substitutions(segment, masked_segment, both)
 
 
 # A token that could name a command. Anything else — a flag, a `<PLACEHOLDER>`,
@@ -4967,6 +4992,34 @@ def self_test():
     expect([(ln, d) for ln, d, _, _ in invocations(base_term)] == [(6, 'nope')],
            f'the terminator at the base column still closes: '
            f'{list(invocations(base_term))}')
+
+    # A quoted paren inside a COMMAND-LINE substitution: shlex strips the
+    # quotes, so `printf ')'` leaves a bare `)` token and the paren walk closed
+    # the substitution early — `OUT=$(printf ')'; autumn nope)` never reached
+    # the command. The depth walks count on the both-quotes-masked copy now, as
+    # `_segments` already did. Both quote kinds and the bare form are covered.
+    for form in ("OUT=$(printf ')'; autumn nope)",
+                 "OUT=$(printf '('; autumn nope)",
+                 'OUT=$(printf "("; autumn nope)',
+                 "$(printf ')'; autumn nope)"):
+        doc = f'```bash\n{form}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{form} reaches the command past a quoted paren: {got}')
+    # A single-quoted WHOLE substitution still runs nothing, and a real nested
+    # `)` still closes correctly.
+    expect(list(invocations("```bash\nprintf '%s' '$(autumn nope)'\n```")) == [],
+           'a single-quoted substitution is printed, not run')
+    expect([d for _, d, _, _ in invocations('```bash\nOUT=$(echo $(autumn nope))\n```')]
+           == ['nope'], 'a real nested substitution still resolves')
+
+    # `function NAME { … }` is bash's other declaration form; the keyword and
+    # the name are stepped over so the body is scanned, as `f() { … }` already
+    # was.
+    for form in ('function f { autumn nope; }; f',
+                 'function f() { autumn nope; }; f'):
+        doc = f'```bash\n{form}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{form} scans its body: {got}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
