@@ -288,6 +288,7 @@ mod schema_drift_guard;
 mod scoped_tokens;
 #[cfg(feature = "db")]
 mod search_index_definition;
+mod secured_route;
 mod security;
 mod seo;
 mod server_timing;
@@ -326,6 +327,7 @@ mod sqlite_replication_wal;
 #[cfg(feature = "ws")]
 mod sse_replay;
 mod static_serving;
+mod step_up_route;
 #[cfg(feature = "storage")]
 mod storage_local_integration;
 #[cfg(feature = "maud")]

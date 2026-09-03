@@ -6,6 +6,39 @@ pub fn block_has_replay_guard(block: &Block) -> bool {
     block_has_generated_replay_guard(block)
 }
 
+/// Whether a pre-body `FromRequestParts` gate macro (`#[secured]`,
+/// `#[step_up]`, `#[throttle]` — issue #1668) about to attach its own gate to
+/// `input_fn` should also make that gate responsible for serving a cached
+/// idempotency replay.
+///
+/// Exactly one guard may own replay-serving, and it must be the one every
+/// OTHER stacked guard's check is already guaranteed to have passed by the
+/// time it runs. That is never true when:
+///
+/// - another guard's gate parameter is already present — [`has_any_guard_gate_param`];
+/// - an earlier-expanded in-body guard (`#[authorize]`, or a gate that
+///   deferred for one of these same reasons) already owns replay —
+///   [`block_has_replay_guard`];
+/// - `#[authorize]` is still an unexpanded attribute and will run AFTER this
+///   gate: its policy check lives inside the handler body, which only runs
+///   once every extractor — including this gate — has already succeeded, so
+///   a gate that served a cached replay itself would return before
+///   `#[authorize]`'s check ever ran.
+pub fn should_own_replay(input_fn: &syn::ItemFn) -> bool {
+    !crate::param_helpers::has_any_guard_gate_param(input_fn)
+        && !block_has_replay_guard(&input_fn.block)
+        && !has_pending_authorize_attr(input_fn)
+}
+
+fn has_pending_authorize_attr(input_fn: &syn::ItemFn) -> bool {
+    input_fn.attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "authorize")
+    })
+}
+
 fn block_has_generated_replay_guard(block: &Block) -> bool {
     let mut index = 0;
     while let Some(stmt) = block.stmts.get(index) {
