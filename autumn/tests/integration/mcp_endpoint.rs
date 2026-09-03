@@ -311,9 +311,10 @@ async fn tools_list_includes_a_body_guard_written_above_the_route_attribute() {
     .await;
 
     let tools = out["result"]["tools"].as_array().expect("tools array");
-    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(
-        names.contains(&"create_guarded_todo"),
+        tools
+            .iter()
+            .any(|t| t["name"].as_str() == Some("create_guarded_todo")),
         "a #[throttle]-above-#[post] route explicitly opted into MCP must not be silently \
          excluded for lacking a response schema: {out}"
     );
