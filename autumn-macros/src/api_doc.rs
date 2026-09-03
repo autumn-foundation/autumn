@@ -702,6 +702,45 @@ pub fn is_public(input_fn: &syn::ItemFn) -> bool {
     has_public_marker_in_stmts(&input_fn.block.stmts)
 }
 
+/// Name of the marker const `#[agent_operable]` prepends to a governed handler
+/// body so the declaration survives the attribute's own removal.
+const AGENT_OPERABLE_MARKER: &str = "__AUTUMN_AGENT_OPERABLE";
+
+/// Detect `#[agent_operable(grant = ...)]` on a handler (issue #1691).
+///
+/// Mirrors [`is_public`]'s attribute/marker duality, because the two stackings
+/// are equally idiomatic and losing either one is silent: a governed handler
+/// whose `ApiDoc::agent_authority` came back `None` would be exposed to agents
+/// as an *ungoverned* MCP tool — audited with `reversibility = "unknown"` and
+/// filed under the manifest's `ungoverned_tools` — with nothing in the source
+/// to show for it.
+///
+/// 1. `#[agent_operable]` (or `#[autumn_web::agent_operable]`) still present as
+///    an attribute, which happens when the route macro is outermost.
+/// 2. The `__AUTUMN_AGENT_OPERABLE` marker const the attribute injects as the
+///    first statement of the body when it expanded *before* the route macro.
+///    Read through [`crate::edge::stmts_have_marker`], so it stays reachable
+///    however many body guards wrapped it in `(async move { … }).await`.
+///
+/// The marker is decoded structurally (a `const` item of that name), never by
+/// scanning stringified tokens, so handler *text* that merely spells it cannot
+/// forge a governed route.
+///
+/// Returns only whether the handler is governed: the authority `static` is
+/// named after the handler, so the route macro needs no further detail from
+/// either site, and the grant path in the marker is the analyser's business.
+pub fn extract_agent_authority(input_fn: &syn::ItemFn) -> bool {
+    let has_attr = input_fn.attrs.iter().any(|attr| {
+        attr.path().is_ident("agent_operable")
+            || attr
+                .path()
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == "agent_operable")
+    });
+    has_attr || crate::edge::stmts_have_marker(&input_fn.block.stmts, AGENT_OPERABLE_MARKER)
+}
+
 fn has_public_marker_in_stmts(stmts: &[syn::Stmt]) -> bool {
     stmts.iter().any(has_public_marker_in_stmt)
 }

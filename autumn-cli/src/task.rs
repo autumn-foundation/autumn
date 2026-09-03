@@ -64,9 +64,10 @@ fn list_tasks(binary: &std::path::Path, opts: &TaskOptions<'_>) {
     command
         .env("AUTUMN_LIST_TASKS", "1")
         // Dispatched earlier than `AUTUMN_LIST_TASKS` in
-        // `AppBuilder::run`, so an inherited one would print the
-        // data-flow manifest where the task listing JSON is expected.
+        // `AppBuilder::run`, so an inherited one would print a manifest
+        // where the task listing JSON is expected.
         .env_remove(crate::data_flow::DUMP_ENV)
+        .env_remove(crate::agents::DUMP_ENV)
         .env("AUTUMN_ENV", opts.profile)
         .env("AUTUMN_PROFILE", opts.profile)
         .stdout(Stdio::piped())
@@ -114,6 +115,7 @@ fn run_task(binary: &std::path::Path, opts: &TaskOptions<'_>) {
         // so an inherited one would exit 0 after printing a manifest
         // without ever running the task.
         .env_remove(crate::data_flow::DUMP_ENV)
+        .env_remove(crate::agents::DUMP_ENV)
         .env("AUTUMN_TASK_ARGS_JSON", args_json)
         .env("AUTUMN_ENV", opts.profile)
         .env("AUTUMN_PROFILE", opts.profile)

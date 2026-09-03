@@ -12,6 +12,7 @@
 //! Users should not depend on this crate directly — use `autumn-web` instead,
 //! which re-exports everything.
 
+mod agent_authority;
 mod api_doc;
 mod authorize;
 mod cached;
@@ -1188,6 +1189,89 @@ pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn query_budget(attr: TokenStream, item: TokenStream) -> TokenStream {
     query_budget::query_budget_macro(attr.into(), item.into()).into()
+}
+
+/// Declare a handler agent-operable, under a named authority grant.
+///
+/// `#[agent_operable(grant = RefundDrafter)]` walks the handler body, derives
+/// the effects it can prove — row writes, unbounded writes, cross-tenant
+/// access, outbound HTTP, webhook fan-out, background jobs — and fails the
+/// build when the named `authority_grant!` does not allow one of them. The
+/// check is a `const` assertion respanned onto the offending call site, so it
+/// works across crates and fires during `cargo build` on every branch,
+/// including the ones no test exercises.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+///
+/// autumn_web::authority_grant! {
+///     /// Draft-only refund authority for the support agent.
+///     pub RefundDrafter {
+///         writes: [Refund],
+///         outbound: ["https://api.stripe.com/v1/refunds"],
+///         jobs: [NotifyFinanceJob],
+///         reversibility: compensable,
+///     }
+/// }
+///
+/// #[post("/refunds")]
+/// #[api_doc(mcp, summary = "Draft a refund")]
+/// #[agent_operable(grant = RefundDrafter)]
+/// async fn draft_refund(
+///     repo: PgRefundRepository,
+///     payouts: PgPayoutRepository,
+///     client: Client,
+///     Json(body): Json<NewRefund>,
+/// ) -> AutumnResult<Json<Refund>> {
+///     let refund = repo.create(&body).await?;               // allowed: `writes: [Refund]`
+///     client.post("https://api.stripe.com/v1/refunds")      // allowed: `outbound: [...]`
+///         .json(&refund)
+///         .send()
+///         .await?;
+///     NotifyFinanceJob::enqueue(NotifyFinanceArgs { refund_id: refund.id }).await?;
+///     Ok(Json(refund))
+/// }
+/// ```
+///
+/// Adding `payouts.delete_all().await?` to that body fails the build: `payouts`
+/// is a tracked repository handle, and the grant allows no unbounded write to
+/// `Payout`.
+///
+/// # What is proved, and what is only declared
+///
+/// * A write, unbounded write or cross-tenant access reached through a handle
+///   named in the signature is **proved**.
+/// * An outbound call with a literal absolute URL is **proved**; one whose host
+///   is resolved from config through a named client is **declared**.
+/// * A webhook dispatch delivers to subscriber-supplied URLs, so it is granted
+///   by topic (`webhooks: ["refund.drafted"]`), never by URL prefix.
+/// * `rate` / `spend` caps are **declared**: this slice records them, it does
+///   not enforce them.
+/// * Anything opaque — a helper handed the handle, a `format!`-built URL, a
+///   `tokio::spawn` that detaches the effect from the request it is audited
+///   under — is reported, never assumed effect-free. A helper is opaque
+///   whether it is free (`wipe(repo)`) or associated (`Billing::wipe(repo)`):
+///   an associated function is another function's business too, and a static
+///   finder that really only reads (`Post::find_published(&mut db)`) is
+///   discharged with `#[agent_effect(none, reason = "…")]` rather than
+///   assumed. A local alias for an effect verb (`let schedule =
+///   NotifyFinanceJob::enqueue;`) is classified against the path it names.
+///
+/// # Escape hatch
+///
+/// `#[agent_effect(...)]` on a statement declares what the analysis cannot
+/// read: `#[agent_effect(writes(Refund), reason = "…")]`, or
+/// `#[agent_effect(none, reason = "…")]` for a statement verified
+/// effect-free. Declared effects are still checked against the grant — the
+/// hatch declares, it never grants — and a `reason` is mandatory. The
+/// annotation is consumed by this macro and never reaches rustc.
+///
+/// See `docs/guide/agent-authority.md` for the full guide.
+#[proc_macro_attribute]
+pub fn agent_operable(attr: TokenStream, item: TokenStream) -> TokenStream {
+    agent_authority::agent_operable_macro(attr.into(), item.into()).into()
 }
 
 /// Gate a route handler on a named feature flag.

@@ -841,6 +841,10 @@ fn build_router_pre_state(
             // a tools/call must mark its replay exempt (avoiding double-
             // counting against the same in-flight counter).
             envelope_load_shed: mcp_load_shed_layer.is_some(),
+            // The agent-authority audit path (#1691) writes through the app's
+            // installed `AuditLogger` and mints its correlation id from the
+            // injected entropy seam, both reached from state.
+            state: state.clone(),
         };
         let mut mcp_router =
             crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
@@ -7219,6 +7223,7 @@ mod tests {
             csrf_header: "x-csrf-token".to_owned(),
             envelope_rate_limited: false,
             envelope_load_shed: false,
+            state: test_state(),
         };
         let mcp_router =
             crate::mcp::build_mcp_router("/mcp", Vec::new(), axum::Router::new(), wiring, None);

@@ -7,6 +7,8 @@ mod acme_end_to_end;
 mod acme_fake_ca;
 mod acting_as_integration;
 mod after_commit_integration;
+#[cfg(feature = "mcp")]
+mod agent_authority;
 mod alerts;
 mod api_versioning_integration;
 #[cfg(feature = "openapi")]

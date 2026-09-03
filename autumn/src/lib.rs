@@ -87,6 +87,16 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+// The build-time agent authority envelope (issue #1691): what an MCP-exposed,
+// agent-operable handler is allowed to do -- which models it writes, whether it
+// leaves the tenant, which hosts it calls, which jobs it enqueues, how
+// reversible the whole thing is -- declared as a `Grant` and checked by the
+// compiler at each proved effect.
+//
+// A plain comment, not a doc comment, for the same reason `classify` carries
+// one: an outer `///` here is merged with the module's `//!` docs and the whole
+// block then resolves its intra-doc links in *this* scope.
+pub mod agent_authority;
 pub mod batches;
 /// Locating a usable Chromium/Chrome binary on the host.
 ///
@@ -1379,6 +1389,41 @@ pub use autumn_macros::throttle;
 /// See [`query_budget::StaticQueryBudget`] for the constant the expansion
 /// leaves behind, and `docs/guide/query-budgets.md` for the guide.
 pub use autumn_macros::query_budget;
+
+/// Declare what an agent-operable handler is allowed to do, and check it.
+///
+/// `#[agent_operable(grant = TheGrant)]` derives the handler's static effect
+/// set — bounded and unbounded writes, cross-tenant queries, outbound calls,
+/// webhook dispatches, job enqueues — and fails the build at the offending call
+/// when the declared [`agent_authority::Grant`] does not cover it. Effects it
+/// cannot prove are errors, not silence; `#[agent_effect(...)]` on the
+/// statement is the escape hatch, and it declares effects that are checked
+/// exactly like proved ones.
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+///
+/// autumn_web::authority_grant! {
+///     pub RefundDrafter {
+///         writes: [Refund],
+///         reversibility: compensable,
+///     }
+/// }
+///
+/// #[post("/refunds")]
+/// #[api_doc(mcp, summary = "Draft a refund")]
+/// #[agent_operable(grant = RefundDrafter)]
+/// async fn draft_refund(
+///     repo: PgRefundRepository,
+///     Json(body): Json<NewRefund>,
+/// ) -> AutumnResult<Json<Refund>> {
+///     Ok(Json(repo.create(&body).await?)) // allowed: `writes: [Refund]`
+/// }
+/// ```
+///
+/// See [`agent_authority`] for the vocabulary and
+/// `docs/guide/agent-authority.md` for the guide.
+pub use autumn_macros::agent_operable;
 
 /// Gate a route handler on a named feature flag. If the flag is disabled for
 /// the current actor the handler responds with `404 Not Found` (default) or
