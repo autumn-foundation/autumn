@@ -73,7 +73,31 @@ These names match what `autumn doctor --json` actually emits in the `name` field
 | `edge_target` **(trunk-dev)** | Run `rustup target add wasm32-wasip1` — the project has `#[edge]` routes, so `autumn build` needs that target to compile the edge capsule (passes with "no `#[edge]` routes" when the project has none) |
 | `deploy_host` **(trunk-dev)** | Set a deploy target in `autumn.toml`: `[deploy] host = "<address>"` (one server) **or** `[deploy] hosts = ["<a>", "<b>"]` (a fleet, in rollout order) — never both. Blank or duplicate `hosts` entries are refused (issue #1621) |
 | `plugin_residue` **(trunk-dev)** | Orphaned plugin wiring (issue #1631). Warns when a plugin is declared in `[dependencies]` but never mounted (`autumn plugin add <name>` finishes the install, `autumn plugin remove <name>` takes the dependency back — for a community `autumn-plugin-*` crate, add the `.plugin(...)` call from its README, since `add` never writes one). Fails when a plugin's fully-qualified type is mounted but the crate is not declared, which does not compile. Warns when migrations a plugin declares are still recorded as applied and the plugin is gone (`autumn plugin remove <name> --drop-data` reverts them); that last finding needs a configured database and the `diesel` CLI, and is skipped otherwise |
+| `platform_support` **(trunk-dev)** | Never fails — reports this platform's Windows support tier (issue #1616). On Windows its `detail` names the Tier 1 (native) and Tier 2 (WSL2) commands and the vcpkg/`VCPKG_ROOT` prerequisite for `generate auth --passkeys` |
 | `edge_routes` **(trunk-dev)** | Fails when an `#[edge]` handler also carries `#[secured]`/`#[authorize]`/`#[step_up]`/`#[throttle]`/`#[intercept]`: remove one of the two — edge routes are unauthenticated read-path routes served without origin middleware. Warns when a marked handler is missing from `edge_routes![]`, or when `src/bin/edge-capsule.rs` is absent |
+
+## Platform support check (unreleased — trunk-dev, issue #1616)
+
+`autumn doctor` runs a `platform_support` check first, reporting the platform's
+Windows support tier. It **always passes** — the tier is information, not a
+defect, and a warning would make `autumn doctor --strict` exit 1 on every
+Windows machine. Read its `detail` rather than its status:
+
+- On Linux/macOS: "every autumn journey runs natively on this platform".
+- On Windows: the Tier 1 (native) commands, the Tier 2 (WSL2) commands, and the
+  Windows prerequisites — notably that `autumn generate auth --passkeys` needs
+  OpenSSL via `vcpkg` with `VCPKG_ROOT` set.
+
+When a user reports that `autumn serve --daemon` (or `stop`/`status`/`restart`),
+`autumn deploy up` (or `rollback`/`status`/`maintenance`), or a `scripts/*.sh`
+gate fails on Windows, that is the **documented Tier 2 refusal, not a bug**:
+those are built on Unix domain sockets, POSIX signals, `ssh`, and bash. Tell
+them to run it from a WSL2 shell. `autumn deploy check` and `autumn deploy plan`
+are the exception and Tier 1 — they are local-only, so a Windows developer can
+validate a deploy config natively before switching to WSL2 to run it.
+Note `autumn serve --bundled-pg` implies `--daemon`, so it is Tier 2 too — on
+Windows use `autumn dev` for a managed-Postgres app. See
+`docs/guide/platform-support.md`.
 
 ## Operator alert checks (unreleased — trunk-dev)
 
