@@ -2236,10 +2236,11 @@ def invocations(text):
     # substitution that could not match across the break either.
     para = []          # (offset_in_joined, lineno, text) for the current paragraph
     para_len = 0
+    in_html_comment = False   # an unclosed `<!--` carried over from a prior paragraph
 
     def take_paragraph():
         """Read the code spans out of the accumulated prose, then clear it."""
-        nonlocal para, para_len
+        nonlocal para, para_len, in_html_comment
         if not para:
             return
         joined = ' '.join(part for _, _, part in para)
@@ -2247,9 +2248,36 @@ def invocations(text):
         # inside `<!-- old: `autumn db` -->` is not a command a reader runs.
         # The comment is blanked to EQUAL-LENGTH filler rather than removed, so
         # every following span keeps the offset the line-number map is built
-        # on. An unclosed `<!--` comments to the end of the paragraph.
-        joined = re.sub(r'<!--.*?(?:-->|$)',
-                        lambda m: ' ' * (m.end() - m.start()), joined)
+        # on. A comment can span the blank line BETWEEN paragraphs, so the open
+        # state is carried across calls: an unclosed `<!--` blanks to the end of
+        # this paragraph and every following one until a `-->` closes it.
+        # Blanking one paragraph at a time missed that — the code span sitting in
+        # the middle paragraph was read as a command and a correctly-commented
+        # page was failed.
+        chars = list(joined)
+        i, n = 0, len(chars)
+        while i < n:
+            if in_html_comment:
+                end = joined.find('-->', i)
+                stop = n if end == -1 else end + 3
+                for j in range(i, stop):
+                    chars[j] = ' '
+                if end == -1:
+                    break
+                i, in_html_comment = stop, False
+            else:
+                start = joined.find('<!--', i)
+                if start == -1:
+                    break
+                end = joined.find('-->', start + 4)
+                stop = n if end == -1 else end + 3
+                for j in range(start, stop):
+                    chars[j] = ' '
+                if end == -1:
+                    in_html_comment = True
+                    break
+                i = stop
+        joined = ''.join(chars)
         for m in re.finditer(r'`([^`]+)`', joined):
             at = para[0][1]
             for offset, ln, _ in para:          # map the span back to its line
@@ -5124,6 +5152,20 @@ def self_test():
     expect([(ln, d) for ln, d, _, _ in invocations(after)] == [(2, 'nope')],
            f'the comment is blanked without shifting the line map: '
            f'{list(invocations(after))}')
+    # A comment can span the blank line BETWEEN paragraphs. The span in the
+    # middle paragraph is still commented out and must stay quiet — blanking one
+    # paragraph at a time read it and failed a correctly-commented page — while a
+    # real span after the closing `-->` is read at its own line.
+    spanning = '<!-- old example\n\n`autumn nope`\n\n-->\n\nRun `autumn migrate`.\n'
+    expect([(ln, d) for ln, d, _, _ in invocations(spanning)] == [(7, 'migrate')],
+           f'a comment spanning a blank line stays closed, the real span after '
+           f'it is still read: {list(invocations(spanning))}')
+    # …and the neighbour that must stay caught: prose BEFORE a multi-paragraph
+    # comment is read; the comment body across the blank line is not.
+    reopen = 'Run `autumn migrate`.\n\n<!-- note\n\n`autumn nope`\n-->\n'
+    expect([d for _, d, _, _ in invocations(reopen)] == ['migrate'],
+           f'prose before a multi-paragraph comment is read, its body is not: '
+           f'{list(invocations(reopen))}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
