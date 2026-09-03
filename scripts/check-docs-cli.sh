@@ -540,7 +540,11 @@ _PUNCTUATION = '();&|'
 # Prompts and grouping that may precede a command in a transcript. `#` is not
 # here because shlex treats it as starting a comment, which is also why a shell
 # comment naming a command needs no special case any more.
-_PROMPT = {'$', '('}
+# Tokens that stand in front of a command without being one: a shell prompt,
+# a subshell's `(`, and a brace group's `{`. `{ autumn migrate; }` runs the
+# command inside the group — bash's own help calls it `{ COMMANDS ; }` — and
+# leaving `{` as the segment head meant the scan never reached it.
+_PROMPT = {'$', '(', '{'}
 
 # Shell keywords that stand in front of a command without being one. `if autumn
 # migrate; then …` runs `autumn migrate` as the condition, and leaving `if` as
@@ -966,6 +970,24 @@ def _nested_command(segment, j, tok):
     return prev == '=' and j > 1 and bool(_COMMAND_KEY_BARE.match(segment[j - 2]))
 
 
+# Programs that execute the argv after their `--` separator. Everything else
+# receives those words as data: `echo -- autumn db` prints them.
+#
+# An allowlist rather than a rule, because there is no way to tell from the
+# text whether an unknown program runs its arguments — and the failure
+# directions are not symmetric. Omitting a runner loses one latent invocation;
+# admitting a printer fails a correct page. The corpus contains no `-- autumn`
+# at all today, so this costs nothing measurable either way.
+_RUNNERS = {'kubectl', 'oc', 'docker', 'podman', 'nerdctl', 'ssh', 'sudo',
+            'env', 'xargs', 'timeout', 'nice', 'flock', 'su', 'runuser',
+            'doas', 'nsenter', 'chroot', 'systemd-run', 'fly', 'heroku'}
+
+
+def _runs_argv(segment, j):
+    """True when something before the `--` at `j` executes what follows it."""
+    return any(tok.rsplit('/', 1)[-1] in _RUNNERS for tok in segment[:j])
+
+
 def _after_image(segment, k):
     """Yield the argv following a container IMAGE.
 
@@ -1159,13 +1181,17 @@ def _from_tokens(tokens):
                 if rest and _autumn_exe(rest[0]):
                     yield ' '.join(rest[1:]), rest[1:]
             elif tok == '--' and j + 1 < len(segment) \
-                    and _autumn_exe(segment[j + 1]) and head is None:
-                # Only a WRAPPER's separator introduces a nested command. When
-                # the segment is itself an autumn command the `--` is its own:
-                # `autumn test -- autumn` forwards to the harness
-                # (`Test::cargo_args` is `trailing_var_arg`), and reading the
-                # forwarded word as a second executable reported that valid
-                # line as needing a subcommand.
+                    and _autumn_exe(segment[j + 1]) and head is None \
+                    and _runs_argv(segment, j):
+                # Only a command that RUNS what follows its separator
+                # introduces a nested command. Two things had to be excluded,
+                # and `head is None` alone covered just the first:
+                #   - the segment is itself an autumn command, so the `--` is
+                #     its own — `autumn test -- autumn` forwards to the
+                #     harness (`Test::cargo_args` is `trailing_var_arg`);
+                #   - the segment is some OTHER program that merely prints its
+                #     arguments — `echo -- autumn db` runs nothing, and
+                #     reading `db` there failed a correct page.
                 yield ' '.join(segment[j + 2:]), segment[j + 2:]
             elif tok == '--entrypoint' and j + 2 < len(segment) \
                     and _autumn_exe(segment[j + 1]):
@@ -2027,6 +2053,32 @@ def self_test():
            'an assignment token is not itself the binary')
     expect(_exe_path('/usr/local/bin/autumn') and not _exe_path('autumn'),
            "an assignment's VALUE must be a PATH before it is a program")
+
+    # --- a `--` separator introduces a nested command only for a program that
+    # RUNS what follows it. `head is None` established only that the segment is
+    # not an autumn command itself, which admitted every other program too —
+    # and `echo -- autumn db` prints those words rather than running them.
+    for runner in ('kubectl exec --', 'kubectl exec deploy/app --',
+                   'docker exec ctr --', 'sudo --', 'xargs --',
+                   '/usr/bin/kubectl exec --'):
+        doc = f'```bash\n{runner} autumn migrate run\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'], f'{runner!r} runs what follows: {got}')
+    for printer in ('echo', 'printf', 'ls'):
+        doc = f'```bash\n{printer} -- autumn db\n```'
+        expect(list(invocations(doc)) == [],
+               f'{printer} -- prints its arguments, it does not run them: '
+               f'{list(invocations(doc))}')
+
+    # --- a brace group runs the commands inside it, so `{` stands in front of
+    # a command the way a subshell's `(` does.
+    for group in ('{ autumn migrate run; }', '( autumn migrate run )',
+                  '{ autumn migrate run; } >log'):
+        doc = f'```bash\n{group}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'], f'a group must be entered: {group} -> {got}')
+    expect(list(invocations('```bash\n{ echo hi; }\n```')) == [],
+           'a group running something else stays quiet')
 
     # --- wrappers that put their OWN options between the keyword and the
     # command they launch. The scan stopped on the first flag, so everything
