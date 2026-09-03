@@ -68,11 +68,14 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_shard_key_unknown.rs");
 
-    // `#[validate(nested)]` collides with this crate's own `ValidateExt` (see
-    // `reject_nested_validator` in autumn-macros) and is refused outright with
-    // a clear diagnostic instead of a downstream `E0034` (issue #1751).
-    #[cfg(feature = "db")]
-    t.compile_fail("tests/compile-fail/model_validate_nested_rejected.rs");
+    // `#[validate(nested)]` collides with this crate's own `ValidateExt` when
+    // both are in scope in the struct's own defining module -- true of
+    // `#[model]`-generated structs too, since `#[model]` forwards
+    // `#[validate(...)]` verbatim (issue #1751). Not `db`-gated: reproduced
+    // with a plain hand-rolled `#[derive(validator::Validate)]` struct, since
+    // the hazard lives in `validator_derive` + `ValidateExt`, not in anything
+    // `#[model]`-specific.
+    t.compile_fail("tests/compile-fail/validate_nested_collides_with_validate_ext.rs");
 
     // Two m2m associations to the same target type with no `helper = "..."`
     // override collide on their target-derived mutation helpers (#1785).
@@ -394,6 +397,12 @@ fn compile_pass_tests() {
     // trait-level and a method-level invalidation edge.
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/cached_coherence.rs");
+
+    // `#[validate(nested)]` compiles cleanly when the struct's own defining
+    // module does not import `ValidateExt`/the prelude, even though another
+    // module in the same crate does -- the workaround for the collision in
+    // `validate_nested_collides_with_validate_ext.rs` (issue #1751).
+    t.pass("tests/compile-pass/validate_nested_without_validate_ext.rs");
 
     // Route macro passes (always available)
     t.pass("tests/compile-pass/valid_handlers.rs");

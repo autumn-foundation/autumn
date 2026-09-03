@@ -13,10 +13,13 @@
 //! (correctly) dropped from the `Update{Model}` `Patch<T>` fields by the
 //! denylist, so the *only* thing that rejects an invalid-once-merged patch
 //! here is the merged-model check. (The last item of #1751's residual list,
-//! `nested`, is not enforced here at all: it is rejected outright by
-//! `reject_nested_validator` in `autumn-macros`, on every generated struct,
-//! because it collides with this crate's own `ValidateExt` — see that
-//! function's doc comment and `tests/compile-fail/model_validate_nested_rejected.rs`.)
+//! `nested`, is not exercised in this file: it would be enforced here through
+//! the same generic mechanism as `custom`, but it also carries a separate,
+//! `ValidateExt`-collision hazard -- scoped to the model's own defining
+//! module -- that has nothing to do with merged-model validation itself. See
+//! `ValidateExt`'s doc comment in `autumn/src/validation.rs` and the
+//! `tests/compile-fail/validate_nested_collides_with_validate_ext.rs` /
+//! `tests/compile-pass/validate_nested_without_validate_ext.rs` fixture pair.)
 //!
 //! Living in the consolidated `integration_tests` binary makes
 //! `cargo build --tests -p autumn-web` the compile-time regression guard: the

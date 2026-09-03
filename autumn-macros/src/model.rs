@@ -2778,12 +2778,23 @@ fn validate_attrs(field: &Field) -> Vec<&syn::Attribute> {
 /// inverts our absent-field skip semantics (`does_not_contain`). See
 /// `validate_attrs_for_patch` for the full rationale.
 ///
-/// `nested` is listed here too (so it is still dropped from `Patch<T>` fields
-/// defensively), but it never actually reaches this filter in practice:
-/// [`reject_nested_validator`] refuses it outright, on every generated
-/// struct, before any codegen runs -- see that function's doc comment for why
-/// it is unconditionally unsafe rather than merely Patch-incompatible.
+/// `nested` is listed here too: it has no `Patch<T>` impl at all, so it must
+/// be dropped from the `Update{Model}` field the same as `custom`. Separately
+/// from the `Patch<T>` question, `nested` on the read model / `NewModel` can
+/// hit a real `E0034: multiple applicable items in scope` if the *model's own
+/// defining module* also imports `autumn_web::prelude::ValidateExt` (a
+/// blanket `impl<T: validator::Validate> ValidateExt for T` also named
+/// `validate`, which collides with `validator_derive`'s bare
+/// `(&field).validate()` nested codegen). This crate cannot detect that from
+/// here -- a derive/attribute macro only sees the item it's attached to, not
+/// the rest of its enclosing module's `use` statements -- so it is not
+/// rejected at macro-expansion time; see the hazard note on
+/// `ValidateExt`'s doc comment (`autumn/src/validation.rs`) for the full
+/// explanation and the workaround (keep the model's own module free of that
+/// import, or use `#[validate(custom(...))]` instead).
 const NON_PATCH_VALIDATORS: &[&str] = &[
+    // See the module-level rationale above for why `nested` is listed here
+    // without a `reject_*`-style macro-time guard.
     "custom",
     "must_match",
     "nested",
@@ -2823,69 +2834,6 @@ const NON_PATCH_VALIDATORS: &[&str] = &[
 /// `Option` field via the derive's `Option`-unwrap on `NewModel`.
 const OPTION_INCOMPATIBLE_VALIDATORS: &[&str] = &["ip"];
 
-/// Reject `#[validate(nested)]` on a `#[model]` field with an immediate,
-/// actionable compile error instead of letting it through to a cryptic
-/// downstream failure (issue #1751).
-///
-/// Unlike every other entry in [`NON_PATCH_VALIDATORS`], `nested` is not
-/// merely unenforceable on `Patch<T>` -- it is fundamentally unsafe to emit
-/// at all in this workspace, on *any* generated struct (`NewModel`, the read
-/// model, or `UpdateModel`), because of a trait collision this crate itself
-/// creates. `validator_derive`'s `nested` codegen
-/// (`validator_derive::tokens::nested::nested_tokens`) calls the field's
-/// value with bare method syntax -- `(&self.field).validate()` -- relying on
-/// `validator::Validate::validate(&self)` being the only candidate in scope.
-/// But `autumn_web`'s own [`crate::validation::ValidateExt`] (re-exported
-/// from `autumn_web::prelude`, so present in virtually every handler module)
-/// is a blanket `impl<T: validator::Validate> ValidateExt for T` that ALSO
-/// supplies a same-named `fn validate(self) -> AutumnResult<Validated<Self>>`
-/// -- and it applies to the nested field's type too, since that type must
-/// itself implement `Validate` for `nested` to mean anything. The instant a
-/// module derives a nested-validating struct while both traits are visible,
-/// rustc reports `E0034: multiple applicable items in scope` for the
-/// generated call, pointing at the derive expansion rather than at anything
-/// the user wrote -- confirmed empirically: a hand-rolled repro with just
-/// `validator::Validate` and a local `ValidateExt`-shaped trait in scope hits
-/// the identical E0034.
-///
-/// So this is refused unconditionally and up front, with a message that
-/// names the field and the real cause, rather than filtered per-struct like
-/// [`validate_attrs_for_patch`] does for its siblings.
-fn reject_nested_validator(field: &Field) -> Result<(), syn::Error> {
-    for attr in field.attrs.iter().filter(|a| a.path().is_ident("validate")) {
-        let syn::Meta::List(list) = &attr.meta else {
-            continue;
-        };
-        let parser = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated;
-        let Ok(nested_metas) = parser.parse2(list.tokens.clone()) else {
-            continue;
-        };
-        for meta in &nested_metas {
-            if meta.path().is_ident("nested") {
-                let field_name = field
-                    .ident
-                    .as_ref()
-                    .map_or_else(|| "<field>".to_string(), ToString::to_string);
-                return Err(syn::Error::new_spanned(
-                    meta,
-                    format!(
-                        "#[validate(nested)] is not supported on `#[model]` fields (field \
-                         `{field_name}`): it collides with this workspace's own \
-                         `autumn_web::prelude::ValidateExt`, which also implements `validate` \
-                         for every `validator::Validate` type -- any module that imports the \
-                         prelude alongside this model fails to compile with `E0034: multiple \
-                         applicable items in scope` on the generated nested-validation call. \
-                         Validate the nested type's fields directly with declarative \
-                         validators on this model, or enforce the rule with \
-                         `#[validate(custom(function = \"...\"))]` instead (see issue #1751)."
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Like [`validate_attrs`], but tailored for the `UpdateModel` `Patch<T>` fields
 /// (#1719): drop the nested validators that `Patch<T>` cannot enforce.
 ///
@@ -2900,9 +2848,9 @@ fn reject_nested_validator(field: &Field) -> Result<(), syn::Error> {
 /// sentinels rather than the underlying values), so propagating them verbatim
 /// would break `UpdateModel` compilation or its correctness even though
 /// `NewModel` still compiles — a latent footgun for a user who adds e.g.
-/// `#[validate(custom(...))]` to a model field. `nested` is the one exception:
-/// it is never reached by this filter at all, because [`reject_nested_validator`]
-/// refuses it outright (on `NewModel` too) before this function ever runs.
+/// `#[validate(custom(...))]` to a model field. (`nested` has its own,
+/// separate hazard even where it does compile -- see [`NON_PATCH_VALIDATORS`]'s
+/// doc comment.)
 ///
 /// `required` is deliberately NOT in the denylist (#1719 / Codex P2): it must
 /// propagate so the `UpdateModel` rejects an explicit `null` on a required
@@ -2950,9 +2898,11 @@ fn reject_nested_validator(field: &Field) -> Result<(), syn::Error> {
 /// the model builds a draft via `from_patch`, which validates the merged
 /// concrete model and closes this gap for `custom`, `must_match`,
 /// `does_not_contain`, and `ip` on `Option<…>` fields (issues #1778/#1751).
-/// `nested` is not part of that coverage: it is refused outright everywhere
-/// (create included) by [`reject_nested_validator`], never merely
-/// create-only. (`required` IS enforced on the PATCH path via the tri-state
+/// `nested` is filtered from `Patch<T>` the same way, and the same
+/// merged-model mechanism would run it too -- but see [`NON_PATCH_VALIDATORS`]'s
+/// doc comment for the separate `ValidateExt` hazard that applies to it on
+/// create and the merged model alike, independent of this Patch-vs-update
+/// question. (`required` IS enforced on the PATCH path via the tri-state
 /// `Patch<T>` impl.)
 fn validate_attrs_for_patch(field: &Field) -> Vec<syn::Attribute> {
     let field_is_option = is_option_type(&field.ty);
@@ -5338,9 +5288,6 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         if let Err(err) = validate_field_schema_markers(field) {
             return err.to_compile_error();
         }
-        if let Err(err) = reject_nested_validator(field) {
-            return err.to_compile_error();
-        }
     }
 
     // Validate that the declared shard_key names an existing field (or "id").
@@ -6329,12 +6276,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // validated on the update path via `from_patch`. The model's fields
             // are concrete `T` (not `Patch<T>`), so every validator — including
             // the ones the `Patch<T>` path cannot express (`ip` on `Option`,
-            // `does_not_contain`, and the cross-field `custom`/`must_match`) —
-            // compiles and runs here without hitting the E0119 trait-coherence
-            // walls that block them on `Patch<T>`. (`nested` is not among them:
-            // `reject_nested_validator` refuses it outright earlier in this
-            // function, so a `#[validate(nested)]` field never reaches this
-            // codegen at all — see #1751.) The struct only derives
+            // `does_not_contain`, and the cross-field `custom`/`must_match`/
+            // `nested`) — compiles and runs here without hitting the E0119
+            // trait-coherence walls that block them on `Patch<T>`. (`nested`
+            // carries its own separate hazard even here: see
+            // `NON_PATCH_VALIDATORS`'s doc comment for the `ValidateExt`
+            // collision it can trigger.) The struct only derives
             // `validator::Validate` when `has_validation` is set (see below), so
             // the attribute is always registered when present.
             let val_attrs = validate_attrs(f);
@@ -6446,11 +6393,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     //   mirroring the create path. `required` is the one non-skip rule: its
     //   `Patch<T>` impl fails `Clear`/`Set(None)` so a PATCH can't null a
     //   required column. Non-declarative/struct-level validators (`custom`,
-    //   `must_match`, `credit_card`, `non_control_character`) have no *usable*
-    //   `Patch<T>` impl and are filtered out here by `validate_attrs_for_patch`
-    //   (they still run on `NewX`); see that helper for the documented
-    //   create-vs-update limitation. `nested` never reaches this filter: it is
-    //   refused outright, on every generated struct, before this point.
+    //   `must_match`, `nested`, `credit_card`, `non_control_character`) have no
+    //   *usable* `Patch<T>` impl and are filtered out here by
+    //   `validate_attrs_for_patch` (they still run on `NewX`); see that helper
+    //   for the documented create-vs-update limitation.
     // - #[lock_version] field: plain required T (the client supplies the
     //   version they read; the framework increments it atomically)
     let mut update_fields: Vec<TokenStream> = fields_for_new
@@ -6460,10 +6406,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let ty = &f.ty;
             // #1719: `Patch<T>` only implements validator's per-field
             // declarative traits, so non-declarative/struct-level validators
-            // (`custom`, `must_match`, …) must be stripped here or the
+            // (`custom`, `must_match`, `nested`, …) must be stripped here or the
             // `UpdateModel` would fail to compile or misvalidate. `NewModel`
-            // keeps them all. (`nested` cannot reach this field at all --
-            // `reject_nested_validator` already refused it earlier.)
+            // keeps them all.
             let val_attrs = validate_attrs_for_patch(f);
             // #1654: see the `NewX` comment -- the patch carries the wrapper for
             // the same reason. `Patch<T>` forwards `Deserialize` and every
@@ -6515,10 +6460,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // — not `Patch<T>` — the model's `#[validate(...)]` rules run against real
     // values, so the validators that hit E0119 coherence walls on `Patch<T>`
     // (`ip` on `Option`, `does_not_contain`) and the cross-field ones
-    // (`custom`, `must_match`) are all enforced on the update path, returning
-    // the same 422 field-error map as create. (`nested` is never among
-    // `#name`'s rules here: it is refused outright at parse time, so no
-    // generated struct ever carries it — #1751.) Runs before the
+    // (`custom`, `must_match`, `nested`) are all enforced on the update path,
+    // returning the same 422 field-error map as create. (`nested` still
+    // carries its own, separate `ValidateExt` hazard here -- see
+    // `NON_PATCH_VALIDATORS`'s doc comment; #1751.) Runs before the
     // `before_update` hook, mirroring create (where `validate_new` runs before
     // `before_create`). Emitted only when the model declares validation; when it
     // does not there is nothing to check and the model derives no `Validate`.
@@ -12133,18 +12078,17 @@ mod tests {
         // the generated `UpdateModel` `Patch<T>` fields while `NewModel` keeps
         // every one. These are enforced on create only and are genuinely
         // unfixable on the PATCH path without the merged-model redesign:
-        //   * `must_match` — cross-field / struct-level; no single-field
-        //     `Patch<T>` trait exists for it.
+        //   * `must_match` / `nested` — cross-field / struct-level; no
+        //     single-field `Patch<T>` trait exists for them. (`nested` also
+        //     carries a separate, `Patch<T>`-independent `ValidateExt` hazard
+        //     even where it does compile — see `NON_PATCH_VALIDATORS`'s doc
+        //     comment — but that hazard is orthogonal to this Patch-filtering
+        //     test, which is pure token-level and never compiles its output.)
         //   * `credit_card` (`ValidateCreditCard`) / `non_control_character`
         //     (`ValidateNonControlCharacter`) — not exported under this
         //     workspace's `validator` feature set, so no `Patch<T>` impl can be
         //     written without enabling new features (out of scope for a latent
         //     case).
-        // `nested` is deliberately NOT exercised here — unlike these three, it is
-        // rejected outright by `reject_nested_validator` before any codegen runs
-        // (see `nested_validator_is_rejected_outright` below), so mixing it into
-        // this combination would just make the whole macro call return a
-        // compile-error token stream instead of the structs this test inspects.
         // This is pure token-level filtering (`model_macro` does not compile the
         // output), so the combination need not be semantically valid — only that
         // each validator ident is dropped from the patch struct.
@@ -12157,6 +12101,7 @@ mod tests {
                     #[validate(
                         length(min = 1),
                         must_match(other = "confirm"),
+                        nested,
                         credit_card,
                         non_control_character
                     )]
@@ -12179,6 +12124,7 @@ mod tests {
         for kept in [
             "length",
             "must_match",
+            "nested",
             "credit_card",
             "non_control_character",
         ] {
@@ -12203,49 +12149,18 @@ mod tests {
             "UpdateSignup must keep the declarative `length` validator: {upd_section}"
         );
         // Every non-declarative validator is stripped from the patch field.
-        for dropped in ["must_match", "credit_card", "non_control_character"] {
+        for dropped in [
+            "must_match",
+            "nested",
+            "credit_card",
+            "non_control_character",
+        ] {
             assert!(
                 !upd_section.contains(dropped),
                 "UpdateSignup must NOT carry the non-Patch `{dropped}` validator \
                  (would break UpdateModel compilation / has no Patch<T> impl): {upd_section}"
             );
         }
-    }
-
-    #[test]
-    fn nested_validator_is_rejected_outright() {
-        // #1751: `#[validate(nested)]` collides with this crate's own
-        // `ValidateExt` (see `reject_nested_validator`'s doc comment for the
-        // full E0034 mechanism), so it is refused unconditionally, before any
-        // struct is emitted -- unlike its `NON_PATCH_VALIDATORS` siblings,
-        // which are merely filtered off the `Patch<T>` fields while staying on
-        // `NewModel`.
-        let output = model_macro(
-            TokenStream::new(),
-            quote! {
-                pub struct Order {
-                    #[id]
-                    pub id: i64,
-                    #[validate(nested)]
-                    pub shipping_address: Address,
-                }
-            },
-        );
-        let generated = output.to_string();
-        assert!(
-            generated.contains("compile_error"),
-            "a `#[validate(nested)]` field must be rejected with a compile error: {generated}"
-        );
-        assert!(
-            generated.contains("shipping_address") && generated.contains("ValidateExt"),
-            "the compile error must name the offending field and the real cause (`ValidateExt` \
-             collision), not a generic message: {generated}"
-        );
-        // Neither struct should be emitted once the field is rejected.
-        assert!(
-            !generated.contains("struct NewOrder") && !generated.contains("struct UpdateOrder"),
-            "no downstream structs should be generated once the field is rejected: {generated}"
-        );
     }
 
     #[test]

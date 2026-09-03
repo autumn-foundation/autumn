@@ -22,20 +22,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `validator_derive`'s `nested` codegen calls a field's value with bare
   `(&field).validate()`, which collides with this crate's own `ValidateExt`
   (`autumn_web::prelude::ValidateExt`, a blanket `impl<T: validator::Validate>
-  ValidateExt for T` also named `validate`) — any module that both derives a
-  `#[validate(nested)]` struct and imports the prelude (virtually every
-  handler module) failed to compile with a cryptic `E0034: multiple
-  applicable items in scope` pointing into the derive expansion, on **create
-  as much as on update**. `#[autumn_web::model]` now refuses
-  `#[validate(nested)]` outright, before any codegen runs, with a diagnostic
-  that names the field and the real cause and suggests `#[validate(custom(...))]`
-  as the alternative (`tests/compile-fail/model_validate_nested_rejected.rs`);
-  `ValidateExt`'s doc comment now carries the same warning for hand-rolled
-  `#[derive(validator::Validate)]` structs outside `#[model]`, which have no
-  such guard. `credit_card`/`non_control_character` remain correctly
-  out of scope: they are not in this workspace's enabled `validator` feature
-  set (only `derive`, not `card`/`unic`), so no model can use them today
-  regardless of the update path.
+  ValidateExt for T` also named `validate`) whenever a struct with a
+  `#[validate(nested)]` field is declared in a module that ALSO imports the
+  prelude — a cryptic `E0034: multiple applicable items in scope` pointing
+  into the derive expansion, on **create as much as on update**, and equally
+  possible on `#[autumn_web::model]` structs (which forward `#[validate(...)]`
+  verbatim) as on hand-rolled ones. The collision is scoped to the struct's
+  own defining module, not any downstream consumer's — proven with a
+  compile-fail/compile-pass fixture pair
+  (`tests/compile-fail/validate_nested_collides_with_validate_ext.rs` /
+  `tests/compile-pass/validate_nested_without_validate_ext.rs`) — and a
+  derive/attribute macro cannot see the rest of its enclosing module's `use`
+  statements, so `#[model]` cannot detect or refuse it at expansion time.
+  `ValidateExt`'s doc comment now documents the hazard and its scope, with the
+  workaround (keep the struct's own module free of that import, or use
+  `#[validate(custom(...))]`). `credit_card`/`non_control_character` remain
+  correctly out of scope: they are not in this workspace's enabled `validator`
+  feature set (only `derive`, not `card`/`unic`), so no model can use them
+  today regardless of the update path.
 
 - **Continuous SQLite replication with point-in-time restore (#1628):** the
   zero-ops SQLite tier (#1614) had snapshot backups (#1595/#1619) and nothing
