@@ -255,9 +255,20 @@ impl SandboxArtifact {
     pub fn seal(mut manifest: SandboxManifest, module: Vec<u8>) -> Result<Self, ArtifactError> {
         check_module(&module)?;
         manifest.sha256 = Self::digest(&module);
+        // Gate before rendering, not after. `parse` below is what makes the
+        // manifest legal, but it only sees the TOML — so serializing first
+        // means a manifest that is refusable from its own fields (over
+        // `MAX_ROUTES`, an oversized name or prefix) is expanded into a second,
+        // larger copy on the way to being rejected. `SandboxManifest`'s fields
+        // are public and this is a public packaging entry point, so the caller
+        // chooses that size. Validation reads the fields in place and refuses
+        // without allocating anything proportional to them.
+        manifest.validate()?;
         // Re-validate through the public constructor so a hand-built manifest
         // can never enter an artifact without passing the same gate a parsed
-        // one does.
+        // one does. Kept as well as the check above: this one also covers what
+        // only the round trip can — a field that serializes to something the
+        // parser reads back differently.
         let manifest = SandboxManifest::parse(&manifest.to_toml()?)?;
         Ok(Self { manifest, module })
     }

@@ -558,6 +558,13 @@ path = "tests/sandbox_stderr_alloc_gate.rs"
 name = "sandbox_response_alloc_gate"
 path = "tests/sandbox_response_alloc_gate.rs"
 
+# Allocation gate for `SandboxArtifact::seal`: a hand-built manifest refusable
+# from its own fields must not be rendered to TOML on the way to being rejected.
+# The verdict is identical either way, so allocation is the observable.
+[[test]]
+name = "sandbox_manifest_seal_alloc_gate"
+path = "tests/sandbox_manifest_seal_alloc_gate.rs"
+
 # Allocation gate for the scaffolded form-render helpers on the same 12-field
 # workload as `benches/form_render.rs` (Bolt follow-up to #2295/#2298, looking
 # at the per-field `error_id` allocation). Own binary for the same
