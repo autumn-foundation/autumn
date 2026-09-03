@@ -542,6 +542,12 @@ _PUNCTUATION = '();&|'
 # comment naming a command needs no special case any more.
 _PROMPT = {'$', '('}
 
+# Shell keywords that stand in front of a command without being one. `if autumn
+# migrate; then …` runs `autumn migrate` as the condition, and leaving `if` as
+# the segment head meant the scan never reached it.
+_CONTROL = {'if', 'elif', 'while', 'until', 'then', 'else', 'do', 'done', 'fi',
+            'time', '!', 'exec', 'command', 'nohup', 'sudo'}
+
 
 def tokenize(text):
     """Shell tokens for `text`, or None when it does not tokenize.
@@ -729,6 +735,49 @@ def _after_image(segment, k):
         yield ' '.join(segment[k:]), segment[k:]
 
 
+def _unwrap(tokens):
+    """Drop the substitution's own outer parens, keeping everything between.
+
+    Only ONE parenthesis is removed from each end, and only from a token that
+    is pure punctuation. Filtering every punctuation token out instead — the
+    first version of this — deleted the inner `;` from
+    `OUT=$(printf x; autumn migrate)`, collapsing two commands into one headed
+    by `printf` and losing the autumn invocation entirely.
+    """
+    inner = list(tokens)
+    if inner and all(c in _PUNCTUATION for c in inner[0]):
+        inner[0] = inner[0][1:]
+        if not inner[0]:
+            inner.pop(0)
+    if inner and all(c in _PUNCTUATION for c in inner[-1]):
+        inner[-1] = inner[-1][:-1]
+        if not inner[-1]:
+            inner.pop()
+    return inner
+
+
+def _embedded_substitutions(tok):
+    """Yield the text inside each `$( … )` written within a single token."""
+    i = 0
+    while True:
+        start = tok.find('$(', i)
+        if start < 0:
+            return
+        depth, j = 0, start + 1
+        while j < len(tok):
+            if tok[j] == '(':
+                depth += 1
+            elif tok[j] == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if j >= len(tok):
+            return
+        yield tok[start + 2:j]
+        i = j + 1
+
+
 def _in_substitutions(segment):
     """Yield the commands written INSIDE `$( … )` in a segment.
 
@@ -746,11 +795,13 @@ def _in_substitutions(segment):
                 i += 1
                 if depth <= 0:
                     break
-            inner = [tok for tok in segment[start:i]
-                     if not all(c in _PUNCTUATION for c in tok)]
-            if inner:
-                yield from _from_tokens(inner)
+            yield from _from_tokens(_unwrap(segment[start:i]))
             continue
+        # `OUT="$(autumn migrate)"` is quoted, so shlex keeps the whole
+        # substitution inside ONE token and the `$` / `(` never sit adjacent.
+        # The text between `$(` and its matching `)` is still a command line.
+        for text in _embedded_substitutions(segment[i]):
+            yield from commands(text)
         i += 1
 
 
@@ -782,7 +833,8 @@ def _from_tokens(tokens):
     """The token half of `commands()`, so nested contexts can re-enter it."""
     for segment in _segments(tokens):
         i = 0
-        while i < len(segment) and (segment[i] in _PROMPT or _ENV_TOKEN.match(segment[i])):
+        while i < len(segment) and (segment[i] in _PROMPT or segment[i] in _CONTROL
+                                    or _ENV_TOKEN.match(segment[i])):
             # An assignment whose VALUE is the binary is itself the command
             # head, not something to step over: a systemd unit writes
             # `ExecStart=/usr/local/bin/autumn db backup …`, and skipping it as
@@ -1385,6 +1437,28 @@ def self_test():
     expect([d for _, d, _, _ in invocations(toml_cmd)] == ['migrate run'],
            f'a TOML `command = "…"` value must be read: {list(invocations(toml_cmd))}')
 
+    # --- inner operators survive the unwrap. Filtering all punctuation out of
+    # a substitution deleted the `;` and collapsed two commands into one.
+    inner_op = '```bash\nOUT=$(printf x; autumn migrate run)\n```'
+    expect([d for _, d, _, _ in invocations(inner_op)] == ['migrate run'],
+           f'an operator inside a substitution must survive: {list(invocations(inner_op))}')
+    # A QUOTED substitution stays inside one token, so `$` and `(` never sit
+    # adjacent and the token-level scan cannot see it.
+    quoted_sub = '```bash\nOUT="$(autumn migrate run)"\n```'
+    expect([d for _, d, _, _ in invocations(quoted_sub)] == ['migrate run'],
+           f'a substitution embedded in a token must be read: {list(invocations(quoted_sub))}')
+    quoted_chain = '```bash\nOUT="$(autumn migrate && autumn dev)"\n```'
+    expect(sorted(d for _, d, _, _ in invocations(quoted_chain)) == ['dev', 'migrate'],
+           'a chain inside a quoted substitution is still a chain')
+
+    # --- a shell keyword stands in FRONT of a command without being one.
+    for line, what in (('if autumn migrate run; then echo ok; fi', 'if'),
+                       ('while autumn migrate run; do sleep 1; done', 'while'),
+                       ('sudo autumn migrate run', 'sudo')):
+        doc = '```bash\n' + line + '\n```'
+        expect('migrate run' in [d for _, d, _, _ in invocations(doc)],
+               f'`{what}` must not hide the command after it: {list(invocations(doc))}')
+
     # What marks a quoted token as a command line is its PREFIX, not its
     # contents — otherwise a message that happens to start with `autumn ` is
     # read as an invocation and a correct page is reported.
@@ -1564,7 +1638,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f"self-test: {13 + 47 + 59 + 4 - len(failures)} passed, {len(failures)} failed")
+    print(f"self-test: {13 + 47 + 65 + 4 - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
