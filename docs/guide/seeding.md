@@ -318,6 +318,9 @@ box with no manual edits.
   factory pattern.
 - **`autumn generate seed`** — tracked in #493 follow-up work.
 
+<!-- cli-surface-allow: autumn generate seed — listed under "Out of scope" precisely because it does not exist; tracked in #493 -->
+
+
 ---
 
 ## See also

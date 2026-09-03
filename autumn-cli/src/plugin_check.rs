@@ -258,7 +258,14 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
     checks.push(CheckResult {
         name: "installability".to_owned(),
         status: CheckStatus::Pass,
-        message: format!("{} routes collected from binary", routes.len()),
+        // Deliberately source-neutral: `autumn plugin-check` collects these by
+        // running a binary, `autumn plugin inspect` reads them out of a
+        // sandboxed plugin's manifest with no binary in sight.
+        message: format!(
+            "{count} route{plural} collected",
+            count = routes.len(),
+            plural = if routes.len() == 1 { "" } else { "s" }
+        ),
         diagnostics: vec![],
     });
 
