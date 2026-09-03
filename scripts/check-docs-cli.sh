@@ -31,12 +31,14 @@
 #      also eats the next token is read from the field's type in the derive —
 #      `--force` (bool) does not, `--shard NAME` (Option<String>) does — so a
 #      value is never mistaken for a subcommand, or a subcommand for a value.
-#   3. A group whose subcommand clap REQUIRES is not left bare in a runnable
-#      line: `autumn db` exits with an error, while `autumn migrate` (an
-#      `Option<>` subcommand) is fine. Checked only inside a fence — in prose,
-#      `autumn deploy` is how English names the command family, 49 times in this
-#      corpus, and reporting those would bury the gate in false positives on
-#      correct pages.
+#   3. A command whose subcommand clap REQUIRES is not left bare in a runnable
+#      line. `autumn db` errors, and so does a bare `autumn` (the root takes a
+#      required subcommand: `Usage: autumn <COMMAND>`, exit 2), while `autumn
+#      migrate` — an `Option<>` subcommand — is fine. Checked only inside a
+#      fence: in prose `autumn deploy` is how English names the command family
+#      (49 times in this corpus) and `autumn` alone is just the binary's name,
+#      so reporting those would bury the gate in false positives on correct
+#      pages — and a gate people learn to ignore has stopped working.
 #
 # TRUTH SET: parsed from the clap derive input in `autumn-cli/src/**/*.rs`, not
 # from a checked-in snapshot. A snapshot is one forgotten regeneration away
@@ -704,7 +706,13 @@ def resolve(tokens, surface, runnable=False):
     derive, never guessed — guessing makes `json` in `autumn routes --format
     json` look like a bad subcommand.
     """
-    if not tokens or not TOKEN.match(tokens[0]):
+    if not tokens:
+        # `autumn` with nothing after it. The root takes a required subcommand
+        # (`Usage: autumn <COMMAND>`, exit 2), so in a runnable line this is the
+        # same defect as a bare `autumn db` — and in prose it is just the name
+        # of the binary, which the corpus writes constantly.
+        return 'autumn' if runnable else None
+    if not TOKEN.match(tokens[0]):
         return None
     if tokens[0] not in surface:
         return 'autumn ' + tokens[0]
@@ -1009,6 +1017,11 @@ def self_test():
            'the same group named in prose must NOT be reported')
     expect(resolve(tk('migrate'), surface, runnable=True) is None,
            'a bare group with an optional subcommand runs fine')
+    expect(resolve([], surface, runnable=True) == 'autumn',
+           'a runnable line that is only `autumn` must be reported — the root '
+           'takes a required subcommand and exits 2')
+    expect(resolve([], surface, runnable=False) is None,
+           'prose naming the binary `autumn` must NOT be reported')
     # The quote rule must require `autumn` immediately inside the quote, or
     # every apostrophe in prose becomes a command position.
     expect(list(invocations("```bash\n# don't run autumn migrate here\n```")) == [],
@@ -1049,7 +1062,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f"self-test: {13 + 29 + 26 + 4 - len(failures)} passed, {len(failures)} failed")
+    print(f"self-test: {13 + 31 + 26 + 4 - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
@@ -1077,9 +1090,11 @@ def main():
     if defects:
         print()
         for f, lineno, bad, argv in defects:
-            note = ('needs a subcommand' if bad[len('autumn '):] in surface
+            note = ('needs a subcommand'
+                    if bad == 'autumn' or bad[len('autumn '):] in surface
                     else 'is not a command')
-            print(f'{f}:{lineno}: `{bad}` {note}  (line: autumn {argv})')
+            line = ('autumn ' + argv).strip()
+            print(f'{f}:{lineno}: `{bad}` {note}  (line: {line})')
         print()
         print('Each line above tells a reader to run something the CLI will '
               'reject. Fix the page, or — if the page is deliberately naming a '
