@@ -559,6 +559,23 @@ def tokenize(text):
         return None
 
 
+def _paren_delta(tok):
+    """Net parenthesis depth contributed by a token.
+
+    `shlex` COALESCES a run of punctuation into one token, so the end of a
+    nested substitution arrives as a single `))`. Testing for an exact `)` never
+    returned to depth zero there, and everything after it — including the
+    command — was swallowed into the assignment.
+
+    Only a token made entirely of shell punctuation is counted, so parentheses
+    inside an ordinary word or a quoted string (which posix `shlex` hands back
+    with its quotes removed) do not move the depth.
+    """
+    if tok and all(c in _PUNCTUATION for c in tok):
+        return tok.count('(') - tok.count(')')
+    return 0
+
+
 def _segments(tokens):
     """Split a token list on shell operators into one list per command.
 
@@ -571,10 +588,10 @@ def _segments(tokens):
     """
     current, out, depth, prev = [], [], 0, ''
     for tok in tokens:
-        if tok == '(' and prev.endswith('$'):
-            depth += 1
-        elif tok == ')' and depth:
-            depth -= 1
+        if tok.startswith('(') and prev.endswith('$'):
+            depth += _paren_delta(tok)          # `$(` opens a substitution
+        elif depth:
+            depth = max(0, depth + _paren_delta(tok))
         if not depth and tok in _OPERATORS:
             out.append(current)
             current = []
@@ -723,18 +740,15 @@ def commands(text):
             # a command substitution in the value has to be stepped over as a
             # unit — otherwise the scan stops on `cat` and never reaches the
             # command the assignment was standing in front of.
-            if segment[i].endswith('$') and i + 1 < len(segment) and segment[i + 1] == '(':
+            if segment[i].endswith('$') and i + 1 < len(segment) \
+                    and segment[i + 1].startswith('('):
                 depth = 0
                 i += 1
                 while i < len(segment):
-                    if segment[i] == '(':
-                        depth += 1
-                    elif segment[i] == ')':
-                        depth -= 1
-                        if depth == 0:
-                            i += 1
-                            break
+                    depth += _paren_delta(segment[i])
                     i += 1
+                    if depth <= 0:              # a coalesced `))` closes both
+                        break
                 continue
             i += 1
         head = None
@@ -1268,6 +1282,20 @@ def self_test():
     subst = ('```bash\nKEY=$(cat secret | tr -d \'x\') autumn migrate run\n```')
     expect([d for _, d, _, _ in invocations(subst)] == ['migrate run'],
            f'a pipe inside $( ) must not split the command: {list(invocations(subst))}')
+    # shlex coalesces a run of punctuation, so a nested substitution ends in a
+    # single `))` token; testing for an exact `)` never reached depth zero and
+    # swallowed the command that followed.
+    nested_sub = '```bash\nTAG=$(echo $(date +%s)) autumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(nested_sub)] == ['migrate run'],
+           f'a coalesced `))` must close both substitutions: {list(invocations(nested_sub))}')
+    deep_sub = '```bash\nA=$(f $(g $(h))) autumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(deep_sub)] == ['migrate run'],
+           f'three levels close on one `)))`: {list(invocations(deep_sub))}')
+    expect(_paren_delta('))') == -2 and _paren_delta('(') == 1,
+           'a punctuation run counts every parenthesis in it')
+    expect(_paren_delta('title:String(x)') == 0,
+           'parens inside an ordinary word do not move the depth')
+
     sub_sh = '```bash\n(autumn migrate && autumn dev)\n```'
     expect([d for _, d, _, _ in invocations(sub_sh)] == ['migrate', 'dev'],
            f'a plain subshell still holds two commands: {list(invocations(sub_sh))}')
@@ -1458,7 +1486,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f"self-test: {13 + 47 + 50 + 4 - len(failures)} passed, {len(failures)} failed")
+    print(f"self-test: {13 + 47 + 54 + 4 - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
