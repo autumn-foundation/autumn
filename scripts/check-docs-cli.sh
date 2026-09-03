@@ -551,7 +551,12 @@ _PROMPT = {'$', '(', '{'}
 # the segment head meant the scan never reached it.
 _CONTROL = {'if', 'elif', 'while', 'until', 'then', 'else', 'do', 'done', 'fi',
             'time', '!', 'exec', 'command', 'nohup', 'sudo', 'env', 'xargs',
-            'timeout', 'nice'}
+            'timeout', 'nice',
+            # …and the launchers that run a DIRECT command operand, not only
+            # one after a `--`. Each was listed as a program whose separator
+            # introduces a command, which covered `systemd-run -- autumn …`
+            # and nothing else — so the ordinary spelling went unread.
+            'systemd-run', 'flock', 'chroot', 'nsenter', 'doas'}
 
 # Options a wrapper takes that consume a SEPARATE value token. `env` and
 # `sudo` both put flags between the keyword and the command they launch —
@@ -583,12 +588,31 @@ _WRAPPER_OPTS = {
               '-P', '--max-procs', '-s', '--max-chars', '-d', '--delimiter'},
     'timeout': {'-k', '--kill-after', '-s', '--signal'},
     'nice': {'-n', '--adjustment'},
+    # `systemd-run [OPTIONS...] COMMAND` and `flock [options] <file> <command>`
+    # — the usage lines the installed binaries print. Only the SEPARATED
+    # value-taking spellings need listing; the attached `--unit=x` form is
+    # self-contained, and an option missing from this table is read as a flag,
+    # which degrades to silence rather than to a false report.
+    'systemd-run': {'-u', '--unit', '-p', '--property', '-E', '--setenv',
+                    '-M', '--machine', '--slice', '--description', '--uid',
+                    '--gid', '--nice', '--working-directory', '--service-type',
+                    '--on-calendar', '--on-active', '--timer-property'},
+    # `flock -c '…'` hands its string to a shell, but the option's owner is
+    # the wrapper rather than the word before it, which this file's `-c`
+    # ownership rule does not yet express — so that spelling stays unread
+    # (silence, not a false report). The direct operand form is what the
+    # corpus and the finding are about.
+    'flock': {'-w', '--wait', '--timeout', '-E', '--conflict-exit-code'},
+    'chroot': {'--userspec', '--groups'},
+    'nsenter': {'-t', '--target', '-S', '--setuid', '-G', '--setgid',
+                '--wd', '--root'},
+    'doas': {'-u', '-C'},
 }
 
 # Wrappers that take POSITIONAL operands of their own before the command:
 # `timeout [OPTION] DURATION COMMAND`. Stepping over the options alone left
 # the duration looking like the executable.
-_WRAPPER_OPERANDS = {'timeout': 1}
+_WRAPPER_OPERANDS = {'timeout': 1, 'flock': 1, 'chroot': 1}
 
 
 # Options that turn a wrapper into an INSPECTION: it describes the names that
@@ -987,13 +1011,18 @@ _KEY_INLINE = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
 _ARGS_ONLY = re.compile(r'^(\s*)' + _QUALIFIED + r'args:\s*$', re.I)
 _ARGS_INLINE = re.compile(r'^(\s*)' + _QUALIFIED + r'args:\s*\[(.*)\]\s*$', re.I)
 _EXEC_KEY_LINE = re.compile(r'^\s*' + _QUALIFIED + r'(?:' + _EXEC_KEYS + r'):', re.I)
-# A FOLDED block scalar joins its lines with spaces, so a command written
-# across two of them is one command. Scanning the physical lines instead let
-# the first resolve on its own and dropped the rest, which is where the drift
-# was. The literal form (`|`) keeps its lines separate and is already right,
-# so only `>` is folded here.
+# A block scalar, folded (`>`) or literal (`|`). A FOLDED one joins its lines
+# with spaces, so a command written across two of them is one command;
+# scanning the physical lines let the first resolve on its own and dropped the
+# rest, which is where the drift was. A LITERAL one keeps its lines separate
+# and each is its own command — but it is still that key's VALUE, so under an
+# exec-family key it fills the container's slot exactly as every other form
+# does. Excluding it left `entrypoint: ["autumn"]` beside `command: |` with an
+# empty slot, and the pair emitted a bare root on a correct recipe.
+#
+# The style is captured, because it decides whether the lines join.
 _FOLDED_KEY = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
-                         r'):\s*>[-+]?([0-9]?)[-+]?\s*$', re.I)
+                         r'):\s*([>|])[-+]?([0-9]?)[-+]?\s*$', re.I)
 # Any mapping key, used only to spot where one object ends and its sibling
 # begins — Compose names its services this way rather than with list items.
 _MAPPING_KEY = re.compile(r'^(\s*)[A-Za-z_][\w.-]*:(\s|$)')
@@ -1008,8 +1037,15 @@ _BLOCKQUOTE = re.compile(r'^\s*(?:>\s?)+')
 # The lookbehind excludes bash's HERE-STRING, `<<<EOF`, which feeds one word
 # to stdin and consumes no following lines at all — reading it as a heredoc
 # swallowed the command underneath it.
+# The delimiter is a shell WORD, not an identifier: `cat <<END.JSON` and
+# `cat <<END}` are both valid and both end on their own spelling. Accepting
+# only `[A-Za-z_][\w-]*` captured the `END` prefix of the first, so the
+# scanner waited for a terminator that never came and ate the rest of the
+# fence — the real command after `END.JSON` included. A word ends at
+# whitespace or at a shell operator, which is what the class says.
+_HEREDOC_WORD = r'[^\s;&|<>()\'"`]+'
 _HEREDOC = re.compile(r'(?<!<)<<-?\s*(?:"([^"]+)"|\'([^\']+)\''
-                      r'|\\([A-Za-z_][\w-]*)|([A-Za-z_][\w-]*))')
+                      r'|\\(' + _HEREDOC_WORD + r')|(' + _HEREDOC_WORD + r'))')
 # A slot key whose value is a plain scalar on the same line. Compose mixes the
 # forms freely — `entrypoint: ["autumn"]` with `command: migrate` — and reading
 # only the bracketed form left the pair half-assembled, so a valid recipe
@@ -1704,13 +1740,16 @@ def invocations(text):
     folded_indent = 0
     folded_base = None      # the column its content sits at
     folded_slot = None      # which container slot it fills, if any
+    folded_literal = False  # `|` keeps its lines apart; `>` joins them
 
     def close_folded():
         """Read a folded scalar: one command per paragraph, lines joined."""
         nonlocal folded, folded_at, folded_base, folded_slot
+        nonlocal folded_literal
         nonlocal pending, pending_kind, pending_at, pending_indent
         paras, at, slot = folded, folded_at, folded_slot
         folded, folded_at, folded_base, folded_slot = None, None, None, None
+        folded_literal = False
         if not paras:
             return
         # A folded value under an exec-family key is that container's argv,
@@ -1721,10 +1760,10 @@ def invocations(text):
         #
         # Only a SINGLE paragraph can be one argv; more than one is more than
         # one command, and those are read on their own as before.
-        filled = [para for para in paras if para]
+        filled = [para for para in paras if para[1]]
         if slot and len(filled) == 1:
-            value = ' '.join(filled[0])
-            pending_kind, pending_at = slot, at
+            value = ' '.join(filled[0][1])
+            pending_kind, pending_at = slot, filled[0][0] or at
             pending_indent = folded_indent
             pending = tokenize(value) or value.split()
             yield from close_pending()
@@ -1733,11 +1772,16 @@ def invocations(text):
         # newline — so it separates two commands. Joining across it built
         # `autumn migrate autumn routes` out of two valid lines and reported
         # the second `autumn` as a phantom subcommand, failing a correct file.
-        for para in paras:
+        #
+        # Each paragraph reports its OWN first line, not the key's. Reporting
+        # the key sent a reader to the `run: |` three lines above the command
+        # that actually fails, and `file:line:` is the whole of what the gate
+        # hands them.
+        for para_at, para in paras:
             if not para:
                 continue
             for display, argv in commands(' '.join(para)):
-                yield at, display, argv, FENCED_COMMAND
+                yield para_at or at, display, argv, FENCED_COMMAND
 
     def close_pending():
         """Finish the list being collected: fill a slot, or run script lines."""
@@ -1834,7 +1878,7 @@ def invocations(text):
         # blank line inside it is a paragraph break, not nothing.
         if folded is not None:
             if not line.strip():
-                folded.append([])
+                folded.append([None, []])
                 continue
             depth = len(line) - len(line.lstrip())
             if depth > folded_indent:
@@ -1845,24 +1889,29 @@ def invocations(text):
                 # `autumn migrate autumn routes` from two valid lines.
                 if folded_base is None:
                     folded_base = depth
-                if depth > folded_base:
-                    # A more-indented block keeps EVERY newline inside it, not
-                    # just the ones at its edges: each of its lines is its own
-                    # command. Breaking only when the depth changed still
-                    # joined two such lines, and because the first accepts
-                    # arguments the second vanished into it.
-                    folded.append([line.strip()])
-                    folded.append([])
+                # A LITERAL (`|`) scalar keeps every newline it is written
+                # with, so each of its lines is its own command and none of
+                # them join — which is also true of a more-indented block
+                # inside a FOLDED one, for the same reason. A more-indented
+                # block keeps EVERY newline, not just the ones at its edges:
+                # breaking only when the depth changed still joined two such
+                # lines, and because the first accepts arguments the second
+                # vanished into it.
+                if folded_literal or depth > folded_base:
+                    folded.append([lineno, [line.strip()]])
+                    folded.append([None, []])
                     continue
                 if depth < folded_base:
                     folded_base = depth
-                    folded.append([])
-                folded[-1].append(line.strip())
+                    folded.append([None, []])
+                if folded[-1][0] is None:
+                    folded[-1][0] = lineno
+                folded[-1][1].append(line.strip())
                 continue
             yield from close_folded()
         fold = _FOLDED_KEY.match(keyline)
         if fold:
-            folded, folded_at = [[]], lineno
+            folded, folded_at = [[None, []]], lineno
             folded_indent = len(fold.group(1))
             # An explicit indentation indicator SETS the content column, so a
             # line further right than it is more-indented and keeps its
@@ -1870,8 +1919,9 @@ def invocations(text):
             # made that line the base and folded the block into one argv,
             # hiding whatever followed. Only when there is no indicator does
             # the first content line decide.
-            folded_base = (folded_indent + int(fold.group(2))
-                           if fold.group(2) else None)
+            folded_literal = fold.group(2) == '|'
+            folded_base = (folded_indent + int(fold.group(3))
+                           if fold.group(3) else None)
             folded_slot = ('args' if _ARGS_KEY_LINE.match(keyline)
                            else 'entry' if _ENTRY_KEY_LINE.match(keyline)
                            else 'cmd' if _EXEC_KEY_LINE.match(keyline)
@@ -3666,6 +3716,74 @@ def self_test():
         doc = f"```bash\n{quiet} 'autumn nope'\n```"
         expect(list(invocations(doc)) == [],
                f'{quiet} carries no command string: {list(invocations(doc))}')
+
+    # A heredoc delimiter is a shell WORD, not an identifier. Reading only the
+    # leading identifier took `END` out of `<<END.JSON`, so the terminator
+    # never matched and the rest of the fence — the command after it
+    # included — was eaten as body.
+    for delim in ('END.JSON', 'END}', 'EOF-1', 'EOF'):
+        doc = f'```bash\ncat <<{delim}\ndata\n{delim}\nautumn nope\n```'
+        got = [(ln, d) for ln, d, _, _ in invocations(doc)]
+        expect(got == [(5, 'nope')], f'<<{delim} ends on its own word: {got}')
+        # …and the body is still data, whatever the delimiter is spelled like.
+        body_only = f'```bash\ncat <<{delim}\nautumn db\n{delim}\n```'
+        expect(list(invocations(body_only)) == [],
+               f'<<{delim} still swallows its body: {list(invocations(body_only))}')
+    esc = '```bash\ncat <<\\END.JSON\ndata\nEND.JSON\nautumn nope\n```'
+    expect([d for _, d, _, _ in invocations(esc)] == ['nope'],
+           f'a backslash-quoted punctuated delimiter works too: '
+           f'{list(invocations(esc))}')
+    # The here-string is still not a heredoc — the broader word class must not
+    # have made `<<<` match.
+    hs = '```bash\nsort <<<"$x"\nautumn nope\n```'
+    expect([d for _, d, _, _ in invocations(hs)] == ['nope'],
+           f'a here-string consumes no lines: {list(invocations(hs))}')
+
+    # Several launchers run a DIRECT command operand, not only one after a
+    # `--`, and each has its own operand count: `flock <file> <command>` and
+    # `chroot NEWROOT COMMAND` take one, `systemd-run`, `nsenter` and `doas`
+    # take none.
+    for launcher in ('systemd-run', 'flock /tmp/lock', 'chroot /mnt',
+                     'nsenter -t 1 -m', 'doas',
+                     'systemd-run --unit=x', 'systemd-run -p CPUQuota=50%',
+                     'flock -w 5 /tmp/lock', 'chroot --userspec=1000 /mnt',
+                     'doas -u deploy'):
+        doc = f'```bash\n{launcher} autumn nope\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{launcher} runs its operand: {got}')
+    # …and a program that merely NAMES one runs nothing.
+    echoed = '```bash\necho systemd-run autumn nope\n```'
+    expect(list(invocations(echoed)) == [],
+           f'a launcher named as an argument runs nothing: '
+           f'{list(invocations(echoed))}')
+
+    # A LITERAL block scalar is still that key's value, so under an exec key it
+    # fills the container's slot exactly as every other form does — leaving it
+    # out left `entrypoint: ["autumn"]` with an empty slot and emitted a bare
+    # root on a correct recipe.
+    lit_slot = '```yaml\nentrypoint: ["autumn"]\ncommand: |\n  migrate\n```'
+    expect([d for _, d, _, _ in invocations(lit_slot)] == ['migrate'],
+           f'a literal scalar fills its slot: {list(invocations(lit_slot))}')
+    lit_drift = '```yaml\nentrypoint: ["autumn"]\ncommand: |\n  nope\n```'
+    expect([d for _, d, _, _ in invocations(lit_drift)] == ['nope'],
+           f'…and drift in one is still named: {list(invocations(lit_drift))}')
+    # `|` keeps its lines apart and `>` joins them: that difference is the
+    # whole reason the two styles exist, and reading either as the other
+    # invents a command out of two valid lines or hides one inside another.
+    lit_two = '```yaml\nrun: |\n  autumn migrate\n  autumn nope\n```'
+    expect([(ln, d) for ln, d, _, _ in invocations(lit_two)]
+           == [(3, 'migrate'), (4, 'nope')],
+           f'a literal scalar keeps its lines apart: {list(invocations(lit_two))}')
+    fold_two = '```yaml\nrun: >\n  autumn migrate\n  status\n```'
+    expect([d for _, d, _, _ in invocations(fold_two)] == ['migrate status'],
+           f'a folded scalar still joins them: {list(invocations(fold_two))}')
+    # Every paragraph reports its OWN first line. Reporting the key sent the
+    # reader to the `run: |` above the command that actually fails, and
+    # `file:line:` is the whole of what the gate hands them.
+    paras = '```yaml\nrun: >\n  autumn migrate\n\n  autumn nope\n```'
+    expect([(ln, d) for ln, d, _, _ in invocations(paras)]
+           == [(3, 'migrate'), (5, 'nope')],
+           f'each paragraph reports its own line: {list(invocations(paras))}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
