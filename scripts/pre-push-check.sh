@@ -98,7 +98,7 @@ cargo fmt --all -- --check
 # `--all-targets` also compiles examples/benches, so together with the test
 # compile below this covers the full set of targets CI builds on every PR.
 step "cargo clippy --workspace --all-targets -- -D warnings"
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
 
 # --- 4. Clippy (autumn-web, gated request-path features) ---------------------
 # Mirrors ci.yml `lint` job's second clippy step. The default-feature run above
@@ -118,7 +118,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 # example / bench targets keeps this leg minutes shorter. CI still runs the
 # `--all-targets` form.
 step "cargo clippy -p autumn-web --features \"<gated request-path set>\" --lib -- -D warnings"
-cargo clippy -p autumn-web \
+cargo clippy --locked -p autumn-web \
   --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" \
   --lib -- -D warnings
 
@@ -128,7 +128,7 @@ cargo clippy -p autumn-web \
 # consolidated `integration_tests` binary that a `-p autumn-cli` loop skips.
 # This is the line that catches cross-package compile breaks locally.
 step "cargo test --workspace --no-run   (compile-only; skips ~17GB trybuild run)"
-cargo test --workspace --no-run
+cargo test --locked --workspace --no-run
 
 # --- 6. Doctests (workspace, doc target only) --------------------------------
 # `--no-run` above skips doctests (they build only in the `--doc` phase), so a
@@ -139,7 +139,7 @@ cargo test --workspace --no-run
 # and — because `--doc` selects only the doc target — never triggers trybuild,
 # so it adds no meaningful disk.
 step "cargo test --workspace --doc   (doctests; --no-run above does not build them)"
-cargo test --workspace --doc
+cargo test --locked --workspace --doc
 
 echo
 echo "pre-push-check: OK — workspace test targets compile clean, doctests pass."
