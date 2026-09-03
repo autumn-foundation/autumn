@@ -31,6 +31,10 @@
 #      also eats the next token is read from the field's type in the derive —
 #      `--force` (bool) does not, `--shard NAME` (Option<String>) does — so a
 #      value is never mistaken for a subcommand, or a subcommand for a value.
+#   2b. A command is recognised after a scalar key that means "a command
+#      follows" (`command:`, `run:`, `Run:`), and the binary is recognised
+#      however its path is spelled — `./autumn`, `/usr/local/bin/autumn`, or as
+#      the value of a systemd `ExecStart=`.
 #   3. A command whose subcommand clap REQUIRES is not left bare in a runnable
 #      line. `autumn db` errors, and so does a bare `autumn` (the root takes a
 #      required subcommand: `Usage: autumn <COMMAND>`, exit 2), while `autumn
@@ -96,10 +100,14 @@
 #     falls between two separate spans). A span that wraps INSIDE its backticks
 #     is read — markdown renders it as one span, and missing that hid a live
 #     `autumn migrate run` in migrations.md behind a `\n> ` break.
-#   - Instructional prefixes in `skills/` (`2. Run: autumn migrate`). Reading
-#     after an arbitrary prose prefix is the heuristic most likely to start
-#     reporting sentences; the same skills name commands in code spans
-#     elsewhere, and those ARE gated.
+#   - An ARBITRARY prose prefix. A bounded set of scalar keys that mean "this is
+#     a command" — `command:`, `run:`, `entrypoint:`, `cmd:`, `exec:`,
+#     `script:` — IS read, since Compose writes `command: autumn migrate`, a
+#     workflow step writes `run: autumn routes`, and the skills write `Run:
+#     autumn migrate` as an instruction. An earlier version of this script
+#     lumped those in with arbitrary prefixes and skipped all 14; the reasoning
+#     was right about arbitrary prefixes and wrong about these, which are the
+#     keys whose whole meaning is that a command follows.
 # Wrapper forms that ARE extracted, because they are unambiguous command
 # positions rather than prose: after a `--` separator (`kubectl exec deploy/app
 # -- autumn …`), inside a quoted wrapper argument (`fly ssh console -C "autumn
@@ -564,6 +572,19 @@ def _segments(tokens):
     return out
 
 
+# A scalar key whose value is a command line. Compose writes `command: autumn
+# migrate`, a GitHub Actions step writes `run: autumn routes`, and the skills
+# write `Run: autumn migrate` as an instruction — all of them commands someone
+# or something will execute.
+#
+# A BOUNDED set, not "any word before a colon". The earlier version of this
+# script excluded these as "instructional prefixes" on the grounds that reading
+# after an arbitrary prose prefix starts reporting sentences. That reasoning was
+# right about arbitrary prefixes and wrong to lump these in with them: `command`
+# and `run` are not arbitrary, they are the keys that mean "this is a command".
+_COMMAND_KEY = re.compile(r'^(command|run|entrypoint|cmd|exec|script):$', re.I)
+
+
 def _autumn_exe(tok):
     """True when the token names the autumn binary, however it is spelled.
 
@@ -680,7 +701,10 @@ def commands(text):
         if i < len(segment) and head is not None:
             yield ' '.join(segment[i + 1:]), segment[i + 1:]
         for j, tok in enumerate(segment):
-            if tok == '--' and j + 1 < len(segment) and _autumn_exe(segment[j + 1]):
+            if _COMMAND_KEY.match(tok) and j + 1 < len(segment) \
+                    and _autumn_exe(segment[j + 1]):
+                yield ' '.join(segment[j + 2:]), segment[j + 2:]
+            elif tok == '--' and j + 1 < len(segment) and _autumn_exe(segment[j + 1]):
                 yield ' '.join(segment[j + 2:]), segment[j + 2:]
             elif tok == '--entrypoint' and j + 2 < len(segment) \
                     and _autumn_exe(segment[j + 1]):
@@ -1189,6 +1213,19 @@ def self_test():
     unit = '```ini\n[Service]\nExecStart=/usr/local/bin/autumn migrate run\n```'
     expect([d for _, d, _, _ in invocations(unit)] == ['migrate run'],
            f'a systemd ExecStart= recipe must be read: {list(invocations(unit))}')
+    # A scalar key that means "a command follows".
+    compose = '```yaml\nservices:\n  migrate:\n    command: autumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(compose)] == ['migrate run'],
+           f'a Compose `command:` value must be read: {list(invocations(compose))}')
+    step = '```yaml\n- run: autumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(step)] == ['migrate run'],
+           'a workflow `run:` step must be read')
+    instr = '```text\n2. Run: autumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(instr)] == ['migrate run'],
+           'a skill instruction `Run:` must be read, case-insensitively')
+    expect(list(invocations('```yaml\n  image: autumn-cli:1.2\n```')) == [],
+           'a key outside the bounded set is not a command position')
+
     cfgs = ('```bash\nAUTUMN_CLUSTER__CLUSTER_NAME=autumn\n'
             'AUTUMN_ALERTS__WEBHOOK_URL=https://alerts.example.com/hooks/autumn\n```')
     expect(list(invocations(cfgs)) == [],
@@ -1348,7 +1385,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f"self-test: {13 + 47 + 40 + 4 - len(failures)} passed, {len(failures)} failed")
+    print(f"self-test: {13 + 47 + 44 + 4 - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
