@@ -11304,11 +11304,11 @@ pub struct Vault {
         let fqdn = "_acme-challenge.myapp.com";
 
         let pass =
-            check_acme_dns_propagation_impl(&fqdn, &ChallengeDnsVisibility::Answered { values: 0 });
+            check_acme_dns_propagation_impl(fqdn, &ChallengeDnsVisibility::Answered { values: 0 });
         assert_eq!(pass.status, CheckStatus::Pass);
 
         let warn =
-            check_acme_dns_propagation_impl(&fqdn, &ChallengeDnsVisibility::Stale { values: 2 });
+            check_acme_dns_propagation_impl(fqdn, &ChallengeDnsVisibility::Stale { values: 2 });
         assert_eq!(warn.status, CheckStatus::Warn);
         assert!(warn.detail.unwrap().contains('2'));
 
