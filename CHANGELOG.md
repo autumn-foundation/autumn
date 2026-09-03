@@ -1436,6 +1436,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never resubmitted) keep showing their real value instead of going blank.
   Other failure classes (missing pool, unknown model, database outage) are
   unchanged and still render the generic error page.
+- **`distributed_lock`'s `cancelled_release_does_not_leak_lock` de-flaked and
+  un-quarantined:** the test raced a `Duration::ZERO` `tokio::time::timeout`
+  against a real `pg_advisory_unlock` round-trip, on the assumption that an
+  already-elapsed timer always wins. It doesn't: `Timeout::poll` polls the
+  wrapped future *before* checking its timer, so whenever the query happened
+  to resolve within that same first poll the timeout never fired and the
+  future was never actually cancelled mid-flight — measured at 1/30
+  same-commit reruns. It had been `--skip`-listed out of `ci.yml`'s Docker
+  sweep for this since, with no tracking issue. The test now polls
+  `release()` by hand exactly once, asserts `Poll::Pending` (proof the query
+  genuinely had not completed — a real network round-trip cannot resolve
+  synchronously on its first poll) and drops it from there: no timing
+  dependency, 0 failures across 50 reruns. Restored to CI's Docker sweep.
 
 ### Added
 
