@@ -566,6 +566,14 @@ _WRAPPER_OPTS = {
     'env': {'-u', '--unset', '-C', '--chdir', '-S', '--split-string'},
     'sudo': {'-u', '--user', '-g', '--group', '-p', '--prompt',
              '-D', '--chdir', '-R', '--chroot', '-T', '--command-timeout'},
+    # The shell builtins in `_CONTROL` take options too, and were being
+    # stepped over without them: `command -p autumn …` left `-p` as the
+    # prospective executable. `command [-pVv]` and `time [-p]` are flags
+    # only; `exec [-cl] [-a name]` has one that takes a value.
+    'command': set(),
+    'time': set(),
+    'nohup': set(),
+    'exec': {'-a'},
 }
 
 
@@ -1138,8 +1146,20 @@ def _mask_quoted(text, quotes="'\""):
         i += 1
         if ch not in quotes:
             continue
-        end = text.find(ch, i)
-        if end < 0:                             # unbalanced: mask the rest
+        # Finding the terminator with a plain search mistook an ESCAPED quote
+        # for it — `"\" <<EOF"` ended the string early, leaving the operator
+        # unmasked. A backslash escapes the next character inside double
+        # quotes; inside single quotes it is literal, so it is only honoured
+        # for the double-quoted case, which is what the shell does.
+        end = i
+        while end < n:
+            if ch == '"' and text[end] == '\\':
+                end += 2
+                continue
+            if text[end] == ch:
+                break
+            end += 1
+        if end >= n:                            # unbalanced: mask the rest
             out.append('x' * (n - i))
             break
         out.append('x' * (end - i))
@@ -1521,7 +1541,7 @@ def invocations(text):
         # ordinary fence a leading `>` is a redirection, not a quote marker.
         if fence is not None and quoted_fence:
             line = _BLOCKQUOTE.sub('', line, count=1)
-        m = re.match(r'^\s*(?:>\s?)*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)', line)
+        m = re.match(r'^\s*(?:>\s?)*(`{3,}|~{3,})\s*(.*)$', line)
         if m:
             held, held_at, heredoc = [], None, None   # a fence boundary ends any hold
             yield from close_folded()           # …a folded scalar
@@ -1536,10 +1556,12 @@ def invocations(text):
                 # everything after read as prose, where a runnable command is
                 # not judged.
                 fence, fence_len = m.group(1)[0], len(m.group(1))
-                lang = m.group(2).lower()
+                # The info string is the first word of the rest.
+                info = m.group(2).strip()
+                lang = re.split(r'[\s,]', info)[0].lower() if info else ''
                 quoted_fence = bool(_BLOCKQUOTE.match(line))
             elif m.group(1)[0] == fence and len(m.group(1)) >= fence_len \
-                    and not m.group(2):
+                    and not m.group(2).strip():
                 fence, lang, quoted_fence = None, None, False
             continue
 
@@ -2252,6 +2274,14 @@ def self_test():
         doc = f'```bash\n{runner} autumn migrate run\n```'
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate run'], f'{runner!r} runs what follows: {got}')
+    # The shell BUILTINS take options too, and stepping over the keyword alone
+    # left the first of them looking like the executable.
+    for builtin in ('command -p', 'command -v', 'time -p', 'exec -a name',
+                    'command', 'exec', 'nohup'):
+        doc = f'```bash\n{builtin} autumn migrate run\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'], f'{builtin!r} must reach the command: {got}')
+
     for printer in ('echo', 'printf', 'ls'):
         doc = f'```bash\n{printer} -- autumn db\n```'
         expect(list(invocations(doc)) == [],
@@ -2305,7 +2335,11 @@ def self_test():
            f'a here-string opens no heredoc: {list(invocations(hstring))}')
     # …and a `<<EOF` that is only mentioned opens nothing either. BOTH quote
     # kinds make the operator inert, unlike `$( )`, where only single ones do.
-    for mention in ('# see <<EOF below', "echo '<<EOF'", 'printf \'%s\' "<<EOF"'):
+    # The last of these is why the terminator search honours backslash
+    # escapes: a plain search mistook the escaped quote for the end of the
+    # string, left the operator unmasked, and opened a heredoc on data.
+    for mention in ('# see <<EOF below', "echo '<<EOF'", 'printf \'%s\' "<<EOF"',
+                    'printf \'%s\' "\\" <<EOF"'):
         doc = f'```bash\n{mention}\nautumn migrate run\n```'
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate run'],
@@ -2737,6 +2771,18 @@ def self_test():
     plain = '```bash\nautumn migrate run\n```'
     expect([w for _, _, _, w in invocations(plain)] == [FENCED_COMMAND],
            'an ordinary fence still opens and closes normally')
+    # A closing fence may be followed only by whitespace, so a run with text
+    # after it is content. Checking merely that the info-string group was
+    # empty let ``` followed by a comment close the block.
+    trailing = '```bash\n``` # shown as output\nautumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(trailing)] == ['migrate run'],
+           f'a run with text after it is not a closer: {list(invocations(trailing))}')
+    expect([w for _, _, _, w in invocations('```bash\nautumn migrate run\n```   ')]
+           == [FENCED_COMMAND],
+           'trailing spaces after a closer are fine')
+    # …and the info string may carry more than the language.
+    expect(list(invocations('```rust,ignore\nlet m = "autumn migrate";\n```')) == [],
+           'a comma-suffixed info string still names the language')
 
     quoted = '> ```bash\n> autumn migrate run\n> ```'
     expect([d for _, d, _, _ in invocations(quoted)] == ['migrate run'],
