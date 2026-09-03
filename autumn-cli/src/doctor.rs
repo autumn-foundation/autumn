@@ -862,25 +862,48 @@ pub enum PortReachability {
 /// HTTP-01 validation requires the CA to reach `:80`, so a refused/timed-out
 /// `:80` is a **Fail**. `:443` merely being down yet is a **Warn** (the listener
 /// may not be up during preflight).
+///
+/// Under DNS-01 the CA never connects to `:80` — domain control is proved by a
+/// TXT record — so an unreachable `:80` costs only the HTTP→HTTPS redirect for
+/// visitors who type `http://`. Grading it a **Fail** would make `doctor
+/// --online --strict` reject a perfectly correct wildcard deployment on a host
+/// that deliberately exposes only `:443`.
 #[must_use]
-pub fn check_acme_ports_impl(
+pub fn check_acme_ports_for_challenge(
     domain: &str,
     port_80: PortReachability,
     port_443: PortReachability,
+    dns01: bool,
 ) -> CheckResult {
     match port_80 {
         PortReachability::Refused | PortReachability::TimedOut | PortReachability::Error => {
-            return CheckResult {
-                name: "acme_ports",
-                status: CheckStatus::Fail,
-                detail: Some(format!(
-                    "port 80 on {domain} is not reachable ({port_80:?}); the ACME CA validates \
-                     HTTP-01 over port 80"
-                )),
-                hint: Some(
-                    "Open inbound TCP/80 to this host (or forward it) so Let's Encrypt can reach \
-                     the HTTP-01 challenge",
-                ),
+            return if dns01 {
+                CheckResult {
+                    name: "acme_ports",
+                    status: CheckStatus::Warn,
+                    detail: Some(format!(
+                        "port 80 on {domain} is not reachable ({port_80:?}); DNS-01 issuance does \
+                         not need it, but visitors who type http:// will not be redirected to \
+                         HTTPS"
+                    )),
+                    hint: Some(
+                        "Optional under DNS-01: open inbound TCP/80 only if you want the \
+                         HTTP→HTTPS redirect",
+                    ),
+                }
+            } else {
+                CheckResult {
+                    name: "acme_ports",
+                    status: CheckStatus::Fail,
+                    detail: Some(format!(
+                        "port 80 on {domain} is not reachable ({port_80:?}); the ACME CA validates \
+                         HTTP-01 over port 80"
+                    )),
+                    hint: Some(
+                        "Open inbound TCP/80 to this host (or forward it) so Let's Encrypt can \
+                         reach the HTTP-01 challenge",
+                    ),
+                }
             };
         }
         PortReachability::Open => {}
@@ -932,12 +955,61 @@ pub enum DnsPointsHere {
 
 /// Grade whether an ACME domain's DNS points at this host (pure; injectable).
 ///
-/// A clear mismatch is a **Fail** (HTTP-01 will hit the wrong host); an
-/// indeterminate result (can't resolve, or can't tell where "here" is) is a
-/// **Warn** rather than a hard failure, since split-horizon DNS and NAT make
-/// "points here" unknowable from inside the host.
+/// Under HTTP-01 a clear mismatch is a **Fail** (the CA will hit the wrong
+/// host); an indeterminate result (can't resolve, or can't tell where "here"
+/// is) is a **Warn** rather than a hard failure, since split-horizon DNS and NAT
+/// make "points here" unknowable from inside the host.
+///
+/// `dns01` softens all of that (issue #1620). "Does this domain resolve to THIS
+/// host" is an HTTP-01 question: the CA
+/// fetches the challenge token over `:80` from whatever the name resolves to, so
+/// a mismatch means issuance hits the wrong server. Under DNS-01 the CA never
+/// connects to this host at all — it reads a TXT record — so pointing the domain
+/// at a load balancer, a CDN edge, or any other front end is not merely allowed,
+/// it is the normal shape of the deployment this feature exists for. Grading it
+/// a **Fail** would make `doctor --online --strict` reject a correct wildcard
+/// deployment.
+///
+/// The check still runs, because where the name points is worth *reporting* —
+/// it is just not a failure. Under DNS-01 every inconclusive-or-elsewhere
+/// outcome is graded **Pass** with the addresses named.
 #[must_use]
-pub fn check_acme_dns_impl(domain: &str, outcome: &DnsPointsHere) -> CheckResult {
+pub fn check_acme_dns_for_challenge(
+    domain: &str,
+    outcome: &DnsPointsHere,
+    dns01: bool,
+) -> CheckResult {
+    if dns01 {
+        return match outcome {
+            DnsPointsHere::Unresolved => CheckResult {
+                name: "acme_dns",
+                status: CheckStatus::Warn,
+                detail: Some(format!(
+                    "{domain} did not resolve to any address; DNS-01 issuance does not need it \
+                     to, but visitors will not reach the app until it does"
+                )),
+                hint: Some(
+                    "Publish A/AAAA records for the domain (and a wildcard record for tenant \
+                     subdomains) so traffic reaches this deployment",
+                ),
+            },
+            DnsPointsHere::Matches => CheckResult {
+                name: "acme_dns",
+                status: CheckStatus::Pass,
+                detail: Some(format!("{domain} resolves to this host")),
+                hint: None,
+            },
+            _ => CheckResult {
+                name: "acme_dns",
+                status: CheckStatus::Pass,
+                detail: Some(format!(
+                    "{domain} resolves somewhere other than this host, which DNS-01 does not \
+                     care about: the CA reads a TXT record rather than connecting here"
+                )),
+                hint: None,
+            },
+        };
+    }
     match outcome {
         DnsPointsHere::Matches => CheckResult {
             name: "acme_dns",
@@ -989,6 +1061,289 @@ pub fn check_acme_dns_impl(domain: &str, outcome: &DnsPointsHere) -> CheckResult
             hint: None,
         },
     }
+}
+
+// ── DNS-01 / wildcard preflight checks (issue #1620) ─────────────────────────
+//
+// DNS-01 introduces exactly three failure classes HTTP-01 does not have, and
+// each one costs an operator a failed issuance to discover the hard way:
+// a credential the app cannot read, a zone whose `_acme-challenge` name public
+// DNS cannot answer for, and a certificate that does not actually cover the
+// tenant subdomains `tenancy.base_domain` will serve. Each is graded by a pure
+// function of injected inputs, exactly like the #1608 ACME graders above.
+
+/// What the DNS provider credential lookup found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsCredentialOutcome {
+    /// No `[server.tls.acme.dns]` section — HTTP-01 issuance, nothing to grade.
+    NotConfigured,
+    /// The section is present but does not deserialize (an unknown provider, or
+    /// an inline secret the runtime refuses). Carries the rendered error.
+    Malformed(String),
+    /// The credential carries everything the provider needs.
+    Usable {
+        /// The provider name, for the message.
+        provider: String,
+        /// The credentials-store key it was read from.
+        key: String,
+    },
+    /// The credential is missing or incomplete. Carries the runtime's own
+    /// message, which names the missing field and where to put it.
+    Unusable(String),
+}
+
+/// Grade the DNS-01 provider credential (pure; injectable).
+///
+/// A **Fail**: without a usable credential the app cannot write a single
+/// challenge record, so every issuance and every renewal fails — and, unlike a
+/// wrong hostname, nothing about the running app reveals it until the
+/// certificate is already expiring.
+#[must_use]
+pub fn check_acme_dns_credential_impl(outcome: &DnsCredentialOutcome) -> CheckResult {
+    match outcome {
+        DnsCredentialOutcome::NotConfigured => CheckResult {
+            name: "acme_dns_credential",
+            status: CheckStatus::Pass,
+            detail: Some(
+                "no [server.tls.acme.dns] section: issuance uses HTTP-01, which needs no DNS \
+                 provider credential"
+                    .to_owned(),
+            ),
+            hint: None,
+        },
+        DnsCredentialOutcome::Malformed(error) => CheckResult {
+            name: "acme_dns_credential",
+            status: CheckStatus::Fail,
+            detail: Some(format!("[server.tls.acme.dns] does not load: {error}")),
+            hint: Some(
+                "Fix the section: `provider` must be one of cloudflare/route53/exec, and API \
+                 tokens belong in the encrypted credentials store (`autumn credentials edit`) or \
+                 an AUTUMN_ACME_DNS_* environment variable — never in autumn.toml",
+            ),
+        },
+        DnsCredentialOutcome::Usable { provider, key } => CheckResult {
+            name: "acme_dns_credential",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "the {provider} DNS-01 credential `{key}` carries the fields it needs"
+            )),
+            hint: None,
+        },
+        DnsCredentialOutcome::Unusable(message) => CheckResult {
+            name: "acme_dns_credential",
+            status: CheckStatus::Fail,
+            detail: Some(message.clone()),
+            hint: Some(
+                "Without it no _acme-challenge record can be written, so every issuance and \
+                 renewal fails. Run `autumn credentials edit` to add the credential",
+            ),
+        },
+    }
+}
+
+/// Read the DNS provider credential the way the runtime does and grade it.
+///
+/// Reads the encrypted credentials store for `profile`, overlaid with the
+/// documented `AUTUMN_ACME_DNS_*` environment variables — the same resolution
+/// order `build_dns_challenge` uses at boot, so a Pass here means the app will
+/// find the same credential.
+#[cfg(feature = "tls")]
+#[must_use]
+pub fn resolve_acme_dns_credential(
+    config: &AcmeDoctorConfig,
+    profile: &str,
+    base_dir: &std::path::Path,
+) -> DnsCredentialOutcome {
+    use autumn_web::acme::dns::{DnsCredential, process_env, validate_credential};
+
+    if let Some(error) = &config.dns_error {
+        return DnsCredentialOutcome::Malformed(error.clone());
+    }
+    let Some(dns) = config.dns.as_ref() else {
+        return DnsCredentialOutcome::NotConfigured;
+    };
+    let store = autumn_web::credentials::load_credentials(profile, base_dir).unwrap_or_default();
+    let credential = DnsCredential::resolve(dns, &store, &process_env);
+    let key = dns.credential.trim().to_owned();
+    match validate_credential(dns.provider, &key, &credential) {
+        Ok(()) => DnsCredentialOutcome::Usable {
+            provider: dns.provider.as_str().to_owned(),
+            key,
+        },
+        Err(message) => DnsCredentialOutcome::Unusable(message),
+    }
+}
+
+/// What public DNS said about a zone's `_acme-challenge` name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChallengeDnsVisibility {
+    /// Public DNS answers authoritatively for the name (whether or not a record
+    /// is currently published there).
+    Answered {
+        /// How many TXT values are currently visible — normally `0` between
+        /// issuances.
+        values: usize,
+    },
+    /// A record is still published from an earlier run.
+    Stale {
+        /// How many leftover TXT values are visible.
+        values: usize,
+    },
+    /// The resolver could not answer for the name.
+    Unanswerable(String),
+}
+
+/// Grade whether a DNS-01 challenge TXT record would be visible in public DNS
+/// (pure; injectable).
+///
+/// A name public DNS cannot answer for is a **Fail**: the CA queries public DNS,
+/// so a broken or missing delegation means every DNS-01 validation fails no
+/// matter how correctly the record is written. Leftover records are a **Warn** —
+/// harmless for issuance, but the fingerprint of an earlier run that died before
+/// cleanup.
+#[must_use]
+pub fn check_acme_dns_propagation_impl(
+    fqdn: &str,
+    visibility: &ChallengeDnsVisibility,
+) -> CheckResult {
+    match visibility {
+        ChallengeDnsVisibility::Answered { .. } => CheckResult {
+            name: "acme_dns_propagation",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "public DNS answers for {fqdn}, so a published DNS-01 challenge record will be \
+                 visible to the CA"
+            )),
+            hint: None,
+        },
+        ChallengeDnsVisibility::Stale { values } => CheckResult {
+            name: "acme_dns_propagation",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{values} leftover TXT record(s) are still published at {fqdn}; an earlier \
+                 issuance did not clean up"
+            )),
+            hint: Some(
+                "Harmless for issuance, but worth removing: they are the fingerprint of an order \
+                 that failed or was interrupted before cleanup",
+            ),
+        },
+        ChallengeDnsVisibility::Unanswerable(reason) => CheckResult {
+            name: "acme_dns_propagation",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "public DNS could not answer for {fqdn}: {reason}. The ACME CA reads the DNS-01 \
+                 challenge record from public DNS, so no wildcard certificate can be issued while \
+                 this name is unanswerable"
+            )),
+            hint: Some(
+                "Check that the zone's NS delegation is live and that its nameservers answer for \
+                 the _acme-challenge name (a `dig TXT _acme-challenge.<domain>` from off-network \
+                 should return NOERROR or NXDOMAIN, never SERVFAIL)",
+            ),
+        },
+    }
+}
+
+/// Query the configured resolvers for a zone's `_acme-challenge` name.
+///
+/// Bounded and only run under `--online`, like the other active ACME probes. A
+/// name that answers on ANY configured resolver is answerable; only a name no
+/// resolver can answer for is graded a failure, so one flaky resolver does not
+/// fail the check.
+#[cfg(feature = "tls")]
+#[must_use]
+pub fn resolve_challenge_dns_visibility(
+    fqdn: &str,
+    resolvers: &[std::net::SocketAddr],
+) -> ChallengeDnsVisibility {
+    use autumn_web::acme::dns::resolver::lookup_txt_blocking;
+
+    let mut last_error = "no resolvers were configured".to_owned();
+    for resolver in resolvers {
+        match lookup_txt_blocking(*resolver, fqdn, std::time::Duration::from_secs(3)) {
+            Ok(answer) if answer.values.is_empty() => {
+                return ChallengeDnsVisibility::Answered { values: 0 };
+            }
+            Ok(answer) => {
+                return ChallengeDnsVisibility::Stale {
+                    values: answer.values.len(),
+                };
+            }
+            Err(e) => last_error = e,
+        }
+    }
+    ChallengeDnsVisibility::Unanswerable(last_error)
+}
+
+/// Grade whether the configured certificate covers `tenancy.base_domain`
+/// (pure; injectable).
+///
+/// A **Fail** when it does not: subdomain-per-tenant routing resolves a tenant
+/// from the Host header, so every tenant subdomain would serve a certificate
+/// name mismatch — the browser error that looks like the whole product is
+/// broken. This is the check that catches `base_domain = "myapp.com"` with
+/// `domains = ["myapp.com"]` and no wildcard.
+#[must_use]
+pub fn check_acme_tenancy_domain_impl(
+    base_domain: Option<&str>,
+    domains: &[String],
+    covers_subdomains: bool,
+) -> CheckResult {
+    let Some(base) = base_domain.map(str::trim).filter(|b| !b.is_empty()) else {
+        return CheckResult {
+            name: "acme_tenancy_domain",
+            status: CheckStatus::Pass,
+            detail: Some(
+                "no [tenancy] base_domain configured, so no tenant subdomains need certificate \
+                 coverage"
+                    .to_owned(),
+            ),
+            hint: None,
+        };
+    };
+    if covers_subdomains {
+        return CheckResult {
+            name: "acme_tenancy_domain",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "the configured certificate covers every subdomain of the [tenancy] base_domain \
+                 {base}"
+            )),
+            hint: None,
+        };
+    }
+    CheckResult {
+        name: "acme_tenancy_domain",
+        status: CheckStatus::Fail,
+        detail: Some(format!(
+            "[tenancy] base_domain is {base}, but [server.tls.acme] domains ({}) do not cover its \
+             subdomains: every tenant host would serve a certificate name mismatch",
+            domains.join(", ")
+        )),
+        hint: Some(
+            "Add the wildcard `*.<base_domain>` to [server.tls.acme] domains and configure \
+             [server.tls.acme.dns] — a wildcard can only be issued over DNS-01",
+        ),
+    }
+}
+
+/// Whether `domains` covers subdomains of `base_domain`, using the runtime's own
+/// RFC 6125 matcher against a probe host no explicit SAN could plausibly name.
+///
+/// A certificate "covers tenant subdomains" only if an ARBITRARY one matches, so
+/// the probe is a random-looking label: an explicit `tenant1.myapp.com` SAN must
+/// not read as coverage for tenant 2.
+#[must_use]
+pub fn acme_covers_tenant_subdomains(base_domain: &str, domains: &[String]) -> bool {
+    let base = base_domain.trim().trim_end_matches('.');
+    if base.is_empty() {
+        return false;
+    }
+    let probe = format!("autumn-doctor-probe-tenant.{base}");
+    domains
+        .iter()
+        .any(|san| autumn_web::config::san_covers_host(san, &probe))
 }
 
 /// Thin bounded I/O wrapper: probe a TCP port on `domain` with a 2s connect
@@ -5530,6 +5885,19 @@ pub struct AcmeDoctorConfig {
     /// value is a valid `u32` or the key is absent (absent uses the runtime
     /// default, 30).
     pub renew_before_days_error: Option<String>,
+    /// The `[server.tls.acme.dns]` section (issue #1620), when configured, as the
+    /// runtime's typed `AcmeDnsConfig` sees it. `None` when the section is absent
+    /// (HTTP-01 issuance) or when it does not deserialize — see
+    /// [`dns_error`](Self::dns_error).
+    pub dns: Option<autumn_web::config::AcmeDnsConfig>,
+    /// The rendered deserialization error for a PRESENT but malformed
+    /// `[server.tls.acme.dns]` section — an unknown provider name, or (most
+    /// usefully) an inline `api_token`, which the runtime rejects outright
+    /// because DNS credentials never belong in `autumn.toml`. Recorded so the
+    /// grader FAILs rather than reporting "no DNS provider configured" for a
+    /// config the server refuses to boot on. `None` when the section is valid or
+    /// absent.
+    pub dns_error: Option<String>,
 }
 
 /// Deserialize `[server.tls.acme] directory` exactly as the runtime does.
@@ -5720,6 +6088,19 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         Some(other) => (None, Some(other.to_string())),
     };
 
+    // Deserialize `[server.tls.acme.dns]` the way the runtime's typed
+    // `AcmeDnsConfig` does. Its `deny_unknown_fields` is the point: an operator
+    // who pastes `api_token = "..."` into `autumn.toml` gets a FAIL naming the
+    // key, not a silently-ignored secret sitting in a plaintext file (#1620).
+    let (dns, dns_error) =
+        acme.get("dns").map_or((None, None), |value| match value
+            .clone()
+            .try_into::<autumn_web::config::AcmeDnsConfig>(
+        ) {
+            Ok(dns) => (Some(dns), None),
+            Err(e) => (None, Some(e.to_string())),
+        });
+
     Some(AcmeDoctorConfig {
         domains,
         contact_email,
@@ -5733,6 +6114,8 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         ca_root_error,
         domains_error,
         renew_before_days_error,
+        dns,
+        dns_error,
     })
 }
 
@@ -5824,8 +6207,10 @@ fn check_acme_deserialize_errors(config: &AcmeDoctorConfig) -> Option<CheckResul
 /// The runtime `TlsConfig::validate()` / `AcmeConfig::validate()` REJECTS an ACME
 /// config that (a) has a `directory` value that fails to deserialize as
 /// [`autumn_web::config::AcmeDirectory`], (b) lists no `domains`, (c) has a blank
-/// `contact_email`, or (d) includes a wildcard `*.` domain (wildcards require
-/// DNS-01, tracked in #1620) — the server exits at boot. `validate()`'s fifth
+/// `contact_email`, (d) includes a wildcard domain with no
+/// `[server.tls.acme.dns]` section (or a malformed one), or (e) has a
+/// `[server.tls.acme.dns]` section its own `validate()` rejects — the server
+/// exits at boot in every case. `validate()`'s fifth
 /// rule, a blank `ca_root_path`, is graded by
 /// [`check_acme_ca_root_impl`] instead: the whole `ca_root_path` story (blank,
 /// non-string, unreadable, unusable, a bundle, or redundant against a public
@@ -5903,13 +6288,30 @@ pub fn check_acme_config_impl(config: &AcmeDoctorConfig) -> Option<CheckResult> 
             "Set [server.tls.acme] renew_before_days below 90 (default 30)",
         ));
     }
-    check_acme_domain_entries(domains)
+    if let Some(fail) = check_acme_domain_entries(domains, config.dns.is_some()) {
+        return Some(fail);
+    }
+    // Mirror `AcmeDnsConfig::validate()` too: a DNS section the runtime rejects
+    // (an exec provider with no command, a zero propagation budget, an
+    // unparseable resolver) exits at boot exactly like a bad `domains` entry.
+    config.dns.as_ref().and_then(|dns| {
+        dns.validate().err().map(|message| {
+            acme_config_fail(
+                message,
+                "Fix the [server.tls.acme.dns] section; the server refuses to boot on it",
+            )
+        })
+    })
 }
 
-/// Grade individual `[server.tls.acme] domains` entries (blank / wildcard),
-/// mirroring `AcmeConfig::validate`'s per-entry rules. Extracted from
+/// Grade individual `[server.tls.acme] domains` entries (blank / wildcard /
+/// padded), mirroring `AcmeConfig::validate`'s per-entry rules. Extracted from
 /// [`check_acme_config_impl`] to keep that grader within the line budget.
-fn check_acme_domain_entries(domains: &[String]) -> Option<CheckResult> {
+///
+/// `dns_configured` is whether `[server.tls.acme.dns]` is present: since #1620 a
+/// wildcard is valid exactly when it is, because only DNS-01 can validate a
+/// wildcard identifier.
+fn check_acme_domain_entries(domains: &[String], dns_configured: bool) -> Option<CheckResult> {
     for (index, domain) in domains.iter().enumerate() {
         let trimmed = domain.trim();
         if trimmed.is_empty() {
@@ -5921,15 +6323,39 @@ fn check_acme_domain_entries(domains: &[String]) -> Option<CheckResult> {
                 "Remove blank/whitespace-only entries from [server.tls.acme] domains",
             ));
         }
-        if trimmed.starts_with("*.") {
-            return Some(acme_config_fail(
-                format!(
-                    "[server.tls.acme] wildcard domain `{trimmed}` is not supported: wildcards \
-                     require the DNS-01 challenge, which is out of scope here (tracked in #1620). \
-                     List explicit hostnames instead"
-                ),
-                "Remove wildcard domains; list explicit hostnames (DNS-01 tracked in #1620)",
-            ));
+        if trimmed.contains('*') {
+            if !dns_configured {
+                return Some(acme_config_fail(
+                    format!(
+                        "[server.tls.acme] wildcard domain `{trimmed}` needs the DNS-01 \
+                         challenge: an ACME CA will not validate a wildcard identifier over \
+                         HTTP-01. Add a [server.tls.acme.dns] section naming your DNS provider \
+                         (and the credentials-store key holding its API token), or list explicit \
+                         hostnames instead"
+                    ),
+                    "Add a [server.tls.acme.dns] section, or list explicit hostnames",
+                ));
+            }
+            let Some(base) = trimmed.strip_prefix("*.") else {
+                return Some(acme_config_fail(
+                    format!(
+                        "[server.tls.acme] domain `{trimmed}` is not a usable wildcard: a \
+                         wildcard SAN must be written as `*.` followed by the base domain (e.g. \
+                         `*.myapp.com`) — a `*` anywhere else is not matched by any client"
+                    ),
+                    "Write the wildcard as `*.<base domain>`",
+                ));
+            };
+            if base.is_empty() || base.contains('*') {
+                return Some(acme_config_fail(
+                    format!(
+                        "[server.tls.acme] domain `{trimmed}` is not a usable wildcard: exactly \
+                         one leading `*.` is allowed and the base domain after it must be \
+                         non-empty (e.g. `*.myapp.com`)"
+                    ),
+                    "Write the wildcard as `*.<base domain>`, with exactly one leading `*.`",
+                ));
+            }
         }
         // The two rules above read `trimmed`, but the runtime stores and uses the
         // entry UNTRIMMED — as the certificate's SAN and as the ACME order's DNS
@@ -5959,7 +6385,19 @@ fn check_acme_domain_entries(domains: &[String]) -> Option<CheckResult> {
 /// unit-testable without real network I/O — `run()` enqueues one bounded port
 /// task and one DNS task for each domain returned here.
 fn acme_online_probe_domains(config: &AcmeDoctorConfig) -> Vec<String> {
-    config.domains.clone()
+    // A `*.myapp.com` entry has no address record of its own, so probing it
+    // literally would resolve to nothing and report a permanent, meaningless
+    // Warn on every wildcard deployment. Probe the base domain it covers
+    // instead — that IS the host tenants' subdomains point at — and drop the
+    // duplicate when the apex is also listed explicitly (#1620).
+    let mut probed: Vec<String> = Vec::new();
+    for domain in &config.domains {
+        let target = domain.strip_prefix("*.").unwrap_or(domain).to_owned();
+        if !target.is_empty() && !probed.contains(&target) {
+            probed.push(target);
+        }
+    }
+    probed
 }
 
 /// Inspect the stored ACME certificate for the CONFIGURED domains under the
@@ -7827,6 +8265,26 @@ pub fn run(opts: DoctorOptions) {
     let (acme_canonical, acme_selected, _) = resolve_active_profiles();
     let merged_acme_toml = get_merged_toml_table_runtime(&acme_canonical, &acme_selected);
     let acme_config = resolve_acme_doctor_config(Some(&merged_acme_toml));
+    // The profile whose encrypted credentials file the runtime would read, and
+    // the tenancy base domain tenant subdomains are resolved against — both read
+    // from the SAME merged, profile-layered view the ACME config comes from, so
+    // the DNS-01 checks below grade exactly what the app will see (#1620).
+    // The CANONICAL profile, not the raw environment variable: the runtime maps
+    // `production` → `prod` before loading `config/credentials/<profile>.toml.enc`
+    // (`normalize_profile_name`), so grading the raw spelling would read a
+    // different file than the server does — and report "no credential found" for
+    // a deployment that is correctly configured, or the reverse.
+    let acme_credentials_profile = if acme_canonical.trim().is_empty() {
+        "dev".to_owned()
+    } else {
+        acme_canonical.trim().to_ascii_lowercase()
+    };
+    let tenancy_base_domain = merged_acme_toml
+        .get("tenancy")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("base_domain"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
 
     // XOR inputs mirror `TlsConfig::validate`, which keys static-mode on
     // `cert_path.is_some()` / `key_path.is_some()`: base them on whether the
@@ -7899,24 +8357,87 @@ pub fn run(opts: DoctorOptions) {
             );
             tasks.push(Box::new(move || check_acme_ca_root_impl(&ca_root)));
 
+            // Offline: the DNS-01 provider credential (issue #1620). Read the
+            // same way the runtime reads it — encrypted credentials store,
+            // overlaid with AUTUMN_ACME_DNS_* — so a Pass here means the app
+            // will find the same credential at boot.
+            // Reading the credential needs the runtime's own resolution +
+            // validation, which live behind autumn-web's `acme` feature (pulled
+            // in by this crate's `tls` feature). Without it the check reports a
+            // Warn rather than silently passing an unverified credential.
+            #[cfg(feature = "tls")]
+            {
+                let credential = resolve_acme_dns_credential(
+                    &acme,
+                    &acme_credentials_profile,
+                    std::path::Path::new("."),
+                );
+                tasks.push(Box::new(move || {
+                    check_acme_dns_credential_impl(&credential)
+                }));
+            }
+            #[cfg(not(feature = "tls"))]
+            if acme.dns.is_some() || acme.dns_error.is_some() {
+                tasks.push(Box::new(|| CheckResult {
+                    name: "acme_dns_credential",
+                    status: CheckStatus::Warn,
+                    detail: Some(
+                        "this autumn binary was built without the `tls` feature, so the DNS-01 \
+                         provider credential cannot be read or validated"
+                            .to_owned(),
+                    ),
+                    hint: Some("Rebuild the CLI with the `tls` feature to run this check"),
+                }));
+            }
+
+            // Offline: does the certificate actually cover the tenant subdomains
+            // `[tenancy] base_domain` will serve? A base domain the certificate
+            // does not cover means every tenant host serves a name mismatch.
+            let tenancy_base = tenancy_base_domain;
+            let tenancy_domains = acme.domains.clone();
+            let covers = tenancy_base
+                .as_deref()
+                .is_some_and(|base| acme_covers_tenant_subdomains(base, &tenancy_domains));
+            tasks.push(Box::new(move || {
+                check_acme_tenancy_domain_impl(tenancy_base.as_deref(), &tenancy_domains, covers)
+            }));
+
             // Probe EVERY configured domain: issuance orders authorizations for
             // all `config.domains`, so a probe of only the first name can pass
             // doctor while issuance fails on an unprobed domain. One port + DNS
             // check per domain, each labeled with the domain in its detail; still
             // bounded and gated behind --online.
             if opts.online {
+                let dns01 = acme.dns.is_some();
                 for domain in acme_online_probe_domains(&acme) {
                     let d80 = domain.clone();
                     tasks.push(Box::new(move || {
                         let p80 = probe_port(&d80, 80);
                         let p443 = probe_port(&d80, 443);
-                        check_acme_ports_impl(&d80, p80, p443)
+                        check_acme_ports_for_challenge(&d80, p80, p443, dns01)
                     }));
                     let d_dns = domain;
                     tasks.push(Box::new(move || {
                         let outcome = resolve_dns_points_here(&d_dns);
-                        check_acme_dns_impl(&d_dns, &outcome)
+                        check_acme_dns_for_challenge(&d_dns, &outcome, dns01)
                     }));
+                }
+
+                // Online: can public DNS answer for the zone's _acme-challenge
+                // name at all? The CA reads the challenge record from public
+                // DNS, so a broken delegation fails every DNS-01 order however
+                // correctly the record is written (#1620).
+                #[cfg(feature = "tls")]
+                if let Some(dns_cfg) = acme.dns.clone() {
+                    let resolvers = dns_cfg.resolver_addrs().unwrap_or_default();
+                    for domain in acme_online_probe_domains(&acme) {
+                        let fqdn = autumn_web::acme::dns::challenge_fqdn(&domain);
+                        let resolvers = resolvers.clone();
+                        tasks.push(Box::new(move || {
+                            let visibility = resolve_challenge_dns_visibility(&fqdn, &resolvers);
+                            check_acme_dns_propagation_impl(&fqdn, &visibility)
+                        }));
+                    }
                 }
             }
         }
@@ -10786,10 +11307,11 @@ pub struct Vault {
 
     #[test]
     fn acme_ports_pass_when_both_open() {
-        let r = check_acme_ports_impl(
+        let r = check_acme_ports_for_challenge(
             "app.example.com",
             PortReachability::Open,
             PortReachability::Open,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -10801,7 +11323,12 @@ pub struct Vault {
             PortReachability::TimedOut,
             PortReachability::Error,
         ] {
-            let r = check_acme_ports_impl("app.example.com", p80, PortReachability::Open);
+            let r = check_acme_ports_for_challenge(
+                "app.example.com",
+                p80,
+                PortReachability::Open,
+                false,
+            );
             assert!(matches!(r.status, CheckStatus::Fail), "port80={p80:?}");
             assert!(r.detail.as_deref().unwrap().contains("port 80"));
         }
@@ -10809,27 +11336,29 @@ pub struct Vault {
 
     #[test]
     fn acme_ports_warn_when_only_443_down() {
-        let r = check_acme_ports_impl(
+        let r = check_acme_ports_for_challenge(
             "app.example.com",
             PortReachability::Open,
             PortReachability::Refused,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
     }
 
     #[test]
     fn acme_dns_pass_when_points_here() {
-        let r = check_acme_dns_impl("app.example.com", &DnsPointsHere::Matches);
+        let r = check_acme_dns_for_challenge("app.example.com", &DnsPointsHere::Matches, false);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
     #[test]
     fn acme_dns_fail_when_resolves_elsewhere() {
-        let r = check_acme_dns_impl(
+        let r = check_acme_dns_for_challenge(
             "app.example.com",
             &DnsPointsHere::ResolvesElsewhere {
                 resolved: vec!["203.0.113.7".to_owned()],
             },
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Fail));
         assert!(r.detail.as_deref().unwrap().contains("203.0.113.7"));
@@ -10838,7 +11367,7 @@ pub struct Vault {
     #[test]
     fn acme_dns_warn_when_indeterminate() {
         for outcome in [DnsPointsHere::Unresolved, DnsPointsHere::LocalIpsUnknown] {
-            let r = check_acme_dns_impl("app.example.com", &outcome);
+            let r = check_acme_dns_for_challenge("app.example.com", &outcome, false);
             assert!(matches!(r.status, CheckStatus::Warn), "outcome={outcome:?}");
         }
     }
@@ -10923,7 +11452,7 @@ pub struct Vault {
         // And the check grades a partial match as a Warn that names the stray
         // address — not a clean Pass.
         let outcome = grade_dns_points_here(&resolved, &local);
-        let r = check_acme_dns_impl("app.example.com", &outcome);
+        let r = check_acme_dns_for_challenge("app.example.com", &outcome, false);
         assert!(
             matches!(r.status, CheckStatus::Warn),
             "a partial DNS match must be a Warn, not a clean Pass"
@@ -11237,7 +11766,273 @@ pub struct Vault {
             ca_root_error: None,
             domains_error: None,
             renew_before_days_error: None,
+            dns: None,
+            dns_error: None,
         }
+    }
+
+    // ── DNS-01 / wildcard preflight (issue #1620) ─────────────────────────────
+
+    fn acme_dns_cfg(
+        provider: autumn_web::config::AcmeDnsProvider,
+    ) -> autumn_web::config::AcmeDnsConfig {
+        toml::from_str(&format!("provider = \"{}\"\n", provider.as_str()))
+            .expect("the minimal DNS section parses")
+    }
+
+    #[test]
+    fn dns_credential_check_passes_when_no_dns_section_is_configured() {
+        let result = check_acme_dns_credential_impl(&DnsCredentialOutcome::NotConfigured);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(
+            result.detail.unwrap().contains("HTTP-01"),
+            "the pass must explain why no credential is needed"
+        );
+    }
+
+    // AC7: "`autumn doctor` diagnoses … missing or invalid provider credential".
+    // A Fail, not a Warn: without it every issuance and renewal fails, and
+    // nothing about the running app reveals that until expiry.
+    #[test]
+    fn a_missing_dns_credential_fails_and_says_where_to_put_it() {
+        let outcome = DnsCredentialOutcome::Unusable(
+            "no Cloudflare API token found for [server.tls.acme.dns] credential `acme_dns`: add \
+             it under `[acme_dns]` in the encrypted credentials store (`autumn credentials edit`) \
+             as `api_token = \"...\"`, or set the AUTUMN_ACME_DNS_API_TOKEN environment variable"
+                .to_owned(),
+        );
+        let result = check_acme_dns_credential_impl(&outcome);
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap();
+        assert!(detail.contains("api_token"), "got: {detail}");
+        assert!(detail.contains("autumn credentials edit"), "got: {detail}");
+    }
+
+    // The runtime refuses to boot on a `[server.tls.acme.dns]` that does not
+    // deserialize — most usefully, one carrying an inline `api_token`. Doctor
+    // must FAIL that rather than report "no DNS provider configured".
+    #[test]
+    fn a_malformed_dns_section_fails_and_names_the_problem() {
+        let result = check_acme_dns_credential_impl(&DnsCredentialOutcome::Malformed(
+            "unknown field `api_token`".to_owned(),
+        ));
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.detail.unwrap().contains("api_token"));
+        assert!(result.hint.unwrap().contains("never in autumn.toml"));
+    }
+
+    #[test]
+    fn a_usable_dns_credential_passes_and_names_the_provider_and_key() {
+        let result = check_acme_dns_credential_impl(&DnsCredentialOutcome::Usable {
+            provider: "cloudflare".to_owned(),
+            key: "acme_dns".to_owned(),
+        });
+        assert_eq!(result.status, CheckStatus::Pass);
+        let detail = result.detail.unwrap();
+        assert!(detail.contains("cloudflare"), "got: {detail}");
+        assert!(detail.contains("acme_dns"), "got: {detail}");
+    }
+
+    // AC7: "challenge TXT record not visible in public DNS". A name the resolvers
+    // cannot answer for at all defeats a correctly-written record, so it is a
+    // Fail; leftover records are only a Warn.
+    #[test]
+    fn challenge_dns_visibility_grades_answerability_then_leftovers() {
+        let fqdn = "_acme-challenge.myapp.com";
+
+        let pass =
+            check_acme_dns_propagation_impl(fqdn, &ChallengeDnsVisibility::Answered { values: 0 });
+        assert_eq!(pass.status, CheckStatus::Pass);
+
+        let warn =
+            check_acme_dns_propagation_impl(fqdn, &ChallengeDnsVisibility::Stale { values: 2 });
+        assert_eq!(warn.status, CheckStatus::Warn);
+        assert!(warn.detail.unwrap().contains('2'));
+
+        let fail = check_acme_dns_propagation_impl(
+            fqdn,
+            &ChallengeDnsVisibility::Unanswerable(
+                "SERVFAIL — the zone's nameservers did not answer".to_owned(),
+            ),
+        );
+        assert_eq!(fail.status, CheckStatus::Fail);
+        let detail = fail.detail.unwrap();
+        assert!(
+            detail.contains(fqdn),
+            "the message must name the record: {detail}"
+        );
+        assert!(detail.contains("SERVFAIL"), "got: {detail}");
+    }
+
+    // AC7: "a `tenancy.base_domain` that the configured certificate domain does
+    // not cover" — the check that catches a subdomain-per-tenant deployment with
+    // a single-hostname certificate, where every tenant serves a name mismatch.
+    #[test]
+    fn tenancy_base_domain_must_be_covered_by_the_certificate() {
+        let single = vec!["myapp.com".to_owned()];
+        let covers = acme_covers_tenant_subdomains("myapp.com", &single);
+        assert!(!covers, "an apex-only certificate covers no subdomain");
+        let result = check_acme_tenancy_domain_impl(Some("myapp.com"), &single, covers);
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap();
+        assert!(detail.contains("myapp.com"), "got: {detail}");
+        assert!(result.hint.unwrap().contains("*.<base_domain>"));
+
+        let wildcard = vec!["myapp.com".to_owned(), "*.myapp.com".to_owned()];
+        let covers = acme_covers_tenant_subdomains("myapp.com", &wildcard);
+        assert!(covers);
+        assert_eq!(
+            check_acme_tenancy_domain_impl(Some("myapp.com"), &wildcard, covers).status,
+            CheckStatus::Pass
+        );
+
+        // No tenancy configured: nothing to cover.
+        assert_eq!(
+            check_acme_tenancy_domain_impl(None, &single, false).status,
+            CheckStatus::Pass
+        );
+        assert_eq!(
+            check_acme_tenancy_domain_impl(Some("   "), &single, false).status,
+            CheckStatus::Pass
+        );
+    }
+
+    // An explicitly-listed tenant hostname is NOT coverage for tenant N+1 — the
+    // probe host must be one no explicit SAN could plausibly name.
+    #[test]
+    fn one_explicit_tenant_san_is_not_subdomain_coverage() {
+        let explicit = vec!["myapp.com".to_owned(), "tenant1.myapp.com".to_owned()];
+        assert!(!acme_covers_tenant_subdomains("myapp.com", &explicit));
+        // …and a wildcard for a DIFFERENT zone is not coverage either.
+        assert!(!acme_covers_tenant_subdomains(
+            "myapp.com",
+            &["*.other.com".to_owned()]
+        ));
+    }
+
+    // Regression (Codex, #1620): the port check was softened for DNS-01 but the
+    // address check was not, so a wildcard deployment behind a load balancer —
+    // the normal shape for this feature — still failed `--online --strict` on a
+    // rule that is HTTP-01-specific by construction.
+    #[test]
+    fn resolving_elsewhere_is_not_a_failure_under_dns01() {
+        let elsewhere = DnsPointsHere::ResolvesElsewhere {
+            resolved: vec!["203.0.113.10".to_owned()],
+        };
+
+        // HTTP-01: the CA fetches the token from whatever the name resolves to,
+        // so pointing elsewhere means issuance hits the wrong server.
+        assert_eq!(
+            check_acme_dns_for_challenge("myapp.com", &elsewhere, false).status,
+            CheckStatus::Fail
+        );
+
+        // DNS-01: the CA reads a TXT record and never connects here at all.
+        let dns01 = check_acme_dns_for_challenge("myapp.com", &elsewhere, true);
+        assert_eq!(dns01.status, CheckStatus::Pass);
+        assert!(
+            dns01.detail.unwrap().contains("TXT record"),
+            "the pass must say why the mismatch does not matter"
+        );
+
+        // A partial match and an unknowable local IP are the same story.
+        for inconclusive in [
+            DnsPointsHere::PartialMatch {
+                unmatched: vec!["203.0.113.10".to_owned()],
+            },
+            DnsPointsHere::LocalIpsUnknown,
+        ] {
+            assert_eq!(
+                check_acme_dns_for_challenge("myapp.com", &inconclusive, true).status,
+                CheckStatus::Pass
+            );
+        }
+
+        // A name that resolves nowhere is still worth a Warn: issuance would
+        // succeed, but no visitor could reach the app.
+        let unresolved =
+            check_acme_dns_for_challenge("myapp.com", &DnsPointsHere::Unresolved, true);
+        assert_eq!(unresolved.status, CheckStatus::Warn);
+        assert!(unresolved.detail.unwrap().contains("visitors"));
+
+        // Resolving here is a plain pass either way.
+        for dns01 in [false, true] {
+            assert_eq!(
+                check_acme_dns_for_challenge("myapp.com", &DnsPointsHere::Matches, dns01).status,
+                CheckStatus::Pass
+            );
+        }
+    }
+
+    // Under DNS-01 the CA never connects to :80, so an unreachable port 80 costs
+    // only the HTTP→HTTPS redirect. Failing it would make `doctor --online
+    // --strict` reject a correct wildcard deployment on a :443-only host.
+    #[test]
+    fn port_80_is_only_a_warning_under_dns01() {
+        let http01 = check_acme_ports_for_challenge(
+            "myapp.com",
+            PortReachability::Refused,
+            PortReachability::Open,
+            false,
+        );
+        assert_eq!(http01.status, CheckStatus::Fail);
+
+        let dns01 = check_acme_ports_for_challenge(
+            "myapp.com",
+            PortReachability::Refused,
+            PortReachability::Open,
+            true,
+        );
+        assert_eq!(dns01.status, CheckStatus::Warn);
+        assert!(
+            dns01.detail.unwrap().contains("redirect"),
+            "the warning must say what is actually lost"
+        );
+
+        // With both ports open the grading is identical either way.
+        for dns in [false, true] {
+            assert_eq!(
+                check_acme_ports_for_challenge(
+                    "myapp.com",
+                    PortReachability::Open,
+                    PortReachability::Open,
+                    dns
+                )
+                .status,
+                CheckStatus::Pass
+            );
+        }
+    }
+
+    // A `*.myapp.com` entry has no address record of its own: probing it
+    // literally would report a permanent, meaningless Warn on every wildcard
+    // deployment. It is probed as the base domain it covers, deduplicated
+    // against an explicitly-listed apex.
+    #[test]
+    fn wildcard_domains_are_probed_as_their_base_domain() {
+        let mut cfg = acme_doctor_cfg(&["myapp.com", "*.myapp.com"], "ops@myapp.com");
+        cfg.dns = Some(acme_dns_cfg(
+            autumn_web::config::AcmeDnsProvider::Cloudflare,
+        ));
+        assert_eq!(
+            acme_online_probe_domains(&cfg),
+            vec!["myapp.com".to_owned()],
+            "the apex is probed once, and the wildcard resolves to it"
+        );
+
+        // A wildcard with no explicit apex still probes the base domain.
+        let cfg = acme_doctor_cfg(&["*.myapp.com"], "ops@myapp.com");
+        assert_eq!(
+            acme_online_probe_domains(&cfg),
+            vec!["myapp.com".to_owned()]
+        );
+
+        // Non-wildcard configs are unchanged.
+        let cfg = acme_doctor_cfg(&["a.example.com", "b.example.com"], "ops@example.com");
+        assert_eq!(
+            acme_online_probe_domains(&cfg),
+            vec!["a.example.com".to_owned(), "b.example.com".to_owned()]
+        );
     }
 
     // Regression (#1608, Codex): doctor must mirror AcmeConfig::validate(). An
@@ -11259,13 +12054,25 @@ pub struct Vault {
     }
 
     #[test]
-    fn acme_config_fail_when_wildcard_domain() {
+    fn acme_config_fail_when_wildcard_domain_has_no_dns_provider() {
         let r = check_acme_config_impl(&acme_doctor_cfg(&["*.example.com"], "ops@example.com"))
-            .expect("wildcard domain must be a FAIL");
+            .expect("a wildcard with no DNS-01 provider must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
-        // Points the operator at the DNS-01 tracking issue, mirroring
-        // AcmeConfig::validate().
-        assert!(r.detail.as_deref().unwrap_or_default().contains("#1620"));
+        // Names the section that fixes it, mirroring AcmeConfig::validate().
+        let detail = r.detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("[server.tls.acme.dns]"), "got: {detail}");
+        assert!(detail.contains("DNS-01"), "got: {detail}");
+
+        // …and with the section present the same config is accepted, because
+        // DNS-01 is exactly what makes a wildcard issuable (#1620).
+        let mut cfg = acme_doctor_cfg(&["*.example.com"], "ops@example.com");
+        cfg.dns = Some(acme_dns_cfg(
+            autumn_web::config::AcmeDnsProvider::Cloudflare,
+        ));
+        assert!(
+            check_acme_config_impl(&cfg).is_none(),
+            "a wildcard WITH a DNS-01 provider is a valid config"
+        );
     }
 
     #[test]
@@ -11666,29 +12473,93 @@ contact_email = \"ops@example.com\"
             (&["app .example.com"], "ops@example.com", 80, 30),
         ];
 
+        // Every case is run BOTH with and without a `[server.tls.acme.dns]`
+        // section, because since #1620 the section is what decides whether a
+        // wildcard entry is valid — so a doctor that ignored it would pass a
+        // wildcard config the server refuses (or fail one it accepts).
         for (domains, contact_email, http_challenge_port, renew_before_days) in cases {
-            let mut doctor_cfg = acme_doctor_cfg(domains, contact_email);
-            doctor_cfg.http_challenge_port = *http_challenge_port;
-            doctor_cfg.renew_before_days = *renew_before_days;
+            for dns in [
+                None,
+                Some(acme_dns_cfg(
+                    autumn_web::config::AcmeDnsProvider::Cloudflare,
+                )),
+                // A DNS section the runtime itself rejects: `exec` with no
+                // command. Doctor must fail it too.
+                Some(
+                    toml::from_str::<autumn_web::config::AcmeDnsConfig>("provider = \"exec\"\n")
+                        .expect("parses; validate() is what rejects it"),
+                ),
+            ] {
+                let mut doctor_cfg = acme_doctor_cfg(domains, contact_email);
+                doctor_cfg.http_challenge_port = *http_challenge_port;
+                doctor_cfg.renew_before_days = *renew_before_days;
+                doctor_cfg.dns = dns.clone();
 
-            let runtime_cfg = autumn_web::config::AcmeConfig {
-                domains: domains.iter().map(|d| (*d).to_owned()).collect(),
-                contact_email: (*contact_email).to_owned(),
-                directory: autumn_web::config::AcmeDirectory::Staging,
-                cache_dir: std::path::PathBuf::from("config/acme"),
-                http_challenge_port: *http_challenge_port,
-                renew_before_days: *renew_before_days,
-                ca_root_path: None,
-            };
+                let runtime_cfg = autumn_web::config::AcmeConfig {
+                    domains: domains.iter().map(|d| (*d).to_owned()).collect(),
+                    contact_email: (*contact_email).to_owned(),
+                    directory: autumn_web::config::AcmeDirectory::Staging,
+                    cache_dir: std::path::PathBuf::from("config/acme"),
+                    http_challenge_port: *http_challenge_port,
+                    renew_before_days: *renew_before_days,
+                    ca_root_path: None,
+                    dns: dns.clone(),
+                };
 
-            assert_eq!(
-                check_acme_config_impl(&doctor_cfg).is_some(),
-                runtime_cfg.validate().is_err(),
-                "doctor and AcmeConfig::validate disagree on domains={domains:?} \
-                 contact_email={contact_email:?} port={http_challenge_port} \
-                 renew_before_days={renew_before_days} (runtime said {:?})",
-                runtime_cfg.validate()
-            );
+                assert_eq!(
+                    check_acme_config_impl(&doctor_cfg).is_some(),
+                    runtime_cfg.validate().is_err(),
+                    "doctor and AcmeConfig::validate disagree on domains={domains:?} \
+                     contact_email={contact_email:?} port={http_challenge_port} \
+                     renew_before_days={renew_before_days} dns={:?} (runtime said {:?})",
+                    dns.as_ref().map(|d| d.provider),
+                    runtime_cfg.validate()
+                );
+            }
+        }
+    }
+
+    // #1620's own rows for the parity test above: a wildcard is valid exactly
+    // when a DNS-01 provider is configured, and a malformed one never is.
+    #[test]
+    fn wildcard_domain_parity_depends_on_the_dns_section() {
+        let wildcard_cases: &[&[&str]] = &[
+            &["*.myapp.com"],
+            &["myapp.com", "*.myapp.com"],
+            &["*"],
+            &["*."],
+            &["*myapp.com"],
+            &["app.*.myapp.com"],
+            &["*.*.myapp.com"],
+        ];
+        for domains in wildcard_cases {
+            for dns in [
+                None,
+                Some(acme_dns_cfg(
+                    autumn_web::config::AcmeDnsProvider::Cloudflare,
+                )),
+            ] {
+                let mut doctor_cfg = acme_doctor_cfg(domains, "ops@myapp.com");
+                doctor_cfg.dns = dns.clone();
+                let runtime_cfg = autumn_web::config::AcmeConfig {
+                    domains: domains.iter().map(|d| (*d).to_owned()).collect(),
+                    contact_email: "ops@myapp.com".to_owned(),
+                    directory: autumn_web::config::AcmeDirectory::Staging,
+                    cache_dir: std::path::PathBuf::from("config/acme"),
+                    http_challenge_port: 80,
+                    renew_before_days: 30,
+                    ca_root_path: None,
+                    dns: dns.clone(),
+                };
+                assert_eq!(
+                    check_acme_config_impl(&doctor_cfg).is_some(),
+                    runtime_cfg.validate().is_err(),
+                    "doctor and AcmeConfig::validate disagree on domains={domains:?} with \
+                     dns={} (runtime said {:?})",
+                    dns.is_some(),
+                    runtime_cfg.validate()
+                );
+            }
         }
     }
 
@@ -12129,12 +13000,17 @@ directory = \"production\"
         let mut ports_checks = Vec::new();
         let mut dns_checks = Vec::new();
         for domain in &domains {
-            ports_checks.push(check_acme_ports_impl(
+            ports_checks.push(check_acme_ports_for_challenge(
                 domain,
                 PortReachability::Open,
                 PortReachability::Open,
+                false,
             ));
-            dns_checks.push(check_acme_dns_impl(domain, &DnsPointsHere::Matches));
+            dns_checks.push(check_acme_dns_for_challenge(
+                domain,
+                &DnsPointsHere::Matches,
+                false,
+            ));
         }
 
         assert_eq!(ports_checks.len(), 2, "one acme_ports check per domain");

@@ -2,8 +2,9 @@
 //! (issue #1608).
 //!
 //! This module lets an Autumn app obtain and auto-renew its own TLS
-//! certificate over the ACME **HTTP-01** challenge, without an operator-provided
-//! certificate on disk or a reverse proxy. It builds directly on the #1603 TLS
+//! certificate over the ACME **HTTP-01** challenge — or, since #1620, over
+//! **DNS-01**, which is what a *wildcard* certificate requires — without an
+//! operator-provided certificate on disk or a reverse proxy. It builds directly on the #1603 TLS
 //! listener: the issued certificate hot-swaps into the SAME
 //! [`ReloadableCertResolver`](crate::tls::ReloadableCertResolver) the listener
 //! already serves, so no second resolver or listener is introduced.
@@ -16,33 +17,40 @@
 //! - [`store`] — the [`AcmeStore`](store::AcmeStore) trait and its filesystem
 //!   implementation ([`FsAcmeStore`](store::FsAcmeStore)) that persists the ACME
 //!   account key and issued certificates (all `0600`).
+//! - [`dns`] — the DNS-01 challenge path (issue #1620): the
+//!   [`DnsProvider`](dns::DnsProvider) seam and its Cloudflare / Route 53 /
+//!   exec-hook implementations, the credential surface, and the bounded wait for
+//!   `_acme-challenge` TXT propagation. Present exactly when
+//!   `[server.tls.acme.dns]` is configured.
 //! - [`renewal`] — issuance, the renew-before-expiry decision
 //!   ([`needs_renewal`](renewal::needs_renewal)), the background renewal loop,
 //!   the self-signed placeholder used to bind `:443` before the first issuance,
 //!   and the [`AcmeStatus`](renewal::AcmeStatus) /
 //!   [`AcmeHealthIndicator`](renewal::AcmeHealthIndicator) observability seam.
 //!
-//! # Deployment scope: single-host in this slice
+//! # Deployment scope
 //!
-//! HTTP-01 ACME as shipped here is **single-host**. The renewal loop
-//! leader-elects correctly across a fleet (so only one replica *orders* per
-//! certificate), but the HTTP-01 token map ([`challenge::Http01Tokens`]) is
-//! per-process in-memory and the only [`store::AcmeStore`] is the local-disk
-//! [`store::FsAcmeStore`]. Behind a load balancer, the CA's `:80` validation
-//! request can therefore land on a replica that never published the token
-//! (→ 404), and non-leader replicas cannot adopt an issued certificate from a
-//! non-shared store. Single-replica deployments are fully correct.
+//! **HTTP-01 is single-host.** The renewal loop leader-elects correctly across a
+//! fleet (so only one replica *orders* per certificate), but the HTTP-01 token
+//! map ([`challenge::Http01Tokens`]) is per-process in-memory and the only
+//! [`store::AcmeStore`] is the local-disk [`store::FsAcmeStore`]. Behind a load
+//! balancer, the CA's `:80` validation request can therefore land on a replica
+//! that never published the token (→ 404). Single-replica deployments are fully
+//! correct; when ACME is configured alongside a distributed scheduler backend
+//! (i.e. a multi-replica deployment) the app emits a startup `warn`.
 //!
-//! Multi-replica HTTP-01 needs a shared token store (or DNS-01), tracked in
-//! #1620. When ACME is configured alongside a distributed scheduler backend
-//! (i.e. a multi-replica deployment) the app emits a startup `warn` to this
-//! effect.
+//! **DNS-01 does not have that limitation**: the challenge response lives in the
+//! operator's zone rather than in one replica's memory, so the CA reaches it
+//! wherever it validates from. The certificate store is still local disk, so a
+//! follower adopts a renewed certificate only from a shared store — but nothing
+//! about the *challenge* is replica-bound.
 //!
 //! The crypto backend is `ring` throughout (`instant-acme` and `rcgen` are both
 //! pinned `default-features = false` + `ring`), the SAME backend the rest of
 //! autumn-web uses — the workspace forbids a second crypto backend.
 
 pub mod challenge;
+pub mod dns;
 pub mod renewal;
 pub mod store;
 

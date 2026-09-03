@@ -577,6 +577,7 @@ There are five targets, one per parsing surface:
 | `headers` | request header parsing |
 | `session` | session cookie decode/verify |
 | `body` | request body decoding **and the inbound-mail parsers** |
+| `dns` | DNS wire-format parsing for the ACME DNS-01 propagation probe |
 
 Each target has a committed seed corpus at `fuzz/corpus/<target>/`.
 

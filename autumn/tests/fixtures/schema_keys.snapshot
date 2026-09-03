@@ -373,6 +373,13 @@ server.tls.acme.ca_root_path
 server.tls.acme.cache_dir
 server.tls.acme.contact_email
 server.tls.acme.directory
+server.tls.acme.dns
+server.tls.acme.dns.command
+server.tls.acme.dns.credential
+server.tls.acme.dns.poll_interval_secs
+server.tls.acme.dns.propagation_timeout_secs
+server.tls.acme.dns.provider
+server.tls.acme.dns.resolvers
 server.tls.acme.domains
 server.tls.acme.http_challenge_port
 server.tls.acme.renew_before_days

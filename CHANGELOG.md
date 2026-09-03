@@ -9,6 +9,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Wildcard certificates via DNS-01 for tenant subdomains (#1620):** autumn
+  already routes a tenant per subdomain and ships a multi-tenant SaaS starter,
+  but the ACME support in #1608 was HTTP-01 only — and no CA validates a
+  wildcard identifier over HTTP-01. A `*.myapp.com` deployment therefore meant
+  one certificate order per tenant (rate limits, and a cold-start stall on
+  tenant *N*'s first request) or going back behind Caddy/nginx, undoing the
+  single-binary story. A new `[server.tls.acme.dns]` section answers every
+  authorization over DNS-01 instead, so one wildcard covers every tenant that
+  exists and every tenant that ever will:
+
+  ```toml
+  [server.tls.acme]
+  domains = ["myapp.com", "*.myapp.com"]
+  contact_email = "ops@myapp.com"
+  directory = "production"
+
+  [server.tls.acme.dns]
+  provider = "cloudflare"
+  ```
+
+  Onboarding a tenant after that costs zero certificate work: no issuance, no
+  restart, no config change.
+
+  - **Providers.** `cloudflare` (scoped API token) and `route53` (SigV4), plus
+    `exec` — an argv-array hook program run as
+    `hook present|cleanup <fqdn> <value>`, which reaches RFC 2136 through
+    `nsupdate`, a registrar CLI, or a webhook shim. No shell is involved, so a
+    challenge value can never be read as shell syntax. The hook's `stderr` is
+    read through a bounded buffer and scrubbed before it is published: both the
+    credentials autumn holds and any the *inherited environment* holds under a
+    credential-shaped name, since an `exec` hook authenticates itself from that
+    environment and a `set -x` trace would otherwise republish its token.
+    Each provider resolves the zone for the whole challenge name rather than
+    caching by suffix, so a cached parent zone can never shadow a separately
+    delegated child.
+  - **Secrets.** The section names a credentials-store *key*, never a token:
+    there is no config field that could hold one, and the section rejects
+    unknown keys, so an `api_token` written into `autumn.toml` is a startup
+    error naming it rather than a plaintext secret. Credentials come from the
+    encrypted store (`autumn credentials edit`) or the `AUTUMN_ACME_DNS_*`
+    environment variables, and are held in a type that renders as `<redacted>`
+    so they cannot reach a log, an error message, or actuator output.
+  - **Propagation.** After publishing, autumn waits until every record is
+    visible before telling the CA to validate. The probe goes to each challenge
+    zone's *own* authoritative nameservers, discovered per order through the
+    configured resolvers — probing a public recursive right after the write
+    plants a negative-cache entry (RFC 2308; 900s on Route 53, 1800s on
+    Cloudflare) that outlives the propagation budget and can never clear. A
+    multi-domain order discovers nameservers per zone, since one zone's servers
+    never answer for another's names. The configured resolvers stay the fallback
+    for any zone whose authoritative set cannot be discovered. The wait is
+    bounded (`propagation_timeout_secs`, default 300) and its timeout names the
+    exact record, the value that never appeared, and the resolver that never saw
+    it. Challenge records are removed after the order finishes, including when
+    it fails.
+  - **Two records, one name.** An apex + wildcard order publishes two different
+    values at `_acme-challenge.<domain>`; every provider appends a value and
+    deletes by `(name, value)` rather than replacing the record set. Providers
+    whose unit of write is the whole record set rather than one record —
+    Route 53's `ChangeResourceRecordSets` — apply every value sharing a name in
+    a single change, because two sequential read-modify-writes race: the second
+    read can still return the pre-change values and write back only its own.
+    Such a write also carries the existing set's **TTL** back out unchanged —
+    the name can be shared with another ACME client, so autumn's own 60s
+    challenge TTL applies only to a set it creates, and Route 53 rejects a
+    `DELETE` whose TTL does not match the live set, which would otherwise leave
+    cleanup unable to remove anything.
+  - **Lifecycle.** Renewal, persistence, staging selection, hot-swap and health
+    are #1608's, unchanged. A failed issuance or renewal now also raises
+    #1610's `scheduled_task_failure` operator alert for `acme-renewal` — weeks
+    before expiry, thanks to the renew-before window — and clears it on the next
+    success. The `acme` health indicator reports `challenge` and `dns_provider`.
+  - **`autumn doctor`.** Three new checks: `acme_dns_credential` (the provider
+    credential is readable and complete), `acme_dns_propagation` (`--online`:
+    public DNS can answer for `_acme-challenge.<domain>` at all), and
+    `acme_tenancy_domain` (`[tenancy] base_domain`'s subdomains are actually
+    covered by the configured certificate). An unreachable `:80` is now a Warn
+    rather than a Fail when DNS-01 is configured, since the CA never connects to
+    it, and a `*.` entry is probed as the base domain it covers.
+  - **Still single-host.** DNS-01 retires HTTP-01's per-process token map, but
+    it does not distribute certificates: the store is local disk, so only the
+    replica holding the renewal lease has the issued certificate. A distributed
+    `[scheduler]` backend therefore still warns at startup — now naming the
+    certificate store rather than the token map.
+
+  See the [TLS guide](docs/guide/tls.md#wildcard-certificates-via-dns-01-servertlsacmedns)
+  and the [deployment walkthrough](docs/guide/deployment.md#subdomain-per-tenant-wildcard-https-on-a-vps).
+
+  **Breaking:** (`acme` feature only) `AcmeRenewalTask` gained the public fields
+  `dns` and `recovery`, and `AcmeConfig` gained `dns`; code that constructs
+  either literally must add them (`None` preserves today's HTTP-01 behavior).
+  The new *output* types in `acme::dns` (the parsed DNS answer, the propagation
+  timeout, the credential, the HTTP request/response) are `#[non_exhaustive]`
+  from the start. `AcmeConfig`, `AcmeDnsConfig`, `AcmeRenewalTask` and
+  `DnsChallenge` are not:
+  callers build them by struct literal and they have no constructor, so sealing
+  them would make them unusable — the same reasoning that left `ServerConfig`
+  open. See the [migration guide](docs/migrations/next.md).
+
+  `autumn-cli`'s `tls` feature now also enables `autumn-web/acme`: `autumn
+  doctor` grades the DNS-01 credential with the runtime's own
+  `validate_credential` and probes `_acme-challenge` visibility with the
+  runtime's own resolver, so the check and the server cannot disagree about what
+  a usable configuration is. Additive — the resolved feature set is a superset
+  of what `tls` already selected.
 - **`autumn plugin remove` and scaffold-time `--with` plugin flags (#1631):**
   `autumn plugin add` (#1606) made installing a plugin one command, but the
   lifecycle only ran one way — a repo-wide grep found no uninstall story at

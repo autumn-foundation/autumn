@@ -191,14 +191,32 @@ See issue #1852.
 On trunk-dev, `autumn doctor --online` (alias `--preflight`) runs active network
 probes, gated behind the CLI `acme` feature:
 
-- `acme_ports` — grades reachability of `:80` (HTTP-01) and `:443`.
+- `acme_ports` — grades reachability of `:80` (HTTP-01) and `:443`. Under
+  DNS-01 an unreachable `:80` is only a **Warn**: the CA never connects to this
+  host, so all that is lost is the HTTP→HTTPS redirect (#1620).
 - `acme_dns` — grades whether the configured `[server.tls.acme]` domains resolve
   to this host (`Matches` = pass, `PartialMatch` = warn, `ResolvesElsewhere` =
-  fail).
+  fail). A `*.` entry is probed as the base domain it covers — a wildcard has no
+  address record of its own. Under DNS-01 a name that resolves elsewhere is a
+  **Pass**: the CA reads a TXT record rather than connecting to this host, so
+  fronting the app with a load balancer or CDN is the normal shape (#1620).
+- `acme_dns_propagation` — whether public DNS can answer for
+  `_acme-challenge.<domain>` at all. **Fail** on SERVFAIL/timeout: the CA reads
+  the challenge record from public DNS, so a broken delegation defeats a
+  correctly-written record. **Warn** on records left over from an interrupted
+  run (#1620).
 
 Two checks are graded **offline**, so they run without `--online`:
 
 - `acme_stored_cert` — the cached leaf's expiry.
+- `acme_dns_credential` — the `[server.tls.acme.dns]` provider credential is
+  readable and carries the fields that provider needs, graded with the runtime's
+  own `validate_credential` so doctor and the server cannot disagree. **Fail**
+  when missing: without it every issuance and renewal fails, and nothing about
+  the running app reveals that until the certificate is expiring (#1620).
+- `acme_tenancy_domain` — `[tenancy] base_domain`'s subdomains are actually
+  covered by `[server.tls.acme] domains`. **Fail** otherwise: every tenant host
+  would serve a certificate name mismatch (#1620).
 - `acme_ca_root` — the configured `[server.tls.acme] ca_root_path`, validated
   through the same `CertificateDer::from_pem_file` + `RootCertStore::add` pair
   the runtime uses. Fails on a blank, unreadable, or unusable file (that state
@@ -206,7 +224,7 @@ Two checks are graded **offline**, so they run without `--online`:
   first certificate becomes a trust anchor — or when it is set alongside a
   publicly-trusted Let's Encrypt directory.
 
-See issue #1858.
+See issues #1858 and #1620.
 
 ## Deploy preflight checks (unreleased — trunk-dev, issues #1607/#1621)
 
