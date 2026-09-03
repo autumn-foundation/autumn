@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`autumn plugin remove` and scaffold-time `--with` plugin flags (#1631):**
+  `autumn plugin add` (#1606) made installing a plugin one command, but the
+  lifecycle only ran one way — a repo-wide grep found no uninstall story at
+  all, and `autumn new` had no plugin flag, so every plugin was a retrofit even
+  when the user knew at day zero they wanted one. Because the install is
+  machine-applied, the removal can be machine-reversed:
+
+  ```bash
+  autumn new my-app --with autumn-admin-plugin   # wired on day zero
+  autumn plugin remove autumn-admin-plugin       # both wires back out
+  ```
+
+  `plugin remove` deletes the `[dependencies]` line and excises the
+  `.plugin(...)` / `.with_blob_store(...)` call — marker comment included — as
+  a balanced-paren span, so a mount configured across several lines comes out
+  whole. An app installed with `plugin add` is byte-identical afterwards and
+  passes `cargo check` on the first try.
+
+  It declines rather than guesses, in the three places a guess would leave an
+  app that does not compile: a mount it cannot read as a single builder call
+  (a plugin built into a variable, or a one-line chain) changes **nothing** and
+  prints the lines to delete; a dependency still named anywhere under `src/`,
+  `tests/`, or `benches/` is kept, with the file that kept it named; a
+  community mount is never deleted, because `add` never wrote one. Partially
+  wired plugins — the shape a manual README install leaves — are unwired as far
+  as they go, with the missing half reported, and removing a plugin that is not
+  installed is an idempotent no-op.
+
+  **The database is never touched by default.** A plugin that declares
+  migrations or owns tables gets them listed, with a statement that they are
+  still there; `--drop-data` reverts them, printing the exact statements and
+  asking for confirmation first (`--yes` for CI; a non-interactive stdin
+  without it is a refusal, not an assumed yes). `--dry-run` writes nothing and
+  distinguishes its answer in the exit code: `3` when a real run would change
+  something — pending *database* work included, so an already-unwired plugin
+  whose tables remain still answers `3` — and `0` when there is nothing to do.
+  `--drop-data` is refused outright when the mount cannot be unwired: dropping
+  what a still-mounted plugin owns would break the running app, so nothing is
+  asked and nothing is changed.
+
+  `autumn new --with <plugin>` is repeatable and resolves every name — curated
+  catalog first, crates.io fallback — and version-checks it **before the
+  scaffold writes a byte**, so a typo never leaves a half-built project behind.
+  With `--starter`, whose own `autumn-web` pin is not knowable until the starter
+  is fetched, names are still resolved up front and the version answer arrives
+  afterwards as "the app was created, the plugin was not wired" (exit 2) rather
+  than as a failed `autumn new`.
+  `autumn doctor` gains a `plugin_residue` check under the existing
+  `--json`/`--strict` contract: a dependency with no mount warns, a mount with
+  no dependency fails (it does not compile), and migrations left applied by a
+  plugin that is gone warn. A CI gate round-trips every first-party plugin
+  through `new --with` → `cargo check` → `plugin remove` → `cargo check` →
+  zero doctor residue.
+
 - **Dependency-advisory gate, on by default, for scaffolded apps and Autumn's
   own releases (#1600):** the CI workflow `autumn new` generates relegated
   vulnerability auditing to a comment ("Optional extensions… Audit: `cargo

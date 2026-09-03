@@ -1590,6 +1590,40 @@ plugin crate already carries the features its mount needs and Cargo unifies
 them. `autumn plugin-check` is the separate, author-facing conformance gate;
 `autumn generate plugin` scaffolds a new plugin crate.
 
+## Removing a plugin, and installing one on day zero (unreleased, issue #1631)
+
+The lifecycle runs both ways, and a plugin can be wired at scaffold time:
+
+```bash
+autumn new my-app --with autumn-admin-plugin --with autumn-search  # repeatable
+autumn plugin remove autumn-admin-plugin
+autumn plugin remove autumn-media-plugin --dry-run                 # every consequence, no writes
+autumn plugin remove autumn-media-plugin --drop-data --yes         # destructive, opt-in
+```
+
+`remove` is the exact reverse of `add` and refuses in the same spirit:
+
+- **It never touches the database.** A plugin that declares migrations or owns
+  tables gets them listed with a statement that they are still there.
+  `--drop-data` reverts them in one transaction, printing the statements and
+  confirming *before any file is written*; a non-interactive stdin without
+  `--yes` is a refusal, never an assumed yes.
+- **It declines rather than guesses.** A mount it cannot read as a single
+  builder call (built into a variable, sharing a line, or nested inside another
+  plugin's constructor) changes nothing and prints the lines to delete, exit 2.
+  So does a dependency not written as a plain `name = "…"` line.
+- **It keeps a dependency the app still uses**, naming the file under `src/`,
+  `tests/`, `benches/`, `examples/` or `build.rs` that kept it.
+- **Idempotent**, like `add`: removing what is not installed says so and
+  changes nothing.
+- **Exit codes**: `0` removed or nothing to do, `1` refused, `2` nothing was
+  changed automatically (apply the printed lines by hand), `3` `--dry-run`
+  found something a real run would change.
+
+`autumn new --with` resolves and version-checks every name *before* the
+scaffold writes a byte, so a typo leaves no half-built project. `autumn doctor`
+reports leftovers as `plugin_residue` — see the doctor skill.
+
 ## File storage and cache plugins
 
 For local or pluggable file storage:
@@ -2483,6 +2517,8 @@ autumn deploy status --json --strict          # read-only per-host state + versi
 autumn deploy maintenance on --message "…"    # maintenance mode on EVERY deploy host over SSH; `off` reverses (#1621)
 autumn plugin list               # installable plugins + the version compatible with this app's autumn-web; --json, --offline (#1606)
 autumn plugin add autumn-admin-plugin   # dependency + builder-chain mount + post-install steps; idempotent, version-gated, --dry-run (#1606)
+autumn plugin remove autumn-admin-plugin   # reverses both wires; never touches the database (--drop-data does, with confirmation); --dry-run exits 3 when it would change something (#1631)
+autumn new my-app --with autumn-admin-plugin   # scaffold with plugins already wired; repeatable, resolved and version-checked before any file is written (#1631)
 autumn data-flow                 # classified-data flow manifest: one row per `#[classified]` column and every sink a declared declassification boundary releases it to; empty reachable set = the column cannot leave the process (#1654)
 autumn data-flow --manifest data-flow-manifest.json --check data-flow-manifest.json   # write it, and fail on drift from the committed copy so a new release edge is reviewed
 autumn data-flow --release --check data-flow-manifest.json   # audit the profile you deploy: a boundary behind `#[cfg(not(debug_assertions))]` exists only in the release build, so a debug-built manifest would certify edges the shipped binary does not have (and miss the ones it does)

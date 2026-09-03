@@ -8934,3 +8934,735 @@ fn plugin_add_first_party_scaffolds_cargo_check() {
         );
     }
 }
+
+// ── `autumn plugin remove` / `autumn new --with` (issue #1631) ──────────────
+
+/// AC #1 + AC #5: `add` then `remove` returns the app to exactly what it was,
+/// and a second `remove` is an idempotent no-op.
+#[test]
+fn plugin_remove_reverses_both_wires_and_is_idempotent() {
+    let (_tmp, project) = fresh_project("plugin-remove");
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    assert_ne!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before
+    );
+
+    let (stdout, _) = run_autumn(&project, &["plugin", "remove", "autumn-admin-plugin"]);
+    assert!(stdout.contains("Removed autumn-admin-plugin"), "{stdout}");
+
+    // Byte-identical: the marker comment, the mount, and the dependency line
+    // all came back out, and nothing else moved.
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before
+    );
+
+    let (stdout, _) = run_autumn(&project, &["plugin", "remove", "autumn-admin-plugin"]);
+    assert!(stdout.contains("not installed"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+}
+
+/// AC #3: `--dry-run` writes nothing, and its exit code distinguishes "would
+/// change something" (3) from "nothing to do" (0).
+#[test]
+fn plugin_remove_dry_run_reports_without_writing_and_signals_pending_changes() {
+    let (_tmp, project) = fresh_project("plugin-remove-dry");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+
+    let (stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &["plugin", "remove", "autumn-admin-plugin", "--dry-run"],
+    );
+    assert_eq!(code, Some(3), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("Dry run"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before
+    );
+
+    // Nothing to do is a plain success, so a script can branch on the code.
+    let (stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &["plugin", "remove", "autumn-search", "--dry-run"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+}
+
+/// AC #2: removal never touches the database, and says exactly what it left
+/// behind plus the flag that would remove it.
+#[test]
+fn plugin_remove_lists_the_data_it_leaves_in_place() {
+    let (_tmp, project) = fresh_project("plugin-remove-data");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-media-plugin", "--offline"],
+    );
+    let (stdout, _) = run_autumn(&project, &["plugin", "remove", "autumn-media-plugin"]);
+    assert!(stdout.contains("media_rooms"), "{stdout}");
+    assert!(stdout.contains("20260720000000_media_rooms"), "{stdout}");
+    assert!(stdout.contains("--drop-data"), "{stdout}");
+    assert!(stdout.contains("database was not touched"), "{stdout}");
+}
+
+/// AC #4: a dependency added by hand with no mount (the `README` install path)
+/// is unwired as far as it goes, and the missing half is reported.
+#[test]
+fn plugin_remove_handles_a_dependency_with_no_mount() {
+    let (_tmp, project) = fresh_project("plugin-remove-partial");
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = fs::read_to_string(&cargo_path).unwrap();
+    fs::write(
+        &cargo_path,
+        cargo.replace(
+            "[dependencies]",
+            "[dependencies]\nautumn-admin-plugin = \"0.7.0\"",
+        ),
+    )
+    .unwrap();
+
+    let (stdout, _) = run_autumn(&project, &["plugin", "remove", "autumn-admin-plugin"]);
+    assert!(stdout.to_lowercase().contains("could not find"), "{stdout}");
+    let cargo_after = fs::read_to_string(&cargo_path).unwrap();
+    assert!(
+        !cargo_after.contains("autumn-admin-plugin"),
+        "{cargo_after}"
+    );
+}
+
+/// AC #4: a builder chain this command cannot read is left completely alone,
+/// and the exact lines to delete are printed. The app never stops compiling.
+#[test]
+fn plugin_remove_degrades_on_an_unexcisable_mount() {
+    let (_tmp, project) = fresh_project("plugin-remove-custom");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    let main_path = project.join("src/main.rs");
+    // A mount built into a variable: a real mount whose type this command
+    // cannot see inside the `.plugin(...)` call.
+    let custom = "#[autumn_web::main]\nasync fn main() {\n    let configured = autumn_admin_plugin::AdminPlugin::new();\n    autumn_web::app()\n        .plugin(configured)\n        .run()\n        .await;\n}\n";
+    fs::write(&main_path, custom).unwrap();
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+
+    let (_stdout, stderr, code) =
+        run_autumn_failing(&project, &["plugin", "remove", "autumn-admin-plugin"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("No files were changed"), "{stderr}");
+    assert!(stderr.contains("AdminPlugin"), "{stderr}");
+
+    assert_eq!(fs::read_to_string(&main_path).unwrap(), custom);
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+}
+
+/// A dependency the app still names elsewhere survives the removal, and the
+/// report says which file kept it alive.
+#[test]
+fn plugin_remove_keeps_a_dependency_the_app_still_uses() {
+    let (_tmp, project) = fresh_project("plugin-remove-inuse");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    fs::write(
+        project.join("src/support.rs"),
+        "pub fn panel() -> autumn_admin_plugin::AdminPlugin { todo!() }\n",
+    )
+    .unwrap();
+
+    let (stdout, _) = run_autumn(&project, &["plugin", "remove", "autumn-admin-plugin"]);
+    assert!(stdout.contains("support.rs"), "{stdout}");
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("autumn-admin-plugin"), "{cargo}");
+    // The mount still came out — only the dependency was held back.
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(!main_rs.contains("AdminPlugin::new()"), "{main_rs}");
+}
+
+/// AC #6: `autumn new --with` scaffolds an app with the plugin already wired.
+#[test]
+fn new_with_scaffolds_an_app_with_the_plugin_wired() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (stdout, _) = run_autumn(
+        tmp.path(),
+        &[
+            "new",
+            "with-app",
+            "--with",
+            "autumn-admin-plugin",
+            "--with",
+            "autumn-search",
+        ],
+    );
+    assert!(stdout.contains("Installed autumn-admin-plugin"), "{stdout}");
+    assert!(stdout.contains("Installed autumn-search"), "{stdout}");
+
+    let project = tmp.path().join("with-app");
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("autumn-admin-plugin ="), "{cargo}");
+    assert!(cargo.contains("autumn-search ="), "{cargo}");
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(
+        main_rs.contains(".plugin(autumn_admin_plugin::AdminPlugin::new())"),
+        "{main_rs}"
+    );
+    assert!(
+        main_rs.contains(".plugin(autumn_search::SearchPlugin::new())"),
+        "{main_rs}"
+    );
+}
+
+/// AC #6: name resolution and version compatibility are checked BEFORE any
+/// file is written — an unknown plugin leaves no project behind at all.
+#[test]
+fn new_with_rejects_an_unknown_plugin_before_scaffolding() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_stdout, stderr, code) =
+        run_autumn_failing(tmp.path(), &["new", "doomed-app", "--with", "tokio"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("autumn plugin list"), "{stderr}");
+    assert!(
+        !tmp.path().join("doomed-app").exists(),
+        "a rejected --with must not leave a half-scaffolded project"
+    );
+}
+
+/// AC #7: `autumn doctor` reports orphaned plugin residue under the existing
+/// `--json` contract.
+#[test]
+fn doctor_reports_a_dependency_with_no_mount_as_residue() {
+    let (_tmp, project) = fresh_project("doctor-residue");
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = fs::read_to_string(&cargo_path).unwrap();
+    fs::write(
+        &cargo_path,
+        cargo.replace(
+            "[dependencies]",
+            "[dependencies]\nautumn-admin-plugin = \"0.7.0\"",
+        ),
+    )
+    .unwrap();
+
+    let (stdout, _stderr, _code) = run_autumn_failing(&project, &["doctor", "--json"]);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let check = value["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "plugin_residue")
+        .unwrap_or_else(|| panic!("plugin_residue missing from {stdout}"));
+    assert_eq!(check["status"], "warn", "{stdout}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("autumn-admin-plugin")),
+        "{stdout}"
+    );
+}
+
+/// A clean scaffold has no residue at all — the check must not warn on every
+/// project that simply has no plugins.
+#[test]
+fn doctor_reports_no_residue_for_a_plain_scaffold() {
+    let (_tmp, project) = fresh_project("doctor-no-residue");
+    let (stdout, _stderr, _code) = run_autumn_failing(&project, &["doctor", "--json"]);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let check = value["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "plugin_residue")
+        .unwrap_or_else(|| panic!("plugin_residue missing from {stdout}"));
+    assert_eq!(check["status"], "pass", "{stdout}");
+}
+
+/// The Success Metric for issue #1631, for every first-party plugin:
+/// `autumn new --with <plugin>` compiles, `autumn plugin remove <plugin>`
+/// returns the app to a state that compiles, and `autumn doctor` finds no
+/// residue afterwards.
+///
+/// Ignored by default (it compiles a generated project per plugin); run in CI
+/// by the `plugin-install` job in `.github/workflows/generator-conformance.yml`.
+/// The projects share one `CARGO_TARGET_DIR` so the framework is built once.
+#[test]
+#[ignore = "compiles generated projects against the local workspace (slow)"]
+fn plugin_new_with_then_remove_round_trips_cargo_check() {
+    let shared_target = tempfile::tempdir().expect("shared target dir");
+    for plugin in FIRST_PARTY_PLUGINS {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let name = plugin.replace('-', "_");
+        run_autumn(tmp.path(), &["new", &name, "--with", plugin]);
+        let project = tmp.path().join(&name);
+        patch_generated_cargo_toml_for_plugins(&project);
+
+        let cargo_check = |stage: &str| {
+            let check = Command::new("cargo")
+                .args(["check", "--all-targets"])
+                .current_dir(&project)
+                .env("CARGO_TARGET_DIR", shared_target.path())
+                .output()
+                .expect("failed to run cargo check");
+            assert!(
+                check.status.success(),
+                "{plugin} does not compile {stage}:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&check.stdout),
+                String::from_utf8_lossy(&check.stderr),
+            );
+        };
+        cargo_check("after `autumn new --with`");
+
+        let (stdout, _) = run_autumn(&project, &["plugin", "remove", plugin]);
+        assert!(stdout.contains(&format!("Removed {plugin}")), "{stdout}");
+        cargo_check("after `autumn plugin remove`");
+
+        let (stdout, _stderr, _code) = run_autumn_failing(&project, &["doctor", "--json"]);
+        let value: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+        let check = value["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .find(|c| c["name"] == "plugin_residue")
+            .unwrap_or_else(|| panic!("plugin_residue missing from {stdout}"));
+        assert_eq!(check["status"], "pass", "{plugin}: {stdout}");
+    }
+}
+
+/// AC #2: `--drop-data` never drops without a confirmation, and a
+/// non-interactive stdin is a refusal — never an assumed yes. Nothing is
+/// changed: not the code, not the database.
+#[test]
+fn plugin_remove_drop_data_refuses_without_a_confirmation() {
+    let (_tmp, project) = fresh_project("plugin-remove-drop-noconfirm");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-media-plugin", "--offline"],
+    );
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+
+    // A reachable-looking Postgres URL so the command gets as far as the
+    // confirmation instead of stopping at "no database configured".
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["plugin", "remove", "autumn-media-plugin", "--drop-data"])
+        .current_dir(&project)
+        .env("DATABASE_URL", "postgres://localhost/definitely-not-here")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run autumn");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("needs a confirmation"), "{stderr}");
+    assert!(stderr.contains("Aborted"), "{stderr}");
+
+    // The confirmation comes BEFORE the edits, so a refusal leaves the app
+    // exactly as it was.
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before
+    );
+}
+
+/// AC #2/#3: `--drop-data --dry-run` prints the exact statements and touches
+/// neither the files nor the database.
+#[test]
+fn plugin_remove_drop_data_dry_run_prints_the_statements_and_writes_nothing() {
+    let (_tmp, project) = fresh_project("plugin-remove-drop-dry");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-media-plugin", "--offline"],
+    );
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args([
+            "plugin",
+            "remove",
+            "autumn-media-plugin",
+            "--drop-data",
+            "--dry-run",
+        ])
+        .current_dir(&project)
+        .env("DATABASE_URL", "postgres://localhost/definitely-not-here")
+        .output()
+        .expect("failed to run autumn");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("DROP TABLE IF EXISTS media_rooms"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("__diesel_schema_migrations"), "{stdout}");
+    assert!(stdout.contains("database was not touched"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before
+    );
+}
+
+/// AC #2: with no database configured there is nothing to connect to, so the
+/// statements are printed instead — and the exit code says so, since a script
+/// must not read "printed for you" as "dropped".
+#[test]
+fn plugin_remove_drop_data_without_a_database_prints_the_statements() {
+    let (_tmp, project) = fresh_project("plugin-remove-drop-nodb");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-media-plugin", "--offline"],
+    );
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "plugin",
+            "remove",
+            "autumn-media-plugin",
+            "--drop-data",
+            "--yes",
+        ],
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("DROP TABLE IF EXISTS media_rooms"),
+        "{stderr}"
+    );
+    // Nothing at all was changed — not the database, and not the code either.
+    assert!(stderr.contains("database is untouched"), "{stderr}");
+    assert!(stderr.contains("still\nwired"), "{stderr}");
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main_rs.contains("MediaPlugin::new()"), "{main_rs}");
+}
+
+/// `--drop-data` needs a declared migration/table list, which only first-party
+/// plugins carry. A community crate is refused before anything is planned.
+#[test]
+fn plugin_remove_drop_data_refuses_a_community_crate_before_editing() {
+    let (_tmp, project) = fresh_project("plugin-remove-drop-community");
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "plugin",
+            "remove",
+            "autumn-plugin-live-feed",
+            "--drop-data",
+            "--yes",
+        ],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("community crate"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+}
+
+/// AC #4: a dependency declared in a shape the manifest rewriter will not
+/// touch is left alone, said so, and exits with the "there is still work for
+/// you" code rather than a bare success.
+#[test]
+fn plugin_remove_leaves_an_uneditable_dependency_and_says_so() {
+    let (_tmp, project) = fresh_project("plugin-remove-subtable");
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = fs::read_to_string(&cargo_path).unwrap();
+    fs::write(
+        &cargo_path,
+        format!("{cargo}\n[dependencies.autumn-admin-plugin]\nversion = \"0.7.0\"\n"),
+    )
+    .unwrap();
+    let cargo_before = fs::read_to_string(&cargo_path).unwrap();
+
+    let (stdout, stderr, code) =
+        run_autumn_failing(&project, &["plugin", "remove", "autumn-admin-plugin"]);
+    assert_eq!(code, Some(2), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("Delete it by hand"), "{stdout}");
+    // Left byte-identical rather than half-rewritten into something Cargo
+    // cannot parse.
+    assert_eq!(fs::read_to_string(&cargo_path).unwrap(), cargo_before);
+}
+
+/// AC #7: a community `autumn-plugin-*` dependency with no mount is residue
+/// too, and gets advice that matches how community plugins actually install.
+#[test]
+fn doctor_reports_an_unmounted_community_dependency_as_residue() {
+    let (_tmp, project) = fresh_project("doctor-residue-community");
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = fs::read_to_string(&cargo_path).unwrap();
+    fs::write(
+        &cargo_path,
+        cargo.replace(
+            "[dependencies]",
+            "[dependencies]\nautumn-plugin-live-feed = \"0.3.1\"",
+        ),
+    )
+    .unwrap();
+
+    let (stdout, _stderr, _code) = run_autumn_failing(&project, &["doctor", "--json"]);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let check = value["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "plugin_residue")
+        .unwrap_or_else(|| panic!("plugin_residue missing from {stdout}"));
+    assert_eq!(check["status"], "warn", "{stdout}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("autumn-plugin-live-feed") && d.contains("README")),
+        "{stdout}"
+    );
+}
+
+/// A builder that lives outside `src/main.rs` — the shape `plugin add`'s own
+/// manual fallback tells users to write — is a correctly wired app, and must
+/// not be warned at (which under `--strict` would fail their CI).
+#[test]
+fn doctor_finds_no_residue_when_the_builder_lives_outside_main_rs() {
+    let (_tmp, project) = fresh_project("doctor-residue-elsewhere");
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = fs::read_to_string(&cargo_path).unwrap();
+    fs::write(
+        &cargo_path,
+        cargo.replace(
+            "[dependencies]",
+            "[dependencies]\nautumn-admin-plugin = \"0.7.0\"",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/app_builder.rs"),
+        "pub fn build() {\n    autumn_web::app().plugin(autumn_admin_plugin::AdminPlugin::new());\n}\n",
+    )
+    .unwrap();
+
+    let (stdout, _stderr, _code) = run_autumn_failing(&project, &["doctor", "--json"]);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let check = value["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "plugin_residue")
+        .unwrap_or_else(|| panic!("plugin_residue missing from {stdout}"));
+    assert_eq!(check["status"], "pass", "{stdout}");
+}
+
+/// Codex review (AC #6): a `--starter` brings its own `Cargo.toml`, which may
+/// pin a different `autumn-web` series than this CLI. That pin is not knowable
+/// until the starter is fetched, so the version answer arrives after the app
+/// exists — and it must read as "the app was created, the plugin was not
+/// wired", not as a bare failure. The starter itself is left complete and
+/// untouched.
+#[test]
+fn new_with_on_an_incompatible_starter_reports_an_unwired_plugin() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let starter = tmp.path().join("old-starter");
+    fs::create_dir_all(starter.join("src")).unwrap();
+    fs::write(
+        starter.join("autumn-starter.toml"),
+        "[starter]\nname = \"old\"\ndescription = \"pins an older autumn-web\"\n",
+    )
+    .unwrap();
+    fs::write(
+        starter.join("Cargo.toml.tmpl"),
+        "[package]\nname = \"{{project_name}}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nautumn-web = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        starter.join("src/main.rs"),
+        "#[autumn_web::main]\nasync fn main() {\n    let app = autumn_web::app()\n        .routes(routes![index]);\n    app.run().await;\n}\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_autumn_failing(
+        tmp.path(),
+        &[
+            "new",
+            "starter-app",
+            "--starter",
+            starter.to_str().unwrap(),
+            "--yes",
+            "--with",
+            "autumn-admin-plugin",
+        ],
+    );
+    assert_eq!(code, Some(2), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("was not wired"), "{stderr}");
+    assert!(stderr.contains("autumn plugin add"), "{stderr}");
+
+    // The starter scaffolded completely; only the plugin is absent.
+    let project = tmp.path().join("starter-app");
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("autumn-web = \"0.1.0\""), "{cargo}");
+    assert!(!cargo.contains("autumn-admin-plugin"), "{cargo}");
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(!main_rs.contains("AdminPlugin"), "{main_rs}");
+}
+
+/// An unknown `--with` name is still refused before the starter is fetched:
+/// that half of the preflight does not need the starter's manifest.
+#[test]
+fn new_with_rejects_an_unknown_plugin_before_fetching_a_starter() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_stdout, stderr, code) = run_autumn_failing(
+        tmp.path(),
+        &[
+            "new",
+            "doomed-starter-app",
+            "--starter",
+            "saas",
+            "--yes",
+            "--with",
+            "tokio",
+        ],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("autumn plugin list"), "{stderr}");
+    assert!(
+        !tmp.path().join("doomed-starter-app").exists(),
+        "a rejected --with must not leave a scaffolded project"
+    );
+}
+
+/// Codex review: a mount that cannot be excised means the plugin is still
+/// wired. Dropping the tables it is about to read would break a running app —
+/// and confirming a destructive step that then silently does nothing is worse.
+/// Nothing is asked, and nothing is changed.
+#[test]
+fn plugin_remove_drop_data_is_not_confirmed_when_the_mount_cannot_be_excised() {
+    let (_tmp, project) = fresh_project("plugin-remove-drop-manual");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-media-plugin", "--offline"],
+    );
+    let main_path = project.join("src/main.rs");
+    // A mount built into a variable: real, and not excisable by this command.
+    let custom = "#[autumn_web::main]\nasync fn main() {\n    let configured = autumn_media_plugin::MediaPlugin::new();\n    autumn_web::app()\n        .plugin(configured)\n        .run()\n        .await;\n}\n";
+    fs::write(&main_path, custom).unwrap();
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+
+    let (stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "plugin",
+            "remove",
+            "autumn-media-plugin",
+            "--drop-data",
+            "--yes",
+        ],
+    );
+    assert_eq!(code, Some(2), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("No files were changed"), "{stderr}");
+    assert!(stderr.contains("--drop-data was not applied"), "{stderr}");
+    // The SQL must never have been presented as something about to run.
+    assert!(
+        !stdout.contains("will run these"),
+        "a drop must not be announced on this path:\n{stdout}"
+    );
+    assert_eq!(fs::read_to_string(&main_path).unwrap(), custom);
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+}
+
+/// Codex review (AC #3): the plugin is already unwired but its tables remain.
+/// No file would move, so the file-level check alone would exit 0 — telling a
+/// script the cleanup is finished while a real run still drops data.
+#[test]
+fn plugin_remove_drop_data_dry_run_exits_three_for_database_only_work() {
+    let (_tmp, project) = fresh_project("plugin-remove-drop-dbonly");
+    // Never installed: nothing to unwire, but the plugin owns tables.
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args([
+            "plugin",
+            "remove",
+            "autumn-media-plugin",
+            "--drop-data",
+            "--dry-run",
+        ])
+        .current_dir(&project)
+        .env("DATABASE_URL", "postgres://localhost/definitely-not-here")
+        .output()
+        .expect("failed to run autumn");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("not installed"), "{stdout}");
+    assert!(
+        stdout.contains("DROP TABLE IF EXISTS media_rooms"),
+        "{stdout}"
+    );
+}
+
+/// Codex review (AC #7): an app whose builder lives in an explicitly-pathed
+/// Cargo target is correctly wired. Reporting it as "declared but never
+/// mounted" would fail `autumn doctor --strict` on a valid project.
+#[test]
+fn doctor_finds_no_residue_when_the_builder_lives_in_a_custom_target() {
+    let (_tmp, project) = fresh_project("doctor-residue-custom-target");
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = fs::read_to_string(&cargo_path).unwrap();
+    fs::write(
+        &cargo_path,
+        format!(
+            "{}\n[[bin]]\nname = \"server\"\npath = \"cmd/server.rs\"\n",
+            cargo.replace(
+                "[dependencies]",
+                "[dependencies]\nautumn-admin-plugin = \"0.7.0\"",
+            )
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(project.join("cmd")).unwrap();
+    fs::write(
+        project.join("cmd/server.rs"),
+        "fn main() {\n    autumn_web::app().plugin(autumn_admin_plugin::AdminPlugin::new());\n}\n",
+    )
+    .unwrap();
+
+    let (stdout, _stderr, _code) = run_autumn_failing(&project, &["doctor", "--json"]);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let check = value["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "plugin_residue")
+        .unwrap_or_else(|| panic!("plugin_residue missing from {stdout}"));
+    assert_eq!(check["status"], "pass", "{stdout}");
+}
