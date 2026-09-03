@@ -151,6 +151,29 @@ transaction, so it does not add a full network RTT. The in-process overhead
 **Budget**: the feature must not regress p99 write latency by more than 5 ms
 relative to the same repository with version history off.
 
+## Computing a diff yourself
+
+Step 2 of the write path above is available directly, in two shapes:
+
+| What you have                        | What to call |
+|--------------------------------------|--------------|
+| a `Value` you still need afterwards  | `compute_diff`, `compute_insert_changes`, `compute_delete_changes` |
+| a `Value` you are done with          | `compute_diff_owned`, `compute_insert_changes_owned`, `compute_delete_changes_owned` |
+
+Both shapes produce the identical changeset. The `_owned` variants take the
+`serde_json::Value` by value so every retained column name and value is *moved*
+into its `ColumnChange` rather than cloned, which is why the generated write
+path uses them: it serializes a throwaway `Value` per mutation and drops it
+immediately after the diff.
+
+```rust,ignore
+use autumn_web::version_history::compute_diff_owned;
+
+let changes = compute_diff_owned(before_json, after_json, &["password_digest"]);
+```
+
+Reach for the borrowed variants when the `Value` has to outlive the call.
+
 ## Storage growth
 
 Each row in `_autumn_version_history` is roughly proportional to the number of
