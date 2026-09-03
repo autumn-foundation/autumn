@@ -1433,9 +1433,7 @@ impl Client {
     /// automatic per-hop pinning.
     #[must_use]
     pub fn get_ssrf_safe(&self, url: impl Into<String>) -> RequestBuilder {
-        let mut builder = self.build_request(Method::GET, url.into());
-        builder.ssrf_safe = true;
-        builder
+        self.build_request(Method::GET, url.into()).ssrf_safe()
     }
 }
 
@@ -1710,6 +1708,33 @@ impl RequestBuilder {
     #[must_use]
     pub const fn pin_to(mut self, addr: SocketAddr) -> Self {
         self.pin_addr = Some(addr);
+        self
+    }
+
+    /// Route this request through the SSRF-safe resolve→validate→pin send path
+    /// documented on [`Client::get_ssrf_safe`], for any HTTP method.
+    ///
+    /// [`Client::get_ssrf_safe`] only builds `GET` requests, but the guarantee
+    /// it describes — reject a resolved address on the built-in SSRF deny-list,
+    /// pin the connection to the validated set, re-validate on every redirect
+    /// hop — is implemented by [`Self::send`] purely from this flag and is not
+    /// GET-specific. Any outbound call whose destination is not a value the
+    /// app itself chose — a webhook subscriber's `target_url`, a user-supplied
+    /// callback, an OAuth discovery endpoint — needs this on **every** verb it
+    /// uses, not only reads. Chain it after [`Client::post`], [`Client::put`],
+    /// etc.:
+    ///
+    /// ```rust,ignore
+    /// client.post(target_url).ssrf_safe().json(&payload).send().await?;
+    /// ```
+    ///
+    /// Same incompatibility with [`pin_to`](Self::pin_to) as `get_ssrf_safe`:
+    /// this path performs its own per-hop resolve→validate→pin, so chaining an
+    /// explicit pin is rejected at send time with
+    /// [`ClientError::PinNotAllowedWithSsrfSafe`].
+    #[must_use]
+    pub const fn ssrf_safe(mut self) -> Self {
+        self.ssrf_safe = true;
         self
     }
 

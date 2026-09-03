@@ -1102,6 +1102,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handler ran, so a retry after such a switch still replays instead of
   re-running the mutation. See
   `docs/security/2026-09-02-idempotency-tenant-scope/`.
+- **Outbound webhook delivery now dials `target_url` through the SSRF-safe
+  path:** `WebhookSubscription::target_url` is a subscriber-chosen
+  destination — the outbound-webhooks guide describes it as "a consumer's
+  registered endpoint" — and the `autumn_webhook_delivery` background job
+  posted to it with a plain `Client::post()`, which carries none of the
+  private/loopback/link-local/CGNAT/cloud-metadata deny-list
+  `Client::get_ssrf_safe()` already enforces elsewhere in the framework. An
+  app following the documented pattern (letting its own users register a
+  webhook receiver URL) let any such user point delivery at an internal
+  service, the app's own database host, or a cloud metadata endpoint, with
+  Autumn's own backend making the request on their behalf. `get_ssrf_safe`
+  itself only ever built a `GET`; the fix adds a general
+  `RequestBuilder::ssrf_safe()` chainable on any verb (`get_ssrf_safe` is now
+  defined in terms of it, unchanged in behavior) and applies it to the
+  webhook delivery request. Delivery to a blocked destination now fails
+  closed with `SsrfBlocked` before any socket opens and is recorded/retried/
+  DLQ'd exactly like any other transport failure. **Compatibility note:** an
+  app relying on `target_url` reaching a private address (e.g. an
+  internal-only receiver during development) will see those deliveries start
+  failing after upgrade — this is the intended effect of closing the gap. See
+  `docs/security/2026-09-03-webhook-ssrf/`.
 
 ### Fixed
 

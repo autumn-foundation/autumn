@@ -616,10 +616,16 @@ pub fn deliver_webhook_job(
         request_headers.insert("Autumn-Signature".to_owned(), signature_header.clone());
 
         let start = std::time::Instant::now();
+        // `target_url` is a subscriber-chosen destination, not one the app
+        // itself picked — exactly the case `ssrf_safe()` exists for. Without
+        // it this POST carries none of the private/link-local/loopback/cloud-
+        // metadata deny-list `Client::get_ssrf_safe` documents. See
+        // docs/security/2026-09-03-webhook-ssrf/README.md.
         let req = manager
             .client
             .named(&sub.target_url)
             .post(&sub.target_url)
+            .ssrf_safe()
             .header("Content-Type", "application/json")
             .header("Autumn-Signature", signature_header)
             .text_body(log.payload.clone());
@@ -985,10 +991,7 @@ mod tests {
             .await
             .unwrap();
 
-        let accept = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            listener.accept(),
-        );
+        let accept = tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept());
 
         let job_result =
             deliver_webhook_job(state, serde_json::json!({ "log_id": "log_ssrf" })).await;
@@ -1009,7 +1012,9 @@ mod tests {
             .unwrap()
             .expect("log should remain stored");
         assert!(
-            log.last_error.as_deref().is_some_and(|e| e.contains("SSRF")),
+            log.last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("SSRF")),
             "delivery log should record the SSRF block, got: {:?}",
             log.last_error
         );
