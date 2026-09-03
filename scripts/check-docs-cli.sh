@@ -718,6 +718,27 @@ def _exe_path(value):
     return '/' in value and _autumn_exe(value)
 
 
+# A service directive whose VALUE systemd runs as a command line. The KEY has
+# to say so: an ordinary shell assignment does not execute its value, and
+# treating every `NAME=/path/to/autumn` as a command reported
+# `BIN=/usr/local/bin/autumn` — documenting a reusable binary path, which is a
+# correct and ordinary thing for a page to do — as a bare root needing a
+# subcommand. Failing a correct page is the direction that teaches readers to
+# ignore a gate, so the key is now matched rather than assumed.
+#
+# Only the two `ExecStart=` lines in `daemon.md` reach this branch in the whole
+# corpus, so narrowing it to the directives systemd actually executes costs no
+# coverage at all.
+_EXEC_DIRECTIVE = re.compile(
+    r'^Exec(?:Start(?:Pre|Post)?|Stop(?:Post)?|Reload|Condition)?=', re.I)
+
+
+def _exec_command(tok):
+    """True when `tok` is a service directive whose value is the binary."""
+    m = _EXEC_DIRECTIVE.match(tok)
+    return bool(m) and _exe_path(tok[m.end():])
+
+
 # A flag whose value is a whole command line for another shell.
 _SHELL_C = re.compile(r'^(-c|-C|--command)$')
 
@@ -919,12 +940,12 @@ def _from_tokens(tokens):
         i = _cron_prefix(segment)
         while i < len(segment) and (segment[i] in _PROMPT or segment[i] in _CONTROL
                                     or _ENV_TOKEN.match(segment[i])):
-            # An assignment whose VALUE is the binary is itself the command
-            # head, not something to step over: a systemd unit writes
+            # A service directive whose VALUE is the binary is itself the
+            # command head, not something to step over: a systemd unit writes
             # `ExecStart=/usr/local/bin/autumn db backup …`, and skipping it as
-            # an environment prefix left the whole recipe ungated.
-            assign = _ENV_TOKEN.match(segment[i])
-            if assign and _exe_path(segment[i][assign.end():]):
+            # an environment prefix left the whole recipe ungated. An ordinary
+            # assignment stays a prefix — it does not run its value.
+            if _exec_command(segment[i]):
                 break
             # `NAME=$(cat file)` tokenizes as `NAME=$` `(` `cat` `file` `)`, so
             # a command substitution in the value has to be stepped over as a
@@ -943,10 +964,7 @@ def _from_tokens(tokens):
             i += 1
         head = None
         if i < len(segment):
-            assign = _ENV_TOKEN.match(segment[i])
-            if _autumn_exe(segment[i]):
-                head = i
-            elif assign and _exe_path(segment[i][assign.end():]):
+            if _autumn_exe(segment[i]) or _exec_command(segment[i]):
                 head = i
         if head is not None:
             i = head
@@ -1602,6 +1620,28 @@ def self_test():
     unit = '```ini\n[Service]\nExecStart=/usr/local/bin/autumn migrate run\n```'
     expect([d for _, d, _, _ in invocations(unit)] == ['migrate run'],
            f'a systemd ExecStart= recipe must be read: {list(invocations(unit))}')
+    for directive in ('ExecStartPre', 'ExecStop', 'ExecReload'):
+        doc = f'```ini\n{directive}=/usr/local/bin/autumn migrate run\n```'
+        expect([d for _, d, _, _ in invocations(doc)] == ['migrate run'],
+               f'{directive}= is executed too: {list(invocations(doc))}')
+    # …but an ordinary assignment does NOT run its value. Documenting a
+    # reusable binary path is a correct and ordinary thing for a page to do,
+    # and reading it as a command reported it as a bare root — failing a
+    # correct page, which is the direction that teaches readers to ignore a
+    # gate. The KEY has to say the value is executed.
+    for assignment in ('BIN=/usr/local/bin/autumn',
+                       'AUTUMN=./autumn',
+                       'BIN="/usr/local/bin/autumn"',
+                       'EXECUTABLE=/usr/local/bin/autumn'):
+        doc = f'```bash\n{assignment}\n```'
+        expect(list(invocations(doc)) == [],
+               f'a plain assignment is not an invocation: {assignment} -> '
+               f'{list(invocations(doc))}')
+    # The variable being USED is still a command, and still not `autumn`:
+    # nothing resolves `$BIN`, so this degrades to silence rather than drift.
+    used = '```bash\nBIN=/usr/local/bin/autumn\n$BIN migrate run\n```'
+    expect(list(invocations(used)) == [],
+           f'a command run through a variable stays quiet: {list(invocations(used))}')
     # --- operators inside a command substitution do not separate commands,
     # but a plain subshell's really do.
     subst = ('```bash\nKEY=$(cat secret | tr -d \'x\') autumn migrate run\n```')
