@@ -854,9 +854,12 @@ _SHELL_C = re.compile(r'^(-c|-C|--command)$')
 # arguments — and recursing into the value reported a page for a command that
 # never runs. The same presence-versus-position mistake as the `--` separator
 # had: the option is only a command string when its OWNER makes it one.
+# Only the programs whose `-c` really is a shell command string. `ssh -c`
+# names a CIPHER and `kubectl -c` a container, so listing every program that
+# can reach a shell was the same over-broad reading one level down: what
+# matters is whose option it is AND what that option means to them.
 _SHELL_RUNNERS = {'sh', 'bash', 'zsh', 'ksh', 'dash', 'ash', 'busybox',
-                  'su', 'runuser', 'doas', 'fly', 'flyctl', 'heroku',
-                  'docker', 'podman', 'kubectl', 'oc', 'ssh'}
+                  'su', 'runuser', 'fly', 'flyctl'}
 # …and the runtimes that take `--entrypoint`, for the same reason.
 _CONTAINER_RUNNERS = {'docker', 'podman', 'nerdctl'}
 
@@ -897,7 +900,7 @@ _EXEC_KEY_LINE = re.compile(r'^\s*' + _QUALIFIED + r'(?:' + _EXEC_KEYS + r'):', 
 # was. The literal form (`|`) keeps its lines separate and is already right,
 # so only `>` is folded here.
 _FOLDED_KEY = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
-                         r'):\s*>[0-9+-]{0,2}\s*$', re.I)
+                         r'):\s*>[-+]?([0-9]?)[-+]?\s*$', re.I)
 # Any mapping key, used only to spot where one object ends and its sibling
 # begins — Compose names its services this way rather than with list items.
 _MAPPING_KEY = re.compile(r'^(\s*)[A-Za-z_][\w.-]*:(\s|$)')
@@ -912,7 +915,8 @@ _BLOCKQUOTE = re.compile(r'^\s*(?:>\s?)+')
 # The lookbehind excludes bash's HERE-STRING, `<<<EOF`, which feeds one word
 # to stdin and consumes no following lines at all — reading it as a heredoc
 # swallowed the command underneath it.
-_HEREDOC = re.compile(r'(?<!<)<<-?\s*(?:"([^"]+)"|\'([^\']+)\'|([A-Za-z_][\w-]*))')
+_HEREDOC = re.compile(r'(?<!<)<<-?\s*(?:"([^"]+)"|\'([^\']+)\''
+                      r'|\\([A-Za-z_][\w-]*)|([A-Za-z_][\w-]*))')
 # A slot key whose value is a plain scalar on the same line. Compose mixes the
 # forms freely — `entrypoint: ["autumn"]` with `command: migrate` — and reading
 # only the bracketed form left the pair half-assembled, so a valid recipe
@@ -1025,8 +1029,14 @@ def _nested_command(segment, j, tok, cmd=0):
     if j == 0:
         return False
     prev = segment[j - 1]
+    # The option's owner is the command word it is attached to, which is not
+    # always the segment head: in `kubectl exec pod -- sh -c '…'` the `-c` is
+    # sh's. Either the token before the option or the head may own it —
+    # `fly ssh console -C '…'` is the second shape, where the option sits
+    # several words after the program that defines it.
     after_c = (bool(_SHELL_C.match(prev))
-               and _is_runner(segment, cmd, _SHELL_RUNNERS))
+               and (_is_runner(segment, j - 2, _SHELL_RUNNERS)
+                    or _is_runner(segment, cmd, _SHELL_RUNNERS)))
     if ' ' in tok:
         marked = after_c or bool(_COMMAND_KEY.match(prev))
         if not marked and prev == '=' and j > 1:
@@ -1455,7 +1465,11 @@ def invocations(text):
         # continues nothing, and joining the next line onto it hid the command
         # there inside the printf's argv. Parity decides: an odd run escapes
         # the newline, an even one is literal backslashes.
-        body = line.rstrip()
+        # …and only OUTSIDE a comment. `echo ok # trailing \\` ends the
+        # command; the backslash is comment text. Joining there swallowed the
+        # next line into the comment, where shlex discarded it — a WRONG join,
+        # not the missed one I had reasoned it would be.
+        body = _strip_comment(line).rstrip()
         if (len(body) - len(body.rstrip('\\'))) % 2 == 1:
             held.append(body[:-1])
             if held_at is None:
@@ -1684,8 +1698,16 @@ def invocations(text):
             yield from close_folded()
         fold = _FOLDED_KEY.match(keyline)
         if fold:
-            folded, folded_at, folded_base = [[]], lineno, None
+            folded, folded_at = [[]], lineno
             folded_indent = len(fold.group(1))
+            # An explicit indentation indicator SETS the content column, so a
+            # line further right than it is more-indented and keeps its
+            # newline. Deriving the column from the first content line instead
+            # made that line the base and folded the block into one argv,
+            # hiding whatever followed. Only when there is no indicator does
+            # the first content line decide.
+            folded_base = (folded_indent + int(fold.group(2))
+                           if fold.group(2) else None)
             folded_slot = ('args' if _ARGS_KEY_LINE.match(keyline)
                            else 'entry' if _ENTRY_KEY_LINE.match(keyline)
                            else 'cmd' if _EXEC_KEY_LINE.match(keyline)
@@ -2414,7 +2436,8 @@ def self_test():
     expect(got == [None, 'autumn db'], f'`&` still separates two commands: {got}')
 
     # --- a heredoc body is DATA the shell writes, not commands it runs.
-    for opener in ("<<'EOF'", '<<"EOF"', '<<EOF', '<<-EOF'):
+    # A backslash quotes the delimiter too, exactly as the quote marks do.
+    for opener in ("<<'EOF'", '<<"EOF"', '<<EOF', '<<-EOF', '<<\\EOF', '<<-\\EOF'):
         doc = f'```bash\ncat >/tmp/x {opener}\nautumn db\nEOF\nautumn migrate run\n```'
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate run'],
@@ -2474,10 +2497,20 @@ def self_test():
         doc = f"```bash\n{runner} 'autumn migrate run'\n```"
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate run'], f'{runner!r} runs its string: {got}')
-    for other in ("echo -c", "printf -c", "ls -c"):
+    for other in ("echo -c", "printf -c", "ls -c",
+                  # `ssh -c` names a CIPHER and `kubectl -c` a container.
+                  "ssh -c", "kubectl logs -c"):
         doc = f"```bash\n{other} 'autumn db'\n```"
         expect(list(invocations(doc)) == [],
                f'{other!r} does not run its argument: {list(invocations(doc))}')
+    # …and the owner is the word the option is attached to, which is not
+    # always the segment head: a shell reached THROUGH another program still
+    # owns its own `-c`.
+    for nested in ('kubectl exec pod -- sh -c', 'docker exec c sh -c',
+                   'env FOO=1 sh -c', 'ssh host sh -c'):
+        doc = f"```bash\n{nested} 'autumn migrate run'\n```"
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'], f'{nested!r} owns its -c: {got}')
     for runner in ('docker run', 'podman run', 'nerdctl run'):
         doc = f'```bash\n{runner} --entrypoint autumn img migrate run\n```'
         got = [d for _, d, _, _ in invocations(doc)]
@@ -2495,6 +2528,11 @@ def self_test():
     real = '```bash\nautumn maintenance on \\\n  --reason x\n```'
     expect([d for _, d, _, _ in invocations(real)] == ['maintenance on --reason x'],
            f'a single backslash still continues: {list(invocations(real))}')
+    # …and a backslash inside a COMMENT continues nothing. Joining there
+    # swallowed the next line into the comment, where shlex discarded it.
+    commented = '```bash\necho ok # no continuation \\\nautumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(commented)] == ['migrate run'],
+           f'a backslash in a comment is comment text: {list(invocations(commented))}')
 
     # --- a folded scalar may carry an explicit indentation indicator, in
     # either order with the chomping one.
@@ -2502,6 +2540,17 @@ def self_test():
         doc = f'```yaml\nrun: {indicator}\n  autumn migrate\n  run\n```'
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate run'], f'`{indicator}` folds: {got}')
+    # An explicit indicator SETS the content column, so a line further right
+    # than it is more-indented and keeps its newline. Taking the column from
+    # the first content line instead folded the block into one argv and hid
+    # whatever followed. Both lines here sit at 4, with the indicator at 2.
+    explicit = '```yaml\nrun: >2-\n    autumn routes\n    autumn run\n```'
+    expect([d for _, d, _, _ in invocations(explicit)] == ['routes', 'run'],
+           f'an explicit indicator decides the base column: {list(invocations(explicit))}')
+    # …and with no indicator the first content line still decides.
+    implicit = '```yaml\nrun: >\n    autumn migrate\n    run\n```'
+    expect([d for _, d, _, _ in invocations(implicit)] == ['migrate run'],
+           f'without one, the first content line decides: {list(invocations(implicit))}')
 
     # --- a brace group runs the commands inside it, so `{` stands in front of
     # a command the way a subshell's `(` does.
