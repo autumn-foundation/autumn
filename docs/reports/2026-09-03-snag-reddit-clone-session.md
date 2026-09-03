@@ -49,11 +49,17 @@ was skipped as irrelevant to HTTP-level behavior).
   vote is cast. 10 truly concurrent same-value `POST /upvote` requests from
   one other session then landed back at `score = 1` / one row — consistent
   with `react()`'s documented toggle (an even number of toggles from a
-  voted starting state returns to voted), not a parity violation. The
-  underlying `votes.id` did change between runs (row deleted and
-  re-inserted an odd number of times across the ten toggles), confirming
-  the deletes/inserts actually happened serially rather than being
-  silently dropped. My first pass reported the `score = 1` / one-row
+  voted starting state returns to voted), not a parity violation. All ten
+  requests were individually confirmed successful — the harness recorded
+  a `303` with a `Location` header on every one of the ten responses
+  (`status counts: {303: 10}`, no errors, no other status code), which is
+  the evidence an ID change alone doesn't provide: it rules out the
+  alternative Codex raised on the prior revision (e.g. two successful
+  toggles plus eight dropped/failed requests reproducing the same final
+  row by coincidence). The underlying `votes.id` also changed between runs
+  (row deleted and re-inserted more than once across the ten toggles),
+  consistent with — but not on its own proof of — all ten executing.
+  My first pass reported the `score = 1` / one-row
   outcome without stating the pre-existing auto-vote, which made the
   parity look unexplained — flagged by an automated PR reviewer
   (`chatgpt-codex-connector`) on this same report and confirmed by
