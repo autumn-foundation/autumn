@@ -1,0 +1,5 @@
+error: unknown dependent action `cascade`; expected one of `destroy`, `delete_all`, `nullify`, `restrict`
+  --> tests/compile-fail/model_dependent_unknown_action.rs:31:21
+   |
+31 | #[has_many(Comment, dependent = cascade)]
+   |                     ^^^^^^^^^

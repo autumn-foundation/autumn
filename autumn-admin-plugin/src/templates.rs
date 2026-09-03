@@ -1803,7 +1803,7 @@ pub fn config_page(
                                 }
                                 td {
                                     @if entry.is_overridden {
-                                        span style="color: var(--warning); font-size: 0.8125rem; font-weight: 500;" {
+                                        span style="color: var(--warning-text); font-size: 0.8125rem; font-weight: 500;" {
                                             "overridden"
                                         }
                                     } @else {
@@ -1990,7 +1990,7 @@ fn render_cell_value(record: &Value, field: &AdminField) -> Markup {
         },
         Some(Value::Bool(b)) => html! {
             @if *b {
-                span style="color: var(--success);" { "✓" }
+                span style="color: var(--success-text);" { "✓" }
             } @else {
                 span style="color: var(--text-muted);" { "✗" }
             }
@@ -2580,6 +2580,128 @@ pub fn model_history_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // WCAG 1.4.3 (contrast minimum) relative-luminance / contrast-ratio
+    // formulas, applied to the admin plugin's own `tokens.css` color pairs.
+    // `#RRGGBB` only — every color literal in `tokens.css` is that shape.
+    fn hex_channel(hex: &str, i: usize) -> f64 {
+        f64::from(u8::from_str_radix(&hex[1 + i * 2..3 + i * 2], 16).unwrap()) / 255.0
+    }
+
+    fn relative_luminance(hex: &str) -> f64 {
+        let f = |c: f64| {
+            if c <= 0.039_28 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.0722f64.mul_add(
+            f(hex_channel(hex, 2)),
+            0.2126f64.mul_add(f(hex_channel(hex, 0)), 0.7152 * f(hex_channel(hex, 1))),
+        )
+    }
+
+    fn contrast_ratio(a: &str, b: &str) -> f64 {
+        let (la, lb) = (relative_luminance(a), relative_luminance(b));
+        let (lighter, darker) = if la >= lb { (la, lb) } else { (lb, la) };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    // Audited 2026-09-02 (Wayfinder). Config page (100% of admin-plugin
+    // deployments that register runtime-config keys) and every model list
+    // page's boolean columns both rendered their status text straight from
+    // `--warning`/`--success` on `--surface`: 3.19:1 and 3.77:1, both below
+    // WCAG AA's 4.5:1 normal-text threshold (the raw tokens are calibrated
+    // for the 3:1 large-text/border/icon uses they already had, not small
+    // foreground text). `--warning-text`/`--success-text` are the same hue
+    // darkened to the framework's existing flash-message foreground shade,
+    // reused here rather than inventing a new color.
+    const SURFACE: &str = "#ffffff";
+    const WARNING: &str = "#d97706";
+    const WARNING_TEXT: &str = "#92400e";
+    const SUCCESS: &str = "#059669";
+    const SUCCESS_TEXT: &str = "#065f46";
+
+    #[test]
+    fn raw_warning_and_success_tokens_fail_wcag_aa_text_contrast_on_surface() {
+        // Documents why `--warning`/`--success` may not be used directly as
+        // small/normal foreground text — the defect `-text` variants fix.
+        assert!(
+            contrast_ratio(WARNING, SURFACE) < 4.5,
+            "if this now passes, --warning's hex changed and the -text variant may be redundant"
+        );
+        assert!(
+            contrast_ratio(SUCCESS, SURFACE) < 4.5,
+            "if this now passes, --success's hex changed and the -text variant may be redundant"
+        );
+    }
+
+    #[test]
+    fn text_safe_warning_and_success_tokens_meet_wcag_aa_contrast_on_surface() {
+        assert!(
+            contrast_ratio(WARNING_TEXT, SURFACE) >= 4.5,
+            "--warning-text on --surface must clear WCAG AA 4.5:1"
+        );
+        assert!(
+            contrast_ratio(SUCCESS_TEXT, SURFACE) >= 4.5,
+            "--success-text on --surface must clear WCAG AA 4.5:1"
+        );
+        // tokens.css is the source of truth; keep these hex literals honest.
+        let css = include_str!("tokens.css");
+        assert!(
+            css.contains(&format!("--warning-text: {WARNING_TEXT}")),
+            "{css}"
+        );
+        assert!(
+            css.contains(&format!("--success-text: {SUCCESS_TEXT}")),
+            "{css}"
+        );
+    }
+
+    #[test]
+    fn config_page_overridden_status_uses_text_safe_warning_token() {
+        use autumn_web::runtime_config::{ConfigEntry, ConfigValue, ConfigValueType};
+
+        let r = dummy_registry();
+        let entries = vec![ConfigEntry {
+            name: "rate_limit".to_owned(),
+            value_type: ConfigValueType::Int,
+            current: ConfigValue::Int(200),
+            default: ConfigValue::Int(100),
+            is_overridden: true,
+            description: None,
+        }];
+        let html = config_page(
+            &r,
+            &entries,
+            &[],
+            "tok",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            None,
+        )
+        .into_string();
+        assert!(
+            html.contains("color: var(--warning-text)"),
+            "overridden status must use the text-safe warning token, not raw --warning: {html}"
+        );
+        assert!(!html.contains("color: var(--warning);"), "{html}");
+    }
+
+    #[test]
+    fn boolean_true_cell_uses_text_safe_success_token() {
+        let record = serde_json::json!({ "active": true });
+        let field = AdminField::new("active", AdminFieldKind::Boolean);
+        let cell = render_cell_value(&record, &field).into_string();
+        assert!(
+            cell.contains("color: var(--success-text)"),
+            "boolean-true cell must use the text-safe success token, not raw --success: {cell}"
+        );
+        assert!(!cell.contains("color: var(--success);"), "{cell}");
+    }
 
     // A model with at-rest encrypted columns (#805): `ssn` is redacted by default;
     // `audit_note` opts into `admin_visible` (shown in read views). The per-field

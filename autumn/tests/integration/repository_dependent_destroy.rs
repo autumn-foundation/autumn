@@ -203,6 +203,222 @@ pub struct ModelDepPost {
 #[autumn_web::repository(ModelDepPost, table = "dep_posts")]
 pub trait ModelDepPostRepository {}
 
+// ── #1702: model-declared `#[has_one(..., dependent = ...)]` ─────────────────
+//
+// Issue #1702 scope item 1 names `has_one` alongside `has_many`. The parser and
+// the `Model::dependents()` codegen treat the two kinds identically (both put
+// the foreign key on the *target*), but until now only the `has_many` spelling
+// was proven end to end. This graph is `has_one`-only, on its own tables, so it
+// cannot perturb the shared `dep_*` counters the tests above assert on.
+//
+// `dep_ho_posts` has at most one `dep_ho_profiles` row; the profile HOOKS, so
+// the test also proves a `has_one` destroy fires the child's lifecycle hook.
+
+diesel::table! {
+    dep_ho_posts (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+diesel::table! {
+    dep_ho_profiles (id) {
+        id -> Int8,
+        post_id -> Int8,
+        bio -> Text,
+    }
+}
+
+pub static DESTROYED_HO_PROFILES: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Default)]
+pub struct DepHoProfileHooks;
+
+impl MutationHooks for DepHoProfileHooks {
+    type Model = DepHoProfile;
+    type NewModel = NewDepHoProfile;
+    type UpdateModel = UpdateDepHoProfile;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &DepHoProfile,
+    ) -> AutumnResult<()> {
+        DESTROYED_HO_PROFILES.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[autumn_web::model(table = "dep_ho_profiles")]
+pub struct DepHoProfile {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub bio: String,
+}
+
+#[autumn_web::repository(DepHoProfile, table = "dep_ho_profiles", hooks = DepHoProfileHooks)]
+pub trait DepHoProfileRepository {}
+
+#[autumn_web::model(table = "dep_ho_posts")]
+#[has_one(DepHoProfile, fk = "post_id", name = md_profile, dependent = destroy)]
+pub struct ModelDepHoPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(ModelDepHoPost, table = "dep_ho_posts")]
+pub trait ModelDepHoPostRepository {}
+
+// Codex round 2: the BULK has_one test gets its own graph and its own counter.
+// Sharing `DESTROYED_HO_PROFILES` with the single-record test above would make
+// the pair order-dependent — each resets the counter and then asserts a
+// different total, so under libtest's default parallel mode (which a direct
+// local `cargo test -- --ignored` run uses; only CI's sweep passes
+// `--test-threads=1`) one test's reset could land between the other's reset and
+// its assertion. A dedicated graph is how every other scenario in this file
+// stays independent, so the bulk case gets one too.
+
+diesel::table! {
+    dep_ho2_posts (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+diesel::table! {
+    dep_ho2_profiles (id) {
+        id -> Int8,
+        post_id -> Int8,
+        bio -> Text,
+    }
+}
+
+pub static DESTROYED_HO2_PROFILES: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Default)]
+pub struct DepHo2ProfileHooks;
+
+impl MutationHooks for DepHo2ProfileHooks {
+    type Model = DepHo2Profile;
+    type NewModel = NewDepHo2Profile;
+    type UpdateModel = UpdateDepHo2Profile;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &DepHo2Profile,
+    ) -> AutumnResult<()> {
+        DESTROYED_HO2_PROFILES.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[autumn_web::model(table = "dep_ho2_profiles")]
+pub struct DepHo2Profile {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub bio: String,
+}
+
+#[autumn_web::repository(
+    DepHo2Profile,
+    table = "dep_ho2_profiles",
+    hooks = DepHo2ProfileHooks
+)]
+pub trait DepHo2ProfileRepository {}
+
+#[autumn_web::model(table = "dep_ho2_posts")]
+#[has_one(DepHo2Profile, fk = "post_id", name = md_profile, dependent = destroy)]
+pub struct ModelDepHo2Post {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(ModelDepHo2Post, table = "dep_ho2_posts")]
+pub trait ModelDepHo2PostRepository {}
+
+// ── #1702 scope item 3: the both-sites precedence rule, behaviourally ────────
+//
+// The reconciliation this issue asked for is "repository attribute wins; the
+// model-side declaration is the one that goes inert". That decision is proven at
+// the token level by the repository macro's codegen tests, but nothing exercised
+// it against a live database — so this graph declares BOTH sites at once, on
+// DIFFERENT children, making the winner observable by which child moves.
+//
+//   bs_parents
+//     - bs_children  repository-attribute  dependent(..., on_delete = destroy)
+//     - bs_ghosts    model-attribute       #[has_many(..., dependent = destroy)]
+//
+// `bs_ghosts.parent_id` deliberately carries NO foreign key constraint: if the
+// model-side leg were (wrongly) also active, the ghost rows would be destroyed;
+// because it is inert, they survive with a now-dangling parent_id. Without the
+// constraint the parent delete succeeds either way, so the assertion — not a
+// database error — is what decides the test.
+
+diesel::table! {
+    bs_parents (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+diesel::table! {
+    bs_children (id) {
+        id -> Int8,
+        parent_id -> Int8,
+        body -> Text,
+    }
+}
+
+diesel::table! {
+    bs_ghosts (id) {
+        id -> Int8,
+        parent_id -> Int8,
+        body -> Text,
+    }
+}
+
+#[autumn_web::model(table = "bs_children")]
+pub struct BsChild {
+    #[id]
+    pub id: i64,
+    pub parent_id: i64,
+    pub body: String,
+}
+
+#[autumn_web::repository(BsChild, table = "bs_children")]
+pub trait BsChildRepository {}
+
+#[autumn_web::model(table = "bs_ghosts")]
+pub struct BsGhost {
+    #[id]
+    pub id: i64,
+    pub parent_id: i64,
+    pub body: String,
+}
+
+#[autumn_web::repository(BsGhost, table = "bs_ghosts")]
+pub trait BsGhostRepository {}
+
+#[autumn_web::model(table = "bs_parents")]
+#[has_many(BsGhost, fk = "parent_id", name = bs_ghosts, dependent = destroy)]
+pub struct BsParent {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(
+    BsParent,
+    table = "bs_parents",
+    dependent(PgBsChildRepository, fk = "parent_id", on_delete = destroy)
+)]
+pub trait BsParentRepository {}
+
 // ── AC3: both-soft destroy graph (soft parent + soft children) ────────────────
 //
 // The parent is `#[soft_delete]` too, so `delete_by_id` soft-deletes the parent
@@ -1269,6 +1485,19 @@ async fn setup_pool() -> (
         // #1800 case 3: parent with a before_delete hook AND a restrict dependent.
         "CREATE TABLE ph_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
         "CREATE TABLE ph_guards (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES ph_posts(id), name TEXT NOT NULL)",
+        // #1702: model-declared `#[has_one(..., dependent = destroy)]` graph.
+        "CREATE TABLE dep_ho_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE dep_ho_profiles (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep_ho_posts(id), bio TEXT NOT NULL)",
+        // #1702 scope item 3: both declaration sites on one parent. `bs_ghosts`
+        // intentionally has NO foreign key, so the parent delete succeeds whether
+        // or not the (inert) model-side leg runs — the row counts decide the test.
+        "CREATE TABLE bs_parents (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE bs_children (id BIGSERIAL PRIMARY KEY, parent_id BIGINT NOT NULL REFERENCES bs_parents(id), body TEXT NOT NULL)",
+        "CREATE TABLE bs_ghosts (id BIGSERIAL PRIMARY KEY, parent_id BIGINT NOT NULL, body TEXT NOT NULL)",
+        // Codex round 2: dedicated graph for the BULK has_one test, so its hook
+        // counter is not shared with the single-record has_one test.
+        "CREATE TABLE dep_ho2_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE dep_ho2_profiles (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep_ho2_posts(id), bio TEXT NOT NULL)",
     ] {
         diesel::sql_query(stmt)
             .execute(&mut conn)
@@ -1357,6 +1586,30 @@ fn dependent_repository_surface_is_generated() {
     // through `preload::FkKey`, so a nullable-FK association compiles.
     assert_is_fn(ModelDepPost::dependents);
     assert_eq!(ModelDepPost::dependents().len(), 4);
+    // #1702: `#[has_one(..., dependent = ...)]` drives the SAME runtime dispatch
+    // as `#[has_many]` — the kind issue #1702 names alongside it. Monomorphize the
+    // has_one parent's single- and bulk-delete paths and assert the model exposes
+    // exactly the one spec its single `has_one` leg declares.
+    assert_is_fn(<PgModelDepHoPostRepository as ModelDepHoPostRepository>::delete_by_id);
+    assert_is_fn(<PgModelDepHoPostRepository as ModelDepHoPostRepository>::delete_many);
+    assert_is_fn(PgDepHoProfileRepository::__autumn_apply_dependent_on_conn);
+    // #1702 scope item 3: the both-sites parent monomorphizes on both delete
+    // paths. Its `config.dependents` is non-empty (repository attribute present),
+    // so the compile-time cascade is what gets emitted and the model's own
+    // `dependents()` — which still reports its one inert spec — is not consulted.
+    assert_is_fn(<PgModelDepHo2PostRepository as ModelDepHo2PostRepository>::delete_many);
+    assert_is_fn(PgDepHo2ProfileRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(<PgBsParentRepository as BsParentRepository>::delete_by_id);
+    assert_is_fn(<PgBsParentRepository as BsParentRepository>::delete_many);
+    assert_is_fn(PgBsChildRepository::__autumn_apply_dependent_on_conn);
+    assert_eq!(BsParent::dependents().len(), 1);
+    let ho_specs = ModelDepHoPost::dependents();
+    assert_eq!(ho_specs.len(), 1);
+    assert_eq!(ho_specs[0].fk, "post_id");
+    assert_eq!(
+        ho_specs[0].action,
+        ::autumn_web::repository::DependentAction::Destroy
+    );
     // Codex P1: the fully model-side three-level graph monomorphizes. The key
     // new codegen is the intermediate `M3Comment`'s cascade leaf executor —
     // its Destroy arm now runtime-dispatches into `M3Comment::dependents()`
@@ -2487,6 +2740,327 @@ async fn model_declared_dependent_cascades_like_repository_attribute() {
         .await,
         0,
         "delete_all child rows removed via the model-declared cascade"
+    );
+}
+
+/// #1702: the model-declared cascade works on `#[has_one]`, not just
+/// `#[has_many]`. Deleting the parent destroys its single `has_one` child in the
+/// same transaction and fires that child's `before_delete` hook — the same
+/// runtime `Model::dependents()` dispatch the `has_many` spelling uses, proven
+/// end to end for the kind issue #1702 names alongside `has_many`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn model_declared_has_one_dependent_destroys_the_child() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_ho_posts (id, title) VALUES (1, 'has-one parent')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dep_ho_profiles (id, post_id, bio) VALUES (1, 1, 'bio')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // A second parent + profile that must be left completely untouched, so the
+    // cascade is proven to be keyed on the deleted parent rather than sweeping
+    // the child table.
+    diesel::sql_query("INSERT INTO dep_ho_posts (id, title) VALUES (2, 'bystander')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dep_ho_profiles (id, post_id, bio) VALUES (2, 2, 'keep me')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    DESTROYED_HO_PROFILES.store(0, Ordering::SeqCst);
+
+    let repo = PgModelDepHoPostRepository::with_pool_untracked(pool.clone());
+    repo.delete_by_id(1)
+        .await
+        .expect("model-declared has_one cascade must not FK-error");
+
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_ho_posts WHERE id = 1"
+        )
+        .await,
+        0,
+        "parent gone"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_ho_profiles WHERE post_id = 1"
+        )
+        .await,
+        0,
+        "the has_one child was destroyed by the model-declared cascade"
+    );
+    assert_eq!(
+        AtomicUsize::load(&DESTROYED_HO_PROFILES, Ordering::SeqCst),
+        1,
+        "the destroyed has_one child fired its before_delete hook exactly once"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_ho_profiles WHERE post_id = 2"
+        )
+        .await,
+        1,
+        "an unrelated parent's has_one child is untouched"
+    );
+}
+
+/// #1702 scope item 3: when BOTH declaration sites are present, the repository
+/// attribute wins and the model-side `#[has_many(..., dependent = ...)]` is
+/// inert — proven against a live database rather than only at the token level.
+///
+/// `BsParent` declares `dependent(PgBsChildRepository, ...)` on its repository
+/// AND `#[has_many(BsGhost, ..., dependent = destroy)]` on its model. Deleting a
+/// parent must destroy the repository-declared children and leave the
+/// model-declared ghosts completely untouched.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn repository_attribute_wins_over_model_declared_dependent() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO bs_parents (id, title) VALUES (1, 'both sites')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for i in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO bs_children (id, parent_id, body) VALUES ({i}, 1, 'child {i}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO bs_ghosts (id, parent_id, body) VALUES ({i}, 1, 'ghost {i}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    let repo = PgBsParentRepository::with_pool_untracked(pool.clone());
+    repo.delete_by_id(1)
+        .await
+        .expect("the repository-attribute cascade must clear the FK-bearing children");
+
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM bs_parents WHERE id = 1"
+        )
+        .await,
+        0,
+        "parent gone"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM bs_children WHERE parent_id = 1"
+        )
+        .await,
+        0,
+        "the repository-attribute `dependent(...)` cascade ran"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM bs_ghosts WHERE parent_id = 1"
+        )
+        .await,
+        2,
+        "the model-side `#[has_many(..., dependent = destroy)]` is inert when the \
+         repository attribute is present — its children must survive"
+    );
+}
+
+/// #1702: the bulk path honors the same precedence. `delete_many` on a parent
+/// declaring both sites must run only the repository-attribute cascade, leaving
+/// the model-declared ghosts of every batched parent in place.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_repository_attribute_wins_over_model_declared_dependent() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    for p in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO bs_parents (id, title) VALUES ({p}, 'batch {p}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO bs_children (id, parent_id, body) VALUES ({p}, {p}, 'child')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO bs_ghosts (id, parent_id, body) VALUES ({p}, {p}, 'ghost')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    let repo = PgBsParentRepository::with_pool_untracked(pool.clone());
+    repo.delete_many(&[1, 2])
+        .await
+        .expect("bulk repository-attribute cascade must not FK-error");
+
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM bs_parents").await,
+        0,
+        "both parents gone"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM bs_children").await,
+        0,
+        "the repository-attribute cascade ran for every batched parent"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM bs_ghosts").await,
+        2,
+        "the model-side declaration stays inert on the bulk path too"
+    );
+}
+
+/// #1702: the model-declared `has_one` cascade also runs on the BULK path.
+/// `delete_many` must destroy each batched parent's single `has_one` child and
+/// fire its hook exactly once per child — the bulk counterpart of
+/// `model_declared_has_one_dependent_destroys_the_child`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_model_declared_has_one_dependent_destroys_children() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    for p in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_ho2_posts (id, title) VALUES ({p}, 'bulk has-one {p}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO dep_ho2_profiles (id, post_id, bio) VALUES ({p}, {p}, 'bio {p}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    // A third parent left out of the batch, to prove the bulk cascade is keyed on
+    // the batched ids rather than sweeping the child table.
+    diesel::sql_query("INSERT INTO dep_ho2_posts (id, title) VALUES (3, 'not batched')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dep_ho2_profiles (id, post_id, bio) VALUES (3, 3, 'keep me')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    DESTROYED_HO2_PROFILES.store(0, Ordering::SeqCst);
+
+    let repo = PgModelDepHo2PostRepository::with_pool_untracked(pool.clone());
+    repo.delete_many(&[1, 2])
+        .await
+        .expect("bulk model-declared has_one cascade must not FK-error");
+
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_ho2_profiles WHERE post_id IN (1, 2)"
+        )
+        .await,
+        0,
+        "each batched parent's has_one child was destroyed"
+    );
+    assert_eq!(
+        AtomicUsize::load(&DESTROYED_HO2_PROFILES, Ordering::SeqCst),
+        2,
+        "each destroyed has_one child fired its before_delete hook exactly once"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_ho2_profiles WHERE post_id = 3"
+        )
+        .await,
+        1,
+        "a parent outside the batch keeps its has_one child"
+    );
+}
+
+/// #1702: a model-declared `restrict` blocks the BULK path too. `ModelDepPost`
+/// declares `#[has_many(DepAward, ..., dependent = restrict)]` model-side only,
+/// so `delete_many` must probe it first, answer 409, and roll the whole batch
+/// back — leaving both parents and every other child of theirs in place.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_model_declared_restrict_blocks_and_rolls_back() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    for p in 41..=42 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_posts (id, title) VALUES ({p}, 'model restrict {p}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO dep_comments (id, post_id, body) VALUES ({p}, {p}, 'c')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    // Only the SECOND parent has a restricting award, so the rollback must also
+    // restore the first parent's already-cascadable comment.
+    diesel::sql_query("INSERT INTO dep_awards (id, post_id, name) VALUES (41, 42, 'gold')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let repo = PgModelDepPostRepository::with_pool_untracked(pool.clone());
+    let err = repo
+        .delete_many(&[41, 42])
+        .await
+        .expect_err("a model-declared restrict must block the bulk delete");
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::CONFLICT,
+        "model-declared restrict answers a typed 409: {err}"
+    );
+
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_posts WHERE id IN (41, 42)"
+        )
+        .await,
+        2,
+        "the whole batch rolled back — neither parent was deleted"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_comments WHERE post_id IN (41, 42)"
+        )
+        .await,
+        2,
+        "the restrict probe ran before any mutating cascade, so no comment was destroyed"
     );
 }
 

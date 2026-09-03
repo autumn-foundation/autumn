@@ -886,6 +886,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dev inspector's detail route (`{inspector_path}/requests/{id}`) is claimed
   alongside its index — both now derive from `inspector_endpoint_paths`, so the
   claim set cannot drift from what the router actually mounts.
+- **🧭 Wayfinder: text-safe warning/success colors in the admin plugin
+  (WCAG contrast 3.19:1 / 3.77:1 → 4.5:1+):** the Runtime Config page's
+  "overridden" status badge (`--warning` #d97706 on `--surface`, every
+  deployment's config page) and every model list page's boolean-field ✓
+  checkmark (`--success` #059669 on `--surface`, rendered for every boolean
+  column in every row) used their raw semantic color token directly as
+  small/normal foreground text — tokens calibrated for the 3:1 large-text/
+  border/icon uses they already had, not WCAG AA's 4.5:1 normal-text
+  threshold. New `--warning-text` (#92400e) and `--success-text` (#065f46)
+  tokens, matching the framework's existing flash-message foreground shades,
+  fix both sites without introducing a new color.
+- **Dependent cascades are documented where the guide already pointed, and the
+  `through =` rejection points at the offending key (#1702):** the repositories
+  guide had no dependent-cascade section at all, even though the counter-cache
+  guide sent readers there for it, and the macro-transparency guide still
+  described the cascade as **single-level with grandchildren unhandled** and as
+  `delete_by_id`-only — both untrue since the cascade became recursive (#1739)
+  and bulk-aware (#1740). `docs/guide/repositories.md` now carries the canonical
+  treatment: both declaration sites (`#[has_many(Child, dependent = <action>)]`
+  on the model, `dependent(PgChildRepository, fk = "...", on_delete = ...)` on
+  the repository as the escape hatch for children outside the
+  `Pg{Child}Repository` convention), the precedence rule between them, the four
+  actions, the transactional/ordering guarantees, and the rejected combinations;
+  `docs/guide/macro-transparency.md` is corrected and links to it. Alongside it,
+  a `dependent`/`on_delete` on a `through = <join_table>` association now spans
+  the `dependent` key itself rather than the association's target ident, so the
+  caret lands on the thing the error tells you to remove. The model-declared
+  `destroy` cascade on `#[has_one]` is now proven end to end, the precedence
+  between the two declaration sites is proven behaviourally, and the three directed
+  compile errors (`dependent` on `#[belongs_to]`, on a `through =` association,
+  and an unknown action) are pinned by trybuild fixtures.
+
 - **ACME config: `autumn doctor` and the runtime now reject the same two
   spellings (#1874):** two low-severity parity gaps let `autumn doctor
   --strict` bless an `autumn.toml` the server refuses to boot on. A
