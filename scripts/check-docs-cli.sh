@@ -1580,6 +1580,36 @@ def _heredoc_openers(text):
                not quoted)
 
 
+def _body_expansions(text):
+    """Yield the command text of every LIVE expansion in a heredoc body.
+
+    Quoting is not special in a body — `'$(autumn …)'` still expands — but a
+    BACKSLASH is: bash's here-document rules let it quote `$` and a backtick,
+    so `\\$(…)` and `` \\` `` are printed rather than run. And a body expands
+    legacy backtick substitutions too, which the `$(` scan alone missed.
+
+    Parity is read straight off the raw line here. That works only because
+    nothing has been tokenized: on a command line shlex resolves `\\\\$(` and
+    `\\$(` to the same characters, which is why THAT path has to decide it from
+    a masked copy instead.
+    """
+    for start, inner in _embedded_spans(text):
+        if not _escaped(text, start):
+            yield inner
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != '`' or _escaped(text, i):
+            i += 1
+            continue
+        end = i + 1
+        while end < n and (text[end] != '`' or _escaped(text, end)):
+            end += 1
+        if end >= n:
+            return                          # unterminated: not a substitution
+        yield text[i + 1:end]
+        i = end + 1
+
+
 def _script_lines(lines):
     """Yield the (lineno, text) of `lines` that are COMMANDS, not data.
 
@@ -1600,7 +1630,7 @@ def _script_lines(lines):
             if candidate.rstrip('\r') == delim:
                 heredocs.pop(0)
             elif expands:
-                for _, inner in _embedded_spans(text):
+                for inner in _body_expansions(text):
                     yield lineno, inner
             continue
         if quote:
@@ -2189,10 +2219,11 @@ def invocations(text):
             if candidate.rstrip('\r') == delim:
                 heredocs.pop(0)
             elif expands:
-                # The body is DATA, but an unquoted delimiter still lets a
-                # substitution inside it run. Quoting is not special in a
-                # heredoc body, so the spans are read from the raw line.
-                for _, inner in _embedded_spans(line):
+                # The body is DATA, but an unquoted delimiter still lets an
+                # expansion inside it run. Quoting is not special in a heredoc
+                # body — only a backslash is — so the spans are read from the
+                # raw line by the rules `_body_expansions` states.
+                for inner in _body_expansions(line):
                     for display, argv in commands(inner):
                         yield lineno, display, argv, FENCED_COMMAND
             continue
@@ -4608,6 +4639,41 @@ def self_test():
            == ['migrate'], 'an unquoted eval is read exactly once')
     expect(list(invocations("```bash\necho 'autumn nope'\n```")) == [],
            'echo does not eval its argument')
+
+    # In a heredoc BODY, quoting is not special but a BACKSLASH is: bash's
+    # here-document rules let it quote `$` and a backtick. And a body expands
+    # legacy backtick substitutions too, which the `$(` scan alone missed.
+    for body, want in (('$(autumn nope)', ['nope']),
+                       ('\\$(autumn nope)', []),
+                       ('\\\\$(autumn nope)', ['nope']),
+                       ('`autumn nope`', ['nope']),
+                       ('\\`autumn nope\\`', []),
+                       ('`autumn nope', []),
+                       ('autumn nope', []),
+                       ('$(autumn nope) `autumn nada`', ['nope', 'nada'])):
+        doc = f'```bash\ncat <<EOF\n{body}\nEOF\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == want, f'heredoc body {body!r} -> {got} != {want}')
+    # A QUOTED delimiter expands nothing at all, whichever form is written.
+    none_doc = "```bash\ncat <<'EOF'\n$(autumn nope) `autumn nada`\nEOF\n```"
+    expect(list(invocations(none_doc)) == [],
+           f'a quoted delimiter expands nothing: {list(invocations(none_doc))}')
+    # The same rules inside a literal `run: |`, which reaches them by a
+    # different path and so has to be checked separately.
+    for body, want in (('$(autumn nope)', ['nope']), ('\\$(autumn nope)', []),
+                       ('`autumn nope`', ['nope'])):
+        doc = f'```yaml\nrun: |\n  cat <<EOF\n  {body}\n  EOF\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == want, f'literal-block heredoc body {body!r}: {got}')
+    # …and the COMMAND-LINE rules are unchanged, which matters because the two
+    # contexts answer the same question by different means: on a command line
+    # tokenization destroys backslash parity, so the decision is made from a
+    # masked copy; in a body nothing is tokenized and it is read off the text.
+    for line, want in (('printf \'%s\' "\\$(autumn nope)"', []),
+                       ('printf \'%s\' "\\\\$(autumn nope)"', ['nope'])):
+        doc = f'```bash\n{line}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == want, f'command line {line!r} -> {got} != {want}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
