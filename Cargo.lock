@@ -568,6 +568,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "autumn-plugin-reference"
+version = "0.7.0"
+dependencies = [
+ "autumn-web",
+ "maud",
+]
+
+[[package]]
 name = "autumn-schema-core"
 version = "0.7.0"
 dependencies = [
@@ -687,6 +695,7 @@ dependencies = [
  "rusty-fork",
  "scoped-futures",
  "secrecy",
+ "semver",
  "serde",
  "serde_json",
  "serde_path_to_error",

@@ -215,6 +215,7 @@ mod payload_version_integration;
 mod pdf;
 #[cfg(feature = "db")]
 mod pg_tls;
+mod plugin_contract;
 #[cfg(feature = "db")]
 mod position_repository_integration;
 #[cfg(feature = "db")]

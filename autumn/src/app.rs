@@ -95,6 +95,7 @@ pub fn app() -> AppBuilder {
         shutdown_hooks: Vec::new(),
         extensions: HashMap::new(),
         registered_plugins: HashSet::new(),
+        plugin_contracts: Vec::new(),
         plugin_config_roots: BTreeSet::new(),
         #[cfg(feature = "maud")]
         error_page_renderer: None,
@@ -345,6 +346,12 @@ pub struct AppBuilder {
     pub(crate) extensions: HashMap<TypeId, Box<dyn Any + Send>>,
     /// Plugin names that have already been applied, for duplicate detection.
     pub(crate) registered_plugins: HashSet<String>,
+    /// Compatibility contracts declared by the plugins applied to this builder
+    /// (issue #1601), in registration order. Emitted after
+    /// [`PLUGIN_CONTRACT_MARKER`](crate::plugin_contract::PLUGIN_CONTRACT_MARKER)
+    /// by the route dump so `autumn plugin-check` can report experimental
+    /// surface use without linking the plugin itself.
+    pub(crate) plugin_contracts: Vec<crate::plugin_contract::PluginContract>,
     /// Top-level config roots plugins have declared as their own opaque config
     /// sections via [`config_section`](AppBuilder::config_section). Threaded into
     /// the default config loader so `server.strict_config` treats them as
@@ -2747,6 +2754,16 @@ impl AppBuilder {
             );
             return self;
         }
+        if let Some(mut contract) = plugin.contract() {
+            Self::enforce_plugin_contract(&contract);
+            // Route attribution keys on `Plugin::name()` while a contract names
+            // the plugin's CRATE; the default `name()` is `type_name`, so a
+            // plugin that declares `env!("CARGO_PKG_NAME")` without overriding
+            // `name()` has two identities. Carry both so
+            // `autumn plugin-check --plugin-name` finds it under either.
+            contract.registered_as = Some(name.as_ref().to_owned());
+            self.plugin_contracts.push(contract);
+        }
         let name_str = name.into_owned();
         self.registered_plugins.insert(name_str.clone());
         // Save outer plugin context so nested plugin() calls don't permanently
@@ -2772,6 +2789,80 @@ impl AppBuilder {
     #[must_use]
     pub fn has_plugin(&self, name: &str) -> bool {
         self.registered_plugins.contains(name)
+    }
+
+    /// The compatibility contracts declared by the plugins applied so far
+    /// (issue #1601), in registration order.
+    ///
+    /// A plugin that returns `None` from
+    /// [`Plugin::contract`](crate::plugin::Plugin::contract) contributes
+    /// nothing here, and a duplicate registration contributes once — the
+    /// duplicate is skipped before its contract is read.
+    #[must_use]
+    pub fn plugin_contracts(&self) -> &[crate::plugin_contract::PluginContract] {
+        &self.plugin_contracts
+    }
+
+    /// Check one plugin's declared `autumn-web` range against the framework it
+    /// is actually compiled into.
+    ///
+    /// An incompatible pairing **panics** at registration: the plugin is about
+    /// to wire itself into an application built on a framework it does not
+    /// claim to support, and the whole point of the contract is that this stops
+    /// being a silent surprise. The message names both versions and both
+    /// remedies.
+    ///
+    /// A requirement that cannot be parsed only warns. It is the *plugin
+    /// author's* typo, and `autumn plugin-check` fails on it in their CI —
+    /// hard-failing here would punish an application author for a mistake they
+    /// cannot fix.
+    ///
+    /// # The escape hatch
+    ///
+    /// The one thing an application author *cannot* fix is a plugin whose
+    /// declared range is merely stale — cargo has already proven the two link
+    /// one `autumn-web`, so an over-tight literal in somebody else's crate
+    /// should not be able to strand a working deployment. Setting
+    /// `AUTUMN_PLUGIN_CONTRACT=warn` downgrades the panic to a `tracing::warn!`
+    /// carrying the same message. It is named in the panic text itself, so the
+    /// person who hits it does not have to find this doc first. Loud-by-default
+    /// is the point; unbootable-with-no-recourse is not.
+    ///
+    /// Note that a **duplicate** registration is skipped before its contract is
+    /// read, so enforcement applies to the first plugin registered under a
+    /// given name.
+    #[track_caller]
+    fn enforce_plugin_contract(contract: &crate::plugin_contract::PluginContract) {
+        use crate::plugin_contract::{AUTUMN_WEB_VERSION, ContractVerdict, evaluate};
+
+        match evaluate(contract, AUTUMN_WEB_VERSION) {
+            ContractVerdict::Compatible | ContractVerdict::Undeclared => {}
+            ContractVerdict::Incompatible(err) => {
+                if std::env::var("AUTUMN_PLUGIN_CONTRACT").as_deref() == Ok("warn") {
+                    tracing::warn!(
+                        plugin = contract.plugin.as_str(),
+                        "{err}\n  (demoted to a warning by AUTUMN_PLUGIN_CONTRACT=warn)"
+                    );
+                } else {
+                    panic!(
+                        "{err}\n  \u{2192} or, to boot anyway while you sort it out, set \
+                         AUTUMN_PLUGIN_CONTRACT=warn"
+                    );
+                }
+            }
+            ContractVerdict::Unparseable {
+                requirement,
+                reason,
+            } => {
+                tracing::warn!(
+                    plugin = contract.plugin.as_str(),
+                    requirement = requirement.as_str(),
+                    reason = reason.as_str(),
+                    "plugin declares an autumn-web requirement that cannot be evaluated; \
+                     compatibility was NOT checked (run `autumn plugin-check` on the plugin)"
+                );
+            }
+        }
     }
 
     /// Declare a plugin-owned top-level config section so it coexists with
@@ -3324,6 +3415,7 @@ impl AppBuilder {
             shutdown_hooks,
             extensions: _,
             registered_plugins: _,
+            plugin_contracts: _,
             plugin_config_roots,
             #[cfg(feature = "maud")]
             error_page_renderer,
@@ -5190,6 +5282,7 @@ impl AppBuilder {
             shutdown_hooks: _,
             extensions: _,
             registered_plugins: _,
+            plugin_contracts: _,
             plugin_config_roots,
             #[cfg(feature = "maud")]
                 error_page_renderer: _,
@@ -5694,6 +5787,7 @@ impl AppBuilder {
             #[cfg(feature = "openapi")]
             openapi,
             plugin_config_roots,
+            plugin_contracts,
             ..
         } = self;
 
@@ -5775,6 +5869,21 @@ impl AppBuilder {
                     marker = crate::route_listing::SECURITY_CONFIG_MARKER
                 ),
                 Err(e) => eprintln!("Failed to serialize security config: {e}"),
+            }
+        }
+
+        // Emit the plugin compatibility contracts declared by this app's
+        // plugins (issue #1601). Gated on `AUTUMN_DUMP_PLUGIN_CONTRACT` so only
+        // `autumn plugin-check` sees it, and emitted even when the array is
+        // empty: the CLI distinguishes "this binary declares no contracts" from
+        // "this binary predates the marker" by the line's presence.
+        if is_dump_plugin_contract_mode() {
+            match serde_json::to_string(&plugin_contracts) {
+                Ok(json) => eprintln!(
+                    "{marker}{json}",
+                    marker = crate::plugin_contract::PLUGIN_CONTRACT_MARKER
+                ),
+                Err(e) => eprintln!("Failed to serialize plugin contracts: {e}"),
             }
         }
 
@@ -7052,6 +7161,16 @@ fn exit_stop_managed_pg() {
 
 pub(crate) fn is_dump_routes_mode() -> bool {
     std::env::var("AUTUMN_DUMP_ROUTES").as_deref() == Ok("1")
+}
+
+/// Whether the dump should also emit the declared plugin contracts
+/// ([`PLUGIN_CONTRACT_MARKER`](crate::plugin_contract::PLUGIN_CONTRACT_MARKER)).
+///
+/// Set by `autumn plugin-check`, which needs the contracts to report
+/// experimental-surface use. The plain `autumn routes` listing does not set it,
+/// so its stderr is unchanged.
+pub(crate) fn is_dump_plugin_contract_mode() -> bool {
+    std::env::var("AUTUMN_DUMP_PLUGIN_CONTRACT").as_deref() == Ok("1")
 }
 
 /// Whether the dump should also emit the resolved security configuration
