@@ -1028,17 +1028,31 @@ def _unwrap(tokens):
 
 
 def _embedded_substitutions(tok):
-    """Yield the text inside each `$( … )` written within a single token."""
+    """Yield the text inside each `$( … )` written within a single token.
+
+    The depth count is quote-aware: a parenthesis inside a quoted argument is
+    data, not nesting. `OUT="$(printf '('; autumn migrate)"` opened a depth the
+    real `)` then only closed halfway, so the substitution was never terminated
+    and the command inside it was dropped.
+    """
     i = 0
     while True:
         start = tok.find('$(', i)
         if start < 0:
             return
-        depth, j = 0, start + 1
+        depth, j, quote = 0, start + 1, None
         while j < len(tok):
-            if tok[j] == '(':
+            ch = tok[j]
+            if quote:
+                if ch == quote:
+                    quote = None
+            elif ch in '"\'':
+                quote = ch
+            elif ch == '\\':
+                j += 1
+            elif ch == '(':
                 depth += 1
-            elif tok[j] == ')':
+            elif ch == ')':
                 depth -= 1
                 if depth == 0:
                     break
@@ -1180,6 +1194,32 @@ def _from_tokens(tokens):
 # A token that could name a command. Anything else — a flag, a `<PLACEHOLDER>`,
 # a TOML `= "0.1.0"`, a box-drawing character from a diagram — ends the walk.
 TOKEN = re.compile(r'^[a-z][a-z0-9-]*$')
+
+# A redirection is shell plumbing, not part of the command. `<` and `>` are
+# deliberately NOT in `_PUNCTUATION` — the docs write `--shard <new>` and
+# splitting on the angle brackets invented a phantom subcommand — so a
+# redirection arrives as one token and stopped the walk before it could judge
+# whether the command was complete: `autumn db >/tmp/out` passed while the
+# identical `autumn db` was reported.
+#
+# A placeholder is told apart by its shape rather than by position: `<new>`
+# closes its own bracket, and no redirection target does.
+_PLACEHOLDER = re.compile(r'^<[^<>\s]*>$')
+_REDIRECT = re.compile(r'^(?:[0-9]+|&)?(?:>>?|<<?<?)(?:&[0-9]+-?)?(.*)$')
+
+
+def _redirect(tok):
+    """Tokens a redirection consumes, or 0 when this is not one.
+
+    1 when the target is glued on (`>/tmp/out`, `2>&1`), 2 when it is the next
+    token (`> /tmp/out`).
+    """
+    if _PLACEHOLDER.match(tok):
+        return 0
+    m = _REDIRECT.match(tok)
+    if not m:
+        return 0
+    return 1 if m.group(1) else 2
 
 WAIVER = re.compile(r'<!--\s*cli-surface-allow:\s*autumn\s+([a-z0-9 -]+?)\s*(?:—|--|:)\s*(\S.*?)-->')
 
@@ -1642,11 +1682,19 @@ def resolve(tokens, surface, runnable=False):
                         return None             # unknown arity: cannot count on
                     i += 2 if node['options'][o] else 1
                     continue
+                eaten = _redirect(t2)
+                if eaten:                       # a redirection is not an argument
+                    i += eaten
+                    continue
                 supplied += 1
                 i += 1
             if runnable and supplied < node['required_args']:
                 return 'autumn ' + path
             return None
+        eaten = _redirect(tok)
+        if eaten:                               # shell plumbing, not the command
+            i += eaten
+            continue
         if not TOKEN.match(tok):
             return None
         if tok in node['children']:
@@ -1856,6 +1904,33 @@ def self_test():
     expect(resolve(tk('migrate -- nope'), surface) is None,
            'everything after `--` is arguments')
 
+    # --- a redirection is shell plumbing, not part of the command. `<` and `>`
+    # are deliberately not split on (the docs write `--shard <new>`), so a
+    # redirection arrives whole and stopped the walk before it could judge
+    # whether the command was complete.
+    for form in ('>/tmp/out', '> /tmp/out', '2>/dev/null', '>>log'):
+        expect(resolve(tk('db ' + form), surface, runnable=True) == 'autumn db',
+               f'a bare group is still incomplete before {form!r}')
+    # `&>all` and `2>&1` carry an `&`, which is an operator: they are split by
+    # SEGMENTATION before `resolve` ever sees them, so they have to be checked
+    # through the whole pipeline rather than as a token list.
+    for form in ('&>all', '2>&1', '>out'):
+        doc = f'```bash\nautumn db {form}\n```'
+        got = [resolve(a, surface, runnable=w == FENCED_COMMAND)
+               for _, _, a, w in invocations(doc)]
+        expect(got == ['autumn db'],
+               f'a bare group is still incomplete before {form!r}: {got}')
+    expect(resolve(tk('replay >out.json'), surface, runnable=True) == 'autumn replay',
+           'a redirection is not the required positional')
+    expect(resolve(tk('replay capsule.json >out'), surface, runnable=True) is None,
+           'a real positional plus a redirection is complete')
+    expect(resolve(tk('migrate --shard <new>'), surface, runnable=True) is None,
+           'a <placeholder> is not a redirection')
+    expect(resolve(tk('migrate --shard <new> status'), surface, runnable=True) is None,
+           'a placeholder does not hide the subcommand behind it')
+    expect(resolve(tk('nope >/tmp/out'), surface) == 'autumn nope',
+           'drift before a redirection is still reported')
+
     # --- compact short-option groups. `-pfoo` and `-rd` are one token each,
     # and both read as an unrecognised option, which stopped the walk and left
     # whatever followed unchecked. Every short the real CLI declares takes a
@@ -2019,6 +2094,19 @@ def self_test():
     nested_sub = '```bash\nTAG=$(echo $(date +%s)) autumn migrate run\n```'
     expect([d for _, d, _, _ in invocations(nested_sub)] == ['migrate run'],
            f'a coalesced `))` must close both substitutions: {list(invocations(nested_sub))}')
+    # A parenthesis inside a quoted argument is DATA, not nesting. Counting it
+    # opened a depth the real `)` only closed halfway, so the substitution was
+    # never terminated and the command inside it was dropped.
+    # Single quotes only: a double quote inside a double-quoted substitution
+    # re-opens rather than nests, and shlex splits the token three ways there.
+    # That is genuinely ambiguous shell which the corpus does not write, so it
+    # is left unasserted rather than pinned to a guess.
+    for label, quoted in [("single", "'('"), ("closer", "')'"),
+                          ("both", "'()'")]:
+        doc = f'```bash\nOUT="$(printf {quoted}; autumn migrate run)"\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'],
+               f'a {label} quoted paren must not affect nesting: {got}')
     deep_sub = '```bash\nA=$(f $(g $(h))) autumn migrate run\n```'
     expect([d for _, d, _, _ in invocations(deep_sub)] == ['migrate run'],
            f'three levels close on one `)))`: {list(invocations(deep_sub))}')
