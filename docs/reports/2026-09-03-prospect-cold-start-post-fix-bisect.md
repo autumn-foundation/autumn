@@ -1,4 +1,4 @@
-# ⛏️ Prospect: which commit ate the missing cold-start savings? (undetermined: the pre-fix and post-fix compile-time growth is real (≈5σ vs calibrated noise), but telescoping math means no single commit can be named)
+# ⛏️ Prospect: which commit ate the missing cold-start savings? (undetermined: total window effect is real (~13,000ms), but whether the pre/post-fix spans are signal or noise depends on a noise estimate this assay can't pin down, and no single commit can be named either way)
 
 ## 🎯 Question
 
@@ -195,9 +195,21 @@ every checkpoint (external deps stay warm); workspace-local crate
 fingerprints and incremental artifacts cleared before every timed build;
 `CARGO_INCREMENTAL=0`. Command: `cargo build -p autumn-web
 --no-default-features --features maud,htmx,tailwind,cache-moka,http-client,reporting`.
-One run per checkpoint, chronological order, plus a same-commit repeat at
-the end. All 34 builds (32 checkpoints + 2 warm re-measurements of
-`d1ecb361`/`dc74ce43` + 1 final-checkpoint repeat) exited 0.
+One run per checkpoint, chronological order, plus a same-commit repeat
+built into that same pass. **Build count, corrected (Codex P2 on
+`480f7ec5`):** this pass ran 35 builds — 32 chronological checkpoints
+(`dc74ce43` through `ef61ae44`) + 1 same-commit repeat of `ef61ae44` built
+into that same run + 2 warm re-measurements of `d1ecb361`/`dc74ce43` — not
+34 as an earlier revision stated (simple arithmetic error: 32+2+1=35). The
+dedicated noise-floor calibration below is a **separate** pass of 6 more
+builds (5 valid + 1 discarded cold-artifact), run afterward. Its reported
+"7 valid samples" are **not** 6 new plus something else — they are the 5
+valid new builds from that separate pass **plus 2 samples already produced
+by this 35-build pass** (the `ef61ae44` chronological-checkpoint value,
+42,637ms, and this pass's own built-in `ef61ae44` repeat, 42,204ms). Total
+distinct builds across both passes: 35 + 6 = 41, all exited 0 (the
+discarded cold-artifact build succeeded; it's excluded from analysis as
+non-representative, not because it failed).
 
 | Checkpoint (chronological) | Elapsed | Δ vs prev | Note |
 |---|---:|---:|---|
@@ -284,21 +296,29 @@ calibrated noise floor in hand:**
   (ef61ae44 − 651929b2)` = `(63,559−55,882) + (42,637−39,226)` =
   `+7,677ms + 3,411ms` = **+11,088ms**, with expected noise stdev
   `1,080ms·√4 = 2,160ms` — **not** `1,527ms·√31`. Against that correctly-
-  derived figure, +11,088ms is **≈5.13σ**: the pre-fix span alone
-  (+7,677ms vs. a 2-endpoint stdev of 1,080ms·√2≈1,527ms) is ≈5.03σ, the
-  post-fix span (+3,411ms) is ≈2.23σ. This is not plausibly noise, and the
-  kill line's second clause is **not met** — reversing what the
-  immediately preceding text here claimed. One caveat kept deliberately
-  visible rather than smoothed over: the σ=1,080ms calibration came from 7
-  builds run back-to-back in one short batch, while the 32-checkpoint walk
-  ran continuously for ~35 minutes with more room for thermal/scheduling
-  drift — the `dc74ce43`/`31423bfc` adjacent-delta magnitude (≈4,600ms,
-  implying a per-point σ some 2-3x the clustered calibration's, if treated
-  as representative of that longer walk) is a live reason the true z-score
-  for the segment-level effect could be smaller than 5.1σ. Even discounted
-  by that much, though, it stays solidly above the ~2σ range associated
-  with real, not-noise effects. See Verdict for what this does and does
-  not establish.
+  derived figure, +11,088ms is **≈5.13σ *if* the calibration's σ=1,080ms
+  represents the noise present throughout the whole 32-checkpoint walk**:
+  the pre-fix span alone (+7,677ms vs. a 2-endpoint stdev of
+  1,080ms·√2≈1,527ms) would be ≈5.03σ, the post-fix span (+3,411ms) ≈2.23σ.
+  **That premise doesn't hold, and carrying the correction through changes
+  the answer, not just the caveat** (Codex P1 on `480f7ec5`, correcting
+  the previous sentence here, which raised this same caveat and then
+  wrongly asserted it didn't matter): the calibration's 7 builds ran
+  back-to-back in one short batch, while the 32-checkpoint walk ran
+  continuously for ~35 minutes with more room for thermal/scheduling
+  drift, and `dc74ce43`/`31423bfc`'s adjacent-delta magnitude (≈4,600ms)
+  implies a per-point σ during that longer walk perhaps 2-3x the clustered
+  calibration's. Carrying that multiplier through, rather than gesturing
+  at it: at 2x, pre-fix drops to ≈2.51σ and post-fix to ≈1.12σ (combined
+  ≈2.57σ); at 3x, pre-fix ≈1.68σ, post-fix ≈0.74σ (combined ≈1.71σ). At
+  the upper end of the range this report's own evidence supports, **the
+  post-fix span is not distinguishable from noise, and even the combined
+  figure is only weak evidence, not the ≈5σ headline number.** The honest
+  range is ≈1.7σ-5.1σ combined, ≈0.7σ-2.2σ for the post-fix span alone —
+  and this assay has no way to determine, from the data collected, which
+  end of that range is closer to true. Resolving it needs noise
+  calibration interspersed *throughout* a long chronological walk, not a
+  clustered batch run separately from it — not done here. See Verdict.
 - **The total-window figure survives, even though attribution inside it
   does not.** End-to-end, `d1ecb361` (55,882ms, one warm sample) →
   `ef61ae44` (42,837ms, 7-sample calibrated mean) is **−13,045ms
@@ -340,38 +360,55 @@ live report needs the map:
    chronological chain, and summing two *contiguous* runs of them
    telescopes to just their four segment-boundary points, not 31
    independent measurements.
-4. **This revision:** correcting the telescoping error, the non-fix sum's
-   real expected noise stdev is `1,080ms·√4 = 2,160ms` (four independent
-   endpoint measurements, not 31), and the observed +11,088ms is **≈5.1σ**
-   — a real, not-noise, systematic compile-time increase across the
-   pre-fix span (`d1ecb361`→`28c6fae8`, ≈5.0σ) and, more weakly, the
-   post-fix span (`651929b2`→`ef61ae44`, ≈2.2σ). See Assay for the caveat
-   about the calibration's own representativeness that keeps this from
-   being stated as beyond-doubt.
+4. **Revision 4: corrected the telescoping error, claimed ≈5.1σ, "real,
+   not noise."** Half right: the telescoping correction itself
+   (`1,080ms·√4 = 2,160ms`, not `1,527ms·√31`) is sound and stands. But
+   that revision raised its own caveat about the calibration's
+   representativeness over a longer, less-controlled walk, then asserted
+   without checking that the conclusion "stays solidly above the ~2σ
+   range" regardless — it didn't verify that.
+5. **This revision:** carrying that caveat's own numbers through (Codex
+   P1 on `480f7ec5`) changes the answer. At a 2-3x noise inflation — the
+   range the `dc74ce43`/`31423bfc` evidence implies for the full walk —
+   the combined significance ranges **≈1.7σ-5.1σ**, and the post-fix span
+   alone ranges **≈0.7σ-2.2σ**, i.e. *not* reliably distinguishable from
+   noise at the pessimistic end. See Assay for the numbers at each
+   multiplier.
 
 **What this assay establishes, and at what confidence:**
 
 - **The total window effect is real and large.** `d1ecb361` → `ef61ae44`,
   ≈−13,000ms (−23-24%), roughly 8-9x the single-measurement noise floor —
-  not in serious doubt at any point across all four revisions.
-- **The pre-fix and post-fix spans each show a real (not noise) net
-  increase in compile time**, not just the total window — ≈5.0σ and
-  ≈2.2σ respectively, per the corrected math above. This is closer to
-  revision 2's original instinct than revision 3's retraction of it,
-  though revision 2 reached it through invalid reasoning (a single
-  under-representative repeat), so getting the right qualitative answer
-  there was luck, not method.
-- **What remains genuinely unresolved: attribution to any specific
-  commit.** Telescoping means a sum over a contiguous span carries *zero*
-  information about which intermediate commit(s) caused the change — that
-  is mathematically true regardless of noise. Individually, `6a6610c4`
-  (+4,990ms) is the largest single delta at ≈3.3σ against the calibrated
-  per-delta noise — a real single-comparison signal, but it was also the
-  largest of 31 candidate deltas, and the expected maximum of 31
-  independent noise draws is itself around 2.5-2.9σ, so this specific
-  value cannot be confidently distinguished from "the biggest of 31 noisy
-  draws" without a dedicated repeat measurement of that one commit. No
-  commit in this dataset clears that bar.
+  not in serious doubt at any point across all five revisions, and not
+  sensitive to the noise-inflation question above (it's a direct 2-point
+  comparison with a huge effect size, not a telescoped sum).
+- **Whether the pre-fix and post-fix spans individually show real,
+  not-noise compile-time growth is genuinely unresolved, not just
+  unattributed.** Under the calibration's own tight noise estimate
+  (σ=1,080ms from a clustered batch), both spans read as real (≈5.0σ
+  pre-fix, ≈2.2σ post-fix). Under the noise scale the report's own
+  `dc74ce43`/`31423bfc` evidence implies for a long, less-controlled walk
+  (2-3x higher), the post-fix span is not distinguishable from noise and
+  the pre-fix span's significance drops substantially too. This assay
+  cannot determine which noise estimate is closer to true — that needs
+  noise calibration interspersed *throughout* a long walk, not a
+  clustered batch run separately from it (not done here). Revision 2's
+  "very likely real" framing was closer to the optimistic end of this
+  range than revision 3's "not distinguishable from noise" was to the
+  pessimistic end, but neither revision had the honest range in hand when
+  it was written.
+- **What remains genuinely unresolved regardless: attribution to any
+  specific commit.** Telescoping means a sum over a contiguous span
+  carries *zero* information about which intermediate commit(s) caused
+  the change — mathematically true independent of the noise-scale
+  question above. Individually, `6a6610c4` (+4,990ms) is the largest
+  single delta at ≈3.3σ against the tight calibration's per-delta noise
+  (lower, and further from significant, under the inflated estimate) — a
+  real single-comparison signal at best, but also the largest of 31
+  candidate deltas, and the expected maximum of 31 independent noise
+  draws is itself around 2.5-2.9σ even under the tight estimate. No
+  commit in this dataset clears a confident attribution bar under either
+  noise scale.
 - **The residual gap to CI is still unexplained.** This proxy's ≈−13,000ms
   absolute saving sits close to, but not exactly at, CI's own observed
   −15,051ms — and this proxy still only measures `autumn-web`'s own
