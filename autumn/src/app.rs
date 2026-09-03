@@ -482,8 +482,14 @@ pub struct AppBuilder {
     story_gallery: Option<crate::stories::StoryGallery>,
     /// Routes explicitly declared by plugins for listing purposes, to complement
     /// opaque `nest_routers`. Included in `autumn routes` output even though
-    /// the underlying Axum router is not enumerable.
-    declared_routes: Vec<crate::route_listing::RouteInfo>,
+    /// the underlying Axum router is not enumerable, and handed to the router
+    /// build so the duplicate-route preflight can see inside those otherwise
+    /// opaque mounts.
+    ///
+    /// `pub(crate)` so [`TestApp`](crate::test::TestApp) can carry them too — a
+    /// harness that dropped them would mount a colliding plugin cleanly in
+    /// tests and panic at boot in production.
+    pub(crate) declared_routes: Vec<crate::route_listing::RouteInfo>,
     /// Whether `.idempotent()` was called on this builder. Applied to the
     /// loaded `AutumnConfig` before router assembly so that startup validation
     /// and `apply_middleware` both see `config.idempotency.enabled = true`.
@@ -1473,6 +1479,37 @@ impl AppBuilder {
             self.declared_routes.push(route);
         }
         self
+    }
+
+    /// The route manifest this builder would dump for `autumn routes` —
+    /// enumerable routes plus everything declared via
+    /// [`declare_plugin_routes`](Self::declare_plugin_routes).
+    ///
+    /// This is the seam a plugin author's conformance test needs: it runs the
+    /// same collection the `AUTUMN_DUMP_ROUTES` path runs, in-process, so
+    /// `autumn_web::plugin_conformance::run_conformance` can be pointed at a
+    /// host app built in a test without compiling and executing a binary.
+    ///
+    /// Framework-owned routes (probes, actuator, docs) are **not** included:
+    /// they depend on the loaded configuration, and a conformance run is about
+    /// what the plugin contributes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouterBuildError::UnregisteredApiVersion`](crate::RouterBuildError::UnregisteredApiVersion)
+    /// if a route names an API version this builder has not registered — the
+    /// same refusal `autumn routes` reports.
+    pub fn plugin_route_infos(
+        &self,
+    ) -> Result<Vec<crate::route_listing::RouteInfo>, crate::RouterBuildError> {
+        let mut infos = crate::route_listing::collect_route_infos(
+            &self.routes,
+            &self.route_sources,
+            &self.scoped_groups,
+            &self.api_versions,
+        )?;
+        infos.extend(self.declared_routes.iter().cloned());
+        Ok(infos)
     }
 
     /// Register an async startup hook that runs after [`AppState`] exists and
@@ -3480,7 +3517,7 @@ impl AppBuilder {
             mail_previews,
             #[cfg(feature = "maud")]
             story_gallery,
-            declared_routes: _,
+            declared_routes,
             idempotency_enabled,
             #[cfg(feature = "mail")]
             mail_interceptor,
@@ -4233,6 +4270,30 @@ impl AppBuilder {
                     g.routes
                         .iter()
                         .any(|r| is_seo_path(&format!("{prefix}{}", r.path)))
+                })
+                // Declared plugin routes belong in this check for the same
+                // reason the others do. A sandboxed manifest may take
+                // `/robots.txt` as its prefix — a `.` is legal inside a prefix
+                // segment — and its routes are nested *after* this router is
+                // merged, so without this the two overlap and axum panics at
+                // startup. The declared-route preflight cannot catch it either:
+                // that compares against a claim set built from config alone,
+                // and SEO also mounts when a source is registered in code.
+                //
+                // Yielding matches what this site already does for a custom
+                // `#[static_get("/robots.txt")]`, and the operator has seen the
+                // prefix on the consent screen before installing it.
+                || declared_routes.iter().any(|r| {
+                    // Only a GET can clash with the generated GETs: a declared
+                    // POST or HEAD merges cleanly into the same `MethodRouter`
+                    // (verified against axum 0.8.9, the same finding
+                    // `reject_declared_framework_collisions` is written on), and
+                    // a `WS` upgrade mounts as a GET. Yielding to a disjoint
+                    // verb would hand an untrusted plugin a way to suppress
+                    // robots.txt and sitemap.xml without even serving them.
+                    (r.method.eq_ignore_ascii_case("GET")
+                        || r.method.eq_ignore_ascii_case("WS"))
+                        && is_seo_path(&r.path)
                 });
             if seo_collision {
                 tracing::warn!(
@@ -4312,6 +4373,11 @@ impl AppBuilder {
                     scoped_groups,
                     merge_routers,
                     nest_routers,
+                    // The sandboxed-plugin manifests (and any other declared plugin
+                    // routes) this builder collected. Handing them to the router build is
+                    // what lets the duplicate-route preflight see inside an otherwise
+                    // opaque `nest` mount and refuse a collision instead of panicking.
+                    declared_routes,
                     custom_layers,
                     static_gate_layers,
                     #[cfg(feature = "maud")]
@@ -5877,6 +5943,7 @@ impl AppBuilder {
                 scoped_groups,
                 merge_routers,
                 nest_routers: Vec::new(),
+                declared_routes: Vec::new(),
                 custom_layers,
                 static_gate_layers: Vec::new(),
                 #[cfg(feature = "maud")]
@@ -7172,6 +7239,13 @@ impl AppBuilder {
             scoped_groups,
             merge_routers,
             nest_routers,
+            // Bound rather than dropped with the rest: a nested router is
+            // opaque, so these declarations are the ONLY thing that lets the
+            // collision preflight see inside a sandboxed plugin's mount.
+            // Replaying with the nests but without them would skip the checks
+            // and reach the axum mount panic the preflight exists to replace
+            // with a refusal.
+            declared_routes,
             custom_layers,
             state_initializers,
             config_loader_factory,
@@ -7359,6 +7433,7 @@ impl AppBuilder {
                 scoped_groups,
                 merge_routers,
                 nest_routers,
+                declared_routes,
                 custom_layers,
                 static_gate_layers: Vec::new(),
                 #[cfg(feature = "maud")]
@@ -14859,6 +14934,7 @@ mod tests {
                 scoped_groups: Vec::new(),
                 merge_routers: Vec::new(),
                 nest_routers: Vec::new(),
+                declared_routes: Vec::new(),
                 custom_layers,
                 static_gate_layers: Vec::new(),
                 #[cfg(feature = "maud")]
@@ -14936,6 +15012,7 @@ mod tests {
                 scoped_groups: Vec::new(),
                 merge_routers: Vec::new(),
                 nest_routers: Vec::new(),
+                declared_routes: Vec::new(),
                 custom_layers,
                 static_gate_layers: Vec::new(),
                 #[cfg(feature = "maud")]

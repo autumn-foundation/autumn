@@ -711,7 +711,7 @@ serialized and neither double-reverts.
 
 ### Sharded deployments
 
-Like `autumn migrate run`, `autumn migrate down` operates on the control
+Like `autumn migrate`, `autumn migrate down` operates on the control
 database plus every configured shard by default, and honours `--shard <name>`
 and `--control-only` to scope to a single target. Targets are rolled back in
 order and the command is **fail-fast**: if a later target fails (for example a

@@ -222,8 +222,18 @@ pub mod metrics;
 pub mod migrate;
 pub(crate) mod pg_conn_str;
 pub mod plugin;
+/// The refusal [`AppBuilder::plugin_route_infos`](app::AppBuilder::plugin_route_infos)
+/// and [`route_listing::collect_route_infos`] return.
+///
+/// Re-exported from the crate-private `router` module because both of those
+/// are public functions that hand it back: without this, a caller could not
+/// name the type, match its variants, or write the signature of a function
+/// that forwards it.
+pub use router::RouterBuildError;
 pub mod plugin_conformance;
 pub mod plugin_contract;
+#[cfg(feature = "plugin-sandbox")]
+pub mod plugin_sandbox;
 pub mod probe;
 pub mod query_string;
 
@@ -449,6 +459,16 @@ pub mod __fuzz {
     // The bytes come off a UDP socket, so anyone on-path can shape them.
     #[cfg(feature = "acme")]
     pub use crate::acme::dns::resolver::parse_response as parse_dns_response;
+    // Sandboxed-plugin decoders (#1609). Both parse bytes produced by an
+    // artifact the operator has explicitly NOT audited: the `.autumn-plugin`
+    // container and the NDJSON frames a guest writes. `plugin-sandbox` is not a
+    // default feature, so the `fuzz/` crate enables it.
+    #[cfg(feature = "plugin-sandbox")]
+    pub use crate::plugin_sandbox::__fuzz_parse_guest_frame as parse_sandbox_guest_frame;
+    #[cfg(feature = "plugin-sandbox")]
+    pub use crate::plugin_sandbox::__fuzz_parse_manifest as parse_sandbox_manifest;
+    #[cfg(feature = "plugin-sandbox")]
+    pub use crate::plugin_sandbox::__fuzz_read_artifact as read_sandbox_artifact;
 
     // Body handling: form-urlencoded (always) + inbound-mail MIME (feature-gated).
     pub use crate::form::__fuzz_decode_urlencoded as decode_urlencoded_form;

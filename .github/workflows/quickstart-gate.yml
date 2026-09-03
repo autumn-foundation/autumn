@@ -156,3 +156,70 @@ jobs:
         # No DB env: the server reads database.url from autumn.toml, the
         # documented configuration a real user has.
         run: ./scripts/check-quickstart.sh scaffold-serve
+
+  local-dev-quickstart:
+    name: "Local-dev quickstart: source-built CLI vs published autumn-web"
+    runs-on: ubuntu-latest
+    # This is the OTHER install path README.md and
+    # docs/guide/getting-started.md document alongside the published-CLI
+    # quickstart above: `cargo install --path autumn-cli` from a source
+    # checkout ("Local development"), then `autumn new`.
+    #
+    # The `quickstart` job above always pairs the published CLI with the
+    # published autumn-web — by construction they were released together,
+    # so they can never disagree. `generator-conformance.yml` always pairs
+    # a source-built CLI with the in-tree autumn-web via
+    # `[patch.crates-io]` — by construction they too can never disagree,
+    # since both come from the same commit. Neither can catch the third,
+    # real pairing a local-development user actually gets: a source-built
+    # CLI (today's trunk-dev) scaffolding a project that stays pinned to
+    # whatever autumn-web is *published* (`autumn new` writes the CLI's own
+    # `CARGO_PKG_VERSION` as the pin — see `autumn-cli/src/new.rs`) — and
+    # that version string is frozen at the last release tag until a
+    # maintainer explicitly cuts the next one (CLAUDE.md, "Never bump the
+    # workspace version"). Any commit that changes a public autumn-web API
+    # the *base* `autumn new` template calls, without a release to carry it
+    # to crates.io yet, breaks exactly this pairing — silently: `autumn
+    # doctor`'s `version_compat` check compares version *strings* (`0.7.0`
+    # matches `0.7.0`) and reports green regardless, because it has no way
+    # to see API drift that a version number does not carry. This job only
+    # runs `autumn new`, not `autumn generate` — drift confined to a
+    # generator-emitted call site is a separate, uncovered instance of the
+    # same gap, not something a red/green here proves either way.
+    #
+    # A red run here means precisely that has happened. Until the next
+    # release ships, the workaround is the one `autumn doctor`'s own docs
+    # already describe: point the generated `Cargo.toml` at the checkout
+    # with a `[patch.crates-io]` override (see
+    # `generated_project_compiles_against_published_autumn_web`'s doc
+    # comment in autumn-cli/tests/e2e.rs for the mechanism and the exact
+    # commit — 76c56b1 — that first triggered it, undetected, for three
+    # days). This job does not gate anything else in this repo; it exists
+    # to make that failure visible the moment it happens instead of
+    # leaving it for whoever tries `cargo install --path autumn-cli` next.
+    #
+    # Skipped on workflow_dispatch: a dispatched run gates a specific
+    # release *candidate* pinned via `cli-version` (docs/release-checklist.md
+    # step 7 — "a red run is a release blocker"), always built against the
+    # candidate's own published crates. This job ignores `cli-version`
+    # entirely and tests the checked-out *source* CLI instead, which is
+    # expected to go red whenever trunk-dev carries unreleased drift —
+    # unrelated to whether the candidate being gated is healthy. Running it
+    # on push/schedule (where it belongs) and excluding it here keeps it
+    # from turning an otherwise-green candidate gate into a false release
+    # blocker.
+    if: github.event_name != 'workflow_dispatch'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: "autumn new my-app, then cargo build against published autumn-web"
+        # No DATABASE_URL, no Postgres service: the base `autumn new`
+        # output (no generate/scaffold) needs neither to reach its first
+        # `cargo build` — and that first build is exactly what breaks.
+        run: |
+          cargo test -p autumn-cli --test e2e \
+            generated_project_compiles_against_published_autumn_web \
+            -- --ignored --exact
