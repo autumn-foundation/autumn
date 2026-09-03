@@ -1929,7 +1929,7 @@ def _from_tokens(tokens, masked=None, classify=None):
         inspecting = False
         i = _cron_prefix(segment)
         while i < len(segment) and (segment[i] in _PROMPT or segment[i] in _CONTROL
-                                    or segment[i] == 'function'
+                                    or segment[i] in ('function', 'coproc')
                                     or _ENV_TOKEN.match(segment[i])):
             # `function NAME { … }` is bash's other way to declare a function,
             # so the keyword AND the name are stepped over to reach the body's
@@ -1937,6 +1937,17 @@ def _from_tokens(tokens, masked=None, classify=None):
             # body — `function f { autumn … }` — was never scanned.
             if segment[i] == 'function':
                 i += 2 if i + 1 < len(segment) else 1
+                continue
+            # `coproc [NAME] command` runs the command asynchronously. The
+            # keyword is stepped over, and an OPTIONAL name with it — but only
+            # a bare identifier followed by more, never the binary itself, so
+            # `coproc autumn …` keeps its command while `coproc worker autumn …`
+            # drops the name and reaches it.
+            if segment[i] == 'coproc':
+                i += 1
+                if i + 1 < len(segment) and not _autumn_exe(segment[i]) \
+                        and re.match(r'^[A-Za-z_]\w*$', segment[i]):
+                    i += 1
                 continue
             # A service directive whose VALUE is the binary is itself the
             # command head, not something to step over: a systemd unit writes
@@ -5020,6 +5031,21 @@ def self_test():
         doc = f'```bash\n{form}\n```'
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['nope'], f'{form} scans its body: {got}')
+
+    # `coproc [NAME] command` runs its command asynchronously. The keyword is
+    # a prefix, and an OPTIONAL name goes with it — but the binary itself is
+    # never taken for the name, so `coproc autumn …` keeps its command while
+    # `coproc worker autumn …` drops the name and reaches it.
+    for form, want in (('coproc autumn nope', ['nope']),
+                       ('coproc worker autumn nope', ['nope']),
+                       ('coproc autumn migrate', ['migrate']),
+                       ('coproc { autumn nope; }', ['nope']),
+                       ('coproc worker { autumn nope; }', ['nope'])):
+        doc = f'```bash\n{form}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == want, f'{form} launches its command: {got}')
+    expect(list(invocations('```bash\necho coproc autumn nope\n```')) == [],
+           'coproc named as an argument launches nothing')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
