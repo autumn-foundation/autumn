@@ -3309,3 +3309,54 @@ pub const ENTROPY: &str = r#"(module
   )
 )
 "#;
+
+/// A guest that calls `fd_write` `calls` times with `iovecs` **zero-length**
+/// descriptors, then answers honestly.
+///
+/// Parameterised rather than written out twice because the whole point is a
+/// controlled comparison: two modules from this function differ in exactly one
+/// `i32.const` operand, so they execute an identical number of guest
+/// instructions and any gap in `fuel_used` between them is host work priced per
+/// descriptor. A pair of hand-written fixtures could not promise that.
+///
+/// The descriptor array is never initialised on purpose. Linear memory starts
+/// zeroed, so every entry is already `{ pointer: 0, length: 0 }` — in bounds,
+/// and with nothing to copy, which is precisely the shape that walks the host's
+/// iovec loop without reaching its byte charge.
+#[must_use]
+pub fn empty_iovecs(iovecs: u32, calls: u32) -> String {
+    format!(
+        r#"(module
+  (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 2 4)
+  (data (i32.const 128) "{{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}}\0a\00")
+
+  ;; Length of the NUL-terminated string at $p.
+  (func $strlen (param $p i32) (result i32)
+    (local $n i32)
+    (block $done
+      (loop $l
+        (br_if $done (i32.eqz (i32.load8_u (i32.add (local.get $p) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $l)))
+    (local.get $n))
+
+  ;; Write the NUL-terminated string at $p to stdout: one wire frame.
+  (func $emit (param $p i32)
+    (i32.store (i32.const 0) (local.get $p))
+    (i32.store (i32.const 4) (call $strlen (local.get $p)))
+    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 16))))
+
+  (func (export "_start")
+    (local $i i32)
+    (loop $l
+      ;; The array at 4096 is untouched zeroed memory: {iovecs} descriptors that
+      ;; each point nowhere and ask for nothing.
+      (drop (call $fd_write (i32.const 1) (i32.const 4096) (i32.const {iovecs}) (i32.const 16)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (i32.const {calls}))))
+    (call $emit (i32.const 128)))
+)
+"#
+    )
+}

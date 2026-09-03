@@ -2728,6 +2728,31 @@ impl HostState {
                 if self.stdout_line.len() >= budget {
                     return false;
                 }
+                // Grow geometrically, but never past the budget. Left to
+                // itself `Vec::push` doubles, which takes a buffer whose
+                // *length* stops at `budget` to a *capacity* of the next power
+                // of two above it — for the default ceiling, 16 MiB of
+                // allocation behind an 8 MiB bound. `request_footprint_bytes`
+                // reserves `2 × max_response_bytes` for this line and validates
+                // the concurrency product against that reservation, so the
+                // slack `Vec` takes for its own amortisation is host memory
+                // nothing accounted for, at every concurrent request at once.
+                //
+                // Clamping the reservation keeps the doubling — and the
+                // amortised push that comes with it — right up to the point
+                // where the next one would overrun the bound, and stops there
+                // rather than at twice it. The 64-byte floor is below the
+                // smallest budget this can compute (`saturating_add(4096)`), so
+                // it only covers the first few pushes.
+                if self.stdout_line.len() == self.stdout_line.capacity() {
+                    let want = self
+                        .stdout_line
+                        .capacity()
+                        .saturating_mul(2)
+                        .clamp(64, budget);
+                    self.stdout_line
+                        .reserve_exact(want.saturating_sub(self.stdout_line.len()));
+                }
                 self.stdout_line.push(*byte);
             }
         }
@@ -3300,6 +3325,23 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
 
                 let mut total: u32 = 0;
                 for index in 0..iovs_len {
+                    // Per descriptor inspected, not per byte copied. Reading an
+                    // iovec out of guest memory and bounds-checking it is host
+                    // work whatever the length says, and the only other charge
+                    // in this function lives inside `while offset < length` —
+                    // which a zero-length iovec skips outright, and which breaks
+                    // before charging once stderr is past its budget. Sixty-four
+                    // free descriptor walks per imported call, against a budget
+                    // that limits only how many calls, is host CPU on a blocking
+                    // worker no ceiling sees.
+                    //
+                    // `charge_units` rather than `charge_bytes`, for the reason
+                    // `random_get` uses it: this is per-item work, not a bulk
+                    // move. `fd_read` needs no such line — its `charge_bytes`
+                    // sits unconditionally in the loop body, and that helper
+                    // floors at one unit, so a drained queue there already costs
+                    // a descriptor's worth of fuel.
+                    charge_units(&mut caller, 1)?;
                     let Some((pointer, length)) = iovec(&caller, memory, iovs, index) else {
                         return Ok(errno::INVAL);
                     };
@@ -3854,6 +3896,39 @@ path = "/hello/greet"
             honest.fuel_used < COPIED / 64,
             "the baseline is not a baseline: {} units",
             honest.fuel_used
+        );
+    }
+
+    #[test]
+    fn walking_an_iovec_vector_is_charged_even_when_it_moves_no_bytes() {
+        // `fd_write`'s only byte charge lives inside `while offset < length`,
+        // which a zero-length descriptor skips outright. Reading that descriptor
+        // out of guest memory and bounds-checking it is host work all the same,
+        // and a guest may present `MAX_IOVECS` of them per imported call — a
+        // budget that prices only the *calls* buys sixty-four times the host CPU
+        // it charged for, on a blocking worker no ceiling sees.
+        //
+        // The control is the same module with one descriptor instead of
+        // sixty-four: identical guest instructions, so the whole gap between
+        // them is host work priced per descriptor. A per-call charge cannot
+        // satisfy this; only a per-descriptor one can.
+        const CALLS: u32 = 8192;
+        const WIDE: u32 = MAX_IOVECS as u32;
+
+        let wide = host(&guests::empty_iovecs(WIDE, CALLS)).run(&get("/hello/greet"));
+        let narrow = host(&guests::empty_iovecs(1, CALLS)).run(&get("/hello/greet"));
+        assert!(wide.result.is_ok(), "{:?}", wide.result);
+        assert!(narrow.result.is_ok(), "{:?}", narrow.result);
+
+        let extra = wide.fuel_used.saturating_sub(narrow.fuel_used);
+        // The exact figure is `CALLS * (WIDE - 1)`; halved here so the assertion
+        // is about the charge existing and scaling, not about wasmi's per
+        // instruction accounting staying byte-identical between two modules.
+        let expected = u64::from(CALLS) * u64::from(WIDE - 1) / 2;
+        assert!(
+            extra >= expected,
+            "sixty-four empty descriptors per call cost {extra} more fuel than one, \
+             short of the {expected} that walking them is worth"
         );
     }
 
@@ -5668,6 +5743,46 @@ path = "/hello/greet"
             "drawing 64 KiB of entropy cost {charged} fuel — the bulk-copy rate \
              would charge about 1,024, so the mixer's work is being sold at a \
              memcpy's price",
+        );
+    }
+
+    #[test]
+    fn the_pending_frame_never_allocates_past_the_budget_it_is_bounded_by() {
+        // The pending-line ceiling bounds the buffer's *length*. Its
+        // *capacity* is what the host actually holds, and `Vec`'s doubling puts
+        // that at the next power of two above the ceiling — nearly twice the
+        // `2 × max_response_bytes` `request_footprint_bytes` reserves for this
+        // line, at every concurrent request at once. A bound the allocation can
+        // exceed is not the bound the concurrency product was validated
+        // against.
+        let limits = ResourceLimits {
+            // Small enough to fill in a test, and deliberately not a power of
+            // two: an unclamped `Vec` lands on 65,536 for this budget, which a
+            // ceiling of exactly 65,536 would have let pass.
+            max_response_bytes: 20_000,
+            ..ResourceLimits::default()
+        };
+        let budget = limits.max_response_bytes * 2 + 4096;
+        let mut state = HostState::new("hello".to_owned(), limits, b"");
+
+        // One byte at a time, because that is the growth pattern that doubles:
+        // a guest writing its frame through a byte-at-a-time formatter is
+        // ordinary, and `write_stdout` sees the bytes either way.
+        for _ in 0..budget {
+            assert!(state.write_stdout(b"x"), "the budget refused a legal frame");
+        }
+        assert_eq!(state.stdout_line.len(), budget, "the buffer did not fill");
+        assert!(
+            state.stdout_line.capacity() <= budget,
+            "a {budget}-byte ceiling holds {} bytes of allocation",
+            state.stdout_line.capacity(),
+        );
+
+        // …and the ceiling still stops the next byte, so bounding the
+        // allocation did not cost the refusal it exists for.
+        assert!(
+            !state.write_stdout(b"x"),
+            "a frame past the ceiling was accepted",
         );
     }
 
