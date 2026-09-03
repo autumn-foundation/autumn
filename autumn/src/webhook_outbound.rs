@@ -621,6 +621,14 @@ pub fn deliver_webhook_job(
         // it this POST carries none of the private/link-local/loopback/cloud-
         // metadata deny-list `Client::get_ssrf_safe` documents. See
         // docs/security/2026-09-03-webhook-ssrf/README.md.
+        //
+        // `ssrf_safe()` routes through the custom send path, which (like the
+        // mock path) bypasses `RequestBuilder::send_recorded`'s own circuit
+        // breaker — that bypass is meant for one-off fetches of an arbitrary
+        // caller-chosen URL, not for repeated deliveries to the same
+        // subscriber host. Wrap the call with `BreakerGuardedCall` to keep
+        // the fail-fast-on-a-down-receiver behavior every other outbound call
+        // gets (PR #2480 review).
         let req = manager
             .client
             .named(&sub.target_url)
@@ -630,7 +638,16 @@ pub fn deliver_webhook_job(
             .header("Autumn-Signature", signature_header)
             .text_body(log.payload.clone());
 
-        let response = req.send().await;
+        let breaker_call =
+            crate::http_client::BreakerGuardedCall::begin(&manager.client, &sub.target_url);
+        let response = match breaker_call {
+            Ok(guarded) => {
+                let result = req.send().await;
+                guarded.record(&result);
+                result
+            }
+            Err(open) => Err(open),
+        };
         let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         tracing::debug!(

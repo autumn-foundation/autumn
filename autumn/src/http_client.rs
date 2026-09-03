@@ -1828,27 +1828,7 @@ impl RequestBuilder {
         }
 
         // ── Resilience / Circuit Breaker ──────────────────────────────────
-        let host = url::Url::parse(&self.url).ok().map_or_else(
-            || "unknown".to_owned(),
-            |u| {
-                let h = u.host_str().unwrap_or("unknown");
-                u.port()
-                    .map_or_else(|| h.to_owned(), |port| format!("{h}:{port}"))
-            },
-        );
-
-        let breaker = self.resilience_config.as_ref().map_or_else(
-            || {
-                crate::circuit_breaker::global_registry().get_or_create(
-                    &host,
-                    crate::circuit_breaker::CircuitBreakerPolicy::default(),
-                )
-            },
-            |rc| {
-                let policy = crate::circuit_breaker::CircuitBreakerPolicy::from_config(rc, &host);
-                crate::circuit_breaker::global_registry().get_or_create_with_config(&host, policy)
-            },
-        );
+        let breaker = breaker_for_url(self.resilience_config.as_ref(), &self.url);
 
         // Check if circuit breaker is open
         if breaker.before_call().is_err() {
@@ -2286,6 +2266,81 @@ const fn is_idempotent_method(method: &Method) -> bool {
 
 const fn is_retryable_status(status: u16) -> bool {
     matches!(status, 502..=504)
+}
+
+/// Resolve (or create) the circuit breaker for `url`'s host, honouring a
+/// per-client `resilience_config` override exactly as [`RequestBuilder::send_recorded`]'s
+/// own breaker path does. Shared with [`BreakerGuardedCall`] so the two paths
+/// cannot drift on how a host name is derived from the URL.
+fn breaker_for_url(
+    resilience_config: Option<&Arc<crate::config::ResilienceConfig>>,
+    url: &str,
+) -> crate::circuit_breaker::CircuitBreaker {
+    let host = url::Url::parse(url).ok().map_or_else(
+        || "unknown".to_owned(),
+        |u| {
+            let h = u.host_str().unwrap_or("unknown");
+            u.port()
+                .map_or_else(|| h.to_owned(), |port| format!("{h}:{port}"))
+        },
+    );
+
+    resilience_config.map_or_else(
+        || {
+            crate::circuit_breaker::global_registry().get_or_create(
+                &host,
+                crate::circuit_breaker::CircuitBreakerPolicy::default(),
+            )
+        },
+        |rc| {
+            let policy = crate::circuit_breaker::CircuitBreakerPolicy::from_config(rc, &host);
+            crate::circuit_breaker::global_registry().get_or_create_with_config(&host, policy)
+        },
+    )
+}
+
+/// Circuit-breaker accounting for a caller that must route through the
+/// SSRF-safe (or otherwise custom) send path — which, like the mock path,
+/// deliberately bypasses [`RequestBuilder::send_recorded`]'s own breaker
+/// block, because that path exists for one-off, per-request fetches of an
+/// arbitrary caller-chosen URL where per-host breaker state would mostly be
+/// noise.
+///
+/// A caller that instead makes *repeated* calls to a small, durable set of
+/// hosts — outbound webhook delivery is the motivating case (#2480 code
+/// review) — still wants the breaker: without it, a webhook receiver that is
+/// down does not fail fast, and every queued delivery pays a full
+/// DNS-resolve-and-connect timeout instead of the open-breaker short-circuit
+/// every other outbound call gets. Wrap such a call with
+/// [`BreakerGuardedCall::begin`] before `send()` and
+/// [`BreakerGuardedCall::record`] after, mirroring exactly what
+/// `send_recorded`'s own breaker-guarded path does (`before_call` gate,
+/// `< 500` success threshold).
+pub(crate) struct BreakerGuardedCall {
+    breaker: crate::circuit_breaker::CircuitBreaker,
+}
+
+impl BreakerGuardedCall {
+    /// Returns `Err(ClientError::CircuitBreakerOpen)` immediately, without
+    /// touching the network, when the breaker for `url`'s host is open.
+    pub(crate) fn begin(client: &Client, url: &str) -> Result<Self, ClientError> {
+        let breaker = breaker_for_url(client.resilience_config.as_ref(), url);
+        if breaker.before_call().is_err() {
+            return Err(ClientError::CircuitBreakerOpen);
+        }
+        Ok(Self { breaker })
+    }
+
+    /// Record the outcome against the breaker: any transport error or `>=
+    /// 500` response counts as a failure, exactly like `send_recorded`'s own
+    /// breaker path.
+    pub(crate) fn record(self, result: &Result<Response, ClientError>) {
+        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(self.breaker);
+        match result {
+            Ok(resp) if resp.status().as_u16() < 500 => guard.success(),
+            _ => guard.failure(),
+        }
+    }
 }
 
 // ── Custom send-path helpers (redirect / pin / SSRF-safe) ─────────────────────
