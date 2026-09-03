@@ -61,7 +61,7 @@ struct JsonReport<'a> {
     blocked: bool,
     bootstrap: bool,
     ack_digest: String,
-    ack_phrase: String,
+    ack_phrase: Option<String>,
     head_posture_digest: &'a str,
     acknowledged_by_digest: Option<&'a str>,
     acknowledgment_reason: Option<&'a str>,
@@ -131,7 +131,11 @@ pub fn markdown(report: &Report<'_>) -> String {
                 );
             }
         }
-        table(&mut out, &widening);
+        // Never truncated. Findings sort by path within a severity, so a capped
+        // widening table would let an author bury the real one under
+        // twenty-five harmless additions — while the acknowledgment digest
+        // still covered it.
+        table_all(&mut out, &widening);
     }
 
     section(
@@ -178,10 +182,20 @@ fn by_severity(findings: &[Finding], severity: Severity) -> Vec<&Finding> {
     findings.iter().filter(|f| f.severity == severity).collect()
 }
 
+/// Every row, no cap. Used for the widening table, which a reviewer must see
+/// in full.
+fn table_all(out: &mut String, findings: &[&Finding]) {
+    table_capped(out, findings, usize::MAX);
+}
+
 /// A markdown table, capped at [`MAX_ROWS`] with the tail collapsed to a count.
 fn table(out: &mut String, findings: &[&Finding]) {
+    table_capped(out, findings, MAX_ROWS);
+}
+
+fn table_capped(out: &mut String, findings: &[&Finding], cap: usize) {
     out.push_str("| Change | Method | Path | Before | After |\n|---|---|---|---|---|\n");
-    for f in findings.iter().take(MAX_ROWS) {
+    for f in findings.iter().take(cap) {
         let _ = writeln!(
             out,
             "| {} | `{}` | `{}` | {} | {} |",
@@ -192,8 +206,8 @@ fn table(out: &mut String, findings: &[&Finding]) {
             code(&f.after)
         );
     }
-    if findings.len() > MAX_ROWS {
-        let _ = write!(out, "\n\u{2026} and {} more.\n", findings.len() - MAX_ROWS);
+    if findings.len() > cap {
+        let _ = write!(out, "\n\u{2026} and {} more.\n", findings.len() - cap);
     }
     out.push('\n');
 }
@@ -216,10 +230,19 @@ fn code(value: &str) -> String {
 /// stripped rather than escaped, since a value carrying one would otherwise
 /// close the code span it is rendered inside.
 fn escape(value: &str) -> String {
+    // Backslashes first: escaping `|` into `\|` after a literal `\` would
+    // produce `\\|`, which GFM renders as a backslash followed by a LIVE cell
+    // delimiter — the very breakout this is here to prevent.
     value
+        .replace('\\', "\\\\")
         .replace('|', "\\|")
         .replace(['\r', '\n'], " ")
         .replace('`', "'")
+}
+
+/// Collapse anything that could start a new line into spaces.
+fn one_line(value: &str) -> String {
+    value.replace(['\r', '\n'], " ")
 }
 
 const fn plural(n: usize) -> &'static str {
@@ -237,15 +260,18 @@ pub fn text(report: &Report<'_>) -> String {
         out.push_str("no posture baseline to compare against yet\n");
     }
     for f in report.findings {
+        // Same newline stripping as the markdown path. A manifest value that
+        // can start a line on stdout can forge a GitHub workflow command
+        // (`::error::`, `::add-mask::`) in any job that runs `--format text`.
         let _ = writeln!(
             out,
             "{:<10} {:<7} {}  {} \u{2192} {}  ({})",
             f.severity.as_str(),
-            f.method,
-            f.path,
-            f.before,
-            f.after,
-            f.detail
+            one_line(&f.method),
+            one_line(&f.path),
+            one_line(&f.before),
+            one_line(&f.after),
+            one_line(&f.detail)
         );
     }
     if !report.widening().is_empty() {
@@ -279,7 +305,10 @@ pub fn json(report: &Report<'_>) -> String {
         blocked: report.blocked(),
         bootstrap: report.bootstrap,
         ack_digest: report.ack_digest.clone(),
-        ack_phrase: format!("{ACK_PHRASE} {}", short(&report.ack_digest)),
+        // Only meaningful when something is actually waiting to be
+        // acknowledged; on a clean run it would be the digest of the empty set.
+        ack_phrase: (counts.widening > 0)
+            .then(|| format!("{ACK_PHRASE} {}", short(&report.ack_digest))),
         head_posture_digest: &report.head_posture_digest,
         acknowledged_by_digest: report.acknowledged.as_ref().map(|a| a.digest.as_str()),
         acknowledgment_reason: report
@@ -317,6 +346,7 @@ mod tests {
             path: path.to_owned(),
             before: "gated (roles: admin)".to_owned(),
             after: "public".to_owned(),
+            fingerprint: "class:gated->public".to_owned(),
             detail: "guard removed: gated \u{2192} public".to_owned(),
         }
     }
@@ -400,14 +430,42 @@ mod tests {
     }
 
     #[test]
-    fn a_long_finding_list_is_capped_with_a_tail_count() {
+    fn a_long_annotation_list_is_capped_with_a_tail_count() {
         let findings: Vec<Finding> = (0..MAX_ROWS + 7)
-            .map(|i| finding("route_added_open", Severity::Widening, &format!("/r{i:03}")))
+            .map(|i| finding("route_removed", Severity::Narrowing, &format!("/r{i:03}")))
             .collect();
         let md = markdown(&report(&findings, None));
         assert!(md.contains("7 more"), "{md}");
         assert!(md.contains("/r000"), "{md}");
         assert!(!md.contains("/r031"), "beyond the cap: {md}");
+    }
+
+    /// The widening table is the one a reviewer is being asked to approve, and
+    /// findings sort by path — so a cap would let an author bury the real
+    /// widening under twenty-five harmless ones while the acknowledgment digest
+    /// still covered it.
+    #[test]
+    fn the_widening_table_is_never_capped() {
+        let mut findings: Vec<Finding> = (0..MAX_ROWS + 5)
+            .map(|i| {
+                finding(
+                    "route_added_open",
+                    Severity::Widening,
+                    &format!("/aaa{i:03}"),
+                )
+            })
+            .collect();
+        findings.push(finding(
+            "classification_downgraded",
+            Severity::Widening,
+            "/zzz-admin",
+        ));
+        let md = markdown(&report(&findings, None));
+        assert!(
+            md.contains("/zzz-admin"),
+            "the last widening row must survive: {md}"
+        );
+        assert!(!md.contains("more."), "no tail collapse on widening: {md}");
     }
 
     #[test]
@@ -417,6 +475,44 @@ mod tests {
         let md = markdown(&r);
         assert!(md.to_lowercase().contains("baseline"), "{md}");
         assert!(!md.contains(ACK_PHRASE), "{md}");
+    }
+
+    /// Route paths and role names are app-controlled text landing in a rendered
+    /// PR comment. A `|` would forge a column, a newline a row, and a backtick
+    /// would close the code span it sits inside.
+    #[test]
+    fn manifest_values_cannot_break_out_of_a_table_cell() {
+        let mut f = finding("route_added_open", Severity::Widening, "/a|b");
+        f.before = "gated (roles: ad\\min)".to_owned();
+        f.after = "pub`lic".to_owned();
+        f.detail = "line one\nline two".to_owned();
+        let findings = vec![f];
+        let md = markdown(&report(&findings, None));
+
+        for line in md.lines().filter(|l| l.starts_with("| ")) {
+            // Header, separator and the one data row: five columns each.
+            assert_eq!(
+                line.matches('|').count() - line.matches("\\|").count(),
+                6,
+                "a value forged a column: {line}"
+            );
+        }
+        assert!(!md.contains("pub`lic"), "backticks are neutralized: {md}");
+        assert!(!md.contains("line one\nline two"), "no forged row: {md}");
+    }
+
+    /// The text rendering feeds job logs, where a line starting with `::` is a
+    /// GitHub workflow command.
+    #[test]
+    fn text_rendering_cannot_forge_a_workflow_command() {
+        let mut f = finding("route_added_open", Severity::Widening, "/a\n::error::pwned");
+        f.detail = "x\n::add-mask::y".to_owned();
+        let findings = vec![f];
+        let out = text(&report(&findings, None));
+        assert!(
+            !out.lines().any(|l| l.trim_start().starts_with("::")),
+            "no line may start a workflow command: {out}"
+        );
     }
 
     #[test]
@@ -448,6 +544,10 @@ mod tests {
         assert_eq!(v["blocked"], false);
         assert_eq!(v["counts"]["widening"], 0);
         assert!(v["findings"].as_array().unwrap().is_empty());
+        assert!(
+            v["ack_phrase"].is_null(),
+            "nothing is waiting to be acknowledged, so no marker is advertised"
+        );
     }
 
     #[test]

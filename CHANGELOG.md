@@ -39,6 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that disables the gate or hides the diff, so a wrongly blocked pull request
   is always unblockable by the team alone, in public, with a reason.
 
+  Both digests use an escaped canonical encoding, so a crafted route path
+  cannot make one finding hash like a set of ordinary ones; every dimension is
+  compared from *both* sides, so a fact that disappears from the manifest (for
+  example every POST leaving the CSRF dimension when `security.csrf.safe_methods`
+  grows) is still reported as the loss it is; and the scaffolded workflow
+  resolves each commenter's real repository permission rather than trusting
+  `author_association`, refuses to run on a pull request that edits the gate
+  itself, and fails rather than bootstrapping when a committed baseline
+  disappears from the base branch.
+
   `autumn new` scaffolds `.github/workflows/posture-gate.yml` by default;
   existing apps adopt it with `autumn upgrade --apply`. The scaffolded deploy
   workflows attest `security-posture.json` with

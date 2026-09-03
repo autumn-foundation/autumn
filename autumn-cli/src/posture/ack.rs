@@ -27,6 +27,15 @@ use super::model::hex_digest;
 /// The comment phrase that acknowledges a posture widening.
 pub const ACK_PHRASE: &str = "/ack-posture";
 
+/// Line the harvester writes between two comment bodies.
+///
+/// Fenced-code state must not leak from one comment into the next: a colleague
+/// who pastes a log and forgets the closing fence would otherwise silently
+/// swallow every later acknowledgment — or, worse, flip the parity so that a
+/// marker *inside* a fence (the gate's own posted report contains one) becomes
+/// live. Each body is parsed with its own fence state.
+pub const SOURCE_SEPARATOR: &str = "<!-- autumn:ack-source -->";
+
 /// How much of the digest the phrase carries. 64 bits is far more than enough
 /// to bind an acknowledgment to a finding set nobody is trying to collide, and
 /// short enough to read out loud.
@@ -77,6 +86,11 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
     let mut fenced = false;
     for line in text.lines() {
         let trimmed = line.trim_start();
+        if trimmed == SOURCE_SEPARATOR {
+            // A new comment body starts here, with a clean slate.
+            fenced = false;
+            continue;
+        }
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             fenced = !fenced;
             continue;
@@ -133,7 +147,7 @@ fn is_digest(candidate: &str) -> bool {
 #[must_use]
 pub fn matching<'a>(acks: &'a [Acknowledgment], digest: &str) -> Option<&'a Acknowledgment> {
     acks.iter()
-        .find(|ack| super::verify::digest_matches(digest, &ack.digest))
+        .find(|ack| super::verify::marker_matches(digest, &ack.digest))
 }
 
 #[cfg(test)]
@@ -149,6 +163,7 @@ mod tests {
             path: path.to_owned(),
             before: "gated (roles: admin)".to_owned(),
             after: "public".to_owned(),
+            fingerprint: "class:gated->public".to_owned(),
             detail: "d".to_owned(),
         }
     }
@@ -235,6 +250,30 @@ mod tests {
     #[test]
     fn the_phrase_is_case_insensitive() {
         assert_eq!(parse_acks("/ACK-POSTURE 0123456789abcdef").len(), 1);
+    }
+
+    #[test]
+    fn an_unbalanced_fence_does_not_leak_into_the_next_comment() {
+        // Comment 1 pastes a log and forgets the closing fence; comment 2 is a
+        // genuine acknowledgment. Without isolation, comment 2 is swallowed.
+        let harvested = format!(
+            "{SOURCE_SEPARATOR}\nHere is the failing log:\n```\nthread panicked\n\
+             {SOURCE_SEPARATOR}\n/ack-posture 0123456789abcdef\n"
+        );
+        let acks = parse_acks(&harvested);
+        assert_eq!(acks.len(), 1, "the second comment still acknowledges");
+    }
+
+    #[test]
+    fn an_unbalanced_fence_cannot_make_a_fenced_marker_live() {
+        // The gate's own report carries the marker inside a fence. A previous
+        // comment with an unbalanced fence must not invert the parity and turn
+        // that report into an acknowledgment of itself.
+        let harvested = format!(
+            "{SOURCE_SEPARATOR}\nlog:\n```\noops\n\
+             {SOURCE_SEPARATOR}\nquoting the bot:\n```\n/ack-posture 0123456789abcdef\n```\n"
+        );
+        assert!(parse_acks(&harvested).is_empty());
     }
 
     // ── matching ────────────────────────────────────────────────────────────

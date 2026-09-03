@@ -2792,10 +2792,11 @@ mod tests {
     }
 
     /// The posture gate (issue #1624) ships turned on, and the pieces that make
-    /// it a *gate* rather than a report are all present: the fresh manifest, the
-    /// staleness check against the committed copy, the base-branch side read out
-    /// of git, an acknowledgment harvest restricted to accounts with write
-    /// access, and a final step that actually fails the job.
+    /// it a *gate* rather than a report are all present: the fresh manifest, a
+    /// staleness check that compares postures rather than bytes, the
+    /// base-branch side read out of git, an acknowledgment harvest restricted
+    /// to accounts with real write permission, and a final step that actually
+    /// fails the job.
     #[test]
     fn the_scaffolded_posture_gate_is_wired_end_to_end() {
         let files = owned(GenerateOptions::default());
@@ -2811,14 +2812,6 @@ mod tests {
         );
         assert!(workflow.contains("--ack-file acks.txt"));
         assert!(
-            workflow.contains("OWNER") && workflow.contains("COLLABORATOR"),
-            "only accounts with write access may acknowledge"
-        );
-        assert!(
-            workflow.contains("exit ${{ steps.diff.outputs.status }}"),
-            "the diff's exit code must fail the job"
-        );
-        assert!(
             workflow.contains("pull-requests: write"),
             "posting the diff needs it"
         );
@@ -2826,6 +2819,61 @@ mod tests {
             !workflow.contains("contents: write"),
             "the gate never writes to the repository"
         );
+    }
+
+    /// Who may acknowledge is the only authorization control in the feature, so
+    /// it must ask GitHub for a real repository permission — `author_association`
+    /// reports organization affiliation, and would let any org member with read
+    /// access unblock a widening.
+    #[test]
+    fn the_scaffolded_gate_checks_real_write_permission_to_acknowledge() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+        assert!(
+            workflow.contains("collaborators/${login}/permission"),
+            "must resolve each commenter's actual permission: {workflow}"
+        );
+        assert!(
+            !workflow.contains("select(.author_association"),
+            "affiliation is not permission — it may be named in a comment \
+             explaining why, never used as the filter"
+        );
+        assert!(
+            workflow.contains("admin|write|maintain"),
+            "and only write-or-better may acknowledge"
+        );
+    }
+
+    /// Bypasses the review found, each pinned by the thing that closes it.
+    #[test]
+    fn the_scaffolded_gate_closes_its_own_bypasses() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        // Editing the gate in the pull request the gate is judging.
+        assert!(workflow.contains("Refuse a pull request that edits this gate"));
+        // Deleting the baseline to make every later run bootstrap.
+        assert!(
+            workflow.contains("existed on origin/${BASE_REF} and is gone"),
+            "a vanished baseline must fail, not bootstrap: {workflow}"
+        );
+        // A base ref that is not in the checkout at all.
+        assert!(workflow.contains("git rev-parse --verify"));
+        // Rewriting someone else's comment, or updating a quoted copy.
+        assert!(workflow.contains("github-actions[bot]"));
+        // A failed comment post (every fork pull request) swallowing the verdict.
+        assert!(
+            workflow.contains("if: always() && steps.diff.outcome == 'success'"),
+            "the verdict must survive a failed comment post: {workflow}"
+        );
+        // One comment per pull request, not one per concurrent push.
+        assert!(workflow.contains("cancel-in-progress: true"));
+        // One comment's unbalanced code fence swallowing another's marker.
+        assert!(workflow.contains("<!-- autumn:ack-source -->"));
     }
 
     /// It is a workflow of its own, not another job on `ci.yml`: `ci.yml` must

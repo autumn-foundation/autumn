@@ -171,13 +171,39 @@ pub fn run_diff(opts: &DiffOptions<'_>) -> i32 {
     };
     let base = match PostureManifest::read(opts.base) {
         Ok(m) => Some(m),
-        Err(ManifestError::Io { .. }) if opts.allow_missing_base => None,
+        // Only a genuinely absent file bootstraps. A base path that exists but
+        // cannot be read — a directory, a permissions problem, an interrupted
+        // `git show` — is a broken run, and reporting it as the benign
+        // "no baseline yet" case would disarm the gate for that run.
+        Err(ManifestError::Io { ref source, .. })
+            if opts.allow_missing_base && source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            None
+        }
         Err(e) => return fail(&e.to_string()),
     };
     let ack_text = match harvested_ack_text(opts) {
         Ok(t) => t,
         Err(e) => return fail(&e),
     };
+
+    // A head manifest with no routes at all, diffed against a base that had
+    // some, scores as a clean surface-*reducing* change — so a partial or
+    // failed audit that still wrote a well-formed file would sail through.
+    // That is a broken run, not a narrowing.
+    if let Some(base_manifest) = &base
+        && !base_manifest.dimensions.routes.entries.is_empty()
+        && head.dimensions.routes.entries.is_empty()
+    {
+        return fail(&format!(
+            "{} lists no routes at all while {} lists {} \u{2014} refusing to score that as a \
+             narrowing. Rebuild the manifest with `autumn routes audit --manifest {}`.",
+            opts.head,
+            opts.base,
+            base_manifest.dimensions.routes.entries.len(),
+            opts.head
+        ));
+    }
 
     let evaluation = evaluate(base.as_ref(), &head, &ack_text);
     let rendered = match render(&evaluation, opts.format) {
@@ -358,7 +384,14 @@ mod tests {
             route("/admin", "public", &[]),
             route("/reports", "gated", &["admin"])
         ));
-        assert!(!evaluate(Some(&base), &later, &comment).blocked());
+        let e = evaluate(Some(&base), &later, &comment);
+        assert!(!e.blocked());
+        assert!(
+            e.acknowledged.is_some(),
+            "it passes *because* the acknowledgment still matches, not because \
+             the widening stopped being detected"
+        );
+        assert_eq!(diff::widening(&e.findings).len(), 1);
     }
 
     #[test]
@@ -392,6 +425,119 @@ mod tests {
         let head = manifest(&route("/a", "gated", &["admin"]));
         let e = evaluate(None, &head, "");
         assert!(render(&e, "markdwon").is_err());
+    }
+
+    /// A base path that exists but cannot be read is a broken run, not the
+    /// benign "no baseline yet" case — reporting it as bootstrap would disarm
+    /// the gate for that run, and the scaffolded workflow always passes
+    /// `--allow-missing-base`.
+    #[test]
+    fn an_unreadable_base_is_a_usage_error_even_with_allow_missing_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = dir.path().join("head.json");
+        std::fs::write(
+            &head,
+            serde_json::to_string(&serde_json::json!({
+                "schema_version": 3,
+                "dimensions": {"routes": {"entries": [
+                    {"path": "/a", "method": "GET", "classification": "public"}
+                ]}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // A directory is present-but-unreadable-as-a-file.
+        let base = dir.path().join("base-dir");
+        std::fs::create_dir(&base).unwrap();
+
+        let code = run_diff(&DiffOptions {
+            base: base.to_str().unwrap(),
+            head: head.to_str().unwrap(),
+            format: "json",
+            output: None,
+            acks: &[],
+            ack_file: None,
+            allow_missing_base: true,
+        });
+        assert_eq!(code, EXIT_USAGE, "must not be scored as a clean bootstrap");
+    }
+
+    /// A head manifest with no routes at all scores as a pure narrowing, so a
+    /// partial or failed audit that still wrote a well-formed file would sail
+    /// through. Refuse to score it.
+    #[test]
+    fn an_empty_head_manifest_against_a_populated_base_is_a_usage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.json");
+        let head = dir.path().join("head.json");
+        std::fs::write(
+            &base,
+            serde_json::to_string(&serde_json::json!({
+                "schema_version": 3,
+                "dimensions": {"routes": {"entries": [
+                    {"path": "/a", "method": "GET", "classification": "gated", "roles": ["admin"]}
+                ]}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&head, r#"{"schema_version":3}"#).unwrap();
+
+        let code = run_diff(&DiffOptions {
+            base: base.to_str().unwrap(),
+            head: head.to_str().unwrap(),
+            format: "json",
+            output: None,
+            acks: &[],
+            ack_file: None,
+            allow_missing_base: true,
+        });
+        assert_eq!(code, EXIT_USAGE);
+    }
+
+    /// `--output` is the flag the scaffolded workflow depends on: it must write
+    /// the report, and it must write an *empty* file on a clean run so the
+    /// workflow's `[ -s … ]` test decides whether to post.
+    #[test]
+    fn the_output_flag_writes_the_report_and_writes_nothing_when_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.json");
+        let head = dir.path().join("head.json");
+        let report = dir.path().join("report.md");
+        let write = |path: &std::path::Path, classification: &str, roles: &str| {
+            std::fs::write(
+                path,
+                format!(
+                    r#"{{"schema_version":3,"dimensions":{{"routes":{{"entries":[
+                       {{"path":"/admin","method":"GET","classification":"{classification}","roles":[{roles}]}}]}}}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+
+        write(&base, "gated", "\"admin\"");
+        write(&head, "public", "");
+        let opts = DiffOptions {
+            base: base.to_str().unwrap(),
+            head: head.to_str().unwrap(),
+            format: "markdown",
+            output: Some(report.to_str().unwrap()),
+            acks: &[],
+            ack_file: None,
+            allow_missing_base: false,
+        };
+        assert_eq!(run_diff(&opts), EXIT_BLOCKED);
+        let written = std::fs::read_to_string(&report).unwrap();
+        assert!(written.contains("/admin"), "{written}");
+        assert!(written.contains(render::COMMENT_MARKER), "{written}");
+
+        write(&head, "gated", "\"admin\"");
+        assert_eq!(run_diff(&opts), 0);
+        assert_eq!(
+            std::fs::read_to_string(&report).unwrap(),
+            "",
+            "a clean run leaves nothing for the workflow to post"
+        );
     }
 
     #[test]

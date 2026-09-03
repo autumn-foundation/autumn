@@ -5,10 +5,25 @@
 //! file and line it lives on, the module it was moved into — is invisible here
 //! by construction, because a refactor that flags the security gate is a gate
 //! nobody keeps.
+//!
+//! Two rules hold everywhere below, and both are load-bearing:
+//!
+//! 1. **Every dimension is compared from both sides.** A fact that *disappears*
+//!    from the head manifest is a fact that was lost. Walking only the head
+//!    would miss it — and the manifest drops entries as well as changing them:
+//!    adding `POST` to `security.csrf.safe_methods` turns CSRF validation off
+//!    for every POST *and* deletes those routes from the csrf dimension.
+//! 2. **Each finding carries a [`Finding::fingerprint`]**: the security-relevant
+//!    delta, escaped, and the only field besides kind/method/path that reaches
+//!    the acknowledgment digest. Human-facing `before`/`after` text stays out of
+//!    it, so a later *narrowing* on an already-acknowledged route does not
+//!    invalidate the acknowledgment, and no crafted route path can make one
+//!    finding hash like two.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
-use super::model::{PostureManifest, RouteEntry, RouteKey, is_open};
+use super::model::{PostureManifest, RouteEntry, RouteKey, escape_field, hex_digest, is_open};
 
 /// Which way a change moves the security surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -35,7 +50,7 @@ impl Severity {
 /// One posture change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
-    /// Stable machine tag, e.g. `route_added_public`. Part of the acknowledgment
+    /// Stable machine tag, e.g. `route_added_open`. Part of the acknowledgment
     /// digest, so renaming one invalidates existing acknowledgments — treat it
     /// as a wire format.
     pub kind: &'static str,
@@ -44,21 +59,33 @@ pub struct Finding {
     pub method: String,
     /// Route path, header name, or `*`.
     pub path: String,
-    /// Posture before, in the base manifest.
+    /// Posture before, in the base manifest. Human-facing.
     pub before: String,
-    /// Posture after, in the head manifest.
+    /// Posture after, in the head manifest. Human-facing.
     pub after: String,
+    /// The security-relevant delta this finding *is*, in a form that changes
+    /// exactly when its security meaning changes: `class:gated->public`,
+    /// `roles+editor`, `scopes-admin`. Part of the acknowledgment digest.
+    pub fingerprint: String,
     /// One sentence naming what actually moved.
     pub detail: String,
 }
 
 impl Finding {
     /// The canonical line this finding contributes to the acknowledgment digest.
+    ///
+    /// Every field is escaped before being joined, so a route path containing a
+    /// tab or a newline cannot forge extra fields or extra lines. Without that,
+    /// one crafted route hashes identically to a set of ordinary ones — and an
+    /// acknowledgment for the crafted set silently covers the ordinary ones.
     #[must_use]
     pub fn canonical(&self) -> String {
         format!(
-            "{}\t{}\t{}\t{}\t{}",
-            self.kind, self.method, self.path, self.before, self.after
+            "{}\t{}\t{}\t{}",
+            self.kind,
+            escape_field(&self.method),
+            escape_field(&self.path),
+            escape_field(&self.fingerprint)
         )
     }
 }
@@ -81,6 +108,7 @@ pub fn diff(base: &PostureManifest, head: &PostureManifest) -> Vec<Finding> {
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| a.method.cmp(&b.method))
             .then_with(|| a.kind.cmp(b.kind))
+            .then_with(|| a.fingerprint.cmp(&b.fingerprint))
     });
     findings
 }
@@ -94,13 +122,43 @@ pub fn widening(findings: &[Finding]) -> Vec<&Finding> {
         .collect()
 }
 
+/// Index routes by `(path, method)`, keeping the **most open** entry when a
+/// manifest carries the same key twice.
+///
+/// A manifest should never contain a duplicate key, but "should never" is not a
+/// guarantee about a file on disk. Letting the last one win would make the
+/// verdict depend on array order — and the order that hides a public route
+/// would be the one that passes.
 fn route_index(m: &PostureManifest) -> BTreeMap<RouteKey, &RouteEntry> {
-    m.dimensions
-        .routes
-        .entries
-        .iter()
-        .map(|e| (e.key(), e))
-        .collect()
+    let mut index: BTreeMap<RouteKey, &RouteEntry> = BTreeMap::new();
+    for entry in &m.dimensions.routes.entries {
+        index
+            .entry(entry.key())
+            .and_modify(|existing| {
+                if more_open(entry, existing) {
+                    *existing = entry;
+                }
+            })
+            .or_insert(entry);
+    }
+    index
+}
+
+/// Whether `candidate` describes a strictly wider posture than `current`, used
+/// only to break duplicate-key ties in the conservative direction.
+fn more_open(candidate: &RouteEntry, current: &RouteEntry) -> bool {
+    match (
+        is_open(&candidate.classification),
+        is_open(&current.classification),
+    ) {
+        (true, false) => true,
+        (false, true) => false,
+        // Same openness: fewer scopes and no policy check is the wider one.
+        _ => {
+            (candidate.scope_set().len(), usize::from(candidate.policy))
+                < (current.scope_set().len(), usize::from(current.policy))
+        }
+    }
 }
 
 fn diff_routes(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Finding>) {
@@ -125,6 +183,7 @@ fn diff_routes(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Fin
                 path: entry.path.clone(),
                 before: "absent".to_owned(),
                 after: entry.posture_label(),
+                fingerprint: format!("added:{}", entry.classification),
                 detail: if open {
                     format!(
                         "new route reachable without a proven guard ({})",
@@ -148,6 +207,7 @@ fn diff_routes(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Fin
                 path: entry.path.clone(),
                 before: entry.posture_label(),
                 after: "absent".to_owned(),
+                fingerprint: "removed".to_owned(),
                 detail: "route no longer mounted".to_owned(),
             });
         }
@@ -195,6 +255,7 @@ fn compare_route(before: &RouteEntry, after: &RouteEntry, out: &mut Vec<Finding>
             path: after.path.clone(),
             before: label_before.clone(),
             after: label_after.clone(),
+            fingerprint: format!("class:{}->{}", before.classification, after.classification),
             detail,
         });
         // A route that stopped being gated has already been reported in the
@@ -216,6 +277,7 @@ fn compare_route(before: &RouteEntry, after: &RouteEntry, out: &mut Vec<Finding>
             path: after.path.clone(),
             before: label_before,
             after: label_after,
+            fingerprint: "policy-removed".to_owned(),
             detail: "record-level policy check removed".to_owned(),
         });
     } else if !before.policy && after.policy {
@@ -226,6 +288,7 @@ fn compare_route(before: &RouteEntry, after: &RouteEntry, out: &mut Vec<Finding>
             path: after.path.clone(),
             before: label_before,
             after: label_after,
+            fingerprint: "policy-added".to_owned(),
             detail: "record-level policy check added".to_owned(),
         });
     }
@@ -233,8 +296,12 @@ fn compare_route(before: &RouteEntry, after: &RouteEntry, out: &mut Vec<Finding>
 
 /// Roles are OR-ed (`#[secured("a", "b")]` admits *either*), so **adding** one
 /// admits more principals and **removing** one admits fewer — the opposite of
-/// the intuition scopes create. Emptying the list entirely is the widest move
-/// of all: `#[secured]` with no roles admits every authenticated session.
+/// the intuition scopes create.
+///
+/// Two boundary cases run the other way, and both come from the same fact:
+/// `#[secured]` with *no* roles admits every authenticated session. So emptying
+/// a non-empty list is the widest move available, and putting the first role on
+/// an empty list is a narrowing, not a widening.
 fn compare_roles(
     before: &RouteEntry,
     after: &RouteEntry,
@@ -258,9 +325,29 @@ fn compare_roles(
             path: after.path.clone(),
             before: label_before.to_owned(),
             after: label_after.to_owned(),
+            fingerprint: format!("roles-cleared:{}", removed.join(",")),
             detail: format!(
                 "role requirement dropped ({}) — any authenticated session now passes",
                 removed.join(", ")
+            ),
+        });
+        return;
+    }
+    if was.is_empty() {
+        // The gate went from "any authenticated session" to "one of these
+        // roles". Strictly fewer callers, however many roles were named.
+        out.push(Finding {
+            kind: "roles_narrowed",
+            severity: Severity::Narrowing,
+            method: after.method.clone(),
+            path: after.path.clone(),
+            before: label_before.to_owned(),
+            after: label_after.to_owned(),
+            fingerprint: format!("roles-first:{}", added.join(",")),
+            detail: format!(
+                "route now requires role{} {} — previously any authenticated session passed",
+                plural(added.len()),
+                added.join(", ")
             ),
         });
         return;
@@ -273,6 +360,7 @@ fn compare_roles(
             path: after.path.clone(),
             before: label_before.to_owned(),
             after: label_after.to_owned(),
+            fingerprint: format!("roles+{}", added.join(",")),
             detail: format!(
                 "role{} {} now also admitted",
                 plural(added.len()),
@@ -288,6 +376,7 @@ fn compare_roles(
             path: after.path.clone(),
             before: label_before.to_owned(),
             after: label_after.to_owned(),
+            fingerprint: format!("roles-{}", removed.join(",")),
             detail: format!(
                 "role{} {} no longer admitted",
                 plural(removed.len()),
@@ -322,6 +411,7 @@ fn compare_scopes(
             path: after.path.clone(),
             before: label_before.to_owned(),
             after: label_after.to_owned(),
+            fingerprint: format!("scopes-{}", removed.join(",")),
             detail: format!(
                 "scope{} {} no longer required",
                 plural(removed.len()),
@@ -337,6 +427,7 @@ fn compare_scopes(
             path: after.path.clone(),
             before: label_before.to_owned(),
             after: label_after.to_owned(),
+            fingerprint: format!("scopes+{}", added.join(",")),
             detail: format!(
                 "scope{} {} now required",
                 plural(added.len()),
@@ -382,11 +473,39 @@ fn diff_authorization_policies(
         .map(RouteEntry::key)
         .collect();
 
+    // Bindings the same route *gained*, so a removal that is really half of a
+    // rename can say so instead of reading as an unexplained loss.
+    let gained_on: BTreeMap<RouteKey, Vec<String>> = after.difference(&before).fold(
+        BTreeMap::new(),
+        |mut acc, (path, method, action, resource)| {
+            acc.entry((path.clone(), method.clone()))
+                .or_default()
+                .push(format!("{action} on {resource}"));
+            acc
+        },
+    );
+
     for (path, method, action, resource) in before.difference(&after) {
         // A binding that vanished because the whole route did is already
         // reported as `route_removed`, and that is a narrowing, not a widening.
         if !routes_after.contains(&(path.clone(), method.clone())) {
             continue;
+        }
+        let mut detail =
+            format!("record-level authorization `{action}` on `{resource}` no longer checked");
+
+        // A resource *rename* looks exactly like a removal plus an addition,
+        // and nothing in the manifest can tell the two apart. Stay conservative
+        // — this still blocks — but name the pairing so a reviewer who is
+        // looking at a rename can acknowledge it in one step instead of
+        // wondering what was lost.
+        if let Some(gained) = gained_on.get(&(path.clone(), method.clone())) {
+            let _ = write!(
+                detail,
+                " (the same route gained: {}; a renamed resource reads as a removal plus an \
+                 addition, which a manifest cannot tell from a real one)",
+                gained.join(", ")
+            );
         }
         out.push(Finding {
             kind: "authorization_binding_removed",
@@ -395,9 +514,8 @@ fn diff_authorization_policies(
             path: path.clone(),
             before: format!("authorize({action}, {resource})"),
             after: "none".to_owned(),
-            detail: format!(
-                "record-level authorization `{action}` on `{resource}` no longer checked"
-            ),
+            fingerprint: format!("authz-removed:{action}:{resource}"),
+            detail,
         });
     }
     for (path, method, action, resource) in after.difference(&before) {
@@ -408,6 +526,7 @@ fn diff_authorization_policies(
             path: path.clone(),
             before: "none".to_owned(),
             after: format!("authorize({action}, {resource})"),
+            fingerprint: format!("authz-added:{action}:{resource}"),
             detail: format!("record-level authorization `{action}` on `{resource}` now checked"),
         });
     }
@@ -431,6 +550,13 @@ fn csrf_index(m: &PostureManifest) -> BTreeMap<RouteKey, (bool, bool)> {
 fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Finding>) {
     let before = csrf_index(base);
     let after = csrf_index(head);
+    let routes_after: BTreeSet<RouteKey> = head
+        .dimensions
+        .routes
+        .entries
+        .iter()
+        .map(RouteEntry::key)
+        .collect();
 
     let mut lost: Vec<(RouteKey, bool)> = Vec::new();
     let mut gained: Vec<RouteKey> = Vec::new();
@@ -441,23 +567,45 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
             _ => {}
         }
     }
+    // The other direction: an entry that *left* the dimension entirely. The
+    // csrf dimension holds only mutating routes, so widening
+    // `security.csrf.safe_methods` deletes entries rather than flipping them —
+    // and at runtime those requests stop being validated.
+    for (key, (enforced_before, _)) in &before {
+        if *enforced_before && !after.contains_key(key) && routes_after.contains(key) {
+            lost.push((key.clone(), false));
+        }
+    }
+    lost.sort();
+    lost.dedup();
 
     // One collapsed finding when CSRF went off everywhere: an app that flips
     // `security.csrf.enabled` produces one row per mutating route otherwise,
     // and a 200-row table is a table nobody reads.
-    let all_off_now = !after.is_empty() && after.values().all(|(enforced, _)| !enforced);
-    let any_on_before = before.values().any(|(enforced, _)| *enforced);
+    let all_off_now = after.values().all(|(enforced, _)| !enforced);
+    let any_on_before = before.values().any(|enforced| enforced.0);
     if all_off_now && any_on_before && lost.len() > 1 {
+        let routes: Vec<String> = lost
+            .iter()
+            .map(|((path, method), _)| format!("{method} {path}"))
+            .collect();
         out.push(Finding {
             kind: "csrf_disabled",
             severity: Severity::Widening,
             method: "*".to_owned(),
             path: "*".to_owned(),
             before: "csrf enforced".to_owned(),
-            after: "csrf not enforced".to_owned(),
+            after: format!("csrf not enforced on {} routes", routes.len()),
+            // The collapsed finding must still say *which* routes lost it, or
+            // an acknowledgment for one set would silently cover another.
+            fingerprint: format!(
+                "csrf-disabled:{}",
+                &hex_digest(routes.join("\n").as_bytes())[..16]
+            ),
             detail: format!(
-                "CSRF enforcement lost on all {} mutating routes",
-                lost.len()
+                "CSRF enforcement lost on all {} mutating routes: {}",
+                routes.len(),
+                routes.join(", ")
             ),
         });
     } else {
@@ -469,6 +617,7 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
                 path,
                 before: "csrf enforced".to_owned(),
                 after: "csrf not enforced".to_owned(),
+                fingerprint: "csrf-removed".to_owned(),
                 detail: if exempt {
                     "CSRF enforcement lost: this route now matches a configured exempt prefix"
                         .to_owned()
@@ -486,69 +635,94 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
             path,
             before: "csrf not enforced".to_owned(),
             after: "csrf enforced".to_owned(),
+            fingerprint: "csrf-added".to_owned(),
             detail: "CSRF enforcement gained".to_owned(),
         });
     }
 }
 
+fn headers_index(m: &PostureManifest) -> BTreeMap<&str, (bool, &str)> {
+    m.dimensions
+        .security_headers
+        .entries
+        .iter()
+        .map(|e| (e.header.as_str(), (e.emitted, e.value.as_str())))
+        .collect()
+}
+
 fn diff_headers(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Finding>) {
-    let before: BTreeMap<&str, (&bool, &str)> = base
-        .dimensions
-        .security_headers
-        .entries
-        .iter()
-        .map(|e| (e.header.as_str(), (&e.emitted, e.value.as_str())))
-        .collect();
-    let after: BTreeMap<&str, (&bool, &str)> = head
-        .dimensions
-        .security_headers
-        .entries
-        .iter()
-        .map(|e| (e.header.as_str(), (&e.emitted, e.value.as_str())))
-        .collect();
+    let before = headers_index(base);
+    let after = headers_index(head);
+
+    let removed = |header: &str, value_before: &str| Finding {
+        kind: "security_header_removed",
+        severity: Severity::Widening,
+        method: "*".to_owned(),
+        path: header.to_owned(),
+        before: value_before.to_owned(),
+        after: "not emitted".to_owned(),
+        fingerprint: "header-removed".to_owned(),
+        detail: format!("security header `{header}` is no longer emitted"),
+    };
 
     for (header, (emitted_now, value_now)) in &after {
-        let Some((emitted_before, value_before)) = before.get(header) else {
-            continue;
-        };
-        if **emitted_before && !**emitted_now {
-            out.push(Finding {
-                kind: "security_header_removed",
-                severity: Severity::Widening,
-                method: "*".to_owned(),
-                path: (*header).to_owned(),
-                before: (*value_before).to_owned(),
-                after: "not emitted".to_owned(),
-                detail: format!("security header `{header}` is no longer emitted"),
-            });
-        } else if !**emitted_before && **emitted_now {
-            out.push(Finding {
-                kind: "security_header_added",
-                severity: Severity::Narrowing,
-                method: "*".to_owned(),
-                path: (*header).to_owned(),
-                before: "not emitted".to_owned(),
-                after: (*value_now).to_owned(),
-                detail: format!("security header `{header}` is now emitted"),
-            });
-        } else if value_before != value_now {
-            // Deliberately neutral. Whether one CSP is weaker than another is
-            // not decidable from the strings, and a gate that blocks on
-            // "the CSP changed" is a gate teams turn off. It is reported so a
-            // human can look, never so a robot can refuse.
-            out.push(Finding {
-                kind: "security_header_value_changed",
-                severity: Severity::Neutral,
-                method: "*".to_owned(),
-                path: (*header).to_owned(),
-                before: (*value_before).to_owned(),
-                after: (*value_now).to_owned(),
-                detail: format!("security header `{header}` value changed — review by eye"),
-            });
+        match before.get(header) {
+            None => {
+                if *emitted_now {
+                    out.push(Finding {
+                        kind: "security_header_added",
+                        severity: Severity::Narrowing,
+                        method: "*".to_owned(),
+                        path: (*header).to_owned(),
+                        before: "not emitted".to_owned(),
+                        after: (*value_now).to_owned(),
+                        fingerprint: "header-added".to_owned(),
+                        detail: format!("security header `{header}` is now emitted"),
+                    });
+                }
+            }
+            Some((emitted_before, value_before)) => {
+                if *emitted_before && !*emitted_now {
+                    out.push(removed(header, value_before));
+                } else if !*emitted_before && *emitted_now {
+                    out.push(Finding {
+                        kind: "security_header_added",
+                        severity: Severity::Narrowing,
+                        method: "*".to_owned(),
+                        path: (*header).to_owned(),
+                        before: "not emitted".to_owned(),
+                        after: (*value_now).to_owned(),
+                        fingerprint: "header-added".to_owned(),
+                        detail: format!("security header `{header}` is now emitted"),
+                    });
+                } else if value_before != value_now {
+                    // Deliberately neutral. Whether one CSP is weaker than
+                    // another is not decidable from the strings, and a gate
+                    // that blocks on "the CSP changed" is a gate teams turn
+                    // off. It is reported so a human can look, never so a robot
+                    // can refuse.
+                    out.push(Finding {
+                        kind: "security_header_value_changed",
+                        severity: Severity::Neutral,
+                        method: "*".to_owned(),
+                        path: (*header).to_owned(),
+                        before: (*value_before).to_owned(),
+                        after: (*value_now).to_owned(),
+                        fingerprint: "header-value-changed".to_owned(),
+                        detail: format!("security header `{header}` value changed — review by eye"),
+                    });
+                }
+            }
+        }
+    }
+    // A header entry that left the manifest entirely is the same loss as one
+    // flipped to `emitted: false`.
+    for (header, (emitted_before, value_before)) in &before {
+        if *emitted_before && !after.contains_key(header) {
+            out.push(removed(header, value_before));
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1064,6 +1238,273 @@ mod tests {
         assert!(widening(&diff(&base, &head)).is_empty());
     }
 
+    // ── security regressions (review findings) ──────────────────────────────
+
+    /// A fact that vanishes from the head manifest is still a fact that was
+    /// lost. Adding `POST` to `security.csrf.safe_methods` turns CSRF
+    /// validation off for every POST *and* removes those routes from the
+    /// manifest's csrf dimension, so a head-only walk sees nothing at all.
+    #[test]
+    fn csrf_entries_that_disappear_from_the_manifest_are_still_widening() {
+        // The route is still mounted on both sides — only its csrf entry is
+        // gone, which is exactly what widening `security.csrf.safe_methods`
+        // does: the route stays, its CSRF validation does not.
+        let r = route("/pay", "POST", "public", &[], &[], false);
+        let base = manifest(
+            &r,
+            r#"{"path":"/pay","method":"POST","csrf_enforced":true,"exempt":false}"#,
+            "",
+            "",
+        );
+        let head = manifest(&r, "", "", "");
+        let f = only(diff(&base, &head));
+        assert_eq!(f.severity, Severity::Widening, "{f:?}");
+        assert_eq!(f.path, "/pay");
+    }
+
+    /// Same shape for headers: an entry that stops being emitted *by vanishing*
+    /// is the same loss as one flipped to `emitted: false`.
+    #[test]
+    fn security_headers_that_disappear_from_the_manifest_are_still_widening() {
+        let base = manifest(
+            "",
+            "",
+            r#"{"header":"x_frame_options","value":"DENY","emitted":true}"#,
+            "",
+        );
+        let head = manifest("", "", "", "");
+        let f = only(diff(&base, &head));
+        assert_eq!(f.kind, "security_header_removed");
+        assert_eq!(f.severity, Severity::Widening);
+    }
+
+    /// A header that was never emitted and then vanishes is not a loss.
+    #[test]
+    fn a_header_that_was_not_emitted_and_then_vanishes_is_not_a_finding() {
+        let base = manifest(
+            "",
+            "",
+            r#"{"header":"referrer_policy","value":"","emitted":false}"#,
+            "",
+        );
+        let head = manifest("", "", "", "");
+        assert!(diff(&base, &head).is_empty());
+    }
+
+    /// A CSRF entry that vanished because its route did is already reported as
+    /// `route_removed`; reporting it twice — once as a narrowing and once as a
+    /// widening — would block a PR for deleting a route.
+    #[test]
+    fn a_csrf_entry_that_left_with_its_route_is_not_a_widening() {
+        let base = manifest(
+            &route("/pay", "POST", "public", &[], &[], false),
+            r#"{"path":"/pay","method":"POST","csrf_enforced":true,"exempt":false}"#,
+            "",
+            "",
+        );
+        let head = manifest("", "", "", "");
+        let findings = diff(&base, &head);
+        assert_eq!(kinds(&findings), vec!["route_removed"]);
+    }
+
+    /// `#[secured]` with no roles admits every authenticated session, so
+    /// *adding* the first role narrows the surface — the one case where an
+    /// added role is not a widening.
+    #[test]
+    fn adding_the_first_role_to_an_unrestricted_gate_is_narrowing() {
+        let base = routes_only(&route("/admin", "GET", "gated", &[], &[], false));
+        let head = routes_only(&route("/admin", "GET", "gated", &["admin"], &[], false));
+        let f = only(diff(&base, &head));
+        assert_eq!(f.kind, "roles_narrowed");
+        assert_eq!(f.severity, Severity::Narrowing);
+    }
+
+    /// The canonical form a finding contributes to the acknowledgment digest is
+    /// delimiter-separated, and route paths and role names are app-controlled.
+    /// If they are not escaped, one crafted route forges the digest of a
+    /// two-finding set — and a stale acknowledgment then covers a widening
+    /// nobody approved.
+    #[test]
+    fn a_crafted_path_cannot_forge_the_canonical_form_of_two_findings() {
+        let smuggled = Finding {
+            kind: "route_added_open",
+            severity: Severity::Widening,
+            method: "GET".to_owned(),
+            path: "/a\tabsent\tpublic\nroute_added_open\tGET\t/admin".to_owned(),
+            before: "absent".to_owned(),
+            after: "public".to_owned(),
+            fingerprint: "added:public".to_owned(),
+            detail: String::new(),
+        };
+        let plain_a = Finding {
+            path: "/a".to_owned(),
+            ..smuggled.clone()
+        };
+        let plain_b = Finding {
+            path: "/admin".to_owned(),
+            ..smuggled.clone()
+        };
+        assert_ne!(
+            smuggled.canonical(),
+            format!("{}\n{}", plain_a.canonical(), plain_b.canonical()),
+            "a tab or newline inside a field must not read as a field separator"
+        );
+        assert!(
+            !smuggled.canonical().contains('\n'),
+            "the canonical form of one finding is one line"
+        );
+    }
+
+    /// A manifest should never carry the same `(path, method)` twice, but "should
+    /// never" is not a guarantee about a file on disk. If the last entry won,
+    /// the verdict would depend on array order — and the order that hides a
+    /// public route would be the one that passes.
+    #[test]
+    fn a_duplicate_route_key_resolves_to_the_most_open_entry_either_way() {
+        let base = routes_only(&route("/a", "GET", "gated", &["admin"], &[], false));
+        let gated = route("/a", "GET", "gated", &["admin"], &[], false);
+        let public = route("/a", "GET", "public", &[], &[], false);
+
+        let gated_first = routes_only(&format!("{gated},{public}"));
+        let public_first = routes_only(&format!("{public},{gated}"));
+
+        for head in [&gated_first, &public_first] {
+            let f = only(diff(&base, head));
+            assert_eq!(
+                f.kind, "classification_downgraded",
+                "a duplicate key must not let the open entry hide behind the gated one"
+            );
+        }
+        assert_eq!(diff(&base, &gated_first), diff(&base, &public_first));
+    }
+
+    /// The acknowledgment digest must describe the *set* of widenings, not the
+    /// order the manifest happened to list its entries in.
+    #[test]
+    fn findings_do_not_depend_on_manifest_entry_order() {
+        let base = routes_only(&format!(
+            "{},{}",
+            route("/a", "GET", "gated", &["admin"], &[], false),
+            route("/b", "GET", "gated", &["admin"], &[], false)
+        ));
+        let forward = routes_only(&format!(
+            "{},{}",
+            route("/a", "GET", "public", &[], &[], false),
+            route("/b", "GET", "public", &[], &[], false)
+        ));
+        let reversed = routes_only(&format!(
+            "{},{}",
+            route("/b", "GET", "public", &[], &[], false),
+            route("/a", "GET", "public", &[], &[], false)
+        ));
+        assert_eq!(diff(&base, &forward), diff(&base, &reversed));
+    }
+
+    /// Two different sets of routes losing CSRF must not share one
+    /// acknowledgment digest — otherwise an ack for the first push silently
+    /// covers a later push that disabled CSRF somewhere else entirely.
+    #[test]
+    fn the_collapsed_csrf_finding_still_identifies_its_routes() {
+        let entries = |paths: &[&str], enforced: bool| {
+            paths
+                .iter()
+                .map(|p| {
+                    format!(
+                        r#"{{"path":"{p}","method":"POST","csrf_enforced":{enforced},"exempt":false}}"#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let first = diff(
+            &manifest("", &entries(&["/r0", "/r1", "/r2"], true), "", ""),
+            &manifest("", &entries(&["/r0", "/r1", "/r2"], false), "", ""),
+        );
+        let second = diff(
+            &manifest("", &entries(&["/x0", "/x1", "/x2"], true), "", ""),
+            &manifest("", &entries(&["/x0", "/x1", "/x2"], false), "", ""),
+        );
+        assert_eq!(only(first.clone()).kind, "csrf_disabled");
+        assert_eq!(only(second.clone()).kind, "csrf_disabled");
+        assert_ne!(
+            only(first).canonical(),
+            only(second).canonical(),
+            "different routes, different acknowledgment"
+        );
+    }
+
+    /// `#[ws]` routes are listed with the synthetic `WS` method on both sides,
+    /// so they key up like any other route.
+    #[test]
+    fn a_websocket_route_is_compared_like_any_other() {
+        let base = routes_only(&route("/live", "WS", "gated", &["member"], &[], false));
+        let head = routes_only(&route("/live", "WS", "public", &[], &[], false));
+        let f = only(diff(&base, &head));
+        assert_eq!(f.method, "WS");
+        assert_eq!(f.severity, Severity::Widening);
+    }
+
+    /// A header key that only one side knows about: added-and-emitted narrows,
+    /// and (covered above) vanished-while-emitted widens.
+    #[test]
+    fn a_header_present_only_in_the_head_manifest_is_reported() {
+        let base = manifest("", "", "", "");
+        let head = manifest(
+            "",
+            "",
+            r#"{"header":"referrer_policy","value":"no-referrer","emitted":true}"#,
+            "",
+        );
+        let f = only(diff(&base, &head));
+        assert_eq!(f.kind, "security_header_added");
+        assert_eq!(f.severity, Severity::Narrowing);
+    }
+
+    /// A resource rename is a removal plus an addition, and no manifest can tell
+    /// it from a real loss — so it still blocks, but the report says why the two
+    /// rows belong together.
+    #[test]
+    fn a_renamed_authorize_resource_blocks_but_explains_the_pairing() {
+        let r = route("/posts/{id}", "PUT", "gated", &["user"], &[], true);
+        let binding = |resource: &str| {
+            format!(
+                r#"{{"path":"/posts/{{id}}","method":"PUT","name":"h","action":"update","resource":"{resource}","provenance":"provable"}}"#
+            )
+        };
+        let findings = diff(
+            &manifest(&r, "", "", &binding("Post")),
+            &manifest(&r, "", "", &binding("Article")),
+        );
+        let removed = findings
+            .iter()
+            .find(|f| f.kind == "authorization_binding_removed")
+            .expect("still reported");
+        assert_eq!(removed.severity, Severity::Widening);
+        assert!(
+            removed.detail.contains("Article"),
+            "the paired addition is named so a rename can be acknowledged in one step: {removed:?}"
+        );
+    }
+
+    /// A later *narrowing* on a route whose widening was already acknowledged
+    /// must not change that widening's canonical form — otherwise the gate
+    /// re-asks for an acknowledgment nobody can see a reason for.
+    #[test]
+    fn a_later_narrowing_does_not_disturb_an_earlier_findings_identity() {
+        let base = routes_only(&route("/admin", "GET", "gated", &["admin"], &[], false));
+        let first = routes_only(&route("/admin", "GET", "public", &[], &[], false));
+        // The follow-up commit adds a record-level policy check: strictly
+        // narrower, and it changes the rendered posture label.
+        let second = routes_only(&route("/admin", "GET", "public", &[], &[], true));
+
+        let a = only(diff(&base, &first));
+        let b = diff(&base, &second)
+            .into_iter()
+            .find(|f| f.kind == "classification_downgraded")
+            .expect("still the same widening");
+        assert_eq!(a.canonical(), b.canonical());
+    }
+
     // ── ordering ────────────────────────────────────────────────────────────
 
     #[test]
@@ -1081,7 +1522,9 @@ mod tests {
         let findings = diff(&base, &head);
         assert_eq!(findings[0].severity, Severity::Widening);
         assert_eq!(findings.last().unwrap().severity, Severity::Narrowing);
-        // Same inputs, same order, every time.
+        // Same inputs, same order, every time — and see
+        // `findings_do_not_depend_on_manifest_entry_order` for the property
+        // that actually matters.
         assert_eq!(findings, diff(&base, &head));
     }
 }

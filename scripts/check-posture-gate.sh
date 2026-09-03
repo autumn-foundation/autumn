@@ -40,9 +40,14 @@ cd "$root"
 EXAMPLES=("hello")
 
 UPDATE=0
-if [ "${1:-}" = "--update" ]; then
-  UPDATE=1
-fi
+case "${1:-}" in
+  "") ;;
+  --update) UPDATE=1 ;;
+  *)
+    echo "usage: $0 [--update]" >&2
+    exit 2
+    ;;
+esac
 
 ACK="${AUTUMN_POSTURE_ACK:-}"
 
@@ -65,8 +70,12 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 echo "Building the autumn CLI…"
-cargo build -q -p autumn-cli --bin autumn
-CLI="$root/target/debug/autumn"
+# `--locked`: a Cargo.lock that does not match the manifests should fail the
+# gate, not resolve something else (same rule as scripts/check-sbom.sh).
+cargo build -q --locked -p autumn-cli --bin autumn
+# Honour a shared target directory, which maintainers running these scripts
+# locally commonly set (again mirroring check-sbom.sh).
+CLI="${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$root/target}}/debug/autumn"
 [ -x "$CLI" ] || die "the autumn CLI did not build at $CLI"
 
 failed=0
@@ -112,7 +121,12 @@ for example in "${EXAMPLES[@]}"; do
       echo "       and refresh the baseline with $0 --update in the same change." >&2
       failed=1
       ;;
-    *) die "$example: \`autumn routes posture diff\` could not run (exit $status)" ;;
+    *)
+      echo "error: $example: \`autumn routes posture diff\` could not run (exit $status)" >&2
+      failed=1
+      # Keep going: one broken example must not hide the verdict for the rest.
+      continue
+      ;;
   esac
 
   # Only worth saying when the posture itself came back clean: then the bytes

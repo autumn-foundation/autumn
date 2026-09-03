@@ -7,8 +7,10 @@
 # How it works:
 #
 #   1. Build this commit's posture manifest (`autumn routes audit --manifest`).
-#   2. Check the committed `security-posture.json` matches what was just built —
-#      a stale committed manifest would make the diff below lie.
+#   2. Check the committed `security-posture.json` still describes the same
+#      posture — a stale committed manifest would make the diff below lie.
+#      Compared by posture digest, not by bytes, so a moved line number or a
+#      renamed handler does not fail your CI.
 #   3. Read the base branch's committed manifest out of git (no second build).
 #   4. Diff the two. Widening changes — a new public route, a gate removed or
 #      loosened, a classification downgraded — fail this check. Narrowing and
@@ -16,21 +18,34 @@
 #      nothing at all.
 #   5. Post (or update) one comment carrying the diff.
 #
-# Unblocking a widening you meant to make — the escape hatch, and the only one:
-# comment on the pull request with the line the report prints,
+# Unblocking a widening you meant to make — the escape hatch, and the only one
+# this workflow provides: comment on the pull request with the line the report
+# prints,
 #
 #     /ack-posture <digest>  the reason this is intended
 #
-# from an account with write access (OWNER, MEMBER or COLLABORATOR — the
-# harvest step below enforces that). The digest names that exact set of
-# widenings: pushing unrelated commits keeps the acknowledgment valid, and a
-# NEW widening needs a new one. There is no switch that hides the diff.
+# from an account with write access (the harvest step below checks the
+# repository permission of each commenter, not just their org affiliation).
+# The digest names that exact set of widenings: pushing unrelated commits keeps
+# the acknowledgment valid, and a NEW widening needs a new one.
+#
+# NOTE: commenting does not re-run this workflow — `pull_request` does not fire
+# on comments. After posting the marker, re-run the check (Checks → the
+# "Security posture" run → Re-run jobs), or push a commit.
 #
 # Turning it on for the first time: the first run finds no baseline on the base
 # branch, blocks nothing, and tells you to commit `security-posture.json`. From
 # the next pull request on, the gate bites.
 #
-# Make it a required check in Settings → Branches once you have a baseline.
+# Two things to set up once, in Settings → Branches and CODEOWNERS:
+#
+#   - Make "Security posture diff" a required check.
+#   - Put `.github/workflows/` under CODEOWNERS review. This workflow runs from
+#     the pull request's own copy, so — like every other `pull_request` gate in
+#     your repository — a change to the workflow file itself is only as trusted
+#     as your review of it. The step "Refuse a pull request that edits this
+#     gate" below fails the run if the file changed; CODEOWNERS is what makes
+#     the review of that change land on the right people.
 
 name: Security posture
 
@@ -41,6 +56,11 @@ permissions:
   contents: read
   # To post the posture diff as a comment. Nothing else in this workflow writes.
   pull-requests: write
+
+concurrency:
+  # Two pushes in quick succession would otherwise each post their own comment.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -55,7 +75,8 @@ jobs:
 
     steps:
       # The base branch's copy of the manifest is read out of git below, so the
-      # base ref has to be in the checkout.
+      # base ref has to be in the checkout. `fetch-depth: 0` is what puts
+      # `origin/<base>` there — do not lower it.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -70,33 +91,66 @@ jobs:
             | sh -s -- --version "v{{autumn_version}}"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      # This workflow decides whether the pull request may merge, and it runs
+      # from the pull request's own copy of itself. Editing it in the same
+      # change that widens the surface would be the cheapest bypass there is,
+      # so the edit has to be a visible, separate decision.
+      - name: Refuse a pull request that edits this gate
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet "origin/${BASE_REF}" -- .github/workflows/posture-gate.yml; then
+            echo "::error file=.github/workflows/posture-gate.yml::this pull request edits the security posture gate itself. That may well be intended — but it cannot be reviewed by the gate it edits. Land the workflow change on its own, with review from a CODEOWNER of .github/workflows/."
+            exit 1
+          fi
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+
       # Compiles the app and reads back its macro-expanded auth posture. This is
       # the only build this job pays for: the base side is a file read.
       - name: Build this commit's posture manifest
         run: autumn routes audit --manifest "$POSTURE_MANIFEST"
 
-      # A committed manifest that does not match the built one would make the
-      # diff describe a posture this commit does not have.
+      # A committed manifest that no longer describes this commit's posture
+      # would make the diff below describe a posture this commit does not have.
+      # Compared by digest: the posture digest deliberately excludes handler
+      # names and source locations, so an unrelated edit above a handler does
+      # not turn into a red gate and a regenerate-and-commit chore.
       - name: Check the committed manifest is up to date
         run: |
           set -euo pipefail
-          if git ls-files --error-unmatch "$POSTURE_MANIFEST" >/dev/null 2>&1; then
-            if ! git diff --quiet -- "$POSTURE_MANIFEST"; then
-              git --no-pager diff -- "$POSTURE_MANIFEST" || true
-              echo "::error file=$POSTURE_MANIFEST::the committed posture manifest is out of date — run \`autumn routes audit --manifest $POSTURE_MANIFEST\` and commit the result"
-              exit 1
-            fi
-          else
+          if ! git ls-files --error-unmatch "$POSTURE_MANIFEST" >/dev/null 2>&1; then
             echo "::notice::no posture baseline is committed yet — commit $POSTURE_MANIFEST so the next pull request can be diffed against it"
+            exit 0
+          fi
+          git show "HEAD:${POSTURE_MANIFEST}" > committed-posture.json
+          FRESH=$(autumn routes posture digest --manifest "$POSTURE_MANIFEST")
+          COMMITTED=$(autumn routes posture digest --manifest committed-posture.json)
+          if [ "$FRESH" != "$COMMITTED" ]; then
+            echo "::error file=$POSTURE_MANIFEST::the committed posture manifest describes a different security posture than this commit builds ($COMMITTED vs $FRESH) — run \`autumn routes audit --manifest $POSTURE_MANIFEST\` and commit the result"
+            exit 1
           fi
 
-      # The previously accepted posture. Absent on the first run, on a fresh
-      # fork, or when the base branch predates the gate: all bootstrap cases,
-      # handled by --allow-missing-base below.
+      # The previously accepted posture. Absent on the first run, or when the
+      # base branch predates the gate — both bootstrap cases. A base ref that is
+      # not in the checkout at all is NOT a bootstrap case: it means this job
+      # cannot see what it is comparing against, and passing everything would be
+      # a security gate that never fires.
       - name: Read the base branch's posture
         run: |
           set -euo pipefail
-          if ! git show "origin/${BASE_REF}:${POSTURE_MANIFEST}" > base-posture.json 2>/dev/null; then
+          git rev-parse --verify "origin/${BASE_REF}^{commit}" >/dev/null 2>&1 || {
+            echo "::error::origin/${BASE_REF} is not in this checkout — the posture gate needs actions/checkout with fetch-depth: 0"
+            exit 1
+          }
+          if git cat-file -e "origin/${BASE_REF}:${POSTURE_MANIFEST}" 2>/dev/null; then
+            git show "origin/${BASE_REF}:${POSTURE_MANIFEST}" > base-posture.json
+          elif git log --oneline -1 "origin/${BASE_REF}" -- "${POSTURE_MANIFEST}" | grep -q .; then
+            # The base branch HAD a manifest and no longer does. Deleting the
+            # baseline is exactly how you would disarm this gate, so it is a
+            # failure, not a bootstrap.
+            echo "::error::${POSTURE_MANIFEST} existed on origin/${BASE_REF} and is gone. Restore it, or land its removal as an explicit, separately reviewed change."
+            exit 1
+          else
             rm -f base-posture.json
             echo "::notice::no posture manifest on origin/${BASE_REF} — nothing to diff against yet"
           fi
@@ -105,19 +159,40 @@ jobs:
 
       # Acknowledgment markers, and who is allowed to write them. `autumn`
       # itself has no GitHub identity and enforces no authorization: this step
-      # is where "who may acknowledge" is decided, by keeping only comments and
-      # reviews from accounts with write access to the repository.
+      # is where "who may acknowledge" is decided. It asks GitHub for each
+      # commenter's actual repository permission rather than trusting
+      # `author_association`, which reports organization affiliation and would
+      # let any org member with read access acknowledge a widening.
+      #
+      # Bodies are separated by a marker so one comment's unbalanced code fence
+      # cannot swallow — or resurrect — a marker in another. Comments from the
+      # bot are skipped: its own report contains the marker it is asking for.
+      #
+      # A GitHub API hiccup must not fail the job: an empty acks.txt means
+      # "nothing acknowledged", which is the safe direction.
       - name: Harvest acknowledgments from authorized reviewers
         run: |
-          set -euo pipefail
+          set -uo pipefail
           : > acks.txt
-          AUTHORIZED='["OWNER","MEMBER","COLLABORATOR"]'
-          gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
-            --jq "map(select(.author_association as \$a | ${AUTHORIZED} | index(\$a))) | .[].body" \
-            >> acks.txt
-          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" \
-            --jq "map(select(.author_association as \$a | ${AUTHORIZED} | index(\$a))) | .[].body" \
-            >> acks.txt
+          authors_and_bodies() {
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/$1" \
+              --jq '.[] | select((.user.login // "") != "github-actions[bot]") | "\(.user.login // "")\t\((.body // "") | @base64)"' || true
+          }
+          {
+            authors_and_bodies "issues/${PR_NUMBER}/comments"
+            authors_and_bodies "pulls/${PR_NUMBER}/reviews"
+          } | while IFS=$'\t' read -r login body64; do
+            [ -n "$login" ] || continue
+            PERM=$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${login}/permission" \
+                     --jq '.permission' 2>/dev/null || echo none)
+            case "$PERM" in
+              admin|write|maintain) ;;
+              *) continue ;;
+            esac
+            printf '%s\n' '<!-- autumn:ack-source -->' >> acks.txt
+            printf '%s\n' "$body64" | base64 -d >> acks.txt
+            printf '\n' >> acks.txt
+          done
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -139,16 +214,24 @@ jobs:
             cat posture-diff.md >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      # One comment, updated in place. A pull request whose posture stops
-      # changing has its comment replaced with a short "resolved" note rather
-      # than leaving a stale block quoted forever.
+      # One comment, updated in place. `continue-on-error` because a pull
+      # request from a fork gets a read-only token however this workflow's
+      # permissions are declared: the diff still runs, the step summary still
+      # carries the report, and the verdict below is still enforced.
       - name: Post the posture diff
-        if: always() && steps.diff.outcome != 'skipped'
+        if: always() && steps.diff.outcome == 'success'
+        continue-on-error: true
         run: |
           set -euo pipefail
           MARKER='<!-- autumn-posture-gate -->'
+          # Only ever update a comment this workflow itself wrote: a quoted
+          # reply carries the marker too, and PATCHing a contributor's comment
+          # (which `pull-requests: write` permits) would rewrite their words.
           EXISTING=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
-            --jq "map(select(.body | contains(\"${MARKER}\"))) | .[0].id // empty")
+            --jq "map(select((.user.login // \"\") == \"github-actions[bot]\" and ((.body // \"\") | contains(\"${MARKER}\")))) | .[0].id // empty")
+          # `--paginate` applies the filter per page, so several pages can each
+          # contribute an id. Take the first.
+          EXISTING=${EXISTING%%$'\n'*}
           if [ -s posture-diff.md ]; then
             BODY_FILE=posture-diff.md
           elif [ -n "$EXISTING" ]; then
@@ -170,6 +253,10 @@ jobs:
 
       # Exit code 1 = an unacknowledged widening. Exit code 2 = the tool could
       # not run (bad path, unreadable manifest), which is a build failure, not a
-      # security finding.
+      # security finding. `if: always()` so a failed comment post — the one step
+      # a fork pull request cannot perform — never swallows the verdict.
       - name: Enforce the gate
-        run: exit ${{ steps.diff.outputs.status }}
+        if: always() && steps.diff.outcome == 'success'
+        run: exit "$STATUS"
+        env:
+          STATUS: ${{ steps.diff.outputs.status }}

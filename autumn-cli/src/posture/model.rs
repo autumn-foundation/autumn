@@ -30,7 +30,15 @@ pub const MIN_SCHEMA_VERSION: u32 = 3;
 /// next bumped, re-read [`PostureManifest::projection`] below: if the bump changes the
 /// meaning of an existing field rather than adding new ones, the diff rules move with
 /// it.
-pub const MAX_SCHEMA_VERSION: u32 = MANIFEST_SCHEMA_VERSION;
+pub const MAX_SCHEMA_VERSION: u32 = 3;
+
+// Deliberately a literal, not `MANIFEST_SCHEMA_VERSION`. Tracking the emitter
+// would auto-widen what this differ accepts on the very bump whose doc comment
+// says to re-read the rules — the compile error below is the point.
+const _: () = assert!(
+    MAX_SCHEMA_VERSION <= MANIFEST_SCHEMA_VERSION,
+    "the differ claims to read a manifest schema the emitter does not produce"
+);
 
 /// Why a manifest could not be turned into a [`PostureManifest`].
 #[derive(Debug)]
@@ -216,6 +224,12 @@ impl RouteEntry {
 }
 
 /// Whether a classification means "anyone can reach this route".
+///
+/// The vocabulary is the one `routes audit` assigns (see
+/// [`AuditRoute::is_unclassified`](crate::routes_audit::AuditRoute::is_unclassified)):
+/// `gated`, `public`, `framework`, `unclassified`. Anything else — including a
+/// value a newer emitter might add — reads as open, which is the safe
+/// direction: it over-reports rather than missing a widening.
 #[must_use]
 pub fn is_open(classification: &str) -> bool {
     // An empty or unknown classification is treated as open on purpose: it is
@@ -267,30 +281,37 @@ impl PostureManifest {
             let scopes: Vec<String> = r.scope_set().into_iter().collect();
             lines.push(format!(
                 "route\t{}\t{}\t{}\troles={}\tscopes={}\tpolicy={}",
-                r.path,
-                r.method,
-                r.classification,
-                roles.join(","),
-                scopes.join(","),
+                escape_field(&r.path),
+                escape_field(&r.method),
+                escape_field(&r.classification),
+                escape_field(&roles.join(",")),
+                escape_field(&scopes.join(",")),
                 r.policy
             ));
         }
         for c in &self.dimensions.csrf.entries {
             lines.push(format!(
                 "csrf\t{}\t{}\tenforced={}",
-                c.path, c.method, c.csrf_enforced
+                escape_field(&c.path),
+                escape_field(&c.method),
+                c.csrf_enforced
             ));
         }
         for h in &self.dimensions.security_headers.entries {
             lines.push(format!(
                 "header\t{}\temitted={}\tvalue={}",
-                h.header, h.emitted, h.value
+                escape_field(&h.header),
+                h.emitted,
+                escape_field(&h.value)
             ));
         }
         for a in &self.dimensions.authorization_policies.entries {
             lines.push(format!(
                 "authz\t{}\t{}\t{}\t{}",
-                a.path, a.method, a.action, a.resource
+                escape_field(&a.path),
+                escape_field(&a.method),
+                escape_field(&a.action),
+                escape_field(&a.resource)
             ));
         }
         lines.sort();
@@ -307,6 +328,29 @@ impl PostureManifest {
     pub fn posture_digest(&self) -> String {
         hex_digest(self.projection().as_bytes())
     }
+}
+
+/// Escape a field for a delimiter-joined canonical form.
+///
+/// Route paths, role names, scope names and header values are all
+/// app-controlled strings, and both digests in this module join fields with
+/// tabs and lines with newlines. Unescaped, one route whose path contains a tab
+/// and a newline hashes exactly like a *set* of ordinary routes — so an
+/// acknowledgment for the crafted one silently covers the ordinary ones. This
+/// is the function that makes the encoding unambiguous.
+#[must_use]
+pub fn escape_field(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Lower-case hex SHA-256 of `bytes`.

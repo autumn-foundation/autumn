@@ -26,8 +26,10 @@ use super::model::{ManifestError, PostureManifest};
 pub struct VerifyOptions<'a> {
     /// Path to the posture manifest to check.
     pub manifest: &'a str,
-    /// The digest CI acknowledged (full, or a prefix of at least
-    /// [`MIN_DIGEST_PREFIX`] hex characters).
+    /// The digest CI acknowledged. A full 64-character digest: unlike the
+    /// acknowledgment marker a human types on a pull request, this one is
+    /// machine-recorded and machine-passed, so there is no reason to accept
+    /// less than all of it.
     pub expect_digest: Option<&'a str>,
     /// `owner/repo` the attestation was minted by.
     pub repo: Option<&'a str>,
@@ -35,10 +37,8 @@ pub struct VerifyOptions<'a> {
     pub skip_signature: bool,
 }
 
-/// Shortest digest prefix that may stand in for a full digest. Shared with the
-/// acknowledgment marker so there is exactly one rule about how much of a
-/// digest is enough.
-pub const MIN_DIGEST_PREFIX: usize = super::ack::SHORT_DIGEST_LEN;
+/// Length of a full SHA-256 digest in hex.
+pub const FULL_DIGEST_LEN: usize = 64;
 
 /// One thing that was checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,14 +71,31 @@ impl VerifyReport {
     }
 }
 
-/// Whether `provided` is an acceptable stand-in for `expected`.
+/// Whether `provided` is the digest `expected`, in full.
 ///
-/// Case-insensitive, hex-only, and never shorter than [`MIN_DIGEST_PREFIX`]:
-/// a two-character "prefix" would match one digest in 256.
+/// Case-insensitive and hex-only. Deliberately *not* prefix matching: the
+/// acknowledgment marker accepts a 16-character prefix because a human types
+/// it into a comment box, but a digest recorded by CI and passed to a deploy
+/// script has no such excuse, and a shorter binding is a weaker one.
 #[must_use]
 pub fn digest_matches(expected: &str, provided: &str) -> bool {
     let provided = provided.trim().to_ascii_lowercase();
-    if !(MIN_DIGEST_PREFIX..=64).contains(&provided.len())
+    if provided.len() != FULL_DIGEST_LEN || !provided.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    expected.trim().to_ascii_lowercase() == provided
+}
+
+/// Whether an acknowledgment marker `provided` binds to `expected`.
+///
+/// This is the human-typed half: a prefix of at least
+/// [`SHORT_DIGEST_LEN`](super::ack::SHORT_DIGEST_LEN) characters is enough,
+/// which is what the gate prints for pasting. A two-character "prefix" would
+/// match one digest in 256, so there is a floor.
+#[must_use]
+pub fn marker_matches(expected: &str, provided: &str) -> bool {
+    let provided = provided.trim().to_ascii_lowercase();
+    if !(super::ack::SHORT_DIGEST_LEN..=FULL_DIGEST_LEN).contains(&provided.len())
         || !provided.chars().all(|c| c.is_ascii_hexdigit())
     {
         return false;
@@ -277,17 +294,24 @@ mod tests {
         assert!(digest_matches(&d, &d.to_uppercase()));
     }
 
+    /// A machine-recorded digest is compared in full: `--expect-digest` takes
+    /// no shortcuts, however long the prefix.
     #[test]
-    fn a_long_enough_prefix_matches() {
+    fn a_prefix_never_satisfies_expect_digest() {
         let d = "0123456789abcdef".to_owned() + &"f".repeat(48);
-        assert!(digest_matches(&d, "0123456789abcdef"));
+        assert!(!digest_matches(&d, "0123456789abcdef"));
+        assert!(!digest_matches(&d, &d[..63]));
+        assert!(digest_matches(&d, &d));
     }
 
+    /// The human-typed marker is the half that may be a prefix — with a floor.
     #[test]
-    fn a_too_short_prefix_never_matches() {
+    fn a_long_enough_marker_prefix_matches() {
         let d = "0123456789abcdef".to_owned() + &"f".repeat(48);
-        assert!(!digest_matches(&d, "0123456789abcde"));
-        assert!(!digest_matches(&d, "01"));
+        assert!(marker_matches(&d, "0123456789abcdef"));
+        assert!(!marker_matches(&d, "0123456789abcde"), "below the floor");
+        assert!(!marker_matches(&d, "01"));
+        assert!(!marker_matches(&d, "fedcba9876543210"), "not a prefix");
     }
 
     #[test]
@@ -296,10 +320,30 @@ mod tests {
         assert!(!digest_matches(&d, "fedcba9876543210"));
     }
 
+    /// A run that verified nothing is not a pass.
+    #[test]
+    fn waiving_both_halves_fails_rather_than_passing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_manifest(dir.path(), "gated");
+        let report = verify_with(
+            &VerifyOptions {
+                manifest: &path,
+                expect_digest: None,
+                repo: None,
+                skip_signature: true,
+            },
+            &FakeVerifier::ok(),
+        )
+        .unwrap();
+        assert!(!report.passed(), "nothing was checked: {report:?}");
+    }
+
     #[test]
     fn a_non_hex_string_never_matches() {
         let d = "0".repeat(64);
         assert!(!digest_matches(&d, "zzzzzzzzzzzzzzzz"));
+        assert!(!digest_matches(&d, &"z".repeat(64)));
+        assert!(!marker_matches(&d, "zzzzzzzzzzzzzzzz"));
     }
 
     // ── verification ────────────────────────────────────────────────────────

@@ -84,8 +84,21 @@ git add security-posture.json
 
 Enabling the gate on a repository whose posture has not changed never breaks
 it. The first run finds no baseline on the base branch, blocks nothing, and
-says so. Make it a required check in **Settings → Branches** once the baseline
-is committed.
+says so.
+
+Two settings finish the job:
+
+- Make **Security posture diff** a required check in *Settings → Branches*.
+  Until it is required, the gate reports; it does not gate.
+- Put `.github/workflows/` under CODEOWNERS review. Like every `pull_request`
+  workflow on GitHub, this one runs from the pull request's own copy of itself,
+  so a change to the gate is only as trusted as the review of that change. The
+  workflow refuses to run a pull request that edits it — land workflow changes
+  on their own, reviewed by someone who owns that path.
+
+Deleting the committed manifest does not quietly turn the gate off either: a
+base branch that *had* a manifest and no longer does fails the check instead of
+bootstrapping.
 
 ---
 
@@ -93,9 +106,11 @@ is committed.
 
 1. `autumn routes audit --manifest security-posture.json` builds this commit's
    manifest. That is the only build the job pays for.
-2. The workflow fails if the committed `security-posture.json` doesn't match
-   what was just built — a stale committed manifest would make the diff lie.
-   Regenerate and commit it as part of the change.
+2. The workflow fails if the committed `security-posture.json` describes a
+   different *posture* than the one just built — a stale committed manifest
+   would make the diff lie. The comparison is by posture digest, not by bytes,
+   so a moved line number or a renamed handler never turns into a
+   regenerate-and-commit chore; a real posture change does.
 3. The base branch's copy is read straight out of git
    (`git show origin/<base>:security-posture.json`). No second build.
 4. `autumn routes posture diff` compares the two and exits `0`, `1`, or `2`.
@@ -117,12 +132,21 @@ Comment on the pull request with the line the report prints:
 
 Rules worth knowing:
 
-- **Who.** The workflow harvests acknowledgment lines only from comments and
-  reviews whose author association is `OWNER`, `MEMBER` or `COLLABORATOR` —
-  i.e. accounts with write access. `autumn` itself has no GitHub identity and
-  enforces no authorization; the workflow step is where that decision lives, so
-  a team that wants something narrower (say, excluding the pull request's own
-  author) edits the `--jq` filter in that step.
+- **Who.** The workflow asks GitHub for each commenter's **repository
+  permission** (`repos/{owner}/{repo}/collaborators/{login}/permission`) and
+  keeps only `admin`, `write` or `maintain`. It deliberately does *not* trust
+  `author_association`: `MEMBER` means "member of the owning organization",
+  which in an org with per-repository permissions includes people with no
+  access to this repository at all. `autumn` itself has no GitHub identity and
+  enforces no authorization — the workflow step is where that decision lives.
+  A team that wants something narrower (excluding the pull request's own
+  author, say — nothing stops a maintainer acknowledging their own widening
+  today) edits that step. Note that editing it makes the file diverge from the
+  scaffold, so `autumn upgrade` will report it as a conflict from then on
+  rather than silently overwriting your version.
+- **Re-running.** Posting the comment does not re-run the check: `pull_request`
+  does not fire on comments. After commenting, re-run the *Security posture*
+  check from the Checks tab, or push a commit.
 - **What it binds to.** The digest is computed over the *exact set of widening
   findings*. Push ten more commits that don't change that set and the
   acknowledgment stays valid. Widen something **new** and the digest changes,
@@ -136,12 +160,18 @@ Rules worth knowing:
 
 ### When the tool is wrong
 
-Acknowledgment **is** the escape hatch, and it is the only one. There is no
-flag that disables the gate, hides the diff, or excludes a route: a
-false positive is unblocked exactly the way a true positive is — by a named
-person saying so on the pull request, in public, with a reason. A wrongly
-blocked pull request is therefore always unblockable by the team alone,
-without waiting on a framework release.
+Acknowledgment **is** the escape hatch, and it is the only one this gate
+provides. There is no flag that disables it, hides the diff, or excludes a
+route: a false positive is unblocked exactly the way a true positive is — by a
+named person saying so on the pull request, in public, with a reason. A wrongly
+blocked pull request is therefore always unblockable by the team alone, without
+waiting on a framework release.
+
+(What no in-repo gate can defend against is the repository's own settings: an
+administrator can always dismiss a required check, and a pull request that
+rewrites the workflow could rewrite this one. The workflow refuses to run when
+it is itself edited, and CODEOWNERS on `.github/workflows/` is what turns that
+refusal into a review.)
 
 If the tool got it wrong, please also
 [open an issue](https://github.com/autumn-foundation/autumn/issues) with the
@@ -177,9 +207,13 @@ autumn routes posture verify \
 - **`--repo`** — runs `gh attestation verify` under the hood. This answers *did
   this file come out of our CI, unmodified?*
 
-It exits `0` only if both hold. Tamper with one byte of a route's
-classification and the digest check fails; substitute a manifest from somewhere
-else and the signature check fails.
+It exits `0` only if every check that ran passed **and at least one actually
+ran**. Tamper with one byte of a route's classification and the digest check
+fails; substitute a manifest from somewhere else and the signature check fails;
+omit both `--expect-digest` and `--repo` and the run fails rather than
+reporting a pass it did not earn. `--expect-digest` takes the full 64-character
+digest — the 16-character short form exists for the comment marker a human
+types, not for a value a deploy script passes.
 
 `--skip-signature` exists for genuinely offline hosts. It is reported as
 **waived**, never as passed, and a run that waives both halves fails: a
@@ -234,6 +268,13 @@ doesn't. It inherits every boundary of
 - **Anything the app doesn't mount through the route registry.** A hand-rolled
   `axum::Router` merged in at the edges is invisible to `routes audit`, and so
   invisible here.
+- **A renamed `#[authorize]` resource.** Renaming `Post` to `Article` reads as
+  one binding removed and another added, and no manifest can tell that from a
+  genuine loss. It blocks, and the report names the pairing so you can
+  acknowledge it in one step.
+- **Middleware-imposed guards.** A route protected by a `RequireApiToken` layer
+  rather than by `#[secured]` is `unclassified` to `routes audit`, so it never
+  reaches this gate in the first place — `routes audit` fails on it first.
 
 ---
 

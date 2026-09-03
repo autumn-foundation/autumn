@@ -166,7 +166,7 @@ jobs:
   metadata:
     name: Crate metadata
     runs-on: ubuntu-latest
-    needs: [examples, benchmarks]
+    needs: [examples, benchmarks, posture-gate]
     steps:
       - uses: actions/checkout@v7
       - name: Check required crates.io metadata fields

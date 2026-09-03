@@ -350,7 +350,13 @@ fn skipping_the_signature_check_says_so_out_loud() {
     ]);
     let text = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
     assert!(
-        text.to_lowercase().contains("signature"),
-        "the waived check must still be reported: {text}"
+        text.contains("WAIVED"),
+        "the waived check must be reported as waived, not as passed: {text}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "with the signature waived and no --expect-digest, nothing was verified — \
+         that is not a pass: {text}"
     );
 }
