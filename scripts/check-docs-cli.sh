@@ -546,7 +546,38 @@ _PROMPT = {'$', '('}
 # migrate; then …` runs `autumn migrate` as the condition, and leaving `if` as
 # the segment head meant the scan never reached it.
 _CONTROL = {'if', 'elif', 'while', 'until', 'then', 'else', 'do', 'done', 'fi',
-            'time', '!', 'exec', 'command', 'nohup', 'sudo'}
+            'time', '!', 'exec', 'command', 'nohup', 'sudo', 'env'}
+
+# Options a wrapper takes that consume a SEPARATE value token. `env` and
+# `sudo` both put flags between the keyword and the command they launch —
+# `env [OPTION]... [NAME=VALUE]... COMMAND`, `sudo [OPTION]... COMMAND` — and
+# the scan stopped on the first flag, so the command behind it went unread.
+#
+# Only the value-taking spellings need listing: anything else starting with
+# `-` consumes just itself, and `--opt=value` is self-contained either way. An
+# option this table does not know is treated as a flag, and when that is wrong
+# the head lands on something that is not the binary — so the line degrades to
+# silence rather than to a false report.
+_WRAPPER_OPTS = {
+    'env': {'-u', '--unset', '-C', '--chdir', '-S', '--split-string'},
+    'sudo': {'-u', '--user', '-g', '--group', '-p', '--prompt',
+             '-D', '--chdir', '-R', '--chroot', '-T', '--command-timeout'},
+}
+
+
+def _skip_wrapper_options(segment, i, value_opts):
+    """Step past a wrapper's own options so its COMMAND becomes the head."""
+    while i < len(segment):
+        tok = segment[i]
+        if tok == '-':                          # `env - COMMAND`: empty env
+            i += 1
+            continue
+        if not tok.startswith('-') or len(tok) < 2:
+            break
+        i += 1
+        if '=' not in tok and tok in value_opts:
+            i += 1                              # its value is the next token
+    return i
 
 # A crontab line puts the command after a five-field schedule, so `autumn` is
 # not the segment head and the scan stopped on the minute field. The corpus
@@ -961,7 +992,10 @@ def _from_tokens(tokens):
                     if depth <= 0:              # a coalesced `))` closes both
                         break
                 continue
+            wrapper = _WRAPPER_OPTS.get(segment[i])
             i += 1
+            if wrapper is not None:
+                i = _skip_wrapper_options(segment, i, wrapper)
         head = None
         if i < len(segment):
             if _autumn_exe(segment[i]) or _exec_command(segment[i]):
@@ -1615,6 +1649,35 @@ def self_test():
            'an assignment token is not itself the binary')
     expect(_exe_path('/usr/local/bin/autumn') and not _exe_path('autumn'),
            "an assignment's VALUE must be a PATH before it is a program")
+
+    # --- wrappers that put their OWN options between the keyword and the
+    # command they launch. The scan stopped on the first flag, so everything
+    # after it went unread — `env` entirely, since it was not even a keyword.
+    for launcher in ('env AUTUMN_ENV=prod autumn migrate run',
+                     'env autumn migrate run',
+                     'env -i autumn migrate run',
+                     'env -u FOO autumn migrate run',
+                     'env --chdir=/srv autumn migrate run',
+                     'env - autumn migrate run',
+                     'env -u FOO -i AUTUMN_ENV=prod autumn migrate run',
+                     'sudo autumn migrate run',
+                     'sudo -u postgres autumn migrate run',
+                     'sudo -u postgres env AUTUMN_ENV=prod autumn migrate run'):
+        doc = f'```bash\n{launcher}\n```'
+        expect([d for _, d, _, _ in invocations(doc)] == ['migrate run'],
+               f'a command launched through a wrapper must be read: {launcher} -> '
+               f'{list(invocations(doc))}')
+    # A value-taking option must eat its value and no more, so a real
+    # subcommand behind it still resolves…
+    ok = '```bash\nsudo -u postgres autumn migrate\n```'
+    expect([d for _, d, _, _ in invocations(ok)] == ['migrate'],
+           f'a correct command behind a wrapper option must resolve: {list(invocations(ok))}')
+    # …including when the option's VALUE is itself the word `autumn`.
+    named = '```bash\nsudo -u autumn autumn migrate\n```'
+    expect([d for _, d, _, _ in invocations(named)] == ['migrate'],
+           f"a user named `autumn` is not the command: {list(invocations(named))}")
+    expect(list(invocations('```bash\nenv | grep AUTUMN\n```')) == [],
+           'env printing the environment launches nothing')
 
     # A systemd unit writes the command as an assignment to a path.
     unit = '```ini\n[Service]\nExecStart=/usr/local/bin/autumn migrate run\n```'
