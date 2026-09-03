@@ -74,6 +74,22 @@ impl<T> AsRef<T> for Validated<T> {
 ///
 /// Returns `AutumnResult<Validated<Self>>` so the `?` operator works
 /// in handlers.
+///
+/// # Hazard: don't combine with `#[validate(nested)]`
+///
+/// This blanket `impl<T: validator::Validate> ValidateExt for T` applies to
+/// *every* `Validate` type, including one used as a `#[validate(nested)]`
+/// field inside another `#[derive(validator::Validate)]` struct. `nested`'s
+/// generated code calls that field with bare method syntax —
+/// `(&self.field).validate()` — and if this trait is also in scope at that
+/// point (it is, the moment a module does `use autumn_web::prelude::*;`),
+/// rustc reports `E0034: multiple applicable items in scope`, pointing at the
+/// derive expansion rather than at anything you wrote. `#[autumn_web::model]`
+/// refuses `#[validate(nested)]` outright for exactly this reason (issue
+/// #1751); a hand-rolled `#[derive(validator::Validate)]` struct has no such
+/// guard, so keep nested-validating structs in a module that does not import
+/// this trait (or `autumn_web::prelude`), or express the rule with
+/// `#[validate(custom(function = "..."))]` instead.
 pub trait ValidateExt: validator::Validate + Sized {
     /// Validate this value and wrap it in [`Validated`].
     ///

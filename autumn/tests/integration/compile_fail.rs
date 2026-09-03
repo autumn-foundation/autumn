@@ -68,6 +68,12 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_shard_key_unknown.rs");
 
+    // `#[validate(nested)]` collides with this crate's own `ValidateExt` (see
+    // `reject_nested_validator` in autumn-macros) and is refused outright with
+    // a clear diagnostic instead of a downstream `E0034` (issue #1751).
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_validate_nested_rejected.rs");
+
     // Two m2m associations to the same target type with no `helper = "..."`
     // override collide on their target-derived mutation helpers (#1785).
     #[cfg(feature = "db")]

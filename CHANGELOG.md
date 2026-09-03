@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
+  update validation left after #1719/#1742/#1778/#1801 (issue #1751).
+  `must_match` — like `custom`, `ip` on `Option<_>` fields, and
+  `does_not_contain` before it — is now behaviorally proven, not just
+  asserted, to be enforced on the update path via merged-model validation
+  (`from_patch`): `tests/integration/validate_merged_model.rs` gained a
+  dedicated cross-field `password`/`password_confirm` case showing the patch
+  struct alone stays create-only while the merged model correctly rejects a
+  mismatch and accepts a match. Investigating the last item, `nested`,
+  surfaced a real, previously-undiscovered defect rather than a mere test gap:
+  `validator_derive`'s `nested` codegen calls a field's value with bare
+  `(&field).validate()`, which collides with this crate's own `ValidateExt`
+  (`autumn_web::prelude::ValidateExt`, a blanket `impl<T: validator::Validate>
+  ValidateExt for T` also named `validate`) — any module that both derives a
+  `#[validate(nested)]` struct and imports the prelude (virtually every
+  handler module) failed to compile with a cryptic `E0034: multiple
+  applicable items in scope` pointing into the derive expansion, on **create
+  as much as on update**. `#[autumn_web::model]` now refuses
+  `#[validate(nested)]` outright, before any codegen runs, with a diagnostic
+  that names the field and the real cause and suggests `#[validate(custom(...))]`
+  as the alternative (`tests/compile-fail/model_validate_nested_rejected.rs`);
+  `ValidateExt`'s doc comment now carries the same warning for hand-rolled
+  `#[derive(validator::Validate)]` structs outside `#[model]`, which have no
+  such guard. `credit_card`/`non_control_character` remain correctly
+  out of scope: they are not in this workspace's enabled `validator` feature
+  set (only `derive`, not `card`/`unic`), so no model can use them today
+  regardless of the update path.
+
 - **Continuous SQLite replication with point-in-time restore (#1628):** the
   zero-ops SQLite tier (#1614) had snapshot backups (#1595/#1619) and nothing
   finer, so a dead VPS cost everything written since the last snapshot — hours.
