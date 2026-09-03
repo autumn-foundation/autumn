@@ -517,24 +517,32 @@ calibrated noise floor in hand:**
   end of that range is closer to true. Resolving it needs noise
   calibration interspersed *throughout* a long chronological walk, not a
   clustered batch run separately from it — not done here. See Verdict.
-- **The total-window figure survives, even though attribution inside it
-  does not — but at a lower confidence than first stated** (Codex P2 on
-  `c38feaa9`, applying the same walk-noise inflation caveat here that the
-  kill-line discussion above already applied to the pre/post-fix spans,
-  rather than treating this claim as exempt from it). End-to-end,
+- **The total-window figure is this report's single strongest number, but
+  it is not immune from the same open noise question as everything
+  else — a claim that it was "solidly real at either end" of a 4.0-5.9σ
+  range overstated what's actually established** (Codex P2 on `1c785d56`,
+  correcting the previous revision's own correction). End-to-end,
   `d1ecb361` (55,882ms, one warm sample from the 32-checkpoint walk) →
   `ef61ae44` (42,837ms, 7-sample calibrated mean) is **−13,045ms
   (−23.4%)**, consistent with the single-sample estimate reported before
   calibration (−13,245ms, −23.7%). Using the clustered calibration's
-  σ=1,080ms at face value, that's ≈8-9σ (dominated by the single, n=1
-  `d1ecb361` sample's stdev, since the endpoint's 7-sample mean has a much
-  smaller SE of ≈408ms) — but `d1ecb361` was measured *within* the same
-  noisy 32-checkpoint walk the kill-line discussion flags as possibly
-  2-3x noisier than the clustered calibration. Applying that same 2-3x
-  range to `d1ecb361`'s stdev gives a combined uncertainty of
-  ≈2,200-3,270ms, so the honest range is **≈4.0σ-5.9σ**, not 8-9σ. Still
-  comfortably real at either end of that range — just not as
-  overwhelmingly so as the unadjusted number suggested. What calibration
+  σ=1,080ms at face value, that's ≈8-9σ. Scaling that by the 2-3x range
+  used elsewhere in this report gives ≈4.0-5.9σ — but that 2-3x figure
+  itself rests on exactly two single-run no-op deltas (`dc74ce43`,
+  `31423bfc`, ±4.6s), which can suggest a point estimate but cannot
+  establish a rigorous *upper bound* on how noisy the 32-checkpoint walk
+  really was, especially with only one `d1ecb361` sample to begin with.
+  Nothing in this report rules out the walk's true noise being higher
+  than 3x the clustered estimate — in which case even 4.0σ is not a safe
+  floor. The honest statement is not "≈4.0-5.9σ, solidly real" but: **the
+  applicable noise scale for this comparison is not established by this
+  data, the same as the pre-fix and post-fix spans** — what distinguishes
+  this number from those is only that its raw effect size (≈13,000ms) is
+  roughly 3-4x theirs, so it would take a noise level considerably higher
+  than anything this report's evidence suggests to put it in real doubt.
+  That is a qualitative reason for somewhat more confidence, not a
+  quantitative one, and this report cannot honestly produce a specific σ
+  figure for it. What calibration
   removes is
   confidence in *why*: whether that total is the fix's raw −24,333ms
   partly clawed back by real per-commit compile-time growth (this report's
@@ -587,17 +595,20 @@ live report needs the map:
 
 **What this assay establishes, and at what confidence:**
 
-- **The total window effect is real and large, though not fully immune to
-  the same noise-inflation question as the spans below** (Codex P2 on
-  `c38feaa9`, correcting an earlier claim that this comparison was exempt
-  from the walk-noise caveat; it isn't, since `d1ecb361` was measured
-  within that same noisy walk). `d1ecb361` →
-  `ef61ae44`, ≈−13,000ms (−23-24%), is ≈8-9σ against the clustered
-  calibration's tight noise estimate but ≈4.0-5.9σ against the same
-  2-3x-inflated estimate applied to the spans below (see Assay) — still
-  solidly real at either end, unlike the post-fix span, but with real
-  (if modest, given the size of the effect) uncertainty in exactly how
-  solid.
+- **The total window effect is this report's strongest single number, but
+  it is subject to the same unresolved noise-scale question as the spans
+  below, not exempt from it** (corrected twice now, most recently Codex
+  P2 on `1c785d56`: a prior revision computed a ≈4.0-5.9σ "floor" using a
+  2-3x noise-inflation range, then asserted that floor as solid — but
+  that 2-3x range itself rests on only two single-run no-op observations
+  and doesn't establish a rigorous upper bound on the walk's true noise).
+  `d1ecb361` → `ef61ae44`, ≈−13,000ms (−23-24%), is ≈8-9σ against the
+  clustered calibration's tight noise estimate; this report cannot
+  honestly state a specific σ figure beyond that, only that the effect
+  size is roughly 3-4x larger than the spans below, so it would take a
+  noise level well outside what any evidence here suggests to put it in
+  real doubt. That is qualitative grounds for more confidence than the
+  spans below warrant, not a quantitative guarantee.
 - **Whether the pre-fix and post-fix spans individually show real,
   not-noise compile-time growth is genuinely unresolved, not just
   unattributed.** Under the calibration's own tight noise estimate
@@ -614,23 +625,36 @@ live report needs the map:
   pessimistic end, but neither revision had the honest range in hand when
   it was written.
 - **What remains genuinely unresolved regardless: attribution to any
-  specific commit.** Telescoping means a sum over a contiguous span
-  carries *zero* information about which intermediate commit(s) caused
-  the change — mathematically true independent of the noise-scale
-  question above, and this is the load-bearing reason no commit can be
-  named, not the multiple-comparisons point that follows (corrected,
-  Codex P2 on `269afeb8`: a simulation of 31 standard-normal draws gives
-  an expected one-sided maximum of ≈2.06σ, ≈2.34σ for the maximum
-  absolute value — not the ≈2.5-2.9σ an earlier revision claimed, which
-  was closer to a ~95th-percentile value than an expectation). Against
-  the correct number, `6a6610c4` (+4,990ms, ≈3.3σ against the tight
-  calibration's per-delta noise) sits *above* the expected maximum of 31
-  draws, not comfortably within it — a simulated `P(max ≥ 3.3σ)` of only
-  ≈1.5%, which doesn't clear a confident attribution bar on its own but
-  is weaker cover for "just noise" than the earlier, incorrect number
-  suggested. What still rules it out is the telescoping argument above
-  and the confirmed, unrelated calibration and warm-cache-bias issues
-  elsewhere in this report — not this multiple-comparisons calculation.
+  specific commit — but telescoping is not the reason for that, and
+  claiming it was is a mistake this section made** (Codex P2 on
+  `1c785d56`, correcting the previous paragraph's own logic, not just its
+  numbers). Telescoping only nullifies information in a *sum* — it has
+  nothing to say about the individual per-checkpoint deltas already
+  sitting in the Assay table, each a standalone two-point measurement.
+  `6a6610c4` (+4,990ms) is exactly such a measurement, and its own
+  `Cargo.toml`/`Cargo.lock` diff touches nothing but `autumn/src/search.rs`
+  — no dependency-cache caveat applies to it at all. The real reason it
+  (and every other individual delta in the table) can't be confidently
+  named as a cause is the **noise/calibration problem already established
+  above**: this apparatus took one measurement per checkpoint, and the
+  true noise floor for a single such measurement is itself uncertain
+  (tight clustered calibration says σ≈1,080ms; the walk itself may run
+  noisier). Against the tight estimate, `6a6610c4`'s ≈3.3σ is a real
+  single-comparison signal, sitting *above*, not within, the expected
+  one-sided maximum of 31 independent draws (a simulation, 200k trials,
+  n=31 standard normal: E[max]≈2.06σ, E[max abs]≈2.34σ, `P(max≥3.3σ)`≈1.5%
+  — correcting an earlier, wrong ≈2.5-2.9σ claim here, which was closer to
+  a ~95th-percentile value than an expectation). That ≈1.5% tail
+  probability is suggestive, not dispositive, and — as the total-window
+  discussion below now also states plainly — this report never
+  established a reliable upper bound on the walk's true noise scale, so
+  even this single-comparison signal cannot be confidently separated from
+  noise. Telescoping is the correct, load-bearing reason the pre-fix and
+  post-fix *aggregate* sums (+7,677ms across 22 commits, +3,411ms across
+  9) carry no information about which commit(s) within each span caused
+  the shift; the noise/calibration problem is the separate, load-bearing
+  reason no *individual* delta — including `6a6610c4`'s — can be
+  confidently named either. Both apply; neither is the other.
 - **This proxy's ≈−13,000ms is not directly comparable to CI's −15,051ms
   at all, and this report previously overstated how close a match that
   was** (Codex P1 on `39ae17a1`). Two compounding reasons, not one: this
