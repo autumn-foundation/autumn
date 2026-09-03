@@ -721,6 +721,18 @@ def _exe_path(value):
 # A flag whose value is a whole command line for another shell.
 _SHELL_C = re.compile(r'^(-c|-C|--command)$')
 
+# A command key that carries no value on its own line, and the YAML list items
+# that follow it. A deployment recipe writes the container command either
+# inline (`command: ["autumn", "migrate"]`, which tokenizes) or as a block
+# list, where the argv arrives on the lines below. Read one at a time, no item
+# is a command, so the whole recipe was invisible.
+#
+# Items may be indented deeper than the key or sit at the same column — YAML
+# allows both, and Kubernetes manifests in the wild use both.
+_KEY_ONLY = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS + r'):\s*$',
+                       re.I)
+_LIST_ITEM = re.compile(r'^(\s*)-\s+(\S.*?)\s*$')
+
 
 def _nested_command(segment, j, tok):
     """True when this token is itself a command line rather than an argument.
@@ -1047,6 +1059,42 @@ def invocations(text):
             yield at, m.group(1)
         para, para_len = [], 0
 
+    # Block-style exec arrays, accumulated across the lines below their key.
+    pending = None          # collected list items, or None when not accumulating
+    pending_at = None       # the line the command key sits on
+    pending_indent = 0
+
+    def take_list():
+        """Read the accumulated block list as a command, then clear it."""
+        nonlocal pending, pending_at
+        items, at = pending, pending_at
+        pending, pending_at = None, None
+        if not items:
+            return
+        if any(' ' in it for it in items):
+            # A list of shell LINES, not of argv words. GitLab's `script:` and
+            # `before_script:` are lists of whole commands, so each item is
+            # scanned as its own line. The two spellings are told apart by
+            # whether any item holds a space, because an exec array's items are
+            # single argv words by construction — reading an exec array this
+            # way instead would see a lone `autumn` and report a bare root that
+            # the next item answers.
+            for it in items:
+                for display, argv in commands(it):
+                    yield at, display, argv, True
+            return
+        if len(items) == 1:
+            # Kubernetes splits an argv across `command:` and a sibling
+            # `args:`, so a one-item block list is not a bare root — the
+            # subcommand is in the other key. Nothing in this corpus writes
+            # that shape; reading block lists at all is what would make it
+            # reportable, so the limit is taken here rather than risked.
+            # (The inline `command: ["autumn"]` form still reports, which is
+            # the same shape in Compose and Fly, where no `args:` key exists.)
+            return
+        for display, argv in _from_tokens(items):
+            yield at, display, argv, True
+
     def add_prose(line, lineno):
         """Accumulate one prose line, with any blockquote marker stripped."""
         nonlocal para_len
@@ -1058,6 +1106,7 @@ def invocations(text):
         m = re.match(r'^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)', line)
         if m:
             held, held_at = [], None            # a fence boundary ends any hold
+            yield from take_list()              # …and any block list
             yield from _spans(take_paragraph(), commands)
             if fence is None:
                 fence, lang = m.group(1)[0], m.group(2).lower()
@@ -1077,6 +1126,18 @@ def invocations(text):
         # and the guide writes five of them on that page alone. Scanning the
         # physical lines instead yields the argv `\`, and the command path split
         # across the break goes unchecked.
+        # A command key with no value on its line opens a block list; the items
+        # below it are the argv. Anything else closes it.
+        item = _LIST_ITEM.match(line)
+        if pending is not None and item and len(item.group(1)) >= pending_indent:
+            pending.append(item.group(2).strip('\'"').rstrip(','))
+            continue
+        yield from take_list()
+        key = _KEY_ONLY.match(line)
+        if key:
+            pending, pending_at, pending_indent = [], lineno, len(key.group(1))
+            continue
+
         logical, at = flush(line, lineno)
         if logical is None:
             continue
@@ -1091,6 +1152,7 @@ def invocations(text):
             for display, argv in commands(span):
                 yield lineno, display, argv, False
 
+    yield from take_list()
     yield from _spans(take_paragraph(), commands)
 
 
@@ -1122,6 +1184,28 @@ def blocks(text):
             prev_blank = False
         index[lineno] = block
     return index
+
+
+def _short_cluster(tok, options):
+    """Tokens consumed by a compact short-option group, or None if unknown.
+
+    Returns 1 when the group is self-contained — every letter is a boolean
+    (`-rd`), or the letter that takes a value carries it attached (`-pfoo`) —
+    and 2 when the group ends on a value-taking option whose value is the next
+    token (`-rp foo`).
+
+    Returns None the moment a letter is not declared, so an unrecognised group
+    is still not walked past: whether it eats the following token is exactly
+    what is unknown there, and guessing is how a gate invents a defect on a
+    correct page.
+    """
+    for pos, ch in enumerate(tok[1:], start=1):
+        name = '-' + ch
+        if name not in options:
+            return None
+        if options[name]:                       # this letter takes a value
+            return 1 if pos < len(tok) - 1 else 2
+    return 1
 
 
 def resolve(tokens, surface, runnable=False):
@@ -1166,6 +1250,16 @@ def resolve(tokens, surface, runnable=False):
             if '=' in tok:                      # --name=value, self-contained
                 i += 1
                 continue
+            if not tok.startswith('--') and len(tok) > 2:
+                # A compact short-option group. POSIX lets shorts bundle and
+                # lets the last one carry its value attached, so `-pfoo` is
+                # `--package foo` and `-rd` is two booleans — both of which
+                # read as one unrecognised token and stopped the walk, leaving
+                # every subcommand written after them unchecked.
+                eaten = _short_cluster(tok, node['options'])
+                if eaten is not None:
+                    i += eaten
+                    continue
             if name not in node['options']:
                 # An option this command does not declare. Flags are out of
                 # scope, so this is not reported — but it also cannot be walked
@@ -1284,6 +1378,14 @@ def self_test():
             with_maintenance: bool,
             #[arg(long, value_name = "NAME")]
             shard: Option<String>,
+            // Shorts, for the compact-group walk. The real CLI declares no
+            // BOOLEAN short today — every short it has takes a value — so
+            // that branch of `_short_cluster` is reachable only here, which
+            // is what a synthetic CLI is for.
+            #[arg(short, long)]
+            package: Option<String>,
+            #[arg(short, long)]
+            verbose: bool,
         },
         #[command(visible_alias = "c")]
         Console,
@@ -1382,7 +1484,9 @@ def self_test():
     # --- options are walked through, not treated as the end of the command.
     # Regression test for a version that stopped at the first `-` and left every
     # subcommand written after an option unchecked.
-    expect(surface['migrate']['options'] == {'--with-maintenance': False, '--shard': True},
+    expect(surface['migrate']['options'] == {'--with-maintenance': False, '--shard': True,
+                                             '-p': True, '--package': True,
+                                             '-v': False, '--verbose': False},
            f"option value-taking must come from the field type, got {surface['migrate']['options']}")
     expect(resolve(tk('migrate --with-maintenance status'), surface) is None,
            'a boolean option must not hide the subcommand after it')
@@ -1396,6 +1500,32 @@ def self_test():
            'an undeclared option stops the walk rather than risking a false positive')
     expect(resolve(tk('migrate -- nope'), surface) is None,
            'everything after `--` is arguments')
+
+    # --- compact short-option groups. `-pfoo` and `-rd` are one token each,
+    # and both read as an unrecognised option, which stopped the walk and left
+    # whatever followed unchecked. Every short the real CLI declares takes a
+    # value, so the boolean branches below are reachable only through the
+    # synthetic `-v` above — which is the point of having a synthetic CLI.
+    expect(resolve(tk('migrate -pfoo nope'), surface) == 'autumn migrate nope',
+           'an attached short-option value must not hide the drift behind it')
+    expect(resolve(tk('migrate -pfoo status'), surface) is None,
+           'a real subcommand behind an attached value must still resolve')
+    expect(resolve(tk('migrate -p foo nope'), surface) == 'autumn migrate nope',
+           'the spaced form of the same option must keep working')
+    expect(resolve(tk('migrate -v nope'), surface) == 'autumn migrate nope',
+           'a boolean short consumes no value')
+    expect(resolve(tk('migrate -vpfoo nope'), surface) == 'autumn migrate nope',
+           'a bundled boolean then an attached value is one self-contained token')
+    expect(resolve(tk('migrate -vp foo nope'), surface) == 'autumn migrate nope',
+           'a bundle ending on a value-taking short eats the NEXT token')
+    expect(resolve(tk('migrate -vp foo status'), surface) is None,
+           'that bundle must not eat the subcommand as well')
+    expect(resolve(tk('migrate -pv nope'), surface) == 'autumn migrate nope',
+           "a value-taking short swallows the rest of its group, so `v` is its value")
+    expect(resolve(tk('migrate -Zfoo nope'), surface) is None,
+           'an unknown short group still stops the walk rather than guessing')
+    expect(resolve(tk('migrate -vZ nope'), surface) is None,
+           'one unknown letter makes the whole group unknown')
 
     # --- quoting. These are what shell-aware tokenization buys: splitting on
     # whitespace consumed `"eu` as the option value and then stopped at `west"`,
@@ -1743,6 +1873,35 @@ def self_test():
     numeric = '```bash\nautumn task backfill 1 2 3 4 5 nope\n```'
     expect([d for _, d, _, _ in invocations(numeric)] == ['task backfill 1 2 3 4 5 nope'],
            f'a numeric argv is not a cron schedule: {list(invocations(numeric))}')
+    # --- block-style exec arrays. The inline form tokenizes; the block form
+    # arrives one item per line, and each item read alone is not a command.
+    for label, doc in [
+        ('deeper indent', '```yaml\ncommand:\n  - autumn\n  - migrate\n  - run\n```'),
+        ('same column',   '```yaml\ncommand:\n- autumn\n- migrate\n- run\n```'),
+        ('quoted items',  '```yaml\ncommand:\n  - "autumn"\n  - "migrate"\n  - "run"\n```'),
+        ('trailing comma','```yaml\ncommand:\n  - autumn,\n  - migrate,\n  - run\n```'),
+    ]:
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'],
+               f'a block exec array ({label}) must be read: {got}')
+    ok_list = '```yaml\ncommand:\n  - autumn\n  - migrate\n```'
+    expect([d for _, d, _, _ in invocations(ok_list)] == ['migrate'],
+           f'a correct block exec array must resolve, not report: {list(invocations(ok_list))}')
+    # A list whose items hold spaces is a list of shell LINES (GitLab's
+    # `script:`), not argv words. Reading an exec array that way would see a
+    # lone `autumn` and report a bare root the next item answers.
+    script = '```yaml\nscript:\n  - autumn migrate run\n  - cargo test\n```'
+    expect([d for _, d, _, _ in invocations(script)] == ['migrate run'],
+           f'a script: list is read as shell lines: {list(invocations(script))}')
+    expect(list(invocations('```yaml\ncommand:\n  - autumn\n```')) == [],
+           'a one-item block list is the k8s command:/args: split, not a bare root')
+    expect(list(invocations('```yaml\ncommand:\n  - sleep\n  - "5"\n```')) == [],
+           'a block list for another program stays quiet')
+    # The accumulator must never fire outside a fence: the corpus ends
+    # sentences with the word "command:" and then opens a bash block.
+    prose = 'Run the following command:\n\n```bash\nautumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(prose)] == ['migrate run'],
+           f'prose ending in "command:" must not swallow the block: {list(invocations(prose))}')
     rust = '```rust\nlet m = "failed to build the in-process autumn server";\n```'
     expect(list(invocations(rust)) == [],
            'a code fence naming autumn outside command position stays quiet')
