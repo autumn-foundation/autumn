@@ -98,7 +98,14 @@ jobs:
       - name: Refuse a pull request that edits this gate
         run: |
           set -euo pipefail
-          if ! git diff --quiet "origin/${BASE_REF}" -- .github/workflows/posture-gate.yml; then
+          GATE=.github/workflows/posture-gate.yml
+          if ! git cat-file -e "origin/${BASE_REF}:${GATE}" 2>/dev/null; then
+            # The pull request that ADDS the gate cannot be refused by it: that
+            # is how a repository adopts it (`autumn upgrade --apply`).
+            echo "::notice::adding the security posture gate for the first time"
+            exit 0
+          fi
+          if ! git diff --quiet "origin/${BASE_REF}" -- "$GATE"; then
             echo "::error file=.github/workflows/posture-gate.yml::this pull request edits the security posture gate itself. That may well be intended — but it cannot be reviewed by the gate it edits. Land the workflow change on its own, with review from a CODEOWNER of .github/workflows/."
             exit 1
           fi

@@ -2854,8 +2854,14 @@ mod tests {
             .get(".github/workflows/posture-gate.yml")
             .expect("scaffolded");
 
-        // Editing the gate in the pull request the gate is judging.
+        // Editing the gate in the pull request the gate is judging — but NOT
+        // the pull request that adds it, which is how a repository adopts the
+        // gate at all (`autumn upgrade --apply`).
         assert!(workflow.contains("Refuse a pull request that edits this gate"));
+        assert!(
+            workflow.contains("adding the security posture gate for the first time"),
+            "the adoption pull request must not be refused by the gate it adds: {workflow}"
+        );
         // Deleting the baseline to make every later run bootstrap.
         assert!(
             workflow.contains("existed on origin/${BASE_REF} and is gone"),
