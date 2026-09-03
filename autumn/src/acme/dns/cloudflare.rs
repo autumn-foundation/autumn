@@ -211,10 +211,13 @@ fn urlencode(value: &str) -> String {
 /// The `_acme-challenge` label itself is dropped, and a bare TLD is not offered
 /// as a zone candidate.
 fn zone_candidates(fqdn: &str) -> Vec<String> {
-    let name = fqdn
-        .trim()
-        .trim_end_matches('.')
-        .trim_start_matches("_acme-challenge.");
+    // The `_acme-challenge` label is NOT stripped: delegating
+    // `_acme-challenge.example.com` to a zone of its own (so an ACME client
+    // needs credentials for nothing else) is a supported and recommended
+    // setup, and stripping the label would skip that zone and write the
+    // record into the parent, where nothing answers for it (issue #1620).
+    // It is simply the most specific candidate, tried first.
+    let name = fqdn.trim().trim_end_matches('.');
     let labels: Vec<&str> = name.split('.').filter(|l| !l.is_empty()).collect();
     // A zone always has at least two labels (`myapp.com`); stopping there also
     // avoids ever asking Cloudflare about `com`.
@@ -611,9 +614,12 @@ mod tests {
 
     #[test]
     fn zone_candidates_are_most_specific_first_and_skip_the_tld() {
+        // `_acme-challenge.<name>` leads: it can be a delegated zone of its own,
+        // which is a recommended way to scope an ACME credential (#1620).
         assert_eq!(
             zone_candidates("_acme-challenge.a.b.myapp.com"),
             vec![
+                "_acme-challenge.a.b.myapp.com".to_owned(),
                 "a.b.myapp.com".to_owned(),
                 "b.myapp.com".to_owned(),
                 "myapp.com".to_owned(),
@@ -621,10 +627,43 @@ mod tests {
         );
         assert_eq!(
             zone_candidates("_acme-challenge.myapp.com"),
-            vec!["myapp.com".to_owned()]
+            vec![
+                "_acme-challenge.myapp.com".to_owned(),
+                "myapp.com".to_owned(),
+            ]
         );
         // Never asks Cloudflare about a bare TLD.
         assert!(!zone_candidates("_acme-challenge.myapp.com").contains(&"com".to_owned()));
+    }
+
+    /// Regression (#1620): `_acme-challenge.example.com` delegated to a zone of
+    /// its own must be found, not skipped in favour of the parent.
+    ///
+    /// This is the setup that lets an operator hand autumn a credential scoped
+    /// to nothing but the challenge zone. Stripping the label wrote the record
+    /// into the parent zone instead, where nothing is authoritative for it.
+    #[tokio::test]
+    async fn a_delegated_challenge_zone_is_used_when_it_exists() {
+        let transport = RecordingTransport::new(&[(
+            ZONE_LOOKUP,
+            r#"{"success":true,"errors":[],"result":[{"id":"zone-challenge","name":"_acme-challenge.myapp.com"}]}"#,
+        )]);
+        let provider = provider(std::sync::Arc::clone(&transport));
+
+        assert_eq!(
+            provider
+                .zone_id("_acme-challenge.myapp.com")
+                .await
+                .expect("the delegated challenge zone resolves"),
+            "zone-challenge"
+        );
+        let asked: Vec<String> = transport.sent().iter().map(|r| r.url.clone()).collect();
+        assert!(
+            asked
+                .iter()
+                .any(|u| u.contains("name=_acme-challenge.myapp.com")),
+            "the challenge name itself must be offered as a zone candidate: {asked:?}"
+        );
     }
 
     #[test]

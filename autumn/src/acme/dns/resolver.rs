@@ -185,8 +185,13 @@ pub async fn authoritative_resolvers(
     recursive: &[SocketAddr],
     lookup: &dyn DnsLookup,
 ) -> Vec<SocketAddr> {
+    // The `_acme-challenge` label stays on: it can itself be a delegated zone
+    // with its own NS records, which is a recommended way to give an ACME
+    // client credentials that reach nothing else. Stripping it skipped that
+    // zone and asked the PARENT's nameservers, which answer a referral rather
+    // than the TXT value — so a correctly published record could only ever time
+    // out. It is simply the most specific candidate, tried first (issue #1620).
     let base = normalize_name(fqdn);
-    let base = base.strip_prefix("_acme-challenge.").unwrap_or(&base);
     let labels: Vec<&str> = base.split('.').filter(|l| !l.is_empty()).collect();
 
     for start in 0..labels.len().saturating_sub(1) {
@@ -1383,6 +1388,56 @@ mod tests {
         )
         .await;
         assert_eq!(found, vec![SocketAddr::from(([192, 0, 2, 1], 53))]);
+    }
+
+    /// Regression (#1620): `_acme-challenge.<domain>` can be a delegated zone
+    /// with its own NS records — a recommended way to scope an ACME credential
+    /// to nothing but the challenge name.
+    ///
+    /// Discovery used to strip the label unconditionally, so it asked the
+    /// PARENT's nameservers. Those answer a referral rather than the TXT value,
+    /// and the probe is sent with recursion disabled, so a correctly published
+    /// record could only ever time out.
+    #[tokio::test]
+    async fn discovery_finds_a_delegated_challenge_zone() {
+        let lookup = DiscoveryLookup::new(
+            &[
+                ("_acme-challenge.myapp.com", &["ns1.challenge.net"]),
+                ("myapp.com", &["ns1.parent.net"]),
+            ],
+            &[
+                ("ns1.challenge.net", &[[192, 0, 2, 9]]),
+                ("ns1.parent.net", &[[192, 0, 2, 2]]),
+            ],
+        );
+        let found = authoritative_resolvers(
+            "_acme-challenge.myapp.com",
+            &[resolver(53)],
+            lookup.as_ref(),
+        )
+        .await;
+        assert_eq!(
+            found,
+            vec![SocketAddr::from(([192, 0, 2, 9], 53))],
+            "the delegated challenge zone's own nameserver must win over the parent's"
+        );
+    }
+
+    /// …and when `_acme-challenge` is NOT delegated (the ordinary case), the
+    /// walk falls through to the parent zone exactly as before.
+    #[tokio::test]
+    async fn discovery_falls_through_to_the_parent_when_the_label_is_not_delegated() {
+        let lookup = DiscoveryLookup::new(
+            &[("myapp.com", &["ns1.parent.net"])],
+            &[("ns1.parent.net", &[[192, 0, 2, 2]])],
+        );
+        let found = authoritative_resolvers(
+            "_acme-challenge.myapp.com",
+            &[resolver(53)],
+            lookup.as_ref(),
+        )
+        .await;
+        assert_eq!(found, vec![SocketAddr::from(([192, 0, 2, 2], 53))]);
     }
 
     // Discovery is best-effort: when it finds nothing the caller falls back to

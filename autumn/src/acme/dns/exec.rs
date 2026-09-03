@@ -128,9 +128,21 @@ impl ExecProvider {
     fn secrets(&self) -> Vec<String> {
         let inherited = self.env_override.as_ref().map_or_else(
             || {
-                // `env::vars()` yields owned pairs; collected first so the
-                // filter can borrow them.
-                let vars: Vec<(String, String)> = std::env::vars().collect();
+                // `vars_os` rather than `vars`: the latter PANICS if any
+                // inherited key or value is not UTF-8, and this runs while
+                // building the diagnostic for a failed hook — a panic there
+                // takes the renewal task down and leaves the served certificate
+                // to expire. Lossy conversion is also what makes the match work:
+                // the hook's stderr is decoded the same way, so a non-UTF-8
+                // credential still lines up with its lossy spelling there.
+                let vars: Vec<(String, String)> = std::env::vars_os()
+                    .map(|(k, v)| {
+                        (
+                            k.to_string_lossy().into_owned(),
+                            v.to_string_lossy().into_owned(),
+                        )
+                    })
+                    .collect();
                 secret_env_values(vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             },
             |vars| secret_env_values(vars.iter().map(|(k, v)| (k.as_str(), v.as_str()))),

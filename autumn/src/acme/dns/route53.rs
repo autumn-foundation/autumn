@@ -499,10 +499,13 @@ fn txt_rrset_for(xml: &str, fqdn: &str) -> TxtRrset {
 /// Zone-name candidates for `fqdn`, most specific first (see the Cloudflare
 /// provider for the same rule).
 fn zone_candidates(fqdn: &str) -> Vec<String> {
-    let name = fqdn
-        .trim()
-        .trim_end_matches('.')
-        .trim_start_matches("_acme-challenge.");
+    // The `_acme-challenge` label is NOT stripped: delegating
+    // `_acme-challenge.example.com` to a zone of its own (so an ACME client
+    // needs credentials for nothing else) is a supported and recommended
+    // setup, and stripping the label would skip that zone and write the
+    // record into the parent, where nothing answers for it (issue #1620).
+    // It is simply the most specific candidate, tried first.
+    let name = fqdn.trim().trim_end_matches('.');
     let labels: Vec<&str> = name.split('.').filter(|l| !l.is_empty()).collect();
     (0..labels.len().saturating_sub(1))
         .map(|start| labels[start..].join("."))
@@ -903,6 +906,36 @@ mod tests {
         assert!(
             change.contains(&format!("<TTL>{CHALLENGE_TTL_SECS}</TTL>")),
             "a set autumn creates gets autumn's TTL: {change}"
+        );
+    }
+
+    /// Regression (#1620): `_acme-challenge.<domain>` delegated to a hosted zone
+    /// of its own must be found, not skipped in favour of the parent — that is
+    /// how an operator scopes a Route 53 credential to the challenge zone alone.
+    #[tokio::test]
+    async fn a_delegated_challenge_zone_is_used_when_it_exists() {
+        let transport = RecordingTransport::new(&[(
+            ZONE_LOOKUP,
+            r"<ListHostedZonesByNameResponse><HostedZones>
+              <HostedZone><Id>/hostedzone/ZCHALLENGE</Id><Name>_acme-challenge.myapp.com.</Name>
+                <Config><PrivateZone>false</PrivateZone></Config></HostedZone>
+              </HostedZones></ListHostedZonesByNameResponse>",
+        )]);
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        assert_eq!(
+            provider
+                .zone_id("_acme-challenge.myapp.com")
+                .await
+                .expect("the delegated challenge zone resolves"),
+            "ZCHALLENGE"
+        );
+        let asked: Vec<String> = transport.sent().iter().map(|r| r.url.clone()).collect();
+        assert!(
+            asked
+                .iter()
+                .any(|u| u.contains("dnsname=_acme-challenge.myapp.com.")),
+            "the challenge name itself must be offered as a zone candidate: {asked:?}"
         );
     }
 

@@ -154,6 +154,14 @@ pub trait DnsProvider: Send + Sync {
 /// unbounded health payload.
 pub const UPSTREAM_EXCERPT_CHARS: usize = 400;
 
+/// What a redacted secret is replaced with.
+const REDACTED: &str = "<redacted>";
+
+/// Values shorter than this are never redacted: they collide with ordinary
+/// words often enough to make a diagnostic useless, and no supported provider
+/// issues a credential this short.
+const MIN_REDACTABLE_SECRET: usize = 8;
+
 /// Make upstream text safe to publish in an issuance error.
 ///
 /// Autumn's own error strings never contain a credential, but the text it copies
@@ -172,27 +180,79 @@ pub const UPSTREAM_EXCERPT_CHARS: usize = 400;
 /// before publishing, control characters (which would let upstream text forge
 /// log lines or inject ANSI escapes into `autumn doctor` output) are stripped,
 /// and the result is truncated to [`UPSTREAM_EXCERPT_CHARS`].
+///
+/// Redaction runs **before** control characters are folded, and again after
+/// each normalization step. Order matters: a credential can itself contain a
+/// control character — an RFC 2136 TSIG key or a PEM private key is multi-line
+/// — and folding first rewrites that secret *inside the text* so it no longer
+/// equals the value being searched for, letting it survive into the published
+/// message. Each secret is also matched in its folded and whitespace-collapsed
+/// forms, so a value that reached `text` through a channel that normalized it
+/// first is caught too (issue #1620).
 #[must_use]
 pub fn sanitize_upstream(text: &str, secrets: &[&str]) -> String {
-    let mut cleaned: String = text
+    let forms: Vec<String> = secrets
+        .iter()
+        .flat_map(|secret| redaction_forms(secret))
+        // A very short "secret" would redact half the message; the shortest
+        // credential any supported provider issues is far longer than this.
+        .filter(|form| form.len() >= MIN_REDACTABLE_SECRET)
+        .collect();
+    let redact = |mut text: String| {
+        for form in &forms {
+            text = text.replace(form.as_str(), REDACTED);
+        }
+        text
+    };
+
+    // Redact, normalize, redact again — see the note above on why the order is
+    // not interchangeable.
+    let raw = redact(text.to_owned());
+    let folded: String = raw
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    for secret in secrets {
-        let secret = secret.trim();
-        // A very short "secret" would redact half the message; the shortest
-        // credential any supported provider issues is far longer than this.
-        if secret.len() >= 8 {
-            cleaned = cleaned.replace(secret, "<redacted>");
-        }
-    }
-    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = redact(folded)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cleaned = redact(collapsed);
+
     if cleaned.chars().count() <= UPSTREAM_EXCERPT_CHARS {
         return cleaned;
     }
     let mut truncated: String = cleaned.chars().take(UPSTREAM_EXCERPT_CHARS).collect();
     truncated.push('…');
     truncated
+}
+
+/// The spellings of `secret` that must all be redacted.
+///
+/// The raw value, the value with control characters folded to spaces, and the
+/// value with whitespace runs collapsed — matching the three states the text
+/// passes through in [`sanitize_upstream`], so a multi-line credential is caught
+/// whichever of them it appears in.
+fn redaction_forms(secret: &str) -> Vec<String> {
+    let trimmed = secret.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut forms = vec![trimmed.to_owned()];
+
+    let folded: String = trimmed
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let folded = folded.trim().to_owned();
+    if !folded.is_empty() && !forms.contains(&folded) {
+        forms.push(folded.clone());
+    }
+
+    let collapsed = folded.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !collapsed.is_empty() && !forms.contains(&collapsed) {
+        forms.push(collapsed);
+    }
+    forms
 }
 
 /// A string that must not reach a log line, an error message, or actuator
@@ -532,6 +592,50 @@ mod tests {
 
     // A short string is not treated as a secret: redacting on a 3-character
     // "secret" would blank out most of any message.
+    /// Regression (#1620): a credential containing control characters must be
+    /// redacted, whatever order the sanitizer's steps run in.
+    ///
+    /// Folding control characters to spaces BEFORE redacting rewrote the secret
+    /// inside the text, so the literal being searched for no longer occurred and
+    /// the credential survived into a message published on the unauthenticated
+    /// `/actuator/health` and pushed to the operator's alert destination. A TSIG
+    /// key file and a PEM private key are both multi-line, and a `set -x` hook
+    /// traces them verbatim.
+    #[test]
+    fn a_multiline_secret_is_redacted_despite_control_folding() {
+        const KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIBVgIBADANBgkqhkiG9w0BAQ\nSECRETLINE9f3a\n-----END PRIVATE KEY-----";
+
+        // The hook traced the key verbatim, newlines and all.
+        let traced = format!("+ nsupdate -k {KEY} failed");
+        let safe = sanitize_upstream(&traced, &[KEY]);
+        assert!(
+            !safe.contains("SECRETLINE9f3a"),
+            "a multi-line credential leaked: {safe}"
+        );
+        assert!(safe.contains("<redacted>"), "got: {safe}");
+        // The surrounding diagnostic survives.
+        assert!(safe.contains("nsupdate"), "got: {safe}");
+
+        // …and the mirror case: the text has already been normalized (newlines
+        // folded to spaces) by whatever produced it, while the secret is still
+        // raw. Matching the secret's folded spelling catches that too.
+        let folded_text = traced.replace('\n', " ");
+        let safe = sanitize_upstream(&folded_text, &[KEY]);
+        assert!(
+            !safe.contains("SECRETLINE9f3a"),
+            "a pre-normalized trace leaked the credential: {safe}"
+        );
+
+        // A tab-separated credential (a TSIG key file's shape) is covered by
+        // the same folding.
+        const TSIG: &str = "hmac-sha256\tautumn-key\tc3VwZXJzZWNyZXR2YWx1ZQ==";
+        let safe = sanitize_upstream(&format!("key rejected: {TSIG}"), &[TSIG]);
+        assert!(
+            !safe.contains("c3VwZXJzZWNyZXR2YWx1ZQ=="),
+            "a tab-separated credential leaked: {safe}"
+        );
+    }
+
     #[test]
     fn a_too_short_secret_is_not_used_as_a_redaction_pattern() {
         assert_eq!(
