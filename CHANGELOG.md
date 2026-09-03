@@ -1414,6 +1414,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`#[secured]`/`#[step_up]`/`#[authorize]`/`#[throttle]` no longer drop a
+  route's OpenAPI response schema when written above the route attribute
+  (#1677):** all four body guards rewrite a handler's return type to
+  `Response` when they expand, so when one was written *above* `#[get]`/
+  `#[post]`/etc. it expanded first and the route macro's `infer_response_body`
+  read back `Response` instead of the handler's real `Json<T>` — silently
+  dropping the response schema from the generated OpenAPI document (throttling
+  itself, including idempotency-replay accounting, was unaffected in either
+  ordering). Each guard already binds the pre-rewrite type as
+  `let __autumn_inner: T = …` around the guarded body; the route macro now
+  recovers the original type from that binding (recursing to the innermost one
+  when guards stack) instead of trusting `sig.output` alone, so the generated
+  schema no longer depends on attribute order. The previously-recommended
+  method-attribute-outermost workaround, documented on `#[throttle]`'s rustdoc
+  and in `docs/guide/rate-limiting.md`, is no longer necessary.
+
 - **Punctuation- and emoji-only titles no longer slip past the validator that
   exists to stop them (#2424):** `examples/reddit-clone` rejects a post title
   like `***`, `!!!???...:::` or `🎉🔥💯` with "Title must contain at least one

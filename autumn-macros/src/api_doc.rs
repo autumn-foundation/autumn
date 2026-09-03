@@ -416,12 +416,71 @@ fn unwrap_json_body(ty: &syn::Type) -> Option<syn::Type> {
 /// * `Result<Json<T>, _>` / `AutumnResult<Json<T>>` — fallible JSON
 /// * `(StatusCode, Json<T>)` — JSON with a custom status code
 /// * `Result<(StatusCode, Json<T>), _>` — the two combined
+///
+/// A body guard (`#[secured]`, `#[step_up]`, `#[authorize]`, `#[throttle]`)
+/// written *above* the route attribute expands before this macro runs and
+/// rewrites `sig.output` to `Response`, which would otherwise make every
+/// guarded route's response schema disappear (#1677). When that has
+/// happened, [`recover_guarded_return_type`] reads the pre-rewrite type back
+/// from the `__autumn_inner` binding the guard left in the body, so
+/// inference is independent of attribute expansion order.
 pub fn infer_response_body(input_fn: &syn::ItemFn) -> Option<TokenStream> {
-    let syn::ReturnType::Type(_, ty) = &input_fn.sig.output else {
+    let ty = match recover_guarded_return_type(&input_fn.block.stmts) {
+        Some(ty) => ty,
+        None => {
+            let syn::ReturnType::Type(_, ty) = &input_fn.sig.output else {
+                return None;
+            };
+            (**ty).clone()
+        }
+    };
+    let ty = unwrap_result_ok(&ty).unwrap_or(ty);
+    find_json_in_type(&ty).map(|inner| schema_entry_for_type(&inner))
+}
+
+/// Recover a handler's pre-rewrite return type from the `__autumn_inner`
+/// binding a body guard leaves behind when it expands before the route macro
+/// (issue #1677).
+///
+/// Every guard that rewrites `sig.output` to `Response` also binds the
+/// original type as `let __autumn_inner: #ty = (async move { … }).await;`
+/// around the handler's real body — see `secured_macro`, `step_up_macro`,
+/// `authorize_macro`, and `throttle_macro`. When guards stack, each
+/// later-expanding guard wraps the earlier guard's whole generated body one
+/// level deeper in that same shape, so only the *innermost* binding carries
+/// the type as the user actually wrote it: every outer one necessarily reads
+/// back `Response`, because by the time that guard ran, an inner guard had
+/// already rewritten `sig.output`. This walk therefore recurses into the
+/// nested wrapper (via the same [`crate::idempotency_guard::expr_nested_async_body`]
+/// shape the marker walks above descend) before accepting a level's own
+/// binding, so the deepest type found wins.
+///
+/// Returns `None` when no such binding exists — an unguarded handler, a
+/// route-attribute-outermost ordering where no guard has expanded yet, or a
+/// guard wrapping a `()`/`impl Trait` return, for which no guard emits an
+/// explicit annotation (Rust rejects `impl Trait` in a local variable's type
+/// ascription) and there is nothing to recover.
+fn recover_guarded_return_type(stmts: &[syn::Stmt]) -> Option<syn::Type> {
+    stmts.iter().find_map(recover_guarded_return_type_from_stmt)
+}
+
+fn recover_guarded_return_type_from_stmt(stmt: &syn::Stmt) -> Option<syn::Type> {
+    let syn::Stmt::Local(local) = stmt else {
         return None;
     };
-    let ty = unwrap_result_ok(ty).unwrap_or_else(|| (**ty).clone());
-    find_json_in_type(&ty).map(|inner| schema_entry_for_type(&inner))
+    let syn::Pat::Type(pat_type) = &local.pat else {
+        return None;
+    };
+    let syn::Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+        return None;
+    };
+    if pat_ident.ident != "__autumn_inner" {
+        return None;
+    }
+    let init_expr = &local.init.as_ref()?.expr;
+    let nested = crate::idempotency_guard::expr_nested_async_body(init_expr)
+        .and_then(|block| recover_guarded_return_type(&block.stmts));
+    Some(nested.unwrap_or_else(|| (*pat_type.ty).clone()))
 }
 
 /// Look for `Json<T>` either directly or inside a tuple element.
@@ -1529,6 +1588,117 @@ mod tests {
         assert_eq!(
             extract_authorize_bindings(&input_fn),
             Vec::<(String, String)>::new()
+        );
+    }
+
+    // ── Response-schema recovery across guard reordering (#1677) ────────────
+    //
+    // When a body guard (`#[secured]`, `#[step_up]`, `#[authorize]`,
+    // `#[throttle]`) is written ABOVE the route method attribute, it expands
+    // first and rewrites `sig.output` to `Response` before the route macro
+    // ever sees the handler. Each guard leaves the pre-rewrite type behind as
+    // `let __autumn_inner: #ty = (async move { … }).await;`, so
+    // `infer_response_body` must recover it from there instead of reading the
+    // (by then rewritten) `sig.output`.
+
+    #[test]
+    fn infer_response_body_reads_sig_output_when_no_guard_marker_present() {
+        // Baseline: an unguarded handler (or the route-attribute-outermost
+        // ordering, where guards haven't expanded yet) is unaffected — the
+        // plain `sig.output` path must keep working exactly as before.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
+        };
+        let schema = infer_response_body(&input_fn)
+            .expect("a bare Json<T> return type must produce a response schema");
+        assert!(
+            schema.to_string().contains("\"Created\""),
+            "schema should name the Created type: {schema}"
+        );
+    }
+
+    #[test]
+    fn infer_response_body_recovers_type_under_single_guard_wrapper() {
+        // Shape emitted by any one of the four body guards when it expands
+        // before the route macro: `sig.output` already reads `Response`, and
+        // the real type is only recoverable from the `__autumn_inner` binding.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::response::Response {
+                let __autumn_inner: ::autumn_web::reexports::axum::Json<Created> =
+                    (async move { todo!() }).await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        let schema = infer_response_body(&input_fn).expect(
+            "a Json<T> return type rewritten to Response by a single guard must still be \
+             recoverable from the __autumn_inner marker",
+        );
+        assert!(
+            schema.to_string().contains("\"Created\""),
+            "recovered schema should name the Created type: {schema}"
+        );
+    }
+
+    #[test]
+    fn infer_response_body_recovers_innermost_type_under_stacked_guards() {
+        // Two guards stacked above the route macro: the outer one's own
+        // `__autumn_inner` binding necessarily reads `Response` (the inner
+        // guard already rewrote `sig.output` by the time the outer guard
+        // captured its own binding), so only the innermost binding carries
+        // the type the user actually wrote.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::response::Response {
+                let __autumn_inner: ::autumn_web::reexports::axum::response::Response = (async move {
+                    let __autumn_inner: ::autumn_web::reexports::axum::Json<Created> =
+                        (async move { todo!() }).await;
+                    ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+                })
+                .await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        let schema = infer_response_body(&input_fn).expect(
+            "the innermost __autumn_inner binding must be recovered even under a second, \
+             outer guard wrapper",
+        );
+        assert!(
+            schema.to_string().contains("\"Created\""),
+            "recovered schema should name the innermost Created type, not Response: {schema}"
+        );
+    }
+
+    #[test]
+    fn infer_response_body_none_when_guard_wraps_unit_return() {
+        // A guard over a `()`-returning handler emits no explicit type
+        // annotation at all (see `original_response`'s `ReturnType::Default`
+        // arm in each guard), so there is nothing to recover — this must not
+        // panic and must simply infer no response schema, same as today.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::response::Response {
+                let __autumn_inner: () = (async move { todo!() }).await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        assert!(infer_response_body(&input_fn).is_none());
+    }
+
+    #[test]
+    fn infer_response_body_recovers_result_wrapped_json_under_guard() {
+        // `Result<Json<T>, E>` / `AutumnResult<Json<T>>` returns must still
+        // unwrap the Ok arm after being recovered from the marker, exactly as
+        // they do when read directly off `sig.output`.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::response::Response {
+                let __autumn_inner: AutumnResult<::autumn_web::reexports::axum::Json<Created>> =
+                    (async move { todo!() }).await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        let schema = infer_response_body(&input_fn)
+            .expect("Result-wrapped Json<T> recovered from the marker must still be inferred");
+        assert!(
+            schema.to_string().contains("\"Created\""),
+            "recovered schema should name the Created type: {schema}"
         );
     }
 }
