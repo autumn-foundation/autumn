@@ -34,11 +34,33 @@ was skipped as irrelevant to HTTP-level behavior).
 **Toured, and held up against a named oracle:**
 
 - **Votable race-safety** (oracle: `docs/guide/votable.md` race-safety
-  contract). 10 concurrent `POST /posts/{id}/upvote` requests from one
-  session landed exactly one `votes` row and `posts.score = 1` — the
-  upsert-and-recompute is race-safe as documented. A same-user re-upvote
-  correctly toggled the vote off (`score` back to 0, row deleted) —
-  matches the toggle semantics documented in `routes/votes.rs`.
+  contract). `submit()` (`routes/posts.rs`) hand-writes a self-upvote —
+  a raw `INSERT INTO votes` plus `score = 1` in the same transaction as the
+  post insert, bypassing `react()` entirely — so every post starts already
+  upvoted by its author (worth calling out on its own: it's exactly the
+  "hand-written insert/update/delete on the edge table" pattern
+  `docs/guide/votable.md`'s "Known limits and warnings" flags as leaving
+  `score` stale, safe here only because both writes happen atomically
+  against a `score` the code computes by hand, not because the pattern is
+  generally safe). Corrected re-run, thread-barrier-synchronized for true
+  concurrency (not shelled-out `curl … &`) rather than my first pass's
+  sequential-looking backgrounded loop: a *fresh* post starts at
+  `score = 1` / one `votes` row (the author's auto-upvote) before any test
+  vote is cast. 10 truly concurrent same-value `POST /upvote` requests from
+  one other session then landed back at `score = 1` / one row — consistent
+  with `react()`'s documented toggle (an even number of toggles from a
+  voted starting state returns to voted), not a parity violation. The
+  underlying `votes.id` did change between runs (row deleted and
+  re-inserted an odd number of times across the ten toggles), confirming
+  the deletes/inserts actually happened serially rather than being
+  silently dropped. My first pass reported the `score = 1` / one-row
+  outcome without stating the pre-existing auto-vote, which made the
+  parity look unexplained — flagged by an automated PR reviewer
+  (`chatgpt-codex-connector`) on this same report and confirmed by
+  rerunning against a known-fresh post; corrected here. A same-user
+  re-upvote afterward correctly toggled the vote off (`score` back to 0,
+  row deleted) — matches the toggle semantics documented in
+  `routes/votes.rs`.
 - **Commentable depth bound** (oracle: `docs/guide/commentable.md` §"Depth
   is bounded on the write path", `max_depth = 5` default). Chained replies
   0→5 all inserted; the depth-6 attempt was refused with `"Replies are
@@ -110,8 +132,18 @@ charter):
   Twelve consecutive bad-password attempts against a real account all
   returned an identical `400 Bad Request` / "Invalid username or password"
   — consistent (no enumeration signal), but there is no lockout behind it
-  to test. Worth a separate charter against an app that *does* use the
-  generator (`examples/saas` or `examples/teams`).
+  to test. **Correction**: an earlier draft of this report proposed
+  re-running this charter against `examples/saas` or `examples/teams`,
+  assuming one of them used `autumn generate auth`. A reviewer
+  (`chatgpt-codex-connector`) checked and both turned out to hand-roll
+  their own login handlers and user schemas the same way reddit-clone
+  does — no `failed_attempts`/`locked_at` columns, no `[auth.lockout]`
+  config, no `/auth/admin/unlock` route in either. Re-checked directly:
+  **no example shipped in this repo actually uses the generated lockout
+  feature** (`grep -rl failed_attempts examples/*/src examples/*/migrations`
+  matches nothing; the columns exist only in
+  `autumn-cli/src/generate/auth.rs`'s template output). The follow-up
+  charter below is corrected accordingly.
 - Session cookie carries `Secure` even though the app was driven over
   plain `http://127.0.0.1` — this is `[session] secure = true` by design
   (documented default, works in Chromium/Firefox's loopback exception).
@@ -150,9 +182,11 @@ charter):
    SubmitToken`) is already identified. If duplicates are confirmed, this
    becomes a legitimate digest entry (or a bug, if any of these forms turn
    out to have an implicit uniqueness claim to violate) rather than a guess.
-2. **Account lockout**, driven against `examples/saas` or `examples/teams`
-   (both plausible users of `autumn generate auth`), to actually exercise
-   the threshold/cooloff/same-response-while-locked/admin-unlock-refusal
+2. **Account lockout** — no shipped example uses `autumn generate auth`'s
+   lockout feature (see correction above), so this charter needs a fresh
+   fixture: run `autumn generate auth` against a scratch app (or extend
+   `examples/saas`/`examples/teams` with it) to actually exercise the
+   threshold/cooloff/same-response-while-locked/admin-unlock-refusal
    behavior documented in `docs/guide/authentication.md`.
 3. **Two-tab / multi-session state tour**: same account voting from two
    sessions concurrently, comment thread refresh mid-reply-chain, session
