@@ -1190,6 +1190,34 @@ mod tests {
         );
     }
 
+    /// The posture manifest attestation (issue #1624) rides the same keyless
+    /// pipeline as the image and SBOM attestations, needs nothing from the
+    /// autumn CLI, and so survives a CLI pin too old for `autumn sbom`.
+    #[test]
+    fn every_deploy_workflow_attests_the_security_posture_manifest() {
+        for template in [
+            include_str!("templates/release/gcp-deploy.yml.tmpl"),
+            include_str!("templates/release/aws-deploy.yml.tmpl"),
+            include_str!("templates/release/azure-deploy.yml.tmpl"),
+        ] {
+            for cli_version in ["0.7.1", "0.7.0"] {
+                let rendered = render_for_cli(template, "my-app", false, false, cli_version);
+                assert!(
+                    rendered.contains("Attest the security posture manifest"),
+                    "posture attestation missing for CLI {cli_version}:\n{rendered}"
+                );
+                assert!(
+                    rendered.contains("subject-path: security-posture.json"),
+                    "the attested subject must be the committed manifest:\n{rendered}"
+                );
+                assert!(
+                    rendered.contains("hashFiles('security-posture.json') != ''"),
+                    "an app with no committed manifest must not fail its deploy:\n{rendered}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn dockerfile_has_three_stages() {
         let tmp = TempDir::new().unwrap();

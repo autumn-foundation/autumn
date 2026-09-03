@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Security posture diffs gate pull requests, and the shipped manifest is
+  signed (#1624):** #1604's manifest proves what an app's security surface
+  *is*; a manifest nobody diffs is a report, not a control. `autumn routes
+  posture` closes that: `diff` compares two manifests and classifies every
+  change as widening, neutral or narrowing; `digest` prints the posture digest
+  a release records; `verify` proves at deploy time that a shipped manifest is
+  the posture CI acknowledged **and** was signed by CI (`gh attestation
+  verify`, reusing #1615's keyless pipeline rather than introducing a second
+  signing story).
+
+  Only widening blocks — a new public route, a guard removed, a classification
+  downgraded — and the rules follow the semantics the framework actually
+  implements: roles are OR-ed, so *adding* one widens; scopes are AND-ed, so
+  *removing* one widens. Routes are keyed on `(path, method)`, and handler
+  names and source locations are excluded from both the comparison and the
+  digest, so a refactor produces no finding at all. A change with no posture
+  effect posts nothing.
+
+  A widening is unblocked by one comment on the pull request:
+
+  ```
+  /ack-posture 4f8a1c0d9e2b7a35  intentional: public status page for launch week
+  ```
+
+  The digest binds the acknowledgment to that exact set of widenings, so
+  unrelated pushes keep it valid while a *new* widening re-blocks. That comment
+  is also the documented escape hatch for a false positive: there is no flag
+  that disables the gate or hides the diff, so a wrongly blocked pull request
+  is always unblockable by the team alone, in public, with a reason.
+
+  `autumn new` scaffolds `.github/workflows/posture-gate.yml` by default;
+  existing apps adopt it with `autumn upgrade --apply`. The scaffolded deploy
+  workflows attest `security-posture.json` with
+  `actions/attest-build-provenance`, and autumn's own `examples/hello` runs the
+  gate in the publish gate (`scripts/check-posture-gate.sh`). See
+  `docs/guide/posture-gate.md`.
+
 - **Build-time authority envelope for agent-operable handlers (#1691):** an
   endpoint exposed as an MCP tool is an action an autonomous agent can take
   with no human in the loop, and nothing said what that action was *allowed*

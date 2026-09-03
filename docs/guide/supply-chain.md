@@ -350,6 +350,9 @@ digest yourself if your threat model requires it.
 - [Release checklist](../release-checklist.md) — the gates a tag must pass.
 - [Health indicators](health-indicators.md) — and `/actuator/info`, what a
   *running* app reports about its own build.
+- [The security posture gate](posture-gate.md) — the same attestation pipeline,
+  applied to the manifest that says which endpoints are public: signed at
+  release, verified in one command at deploy time.
 
 [sigstore]: https://www.sigstore.dev/
 [gh]: https://cli.github.com/

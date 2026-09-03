@@ -1,0 +1,501 @@
+{
+  "schema_version": 3,
+  "dimensions": {
+    "routes": {
+      "provenance": "provable",
+      "source": "macro:#[secured]/#[authorize]/#[public]",
+      "entries": [
+        {
+          "path": "/",
+          "method": "GET",
+          "name": "index",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/hello/src/main.rs:15",
+          "provenance": "provable"
+        },
+        {
+          "path": "/_autumn/inspect",
+          "method": "GET",
+          "name": "inspector_index",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/_autumn/inspect/requests/{id}",
+          "method": "GET",
+          "name": "inspector_detail",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/_autumn/jobs/{token}",
+          "method": "GET",
+          "name": "job_status",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/a11y",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/circuitbreakers",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/configprops",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/env",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/health",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/info",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/jobs",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/logfile",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/loggers",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/loggers/{name}",
+          "method": "PUT",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/metrics",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/prometheus",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/shadow",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/tasks",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/ui",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/ui/metrics",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/ui/tasks",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/webhooks/dlq",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/webhooks/replay",
+          "method": "POST",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/health",
+          "method": "GET",
+          "name": "health",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/hello",
+          "method": "GET",
+          "name": "hello",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/hello/src/main.rs:21",
+          "provenance": "provable"
+        },
+        {
+          "path": "/hello/{name}",
+          "method": "GET",
+          "name": "hello_name",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/hello/src/main.rs:27",
+          "provenance": "provable"
+        },
+        {
+          "path": "/live",
+          "method": "GET",
+          "name": "live",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/ready",
+          "method": "GET",
+          "name": "ready",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/startup",
+          "method": "GET",
+          "name": "startup",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/autumn-htmx-csrf.js",
+          "method": "GET",
+          "name": "htmx_csrf",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/htmx.min.js",
+          "method": "GET",
+          "name": "htmx",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/idiomorph.min.js",
+          "method": "GET",
+          "name": "idiomorph",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/sse.js",
+          "method": "GET",
+          "name": "htmx_sse",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/{*path}",
+          "method": "GET",
+          "name": "static_files",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        }
+      ]
+    },
+    "csrf": {
+      "provenance": "declared",
+      "source": "config:security.csrf",
+      "exempt_paths": [],
+      "entries": [
+        {
+          "path": "/actuator/loggers/{name}",
+          "method": "PUT",
+          "csrf_enforced": false,
+          "exempt": false
+        },
+        {
+          "path": "/actuator/webhooks/replay",
+          "method": "POST",
+          "csrf_enforced": false,
+          "exempt": false
+        }
+      ]
+    },
+    "security_headers": {
+      "provenance": "declared",
+      "source": "config:security.headers",
+      "entries": [
+        {
+          "header": "content_security_policy",
+          "value": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'",
+          "emitted": true
+        },
+        {
+          "header": "permissions_policy",
+          "value": "",
+          "emitted": false
+        },
+        {
+          "header": "referrer_policy",
+          "value": "strict-origin-when-cross-origin",
+          "emitted": true
+        },
+        {
+          "header": "strict_transport_security",
+          "value": "",
+          "emitted": false
+        },
+        {
+          "header": "x_content_type_options",
+          "value": "nosniff",
+          "emitted": true
+        },
+        {
+          "header": "x_frame_options",
+          "value": "DENY",
+          "emitted": true
+        },
+        {
+          "header": "xss_protection",
+          "value": "1; mode=block",
+          "emitted": true
+        }
+      ]
+    },
+    "authorization_policies": {
+      "provenance": "provable",
+      "source": "macro:#[authorize]",
+      "runtime_caveat": "the route→action→resource binding is proven from macro-expanded code; which impl Policy<Resource> serves it is resolved from the PolicyRegistry at boot (AppBuilder::policy::<R, _>(...)). A missing registration is not visible at build time — see the policy_registration entry in `excluded`.",
+      "entries": []
+    }
+  },
+  "excluded": [
+    {
+      "dimension": "repository_policy_bindings",
+      "eventual_provenance": "provable",
+      "reason": "#[repository(api = ..., policy = ...)] auto-API handlers enforce fixed show/create/update/delete policy actions, but the macro discards the policy type at expansion and RepositoryApiMeta carries only a type-erased probe; their presence still shows as routes.entries[].policy"
+    },
+    {
+      "dimension": "sessions",
+      "eventual_provenance": "declared",
+      "reason": "later phase"
+    },
+    {
+      "dimension": "secrets",
+      "eventual_provenance": "declared",
+      "reason": "later phase"
+    },
+    {
+      "dimension": "encryption",
+      "eventual_provenance": "provable",
+      "reason": "later phase (#[encrypted] fields provable; key config declared)"
+    },
+    {
+      "dimension": "rate_limit",
+      "eventual_provenance": "declared",
+      "reason": "later phase"
+    },
+    {
+      "dimension": "submit_token",
+      "eventual_provenance": "declared",
+      "reason": "later phase"
+    },
+    {
+      "dimension": "outbound_http",
+      "eventual_provenance": "declared",
+      "reason": "later phase; named-client base_urls allowlist is config, nothing proves every outbound call routes through a named client"
+    },
+    {
+      "dimension": "policy_registration",
+      "eventual_provenance": "runtime-only",
+      "reason": "boot-time fact; excluded from a build-time manifest by design — the authorization_policies dimension proves bindings and carries this as its runtime_caveat"
+    },
+    {
+      "dimension": "serve_path_routers",
+      "eventual_provenance": "provable",
+      "reason": "opt-in serve-path HTTP surfaces (MCP, inbound-mail, storage, SEO) are injected only on the serve path, after the dump early-exit, so they are not enumerated by `autumn routes` at build time; their mutating POSTs (MCP, inbound-mail) run outside the framework CSRF layer and self-protect (MCP: origin + csrf_header + trusted-host; inbound-mail: provider signature verification). Enumerating them is deferred to a dump-plumbing follow-up"
+    }
+  ]
+}

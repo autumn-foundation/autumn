@@ -197,7 +197,8 @@ pub fn run_diff(opts: &DiffOptions<'_>) -> i32 {
     if evaluation.blocked() {
         eprintln!(
             "\n\u{2717} security posture widened and is not acknowledged.\n  \
-             Comment on the pull request with:\n\n      {} {}\n",
+             Acknowledge it with this line \u{2014} as a pull-request comment, or \
+             locally as `--ack <digest>`:\n\n      {} {}\n",
             ack::ACK_PHRASE,
             ack::short(&evaluation.ack_digest)
         );

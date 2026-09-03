@@ -17,6 +17,11 @@
 # `autumn routes audit` (route auth-coverage security manifest), both run
 # against the prebuilt `autumn` CLI installed mid-job.
 #
+# The companion `.github/workflows/posture-gate.yml` takes the next step on
+# pull requests: it diffs this app's security posture against the base branch
+# and blocks a change that widens it until a reviewer acknowledges it on the
+# pull request. See docs/guide/posture-gate.md.
+#
 # Optional extensions (not required for green CI on a fresh scaffold):
 #   - Agent authority (issue #1691): once any handler carries
 #     `#[agent_operable]` or the app mounts MCP, commit a manifest with

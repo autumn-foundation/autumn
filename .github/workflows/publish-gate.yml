@@ -5,6 +5,8 @@ name: Publish Gate
 #
 # Jobs:
 #   metadata      — required crates.io metadata fields present in every crate
+#   posture-gate  — autumn's own example apps run the security posture gate
+#                   they scaffold into apps (#1624)
 #   package       — cargo package dry-run (no upload) for every crate
 #   docs          — docs.rs-compatible documentation build, no broken links
 #   semver        — public API SemVer compatibility vs last crates.io version
@@ -54,6 +56,26 @@ jobs:
       - uses: actions/checkout@v7
       - name: Check examples catalog coherence
         run: ./scripts/check-examples.sh
+
+  # ---------------------------------------------------------------------------
+  # 0a. Security posture gate on autumn's own example apps — issue #1624
+  #
+  # The gate autumn scaffolds into every app, run against an autumn app: builds
+  # `examples/hello`, emits its posture manifest, and diffs it against the
+  # manifest committed next to the example. A change that widens the example's
+  # security surface — a route reachable by more callers, a guard removed —
+  # fails here, with the same acknowledgment escape hatch the product ships.
+  # See scripts/check-posture-gate.sh and docs/guide/posture-gate.md.
+  # ---------------------------------------------------------------------------
+  posture-gate:
+    name: Security posture gate (examples)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the posture gate over the example apps
+        run: ./scripts/check-posture-gate.sh
 
   # ---------------------------------------------------------------------------
   # 0b. Benchmark harness structure gate

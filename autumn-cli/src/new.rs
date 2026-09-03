@@ -34,6 +34,8 @@ pub mod templates {
     pub const SEED_CARGO_TOML: &str = include_str!("templates/seed_Cargo.toml.tmpl");
     pub const INTEGRATION_TEST: &str = include_str!("templates/tests/integration_test.rs.tmpl");
     pub const CI_WORKFLOW: &str = include_str!("templates/.github/workflows/ci.yml.tmpl");
+    pub const POSTURE_GATE_WORKFLOW: &str =
+        include_str!("templates/.github/workflows/posture-gate.yml.tmpl");
     pub const RUST_TOOLCHAIN: &str = include_str!("templates/rust-toolchain.toml.tmpl");
     pub const RUSTFMT: &str = include_str!("templates/rustfmt.toml.tmpl");
     pub const CLIPPY: &str = include_str!("templates/clippy.toml.tmpl");
@@ -416,6 +418,14 @@ pub fn framework_owned_files(
     files.insert(".gitignore", render(templates::GITIGNORE));
     files.insert(".env.example", render(templates::ENV_EXAMPLE));
     files.insert(".github/workflows/ci.yml", ci_yml);
+    // The security posture gate (issue #1624) is a separate workflow rather
+    // than another job in `ci.yml`: it needs `pull-requests: write` to post the
+    // diff, and that permission has no business on the job that runs the test
+    // suite.
+    files.insert(
+        ".github/workflows/posture-gate.yml",
+        render(templates::POSTURE_GATE_WORKFLOW),
+    );
     files.insert("rust-toolchain.toml", render(templates::RUST_TOOLCHAIN));
     files.insert("rustfmt.toml", render(templates::RUSTFMT));
     files.insert("clippy.toml", render(templates::CLIPPY));
@@ -1794,6 +1804,53 @@ mod tests {
         );
     }
 
+    /// The first unsubstituted **autumn** template token in `content`, if any.
+    ///
+    /// Autumn's tokens are `{{lower_snake}}`; GitHub Actions expressions are
+    /// `${{ github.token }}`. Both contain `{{`, so a bare `contains("{{")`
+    /// would forbid every scaffolded workflow from using an Actions expression.
+    /// This looks for our shape specifically, which is what the check was ever
+    /// about.
+    fn unsubstituted_token(content: &str) -> Option<String> {
+        let bytes = content.as_bytes();
+        let mut from = 0;
+        while let Some(offset) = content[from..].find("{{") {
+            let open = from + offset;
+            // `${{ … }}` is a GitHub Actions expression, not ours.
+            let escaped = open > 0 && bytes[open - 1] == b'$';
+            if !escaped && let Some(len) = content[open + 2..].find("}}") {
+                let token = &content[open + 2..open + 2 + len];
+                if !token.is_empty()
+                    && token
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                {
+                    return Some(token.to_owned());
+                }
+            }
+            from = open + 2;
+        }
+        None
+    }
+
+    #[test]
+    fn placeholder_scanner_tells_our_tokens_from_actions_expressions() {
+        assert_eq!(
+            unsubstituted_token("name: ${{ github.token }} and {{project_name}}").as_deref(),
+            Some("project_name"),
+            "an Actions expression is fine; ours is not"
+        );
+        assert_eq!(
+            unsubstituted_token("${{ github.event.pull_request.number }}"),
+            None
+        );
+        assert_eq!(
+            unsubstituted_token("run: exit ${{ steps.diff.outputs.status }}"),
+            None
+        );
+        assert_eq!(unsubstituted_token("nothing templated here"), None);
+    }
+
     #[test]
     fn no_unsubstituted_placeholders() {
         let tmp = TempDir::new().unwrap();
@@ -1803,8 +1860,9 @@ mod tests {
         for entry in walkdir(&p) {
             let content = fs::read_to_string(&entry).unwrap();
             assert!(
-                !content.contains("{{"),
-                "unsubstituted placeholder in {}",
+                unsubstituted_token(&content).is_none(),
+                "unsubstituted placeholder {:?} in {}",
+                unsubstituted_token(&content),
                 entry.display()
             );
         }
@@ -2329,8 +2387,9 @@ mod tests {
         for entry in walkdir(&p) {
             let content = fs::read_to_string(&entry).unwrap();
             assert!(
-                !content.contains("{{"),
-                "unsubstituted placeholder in {}",
+                unsubstituted_token(&content).is_none(),
+                "unsubstituted placeholder {:?} in {}",
+                unsubstituted_token(&content),
                 entry.display()
             );
         }
@@ -2717,6 +2776,7 @@ mod tests {
             ".gitignore",
             ".env.example",
             ".github/workflows/ci.yml",
+            ".github/workflows/posture-gate.yml",
             "rust-toolchain.toml",
             "rustfmt.toml",
             "clippy.toml",
@@ -2729,6 +2789,52 @@ mod tests {
                 files.keys()
             );
         }
+    }
+
+    /// The posture gate (issue #1624) ships turned on, and the pieces that make
+    /// it a *gate* rather than a report are all present: the fresh manifest, the
+    /// staleness check against the committed copy, the base-branch side read out
+    /// of git, an acknowledgment harvest restricted to accounts with write
+    /// access, and a final step that actually fails the job.
+    #[test]
+    fn the_scaffolded_posture_gate_is_wired_end_to_end() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded by default");
+
+        assert!(workflow.contains("autumn routes audit --manifest"));
+        assert!(workflow.contains("autumn routes posture diff"));
+        assert!(
+            workflow.contains("--allow-missing-base"),
+            "first run must not break a repo"
+        );
+        assert!(workflow.contains("--ack-file acks.txt"));
+        assert!(
+            workflow.contains("OWNER") && workflow.contains("COLLABORATOR"),
+            "only accounts with write access may acknowledge"
+        );
+        assert!(
+            workflow.contains("exit ${{ steps.diff.outputs.status }}"),
+            "the diff's exit code must fail the job"
+        );
+        assert!(
+            workflow.contains("pull-requests: write"),
+            "posting the diff needs it"
+        );
+        assert!(
+            !workflow.contains("contents: write"),
+            "the gate never writes to the repository"
+        );
+    }
+
+    /// It is a workflow of its own, not another job on `ci.yml`: `ci.yml` must
+    /// not acquire the `pull-requests: write` token the gate needs.
+    #[test]
+    fn the_posture_gate_does_not_widen_the_ci_workflows_permissions() {
+        let files = owned(GenerateOptions::default());
+        let ci = files.get(".github/workflows/ci.yml").expect("scaffolded");
+        assert!(!ci.contains("pull-requests: write"));
     }
 
     #[test]
