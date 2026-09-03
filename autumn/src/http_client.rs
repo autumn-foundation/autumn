@@ -1351,6 +1351,7 @@ impl Client {
             pin_addr: None,
             ssrf_safe: false,
             discard_response_body: false,
+            breaker_scoped: false,
         }
     }
 
@@ -1506,6 +1507,10 @@ pub struct RequestBuilder {
     /// When `true`, the response body is dropped unread. See
     /// [`RequestBuilder::discard_response_body`].
     discard_response_body: bool,
+    /// When `true`, `send_recorded` keeps circuit-breaker accounting even on
+    /// the custom send path (`needs_custom_path()`). See
+    /// [`RequestBuilder::breaker_scoped`].
+    breaker_scoped: bool,
 }
 
 impl RequestBuilder {
@@ -1738,15 +1743,40 @@ impl RequestBuilder {
         self
     }
 
-    /// The fully-resolved URL this request will dial: an alias passed to
-    /// [`Client::post`]/etc. (e.g. `"hook-service"`) is already expanded
-    /// against `[http.client.base_urls]` by [`Client::build_request`] before
-    /// this builder exists, so this is never the bare alias. A caller that
-    /// needs to key something (a circuit breaker, a log line) by destination
-    /// host must read it from here rather than from whatever string it
-    /// originally passed to `post`/`get`/etc. — see [`BreakerGuardedCall::begin`].
-    pub(crate) fn url(&self) -> &str {
-        &self.url
+    /// Keep circuit-breaker accounting even when this request also needs the
+    /// custom send path (`ssrf_safe()`, `pin_to()`, `no_redirect()`,
+    /// `follow_redirects()`).
+    ///
+    /// That custom path otherwise bypasses `send_recorded`'s breaker block
+    /// entirely — right for its usual case, a one-off fetch of an arbitrary
+    /// caller-chosen URL, where per-host breaker state is mostly noise. A
+    /// caller instead making *repeated* calls to a small, durable set of
+    /// hosts — outbound webhook delivery is the motivating case (#2480 code
+    /// review) — still wants the breaker: without it, a down receiver never
+    /// fails fast, and every queued delivery pays a full
+    /// DNS-resolve-and-connect timeout instead of the open-breaker
+    /// short-circuit every other outbound call gets.
+    ///
+    /// This flag is read from *inside* `send_recorded`, not layered on
+    /// externally, which is what makes it free to get right on every other
+    /// axis `send` already handles correctly: a mocked client's `self.mock.is_some()`
+    /// check runs first regardless (mock behavior is unaffected); a capsule
+    /// replay's `current_tape()` check happens even earlier, in `send` itself,
+    /// before `send_recorded` is ever reached (an open-breaker attempt is
+    /// therefore never gated on live state during replay, and — because it
+    /// stays behind `send`'s own capture tee — an open-breaker attempt made
+    /// *while capturing* is recorded into the capsule exactly like any other
+    /// outcome, so a later replay of that exact run reproduces
+    /// `CircuitBreakerOpen` instead of diverging).
+    ///
+    /// Breaker keying always uses this request's *resolved* URL (`self.url`
+    /// — already expanded past any `[http.client.base_urls]` alias by
+    /// `Client::build_request`), so an alias-targeted destination keys the
+    /// same breaker bucket a literal-URL request to the same host would.
+    #[must_use]
+    pub(crate) const fn breaker_scoped(mut self) -> Self {
+        self.breaker_scoped = true;
+        self
     }
 
     /// Send the request, applying retries and returning a [`Response`].
@@ -1833,8 +1863,13 @@ impl RequestBuilder {
         // (+ optional .resolve()) and does manual redirect handling. Like the
         // mock path it deliberately BYPASSES the process-global circuit breaker
         // to avoid entangling these one-off, per-URL requests with the shared
-        // per-host breaker registry.
+        // per-host breaker registry — unless the caller opted in via
+        // `breaker_scoped()` (repeated calls to a small, durable host set; see
+        // its doc comment).
         if self.needs_custom_path() {
+            if self.breaker_scoped {
+                return self.send_custom_breaker_guarded().await;
+            }
             return self.send_custom().await;
         }
 
@@ -1861,6 +1896,27 @@ impl RequestBuilder {
             Err(_) => {
                 guard.failure();
             }
+        }
+        res
+    }
+
+    /// The custom send path (`send_custom`), with breaker accounting exactly
+    /// like the plain-path breaker block above: `before_call` gate,
+    /// `CircuitBreakerGuard` covering the call (its `Drop` releases a
+    /// half-open slot if this future is cancelled or panics before finishing),
+    /// `< 500` success threshold. Only reached when `breaker_scoped()` was
+    /// set — see its doc comment for why this has to live here rather than in
+    /// an external wrapper around `send()`.
+    async fn send_custom_breaker_guarded(self) -> Result<Response, ClientError> {
+        let breaker = breaker_for_url(self.resilience_config.as_ref(), &self.url);
+        if breaker.before_call().is_err() {
+            return Err(ClientError::CircuitBreakerOpen);
+        }
+        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker);
+        let res = self.send_custom().await;
+        match &res {
+            Ok(resp) if resp.status().as_u16() < 500 => guard.success(),
+            _ => guard.failure(),
         }
         res
     }
@@ -2279,25 +2335,11 @@ const fn is_retryable_status(status: u16) -> bool {
     matches!(status, 502..=504)
 }
 
-/// Whether this task is replaying a failure capsule — the same check
-/// [`RequestBuilder::send`] makes before anything else, mirrored here for
-/// [`BreakerGuardedCall::begin`]. No-op twin for builds without `reporting`,
-/// the feature the whole `capsule` module (and therefore `current_tape`) is
-/// gated behind.
-#[cfg(feature = "reporting")]
-fn replay_tape_active() -> bool {
-    crate::capsule::effects::current_tape().is_some()
-}
-
-#[cfg(not(feature = "reporting"))]
-const fn replay_tape_active() -> bool {
-    false
-}
-
 /// Resolve (or create) the circuit breaker for `url`'s host, honouring a
 /// per-client `resilience_config` override exactly as [`RequestBuilder::send_recorded`]'s
-/// own breaker path does. Shared with [`BreakerGuardedCall`] so the two paths
-/// cannot drift on how a host name is derived from the URL.
+/// own breaker path does. Shared by both the plain-path breaker block and
+/// [`RequestBuilder::send_custom_breaker_guarded`] so the two cannot drift on
+/// how a host name is derived from the URL.
 fn breaker_for_url(
     resilience_config: Option<&Arc<crate::config::ResilienceConfig>>,
     url: &str,
@@ -2323,85 +2365,6 @@ fn breaker_for_url(
             crate::circuit_breaker::global_registry().get_or_create_with_config(&host, policy)
         },
     )
-}
-
-/// Circuit-breaker accounting for a caller that must route through the
-/// SSRF-safe (or otherwise custom) send path — which, like the mock path,
-/// deliberately bypasses [`RequestBuilder::send_recorded`]'s own breaker
-/// block, because that path exists for one-off, per-request fetches of an
-/// arbitrary caller-chosen URL where per-host breaker state would mostly be
-/// noise.
-///
-/// A caller that instead makes *repeated* calls to a small, durable set of
-/// hosts — outbound webhook delivery is the motivating case (#2480 code
-/// review) — still wants the breaker: without it, a webhook receiver that is
-/// down does not fail fast, and every queued delivery pays a full
-/// DNS-resolve-and-connect timeout instead of the open-breaker short-circuit
-/// every other outbound call gets. Wrap such a call with
-/// [`BreakerGuardedCall::begin`] before `send()` and
-/// [`BreakerGuardedCall::record`] after, mirroring exactly what
-/// `send_recorded`'s own breaker-guarded path does (`before_call` gate,
-/// `< 500` success threshold) — including its `self.mock.is_some()` bypass
-/// (#2480 review, round 2): a client with a mock registry attached must never
-/// touch the real breaker, or a mocked failure in one test could open the
-/// shared global breaker for a host name reused by an unrelated later test.
-///
-/// The [`crate::circuit_breaker::CircuitBreakerGuard`] is created inside
-/// `begin`, not deferred to `record` — its `Drop` releases the
-/// `half_open_in_flight` slot `before_call` reserved if the caller's future
-/// is cancelled or panics before `record` runs (#2480 review, round 2);
-/// deferring construction would leak that slot on every such interruption,
-/// eventually wedging the breaker in `HalfOpen` forever.
-pub(crate) struct BreakerGuardedCall {
-    /// `None` when the client this call was `begin`-ed against has a mock
-    /// registry attached, or a capsule replay is in progress on this task:
-    /// `record` is then a no-op, matching the bypasses above.
-    guard: Option<crate::circuit_breaker::CircuitBreakerGuard>,
-}
-
-impl BreakerGuardedCall {
-    /// Returns `Err(ClientError::CircuitBreakerOpen)` immediately, without
-    /// touching the network, when the breaker for `url`'s host is open.
-    ///
-    /// Also bypassed — exactly like the mock case — when this task is
-    /// replaying a failure capsule: [`RequestBuilder::send`] answers such a
-    /// call from the capsule's recorded effect tape before it ever reaches
-    /// `send_recorded`'s breaker block (`#[cfg(feature = "reporting")] if let
-    /// Some(tape) = current_tape() { return replayed_response(...) }`, ahead
-    /// of everything else in `send`). A caller wrapping that call in
-    /// `BreakerGuardedCall` sits *outside* `send` and knows nothing about the
-    /// tape, so without this check it would gate the replay on live global
-    /// breaker state unrelated to the recorded run (an open breaker turns a
-    /// capsule that actually succeeded into a spurious `CircuitBreakerOpen`,
-    /// never consulting the tape at all) and, on a closed breaker, feed the
-    /// *replayed* outcome back into that same live state — historical replay
-    /// traffic contaminating a production breaker (#2480 review, round 3).
-    pub(crate) fn begin(client: &Client, url: &str) -> Result<Self, ClientError> {
-        if client.mock.is_some() || replay_tape_active() {
-            return Ok(Self { guard: None });
-        }
-        let breaker = breaker_for_url(client.resilience_config.as_ref(), url);
-        if breaker.before_call().is_err() {
-            return Err(ClientError::CircuitBreakerOpen);
-        }
-        Ok(Self {
-            guard: Some(crate::circuit_breaker::CircuitBreakerGuard::new(breaker)),
-        })
-    }
-
-    /// Record the outcome against the breaker: any transport error or `>=
-    /// 500` response counts as a failure, exactly like `send_recorded`'s own
-    /// breaker path. A no-op when `begin` bypassed the breaker (mocked
-    /// client).
-    pub(crate) fn record(self, result: &Result<Response, ClientError>) {
-        let Some(guard) = self.guard else {
-            return;
-        };
-        match result {
-            Ok(resp) if resp.status().as_u16() < 500 => guard.success(),
-            _ => guard.failure(),
-        }
-    }
 }
 
 // ── Custom send-path helpers (redirect / pin / SSRF-safe) ─────────────────────
@@ -3214,13 +3177,31 @@ mod tests {
         assert!(other.base_url.is_none());
     }
 
-    // PR #2480 review (P1): a `RequestBuilder`'s `.url()` must be the
-    // *expanded* destination when built through an alias, not the bare alias
-    // string — a caller keying a circuit breaker (or anything else) by
-    // destination host has to read it from here, never from what it
-    // originally passed to `post`/`get`/etc.
+    // PR #2480 review, round 4 (redesign): `breaker_scoped()` moved breaker
+    // accounting for the custom send path from an external wrapper
+    // (`BreakerGuardedCall`, now removed) to a flag `send_recorded` itself
+    // reads — which is what makes the mock bypass, the capsule-replay bypass,
+    // and correct capsule *recording* of an open-breaker attempt all free:
+    // they were already correctly ordered around `send_recorded` before this
+    // flag existed, for every other caller.
+    //
+    // This test locks in the one thing the external wrapper got wrong (P1,
+    // round 1): keying the breaker by the alias a caller passed to
+    // `post`/`get`/etc. rather than the expanded destination. `self.url` is
+    // set once, by `Client::build_request`, before any `breaker_scoped()` /
+    // `ssrf_safe()` flag is even read — so there is no separate "pass the
+    // right URL" step left to get wrong.
     #[test]
-    fn request_builder_url_is_expanded_not_the_alias() {
+    fn breaker_scoped_keys_by_resolved_url_not_alias() {
+        // breaker_for_url really does get_or_create against the shared global
+        // registry, so this needs the same isolation as every other test that
+        // touches it directly — otherwise a concurrently-running test's "no
+        // breaker entry for this host" assertion can observe the entry this
+        // test creates (and never cleans up otherwise).
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let mut base_urls = std::collections::HashMap::new();
         base_urls.insert(
             "hook-service".to_owned(),
@@ -3234,65 +3215,122 @@ mod tests {
         };
         let client = Client::from_config(&config);
 
-        let req = client.named("hook-service").post("hook-service");
-        assert_eq!(req.url(), "http://mock-receiver/base/hook-service");
+        let req = client
+            .named("hook-service")
+            .post("hook-service")
+            .ssrf_safe()
+            .breaker_scoped();
+        assert_eq!(req.url, "http://mock-receiver/base/hook-service");
+        assert!(req.breaker_scoped);
 
         // The bare alias would neither parse as a URL nor name the real
         // destination host — exactly the bug the P1 finding caught.
         assert!(url::Url::parse("hook-service").is_err());
-        let breaker = super::breaker_for_url(None, req.url());
+        let breaker = super::breaker_for_url(None, &req.url);
         assert_eq!(breaker.name(), "mock-receiver");
+
+        crate::circuit_breaker::global_registry().clear();
     }
 
-    // PR #2480 review, round 2 (P2): `BreakerGuardedCall` must never touch the
-    // real shared breaker for a client with a mock registry attached —
-    // `send_recorded` itself bypasses the breaker whenever `self.mock.is_some()`
-    // (checked before it ever reaches the breaker block), and a caller that
-    // wraps a mocked send in `BreakerGuardedCall` without honouring the same
-    // bypass would let a deliberately-mocked failure in one test mutate global
-    // breaker state a later, unrelated test reusing the same host name would
-    // then trip over.
-    #[test]
-    fn breaker_guarded_call_is_a_noop_for_a_mocked_client() {
+    // PR #2480 review, round 4: `breaker_scoped()` on the custom send path
+    // must trip and fail fast exactly like the plain-path breaker already
+    // does (`test_http_client_circuit_breaker_integration`), and must key on
+    // the same host a non-custom-path request to the same URL would.
+    //
+    // No listener needed: `send_ssrf_safe` refuses a loopback destination
+    // (`SsrfBlocked`) before ever dialing, and that refusal is exactly the
+    // kind of failure the breaker must count — a subscriber pointing
+    // `target_url` at a blocked destination repeatedly must trip the breaker
+    // on those refusals just as it would on real 5xxs, not bypass accounting
+    // entirely.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn breaker_scoped_custom_path_trips_and_fails_fast() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let mut rc = crate::config::ResilienceConfig::default();
+        rc.circuit_breaker.defaults.failure_ratio_threshold = Some(0.5);
+        rc.circuit_breaker.defaults.minimum_sample_count = Some(3);
+        rc.circuit_breaker.defaults.open_duration_secs = Some(10);
+        let client = Client {
+            resilience_config: Some(Arc::new(rc)),
+            ..Client::new()
+        };
+
+        let url = "http://127.0.0.1:1/blocked";
+
+        for _ in 0..3 {
+            let res = client.post(url).ssrf_safe().breaker_scoped().send().await;
+            assert!(
+                matches!(res, Err(ClientError::SsrfBlocked(_))),
+                "expected SsrfBlocked, got {res:?}"
+            );
+        }
+
+        // The breaker for 127.0.0.1 should now be OPEN — the next attempt
+        // must fail fast with CircuitBreakerOpen rather than SsrfBlocked,
+        // proving it never re-entered send_custom (no re-resolution, no
+        // reqwest client built).
+        let res = client.post(url).ssrf_safe().breaker_scoped().send().await;
+        assert!(matches!(res, Err(ClientError::CircuitBreakerOpen)));
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    // PR #2480 review, round 4: a client with a mock registry attached must
+    // never touch the real breaker even with `breaker_scoped()` set —
+    // `send_recorded` checks `self.mock.is_some()` before it ever reads
+    // `breaker_scoped`, so a deliberately-mocked failure in one test cannot
+    // open the shared global breaker for a host name reused by an unrelated
+    // later test.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn breaker_scoped_bypassed_for_mocked_client() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
         let registry = Arc::new(MockRegistry::new());
+        let mock = MockSetupBuilder {
+            registry: registry.clone(),
+            alias: "http://mock-receiver/hook".to_owned(),
+            method: None,
+            path: None,
+        }
+        .post("/hook")
+        .respond_with(500, serde_json::json!({ "error": "down" }));
         let client = Client::new().with_mock(registry);
 
-        let call = BreakerGuardedCall::begin(&client, "http://mock-receiver/hook")
-            .expect("a mocked client must never see CircuitBreakerOpen");
+        // More attempts than minimum_sample_count would need to trip a real
+        // breaker at default thresholds — every one must still reach the
+        // mock rather than short-circuiting on CircuitBreakerOpen.
+        for _ in 0..12 {
+            let res = client
+                .named("http://mock-receiver/hook")
+                .post("http://mock-receiver/hook")
+                .ssrf_safe()
+                .breaker_scoped()
+                .send()
+                .await;
+            let res = res.expect("a mocked client must never see CircuitBreakerOpen");
+            assert_eq!(res.status().as_u16(), 500);
+        }
+        mock.expect_called(12);
+
+        // No breaker entry should exist for the mocked host at all.
         assert!(
-            call.guard.is_none(),
-            "begin() must not touch the real breaker for a mocked client"
+            crate::circuit_breaker::global_registry()
+                .all_breakers()
+                .iter()
+                .all(|b| b.name() != "mock-receiver"),
+            "a mocked send must never create a real breaker entry"
         );
 
-        // record() on the no-op guard must not panic and must not fabricate a
-        // breaker entry for the host.
-        call.record(&Err(ClientError::CircuitBreakerOpen));
-    }
-
-    // PR #2480 review, round 3 (P2): `BreakerGuardedCall` must also bypass the
-    // real breaker while this task is replaying a failure capsule — the same
-    // check `RequestBuilder::send` makes (`current_tape()`) before it ever
-    // reaches `send_recorded`'s breaker block, so a caller wrapping the call
-    // externally has to make the identical check or it gates/contaminates the
-    // live breaker with a replay that `send` itself never routed through it.
-    #[cfg(feature = "reporting")]
-    #[tokio::test]
-    async fn breaker_guarded_call_is_a_noop_during_capsule_replay() {
-        let tape = crate::capsule::effects::ReplayEffects::new(
-            crate::capsule::schema::CapsuleEffects::default(),
-        );
-        let client = Client::new();
-
-        crate::capsule::effects::with_effect_tape(std::sync::Arc::new(tape), async {
-            let call = BreakerGuardedCall::begin(&client, "http://replay-target/hook")
-                .expect("a capsule replay must never see CircuitBreakerOpen from live state");
-            assert!(
-                call.guard.is_none(),
-                "begin() must not touch the real breaker during capsule replay"
-            );
-            call.record(&Err(ClientError::CircuitBreakerOpen));
-        })
-        .await;
+        crate::circuit_breaker::global_registry().clear();
     }
 
     // TEST 26: from_request_parts uses AutumnConfig.http when no HttpConfig extension.
