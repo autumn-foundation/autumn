@@ -2569,21 +2569,31 @@ async fn send_one(
     };
     let mut last_transient_err: Option<reqwest::Error> = None;
 
+    // A prior attempt's own connect/timeout error may be why the deadline is
+    // already gone — surface that error (preserving
+    // `ClientError::Request(e).is_timeout()` for callers) instead of masking
+    // it as an unrelated `InvalidUrl`.
+    let deadline_exceeded_err = |last_transient_err: &mut Option<reqwest::Error>| {
+        last_transient_err.take().map_or_else(
+            || ssrf_safe_deadline_error(url),
+            |e| ClientError::Request(e.without_url()),
+        )
+    };
+
     for attempt in 0..max_attempts {
         if attempt > 0 {
             if deadline.is_some_and(|d| Instant::now() >= d) {
-                // A prior attempt's own connect/timeout error may be why the
-                // deadline is already gone — surface that error (preserving
-                // `ClientError::Request(e).is_timeout()` for callers) instead
-                // of masking it as an unrelated `InvalidUrl`.
-                return Err(last_transient_err.take().map_or_else(
-                    || ssrf_safe_deadline_error(url),
-                    |e| ClientError::Request(e.without_url()),
-                ));
+                return Err(deadline_exceeded_err(&mut last_transient_err));
             }
             let exp = (attempt - 1).min(10);
-            let delay = Duration::from_millis(100 * (1_u64 << exp));
+            let mut delay = Duration::from_millis(100 * (1_u64 << exp));
+            if let Some(d) = deadline {
+                delay = delay.min(d.saturating_duration_since(Instant::now()));
+            }
             tokio::time::sleep(delay).await;
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(deadline_exceeded_err(&mut last_transient_err));
+            }
         }
 
         let mut req = client.request(method.clone(), url);
