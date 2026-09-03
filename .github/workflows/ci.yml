@@ -250,13 +250,34 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      # Registry cache only. `cache-bin` would restore $CARGO_HOME/bin, and
+      # install-action skips its verified download when the pinned version is
+      # already there — the auditor this gate trusts must come from the pin,
+      # not from a cache entry.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-deny@0.20.2
-      - name: cargo-deny check
-        run: cargo deny check advisories licenses sources
-      - name: cargo-deny check (sqlite backend graph)
-        run: cargo deny --config deny-sqlite.toml check advisories licenses sources
+      # Advisories go through the shared gate (issue #1600) so PR CI, the
+      # publish gate and a local run are literally the same check: the
+      # workspace graph, the SQLite backend graph, and the day-one graph of a
+      # freshly scaffolded app audited against the `deny.toml` that `autumn
+      # new` ships. It retries the advisory-database fetch and fails closed if
+      # the database stays unreachable.
+      - name: Dependency advisory gate
+        run: ./scripts/check-advisories.sh
+      # A gate nobody has watched fail is indistinguishable from one that no
+      # longer runs: this audits a throwaway crate with an injected
+      # known-vulnerable dependency and requires the gate to reject it, then to
+      # accept it once — and only once — the advisory is waived.
+      - name: Advisory gate self-test (injected vulnerable dependency)
+        run: ./scripts/check-advisories.sh --self-test
+      - name: cargo-deny check (licenses, sources)
+        run: cargo deny check licenses sources
+      - name: cargo-deny check (licenses, sources; sqlite backend graph)
+        run: cargo deny --config deny-sqlite.toml check licenses sources
 
   test:
     name: Test (${{ matrix.os }})

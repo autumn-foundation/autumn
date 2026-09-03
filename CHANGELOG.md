@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dependency-advisory gate, on by default, for scaffolded apps and Autumn's
+  own releases (#1600):** the CI workflow `autumn new` generates relegated
+  vulnerability auditing to a comment ("Optional extensions… Audit: `cargo
+  install cargo-audit`"), which almost nobody enabled, so apps shipped with
+  known-vulnerable transitive dependencies and found out from a pentest rather
+  than from CI. A generated app now audits its whole dependency tree on every
+  push and pull request, and a known RustSec advisory fails the build:
+
+  - `.github/workflows/ci.yml` installs a pinned cargo-deny and runs `cargo deny
+    check advisories`, reading the new **`deny.toml`** the scaffold writes at
+    the project root. Waive an advisory by adding an `ignore` entry there with
+    its id, a `reason`, and a review-by date — the gate stays on and lets
+    exactly that one id through; an unwaived advisory still fails.
+  - Day-one CI is green for every flavor: the scaffold ships documented
+    waivers for the advisories its own tree cannot avoid — RUSTSEC-2023-0071
+    (`rsa` via the unconditional `jsonwebtoken` dependency, no patched release
+    exists) everywhere, plus RUSTSEC-2024-0384 (`instant`, via the
+    embedded-Postgres build stack) for `--bundled-pg` apps and only those.
+    Autumn's own CI re-audits autumn-web's tree — with every feature a scaffold
+    flavor can enable — against that exact policy on every run, so the waiver
+    set cannot quietly stop covering what the scaffold ships.
+  - An app upgraded from an older release receives the workflow but not the
+    policy (`deny.toml` is the app's file, never reconciled): the audit step
+    detects that and says which file to add, rather than auditing under
+    cargo-deny's unwaived default. See `docs/migrations/next.md`.
+  - When the advisory database is unreachable the gate **fails closed**: the
+    fetch is its own step, retried three times with backoff, and the audit then
+    runs `--offline` against it — no hang, no silent skip, and a failure in the
+    audit step always names a real advisory.
+  - Autumn's own release path is gated the same way: `scripts/check-advisories.sh`
+    runs in PR CI *and* in the Publish Gate (a `prepare-release` dependency), so
+    a release with an unwaived advisory in its tree cannot be tagged. Its
+    `--self-test` proves the gate can still go red by auditing an injected
+    known-vulnerable dependency (`time 0.1.45`, RUSTSEC-2020-0071) and requiring
+    rejection, then acceptance once that id is waived.
+  - Docs: [supply-chain guide](docs/guide/supply-chain.md) covers what the gate
+    checks, how to read a failure, and how to waive an advisory.
+
 - **A published Windows support policy, enforced by a `windows-latest` journey
   gate (#1616):** the PRD promised "developers build on macOS and Windows", but
   nothing said what a Windows developer could actually expect, and the native

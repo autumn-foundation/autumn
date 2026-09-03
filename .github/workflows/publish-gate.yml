@@ -11,6 +11,8 @@ name: Publish Gate
 #   release-notes — workspace version / CHANGELOG / tag alignment
 #   smoke         — fresh downstream project compiles against the candidate crate set
 #   examples-e2e  — every example builds, boots for real, and passes a Chromium smoke
+#   advisories    — no unwaived RustSec advisory in the dependency tree being
+#                   published, app scaffold included (#1600)
 #   sbom          — CycloneDX SBOM generated, re-verified against the source
 #                   tree, and pinned to the version/tag being released (#1615)
 #   sbom-attest   — signs that SBOM on tag pushes. A separate, checkout-free
@@ -242,6 +244,39 @@ jobs:
         run: ./scripts/check-migration-guides.sh
 
   # ---------------------------------------------------------------------------
+  # 5a. Dependency advisories (issue #1600)
+  #
+  # A release must not carry a known-vulnerable dependency. PR CI runs the same
+  # gate, but PR CI is not the release path: a tag can be pushed from a commit
+  # whose CI predates an advisory being published, and the advisory database is
+  # fetched fresh here, at tag time. The gate audits the workspace graph, the
+  # SQLite backend graph, and the graph a freshly scaffolded app resolves —
+  # under the `deny.toml` that `autumn new` writes — so "day-one CI is green
+  # for a generated app" is verified against the crates actually being
+  # published. The self-test proves the gate can still go red.
+  # ---------------------------------------------------------------------------
+  advisories:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Registry cache only. `cache-bin` would restore $CARGO_HOME/bin, and
+      # install-action skips its verified download when the pinned version is
+      # already there — the auditor this gate trusts must come from the pin,
+      # not from a cache entry.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - uses: taiki-e/install-action@v2.85.5
+        with:
+          tool: cargo-deny@0.20.2
+      - name: Dependency advisory gate
+        run: ./scripts/check-advisories.sh
+      - name: Advisory gate self-test (injected vulnerable dependency)
+        run: ./scripts/check-advisories.sh --self-test
+
+  # ---------------------------------------------------------------------------
   # 5b. Software Bill of Materials (issue #1615)
   #
   # Generates the workspace SBOM with the CLI from THIS checkout, then
@@ -391,7 +426,7 @@ jobs:
     runs-on: ubuntu-latest
     # Only runs on tag pushes; depends on all gate jobs so artifacts are only
     # produced when every check passes.
-    needs: [semver, release-notes, smoke, examples-e2e, sbom, sbom-attest]
+    needs: [semver, release-notes, smoke, examples-e2e, advisories, sbom, sbom-attest]
     if: github.ref_type == 'tag'
     steps:
       - uses: actions/checkout@v7
