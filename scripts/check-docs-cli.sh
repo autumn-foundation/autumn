@@ -46,9 +46,9 @@
 #      correct pages as broken (`autumn upgrade` defaults its `path` to "." and
 #      the guide runs it bare 20 times) before that was caught by measuring.
 #
-# Both `requires_sub` and `requires_arg` were validated against the built
-# binary's `--help` usage strings across all 173 command paths: exact agreement,
-# no mismatch in either direction.
+# Both `requires_sub` and the required-positional COUNT were validated against
+# the built binary's `--help` usage strings across all 173 command paths: exact
+# agreement, no mismatch in either direction.
 #
 # TRUTH SET: parsed from the clap derive input in `autumn-cli/src/**/*.rs`, not
 # from a checked-in snapshot. A snapshot is one forgotten regeneration away
@@ -300,20 +300,23 @@ def _subcommand_type(payload):
 
 
 def _positionals(payload):
-    """(takes_any, requires_one) for a variant's positional arguments.
+    """(takes_any, required_count) for a variant's positional arguments.
 
     `takes_any` matters because a positional makes the next token in `autumn db
     pull posts` unjudgeable — it is a table name, not a subcommand — so the walk
     stops there rather than reporting drift it cannot prove.
 
-    `requires_one` matters because clap rejects the command outright without it:
+    `required_count` matters because clap rejects the command outright without
+    them, and it is a COUNT rather than a flag because a command can require
+    more than one: `autumn generate controller pages` supplies `name` and stops,
+    but `actions` is `required = true` as well, so clap still rejects it.
     `autumn replay` exits with "the following required arguments were not
     provided: <CAPSULE>". Required-ness is the field's type — a bare `String` is
     required, `Option<T>` and `Vec<T>` are not — and the field carries no
     `#[arg]` attribute at all in that case, which is why this walks fields
     rather than matching attributes.
     """
-    takes_any = requires_one = False
+    takes_any, required = False, 0
     attrs = []
     pending = ''
     for raw in payload.split('\n'):
@@ -349,12 +352,19 @@ def _positionals(payload):
         # `bool` is a flag, never a required positional. Getting this wrong is
         # expensive in one direction only: a required-ness false positive fires
         # on pages that are correct, which is how a gate loses its readers.
-        if (ftype in ('bool',)
-                or ftype.startswith(('Option<', 'Vec<'))
-                or re.search(r'\bdefault_value', attr_text)):
+        if ftype in ('bool',) or re.search(r'\bdefault_value', attr_text):
             continue
-        requires_one = True
-    return takes_any, requires_one
+        if ftype.startswith('Option<'):
+            continue
+        if ftype.startswith('Vec<'):
+            # A `Vec` positional is optional unless clap is told otherwise.
+            # `generate controller` marks its `actions: Vec<String>` with
+            # `required = true`, so it needs at least one on top of `name`.
+            if re.search(r'\brequired\s*=\s*true', attr_text):
+                required += 1
+            continue
+        required += 1
+    return takes_any, required
 
 
 # An option field: the `#[arg(…)]` attribute, the field name, and its type. The
@@ -411,7 +421,7 @@ def build_surface(sources):
                 for group in re.findall(r'\b(?:visible_)?aliases\s*=\s*\[([^\]]*)\]', attrs):
                     spellings.update(re.findall(r'"([^"]+)"', group))
                 node = {'children': {}, 'positionals': False, 'options': {},
-                        'requires_sub': False, 'requires_arg': False}
+                        'requires_sub': False, 'required_args': 0}
                 if kind == 'tuple':
                     inner = re.search(r'\(\s*(?:pub\s+)?([A-Za-z0-9_:]+)', payload)
                     if inner:
@@ -429,14 +439,14 @@ def build_surface(sources):
                             if st:
                                 node['children'] = build(st, seen)
                                 node['requires_sub'] = required and bool(node['children'])
-                            node['positionals'], node['requires_arg'] = _positionals(structs[it])
+                            node['positionals'], node['required_args'] = _positionals(structs[it])
                             node['options'] = _options(structs[it])
                 elif kind == 'struct':
                     st, required = _subcommand_type(payload)
                     if st:
                         node['children'] = build(st, seen)
                         node['requires_sub'] = required and bool(node['children'])
-                    node['positionals'], node['requires_arg'] = _positionals(payload)
+                    node['positionals'], node['required_args'] = _positionals(payload)
                     node['options'] = _options(payload)
                 for spelling in spellings:
                     tree[spelling] = node
@@ -456,7 +466,7 @@ def build_surface(sources):
                          'positionals': v['positionals'],
                          'options': v['options'],
                          'requires_sub': v['requires_sub'],
-                         'requires_arg': v['requires_arg']}
+                         'required_args': v['required_args']}
             flat.update(flatten(v['children'], key))
         return flat
 
@@ -554,6 +564,28 @@ def _segments(tokens):
     return out
 
 
+def _after_image(segment, k):
+    """Yield the argv following a container IMAGE.
+
+    `docker run --rm --entrypoint autumn my-app:latest sbom --binary …` runs an
+    autumn command, but `autumn` there is the ENTRYPOINT — an option's value —
+    and the command is what follows the image. Docker's own grammar is
+    `docker run [OPTIONS] IMAGE [COMMAND] [ARG…]`, so the options run out, one
+    token is the image, and the rest is ours.
+
+    Deliberately no model of docker's own option arity: if an option before the
+    image takes a value (`-v /host:/ctr`), that value is mistaken for the image
+    and the real image lands first in the argv, where it fails to look like a
+    command name and the walk stops. That degrades to silence, never to a false
+    positive on a page that is correct.
+    """
+    while k < len(segment) and segment[k].startswith('-'):
+        k += 1                                  # further options before IMAGE
+    k += 1                                      # the IMAGE itself
+    if k < len(segment):
+        yield ' '.join(segment[k:]), segment[k:]
+
+
 def commands(text):
     """Yield (display, argv_tokens) for every `autumn …` in command position.
 
@@ -599,6 +631,11 @@ def commands(text):
         for j, tok in enumerate(segment):
             if tok == '--' and j + 1 < len(segment) and segment[j + 1] == 'autumn':
                 yield ' '.join(segment[j + 2:]), segment[j + 2:]
+            elif tok == '--entrypoint' and j + 2 < len(segment) \
+                    and segment[j + 1] == 'autumn':
+                yield from _after_image(segment, j + 2)
+            elif tok == '--entrypoint=autumn':
+                yield from _after_image(segment, j + 1)
             elif tok.startswith('autumn ') and (inner := tokenize(tok)):
                 # The inner command line goes through the SAME segment split as
                 # the outer one: `-C "autumn migrate && autumn nope"` is a chain
@@ -810,9 +847,33 @@ def resolve(tokens, surface, runnable=False):
                 return None
             i += 2 if node['options'][name] else 1
             continue
-        if not TOKEN.match(tok):
+        if not node['children']:
+            # A leaf: everything left is arguments, and here the ambiguity
+            # between "value" and "subcommand name" is gone, so the remaining
+            # tokens can be COUNTED against the required positionals rather
+            # than abandoned. `autumn generate controller pages` supplies
+            # `name` and stops, but `actions` is `required = true` too.
+            supplied = 0
+            while i < len(tokens):
+                t2 = tokens[i]
+                if t2 == '--':
+                    i += 1
+                    continue
+                if t2.startswith('-') and len(t2) > 1:
+                    o = t2.split('=', 1)[0]
+                    if '=' in t2:
+                        i += 1
+                        continue
+                    if o not in node['options']:
+                        return None             # unknown arity: cannot count on
+                    i += 2 if node['options'][o] else 1
+                    continue
+                supplied += 1
+                i += 1
+            if runnable and supplied < node['required_args']:
+                return 'autumn ' + path
             return None
-        if not node['children']:                # leaf: the rest are arguments
+        if not TOKEN.match(tok):
             return None
         if tok in node['children']:
             path = path + ' ' + tok
@@ -835,11 +896,10 @@ def resolve(tokens, surface, runnable=False):
     if runnable and surface[path]['requires_sub']:
         return 'autumn ' + path
 
-    # Same shape one level down: `autumn replay` exits with "the following
-    # required arguments were not provided: <CAPSULE>". The walk only reaches
-    # here having consumed no positional — supplying one ends the walk earlier,
-    # since a value cannot be told from a subcommand name.
-    if runnable and surface[path]['requires_arg']:
+    # Same shape one level down, for a command reached with no tokens left:
+    # `autumn replay` exits with "the following required arguments were not
+    # provided: <CAPSULE>".
+    if runnable and surface[path]['required_args']:
         return 'autumn ' + path
     return None
 
@@ -914,6 +974,13 @@ def self_test():
             capsule: String,
             #[arg(short, long)]
             package: Option<String>,
+        },
+        Controller {
+            name: String,
+            #[arg(required = true)]
+            actions: Vec<String>,
+            #[arg(long)]
+            api: bool,
         },
         New {
             name: Option<String>,
@@ -1120,12 +1187,31 @@ def self_test():
     # read a positional carrying `default_value` as required — `autumn upgrade`
     # takes `path: String` defaulting to "." and the guide runs it bare 20
     # times. Required-ness is only what clap cannot supply itself.
-    expect(surface['replay']['requires_arg'],
-           'a bare `capsule: String` field is a required positional')
-    expect(not surface['upgrade']['requires_arg'],
+    expect(surface['replay']['required_args'] == 1,
+           'a bare `capsule: String` field is one required positional')
+    expect(surface['upgrade']['required_args'] == 0,
            'a positional with default_value is NOT required')
-    expect(not surface['db pull']['requires_arg'], 'a Vec<> positional is not required')
-    expect(not surface['new']['requires_arg'], 'an Option<> positional is not required')
+    expect(surface['db pull']['required_args'] == 0, 'a plain Vec<> is not required')
+    expect(surface['new']['required_args'] == 0, 'an Option<> positional is not required')
+    expect(surface['controller']['required_args'] == 2,
+           'required-ness is a COUNT: `name` plus a `required = true` Vec')
+    expect(resolve(tk('controller pages'), surface, runnable=True) == 'autumn controller',
+           'stopping at the first positional must not accept a command still '
+           'missing a second required one')
+    expect(resolve(tk('controller pages home'), surface, runnable=True) is None,
+           'supplying both required positionals resolves')
+    expect(resolve(tk('controller pages home --api'), surface, runnable=True) is None,
+           'an option after the positionals is not counted as one')
+
+    # --- a container entrypoint names the binary; the command follows the IMAGE
+    dock = '```bash\ndocker run --rm --entrypoint autumn my-app:latest migrate run\n```'
+    expect([d for _, d, _, _ in invocations(dock)] == ['migrate run'],
+           f'a command behind a docker entrypoint must be read: {list(invocations(dock))}')
+    dock_eq = '```bash\ndocker run --entrypoint=autumn img migrate run\n```'
+    expect([d for _, d, _, _ in invocations(dock_eq)] == ['migrate run'],
+           '--entrypoint=autumn is the same layout')
+    expect(list(invocations('```bash\ndocker run --entrypoint autumn my-app:latest\n```')) == [],
+           'an entrypoint with no command after the image yields nothing')
     expect(resolve(tk('replay'), surface, runnable=True) == 'autumn replay',
            'a runnable line missing a required positional must be reported')
     expect(resolve(tk('replay capsule.json'), surface, runnable=True) is None,
@@ -1187,7 +1273,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f"self-test: {13 + 39 + 29 + 4 - len(failures)} passed, {len(failures)} failed")
+    print(f"self-test: {13 + 47 + 32 + 4 - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
@@ -1218,9 +1304,10 @@ def main():
             path = bad[len('autumn '):]
             if bad != 'autumn' and path not in surface:
                 note = 'is not a command'
-            elif bad != 'autumn' and surface[path]['requires_arg'] \
+            elif bad != 'autumn' and surface[path]['required_args'] \
                     and not surface[path]['requires_sub']:
-                note = 'needs an argument'
+                n = surface[path]['required_args']
+                note = f'needs {n} argument' + ('s' if n > 1 else '')
             else:
                 note = 'needs a subcommand'
             line = ('autumn ' + argv).strip()
