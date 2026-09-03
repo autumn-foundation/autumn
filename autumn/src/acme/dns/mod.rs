@@ -115,7 +115,7 @@ pub const UPSTREAM_EXCERPT_CHARS: usize = 400;
 /// Autumn's own error strings never contain a credential, but the text it copies
 /// **in** from a provider is not under its control, and that text is published
 /// verbatim on the unauthenticated `/actuator/health` and to the operator's
-/// alert destination (Slack, PagerDuty, email). Two real shapes make that
+/// alert destination (Slack, `PagerDuty`, email). Two real shapes make that
 /// dangerous:
 ///
 /// - AWS answers a `SignatureDoesNotMatch` by echoing the canonical request it
@@ -132,15 +132,7 @@ pub const UPSTREAM_EXCERPT_CHARS: usize = 400;
 pub fn sanitize_upstream(text: &str, secrets: &[&str]) -> String {
     let mut cleaned: String = text
         .chars()
-        .map(|c| {
-            if c == '\t' {
-                ' '
-            } else if c.is_control() {
-                ' '
-            } else {
-                c
-            }
-        })
+        .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     for secret in secrets {
         let secret = secret.trim();

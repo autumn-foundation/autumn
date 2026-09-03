@@ -553,9 +553,9 @@ fn sign_request(
     sign_request_for_service(request, credentials, timestamp, SERVICE)
 }
 
-/// As [`sign_request`], with the SigV4 service name injected.
+/// As [`sign_request`], with the `SigV4` service name injected.
 ///
-/// The service is a parameter for exactly one reason: AWS's published SigV4 test
+/// The service is a parameter for exactly one reason: AWS's published `SigV4` test
 /// suite signs for the service literally named `service`, and a hand-rolled
 /// signer is only worth trusting if it reproduces the vendor's own vector
 /// end-to-end. Production always passes [`SERVICE`].
@@ -602,7 +602,7 @@ fn sign_request_for_service(
     let mut canonical_headers = String::new();
     for (name, value) in &request.headers {
         use std::fmt::Write as _;
-        let _ = write!(canonical_headers, "{name}:{}\n", value.trim());
+        let _ = writeln!(canonical_headers, "{name}:{}", value.trim());
     }
     let signed_headers = request
         .headers
@@ -662,10 +662,14 @@ mod tests {
     }
 
     fn rrset_with(values: &[&str]) -> String {
-        let records: String = values
-            .iter()
-            .map(|v| format!("<ResourceRecord><Value>&quot;{v}&quot;</Value></ResourceRecord>"))
-            .collect();
+        let mut records = String::new();
+        for value in values {
+            use std::fmt::Write as _;
+            let _ = write!(
+                records,
+                "<ResourceRecord><Value>&quot;{value}&quot;</Value></ResourceRecord>"
+            );
+        }
         format!(
             "<ListResourceRecordSetsResponse><ResourceRecordSets><ResourceRecordSet>\
              <Name>_acme-challenge.myapp.com.</Name><Type>TXT</Type><TTL>60</TTL>\
@@ -811,7 +815,7 @@ mod tests {
         );
     }
 
-    /// Every request is SigV4-signed, and the zone is looked up once and cached.
+    /// Every request is `SigV4`-signed, and the zone is looked up once and cached.
     #[tokio::test]
     async fn every_request_is_signed_and_the_zone_is_cached() {
         let transport = RecordingTransport::new(&[
@@ -946,7 +950,7 @@ mod tests {
 
     /// The query string is part of the canonical request, so two requests that
     /// differ only there must sign differently — and the same query in a
-    /// different order must sign identically (SigV4 sorts it).
+    /// different order must sign identically (`SigV4` sorts it).
     #[test]
     fn sigv4_covers_the_query_string_and_is_order_independent() {
         let sign = |url: &str| {

@@ -242,8 +242,10 @@ fn parse_api_response(
                     .join("; ")
             })
             .filter(|d| !d.is_empty())
-            .map(|detail| sanitize_upstream(&detail, secrets))
-            .unwrap_or_else(|| "no error detail returned".to_owned());
+            .map_or_else(
+                || "no error detail returned".to_owned(),
+                |detail| sanitize_upstream(&detail, secrets),
+            );
         return Err(format!(
             "could not {what} (HTTP {} from {redacted_url}): {detail}",
             response.status
