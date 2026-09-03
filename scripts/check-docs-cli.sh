@@ -675,9 +675,11 @@ def _cron_prefix(segment):
 
     The system-crontab user field (`/etc/cron.d`: `0 2 * * * root autumn …`)
     is indistinguishable from a command name in general, so it is stepped over
-    only when the token after it IS the binary. That cannot manufacture a
-    false positive: the schedule has already matched, and the invocation is
-    read from the executable itself either way.
+    only when the token after it is something that LAUNCHES: the binary
+    itself, or a wrapper that reaches it (`root flock /var/lock/x autumn …`,
+    which the narrower "must be the binary" test could not see past). That
+    cannot manufacture a false positive: the schedule has already matched, and
+    the invocation is still read from the executable itself either way.
     """
     if segment and _CRON_SHORTCUT.match(segment[0]):
         i = 1
@@ -686,8 +688,9 @@ def _cron_prefix(segment):
     else:
         return 0
     if i < len(segment) and not _autumn_exe(segment[i]) \
-            and _CRON_USER.match(segment[i]) \
-            and i + 1 < len(segment) and _autumn_exe(segment[i + 1]):
+            and _CRON_USER.match(segment[i]) and i + 1 < len(segment) \
+            and (_autumn_exe(segment[i + 1])
+                 or segment[i + 1] in _CONTROL):
         i += 1
     return i
 
@@ -1502,6 +1505,14 @@ def _from_tokens(tokens, masked=None):
                     break
                 i = _skip_wrapper_options(segment, i, wrapper)
                 i += _WRAPPER_OPERANDS.get(wrapper_name, 0)
+                # A wrapper's own `--` ends ITS options; the command follows.
+                # For a wrapper with no operands the option walk already ate
+                # it, but for one with them the separator arrives afterwards
+                # and stopped the walk — `timeout 5 -- autumn migrate` and
+                # `flock /tmp/lock -- autumn migrate` went unread, while the
+                # spelling without the separator was fine.
+                if i < len(segment) and segment[i] == '--':
+                    i += 1
         # A redirection may also come BEFORE the command — `>/tmp/out autumn
         # migrate` is valid and runs autumn — and the prefix walk stopped on
         # it, so the whole line went unread.
@@ -3814,6 +3825,43 @@ def self_test():
     alone = '```yaml\nentrypoint: ["autumn"]\n```'
     expect([d for _, d, _, _ in invocations(alone)] == [''],
            f'an unpaired entrypoint is a real bare root: {list(invocations(alone))}')
+
+    # A wrapper's own `--` ends ITS options and the command follows. For a
+    # wrapper with no operands the option walk already consumed the separator,
+    # which is why this only ever failed for the ones that take operands —
+    # there it arrives after them and stopped the walk.
+    for launcher in ('timeout 5', 'flock /tmp/lock', 'chroot /mnt',
+                     'systemd-run', 'nsenter', 'doas', 'xargs', 'sudo', 'env'):
+        doc = f'```bash\n{launcher} -- autumn nope\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{launcher} -- reaches its command: {got}')
+    # The separator still belongs to whoever wrote it: a command's own `--`
+    # forwards to itself, and a program that only prints its arguments runs
+    # nothing.
+    own = '```bash\nautumn test -- autumn nope\n```'
+    expect([d for _, d, _, _ in invocations(own)] == ['test -- autumn nope'],
+           f"autumn's own separator is not a wrapper's: {list(invocations(own))}")
+    expect(list(invocations('```bash\necho -- autumn nope\n```')) == [],
+           'echo prints its separator, it does not launch')
+
+    # The `/etc/cron.d` user field is stepped over when what follows LAUNCHES —
+    # the binary, or a wrapper that reaches it. Requiring the binary itself
+    # could not see past `root flock /var/lock/x autumn …`.
+    for line in ('*/5 * * * * deploy autumn nope',
+                 '*/5 * * * * deploy flock /tmp/lock autumn nope',
+                 '*/5 * * * * deploy timeout 5 autumn nope',
+                 '@daily deploy flock /tmp/lock autumn nope',
+                 '*/5 * * * * flock /tmp/lock autumn nope',
+                 '*/5 * * * * autumn nope'):
+        doc = f'```cron\n{line}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{line!r} reaches its command: {got}')
+    # …and a schedule followed by something that is not autumn stays silent,
+    # whether or not a user field is written.
+    for quiet in ('*/5 * * * * backup.sh', '*/5 * * * * deploy backup.sh'):
+        doc = f'```cron\n{quiet}\n```'
+        expect(list(invocations(doc)) == [],
+               f'{quiet!r} runs no autumn: {list(invocations(doc))}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
