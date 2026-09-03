@@ -428,6 +428,37 @@ fn the_api_flavor_ships_the_same_gate() {
     assert!(deny.contains("[advisories]"), "--api needs the policy too");
 }
 
+/// Pinning the auditor buys nothing if the job restores a previously cached
+/// binary instead: `Swatinem/rust-cache` caches `$CARGO_HOME/bin` by default,
+/// and `install-action` skips its verified download when the pinned version is
+/// already on PATH — so from the second run onward the auditor would come from
+/// a cache entry rather than the pin.
+#[test]
+fn the_auditor_comes_from_its_pin_and_never_from_a_cache() {
+    let (_tmp, project) = scaffold("cache-app", &[]);
+    let ci = code_only(&read_project_file(&project, ".github/workflows/ci.yml"));
+    for workflow in [
+        ci.clone(),
+        code_only(&read_repo_file(".github/workflows/ci.yml")),
+        code_only(&read_repo_file(".github/workflows/publish-gate.yml")),
+    ] {
+        for (install, _) in workflow.match_indices("cargo-deny@") {
+            // The cache step that could serve this install is the last one
+            // before it; other jobs' caches are none of this test's business.
+            let Some(cache) = workflow[..install].rfind("Swatinem/rust-cache") else {
+                continue;
+            };
+            assert!(
+                workflow[cache..install].contains("cache-bin: false"),
+                "the cache step preceding a pinned cargo-deny install must not cache \
+                 $CARGO_HOME/bin, or the auditor comes from the cache instead of the \
+                 pin:\n{}",
+                &workflow[cache..install]
+            );
+        }
+    }
+}
+
 /// The version pin in the scaffold and the one the framework audits itself with
 /// must agree: a scaffold that lags is a scaffold whose users hit bugs this
 /// repo already fixed, and a divergence is invisible until it bites.

@@ -263,6 +263,19 @@ prove_policy_blocks() {
     return 1
   fi
   if [ "${status}" -ne 0 ]; then
+    # A non-zero exit is only acceptable when the run still REPORTED advisories
+    # and simply found a different one — the fixture's own tiny tree (libc,
+    # winapi) is audited under a policy that denies unmaintained and unsound
+    # crates too, so a future advisory there must not be read as a broken
+    # waiver. A failure that names no advisory at all is the auditor never
+    # getting that far (an unloadable config, a missing database), and treating
+    # that as "waiver honoured" would make this whole proof vacuous.
+    if ! printf '%s' "${output}" | grep -q 'RUSTSEC-'; then
+      echo "error: ${label} failed AFTER waiving ${VULNERABLE_ADVISORY} without reporting" >&2
+      echo "       any advisory - the audit did not run, so the waiver proved nothing:" >&2
+      echo "${output}" >&2
+      return 1
+    fi
     echo "note: ${label} still fails the fixture, but no longer for ${VULNERABLE_ADVISORY};" >&2
     echo "      an unrelated advisory now affects the fixture's own tree:" >&2
     echo "${output}" >&2

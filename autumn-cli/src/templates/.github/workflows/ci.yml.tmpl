@@ -76,7 +76,14 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # `cache-bin` is off deliberately: it would cache $CARGO_HOME/bin, and the
+      # cargo-deny install below skips its verified download when the pinned
+      # version is already on PATH. The auditor this app's security gate trusts
+      # must come from that pin, not from a restored cache entry. Everything
+      # else (registry, git deps, target dir) is still cached.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: Check formatting
         run: cargo fmt --all -- --check
