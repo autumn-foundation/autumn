@@ -551,7 +551,7 @@ _PROMPT = {'$', '(', '{'}
 # the segment head meant the scan never reached it.
 _CONTROL = {'if', 'elif', 'while', 'until', 'then', 'else', 'do', 'done', 'fi',
             'time', '!', 'exec', 'command', 'nohup', 'sudo', 'env', 'xargs',
-            'timeout', 'nice',
+            'timeout', 'nice', 'ssh',
             # …and the launchers that run a DIRECT command operand, not only
             # one after a `--`. Each was listed as a program whose separator
             # introduces a command, which covered `systemd-run -- autumn …`
@@ -604,6 +604,11 @@ _WRAPPER_OPTS = {
     # corpus and the finding are about.
     'flock': {'-w', '--wait', '--timeout', '-E', '--conflict-exit-code'},
     'chroot': {'--userspec', '--groups'},
+    # `ssh [options] destination [command [argument ...]]` — the usage line
+    # the installed /usr/bin/ssh prints. Its `-c` is a CIPHER, which is why
+    # ssh is deliberately absent from `_SHELL_C_OPTS`.
+    'ssh': {'-b', '-c', '-D', '-E', '-e', '-F', '-I', '-i', '-J', '-L', '-l',
+            '-m', '-O', '-o', '-p', '-Q', '-R', '-S', '-W', '-w'},
     'nsenter': {'-t', '--target', '-S', '--setuid', '-G', '--setgid',
                 '--wd', '--root'},
     'doas': {'-u', '-C'},
@@ -612,7 +617,7 @@ _WRAPPER_OPTS = {
 # Wrappers that take POSITIONAL operands of their own before the command:
 # `timeout [OPTION] DURATION COMMAND`. Stepping over the options alone left
 # the duration looking like the executable.
-_WRAPPER_OPERANDS = {'timeout': 1, 'flock': 1, 'chroot': 1}
+_WRAPPER_OPERANDS = {'timeout': 1, 'flock': 1, 'chroot': 1, 'ssh': 1}
 
 
 # Options that turn a wrapper into an INSPECTION: it describes the names that
@@ -1052,9 +1057,43 @@ _BLOCKQUOTE = re.compile(r'^\s*(?:>\s?)+')
 # scanner waited for a terminator that never came and ate the rest of the
 # fence — the real command after `END.JSON` included. A word ends at
 # whitespace or at a shell operator, which is what the class says.
-_HEREDOC_WORD = r'[^\s;&|<>()\'"`]+'
-_HEREDOC = re.compile(r'(?<!<)<<-?\s*(?:"([^"]+)"|\'([^\']+)\''
-                      r'|\\(' + _HEREDOC_WORD + r')|(' + _HEREDOC_WORD + r'))')
+# The operator only; the delimiter after it is read by `_heredoc_delim`,
+# because a shell word is more than any one alternation can describe.
+_HEREDOC = re.compile(r'(?<!<)<<-?[ \t]*')
+
+
+def _heredoc_delim(text, i):
+    """The heredoc delimiter word starting at `i`, with its quoting removed.
+
+    A delimiter is a shell WORD, and a word may be spelled in PIECES:
+    `<<'END'.JSON` quotes the first half only, and quote removal joins the two
+    into `END.JSON`. Matching one quoted run or one bare run captured half of
+    it, so the terminator never matched and the rest of the fence — the real
+    command after it included — was eaten as body.
+
+    Returns None when there is no word, which is what makes the here-string
+    `<<<EOF` fall out: the character after the operator is `<`, and an
+    operator ends a word rather than joining it.
+    """
+    out, n = [], len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ' \t' or ch in ';&|<>()':
+            break
+        if ch == '\\' and i + 1 < n:
+            out.append(text[i + 1])
+            i += 2
+            continue
+        if ch in '"\'':
+            end = text.find(ch, i + 1)
+            if end < 0:                     # unterminated: not a delimiter
+                return None
+            out.append(text[i + 1:end])
+            i = end + 1
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out) or None
 # A slot key whose value is a plain scalar on the same line. Compose mixes the
 # forms freely — `entrypoint: ["autumn"]` with `command: migrate` — and reading
 # only the bracketed form left the pair half-assembled, so a valid recipe
@@ -1633,6 +1672,7 @@ def invocations(text):
     exist. Only the second is ever waivable.
     """
     fence = None
+    fence_indent = 0   # how far the OPENING marker was indented
     lang = None
     held = []          # parts of a backslash-continued line, oldest first
     held_at = None     # the line the continued command STARTED on
@@ -1758,15 +1798,16 @@ def invocations(text):
     folded_base = None      # the column its content sits at
     folded_slot = None      # which container slot it fills, if any
     folded_literal = False  # `|` keeps its lines apart; `>` joins them
+    folded_cont = False     # …unless the line before ended in a backslash
 
     def close_folded():
         """Read a folded scalar: one command per paragraph, lines joined."""
         nonlocal folded, folded_at, folded_base, folded_slot
-        nonlocal folded_literal
+        nonlocal folded_literal, folded_cont
         nonlocal pending, pending_kind, pending_at, pending_indent
         paras, at, slot = folded, folded_at, folded_slot
         folded, folded_at, folded_base, folded_slot = None, None, None, None
-        folded_literal = False
+        folded_literal, folded_cont = False, False
         if not paras:
             return
         # A folded value under an exec-family key is that container's argv,
@@ -1837,7 +1878,7 @@ def invocations(text):
         # ordinary fence a leading `>` is a redirection, not a quote marker.
         if fence is not None and quoted_fence:
             line = _BLOCKQUOTE.sub('', line, count=1)
-        m = re.match(r'^\s*(?:>\s?)*(`{3,}|~{3,})\s*(.*)$', line)
+        m = re.match(r'^( *)(?:>\s?)*( *)(`{3,}|~{3,})\s*(.*)$', line)
         if m:
             held, held_at, heredocs = [], None, []   # a fence boundary ends any hold
             yield from close_quote()            # …an unterminated quote
@@ -1852,13 +1893,24 @@ def invocations(text):
                 # block is content — closing on it ended the fence early and
                 # everything after read as prose, where a runnable command is
                 # not judged.
-                fence, fence_len = m.group(1)[0], len(m.group(1))
+                fence, fence_len = m.group(3)[0], len(m.group(3))
+                fence_indent = len(m.group(1)) + len(m.group(2))
                 # The info string is the first word of the rest.
-                info = m.group(2).strip()
+                info = m.group(4).strip()
                 lang = re.split(r'[\s,]', info)[0].lower() if info else ''
                 quoted_fence = bool(_BLOCKQUOTE.match(line))
-            elif m.group(1)[0] == fence and len(m.group(1)) >= fence_len \
-                    and not m.group(2).strip():
+            # Markdown allows a closing fence at most three spaces further in
+            # than the block it closes; beyond that the line is CONTENT. The
+            # indent was ignored entirely, so an indented ``` inside a bash
+            # fence ended it early and everything below read as prose, where a
+            # runnable command is not judged. The bound is RELATIVE to the
+            # opener rather than absolute, because a fence nested in a list
+            # item is legitimately indented — this corpus has none past three
+            # spaces, but capping absolutely would stop reading the first one
+            # that appears.
+            elif m.group(3)[0] == fence and len(m.group(3)) >= fence_len \
+                    and not m.group(4).strip() \
+                    and len(m.group(1)) + len(m.group(2)) <= fence_indent + 3:
                 fence, lang, quoted_fence = None, None, False
             continue
 
@@ -1915,8 +1967,24 @@ def invocations(text):
                 # lines, and because the first accepts arguments the second
                 # vanished into it.
                 if folded_literal or depth > folded_base:
-                    folded.append([lineno, [line.strip()]])
-                    folded.append([None, []])
+                    # A trailing unescaped backslash continues the line here
+                    # exactly as it does in a shell fence — these lines ARE
+                    # shell. Sending each to the parser on its own stopped the
+                    # first at the backslash and left the second with no
+                    # executable, so `autumn \` / `definitely-not-a-command`
+                    # resolved to nothing and the drift went unreported.
+                    text = line.strip()
+                    body = _strip_comment(text).rstrip()
+                    cont = _escaped(body + ' ', len(body))
+                    if cont:
+                        text = body[:-1]
+                    if folded_cont:
+                        folded[-1][1].append(text)
+                    else:
+                        folded.append([lineno, [text]])
+                    folded_cont = cont
+                    if not cont:
+                        folded.append([None, []])
                     continue
                 if depth < folded_base:
                     folded_base = depth
@@ -1936,7 +2004,7 @@ def invocations(text):
             # made that line the base and folded the block into one argv,
             # hiding whatever followed. Only when there is no indicator does
             # the first content line decide.
-            folded_literal = fold.group(2) == '|'
+            folded_literal, folded_cont = fold.group(2) == '|', False
             folded_base = (folded_indent + int(fold.group(3))
                            if fold.group(3) else None)
             folded_slot = ('args' if _ARGS_KEY_LINE.match(keyline)
@@ -2050,10 +2118,13 @@ def invocations(text):
             # next line was consumed as the body.
             if _escaped(stripped, opener.start()):
                 continue
+            delim = _heredoc_delim(stripped, opener.end())
+            if delim is None:
+                continue
             # `<<-` allows the terminator to be indented with TABS; a plain
             # `<<` requires it alone on the line. Accepting any indentation
             # closed a heredoc early and reported its data as a command.
-            heredocs.append((next(g for g in opener.groups() if g),
+            heredocs.append((delim,
                              stripped[opener.start():opener.start() + 3] == '<<-'))
         # Backticks inside a fence are not markdown spans. In a shell block
         # they are legacy command substitution — `` OUT=`autumn migrate` `` is
@@ -3862,6 +3933,64 @@ def self_test():
         doc = f'```cron\n{quiet}\n```'
         expect(list(invocations(doc)) == [],
                f'{quiet!r} runs no autumn: {list(invocations(doc))}')
+
+    # `ssh [options] destination [command …]` runs its command operand, which
+    # the separator branch alone never reached.
+    for form in ('ssh host', 'ssh -p 22 host', 'ssh deploy@host',
+                 'ssh -c aes256 host', 'ssh -o X=y host', 'ssh -i ~/.k host'):
+        doc = f'```bash\n{form} autumn nope\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{form} runs its remote command: {got}')
+    expect(list(invocations('```bash\necho ssh host autumn nope\n```')) == [],
+           'a destination named as an argument launches nothing')
+
+    # Lines inside a literal `run: |` ARE shell, so a trailing unescaped
+    # backslash continues them. Reading each on its own stopped the first at
+    # the backslash and left the second with no executable, so the drift
+    # resolved to nothing and went unreported.
+    cont = '```yaml\nrun: |\n  autumn \\\n    nope\n```'
+    expect([(ln, d) for ln, d, _, _ in invocations(cont)] == [(3, 'nope')],
+           f'a continuation inside a literal scalar joins: {list(invocations(cont))}')
+    three = '```yaml\nrun: |\n  autumn \\\n    migrate \\\n    status\n```'
+    expect([d for _, d, _, _ in invocations(three)] == ['migrate status'],
+           f'…across three lines too: {list(invocations(three))}')
+    # Parity holds here as everywhere: an even run is literal backslashes and
+    # continues nothing, and two ordinary lines stay two commands.
+    evenbs = '```yaml\nrun: |\n  printf %s \\\\\n  autumn nope\n```'
+    expect([(ln, d) for ln, d, _, _ in invocations(evenbs)] == [(4, 'nope')],
+           f'an even backslash run continues nothing: {list(invocations(evenbs))}')
+    two = '```yaml\nrun: |\n  autumn migrate\n  autumn nope\n```'
+    expect([(ln, d) for ln, d, _, _ in invocations(two)]
+           == [(3, 'migrate'), (4, 'nope')],
+           f'…and plain lines stay apart: {list(invocations(two))}')
+
+    # A closing fence may be indented at most three spaces past the block it
+    # closes; further in, the line is CONTENT. Ignoring the indent ended a
+    # fence early and everything below read as prose, where a runnable command
+    # is not judged.
+    deep = '```bash\nautumn migrate\n    ```\nautumn nope\n```'
+    expect([(ln, d) for ln, d, _, _ in invocations(deep)]
+           == [(2, 'migrate'), (4, 'nope')],
+           f'a four-space ``` is fence content: {list(invocations(deep))}')
+    for closer in ('```', '   ```'):
+        doc = f'```bash\nautumn migrate\n{closer}\nautumn nope'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate'], f'{closer!r} still closes the fence: {got}')
+    # The bound is RELATIVE, so a fence nested in a list item still opens.
+    nested = '- item\n\n      ```bash\n      autumn nope\n      ```\n'
+    expect([d for _, d, _, _ in invocations(nested)] == ['nope'],
+           f'a list-nested fence is still read: {list(invocations(nested))}')
+
+    # A delimiter is a shell word, and a word may be spelled in PIECES —
+    # quote removal joins `<<'END'.JSON` into one `END.JSON`.
+    for spelling in ("<<'END'.JSON", '<<"END".JSON', '<<END.JSON',
+                     "<<'END.JSON'", '<<END".JS"ON'):
+        doc = f'```bash\ncat {spelling}\ndata\nEND.JSON\nautumn nope\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{spelling} ends on END.JSON: {got}')
+    pieces_body = "```bash\ncat <<'END'.JSON\nautumn db\nEND.JSON\n```"
+    expect(list(invocations(pieces_body)) == [],
+           f'…and its body is still data: {list(invocations(pieces_body))}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
