@@ -121,6 +121,317 @@ pub struct DoctorDeprecation {
     pub remove_in: String,
 }
 
+/// One plugin's wiring state, as `autumn doctor` can see it from the project's
+/// `Cargo.toml`, `src/main.rs`, and (best effort) its migration history.
+/// Input to [`check_plugin_residue_impl`] (issue #1631).
+// Four independent yes/no facts about one plugin, each read from a different
+// place (the manifest, the source tree, the source tree again with a stricter
+// probe, the catalog). Folding them into an enum would mean enumerating the
+// combinations, which is exactly what `check_plugin_residue_impl` does.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone)]
+pub struct PluginWiring {
+    /// The plugin's crate name.
+    pub crate_name: String,
+    /// Whether this is a community `autumn-plugin-*` crate. `plugin add` is
+    /// dependency-only for those BY DESIGN — it never writes their mount — so
+    /// "run `autumn plugin add` to finish the install" is wrong advice for
+    /// them, and the finding has to say something else.
+    pub community: bool,
+    /// Whether `[dependencies]` declares it.
+    pub dependency: bool,
+    /// Whether anything in the app's sources looks like a mount of it —
+    /// including a bare `<Name>Plugin::new(` with no crate path, which is
+    /// enough to stop this check nagging about a plugin that IS wired.
+    pub mount: bool,
+    /// Whether a mount names the plugin's fully-qualified type path. Only this
+    /// proves the app is reaching into *this* crate; a bare constructor could
+    /// be the app's own same-named type, which is why the "mounted but not
+    /// declared, so this does not compile" failure needs the stronger signal.
+    pub mount_qualified: bool,
+    /// Migration versions this plugin declares that the database still records
+    /// as applied. Only meaningful when the plugin is otherwise gone; empty
+    /// whenever the migration history could not be read.
+    pub orphaned_migrations: Vec<String>,
+}
+
+/// Check for orphaned plugin residue: a half-install in either direction, or
+/// migrations applied by a plugin that is no longer in the app (issue #1631).
+///
+/// Pure and injectable, like every other `_impl` check here, so the three
+/// findings can be tested without a project on disk or a database.
+pub fn check_plugin_residue_impl(wirings: &[PluginWiring]) -> CheckResult {
+    let mut failures: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Two independent findings per plugin, not one match: a wiring asymmetry
+    // and an orphaned migration are different residue, and an arm ordering
+    // that reports one can silently drop the other. `check_plugin_residue_impl`
+    // is `pub` and injectable, so the invariant cannot live in its caller.
+    for wiring in wirings {
+        let name = &wiring.crate_name;
+        match (wiring.dependency, wiring.mount) {
+            // A mount with no dependency does not compile. That is not a
+            // matter of taste for `--strict` to decide — but it is only sound
+            // on the QUALIFIED signal: a bare `SearchPlugin::new(` may be the
+            // app's own type, and asserting a compile failure on a substring
+            // collision would be a hard `Fail` this check has not earned.
+            (false, true) if wiring.mount_qualified => failures.push(format!(
+                "{name} is mounted in the builder chain but not declared in [dependencies] — this app does not compile; run `autumn plugin add {name}`, or delete the mount"
+            )),
+            (true, false) => warnings.push(format!(
+                "{name} is declared in [dependencies] but never mounted — {}, or run `autumn plugin remove {name}` to take the dependency back",
+                if wiring.community {
+                    // `plugin add` is dependency-only for a community crate BY
+                    // DESIGN — it never writes their mount — so "finish the
+                    // install" is advice that would go nowhere.
+                    "`autumn plugin add` writes no mount for a community crate, so add the `.plugin(...)` call from its README".to_owned()
+                } else {
+                    format!("run `autumn plugin add {name}` to finish the install")
+                }
+            )),
+            // Unqualified evidence only, both wires agreeing, or neither
+            // present: nothing to say about the wiring.
+            (false, true | false) | (true, true) => {}
+        }
+        // Residue in the database is only residue once the plugin is gone from
+        // the code; while it is installed, applied migrations are just a
+        // working install.
+        if !wiring.dependency && !wiring.mount && !wiring.orphaned_migrations.is_empty() {
+            warnings.push(format!(
+                "{name} is not installed, but migrations it declares are still recorded as applied: {} — the tables they created are still in the database; `autumn plugin remove {name} --drop-data` reverts them",
+                wiring.orphaned_migrations.join(", ")
+            ));
+        }
+    }
+
+    let status = if failures.is_empty() {
+        if warnings.is_empty() {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warn
+        }
+    } else {
+        CheckStatus::Fail
+    };
+    if status == CheckStatus::Pass {
+        return CheckResult {
+            name: "plugin_residue",
+            status,
+            detail: Some("no orphaned plugin wiring or migrations".into()),
+            hint: None,
+        };
+    }
+    // Failures first, then warnings: a non-compiling app is the finding to act
+    // on, and every other finding is still listed alongside it.
+    let detail = failures
+        .into_iter()
+        .chain(warnings)
+        .collect::<Vec<_>>()
+        .join("\n");
+    CheckResult {
+        name: "plugin_residue",
+        status,
+        detail: Some(detail),
+        hint: Some(
+            "`autumn plugin list` shows what is installable; `autumn plugin remove <name>` unwires a plugin cleanly",
+        ),
+    }
+}
+
+/// Every migration version the `diesel migration list` output records as
+/// applied, oldest first.
+///
+/// The sibling of [`parse_latest_applied_migration_version`], which only needs
+/// the newest: an orphaned plugin migration can sit anywhere in the history,
+/// so the residue check needs the whole set.
+fn parse_applied_migration_versions(output: &str) -> Vec<String> {
+    parse_applied_migration_tokens(output)
+        .map(|token| {
+            // `20260720000000_media_rooms` and a bare `20260720000000` both
+            // reduce to the version key `__diesel_schema_migrations` uses.
+            token
+                .split_once('_')
+                .map_or(token, |(head, _)| head)
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Every `[X] <token>` entry in a `diesel migration list` listing, verbatim.
+///
+/// Shared by [`parse_applied_migration_versions`] and
+/// [`parse_latest_applied_migration_version`] so the two cannot disagree about
+/// what "applied" looks like in that output.
+fn parse_applied_migration_tokens(output: &str) -> impl Iterator<Item = &str> {
+    output.lines().filter_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("[X]")
+            .or_else(|| trimmed.strip_prefix("[x]"))?
+            .split_whitespace()
+            .next()
+    })
+}
+
+/// Every applied migration version in the database at `database_url`.
+///
+/// Best effort, exactly like [`latest_applied_migration_version`]: no `diesel`
+/// binary, no database, or a failed invocation all read as "nothing known",
+/// which makes the orphaned-migration finding impossible rather than wrong.
+fn applied_migration_versions(database_url: &str) -> Vec<String> {
+    diesel_migration_list(database_url)
+        .as_deref()
+        .map_or_else(Vec::new, parse_applied_migration_versions)
+}
+
+/// The wiring state of every first-party plugin (and every community
+/// `autumn-plugin-*` dependency) in the project rooted at `root`.
+///
+/// Everything is read from disk; `applied` is whatever migration history the
+/// caller could obtain, and may be empty.
+fn resolve_plugin_wirings(
+    root: &std::path::Path,
+    applied: impl FnOnce() -> Vec<String>,
+) -> Vec<PluginWiring> {
+    let Ok(manifest) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    // The WHOLE `src` tree, not just `main.rs`: an app whose builder lives in
+    // `src/app.rs` — the shape `plugin add`'s own manual fallback produces,
+    // since it prints the mount for the user to paste wherever their chain is —
+    // is correctly wired, and must not be warned at (nor failed under
+    // `--strict`) for it. Plus every target the manifest gives an explicit path
+    // to (`[[bin]] path = "cmd/server.rs"`), because a builder chain living
+    // there is just as real, and calling it "never mounted" would fail
+    // `--strict` on a valid project. Same scan `plugin remove` uses to decide
+    // whether a dependency is still needed.
+    let main_src = read_app_sources(root);
+    let masked = crate::rust_source::mask_non_code(&main_src);
+
+    let mut wirings: Vec<PluginWiring> = crate::plugin::catalog::FIRST_PARTY
+        .iter()
+        .map(|entry| PluginWiring {
+            crate_name: entry.crate_name.to_owned(),
+            community: false,
+            dependency: crate::plugin::install::dependency_present(&manifest, entry.crate_name),
+            mount: crate::plugin::install::mount_present(&main_src, entry),
+            mount_qualified: crate::plugin::install::mount_call_span(&masked, entry, |argument| {
+                argument.contains(entry.mount_arg)
+            })
+            .is_some(),
+            orphaned_migrations: Vec::new(),
+        })
+        .collect();
+
+    // Reading the migration history costs a `diesel` subprocess and a database
+    // round trip, so it happens ONLY when the answer could change something:
+    // some plugin is absent from the code *and* declares migrations that could
+    // still be applied. On the overwhelmingly common project — no departed
+    // plugin, or none that owns schema — `autumn doctor` pays nothing for this
+    // check beyond the file reads it already did.
+    let candidates: Vec<(usize, Vec<String>)> = wirings
+        .iter()
+        .enumerate()
+        .filter(|(_, wiring)| !wiring.dependency && !wiring.mount)
+        .filter_map(|(index, wiring)| {
+            let entry = crate::plugin::catalog::lookup(&wiring.crate_name)?;
+            if entry.migrations.is_empty() {
+                return None;
+            }
+            Some((
+                index,
+                entry
+                    .migrations
+                    .iter()
+                    .map(|version| {
+                        version
+                            .split_once('_')
+                            .map_or(*version, |(head, _)| head)
+                            .to_owned()
+                    })
+                    .collect(),
+            ))
+        })
+        .collect();
+    if !candidates.is_empty() {
+        let applied = applied();
+        for (index, declared) in candidates {
+            wirings[index].orphaned_migrations = declared
+                .into_iter()
+                .filter(|version| applied.contains(version))
+                .collect();
+        }
+    }
+
+    // Community crates: the dependency names them, and the convention names the
+    // struct their mount must build, so the dependency-without-mount half of
+    // the check works for them too. The reverse (a mount with no dependency)
+    // is not detectable — there is nothing to enumerate from.
+    for crate_name in community_dependencies(&manifest) {
+        let Some(struct_name) = crate::plugin::catalog::community_struct_name(&crate_name) else {
+            continue;
+        };
+        let mount = masked.contains(&struct_name);
+        wirings.push(PluginWiring {
+            mount,
+            // A community crate has no catalog entry to give a qualified type
+            // path, so there is nothing stronger to check — and with
+            // `dependency: true` always set here, the `Fail` arm is
+            // unreachable for them anyway.
+            mount_qualified: mount,
+            crate_name,
+            community: true,
+            dependency: true,
+            orphaned_migrations: Vec::new(),
+        });
+    }
+    wirings
+}
+
+/// Every Rust source file a Cargo target in `root` is built from,
+/// concatenated: the `src/` tree plus every explicitly-pathed target.
+///
+/// Cheap and good enough for a presence probe: the caller only asks whether a
+/// mount appears anywhere in the app's own sources, and concatenation cannot
+/// invent one that is not in some file. Files are read in a stable order and
+/// each is newline-terminated, so a probe can never straddle two of them.
+fn read_app_sources(root: &std::path::Path) -> String {
+    let mut out = String::new();
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    let conventional = crate::plugin::install::rs_files_under(&root.join("src"));
+    let explicit = crate::plugin::install::explicit_target_sources(root);
+    for path in conventional.into_iter().chain(explicit) {
+        if seen.contains(&path) {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            out.push_str(&content);
+            out.push('\n');
+        }
+        seen.push(path);
+    }
+    out
+}
+
+/// Every `[dependencies]` entry following the community `autumn-plugin-<name>`
+/// convention.
+fn community_dependencies(manifest: &str) -> Vec<String> {
+    let Ok(table) = toml::from_str::<toml::Table>(manifest) else {
+        return Vec::new();
+    };
+    table
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .map(|deps| {
+            deps.keys()
+                .filter(|name| crate::plugin::catalog::is_community_name(name))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Check for deprecated config key usage (pure, injectable for tests).
 ///
 /// Emits one `⚠️ deprecated_keys` check with one line of `detail` per offending
@@ -3873,32 +4184,31 @@ fn check_replica_migrations(
 }
 
 fn latest_applied_migration_version(database_url: &str) -> Option<String> {
+    parse_latest_applied_migration_version(&diesel_migration_list(database_url)?)
+}
+
+/// The `diesel migration list` output for `database_url`, or `None` when the
+/// binary is absent, the database is unreachable, or the command failed.
+///
+/// Best effort by design: every caller treats "nothing known" as "raise no
+/// finding", which makes a missing `diesel` CLI impossible to mistake for a
+/// clean database.
+fn diesel_migration_list(database_url: &str) -> Option<String> {
     let output = std::process::Command::new("diesel")
         .args(["migration", "list"])
         .env("DATABASE_URL", database_url)
         .output()
         .ok()?;
-
     if !output.status.success() {
         return None;
     }
-
-    parse_latest_applied_migration_version(&String::from_utf8_lossy(&output.stdout))
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn parse_latest_applied_migration_version(output: &str) -> Option<String> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            let version = trimmed
-                .strip_prefix("[X]")
-                .or_else(|| trimmed.strip_prefix("[x]"))?
-                .split_whitespace()
-                .next()?;
-            Some(version.to_owned())
-        })
+    parse_applied_migration_tokens(output)
         .max()
+        .map(std::borrow::ToOwned::to_owned)
 }
 
 /// Parse (host, port) from a Postgres connection URL.
@@ -8381,6 +8691,24 @@ pub fn run(opts: DoctorOptions) {
         let scan = crate::edge_scan::resolve_edge_scan(std::path::Path::new("."));
         let capsule_bin_exists = std::path::Path::new(EDGE_CAPSULE_BIN).exists();
         check_edge_routes_impl(&scan, capsule_bin_exists)
+    }));
+
+    // 18. Orphaned plugin residue (issue #1631): a dependency with no mount, a
+    //     mount with no dependency, or migrations still applied for a plugin
+    //     that is no longer in the app. The migration half is best effort —
+    //     `__diesel_schema_migrations` has no source column, so the only way to
+    //     attribute a version to a plugin is the plugin's own declared list,
+    //     and reading the history at all needs a configured database plus the
+    //     `diesel` CLI. Without either, the check still reports the two static
+    //     findings and simply never raises the third.
+    let residue_database_url = db_topology.primary_url.clone().or(db_topology.legacy_url);
+    tasks.push(Box::new(move || {
+        let wirings = resolve_plugin_wirings(std::path::Path::new("."), || {
+            residue_database_url
+                .as_deref()
+                .map_or_else(Vec::new, applied_migration_versions)
+        });
+        check_plugin_residue_impl(&wirings)
     }));
 
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
@@ -18239,5 +18567,278 @@ redirect_uri = "http://localhost/callback"
             check.expect("negative keep_releases must fail").status,
             CheckStatus::Fail
         );
+    }
+    // ── `plugin_residue` (issue #1631, AC #7) ────────────────────────────────
+
+    fn wiring(crate_name: &str, dependency: bool, mount: bool) -> PluginWiring {
+        PluginWiring {
+            crate_name: crate_name.to_owned(),
+            community: false,
+            dependency,
+            mount,
+            mount_qualified: mount,
+            orphaned_migrations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn plugin_residue_passes_when_every_plugin_is_wired_consistently() {
+        let result = check_plugin_residue_impl(&[
+            wiring("autumn-admin-plugin", true, true),
+            wiring("autumn-search", false, false),
+        ]);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(result.name, "plugin_residue");
+    }
+
+    /// A dependency with no mount is the residue `plugin remove` exists to
+    /// prevent, and what a half-finished manual install leaves behind.
+    #[test]
+    fn plugin_residue_warns_on_a_dependency_with_no_mount() {
+        let result = check_plugin_residue_impl(&[wiring("autumn-admin-plugin", true, false)]);
+        assert_eq!(result.status, CheckStatus::Warn);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("autumn-admin-plugin"), "{detail}");
+        assert!(detail.contains("mount"), "{detail}");
+    }
+
+    /// A mount with no dependency does not compile — that is a failure, not a
+    /// warning, whatever `--strict` is set to.
+    #[test]
+    fn plugin_residue_fails_on_a_mount_with_no_dependency() {
+        let result = check_plugin_residue_impl(&[wiring("autumn-search", false, true)]);
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("autumn-search"), "{detail}");
+    }
+
+    /// The third residue kind: the plugin is gone from the code, but its
+    /// migrations are still recorded as applied.
+    #[test]
+    fn plugin_residue_warns_on_migrations_whose_plugin_is_gone() {
+        let result = check_plugin_residue_impl(&[PluginWiring {
+            crate_name: "autumn-media-plugin".to_owned(),
+            community: false,
+            dependency: false,
+            mount: false,
+            mount_qualified: false,
+            orphaned_migrations: vec!["20260720000000".to_owned()],
+        }]);
+        assert_eq!(result.status, CheckStatus::Warn);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("20260720000000"), "{detail}");
+        assert!(detail.contains("autumn-media-plugin"), "{detail}");
+    }
+
+    /// A plugin that is still installed is not residue, however many of its
+    /// migrations are applied — that is just a working install.
+    #[test]
+    fn plugin_residue_ignores_migrations_of_an_installed_plugin() {
+        let result = check_plugin_residue_impl(&[PluginWiring {
+            crate_name: "autumn-media-plugin".to_owned(),
+            community: false,
+            dependency: true,
+            mount: true,
+            mount_qualified: true,
+            orphaned_migrations: vec!["20260720000000".to_owned()],
+        }]);
+        assert_eq!(result.status, CheckStatus::Pass);
+    }
+
+    /// The worst finding decides the status, and every finding is reported —
+    /// a fail must not hide the warnings alongside it.
+    #[test]
+    fn plugin_residue_reports_every_finding_and_takes_the_worst_status() {
+        let result = check_plugin_residue_impl(&[
+            wiring("autumn-admin-plugin", true, false),
+            wiring("autumn-search", false, true),
+        ]);
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("autumn-admin-plugin"), "{detail}");
+        assert!(detail.contains("autumn-search"), "{detail}");
+    }
+
+    /// The residue check has to survive the `--json` contract like every other
+    /// check: a name, a status, and a detail string.
+    #[test]
+    fn plugin_residue_serializes_under_the_json_contract() {
+        let results = vec![check_plugin_residue_impl(&[wiring(
+            "autumn-admin-plugin",
+            true,
+            false,
+        )])];
+        let summary = compute_summary(&results);
+        let json = to_json_output(&results, &summary);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let check = value["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .find(|c| c["name"] == "plugin_residue")
+            .expect("plugin_residue row");
+        assert_eq!(check["status"], "warn");
+        assert!(check["detail"].as_str().is_some_and(|d| !d.is_empty()));
+    }
+
+    /// `--strict` turns the dependency-without-mount warning into a failing
+    /// run; that is the contract AC #7 asks the check to inherit.
+    #[test]
+    fn plugin_residue_warnings_are_strict_failures() {
+        let results = vec![check_plugin_residue_impl(&[wiring(
+            "autumn-admin-plugin",
+            true,
+            false,
+        )])];
+        let summary = compute_summary(&results);
+        assert_eq!(summary.warned, 1);
+        assert_eq!(summary.failed, 0);
+        // The contract is the exit code, not the counts: `--strict` turns this
+        // warning into a failing run, and a plain run leaves it advisory.
+        assert_eq!(exit_code(&summary, true), 1);
+        assert_eq!(exit_code(&summary, false), 0);
+    }
+
+    /// A community `autumn-plugin-*` dependency with no mount is residue too —
+    /// but `plugin add` never writes a community mount, so the advice has to
+    /// be different from a first-party plugin's.
+    #[test]
+    fn plugin_residue_gives_community_crates_their_own_advice() {
+        let result = check_plugin_residue_impl(&[PluginWiring {
+            crate_name: "autumn-plugin-live-feed".to_owned(),
+            community: true,
+            dependency: true,
+            mount: false,
+            mount_qualified: false,
+            orphaned_migrations: Vec::new(),
+        }]);
+        assert_eq!(result.status, CheckStatus::Warn);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("README"), "{detail}");
+        assert!(!detail.contains("to finish the install"), "{detail}");
+    }
+
+    /// The `Fail` says "this app does not compile", so it needs evidence that
+    /// the app really reaches into THIS crate. A bare `SearchPlugin::new(` may
+    /// be the app's own same-named type, and a hard failure on a substring
+    /// collision is a verdict this check has not earned.
+    #[test]
+    fn plugin_residue_does_not_fail_on_an_unqualified_constructor_collision() {
+        let result = check_plugin_residue_impl(&[PluginWiring {
+            crate_name: "autumn-search".to_owned(),
+            community: false,
+            dependency: false,
+            mount: true,
+            mount_qualified: false,
+            orphaned_migrations: Vec::new(),
+        }]);
+        assert_eq!(result.status, CheckStatus::Pass);
+    }
+
+    /// The disk glue, end to end: a dependency declared with no mount anywhere
+    /// in `src/` is residue, and a mount that lives OUTSIDE `src/main.rs` is
+    /// not — the shape `plugin add`'s manual fallback tells users to write.
+    #[test]
+    fn plugin_wirings_are_resolved_from_the_whole_src_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = \"0.7.0\"\nautumn-admin-plugin = \"0.7.0\"\nautumn-plugin-live-feed = \"0.3.1\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() { app::build(); }\n").unwrap();
+        // The builder lives in a sibling module, not in `main.rs`.
+        std::fs::write(
+            root.join("src/app.rs"),
+            "pub fn build() {\n    autumn_web::app().plugin(autumn_admin_plugin::AdminPlugin::new());\n}\n",
+        )
+        .unwrap();
+
+        let wirings = resolve_plugin_wirings(root, Vec::new);
+        let admin = wirings
+            .iter()
+            .find(|w| w.crate_name == "autumn-admin-plugin")
+            .expect("admin wiring");
+        assert!(admin.dependency && admin.mount, "{admin:?}");
+        assert!(admin.mount_qualified, "{admin:?}");
+
+        let feed = wirings
+            .iter()
+            .find(|w| w.crate_name == "autumn-plugin-live-feed")
+            .expect("community wiring");
+        assert!(feed.community && feed.dependency, "{feed:?}");
+        assert!(!feed.mount, "{feed:?}");
+
+        assert_eq!(
+            check_plugin_residue_impl(&wirings).status,
+            CheckStatus::Warn,
+            "the unmounted community crate is the only finding"
+        );
+    }
+
+    /// A declared migration still recorded as applied, for a plugin that is
+    /// gone from the code — and the version key is matched after the
+    /// `_name` suffix is stripped, the way `diesel migration list` prints it.
+    #[test]
+    fn plugin_wirings_match_declared_migrations_against_applied_versions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = \"0.7.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let wirings = resolve_plugin_wirings(root, || vec!["20260720000000".to_owned()]);
+        let media = wirings
+            .iter()
+            .find(|w| w.crate_name == "autumn-media-plugin")
+            .expect("media wiring");
+        assert_eq!(media.orphaned_migrations, vec!["20260720000000".to_owned()]);
+        assert_eq!(
+            check_plugin_residue_impl(&wirings).status,
+            CheckStatus::Warn
+        );
+    }
+
+    /// The migration history costs a subprocess and a database round trip, so
+    /// it must not be read when no departed plugin could possibly have left
+    /// one — which is every ordinary project.
+    #[test]
+    fn plugin_wirings_do_not_read_the_migration_history_without_a_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = \"0.7.0\"\nautumn-media-plugin = \"0.7.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/main.rs"),
+            "fn main() { autumn_web::app().plugin(autumn_media_plugin::MediaPlugin::new()); }\n",
+        )
+        .unwrap();
+
+        // The closure panics if called: the plugin is installed, so there is
+        // no orphan to look for.
+        let wirings = resolve_plugin_wirings(root, || panic!("must not query the database"));
+        assert_eq!(
+            check_plugin_residue_impl(&wirings).status,
+            CheckStatus::Pass
+        );
+    }
+
+    /// Every applied version is needed, not just the newest: an orphan can sit
+    /// anywhere in the history.
+    #[test]
+    fn applied_migration_versions_are_parsed_from_the_diesel_listing() {
+        let output = "Migrations:\n  [X] 20260101000000_create_users\n  [ ] 20260202000000_pending\n  [X] 20260720000000_media_rooms\n";
+        let versions = parse_applied_migration_versions(output);
+        assert_eq!(versions, vec!["20260101000000", "20260720000000"]);
     }
 }
