@@ -550,7 +550,8 @@ _PROMPT = {'$', '(', '{'}
 # migrate; then …` runs `autumn migrate` as the condition, and leaving `if` as
 # the segment head meant the scan never reached it.
 _CONTROL = {'if', 'elif', 'while', 'until', 'then', 'else', 'do', 'done', 'fi',
-            'time', '!', 'exec', 'command', 'nohup', 'sudo', 'env', 'xargs'}
+            'time', '!', 'exec', 'command', 'nohup', 'sudo', 'env', 'xargs',
+            'timeout', 'nice'}
 
 # Options a wrapper takes that consume a SEPARATE value token. `env` and
 # `sudo` both put flags between the keyword and the command they launch —
@@ -580,7 +581,14 @@ _WRAPPER_OPTS = {
     'xargs': {'-a', '--arg-file', '-E', '-e', '--eof', '-I', '--replace',
               '-i', '-L', '--max-lines', '-l', '-n', '--max-args',
               '-P', '--max-procs', '-s', '--max-chars', '-d', '--delimiter'},
+    'timeout': {'-k', '--kill-after', '-s', '--signal'},
+    'nice': {'-n', '--adjustment'},
 }
+
+# Wrappers that take POSITIONAL operands of their own before the command:
+# `timeout [OPTION] DURATION COMMAND`. Stepping over the options alone left
+# the duration looking like the executable.
+_WRAPPER_OPERANDS = {'timeout': 1}
 
 
 # Options that turn a wrapper into an INSPECTION: it describes the names that
@@ -962,8 +970,17 @@ def _strip_comment(text):
     a `#` inside a value survives, and YAML's own rule (a comment needs
     whitespace before it, or the start of the line) keeps `--tag=#1` intact.
     """
-    quote = None
-    for i, ch in enumerate(text):
+    quote, i, n = None, 0, len(text)
+    while i < n:
+        ch = text[i]
+        # A backslash escapes the next character, except inside single
+        # quotes where it is literal. Without this the walker closed a
+        # string at an ESCAPED quote and truncated the line at a `#` that
+        # was still quoted — discarding, in one reproduction, the heredoc
+        # opener that kept the lines below it from being read as commands.
+        if ch == '\\' and quote != "'":
+            i += 2
+            continue
         if quote:
             if ch == quote:
                 quote = None
@@ -971,6 +988,7 @@ def _strip_comment(text):
             quote = ch
         elif ch == '#' and (i == 0 or text[i - 1] in ' \t'):
             return text[:i]
+        i += 1
     return text
 
 
@@ -1155,6 +1173,12 @@ def _embedded_spans(tok):
         start = tok.find('$(', i)
         if start < 0:
             return
+        # `$((` is ARITHMETIC, not a command, and `\$(` is a literal dollar
+        # the shell prints. Reporting either rejected a page that runs no
+        # autumn at all.
+        if tok[start:start + 3] == '$((' or (start and tok[start - 1] == '\\'):
+            i = start + 2
+            continue
         depth, j, quote = 0, start + 1, None
         while j < len(tok):
             ch = tok[j]
@@ -1227,14 +1251,17 @@ def _mask_single_quoted(text):
 
 
 def _in_substitutions(segment, masked=()):
-    """Yield the commands written INSIDE `$( … )` in a segment.
+    """Yield the commands written INSIDE `$( … )` or `<( … )` in a segment.
 
     Re-enters the same parser on the substitution's own tokens, so a chain or
     an environment prefix inside one is handled exactly as it is outside.
     """
     i = 0
     while i < len(segment):
-        if segment[i].endswith('$') and i + 1 < len(segment) \
+        # `<(` and `>(` are PROCESS SUBSTITUTION: bash runs the list inside
+        # them and hands the caller a file. Only `$(` was recursed into, so a
+        # command written in one — `cat <(autumn migrate)` — went unread.
+        if segment[i].endswith(('$', '<', '>')) and i + 1 < len(segment) \
                 and segment[i + 1].startswith('('):
             depth, start = 0, i + 1
             i += 1
@@ -1333,6 +1360,7 @@ def _from_tokens(tokens, masked=None):
                     inspecting = True       # describes its arguments, runs none
                     break
                 i = _skip_wrapper_options(segment, i, wrapper)
+                i += _WRAPPER_OPERANDS.get(wrapper_name, 0)
         # A redirection may also come BEFORE the command — `>/tmp/out autumn
         # migrate` is valid and runs autumn — and the prefix walk stopped on
         # it, so the whole line went unread.
@@ -3318,6 +3346,65 @@ def self_test():
         doc = f'```bash\ndocker run --rm {form} img migrate run\n```'
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate run'], f'{form} must be read: {got}')
+
+    # A BACKSLASH escapes the next character, so an escaped quote does not end
+    # a string. Walking past it closed the string early and truncated the line
+    # at a `#` that was still quoted — here that threw away the heredoc opener,
+    # and the body below it was read as commands rather than as data.
+    esc_q = ('```bash\nprintf \'%s\' "\\" # literal"; cat <<EOF\n'
+             'autumn nope\nEOF\n```')
+    expect(list(invocations(esc_q)) == [],
+           f'an escaped quote keeps the heredoc opener: {list(invocations(esc_q))}')
+    esc_run = '```bash\nprintf \'%s\' "\\" # literal"; autumn migrate status\n```'
+    expect([d for _, d, _, _ in invocations(esc_run)] == ['migrate status'],
+           f'a real command after an escaped quote is still read: '
+           f'{list(invocations(esc_run))}')
+    # Inside SINGLE quotes a backslash is literal and escapes nothing, so the
+    # string really does end at the next quote and the `#` is a comment.
+    sq_bs = "```bash\nprintf '\\' # autumn nope\n```"
+    expect(list(invocations(sq_bs)) == [],
+           f"a backslash inside single quotes escapes nothing: "
+           f'{list(invocations(sq_bs))}')
+
+    # `<( … )` and `>( … )` are PROCESS SUBSTITUTION: bash runs the list inside
+    # and hands the caller a file. Only `$(` was recursed into, so a command
+    # written in one went unread.
+    psub = '```bash\ndiff <(autumn console) <(autumn nope)\n```'
+    expect([d for _, d, _, _ in invocations(psub)] == ['console', 'nope'],
+           f'both process substitutions run: {list(invocations(psub))}')
+    expect([d for _, d, _, _ in invocations('```bash\ntee >(autumn nope)\n```')]
+           == ['nope'], 'an output process substitution runs too')
+    # A plain redirection is NOT a substitution — `<` followed by a word reads
+    # a file, and the line itself is the only command on it.
+    redir = '```bash\nautumn migrate status < input.sql\n```'
+    expect([d for _, d, _, _ in invocations(redir)] == ['migrate status < input.sql'],
+           f'a redirection is not a substitution: {list(invocations(redir))}')
+
+    # `$((` opens ARITHMETIC, not a command, and `\$(` is a literal dollar the
+    # shell prints. Recursing into either reported a page that runs no autumn.
+    for quiet in ('echo "$(( autumn ))"', 'printf \'%s\' "\\$(autumn nope)"'):
+        doc = f'```bash\n{quiet}\n```'
+        expect(list(invocations(doc)) == [],
+               f'{quiet} runs nothing: {list(invocations(doc))}')
+    mixed = '```bash\necho "$(( 1 + 2 ))"; OUT=$(autumn console)\n```'
+    expect([d for _, d, _, _ in invocations(mixed)] == ['console'],
+           f'a real substitution beside arithmetic still runs: '
+           f'{list(invocations(mixed))}')
+
+    # `timeout [OPTION] DURATION COMMAND` takes a positional operand of its
+    # own. Stepping over its options alone left the duration looking like the
+    # executable, so the command after it was never reached.
+    for form in ('timeout 5', 'timeout 30s', 'timeout -k 1 5',
+                 'timeout --signal=TERM 5'):
+        doc = f'```bash\n{form} autumn nope\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{form} must reach its command: {got}')
+    # `nice` takes options but no operand, so consuming one would have eaten
+    # the command instead.
+    for form in ('nice', 'nice -n 5'):
+        doc = f'```bash\n{form} autumn migrate status\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate status'], f'{form} takes no operand: {got}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
