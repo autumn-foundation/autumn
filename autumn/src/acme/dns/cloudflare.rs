@@ -566,6 +566,7 @@ mod tests {
             &response,
             "create the Cloudflare TXT record",
             "https://api.cloudflare.com/client/v4/zones/z/dns_records",
+            &[],
         )
         .expect_err("403 is a failure");
         assert!(
