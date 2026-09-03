@@ -113,35 +113,49 @@ mod tests {
         let body = body.to_string();
 
         thread::spawn(move || {
-            for _ in 0..num_requests {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    let mut reader = BufReader::new(&mut stream);
-                    let mut req_line = String::new();
-                    if reader.read_line(&mut req_line).is_err() || req_line.is_empty() {
-                        continue;
-                    }
-
-                    loop {
-                        let mut header_line = String::new();
-                        if reader.read_line(&mut header_line).is_err()
-                            || header_line == "\r\n"
-                            || header_line.trim().is_empty()
-                        {
-                            break;
-                        }
-                    }
-
-                    let response = if body.is_empty() {
-                        format!("{status_line}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-                    } else {
-                        format!(
-                            "{status_line}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
-                            body.len()
-                        )
-                    };
-                    let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.flush();
+            // Count requests actually served, not accept() attempts: the
+            // original `for _ in 0..num_requests { if let Ok(..) =
+            // listener.accept() { .. } }` spent one of its num_requests
+            // "slots" on every accept() call, success or not, so a single
+            // transient accept() error (observed on windows-latest CI —
+            // loopback connections there are occasionally intercepted by
+            // Defender/firewall and reset before the OS hands them to
+            // accept()) silently starved the client of a response it was
+            // always going to get otherwise, until its own timeout expired.
+            // Retry on a transient accept()/read failure instead of
+            // treating it as one of the num_requests attempts used up.
+            let mut served = 0;
+            while served < num_requests {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    continue;
+                };
+                let mut reader = BufReader::new(&mut stream);
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).is_err() || req_line.is_empty() {
+                    continue;
                 }
+
+                loop {
+                    let mut header_line = String::new();
+                    if reader.read_line(&mut header_line).is_err()
+                        || header_line == "\r\n"
+                        || header_line.trim().is_empty()
+                    {
+                        break;
+                    }
+                }
+
+                let response = if body.is_empty() {
+                    format!("{status_line}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                } else {
+                    format!(
+                        "{status_line}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                served += 1;
             }
         });
 
@@ -159,16 +173,23 @@ mod tests {
 
     #[test]
     fn test_fetch_endpoint_failure() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener); // Close so connection fails
-
+        // Deliberately does NOT bind an ephemeral port and drop it to
+        // "guarantee" the port is closed: every other test in this module
+        // runs concurrently (the default test harness) and independently
+        // calls `TcpListener::bind("127.0.0.1:0")` via `spawn_mock_server`,
+        // so a just-freed ephemeral port can be reallocated by one of
+        // THOSE binds before this test's client connects — observed on
+        // windows-latest CI as this assertion failing because the request
+        // landed on a live, unrelated mock server instead of getting
+        // refused. Port 1 (tcpmux) is never bound by anything in this
+        // suite or a CI sandbox and needs no privilege to *connect* to
+        // (only to bind), so there is nothing to race against.
         let client = Client::builder()
             .no_proxy()
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
-        let val = fetch_endpoint(&client, &format!("http://127.0.0.1:{port}"), "/test");
+        let val = fetch_endpoint(&client, "http://127.0.0.1:1", "/test");
         assert!(val.get("error").is_some());
     }
 

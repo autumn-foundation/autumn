@@ -1449,6 +1449,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   genuinely had not completed — a real network round-trip cannot resolve
   synchronously on its first poll) and drops it from there: no timing
   dependency, 0 failures across 50 reruns. Restored to CI's Docker sweep.
+- **`autumn-cli export`'s `test_fetch_endpoint_success`/`test_fetch_endpoint_failure`
+  de-flaked on `windows-latest` CI:** two independent mechanisms in the same
+  hand-rolled mock-HTTP-server test harness (`export.rs`). The success-path
+  server capped itself at `num_requests` *accept() attempts* rather than
+  *served requests*, so a single transient `accept()` error (seen on
+  windows-latest, where loopback connections are occasionally intercepted by
+  Defender/firewall) silently gave up and left the client to time out with
+  no response. The failure-path test "guaranteed" a closed port by binding
+  an ephemeral port and immediately dropping it — but every test in the
+  module runs concurrently and independently calls
+  `TcpListener::bind("127.0.0.1:0")`, so the just-freed port could be
+  reallocated to another test's mock server before this test's client
+  connected, landing on a live, unrelated server instead of getting refused.
+  The mock server now retries past a transient `accept()`/read failure
+  instead of spending one of its `num_requests` slots on it, and the
+  failure-path test connects to a fixed, never-bound port (`127.0.0.1:1`)
+  instead of racing the ephemeral-port allocator.
 
 ### Added
 
