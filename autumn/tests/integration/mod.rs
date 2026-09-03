@@ -250,6 +250,11 @@ mod read_your_writes_routing;
 // Postgres fork (jsonb snapshot cast, Timestamptz binds, COALESCE unique index).
 #[cfg(feature = "db")]
 mod ledger_postgres;
+// Ledger findings/fix harness for the generated `ledger_as_of`/`ledger_diff`
+// read path: profiles the unbounded full-chain read against a deep,
+// production-shaped chain and (after the fix) the bounded replacement.
+#[cfg(feature = "db")]
+mod ledger_as_of_deep_chain_profile;
 #[cfg(feature = "db")]
 mod repository_audit_actor;
 #[cfg(feature = "db")]
