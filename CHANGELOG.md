@@ -1424,11 +1424,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself, including idempotency-replay accounting, was unaffected in either
   ordering). Each guard already binds the pre-rewrite type as
   `let __autumn_inner: T = …` around the guarded body; the route macro now
-  recovers the original type from that binding (recursing to the innermost one
-  when guards stack) instead of trusting `sig.output` alone, so the generated
-  schema no longer depends on attribute order. The previously-recommended
-  method-attribute-outermost workaround, documented on `#[throttle]`'s rustdoc
-  and in `docs/guide/rate-limiting.md`, is no longer necessary.
+  recovers the original type from that binding — matched by its exact
+  structural shape, not merely its name, so an unrelated handler-local that
+  happens to share it is never mistaken for the marker — recursing to the
+  innermost binding when guards stack, instead of trusting `sig.output`
+  alone. The generated schema no longer depends on attribute order. The
+  previously-recommended method-attribute-outermost workaround, documented
+  on `#[throttle]`'s rustdoc and in `docs/guide/rate-limiting.md`, is no
+  longer necessary.
+
+  This is a macro/metadata-only change — no authorization, rate-limiting, or
+  idempotency-replay runtime behavior differs in either attribute ordering.
+  `ApiDoc::response` does have one existing runtime reader, `mount_mcp`'s MCP
+  tool-catalog eligibility gate: a guard-above-route JSON handler explicitly
+  opted in with `#[api_doc(mcp)]` was previously excluded from `tools/list`
+  as "no response schema", and is now correctly listed, matching the
+  developer's existing opt-in — every MCP call still dispatches through the
+  same authenticated handler pipeline, so this closes an availability gap
+  rather than changing what a call is authorized to do.
 
 - **Punctuation- and emoji-only titles no longer slip past the validator that
   exists to stop them (#2424):** `examples/reddit-clone` rejects a post title

@@ -1,4 +1,4 @@
-use syn::{Block, Expr, ExprIf, Item, Pat, Stmt};
+use syn::{Block, Expr, ExprIf, Item, Pat, Stmt, Type};
 
 const REPLAY_GUARD_IDENT: &str = "__AUTUMN_IDEMPOTENCY_REPLAY_GUARD";
 
@@ -497,6 +497,43 @@ pub fn expr_nested_async_body(expr: &Expr) -> Option<&Block> {
         Expr::Paren(paren) => expr_nested_async_body(&paren.expr),
         _ => None,
     }
+}
+
+/// The exact shape a body guard (`#[secured]`, `#[step_up]`, `#[authorize]`,
+/// `#[throttle]`) emits when it rewrites a non-unit, non-`impl Trait` return
+/// type: a `let __autumn_inner: T = <init>;` binding sitting exactly one
+/// statement before the end of `block`, immediately followed by the
+/// generated `IntoResponse::into_response(__autumn_inner)` tail (issue
+/// #1677's `api_doc::infer_response_body` recovery relies on this).
+///
+/// Deliberately structural rather than a bare name-and-type scan: matching
+/// only the required *position* (second-to-last, with that exact tail
+/// following) means a handler that happens to declare its own unrelated
+/// local named `__autumn_inner` elsewhere in the body — anywhere but that
+/// exact position — is never mistaken for a guard's generated binding.
+/// Returns the local's declared type together with its initializer
+/// expression, so a caller can both read the type and recurse into a deeper
+/// nested guard via [`expr_nested_async_body`].
+pub fn generated_inner_response_binding(block: &Block) -> Option<(&Type, &Expr)> {
+    let len = block.stmts.len();
+    if len < 2 {
+        return None;
+    }
+    let index = len - 2;
+    let Stmt::Local(local) = &block.stmts[index] else {
+        return None;
+    };
+    if !pat_binds_inner_response(&local.pat) {
+        return None;
+    }
+    let Pat::Type(pat_type) = &local.pat else {
+        return None;
+    };
+    if !stmt_is_inner_response_tail(&block.stmts[index + 1]) {
+        return None;
+    }
+    let init_expr = &local.init.as_ref()?.expr;
+    Some((&pat_type.ty, init_expr))
 }
 
 fn stmt_is_inner_response_tail(stmt: &Stmt) -> bool {
