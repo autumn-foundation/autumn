@@ -5,6 +5,9 @@
 # tree — direct or transitive — carries a known RustSec security advisory that
 # is not waived below, the job fails and the change does not merge.
 #
+# Full guide: docs/guide/supply-chain.md in the Autumn repository
+# (https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/supply-chain.md).
+#
 # ── Reading a failure ───────────────────────────────────────────────────────
 # For every finding cargo-deny prints the advisory id (`RUSTSEC-YYYY-NNNN`), a
 # one-line title, the affected crate and version, the fixed version if one
@@ -19,6 +22,11 @@
 # Prefer a fix over a waiver:
 #   1. `cargo update -p <crate>` when a patched version is already compatible.
 #   2. Otherwise bump the direct dependency that pulls the vulnerable crate in.
+#   3. When that dependency is `autumn-web` — the common case, since most of
+#      this tree arrives through it — upgrade to an autumn-web release that
+#      resolves a fixed version. If none does yet, open an issue at
+#      https://github.com/autumn-foundation/autumn/issues and waive it here
+#      with a review-by date in the meantime.
 #
 # ── Waiving one ─────────────────────────────────────────────────────────────
 # When no fix exists (the advisory says "no safe upgrade is available") or the
@@ -29,23 +37,33 @@
 # id through — every other advisory, including a new one in the same crate,
 # still fails CI. Waivers are debt; revisit them on their review-by date.
 #
-# This file configures cargo-deny's `advisories` check, which is what CI runs.
-# Licenses, banned crates and source registries are cargo-deny's other checks;
-# add `[licenses]` / `[bans]` / `[sources]` sections here if you want those too.
+# This file configures cargo-deny's `advisories` check, which is the check CI
+# runs. cargo-deny can also check licenses, banned crates and source registries;
+# to adopt those, add `[licenses]` / `[bans]` / `[sources]` sections here *and*
+# widen the command in `.github/workflows/ci.yml` — sections alone change
+# nothing, because the workflow asks only for `advisories`.
 
 [advisories]
 # Cover the whole resolved dependency graph, transitive crates included.
-# Vulnerabilities are always denied. `unmaintained` and `unsound` are stated
+#
+# Vulnerabilities are always denied — that is not configurable, and it is the
+# part of this gate that matters most. `unmaintained` and `unsound` are stated
 # explicitly rather than left to cargo-deny's version-dependent default, so this
-# policy means the same thing on every auditor version; narrow either to
-# "workspace" (only your own direct dependencies) if deep transitive noise is
-# not worth triaging for this app — the vulnerability check stays on regardless.
-# Yanked crates warn rather than fail: a yank is not a vulnerability.
+# policy means the same thing on every auditor version.
+#
+# If unmaintained/unsound findings deep in the tree are more noise than signal
+# for this app — they are not vulnerabilities, and you often cannot fix a crate
+# five levels down — set either to "none". Vulnerabilities keep failing
+# regardless. ("workspace" scopes a check to your own crates, which for a
+# single-crate app means the same thing as "none"; the useful values here are
+# "all" and "none".) Yanked crates warn rather than fail: a yank is not a
+# vulnerability.
 unmaintained = "all"
 unsound = "all"
 yanked = "warn"
 ignore = [
     # RUSTSEC-2023-0071 — `rsa` "Marvin Attack" timing sidechannel.
+    # https://rustsec.org/advisories/RUSTSEC-2023-0071
     #
     # Ships pre-waived because it is unavoidable rather than accepted lightly:
     # `rsa` reaches every Autumn app through `jsonwebtoken`, an unconditional
@@ -53,8 +71,23 @@ ignore = [
     # says "no safe upgrade is available"). The vulnerable path is RSA-family
     # JWT signing/verification; key recovery needs an attacker-timed RSA
     # private-key operation oracle, which an Autumn app does not expose by
-    # default. Tracked upstream in autumn-foundation/autumn#1600 and dropped
-    # when a fixed `rsa` — or a `jsonwebtoken` without the RSA backend — ships.
+    # default. Autumn re-triages this every release and drops the waiver when a
+    # fixed `rsa` — or a `jsonwebtoken` without the RSA backend — ships, so the
+    # review-by below is Autumn's cadence: on a date that has passed, take the
+    # newest autumn-web and re-run the audit before assuming it still stands.
     # Review-by: 2026-10-01.
     { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path; review-by 2026-10-01" },
+    # >>> autumn:bundled-pg-waiver
+    # RUSTSEC-2024-0384 — `instant` is unmaintained.
+    # https://rustsec.org/advisories/RUSTSEC-2024-0384
+    #
+    # Present because this app enables autumn-web's `managed-pg-bundled` feature
+    # (`autumn new --bundled-pg`), where `instant` arrives as a *build-time*
+    # transitive of the embedded-Postgres stack:
+    # instant -> parking_lot -> reqwest-retry -> postgresql_archive ->
+    # (build) postgresql_embedded. Unmaintained, not vulnerable — there is no
+    # exploit here, and no safe upgrade (the author recommends `web-time`).
+    # Review-by: 2026-10-01.
+    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive of the managed-pg-bundled embedded-Postgres stack; no safe upgrade; review-by 2026-10-01" },
+    # <<< autumn:bundled-pg-waiver
 ]

@@ -55,11 +55,27 @@ require_cargo_deny() {
 
 # Fetch the RustSec advisory database, retrying transient network failures.
 # Returns non-zero — failing the gate — when it stays unreachable.
+#
+# `cargo deny fetch` loads the config BEFORE it touches the network, so a
+# malformed `deny.toml` fails here too — deterministically, on every attempt.
+# Retrying that is pointless and reporting it as "database unreachable" sends
+# the reader hunting a network problem they do not have, so a failure naming a
+# config file is surfaced immediately instead.
 fetch_advisory_db() {
-  local attempt=1
+  local attempt=1 output
   while [ "$attempt" -le "$RETRIES" ]; do
-    if cargo deny fetch db; then
+    set +e
+    output="$(cargo deny fetch db 2>&1)"
+    local status=$?
+    set -e
+    printf '%s\n' "${output}" >&2
+    if [ "${status}" -eq 0 ]; then
       return 0
+    fi
+    if printf '%s' "${output}" | grep -qE 'deny(-sqlite)?\.toml'; then
+      echo "error: cargo-deny could not load the advisory config (see above) - this is a" >&2
+      echo "       configuration error, not a network failure. Fix the file and re-run." >&2
+      return 1
     fi
     echo "advisory database unreachable (attempt ${attempt}/${RETRIES})" >&2
     if [ "$attempt" -lt "$RETRIES" ]; then
@@ -91,19 +107,38 @@ audit_workspace() {
 # Audit autumn-web's dependency tree against the policy `autumn new` ships, so
 # a generated app's day-one CI cannot be red on its first push.
 #
+# The feature list is the UNION of every autumn-web feature any scaffold flavor
+# can turn on — `--bundled-pg` is the one that matters, because
+# `managed-pg-bundled` drags in the embedded-Postgres stack and with it an
+# advisory the default flavor's tree does not have. Auditing only the default
+# set is how a flavor ships waivers that do not cover its own tree; the
+# `the_gate_audits_every_feature_a_scaffold_flavor_can_enable` test keeps this
+# list honest as flavors change. (`--daemon` and `--api` switch defaults off and
+# name subsets of this, so the union covers them.)
+#
+# Feature narrowing here is one-directional: cargo-deny keeps optional
+# dependencies in the graph whether or not their feature is on, so naming a
+# feature can only ADD crates (it pulls in feature-gated chains like
+# managed-pg-bundled's build-time stack). Never treat an omitted feature as
+# proof that its crates were excluded.
+#
 # Scope, honestly: cargo-deny audits every crate reachable from a manifest,
-# optional dependencies included, so this is a SUPERSET of what a generated app
-# actually compiles (it is narrowed to autumn-web's own tree — other workspace
-# members' dependencies, e.g. the S3 storage and embedded-Postgres stacks, are
-# out). A pass therefore guarantees the scaffold is advisory-clean; a finding in
-# an optional dependency is triaged like any other — fixed, or waived with a
-# reason in the scaffold's `deny.toml`.
+# optional dependencies included, and this roots at autumn-web resolved against
+# the WORKSPACE lockfile with `--exclude-dev`. A generated app roots at its own
+# manifest — adding `maud`, `diesel_migrations` and its dev-dependencies — and
+# resolves its own lockfile from crates.io. So this covers the autumn-web half
+# of a generated app's tree, generously (a superset of what the app compiles
+# from autumn-web), and not the app's own direct dependencies. A pass means the
+# shipped waiver set still covers what autumn-web brings; a finding is triaged
+# like any other — fixed, or waived with a reason in the scaffold's `deny.toml`.
+SCAFFOLD_FEATURES="flash,managed-pg-bundled,i18n,seed,embed-assets"
+
 audit_scaffold_graph() {
   log "scaffold day-one graph (${SCAFFOLD_POLICY})"
   cargo deny --offline \
     --manifest-path autumn/Cargo.toml \
     --exclude-dev \
-    --features flash \
+    --features "${SCAFFOLD_FEATURES}" \
     --config "${SCAFFOLD_POLICY}" \
     check advisories
 }
@@ -124,23 +159,22 @@ run_gate() {
 #
 # A gate nobody has ever seen fail is indistinguishable from a gate that no
 # longer runs. This audits a throwaway crate carrying an injected
-# known-vulnerable dependency, under this repository's *real* advisory policy,
-# and requires:
+# known-vulnerable dependency and requires, for EACH policy this repository
+# ships:
 #
 #   1. the unwaived advisory to FAIL the check, naming its id, and
 #   2. the same tree to PASS once — and only once — that id is waived,
-#      which is the waiver mechanism the scaffold documents.
+#      which is the waiver mechanism the docs describe.
+#
+# Both policies are covered on purpose. The workspace `deny.toml` is what gates
+# this repo; the scaffold's `deny.toml.tmpl` is what gates every generated app,
+# and it is otherwise only ever exercised against trees that happen to be
+# clean — so nothing would notice if it stopped blocking.
 
-self_test() {
-  require_cargo_deny
-  fetch_advisory_db
-
-  local fixture
-  fixture="$(mktemp -d)"
-  # shellcheck disable=SC2064  # expand $fixture now, not at trap time
-  trap "rm -rf '${fixture}'" EXIT
-
-  cat > "${fixture}/Cargo.toml" <<EOF
+# Write the throwaway crate carrying the injected vulnerable dependency.
+write_fixture_crate() {
+  local dir="$1"
+  cat > "${dir}/Cargo.toml" <<EOF
 [package]
 name = "advisory-gate-self-test"
 version = "0.0.0"
@@ -152,62 +186,97 @@ ${VULNERABLE_DEP}
 
 [workspace]
 EOF
-  mkdir -p "${fixture}/src"
-  echo 'fn main() {}' > "${fixture}/src/main.rs"
+  mkdir -p "${dir}/src"
+  echo 'fn main() {}' > "${dir}/src/main.rs"
 
-  # The fixture is audited under this repo's own advisory policy, so the test
-  # fails if that policy is ever loosened into not catching this.
-  advisories_section deny.toml > "${fixture}/deny.toml"
+  if ! ( cd "${dir}" && cargo fetch >/dev/null 2>&1 ); then
+    echo "error: could not fetch the self-test fixture's dependencies." >&2
+    return 1
+  fi
+}
+
+# Prove one policy both blocks the injected advisory and honours its waiver.
+#
+#   $1  label for the log
+#   $2  path to the config whose `[advisories]` section is under test
+prove_policy_blocks() {
+  local label="$1" policy="$2" fixture output status
+  fixture="$(mktemp -d)"
+  # shellcheck disable=SC2064  # expand $fixture now, not at trap time
+  trap "rm -rf '${fixture}'" RETURN
+
+  write_fixture_crate "${fixture}"
+
+  # Only the advisories policy travels: the rest of a config ([graph] features,
+  # licenses) names crates this fixture does not have.
+  advisories_section "${policy}" > "${fixture}/deny.toml"
   if ! grep -q 'unused-ignored-advisory' "${fixture}/deny.toml"; then
-    # The repo's waivers are for crates this fixture does not have; that is not
-    # what is under test here.
+    # The policy's own waivers are for crates this fixture does not have; that
+    # is not what is under test here.
     echo 'unused-ignored-advisory = "allow"' >> "${fixture}/deny.toml"
   fi
   if grep -q "${VULNERABLE_ADVISORY}" "${fixture}/deny.toml"; then
-    echo "error: self-test fixture advisory ${VULNERABLE_ADVISORY} is waived in deny.toml;" >&2
+    echo "error: ${label} waives ${VULNERABLE_ADVISORY}, the advisory this self-test injects;" >&2
     echo "       pick a different injected dependency, the negative case proves nothing." >&2
-    exit 1
+    return 1
   fi
 
-  if ! ( cd "${fixture}" && cargo fetch >/dev/null 2>&1 ); then
-    echo "error: could not fetch the self-test fixture's dependencies." >&2
-    exit 1
-  fi
-
-  log "self-test: an injected known-vulnerable dependency must FAIL the gate"
-  local output status
+  log "self-test (${label}): an injected known-vulnerable dependency must FAIL the gate"
   set +e
   output="$( cd "${fixture}" && cargo deny --offline check advisories 2>&1 )"
   status=$?
   set -e
   if [ "${status}" -eq 0 ]; then
-    echo "error: the advisory gate PASSED a tree containing ${VULNERABLE_ADVISORY}." >&2
+    echo "error: ${label} PASSED a tree containing ${VULNERABLE_ADVISORY}." >&2
     echo "${output}" >&2
-    exit 1
+    return 1
   fi
   if ! printf '%s' "${output}" | grep -q "${VULNERABLE_ADVISORY}"; then
-    echo "error: the gate failed, but not for ${VULNERABLE_ADVISORY}:" >&2
+    echo "error: ${label} failed, but not for ${VULNERABLE_ADVISORY}:" >&2
     echo "${output}" >&2
-    exit 1
+    return 1
   fi
   echo "blocked ${VULNERABLE_ADVISORY} as expected"
 
-  log "self-test: the documented waiver must unblock exactly that advisory"
+  log "self-test (${label}): the documented waiver must unblock exactly that advisory"
   if ! grep -q '^ignore = \[' "${fixture}/deny.toml"; then
-    echo "error: deny.toml's [advisories] section has no 'ignore = [' list to waive into;" >&2
+    echo "error: ${label}'s [advisories] section has no 'ignore = [' list to waive into;" >&2
     echo "       the waiver half of this self-test cannot run." >&2
-    exit 1
+    return 1
   fi
   awk -v waiver="    { id = \"${VULNERABLE_ADVISORY}\", reason = \"advisory gate self-test\" }," \
     '{ print } /^ignore = \[/ { print waiver }' \
     "${fixture}/deny.toml" > "${fixture}/deny.waived.toml"
   mv "${fixture}/deny.waived.toml" "${fixture}/deny.toml"
-  if ! ( cd "${fixture}" && cargo deny --offline check advisories ); then
-    echo "error: a waived advisory still failed the gate - the waiver mechanism is broken." >&2
-    exit 1
+  set +e
+  output="$( cd "${fixture}" && cargo deny --offline check advisories 2>&1 )"
+  status=$?
+  set -e
+  # The fixture's own tiny tree (libc, winapi) is audited under a policy that
+  # denies unmaintained and unsound crates too, so a future advisory against one
+  # of them would fail this run for a reason that has nothing to do with the
+  # waiver under test. What the waiver must achieve is precise: the injected
+  # advisory stops being reported.
+  if printf '%s' "${output}" | grep -q "${VULNERABLE_ADVISORY}"; then
+    echo "error: ${label} still reports a WAIVED advisory - the waiver mechanism is broken." >&2
+    echo "${output}" >&2
+    return 1
   fi
+  if [ "${status}" -ne 0 ]; then
+    echo "note: ${label} still fails the fixture, but no longer for ${VULNERABLE_ADVISORY};" >&2
+    echo "      an unrelated advisory now affects the fixture's own tree:" >&2
+    echo "${output}" >&2
+  fi
+}
 
-  log "advisory gate self-test OK (${VULNERABLE_ADVISORY} blocked, then waived)"
+self_test() {
+  require_cargo_deny
+  fetch_advisory_db
+
+  prove_policy_blocks "the workspace policy (deny.toml)" deny.toml
+  prove_policy_blocks "the scaffold policy (${SCAFFOLD_POLICY})" "${SCAFFOLD_POLICY}"
+
+  log "advisory gate self-test OK (${VULNERABLE_ADVISORY} blocked, then waived, under both policies)"
 }
 
 case "${1:-}" in

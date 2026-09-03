@@ -114,10 +114,12 @@ runs in both PR CI and the Publish Gate (`advisories` job, a `prepare-release`
 dependency), auditing three graphs against the RustSec database with cargo-deny:
 
 - the workspace (`deny.toml`) and the SQLite backend graph (`deny-sqlite.toml`);
-- **the scaffold's day-one graph** — `autumn-web` exactly as a freshly generated
-  app resolves it, audited with the `deny.toml` that `autumn new` writes into
-  that app. This is what keeps "a scaffolded app's CI is green on day one" true
-  release over release, rather than a claim that decays.
+- **the scaffold's day-one graph** — `autumn-web`'s tree with every feature any
+  scaffold flavor can enable, audited with the `deny.toml` that `autumn new`
+  writes into a generated app. That is a superset of the autumn-web half of a
+  real app's tree (not its own direct dependencies, and resolved against this
+  workspace's lockfile), and it is what keeps "a scaffolded app's CI is green on
+  day one" true release over release rather than a claim that decays.
 
 An advisory with no fix is accepted by adding an `ignore` entry (id, `reason`,
 review-by date) — never by weakening or removing the gate. `--self-test` proves

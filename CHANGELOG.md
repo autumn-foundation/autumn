@@ -22,11 +22,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the project root. Waive an advisory by adding an `ignore` entry there with
     its id, a `reason`, and a review-by date — the gate stays on and lets
     exactly that one id through; an unwaived advisory still fails.
-  - Day-one CI is green: the scaffold ships one documented waiver
-    (RUSTSEC-2023-0071, `rsa` via the unconditional `jsonwebtoken` dependency,
-    for which no patched release exists), and Autumn's own CI re-audits the
-    scaffold's dependency tree against that exact policy on every run, so the
-    waiver set cannot quietly stop covering what the scaffold ships.
+  - Day-one CI is green for every flavor: the scaffold ships documented
+    waivers for the advisories its own tree cannot avoid — RUSTSEC-2023-0071
+    (`rsa` via the unconditional `jsonwebtoken` dependency, no patched release
+    exists) everywhere, plus RUSTSEC-2024-0384 (`instant`, via the
+    embedded-Postgres build stack) for `--bundled-pg` apps and only those.
+    Autumn's own CI re-audits autumn-web's tree — with every feature a scaffold
+    flavor can enable — against that exact policy on every run, so the waiver
+    set cannot quietly stop covering what the scaffold ships.
+  - An app upgraded from an older release receives the workflow but not the
+    policy (`deny.toml` is the app's file, never reconciled): the audit step
+    detects that and says which file to add, rather than auditing under
+    cargo-deny's unwaived default. See `docs/migrations/next.md`.
   - When the advisory database is unreachable the gate **fails closed**: the
     fetch is its own step, retried three times with backoff, and the audit then
     runs `--offline` against it — no hang, no silent skip, and a failure in the

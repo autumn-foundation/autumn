@@ -389,7 +389,14 @@ Four things to read, in order:
    is the highest entry in that chain you control.
 
 Fix it before you waive it: `cargo update -p <crate>` when a patched version is
-already compatible, otherwise bump the direct dependency that pulls it in.
+already compatible, otherwise bump the direct dependency that pulls it in. In an
+Autumn app that dependency is usually `autumn-web` itself — most of the tree
+arrives through it — so check whether a newer autumn-web release resolves a
+fixed version, and if none does yet, [open an
+issue](https://github.com/autumn-foundation/autumn/issues) and waive it locally
+with a review-by date in the meantime. (The example above is the one advisory
+you will not see fail: it ships pre-waived. Every other finding reads the same
+way.)
 
 ### Waiving an advisory
 
@@ -409,28 +416,43 @@ one in the same crate — still fails, and the gate itself stays on. The id and
 the rationale are committed to your repository, so the decision is reviewable
 in a pull request rather than living in someone's memory.
 
-Your generated `deny.toml` ships with **one** waiver already in it:
+Your generated `deny.toml` ships with a waiver already in it:
 `RUSTSEC-2023-0071`. `rsa` reaches every Autumn app through `jsonwebtoken`,
 which `autumn-web` depends on unconditionally, and no patched `rsa` release
-exists. That waiver is why a freshly scaffolded app's CI is green on day one
-instead of red on the first push; Autumn's own CI re-audits the scaffold's
-dependency tree against that exact policy on every release, so the waiver set
-cannot quietly stop covering what the scaffold ships.
+exists. An app generated with `--bundled-pg` gets a second one
+(`RUSTSEC-2024-0384`, `instant`, unmaintained, reachable only through the
+embedded-Postgres build stack) — and only that flavor gets it, so cargo-deny's
+"this waiver is unused" warning stays available to tell you when one of *your*
+waivers has gone stale.
+
+Those waivers are why a freshly scaffolded app's CI is green on day one instead
+of red on the first push. Autumn's own CI re-audits autumn-web's dependency tree
+against that exact policy on every run, so the shipped waiver set cannot quietly
+stop covering what the scaffold ships.
 
 Never disable the gate to get green. `continue-on-error: true`, `|| true`, and
-deleting the step all turn a security control into a decoration — and an
-integration test in this repository fails if the generated workflow does any of
-them.
+deleting the step all turn a security control into a decoration. Autumn's own
+test suite fails if the *generated* workflow does any of them, and in your
+project an edited `ci.yml` comes back as a conflict on every
+[`autumn upgrade`](upgrading.md#scaffold-files) — the cost of the workaround
+keeps being paid. Fix the advisory, or waive it.
 
 ### When the advisory database is unreachable
 
 The gate **fails closed**. Fetching the RustSec database is the one part that
-needs the network, so the generated workflow does it in its own step, retrying
-three times with backoff (10s, 20s). If the database is still unreachable, the
-job fails with an explicit message rather than hanging or silently skipping the
-audit — a dependency tree nobody could verify is never reported as clean. The
-audit itself then runs `--offline` against the database just fetched, so a
-failure in *that* step is always a real advisory and never a network blip.
+needs the network, so the generated workflow does it in its own step: three
+attempts, backing off 10s then 20s between them. If the database is still
+unreachable the job fails with an explicit message rather than hanging or
+silently skipping the audit — a dependency tree nobody could verify is never
+reported as clean. The audit itself then runs `--offline` against the database
+just fetched, so a failure in *that* step is always a real advisory and never a
+network blip.
+
+Two related failures are called out rather than mistaken for an outage:
+cargo-deny loads `deny.toml` *before* it touches the network, so a malformed
+policy is reported as the configuration error it is; and a missing `deny.toml`
+stops the step with a message naming the file, instead of auditing your app
+under cargo-deny's built-in default policy, which waives nothing.
 
 ### The framework's own gate
 
@@ -443,16 +465,22 @@ unwaived advisory sits in the tree being published:
 ./scripts/check-advisories.sh --self-test  # prove the gate still rejects a CVE
 ```
 
-The third graph is the interesting one: it audits `autumn-web` exactly as a
-freshly generated app resolves it, against the `deny.toml` that `autumn new`
-writes — so "your day-one CI is green" is a checked property of every release,
-not a hope.
+The third graph is the interesting one: it audits `autumn-web`'s dependency
+tree against the `deny.toml` that `autumn new` writes, with every feature any
+scaffold flavor can enable turned on — so "your day-one CI is green" is a
+checked property of every release rather than a hope. Being precise about what
+that covers: it is the autumn-web half of your tree, audited generously (a
+superset of what your app compiles from autumn-web), resolved against Autumn's
+own lockfile. Your app's own direct dependencies, and the exact versions your
+lockfile resolves, are what *your* CI audits — which is why the gate ships with
+your app rather than only living here.
 
-`--self-test` is the negative proof, and it runs in CI on every push: it audits
-a throwaway crate carrying a deliberately injected known-vulnerable dependency
-(`time 0.1.45`, RUSTSEC-2020-0071) and requires the gate to reject it, then to
-accept it once — and only once — that id is waived. A gate nobody has watched
-fail is indistinguishable from a gate that no longer runs.
+`--self-test` is the negative proof, and it runs in Autumn's CI on every pull
+request: it audits a throwaway crate carrying a deliberately injected
+known-vulnerable dependency (`time 0.1.45`, RUSTSEC-2020-0071) and requires
+both policies — Autumn's own and the one shipped into your app — to reject it,
+then to accept it once, and only once, that id is waived. A gate nobody has
+watched fail is indistinguishable from a gate that no longer runs.
 
 ---
 

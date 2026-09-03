@@ -206,8 +206,16 @@ reporting a clean project it never looked at.
 | `.gitignore`, `.env.example` | `tests/**`, `migrations/**`, `i18n/**` |
 | `.github/workflows/ci.yml` | `config/credentials/**` (your secrets) |
 | `rust-toolchain.toml`, `rustfmt.toml`, `clippy.toml` | `static/js/**` (vendored — `autumn assets` owns these) |
-| | `deny.toml` (your advisory waivers — scaffolded once, then yours) |
-| `tailwind.config.js`, `static/css/input.css` (fullstack only) | |
+| `tailwind.config.js`, `static/css/input.css` (fullstack only) | `deny.toml` (your advisory waivers — scaffolded once, then yours) |
+
+> **`deny.toml` and the advisory gate.** The reconciled `ci.yml` runs
+> `cargo deny check advisories` against a `deny.toml` at your project root
+> (issue #1600). A project scaffolded before that gate existed does not have
+> one, and the upgrade will not write it — the waiver list is yours to grow, and
+> a file you edit would come back as a conflict on every later run. Copy the one
+> `autumn new` generates into your project root in the same commit; the audit
+> step says so too rather than auditing you under an unwaived default. See
+> [the advisory gate](supply-chain.md#part-3a--the-advisory-gate-known-vulnerable-dependencies).
 
 **Application source is out of bounds.** The command never reads, writes, or
 names a path under `src/`. API migration to your own code is the *first* half

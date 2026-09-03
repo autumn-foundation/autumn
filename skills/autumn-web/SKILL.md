@@ -2051,7 +2051,14 @@ the build.
 - A fresh scaffold ships one waiver already — RUSTSEC-2023-0071 (`rsa`, reached
   through the unconditional `jsonwebtoken` dependency, no patched release
   exists) — which is why day-one CI is green. Do not remove it without checking
-  whether a fixed `rsa` has shipped.
+  whether a fixed `rsa` has shipped. `--bundled-pg` apps get a second waiver
+  (RUSTSEC-2024-0384, `instant`, via the embedded-Postgres build stack); other
+  flavors deliberately do not, so an unused-waiver warning still means one of
+  the app author's own waivers went stale.
+- An app upgraded from a release before this gate existed receives the workflow
+  but not `deny.toml` (the policy is the app's, so `autumn upgrade` never
+  writes it). The audit step says so and stops; copy the file from a freshly
+  generated app rather than removing the step.
 - When the advisory database is unreachable the gate **fails closed**: the
   fetch is a separate step retried 3× with backoff, and the audit then runs
   `--offline` against it, so a failure in the audit step is always a real

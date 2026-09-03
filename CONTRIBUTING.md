@@ -707,7 +707,8 @@ reject it, then to accept it once — and only once — that id is waived.
 **Scope.** The gate covers the shipped root workspace — the default plus
 additive Postgres feature graph (`deny.toml`) and the mutually-exclusive sqlite
 backend graph (`deny-sqlite.toml`), including dev- and build-dependency
-licenses. The repository's separate *excluded* sub-workspaces — `fuzz/` and
+licenses — plus, for advisories only, autumn-web's tree under the policy
+`autumn new` ships (`autumn-cli/src/templates/deny.toml.tmpl`). The repository's separate *excluded* sub-workspaces — `fuzz/` and
 `examples/island-flock`, which each declare their own `[workspace]` and are
 excluded from the root `Cargo.toml` — are non-shipped harnesses/examples and are
 not gated here. Adding a per-sub-workspace cargo-deny pass (each needs its own

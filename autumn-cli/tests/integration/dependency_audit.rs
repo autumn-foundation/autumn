@@ -97,11 +97,16 @@ fn read_project_file(project: &Path, rel: &str) -> String {
         .replace("\r\n", "\n")
 }
 
-/// Every RUSTSEC id mentioned in a cargo-deny config's `ignore` list.
+/// Every RUSTSEC id waived by a cargo-deny config.
+///
+/// Only structured `{ id = "…" }` entries count: an id cited inside another
+/// waiver's `reason` ("superseded by RUSTSEC-…") is prose, and counting it
+/// would invent a waiver that does not exist.
 fn waived_ids(config: &str) -> Vec<String> {
     config
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
+        .filter(|line| line.contains("id ="))
         .flat_map(|line| {
             line.match_indices("RUSTSEC-")
                 .map(|(at, _)| {
@@ -113,6 +118,22 @@ fn waived_ids(config: &str) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// The body of one workflow step: from its `- name: <step>` to the next step.
+///
+/// Whole-file `contains` checks on a workflow are how a retry loop gets deleted
+/// from the step that needs it while some other step's `sleep` keeps the
+/// assertion green.
+fn workflow_step<'a>(yaml: &'a str, step: &str) -> &'a str {
+    let start = yaml
+        .find(&format!("- name: {step}"))
+        .unwrap_or_else(|| panic!("no step named {step:?} in:\n{yaml}"));
+    let rest = &yaml[start + 1..];
+    let end = rest
+        .find("- name: ")
+        .map_or(yaml.len(), |at| start + 1 + at);
+    &yaml[start..end]
 }
 
 // ---------------------------------------------------------------------------
@@ -141,10 +162,14 @@ fn scaffolded_audit_is_not_an_opt_in_comment() {
         !template.contains("cargo install cargo-audit"),
         "the opt-in `cargo install cargo-audit` note must be replaced by a real gate:\n{template}"
     );
-    let optional_section = template
+    let header = template
+        .split("\nname: CI")
+        .next()
+        .expect("the template must have a header comment before `name: CI`");
+    let optional_section = header
         .split("Optional extensions")
         .nth(1)
-        .unwrap_or_default();
+        .expect("the header must still list its optional extensions");
     assert!(
         !optional_section.to_lowercase().contains("audit:"),
         "dependency auditing must not be listed as an optional extension:\n{optional_section}"
@@ -200,8 +225,9 @@ fn scaffold_waivers_are_documented_with_a_reason_and_a_review_date() {
         deny.contains("RUSTSEC-2023-0071"),
         "the unavoidable rsa advisory must ship pre-waived so day-one CI is green:\n{deny}"
     );
+    let entries = code_only(&deny);
     for id in waived_ids(&deny) {
-        let entry = deny
+        let entry = entries
             .lines()
             .find(|line| line.contains(&id) && line.contains("id ="))
             .unwrap_or_else(|| {
@@ -211,11 +237,14 @@ fn scaffold_waivers_are_documented_with_a_reason_and_a_review_date() {
             entry.contains("reason ="),
             "waiver for {id} must record a rationale, got: {entry}"
         );
+        // On the entry, not in the file's prose: a header that merely
+        // *describes* review-by dates satisfies a whole-file match, and every
+        // shipped waiver would pass while carrying none.
+        assert!(
+            entry.to_lowercase().contains("review-by"),
+            "waivers are debt: {id} must carry a review-by date in its reason, got: {entry}"
+        );
     }
-    assert!(
-        deny.to_lowercase().contains("review-by"),
-        "waivers are debt: each must carry a review-by date:\n{deny}"
-    );
 }
 
 /// A waiver the framework itself has not triaged has no business being
@@ -235,20 +264,67 @@ fn scaffold_waivers_are_a_subset_of_the_frameworks_own() {
     }
 }
 
+/// cargo-deny has no knob that downgrades a vulnerability — the `ignore` list
+/// is the only way past one — so the ways this policy could quietly stop
+/// gating are narrowing a scope, or the workflow asking for a different check.
 #[test]
-fn scaffold_policy_never_downgrades_a_vulnerability() {
+fn the_scaffolded_policy_ships_its_widest_scopes() {
     let (_tmp, project) = scaffold("posture-app", &[]);
     let deny = code_only(&read_project_file(&project, "deny.toml"));
 
-    for downgrade in ["vulnerability = \"allow\"", "vulnerability = \"warn\""] {
+    for (key, expected) in [("unmaintained", "all"), ("unsound", "all")] {
+        let line = deny
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("{key} =")))
+            .unwrap_or_else(|| panic!("the policy must state its {key} scope:\n{deny}"));
         assert!(
-            !deny.contains(downgrade),
-            "the scaffolded policy must keep vulnerabilities blocking, got: {downgrade}"
+            line.contains(expected),
+            "a generated app must ship the widest {key} scope — an author may narrow \
+             it themselves, the framework must not narrow it for them; got: {line}"
         );
     }
+
+    let ci = code_only(&read_project_file(&project, ".github/workflows/ci.yml"));
     assert!(
-        deny.contains("unmaintained =") && deny.contains("unsound ="),
-        "the scaffolded policy must state its unmaintained/unsound scope explicitly:\n{deny}"
+        ci.contains("check advisories"),
+        "narrowing the policy is pointless if the workflow stops asking for the \
+         advisories check:\n{ci}"
+    );
+}
+
+/// The policy is a config file before it is documentation: if it does not
+/// parse, every generated app fails its first CI run on a TOML error.
+#[test]
+fn the_scaffolded_policy_is_valid_toml() {
+    for flags in [&[][..], &["--api"], &["--bundled-pg"]] {
+        let name = format!("toml-{}-app", flags.join("-").replace("--", ""));
+        let (_tmp, project) = scaffold(&name, flags);
+        let raw = read_project_file(&project, "deny.toml");
+        let parsed: toml::Value = toml::from_str(&raw)
+            .unwrap_or_else(|e| panic!("generated deny.toml is not valid TOML: {e}\n{raw}"));
+        let ignore = parsed
+            .get("advisories")
+            .and_then(|advisories| advisories.get("ignore"))
+            .and_then(toml::Value::as_array)
+            .expect("the policy must expose an [advisories] ignore list");
+        for waiver in ignore {
+            assert!(
+                waiver.get("id").is_some() && waiver.get("reason").is_some(),
+                "every shipped waiver must carry an id and a reason, got: {waiver}"
+            );
+        }
+    }
+}
+
+/// A waiver for an advisory the app's tree cannot reach spends the one signal
+/// cargo-deny has for "this waiver of yours has gone stale".
+#[test]
+fn the_scaffold_waives_only_what_its_own_flavor_can_hit() {
+    let (_tmp, plain) = scaffold("no-extra-waiver-app", &[]);
+    assert!(
+        !read_project_file(&plain, "deny.toml").contains("RUSTSEC-2024-0384"),
+        "the managed-pg-bundled waiver has no business in an app that never \
+         enables that feature"
     );
 }
 
@@ -293,24 +369,40 @@ fn scaffolded_audit_retries_then_fails_closed_when_the_database_is_unreachable()
     let raw = read_project_file(&project, ".github/workflows/ci.yml");
     let ci = code_only(&raw);
 
+    let fetch = workflow_step(&ci, "Fetch the RustSec advisory database");
     assert!(
-        ci.contains("cargo deny fetch db"),
-        "the advisory database fetch must be its own, retryable step:\n{ci}"
+        fetch.contains("cargo deny fetch db"),
+        "the advisory database fetch must be its own, retryable step:\n{fetch}"
     );
     assert!(
-        ci.contains("for attempt in"),
-        "the fetch must retry rather than fail on the first network hiccup:\n{ci}"
+        fetch.contains("for attempt in"),
+        "the fetch must retry rather than fail on the first network hiccup:\n{fetch}"
     );
     assert!(
-        ci.contains("sleep"),
-        "retries must back off between attempts:\n{ci}"
+        fetch.contains("sleep"),
+        "retries must back off between attempts:\n{fetch}"
     );
     assert!(
-        ci.contains("exit 1"),
-        "an unreachable advisory database must fail the job, not skip the audit:\n{ci}"
+        fetch.contains("exit 1"),
+        "an unreachable advisory database must fail the job, not skip the audit:\n{fetch}"
+    );
+    // The last attempt has nothing left to wait for: sleeping there burns CI
+    // minutes and logs a retry that never comes.
+    assert!(
+        fetch.contains("-lt 3"),
+        "the backoff must not sleep after the final attempt:\n{fetch}"
+    );
+    // An app upgraded from a release before this gate existed has this workflow
+    // and no policy file. cargo-deny would silently fall back to its built-in
+    // default — no waivers — and fail on an advisory the scaffold already
+    // triaged, so the gate says what is missing instead.
+    assert!(
+        fetch.contains("deny.toml"),
+        "the gate must check its policy exists before auditing:\n{fetch}"
     );
     assert!(
-        ci.contains("--offline check advisories"),
+        workflow_step(&ci, "Audit dependencies (RustSec advisories)")
+            .contains("--offline check advisories"),
         "the check itself must run against the fetched database, so a failure there \
          is a real advisory and not a network blip:\n{ci}"
     );
@@ -353,11 +445,18 @@ fn the_scaffold_audits_with_the_same_pinned_auditor_as_the_framework() {
     let scaffold_pin = pin(&code_only(&read_repo_file(
         "autumn-cli/src/templates/.github/workflows/ci.yml.tmpl",
     )));
-    let framework_pin = pin(&code_only(&read_repo_file(".github/workflows/ci.yml")));
-    assert_eq!(
-        scaffold_pin, framework_pin,
-        "the scaffolded audit pin and the framework's own must agree"
-    );
+    for framework in [
+        ".github/workflows/ci.yml",
+        ".github/workflows/publish-gate.yml",
+    ] {
+        assert_eq!(
+            scaffold_pin,
+            pin(&code_only(&read_repo_file(framework))),
+            "the scaffolded audit pin and {framework}'s must agree — an auditor that \
+             drifts between the release path, PR CI and generated apps means three \
+             different gates wearing one name"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +553,304 @@ fn the_gate_checks_the_scaffolds_day_one_dependency_tree() {
         script.contains("autumn-cli/src/templates/deny.toml.tmpl"),
         "the gate must audit the scaffold's shipped policy against autumn-web's graph:\n{script}"
     );
+}
+
+/// Every `autumn-web` feature any scaffold flavor can turn on has to be inside
+/// the graph the release gate audits. Otherwise a flavor ships a waiver set
+/// that does not cover its own dependency tree and its day-one CI is red —
+/// which is exactly what `--bundled-pg` did, whose `managed-pg-bundled` feature
+/// drags in `instant` (RUSTSEC-2024-0384).
+#[test]
+fn the_gate_audits_every_feature_a_scaffold_flavor_can_enable() {
+    let audited = gate_audited_features();
+    let defaults = autumn_web_default_features();
+
+    for flags in scaffold_flavors() {
+        let name = format!("features-{}-app", flavor_slug(flags));
+        let (_tmp, project) = scaffold(&name, flags);
+        for feature in scaffold_autumn_web_features(&read_project_file(&project, "Cargo.toml")) {
+            assert!(
+                audited.contains(&feature) || defaults.contains(&feature),
+                "`autumn new {}` enables autumn-web/{feature}, which the release gate never \
+                 audits — that flavor's shipped waivers are unverified. Add it to the \
+                 --features list in scripts/check-advisories.sh.\naudited: {audited:?}",
+                flags.join(" "),
+            );
+        }
+    }
+}
+
+/// Every flavor `autumn new` can produce, so a gate that only holds for the
+/// default scaffold cannot pass for the whole feature.
+fn scaffold_flavors() -> Vec<&'static [&'static str]> {
+    vec![
+        &[],
+        &["--api"],
+        &["--daemon"],
+        &["--bundled-pg"],
+        &["--with-i18n", "--with-seed"],
+        &["--api", "--with-i18n"],
+    ]
+}
+
+fn flavor_slug(flags: &[&str]) -> String {
+    if flags.is_empty() {
+        "default".to_owned()
+    } else {
+        flags.join("-").replace("--", "")
+    }
+}
+
+/// The `--features` list `scripts/check-advisories.sh` audits the scaffold with.
+fn gate_audited_features() -> Vec<String> {
+    let script = read_repo_file("scripts/check-advisories.sh");
+    let line = script
+        .lines()
+        .find(|line| line.starts_with("SCAFFOLD_FEATURES="))
+        .unwrap_or_else(|| panic!("the gate must audit an explicit feature set:\n{script}"));
+    line.trim_start_matches("SCAFFOLD_FEATURES=")
+        .trim_matches('"')
+        .split(',')
+        .map(|feature| feature.trim().to_owned())
+        .filter(|feature| !feature.is_empty())
+        .collect()
+}
+
+/// autumn-web's own default features — on unless a flavor opts out, and every
+/// opt-out flavor names a subset of them.
+fn autumn_web_default_features() -> Vec<String> {
+    let manifest = read_repo_file("autumn/Cargo.toml");
+    let line = manifest
+        .lines()
+        .find(|line| line.starts_with("default = ["))
+        .expect("autumn/Cargo.toml must declare a default feature list");
+    line.trim_start_matches("default = [")
+        .trim_end_matches(']')
+        .split(',')
+        .map(|feature| feature.trim().trim_matches('"').to_owned())
+        .filter(|feature| !feature.is_empty())
+        .collect()
+}
+
+/// Every autumn-web feature a generated `Cargo.toml` can switch on: those named
+/// on the dependency line, and those the app's own features forward.
+fn scaffold_autumn_web_features(cargo_toml: &str) -> Vec<String> {
+    let mut features: Vec<String> = cargo_toml
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .flat_map(|line| {
+            line.match_indices("autumn-web/")
+                .map(|(at, _)| {
+                    line[at + "autumn-web/".len()..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    if let Some(line) = cargo_toml
+        .lines()
+        .find(|line| line.starts_with("autumn-web = "))
+        && let Some(at) = line.find("features = [")
+    {
+        let list = &line[at + "features = [".len()..];
+        let list = &list[..list.find(']').unwrap_or(list.len())];
+        features.extend(
+            list.split(',')
+                .map(|feature| feature.trim().trim_matches('"').to_owned())
+                .filter(|feature| !feature.is_empty()),
+        );
+    }
+    features.sort();
+    features.dedup();
+    features
+}
+
+/// The `--bundled-pg` flavor's tree carries an advisory the default flavor's
+/// does not, so that flavor's shipped policy has to cover it.
+#[test]
+fn the_scaffold_policy_covers_the_bundled_postgres_flavor() {
+    let (_tmp, project) = scaffold("bundled-pg-policy-app", &["--bundled-pg"]);
+    let deny = read_project_file(&project, "deny.toml");
+    assert!(
+        deny.contains("RUSTSEC-2024-0384"),
+        "`--bundled-pg` pulls `instant` (RUSTSEC-2024-0384) through \
+         managed-pg-bundled; without a waiver that app's first CI run is red:\n{deny}"
+    );
+}
+
+/// The gate is only worth something if it reaches every app `autumn new` can
+/// produce — a flavor whose workflow renders without the audit step, or without
+/// the policy it reads, is a flavor shipping an ungated app.
+#[test]
+fn every_flavor_ships_the_gate_and_its_policy() {
+    for flags in scaffold_flavors() {
+        let name = format!("gate-{}-app", flavor_slug(flags));
+        let (_tmp, project) = scaffold(&name, flags);
+        let ci = code_only(&read_project_file(&project, ".github/workflows/ci.yml"));
+        assert!(
+            ci.contains("--offline check advisories"),
+            "`autumn new {}` must still audit its dependencies:\n{ci}",
+            flags.join(" ")
+        );
+        assert!(
+            !ci.contains("continue-on-error"),
+            "`autumn new {}` must not soft-fail any step:\n{ci}",
+            flags.join(" ")
+        );
+        let deny = read_project_file(&project, "deny.toml");
+        assert!(
+            deny.contains("[advisories]") && deny.contains("RUSTSEC-2023-0071"),
+            "`autumn new {}` must ship the policy its CI reads:\n{deny}",
+            flags.join(" ")
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The framework's own gate: what the script does, not just that it is called.
+// ---------------------------------------------------------------------------
+
+/// AC5 for the framework's gate, executed rather than grepped: with an
+/// advisory database that cannot be fetched, the gate must fail — not skip the
+/// audit, not report a clean tree.
+#[cfg(unix)]
+#[test]
+fn the_gate_fails_closed_when_the_advisory_database_cannot_be_fetched() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let stub_dir = tempfile::tempdir().expect("tempdir");
+    let stub = stub_dir.path().join("cargo");
+    fs::write(
+        &stub,
+        "#!/bin/sh\n\
+         # `--version` succeeds so the gate gets past its tool check; the fetch\n\
+         # always fails, standing in for an unreachable advisory database.\n\
+         case \"$*\" in\n\
+         *--version*) echo 'cargo-deny 0.0.0-stub'; exit 0 ;;\n\
+         *'fetch db'*) echo 'stub: network unreachable' >&2; exit 1 ;;\n\
+         *) exit 0 ;;\n\
+         esac\n",
+    )
+    .expect("write stub");
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+    let path = format!(
+        "{}:{}",
+        stub_dir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(workspace_root().join("scripts/check-advisories.sh"))
+        .current_dir(workspace_root())
+        .env("PATH", path)
+        .env("ADVISORY_DB_FETCH_RETRIES", "1")
+        .output()
+        .expect("failed to run check-advisories.sh");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "an unfetchable advisory database must fail the gate, got success:\n{combined}"
+    );
+    assert!(
+        combined.contains("failing closed"),
+        "the failure must say the gate failed closed rather than skipped:\n{combined}"
+    );
+}
+
+/// The script has to keep the properties the docs promise: retries, an offline
+/// check so a failure names an advisory, and a fail-closed exit.
+#[test]
+fn the_gate_script_retries_the_fetch_and_audits_offline() {
+    let script = read_repo_file("scripts/check-advisories.sh");
+    let code = code_only(&script);
+    for expected in [
+        "cargo deny fetch db",
+        "--offline check advisories",
+        "failing closed",
+    ] {
+        assert!(
+            code.contains(expected),
+            "the gate must keep {expected:?} in its executable body:\n{code}"
+        );
+    }
+    assert!(
+        code.contains("ADVISORY_DB_FETCH_RETRIES"),
+        "the fetch must stay retryable:\n{code}"
+    );
+    assert!(
+        code.contains("audit_scaffold_graph"),
+        "the gate must audit the scaffold's day-one graph, not only the workspace:\n{code}"
+    );
+}
+
+/// A gate the release does not depend on is a gate a release can ignore.
+#[test]
+fn prepare_release_depends_on_the_advisory_gate() {
+    let gate = read_repo_file(".github/workflows/publish-gate.yml");
+    let prepare = gate
+        .split("\n  prepare-release:")
+        .nth(1)
+        .expect("publish-gate.yml must define a prepare-release job");
+    let needs = prepare
+        .lines()
+        .find(|line| line.trim_start().starts_with("needs:"))
+        .expect("prepare-release must declare its gate dependencies");
+    assert!(
+        needs.contains("advisories"),
+        "the release must not be preparable while the advisory gate is red, got: {needs}"
+    );
+}
+
+/// The framework's own advisory steps must block, exactly as the scaffold's do.
+#[test]
+fn the_frameworks_advisory_steps_cannot_be_soft_failed() {
+    for workflow in [
+        ".github/workflows/ci.yml",
+        ".github/workflows/publish-gate.yml",
+    ] {
+        let yaml = code_only(&read_repo_file(workflow));
+        for step in [
+            "Dependency advisory gate",
+            "Advisory gate self-test (injected vulnerable dependency)",
+        ] {
+            let body = workflow_step(&yaml, step);
+            assert!(
+                !body.contains("continue-on-error"),
+                "{workflow}'s {step:?} step must fail the job:\n{body}"
+            );
+            assert!(
+                !body.contains("|| true"),
+                "{workflow}'s {step:?} step must not swallow its exit code:\n{body}"
+            );
+        }
+    }
+}
+
+/// Waivers in the framework's own policy are held to what the scaffold's are:
+/// an id alone records a decision nobody can review.
+#[test]
+fn the_frameworks_own_waivers_carry_a_reason() {
+    for config in ["deny.toml", "deny-sqlite.toml"] {
+        let policy = read_repo_file(config);
+        let entries = code_only(&policy);
+        for id in waived_ids(&policy) {
+            let entry = entries
+                .lines()
+                .find(|line| line.contains(&id) && line.contains("id ="))
+                .unwrap_or_else(|| panic!("{config}: {id} must be a structured ignore entry"));
+            assert!(
+                entry.contains("reason ="),
+                "{config}: waiver for {id} must record a rationale, got: {entry}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

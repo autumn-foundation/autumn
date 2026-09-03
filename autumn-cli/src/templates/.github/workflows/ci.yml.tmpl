@@ -99,15 +99,34 @@ jobs:
       # a dependency tree nobody could verify is never reported as clean.
       - name: Fetch the RustSec advisory database
         run: |
+          # cargo-deny falls back to a built-in default when it finds no config,
+          # which would audit this app under a policy with no waivers and fail on
+          # an advisory the scaffold already triaged. An app upgraded from a
+          # release before this gate existed has this workflow but not the
+          # policy file, so say so plainly instead of letting that happen.
+          if [ ! -f deny.toml ]; then
+            echo "::error::deny.toml is missing. It is this app's dependency advisory policy, and the audit below reads it. Copy the one \`autumn new\` generates (see docs/guide/supply-chain.md in the Autumn repository) into the project root and commit it."
+            exit 1
+          fi
           cargo fetch
           fetched=""
           for attempt in 1 2 3; do
-            if cargo deny fetch db; then
+            if output=$(cargo deny fetch db 2>&1); then
               fetched="yes"
               break
             fi
-            echo "advisory database unreachable (attempt $attempt/3); retrying in $((attempt * 10))s"
-            sleep "$((attempt * 10))"
+            echo "$output"
+            # cargo-deny loads deny.toml before it touches the network, so a
+            # malformed policy fails here on every attempt. Retrying that wastes
+            # a minute and blames the network for your typo.
+            if echo "$output" | grep -q 'deny\.toml'; then
+              echo "::error::deny.toml could not be loaded (see above) - a configuration error, not a network failure."
+              exit 1
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "advisory database unreachable (attempt $attempt/3); retrying in $((attempt * 10))s"
+              sleep "$((attempt * 10))"
+            fi
           done
           if [ -z "$fetched" ]; then
             echo "::error::RustSec advisory database unreachable after 3 attempts - failing closed."

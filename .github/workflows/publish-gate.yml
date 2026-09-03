@@ -261,6 +261,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      # Registry cache only. `cache-bin` would restore $CARGO_HOME/bin, and
+      # install-action skips its verified download when the pinned version is
+      # already there — the auditor this gate trusts must come from the pin,
+      # not from a cache entry.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-deny@0.20.2
