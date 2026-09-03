@@ -1645,6 +1645,51 @@ def _body_expansions(text):
         i = end + 1
 
 
+def _body_balanced(text):
+    """True when a heredoc-body fragment leaves no `$(` or backtick open.
+
+    A command substitution in a body may span newlines, so a fragment ending
+    mid-`$( … )` has to be held and joined with the lines below it before it is
+    scanned. A backslash quotes `$` and a backtick in a body, so an escaped
+    opener does not count toward the balance.
+    """
+    depth, bt, i, n = 0, 0, 0, len(text)
+    while i < n:
+        if text[i] == '\\':
+            i += 2
+            continue
+        if text[i] == '`':
+            bt ^= 1
+        elif bt:
+            pass                            # inside a backtick run, ` decides
+        elif text[i:i + 2] == '$(':
+            depth += 1
+            i += 2
+            continue
+        elif text[i] == ')' and depth:
+            depth -= 1
+        i += 1
+    return depth == 0 and bt == 0
+
+
+def _body_commands(buf, lineno, text):
+    """Accumulate one heredoc-body line; yield (lineno, inner) when it settles.
+
+    `buf` is a list of (lineno, text) carried across calls while a substitution
+    is still open. Nothing is yielded until the fragment balances, at which
+    point every live expansion in the whole fragment is read and the buffer
+    clears. An unbalanced tail left at the terminator is a shell syntax error,
+    so the caller drops it.
+    """
+    buf.append((lineno, text))
+    joined = '\n'.join(t for _, t in buf)
+    if _body_balanced(joined):
+        at = buf[0][0]
+        for inner in _body_expansions(joined):
+            yield at, inner
+        buf.clear()
+
+
 def _script_lines(lines):
     """Yield the (lineno, text) of `lines` that are COMMANDS, not data.
 
@@ -1658,15 +1703,17 @@ def _script_lines(lines):
     swallowing them, exactly as the fence path does.
     """
     heredocs, quoted, quoted_at, quote = [], [], None, None
+    heredoc_buf = []
     for lineno, text in lines:
         if heredocs:
             delim, tabs, expands = heredocs[0]
             candidate = text.lstrip('\t') if tabs else text
             if candidate.rstrip('\r') == delim:
                 heredocs.pop(0)
+                heredoc_buf = []            # drop any unclosed fragment
             elif expands:
-                for inner in _body_expansions(text):
-                    yield lineno, inner
+                for at, inner in _body_commands(heredoc_buf, lineno, text):
+                    yield at, inner
             continue
         if quote:
             quoted.append(text)
@@ -2090,6 +2137,7 @@ def invocations(text):
     fence_len = 0           # how long the opening run was: a closer matches it
     quoted_fence = False    # the open fence sits inside a markdown block quote
     heredocs = []           # terminators still to consume, in order
+    heredoc_buf = []        # body lines held while a `$( … )` spans them
     folded = None           # paragraphs of a folded (`>`) block scalar
     folded_at = None
     folded_indent = 0
@@ -2217,6 +2265,7 @@ def invocations(text):
             and len(m.group(1)) + len(m.group(2)) <= container + 3
         if m and (opens or closes):
             held, held_at, heredocs = [], None, []   # a fence boundary ends any hold
+            heredoc_buf = []
             yield from close_quote()            # …an unterminated quote
             yield from close_folded()           # …a folded scalar
             yield from close_pending()          # …and any list
@@ -2268,14 +2317,16 @@ def invocations(text):
             candidate = line.lstrip('\t') if tabs else line
             if candidate.rstrip('\r') == delim:
                 heredocs.pop(0)
+                heredoc_buf = []            # drop any unclosed fragment
             elif expands:
                 # The body is DATA, but an unquoted delimiter still lets an
                 # expansion inside it run. Quoting is not special in a heredoc
-                # body — only a backslash is — so the spans are read from the
-                # raw line by the rules `_body_expansions` states.
-                for inner in _body_expansions(line):
+                # body — only a backslash is — so the spans are read by the
+                # rules `_body_expansions` states, and a `$( … )` that spans
+                # body lines is held by `_body_commands` until it closes.
+                for at, inner in _body_commands(heredoc_buf, lineno, line):
                     for display, argv in commands(inner):
-                        yield lineno, display, argv, FENCED_COMMAND
+                        yield at, display, argv, FENCED_COMMAND
             continue
 
         # A trailing comment is valid on a key line, and these patterns are
@@ -2287,7 +2338,14 @@ def invocations(text):
         # blank line inside it is a paragraph break, not nothing.
         if folded is not None:
             if not line.strip():
+                # A blank line ENDS a pending continuation: bash joins the
+                # backslash to the empty next line, so `autumn migrate \` + a
+                # blank line is the finished command `autumn migrate`. Leaving
+                # `folded_cont` set here appended onto an empty paragraph on
+                # the next content line and raised IndexError, crashing the
+                # whole docs job on a valid script.
                 folded.append([None, []])
+                folded_cont = False
                 continue
             depth = len(line) - len(line.lstrip())
             if depth > folded_indent:
@@ -4761,6 +4819,41 @@ def self_test():
     # value.
     expect(list(invocations("```bash\necho --split-string='autumn nope'\n```")) == [],
            'a split-string option on echo runs nothing')
+
+    # A continuation followed by a BLANK line: bash joins the backslash to the
+    # empty next line, so `autumn migrate \` + blank is the finished command.
+    # Leaving the continuation state set appended onto an empty paragraph on
+    # the next content line and raised IndexError — a crash of the whole docs
+    # job on a valid script, so this is asserted first among the round's cases.
+    crash = '```yaml\nrun: |\n  autumn migrate \\\n\n  autumn nope\n```'
+    got = [(ln, d) for ln, d, _, _ in invocations(crash)]
+    expect(got == [(3, 'migrate'), (5, 'nope')],
+           f'a continuation before a blank line does not crash: {got}')
+
+    # A command substitution in a heredoc body may span physical lines. Read
+    # line by line, `$(` on one line and `)` on another was never seen whole,
+    # so the command between them was left as body data.
+    for doc, want in (
+            ('```bash\ncat <<EOF\n$(autumn nope\n)\nEOF\n```', ['nope']),
+            ('```bash\ncat <<EOF\n$(autumn\nnope\n)\nEOF\n```', ['nope']),
+            ('```bash\ncat <<EOF\n`autumn\nnope`\nEOF\n```', ['nope']),
+            ('```yaml\nrun: |\n  cat <<EOF\n  $(autumn nope\n  )\n  EOF\n```',
+             ['nope'])):
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == want, f'a multiline body substitution is read: {got}')
+    # Two separate single-line substitutions stay two, each on its own line.
+    two = '```bash\ncat <<EOF\n$(autumn nope)\n$(autumn nada)\nEOF\n```'
+    expect([(ln, d) for ln, d, _, _ in invocations(two)]
+           == [(3, 'nope'), (4, 'nada')],
+           f'separate body substitutions keep their lines: {list(invocations(two))}')
+    # An escaped or quoted-delimiter span expands nothing, and an UNTERMINATED
+    # one is dropped at the terminator rather than swallowing the line after.
+    for doc, want in (
+            ('```bash\ncat <<EOF\n\\$(autumn nope\n)\nEOF\n```', []),
+            ("```bash\ncat <<'EOF'\n$(autumn nope\n)\nEOF\n```", []),
+            ('```bash\ncat <<EOF\n$(autumn nope\nEOF\nautumn after\n```', ['after'])):
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == want, f'multiline body edge case: {got} != {want}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
