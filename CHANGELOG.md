@@ -1517,6 +1517,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   link's label is a new `layout.skip_to_content` Fluent key translated in
   both `i18n/en.ftl` and `i18n/es.ftl`, not a hardcoded English string,
   matching the rest of that layout's chrome.
+
+  `autumn check --a11y`'s `bypass` rule (`autumn-cli/src/check.rs`) itself had
+  a false positive this fix exposed: it unconditionally required a skip link
+  as the page's first `<a>`, so `todo-app`'s post-fix shell — `<main>`
+  immediately inside `<body>`, its only link in the footer, after `<main>` —
+  still reported Serious `bypass`, even though there is no nav/header for a
+  skip link to bypass there. The rule now skips the check when nothing
+  (no nav, header, or link) precedes `<main>`, matching the exact reasoning
+  already applied to `todo-app`/`media-room` above; it still fires whenever
+  content — `<nav>`-wrapped or not — precedes `<main>` without a skip link
+  (both pre-existing regression tests plus two new ones cover this).
 - **A sandboxed plugin can no longer abort the application at boot:** the
   duplicate-route preflight skips `nest` mounts because axum exposes no way to
   enumerate a nested router — but a sandboxed plugin's manifest *is* its route

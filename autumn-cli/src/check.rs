@@ -191,6 +191,20 @@ fn check_skip_link(html: &str, out: &mut Vec<A11yViolation>) {
     let body_start = html.find("<body").unwrap_or(0);
     let body_content = &html[body_start..];
 
+    // A skip link exists to let keyboard users jump past content that
+    // precedes the page's main landmark (nav, header, banners, ...). When
+    // `<main>` is itself the first thing in `<body>` there is nothing to
+    // bypass, so requiring a skip link would flag pages it cannot help
+    // (e.g. a single-section page whose only link sits in its footer, after
+    // `<main>`). Only applied when a `<main>` landmark was actually found —
+    // its absence is `landmark-one-main`'s concern, not this rule's.
+    let body_tag_end = body_content.find('>').map_or(0, |p| p + 1);
+    if let Some(main_pos) = body_content.find("<main")
+        && !body_content[body_tag_end..main_pos].contains('<')
+    {
+        return;
+    }
+
     // The skip link must be the FIRST focusable link in the document; a skip
     // link that comes after navigation links doesn't help keyboard users.
     // Verify by finding the first <a > and checking it is the skip link.
@@ -917,6 +931,33 @@ mod tests {
     #[test]
     fn missing_skip_link_fails() {
         let html = r#"<html lang="en"><body><nav>stuff</nav><main></main></body></html>"#;
+        assert!(
+            violation_ids(html).contains(&"bypass"),
+            "{:?}",
+            violation_ids(html)
+        );
+    }
+
+    #[test]
+    fn main_first_in_body_no_skip_link_needed_passes() {
+        // <main> is the very first thing in <body> — no nav/header precedes
+        // it, so there is nothing for a skip link to bypass. The page's only
+        // link sits in its footer, after <main>. Flagging this would ask for
+        // a skip link that fixes nothing (issue found via examples/todo-app).
+        let html = r#"<html lang="en"><body><main><h1>Hi</h1></main><footer><a href="/">Home</a></footer></body></html>"#;
+        assert!(
+            !violation_ids(html).contains(&"bypass"),
+            "{:?}",
+            violation_ids(html)
+        );
+    }
+
+    #[test]
+    fn bare_links_before_main_without_nav_tag_still_requires_skip_link() {
+        // Content before <main> still needs a skip link even when it isn't
+        // wrapped in a literal <nav> element (mirrors
+        // skip_link_after_nav_link_fails, without the skip link at all).
+        let html = r#"<html lang="en"><body><a href="/home">Home</a><main><h1>Hi</h1></main></body></html>"#;
         assert!(
             violation_ids(html).contains(&"bypass"),
             "{:?}",
