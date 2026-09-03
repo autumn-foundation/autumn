@@ -2027,6 +2027,41 @@ build?", "where did this binary come from?", or for compliance/audit evidence.
 See `docs/guide/supply-chain.md` for the end-to-end walkthrough, including the
 negative case (tamper with a byte, watch verification fail).
 
+## Dependency advisories — the audit gate (unreleased, issue #1600)
+
+Every app `autumn new` generates audits its whole dependency tree on each push
+and pull request: the scaffolded `.github/workflows/ci.yml` installs a pinned
+cargo-deny and runs `cargo deny check advisories` against a `deny.toml` at the
+project root. A known RustSec advisory that `deny.toml` does not waive fails
+the build.
+
+- **Never "fix" a failing audit by weakening the gate.** `continue-on-error`,
+  `|| true`, and deleting the step turn a security control into a decoration —
+  and an integration test in the framework fails if the generated workflow does
+  any of them. If asked to get CI green, fix or waive the advisory instead.
+- Prefer a real fix: `cargo update -p <crate>` when a patched version is
+  compatible, else bump the direct dependency that pulls it in. Read the
+  dependency path cargo-deny prints bottom-up — the crate to bump is the
+  highest entry in that chain the app controls.
+- Waive only when no fix exists ("no safe upgrade is available") or the
+  vulnerable path is unreachable, by adding to `deny.toml`:
+  `{ id = "RUSTSEC-…", reason = "why this is acceptable here; review-by <date>" }`.
+  A waiver lets exactly one id through; the gate stays on and every other
+  advisory still fails.
+- A fresh scaffold ships one waiver already — RUSTSEC-2023-0071 (`rsa`, reached
+  through the unconditional `jsonwebtoken` dependency, no patched release
+  exists) — which is why day-one CI is green. Do not remove it without checking
+  whether a fixed `rsa` has shipped.
+- When the advisory database is unreachable the gate **fails closed**: the
+  fetch is a separate step retried 3× with backoff, and the audit then runs
+  `--offline` against it, so a failure in the audit step is always a real
+  advisory rather than a network blip.
+- The framework gates itself the same way in PR CI and the Publish Gate:
+  `./scripts/check-advisories.sh` (and `--self-test`, which proves the gate can
+  still reject an injected known-vulnerable dependency).
+
+`docs/guide/supply-chain.md` "Part 3a" has the failure-reading walkthrough.
+
 ## Observability defaults
 
 Published 0.5.0 behavior:
