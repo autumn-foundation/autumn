@@ -831,6 +831,9 @@ _EXEC_KEY_LINE = re.compile(r'^\s*' + _QUALIFIED + r'(?:' + _EXEC_KEYS + r'):', 
 # so only `>` is folded here.
 _FOLDED_KEY = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
                          r'):\s*>[-+]?\s*$', re.I)
+# Any mapping key, used only to spot where one object ends and its sibling
+# begins — Compose names its services this way rather than with list items.
+_MAPPING_KEY = re.compile(r'^(\s*)[A-Za-z_][\w.-]*:(\s|$)')
 _ENTRY_KEY_LINE = re.compile(r'^\s*' + _QUALIFIED + r'(?:' + _ENTRY_KEYS + r'):', re.I)
 
 
@@ -1237,19 +1240,26 @@ def invocations(text):
         for display, argv in _from_tokens(items):
             yield at, display, argv, FENCED_COMMAND
 
-    folded = None           # lines of a folded (`>`) block scalar
+    folded = None           # paragraphs of a folded (`>`) block scalar
     folded_at = None
     folded_indent = 0
 
     def close_folded():
-        """Join a folded scalar's lines with spaces and read them as one."""
+        """Read a folded scalar: one command per paragraph, lines joined."""
         nonlocal folded, folded_at
-        parts, at = folded, folded_at
+        paras, at = folded, folded_at
         folded, folded_at = None, None
-        if not parts:
+        if not paras:
             return
-        for display, argv in commands(' '.join(parts)):
-            yield at, display, argv, FENCED_COMMAND
+        # Folding joins lines with spaces, but a BLANK line survives as a real
+        # newline — so it separates two commands. Joining across it built
+        # `autumn migrate autumn routes` out of two valid lines and reported
+        # the second `autumn` as a phantom subcommand, failing a correct file.
+        for para in paras:
+            if not para:
+                continue
+            for display, argv in commands(' '.join(para)):
+                yield at, display, argv, FENCED_COMMAND
 
     def close_pending():
         """Finish the list being collected: fill a slot, or run script lines."""
@@ -1307,17 +1317,24 @@ def invocations(text):
         # and the guide writes five of them on that page alone. Scanning the
         # physical lines instead yields the argv `\`, and the command path split
         # across the break goes unchecked.
-        # A folded scalar swallows every more-indented line below its key.
+        # A trailing comment is valid on a key line, and these patterns are
+        # end-anchored, so the key is matched against the line without it.
+        # `run: > # folded for readability` is an ordinary thing to write.
+        keyline = _strip_comment(line).rstrip()
+
+        # A folded scalar swallows every more-indented line below its key; a
+        # blank line inside it is a paragraph break, not nothing.
         if folded is not None:
             if not line.strip():
+                folded.append([])
                 continue
             if len(line) - len(line.lstrip()) > folded_indent:
-                folded.append(line.strip())
+                folded[-1].append(line.strip())
                 continue
             yield from close_folded()
-        fold = _FOLDED_KEY.match(line)
+        fold = _FOLDED_KEY.match(keyline)
         if fold:
-            folded, folded_at = [], lineno
+            folded, folded_at = [[]], lineno
             folded_indent = len(fold.group(1))
             continue
 
@@ -1328,14 +1345,14 @@ def invocations(text):
             pending.append(_list_value(item.group(2)))
             continue
         yield from close_pending()
-        inline = _KEY_INLINE.match(line) or _ARGS_INLINE.match(line)
-        key = inline or _KEY_ONLY.match(line) or _ARGS_ONLY.match(line)
+        inline = _KEY_INLINE.match(keyline) or _ARGS_INLINE.match(keyline)
+        key = inline or _KEY_ONLY.match(keyline) or _ARGS_ONLY.match(keyline)
         if key:
-            if _ARGS_ONLY.match(line) or _ARGS_INLINE.match(line):
+            if _ARGS_ONLY.match(keyline) or _ARGS_INLINE.match(keyline):
                 kind = 'args'
-            elif _ENTRY_KEY_LINE.match(line):
+            elif _ENTRY_KEY_LINE.match(keyline):
                 kind = 'entry'
-            elif _EXEC_KEY_LINE.match(line):
+            elif _EXEC_KEY_LINE.match(keyline):
                 kind = 'cmd'
             else:
                 kind = 'script'
@@ -1347,10 +1364,20 @@ def invocations(text):
             continue
         # A held half waits for its sibling across intervening keys, because a
         # YAML mapping is unordered — `image:` sits between the two often
-        # enough, and `args:` may be written first. What ends the wait is a NEW
-        # list entry at or left of the pair's own column: the next container,
-        # which cannot be the same argv.
+        # enough, and `args:` may be written first.
+        #
+        # What ends the wait is the start of a SIBLING object: a list entry at
+        # or left of the pair's column, or a mapping key strictly left of it.
+        # Compose names its services with mapping keys rather than list items,
+        # so watching only for list entries let two services' slots run
+        # together into `worker autumn definitely-not-a-command`, where autumn
+        # is no longer the head and the drift went unseen. The `<` is what
+        # keeps a sibling key of the SAME object — `image:` between `command:`
+        # and `args:` — from ending it.
         if item and len(item.group(1)) <= slots_indent:
+            yield from emit_slots()
+        elif slots and _MAPPING_KEY.match(keyline) \
+                and len(_MAPPING_KEY.match(keyline).group(1)) < slots_indent:
             yield from emit_slots()
 
         logical, at = flush(line, lineno)
@@ -2281,6 +2308,23 @@ def self_test():
     ends = '```yaml\ncommand: >\n  autumn migrate\nimage: a:1\n```'
     expect([d for _, d, _, _ in invocations(ends)] == ['migrate'],
            f'a folded scalar ends at the next key: {list(invocations(ends))}')
+    # A blank line inside a folded scalar survives as a real newline, so it
+    # separates two commands. Joining across it built one argv out of two
+    # valid lines and reported the second `autumn` as a phantom subcommand.
+    para = '```yaml\nrun: >\n  autumn migrate\n\n  autumn routes\n```'
+    expect([d for _, d, _, _ in invocations(para)] == ['migrate', 'routes'],
+           f'a blank line separates folded commands: {list(invocations(para))}')
+    para_drift = '```yaml\nrun: >\n  autumn migrate\n\n  autumn run\n```'
+    expect([d for _, d, _, _ in invocations(para_drift)] == ['migrate', 'run'],
+           f'drift after a paragraph break is still read: {list(invocations(para_drift))}')
+    # A trailing comment is valid on a key line, and these patterns are
+    # end-anchored, so the key must be matched without it.
+    for label, doc in [
+        ('folded header', '```yaml\nrun: > # folded for readability\n  autumn migrate\n  run\n```'),
+        ('block key', '```yaml\ncommand: # the argv\n  - autumn\n  - migrate\n  - run\n```'),
+    ]:
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'], f'a comment on a {label} must not hide it: {got}')
 
     # --- an annotated array is ordinary, and keeping the annotation in the
     # argv made the element resolve to nothing, hiding the drift beside it.
@@ -2316,6 +2360,23 @@ def self_test():
     drift = '```yaml\nentrypoint: ["autumn"]\ncommand: ["nope"]\n```'
     expect([d for _, d, _, _ in invocations(drift)] == ['nope'],
            f'drift in the CMD half must be read: {list(invocations(drift))}')
+    # Compose names its services with mapping keys, not list items, so a
+    # sibling object has to end the wait too — otherwise two services' slots
+    # run together and autumn is no longer at the head of the argv.
+    two_services = ('```yaml\nservices:\n  web:\n    command: ["autumn", "run"]\n'
+                    '  worker:\n    entrypoint: ["worker"]\n```')
+    expect([d for _, d, _, _ in invocations(two_services)] == ['run'],
+           f'a sibling service must not absorb the previous one: '
+           f'{list(invocations(two_services))}')
+    # …but a sibling key of the SAME object must not, which is the whole
+    # reason the boundary is strictly-left rather than at-or-left.
+    same_object = ('```yaml\nspec:\n  containers:\n    - name: m\n'
+                   '      command: ["autumn"]\n      image: a:1\n'
+                   '      args: ["migrate"]\n```')
+    expect([d for _, d, _, _ in invocations(same_object)] == ['migrate'],
+           f'a sibling key of the same object keeps the pair open: '
+           f'{list(invocations(same_object))}')
+
     # The accumulator's state must not collide with the backslash-continuation
     # buffer it shares a scope with — they were both called `held`, and a
     # continuation inside a fence then reported the wrong line.
