@@ -327,6 +327,14 @@ doesn't. It inherits every boundary of
   reports about itself. The gate isolates the *verdict* from that code (see
   "How a run works"), not the *measurement*. Review build scripts as the
   privileged code they are.
+- **Routes that only exist in your deployed configuration.** `autumn routes
+  audit` compiles with Cargo's default profile and default features, while your
+  production image is typically `--release` and may enable extra features. A
+  route behind `#[cfg(not(debug_assertions))]`, or behind a feature only the
+  deployment turns on, is therefore absent from the manifest — and so invisible
+  to this gate. If your app has such routes, audit the configuration you ship
+  until [#2472](https://github.com/autumn-foundation/autumn/issues/2472) closes
+  that gap.
 
 ---
 
