@@ -583,9 +583,13 @@ _WRAPPER_OPTS = {
     # `xargs [OPTION]... COMMAND [INITIAL-ARGS]...` runs COMMAND directly, not
     # only after a `--`. It was recognised for the separator form alone, so
     # the ordinary `… | xargs autumn migrate` went unread entirely.
-    'xargs': {'-a', '--arg-file', '-E', '-e', '--eof', '-I', '--replace',
-              '-i', '-L', '--max-lines', '-l', '-n', '--max-args',
-              '-P', '--max-procs', '-s', '--max-chars', '-d', '--delimiter'},
+    # Only the spellings whose value is a SEPARATE token. `-e/--eof`,
+    # `-i/--replace` and `-l` take an OPTIONAL attached value (`--eof[=END]`),
+    # so bare they are flags — listing them here made the walk swallow the
+    # command as their value and `xargs -i autumn …` went unread.
+    'xargs': {'-a', '--arg-file', '-E', '-I', '-L', '--max-lines',
+              '-n', '--max-args', '-P', '--max-procs', '-s', '--max-chars',
+              '-d', '--delimiter', '--process-slot-var'},
     'timeout': {'-k', '--kill-after', '-s', '--signal'},
     'nice': {'-n', '--adjustment'},
     # `systemd-run [OPTIONS...] COMMAND` and `flock [options] <file> <command>`
@@ -593,24 +597,33 @@ _WRAPPER_OPTS = {
     # value-taking spellings need listing; the attached `--unit=x` form is
     # self-contained, and an option missing from this table is read as a flag,
     # which degrades to silence rather than to a false report.
-    'systemd-run': {'-u', '--unit', '-p', '--property', '-E', '--setenv',
-                    '-M', '--machine', '--slice', '--description', '--uid',
-                    '--gid', '--nice', '--working-directory', '--service-type',
-                    '--on-calendar', '--on-active', '--timer-property'},
+    'systemd-run': {'-H', '--host', '-M', '--machine', '-u', '--unit',
+                    '-p', '--property', '-E', '--setenv', '--description',
+                    '--slice', '--expand-environment', '--service-type',
+                    '--uid', '--gid', '--nice', '--working-directory',
+                    '--path-property', '--socket-property', '--on-active',
+                    '--on-boot', '--on-startup', '--on-unit-active',
+                    '--on-unit-inactive', '--on-calendar', '--timer-property'},
     # `flock -c '…'` hands its string to a shell, but the option's owner is
     # the wrapper rather than the word before it, which this file's `-c`
     # ownership rule does not yet express — so that spelling stays unread
     # (silence, not a false report). The direct operand form is what the
     # corpus and the finding are about.
-    'flock': {'-w', '--wait', '--timeout', '-E', '--conflict-exit-code'},
+    'flock': {'-w', '--timeout', '-E', '--conflict-exit-code',
+              '-c', '--command'},
     'chroot': {'--userspec', '--groups'},
-    # `ssh [options] destination [command [argument ...]]` — the usage line
-    # the installed /usr/bin/ssh prints. Its `-c` is a CIPHER, which is why
-    # ssh is deliberately absent from `_SHELL_C_OPTS`.
+    # `ssh [options] destination [command [argument ...]]`. Unlike every other
+    # entry in this table, this one is NOT read off a locally installed
+    # binary — ssh is not present in this environment — so it comes from the
+    # documented option set instead. Its `-c` is a CIPHER, which is why ssh is
+    # deliberately absent from `_SHELL_C_OPTS`.
     'ssh': {'-b', '-c', '-D', '-E', '-e', '-F', '-I', '-i', '-J', '-L', '-l',
             '-m', '-O', '-o', '-p', '-Q', '-R', '-S', '-W', '-w'},
-    'nsenter': {'-t', '--target', '-S', '--setuid', '-G', '--setgid',
-                '--wd', '--root'},
+    # nsenter spells almost everything with an OPTIONAL attached value
+    # (`--setuid[=<uid>]`, `--root[=<dir>]`, `--wd[=<dir>]`), so those are
+    # flags when written bare; only `--target` and `--wdns` take a separate
+    # one. Listing the optional ones ate the command after them.
+    'nsenter': {'-t', '--target', '-W', '--wdns'},
     'doas': {'-u', '-C'},
 }
 
@@ -3991,6 +4004,51 @@ def self_test():
     pieces_body = "```bash\ncat <<'END'.JSON\nautumn db\nEND.JSON\n```"
     expect(list(invocations(pieces_body)) == [],
            f'…and its body is still data: {list(invocations(pieces_body))}')
+
+    # Every wrapper option table, checked against the spelling the installed
+    # binary documents. Two kinds of error live here and they fail in opposite
+    # directions: a value-taking option missing from the table leaves its
+    # VALUE in command position, and an option wrongly listed EATS the command
+    # as its value. Both end in silence, which is why neither showed up until
+    # each spelling was walked one at a time.
+    takes_value = {
+        'systemd-run': ['-H host', '--host host', '--host=host', '-M c',
+                        '--machine c', '-u n', '--unit n', '-p X=1',
+                        '--property X=1', '-E A=b', '--setenv A=b',
+                        '--description d', '--slice s',
+                        '--expand-environment yes', '--service-type exec',
+                        '--uid 1000', '--gid 1000', '--nice 5',
+                        '--working-directory /x', '--path-property X=1',
+                        '--socket-property X=1', '--on-active 5',
+                        '--on-boot 5', '--on-startup 5', '--on-unit-active 5',
+                        '--on-unit-inactive 5', '--on-calendar daily',
+                        '--timer-property X=1'],
+        'nsenter': ['-t 1', '--target 1', '-W /x', '--wdns /x'],
+        'xargs': ['-a f', '--arg-file f', '-E END', '-I{}', '-I {}', '-L 1',
+                  '-n 1', '-P 2', '-s 100', '-d ,', '--process-slot-var V'],
+        'flock': ['-w 5 /tmp/l', '--timeout 5 /tmp/l', '-E 1 /tmp/l'],
+        'timeout': ['-k 1 5', '--signal=TERM 5'],
+    }
+    # …and the FLAGS beside them, which must not swallow anything. nsenter
+    # spells almost everything with an optional attached value
+    # (`--setuid[=<uid>]`), and xargs spells `-e`, `-i` and `-l` that way, so
+    # bare they are flags — the tables had them the other way round.
+    flags = {
+        'systemd-run': ['-t', '--pty', '-q', '--quiet', '-d', '--same-dir',
+                        '-r', '--remain-after-exit', '-G', '--collect',
+                        '--wait', '--user', '--system', '--scope'],
+        'nsenter': ['-S', '-G', '--setuid', '--setgid', '-r', '--root',
+                    '-w', '--wd', '-m', '-C', '-U', '-T'],
+        'xargs': ['-e', '--eof', '-i', '-l', '--replace', '-r', '-t',
+                  '-0', '--null'],
+    }
+    for table, kind in ((takes_value, 'value'), (flags, 'flag')):
+        for wrapper, opts in table.items():
+            for opt in opts:
+                doc = f'```bash\n{wrapper} {opt} autumn nope\n```'
+                got = [d for _, d, _, _ in invocations(doc)]
+                expect(got == ['nope'],
+                       f'{wrapper} {opt} ({kind}) must reach its command: {got}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
