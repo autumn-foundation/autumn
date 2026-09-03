@@ -6,6 +6,13 @@ local MCP server). It is the production, non-watch counterpart to
 [`autumn dev`](./getting-started.md): no file watching, no hot reload, plus a
 managed lifecycle and a no-fuss local database story.
 
+> **Windows:** the daemon lifecycle (`--daemon`, `stop`, `status`, `restart`) is
+> **Tier 2 — supported via WSL2**. It is built on Unix domain sockets and POSIX
+> signals, so on native Windows these commands fail fast with a message pointing
+> at the policy rather than half-working. Foreground `autumn serve` and the whole
+> `autumn dev` loop — managed Postgres included — are Tier 1 and run natively.
+> See [Platform support](./platform-support.md).
+
 ## Quick start
 
 ```sh

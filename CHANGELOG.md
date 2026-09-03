@@ -115,6 +115,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a usable configuration is. Additive — the resolved feature set is a superset
   of what `tls` already selected.
 
+- **Dependency-advisory gate, on by default, for scaffolded apps and Autumn's
+  own releases (#1600):** the CI workflow `autumn new` generates relegated
+  vulnerability auditing to a comment ("Optional extensions… Audit: `cargo
+  install cargo-audit`"), which almost nobody enabled, so apps shipped with
+  known-vulnerable transitive dependencies and found out from a pentest rather
+  than from CI. A generated app now audits its whole dependency tree on every
+  push and pull request, and a known RustSec advisory fails the build:
+
+  - `.github/workflows/ci.yml` installs a pinned cargo-deny and runs `cargo deny
+    check advisories`, reading the new **`deny.toml`** the scaffold writes at
+    the project root. Waive an advisory by adding an `ignore` entry there with
+    its id, a `reason`, and a review-by date — the gate stays on and lets
+    exactly that one id through; an unwaived advisory still fails.
+  - Day-one CI is green for every flavor: the scaffold ships documented
+    waivers for the advisories its own tree cannot avoid — RUSTSEC-2023-0071
+    (`rsa` via the unconditional `jsonwebtoken` dependency, no patched release
+    exists) everywhere, plus RUSTSEC-2024-0384 (`instant`, via the
+    embedded-Postgres build stack) for `--bundled-pg` apps and only those.
+    Autumn's own CI re-audits autumn-web's tree — with every feature a scaffold
+    flavor can enable — against that exact policy on every run, so the waiver
+    set cannot quietly stop covering what the scaffold ships.
+  - An app upgraded from an older release receives the workflow but not the
+    policy (`deny.toml` is the app's file, never reconciled): the audit step
+    detects that and says which file to add, rather than auditing under
+    cargo-deny's unwaived default. See `docs/migrations/next.md`.
+  - When the advisory database is unreachable the gate **fails closed**: the
+    fetch is its own step, retried three times with backoff, and the audit then
+    runs `--offline` against it — no hang, no silent skip, and a failure in the
+    audit step always names a real advisory.
+  - Autumn's own release path is gated the same way: `scripts/check-advisories.sh`
+    runs in PR CI *and* in the Publish Gate (a `prepare-release` dependency), so
+    a release with an unwaived advisory in its tree cannot be tagged. Its
+    `--self-test` proves the gate can still go red by auditing an injected
+    known-vulnerable dependency (`time 0.1.45`, RUSTSEC-2020-0071) and requiring
+    rejection, then acceptance once that id is waived.
+  - Docs: [supply-chain guide](docs/guide/supply-chain.md) covers what the gate
+    checks, how to read a failure, and how to waive an advisory.
+
+- **A published Windows support policy, enforced by a `windows-latest` journey
+  gate (#1616):** the PRD promised "developers build on macOS and Windows", but
+  nothing said what a Windows developer could actually expect, and the native
+  journey degraded silently. `autumn dev` stopped the app with
+  `TerminateProcess`, which skips `on_shutdown` hooks — so a managed Postgres
+  cluster was orphaned on every hot reload — and `autumn deploy up` staged
+  secrets without the `0600` its Unix path applies.
+
+  There are now two tiers, published in
+  [Platform support](docs/guide/platform-support.md) and in the README. **Tier 1
+  works natively on Windows**: `new`, `doctor`, `setup`, `dev`, `test`,
+  foreground `serve`, managed Postgres, and the local-only `deploy check` /
+  `deploy plan`. **Tier 2 is supported via WSL2**: the `serve --daemon`
+  lifecycle, the `deploy` actions that reach a host over SSH (`up`, `rollback`,
+  `status`, `maintenance`), and the bash contributor gate scripts. Tier 2
+  commands now **fail fast** on native Windows with an error
+  naming the tier, the reason, and the policy — instead of half-working. (The
+  two script-shaped Tier 2 entries — `scripts/*.sh` and the browser
+  `SystemTest` suites — have no autumn entry point to refuse from, so for those
+  the tier is documentation.)
+
+  The `dev` teardown is fixed rather than documented away. The runtime accepts
+  a cooperative shutdown request through `AUTUMN_SHUTDOWN_SIGNAL_FILE` (opt-in;
+  unset changes nothing) and drains through the same graceful path a signal
+  takes on Unix, so shutdown hooks run and the managed cluster stops cleanly. If
+  an app misses that budget, `autumn dev` force-stops it **and says the hooks may
+  not have run** — degraded, never silent. The budget is the app's own
+  (`prestop_grace_secs + shutdown_timeout_secs`, resolved through the same
+  profile-aware reader `autumn serve stop` uses) plus headroom for the hooks
+  that run after the drain, so an app that legitimately takes 35 seconds to
+  shut down is not cut off early.
+
+  `autumn doctor` gains a `platform_support` check reporting the platform's tier
+  and the Windows prerequisites (the vcpkg/OpenSSL requirement for
+  `generate auth --passkeys`). The tier table lives in one place
+  (`autumn-cli/src/platform.rs`); the doctor check and every fail-fast message
+  read from it, and a parity test fails the build when the guide's two tier
+  tables are not exactly the table's two tiers — moving one row between tiers in
+  either file turns it red. A `windows-tier1` CI job walks the whole Tier 1
+  journey — scaffold, `doctor`, `setup`, dev-loop edit/rebuild/reload, managed
+  Postgres boot and clean shutdown — on every pull request into `trunk-dev`. On
+  its first run the gate immediately earned its keep, surfacing a Windows-only
+  link failure (`LNK4319`, the PDB public-symbol limit) that a debug build of a
+  `--bundled-pg` scaffold hits and that the pre-existing `cargo test
+  --workspace` Windows leg could never see, because it never builds a
+  scaffolded app. The workaround is documented in the platform-support guide;
+  the product-level fix is tracked separately.
 - **Build-time authority envelope for agent-operable handlers (#1691):** an
   endpoint exposed as an MCP tool is an action an autonomous agent can take
   with no human in the loop, and nothing said what that action was *allowed*

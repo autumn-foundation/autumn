@@ -595,13 +595,48 @@ field for field:
 
 ## Behavior changes
 
-Changes that still compile but behave differently at runtime. Examples:
+### CI: `autumn upgrade` adds a blocking dependency audit — add `deny.toml` with it
+
+`.github/workflows/ci.yml` is framework-owned, so `autumn upgrade --apply`
+reconciles it and your project picks up the new dependency-advisory gate
+(issue #1600): it runs `cargo deny check advisories` on every push and fails
+the build on a known RustSec advisory.
+
+That audit reads a `deny.toml` at your project root, which `autumn new` writes
+for new projects and the upgrade deliberately does **not** create — its waiver
+list is yours, and a file you are asked to edit must never come back as an
+upgrade conflict. Add it in the same commit as the upgrade:
+
+Generate a throwaway project with the release you are upgrading to, **using the
+same flags you originally scaffolded with**, and copy its policy in. The flags
+matter: `--bundled-pg` apps pull the embedded-Postgres build stack, so their
+policy carries a second waiver (`RUSTSEC-2024-0384`, `instant`) that other
+flavors deliberately do not ship. A donor generated without your flags installs
+a policy that fails your first audit.
+
+```bash
+cd /tmp
+autumn new policy-donor          # add your original flags here, e.g. --bundled-pg
+cd -
+cp /tmp/policy-donor/deny.toml ./deny.toml
+rm -rf /tmp/policy-donor
+git add deny.toml
+```
+
+Without it the audit step stops before auditing and tells you exactly this —
+it does not fall back to an unwaived default policy and fail on an advisory
+Autumn has already triaged (`rsa`/RUSTSEC-2023-0071, which reaches every
+Autumn app through `jsonwebtoken` and has no patched release).
+
+Then read [the advisory gate](../guide/supply-chain.md#part-3a--the-advisory-gate-known-vulnerable-dependencies)
+for how to read a failure and how to waive an advisory. Never disable the step
+to get green: an edited `ci.yml` becomes a conflict on every later upgrade.
+
+Other changes that still compile but behave differently at runtime. Examples:
 
 - Error responses adopted a new JSON shape.
 - A default middleware is now ordered differently.
 - A scheduled task now runs on a different worker.
-
-If nothing changed, delete this section.
 
 ## Deprecations retained from `{X.Y}`
 

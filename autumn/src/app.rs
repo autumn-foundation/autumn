@@ -11916,6 +11916,84 @@ enum DrainCause {
     UpgradeCutover,
 }
 
+/// Environment variable naming a file whose appearance drains this app.
+///
+/// Windows has no `SIGTERM`, so a parent process that supervises an Autumn app
+/// (today: `autumn dev`) could only stop it with `TerminateProcess` — which
+/// skips `on_shutdown` hooks entirely, orphaning a managed Postgres child on
+/// every hot reload (issue #1616). Setting this variable gives such a parent a
+/// portable way to request the *same* graceful drain a signal triggers: create
+/// the file, and the app runs its normal shutdown sequence.
+///
+/// Opt-in: unset (or empty), nothing watches anything. The file's contents are
+/// never read — its existence is the whole signal — so a parent can create it
+/// with a plain zero-byte `File::create`. It must be a regular file; a directory
+/// at that path is ignored.
+///
+/// **Honored on non-Unix targets only.** On Unix `SIGTERM` already does this
+/// job, and arming a file-triggered drain there would put a production
+/// deployment one operator-configured path away from being drainable by anything
+/// that can create a file. The variable is accepted and ignored on Unix.
+pub const SHUTDOWN_SIGNAL_FILE_ENV: &str = "AUTUMN_SHUTDOWN_SIGNAL_FILE";
+
+/// Resolve the cooperative-shutdown file from a raw environment value.
+///
+/// Split out from the env read so it is testable without mutating process-global
+/// state. A blank value is treated as unset: an exported-but-empty variable must
+/// not resolve to the current directory, where an unrelated file would drain the
+/// app.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix drain arm, compiled and tested on every platform"
+    )
+)]
+fn external_shutdown_path_from(value: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    let trimmed = value?.to_string_lossy().trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Trim before building the path, not just before testing for emptiness: a
+    // value with stray whitespace would otherwise resolve to a sibling path the
+    // parent never writes, and the failure would be silent — every reload
+    // stalling the full budget and hard-killing, which is the bug this exists
+    // to fix.
+    Some(std::path::PathBuf::from(trimmed))
+}
+
+/// Resolve when the cooperative-shutdown file at `path` exists.
+///
+/// Never resolves when `path` is `None` (the feature is not configured), so an
+/// app that does not opt in is unaffected. Resolves immediately when the file is
+/// already present at boot: a supervising parent removes a stale file before
+/// spawning, so a file that survives into a fresh process means a stop was
+/// requested and unhandled — draining is the safe direction.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix drain arm, compiled and tested on every platform"
+    )
+)]
+async fn external_shutdown_signal(path: Option<std::path::PathBuf>) {
+    let Some(path) = path else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    let interval = std::time::Duration::from_millis(100);
+    loop {
+        // `is_file`, not "exists": `metadata` succeeds on a directory, so a
+        // variable pointed at one would drain the app on every boot — bind,
+        // drain, exit 0 — which a supervisor reads as a healthy restart loop
+        // rather than the misconfiguration it is.
+        if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_file()) {
+            return;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
 /// Wait for a shutdown signal (Ctrl+C, SIGTERM on Unix, or a canary rollback
 /// flag file written by a controller).
 ///
@@ -11958,6 +12036,29 @@ async fn shutdown_signal(upgrade_cutover: tokio_util::sync::CancellationToken) -
         tracing::info!("Canary rollback signalled, starting graceful shutdown");
     };
 
+    // A supervising parent that has no `SIGTERM` to send — `autumn dev` on
+    // Windows — can request this exact drain by creating a file (#1616).
+    //
+    // Deliberately `cfg`-gated to the platforms that need it, rather than armed
+    // everywhere and left inert by an unset variable. Autumn deploys to Linux,
+    // and on Linux this would be a production drain trigger reachable by
+    // anything that can create a path an operator configured — with no
+    // authentication and no benefit, since `SIGTERM` already exists there. The
+    // helpers stay compiled and unit-tested on every platform.
+    #[cfg(not(unix))]
+    let external_stop = async {
+        let path =
+            external_shutdown_path_from(std::env::var_os(SHUTDOWN_SIGNAL_FILE_ENV).as_deref());
+        external_shutdown_signal(path.clone()).await;
+        tracing::warn!(
+            path = ?path,
+            "Cooperative shutdown requested via {SHUTDOWN_SIGNAL_FILE_ENV}, starting graceful shutdown"
+        );
+    };
+
+    #[cfg(unix)]
+    let external_stop = std::future::pending::<()>();
+
     let upgrade = async {
         upgrade_cutover.cancelled().await;
         tracing::info!("Successor is serving after an in-place upgrade, draining this build");
@@ -11967,6 +12068,7 @@ async fn shutdown_signal(upgrade_cutover: tokio_util::sync::CancellationToken) -
         () = ctrl_c => DrainCause::Signal,
         () = terminate => DrainCause::Signal,
         () = canary_rollback => DrainCause::Signal,
+        () = external_stop => DrainCause::Signal,
         () = upgrade => DrainCause::UpgradeCutover,
     }
 }
@@ -12543,6 +12645,137 @@ mod tests {
             ..AppState::test_default()
         };
         crate::router::build_router(routes, &config, state)
+    }
+
+    // ── Cooperative external shutdown (#1616) ──────────────────────────────
+    //
+    // On Windows there is no SIGTERM: `autumn dev` could only stop the app with
+    // `TerminateProcess`, which skips `on_shutdown` hooks — so a managed
+    // Postgres child was orphaned on every hot reload. These cover the runtime
+    // half of the fix: an opt-in, env-named flag file that drains the app
+    // through the *same* graceful path a signal takes.
+
+    #[test]
+    fn external_shutdown_path_is_none_when_the_env_var_is_absent() {
+        assert_eq!(external_shutdown_path_from(None), None);
+    }
+
+    #[test]
+    fn external_shutdown_path_ignores_an_empty_env_value() {
+        // An empty value is what an unset-but-exported variable looks like. It
+        // must not resolve to the current directory, where any stray file would
+        // drain the app.
+        assert_eq!(
+            external_shutdown_path_from(Some(std::ffi::OsStr::new(""))),
+            None
+        );
+        assert_eq!(
+            external_shutdown_path_from(Some(std::ffi::OsStr::new("   "))),
+            None
+        );
+    }
+
+    #[test]
+    fn external_shutdown_path_trims_surrounding_whitespace() {
+        // A value that only *looks* blank is rejected above; one with real
+        // content and stray whitespace must resolve to the path the parent
+        // actually wrote, not to a sibling with a leading space that will
+        // never match. Getting this wrong is silent: on Windows every reload
+        // would stall the full budget and hard-kill, reintroducing the
+        // orphaned-cluster bug this seam exists to fix.
+        assert_eq!(
+            external_shutdown_path_from(Some(std::ffi::OsStr::new("  /tmp/autumn-stop  "))),
+            Some(std::path::PathBuf::from("/tmp/autumn-stop"))
+        );
+    }
+
+    #[tokio::test]
+    async fn external_shutdown_signal_ignores_a_directory_at_the_path() {
+        // `metadata()` succeeds on a directory. If existence alone were the
+        // test, pointing the variable at a directory would drain the app on
+        // every boot — bind, drain, exit 0 — which under a supervisor is a
+        // restart loop that reports success on every iteration.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("not-a-signal");
+        std::fs::create_dir(&path).unwrap();
+
+        let resolved = tokio::time::timeout(
+            std::time::Duration::from_millis(400),
+            external_shutdown_signal(Some(path)),
+        )
+        .await;
+        assert!(resolved.is_err(), "a directory must not count as a signal");
+    }
+
+    #[test]
+    fn external_shutdown_path_uses_the_env_value_verbatim() {
+        assert_eq!(
+            external_shutdown_path_from(Some(std::ffi::OsStr::new("/tmp/autumn-stop"))),
+            Some(std::path::PathBuf::from("/tmp/autumn-stop"))
+        );
+    }
+
+    #[tokio::test]
+    async fn external_shutdown_signal_never_resolves_without_a_path() {
+        // Not configured must mean "never drains" — not "drains immediately",
+        // which would take down every app that does not opt in.
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            external_shutdown_signal(None),
+        )
+        .await;
+        assert!(
+            pending.is_err(),
+            "an unconfigured signal must never resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_shutdown_signal_resolves_when_the_file_appears() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("dev-shutdown.signal");
+
+        let writer_path = path.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            std::fs::write(&writer_path, b"stop").unwrap();
+        });
+
+        let signalled = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            external_shutdown_signal(Some(path)),
+        )
+        .await;
+        assert!(signalled.is_ok(), "writing the file must drain the app");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_shutdown_signal_resolves_immediately_when_present_at_boot() {
+        // `autumn dev` removes a stale file before spawning, but a crashed
+        // parent can leave one behind; resolving immediately is the safe
+        // direction — the app exits gracefully rather than ignoring a stop.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("dev-shutdown.signal");
+        std::fs::write(&path, b"stop").unwrap();
+
+        let signalled = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            external_shutdown_signal(Some(path)),
+        )
+        .await;
+        assert!(
+            signalled.is_ok(),
+            "a file present at boot must drain the app"
+        );
+    }
+
+    #[test]
+    fn external_shutdown_env_var_is_the_name_the_cli_writes() {
+        // `autumn-cli` mirrors this constant (it cannot depend on autumn-web's
+        // private items); a rename on either side breaks the dev loop silently,
+        // so pin the wire name here.
+        assert_eq!(SHUTDOWN_SIGNAL_FILE_ENV, "AUTUMN_SHUTDOWN_SIGNAL_FILE");
     }
 
     #[tokio::test]

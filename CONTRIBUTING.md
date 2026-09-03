@@ -673,23 +673,43 @@ Reviewers should treat a new request-path parser with neither as incomplete.
 
 ## Supply chain (cargo-deny)
 
-The `supply-chain` CI job (`.github/workflows/ci.yml`) runs `cargo deny check
-advisories licenses sources` **twice** against a pinned cargo-deny (0.20.2):
-once on the checked-in `deny.toml` (the default + Postgres + additive CI feature
-graph) and once on `deny-sqlite.toml` (the mutually-exclusive sqlite backend
-graph). The two configs share the same advisories/licenses/sources policy — keep
-them in sync — and differ only in their `[graph]` features. All three checks —
-advisories (RustSec), licenses (allow-list, including dev- and build-dependency
-licenses), and sources (crate registries) — are **blocking** in both passes, so
-a PR that introduces a new advisory, an un-allowed license, or an unknown source
-registry will fail CI. The step-by-step for triaging a failing advisory (prefer
-a minimal fix; document an ignore with a reason and a review-by date only when
-no fix exists) lives in the header comment of `deny.toml`.
+The `supply-chain` CI job (`.github/workflows/ci.yml`) checks the dependency
+tree with a pinned cargo-deny (0.20.2) against two configs: the checked-in
+`deny.toml` (the default + Postgres + additive CI feature graph) and
+`deny-sqlite.toml` (the mutually-exclusive sqlite backend graph). The two
+configs share the same advisories/licenses/sources policy — keep them in sync —
+and differ only in their `[graph]` features. Licenses (allow-list, including
+dev- and build-dependency licenses) and sources (crate registries) run directly;
+all of it is **blocking**, so a PR that introduces a new advisory, an un-allowed
+license, or an unknown source registry fails CI. The step-by-step for triaging a
+failing advisory (prefer a minimal fix; document an ignore with a reason and a
+review-by date only when no fix exists) lives in the header comment of
+`deny.toml`.
+
+Advisories go through `scripts/check-advisories.sh` (issue #1600), which the
+**Publish Gate** runs too, so a release cannot be tagged while an unwaived
+RustSec advisory sits in the tree being published. Run it locally exactly as CI
+does:
+
+```bash
+./scripts/check-advisories.sh              # workspace, sqlite graph, scaffold graph
+./scripts/check-advisories.sh --self-test  # prove the gate still rejects a CVE
+```
+
+It audits a third graph beyond the two above: `autumn-web` under the `deny.toml`
+that `autumn new` writes into a generated app (`autumn-cli/src/templates/deny.toml.tmpl`),
+so an advisory the scaffold's shipped waiver set does not cover fails here
+rather than in a user's first CI run. Its advisory-database fetch retries and
+**fails closed**; the audits then run `--offline`, so a failure always names an
+advisory rather than a network blip. `--self-test` audits a throwaway crate with
+a deliberately injected known-vulnerable dependency and requires the gate to
+reject it, then to accept it once — and only once — that id is waived.
 
 **Scope.** The gate covers the shipped root workspace — the default plus
 additive Postgres feature graph (`deny.toml`) and the mutually-exclusive sqlite
 backend graph (`deny-sqlite.toml`), including dev- and build-dependency
-licenses. The repository's separate *excluded* sub-workspaces — `fuzz/` and
+licenses — plus, for advisories only, autumn-web's tree under the policy
+`autumn new` ships (`autumn-cli/src/templates/deny.toml.tmpl`). The repository's separate *excluded* sub-workspaces — `fuzz/` and
 `examples/island-flock`, which each declare their own `[workspace]` and are
 excluded from the root `Cargo.toml` — are non-shipped harnesses/examples and are
 not gated here. Adding a per-sub-workspace cargo-deny pass (each needs its own
