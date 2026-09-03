@@ -9,8 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **A CI gate for the "local development" install path** (`local-dev-quickstart`
-  job in `.github/workflows/quickstart-gate.yml`): `cargo install --path
+- **A CI gate for the "local development" install path [no-plugin]:** nothing
+  here is agent-facing — it's a CI/test-harness addition, not new framework
+  surface (`local-dev-quickstart` job in
+  `.github/workflows/quickstart-gate.yml`). `cargo install --path
   autumn-cli` from a source checkout, then `autumn new`, is a first-class path
   in README.md and `docs/guide/getting-started.md`, but nothing in CI built
   that exact pairing — a source-built (trunk-dev) CLI's scaffold against the
