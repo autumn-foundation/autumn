@@ -115,6 +115,7 @@ jobs:
   #   generated_scaffold_cargo_checks             (generate.rs)
   #   generated_policy_scaffold_cargo_checks      (generate.rs)
   #   generated_nested_scaffold_cargo_checks      (generate.rs)
+  #   generated_counter_cache_scaffold_cargo_checks (generate.rs, #2431)
   #   generated_scaffold_config_cargo_checks      (generate.rs)
   #   i18n_scaffold_*_cargo_checks                (cli_tests, #1349)
   #   generated_validated_scaffold_round_trip_test_passes (generate.rs)
@@ -181,6 +182,15 @@ jobs:
         run: |
           cargo test -p autumn-cli --test generate \
             generated_nested_scaffold_cargo_checks -- --ignored --exact
+
+      - name: generated_counter_cache_scaffold_cargo_checks
+        # Issue #2431: the only machine proof that `--belongs-to <Parent>
+        # --counter-cache` produces a child model that actually compiles.
+        # `#[belongs_to(...)]` was being emitted above `#[autumn_web::model]`
+        # instead of below it, which `cargo check` alone catches.
+        run: |
+          cargo test -p autumn-cli --test generate \
+            generated_counter_cache_scaffold_cargo_checks -- --ignored --exact
 
       - name: generated_scaffold_config_cargo_checks
         run: |

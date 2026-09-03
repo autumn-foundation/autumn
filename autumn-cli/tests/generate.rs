@@ -2240,6 +2240,90 @@ fn generated_nested_scaffold_cargo_checks() {
     );
 }
 
+/// Issue #2431: `--belongs-to <Parent> --counter-cache` must produce a child
+/// model that actually compiles. Before this fix, `add_counter_cache_to_model_source`
+/// inserted the generated `#[belongs_to(Post, counter_cache)]` attribute ABOVE
+/// `#[autumn_web::model]` instead of below it — `#[belongs_to]` is a helper
+/// attribute only `#[model]`'s own expansion understands, so rustc rejected it
+/// outright with `cannot find attribute belongs_to in this scope` on every
+/// first-time use of the documented, only invocation of this flag. No prior
+/// test ever ran `cargo check` on a `--counter-cache` scaffold (the unit test
+/// covering the rewrite only asserted the attribute's text was present, not
+/// its position), so this compile break shipped invisibly.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_counter_cache_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("counter-cache-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &["generate", "scaffold", "Post", "title:String", "body:Text"],
+    );
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Comment",
+            "post:references",
+            "body:Text",
+            "--belongs-to",
+            "Post",
+            "--counter-cache",
+        ],
+    );
+
+    // The generated attribute must sit below `#[autumn_web::model]`, not
+    // above it — this is the assertion the pre-fix unit test was missing.
+    let model = fs::read_to_string(project.join("src/models/comment.rs")).unwrap();
+    let model_pos = model
+        .find("#[autumn_web::model]")
+        .expect("model attribute present");
+    let belongs_to_pos = model
+        .find("#[belongs_to(Post, counter_cache)]")
+        .expect("belongs_to attribute present");
+    assert!(
+        model_pos < belongs_to_pos,
+        "#[belongs_to] must be emitted below #[autumn_web::model]:\n{model}"
+    );
+
+    // The parent-side warning names the two lines the scaffold cannot own
+    // (schema.rs + the model struct) — paste them in by hand before `cargo
+    // check`, matching what a real user following the warning would do.
+    let schema = fs::read_to_string(project.join("src/schema.rs")).unwrap();
+    let patched_schema = schema.replacen(
+        "posts (id) {",
+        "posts (id) {\n        comment_count -> Int8,",
+        1,
+    );
+    assert_ne!(schema, patched_schema, "expected to find the posts table");
+    fs::write(project.join("src/schema.rs"), patched_schema).unwrap();
+
+    let post_model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    let patched_post_model = post_model.replacen(
+        "pub struct Post {",
+        "pub struct Post {\n    #[default]\n    pub comment_count: i64,",
+        1,
+    );
+    assert_ne!(post_model, patched_post_model, "expected the Post struct");
+    fs::write(project.join("src/models/post.rs"), patched_post_model).unwrap();
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on the --counter-cache scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
 /// Issue #1125: a scaffold WITH an owner column generates a record-level
 /// `Policy`/`Scope`, authorizes the mutating HTML handlers, scopes the index,
 /// and emits a cross-user 403 smoke test. `cargo check --tests` proves the

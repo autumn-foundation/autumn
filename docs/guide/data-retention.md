@@ -133,9 +133,9 @@ one guards an invariant another subsystem depends on:
   for volume, lower the job's `unique_for_ms`.
 
   **`failed` is also the dead-letter state.** A `job_history` window therefore
-  bounds how long a dead-lettered job stays replayable with `autumn jobs
-  retry`. If you triage dead letters by hand, set the window longer than your
-  triage window, or leave it unset.
+  bounds how long a dead-lettered job stays replayable from the jobs dashboard
+  (`POST /admin/jobs/{id}/retry`). If you triage dead letters by hand, set the
+  window longer than your triage window, or leave it unset.
 
 - **`experiment_assignments`** matches only assignments belonging to an
   **archived** experiment, or one whose experiment row is gone. A sticky

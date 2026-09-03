@@ -126,7 +126,7 @@ delivery remain correlated with the request that triggered them.
 change, run the migration before deploying new workers:
 
 ```shell
-autumn migrate run
+autumn migrate
 ```
 
 or apply it manually:

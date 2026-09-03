@@ -1351,6 +1351,7 @@ impl Client {
             pin_addr: None,
             ssrf_safe: false,
             discard_response_body: false,
+            breaker_scoped: false,
         }
     }
 
@@ -1433,9 +1434,7 @@ impl Client {
     /// automatic per-hop pinning.
     #[must_use]
     pub fn get_ssrf_safe(&self, url: impl Into<String>) -> RequestBuilder {
-        let mut builder = self.build_request(Method::GET, url.into());
-        builder.ssrf_safe = true;
-        builder
+        self.build_request(Method::GET, url.into()).ssrf_safe()
     }
 }
 
@@ -1508,6 +1507,10 @@ pub struct RequestBuilder {
     /// When `true`, the response body is dropped unread. See
     /// [`RequestBuilder::discard_response_body`].
     discard_response_body: bool,
+    /// When `true`, `send_recorded` keeps circuit-breaker accounting even on
+    /// the custom send path (`needs_custom_path()`). See
+    /// [`RequestBuilder::breaker_scoped`].
+    breaker_scoped: bool,
 }
 
 impl RequestBuilder {
@@ -1713,6 +1716,69 @@ impl RequestBuilder {
         self
     }
 
+    /// Route this request through the SSRF-safe resolve→validate→pin send path
+    /// documented on [`Client::get_ssrf_safe`], for any HTTP method.
+    ///
+    /// [`Client::get_ssrf_safe`] only builds `GET` requests, but the guarantee
+    /// it describes — reject a resolved address on the built-in SSRF deny-list,
+    /// pin the connection to the validated set, re-validate on every redirect
+    /// hop — is implemented by [`Self::send`] purely from this flag and is not
+    /// GET-specific. Any outbound call whose destination is not a value the
+    /// app itself chose — a webhook subscriber's `target_url`, a user-supplied
+    /// callback, an OAuth discovery endpoint — needs this on **every** verb it
+    /// uses, not only reads. Chain it after [`Client::post`], [`Client::put`],
+    /// etc.:
+    ///
+    /// ```rust,ignore
+    /// client.post(target_url).ssrf_safe().json(&payload).send().await?;
+    /// ```
+    ///
+    /// Same incompatibility with [`pin_to`](Self::pin_to) as `get_ssrf_safe`:
+    /// this path performs its own per-hop resolve→validate→pin, so chaining an
+    /// explicit pin is rejected at send time with
+    /// [`ClientError::PinNotAllowedWithSsrfSafe`].
+    #[must_use]
+    pub const fn ssrf_safe(mut self) -> Self {
+        self.ssrf_safe = true;
+        self
+    }
+
+    /// Keep circuit-breaker accounting even when this request also needs the
+    /// custom send path (`ssrf_safe()`, `pin_to()`, `no_redirect()`,
+    /// `follow_redirects()`).
+    ///
+    /// That custom path otherwise bypasses `send_recorded`'s breaker block
+    /// entirely — right for its usual case, a one-off fetch of an arbitrary
+    /// caller-chosen URL, where per-host breaker state is mostly noise. A
+    /// caller instead making *repeated* calls to a small, durable set of
+    /// hosts — outbound webhook delivery is the motivating case (#2480 code
+    /// review) — still wants the breaker: without it, a down receiver never
+    /// fails fast, and every queued delivery pays a full
+    /// DNS-resolve-and-connect timeout instead of the open-breaker
+    /// short-circuit every other outbound call gets.
+    ///
+    /// This flag is read from *inside* `send_recorded`, not layered on
+    /// externally, which is what makes it free to get right on every other
+    /// axis `send` already handles correctly: a mocked client's `self.mock.is_some()`
+    /// check runs first regardless (mock behavior is unaffected); a capsule
+    /// replay's `current_tape()` check happens even earlier, in `send` itself,
+    /// before `send_recorded` is ever reached (an open-breaker attempt is
+    /// therefore never gated on live state during replay, and — because it
+    /// stays behind `send`'s own capture tee — an open-breaker attempt made
+    /// *while capturing* is recorded into the capsule exactly like any other
+    /// outcome, so a later replay of that exact run reproduces
+    /// `CircuitBreakerOpen` instead of diverging).
+    ///
+    /// Breaker keying always uses this request's *resolved* URL (`self.url`
+    /// — already expanded past any `[http.client.base_urls]` alias by
+    /// `Client::build_request`), so an alias-targeted destination keys the
+    /// same breaker bucket a literal-URL request to the same host would.
+    #[must_use]
+    pub(crate) const fn breaker_scoped(mut self) -> Self {
+        self.breaker_scoped = true;
+        self
+    }
+
     /// Send the request, applying retries and returning a [`Response`].
     ///
     /// # Errors
@@ -1797,33 +1863,18 @@ impl RequestBuilder {
         // (+ optional .resolve()) and does manual redirect handling. Like the
         // mock path it deliberately BYPASSES the process-global circuit breaker
         // to avoid entangling these one-off, per-URL requests with the shared
-        // per-host breaker registry.
+        // per-host breaker registry — unless the caller opted in via
+        // `breaker_scoped()` (repeated calls to a small, durable host set; see
+        // its doc comment).
         if self.needs_custom_path() {
-            return self.send_custom().await;
+            if self.breaker_scoped {
+                return self.send_custom_breaker_guarded().await;
+            }
+            return self.send_custom(false).await;
         }
 
         // ── Resilience / Circuit Breaker ──────────────────────────────────
-        let host = url::Url::parse(&self.url).ok().map_or_else(
-            || "unknown".to_owned(),
-            |u| {
-                let h = u.host_str().unwrap_or("unknown");
-                u.port()
-                    .map_or_else(|| h.to_owned(), |port| format!("{h}:{port}"))
-            },
-        );
-
-        let breaker = self.resilience_config.as_ref().map_or_else(
-            || {
-                crate::circuit_breaker::global_registry().get_or_create(
-                    &host,
-                    crate::circuit_breaker::CircuitBreakerPolicy::default(),
-                )
-            },
-            |rc| {
-                let policy = crate::circuit_breaker::CircuitBreakerPolicy::from_config(rc, &host);
-                crate::circuit_breaker::global_registry().get_or_create_with_config(&host, policy)
-            },
-        );
+        let breaker = breaker_for_url(self.resilience_config.as_ref(), &self.url);
 
         // Check if circuit breaker is open
         if breaker.before_call().is_err() {
@@ -1845,6 +1896,36 @@ impl RequestBuilder {
             Err(_) => {
                 guard.failure();
             }
+        }
+        res
+    }
+
+    /// The custom send path (`send_custom`), with breaker accounting exactly
+    /// like the plain-path breaker block above: `before_call` gate,
+    /// `CircuitBreakerGuard` covering the call (its `Drop` releases a
+    /// half-open slot if this future is cancelled or panics before finishing),
+    /// `< 500` success threshold. Only reached when `breaker_scoped()` was
+    /// set — see its doc comment for why this has to live here rather than in
+    /// an external wrapper around `send()`.
+    async fn send_custom_breaker_guarded(self) -> Result<Response, ClientError> {
+        let breaker = breaker_for_url(self.resilience_config.as_ref(), &self.url);
+        if breaker.before_call().is_err() {
+            return Err(ClientError::CircuitBreakerOpen);
+        }
+        // Read before the breaker moves into the guard below. Mirrors the
+        // plain-path breaker block's own `is_half_open` (passed to
+        // `send_inner` to force a single attempt): a half-open probe is a
+        // budgeted, limited trial (`half_open_trial_count`), and letting
+        // `send_one`'s own retry loop turn one trial into several real
+        // network attempts spends that budget on one logical delivery
+        // instead of testing recovery with independent probes (#2480
+        // review, round 10).
+        let is_half_open = breaker.state() == crate::circuit_breaker::CircuitState::HalfOpen;
+        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker);
+        let res = self.send_custom(is_half_open).await;
+        match &res {
+            Ok(resp) if resp.status().as_u16() < 500 => guard.success(),
+            _ => guard.failure(),
         }
         res
     }
@@ -1985,7 +2066,14 @@ impl RequestBuilder {
     }
 
     /// Dispatch to the appropriate custom send path. Consumes `self`.
-    async fn send_custom(self) -> Result<Response, ClientError> {
+    ///
+    /// `is_half_open`: `true` when this call is a circuit-breaker half-open
+    /// probe (only ever passed by [`Self::send_custom_breaker_guarded`]);
+    /// forces every `send_one` this dispatch reaches down to a single
+    /// attempt, exactly like the plain-path breaker block's own
+    /// `send_inner(is_half_open)` already does — see
+    /// `send_custom_breaker_guarded`'s doc comment.
+    async fn send_custom(self, is_half_open: bool) -> Result<Response, ClientError> {
         // Reject the incompatible `get_ssrf_safe` + `pin_to` combination up
         // front — deterministically, before any network I/O. `get_ssrf_safe`
         // routes through `send_ssrf_safe`, which runs its OWN per-hop
@@ -2043,7 +2131,7 @@ impl RequestBuilder {
             .unwrap_or_else(|| Duration::from_secs(30));
 
         if self.ssrf_safe {
-            return self.send_ssrf_safe(timeout).await;
+            return self.send_ssrf_safe(timeout, is_half_open).await;
         }
 
         // Extract the follow parameters (ending the borrow) before moving `self`.
@@ -2052,7 +2140,9 @@ impl RequestBuilder {
             RedirectMode::None | RedirectMode::Default => None,
         };
         if let Some((max, validator)) = follow {
-            return self.follow_loop(max, validator, timeout).await;
+            return self
+                .follow_loop(max, validator, timeout, is_half_open)
+                .await;
         }
 
         // Only `RedirectMode::None` (explicit `no_redirect`) and the pin-only
@@ -2074,6 +2164,8 @@ impl RequestBuilder {
             self.body.as_ref(),
             &self.retry_policy,
             self.discard_response_body,
+            None,
+            is_half_open,
         )
         .await
     }
@@ -2094,6 +2186,7 @@ impl RequestBuilder {
         max: usize,
         validator: RedirectValidator,
         timeout: Duration,
+        is_half_open: bool,
     ) -> Result<Response, ClientError> {
         let original =
             url::Url::parse(&self.url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
@@ -2127,6 +2220,8 @@ impl RequestBuilder {
                 body.as_ref(),
                 &self.retry_policy,
                 self.discard_response_body,
+                None,
+                is_half_open,
             )
             .await?;
 
@@ -2172,7 +2267,42 @@ impl RequestBuilder {
     /// default cap while every per-hop safety step (resolve→validate→pin,
     /// https→http downgrade block, sensitive-header stripping, method/body
     /// rewrite) still applies.
-    async fn send_ssrf_safe(self, timeout: Duration) -> Result<Response, ClientError> {
+    /// Runs the whole resolve→validate→pin→redirect operation against one
+    /// deadline `timeout` from now, rather than handing every phase of every
+    /// hop a fresh `timeout`-length budget.
+    ///
+    /// Without this, `timeout` only bounded each hop's own connect/response
+    /// wait — the DNS lookup in [`resolve_and_validate`] had no timeout of
+    /// its own, and every redirect hop got a full fresh `timeout` regardless
+    /// of how long earlier hops already took. A subscriber-controlled
+    /// destination (the motivating case: outbound webhook delivery, #2480
+    /// code review) with stalled DNS or a slow multi-hop redirect chain
+    /// could therefore occupy a job worker for `timeout × (hops + 1)` plus
+    /// unbounded DNS wait, rather than the single `timeout` every other
+    /// outbound call is bounded by.
+    ///
+    /// The budget shrinks across two seams per hop — the DNS lookup, then
+    /// the connect/response reqwest performs — rather than being enforced by
+    /// one coarse outer `tokio::time::timeout` wrapping the whole call: a
+    /// coarse wrap would race the *same* duration against both this
+    /// operation's start and each hop's own reqwest-level timeout, and since
+    /// the outer clock always starts first it would almost always fire
+    /// first, silently reclassifying an ordinary single-hop stall from
+    /// `ClientError::Request` (a `reqwest::Error` callers can query with
+    /// `.is_timeout()`) into `ClientError::InvalidUrl` (#2480 review, round
+    /// 7). Shrinking the *reqwest* timeout instead means a connect/response
+    /// stall in the common (no-redirect) case still times out inside
+    /// reqwest itself and keeps that exact, already-documented error shape;
+    /// only a stall in the DNS lookup — which had no error shape of its own
+    /// to preserve, because it had no timeout at all before this fix —
+    /// surfaces as `InvalidUrl`, consistent with the DNS-failure case
+    /// immediately below reusing the same variant.
+    async fn send_ssrf_safe(
+        self,
+        timeout: Duration,
+        is_half_open: bool,
+    ) -> Result<Response, ClientError> {
+        let deadline = std::time::Instant::now() + timeout;
         let (follow, max) = self.ssrf_redirect_plan();
         let original =
             url::Url::parse(&self.url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
@@ -2183,15 +2313,25 @@ impl RequestBuilder {
         let mut headers = self.extra_headers.clone();
         let mut body = self.body.clone();
         for hop in 0.. {
+            let remaining_for_lookup = deadline_remaining_or_timeout(deadline, &current)?;
             // Resolve host → ALL validated addresses (rejects if ANY resolved IP
             // is blocked), then pin the full set so reqwest cannot re-resolve but
             // can still fall back across the validated addresses in order.
-            let addrs = resolve_and_validate(&current).await?;
+            // Wrapped in the *remaining* budget, not the full per-request
+            // `timeout`: resolve_and_validate's DNS lookup previously had no
+            // timeout of its own at all.
+            let addrs = tokio::time::timeout(remaining_for_lookup, resolve_and_validate(&current))
+                .await
+                .map_err(|_| ssrf_safe_deadline_error(&current))??;
             let host = host_of(&current)?;
+            // Re-measured after the lookup, so a slow DNS response shrinks
+            // what's left for the connect/response phase below rather than
+            // that phase getting a fresh full `timeout` regardless.
+            let remaining_for_connect = deadline_remaining_or_timeout(deadline, &current)?;
             let client = build_oneshot_client(
                 Some((host, addrs)),
                 reqwest::redirect::Policy::none(),
-                timeout,
+                remaining_for_connect,
             )?;
             // On any post-origin hop, drop credential-bearing headers if the
             // current target is cross-origin (stays stripped once stripped).
@@ -2206,6 +2346,8 @@ impl RequestBuilder {
                 body.as_ref(),
                 &self.retry_policy,
                 self.discard_response_body,
+                Some(deadline),
+                is_half_open,
             )
             .await?;
 
@@ -2263,6 +2405,64 @@ const fn is_retryable_status(status: u16) -> bool {
     matches!(status, 502..=504)
 }
 
+/// Time left until `deadline`, or the deadline error if it has already
+/// passed before this hop's next phase (DNS lookup or connect) even began.
+/// Used by [`RequestBuilder::send_ssrf_safe`] to shrink the budget handed to
+/// each successive phase rather than resetting it every hop.
+fn deadline_remaining_or_timeout(
+    deadline: std::time::Instant,
+    current: &str,
+) -> Result<Duration, ClientError> {
+    let now = std::time::Instant::now();
+    if now >= deadline {
+        return Err(ssrf_safe_deadline_error(current));
+    }
+    Ok(deadline - now)
+}
+
+/// The error [`RequestBuilder::send_ssrf_safe`] returns when its overall
+/// deadline is exhausted — reusing [`ClientError::InvalidUrl`] rather than a
+/// new variant (see that call site's doc comment for why), consistent with
+/// the adjacent DNS-lookup-failure case in [`resolve_and_validate`] already
+/// using the same variant for the same phase.
+fn ssrf_safe_deadline_error(current: &str) -> ClientError {
+    ClientError::InvalidUrl(format!(
+        "SSRF-safe resolve/redirect operation exceeded its deadline resolving {current}"
+    ))
+}
+
+/// Resolve (or create) the circuit breaker for `url`'s host, honouring a
+/// per-client `resilience_config` override exactly as [`RequestBuilder::send_recorded`]'s
+/// own breaker path does. Shared by both the plain-path breaker block and
+/// [`RequestBuilder::send_custom_breaker_guarded`] so the two cannot drift on
+/// how a host name is derived from the URL.
+fn breaker_for_url(
+    resilience_config: Option<&Arc<crate::config::ResilienceConfig>>,
+    url: &str,
+) -> crate::circuit_breaker::CircuitBreaker {
+    let host = url::Url::parse(url).ok().map_or_else(
+        || "unknown".to_owned(),
+        |u| {
+            let h = u.host_str().unwrap_or("unknown");
+            u.port()
+                .map_or_else(|| h.to_owned(), |port| format!("{h}:{port}"))
+        },
+    );
+
+    resilience_config.map_or_else(
+        || {
+            crate::circuit_breaker::global_registry().get_or_create(
+                &host,
+                crate::circuit_breaker::CircuitBreakerPolicy::default(),
+            )
+        },
+        |rc| {
+            let policy = crate::circuit_breaker::CircuitBreakerPolicy::from_config(rc, &host);
+            crate::circuit_breaker::global_registry().get_or_create_with_config(&host, policy)
+        },
+    )
+}
+
 // ── Custom send-path helpers (redirect / pin / SSRF-safe) ─────────────────────
 
 /// Build a one-shot `reqwest::Client` for the custom send path, with the given
@@ -2300,6 +2500,54 @@ fn build_oneshot_client(
 /// Send a single request through `client` (no manual redirect following — the
 /// client's redirect policy governs that) with the same transient-error and
 /// 429/5xx retry behaviour as the shared path, and collect the [`Response`].
+///
+/// `deadline`, when set, bounds the *retry loop* — checked before each
+/// backoff sleep, so a retry that would start after the deadline is skipped
+/// in favour of failing the call immediately with a deadline error, rather
+/// than a stale response/error from an attempt that already ran. This exists
+/// for
+/// [`RequestBuilder::send_ssrf_safe`] (#2480 review, round 8): passing a
+/// shrunk per-hop `timeout` into `client`'s own reqwest-level timeout, as
+/// every other caller here already does, bounds one attempt's connect/
+/// response wait, but `client` is reused across every retry `send_one`
+/// itself performs — each gets that same per-attempt timeout again, and the
+/// backoff/`Retry-After` sleeps between attempts are outside it entirely, so
+/// a retried, timing-out SSRF-safe hop could still run well past the overall
+/// deadline the caller computed. Checked only before sleeping (never wrapped
+/// around an in-flight attempt), so it cannot race an attempt's own
+/// reqwest-level timeout the way an outer `tokio::time::timeout` would (see
+/// round 7's `ClientError::Request`/`.is_timeout()` regression) — the first
+/// attempt's error shape is always preserved unchanged. Other callers pass
+/// `None`, so their behavior is exactly as before this parameter existed.
+///
+/// Two more `deadline` seams round 9 found `send_ssrf_safe`'s own deadline
+/// fix had missed: `client`'s own reqwest-level timeout is fixed at
+/// build-hop-start, so a retry within the same hop still got the *original*
+/// per-attempt budget rather than what's actually left; and the 429
+/// `Retry-After` sleep is a second sleep, separate from the backoff sleep
+/// above, that the deadline check never covered at all. Both are fixed here:
+/// every attempt sends with an explicit per-request `.timeout()` recomputed
+/// from `deadline` (overriding `client`'s built-in one only when `deadline`
+/// is set, so non-SSRF-safe callers passing `None` are unaffected), and the
+/// `Retry-After` sleep is capped by the remaining budget and followed by the
+/// same deadline check the backoff sleep already has — falling through to
+/// return the 429 response as final, exactly like running out of
+/// `max_attempts` already does, rather than sleeping past the deadline first.
+///
+/// `suppress_retries`, when `true`, forces a single attempt regardless of
+/// `retry_policy` — the same thing [`RequestBuilder::send_inner`]'s own
+/// `suppress_retries` parameter does for the plain (non-custom) breaker path
+/// during a circuit-breaker half-open probe (#2480 review, round 10): a
+/// probe is a budgeted, limited trial, and letting this retry loop turn one
+/// trial into several real network attempts spends that budget on one
+/// logical delivery rather than testing recovery with independent probes.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one seam shared by three call sites (plain custom path, follow_loop, send_ssrf_safe); \
+              splitting the request-shape fields into their own struct would still leave the \
+              retry/discard/deadline/half-open knobs alongside it, for no reduction in what a \
+              caller reasons about"
+)]
 async fn send_one(
     client: &reqwest::Client,
     method: &Method,
@@ -2308,22 +2556,55 @@ async fn send_one(
     body: Option<&Bytes>,
     retry_policy: &RetryPolicy,
     discard_response_body: bool,
+    deadline: Option<Instant>,
+    suppress_retries: bool,
 ) -> Result<Response, ClientError> {
     let start = Instant::now();
-    let max_attempts = if is_idempotent_method(method) || !retry_policy.retry_idempotent_only {
+    let max_attempts = if suppress_retries {
+        1
+    } else if is_idempotent_method(method) || !retry_policy.retry_idempotent_only {
         retry_policy.max_retries.saturating_add(1)
     } else {
         1
     };
+    let mut last_transient_err: Option<reqwest::Error> = None;
+
+    // A prior attempt's own connect/timeout error may be why the deadline is
+    // already gone — surface that error (preserving
+    // `ClientError::Request(e).is_timeout()` for callers) instead of masking
+    // it as an unrelated `InvalidUrl`.
+    let deadline_exceeded_err = |last_transient_err: &mut Option<reqwest::Error>| {
+        last_transient_err.take().map_or_else(
+            || ssrf_safe_deadline_error(url),
+            |e| ClientError::Request(e.without_url()),
+        )
+    };
 
     for attempt in 0..max_attempts {
         if attempt > 0 {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(deadline_exceeded_err(&mut last_transient_err));
+            }
             let exp = (attempt - 1).min(10);
-            let delay = Duration::from_millis(100 * (1_u64 << exp));
+            let mut delay = Duration::from_millis(100 * (1_u64 << exp));
+            if let Some(d) = deadline {
+                delay = delay.min(d.saturating_duration_since(Instant::now()));
+            }
             tokio::time::sleep(delay).await;
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(deadline_exceeded_err(&mut last_transient_err));
+            }
         }
 
         let mut req = client.request(method.clone(), url);
+        // Recomputed fresh every attempt (not just retries) rather than
+        // relying solely on `client`'s own timeout, which was fixed when the
+        // caller built it at hop-start: without this override, a retry deep
+        // into a hop's budget would still get the full original per-attempt
+        // timeout rather than what's actually left before `deadline`.
+        if let Some(d) = deadline {
+            req = req.timeout(d.saturating_duration_since(Instant::now()));
+        }
         req = inject_trace_context(req);
         for (name, value) in extra_headers {
             req = req.header(name.clone(), value.clone());
@@ -2345,10 +2626,23 @@ async fn send_one(
                     if let Some(req_timeout) = retry_policy.request_timeout {
                         sleep_delay = sleep_delay.min(req_timeout);
                     }
+                    if let Some(d) = deadline {
+                        sleep_delay = sleep_delay.min(d.saturating_duration_since(Instant::now()));
+                    }
                     tokio::time::sleep(sleep_delay).await;
-                    continue;
+                    if deadline.is_none_or(|d| Instant::now() < d) {
+                        continue;
+                    }
+                    // Deadline exceeded during (or because of) the
+                    // Retry-After wait — fall through and return this 429
+                    // response as the final outcome, exactly as running out
+                    // of max_attempts already does, instead of sleeping past
+                    // the deadline and only then giving up.
                 }
-                if is_retryable_status(status.as_u16()) && attempt + 1 < max_attempts {
+                if is_retryable_status(status.as_u16())
+                    && attempt + 1 < max_attempts
+                    && deadline.is_none_or(|d| Instant::now() < d)
+                {
                     continue;
                 }
 
@@ -2374,7 +2668,9 @@ async fn send_one(
                     url: Some(url_used),
                 });
             }
-            Err(e) if (e.is_connect() || e.is_timeout()) && attempt + 1 < max_attempts => {}
+            Err(e) if (e.is_connect() || e.is_timeout()) && attempt + 1 < max_attempts => {
+                last_transient_err = Some(e);
+            }
             Err(e) => return Err(ClientError::Request(e.without_url())),
         }
     }
@@ -3071,6 +3367,162 @@ mod tests {
         // Unknown alias falls back to client-level base_url (None in this case).
         let other = client.named("sendgrid");
         assert!(other.base_url.is_none());
+    }
+
+    // PR #2480 review, round 4 (redesign): `breaker_scoped()` moved breaker
+    // accounting for the custom send path from an external wrapper
+    // (`BreakerGuardedCall`, now removed) to a flag `send_recorded` itself
+    // reads — which is what makes the mock bypass, the capsule-replay bypass,
+    // and correct capsule *recording* of an open-breaker attempt all free:
+    // they were already correctly ordered around `send_recorded` before this
+    // flag existed, for every other caller.
+    //
+    // This test locks in the one thing the external wrapper got wrong (P1,
+    // round 1): keying the breaker by the alias a caller passed to
+    // `post`/`get`/etc. rather than the expanded destination. `self.url` is
+    // set once, by `Client::build_request`, before any `breaker_scoped()` /
+    // `ssrf_safe()` flag is even read — so there is no separate "pass the
+    // right URL" step left to get wrong.
+    #[test]
+    fn breaker_scoped_keys_by_resolved_url_not_alias() {
+        // breaker_for_url really does get_or_create against the shared global
+        // registry, so this needs the same isolation as every other test that
+        // touches it directly — otherwise a concurrently-running test's "no
+        // breaker entry for this host" assertion can observe the entry this
+        // test creates (and never cleans up otherwise).
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut base_urls = std::collections::HashMap::new();
+        base_urls.insert(
+            "hook-service".to_owned(),
+            "http://mock-receiver/base".to_owned(),
+        );
+        let config = HttpClientConfig {
+            timeout_secs: 30,
+            max_retries: 3,
+            max_retry_after_secs: 10,
+            base_urls,
+        };
+        let client = Client::from_config(&config);
+
+        let req = client
+            .named("hook-service")
+            .post("hook-service")
+            .ssrf_safe()
+            .breaker_scoped();
+        assert_eq!(req.url, "http://mock-receiver/base/hook-service");
+        assert!(req.breaker_scoped);
+
+        // The bare alias would neither parse as a URL nor name the real
+        // destination host — exactly the bug the P1 finding caught.
+        assert!(url::Url::parse("hook-service").is_err());
+        let breaker = super::breaker_for_url(None, &req.url);
+        assert_eq!(breaker.name(), "mock-receiver");
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    // PR #2480 review, round 4: `breaker_scoped()` on the custom send path
+    // must trip and fail fast exactly like the plain-path breaker already
+    // does (`test_http_client_circuit_breaker_integration`), and must key on
+    // the same host a non-custom-path request to the same URL would.
+    //
+    // No listener needed: `send_ssrf_safe` refuses a loopback destination
+    // (`SsrfBlocked`) before ever dialing, and that refusal is exactly the
+    // kind of failure the breaker must count — a subscriber pointing
+    // `target_url` at a blocked destination repeatedly must trip the breaker
+    // on those refusals just as it would on real 5xxs, not bypass accounting
+    // entirely.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn breaker_scoped_custom_path_trips_and_fails_fast() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let mut rc = crate::config::ResilienceConfig::default();
+        rc.circuit_breaker.defaults.failure_ratio_threshold = Some(0.5);
+        rc.circuit_breaker.defaults.minimum_sample_count = Some(3);
+        rc.circuit_breaker.defaults.open_duration_secs = Some(10);
+        let client = Client {
+            resilience_config: Some(Arc::new(rc)),
+            ..Client::new()
+        };
+
+        let url = "http://127.0.0.1:1/blocked";
+
+        for _ in 0..3 {
+            let res = client.post(url).ssrf_safe().breaker_scoped().send().await;
+            assert!(
+                matches!(res, Err(ClientError::SsrfBlocked(_))),
+                "expected SsrfBlocked, got {res:?}"
+            );
+        }
+
+        // The breaker for 127.0.0.1 should now be OPEN — the next attempt
+        // must fail fast with CircuitBreakerOpen rather than SsrfBlocked,
+        // proving it never re-entered send_custom (no re-resolution, no
+        // reqwest client built).
+        let res = client.post(url).ssrf_safe().breaker_scoped().send().await;
+        assert!(matches!(res, Err(ClientError::CircuitBreakerOpen)));
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    // PR #2480 review, round 4: a client with a mock registry attached must
+    // never touch the real breaker even with `breaker_scoped()` set —
+    // `send_recorded` checks `self.mock.is_some()` before it ever reads
+    // `breaker_scoped`, so a deliberately-mocked failure in one test cannot
+    // open the shared global breaker for a host name reused by an unrelated
+    // later test.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn breaker_scoped_bypassed_for_mocked_client() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let registry = Arc::new(MockRegistry::new());
+        let mock = MockSetupBuilder {
+            registry: registry.clone(),
+            alias: "http://mock-receiver/hook".to_owned(),
+            method: None,
+            path: None,
+        }
+        .post("/hook")
+        .respond_with(500, serde_json::json!({ "error": "down" }));
+        let client = Client::new().with_mock(registry);
+
+        // More attempts than minimum_sample_count would need to trip a real
+        // breaker at default thresholds — every one must still reach the
+        // mock rather than short-circuiting on CircuitBreakerOpen.
+        for _ in 0..12 {
+            let res = client
+                .named("http://mock-receiver/hook")
+                .post("http://mock-receiver/hook")
+                .ssrf_safe()
+                .breaker_scoped()
+                .send()
+                .await;
+            let res = res.expect("a mocked client must never see CircuitBreakerOpen");
+            assert_eq!(res.status().as_u16(), 500);
+        }
+        mock.expect_called(12);
+
+        // No breaker entry should exist for the mocked host at all.
+        assert!(
+            crate::circuit_breaker::global_registry()
+                .all_breakers()
+                .iter()
+                .all(|b| b.name() != "mock-receiver"),
+            "a mocked send must never create a real breaker entry"
+        );
+
+        crate::circuit_breaker::global_registry().clear();
     }
 
     // TEST 26: from_request_parts uses AutumnConfig.http when no HttpConfig extension.
