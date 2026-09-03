@@ -168,16 +168,45 @@ dependency, from scratch, on every sample, forever.** This report's
 warm-target apparatus pays that cost **at most once**, on whichever
 checkpoint first introduces a given dependency — after that, it's cached
 and invisible in every later delta, even though CI keeps paying it every
-week. `git log --name-only -- Cargo.lock` over this window shows **4 of
-the 31 non-fix commits actually touched `Cargo.lock`**: `fec52215`
-(zero-downtime state migration, this report's second-largest post-fix
-delta at +4,591ms), `61bdd9c2` (Web Push, +1,995ms), `bc99a4b8` (scaffold
-DSL constraints, −733ms), and `141f36ef` (a `base64` patch-version bump,
-−2,518ms, unlikely to matter much on its own). **This report's deltas for
-those four commits cannot be trusted as representative of their true,
-CI-relevant recurring contribution** — the apparatus can only undercount,
-never overcount, a genuine per-dependency cost, since it's structurally
-incapable of showing more than a one-time compile for anything new. It
+week. `git log --name-only -- Cargo.lock` over this window flags **4 of
+the 31 non-fix commits as touching `Cargo.lock`** — but "touches the
+file" is a crude proxy for "changes *this exact feature set's* resolved
+graph," and checking each one against `cargo tree -p autumn-web
+--no-default-features --features
+maud,htmx,tailwind,cache-moka,http-client,reporting` (Codex P2 on
+`d2a980c3`, verified independently rather than taken on trust — see the
+per-commit correction below) changes the list:
+
+- `fec52215` (zero-downtime state migration, this report's second-largest
+  post-fix delta at +4,591ms) is a **confirmed false positive**: its only
+  `Cargo.lock` change adds the unrelated `hot-upgrade` example/workspace
+  package, which is absent from this feature set's resolved tree. Its
+  delta should **not** be discounted on this basis — if it's real, the
+  cause is something else (or noise, per the significance discussion
+  above).
+- `141f36ef` (a `base64` patch-version bump) and `61bdd9c2` (Web Push)
+  are **confirmed real**: `cargo tree` shows both `base64 v0.22.1` and
+  `v0.23.1` coexisting in this exact feature set (the bump adds a second
+  compiled version, not a swap), and `p256 v0.13.2` — the crate Web
+  Push's own commit message says gained a new `ecdh` feature flag — is in
+  the tree too.
+- `bc99a4b8` (scaffold DSL constraints) is **disputed**: Codex's finding
+  characterized it as "only adds `serde_urlencoded` to `autumn-cli`,"
+  but the actual `Cargo.lock` diff (`git show bc99a4b8 -- Cargo.lock`)
+  adds `serde_urlencoded` to **`reqwest`'s own** dependency list, and
+  `cargo tree` confirms `reqwest` (via the `http-client` feature this
+  build enables) resolves `serde_urlencoded v0.7.1` into this exact tree.
+  Kept flagged, on the verified evidence, contrary to the review comment
+  that prompted this recheck — noted here rather than either accepted or
+  silently dropped.
+
+Net: 3 of the 4 originally-flagged commits (`141f36ef`, `61bdd9c2`,
+`bc99a4b8`) are confirmed relevant to this feature set's resolved graph;
+`fec52215` is not. **For the 3 confirmed commits, this report's deltas
+cannot be trusted as representative of their true, CI-relevant recurring
+contribution** — the apparatus can only undercount, never overcount, a
+genuine per-dependency cost, since it's structurally incapable of showing
+more than a one-time compile for anything new. It
 also means the "total window effect" and "this proxy's absolute saving vs.
 CI's" comparisons throughout Assay and Verdict are weaker than stated
 there: they are not just measuring a narrower workload (library-only, no
@@ -487,14 +516,18 @@ live report needs the map:
   **empty** `target/` and no compiler-wrapper cache on every single
   sample (see Apparatus's fourth correction). This apparatus pays each
   external dependency's compile cost once per introduction; CI pays it on
-  every sample, forever. Four of the 31 non-fix commits touched
-  `Cargo.lock`, so their deltas in this report specifically cannot be
-  trusted as CI-representative — and the apparatus can only *undercount*
-  that cost, never overcount it, so the true CI-relevant total for this
-  window is more likely to exceed this proxy's ≈−13,000ms-implied
-  workspace-only cost than to match it. The parent report's CI/runner-
-  variance confound (1-sample local A/B vs. 3-sample CI p95, different
-  runners) is also still live and undistinguished from any of this.
+  every sample, forever. Of the 4 non-fix commits that touched
+  `Cargo.lock`, 3 (`141f36ef`, `61bdd9c2`, `bc99a4b8`) are confirmed via
+  `cargo tree` to actually affect this feature set's resolved graph (see
+  Apparatus's fourth correction for the per-commit check and the one
+  confirmed false positive, `fec52215`) — their deltas in this report
+  specifically cannot be trusted as CI-representative, and the apparatus
+  can only *undercount* that cost, never overcount it, so the true
+  CI-relevant total for this window is more likely to exceed this proxy's
+  ≈−13,000ms-implied workspace-only cost than to match it. The parent
+  report's CI/runner-variance confound (1-sample local A/B vs. 3-sample CI
+  p95, different runners) is also still live and undistinguished from any
+  of this.
 
 **What would resolve this, as an explicit follow-up (not chartered or run
 here):**
