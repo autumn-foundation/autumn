@@ -625,7 +625,11 @@ def _ungrouped(segment):
 # after an arbitrary prose prefix starts reporting sentences. That reasoning was
 # right about arbitrary prefixes and wrong to lump these in with them: `command`
 # and `run` are not arbitrary, they are the keys that mean "this is a command".
-_COMMAND_KEY = re.compile(r'^(command|run|entrypoint|cmd|exec|script):$', re.I)
+_COMMAND_KEYS = r'command|run|entrypoint|cmd|exec|script'
+_COMMAND_KEY = re.compile(r'^(' + _COMMAND_KEYS + r'):$', re.I)
+# The same keys in TOML, where the value is quoted after an `=`:
+# `command = "autumn migrate --with-maintenance"` (maintenance-mode.md).
+_COMMAND_KEY_BARE = re.compile(r'^(' + _COMMAND_KEYS + r')$', re.I)
 
 
 def _autumn_exe(tok):
@@ -678,9 +682,29 @@ def _nested_command(segment, j, tok):
     img sbom` — would read as an empty command line and be reported as needing a
     subcommand, on a page that is correct.
     """
+    # What marks a quoted token as a command line is the thing in front of it,
+    # never its contents. A shell's `-c`/`-C`/`--command`, a scalar key
+    # (`command: "…"`), or that key's TOML spelling (`command = "…"`).
+    #
+    # Judging by contents instead — "it starts with `autumn `" — was the earlier
+    # rule and it is wrong in both directions: it misses
+    # `sh -c "AUTUMN_ENV=prod autumn …"`, whose first word is a prefix, and it
+    # reads `autumn maintenance on --reason "autumn migrate failed"` as an
+    # invocation of `autumn migrate failed`, reporting a correct page.
+    if j == 0:
+        return False
+    prev = segment[j - 1]
+    after_c = bool(_SHELL_C.match(prev))
     if ' ' in tok:
-        return _autumn_exe(tok.split(' ', 1)[0])
-    return _autumn_exe(tok) and j > 0 and bool(_SHELL_C.match(segment[j - 1]))
+        marked = after_c or bool(_COMMAND_KEY.match(prev))
+        if not marked and prev == '=' and j > 1:
+            marked = bool(_COMMAND_KEY_BARE.match(segment[j - 2]))
+        return marked
+    # A SINGLE token is a command line only after `-c`, never after a key: the
+    # key branch already reads `command: autumn migrate` inline, and treating
+    # its bare `autumn` as a nested line too yielded a second, empty invocation
+    # that reported the page as needing a subcommand.
+    return after_c and _autumn_exe(tok)
 
 
 def _after_image(segment, k):
@@ -705,6 +729,31 @@ def _after_image(segment, k):
         yield ' '.join(segment[k:]), segment[k:]
 
 
+def _in_substitutions(segment):
+    """Yield the commands written INSIDE `$( … )` in a segment.
+
+    Re-enters the same parser on the substitution's own tokens, so a chain or
+    an environment prefix inside one is handled exactly as it is outside.
+    """
+    i = 0
+    while i < len(segment):
+        if segment[i].endswith('$') and i + 1 < len(segment) \
+                and segment[i + 1].startswith('('):
+            depth, start = 0, i + 1
+            i += 1
+            while i < len(segment):
+                depth += _paren_delta(segment[i])
+                i += 1
+                if depth <= 0:
+                    break
+            inner = [tok for tok in segment[start:i]
+                     if not all(c in _PUNCTUATION for c in tok)]
+            if inner:
+                yield from _from_tokens(inner)
+            continue
+        i += 1
+
+
 def commands(text):
     """Yield (display, argv_tokens) for every `autumn …` in command position.
 
@@ -726,6 +775,11 @@ def commands(text):
     tokens = tokenize(text)
     if tokens is None:
         tokens = text.split()
+    yield from _from_tokens(tokens)
+
+
+def _from_tokens(tokens):
+    """The token half of `commands()`, so nested contexts can re-enter it."""
     for segment in _segments(tokens):
         i = 0
         while i < len(segment) and (segment[i] in _PROMPT or _ENV_TOKEN.match(segment[i])):
@@ -773,16 +827,18 @@ def commands(text):
                 yield from _after_image(segment, j + 2)
             elif tok == '--entrypoint=autumn':
                 yield from _after_image(segment, j + 1)
-            elif _nested_command(segment, j, tok) and (inner := tokenize(tok)):
-                # The inner command line goes through the SAME segment split as
-                # the outer one: `-C "autumn migrate && autumn nope"` is a chain
-                # too, and yielding it as one argv left everything after the
-                # first operator unjudged. Its head is matched with the same
-                # `_autumn_exe` as the outer line, so a path-qualified spelling
-                # (`sh -c "/usr/local/bin/autumn …"`) is not a second-class one.
-                for part in _segments(inner):
-                    if part and _autumn_exe(part[0]):
-                        yield ' '.join(part[1:]), part[1:]
+            elif _nested_command(segment, j, tok):
+                # A nested command line is RE-ENTERED, not re-implemented. It
+                # gets environment prefixes, chains, path-qualified spellings
+                # and everything else for free, because it is the same parser:
+                # `sh -c "AUTUMN_ENV=prod autumn migrate"` had none of that when
+                # this branch matched only a literal `autumn ` head of its own.
+                yield from commands(tok)
+
+        # A command substitution is a command line too. Stepping over it to
+        # reach what follows the assignment is only half the job —
+        # `OUT=$(autumn migrate)` runs a command that nothing was reading.
+        yield from _in_substitutions(segment)
 
 
 # A token that could name a command. Anything else — a flag, a `<PLACEHOLDER>`,
@@ -1314,6 +1370,28 @@ def self_test():
     expect([d for _, d, _, _ in invocations(ep)] == ['migrate run'],
            f'--entrypoint autumn is a value, read via the image rule: {list(invocations(ep))}')
 
+    # --- a nested command line is RE-ENTERED through the same parser, so an
+    # environment prefix or a chain inside one needs no separate handling.
+    envc = '```bash\nsh -c "AUTUMN_ENV=prod autumn migrate run"\n```'
+    expect([d for _, d, _, _ in invocations(envc)] == ['migrate run'],
+           f'an env prefix inside a -c wrapper must be read: {list(invocations(envc))}')
+    subcmd = '```bash\nOUT=$(autumn migrate run)\n```'
+    expect([d for _, d, _, _ in invocations(subcmd)] == ['migrate run'],
+           f'a command INSIDE a substitution must be read: {list(invocations(subcmd))}')
+    both = '```bash\nOUT=$(autumn routes) autumn migrate run\n```'
+    expect(sorted(d for _, d, _, _ in invocations(both)) == ['migrate run', 'routes'],
+           f'the substitution and what follows it are both commands: {list(invocations(both))}')
+    toml_cmd = '```toml\ncommand = "autumn migrate run"\n```'
+    expect([d for _, d, _, _ in invocations(toml_cmd)] == ['migrate run'],
+           f'a TOML `command = "…"` value must be read: {list(invocations(toml_cmd))}')
+
+    # What marks a quoted token as a command line is its PREFIX, not its
+    # contents — otherwise a message that happens to start with `autumn ` is
+    # read as an invocation and a correct page is reported.
+    msg = '```bash\nautumn maintenance on --reason "autumn migrate failed"\n```'
+    expect([d for _, d, _, _ in invocations(msg)] == ['maintenance on --reason autumn migrate failed'],
+           f'a --reason message is an argument, not a nested command: {list(invocations(msg))}')
+
     # A scalar key that means "a command follows".
     compose = '```yaml\nservices:\n  migrate:\n    command: autumn migrate run\n```'
     expect([d for _, d, _, _ in invocations(compose)] == ['migrate run'],
@@ -1486,7 +1564,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f"self-test: {13 + 47 + 54 + 4 - len(failures)} passed, {len(failures)} failed")
+    print(f"self-test: {13 + 47 + 59 + 4 - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
