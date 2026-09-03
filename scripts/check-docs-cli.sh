@@ -851,11 +851,18 @@ _FOLDED_KEY = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
 # Any mapping key, used only to spot where one object ends and its sibling
 # begins — Compose names its services this way rather than with list items.
 _MAPPING_KEY = re.compile(r'^(\s*)[A-Za-z_][\w.-]*:(\s|$)')
+# A markdown block-quote marker, which prefixes every line of a fence nested
+# inside one.
+_BLOCKQUOTE = re.compile(r'^\s*(?:>\s?)+')
 # A heredoc's body is DATA the shell writes, not commands it runs. A page
 # showing `cat > file <<'EOF'` around some example text was having that text
 # scanned as if it were runnable, so an illustrative `autumn db` inside one
 # failed the gate.
-_HEREDOC = re.compile(r'<<-?\s*(?:"([^"]+)"|\'([^\']+)\'|([A-Za-z_][\w-]*))')
+#
+# The lookbehind excludes bash's HERE-STRING, `<<<EOF`, which feeds one word
+# to stdin and consumes no following lines at all — reading it as a heredoc
+# swallowed the command underneath it.
+_HEREDOC = re.compile(r'(?<!<)<<-?\s*(?:"([^"]+)"|\'([^\']+)\'|([A-Za-z_][\w-]*))')
 # A slot key whose value is a plain scalar on the same line. Compose mixes the
 # forms freely — `entrypoint: ["autumn"]` with `command: migrate` — and reading
 # only the bracketed form left the pair half-assembled, so a valid recipe
@@ -1074,7 +1081,7 @@ def _unwrap(tokens):
     return inner
 
 
-def _embedded_substitutions(tok):
+def _embedded_spans(tok):
     """Yield the text inside each `$( … )` written within a single token.
 
     The depth count is quote-aware: a parenthesis inside a quoted argument is
@@ -1106,31 +1113,43 @@ def _embedded_substitutions(tok):
             j += 1
         if j >= len(tok):
             return
-        yield tok[start + 2:j]
+        yield start, tok[start + 2:j]
         i = j + 1
 
 
-def _single_quoted(text):
-    """The substrings of `text` that sit inside single quotes.
+def _mask_single_quoted(text):
+    """`text` with single-quoted CONTENT replaced by filler of equal length.
 
     shlex removes the quote delimiters before anything downstream can ask, so
     a literal `'$(autumn db)'` reached the substitution recursion looking
-    exactly like a real one and a `printf` of that text was reported as a
-    command. Single quotes only: double quotes do not stop substitution.
+    exactly like a real one, and a `printf` of that text was reported as a
+    command. Masking answers the question positionally: a body that survives
+    into the masked copy was written outside single quotes and runs.
+
+    Testing instead whether the body TEXT appeared anywhere single-quoted
+    suppressed a real substitution that merely repeated a quoted one —
+    `printf '%s' '$(autumn nope)'; OUT="$(autumn nope)"` runs the second.
+
+    Single quotes only: double quotes do not stop substitution.
     """
-    out, i = [], 0
-    while True:
-        start = text.find("'", i)
-        if start < 0:
-            return out
-        end = text.find("'", start + 1)
-        if end < 0:
-            return out
-        out.append(text[start + 1:end])
+    out, i, n = [], 0, len(text)
+    while i < n:
+        ch = text[i]
+        out.append(ch)
+        i += 1
+        if ch != "'":
+            continue
+        end = text.find("'", i)
+        if end < 0:                             # unbalanced: mask the rest
+            out.append('x' * (n - i))
+            break
+        out.append('x' * (end - i))
+        out.append("'")
         i = end + 1
+    return ''.join(out)
 
 
-def _in_substitutions(segment, literals=()):
+def _in_substitutions(segment, masked=()):
     """Yield the commands written INSIDE `$( … )` in a segment.
 
     Re-enters the same parser on the substitution's own tokens, so a chain or
@@ -1152,10 +1171,16 @@ def _in_substitutions(segment, literals=()):
         # `OUT="$(autumn migrate)"` is quoted, so shlex keeps the whole
         # substitution inside ONE token and the `$` / `(` never sit adjacent.
         # The text between `$(` and its matching `)` is still a command line.
-        for text in _embedded_substitutions(segment[i]):
-            # …unless the whole substitution was written inside single quotes,
-            # where the shell prints it rather than running it.
-            if any(text in lit for lit in literals):
+        for start, text in _embedded_spans(segment[i]):
+            # …unless THIS substitution was written inside single quotes, where
+            # the shell prints it rather than running it. Masking preserves
+            # length, so the same offset in the masked token still reads `$(`
+            # only when the shell would have executed it. Comparing the body
+            # TEXT instead was wrong twice over: it suppressed a real
+            # substitution that repeated a quoted one, and it suppressed a real
+            # one whose own body contained a quoted character.
+            mask_tok = masked[i] if i < len(masked) else ''
+            if mask_tok[start:start + 2] != '$(':
                 continue
             yield from commands(text)
         i += 1
@@ -1182,12 +1207,22 @@ def commands(text):
     tokens = tokenize(text)
     if tokens is None:
         tokens = text.split()
-    yield from _from_tokens(tokens, _single_quoted(text))
+    masked = tokenize(_mask_single_quoted(text))
+    yield from _from_tokens(tokens, masked)
 
 
-def _from_tokens(tokens, literals=()):
+def _from_tokens(tokens, masked=None):
     """The token half of `commands()`, so nested contexts can re-enter it."""
-    for segment in _segments(tokens):
+    segments = _segments(tokens)
+    # The masked copy is tokenized and segmented in parallel. Masking replaces
+    # only characters INSIDE single quotes, leaving every delimiter and
+    # operator in place, so the two shapes agree — and when they somehow do
+    # not, the masked view is dropped rather than trusted.
+    masked_segments = _segments(masked) if masked is not None else None
+    if masked_segments is None or len(masked_segments) != len(segments) \
+            or any(len(a) != len(b) for a, b in zip(segments, masked_segments)):
+        masked_segments = segments
+    for segment, masked_segment in zip(segments, masked_segments):
         i = _cron_prefix(segment)
         while i < len(segment) and (segment[i] in _PROMPT or segment[i] in _CONTROL
                                     or _ENV_TOKEN.match(segment[i])):
@@ -1272,7 +1307,7 @@ def _from_tokens(tokens, literals=()):
         # A command substitution is a command line too. Stepping over it to
         # reach what follows the assignment is only half the job —
         # `OUT=$(autumn migrate)` runs a command that nothing was reading.
-        yield from _in_substitutions(segment, literals)
+        yield from _in_substitutions(segment, masked_segment)
 
 
 # A token that could name a command. Anything else — a flag, a `<PLACEHOLDER>`,
@@ -1402,6 +1437,7 @@ def invocations(text):
         for display, argv in _from_tokens(items):
             yield at, display, argv, FENCED_COMMAND
 
+    quoted_fence = False    # the open fence sits inside a markdown block quote
     heredoc = None          # the terminator of a heredoc being consumed
     folded = None           # paragraphs of a folded (`>`) block scalar
     folded_at = None
@@ -1456,7 +1492,13 @@ def invocations(text):
         para_len += len(stripped) + 1
 
     for lineno, line in enumerate(text.split('\n'), 1):
-        m = re.match(r'^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)', line)
+        # A fence nested in a BLOCK QUOTE carries a `>` on every line, so the
+        # marker is not at the start and the whole block went unread. The
+        # prefix is stripped only while such a fence is open, because inside an
+        # ordinary fence a leading `>` is a redirection, not a quote marker.
+        if fence is not None and quoted_fence:
+            line = _BLOCKQUOTE.sub('', line, count=1)
+        m = re.match(r'^\s*(?:>\s?)*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)', line)
         if m:
             held, held_at, heredoc = [], None, None   # a fence boundary ends any hold
             yield from close_folded()           # …a folded scalar
@@ -1465,8 +1507,9 @@ def invocations(text):
             yield from _spans(take_paragraph(), commands)
             if fence is None:
                 fence, lang = m.group(1)[0], m.group(2).lower()
+                quoted_fence = bool(_BLOCKQUOTE.match(line))
             elif line.strip().startswith(fence * 3):
-                fence, lang = None, None
+                fence, lang, quoted_fence = None, None, False
             continue
 
         if fence is None:
@@ -1533,6 +1576,11 @@ def invocations(text):
         item = _LIST_ITEM.match(line)
         if pending is not None and item and len(item.group(1)) >= pending_indent:
             pending.append(_list_value(item.group(2)))
+            continue
+        # YAML allows a blank line or a standalone comment between sequence
+        # entries. Closing the list on one reduced a valid `command:` to its
+        # first element and reported a bare root on a correct manifest.
+        if pending is not None and not _strip_comment(line).strip():
             continue
         yield from close_pending()
         inline = _KEY_INLINE.match(keyline) or _ARGS_INLINE.match(keyline)
@@ -1608,8 +1656,15 @@ def invocations(text):
             yield at, display, argv, FENCED_COMMAND
         # …and a line that OPENS a heredoc is itself a command, but everything
         # after it until the terminator is the data it writes.
-        opener = _HEREDOC.search(logical)
-        if opener:
+        # The DELIMITER is read from the real line — masking would replace the
+        # name inside `<<'EOF'` with filler — while the masked copy decides
+        # whether the operator itself was written inside single quotes. A
+        # `<<EOF` mentioned in a comment or quoted as an argument opens
+        # nothing, and treating it as an opener silenced every line after it.
+        stripped = _strip_comment(logical)
+        masked_line = _mask_single_quoted(stripped)
+        opener = _HEREDOC.search(stripped)
+        if opener and masked_line[opener.start():opener.start() + 2] == '<<':
             heredoc = next(g for g in opener.groups() if g)
         # Backticks inside a fence are not markdown spans. In a shell block
         # they are legacy command substitution — `` OUT=`autumn migrate` `` is
@@ -2208,6 +2263,17 @@ def self_test():
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate run'],
                f'a heredoc body ({opener}) is not scanned, and the line after it is: {got}')
+    # `<<<EOF` is a HERE-STRING: it feeds one word to stdin and consumes no
+    # following lines. Reading it as a heredoc swallowed the command under it.
+    hstring = '```bash\ncat <<<EOF\nautumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(hstring)] == ['migrate run'],
+           f'a here-string opens no heredoc: {list(invocations(hstring))}')
+    # …and a `<<EOF` that is only mentioned opens nothing either.
+    for mention in ('# see <<EOF below', "echo '<<EOF'"):
+        doc = f'```bash\n{mention}\nautumn migrate run\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'],
+               f'a mentioned <<EOF ({mention}) opens nothing: {got}')
     # An unterminated heredoc must not swallow the rest of the FILE.
     unterminated = ('```bash\ncat <<EOF\nautumn db\n```\n\n'
                     '```bash\nautumn migrate run\n```')
@@ -2614,6 +2680,26 @@ def self_test():
            'a command with no args sibling is still a bare root')
     expect(list(invocations('```yaml\nargs:\n  - nope\n```')) == [],
            'an args: key with no command before it runs nothing')
+    # YAML allows a blank line or a standalone comment between sequence
+    # entries. Closing the list on one reduced a valid `command:` to its first
+    # element and reported a bare root on a correct manifest.
+    for label, gap in [('blank', ''), ('comment', '  # the subcommand')]:
+        doc = f'```yaml\ncommand:\n  - autumn\n{gap}\n  - migrate\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate'], f'a {label} line must not close the list: {got}')
+
+    # --- a fence nested in a markdown BLOCK QUOTE carries a `>` on every line,
+    # so the marker is not at the start of it. This corpus has six such pages.
+    quoted = '> ```bash\n> autumn migrate run\n> ```'
+    expect([d for _, d, _, _ in invocations(quoted)] == ['migrate run'],
+           f'a block-quoted fence must be read: {list(invocations(quoted))}')
+    expect([w for _, _, _, w in invocations(quoted)] == [FENCED_COMMAND],
+           'and its contents are runnable, like any other fence')
+    # …while inside an ORDINARY fence a leading `>` is a redirection, which is
+    # why the prefix is only stripped for a fence that opened inside a quote.
+    redir = '```bash\n>/tmp/out autumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(redir)] == ['migrate run'],
+           f'a leading redirection is not a quote marker: {list(invocations(redir))}')
     # A YAML mapping is unordered, so `args:` may be written FIRST. Requiring
     # the command half to arrive first made source order significant and
     # reported a valid manifest as a bare root.
@@ -2891,6 +2977,18 @@ def self_test():
         doc = f'```bash\n{real}\n```'
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate run'], f'a real substitution still runs: {real} -> {got}')
+    # The decision is POSITIONAL. Asking whether the body text appeared
+    # anywhere single-quoted was wrong twice over: it suppressed a real
+    # substitution that merely repeated a quoted one…
+    both = '```bash\nprintf \'%s\' \'$(autumn run)\'; OUT="$(autumn run)"\n```'
+    expect([d for _, d, _, _ in invocations(both)] == ['run'],
+           f'a real substitution beside an identical quoted one runs, and the '
+           f'quoted one stays quiet: {list(invocations(both))}')
+    # …and one whose own body contains a quoted character, which is the
+    # quoted-paren case from an earlier round reaching the same code.
+    inner = '```bash\nOUT="$(printf \'(\'; autumn migrate run)"\n```'
+    expect([d for _, d, _, _ in invocations(inner)] == ['migrate run'],
+           f'a body containing a quote is not itself quoted: {list(invocations(inner))}')
     # …and drift inside a literal run is still reported, just not as a command.
     lit_drift = "```bash\nprintf '%s\\n' '`autumn nope`'\n```"
     bad = [d for _, d, a, w in invocations(lit_drift)
