@@ -126,13 +126,15 @@ impl ExecProvider {
     /// credentials autumn itself handed the provider, plus whatever the
     /// inherited environment holds under a credential-shaped name.
     fn secrets(&self) -> Vec<String> {
-        let inherited = match &self.env_override {
-            Some(vars) => secret_env_values(vars.iter().map(|(k, v)| (k.as_str(), v.as_str()))),
-            None => {
+        let inherited = self.env_override.as_ref().map_or_else(
+            || {
+                // `env::vars()` yields owned pairs; collected first so the
+                // filter can borrow them.
                 let vars: Vec<(String, String)> = std::env::vars().collect();
                 secret_env_values(vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            }
-        };
+            },
+            |vars| secret_env_values(vars.iter().map(|(k, v)| (k.as_str(), v.as_str()))),
+        );
         self.secrets
             .iter()
             .map(|s| super::SecretString::expose(s).to_owned())
@@ -185,7 +187,7 @@ impl ExecProvider {
         let finished = tokio::time::timeout(HOOK_TIMEOUT, async {
             let mut stderr = Vec::new();
             let drain = read_bounded(&mut pipe, &mut stderr, MAX_STDERR_BYTES);
-            let (_, status) = tokio::join!(drain, child.wait());
+            let ((), status) = tokio::join!(drain, child.wait());
             (stderr, status)
         })
         .await;
