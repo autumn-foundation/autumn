@@ -834,7 +834,40 @@ _FOLDED_KEY = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
 # Any mapping key, used only to spot where one object ends and its sibling
 # begins — Compose names its services this way rather than with list items.
 _MAPPING_KEY = re.compile(r'^(\s*)[A-Za-z_][\w.-]*:(\s|$)')
+# A slot key whose value is a plain scalar on the same line. Compose mixes the
+# forms freely — `entrypoint: ["autumn"]` with `command: migrate` — and reading
+# only the bracketed form left the pair half-assembled, so a valid recipe
+# reported a bare root. Block indicators (`>`, `|`) and anchors are excluded:
+# those are handled before this, or are not values at all.
+_KEY_SCALAR = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
+                         r'|args):\s*(?![>|&*\[])(\S.*)$', re.I)
 _ENTRY_KEY_LINE = re.compile(r'^\s*' + _QUALIFIED + r'(?:' + _ENTRY_KEYS + r'):', re.I)
+_ARGS_KEY_LINE = re.compile(r'^\s*' + _QUALIFIED + r'args:', re.I)
+
+
+def _backticks(line):
+    """Yield (executes, text) for every backtick run on the line.
+
+    `executes` is True when the run OPENS outside single quotes, which is
+    exactly when a shell would run it: single quotes make a backtick literal,
+    double quotes do NOT, and a backslash escapes the next character except
+    inside single quotes. Treating every run alike marked
+    `printf '%s\\n' '`autumn db`'` as a command and reported a correct
+    snippet as broken; a literal run is still yielded, as a mention.
+    """
+    literal, in_single, i = [], False, 0
+    while i < len(line):
+        if line[i] == '\\' and not in_single:
+            literal.extend([in_single] * 2)
+            i += 2
+            continue
+        literal.append(in_single)
+        if line[i] == "'":
+            in_single = not in_single
+        i += 1
+    literal.extend([in_single] * (len(line) - len(literal)))
+    for m in re.finditer(r'`([^`\n]+)`', line):
+        yield (not literal[m.start()]), m.group(1)
 
 
 def _strip_comment(text):
@@ -1123,7 +1156,12 @@ def _from_tokens(tokens):
             elif tok == '--entrypoint' and j + 2 < len(segment) \
                     and _autumn_exe(segment[j + 1]):
                 yield from _after_image(segment, j + 2)
-            elif tok == '--entrypoint=autumn':
+            elif tok.startswith('--entrypoint=') \
+                    and _autumn_exe(tok[len('--entrypoint='):]):
+                # The attached form takes a path just as the separated one
+                # does — `--entrypoint=/usr/local/bin/autumn` — and comparing
+                # the whole token against one spelling accepted only the bare
+                # word, so the path-qualified recipe went unread.
                 yield from _after_image(segment, j + 1)
             elif _nested_command(segment, j, tok):
                 # A nested command line is RE-ENTERED, not re-implemented. It
@@ -1362,6 +1400,27 @@ def invocations(text):
             if inline:
                 yield from close_pending()
             continue
+        # The same keys with a plain scalar value. A scalar fills its slot like
+        # a list does, so `entrypoint: ["autumn"]` + `command: migrate` is one
+        # argv — and routing it here rather than leaving it to the line scan is
+        # what keeps a single report per recipe instead of two readings of it.
+        scalar = _KEY_SCALAR.match(keyline)
+        if scalar:
+            if _ARGS_KEY_LINE.match(keyline):
+                kind = 'args'
+            elif _ENTRY_KEY_LINE.match(keyline):
+                kind = 'entry'
+            elif _EXEC_KEY_LINE.match(keyline):
+                kind = 'cmd'
+            else:
+                kind = None         # `script:`/`run:` — one whole shell line,
+            if kind:                # which the ordinary line scan reads.
+                value = scalar.group(2)
+                pending_kind, pending_at = kind, lineno
+                pending_indent = len(scalar.group(1))
+                pending = tokenize(value) or value.split()
+                yield from close_pending()
+                continue
         # A held half waits for its sibling across intervening keys, because a
         # YAML mapping is unordered — `image:` sits between the two often
         # enough, and `args:` may be written first.
@@ -1406,8 +1465,13 @@ def invocations(text):
         # and `generators.md:514` is a rust `//!` doc comment. Those name a
         # command group the ordinary way and must not read as bare-group
         # defects — but they are still fenced, so no waiver reaches them.
-        runnable = lang in _SHELL_LANGS and not line.lstrip().startswith('#')
-        for span in re.findall(r'`([^`\n]+)`', line):
+        shell_line = lang in _SHELL_LANGS and not line.lstrip().startswith('#')
+        for executes, span in _backticks(line):
+            # Single quotes make a backtick literal — `printf '%s\n' '`autumn
+            # db`'` prints the text and runs nothing — so a run opening inside
+            # them is data, not a command. It is still read as a mention, so
+            # drift in it is reported; it just is not a runnable command line.
+            runnable = shell_line and executes
             for display, argv in commands(span):
                 yield lineno, display, argv, (FENCED_COMMAND if runnable
                                               else FENCED_SPAN)
@@ -2377,6 +2441,25 @@ def self_test():
            f'a sibling key of the same object keeps the pair open: '
            f'{list(invocations(same_object))}')
 
+    # Compose mixes the list and scalar forms freely, so a scalar fills its
+    # slot like a list does. Reading only the bracketed form left the pair
+    # half-assembled and reported a valid recipe as a bare root.
+    for label, doc in [
+        ('list + scalar', '```yaml\nentrypoint: ["autumn"]\ncommand: migrate\n```'),
+        ('quoted scalar', '```yaml\nentrypoint: ["autumn"]\ncommand: "migrate"\n```'),
+        ('scalar first', '```yaml\ncommand: migrate\nentrypoint: ["autumn"]\n```'),
+        ('both scalar', '```yaml\nentrypoint: autumn\ncommand: migrate\n```'),
+    ]:
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate'], f'a scalar slot ({label}) must assemble: {got}')
+    sdrift = '```yaml\nentrypoint: ["autumn"]\ncommand: "run"\n```'
+    expect([d for _, d, _, _ in invocations(sdrift)] == ['run'],
+           f'drift in a scalar slot is read: {list(invocations(sdrift))}')
+    # A scalar that is a whole command on its own must still be read ONCE.
+    lone = '```yaml\ncommand: autumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(lone)] == ['migrate run'],
+           f'a lone scalar command is read exactly once: {list(invocations(lone))}')
+
     # The accumulator's state must not collide with the backslash-continuation
     # buffer it shares a scope with — they were both called `held`, and a
     # continuation inside a fence then reported the wrong line.
@@ -2479,6 +2562,27 @@ def self_test():
     expect([w for _, _, _, w in invocations('```yaml\nkey: `autumn db`\n```')]
            == [FENCED_SPAN],
            'a backtick span in a non-shell fence stays a mention')
+    # Single quotes make a backtick literal, so the shell prints it rather than
+    # running it. Double quotes do NOT, which is why only single ones count.
+    literal_bt = "```bash\nprintf '%s\\n' '`autumn db`'\n```"
+    expect([w for _, _, _, w in invocations(literal_bt)] == [FENCED_SPAN],
+           f'a single-quoted backtick is data: {list(invocations(literal_bt))}')
+    expect([w for _, _, _, w in invocations('```bash\necho "`autumn db`"\n```')]
+           == [FENCED_COMMAND],
+           'a double-quoted backtick still runs')
+    # …and drift inside a literal run is still reported, just not as a command.
+    lit_drift = "```bash\nprintf '%s\\n' '`autumn nope`'\n```"
+    bad = [d for _, d, a, w in invocations(lit_drift)
+           if resolve(a, surface, runnable=w == FENCED_COMMAND)]
+    expect(bad == ['nope'], f'drift in a literal backtick is still named: {bad}')
+
+    # Docker's attached option form takes a path just as the separated one
+    # does; comparing the whole token to one spelling read only the bare word.
+    for form in ('--entrypoint autumn', '--entrypoint=autumn',
+                 '--entrypoint=/usr/local/bin/autumn', '--entrypoint ./autumn'):
+        doc = f'```bash\ndocker run --rm {form} img migrate run\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'], f'{form} must be read: {got}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
