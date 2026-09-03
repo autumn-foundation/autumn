@@ -231,11 +231,16 @@ fn add_belongs_to_imports(
         // Defensive: `render_model_file` always emits this line, but if a
         // hand-edited model dropped it, fall back to just above `#[model]`
         // rather than silently skipping imports the generated code needs.
-        return source.replacen(
-            MODEL_ATTR,
-            &format!("{schema_import}{model_import}{MODEL_ATTR}"),
-            1,
-        );
+        // Guarded the same way as the normal path below, so this stays
+        // idempotent even if only one of the two imports is already there.
+        let mut prefix = String::new();
+        if !source.contains(&schema_import) {
+            prefix.push_str(&schema_import);
+        }
+        if !source.contains(&model_import) {
+            prefix.push_str(&model_import);
+        }
+        return source.replacen(MODEL_ATTR, &format!("{prefix}{MODEL_ATTR}"), 1);
     };
     let Some(line_end_rel) = source[own_start..].find('\n') else {
         return source.to_owned();
