@@ -37,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [idempotency, routing, headers, session, body, dns]
+        target: [idempotency, routing, headers, session, body, dns, sandbox]
     steps:
       - uses: actions/checkout@v7
       - name: Report and enlarge headroom for the ASAN build

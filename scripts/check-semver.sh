@@ -240,7 +240,8 @@ for crate in "${CRATES[@]}"; do
     # It cannot equal either set alone: cargo-semver-checks enables `--features`
     # symmetrically on the 0.6.0 baseline build too, so any feature the baseline
     # lacks would error there.
-    #   - EXCLUDES the 0.7.0-only features `sim-testing`, `pdf` and `edge`: all
+    #   - EXCLUDES the 0.7.0-only features `sim-testing`, `pdf`, `edge` and
+    #     `plugin-sandbox`: all
     #     are NEW in 0.7.0 and absent from the 0.6.0 baseline, so the symmetric
     #     enable would fail the baseline build ("v0.6.0 does not have feature
     #     ...") and re-break the gate. Add each once a future baseline carries
@@ -311,7 +312,7 @@ for crate in "${CRATES[@]}"; do
     [[ -n "$autumn_web_current_version" ]] || \
       die "could not determine autumn-web version for the SemVer allowlist guard"
     if [[ "$autumn_web_current_version" != "$SEMVER_ALLOWLIST_TARGET_VERSION" ]]; then
-      die "autumn-web is now v${autumn_web_current_version} but the SemVer feature allowlist is pinned to ${SEMVER_ALLOWLIST_TARGET_VERSION} (computed as the 0.6.0-baseline ∩ 0.7.0 feature set). cargo-semver-checks now compares against a newer baseline, which may already carry features this list still omits (currently sim-testing/pdf/edge) — recompute both allowlists as (new-baseline ∩ current) features before releasing. See the comment above this block."
+      die "autumn-web is now v${autumn_web_current_version} but the SemVer feature allowlist is pinned to ${SEMVER_ALLOWLIST_TARGET_VERSION} (computed as the 0.6.0-baseline ∩ 0.7.0 feature set). cargo-semver-checks now compares against a newer baseline, which may already carry features this list still omits (currently sim-testing/pdf/edge/plugin-sandbox) — recompute both allowlists as (new-baseline ∩ current) features before releasing. See the comment above this block."
     fi
 
     autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting,presence,webauthn,inbound-mail,inbound-mailgun,inbound-ses,telemetry-otlp,offline-sync,embed-assets,tls,acme"
