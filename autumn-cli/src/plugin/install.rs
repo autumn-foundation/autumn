@@ -695,6 +695,106 @@ pub fn plan_add_community(
     })
 }
 
+/// Every Rust source file a Cargo target in `root` is built from, *outside*
+/// the conventional `src`/`tests`/`benches`/`examples` trees.
+///
+/// Cargo lets a target live anywhere: `[[bin]] path = "cmd/server.rs"` is
+/// valid, and invisible to a scan of the conventional directories. Two
+/// commands need to see those files, for mirror-image reasons — `plugin
+/// remove` must not strip a dependency such a target still uses, and `autumn
+/// doctor` must not report a plugin mounted there as "declared but never
+/// mounted" (which would fail `--strict` on a perfectly valid project). One
+/// definition, so the two cannot disagree about where an app's code lives.
+///
+/// Returns the file each target names, plus every `.rs` file in that file's
+/// own directory tree — a target's sibling modules (`cmd/routes.rs`) are part
+/// of it. The tree sweep is deliberately skipped for a file sitting directly
+/// at the project root, where "the whole tree" would mean the entire checkout,
+/// `target/` included; the conventional sweep already covers what matters
+/// there.
+#[must_use]
+pub fn explicit_target_sources(root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for named in explicit_target_paths(root) {
+        push_unique(&mut out, named.clone());
+        match named.parent() {
+            Some(parent) if parent != root => {
+                for file in rs_files_under(parent) {
+                    push_unique(&mut out, file);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Push `path` unless it is already there — the same file can be reached from
+/// two targets (a `[[bin]]` and its `[[test]]` sharing a directory).
+fn push_unique(out: &mut Vec<PathBuf>, path: PathBuf) {
+    if !out.contains(&path) {
+        out.push(path);
+    }
+}
+
+/// Every source path `root`'s manifest names explicitly: the build script and
+/// any `path` on a `[lib]`, `[[bin]]`, `[[example]]`, `[[test]]` or
+/// `[[bench]]` target.
+fn explicit_target_paths(root: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![root.join("build.rs")];
+    let Ok(manifest) = std::fs::read_to_string(manifest_path(root)) else {
+        return paths;
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(&manifest) else {
+        return paths;
+    };
+    // A custom build-script path (`[package] build = "…"`) replaces `build.rs`.
+    if let Some(build) = table
+        .get("package")
+        .and_then(|package| package.get("build"))
+        .and_then(toml::Value::as_str)
+    {
+        paths.push(root.join(build));
+    }
+    let mut push_path = |value: &toml::Value| {
+        if let Some(path) = value.get("path").and_then(toml::Value::as_str) {
+            paths.push(root.join(path));
+        }
+    };
+    if let Some(lib) = table.get("lib") {
+        push_path(lib);
+    }
+    for kind in ["bin", "example", "test", "bench"] {
+        if let Some(targets) = table.get(kind).and_then(toml::Value::as_array) {
+            for target in targets {
+                push_path(target);
+            }
+        }
+    }
+    paths
+}
+
+/// Every `.rs` file under `dir`, recursively, in a stable order.
+#[must_use]
+pub fn rs_files_under(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    // Sorted: `read_dir` order is unspecified, and both callers report or
+    // concatenate what they find.
+    let mut paths: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+    paths.sort();
+    let mut out = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            out.extend(rs_files_under(&path));
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+    out
+}
+
 /// `root`'s `Cargo.toml`.
 #[must_use]
 pub fn manifest_path(root: &Path) -> PathBuf {

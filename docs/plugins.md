@@ -182,7 +182,12 @@ autumn plugin remove autumn-media-plugin --drop-data          # asks first
 autumn plugin remove autumn-media-plugin --drop-data --yes    # non-interactive
 ```
 
-`--drop-data` prints the exact statements it will run, then asks for
+`--drop-data` is refused outright when the mount cannot be unwired: the plugin
+is still wired into the app, and dropping what it owns while it is still
+mounted would break it. Nothing is asked and nothing is changed — unwire it by
+hand first, then re-run.
+
+Otherwise `--drop-data` prints the exact statements it will run, then asks for
 confirmation (`--yes` answers for you; a non-interactive stdin without `--yes`
 is a refusal, never an assumed yes). It drives Postgres; with any other
 backend, or no database configured, it prints the statements for you to run
@@ -197,12 +202,14 @@ to a plugin any other way.
 |---|---|
 | `0` | Removed, or nothing to do |
 | `1` | Refused: unknown plugin, not an Autumn project, or the `--drop-data` step failed |
-| `2` | Nothing was changed automatically — apply the printed edits by hand. Also `--drop-data`'s answer when it printed the statements instead of running them (no database configured, or a non-Postgres backend), and when a dependency is declared in a shape the command will not rewrite |
+| `2` | Nothing was changed automatically — apply the printed edits by hand. Also `--drop-data`'s answer when it printed the statements instead of running them (no database configured, or a non-Postgres backend — in which case the code is left wired too, so nothing changed at all), and when a dependency is declared in a shape the command will not rewrite |
 | `3` | `--dry-run` only: a real run **would** change something |
 
 `--dry-run` prints every file edit and every data consequence and writes
 nothing, so `3` versus `0` answers "is there anything left to remove?" without
-parsing prose.
+parsing prose. Pending **database** work counts: `remove --drop-data --dry-run`
+on a plugin that is already unwired but whose tables are still there exits `3`,
+because a real run would still drop them.
 
 ## Scaffolding an app with plugins
 
@@ -245,6 +252,10 @@ plugin puts in the database, and when.
 | Dependency declared, never mounted | warn |
 | Mounted, but not declared in `[dependencies]` (does not compile) | fail |
 | Plugin gone, but migrations it declares are still applied | warn |
+
+The wiring scan reads every Rust file a Cargo target is built from — the `src/`
+tree plus any target the manifest gives an explicit `path` to — so a builder
+chain living in `cmd/server.rs` is seen as the mount it is.
 
 The migration finding is best effort: it needs a configured database and the
 `diesel` CLI to read the history. Without either, the two static findings still

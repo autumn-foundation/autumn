@@ -301,8 +301,12 @@ fn resolve_plugin_wirings(
     // `src/app.rs` — the shape `plugin add`'s own manual fallback produces,
     // since it prints the mount for the user to paste wherever their chain is —
     // is correctly wired, and must not be warned at (nor failed under
-    // `--strict`) for it.
-    let main_src = read_rs_tree(&root.join("src"));
+    // `--strict`) for it. Plus every target the manifest gives an explicit path
+    // to (`[[bin]] path = "cmd/server.rs"`), because a builder chain living
+    // there is just as real, and calling it "never mounted" would fail
+    // `--strict` on a valid project. Same scan `plugin remove` uses to decide
+    // whether a dependency is still needed.
+    let main_src = read_app_sources(root);
     let masked = crate::rust_source::mask_non_code(&main_src);
 
     let mut wirings: Vec<PluginWiring> = crate::plugin::catalog::FIRST_PARTY
@@ -385,28 +389,27 @@ fn resolve_plugin_wirings(
     wirings
 }
 
-/// Every `.rs` file under `dir`, concatenated.
+/// Every Rust source file a Cargo target in `root` is built from,
+/// concatenated: the `src/` tree plus every explicitly-pathed target.
 ///
-/// Cheap and good enough for a presence probe: the callers only ask whether a
+/// Cheap and good enough for a presence probe: the caller only asks whether a
 /// mount appears anywhere in the app's own sources, and concatenation cannot
-/// invent one that is not in some file.
-fn read_rs_tree(dir: &std::path::Path) -> String {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return String::new();
-    };
-    let mut paths: Vec<std::path::PathBuf> =
-        entries.filter_map(Result::ok).map(|e| e.path()).collect();
-    paths.sort();
+/// invent one that is not in some file. Files are read in a stable order and
+/// each is newline-terminated, so a probe can never straddle two of them.
+fn read_app_sources(root: &std::path::Path) -> String {
     let mut out = String::new();
-    for path in paths {
-        if path.is_dir() {
-            out.push_str(&read_rs_tree(&path));
-        } else if path.extension().is_some_and(|ext| ext == "rs")
-            && let Ok(content) = std::fs::read_to_string(&path)
-        {
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    let conventional = crate::plugin::install::rs_files_under(&root.join("src"));
+    let explicit = crate::plugin::install::explicit_target_sources(root);
+    for path in conventional.into_iter().chain(explicit) {
+        if seen.contains(&path) {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&path) {
             out.push_str(&content);
             out.push('\n');
         }
+        seen.push(path);
     }
     out
 }

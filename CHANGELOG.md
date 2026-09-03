@@ -43,7 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asking for confirmation first (`--yes` for CI; a non-interactive stdin
   without it is a refusal, not an assumed yes). `--dry-run` writes nothing and
   distinguishes its answer in the exit code: `3` when a real run would change
-  something, `0` when there is nothing to do.
+  something — pending *database* work included, so an already-unwired plugin
+  whose tables remain still answers `3` — and `0` when there is nothing to do.
+  `--drop-data` is refused outright when the mount cannot be unwired: dropping
+  what a still-mounted plugin owns would break the running app, so nothing is
+  asked and nothing is changed.
 
   `autumn new --with <plugin>` is repeatable and resolves every name — curated
   catalog first, crates.io fallback — and version-checks it **before the

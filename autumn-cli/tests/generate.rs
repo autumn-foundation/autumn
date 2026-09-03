@@ -9358,7 +9358,11 @@ fn plugin_remove_drop_data_without_a_database_prints_the_statements() {
         stderr.contains("DROP TABLE IF EXISTS media_rooms"),
         "{stderr}"
     );
-    assert!(stderr.contains("database is unchanged"), "{stderr}");
+    // Nothing at all was changed — not the database, and not the code either.
+    assert!(stderr.contains("database is untouched"), "{stderr}");
+    assert!(stderr.contains("still\nwired"), "{stderr}");
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main_rs.contains("MediaPlugin::new()"), "{main_rs}");
 }
 
 /// `--drop-data` needs a declared migration/table list, which only first-party
@@ -9552,4 +9556,113 @@ fn new_with_rejects_an_unknown_plugin_before_fetching_a_starter() {
         !tmp.path().join("doomed-starter-app").exists(),
         "a rejected --with must not leave a scaffolded project"
     );
+}
+
+/// Codex review: a mount that cannot be excised means the plugin is still
+/// wired. Dropping the tables it is about to read would break a running app —
+/// and confirming a destructive step that then silently does nothing is worse.
+/// Nothing is asked, and nothing is changed.
+#[test]
+fn plugin_remove_drop_data_is_not_confirmed_when_the_mount_cannot_be_excised() {
+    let (_tmp, project) = fresh_project("plugin-remove-drop-manual");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-media-plugin", "--offline"],
+    );
+    let main_path = project.join("src/main.rs");
+    // A mount built into a variable: real, and not excisable by this command.
+    let custom = "#[autumn_web::main]\nasync fn main() {\n    let configured = autumn_media_plugin::MediaPlugin::new();\n    autumn_web::app()\n        .plugin(configured)\n        .run()\n        .await;\n}\n";
+    fs::write(&main_path, custom).unwrap();
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+
+    let (stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "plugin",
+            "remove",
+            "autumn-media-plugin",
+            "--drop-data",
+            "--yes",
+        ],
+    );
+    assert_eq!(code, Some(2), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("No files were changed"), "{stderr}");
+    assert!(stderr.contains("--drop-data was not applied"), "{stderr}");
+    // The SQL must never have been presented as something about to run.
+    assert!(
+        !stdout.contains("will run these"),
+        "a drop must not be announced on this path:\n{stdout}"
+    );
+    assert_eq!(fs::read_to_string(&main_path).unwrap(), custom);
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+}
+
+/// Codex review (AC #3): the plugin is already unwired but its tables remain.
+/// No file would move, so the file-level check alone would exit 0 — telling a
+/// script the cleanup is finished while a real run still drops data.
+#[test]
+fn plugin_remove_drop_data_dry_run_exits_three_for_database_only_work() {
+    let (_tmp, project) = fresh_project("plugin-remove-drop-dbonly");
+    // Never installed: nothing to unwire, but the plugin owns tables.
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args([
+            "plugin",
+            "remove",
+            "autumn-media-plugin",
+            "--drop-data",
+            "--dry-run",
+        ])
+        .current_dir(&project)
+        .env("DATABASE_URL", "postgres://localhost/definitely-not-here")
+        .output()
+        .expect("failed to run autumn");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("not installed"), "{stdout}");
+    assert!(
+        stdout.contains("DROP TABLE IF EXISTS media_rooms"),
+        "{stdout}"
+    );
+}
+
+/// Codex review (AC #7): an app whose builder lives in an explicitly-pathed
+/// Cargo target is correctly wired. Reporting it as "declared but never
+/// mounted" would fail `autumn doctor --strict` on a valid project.
+#[test]
+fn doctor_finds_no_residue_when_the_builder_lives_in_a_custom_target() {
+    let (_tmp, project) = fresh_project("doctor-residue-custom-target");
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = fs::read_to_string(&cargo_path).unwrap();
+    fs::write(
+        &cargo_path,
+        format!(
+            "{}\n[[bin]]\nname = \"server\"\npath = \"cmd/server.rs\"\n",
+            cargo.replace(
+                "[dependencies]",
+                "[dependencies]\nautumn-admin-plugin = \"0.7.0\"",
+            )
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(project.join("cmd")).unwrap();
+    fs::write(
+        project.join("cmd/server.rs"),
+        "fn main() {\n    autumn_web::app().plugin(autumn_admin_plugin::AdminPlugin::new());\n}\n",
+    )
+    .unwrap();
+
+    let (stdout, _stderr, _code) = run_autumn_failing(&project, &["doctor", "--json"]);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let check = value["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "plugin_residue")
+        .unwrap_or_else(|| panic!("plugin_residue missing from {stdout}"));
+    assert_eq!(check["status"], "pass", "{stdout}");
 }

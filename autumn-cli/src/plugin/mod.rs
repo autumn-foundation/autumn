@@ -605,12 +605,18 @@ pub fn removal_changes_files(outcome: &RemoveOutcome) -> bool {
 }
 
 /// The process exit code for a completed `plugin remove` (AC #3).
+///
+/// `drop_would_run` is the `--drop-data` half: a plugin already unwired whose
+/// tables are still there has no file to change, but a real run WOULD change
+/// the database — and "`--dry-run` exits 3 whenever a real run would change
+/// something" has to mean the database too, or a script reads "nothing left to
+/// clean up" off a plan that still drops tables.
 #[must_use]
-pub fn remove_exit_code(outcome: &RemoveOutcome, dry_run: bool) -> i32 {
+pub fn remove_exit_code(outcome: &RemoveOutcome, dry_run: bool, drop_would_run: bool) -> i32 {
     if matches!(outcome, RemoveOutcome::Manual { .. }) || leaves_a_hand_edit(outcome) {
         return MANUAL_FALLBACK_EXIT_CODE;
     }
-    if dry_run && removal_changes_files(outcome) {
+    if dry_run && (removal_changes_files(outcome) || drop_would_run) {
         return DRY_RUN_PENDING_EXIT_CODE;
     }
     0
@@ -672,19 +678,36 @@ pub fn run_remove(opts: &RemoveOptions<'_>) -> i32 {
         }
     };
 
+    // The manual fallback is settled FIRST, before `--drop-data` prints a
+    // statement or asks for a confirmation. The plugin is still wired into the
+    // app on this path, so dropping the tables it is about to read would break
+    // a running app — and confirming a destructive step that then silently does
+    // nothing is worse still. Neither the code nor the database is touched.
+    if let RemoveOutcome::Manual { residue, .. } = &outcome {
+        let needs_data_note = opts.drop_data && !residue.is_empty();
+        eprintln!("{}", render_remove(opts.name, &outcome, opts.dry_run));
+        if needs_data_note {
+            eprintln!(
+                "\n--drop-data was not applied, and nothing was asked: {} is still wired into\nthis app, and dropping what it owns while it is still mounted would break it.\nUnwire it by hand as above, then re-run with `--drop-data`.",
+                opts.name
+            );
+        }
+        return MANUAL_FALLBACK_EXIT_CODE;
+    }
+
     // `--drop-data` is decided and CONFIRMED before a single file is written.
     // Asking after the edits are on disk means a declined prompt leaves the app
     // already unwired while the message says "Aborted" — the one ordering a
     // destructive flag must not have.
-    let drop_plan = match &resolved {
+    let drop_step = match &resolved {
         Resolved::FirstParty(entry) if opts.drop_data => {
             let absent = matches!(outcome, RemoveOutcome::NotInstalled { .. });
             match prepare_drop_data(entry, opts, absent) {
-                Ok(plan) => plan,
+                Ok(step) => step,
                 Err(code) => return code,
             }
         }
-        _ => None,
+        _ => DropStep::Nothing,
     };
 
     let flags = crate::generate::Flags {
@@ -698,14 +721,7 @@ pub fn run_remove(opts: &RemoveOptions<'_>) -> i32 {
         return 1;
     }
 
-    let report = render_remove(opts.name, &outcome, opts.dry_run);
-    if matches!(outcome, RemoveOutcome::Manual { .. }) {
-        // A refusal, not a result — same contract as `plugin add`'s manual
-        // fallback: stderr, and an exit code a script can act on.
-        eprintln!("{report}");
-        return MANUAL_FALLBACK_EXIT_CODE;
-    }
-    println!("{report}");
+    println!("{}", render_remove(opts.name, &outcome, opts.dry_run));
     if matches!(resolved, Resolved::Community(_)) {
         println!(
             "\n{} is a community crate: this CLI has no list of the migrations or tables it\nowns, so nothing here can tell you what it left in the database. Check the\ncrate's README before assuming the removal was complete.",
@@ -713,14 +729,32 @@ pub fn run_remove(opts: &RemoveOptions<'_>) -> i32 {
         );
     }
 
-    if let Some(plan) = drop_plan {
-        let code = apply_drop_data(&plan);
+    if let DropStep::Confirmed(plan) = &drop_step {
+        let code = apply_drop_data(plan);
         if code != 0 {
             return code;
         }
     }
 
-    remove_exit_code(&outcome, opts.dry_run)
+    remove_exit_code(
+        &outcome,
+        opts.dry_run,
+        matches!(drop_step, DropStep::WouldRun),
+    )
+}
+
+/// What the `--drop-data` step resolved to, before anything is applied.
+#[derive(Debug)]
+enum DropStep {
+    /// Not asked for, nothing declared, or the statements were handed to the
+    /// user to run themselves.
+    Nothing,
+    /// A dry run: these statements WOULD run. Carried separately from
+    /// [`Self::Confirmed`] because a dry run must still say, in its exit code,
+    /// that a real run would change something.
+    WouldRun,
+    /// Confirmed and ready to apply once the code edits land.
+    Confirmed(Box<ConfirmedDrop>),
 }
 
 /// A confirmed `--drop-data` step, ready to apply once the code edits land.
@@ -737,14 +771,13 @@ struct ConfirmedDrop {
 /// Decide, print and confirm the `--drop-data` step — before anything is
 /// written.
 ///
-/// `Ok(None)` means there is nothing left to do for `--drop-data` (nothing
-/// declared, or the statements were printed for the user to run). `Err(code)`
-/// is a refusal that aborts the whole command with **no** file changed.
+/// `Err(code)` is a refusal that aborts the whole command with **no** file
+/// changed — not the manifest, not `main.rs`, not the database.
 fn prepare_drop_data(
     entry: &'static catalog::CatalogEntry,
     opts: &RemoveOptions<'_>,
     not_installed_here: bool,
-) -> Result<Option<ConfirmedDrop>, i32> {
+) -> Result<DropStep, i32> {
     use remove::DropDataDecision;
 
     // The `.env`/config resolution `autumn migrate` uses, but WITHOUT
@@ -757,7 +790,7 @@ fn prepare_drop_data(
                 "\n--drop-data: {} declares no migrations and owns no tables, so there is\nnothing in the database to drop.",
                 entry.crate_name
             );
-            Ok(None)
+            Ok(DropStep::Nothing)
         }
         DropDataDecision::PrintOnly { reason, statements } => {
             // Exit 2, not 0: the database was NOT changed, and a script reading
@@ -765,7 +798,7 @@ fn prepare_drop_data(
             // Same meaning `plugin add`/`remove` already give 2 — "nothing was
             // changed automatically; apply the printed lines by hand".
             eprintln!(
-                "\n--drop-data was not applied — {reason}.\nThe database is unchanged. Run these yourself, in this order:\n"
+                "\n--drop-data was not applied — {reason}.\nNothing was changed at all: the database is untouched, and the plugin is still\nwired (re-run without `--drop-data` to unwire just the code). Run these\nyourself, in this order:\n"
             );
             for statement in &statements {
                 eprintln!("  {statement}");
@@ -781,7 +814,9 @@ fn prepare_drop_data(
                 for statement in &statements {
                     println!("  {statement}");
                 }
-                return Ok(None);
+                // A real run WOULD change the database, so a dry run has to say
+                // so in its exit code even when no file would move.
+                return Ok(DropStep::WouldRun);
             }
             println!(
                 "\n--drop-data will run these against {}, in this order:\n",
@@ -803,11 +838,11 @@ fn prepare_drop_data(
                 eprintln!("\nAborted: nothing was changed — not the code, not the database.");
                 return Err(1);
             }
-            Ok(Some(ConfirmedDrop {
+            Ok(DropStep::Confirmed(Box::new(ConfirmedDrop {
                 url,
                 statements,
                 crate_name: entry.crate_name,
-            }))
+            })))
         }
     }
 }
@@ -1450,9 +1485,12 @@ mod tests {
     fn a_dry_run_with_pending_edits_exits_distinctly() {
         let outcome = removed(plan_with_one_edit(), vec![Wire::Mount], Vec::new());
         assert!(removal_changes_files(&outcome));
-        assert_eq!(remove_exit_code(&outcome, true), DRY_RUN_PENDING_EXIT_CODE);
+        assert_eq!(
+            remove_exit_code(&outcome, true, false),
+            DRY_RUN_PENDING_EXIT_CODE
+        );
         // A real run of the same outcome is an ordinary success.
-        assert_eq!(remove_exit_code(&outcome, false), 0);
+        assert_eq!(remove_exit_code(&outcome, false, false), 0);
     }
 
     #[test]
@@ -1461,8 +1499,8 @@ mod tests {
             residue: DataResidue::default(),
         };
         assert!(!removal_changes_files(&outcome));
-        assert_eq!(remove_exit_code(&outcome, true), 0);
-        assert_eq!(remove_exit_code(&outcome, false), 0);
+        assert_eq!(remove_exit_code(&outcome, true, false), 0);
+        assert_eq!(remove_exit_code(&outcome, false, false), 0);
     }
 
     /// An outcome whose plan turns out to hold no action is "nothing to do"
@@ -1471,7 +1509,28 @@ mod tests {
     fn a_dry_run_whose_plan_is_empty_exits_zero() {
         let outcome = removed(empty_plan(), Vec::new(), vec![Wire::Mount]);
         assert!(!removal_changes_files(&outcome));
-        assert_eq!(remove_exit_code(&outcome, true), 0);
+        assert_eq!(remove_exit_code(&outcome, true, false), 0);
+    }
+
+    /// The plugin is already unwired, but `--drop-data` would still drop its
+    /// tables. No file would move, so the file-level check says "nothing to
+    /// do" — and a dry run that answered `0` there would tell a script the
+    /// cleanup is finished while a real run still drops data.
+    #[test]
+    fn a_dry_run_with_only_pending_database_work_still_exits_three() {
+        let outcome = RemoveOutcome::NotInstalled {
+            residue: DataResidue {
+                migrations: vec!["20260720000000_media_rooms".to_owned()],
+                tables: vec!["media_rooms".to_owned()],
+            },
+        };
+        assert!(!removal_changes_files(&outcome));
+        assert_eq!(
+            remove_exit_code(&outcome, true, true),
+            DRY_RUN_PENDING_EXIT_CODE
+        );
+        // A real run applies it, so it is an ordinary success.
+        assert_eq!(remove_exit_code(&outcome, false, true), 0);
     }
 
     /// The manual fallback is a refusal in both modes: nothing can be changed
@@ -1484,8 +1543,14 @@ mod tests {
             mount_snippet: String::new(),
             residue: DataResidue::default(),
         };
-        assert_eq!(remove_exit_code(&outcome, true), MANUAL_FALLBACK_EXIT_CODE);
-        assert_eq!(remove_exit_code(&outcome, false), MANUAL_FALLBACK_EXIT_CODE);
+        assert_eq!(
+            remove_exit_code(&outcome, true, false),
+            MANUAL_FALLBACK_EXIT_CODE
+        );
+        assert_eq!(
+            remove_exit_code(&outcome, false, false),
+            MANUAL_FALLBACK_EXIT_CODE
+        );
     }
 
     /// A confirmation prompt must not print the database password into a

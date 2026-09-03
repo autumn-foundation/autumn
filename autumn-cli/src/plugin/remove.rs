@@ -311,89 +311,12 @@ fn still_referenced(
     // one scan but not the other is a dependency stripped from under a target
     // that still needs it.
     let markers = crate::generate::emit::crate_reference_markers(crate_name);
-    explicit_target_roots(root)
+    super::install::explicit_target_sources(root)
         .into_iter()
-        .find(|path| file_or_tree_contains(path, &markers, root))
-}
-
-/// Every source path the manifest names explicitly, outside the conventional
-/// trees: the build script and any `path = "…"` on a `[lib]`, `[[bin]]`,
-/// `[[example]]`, `[[test]]` or `[[bench]]` target.
-///
-/// Cargo lets a target live anywhere — `[[bin]] path = "cmd/server.rs"` is
-/// valid and invisible to a `src`/`tests`/`benches`/`examples` sweep. That
-/// target compiles against the same `[dependencies]`, so a plugin it still uses
-/// must keep its dependency line just as surely as one `src/` uses.
-fn explicit_target_roots(root: &Path) -> Vec<std::path::PathBuf> {
-    let mut roots = vec![root.join("build.rs")];
-    let Ok(manifest) = std::fs::read_to_string(root.join("Cargo.toml")) else {
-        return roots;
-    };
-    let Ok(table) = toml::from_str::<toml::Table>(&manifest) else {
-        return roots;
-    };
-    // A custom build-script path (`[package] build = "…"`) replaces `build.rs`.
-    if let Some(build) = table
-        .get("package")
-        .and_then(|package| package.get("build"))
-        .and_then(toml::Value::as_str)
-    {
-        roots.push(root.join(build));
-    }
-    let mut push_path = |value: &toml::Value| {
-        if let Some(path) = value.get("path").and_then(toml::Value::as_str) {
-            roots.push(root.join(path));
-        }
-    };
-    if let Some(lib) = table.get("lib") {
-        push_path(lib);
-    }
-    for kind in ["bin", "example", "test", "bench"] {
-        if let Some(targets) = table.get(kind).and_then(toml::Value::as_array) {
-            for target in targets {
-                push_path(target);
-            }
-        }
-    }
-    roots
-}
-
-/// Whether `path` — or, when it sits in a directory of its own, that whole
-/// directory tree — contains any of `markers`.
-///
-/// The directory sweep is what catches a target's sibling modules
-/// (`cmd/server.rs` plus `cmd/routes.rs`). It is deliberately skipped when the
-/// file sits directly at the project root, where "the whole tree" would mean
-/// the entire checkout — `target/` included.
-fn file_or_tree_contains(path: &Path, markers: &[String], root: &Path) -> bool {
-    let contains = |file: &Path| {
-        std::fs::read_to_string(file)
-            .is_ok_and(|src| markers.iter().any(|marker| src.contains(marker.as_str())))
-    };
-    if contains(path) {
-        return true;
-    }
-    match path.parent() {
-        Some(parent) if parent != root => rs_files_under(parent).iter().any(|file| contains(file)),
-        _ => false,
-    }
-}
-
-/// Every `.rs` file under `dir`, recursively.
-fn rs_files_under(dir: &Path) -> Vec<std::path::PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if path.is_dir() {
-            out.extend(rs_files_under(&path));
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
-    out
+        .find(|path| {
+            std::fs::read_to_string(path)
+                .is_ok_and(|src| markers.iter().any(|marker| src.contains(marker.as_str())))
+        })
 }
 
 /// Whether `remove_cargo_dependencies` actually took `crate_name` out of
