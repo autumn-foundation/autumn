@@ -190,28 +190,56 @@ per-commit correction below) changes the list:
   compiled version, not a swap), and `p256 v0.13.2` — the crate Web
   Push's own commit message says gained a new `ecdh` feature flag — is in
   the tree too.
-- `bc99a4b8` (scaffold DSL constraints) is **disputed**: Codex's finding
-  characterized it as "only adds `serde_urlencoded` to `autumn-cli`,"
-  but the actual `Cargo.lock` diff (`git show bc99a4b8 -- Cargo.lock`)
-  adds `serde_urlencoded` to **`reqwest`'s own** dependency list, and
-  `cargo tree` confirms `reqwest` (via the `http-client` feature this
-  build enables) resolves `serde_urlencoded v0.7.1` into this exact tree.
-  Kept flagged, on the verified evidence, contrary to the review comment
-  that prompted this recheck — noted here rather than either accepted or
-  silently dropped.
+- `bc99a4b8` (scaffold DSL constraints) — **retracted, a second confirmed
+  false positive** (Codex P2 on `abea7490`, correcting my own prior
+  verification, which was sloppy: I saw `reqwest` and `serde_urlencoded`
+  both appear somewhere in the tree and stopped there, without checking
+  *which* `reqwest`). The exact feature set this report times resolves
+  `reqwest v0.12.28` (confirmed: `cargo tree -p autumn-web ... -i
+  "reqwest@0.12.28"`); `bc99a4b8^:Cargo.lock` (the parent commit, before
+  this change) shows `reqwest 0.12.28` **already** listed
+  `serde_urlencoded` as a dependency — it was never added by this commit.
+  What `bc99a4b8` actually adds `serde_urlencoded` to is `reqwest
+  v0.13.4`, a wholly different resolved version pulled in only by
+  `autumn-cli`'s dev-dependencies, never built by `cargo build -p
+  autumn-web`. Compounding that: `autumn/Cargo.toml` (`autumn-web`'s own
+  manifest) already lists `serde_urlencoded = "0.7"` as a **direct**
+  dependency regardless of `reqwest` at all. None of that is touched by
+  `bc99a4b8`. My first correction (`abea7490`) was itself wrong to keep
+  this flagged — reversed here.
 
-Net: 3 of the 4 originally-flagged commits (`141f36ef`, `61bdd9c2`,
-`bc99a4b8`) are confirmed relevant to this feature set's resolved graph;
-`fec52215` is not. **For the 3 confirmed commits, this report's deltas
-cannot be trusted as representative of their true, CI-relevant recurring
-contribution** — the apparatus can only undercount, never overcount, a
-genuine per-dependency cost, since it's structurally incapable of showing
-more than a one-time compile for anything new. It
+Net, after two rounds of verification: **2 of the 4** originally-flagged
+commits (`141f36ef`, `61bdd9c2`) are confirmed relevant to this feature
+set's resolved graph; `fec52215` and `bc99a4b8` are both confirmed false
+positives. **For the 2 confirmed commits, this report's deltas cannot be
+trusted as representative of their true, CI-relevant recurring
+contribution** — but not for a purely one-directional reason (see the
+next correction). It
 also means the "total window effect" and "this proxy's absolute saving vs.
 CI's" comparisons throughout Assay and Verdict are weaker than stated
 there: they are not just measuring a narrower workload (library-only, no
 scaffold/server-start) as already disclosed, but a workload measured under
-a fundamentally warmer caching regime than CI ever runs under. Not
+a fundamentally warmer caching regime than CI ever runs under.
+
+**The bias is not one-directional** (Codex P2 on `abea7490`, correcting
+the "can only undercount, never overcount" claim this section originally
+made): when a checkpoint upgrades or newly introduces a dependency, this
+apparatus's warm-target delta charges that checkpoint the *entire* fresh
+compile cost of the new/changed dependency, while the *previous*
+checkpoint paid nothing for it (it wasn't cached yet, or didn't exist).
+A true cold-vs-cold comparison — what CI actually runs — would instead
+show the much smaller *marginal* difference between compiling the old
+version and the new one, since both a fully-cold pre- and post-commit
+build pay for *some* version of that dependency. So at the introducing
+checkpoint specifically, this apparatus likely **overcounts** the
+commit's true CI-relevant marginal cost; at every checkpoint *after* it,
+the dependency is cached and the apparatus shows nothing for it, which
+**undercounts** the recurring cost CI keeps paying. Both directions are
+real, and this report cannot say which dominates for `141f36ef` or
+`61bdd9c2` specifically without a genuinely cold-per-checkpoint rerun.
+Practically, this makes individual per-commit deltas in this dataset
+*less* interpretable than the "undercount only" framing suggested, not
+more — reinforcing the undetermined verdict, not weakening it. Not
 corrected by re-running (out of this session's time box — a true
 apples-to-apples repeat would need an empty `target/` per checkpoint,
 i.e. 32+ fully cold builds, each potentially 60-120s, a materially larger
@@ -517,16 +545,20 @@ live report needs the map:
   sample (see Apparatus's fourth correction). This apparatus pays each
   external dependency's compile cost once per introduction; CI pays it on
   every sample, forever. Of the 4 non-fix commits that touched
-  `Cargo.lock`, 3 (`141f36ef`, `61bdd9c2`, `bc99a4b8`) are confirmed via
-  `cargo tree` to actually affect this feature set's resolved graph (see
-  Apparatus's fourth correction for the per-commit check and the one
-  confirmed false positive, `fec52215`) — their deltas in this report
-  specifically cannot be trusted as CI-representative, and the apparatus
-  can only *undercount* that cost, never overcount it, so the true
-  CI-relevant total for this window is more likely to exceed this proxy's
-  ≈−13,000ms-implied workspace-only cost than to match it. The parent
-  report's CI/runner-variance confound (1-sample local A/B vs. 3-sample CI
-  p95, different runners) is also still live and undistinguished from any
+  `Cargo.lock`, only **2** (`141f36ef`, `61bdd9c2`) are confirmed via
+  version-specific `cargo tree` checks to actually affect this feature
+  set's resolved graph — `fec52215` and, after a second, more careful
+  check, `bc99a4b8` too are both confirmed false positives (see
+  Apparatus's fourth and fifth corrections). Their deltas cannot be
+  trusted as CI-representative, but not in a single, simple direction:
+  the apparatus likely *overcounts* each one's cost at its own
+  introducing checkpoint (charging the full fresh-compile cost rather
+  than CI's much smaller cold-vs-cold marginal difference) and
+  *undercounts* it at every checkpoint after (nothing shown where CI pays
+  every sample). Which effect dominates for this window's total is not
+  resolvable from this data. The parent report's CI/runner-variance
+  confound (1-sample local A/B vs. 3-sample CI p95, different runners) is
+  also still live and undistinguished from any
   of this.
 
 **What would resolve this, as an explicit follow-up (not chartered or run
