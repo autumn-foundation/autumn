@@ -3294,6 +3294,20 @@ impl AppBuilder {
             return;
         }
 
+        // ── Agent-authority manifest dump mode ─────────────────────────
+        // When AUTUMN_DUMP_AGENT_AUTHORITY=1, print the agent-authority
+        // manifest (#1691) and exit. Triggered by `autumn agents manifest`,
+        // which needs the whole binary's registrations -- every
+        // `#[agent_operable]` action and every declared `authority_grant!`,
+        // across the app AND its plugins -- joined against this app's route
+        // table, because which actions an agent can actually reach is a fact
+        // about the mounted routes and not about the annotations alone. Runs
+        // before any database or port is touched.
+        if crate::agent_authority::manifest::is_dump_mode() {
+            self.run_dump_agent_authority_mode();
+            return;
+        }
+
         // ── Jobs manifest dump mode ────────────────────────────────────
         // When AUTUMN_DUMP_JOBS=1, print the effective drained-queue manifest
         // (TOML `queues = [...]`) and exit. Triggered by `autumn jobs manifest`
@@ -4009,6 +4023,24 @@ impl AppBuilder {
         // configured. Installed after the mailer so the mail channel can bind
         // to the live `Mailer` extension.
         crate::alerts::install_from_config(&state, &config.alerts, alert_channels);
+        // An MCP endpoint with no audit sink still serves tools; what it does
+        // not do is leave a record that an agent called one. That is a property
+        // of the deployment rather than of any grant, so it is said once, here,
+        // where both are known -- and it is also carried in the agent-authority
+        // manifest's `audit.sink_configured` (#1691 R9).
+        #[cfg(feature = "mcp")]
+        if mcp.is_some()
+            && !audit_logger
+                .as_ref()
+                .is_some_and(|logger| logger.is_enabled())
+        {
+            tracing::warn!(
+                target: "autumn.agent",
+                "MCP is mounted with no audit sink installed: agent tool calls will be traced \
+                 but not recorded. Install one with `AppBuilder::with_audit_sink(..)`. \
+                 See docs/guide/agent-authority.md"
+            );
+        }
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -5767,6 +5799,48 @@ impl AppBuilder {
         crate::managed_pg::emergency_stop_async().await;
     }
 
+    /// Dump the agent-authority manifest as one marker-prefixed JSON line and
+    /// exit.
+    ///
+    /// Triggered when `AUTUMN_DUMP_AGENT_AUTHORITY=1` is set (by `autumn agents
+    /// manifest`). Takes `&self` rather than consuming the builder: it reads
+    /// the route table and the audit-sink status and touches nothing else, so
+    /// there is no database to open and no port to bind.
+    fn run_dump_agent_authority_mode(&self) {
+        // Whether agent invocations have anywhere to be recorded is a property
+        // of the deployment, not of any grant, and it belongs in the document
+        // rather than in a startup line nobody reads (#1691 R9).
+        let audit_sink_configured = self
+            .audit_logger
+            .as_ref()
+            .is_some_and(|logger| logger.is_enabled());
+        // The whole-API MCP hatch, when the `mcp` feature is compiled in and
+        // the app opted into it. Without it every route `expose_all_as_mcp()`
+        // exposes would be missing from the document entirely.
+        #[cfg(feature = "mcp")]
+        let expose_all = self.mcp.as_ref().is_some_and(|rt| rt.expose_all);
+        #[cfg(not(feature = "mcp"))]
+        let expose_all = false;
+        // Top-level routes carry their own path; a scoped group's children do
+        // not -- the group's prefix is applied at mount time, so the path on
+        // the `Route` is the child path alone. Passing that through would
+        // record `/items` for a tool an agent calls at `/api/v1/items`, and a
+        // scope rename would then produce no drift at all.
+        let routes: Vec<crate::agent_authority::manifest::RouteSummary> = self
+            .routes
+            .iter()
+            .map(|route| agent_authority_route_summary(route, None, expose_all))
+            .chain(self.scoped_groups.iter().flat_map(|group| {
+                group.routes.iter().map(move |route| {
+                    agent_authority_route_summary(route, Some(&group.prefix), expose_all)
+                })
+            }))
+            .collect();
+        crate::agent_authority::manifest::print_manifest_dump(
+            &crate::agent_authority::manifest::build(&routes, audit_sink_configured),
+        );
+    }
+
     /// Dump the application's route listing as JSON and exit.
     ///
     /// Triggered when `AUTUMN_DUMP_ROUTES=1` is set (by `autumn routes`).
@@ -7185,6 +7259,63 @@ pub(crate) fn is_dump_security_mode() -> bool {
 
 pub(crate) fn is_dump_jobs_mode() -> bool {
     std::env::var("AUTUMN_DUMP_JOBS").as_deref() == Ok("1")
+}
+
+/// The slice of a [`Route`] the agent-authority manifest needs (#1691).
+///
+/// Built here rather than in `agent_authority::manifest` so that module needs
+/// no dependency on the router, and unconditionally rather than behind the
+/// `openapi` feature: which handlers an agent can reach is not an
+/// documentation concern.
+///
+/// `expose_all` is the app's whole-API MCP hatch. It has to be threaded in:
+/// deriving tool-ness from `#[api_doc(mcp)]` alone made every route
+/// `expose_all_as_mcp()` swept up invisible to this document — in neither
+/// `actions` nor `ungoverned_tools` — while the document's own `excluded`
+/// section claimed they surfaced there (#1691 P2-6). The same call also
+/// applies the JSON-out eligibility gate, so an HTML route someone tagged
+/// `#[api_doc(mcp)]` is no longer reported as a tool it will never become.
+fn agent_authority_route_summary(
+    route: &Route,
+    scope_prefix: Option<&str>,
+    expose_all: bool,
+) -> crate::agent_authority::manifest::RouteSummary {
+    // One string, used both for the row and for the predicate, so the two can
+    // never disagree about a route's verb.
+    let method = route.method.to_string();
+    // The path an agent actually calls. `join_nested_path` is the same helper
+    // the OpenAPI collector uses for scoped groups, so the manifest and the
+    // spec cannot disagree about where a route lives.
+    let path = scope_prefix.map_or_else(
+        || route.path.to_string(),
+        |prefix| crate::router::join_nested_path(prefix, route.path),
+    );
+    let exposed_by = crate::agent_authority::manifest::mcp_exposure(
+        &crate::agent_authority::manifest::McpExposureInput {
+            method: &method,
+            hidden: route.api_doc.hidden,
+            mcp_tool: route.api_doc.mcp_tool,
+            mcp_exclude: route.api_doc.mcp_exclude,
+            mcp_stream: route.api_doc.mcp_stream,
+            has_response_schema: route.api_doc.response.is_some(),
+            success_status: route.api_doc.success_status,
+            expose_all,
+        },
+    );
+    crate::agent_authority::manifest::RouteSummary {
+        method,
+        path,
+        handler: route.name,
+        // The name an MCP client actually calls: `#[api_doc(operation_id =
+        // "...")]` renames the tool without renaming the handler.
+        operation_id: route.api_doc.operation_id,
+        module_path: route.api_doc.module_path,
+        mcp_tool: exposed_by.is_some(),
+        exposed_by,
+        // Filled by the route macro from the handler's `#[agent_operable]`
+        // marker, in either attribute order.
+        agent_authority: route.api_doc.agent_authority,
+    }
 }
 
 pub(crate) fn is_list_one_off_tasks_mode() -> bool {
@@ -10824,6 +10955,90 @@ const fn is_mutating_method(method: &http::Method) -> bool {
 /// deployments that pick the long-form alias.
 fn is_production_profile(profile: &str) -> bool {
     matches!(profile, "prod" | "production")
+}
+
+#[cfg(test)]
+mod agent_authority_route_summary_tests {
+    use super::*;
+
+    fn route_with(path: &'static str, mcp_tool: bool) -> Route {
+        let mut api_doc = crate::openapi::ApiDoc {
+            method: "GET",
+            path,
+            operation_id: "list_items",
+            mcp_tool,
+            ..crate::openapi::ApiDoc::default()
+        };
+        // The exposure rule is JSON-out gated, so a route with no response
+        // schema is never a tool no matter what it is tagged with. Give it one.
+        api_doc.response = Some(crate::openapi::SchemaEntry {
+            name: "Item",
+            kind: crate::openapi::SchemaKind::Ref,
+            identity: None,
+        });
+        Route {
+            method: http::Method::GET,
+            path,
+            handler: axum::routing::any(|| async { "" }),
+            name: "list_items",
+            api_doc,
+            repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
+            api_version: None,
+            sunset_opt_out: false,
+        }
+    }
+
+    #[test]
+    fn a_scoped_route_records_the_path_an_agent_actually_calls() {
+        // A scoped group's children carry only the child path -- the prefix is
+        // applied at mount time. Recording `/items` for a tool served at
+        // `/api/v1/items` would make the manifest wrong about where the agent
+        // surface is, and a scope rename would produce no drift at all.
+        let route = route_with("/items", true);
+        let summary = agent_authority_route_summary(&route, Some("/api/v1"), false);
+        assert_eq!(summary.path, "/api/v1/items");
+        assert_eq!(summary.method, "GET");
+        assert!(summary.mcp_tool);
+
+        // A top-level route has no prefix and is unchanged.
+        let top = agent_authority_route_summary(&route, None, false);
+        assert_eq!(top.path, "/items");
+    }
+
+    #[test]
+    fn a_scoped_root_route_joins_the_way_the_openapi_collector_does() {
+        // Delegated to `join_nested_path` rather than string concatenation, so
+        // the manifest and the spec cannot disagree about trailing slashes.
+        let root = route_with("/", true);
+        let summary = agent_authority_route_summary(&root, Some("/api"), false);
+        assert_eq!(
+            summary.path,
+            crate::router::join_nested_path("/api", "/"),
+            "the manifest must join paths exactly as the spec does"
+        );
+    }
+
+    #[test]
+    fn the_operation_id_names_the_tool_and_exposure_says_why() {
+        use crate::agent_authority::manifest::McpExposedBy;
+
+        let tagged = agent_authority_route_summary(&route_with("/items", true), None, false);
+        assert_eq!(tagged.operation_id, "list_items");
+        assert_eq!(tagged.exposed_by, Some(McpExposedBy::Attribute));
+
+        // Untagged and no hatch: not a tool at all.
+        let plain = agent_authority_route_summary(&route_with("/items", false), None, false);
+        assert!(!plain.mcp_tool);
+        assert_eq!(plain.exposed_by, None);
+
+        // Untagged, but the whole-API hatch sweeps up a read-only verb.
+        let hatched = agent_authority_route_summary(&route_with("/items", false), None, true);
+        assert!(hatched.mcp_tool);
+        assert_eq!(hatched.exposed_by, Some(McpExposedBy::Hatch));
+    }
 }
 
 #[cfg(test)]

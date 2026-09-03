@@ -386,6 +386,14 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// The registered name of this job, as passed to `AppBuilder::jobs`.
             pub const NAME: &'static str = #job_name;
 
+            /// The same name, under the fixed spelling `#[agent_operable]`'s
+            /// const checks read (#1691). A grant lists the *registered* job
+            /// name, so resolving the type through this constant is what stops
+            /// a local `type Alias = OtherJob;` from satisfying a grant that
+            /// never authorised it.
+            #[doc(hidden)]
+            pub const __AUTUMN_JOB_NAME: &'static str = #job_name;
+
             pub async fn enqueue(args: #args_type) -> ::autumn_web::AutumnResult<()> {
                 let payload = ::autumn_web::reexports::serde_json::to_value(&args)
                     .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;

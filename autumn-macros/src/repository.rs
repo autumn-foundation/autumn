@@ -647,6 +647,12 @@ fn generate_coherence_items(
 ) -> syn::Result<TokenStream> {
     let overrides = parse_method_coherence_attrs(trait_def)?;
     let model_name = &config.model_name;
+    // The grant spells the model as source does, and `r#Type` is written
+    // `Type` there: `stringify!` would have kept the `r#`.
+    let model_ident = {
+        let spelled = model_name.to_string();
+        spelled.strip_prefix("r#").unwrap_or(&spelled).to_string()
+    };
     let table_name = &config.table_name;
     let trait_name_str = trait_def.ident.to_string();
     let writes = write_method_names(config, trait_def);
@@ -720,6 +726,14 @@ fn generate_coherence_items(
             #[doc(hidden)]
             pub const __AUTUMN_MODEL_NAME: fn() -> &'static ::core::primitive::str =
                 || ::core::any::type_name::<#model_name>();
+
+            /// The model this repository writes, unqualified — the subject an
+            /// agent-authority grant names (#1691). `__AUTUMN_MODEL_NAME`
+            /// carries the full `type_name` path, which no grant can be
+            /// expected to spell; this is the last segment alone, readable in
+            /// const context so the authority assertion works across crates.
+            #[doc(hidden)]
+            pub const __AUTUMN_MODEL_IDENT: &'static ::core::primitive::str = #model_ident;
         }
     };
 
@@ -1991,12 +2005,21 @@ fn vh_insert_ts(
         quote! { ::core::option::Option::None::<&str> }
     };
 
+    // #2429: the `__vh_json` / `__vh_before_json` / `__vh_after_json` bindings
+    // are freshly serialized per mutation and used for nothing but the diff, so
+    // they are handed to the `*_owned` entry points **by value**. Those move
+    // each retained column name and value straight into the `ColumnChange`,
+    // where the `&Value` variants had to clone every one of them and then drop
+    // the original — two allocations and two drops per retained field on the
+    // audit-trail write path of every versioned repository. Output is identical
+    // (`autumn/src/version_history.rs` holds the owned and borrowed functions to
+    // an exact parity matrix); do not reintroduce a borrow here.
     let changes_ts = match op {
         "insert" => quote! {
             {
                 use ::autumn_web::version_history::VersionedRecord as _;
                 let __vh_json = (#record_expr).version_column_values();
-                let __vh_changes = ::autumn_web::version_history::compute_insert_changes(&__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
+                let __vh_changes = ::autumn_web::version_history::compute_insert_changes_owned(__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
                 ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
                     .unwrap_or_else(|_| "[]".to_string())
             }
@@ -2005,7 +2028,7 @@ fn vh_insert_ts(
             {
                 use ::autumn_web::version_history::VersionedRecord as _;
                 let __vh_json = (#record_expr).version_column_values();
-                let __vh_changes = ::autumn_web::version_history::compute_delete_changes(&__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
+                let __vh_changes = ::autumn_web::version_history::compute_delete_changes_owned(__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
                 ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
                     .unwrap_or_else(|_| "[]".to_string())
             }
@@ -2018,7 +2041,7 @@ fn vh_insert_ts(
                     use ::autumn_web::version_history::VersionedRecord as _;
                     let __vh_before_json = (#before).version_column_values();
                     let __vh_after_json = (#record_expr).version_column_values();
-                    let __vh_changes = ::autumn_web::version_history::compute_diff(&__vh_before_json, &__vh_after_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
+                    let __vh_changes = ::autumn_web::version_history::compute_diff_owned(__vh_before_json, __vh_after_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
                     ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
                         .unwrap_or_else(|_| "[]".to_string())
                 }
@@ -19680,6 +19703,85 @@ mod tests {
             rendered,
             vec!["crate::views::recent_posts", "home::sidebar"]
         );
+    }
+
+    // ── #2429: version-history codegen hands over owned values ───────
+
+    /// Render `vh_insert_ts` for one op with a whitespace-normalized body, so
+    /// the assertions below read like the code they are checking.
+    fn vh_tokens(op: &str) -> String {
+        let record_expr = quote! { __rec };
+        let before_expr = quote! { __before };
+        let conn_ident = quote! { conn };
+        let model_ident: proc_macro2::Ident = syn::parse_quote!(Post);
+        vh_insert_ts(
+            "posts",
+            op,
+            false,
+            &record_expr,
+            Some(&before_expr),
+            &conn_ident,
+            &model_ident,
+            false,
+        )
+        .to_string()
+        .replace(' ', "")
+    }
+
+    #[test]
+    fn vh_codegen_moves_the_disposable_value_into_compute_insert_changes() {
+        let ts = vh_tokens("insert");
+        assert!(
+            ts.contains("compute_insert_changes_owned(__vh_json,"),
+            "insert codegen must move `__vh_json` into the owned entry point: {ts}"
+        );
+        assert!(
+            !ts.contains("compute_insert_changes(&__vh_json"),
+            "insert codegen must not keep borrowing `__vh_json`: {ts}"
+        );
+    }
+
+    #[test]
+    fn vh_codegen_moves_the_disposable_value_into_compute_delete_changes() {
+        let ts = vh_tokens("delete");
+        assert!(
+            ts.contains("compute_delete_changes_owned(__vh_json,"),
+            "delete codegen must move `__vh_json` into the owned entry point: {ts}"
+        );
+        assert!(
+            !ts.contains("compute_delete_changes(&__vh_json"),
+            "delete codegen must not keep borrowing `__vh_json`: {ts}"
+        );
+    }
+
+    #[test]
+    fn vh_codegen_moves_both_disposable_values_into_compute_diff() {
+        let ts = vh_tokens("update");
+        assert!(
+            ts.contains("compute_diff_owned(__vh_before_json,__vh_after_json,"),
+            "update codegen must move both values into the owned entry point: {ts}"
+        );
+        assert!(
+            !ts.contains("compute_diff(&__vh_before_json"),
+            "update codegen must not keep borrowing the before/after values: {ts}"
+        );
+    }
+
+    #[test]
+    fn vh_codegen_still_serializes_each_record_exactly_once() {
+        // Moving the value into the diff must not tempt a second
+        // `version_column_values()` call: that would double the serialization
+        // cost the change is meant to reduce, and — for a model whose
+        // serialization is not pure — could record a different snapshot than
+        // the one that was written.
+        for (op, expected) in [("insert", 1), ("delete", 1), ("update", 2)] {
+            let ts = vh_tokens(op);
+            assert_eq!(
+                ts.matches("version_column_values()").count(),
+                expected,
+                "{op} codegen must call version_column_values() {expected}x: {ts}"
+            );
+        }
     }
 
     #[test]

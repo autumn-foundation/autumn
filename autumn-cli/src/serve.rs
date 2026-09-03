@@ -672,6 +672,9 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
     // print the data-flow manifest and exit 0 -- a `serve` that reports success
     // and serves nothing (#1654 review round 5).
     cmd.env_remove(crate::data_flow::DUMP_ENV);
+    // `AUTUMN_DUMP_AGENT_AUTHORITY=1` (#1691) sits one rung further up the same
+    // ladder, with the same consequence.
+    cmd.env_remove(crate::agents::DUMP_ENV);
     // Same hazard, sharper consequence (#1605). `AUTUMN_DB_RETENTION=report|purge`
     // is the internal one-shot mode behind `autumn db retention`, and it is
     // dispatched in `AppBuilder::run` *before* the server binds a listener. One
