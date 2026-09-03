@@ -558,6 +558,10 @@ _CONTROL = {'if', 'elif', 'while', 'until', 'then', 'else', 'do', 'done', 'fi',
             'case', 'in', 'esac',
             'time', '!', 'exec', 'command', 'nohup', 'sudo', 'env', 'xargs',
             'timeout', 'nice', 'ssh',
+            # `eval` combines its arguments into shell input and runs the
+            # result, so an UNQUOTED `eval autumn …` is that command with a
+            # prefix; the quoted form is handled as a command string below.
+            'eval',
             # …and the launchers that run a DIRECT command operand, not only
             # one after a `--`. Each was listed as a program whose separator
             # introduces a command, which covered `systemd-run -- autumn …`
@@ -1072,6 +1076,9 @@ def _shell_c(tok, owner):
 _KEY_ONLY = re.compile(r'^(\s*(?:-\s+)?)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS + r'):\s*$',
                        re.I)
 _LIST_ITEM = re.compile(r'^(\s*)-\s+(\S.*?)\s*$')
+# A markdown list item, matched for its CONTENT COLUMN — the column a fence
+# inside the item is measured against.
+_CONTAINER_ITEM = re.compile(r'^ *(?:[-*+]|\d+[.)])\s+')
 
 # The same key with its list written inline, and the sibling `args:` key.
 #
@@ -1142,13 +1149,14 @@ def _heredoc_delim(text, i):
     `<<<EOF` fall out: the character after the operator is `<`, and an
     operator ends a word rather than joining it.
     """
-    out, n = [], len(text)
+    out, n, quoted = [], len(text), False
     while i < n:
         ch = text[i]
         if ch in ' \t' or ch in ';&|<>()':
             break
         if ch == '\\' and i + 1 < n:
             out.append(text[i + 1])
+            quoted = True
             i += 2
             continue
         if ch in '"\'':
@@ -1158,6 +1166,7 @@ def _heredoc_delim(text, i):
             # opened nothing and its data was scanned as commands. Inside
             # SINGLE quotes a backslash is literal, which is why the walk
             # differs by quote kind, exactly as `_mask_quoted` does.
+            quoted = True
             j = i + 1
             while j < n:
                 if ch == '"' and text[j] == '\\' and j + 1 < n:
@@ -1174,7 +1183,8 @@ def _heredoc_delim(text, i):
             continue
         out.append(ch)
         i += 1
-    return ''.join(out) or None
+    word = ''.join(out)
+    return (word, quoted) if word else None
 # A slot key whose value is a plain scalar on the same line. Compose mixes the
 # forms freely — `entrypoint: ["autumn"]` with `command: migrate` — and reading
 # only the bracketed form left the pair half-assembled, so a valid recipe
@@ -1316,8 +1326,17 @@ def _nested_command(segment, j, tok, cmd=0):
     # position names the program whose option it is — the head does.
     after_c = any(_shell_c(prev, segment[k]) for k in (j - 2, cmd, 0)
                   if 0 <= k < len(segment))
+    # `eval 'autumn …'` joins its arguments into shell input and executes
+    # them, so a quoted token after it is a command line exactly as a shell's
+    # `-c` string is. It carries no option to hang the rule on, so the KEYWORD
+    # itself owns what follows — but only a MULTI-WORD token: an unquoted
+    # `eval autumn migrate` is already reached by the prefix walk, and marking
+    # its bare `autumn` as a nested line too reported the page twice, once for
+    # the real command and once for an empty argv.
+    eval_owns = (prev == 'eval' or (cmd < j and segment[cmd] == 'eval')
+                 or (j > 0 and segment[0] == 'eval'))
     if ' ' in tok:
-        marked = after_c or bool(_COMMAND_KEY.match(prev))
+        marked = after_c or eval_owns or bool(_COMMAND_KEY.match(prev))
         if not marked and prev == '=' and j > 1:
             marked = bool(_COMMAND_KEY_BARE.match(segment[j - 2]))
         return marked
@@ -1548,10 +1567,17 @@ def _heredoc_openers(text):
             continue
         if _escaped(text, opener.start()):
             continue
-        delim = _heredoc_delim(text, opener.end())
-        if delim is None:
+        found = _heredoc_delim(text, opener.end())
+        if found is None:
             continue
-        yield delim, text[opener.start():opener.start() + 3] == '<<-'
+        delim, quoted = found
+        # An UNQUOTED delimiter leaves the body subject to expansion — bash's
+        # manual lists parameter expansion, command substitution and
+        # arithmetic — so `cat <<EOF` with `$(autumn …)` under it really does
+        # run that command, while `cat <<'EOF'` prints it. Skipping every body
+        # line alike let the first bypass the gate.
+        yield (delim, text[opener.start():opener.start() + 3] == '<<-',
+               not quoted)
 
 
 def _script_lines(lines):
@@ -1569,10 +1595,13 @@ def _script_lines(lines):
     heredocs, quoted, quoted_at, quote = [], [], None, None
     for lineno, text in lines:
         if heredocs:
-            delim, tabs = heredocs[0]
+            delim, tabs, expands = heredocs[0]
             candidate = text.lstrip('\t') if tabs else text
             if candidate.rstrip('\r') == delim:
                 heredocs.pop(0)
+            elif expands:
+                for _, inner in _embedded_spans(text):
+                    yield lineno, inner
             continue
         if quote:
             quoted.append(text)
@@ -1854,6 +1883,7 @@ def invocations(text):
     """
     fence = None
     fence_indent = 0   # how far the OPENING marker was indented
+    container = 0      # content column of the innermost open list item
     lang = None
     held = []          # parts of a backslash-continued line, oldest first
     held_at = None     # the line the continued command STARTED on
@@ -2095,7 +2125,17 @@ def invocations(text):
                   # spaces, but capping absolutely would stop reading the
                   # first one that appears.
                   and len(m.group(1)) + len(m.group(2)) <= fence_indent + 3)
-        if m and (fence is None or closes):
+        # A fence OPENS only within three spaces of its container's content
+        # column — at the top level that is zero, so a four-space line is an
+        # indented code block and the prose after it is prose. The bound has
+        # to be the same one the closer uses; accepting any indent on the way
+        # in meant an indented block was entered as a fence and a correct page
+        # was gated. Verified against a CommonMark implementation, which also
+        # showed the six-space-under-a-list case this file used to assert is
+        # indented code rather than a fence.
+        opens = m is not None and fence is None \
+            and len(m.group(1)) + len(m.group(2)) <= container + 3
+        if m and (opens or closes):
             held, held_at, heredocs = [], None, []   # a fence boundary ends any hold
             yield from close_quote()            # …an unterminated quote
             yield from close_folded()           # …a folded scalar
@@ -2123,6 +2163,13 @@ def invocations(text):
             if not line.strip():                # a blank line ends a paragraph
                 yield from _spans(take_paragraph(), commands)
             else:
+                # A list item opens a CONTAINER whose content column is where
+                # its text starts; anything less indented has left it again.
+                item = _CONTAINER_ITEM.match(line)
+                if item:
+                    container = len(item.group(0))
+                elif len(line) - len(line.lstrip()) < container:
+                    container = 0
                 add_prose(line, lineno)
             continue
 
@@ -2137,10 +2184,17 @@ def invocations(text):
         # delimiter resumed scanning inside the second body, so its data read
         # as commands.
         if heredocs:
-            delim, tabs = heredocs[0]
+            delim, tabs, expands = heredocs[0]
             candidate = line.lstrip('\t') if tabs else line
             if candidate.rstrip('\r') == delim:
                 heredocs.pop(0)
+            elif expands:
+                # The body is DATA, but an unquoted delimiter still lets a
+                # substitution inside it run. Quoting is not special in a
+                # heredoc body, so the spans are read from the raw line.
+                for _, inner in _embedded_spans(line):
+                    for display, argv in commands(inner):
+                        yield lineno, display, argv, FENCED_COMMAND
             continue
 
         # A trailing comment is valid on a key line, and these patterns are
@@ -4179,10 +4233,24 @@ def self_test():
         doc = f'```bash\nautumn migrate\n{closer}\nautumn nope'
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate'], f'{closer!r} still closes the fence: {got}')
-    # The bound is RELATIVE, so a fence nested in a list item still opens.
-    nested = '- item\n\n      ```bash\n      autumn nope\n      ```\n'
-    expect([d for _, d, _, _ in invocations(nested)] == ['nope'],
-           f'a list-nested fence is still read: {list(invocations(nested))}')
+    # The bound is RELATIVE to the container's content column, so a fence
+    # nested in a list item still opens — but only within three spaces of that
+    # column. This assertion used to demand that a SIX-space fence under
+    # `- item` be read, which a CommonMark implementation says is an indented
+    # code block: a test written from this file's behaviour rather than from
+    # the grammar, agreeing with the defect it should have caught.
+    for pad, is_fence in ((2, True), (5, True), (6, False)):
+        doc = f'- item\n\n{" " * pad}```bash\n{" " * pad}autumn nope\n{" " * pad}```\n'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == (['nope'] if is_fence else []),
+               f'a fence {pad} spaces under a list item: {got}')
+    # …and at the TOP level the container column is zero, so four spaces is an
+    # indented code block and what follows it is prose.
+    for pad, is_fence in ((0, True), (3, True), (4, False)):
+        doc = f'{" " * pad}```bash\n{" " * pad}autumn nope\n{" " * pad}```\n'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == (['nope'] if is_fence else []),
+               f'a top-level fence at {pad} spaces: {got}')
 
     # A delimiter is a shell word, and a word may be spelled in PIECES —
     # quote removal joins `<<'END'.JSON` into one `END.JSON`.
@@ -4506,6 +4574,40 @@ def self_test():
                 '```bash\ndeploy() {\n  autumn nope\n}\ndeploy\n```'):
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['nope'], f'a function body is scanned: {got}')
+
+    # An UNQUOTED heredoc delimiter leaves the body subject to expansion, so
+    # `cat <<EOF` with `$(autumn …)` under it really runs that command, while
+    # `cat <<'EOF'` prints it. Skipping every body line alike missed the first.
+    live = '```bash\ncat <<EOF\n$(autumn nope)\nEOF\n```'
+    expect([(ln, d) for ln, d, _, _ in invocations(live)] == [(3, 'nope')],
+           f'an unquoted heredoc expands its substitutions: {list(invocations(live))}')
+    for delim in ("'EOF'", '"EOF"', '\\EOF'):
+        doc = f'```bash\ncat <<{delim}\n$(autumn nope)\nEOF\n```'
+        expect(list(invocations(doc)) == [],
+               f'<<{delim} prints it instead: {list(invocations(doc))}')
+    # Quoting is not special INSIDE a body, so a single-quoted substitution
+    # there still expands — the opposite of the rule on a command line.
+    inner_q = "```bash\ncat <<EOF\n'$(autumn nope)'\nEOF\n```"
+    expect([d for _, d, _, _ in invocations(inner_q)] == ['nope'],
+           f'quotes in a body are literal text: {list(invocations(inner_q))}')
+    # …and ordinary body text is still data.
+    expect(list(invocations('```bash\ncat <<EOF\nautumn nope\nEOF\n```')) == [],
+           'plain heredoc body text is not a command')
+
+    # `eval` combines its arguments into shell input and executes them.
+    for form in ("eval 'autumn nope'", 'eval "autumn nope"', 'eval autumn nope',
+                 "sudo eval 'autumn nope'"):
+        doc = f'```bash\n{form}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{form} runs its argument: {got}')
+    # The keyword owns only a COMMAND STRING. An unquoted `eval autumn migrate`
+    # is already reached by the prefix walk, and marking its bare `autumn` as a
+    # nested line too reported the page twice — once really, once as an empty
+    # argv.
+    expect([d for _, d, _, _ in invocations('```bash\neval autumn migrate\n```')]
+           == ['migrate'], 'an unquoted eval is read exactly once')
+    expect(list(invocations("```bash\necho 'autumn nope'\n```")) == [],
+           'echo does not eval its argument')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
