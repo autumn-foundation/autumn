@@ -119,17 +119,25 @@ was skipped as irrelevant to HTTP-level behavior).
 charter):
 
 - Interrupt tour proper — cancel-mid-submit, browser back-and-resubmit,
-  double-click race on `POST /submit` itself. `reddit-clone`'s own forms
-  (submit, register, comment) do not opt into the framework's
-  [one-time submit-token protection](../guide/submit-tokens.md) (`grep` for
-  `_submit_token` / `SubmitToken` in `examples/reddit-clone/src` returns
-  nothing), so a double-click almost certainly *does* create duplicate
-  posts/subreddits/comments — but since the framework never claims this is
-  automatic (the guide is explicit that it's per-form opt-in) and the app
-  makes no claim of double-submit protection either, this isn't a
-  documented-claim violation. It reads as a legitimate gap in the example's
-  own showcase, not a framework or app bug — flagged here as a rough edge
-  rather than filed.
+  double-click race on `POST /submit` itself. None of `reddit-clone`'s own
+  forms (submit, register, comment, community-create) opt into the
+  framework's [one-time submit-token protection](../guide/submit-tokens.md)
+  (`grep` for `_submit_token` / `SubmitToken` in
+  `examples/reddit-clone/src` returns nothing), but that only creates a
+  *duplicate-row* risk where nothing else backstops it: post submission and
+  comments do a plain insert with no natural uniqueness key, so a
+  double-click there almost certainly *does* create a duplicate row.
+  Register (unique `username`) and community creation (unique `slug`,
+  via `find_or_create_by_slug` — confirmed after `chatgpt-codex-connector`
+  caught an earlier revision of this report incorrectly including
+  subreddits here) both have a uniqueness backstop that turns a racing
+  double-click into a "already taken" rejection on the loser instead of a
+  duplicate. Either way, since the framework never claims `SubmitToken`
+  protection is automatic (the guide is explicit that it's per-form
+  opt-in) and the app makes no claim of double-submit protection either,
+  none of this is a documented-claim violation. It reads as a legitimate
+  gap in the example's own showcase for posts/comments specifically, not a
+  framework or app bug — flagged here as a rough edge rather than filed.
 - Account lockout (`docs/guide/authentication.md` §"Account lockout") does
   not apply to this app at all: `reddit-clone`'s `users` table is
   hand-rolled (no `failed_attempts`/`locked_at` columns, no
@@ -169,10 +177,18 @@ charter):
   repro + rate + pinned environment + named oracle + dedup search) — every
   oracle checked came back agreeing with the implementation.
 - **Digest (oracle-less, not filed as bugs):**
-  - Double-click / back-button resubmission on `reddit-clone`'s own forms
-    likely creates duplicate posts/comments/subreddits, since none of them
-    use `SubmitToken`. Expectation, not a documented contract — the example
-    simply doesn't showcase this framework feature.
+  - Double-click / back-button resubmission on `reddit-clone`'s post-submit
+    and comment forms likely creates duplicate rows, since neither uses
+    `SubmitToken`. Expectation, not a documented contract — the example
+    simply doesn't showcase this framework feature. **Correction**: an
+    earlier revision of this entry also named community (subreddit)
+    creation, which is wrong — `chatgpt-codex-connector` pointed out that
+    `subreddits::create` (`routes/subreddits.rs`) goes through
+    `find_or_create_by_slug` on the unique `slug` column, so a racing
+    double-click gets "Community name already taken" on the loser, not a
+    duplicate row. Checked directly and confirmed; narrowed to posts and
+    comments, the two forms that do plain inserts with no uniqueness
+    constraint to fall back on.
 - **Solid areas** (toured, held up, no further attention needed absent new
   changes to the surface): votable race-safety and toggle semantics,
   commentable depth/cross-record bounds, post edit/delete authorization,
