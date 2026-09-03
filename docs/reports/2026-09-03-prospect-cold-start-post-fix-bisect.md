@@ -1,4 +1,4 @@
-# ⛏️ Prospect: which commit ate the missing cold-start savings? (undetermined: total window effect is real (~13,000ms), but whether the pre/post-fix spans are signal or noise depends on a noise estimate this assay can't pin down, and no single commit can be named either way)
+# ⛏️ Prospect: which commit ate the missing cold-start savings? (undetermined: the ~13,000ms total window effect is this assay's strongest evidence, but a rigorous noise floor for this apparatus was never established, so no confidence figure — total, span-level, or per-commit — can be honestly stated)
 
 ## 🎯 Question
 
