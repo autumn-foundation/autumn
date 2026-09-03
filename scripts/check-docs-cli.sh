@@ -1166,6 +1166,25 @@ def _heredoc_delim(text, i):
     out, n, quoted = [], len(text), False
     while i < n:
         ch = text[i]
+        # A command substitution is PART of the delimiter word — bash does not
+        # expand a heredoc delimiter, so `<<EOF$(printf x)` waits for the
+        # literal `EOF$(printf x)`. Its parens do not end the word, so they are
+        # consumed verbatim; stopping at the `(` recorded only `EOF$` and the
+        # terminator never matched.
+        if text[i:i + 2] == '$(':
+            depth, j = 0, i + 1
+            while j < n:
+                if text[j] == '(':
+                    depth += 1
+                elif text[j] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        j += 1
+                        break
+                j += 1
+            out.append(text[i:j])
+            i = j
+            continue
         if ch in ' \t' or ch in ';&|<>()':
             break
         if ch == '\\' and i + 1 < n:
@@ -5046,6 +5065,18 @@ def self_test():
         expect(got == want, f'{form} launches its command: {got}')
     expect(list(invocations('```bash\necho coproc autumn nope\n```')) == [],
            'coproc named as an argument launches nothing')
+
+    # A `$( … )` is part of the delimiter WORD — bash does not expand a
+    # heredoc delimiter — so `<<EOF$(printf x)` waits for the literal
+    # `EOF$(printf x)`. Stopping at the `(` recorded only `EOF$`, the
+    # terminator never matched, and the body ran to the fence.
+    expect(_heredoc_delim('EOF$(printf x)', 0) == ('EOF$(printf x)', False),
+           f'a delimiter keeps its $( … ): {_heredoc_delim("EOF$(printf x)", 0)}')
+    dollar_delim = ('```bash\ncat <<EOF$(printf x)\nautumn nope\n'
+                    'EOF$(printf x)\nautumn after\n```')
+    expect([(ln, d) for ln, d, _, _ in invocations(dollar_delim)] == [(5, 'after')],
+           f'the real terminator matches and the body is data: '
+           f'{list(invocations(dollar_delim))}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
