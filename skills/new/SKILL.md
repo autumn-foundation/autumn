@@ -3,7 +3,7 @@ name: new
 description: >
   Use when the user runs /autumn:new, asks to create a new Autumn web
   application, or wants to scaffold a fresh project with the autumn CLI.
-argument-hint: "<app-name> [--with-i18n] [--with-seed]"
+argument-hint: "<app-name> [--with-i18n] [--with-seed] [--with <plugin>]"
 allowed-tools:
   - Bash
   - Read
@@ -19,15 +19,17 @@ setup`, and walks the user through the first-run configuration.
 
 1. Confirm the app name, flags, and target directory:
    ```
-   Will create: autumn new <app-name> [--with-i18n] [--with-seed]
+   Will create: autumn new <app-name> [--with-i18n] [--with-seed] [--with <plugin>]
    Directory:   ./<app-name>/
    ```
    Pass any flags the user provided (e.g. `--with-i18n`, `--with-seed`) through
    to the command — they can only be applied at creation time, not added later.
+   `--with <plugin>` is the exception: a plugin can also be added afterwards
+   with `autumn plugin add`, and removed again with `autumn plugin remove`.
 2. Ask for confirmation before proceeding.
 3. Run with the user's flags:
    ```bash
-   autumn new <app-name> [--with-i18n] [--with-seed]
+   autumn new <app-name> [--with-i18n] [--with-seed] [--with <plugin>]
    ```
 4. Change into the new directory and run:
    ```bash
@@ -70,6 +72,13 @@ First-run checklist:
   `i18n/en.ftl`, the `[i18n]` block in `autumn.toml`, and the `i18n` feature
   on `autumn-web`).
 - `--with-seed`: Scaffold a stub `src/bin/seed.rs` for database seeding.
+- `--with <plugin>` **(trunk-dev, issue #1631)**: Scaffold the app with that
+  plugin already wired — dependency plus builder-chain mount, the same edits
+  `autumn plugin add` makes. Repeatable (`--with autumn-admin-plugin --with
+  autumn-search`). Every name is resolved and version-checked before any file
+  is written, so an unknown or incompatible plugin leaves no half-built
+  project. Takes the same names as `autumn plugin list`. Wiring code is all it
+  does: no migration is applied and no table is created.
 - `--api` **(trunk-dev)**: Scaffold a JSON-first app instead of the HTML/view
   flavor (issue #1847). Handlers return `Json<…>`; `autumn-web` is pinned
   `default-features = false` to a lean set (`db`, `cache-moka`, `http-client`,
