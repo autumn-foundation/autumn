@@ -13,9 +13,13 @@
 # DB-dependent tests can opt in. Tests decorated `#[ignore]` are skipped by
 # default; run `cargo test -- --ignored` to include them.
 #
-# Also enforced: `autumn a11y verify` (accessibility) and
-# `autumn routes audit` (route auth-coverage security manifest), both run
-# against the prebuilt `autumn` CLI installed mid-job.
+# Also enforced: `autumn a11y verify` (accessibility), `autumn routes audit`
+# (route auth-coverage security manifest) — both run against the prebuilt
+# `autumn` CLI installed mid-job — and `cargo deny check advisories`, which
+# fails the build when any crate in this app's dependency tree carries a known
+# RustSec security advisory. That audit reads `deny.toml` at the repository
+# root; waive an advisory by adding an entry there, never by weakening or
+# deleting the step.
 #
 # Optional extensions (not required for green CI on a fresh scaffold):
 #   - Agent authority (issue #1691): once any handler carries
@@ -30,7 +34,6 @@
 #   - Tailwind: add `autumn setup --tailwind` and run the downloaded binary
 #     before `cargo build` to compile CSS in CI.
 #   - Coverage: install cargo-llvm-cov and upload to Codecov.
-#   - Audit: `cargo install cargo-audit` then `cargo audit`.
 
 name: CI
 
@@ -80,6 +83,41 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+      # Dependency advisory gate: every crate in this app's tree — transitive
+      # included — is checked against the RustSec advisory database, and a known
+      # advisory that `deny.toml` does not explicitly waive fails the build. See
+      # `deny.toml` for how to read a finding and how to waive one.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2.85.5
+        with:
+          tool: cargo-deny@0.20.2
+
+      # The advisory database is the one part of this gate that needs the
+      # network, so fetching it is a separate, retried step. If it is still
+      # unreachable after the retries the job FAILS — the gate is fail closed:
+      # a dependency tree nobody could verify is never reported as clean.
+      - name: Fetch the RustSec advisory database
+        run: |
+          cargo fetch
+          fetched=""
+          for attempt in 1 2 3; do
+            if cargo deny fetch db; then
+              fetched="yes"
+              break
+            fi
+            echo "advisory database unreachable (attempt $attempt/3); retrying in $((attempt * 10))s"
+            sleep "$((attempt * 10))"
+          done
+          if [ -z "$fetched" ]; then
+            echo "::error::RustSec advisory database unreachable after 3 attempts - failing closed."
+            exit 1
+          fi
+
+      # Runs against the database fetched above, so a failure here is a real
+      # advisory rather than a network blip.
+      - name: Audit dependencies (RustSec advisories)
+        run: cargo deny --offline check advisories
 
       # Accessibility gate: install the prebuilt `autumn` CLI matching this app's
       # autumn-web version and scan raw html! markup for a11y violations. This is an

@@ -34,6 +34,10 @@ pub mod templates {
     pub const SEED_CARGO_TOML: &str = include_str!("templates/seed_Cargo.toml.tmpl");
     pub const INTEGRATION_TEST: &str = include_str!("templates/tests/integration_test.rs.tmpl");
     pub const CI_WORKFLOW: &str = include_str!("templates/.github/workflows/ci.yml.tmpl");
+    /// Dependency advisory policy read by the generated CI's `cargo deny check
+    /// advisories` gate (issue #1600). Deliberately *not* framework-owned — see
+    /// [`framework_owned_files`].
+    pub const DENY_TOML: &str = include_str!("templates/deny.toml.tmpl");
     pub const RUST_TOOLCHAIN: &str = include_str!("templates/rust-toolchain.toml.tmpl");
     pub const RUSTFMT: &str = include_str!("templates/rustfmt.toml.tmpl");
     pub const CLIPPY: &str = include_str!("templates/clippy.toml.tmpl");
@@ -260,6 +264,13 @@ fn generate_inner(
         project_dir.join("README.md"),
         render_readme(render(templates::README), opts, &vars),
     )?;
+
+    // The dependency advisory policy the generated CI enforces (issue #1600).
+    // Written here rather than through `framework_owned_files` because its
+    // waiver list is the app author's to grow: a file the developer is *asked*
+    // to edit would otherwise come back as a scaffold-reconciliation conflict
+    // on every `autumn upgrade`, exactly like `Cargo.toml` would.
+    fs::write(project_dir.join("deny.toml"), render(templates::DENY_TOML))?;
 
     let main_template = if opts.with_api {
         templates::MAIN_API_RS
@@ -538,6 +549,10 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     println!("  Created {name}/rust-toolchain.toml");
     println!("  Created {name}/rustfmt.toml");
     println!("  Created {name}/clippy.toml");
+    // Named with its purpose attached: when the advisory gate first fires, a
+    // developer who does not know this file exists reaches for disabling the CI
+    // step instead of recording a waiver here.
+    println!("  Created {name}/deny.toml (dependency advisory policy — CI audits against it)");
     println!("  Created {name}/migrations/");
     println!("  Created {name}/tests/integration_test.rs");
     println!("  Created {name}/config/master.key (keep secret — never commit)");
@@ -2729,6 +2744,33 @@ mod tests {
                 files.keys()
             );
         }
+    }
+
+    /// The advisory policy is generated but deliberately *not* reconciled
+    /// (issue #1600): its waiver list is the app author's, and a file the
+    /// developer is asked to edit would come back as a conflict on every
+    /// `autumn upgrade` — the same reason `Cargo.toml` is not owned either.
+    #[test]
+    fn the_advisory_policy_is_generated_but_not_framework_owned() {
+        for opts in [
+            GenerateOptions::default(),
+            GenerateOptions {
+                with_api: true,
+                ..GenerateOptions::default()
+            },
+        ] {
+            assert!(
+                !owned(opts).contains_key("deny.toml"),
+                "deny.toml carries the app's own waivers; reconciling it would \
+                 conflict with every waiver its author adds"
+            );
+        }
+        let tmp = TempDir::new().unwrap();
+        generate("policy-owner-app", tmp.path()).unwrap();
+        assert!(
+            tmp.path().join("policy-owner-app/deny.toml").is_file(),
+            "…but `autumn new` must still write it"
+        );
     }
 
     #[test]

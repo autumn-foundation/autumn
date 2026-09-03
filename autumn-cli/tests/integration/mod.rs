@@ -5,6 +5,7 @@ mod console;
 mod db;
 mod db_pull;
 mod db_scrub;
+mod dependency_audit;
 mod deploy;
 mod edge;
 mod generate_json_postgres;

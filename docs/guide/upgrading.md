@@ -206,6 +206,7 @@ reporting a clean project it never looked at.
 | `.gitignore`, `.env.example` | `tests/**`, `migrations/**`, `i18n/**` |
 | `.github/workflows/ci.yml` | `config/credentials/**` (your secrets) |
 | `rust-toolchain.toml`, `rustfmt.toml`, `clippy.toml` | `static/js/**` (vendored — `autumn assets` owns these) |
+| | `deny.toml` (your advisory waivers — scaffolded once, then yours) |
 | `tailwind.config.js`, `static/css/input.css` (fullstack only) | |
 
 **Application source is out of bounds.** The command never reads, writes, or

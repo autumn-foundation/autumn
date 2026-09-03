@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dependency-advisory gate, on by default, for scaffolded apps and Autumn's
+  own releases (#1600):** the CI workflow `autumn new` generates relegated
+  vulnerability auditing to a comment ("Optional extensions… Audit: `cargo
+  install cargo-audit`"), which almost nobody enabled, so apps shipped with
+  known-vulnerable transitive dependencies and found out from a pentest rather
+  than from CI. A generated app now audits its whole dependency tree on every
+  push and pull request, and a known RustSec advisory fails the build:
+
+  - `.github/workflows/ci.yml` installs a pinned cargo-deny and runs `cargo deny
+    check advisories`, reading the new **`deny.toml`** the scaffold writes at
+    the project root. Waive an advisory by adding an `ignore` entry there with
+    its id, a `reason`, and a review-by date — the gate stays on and lets
+    exactly that one id through; an unwaived advisory still fails.
+  - Day-one CI is green: the scaffold ships one documented waiver
+    (RUSTSEC-2023-0071, `rsa` via the unconditional `jsonwebtoken` dependency,
+    for which no patched release exists), and Autumn's own CI re-audits the
+    scaffold's dependency tree against that exact policy on every run, so the
+    waiver set cannot quietly stop covering what the scaffold ships.
+  - When the advisory database is unreachable the gate **fails closed**: the
+    fetch is its own step, retried three times with backoff, and the audit then
+    runs `--offline` against it — no hang, no silent skip, and a failure in the
+    audit step always names a real advisory.
+  - Autumn's own release path is gated the same way: `scripts/check-advisories.sh`
+    runs in PR CI *and* in the Publish Gate (a `prepare-release` dependency), so
+    a release with an unwaived advisory in its tree cannot be tagged. Its
+    `--self-test` proves the gate can still go red by auditing an injected
+    known-vulnerable dependency (`time 0.1.45`, RUSTSEC-2020-0071) and requiring
+    rejection, then acceptance once that id is waived.
+  - Docs: [supply-chain guide](docs/guide/supply-chain.md) covers what the gate
+    checks, how to read a failure, and how to waive an advisory.
+
 - **Build-time authority envelope for agent-operable handlers (#1691):** an
   endpoint exposed as an MCP tool is an action an autonomous agent can take
   with no human in the loop, and nothing said what that action was *allowed*
