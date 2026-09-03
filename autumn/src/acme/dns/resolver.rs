@@ -922,7 +922,10 @@ mod tests {
         assert_eq!(u16::from_be_bytes([msg[2], msg[3]]), FLAG_RECURSION_DESIRED);
         assert_eq!(u16::from_be_bytes([msg[4], msg[5]]), 1, "QDCOUNT");
         assert_eq!(query_name(&msg), "_acme-challenge.myapp.com");
-        assert_eq!(&msg[msg.len() - 4..], &[0, 16, 0, 1], "TXT/IN");
+        // QTYPE/QCLASS sit right after the root label, BEFORE the EDNS0 OPT
+        // record the query now appends (see `a_query_advertises_an_edns0_buffer`).
+        let qtype_at = msg.len() - 11 - 4;
+        assert_eq!(&msg[qtype_at..qtype_at + 4], &[0, 16, 0, 1], "TXT/IN");
         // A trailing dot is the same name.
         assert_eq!(
             encode_txt_query(1, "myapp.com.").unwrap(),
@@ -1490,7 +1493,7 @@ mod tests {
         assert!(err.contains("_acme-challenge.myapp.com"), "got: {err}");
         assert!(err.contains("value-apex"), "got: {err}");
         assert!(err.contains("127.0.0.1:5353"), "got: {err}");
-        assert!(err.contains("does not exist yet"), "got: {err}");
+        assert!(err.contains("does not exist there yet"), "got: {err}");
         assert!(
             err.contains("propagation_timeout_secs"),
             "the message must say which knob to turn: {err}"

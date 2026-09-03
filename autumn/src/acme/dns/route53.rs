@@ -337,23 +337,37 @@ fn is_hosted_zone_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 32 && id.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
-/// The hosted zone id in a `ListHostedZonesByName` response whose `Name` is
-/// exactly `candidate`.
+/// The **public** hosted zone id in a `ListHostedZonesByName` response whose
+/// `Name` is exactly `candidate`.
 ///
-/// Route 53 answers with zones lexicographically at or after `dnsname`, so a
-/// name check is mandatory: without it, a lookup for `myapp.com` in an account
-/// that does not host it would silently return the *next* zone.
+/// Two filters, each guarding a real failure:
+///
+/// - **Exact name.** Route 53 answers with zones lexicographically at or after
+///   `dnsname`, so without a name check a lookup for `myapp.com` in an account
+///   that does not host it would silently return the *next* zone.
+/// - **Not private.** See [`is_private_zone`].
 fn hosted_zone_id_for(xml: &str, candidate: &str) -> Option<String> {
     let wanted = format!("{}.", candidate.trim_end_matches('.').to_ascii_lowercase());
     xml_elements(xml, "HostedZone")
         .into_iter()
         .find_map(|zone| {
             let name = xml_element(zone, "Name")?.to_ascii_lowercase();
-            if name != wanted {
+            if name != wanted || is_private_zone(zone) {
                 return None;
             }
             Some(strip_zone_prefix(xml_element(zone, "Id")?).to_owned())
         })
+}
+
+/// Whether a `<HostedZone>` element is a private (VPC-only) zone.
+///
+/// Split-horizon DNS — one private hosted zone for the VPC and one public zone
+/// for the internet, same name — is a mainstream AWS shape. Writing the
+/// challenge into the private zone makes it invisible to the CA, so every order
+/// times out on the propagation wait while dead records pile up in the internal
+/// zone.
+fn is_private_zone(zone: &str) -> bool {
+    xml_element(zone, "PrivateZone").is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
 }
 
 /// The TXT values of the `ResourceRecordSet` for `fqdn` in a
@@ -671,7 +685,10 @@ mod tests {
     }
 
     fn r53(transport: std::sync::Arc<RecordingTransport>) -> Route53Provider {
-        Route53Provider::new(credentials(), transport as std::sync::Arc<dyn HttpTransport>)
+        Route53Provider::new(
+            credentials(),
+            transport as std::sync::Arc<dyn HttpTransport>,
+        )
     }
 
     /// Route 53 replaces a whole record set rather than adding to it, so the
@@ -845,7 +862,10 @@ mod tests {
             RecordingTransport::new(&[(RRSET_LIST, empty_rrset()), (RRSET_CHANGE, changed())]);
         let mut creds = credentials();
         creds.hosted_zone_id = Some("/hostedzone/ZPUBLIC".to_owned());
-        let provider = Route53Provider::new(creds, std::sync::Arc::clone(&transport) as std::sync::Arc<dyn HttpTransport>);
+        let provider = Route53Provider::new(
+            creds,
+            std::sync::Arc::clone(&transport) as std::sync::Arc<dyn HttpTransport>,
+        );
         provider
             .upsert_txt(&TxtRecord::new("myapp.com", "v"))
             .await

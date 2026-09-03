@@ -195,7 +195,7 @@ mod tests {
         let provider = ExecProvider::new(vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            r#"test "$1" = present && test "$2" = _acme-challenge.myapp.com && test "$3" = challenge-value"#
+            r#"test "$1" = -- && test "$2" = present && test "$3" = _acme-challenge.myapp.com && test "$4" = challenge-value"#
                 .to_owned(),
             "hook".to_owned(),
         ]);
@@ -208,7 +208,7 @@ mod tests {
         let provider = ExecProvider::new(vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            r#"test "$1" = cleanup"#.to_owned(),
+            r#"test "$1" = -- && test "$2" = cleanup"#.to_owned(),
             "hook".to_owned(),
         ]);
         provider
@@ -252,7 +252,7 @@ mod tests {
         let provider = ExecProvider::new(vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            r#"test "$3" = '; touch /tmp/pwned`whoami`'"#.to_owned(),
+            r#"test "$4" = '; touch /tmp/pwned`whoami`'"#.to_owned(),
             "hook".to_owned(),
         ]);
         let hostile = TxtRecord::new("myapp.com", "; touch /tmp/pwned`whoami`");
