@@ -1437,7 +1437,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **🧭 Wayfinder: keyboard bypass-blocks link added to 7 supported example
+- **🧭 Wayfinder: keyboard bypass-blocks link added to 6 supported example
   apps (a11y `bypass` Serious 7/8 → 0/8; `landmark-one-main` Moderate 1/8 → 0/8):**
   `autumn check --a11y` — the framework's own WCAG audit, run against each
   layout's rendered shell — found `todo-app`, `blog`, `bookmarks`,
@@ -1445,18 +1445,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   example apps with an HTML UI; `reddit-clone` already had it) missing the
   skip-to-content link that `autumn new`'s own scaffold (`autumn-cli/src/templates/main.rs.tmpl`)
   ships by default. A keyboard-only user visiting any of these — including
-  `saas`/`teams`, whose nav is the login/signup entry point, and the `todo-app`
-  walked step-by-step in `docs/guide/getting-started.md` — must tab through
+  `saas`/`teams`, whose nav is the login/signup entry point — must tab through
   every nav link before reaching the page's actual content on **every single
   page load**, with no way to jump past it (WCAG 2.4.1 Bypass Blocks). `todo-app`
   additionally had no `<main>` landmark at all, so a screen-reader user's
   "jump to main content" shortcut had nothing to land on.
   Fix: a visually-hidden, focus-revealed `<a href="#main-content">` as the
-  first element inside `<body>` plus a `<main id="main-content">` landmark on
-  every affected layout — the exact pattern `examples/reddit-clone` already
-  used and the scaffold template establishes, so no new CSS or dependency is
-  introduced. `examples/media-room` was audited and left unchanged: it has no
-  nav/header to bypass, so a skip link there would address nothing.
+  first element inside `<body>` on the 6 apps whose layout has a nav/header
+  preceding the content, plus a `<main id="main-content">` landmark on every
+  affected layout including `todo-app` — the exact skip-link pattern
+  `examples/reddit-clone` already used and the scaffold template establishes,
+  so no new CSS or dependency is introduced. `todo-app`'s page has no
+  nav/header at all (content is the first thing in `<body>`), so it gets only
+  the `<main>` landmark — a skip link there would add a tab stop ahead of the
+  first form control while bypassing nothing, the same reason
+  `examples/media-room` (also audited, also nav-less) was left unchanged.
+  `examples/blog` is i18n-aware (`/es/...` routes via `t!`), so its skip
+  link's label is a new `layout.skip_to_content` Fluent key translated in
+  both `i18n/en.ftl` and `i18n/es.ftl`, not a hardcoded English string,
+  matching the rest of that layout's chrome.
 - **Punctuation- and emoji-only titles no longer slip past the validator that
   exists to stop them (#2424):** `examples/reddit-clone` rejects a post title
   like `***`, `!!!???...:::` or `🎉🔥💯` with "Title must contain at least one

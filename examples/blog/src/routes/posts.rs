@@ -87,7 +87,7 @@ pub fn layout_with_seo(
                   class="skip-link sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 \
                          focus:z-50 focus:px-4 focus:py-2 focus:bg-white focus:text-gray-900 \
                          focus:border focus:border-gray-300 focus:rounded focus:shadow" {
-                    "Skip to main content"
+                    (t!(locale, "layout.skip_to_content"))
                 }
                 // Navigation
                 nav class="border-b border-stone-200 bg-white/80 backdrop-blur-sm sticky top-0 z-10" {
