@@ -849,6 +849,22 @@ def _exec_command(tok):
 
 # A flag whose value is a whole command line for another shell.
 _SHELL_C = re.compile(r'^(-c|-C|--command)$')
+# Programs whose `-c` argument is a shell COMMAND STRING. Any other program's
+# `-c` means something else entirely — `echo -c 'autumn db'` prints its
+# arguments — and recursing into the value reported a page for a command that
+# never runs. The same presence-versus-position mistake as the `--` separator
+# had: the option is only a command string when its OWNER makes it one.
+_SHELL_RUNNERS = {'sh', 'bash', 'zsh', 'ksh', 'dash', 'ash', 'busybox',
+                  'su', 'runuser', 'doas', 'fly', 'flyctl', 'heroku',
+                  'docker', 'podman', 'kubectl', 'oc', 'ssh'}
+# …and the runtimes that take `--entrypoint`, for the same reason.
+_CONTAINER_RUNNERS = {'docker', 'podman', 'nerdctl'}
+
+
+def _is_runner(segment, cmd, names):
+    """True when the command at `cmd` is one of `names`."""
+    return (cmd < len(segment)
+            and segment[cmd].rsplit('/', 1)[-1] in names)
 
 # A command key that carries no value on its own line, and the YAML list items
 # that follow it. A deployment recipe writes the container command either
@@ -881,7 +897,7 @@ _EXEC_KEY_LINE = re.compile(r'^\s*' + _QUALIFIED + r'(?:' + _EXEC_KEYS + r'):', 
 # was. The literal form (`|`) keeps its lines separate and is already right,
 # so only `>` is folded here.
 _FOLDED_KEY = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
-                         r'):\s*>[-+]?\s*$', re.I)
+                         r'):\s*>[0-9+-]{0,2}\s*$', re.I)
 # Any mapping key, used only to spot where one object ends and its sibling
 # begins — Compose names its services this way rather than with list items.
 _MAPPING_KEY = re.compile(r'^(\s*)[A-Za-z_][\w.-]*:(\s|$)')
@@ -984,7 +1000,7 @@ def _inline_items(body):
     return [i for i in items if i]
 
 
-def _nested_command(segment, j, tok):
+def _nested_command(segment, j, tok, cmd=0):
     """True when this token is itself a command line rather than an argument.
 
     Two shapes: a quoted token carrying arguments (`-C "autumn migrate run"`,
@@ -1009,7 +1025,8 @@ def _nested_command(segment, j, tok):
     if j == 0:
         return False
     prev = segment[j - 1]
-    after_c = bool(_SHELL_C.match(prev))
+    after_c = (bool(_SHELL_C.match(prev))
+               and _is_runner(segment, cmd, _SHELL_RUNNERS))
     if ' ' in tok:
         marked = after_c or bool(_COMMAND_KEY.match(prev))
         if not marked and prev == '=' and j > 1:
@@ -1344,16 +1361,18 @@ def _from_tokens(tokens, masked=None):
                 #     reading `db` there failed a correct page.
                 yield ' '.join(segment[j + 2:]), segment[j + 2:]
             elif tok == '--entrypoint' and j + 2 < len(segment) \
-                    and _autumn_exe(segment[j + 1]):
+                    and _autumn_exe(segment[j + 1]) \
+                    and _is_runner(segment, cmd_at, _CONTAINER_RUNNERS):
                 yield from _after_image(segment, j + 2)
             elif tok.startswith('--entrypoint=') \
-                    and _autumn_exe(tok[len('--entrypoint='):]):
+                    and _autumn_exe(tok[len('--entrypoint='):]) \
+                    and _is_runner(segment, cmd_at, _CONTAINER_RUNNERS):
                 # The attached form takes a path just as the separated one
                 # does — `--entrypoint=/usr/local/bin/autumn` — and comparing
                 # the whole token against one spelling accepted only the bare
                 # word, so the path-qualified recipe went unread.
                 yield from _after_image(segment, j + 1)
-            elif _nested_command(segment, j, tok):
+            elif _nested_command(segment, j, tok, cmd_at):
                 # A nested command line is RE-ENTERED, not re-implemented. It
                 # gets environment prefixes, chains, path-qualified spellings
                 # and everything else for free, because it is the same parser:
@@ -1431,8 +1450,14 @@ def invocations(text):
     def flush(line, lineno):
         """Fold a backslash continuation into one logical line."""
         nonlocal held, held_at
-        if line.rstrip().endswith('\\'):
-            held.append(line.rstrip()[:-1])
+        # A trailing backslash continues the line only when it is itself
+        # UNESCAPED. `printf '%s' \\\\` prints one literal backslash and
+        # continues nothing, and joining the next line onto it hid the command
+        # there inside the printf's argv. Parity decides: an odd run escapes
+        # the newline, an even one is literal backslashes.
+        body = line.rstrip()
+        if (len(body) - len(body.rstrip('\\'))) % 2 == 1:
+            held.append(body[:-1])
             if held_at is None:
                 held_at = lineno
             return None, None
@@ -2442,6 +2467,41 @@ def self_test():
                     '```bash\nautumn migrate run\n```')
     expect([d for _, d, _, _ in invocations(unterminated)] == ['migrate run'],
            f'a fence boundary ends a heredoc: {list(invocations(unterminated))}')
+
+    # --- an option is a command string only when its OWNER makes it one. Any
+    # program may take a `-c` or an `--entrypoint`; only some run the value.
+    for runner in ("sh -c", "bash -c", "su -c", "fly ssh console -C"):
+        doc = f"```bash\n{runner} 'autumn migrate run'\n```"
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'], f'{runner!r} runs its string: {got}')
+    for other in ("echo -c", "printf -c", "ls -c"):
+        doc = f"```bash\n{other} 'autumn db'\n```"
+        expect(list(invocations(doc)) == [],
+               f'{other!r} does not run its argument: {list(invocations(doc))}')
+    for runner in ('docker run', 'podman run', 'nerdctl run'):
+        doc = f'```bash\n{runner} --entrypoint autumn img migrate run\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'], f'{runner!r} takes an entrypoint: {got}')
+    for other in ('echo', 'ls'):
+        doc = f'```bash\n{other} --entrypoint autumn img db\n```'
+        expect(list(invocations(doc)) == [],
+               f'{other!r} has no entrypoint to override: {list(invocations(doc))}')
+
+    # --- a trailing backslash continues a line only when itself unescaped.
+    escaped = "```bash\nprintf '%s' \\\\\\\\\nautumn migrate run\n```"
+    expect([d for _, d, _, _ in invocations(escaped)] == ['migrate run'],
+           f'a doubled backslash is literal, not a continuation: '
+           f'{list(invocations(escaped))}')
+    real = '```bash\nautumn maintenance on \\\n  --reason x\n```'
+    expect([d for _, d, _, _ in invocations(real)] == ['maintenance on --reason x'],
+           f'a single backslash still continues: {list(invocations(real))}')
+
+    # --- a folded scalar may carry an explicit indentation indicator, in
+    # either order with the chomping one.
+    for indicator in ('>', '>-', '>+', '>2', '>2-', '>-2'):
+        doc = f'```yaml\nrun: {indicator}\n  autumn migrate\n  run\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'], f'`{indicator}` folds: {got}')
 
     # --- a brace group runs the commands inside it, so `{` stands in front of
     # a command the way a subshell's `(` does.
