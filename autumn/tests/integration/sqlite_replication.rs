@@ -206,6 +206,15 @@ impl Harness {
             SqliteConnection::establish(":memory:").expect("placeholder"),
         );
         drop(conn);
+        // The replicator pins a connection of its own for the whole of its life
+        // — that is what stops SQLite from checkpointing behind its back — and
+        // Windows refuses to unlink a file that any handle still holds open.
+        // Repointing it at a scratch path drops the original connection, so the
+        // unlink below actually removes the database instead of silently
+        // failing. Unlinking an open file is fine on Linux, which is why only
+        // Windows saw this.
+        let scratch = self.db.with_file_name("destroyed-scratch.db");
+        self.rebuild(settings(&scratch));
         for path in [
             self.db.clone(),
             PathBuf::from(format!("{}-wal", self.db.display())),
