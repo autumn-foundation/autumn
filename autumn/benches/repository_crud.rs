@@ -218,12 +218,65 @@ fn database_url() -> String {
     url
 }
 
+#[derive(diesel::QueryableByName)]
+struct ExistsRow {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    present: bool,
+}
+
+/// Guard that drops this harness's own table when it goes out of scope
+/// (normal completion or an unwinding panic), so a clean run never leaves
+/// state behind for the next one to trip over. Opens its own connection
+/// rather than borrowing one, since it must outlive everything else in
+/// `main` including the tokio runtime.
+struct TableGuard {
+    url: String,
+}
+
+impl Drop for TableGuard {
+    fn drop(&mut self) {
+        if let Ok(mut conn) = diesel::PgConnection::establish(&self.url) {
+            let _ = conn.batch_execute("DROP TABLE IF EXISTS bolt_bench_products");
+        }
+    }
+}
+
 /// Fresh table, seeded with a realistic-shaped fixture — skewed enough that
 /// no two rows are identical, cheap enough to seed in one `INSERT ... SELECT`.
+///
+/// Refuses to touch a pre-existing `bolt_bench_products` table rather than
+/// dropping it: `DATABASE_URL` only promises a reachable, TLS-free Postgres,
+/// not a disposable/scratch one, so this harness must not assume it owns
+/// whatever happens to already be there (Codex review on #2486). Callers
+/// clean up after themselves via [`TableGuard`], so a table surviving to the
+/// next run is itself a signal something is wrong — worth surfacing, not
+/// silently clearing.
 fn setup_and_seed(url: &str) {
+    // Imported locally, not at module scope: an outer `use diesel::prelude::*`
+    // (the sync `RunQueryDsl`) would make method resolution ambiguous against
+    // the async `RunQueryDsl` the `#[repository]`-generated `save`/
+    // `find_by_id`/`page` bodies use elsewhere in this file (same reasoning
+    // as `export_csv_list_count_profile.rs`).
+    use diesel::RunQueryDsl;
+
     let mut conn = diesel::PgConnection::establish(url).expect("sync db connection");
-    conn.batch_execute("DROP TABLE IF EXISTS bolt_bench_products")
-        .expect("drop table");
+    let exists: bool = diesel::sql_query(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM pg_catalog.pg_tables \
+            WHERE schemaname = 'public' AND tablename = 'bolt_bench_products' \
+         ) AS present",
+    )
+    .get_result::<ExistsRow>(&mut conn)
+    .expect("check for pre-existing table")
+    .present;
+    assert!(
+        !exists,
+        "refusing to run: table `bolt_bench_products` already exists in this database. This \
+         harness does not touch pre-existing tables — it only creates and drops its own. If \
+         this is a leftover from a previous run of this harness that didn't exit cleanly, drop \
+         it yourself first (`DROP TABLE bolt_bench_products`); otherwise point DATABASE_URL at \
+         a different (scratch) database."
+    );
     conn.batch_execute(
         "CREATE TABLE bolt_bench_products ( \
             id BIGSERIAL PRIMARY KEY, \
@@ -256,6 +309,10 @@ fn main() {
 
     let url = database_url();
     setup_and_seed(&url);
+    // Must outlive everything below, including `rt`: dropped last, at the end
+    // of `main` (or while unwinding a panic), so a run cleans up its own
+    // table instead of leaving it for the next invocation to trip over.
+    let _table_guard = TableGuard { url: url.clone() };
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
