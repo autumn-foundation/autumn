@@ -50,6 +50,12 @@
 #     sentence is not a copyable line, and scanning prose drags in every
 #     "autumn is", "autumn never", "the autumn crate".
 #
+# CHAINS: a line may hold several commands (`autumn migrate && autumn seed &&
+# autumn dev` appears in the guide). Every command in the chain is resolved, not
+# just the first — checking only the head would leave the tail of every chained
+# line ungated, which is where a second command is most easily left behind by a
+# rename.
+#
 # CORPUS SCOPE: reader-facing task docs only — `docs/guide/`, `docs/migrations/`,
 # `skills/`, `agents/`, and the root `README.md` / `EXAMPLES.md` /
 # `CONTRIBUTING.md` / `STABILITY.md`. Deliberately excluded:
@@ -64,13 +70,23 @@
 #
 # WAIVERS: a reader-facing page sometimes has to name a command that does not
 # exist — "`autumn generate island` does not exist yet" is a real answer to a
-# real question. Waive it with a marker anywhere in the same file:
+# real question. Waive it with a marker directly below the passage that names it:
 #
 #     <!-- cli-surface-allow: autumn generate island — planned, see #493 -->
 #
 # The marker sits in the page beside the claim, so when the sentence is deleted
 # or the command ships, the waiver goes with it. A central allowlist would
 # outlive both. Every waiver must carry a reason after the command.
+#
+# A waiver is scoped two ways, because a broad one is worse than none — it
+# silently re-admits the defect the gate exists to catch:
+#   - It NEVER applies inside a fenced shell block. A page may *name* a command
+#     that does not exist; it may never hand one to a reader to run. This is the
+#     rule that keeps a waiver from undoing the `system-tests.md` fix, where a
+#     planned command sat inside a runnable block.
+#   - It covers only its own blank-line-separated block and the one directly
+#     above it — the passage it was written for. The same command spelled wrong
+#     further down the page is still reported.
 #
 # USAGE:
 #   scripts/check-docs-cli.sh              # gate the corpus
@@ -280,10 +296,18 @@ def cli_sources(root):
 # still start with the command being demonstrated.
 SHELL_LANGS = {'bash', 'sh', 'shell', 'console', 'zsh', 'terminal', 'text', ''}
 
-# `autumn` as the head of a command: at line start, after a `$` prompt, or
-# after a shell operator. The lookbehind rejects `autumn-cli`, `autumn-web`,
-# `./autumn`, and `autumn/src/…`, none of which are CLI invocations.
-INVOCATION = re.compile(r'(?:^|[;&|(]\s*|\$\s+)autumn\s+(.+)$')
+# A line may chain several commands — `autumn migrate && autumn seed && autumn
+# dev` is real, and appears in the guide. Splitting on shell operators first and
+# then matching each segment is what makes the later commands in a chain
+# checkable; a single regex over the whole line yields only the first, and the
+# rest ride in free. Splitting is safe even inside a quoted argument, because
+# only segments that then START with `autumn` are read as invocations.
+CHAIN = re.compile(r'&&|\|\||[;|&]')
+
+# `autumn` as the head of a segment, after any prompt or grouping punctuation.
+# The `\s` after the name rejects `autumn-cli`, `autumn-web` and `autumn/src/…`;
+# anchoring to the segment start rejects `./autumn` and `cd autumn`.
+INVOCATION = re.compile(r'^[\s(]*\$?\s*autumn\s+(.+)$')
 
 # A token that could name a command. Anything else — a flag, a `<PLACEHOLDER>`,
 # a TOML `= "0.1.0"`, a box-drawing character from a diagram — ends the walk.
@@ -308,7 +332,13 @@ def corpus(root):
 
 
 def invocations(text):
-    """Yield (line_no, argv) for every copyable `autumn …` line."""
+    """Yield (line_no, argv, in_fence) for every copyable `autumn …` command.
+
+    `in_fence` separates the two populations that matter for waivers: a command
+    inside a fenced shell block is something a reader COPIES, while one in an
+    inline span may be a sentence naming a command in order to say it does not
+    exist. Only the second is ever waivable.
+    """
     fence = None
     lang = None
     for lineno, line in enumerate(text.split('\n'), 1):
@@ -321,12 +351,36 @@ def invocations(text):
             continue
         candidates = []
         if fence is not None and lang in SHELL_LANGS:
-            candidates.append(line)
-        candidates.extend(re.findall(r'`([^`\n]+)`', line))
-        for c in candidates:
-            hit = INVOCATION.search(c.strip())
-            if hit:
-                yield lineno, hit.group(1).strip()
+            candidates.append((line, True))
+        candidates.extend((span, False) for span in re.findall(r'`([^`\n]+)`', line))
+        for text_, in_fence in candidates:
+            for segment in CHAIN.split(text_):
+                hit = INVOCATION.match(segment.rstrip())
+                if hit:
+                    yield lineno, hit.group(1).strip(), in_fence
+
+
+def blocks(text):
+    """Map each 1-based line number to the index of its blank-line-separated block.
+
+    Used to tie a waiver to the passage it sits with, rather than to the whole
+    file. A marker waives its own block and the one directly above it — which is
+    where the sentence being waived actually lives — so an unrelated occurrence
+    further down the page is still reported.
+    """
+    index = {}
+    block = 0
+    prev_blank = True
+    for lineno, line in enumerate(text.split('\n'), 1):
+        blank = not line.strip()
+        if blank:
+            prev_blank = True
+        else:
+            if prev_blank:
+                block += 1
+            prev_blank = False
+        index[lineno] = block
+    return index
 
 
 def resolve(argv, surface):
@@ -360,12 +414,29 @@ def scan(root, surface, files):
     defects, waived = [], 0
     for f in files:
         text = (root / f).read_text(errors='replace')
-        allowed = {m.group(1).strip() for m in WAIVER.finditer(text)}
-        for lineno, argv in invocations(text):
+        line_block = blocks(text)
+
+        # command -> the block indices it is waived in. A waiver covers its own
+        # block and the one immediately above it; anything else in the file is
+        # still gated. File-wide waivers were the first version of this and were
+        # wrong: the `autumn system-test` waiver added for one sentence in
+        # system-tests.md also silenced `autumn system-test check` inside a
+        # runnable block on the same page — re-admitting, unnoticed, the exact
+        # defect this gate was written to remove.
+        allowed = collections.defaultdict(set)
+        for m in WAIVER.finditer(text):
+            marker_line = text.count('\n', 0, m.start()) + 1
+            marker_block = line_block[marker_line]
+            allowed[m.group(1).strip()].update({marker_block, marker_block - 1})
+
+        for lineno, argv, in_fence in invocations(text):
             bad = resolve(argv, surface)
             if bad is None:
                 continue
-            if bad[len('autumn '):] in allowed:
+            command = bad[len('autumn '):]
+            # A fenced shell block is copyable, so nothing waives it: a page may
+            # NAME a command that does not exist, never hand one over to be run.
+            if not in_fence and line_block[lineno] in allowed.get(command, ()):
                 waived += 1
                 continue
             defects.append((f, lineno, bad, argv))
@@ -469,7 +540,19 @@ def self_test():
     ])
     found = list(invocations(doc))
     expect(len(found) == 2, f'expected 2 copyable invocations, got {len(found)}: {found}')
-    expect(all(a == 'migrate run' for _, a in found), f'bad argv extraction: {found}')
+    expect(all(a == 'migrate run' for _, a, _ in found), f'bad argv extraction: {found}')
+    expect([fenced for _, _, fenced in found] == [True, False],
+           'a fenced command and an inline one must be told apart')
+
+    # --- chains: every command on the line, not just the head. Regression test
+    # for a version that matched the line once and let the tail ride in free.
+    chained = list(invocations('```bash\nautumn migrate && autumn nope ; autumn c\n```'))
+    expect([a for _, a, _ in chained] == ['migrate', 'nope', 'c'],
+           f'every command in a chain must be extracted, got {chained}')
+    expect(list(invocations('```bash\nautumn routes | grep GET\n```'))[0][1] == 'routes',
+           'a pipe into a non-autumn command must still yield the autumn one')
+    expect(len(list(invocations("```bash\nautumn generate scaffold Post 'a:String{x;y}'\n```"))) == 1,
+           'splitting must not manufacture invocations out of a quoted argument')
 
     # --- waivers
     expect(WAIVER.search('<!-- cli-surface-allow: autumn generate island — planned #493 -->'),
@@ -477,9 +560,32 @@ def self_test():
     expect(not WAIVER.search('<!-- cli-surface-allow: autumn generate island -->'),
            'a waiver without a reason must not parse')
 
+    # A waiver must not reach into a runnable block, and must not reach across
+    # the page. Both were true of the first version of this script, and the
+    # first one silently re-admitted the defect the gate was written to remove.
+    waived_page = '\n'.join([
+        'There is no `autumn nope`.',
+        '',
+        '<!-- cli-surface-allow: autumn nope — named only to say it does not exist -->',
+        '',
+        '```bash',
+        'autumn nope',
+        '```',
+        '',
+        'Unrelated later paragraph mentioning `autumn nope` by mistake.',
+    ])
+    tmp = pathlib.Path(os.environ.get('TMPDIR', '/tmp')) / 'cli-surface-waiver-selftest.md'
+    tmp.write_text(waived_page)
+    found_defects, n_waived = scan(tmp.parent, surface, [tmp.name])
+    tmp.unlink()
+    reported = sorted(lineno for _, lineno, _, _ in found_defects)
+    expect(n_waived == 1, f'the sentence above the marker must be waived, got {n_waived}')
+    expect(reported == [6, 9],
+           f'a fenced block and a distant paragraph must both still report, got {reported}')
+
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f'self-test: {13 + 9 + 2 + 2 - len(failures)} passed, {len(failures)} failed')
+    print(f'self-test: {13 + 9 + 6 + 4 - len(failures)} passed, {len(failures)} failed')
     return 1 if failures else 0
 
 
