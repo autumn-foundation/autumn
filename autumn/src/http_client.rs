@@ -2326,27 +2326,48 @@ fn breaker_for_url(
 /// [`BreakerGuardedCall::begin`] before `send()` and
 /// [`BreakerGuardedCall::record`] after, mirroring exactly what
 /// `send_recorded`'s own breaker-guarded path does (`before_call` gate,
-/// `< 500` success threshold).
+/// `< 500` success threshold) — including its `self.mock.is_some()` bypass
+/// (#2480 review, round 2): a client with a mock registry attached must never
+/// touch the real breaker, or a mocked failure in one test could open the
+/// shared global breaker for a host name reused by an unrelated later test.
+///
+/// The [`crate::circuit_breaker::CircuitBreakerGuard`] is created inside
+/// `begin`, not deferred to `record` — its `Drop` releases the
+/// `half_open_in_flight` slot `before_call` reserved if the caller's future
+/// is cancelled or panics before `record` runs (#2480 review, round 2);
+/// deferring construction would leak that slot on every such interruption,
+/// eventually wedging the breaker in `HalfOpen` forever.
 pub(crate) struct BreakerGuardedCall {
-    breaker: crate::circuit_breaker::CircuitBreaker,
+    /// `None` when the client this call was `begin`-ed against has a mock
+    /// registry attached: `record` is then a no-op, matching the bypass
+    /// above.
+    guard: Option<crate::circuit_breaker::CircuitBreakerGuard>,
 }
 
 impl BreakerGuardedCall {
     /// Returns `Err(ClientError::CircuitBreakerOpen)` immediately, without
     /// touching the network, when the breaker for `url`'s host is open.
     pub(crate) fn begin(client: &Client, url: &str) -> Result<Self, ClientError> {
+        if client.mock.is_some() {
+            return Ok(Self { guard: None });
+        }
         let breaker = breaker_for_url(client.resilience_config.as_ref(), url);
         if breaker.before_call().is_err() {
             return Err(ClientError::CircuitBreakerOpen);
         }
-        Ok(Self { breaker })
+        Ok(Self {
+            guard: Some(crate::circuit_breaker::CircuitBreakerGuard::new(breaker)),
+        })
     }
 
     /// Record the outcome against the breaker: any transport error or `>=
     /// 500` response counts as a failure, exactly like `send_recorded`'s own
-    /// breaker path.
+    /// breaker path. A no-op when `begin` bypassed the breaker (mocked
+    /// client).
     pub(crate) fn record(self, result: &Result<Response, ClientError>) {
-        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(self.breaker);
+        let Some(guard) = self.guard else {
+            return;
+        };
         match result {
             Ok(resp) if resp.status().as_u16() < 500 => guard.success(),
             _ => guard.failure(),
@@ -3192,6 +3213,31 @@ mod tests {
         assert!(url::Url::parse("hook-service").is_err());
         let breaker = super::breaker_for_url(None, req.url());
         assert_eq!(breaker.name(), "mock-receiver");
+    }
+
+    // PR #2480 review, round 2 (P2): `BreakerGuardedCall` must never touch the
+    // real shared breaker for a client with a mock registry attached —
+    // `send_recorded` itself bypasses the breaker whenever `self.mock.is_some()`
+    // (checked before it ever reaches the breaker block), and a caller that
+    // wraps a mocked send in `BreakerGuardedCall` without honouring the same
+    // bypass would let a deliberately-mocked failure in one test mutate global
+    // breaker state a later, unrelated test reusing the same host name would
+    // then trip over.
+    #[test]
+    fn breaker_guarded_call_is_a_noop_for_a_mocked_client() {
+        let registry = Arc::new(MockRegistry::new());
+        let client = Client::new().with_mock(registry);
+
+        let call = BreakerGuardedCall::begin(&client, "http://mock-receiver/hook")
+            .expect("a mocked client must never see CircuitBreakerOpen");
+        assert!(
+            call.guard.is_none(),
+            "begin() must not touch the real breaker for a mocked client"
+        );
+
+        // record() on the no-op guard must not panic and must not fabricate a
+        // breaker entry for the host.
+        call.record(&Err(ClientError::CircuitBreakerOpen));
     }
 
     // TEST 26: from_request_parts uses AutumnConfig.http when no HttpConfig extension.
