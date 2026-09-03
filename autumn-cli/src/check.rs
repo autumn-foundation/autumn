@@ -197,9 +197,13 @@ fn check_skip_link(html: &str, out: &mut Vec<A11yViolation>) {
     // bypass, so requiring a skip link would flag pages it cannot help
     // (e.g. a single-section page whose only link sits in its footer, after
     // `<main>`). Only applied when a `<main>` landmark was actually found —
-    // its absence is `landmark-one-main`'s concern, not this rule's.
+    // its absence is `landmark-one-main`'s concern, not this rule's. The tag
+    // must match exactly `<main` (via `opening_tag_matches`, not a bare
+    // substring search) so a custom element like `<main-nav>` — which can
+    // itself carry navigation before the real `<main>` — isn't mistaken for
+    // the landmark.
     let body_tag_end = body_content.find('>').map_or(0, |p| p + 1);
-    if let Some(main_pos) = body_content.find("<main")
+    if let Some(main_pos) = find_opening_tag(body_content, "main")
         && !body_content[body_tag_end..main_pos].contains('<')
     {
         return;
@@ -533,6 +537,25 @@ fn strip_html_comments(html: &str) -> String {
 
     result.push_str(rest);
     result
+}
+
+/// Byte offset of the first opening tag exactly named `name` (via
+/// [`opening_tag_matches`]), or `None` if there is none. Unlike a bare
+/// `html.find("<name")`, this does not mistake a custom element sharing the
+/// prefix (e.g. `<main-nav>` when searching for `main`) for the real tag.
+fn find_opening_tag(html: &str, name: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    while let Some(rel_pos) = html[offset..].find('<') {
+        let tag_start = offset + rel_pos;
+        let rest = &html[tag_start..];
+        let tag_end = rest.find('>').unwrap_or(rest.len());
+        let tag = &rest[..tag_end];
+        if opening_tag_matches(tag, name) {
+            return Some(tag_start);
+        }
+        offset = tag_start + tag_end.saturating_add(1);
+    }
+    None
 }
 
 fn count_opening_tags(html: &str, name: &str) -> usize {
@@ -958,6 +981,21 @@ mod tests {
         // wrapped in a literal <nav> element (mirrors
         // skip_link_after_nav_link_fails, without the skip link at all).
         let html = r#"<html lang="en"><body><a href="/home">Home</a><main><h1>Hi</h1></main></body></html>"#;
+        assert!(
+            violation_ids(html).contains(&"bypass"),
+            "{:?}",
+            violation_ids(html)
+        );
+    }
+
+    #[test]
+    fn custom_element_sharing_main_prefix_is_not_mistaken_for_landmark() {
+        // A bare substring search for "<main" would match "<main-nav>" (a
+        // custom element), treat it as the landmark, and see nothing before
+        // it — wrongly exempting a page whose real navigation-bearing
+        // <main-nav> precedes the actual <main> landmark and has no skip
+        // link.
+        let html = r#"<html lang="en"><body><main-nav><a href="/home">Home</a></main-nav><main><h1>Hi</h1></main></body></html>"#;
         assert!(
             violation_ids(html).contains(&"bypass"),
             "{:?}",
