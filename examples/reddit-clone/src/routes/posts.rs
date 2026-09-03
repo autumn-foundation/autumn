@@ -1625,6 +1625,55 @@ mod tests {
         );
     }
 
+    // ── #2423: a NUL byte is an inline field error, not a 500 ──────
+
+    /// The reported repro, on the reported form: `body=before%00after` used to
+    /// decode cleanly, pass every `#[validate(...)]` rule on `SubmitPostForm`,
+    /// and fail only when Diesel handed the byte to Postgres — an unhandled
+    /// 500. It is now an ordinary field error, so `submit` takes its existing
+    /// 422 re-render branch with no change to this route.
+    #[tokio::test]
+    async fn a_nul_byte_in_the_body_is_an_inline_field_error() {
+        use autumn_web::form::NUL_CHARACTER_FIELD_ERROR;
+        use autumn_web::reexports::axum::body::Body;
+        use autumn_web::reexports::axum::extract::FromRequest as _;
+
+        let req = http::Request::builder()
+            .method("POST")
+            .uri(paths::submit())
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "title=nul-test&url=&subreddit_id=1&body=before%00after",
+            ))
+            .expect("build request");
+
+        let form = ChangesetForm::<SubmitPostForm>::from_request(req, &())
+            .await
+            .expect("the body still decodes — this is a validation failure, not a 400");
+
+        // Rejected, so `submit`'s `form.into_valid()` takes the 422 branch...
+        assert!(!form.is_valid());
+        assert_eq!(form.errors_for("body"), [NUL_CHARACTER_FIELD_ERROR]);
+        // ...and only the field that carried the byte is flagged.
+        assert!(form.errors_for("title").is_empty());
+
+        // The re-rendered form carries the message inline and keeps the
+        // author's text, minus the byte it could never have stored.
+        let rendered = submit_form_markup(&form, &[], None).into_string();
+        assert!(
+            rendered.contains("Cannot contain the NUL character"),
+            "the message must render next to the field; rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("beforeafter"),
+            "the author's text must survive the round-trip; rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains('\u{0}'),
+            "a raw NUL must never be echoed back into the HTML"
+        );
+    }
+
     // ── Typed a11y form primitives (#1706) ─────────────────────────
 
     fn blank_submit_form() -> ChangesetForm<SubmitPostForm> {
