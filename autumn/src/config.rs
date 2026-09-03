@@ -6799,6 +6799,7 @@ impl TlsConfig {
 /// directory = "staging"
 /// ```
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct AcmeConfig {
     /// Domains to include on the issued certificate (SANs). At least one is
     /// required. Wildcards (`*.example.com`) are rejected — they require the
@@ -7034,6 +7035,7 @@ impl AcmeConfig {
 /// ```
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct AcmeDnsConfig {
     /// Which DNS provider writes the `_acme-challenge` TXT records.
     pub provider: AcmeDnsProvider,

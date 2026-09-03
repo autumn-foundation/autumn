@@ -16,6 +16,7 @@ use futures::future::BoxFuture;
 
 /// An outbound HTTP request built by a DNS provider.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HttpRequest {
     /// HTTP method (`GET`, `POST`, `DELETE`).
     pub method: &'static str,
@@ -89,6 +90,7 @@ impl HttpRequest {
 
 /// An HTTP response as the providers need it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HttpResponse {
     /// HTTP status code.
     pub status: u16,

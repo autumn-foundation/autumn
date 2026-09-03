@@ -62,6 +62,7 @@ pub type RecoveryFn = Arc<dyn Fn() + Send + Sync>;
 ///
 /// Present on [`AcmeRenewalTask`] exactly when `[server.tls.acme.dns]` is
 /// configured; its absence keeps issuance on #1608's HTTP-01 path byte for byte.
+#[non_exhaustive]
 pub struct DnsChallenge {
     /// Writes and removes the `_acme-challenge` TXT records.
     pub provider: Arc<dyn DnsProvider>,
@@ -314,6 +315,7 @@ fn default_now_unix() -> i64 {
 ///
 /// Built by the app at bind time (after the initial resolver is constructed) and
 /// spawned as a sibling of the main server under `server_shutdown`.
+#[non_exhaustive]
 pub struct AcmeRenewalTask {
     /// The resolver the TLS listener serves; issued certs are swapped in here.
     pub resolver: Arc<ReloadableCertResolver>,

@@ -408,6 +408,66 @@ addition. Direct struct-literal construction of all three types is rare outside
 the framework: `ApiDoc` and `RouteInfo` are macro-emitted, and `ServerConfig` is
 normally deserialized from `autumn.toml`.
 
+### ACME: `AcmeRenewalTask` gains `dns` and `recovery`, `AcmeConfig` gains `dns`
+
+Wildcard certificates over the DNS-01 challenge
+([the guide](../guide/tls.md#wildcard-certificates-via-dns-01-servertlsacmedns))
+add two fields to `acme::renewal::AcmeRenewalTask` and one to
+`config::AcmeConfig`. Everything here is behind the off-by-default `acme`
+feature, and an app that configures no `[server.tls.acme.dns]` section behaves
+exactly as before — HTTP-01, unchanged.
+
+* `AcmeRenewalTask::dns: Option<acme::renewal::DnsChallenge>` — the DNS-01
+  wiring. `None` keeps issuance on the HTTP-01 path.
+* `AcmeRenewalTask::recovery: Option<acme::renewal::RecoveryFn>` — invoked after
+  an issuance that succeeded following a recorded failure, so the app can clear
+  the operator alert its reporter raised.
+* `AcmeConfig::dns: Option<config::AcmeDnsConfig>` — the deserialized
+  `[server.tls.acme.dns]` section.
+
+Only **struct-literal construction** is affected, which in practice means test
+harnesses: the framework builds `AcmeRenewalTask` itself, and `AcmeConfig` is
+deserialized from `autumn.toml`. Neither type derives `Default`, so the fix is
+to name the fields.
+
+**Before (`{X.Y}`):**
+
+```rust
+let task = AcmeRenewalTask {
+    resolver,
+    provider,
+    store,
+    cert_id,
+    tokens,
+    status,
+    config,
+    serving_stored_cert: false,
+    leadership_degraded: false,
+    renew_window_misconfigured: AtomicBool::new(false),
+};
+```
+
+**After (`{X.Z}`):**
+
+```rust
+let task = AcmeRenewalTask {
+    // …unchanged fields…
+    renew_window_misconfigured: AtomicBool::new(false),
+    dns: None,      // Some(DnsChallenge { .. }) to issue over DNS-01
+    recovery: None, // Some(callback) to clear an operator alert on recovery
+};
+```
+
+Both structs are now `#[non_exhaustive]`, along with every new type in
+`acme::dns`, so this is the last time a field added here is a breaking change:
+from now on a literal must already end in `..` and a new field lands additively.
+
+**Automation:** `manual` — `autumn upgrade` ships no codemod. The edit is two
+lines in a test harness, and a rewrite cannot tell an `AcmeRenewalTask` literal
+that means "HTTP-01" from one whose author intended to configure DNS-01;
+defaulting to `None` silently would be right in the first case and wrong in the
+second, which is exactly the choice a human should make.
+
 ## Plugin authors
 
 This release **adds** plugin-facing surface and removes none, so no plugin that
@@ -498,11 +558,36 @@ single most valuable section of the guide — keep it factual and short.
 
 ## Configuration changes
 
-- `autumn.toml` keys that were renamed, removed, or have new defaults.
-- New `AUTUMN_*` environment variables.
-- Default profile changes.
+**New `[server.tls.acme.dns]` section** (additive; absent means HTTP-01, exactly
+as before). It names a DNS provider and the *credentials-store key* holding that
+provider's API credential — never the credential itself. The section is
+`deny_unknown_fields`, so an `api_token = "..."` written into `autumn.toml` is a
+startup error naming the key rather than a plaintext secret nobody notices:
 
-If nothing changed, delete this section.
+```toml
+[server.tls.acme]
+domains = ["myapp.com", "*.myapp.com"]   # a wildcard is now accepted…
+contact_email = "ops@myapp.com"
+
+[server.tls.acme.dns]                    # …when this section is present
+provider = "cloudflare"                  # cloudflare | route53 | exec
+```
+
+A wildcard entry in `[server.tls.acme] domains` is rejected at startup **unless**
+this section is configured, because no CA validates a wildcard identifier over
+HTTP-01.
+
+**New environment variables**, which override the encrypted credentials store
+field for field:
+
+| Variable | Field |
+|---|---|
+| `AUTUMN_ACME_DNS_API_TOKEN` | `api_token` (Cloudflare) |
+| `AUTUMN_ACME_DNS_ACCESS_KEY_ID` | `access_key_id` (Route 53) |
+| `AUTUMN_ACME_DNS_SECRET_ACCESS_KEY` | `secret_access_key` (Route 53) |
+| `AUTUMN_ACME_DNS_SESSION_TOKEN` | `session_token` (Route 53) |
+| `AUTUMN_ACME_DNS_HOSTED_ZONE_ID` | `hosted_zone_id` (Route 53) |
+| `AUTUMN_ACME_DNS_REGION` | `region` (Route 53) |
 
 ## Behavior changes
 

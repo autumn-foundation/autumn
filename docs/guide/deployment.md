@@ -97,8 +97,9 @@ internals: [TLS & HTTPS guide](./tls.md).
 
 ### Subdomain-per-tenant: wildcard HTTPS on a VPS
 
-The `saas` starter routes a tenant per subdomain, which the single-hostname
-setup above cannot serve: one certificate per tenant means an issuance on
+The `saas` starter is built for multi-tenancy — it ships session-based tenant
+resolution, which you switch to `source = "subdomain"` to give each tenant its
+own hostname. That is what the single-hostname setup above cannot serve: one certificate per tenant means an issuance on
 tenant *N*'s first request and Let's Encrypt rate limits as an onboarding
 ceiling. A **wildcard** certificate covers every tenant, existing and future,
 and needs the DNS-01 challenge — which needs your DNS provider's API token.
@@ -114,11 +115,13 @@ $ cd myapp
 wildcard `A` record for `*.myapp.com`, both at the VPS's public IP. (Autumn
 writes only the ephemeral ACME challenge records, never these.)
 
-**2.** Store the DNS provider token — `autumn credentials edit` opens the
-encrypted store in `$EDITOR`:
+**2.** Store the DNS provider token. `autumn credentials edit` opens the
+encrypted store in `$EDITOR` — pass the profile you will run under, because that
+is the file the server reads (`AUTUMN_ENV=production` resolves to the `prod`
+profile):
 
 ```console
-$ autumn credentials edit
+$ autumn credentials edit --env prod
 ```
 
 ```toml
@@ -126,17 +129,28 @@ $ autumn credentials edit
 api_token = "your-cloudflare-token"
 ```
 
-**3.** Add the wildcard certificate to `autumn.toml`. Fifteen lines, including
-the tenancy the starter already ships:
+A Cloudflare token needs **Zone:Read** (to find the zone) and **DNS:Edit** (to
+write the challenge record), scoped to the zone.
+
+**3.** Turn on the `acme` feature in the app's `Cargo.toml` — it is off by
+default:
+
+```toml
+[features]
+acme = ["autumn-web/acme"]
+```
+
+**4.** Edit `autumn.toml`. The starter already ships a `[server]` and a
+`[tenancy]` table, so change those in place rather than adding second ones, and
+append the two ACME tables. Thirteen lines in all:
 
 ```toml
 [server]
-host = "0.0.0.0"
-port = 443
+host = "0.0.0.0"   # the starter's default, 127.0.0.1, is loopback-only
+port = 443         # ACME wraps THIS listener in TLS
 
 [tenancy]
-enabled = true
-source = "subdomain"
+source = "subdomain"     # the starter ships "session"
 base_domain = "myapp.com"
 
 [server.tls.acme]
@@ -148,7 +162,7 @@ directory = "production"
 provider = "cloudflare"
 ```
 
-**4.** Check it before spending a rate limit, then run:
+**5.** Check it before spending a rate limit, then build:
 
 ```console
 $ autumn doctor --online

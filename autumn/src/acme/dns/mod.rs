@@ -59,6 +59,7 @@ pub fn challenge_fqdn(domain: &str) -> String {
 
 /// One `_acme-challenge` TXT record to publish or remove.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TxtRecord {
     /// Fully-qualified record name, e.g. `_acme-challenge.myapp.com`.
     pub fqdn: String,
@@ -209,6 +210,7 @@ impl std::fmt::Display for SecretString {
 /// section has no field that could hold one.
 #[derive(Clone, Default, serde::Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct DnsCredential {
     /// Cloudflare scoped API token (`Zone:DNS:Edit` on the zone).
     pub api_token: Option<SecretString>,

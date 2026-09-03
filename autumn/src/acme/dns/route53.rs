@@ -38,6 +38,7 @@ const CHALLENGE_TTL_SECS: u32 = 60;
 
 /// The AWS credentials and zone hints Route 53 issuance needs.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct Route53Credentials {
     /// AWS access key id.
     pub access_key_id: String,

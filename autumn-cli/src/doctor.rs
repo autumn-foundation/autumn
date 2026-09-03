@@ -7763,12 +7763,16 @@ pub fn run(opts: DoctorOptions) {
     // the tenancy base domain tenant subdomains are resolved against — both read
     // from the SAME merged, profile-layered view the ACME config comes from, so
     // the DNS-01 checks below grade exactly what the app will see (#1620).
-    let acme_credentials_profile = std::env::var("AUTUMN_ENV")
-        .ok()
-        .or_else(|| std::env::var("AUTUMN_PROFILE").ok())
-        .map(|p| p.trim().to_ascii_lowercase())
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| "dev".to_owned());
+    // The CANONICAL profile, not the raw environment variable: the runtime maps
+    // `production` → `prod` before loading `config/credentials/<profile>.toml.enc`
+    // (`normalize_profile_name`), so grading the raw spelling would read a
+    // different file than the server does — and report "no credential found" for
+    // a deployment that is correctly configured, or the reverse.
+    let acme_credentials_profile = if acme_canonical.trim().is_empty() {
+        "dev".to_owned()
+    } else {
+        acme_canonical.trim().to_ascii_lowercase()
+    };
     let tenancy_base_domain = merged_acme_toml
         .get("tenancy")
         .and_then(toml::Value::as_table)

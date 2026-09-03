@@ -477,7 +477,7 @@ moment it resolves to your host.
 
 | `provider` | Credential fields | Notes |
 |---|---|---|
-| `cloudflare` | `api_token` | A scoped API token with **Zone:DNS:Edit** on the zone. The zone is discovered from the record name. |
+| `cloudflare` | `api_token` | A scoped API token with **Zone:Read** *and* **DNS:Edit** on the zone — `Zone:Read` because the zone id is discovered from the record name. |
 | `route53` | `access_key_id`, `secret_access_key`, optionally `session_token`, `hosted_zone_id`, `region` | Needs `route53:ChangeResourceRecordSets` and `route53:ListResourceRecordSets` on the zone (plus `route53:ListHostedZonesByName` unless you set `hosted_zone_id`). |
 | `exec` | none — the hook authenticates itself | The escape hatch: any other provider. See below. |
 
@@ -493,11 +493,22 @@ Put it in the encrypted credentials store:
 $ autumn credentials edit
 ```
 
+```console
+$ autumn credentials edit --env prod
+```
+
 ```toml
-# config/credentials/production.toml.enc (decrypted for editing)
+# config/credentials/prod.toml.enc (decrypted for editing)
 [acme_dns]
 api_token = "your-cloudflare-token"
 ```
+
+> Pass the profile you will run under. `AUTUMN_ENV=production` resolves to the
+> **`prod`** profile, so the server reads `config/credentials/prod.toml.enc` —
+> while a bare `autumn credentials edit` writes `development.toml.enc`. A
+> credentials file that does not exist loads as an *empty store*, so the
+> mismatch surfaces as "no Cloudflare API token found" rather than as a missing
+> file.
 
 The table name is the `credential` key from `[server.tls.acme.dns]`, which
 defaults to `acme_dns`. For Route 53 the same table carries the AWS fields:
@@ -563,16 +574,31 @@ printf 'server ns1.myapp.com\nupdate %s\nsend\n' "$ACTION" | nsupdate -k /etc/au
 
 ### Waiting for propagation
 
-After writing the records, autumn waits until **every** configured resolver
-returns them before telling the CA to validate — signalling early is how a
-DNS-01 authorization gets burnt. The wait is bounded:
+After writing the records, autumn waits until they are visible before telling
+the CA to validate — signalling early is how a DNS-01 authorization gets burnt.
+
+The probe goes to the zone's **authoritative** nameservers, not to the resolvers
+you configure. That is deliberate, and it is the difference between a feature
+that works and one that fails every renewal: a probe sent to a public recursive
+resolver the instant the provider's API returns arrives *before* the record is
+live on the zone's own servers, so the resolver answers `NXDOMAIN` and **caches
+that negatively** for the zone's SOA minimum — 900s on Route 53, 1800s on
+Cloudflare, both longer than the propagation budget. Every later probe would
+then read the cached "not there". So `resolvers` is used to *discover* the
+zone's nameservers (an `NS` lookup, then an `A` lookup per server), and the
+propagation probe is sent to those directly. When discovery fails — a
+split-horizon setup, a resolver that will not answer `NS` — autumn falls back to
+probing `resolvers` directly and logs a warning.
+
+`[server.tls.acme.dns]` fields:
 
 | Field | Default | Meaning |
 |---|---|---|
+| `provider` | required | `cloudflare`, `route53`, or `exec`. |
 | `credential` | `acme_dns` | Key in the encrypted credentials store holding the provider credential. A key *name*, never a token. |
-| `propagation_timeout_secs` | `300` | Give up if the records are still not visible after this long. |
+| `propagation_timeout_secs` | `300` | Give up if the records are still not visible after this long. Capped at `3600`. |
 | `poll_interval_secs` | `5` | Gap between propagation probes. |
-| `resolvers` | `["1.1.1.1:53", "8.8.8.8:53"]` | Resolvers that must all see the record. Each entry is an IP (port 53 implied) or `IP:port`; hostnames are rejected. |
+| `resolvers` | `["1.1.1.1:53", "8.8.8.8:53"]` | Resolvers used to discover the zone's nameservers, and probed directly if that fails. Each entry is an IP (port 53 implied) or `IP:port`; hostnames are rejected. |
 | `command` | — | The `exec` hook's argv array. Required for `exec`, rejected for the others. |
 
 A timeout names the exact record, the value that never appeared, and the
@@ -601,9 +627,10 @@ without a value would remove its sibling and fail the order.
 ### What DNS-01 does *not* need
 
 - **Inbound port 80.** The CA never connects to your host for DNS-01. Autumn
-  still binds `http_challenge_port` for the HTTP→HTTPS redirect, and
-  `autumn doctor` grades an unreachable `:80` as a Warn rather than a failure
-  when DNS-01 is configured.
+  still *tries* to bind `http_challenge_port` for the HTTP→HTTPS redirect, but a
+  bind failure is only a warning under DNS-01 — the app starts and serves HTTPS
+  without it, so a container with no `CAP_NET_BIND_SERVICE` is a supported
+  deployment. `autumn doctor` grades an unreachable `:80` the same way.
 - **A record for the wildcard.** `*.myapp.com` has no address record of its own;
   the tenant subdomains point at your host (a wildcard `A`/`AAAA` record, or one
   per tenant). Creating those is your one-time job — autumn only writes the

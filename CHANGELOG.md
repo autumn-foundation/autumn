@@ -69,9 +69,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   See the [TLS guide](docs/guide/tls.md#wildcard-certificates-via-dns-01-servertlsacmedns)
   and the [deployment walkthrough](docs/guide/deployment.md#subdomain-per-tenant-wildcard-https-on-a-vps).
 
-  **Breaking (`acme` feature only):** `AcmeRenewalTask` gained the public fields
+  **Breaking:** (`acme` feature only) `AcmeRenewalTask` gained the public fields
   `dns` and `recovery`, and `AcmeConfig` gained `dns`; code that constructs
   either literally must add them (`None` preserves today's HTTP-01 behavior).
+  Both structs — and every new struct in `acme::dns` — are now
+  `#[non_exhaustive]`, so this is the last time a field here is a break. See the
+  [migration guide](docs/migrations/next.md).
+
+  `autumn-cli`'s `tls` feature now also enables `autumn-web/acme`: `autumn
+  doctor` grades the DNS-01 credential with the runtime's own
+  `validate_credential` and probes `_acme-challenge` visibility with the
+  runtime's own resolver, so the check and the server cannot disagree about what
+  a usable configuration is. Additive — the resolved feature set is a superset
+  of what `tls` already selected.
 
 - **Build-time authority envelope for agent-operable handlers (#1691):** an
   endpoint exposed as an MCP tool is an action an autonomous agent can take

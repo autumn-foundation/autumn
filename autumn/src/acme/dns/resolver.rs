@@ -72,6 +72,7 @@ const MAX_RESPONSE: usize = 4096;
 
 /// What one resolver said about a TXT name.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TxtAnswer {
     /// The TXT values in the answer section (character-strings concatenated per
     /// record, as RFC 1035 §3.3.14 requires).
@@ -372,6 +373,7 @@ pub fn encode_query(
 
 /// One resource record's payload, decoded for the types this client asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Rdata {
     /// A `TXT` record's character-strings, concatenated (RFC 1035 §3.3.14).
     Txt(String),
@@ -385,6 +387,7 @@ pub enum Rdata {
 
 /// One decoded answer-section record.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ResourceRecord {
     /// The record's owner name, lowercased and without the trailing dot.
     pub name: String,
@@ -396,6 +399,7 @@ pub struct ResourceRecord {
 
 /// A parsed DNS response.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DnsAnswer {
     /// The response code: `0` NOERROR, `3` NXDOMAIN, …
     pub rcode: u8,
@@ -671,6 +675,7 @@ pub fn group_by_name(records: &[TxtRecord]) -> BTreeMap<String, Vec<String>> {
 /// Kept separate from the message so the wait's own logic is testable and the
 /// wording lives in one place.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PropagationTimeout {
     /// The record name that never carried every expected value.
     pub fqdn: String,
