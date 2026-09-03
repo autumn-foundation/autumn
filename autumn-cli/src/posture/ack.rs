@@ -83,19 +83,34 @@ pub fn short(digest: &str) -> String {
 #[must_use]
 pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
     let mut acks = Vec::new();
-    let mut fenced = false;
+    // The character and length of the fence currently open, if any. Toggling a
+    // bool instead would let the inner ``` of a report quoted inside a ````
+    // block *close* the outer fence, making the quoted marker live — so
+    // quoting an acknowledgment would acknowledge it.
+    let mut fence: Option<(char, usize)> = None;
     for line in text.lines() {
         let trimmed = line.trim_start();
         if trimmed == SOURCE_SEPARATOR {
             // A new comment body starts here, with a clean slate.
-            fenced = false;
+            fence = None;
             continue;
         }
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
-            continue;
+        match (fence, fence_run(trimmed)) {
+            // A fence closes only with the same character, at least as long,
+            // and nothing after it — CommonMark's rule.
+            (Some((open_char, open_len)), Some((c, len, bare)))
+                if c == open_char && len >= open_len && bare =>
+            {
+                fence = None;
+                continue;
+            }
+            (None, Some((c, len, _))) => {
+                fence = Some((c, len));
+                continue;
+            }
+            _ => {}
         }
-        if fenced || trimmed.starts_with('>') {
+        if fence.is_some() || trimmed.starts_with('>') {
             continue;
         }
         if let Some(ack) = parse_marker(trimmed) {
@@ -103,6 +118,21 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
         }
     }
     acks
+}
+
+/// The leading fence run of `line`, as `(character, length, nothing follows)`.
+///
+/// `None` when the line does not open or close a fence at all. The third
+/// element separates a closing fence (bare) from an opening one that carries
+/// an info string, such as a backtick run followed by `rust`.
+fn fence_run(line: &str) -> Option<(char, usize, bool)> {
+    let c = line.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let len = line.chars().take_while(|ch| *ch == c).count();
+    if len < 3 {
+        return None;
+    }
+    let rest = line.chars().skip(len).collect::<String>();
+    Some((c, len, rest.trim().is_empty()))
 }
 
 /// Parse one already-trimmed, already-vetted line.
@@ -250,6 +280,62 @@ mod tests {
     #[test]
     fn the_phrase_is_case_insensitive() {
         assert_eq!(parse_acks("/ACK-POSTURE 0123456789abcdef").len(), 1);
+    }
+
+    /// A reviewer quoting the gate's own report wraps it in a *longer* fence,
+    /// because the report already contains a three-backtick block. Toggling on
+    /// any fence line lets the inner three-backtick line close the outer
+    /// four-backtick one, so the quoted marker becomes live and the reviewer
+    /// acknowledges a widening they were only discussing. Per CommonMark, a
+    /// fence closes only with the same character, at least as long.
+    #[test]
+    fn a_nested_fence_does_not_reopen_the_block_it_sits_in() {
+        let quoting_the_report = "\
+Not convinced by this one:
+
+````
+### 🛡️ Security posture diff
+
+To acknowledge these exact changes, comment with:
+
+```
+/ack-posture 0123456789abcdef
+```
+````
+
+Let us talk about it first.
+";
+        assert!(
+            parse_acks(quoting_the_report).is_empty(),
+            "quoting the report is not acknowledging it"
+        );
+    }
+
+    /// The mirror of the above: a genuine marker after a correctly closed
+    /// longer fence still counts, so the stricter rule does not make the
+    /// escape hatch harder to use.
+    #[test]
+    fn a_marker_after_a_closed_longer_fence_still_acknowledges() {
+        let body = "\
+````
+context
+```
+not a marker: /ack-posture ffffffffffffffff
+```
+````
+
+/ack-posture 0123456789abcdef  intentional, launch week
+";
+        let acks = parse_acks(body);
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].digest, "0123456789abcdef");
+    }
+
+    /// Tildes and backticks do not close each other.
+    #[test]
+    fn a_tilde_fence_is_not_closed_by_backticks() {
+        let body = "~~~\n```\n/ack-posture 0123456789abcdef\n";
+        assert!(parse_acks(body).is_empty());
     }
 
     #[test]
