@@ -13,9 +13,10 @@ subscription. This page is meant to be followed verbatim; every command is
 runnable as written.
 
 > **Scope.** This is about *what is inside* an artifact and *where it came
-> from*. Whether any of it is known-vulnerable is a separate question — see
-> `cargo audit` and issue #1600. Runtime build-info reporting lives on
-> `/actuator/info`.
+> from*. Whether any of it is **known-vulnerable** is the advisory gate, which
+> your scaffolded app runs on every push — jump to
+> [Part 3a](#part-3a--the-advisory-gate-known-vulnerable-dependencies). Runtime
+> build-info reporting lives on `/actuator/info`.
 
 ---
 
@@ -327,6 +328,162 @@ digest yourself if your threat model requires it.
 
 ---
 
+## Part 3a — the advisory gate: known-vulnerable dependencies
+
+An SBOM tells you *what* you are running. The advisory gate tells you whether
+any of it is known to be vulnerable — and, unlike a dashboard of alerts, it
+blocks the build.
+
+### What it checks
+
+Every app `autumn new` generates ships two halves of one gate:
+
+| File | Role |
+|---|---|
+| `.github/workflows/ci.yml` | Runs `cargo deny check advisories` on every push and pull request. |
+| `deny.toml` | The policy it reads: what counts as a failure, and which advisories you have explicitly accepted. |
+
+The check resolves your **whole** dependency graph — transitive crates
+included, not just what your `Cargo.toml` names — and matches it against the
+[RustSec advisory database][rustsec]. A crate with a known advisory that
+`deny.toml` does not waive fails the job. Vulnerabilities always fail;
+`unmaintained` and `unsound` advisories fail too (narrow those in `deny.toml`
+if you would rather triage them separately), and a yanked crate warns.
+
+Run exactly what CI runs, locally:
+
+```bash
+cargo install --locked cargo-deny   # once
+cargo deny check advisories
+```
+
+### Reading a failure
+
+```console
+error[vulnerability]: Marvin Attack: potential key recovery through timing sidechannels
+    ┌─ /home/you/my-app/Cargo.lock:322:1
+    │
+322 │ rsa 0.9.10 registry+https://github.com/rust-lang/crates.io-index
+    │ ────────────────────────────────────────────────────────────────
+    │
+    ├ ID: RUSTSEC-2023-0071
+    ├ Advisory: https://rustsec.org/advisories/RUSTSEC-2023-0071
+    ├ Solution: No safe upgrade is available!
+    ├ rsa v0.9.10
+      └── jsonwebtoken v10.1.0
+          └── autumn-web v0.7.0
+              └── my-app v0.1.0
+
+advisories FAILED
+```
+
+Four things to read, in order:
+
+1. **The id** (`RUSTSEC-2023-0071`) — the advisory's permanent name; the
+   `Advisory:` URL has the full write-up and the real-world exploitability.
+2. **The crate and version** (`rsa 0.9.10`) — what is actually vulnerable.
+3. **`Solution:`** — the fixed version, or "No safe upgrade is available!"
+   when upstream has not shipped one.
+4. **The dependency path**, read bottom-up — `my-app` → `autumn-web` →
+   `jsonwebtoken` → `rsa`. The crate to bump is rarely the vulnerable one; it
+   is the highest entry in that chain you control.
+
+Fix it before you waive it: `cargo update -p <crate>` when a patched version is
+already compatible, otherwise bump the direct dependency that pulls it in. In an
+Autumn app that dependency is usually `autumn-web` itself — most of the tree
+arrives through it — so check whether a newer autumn-web release resolves a
+fixed version, and if none does yet, [open an
+issue](https://github.com/autumn-foundation/autumn/issues) and waive it locally
+with a review-by date in the meantime. (The example above is the one advisory
+you will not see fail: it ships pre-waived. Every other finding reads the same
+way.)
+
+### Waiving an advisory
+
+When there is no fix — or the vulnerable code path is unreachable from your app
+— acknowledge the advisory in `deny.toml` instead of weakening the gate:
+
+```toml
+[advisories]
+ignore = [
+    # Why this is acceptable *here*, and when you will look again.
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path; review-by 2026-10-01" },
+]
+```
+
+A waiver lets exactly one id through. Every other advisory — including a new
+one in the same crate — still fails, and the gate itself stays on. The id and
+the rationale are committed to your repository, so the decision is reviewable
+in a pull request rather than living in someone's memory.
+
+Your generated `deny.toml` ships with a waiver already in it:
+`RUSTSEC-2023-0071`. `rsa` reaches every Autumn app through `jsonwebtoken`,
+which `autumn-web` depends on unconditionally, and no patched `rsa` release
+exists. An app generated with `--bundled-pg` gets a second one
+(`RUSTSEC-2024-0384`, `instant`, unmaintained, reachable only through the
+embedded-Postgres build stack) — and only that flavor gets it, so cargo-deny's
+"this waiver is unused" warning stays available to tell you when one of *your*
+waivers has gone stale.
+
+Those waivers are why a freshly scaffolded app's CI is green on day one instead
+of red on the first push. Autumn's own CI re-audits autumn-web's dependency tree
+against that exact policy on every run, so the shipped waiver set cannot quietly
+stop covering what the scaffold ships.
+
+Never disable the gate to get green. `continue-on-error: true`, `|| true`, and
+deleting the step all turn a security control into a decoration. Autumn's own
+test suite fails if the *generated* workflow does any of them, and in your
+project an edited `ci.yml` comes back as a conflict on every
+[`autumn upgrade`](upgrading.md#scaffold-files) — the cost of the workaround
+keeps being paid. Fix the advisory, or waive it.
+
+### When the advisory database is unreachable
+
+The gate **fails closed**. Fetching the RustSec database is the one part that
+needs the network, so the generated workflow does it in its own step: three
+attempts, backing off 10s then 20s between them. If the database is still
+unreachable the job fails with an explicit message rather than hanging or
+silently skipping the audit — a dependency tree nobody could verify is never
+reported as clean. The audit itself then runs `--offline` against the database
+just fetched, so a failure in *that* step is always a real advisory and never a
+network blip.
+
+Two related failures are called out rather than mistaken for an outage:
+cargo-deny loads `deny.toml` *before* it touches the network, so a malformed
+policy is reported as the configuration error it is; and a missing `deny.toml`
+stops the step with a message naming the file, instead of auditing your app
+under cargo-deny's built-in default policy, which waives nothing.
+
+### The framework's own gate
+
+Autumn holds itself to the same rule. `scripts/check-advisories.sh` runs in
+both PR CI and the **Publish Gate**, so a release cannot be tagged while an
+unwaived advisory sits in the tree being published:
+
+```bash
+./scripts/check-advisories.sh              # workspace, sqlite graph, scaffold graph
+./scripts/check-advisories.sh --self-test  # prove the gate still rejects a CVE
+```
+
+The third graph is the interesting one: it audits `autumn-web`'s dependency
+tree against the `deny.toml` that `autumn new` writes, with every feature any
+scaffold flavor can enable turned on — so "your day-one CI is green" is a
+checked property of every release rather than a hope. Being precise about what
+that covers: it is the autumn-web half of your tree, audited generously (a
+superset of what your app compiles from autumn-web), resolved against Autumn's
+own lockfile. Your app's own direct dependencies, and the exact versions your
+lockfile resolves, are what *your* CI audits — which is why the gate ships with
+your app rather than only living here.
+
+`--self-test` is the negative proof, and it runs in Autumn's CI on every pull
+request: it audits a throwaway crate carrying a deliberately injected
+known-vulnerable dependency (`time 0.1.45`, RUSTSEC-2020-0071) and requires
+both policies — Autumn's own and the one shipped into your app — to reject it,
+then to accept it once, and only once, that id is waived. A gate nobody has
+watched fail is indistinguishable from a gate that no longer runs.
+
+---
+
 ## Command reference
 
 | Command | Answers |
@@ -340,6 +497,9 @@ digest yourself if your threat model requires it.
 | `autumn sbom --binary FILE` | What is compiled into this binary? (no source tree) |
 | `autumn sbom --features F` | …resolving the features the build used. |
 | `autumn sbom --filter-platform T` | …restricted to one target triple. |
+| `cargo deny check advisories` | Is anything in this tree known-vulnerable? (reads `deny.toml`) |
+| `./scripts/check-advisories.sh` | …for Autumn's own graphs, and for the app scaffold's. |
+| `./scripts/check-advisories.sh --self-test` | Can that gate still reject a known CVE? |
 | `gh attestation verify F --repo O/R` | Did `O/R`'s CI build exactly these bytes? |
 
 ---
@@ -354,6 +514,7 @@ digest yourself if your threat model requires it.
   applied to the manifest that says which endpoints are public: signed at
   release, verified in one command at deploy time.
 
+[rustsec]: https://rustsec.org/
 [sigstore]: https://www.sigstore.dev/
 [gh]: https://cli.github.com/
 [auditable]: https://github.com/rust-secure-code/cargo-auditable

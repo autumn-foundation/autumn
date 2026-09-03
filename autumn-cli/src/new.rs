@@ -36,6 +36,10 @@ pub mod templates {
     pub const CI_WORKFLOW: &str = include_str!("templates/.github/workflows/ci.yml.tmpl");
     pub const POSTURE_GATE_WORKFLOW: &str =
         include_str!("templates/.github/workflows/posture-gate.yml.tmpl");
+    /// Dependency advisory policy read by the generated CI's `cargo deny check
+    /// advisories` gate (issue #1600). Deliberately *not* framework-owned — see
+    /// [`super::framework_owned_files`].
+    pub const DENY_TOML: &str = include_str!("templates/deny.toml.tmpl");
     pub const RUST_TOOLCHAIN: &str = include_str!("templates/rust-toolchain.toml.tmpl");
     pub const RUSTFMT: &str = include_str!("templates/rustfmt.toml.tmpl");
     pub const CLIPPY: &str = include_str!("templates/clippy.toml.tmpl");
@@ -263,6 +267,16 @@ fn generate_inner(
         render_readme(render(templates::README), opts, &vars),
     )?;
 
+    // The dependency advisory policy the generated CI enforces (issue #1600).
+    // Written here rather than through `framework_owned_files` because its
+    // waiver list is the app author's to grow: a file the developer is *asked*
+    // to edit would otherwise come back as a scaffold-reconciliation conflict
+    // on every `autumn upgrade`, exactly like `Cargo.toml` would.
+    fs::write(
+        project_dir.join("deny.toml"),
+        render_deny_toml(&render(templates::DENY_TOML), opts),
+    )?;
+
     let main_template = if opts.with_api {
         templates::MAIN_API_RS
     } else {
@@ -443,6 +457,38 @@ pub fn framework_owned_files(
     files
 }
 
+/// Anchors around the waiver that only a `--bundled-pg` app's tree can reach.
+const DENY_BUNDLED_PG_OPEN: &str = "    # >>> autumn:bundled-pg-waiver\n";
+const DENY_BUNDLED_PG_CLOSE: &str = "    # <<< autumn:bundled-pg-waiver\n";
+
+/// Resolve the scaffolded `deny.toml` for `opts`.
+///
+/// `managed-pg-bundled` drags the embedded-Postgres build stack — and with it
+/// `instant` (RUSTSEC-2024-0384, unmaintained, no fix) — into the tree, so a
+/// `--bundled-pg` app needs that waiver on day one or its first CI run is red.
+/// Every other flavor would be carrying a waiver for a crate it does not have,
+/// and cargo-deny warns about unused waivers by design: that warning is how a
+/// developer learns one of *their* waivers has gone stale, so it must not be
+/// spent on one the framework shipped for a feature they never enabled.
+fn render_deny_toml(rendered: &str, opts: GenerateOptions) -> String {
+    if opts.with_bundled_pg {
+        return rendered
+            .replace(DENY_BUNDLED_PG_OPEN, "")
+            .replace(DENY_BUNDLED_PG_CLOSE, "");
+    }
+    let (open, close) = (
+        rendered.find(DENY_BUNDLED_PG_OPEN),
+        rendered.find(DENY_BUNDLED_PG_CLOSE),
+    );
+    let (Some(open), Some(close)) = (open, close) else {
+        debug_assert!(false, "deny.toml.tmpl lost its bundled-pg waiver anchors");
+        return rendered.to_owned();
+    };
+    let mut out = rendered.to_owned();
+    out.replace_range(open..close + DENY_BUNDLED_PG_CLOSE.len(), "");
+    out
+}
+
 fn scaffold_vendor_assets(project_dir: &Path) -> Result<(), NewError> {
     let htmx_bytes = autumn_web::HTMX_JS;
     let htmx_version = autumn_web::HTMX_VERSION;
@@ -548,6 +594,10 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     println!("  Created {name}/rust-toolchain.toml");
     println!("  Created {name}/rustfmt.toml");
     println!("  Created {name}/clippy.toml");
+    // Named with its purpose attached: when the advisory gate first fires, a
+    // developer who does not know this file exists reaches for disabling the CI
+    // step instead of recording a waiver here.
+    println!("  Created {name}/deny.toml (dependency advisory policy — CI audits against it)");
     println!("  Created {name}/migrations/");
     println!("  Created {name}/tests/integration_test.rs");
     println!("  Created {name}/config/master.key (keep secret — never commit)");
@@ -2950,6 +3000,70 @@ mod tests {
         let files = owned(GenerateOptions::default());
         let ci = files.get(".github/workflows/ci.yml").expect("scaffolded");
         assert!(!ci.contains("pull-requests: write"));
+    }
+
+    /// The bundled-pg waiver is resolved by flag, and its anchors are internal
+    /// bookkeeping — a leaked `>>> autumn:` marker would ship in every app.
+    #[test]
+    fn the_advisory_policy_resolves_its_flavor_anchors() {
+        let vars = TemplateVars {
+            project_name: "demo",
+            crate_name: "demo",
+            autumn_version: "0.7.0",
+            rust_version: "1.88.0",
+        };
+        let rendered = render_template(templates::DENY_TOML, &vars);
+        for opts in [
+            GenerateOptions::default(),
+            GenerateOptions {
+                with_bundled_pg: true,
+                with_daemon: true,
+                ..GenerateOptions::default()
+            },
+        ] {
+            let policy = render_deny_toml(&rendered, opts);
+            assert!(
+                !policy.contains("autumn:bundled-pg-waiver"),
+                "template anchors must never reach a generated project:\n{policy}"
+            );
+            assert_eq!(
+                policy.contains("RUSTSEC-2024-0384"),
+                opts.with_bundled_pg,
+                "the managed-pg-bundled waiver belongs to exactly the flavor whose \
+                 tree can reach it"
+            );
+            assert!(
+                policy.contains("RUSTSEC-2023-0071"),
+                "every flavor's tree reaches rsa through jsonwebtoken"
+            );
+        }
+    }
+
+    /// The advisory policy is generated but deliberately *not* reconciled
+    /// (issue #1600): its waiver list is the app author's, and a file the
+    /// developer is asked to edit would come back as a conflict on every
+    /// `autumn upgrade` — the same reason `Cargo.toml` is not owned either.
+    #[test]
+    fn the_advisory_policy_is_generated_but_not_framework_owned() {
+        for opts in [
+            GenerateOptions::default(),
+            GenerateOptions {
+                with_api: true,
+                ..GenerateOptions::default()
+            },
+        ] {
+            assert!(
+                !owned(opts).contains_key("deny.toml"),
+                "deny.toml carries the app's own waivers; reconciling it would \
+                 conflict with every waiver its author adds"
+            );
+        }
+        let tmp = TempDir::new().unwrap();
+        generate("policy-owner-app", tmp.path()).unwrap();
+        assert!(
+            tmp.path().join("policy-owner-app/deny.toml").is_file(),
+            "…but `autumn new` must still write it"
+        );
     }
 
     #[test]

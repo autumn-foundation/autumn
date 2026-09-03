@@ -1063,6 +1063,35 @@ fn maintenance_help_cross_references_the_deploy_fan_out() {
     );
 }
 
+/// Did this run end in the native-Windows Tier 2 refusal (#1616)?
+///
+/// `autumn deploy up` reaches a host over ssh and stages secrets with Unix file
+/// modes, so it is Tier 2 and refuses before loading any config — deliberately,
+/// so it does no work it is going to reject. That puts the preflight assertions
+/// in the `up` tests below out of reach on Windows.
+///
+/// This asserts the refusal instead of skipping, so those tests still prove
+/// something there: the whole body stays compiled on every platform, because a
+/// `#[cfg]`-ed-away test is exactly the blindness that let the Windows defects
+/// this issue fixes survive in the first place.
+fn ended_in_windows_tier_two_refusal(stdout: &str, stderr: &str) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("on Windows, not native."),
+        "on Windows `deploy up` must end in the Tier 2 refusal\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains("platform-support.md"),
+        "the Tier 2 refusal must point at the published policy\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    true
+}
+
 #[test]
 fn deploy_up_rejects_an_only_host_that_is_not_in_the_fleet() {
     // #1621 (§3.2): `--only` is checked against `[deploy] hosts` before anything
@@ -1076,6 +1105,9 @@ fn deploy_up_rejects_an_only_host_that_is_not_in_the_fleet() {
         &[],
     );
     let combined = format!("{stdout}{stderr}");
+    if ended_in_windows_tier_two_refusal(&stdout, &stderr) {
+        return;
+    }
     assert!(
         combined.contains("web-9.example.com"),
         "the error must quote the unmatched host\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -1101,6 +1133,9 @@ fn deploy_up_fails_fast_without_host() {
         !combined.contains("panicked"),
         "a hostless `up` must fail cleanly, not panic\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    if ended_in_windows_tier_two_refusal(&stdout, &stderr) {
+        return;
+    }
     assert!(
         combined.contains("[deploy] host") && combined.contains("hosts"),
         "the missing-host report must name both spellings\nstdout:\n{stdout}\nstderr:\n{stderr}"

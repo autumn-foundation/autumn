@@ -42,6 +42,18 @@ pub struct CatalogEntry {
     /// second, default-constructed one over it would win the duplicate check
     /// and silently discard the user's configuration.
     pub constructor: &'static str,
+    /// Migration versions the plugin ships or registers, as the directory
+    /// names its own `migrations/` tree uses. Declared here because
+    /// `__diesel_schema_migrations` is keyed by version alone and carries no
+    /// source column, so a departed plugin's rows are otherwise
+    /// indistinguishable from the app's own (issue #1631). Empty for a plugin
+    /// that owns no schema.
+    pub migrations: &'static [&'static str],
+    /// Tables the plugin creates and owns, in safe **drop order** — dependents
+    /// before the tables they reference — so `plugin remove --drop-data`'s
+    /// statements apply top to bottom, exactly like the plugin's own
+    /// `down.sql`. Empty for a plugin that owns no tables.
+    pub tables: &'static [&'static str],
     /// Config keys the plugin needs before the app can serve it.
     pub config_keys: &'static [&'static str],
     /// Follow-up steps printed after a successful install.
@@ -75,6 +87,12 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
         mount_call: ".plugin(",
         mount_arg: "autumn_admin_plugin::AdminPlugin",
         constructor: "AdminPlugin::new(",
+        // The admin panel reads framework-owned tables (`autumn_experiments`,
+        // `autumn_experiment_changes`) created by `autumn-web`'s OWN
+        // migrations, not by the plugin. Removing the plugin leaves nothing of
+        // the plugin's behind, so there is nothing to declare.
+        migrations: &[],
+        tables: &[],
         config_keys: &["[database]\nprimary_url = \"postgres://localhost/my_app\""],
         post_install: &[
             "Register a model with `autumn generate admin <Model>` — the panel mounts at /admin but starts with no models.",
@@ -92,6 +110,9 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
         mount_call: ".plugin(",
         mount_arg: "autumn_cache_redis::RedisCachePlugin",
         constructor: "RedisCachePlugin::new(",
+        // Cache entries live in Redis, not in the app's database.
+        migrations: &[],
+        tables: &[],
         config_keys: &[
             "[cache]\nbackend = \"redis\"\n\n[cache.redis]\nurl = \"redis://127.0.0.1:6379\"",
         ],
@@ -109,6 +130,12 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
         mount_call: ".plugin(",
         mount_arg: "autumn_media_plugin::MediaPlugin",
         constructor: "MediaPlugin::new(",
+        // Shipped in the crate's own `migrations/` tree, applied by hand for
+        // apps that set `[media] room_store_backend = "db"`.
+        migrations: &["20260720000000_media_rooms"],
+        // Drop order mirrors the migration's `down.sql`: participants
+        // reference their room.
+        tables: &["media_room_participants", "media_rooms"],
         config_keys: &[
             "[media]\nroom_max_participants = 6\n\n[media.mediamtx]\napi_base = \"http://127.0.0.1:9997\"",
         ],
@@ -127,6 +154,13 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
         mount_call: ".plugin(",
         mount_arg: "autumn_search::SearchPlugin",
         constructor: "SearchPlugin::new(",
+        // The Postgres engine bootstraps its schema at runtime with
+        // `CREATE TABLE IF NOT EXISTS` (`autumn-search/src/postgres.rs`)
+        // rather than through `diesel_migrations`, so nothing is recorded in
+        // `__diesel_schema_migrations` — but the tables are still the
+        // plugin's, and still there after it is unwired.
+        migrations: &[],
+        tables: &["autumn_search_documents", "autumn_search_deletes"],
         config_keys: &["[search]\nengine = \"postgres\""],
         post_install: &[
             "Mark a model with `#[searchable]`, then register it: `SearchPlugin::new().postgres().index::<Model>()`.",
@@ -153,6 +187,10 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
         mount_call: ".with_blob_store(",
         mount_arg: "autumn_storage_s3::S3BlobStore",
         constructor: "S3BlobStore::from_config(",
+        // Blobs live in the S3 bucket, which this command never touches: it is
+        // not the app's database and may well outlive the app.
+        migrations: &[],
+        tables: &[],
         config_keys: &[
             "[storage]\nbackend = \"s3\"\n\n[storage.s3]\nbucket = \"my-bucket\"\nregion = \"us-east-1\"",
         ],

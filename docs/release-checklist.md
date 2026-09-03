@@ -107,6 +107,29 @@ Run the gate locally before tagging:
 RELEASE_TAG=v0.7.0 ./scripts/check-sbom.sh
 ```
 
+### Dependency advisories
+
+A release must not ship a known-vulnerable dependency. `scripts/check-advisories.sh`
+runs in both PR CI and the Publish Gate (`advisories` job, a `prepare-release`
+dependency), auditing three graphs against the RustSec database with cargo-deny:
+
+- the workspace (`deny.toml`) and the SQLite backend graph (`deny-sqlite.toml`);
+- **the scaffold's day-one graph** — `autumn-web`'s tree with every feature any
+  scaffold flavor can enable, audited with the `deny.toml` that `autumn new`
+  writes into a generated app. That is a superset of the autumn-web half of a
+  real app's tree (not its own direct dependencies, and resolved against this
+  workspace's lockfile), and it is what keeps "a scaffolded app's CI is green on
+  day one" true release over release rather than a claim that decays.
+
+An advisory with no fix is accepted by adding an `ignore` entry (id, `reason`,
+review-by date) — never by weakening or removing the gate. `--self-test` proves
+the gate can still go red by auditing an injected known-vulnerable dependency.
+
+```bash
+./scripts/check-advisories.sh              # the gate, all three graphs
+./scripts/check-advisories.sh --self-test  # the negative proof
+```
+
 ---
 
 ## Automated Gates (`publish-gate` Workflow)
@@ -198,6 +221,24 @@ Creates a temporary directory outside the workspace, generates a minimal Autumn
 app skeleton, substitutes the candidate crate set (by path, simulating a crates.io
 install), and verifies it compiles. This proves the published `autumn-web` is
 usable from a fresh project without workspace path dependencies.
+
+### 6a · Dependency Advisory Gate (`advisories` job)
+
+Script: `scripts/check-advisories.sh`
+
+Fails the release when any crate in the tree being published carries a RustSec
+advisory that `deny.toml`, `deny-sqlite.toml`, or the scaffold's shipped
+`deny.toml` does not explicitly waive. PR CI runs the same script, but that is
+not enough on its own: a tag can be pushed from a commit whose CI predates an
+advisory's publication, so the database is fetched fresh at tag time. The
+advisory-database fetch retries with backoff and **fails closed** if the
+database stays unreachable; the audits then run `--offline` against it, so a
+failure names an advisory rather than a network blip.
+
+The job also runs `--self-test`, which audits a throwaway crate with an
+injected known-vulnerable dependency (`time 0.1.45`, RUSTSEC-2020-0071) and
+requires the gate to reject it — then to accept it once, and only once, that
+advisory is waived.
 
 ### 6b · SBOM Gate (`sbom` job)
 
@@ -382,6 +423,9 @@ the release's rename-level changes.
   its own, so `--test repo_hygiene` errors with "no test target named".
 - [ ] `RELEASE_TAG=v<version> ./scripts/check-sbom.sh` — the SBOM gate, run
   locally before tagging so a drifted lockfile is caught before CI.
+- [ ] `./scripts/check-advisories.sh` — the advisory gate, run locally before
+  tagging so a newly published RUSTSEC advisory is triaged (fixed or waived
+  with a reason) before it blocks the tag.
 
 ## First-Run Docs Gate
 

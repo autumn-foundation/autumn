@@ -13,9 +13,13 @@
 # DB-dependent tests can opt in. Tests decorated `#[ignore]` are skipped by
 # default; run `cargo test -- --ignored` to include them.
 #
-# Also enforced: `autumn a11y verify` (accessibility) and
-# `autumn routes audit` (route auth-coverage security manifest), both run
-# against the prebuilt `autumn` CLI installed mid-job.
+# Also enforced: `autumn a11y verify` (accessibility), `autumn routes audit`
+# (route auth-coverage security manifest) — both run against the prebuilt
+# `autumn` CLI installed mid-job — and `cargo deny check advisories`, which
+# fails the build when any crate in this app's dependency tree carries a known
+# RustSec security advisory. That audit reads `deny.toml` at the repository
+# root; waive an advisory by adding an entry there, never by weakening or
+# deleting the step.
 #
 # The companion `.github/workflows/posture-gate.yml` takes the next step on
 # pull requests: it diffs this app's security posture against the base branch
@@ -35,7 +39,6 @@
 #   - Tailwind: add `autumn setup --tailwind` and run the downloaded binary
 #     before `cargo build` to compile CSS in CI.
 #   - Coverage: install cargo-llvm-cov and upload to Codecov.
-#   - Audit: `cargo install cargo-audit` then `cargo audit`.
 
 name: CI
 
@@ -78,13 +81,74 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # `cache-bin` is off deliberately: it would cache $CARGO_HOME/bin, and the
+      # cargo-deny install below skips its verified download when the pinned
+      # version is already on PATH. The auditor this app's security gate trusts
+      # must come from that pin, not from a restored cache entry. Everything
+      # else (registry, git deps, target dir) is still cached.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+      # Dependency advisory gate: every crate in this app's tree — transitive
+      # included — is checked against the RustSec advisory database, and a known
+      # advisory that `deny.toml` does not explicitly waive fails the build. See
+      # `deny.toml` for how to read a finding and how to waive one.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2.85.5
+        with:
+          tool: cargo-deny@0.20.2
+
+      # The advisory database is the one part of this gate that needs the
+      # network, so fetching it is a separate, retried step. If it is still
+      # unreachable after the retries the job FAILS — the gate is fail closed:
+      # a dependency tree nobody could verify is never reported as clean.
+      - name: Fetch the RustSec advisory database
+        run: |
+          # cargo-deny falls back to a built-in default when it finds no config,
+          # which would audit this app under a policy with no waivers and fail on
+          # an advisory the scaffold already triaged. An app upgraded from a
+          # release before this gate existed has this workflow but not the
+          # policy file, so say so plainly instead of letting that happen.
+          if [ ! -f deny.toml ]; then
+            echo "::error::deny.toml is missing. It is this app's dependency advisory policy, and the audit below reads it. Copy the one \`autumn new\` generates (see docs/guide/supply-chain.md in the Autumn repository) into the project root and commit it."
+            exit 1
+          fi
+          cargo fetch
+          fetched=""
+          for attempt in 1 2 3; do
+            if output=$(cargo deny fetch db 2>&1); then
+              fetched="yes"
+              break
+            fi
+            echo "$output"
+            # cargo-deny loads deny.toml before it touches the network, so a
+            # malformed policy fails here on every attempt. Retrying that wastes
+            # a minute and blames the network for your typo.
+            if echo "$output" | grep -q 'deny\.toml'; then
+              echo "::error::deny.toml could not be loaded (see above) - a configuration error, not a network failure."
+              exit 1
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "advisory database unreachable (attempt $attempt/3); retrying in $((attempt * 10))s"
+              sleep "$((attempt * 10))"
+            fi
+          done
+          if [ -z "$fetched" ]; then
+            echo "::error::RustSec advisory database unreachable after 3 attempts - failing closed."
+            exit 1
+          fi
+
+      # Runs against the database fetched above, so a failure here is a real
+      # advisory rather than a network blip.
+      - name: Audit dependencies (RustSec advisories)
+        run: cargo deny --offline check advisories
 
       # Accessibility gate: install the prebuilt `autumn` CLI matching this app's
       # autumn-web version and scan raw html! markup for a11y violations. This is an

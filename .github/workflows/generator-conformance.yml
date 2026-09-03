@@ -598,15 +598,23 @@ jobs:
   # result — the only place the generated mount snippets are compiled against
   # the real crates.
   #
+  # The second step is issue #1631's Success Metric, the other direction of the
+  # same guarantee: `autumn new --with <plugin>` compiles, `autumn plugin
+  # remove <plugin>` returns the app to a state that compiles, and `autumn
+  # doctor` reports no plugin residue afterwards.
+  #
   # It lives in its own job (not the compile-and-serve matrix) because it
   # builds the aws-sdk-s3 / redis / media dependency graphs, which nothing else
-  # in this workflow pulls in. The five projects share one CARGO_TARGET_DIR
-  # inside the test, so the framework is compiled once.
+  # in this workflow pulls in. Each step's five projects share one
+  # CARGO_TARGET_DIR inside the test, so the framework is compiled once per
+  # step and the second step reuses the first's warm cargo cache.
   plugin-install:
-    name: autumn plugin add install gate
+    name: autumn plugin install/remove lifecycle gate
     needs: meta
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
-    timeout-minutes: 90
+    # Two five-project compile sweeps now, not one; the second reuses the
+    # first's warm target dir but still runs its own `cargo check` per plugin.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
 
@@ -625,3 +633,14 @@ jobs:
         run: |
           cargo test -p autumn-cli --test generate \
             plugin_add_first_party_scaffolds_cargo_check -- --ignored --exact
+
+      # Issue #1631's Success Metric, the other half of the same guarantee:
+      # `autumn new --with <plugin>` compiles, `autumn plugin remove <plugin>`
+      # returns the app to a state that compiles, and `autumn doctor` finds no
+      # residue afterwards — for every first-party plugin. It shares this job
+      # (and so the warm cargo cache) with the install gate above, since it
+      # builds the same aws-sdk-s3 / redis / media dependency graphs.
+      - name: plugin_new_with_then_remove_round_trips_cargo_check
+        run: |
+          cargo test -p autumn-cli --test generate \
+            plugin_new_with_then_remove_round_trips_cargo_check -- --ignored --exact

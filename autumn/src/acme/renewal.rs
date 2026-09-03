@@ -19,6 +19,8 @@ use std::time::Duration;
 use rustls::crypto::CryptoProvider;
 
 use crate::acme::challenge::Http01Tokens;
+use crate::acme::dns::resolver::DnsLookup;
+use crate::acme::dns::{DnsProvider, TxtRecord};
 use crate::acme::store::{AcmeStore, CertId, StoredCert};
 use crate::config::AcmeConfig;
 use crate::scheduler::SchedulerCoordinator;
@@ -29,6 +31,11 @@ use crate::tls::ReloadableCertResolver;
 /// enough to act well inside the (default 30-day) renew-before window while
 /// costing almost nothing.
 const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// How long to wait for a DNS-01 order to settle after signalling the challenges
+/// ready. See [`AcmeRenewalTask::await_order_ready`] for why the default is too
+/// short here.
+const DNS01_ORDER_READY_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// The scheduler task name used for ACME renewal leader-election.
 const RENEWAL_TASK_NAME: &str = "acme-renewal";
@@ -41,6 +48,36 @@ const RENEWAL_TASK_NAME: &str = "acme-renewal";
 ///
 /// [`ErrorReporter`]: crate::reporting::ErrorReporter
 pub type ReporterFn = Arc<dyn Fn(String) + Send + Sync>;
+
+/// A callback invoked after a successful issuance/renewal that followed a
+/// recorded failure.
+///
+/// The app wires this to #1610's operator-alert recovery, so a
+/// `scheduled_task_failure` alert raised for `acme-renewal` is cleared once the
+/// certificate is obtained. Failures reach the operator through
+/// [`ReporterFn`]; this is the other half of that pair.
+pub type RecoveryFn = Arc<dyn Fn() + Send + Sync>;
+
+/// Everything the DNS-01 challenge path needs (issue #1620).
+///
+/// Present on [`AcmeRenewalTask`] exactly when `[server.tls.acme.dns]` is
+/// configured; its absence keeps issuance on #1608's HTTP-01 path byte for byte.
+pub struct DnsChallenge {
+    /// Writes and removes the `_acme-challenge` TXT records.
+    pub provider: Arc<dyn DnsProvider>,
+    /// Sends the DNS queries that discover the zone's nameservers and confirm
+    /// the records are visible.
+    pub lookup: Arc<dyn DnsLookup>,
+    /// The resolvers used to DISCOVER the zone's authoritative nameservers — and
+    /// the fallback probed directly when discovery fails. See
+    /// [`resolver`](crate::acme::dns::resolver) for why the propagation probe
+    /// goes to the authoritative servers rather than to these.
+    pub resolvers: Vec<std::net::SocketAddr>,
+    /// Bound on the propagation wait.
+    pub propagation_timeout: Duration,
+    /// Gap between propagation probes.
+    pub poll_interval: Duration,
+}
 
 /// Decide whether a certificate whose leaf expires at `not_after_unix` should be
 /// renewed now.
@@ -165,6 +202,10 @@ pub struct AcmeHealthIndicator {
     status: AcmeStatus,
     renew_before_days: u32,
     now_unix: fn() -> i64,
+    /// The configured DNS-01 provider name, when DNS-01 is in use (#1620).
+    /// A provider NAME, never a credential — it is published in
+    /// `/actuator/health`.
+    dns_provider: Option<&'static str>,
 }
 
 impl AcmeHealthIndicator {
@@ -176,7 +217,20 @@ impl AcmeHealthIndicator {
             status,
             renew_before_days,
             now_unix: default_now_unix,
+            dns_provider: None,
         }
+    }
+
+    /// Report which challenge type is in use, naming the DNS-01 provider when
+    /// one is configured (issue #1620).
+    ///
+    /// Surfaces `challenge` (`http-01`/`dns-01`) and `dns_provider` in the
+    /// health details, which is the first thing an operator needs when issuance
+    /// is failing. Both are configuration NAMES; no credential is exposed.
+    #[must_use]
+    pub const fn with_dns_provider(mut self, provider: Option<&'static str>) -> Self {
+        self.dns_provider = provider;
+        self
     }
 
     /// Grade the current status against `now_unix` (pure; used by `check` and
@@ -187,6 +241,17 @@ impl AcmeHealthIndicator {
         let snap = self.status.snapshot();
         let mut details = std::collections::HashMap::new();
 
+        details.insert(
+            "challenge".to_owned(),
+            serde_json::json!(if self.dns_provider.is_some() {
+                "dns-01"
+            } else {
+                "http-01"
+            }),
+        );
+        if let Some(provider) = self.dns_provider {
+            details.insert("dns_provider".to_owned(), serde_json::json!(provider));
+        }
         if let Some(not_after) = snap.cert_not_after_unix {
             let days = (not_after - now_unix) / 86_400;
             details.insert("days_until_expiry".to_owned(), serde_json::json!(days));
@@ -287,6 +352,14 @@ pub struct AcmeRenewalTask {
     /// hourly tick would order a brand-new certificate until the CA rate-limits
     /// the account. Cleared only by a restart (which re-runs config validation).
     pub renew_window_misconfigured: std::sync::atomic::AtomicBool,
+    /// DNS-01 wiring (issue #1620), present exactly when
+    /// `[server.tls.acme.dns]` is configured. `None` keeps issuance on #1608's
+    /// HTTP-01 path; `Some` answers every authorization over DNS-01, which is
+    /// the only challenge type a CA accepts for a **wildcard** identifier.
+    pub dns: Option<DnsChallenge>,
+    /// Invoked after an issuance that succeeded following a recorded failure,
+    /// so the app can clear the operator alert its `reporter` raised (#1610).
+    pub recovery: Option<RecoveryFn>,
 }
 
 /// RAII guard tracking the HTTP-01 tokens published for one order.
@@ -492,7 +565,14 @@ impl AcmeRenewalTask {
     fn handle_issue_outcome(&self, outcome: Result<i64, String>, reporter: &ReporterFn) {
         match outcome {
             Ok(not_after) => {
+                // Read BEFORE `record_success` clears it: the recovery callback
+                // must fire only for a success that ends an OUTSTANDING failure,
+                // so a steady-state renewal does not re-notify every cycle.
+                let recovered_from_failure = self.status.snapshot().last_failure.is_some();
                 self.status.record_success(now_unix(), not_after);
+                if recovered_from_failure && let Some(recovery) = &self.recovery {
+                    recovery();
+                }
                 tracing::info!(
                     cert_id = self.cert_id.as_str(),
                     "ACME certificate issued/renewed and hot-swapped into the TLS listener"
@@ -582,12 +662,15 @@ impl AcmeRenewalTask {
         }
     }
 
-    /// The full HTTP-01 issuance flow: order → challenge → finalize → persist →
+    /// The full issuance flow: order → challenge → finalize → persist →
     /// hot-swap. Returns the issued leaf's `notAfter` on success.
+    ///
+    /// The challenge half is the only part that varies: HTTP-01 (#1608) when no
+    /// DNS provider is configured, DNS-01 (#1620) when one is — the latter being
+    /// the only challenge type a CA will accept for a wildcard identifier.
+    /// Everything downstream (CSR, finalize, persistence, hot-swap) is shared.
     async fn issue(&self) -> Result<i64, String> {
-        use instant_acme::{
-            AuthorizationStatus, ChallengeType, Identifier, NewOrder, OrderStatus, RetryPolicy,
-        };
+        use instant_acme::{Identifier, NewOrder};
 
         let account = self.load_or_register_account().await?;
 
@@ -597,49 +680,361 @@ impl AcmeRenewalTask {
             .iter()
             .map(|d| Identifier::Dns(d.clone()))
             .collect();
+        // A wildcard is ordered as the literal `*.myapp.com` identifier (RFC 8555
+        // §7.1.3); the CA answers with an authorization whose identifier is the
+        // BASE domain plus `wildcard: true` (§7.1.4), which is why the
+        // `_acme-challenge` record name is derived from the AUTHORIZATION's
+        // identifier rather than from the configured domain list.
         let mut order = account
             .new_order(&NewOrder::new(&identifiers))
             .await
             .map_err(|e| format!("failed to create ACME order: {e}"))?;
 
-        // Publish an HTTP-01 response for each pending authorization. The RAII
-        // guard removes every published token from the shared map on ALL exit
-        // paths (early `?` inside this scope, the `poll_ready` error below, or
-        // normal completion), so a transient failure cannot leak tokens that
-        // accumulate across repeated renewal attempts.
+        // Both arms answer their challenges AND wait for the order to settle
+        // before their challenge responses are torn down: `set_ready` only tells
+        // the CA to *queue* validation, so a token or TXT record removed before
+        // the order reaches `ready` is removed while the CA is still looking at
+        // it.
+        if let Some(dns) = &self.dns {
+            self.answer_dns01(&mut order, dns).await?;
+        } else {
+            let published = self.answer_http01(&mut order).await?;
+            let ready = self.await_order_ready(&mut order).await;
+            drop(published);
+            ready?;
+        }
+        self.finalize_and_install(&mut order).await
+    }
+
+    /// Publish an HTTP-01 response for every pending authorization and tell the
+    /// CA each is ready, returning the RAII guard that un-publishes them.
+    async fn answer_http01<'a>(
+        &'a self,
+        order: &mut instant_acme::Order,
+    ) -> Result<PublishedTokens<'a>, String> {
+        use instant_acme::{AuthorizationStatus, ChallengeType};
+
+        // Every token handed to the guard is inserted into the shared map
+        // immediately and removed again when the guard drops — so no matter
+        // which `?` returns `Err`, published tokens never leak into the map to
+        // accumulate across repeated failures.
         let mut published = PublishedTokens::new(&self.tokens);
-        {
-            let mut authorizations = order.authorizations();
-            while let Some(result) = authorizations.next().await {
-                let mut authz =
-                    result.map_err(|e| format!("failed to fetch authorization: {e}"))?;
-                if authz.status == AuthorizationStatus::Valid {
-                    continue;
-                }
-                let mut challenge = authz
-                    .challenge(ChallengeType::Http01)
-                    .ok_or_else(|| "authorization offered no http-01 challenge".to_owned())?;
-                let token = challenge.token.clone();
-                let key_auth = challenge.key_authorization().as_str().to_owned();
-                // Publish BEFORE signalling ready so the CA can fetch it — and
-                // track it in the guard so a failing `set_ready` still cleans up.
-                published.publish(token, key_auth);
-                challenge
-                    .set_ready()
-                    .await
-                    .map_err(|e| format!("failed to signal challenge ready: {e}"))?;
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut authz = result.map_err(|e| format!("failed to fetch authorization: {e}"))?;
+            if authz.status == AuthorizationStatus::Valid {
+                continue;
             }
+            let mut challenge = authz
+                .challenge(ChallengeType::Http01)
+                .ok_or_else(|| "authorization offered no http-01 challenge".to_owned())?;
+            let token = challenge.token.clone();
+            let key_auth = challenge.key_authorization().as_str().to_owned();
+            // Publish BEFORE signalling ready so the CA can fetch it — and
+            // track it in the guard so a failing `set_ready` still cleans up.
+            published.publish(token, key_auth);
+            challenge
+                .set_ready()
+                .await
+                .map_err(|e| format!("failed to signal challenge ready: {e}"))?;
+        }
+        Ok(published)
+    }
+
+    /// Answer every pending authorization over DNS-01 and wait for the order to
+    /// settle (issue #1620).
+    ///
+    /// Strictly ordered: collect every challenge value, publish **all** of them,
+    /// wait until every configured resolver sees every value, tell the CA to
+    /// validate, and only then wait for the order to become ready. Signalling
+    /// ready before propagation is how a DNS-01 authorization is burnt — the CA
+    /// queries once, sees nothing, and marks it invalid.
+    ///
+    /// The records are removed on **every** exit path, including the error ones,
+    /// so a failing order never leaves `_acme-challenge` litter in the zone to
+    /// accumulate across retries. Removal happens only after the order has
+    /// settled: `set_ready` merely *queues* validation, so deleting a record the
+    /// moment it returns would pull it out from under a CA that has not looked
+    /// yet.
+    async fn answer_dns01(
+        &self,
+        order: &mut instant_acme::Order,
+        dns: &DnsChallenge,
+    ) -> Result<(), String> {
+        let wanted = self.collect_dns01_records(order).await?;
+        if wanted.is_empty() {
+            // Every authorization is already valid (a re-used order): nothing to
+            // publish, nothing to clean up — but the order still has to settle.
+            return self.await_order_ready(order).await;
         }
 
-        // Wait for the order to become ready. The guard clears published tokens
-        // when it drops at the end of `issue`, on both the error and Ok paths.
+        // Track what actually reached the provider — including a partial publish
+        // interrupted mid-way — so cleanup removes exactly those and no more.
+        let mut published: Vec<TxtRecord> = Vec::new();
+        let outcome = self
+            .publish_and_validate_dns01(order, dns, &wanted, &mut published)
+            .await;
+        Self::cleanup_dns01(dns, &published).await;
+        outcome
+    }
+
+    /// Publish `wanted`, wait for propagation, signal every challenge ready, and
+    /// wait for the order to reach `ready`.
+    ///
+    /// Split out of [`answer_dns01`](Self::answer_dns01) so the caller can run
+    /// cleanup after it regardless of which step failed — and so cleanup runs
+    /// only once the CA has finished with the records.
+    async fn publish_and_validate_dns01(
+        &self,
+        order: &mut instant_acme::Order,
+        dns: &DnsChallenge,
+        wanted: &[TxtRecord],
+        published: &mut Vec<TxtRecord>,
+    ) -> Result<(), String> {
+        // Recorded BEFORE the write, not after: a batch that fails partway may
+        // still have written some of these names, and the provider contract
+        // makes deleting a value that was never published a no-op. Publishing
+        // goes through the batch entry point because a set-replacing provider
+        // (Route 53) must apply every value sharing a name in one change —
+        // sequential read-modify-writes race and drop one of them (#1620).
+        published.extend(wanted.iter().cloned());
+        dns.provider.upsert_txt_batch(wanted).await.map_err(|e| {
+            format!(
+                "failed to publish the DNS-01 TXT records via the {} provider: {e}",
+                dns.provider.name()
+            )
+        })?;
+
+        // Probe the zone's OWN nameservers, not the configured recursive
+        // resolvers. Probing a public recursive immediately after the write
+        // plants a negative-cache entry whose TTL (900s for Route 53, 1800s for
+        // Cloudflare) outlives the propagation budget, so every later probe —
+        // and every later renewal — reads the cached "not there" and the wait
+        // can never succeed. The configured resolvers are how the authoritative
+        // set is discovered, and the fallback when that fails.
+        let probe_targets = Self::dns01_probe_targets(dns, wanted).await;
+
+        crate::acme::dns::resolver::wait_for_propagation(
+            wanted,
+            &probe_targets,
+            dns.propagation_timeout,
+            dns.poll_interval,
+            dns.lookup.as_ref(),
+        )
+        .await?;
+
+        Self::signal_dns01_ready(order).await?;
+        // Inside the cleanup scope on purpose: the CA validates asynchronously
+        // after `set_ready`, so the records must stay published until the order
+        // has actually settled.
+        self.await_order_ready(order).await
+    }
+
+    /// The servers the propagation wait should probe for each challenge name:
+    /// that name's own authoritative nameservers when they can be discovered,
+    /// else the configured resolvers.
+    ///
+    /// Discovery runs once per **distinct challenge name**, not once per order.
+    /// A wildcard order's records all share one name (`*.myapp.com` and
+    /// `myapp.com` both challenge `_acme-challenge.myapp.com`), so that common
+    /// case still costs a single `NS` lookup plus one `A` lookup per
+    /// nameserver. A multi-domain order spans several zones, and the first
+    /// zone's servers are not authoritative for the rest — probing them for
+    /// another zone's name can only ever time out, after which the caller
+    /// deletes every record. So each zone gets its own targets (issue #1620).
+    ///
+    /// Discovery is per-order rather than per-boot because a zone's NS set can
+    /// change between renewals.
+    async fn dns01_probe_targets(
+        dns: &DnsChallenge,
+        wanted: &[TxtRecord],
+    ) -> crate::acme::dns::resolver::ProbeTargets {
+        let mut targets = crate::acme::dns::resolver::ProbeTargets::flat(&dns.resolvers);
+        let mut discovered: Vec<&str> = Vec::new();
+        for record in wanted {
+            if discovered.contains(&record.fqdn.as_str()) {
+                continue;
+            }
+            discovered.push(&record.fqdn);
+            let authoritative = crate::acme::dns::resolver::authoritative_resolvers(
+                &record.fqdn,
+                &dns.resolvers,
+                dns.lookup.as_ref(),
+            )
+            .await;
+            if authoritative.is_empty() {
+                // Fall back for THIS name only: one zone with a broken
+                // delegation must not drag the others onto recursive resolvers.
+                tracing::warn!(
+                    fqdn = record.fqdn,
+                    "could not discover the authoritative nameservers for the DNS-01 challenge \
+                     zone; falling back to the configured resolvers for this name. A recursive \
+                     resolver can cache a negative answer for longer than the propagation \
+                     budget, so raise [server.tls.acme.dns] propagation_timeout_secs if issuance \
+                     times out"
+                );
+                continue;
+            }
+            tracing::debug!(
+                fqdn = record.fqdn,
+                servers = authoritative.len(),
+                "probing the DNS-01 challenge zone's authoritative nameservers"
+            );
+            targets.set_authoritative(&record.fqdn, authoritative);
+        }
+        targets
+    }
+
+    /// The TXT record each pending authorization needs, in order.
+    ///
+    /// An authorization for `*.myapp.com` carries the identifier `myapp.com`
+    /// with a wildcard flag, so an apex + wildcard order yields TWO records at
+    /// the SAME name with different values. Both are returned and both must be
+    /// live before validation — which is why every provider here appends rather
+    /// than replaces.
+    async fn collect_dns01_records(
+        &self,
+        order: &mut instant_acme::Order,
+    ) -> Result<Vec<TxtRecord>, String> {
+        use instant_acme::{AuthorizationStatus, ChallengeType, Identifier};
+
+        let mut records = Vec::new();
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut authz = result.map_err(|e| format!("failed to fetch authorization: {e}"))?;
+            if authz.status == AuthorizationStatus::Valid {
+                continue;
+            }
+            let domain = match authz.identifier().identifier {
+                Identifier::Dns(dns) => dns.clone(),
+                other => {
+                    return Err(format!(
+                        "the DNS-01 challenge can only answer a DNS identifier, but this \
+                         authorization is for {other:?}"
+                    ));
+                }
+            };
+            // The record name comes from the CA's answer, and writing it commits
+            // a DNS change in whatever zone the provider credential can reach.
+            // The CSR is pinned to `config.domains`, so a hostile directory
+            // cannot obtain a certificate for a name it was not asked for — but
+            // it could still steer autumn into writing `_acme-challenge.<x>`
+            // into an unrelated zone (and, under the exec hook, into an argv
+            // entry). Only answer for a name that was actually ordered.
+            if !Self::is_ordered_identifier(&self.config.domains, &domain) {
+                return Err(format!(
+                    "the CA returned an authorization for `{domain}`, which is not one of the \
+                     configured [server.tls.acme] domains; refusing to publish a challenge record \
+                     for it"
+                ));
+            }
+            let challenge = authz.challenge(ChallengeType::Dns01).ok_or_else(|| {
+                format!(
+                    "the CA offered no dns-01 challenge for `{domain}`; a wildcard certificate \
+                     cannot be issued without it"
+                )
+            })?;
+            records.push(TxtRecord::new(
+                &domain,
+                challenge.key_authorization().dns_value(),
+            ));
+        }
+        Ok(records)
+    }
+
+    /// Whether `identifier` is a name this order actually asked for.
+    ///
+    /// An authorization's identifier is the BASE domain, so `*.myapp.com` in the
+    /// config authorises an authorization for `myapp.com` (RFC 8555 §7.1.4).
+    fn is_ordered_identifier(domains: &[String], identifier: &str) -> bool {
+        let identifier = identifier.trim().trim_end_matches('.').to_ascii_lowercase();
+        domains.iter().any(|domain| {
+            let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+            domain == identifier || domain.strip_prefix("*.") == Some(identifier.as_str())
+        })
+    }
+
+    /// Tell the CA every pending DNS-01 challenge is ready to validate.
+    ///
+    /// A second pass over the order's authorizations: their state is already
+    /// cached from [`collect_dns01_records`](Self::collect_dns01_records), so
+    /// this costs no extra fetch — it exists only so no challenge is signalled
+    /// before every record has propagated.
+    async fn signal_dns01_ready(order: &mut instant_acme::Order) -> Result<(), String> {
+        use instant_acme::{AuthorizationStatus, ChallengeType};
+
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut authz = result.map_err(|e| format!("failed to fetch authorization: {e}"))?;
+            if authz.status == AuthorizationStatus::Valid {
+                continue;
+            }
+            let mut challenge = authz
+                .challenge(ChallengeType::Dns01)
+                .ok_or_else(|| "authorization offered no dns-01 challenge".to_owned())?;
+            challenge
+                .set_ready()
+                .await
+                .map_err(|e| format!("failed to signal the dns-01 challenge ready: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Remove every published challenge record, best-effort.
+    ///
+    /// A cleanup failure is logged, never propagated: the order's own outcome is
+    /// what the caller reports, and turning a successful issuance into a failure
+    /// because a leftover TXT record could not be deleted would be worse than
+    /// the litter. The next order's publish is idempotent either way.
+    async fn cleanup_dns01(dns: &DnsChallenge, published: &[TxtRecord]) {
+        if published.is_empty() {
+            return;
+        }
+        // Batched for the same reason publishing is: removing two values at one
+        // name one at a time lets a set-replacing provider's stale read
+        // resurrect the value it just removed (#1620).
+        if let Err(e) = dns.provider.delete_txt_batch(published).await {
+            tracing::warn!(
+                provider = dns.provider.name(),
+                error = %e,
+                "could not remove the DNS-01 challenge TXT records; they will be overwritten by \
+                 the next issuance but can be deleted by hand"
+            );
+        }
+    }
+
+    /// Wait for the order to leave `pending`, rejecting any state but `ready`.
+    ///
+    /// DNS-01 gets a much longer budget than the default. `RetryPolicy::default()`
+    /// stops after roughly 16 seconds, which is fine for HTTP-01 (the CA fetches
+    /// a URL synchronously) but marginal for DNS-01, where Let's Encrypt
+    /// validates asynchronously from several network perspectives. And giving up
+    /// early is not benign: the caller then runs cleanup, deleting the TXT
+    /// records **while the CA is still reading them**, so the authorizations go
+    /// invalid and the next attempt spends another of the CA's five
+    /// failed-validations-per-hour.
+    async fn await_order_ready(&self, order: &mut instant_acme::Order) -> Result<(), String> {
+        use instant_acme::{OrderStatus, RetryPolicy};
+
+        let policy = if self.dns.is_some() {
+            RetryPolicy::default().timeout(DNS01_ORDER_READY_TIMEOUT)
+        } else {
+            RetryPolicy::default()
+        };
         let status = order
-            .poll_ready(&RetryPolicy::default())
+            .poll_ready(&policy)
             .await
             .map_err(|e| format!("order did not become ready: {e}"))?;
         if status != OrderStatus::Ready {
             return Err(format!("ACME order ended in unexpected state {status:?}"));
         }
+        Ok(())
+    }
+
+    /// Finalize the ready order, persist the issued pair, and hot-swap it into
+    /// the live resolver. Returns the leaf's `notAfter`.
+    async fn finalize_and_install(&self, order: &mut instant_acme::Order) -> Result<i64, String> {
+        use instant_acme::RetryPolicy;
 
         // Finalize with a FRESH rcgen keypair + CSR for exactly these domains.
         let (csr_der, key_pem) = self.generate_csr()?;
@@ -806,6 +1201,218 @@ fn now_unix() -> i64 {
 mod tests {
     use super::*;
     use crate::actuator::HealthStatus;
+
+    /// A [`DnsProvider`] that records nothing and writes nothing: these tests
+    /// exercise nameserver *discovery*, which never touches the provider.
+    struct NoopProvider;
+
+    impl crate::acme::dns::DnsProvider for NoopProvider {
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+        fn upsert_txt<'a>(
+            &'a self,
+            _record: &'a TxtRecord,
+        ) -> futures::future::BoxFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn delete_txt<'a>(
+            &'a self,
+            _record: &'a TxtRecord,
+        ) -> futures::future::BoxFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Regression (#1620): a multi-domain order spans several zones, and each
+    /// must be probed through its OWN authoritative nameservers.
+    ///
+    /// The bug this pins: discovering nameservers from `wanted.first()` alone
+    /// and probing every name at them. `ns-a.example` is not authoritative for
+    /// `myapp.io`, so it never answers with that zone's TXT value — the wait
+    /// spends its whole budget and the caller then deletes every record, so a
+    /// perfectly correct two-domain order fails on every attempt.
+    ///
+    /// A `ScriptedZoneLookup` answers `NS`/`A` per zone and refuses to answer
+    /// TXT for a name a server is not authoritative for, which is what a real
+    /// nameserver does.
+    #[tokio::test]
+    async fn probe_targets_are_discovered_per_zone() {
+        use crate::acme::dns::resolver::{DnsAnswer, DnsLookup, Rdata, ResourceRecord};
+        use std::net::SocketAddr;
+
+        /// `zone -> (nameserver name, nameserver address)`.
+        struct ScriptedZoneLookup {
+            zones: Vec<(&'static str, &'static str, SocketAddr)>,
+            asked: std::sync::Mutex<Vec<(SocketAddr, String, u16)>>,
+        }
+
+        impl DnsLookup for ScriptedZoneLookup {
+            fn query<'a>(
+                &'a self,
+                server: SocketAddr,
+                name: &'a str,
+                qtype: u16,
+                _recursion_desired: bool,
+            ) -> futures::future::BoxFuture<'a, Result<DnsAnswer, String>> {
+                self.asked
+                    .lock()
+                    .unwrap()
+                    .push((server, name.to_owned(), qtype));
+                let name = name.to_owned();
+                let zones = self.zones.clone();
+                Box::pin(async move {
+                    let records = match qtype {
+                        // NS: only for a zone this script knows.
+                        2 => zones
+                            .iter()
+                            .find(|(zone, ..)| *zone == name)
+                            .map(|(zone, ns, _)| ResourceRecord {
+                                name: (*zone).to_owned(),
+                                rtype: 2,
+                                rdata: Rdata::Name((*ns).to_owned()),
+                            })
+                            .into_iter()
+                            .collect::<Vec<_>>(),
+                        // A: resolve a nameserver's own name.
+                        1 => zones
+                            .iter()
+                            .find(|(_, ns, _)| *ns == name)
+                            .map(|(_, ns, addr)| ResourceRecord {
+                                name: (*ns).to_owned(),
+                                rtype: 1,
+                                rdata: Rdata::A(match addr.ip() {
+                                    std::net::IpAddr::V4(v4) => v4,
+                                    std::net::IpAddr::V6(_) => unreachable!("scripted as v4"),
+                                }),
+                            })
+                            .into_iter()
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    Ok(DnsAnswer { rcode: 0, records })
+                })
+            }
+        }
+
+        let ns_a: SocketAddr = "10.0.0.1:53".parse().unwrap();
+        let ns_b: SocketAddr = "10.0.0.2:53".parse().unwrap();
+        let recursive: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        let lookup = std::sync::Arc::new(ScriptedZoneLookup {
+            zones: vec![
+                ("myapp.com", "ns-a.example", ns_a),
+                ("myapp.io", "ns-b.example", ns_b),
+            ],
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let dns = DnsChallenge {
+            provider: std::sync::Arc::new(NoopProvider),
+            lookup: std::sync::Arc::clone(&lookup) as std::sync::Arc<dyn DnsLookup>,
+            resolvers: vec![recursive],
+            propagation_timeout: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(10),
+        };
+
+        // An apex+wildcard pair on .com (one shared name) plus a second domain.
+        let wanted = vec![
+            TxtRecord::new("myapp.com", "value-apex"),
+            TxtRecord::new("myapp.com", "value-wildcard"),
+            TxtRecord::new("myapp.io", "value-io"),
+        ];
+        let targets = AcmeRenewalTask::dns01_probe_targets(&dns, &wanted).await;
+
+        assert_eq!(
+            targets.for_name("_acme-challenge.myapp.com"),
+            ([ns_a].as_slice(), true),
+            "the .com name must be probed at its own zone's nameserver, authoritatively"
+        );
+        assert_eq!(
+            targets.for_name("_acme-challenge.myapp.io"),
+            ([ns_b].as_slice(), true),
+            "the .io name must NOT inherit the first zone's nameserver — it is not \
+             authoritative for .io and can only ever answer a referral"
+        );
+
+        // The shared name is discovered once, not once per value: the apex and
+        // its wildcard challenge the same record.
+        let ns_queries = lookup
+            .asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, name, qtype)| *qtype == 2 && name == "myapp.com")
+            .count();
+        assert_eq!(
+            ns_queries, 1,
+            "one NS discovery per distinct challenge name"
+        );
+    }
+
+    /// A zone whose nameservers cannot be discovered falls back to the
+    /// configured resolvers **for that name only** — a broken delegation on one
+    /// domain must not drag a working one onto recursive resolvers, where a
+    /// negative cache entry can outlive the propagation budget.
+    #[tokio::test]
+    async fn undiscoverable_zones_fall_back_without_affecting_their_neighbours() {
+        use crate::acme::dns::resolver::{DnsAnswer, DnsLookup, Rdata, ResourceRecord};
+        use std::net::SocketAddr;
+
+        struct OnlyComIsDiscoverable;
+        impl DnsLookup for OnlyComIsDiscoverable {
+            fn query<'a>(
+                &'a self,
+                _server: SocketAddr,
+                name: &'a str,
+                qtype: u16,
+                _recursion_desired: bool,
+            ) -> futures::future::BoxFuture<'a, Result<DnsAnswer, String>> {
+                let name = name.to_owned();
+                Box::pin(async move {
+                    let records = match (qtype, name.as_str()) {
+                        (2, "myapp.com") => vec![ResourceRecord {
+                            name: name.clone(),
+                            rtype: 2,
+                            rdata: Rdata::Name("ns-a.example".to_owned()),
+                        }],
+                        (1, "ns-a.example") => vec![ResourceRecord {
+                            name: name.clone(),
+                            rtype: 1,
+                            rdata: Rdata::A(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                        }],
+                        _ => Vec::new(),
+                    };
+                    Ok(DnsAnswer { rcode: 0, records })
+                })
+            }
+        }
+
+        let recursive: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        let dns = DnsChallenge {
+            provider: std::sync::Arc::new(NoopProvider),
+            lookup: std::sync::Arc::new(OnlyComIsDiscoverable),
+            resolvers: vec![recursive],
+            propagation_timeout: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(10),
+        };
+        let wanted = vec![
+            TxtRecord::new("myapp.com", "value-com"),
+            TxtRecord::new("myapp.io", "value-io"),
+        ];
+        let targets = AcmeRenewalTask::dns01_probe_targets(&dns, &wanted).await;
+
+        assert_eq!(
+            targets.for_name("_acme-challenge.myapp.com"),
+            ([SocketAddr::from(([10, 0, 0, 1], 53))].as_slice(), true),
+            "the discoverable zone keeps its authoritative servers"
+        );
+        assert_eq!(
+            targets.for_name("_acme-challenge.myapp.io"),
+            ([recursive].as_slice(), false),
+            "the undiscoverable zone falls back to the configured resolvers — and is \
+             marked non-authoritative, so its probe asks them to actually resolve"
+        );
+    }
 
     const DAY: i64 = 86_400;
 
@@ -1065,6 +1672,7 @@ mod tests {
             http_challenge_port: 80,
             renew_before_days: 30,
             ca_root_path: None,
+            dns: None,
         };
         let task = AcmeRenewalTask {
             resolver,
@@ -1077,6 +1685,8 @@ mod tests {
             serving_stored_cert: false,
             leadership_degraded: false,
             renew_window_misconfigured: std::sync::atomic::AtomicBool::new(false),
+            dns: None,
+            recovery: None,
         };
 
         // Capture reporter invocations.
@@ -1167,6 +1777,7 @@ mod tests {
             http_challenge_port: 80,
             renew_before_days: 30,
             ca_root_path: None,
+            dns: None,
         };
         let task = AcmeRenewalTask {
             resolver,
@@ -1179,6 +1790,8 @@ mod tests {
             serving_stored_cert: false,
             leadership_degraded,
             renew_window_misconfigured: std::sync::atomic::AtomicBool::new(false),
+            dns: None,
+            recovery: None,
         };
         (task, store_dir, status)
     }

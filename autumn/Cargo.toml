@@ -38,8 +38,18 @@ mcp = ["openapi"]
 # allowlist HTML sanitizer `markdown::render_user_content` runs its output
 # through, so a content app can accept user Markdown without stored XSS.
 markdown = ["dep:pulldown-cmark", "dep:ammonia"]
+# `reqwest?/blocking` powers the replication S3 destination (#1628), which needs
+# BOTH `db` and `http-client`. The `?` means it is enabled only when something
+# else already pulled reqwest in, so an app on `http-client` alone (no database,
+# and therefore no replication) does not compile the blocking client. The
+# replication loop runs on its own OS thread — file, SQLite and network I/O all
+# off the reactor — and `autumn db replica restore` is a synchronous CLI with no
+# runtime at all, so a blocking client is the one shape both can share. It is
+# constructed, used and dropped only on those threads, never inside the async
+# runtime.
 db = [
     "autumn-macros/db",
+    "reqwest?/blocking",
     "dep:deadpool",
     "dep:diesel",
     "dep:diesel-async",
@@ -211,7 +221,7 @@ tls = ["dep:tokio-rustls", "dep:x509-parser", "dep:rustls", "dep:rustls-pki-type
 # ACME order state machine) and `rcgen` (account/cert key + CSR + self-signed
 # placeholder), both pinned to `ring` so no second crypto backend enters the
 # graph.
-acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2"]
+acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2", "dep:reqwest"]
 # Origin-side half of the edge capsule (issue #1790). Adds the `autumn_web::edge`
 # re-export of the `autumn-edge` crate, the `CacheEdgeKv` adapter that projects
 # the app's `Cache` onto the `EdgeKv` seam, and `AppBuilder::with_edge_kv`, which
