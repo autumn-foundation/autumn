@@ -4264,7 +4264,7 @@ fn run_command(command: Commands) {
                 // AC #6: every `--with` name is resolved and version-checked
                 // BEFORE the scaffold writes a byte, so a typo or an
                 // incompatible plugin never leaves a half-built project behind.
-                let plugins = resolve_scaffold_plugins(&with);
+                let plugins = resolve_scaffold_plugins(&with, None);
                 starters::run(
                     &name,
                     &starter,
@@ -4274,7 +4274,7 @@ fn run_command(command: Commands) {
                 );
                 wire_scaffold_plugins_into(&name, &plugins);
             } else {
-                let plugins = resolve_scaffold_plugins(&with);
+                let plugins = resolve_scaffold_plugins(&with, Some(plugin::first_party_version()));
                 new::run(
                     &name,
                     new::GenerateOptions {
@@ -5043,20 +5043,24 @@ fn run_task_command(
 /// directory tree, and a project that exists but is missing the plugin the user
 /// asked for is worse than no project at all.
 ///
-/// The version gate compares against **this CLI's** `autumn-web`, which is what
-/// `autumn new` pins. On the `--starter` path the starter tree brings its own
-/// manifest and may pin a different series; the gate is still worth running
-/// (an unknown name is caught either way), but a starter on an older series
-/// gets its real compatibility answer from `cargo` rather than from here.
-fn resolve_scaffold_plugins(names: &[String]) -> Vec<plugin::ScaffoldPlugin> {
+/// `scaffold_autumn_web` is the `autumn-web` the scaffold will pin, or `None`
+/// when that is not knowable yet. `autumn new`'s own template pins this CLI's
+/// version, so the gate is exact there. A `--starter` brings its own manifest,
+/// which does not exist until the starter is fetched — so only the half that
+/// IS knowable (does this name resolve at all, and to what version) runs
+/// before the write, and the compatibility answer comes from
+/// `plugin::wire_scaffold_plugins` reading the starter's real manifest
+/// afterwards.
+fn resolve_scaffold_plugins(
+    names: &[String],
+    scaffold_autumn_web: Option<&str>,
+) -> Vec<plugin::ScaffoldPlugin> {
     if names.is_empty() {
         return Vec::new();
     }
-    // The scaffold pins `autumn-web` at this CLI's own version, so that is the
-    // version every `--with` plugin is checked against.
     match plugin::preflight_scaffold_plugins(
         names,
-        plugin::first_party_version(),
+        scaffold_autumn_web,
         plugin::registry::latest_version,
     ) {
         Ok(plugins) => plugins,

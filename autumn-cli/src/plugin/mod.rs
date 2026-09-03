@@ -927,7 +927,7 @@ pub struct ScaffoldPlugin {
 /// community crate) has no resolvable version.
 pub fn preflight_scaffold_plugins(
     names: &[String],
-    scaffold_autumn_web: &str,
+    scaffold_autumn_web: Option<&str>,
     resolve_community_version: impl Fn(&str) -> Option<String>,
 ) -> Result<Vec<ScaffoldPlugin>, String> {
     let mut out: Vec<ScaffoldPlugin> = Vec::with_capacity(names.len());
@@ -961,11 +961,17 @@ pub fn preflight_scaffold_plugins(
         // series — which is exactly the regression worth catching before a
         // project exists on disk. A community crate's range is not knowable,
         // so it is not gated here (`Compat::Unknown` passes).
-        if matches!(resolved, Resolved::FirstParty(_))
-            && install::check_compat(scaffold_autumn_web, &version) == Compat::Incompatible
+        // `None` when the pin is not knowable yet — a `--starter` brings its own
+        // manifest, which does not exist until the starter is fetched. The
+        // version answer then comes from `plan_add` reading the real manifest,
+        // and `wire_scaffold_plugins` reports it as "the app was created, the
+        // plugin was not wired" rather than as a bare failure.
+        if let Some(pinned) = scaffold_autumn_web
+            && matches!(resolved, Resolved::FirstParty(_))
+            && install::check_compat(pinned, &version) == Compat::Incompatible
         {
             return Err(format!(
-                "`{name} {version}` supports autumn-web {}, but this scaffold pins autumn-web {scaffold_autumn_web} — no files were written.\nInstall the matching CLI series and try again.",
+                "`{name} {version}` supports autumn-web {}, but this scaffold pins autumn-web {pinned} — no files were written.\nInstall the matching CLI series and try again.",
                 install::supported_range(&version)
             ));
         }
@@ -983,7 +989,12 @@ pub fn preflight_scaffold_plugins(
 /// Returns the process exit code: `0` when every plugin was wired, or the
 /// worst code any single install produced. Runs only after
 /// [`preflight_scaffold_plugins`] has passed, so nothing here can be the first
-/// place a bad name is noticed.
+/// place a bad name is noticed — but it IS the first place a `--starter`'s own
+/// `autumn-web` pin can be read, so an incompatibility there surfaces here
+/// rather than in the preflight. The app has already been scaffolded by then,
+/// so that is reported as an app that exists without the plugin (exit
+/// [`MANUAL_FALLBACK_EXIT_CODE`], "install it yourself later") rather than as
+/// a failed `autumn new`.
 #[must_use]
 pub fn wire_scaffold_plugins(root: &Path, plugins: &[ScaffoldPlugin]) -> i32 {
     let mut worst = 0;
@@ -997,8 +1008,11 @@ pub fn wire_scaffold_plugins(root: &Path, plugins: &[ScaffoldPlugin]) -> i32 {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(err) => {
-                eprintln!("autumn new --with {}: {err}", plugin.name);
-                worst = worst.max(1);
+                eprintln!(
+                    "\nautumn new: the app was created, but {} was not wired — {err}\nInstall it later with `autumn plugin add {}`.",
+                    plugin.name, plugin.name
+                );
+                worst = worst.max(MANUAL_FALLBACK_EXIT_CODE);
                 continue;
             }
         };
@@ -1502,11 +1516,13 @@ mod tests {
         None
     }
 
+    /// The pin `autumn new`'s own template writes, as the preflight sees it.
+    const PINNED: Option<&str> = Some(env!("CARGO_PKG_VERSION"));
+
     #[test]
     fn scaffold_preflight_resolves_first_party_plugins_in_order() {
         let names = vec!["autumn-search".to_owned(), "autumn-admin-plugin".to_owned()];
-        let resolved =
-            preflight_scaffold_plugins(&names, first_party_version(), no_community).unwrap();
+        let resolved = preflight_scaffold_plugins(&names, PINNED, no_community).unwrap();
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].name, "autumn-search");
         assert_eq!(resolved[1].name, "autumn-admin-plugin");
@@ -1518,8 +1534,7 @@ mod tests {
     #[test]
     fn scaffold_preflight_deduplicates_repeated_names() {
         let names = vec!["autumn-search".to_owned(), "autumn-search".to_owned()];
-        let resolved =
-            preflight_scaffold_plugins(&names, first_party_version(), no_community).unwrap();
+        let resolved = preflight_scaffold_plugins(&names, PINNED, no_community).unwrap();
         assert_eq!(resolved.len(), 1);
     }
 
@@ -1527,8 +1542,7 @@ mod tests {
     #[test]
     fn scaffold_preflight_rejects_an_unknown_plugin() {
         let names = vec!["tokio".to_owned()];
-        let err =
-            preflight_scaffold_plugins(&names, first_party_version(), no_community).unwrap_err();
+        let err = preflight_scaffold_plugins(&names, PINNED, no_community).unwrap_err();
         assert!(err.contains("tokio"), "{err}");
         assert!(err.contains("autumn plugin list"), "{err}");
     }
@@ -1537,7 +1551,7 @@ mod tests {
     #[test]
     fn scaffold_preflight_refuses_an_incompatible_series() {
         let names = vec!["autumn-admin-plugin".to_owned()];
-        let err = preflight_scaffold_plugins(&names, "0.1.0", no_community).unwrap_err();
+        let err = preflight_scaffold_plugins(&names, Some("0.1.0"), no_community).unwrap_err();
         assert!(err.contains("0.1.0"), "{err}");
         assert!(err.contains(first_party_version()), "{err}");
     }
@@ -1547,7 +1561,7 @@ mod tests {
     #[test]
     fn scaffold_preflight_resolves_a_community_version() {
         let names = vec!["autumn-plugin-live-feed".to_owned()];
-        let resolved = preflight_scaffold_plugins(&names, first_party_version(), |name| {
+        let resolved = preflight_scaffold_plugins(&names, PINNED, |name| {
             (name == "autumn-plugin-live-feed").then(|| "0.3.1".to_owned())
         })
         .unwrap();
@@ -1558,8 +1572,7 @@ mod tests {
     #[test]
     fn scaffold_preflight_refuses_an_unresolvable_community_version() {
         let names = vec!["autumn-plugin-live-feed".to_owned()];
-        let err =
-            preflight_scaffold_plugins(&names, first_party_version(), no_community).unwrap_err();
+        let err = preflight_scaffold_plugins(&names, PINNED, no_community).unwrap_err();
         assert!(err.contains("autumn-plugin-live-feed"), "{err}");
     }
 
@@ -1567,10 +1580,8 @@ mod tests {
     #[test]
     fn scaffold_preflight_refuses_an_implausible_community_version() {
         let names = vec!["autumn-plugin-live-feed".to_owned()];
-        let err = preflight_scaffold_plugins(&names, first_party_version(), |_| {
-            Some("\"; rm -rf /".to_owned())
-        })
-        .unwrap_err();
+        let err = preflight_scaffold_plugins(&names, PINNED, |_| Some("\"; rm -rf /".to_owned()))
+            .unwrap_err();
         assert!(err.to_lowercase().contains("version"), "{err}");
     }
 
@@ -1598,5 +1609,22 @@ mod tests {
             redact_database_url("postgres://db.internal/app?options=-c%20a@b"),
             "postgres://db.internal/app?options=-c%20a@b"
         );
+    }
+
+    /// Codex review: a `--starter` brings its own manifest, which does not
+    /// exist until it is fetched — so there is no pin to gate against yet. The
+    /// name still has to resolve before anything is written; the version answer
+    /// comes later, from the starter's real manifest.
+    #[test]
+    fn scaffold_preflight_without_a_known_pin_still_resolves_but_does_not_gate() {
+        let names = vec!["autumn-admin-plugin".to_owned()];
+        let resolved = preflight_scaffold_plugins(&names, None, no_community).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].version, first_party_version());
+
+        // An unknown name is still refused, because that IS knowable up front.
+        let err =
+            preflight_scaffold_plugins(&["tokio".to_owned()], None, no_community).unwrap_err();
+        assert!(err.contains("autumn plugin list"), "{err}");
     }
 }

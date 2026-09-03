@@ -144,9 +144,12 @@ three things rather than guessing:
   is changed — not even the dependency — and the exact lines to delete are
   printed instead. (Exit code `2`, the same "apply this by hand" signal `add`
   uses.)
-- **A dependency the app still uses.** If any file under `src/`, `tests/`, or
-  `benches/` still names the crate after the mount comes out, the dependency
-  stays and the report says which file kept it. Delete that usage and re-run.
+- **A dependency the app still uses.** If any file that a Cargo target is built
+  from still names the crate after the mount comes out, the dependency stays and
+  the report says which file kept it. That covers `src/`, `tests/`, `benches/`
+  and `examples/`, the build script, and any target the manifest gives an
+  explicit `path` to (`[[bin]] path = "cmd/server.rs"` and its sibling
+  modules). Delete that usage and re-run.
 - **A community mount.** `add` never writes one, so `remove` never deletes one.
   The dependency comes back out once nothing references the crate.
 
@@ -218,6 +221,13 @@ name is a typo, not an error. The generated app compiles on the first try.
 Community `autumn-plugin-<name>` crates work here too, with the same
 dependency-only rule: the dependency is written, the mount is printed for you to
 paste.
+
+`--with` composes with `--starter`. One difference: a starter brings its own
+`Cargo.toml`, so its `autumn-web` pin is not knowable until the starter has been
+fetched. Names are still resolved before anything is written, but a starter
+pinned to a different series gets its compatibility answer afterwards — the app
+is scaffolded, the plugin is reported as not wired, and the command exits `2`
+so a script does not read it as a complete install.
 
 Scaffolding wires code, not data: exactly like `plugin add`, `--with` runs no
 migration and creates no table. See

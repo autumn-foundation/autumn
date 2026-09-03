@@ -309,12 +309,89 @@ fn still_referenced(
     }
     let ident = crate_name.replace('-', "_");
     let markers = [format!("{ident}::"), format!("use {ident}")];
-    let build_rs = root.join("build.rs");
-    let build_src = std::fs::read_to_string(&build_rs).ok()?;
-    markers
-        .iter()
-        .any(|marker| build_src.contains(marker.as_str()))
-        .then_some(build_rs)
+    explicit_target_roots(root)
+        .into_iter()
+        .find(|path| file_or_tree_contains(path, &markers, root))
+}
+
+/// Every source path the manifest names explicitly, outside the conventional
+/// trees: the build script and any `path = "…"` on a `[lib]`, `[[bin]]`,
+/// `[[example]]`, `[[test]]` or `[[bench]]` target.
+///
+/// Cargo lets a target live anywhere — `[[bin]] path = "cmd/server.rs"` is
+/// valid and invisible to a `src`/`tests`/`benches`/`examples` sweep. That
+/// target compiles against the same `[dependencies]`, so a plugin it still uses
+/// must keep its dependency line just as surely as one `src/` uses.
+fn explicit_target_roots(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut roots = vec![root.join("build.rs")];
+    let Ok(manifest) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return roots;
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(&manifest) else {
+        return roots;
+    };
+    // A custom build-script path (`[package] build = "…"`) replaces `build.rs`.
+    if let Some(build) = table
+        .get("package")
+        .and_then(|package| package.get("build"))
+        .and_then(toml::Value::as_str)
+    {
+        roots.push(root.join(build));
+    }
+    let mut push_path = |value: &toml::Value| {
+        if let Some(path) = value.get("path").and_then(toml::Value::as_str) {
+            roots.push(root.join(path));
+        }
+    };
+    if let Some(lib) = table.get("lib") {
+        push_path(lib);
+    }
+    for kind in ["bin", "example", "test", "bench"] {
+        if let Some(targets) = table.get(kind).and_then(toml::Value::as_array) {
+            for target in targets {
+                push_path(target);
+            }
+        }
+    }
+    roots
+}
+
+/// Whether `path` — or, when it sits in a directory of its own, that whole
+/// directory tree — contains any of `markers`.
+///
+/// The directory sweep is what catches a target's sibling modules
+/// (`cmd/server.rs` plus `cmd/routes.rs`). It is deliberately skipped when the
+/// file sits directly at the project root, where "the whole tree" would mean
+/// the entire checkout — `target/` included.
+fn file_or_tree_contains(path: &Path, markers: &[String], root: &Path) -> bool {
+    let contains = |file: &Path| {
+        std::fs::read_to_string(file)
+            .is_ok_and(|src| markers.iter().any(|marker| src.contains(marker.as_str())))
+    };
+    if contains(path) {
+        return true;
+    }
+    match path.parent() {
+        Some(parent) if parent != root => rs_files_under(parent).iter().any(|file| contains(file)),
+        _ => false,
+    }
+}
+
+/// Every `.rs` file under `dir`, recursively.
+fn rs_files_under(dir: &Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(rs_files_under(&path));
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+    out
 }
 
 /// Whether `remove_cargo_dependencies` actually took `crate_name` out of
@@ -1225,5 +1302,118 @@ autumn-plugin-live-feed = "0.3.1"
                 .is_some_and(|kept| kept.reason().contains("build.rs")),
             "{dependency_retained:?}"
         );
+    }
+
+    /// Codex review: Cargo lets a target live anywhere. A `[[bin]] path =
+    /// "cmd/server.rs"` that still uses the plugin is invisible to a
+    /// `src`/`tests`/`benches`/`examples` sweep, and stripping the dependency
+    /// stops that target compiling.
+    #[test]
+    fn a_dependency_used_only_from_a_custom_target_path_is_retained() {
+        let cargo =
+            format!("{SCAFFOLD_CARGO}\n[[bin]]\nname = \"server\"\npath = \"cmd/server.rs\"\n");
+        let tmp = fake_project(SCAFFOLD_MAIN, &cargo);
+        std::fs::create_dir_all(tmp.path().join("cmd")).unwrap();
+        std::fs::write(
+            tmp.path().join("cmd/server.rs"),
+            "fn main() { let _ = autumn_admin_plugin::AdminPlugin::new(); }\n",
+        )
+        .unwrap();
+
+        let outcome = plan_remove(tmp.path(), admin()).unwrap();
+        let RemoveOutcome::Removed {
+            dependency_retained,
+            ..
+        } = &outcome
+        else {
+            panic!("expected Removed, got {outcome:?}");
+        };
+        assert!(
+            dependency_retained
+                .as_ref()
+                .is_some_and(|kept| kept.reason().contains("server.rs")),
+            "{dependency_retained:?}"
+        );
+    }
+
+    /// A sibling module of such a target counts too — the target's own tree is
+    /// swept, not just the file the manifest names.
+    #[test]
+    fn a_dependency_used_from_a_custom_targets_sibling_module_is_retained() {
+        let cargo =
+            format!("{SCAFFOLD_CARGO}\n[[bin]]\nname = \"server\"\npath = \"cmd/server.rs\"\n");
+        let tmp = fake_project(SCAFFOLD_MAIN, &cargo);
+        std::fs::create_dir_all(tmp.path().join("cmd")).unwrap();
+        std::fs::write(
+            tmp.path().join("cmd/server.rs"),
+            "mod panel;\nfn main() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("cmd/panel.rs"),
+            "pub use autumn_admin_plugin::AdminPlugin;\n",
+        )
+        .unwrap();
+
+        let outcome = plan_remove(tmp.path(), admin()).unwrap();
+        let RemoveOutcome::Removed {
+            dependency_retained,
+            ..
+        } = &outcome
+        else {
+            panic!("expected Removed, got {outcome:?}");
+        };
+        assert!(dependency_retained.is_some(), "{outcome:?}");
+    }
+
+    /// A custom build-script path (`[package] build = "…"`) replaces
+    /// `build.rs`, and is scanned in its place.
+    #[test]
+    fn a_dependency_used_only_from_a_custom_build_script_is_retained() {
+        let cargo = SCAFFOLD_CARGO.replace(
+            "edition = \"2024\"",
+            "edition = \"2024\"\nbuild = \"tools/build.rs\"",
+        );
+        let tmp = fake_project(SCAFFOLD_MAIN, &cargo);
+        std::fs::create_dir_all(tmp.path().join("tools")).unwrap();
+        std::fs::write(
+            tmp.path().join("tools/build.rs"),
+            "fn main() { let _ = autumn_admin_plugin::VERSION; }\n",
+        )
+        .unwrap();
+
+        let outcome = plan_remove(tmp.path(), admin()).unwrap();
+        let RemoveOutcome::Removed {
+            dependency_retained,
+            ..
+        } = &outcome
+        else {
+            panic!("expected Removed, got {outcome:?}");
+        };
+        assert!(dependency_retained.is_some(), "{outcome:?}");
+    }
+
+    /// The widened scan must not become "retain everything": an ordinary
+    /// project with a custom target that does NOT use the plugin still gets its
+    /// dependency removed.
+    #[test]
+    fn a_custom_target_that_does_not_use_the_plugin_does_not_retain_it() {
+        let cargo =
+            format!("{SCAFFOLD_CARGO}\n[[bin]]\nname = \"server\"\npath = \"cmd/server.rs\"\n");
+        let tmp = fake_project(SCAFFOLD_MAIN, &cargo);
+        std::fs::create_dir_all(tmp.path().join("cmd")).unwrap();
+        std::fs::write(tmp.path().join("cmd/server.rs"), "fn main() {}\n").unwrap();
+
+        let outcome = plan_remove(tmp.path(), admin()).unwrap();
+        let RemoveOutcome::Removed {
+            removed,
+            dependency_retained,
+            ..
+        } = &outcome
+        else {
+            panic!("expected Removed, got {outcome:?}");
+        };
+        assert!(dependency_retained.is_none(), "{dependency_retained:?}");
+        assert!(removed.contains(&Wire::Dependency), "{removed:?}");
     }
 }

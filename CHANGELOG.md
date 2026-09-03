@@ -48,6 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn new --with <plugin>` is repeatable and resolves every name — curated
   catalog first, crates.io fallback — and version-checks it **before the
   scaffold writes a byte**, so a typo never leaves a half-built project behind.
+  With `--starter`, whose own `autumn-web` pin is not knowable until the starter
+  is fetched, names are still resolved up front and the version answer arrives
+  afterwards as "the app was created, the plugin was not wired" (exit 2) rather
+  than as a failed `autumn new`.
   `autumn doctor` gains a `plugin_residue` check under the existing
   `--json`/`--strict` contract: a dependency with no mount warns, a mount with
   no dependency fails (it does not compile), and migrations left applied by a

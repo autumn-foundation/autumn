@@ -9476,3 +9476,80 @@ fn doctor_finds_no_residue_when_the_builder_lives_outside_main_rs() {
         .unwrap_or_else(|| panic!("plugin_residue missing from {stdout}"));
     assert_eq!(check["status"], "pass", "{stdout}");
 }
+
+/// Codex review (AC #6): a `--starter` brings its own `Cargo.toml`, which may
+/// pin a different `autumn-web` series than this CLI. That pin is not knowable
+/// until the starter is fetched, so the version answer arrives after the app
+/// exists — and it must read as "the app was created, the plugin was not
+/// wired", not as a bare failure. The starter itself is left complete and
+/// untouched.
+#[test]
+fn new_with_on_an_incompatible_starter_reports_an_unwired_plugin() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let starter = tmp.path().join("old-starter");
+    fs::create_dir_all(starter.join("src")).unwrap();
+    fs::write(
+        starter.join("autumn-starter.toml"),
+        "[starter]\nname = \"old\"\ndescription = \"pins an older autumn-web\"\n",
+    )
+    .unwrap();
+    fs::write(
+        starter.join("Cargo.toml.tmpl"),
+        "[package]\nname = \"{{project_name}}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nautumn-web = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        starter.join("src/main.rs"),
+        "#[autumn_web::main]\nasync fn main() {\n    let app = autumn_web::app()\n        .routes(routes![index]);\n    app.run().await;\n}\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_autumn_failing(
+        tmp.path(),
+        &[
+            "new",
+            "starter-app",
+            "--starter",
+            starter.to_str().unwrap(),
+            "--yes",
+            "--with",
+            "autumn-admin-plugin",
+        ],
+    );
+    assert_eq!(code, Some(2), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("was not wired"), "{stderr}");
+    assert!(stderr.contains("autumn plugin add"), "{stderr}");
+
+    // The starter scaffolded completely; only the plugin is absent.
+    let project = tmp.path().join("starter-app");
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("autumn-web = \"0.1.0\""), "{cargo}");
+    assert!(!cargo.contains("autumn-admin-plugin"), "{cargo}");
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(!main_rs.contains("AdminPlugin"), "{main_rs}");
+}
+
+/// An unknown `--with` name is still refused before the starter is fetched:
+/// that half of the preflight does not need the starter's manifest.
+#[test]
+fn new_with_rejects_an_unknown_plugin_before_fetching_a_starter() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_stdout, stderr, code) = run_autumn_failing(
+        tmp.path(),
+        &[
+            "new",
+            "doomed-starter-app",
+            "--starter",
+            "saas",
+            "--yes",
+            "--with",
+            "tokio",
+        ],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("autumn plugin list"), "{stderr}");
+    assert!(
+        !tmp.path().join("doomed-starter-app").exists(),
+        "a rejected --with must not leave a scaffolded project"
+    );
+}
