@@ -667,18 +667,30 @@ mod tests {
         );
     }
 
-    /// A scripted lookup: each call pops the next answer for its resolver.
+    /// A scripted lookup: a STABLE answer per resolver, repeated on every round.
+    ///
+    /// Keyed per resolver rather than a shared queue, because the wait polls in
+    /// rounds — a queue would hand round two whatever round one did not consume,
+    /// so "this resolver is the lagging one" could not be expressed at all.
+    /// A resolver with no scripted answer returns NXDOMAIN (not published yet).
     struct ScriptedLookup {
-        answers: Mutex<Vec<Result<TxtAnswer, String>>>,
+        answers: std::collections::HashMap<String, Result<TxtAnswer, String>>,
         calls: Mutex<Vec<(String, String)>>,
     }
 
     impl ScriptedLookup {
-        fn new(answers: Vec<Result<TxtAnswer, String>>) -> Arc<Self> {
+        fn new(answers: Vec<(SocketAddr, Result<TxtAnswer, String>)>) -> Arc<Self> {
             Arc::new(Self {
-                answers: Mutex::new(answers),
+                answers: answers
+                    .into_iter()
+                    .map(|(addr, answer)| (addr.to_string(), answer))
+                    .collect(),
                 calls: Mutex::new(Vec::new()),
             })
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
         }
     }
 
@@ -688,21 +700,21 @@ mod tests {
             resolver: SocketAddr,
             name: &'a str,
         ) -> BoxFuture<'a, Result<TxtAnswer, String>> {
-            let mut answers = self.answers.lock().unwrap();
-            let next = if answers.is_empty() {
-                Ok(TxtAnswer {
-                    values: Vec::new(),
-                    rcode: 3,
-                })
-            } else {
-                answers.remove(0)
-            };
-            drop(answers);
             self.calls
                 .lock()
                 .unwrap()
                 .push((resolver.to_string(), name.to_owned()));
-            Box::pin(async move { next })
+            let answer = self
+                .answers
+                .get(&resolver.to_string())
+                .cloned()
+                .unwrap_or_else(|| {
+                    Ok(TxtAnswer {
+                        values: Vec::new(),
+                        rcode: 3,
+                    })
+                });
+            Box::pin(async move { answer })
         }
     }
 
@@ -718,7 +730,10 @@ mod tests {
                 rcode: 0,
             })
         };
-        let lookup = ScriptedLookup::new(vec![visible(), visible()]);
+        let lookup = ScriptedLookup::new(vec![
+            (resolver(53), visible()),
+            (resolver(5353), visible()),
+        ]);
         let records = vec![
             TxtRecord::new("myapp.com", "value-apex"),
             TxtRecord::new("myapp.com", "value-wildcard"),
@@ -732,14 +747,16 @@ mod tests {
         )
         .await
         .expect("both resolvers see both values");
-        assert_eq!(lookup.calls.lock().unwrap().len(), 2);
+        // One round, one query per resolver: the two values share a record name,
+        // so they are checked as a set rather than queried separately.
+        assert_eq!(lookup.call_count(), 2);
     }
 
     // AC5: "a bounded, documented wait for TXT record propagation whose timeout
     // error names the exact record that failed to propagate."
     #[tokio::test]
     async fn a_timeout_names_the_record_the_value_and_the_resolver() {
-        let lookup = ScriptedLookup::new(Vec::new()); // always NXDOMAIN
+        let lookup = ScriptedLookup::new(Vec::new()); // every resolver: NXDOMAIN
         let records = vec![TxtRecord::new("myapp.com", "value-apex")];
         let err = wait_for_propagation(
             &records,
@@ -765,14 +782,20 @@ mod tests {
     #[tokio::test]
     async fn one_lagging_resolver_blocks_the_wait() {
         let lookup = ScriptedLookup::new(vec![
-            Ok(TxtAnswer {
-                values: vec!["v".to_owned()],
-                rcode: 0,
-            }),
-            Ok(TxtAnswer {
-                values: Vec::new(),
-                rcode: 0,
-            }),
+            (
+                resolver(53),
+                Ok(TxtAnswer {
+                    values: vec!["v".to_owned()],
+                    rcode: 0,
+                }),
+            ),
+            (
+                resolver(5353),
+                Ok(TxtAnswer {
+                    values: Vec::new(),
+                    rcode: 0,
+                }),
+            ),
         ]);
         let err = wait_for_propagation(
             &[TxtRecord::new("myapp.com", "v")],
@@ -791,9 +814,10 @@ mod tests {
     // `_acme-challenge` is usually a broken delegation.
     #[tokio::test]
     async fn a_resolver_error_is_carried_into_the_timeout_message() {
-        let lookup = ScriptedLookup::new(vec![Err("SERVFAIL — the zone's nameservers did not \
-                                                   answer"
-            .to_owned())]);
+        let lookup = ScriptedLookup::new(vec![(
+            resolver(53),
+            Err("SERVFAIL — the zone's nameservers did not answer".to_owned()),
+        )]);
         let err = wait_for_propagation(
             &[TxtRecord::new("myapp.com", "v")],
             &[resolver(53)],

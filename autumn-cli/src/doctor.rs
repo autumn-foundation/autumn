@@ -5705,8 +5705,10 @@ fn check_acme_deserialize_errors(config: &AcmeDoctorConfig) -> Option<CheckResul
 /// The runtime `TlsConfig::validate()` / `AcmeConfig::validate()` REJECTS an ACME
 /// config that (a) has a `directory` value that fails to deserialize as
 /// [`autumn_web::config::AcmeDirectory`], (b) lists no `domains`, (c) has a blank
-/// `contact_email`, or (d) includes a wildcard `*.` domain (wildcards require
-/// DNS-01, tracked in #1620) — the server exits at boot. `validate()`'s fifth
+/// `contact_email`, (d) includes a wildcard domain with no
+/// `[server.tls.acme.dns]` section (or a malformed one), or (e) has a
+/// `[server.tls.acme.dns]` section its own `validate()` rejects — the server
+/// exits at boot in every case. `validate()`'s fifth
 /// rule, a blank `ca_root_path`, is graded by
 /// [`check_acme_ca_root_impl`] instead: the whole `ca_root_path` story (blank,
 /// non-string, unreadable, unusable, a bundle, or redundant against a public
@@ -5784,13 +5786,30 @@ pub fn check_acme_config_impl(config: &AcmeDoctorConfig) -> Option<CheckResult> 
             "Set [server.tls.acme] renew_before_days below 90 (default 30)",
         ));
     }
-    check_acme_domain_entries(domains)
+    if let Some(fail) = check_acme_domain_entries(domains, config.dns.is_some()) {
+        return Some(fail);
+    }
+    // Mirror `AcmeDnsConfig::validate()` too: a DNS section the runtime rejects
+    // (an exec provider with no command, a zero propagation budget, an
+    // unparseable resolver) exits at boot exactly like a bad `domains` entry.
+    config.dns.as_ref().and_then(|dns| {
+        dns.validate().err().map(|message| {
+            acme_config_fail(
+                message,
+                "Fix the [server.tls.acme.dns] section; the server refuses to boot on it",
+            )
+        })
+    })
 }
 
-/// Grade individual `[server.tls.acme] domains` entries (blank / wildcard),
-/// mirroring `AcmeConfig::validate`'s per-entry rules. Extracted from
+/// Grade individual `[server.tls.acme] domains` entries (blank / wildcard /
+/// padded), mirroring `AcmeConfig::validate`'s per-entry rules. Extracted from
 /// [`check_acme_config_impl`] to keep that grader within the line budget.
-fn check_acme_domain_entries(domains: &[String]) -> Option<CheckResult> {
+///
+/// `dns_configured` is whether `[server.tls.acme.dns]` is present: since #1620 a
+/// wildcard is valid exactly when it is, because only DNS-01 can validate a
+/// wildcard identifier.
+fn check_acme_domain_entries(domains: &[String], dns_configured: bool) -> Option<CheckResult> {
     for (index, domain) in domains.iter().enumerate() {
         let trimmed = domain.trim();
         if trimmed.is_empty() {
@@ -5802,15 +5821,39 @@ fn check_acme_domain_entries(domains: &[String]) -> Option<CheckResult> {
                 "Remove blank/whitespace-only entries from [server.tls.acme] domains",
             ));
         }
-        if trimmed.starts_with("*.") {
-            return Some(acme_config_fail(
-                format!(
-                    "[server.tls.acme] wildcard domain `{trimmed}` is not supported: wildcards \
-                     require the DNS-01 challenge, which is out of scope here (tracked in #1620). \
-                     List explicit hostnames instead"
-                ),
-                "Remove wildcard domains; list explicit hostnames (DNS-01 tracked in #1620)",
-            ));
+        if trimmed.contains('*') {
+            if !dns_configured {
+                return Some(acme_config_fail(
+                    format!(
+                        "[server.tls.acme] wildcard domain `{trimmed}` needs the DNS-01 \
+                         challenge: an ACME CA will not validate a wildcard identifier over \
+                         HTTP-01. Add a [server.tls.acme.dns] section naming your DNS provider \
+                         (and the credentials-store key holding its API token), or list explicit \
+                         hostnames instead"
+                    ),
+                    "Add a [server.tls.acme.dns] section, or list explicit hostnames",
+                ));
+            }
+            let Some(base) = trimmed.strip_prefix("*.") else {
+                return Some(acme_config_fail(
+                    format!(
+                        "[server.tls.acme] domain `{trimmed}` is not a usable wildcard: a \
+                         wildcard SAN must be written as `*.` followed by the base domain (e.g. \
+                         `*.myapp.com`) — a `*` anywhere else is not matched by any client"
+                    ),
+                    "Write the wildcard as `*.<base domain>`",
+                ));
+            };
+            if base.is_empty() || base.contains('*') {
+                return Some(acme_config_fail(
+                    format!(
+                        "[server.tls.acme] domain `{trimmed}` is not a usable wildcard: exactly \
+                         one leading `*.` is allowed and the base domain after it must be \
+                         non-empty (e.g. `*.myapp.com`)"
+                    ),
+                    "Write the wildcard as `*.<base domain>`, with exactly one leading `*.`",
+                ));
+            }
         }
         // The two rules above read `trimmed`, but the runtime stores and uses the
         // entry UNTRIMMED — as the certificate's SAN and as the ACME order's DNS
@@ -11406,13 +11449,23 @@ pub struct Vault {
     }
 
     #[test]
-    fn acme_config_fail_when_wildcard_domain() {
+    fn acme_config_fail_when_wildcard_domain_has_no_dns_provider() {
         let r = check_acme_config_impl(&acme_doctor_cfg(&["*.example.com"], "ops@example.com"))
-            .expect("wildcard domain must be a FAIL");
+            .expect("a wildcard with no DNS-01 provider must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
-        // Points the operator at the DNS-01 tracking issue, mirroring
-        // AcmeConfig::validate().
-        assert!(r.detail.as_deref().unwrap_or_default().contains("#1620"));
+        // Names the section that fixes it, mirroring AcmeConfig::validate().
+        let detail = r.detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("[server.tls.acme.dns]"), "got: {detail}");
+        assert!(detail.contains("DNS-01"), "got: {detail}");
+
+        // …and with the section present the same config is accepted, because
+        // DNS-01 is exactly what makes a wildcard issuable (#1620).
+        let mut cfg = acme_doctor_cfg(&["*.example.com"], "ops@example.com");
+        cfg.dns = Some(acme_dns_cfg(autumn_web::config::AcmeDnsProvider::Cloudflare));
+        assert!(
+            check_acme_config_impl(&cfg).is_none(),
+            "a wildcard WITH a DNS-01 provider is a valid config"
+        );
     }
 
     #[test]
@@ -11813,29 +11866,89 @@ contact_email = \"ops@example.com\"
             (&["app .example.com"], "ops@example.com", 80, 30),
         ];
 
+        // Every case is run BOTH with and without a `[server.tls.acme.dns]`
+        // section, because since #1620 the section is what decides whether a
+        // wildcard entry is valid — so a doctor that ignored it would pass a
+        // wildcard config the server refuses (or fail one it accepts).
         for (domains, contact_email, http_challenge_port, renew_before_days) in cases {
-            let mut doctor_cfg = acme_doctor_cfg(domains, contact_email);
-            doctor_cfg.http_challenge_port = *http_challenge_port;
-            doctor_cfg.renew_before_days = *renew_before_days;
+            for dns in [
+                None,
+                Some(acme_dns_cfg(autumn_web::config::AcmeDnsProvider::Cloudflare)),
+                // A DNS section the runtime itself rejects: `exec` with no
+                // command. Doctor must fail it too.
+                Some(
+                    toml::from_str::<autumn_web::config::AcmeDnsConfig>("provider = \"exec\"\n")
+                        .expect("parses; validate() is what rejects it"),
+                ),
+            ] {
+                let mut doctor_cfg = acme_doctor_cfg(domains, contact_email);
+                doctor_cfg.http_challenge_port = *http_challenge_port;
+                doctor_cfg.renew_before_days = *renew_before_days;
+                doctor_cfg.dns = dns.clone();
 
-            let runtime_cfg = autumn_web::config::AcmeConfig {
-                domains: domains.iter().map(|d| (*d).to_owned()).collect(),
-                contact_email: (*contact_email).to_owned(),
-                directory: autumn_web::config::AcmeDirectory::Staging,
-                cache_dir: std::path::PathBuf::from("config/acme"),
-                http_challenge_port: *http_challenge_port,
-                renew_before_days: *renew_before_days,
-                ca_root_path: None,
-            };
+                let runtime_cfg = autumn_web::config::AcmeConfig {
+                    domains: domains.iter().map(|d| (*d).to_owned()).collect(),
+                    contact_email: (*contact_email).to_owned(),
+                    directory: autumn_web::config::AcmeDirectory::Staging,
+                    cache_dir: std::path::PathBuf::from("config/acme"),
+                    http_challenge_port: *http_challenge_port,
+                    renew_before_days: *renew_before_days,
+                    ca_root_path: None,
+                    dns: dns.clone(),
+                };
 
-            assert_eq!(
-                check_acme_config_impl(&doctor_cfg).is_some(),
-                runtime_cfg.validate().is_err(),
-                "doctor and AcmeConfig::validate disagree on domains={domains:?} \
-                 contact_email={contact_email:?} port={http_challenge_port} \
-                 renew_before_days={renew_before_days} (runtime said {:?})",
-                runtime_cfg.validate()
-            );
+                assert_eq!(
+                    check_acme_config_impl(&doctor_cfg).is_some(),
+                    runtime_cfg.validate().is_err(),
+                    "doctor and AcmeConfig::validate disagree on domains={domains:?} \
+                     contact_email={contact_email:?} port={http_challenge_port} \
+                     renew_before_days={renew_before_days} dns={:?} (runtime said {:?})",
+                    dns.as_ref().map(|d| d.provider),
+                    runtime_cfg.validate()
+                );
+            }
+        }
+    }
+
+    // #1620's own rows for the parity test above: a wildcard is valid exactly
+    // when a DNS-01 provider is configured, and a malformed one never is.
+    #[test]
+    fn wildcard_domain_parity_depends_on_the_dns_section() {
+        let wildcard_cases: &[&[&str]] = &[
+            &["*.myapp.com"],
+            &["myapp.com", "*.myapp.com"],
+            &["*"],
+            &["*."],
+            &["*myapp.com"],
+            &["app.*.myapp.com"],
+            &["*.*.myapp.com"],
+        ];
+        for domains in wildcard_cases {
+            for dns in [
+                None,
+                Some(acme_dns_cfg(autumn_web::config::AcmeDnsProvider::Cloudflare)),
+            ] {
+                let mut doctor_cfg = acme_doctor_cfg(domains, "ops@myapp.com");
+                doctor_cfg.dns = dns.clone();
+                let runtime_cfg = autumn_web::config::AcmeConfig {
+                    domains: domains.iter().map(|d| (*d).to_owned()).collect(),
+                    contact_email: "ops@myapp.com".to_owned(),
+                    directory: autumn_web::config::AcmeDirectory::Staging,
+                    cache_dir: std::path::PathBuf::from("config/acme"),
+                    http_challenge_port: 80,
+                    renew_before_days: 30,
+                    ca_root_path: None,
+                    dns: dns.clone(),
+                };
+                assert_eq!(
+                    check_acme_config_impl(&doctor_cfg).is_some(),
+                    runtime_cfg.validate().is_err(),
+                    "doctor and AcmeConfig::validate disagree on domains={domains:?} with \
+                     dns={} (runtime said {:?})",
+                    dns.is_some(),
+                    runtime_cfg.validate()
+                );
+            }
         }
     }
 
