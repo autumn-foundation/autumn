@@ -17949,6 +17949,46 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             __out
         }
     };
+    // Single-row counterpart of `ledger_map_rows`, for the bounded
+    // `__autumn_ledger_revision_at` lookup: the same per-row mapping (op
+    // decode, snapshot parse-or-error), applied to at most one `raw_row`
+    // instead of folded over a whole `raw_rows` chain.
+    let ledger_map_row_opt = quote! {
+        match raw_row {
+            ::core::option::Option::None => ::core::option::Option::None,
+            ::core::option::Option::Some(row) => {
+                let op = match row.op.as_str() {
+                    "insert" => ::autumn_web::version_history::VersionOp::Insert,
+                    "delete" => ::autumn_web::version_history::VersionOp::Delete,
+                    _ => ::autumn_web::version_history::VersionOp::Update,
+                };
+                let snapshot: ::autumn_web::reexports::serde_json::Value =
+                    ::autumn_web::reexports::serde_json::from_str(&row.snapshot)
+                        .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
+                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                                table: #table_name.to_string(),
+                                record_id,
+                                detail: format!("revision {} has an unreadable snapshot: {err}", row.seq),
+                            },
+                        ))?;
+                ::core::option::Option::Some(::autumn_web::ledger::LedgerRevision {
+                    id: row.id,
+                    table_name: row.table_name,
+                    tenant_id: row.tenant_id,
+                    record_id: row.record_id,
+                    seq: row.seq,
+                    op,
+                    actor: row.actor,
+                    request_id: row.request_id,
+                    snapshot,
+                    valid_from: row.valid_from,
+                    recorded_at: row.recorded_at,
+                    prev_hash: row.prev_hash,
+                    hash: row.hash,
+                })
+            }
+        }
+    };
 
     // The live-row read is tenant-filtered only on a tenant-scoped repository:
     // a plain model has no `tenant_id` column to name.
@@ -18118,6 +18158,176 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::core::result::Result::Ok(revisions)
                 }
 
+                /// The single revision in force at a bitemporal instant,
+                /// fetched directly rather than through
+                /// [`ledger_revisions`](Self::ledger_revisions).
+                ///
+                /// `ledger_revisions` reads every stored revision — and every
+                /// stored snapshot, the largest column in the table — to
+                /// answer a question that has exactly one answer. This issues
+                /// one indexed, bounded lookup instead: `ORDER BY seq DESC
+                /// LIMIT 1` against `idx_autumn_ledger_revisions_record`,
+                /// with the same `None`-is-unbounded predicate
+                /// [`snapshot_as_of`](crate::ledger::snapshot_as_of) applies
+                /// in memory, now evaluated by the database. Picking the
+                /// greatest surviving `seq` via `ORDER BY ... LIMIT 1` is
+                /// `max_by_key(seq)` over the qualifying rows — the same
+                /// selection, computed the same way, just without
+                /// materializing the rows that lose.
+                ///
+                /// `recorded_at` is monotonic non-decreasing in `seq` (see
+                /// [`monotonic_recorded_at`](crate::ledger::monotonic_recorded_at)),
+                /// so a transaction-time bound — what
+                /// [`ledger_as_of`](Self::ledger_as_of) and
+                /// [`ledger_diff`](Self::ledger_diff) use — lets the scan
+                /// stop at the first qualifying row: only the revisions newer
+                /// than the answer are read, never the whole chain. A
+                /// valid-time bound alone has no such guarantee (a
+                /// back-dated correction can land anywhere in `seq` order),
+                /// so it can still read back to the front of the chain in the
+                /// worst case — exactly what `ledger_revisions` always did,
+                /// never worse.
+                ///
+                /// # Errors
+                ///
+                /// Returns an error if the ledger table cannot be read, or if
+                /// the matching revision's stored snapshot is no longer valid
+                /// JSON.
+                #[doc(hidden)]
+                async fn __autumn_ledger_revision_at(
+                    &self,
+                    record_id: i64,
+                    as_of: ::autumn_web::ledger::LedgerAsOf,
+                ) -> ::autumn_web::AutumnResult<::core::option::Option<::autumn_web::ledger::LedgerRevision>> {
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+
+                    #ledger_cross_shard_guard
+                    #ledger_cross_tenant_guard
+                    #ledger_tenant_setup
+
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+                    let __ledger_transaction_bound = as_of.transaction;
+                    let __ledger_valid_bound = as_of.valid;
+
+                    let revision: ::core::option::Option<::autumn_web::ledger::LedgerRevision> =
+                        ::autumn_web::backend_select! {
+                            pg => {{
+                                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                                struct __AutumnLedgerRow {
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    table_name: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    tenant_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    record_id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    seq: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    op: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    actor: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    request_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    snapshot: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                                    valid_from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    prev_hash: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    hash: ::std::string::String,
+                                }
+
+                                let raw_row: ::core::option::Option<__AutumnLedgerRow> =
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, tenant_id, record_id, seq, op, actor, \
+                                         request_id, snapshot, valid_from, \
+                                         recorded_at, prev_hash, hash \
+                                         FROM _autumn_ledger_revisions \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3::text IS NULL OR tenant_id = $3) \
+                                         AND ($4::timestamptz IS NULL OR recorded_at <= $4) \
+                                         AND ($5::timestamptz IS NULL OR valid_from <= $5) \
+                                         ORDER BY seq DESC LIMIT 1"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(__ledger_transaction_bound)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(__ledger_valid_bound)
+                                    .get_results::<__AutumnLedgerRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                    .into_iter()
+                                    .next();
+
+                                #ledger_map_row_opt
+                            }},
+                            sqlite => {{
+                                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                                struct __AutumnLedgerRow {
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    table_name: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    tenant_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    record_id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    seq: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    op: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    actor: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    request_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    snapshot: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
+                                    valid_from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
+                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    prev_hash: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    hash: ::std::string::String,
+                                }
+
+                                let raw_row: ::core::option::Option<__AutumnLedgerRow> =
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, tenant_id, record_id, seq, op, actor, \
+                                         request_id, snapshot, valid_from, \
+                                         recorded_at, prev_hash, hash \
+                                         FROM _autumn_ledger_revisions \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3 IS NULL OR tenant_id = $3) \
+                                         AND ($4 IS NULL OR recorded_at <= $4) \
+                                         AND ($5 IS NULL OR valid_from <= $5) \
+                                         ORDER BY seq DESC LIMIT 1"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(__ledger_transaction_bound)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(__ledger_valid_bound)
+                                    .get_results::<__AutumnLedgerRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                    .into_iter()
+                                    .next();
+
+                                #ledger_map_row_opt
+                            }},
+                        };
+
+                    ::core::result::Result::Ok(revision)
+                }
+
                 /// The record's exact state at a past **transaction** instant —
                 /// what a plain query would have returned at that moment.
                 ///
@@ -18148,20 +18358,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 /// # Errors
                 ///
                 /// Propagates read errors from
-                /// [`ledger_revisions`](Self::ledger_revisions), and fails if a
-                /// snapshot cannot be deserialized back into the model.
+                /// [`__autumn_ledger_revision_at`](Self::__autumn_ledger_revision_at),
+                /// and fails if a snapshot cannot be deserialized back into
+                /// the model.
                 pub async fn ledger_as_of_at(
                     &self,
                     record_id: i64,
                     as_of: ::autumn_web::ledger::LedgerAsOf,
                 ) -> ::autumn_web::AutumnResult<::core::option::Option<#model_name>> {
-                    let revisions = self.ledger_revisions(record_id).await?;
                     let ::core::option::Option::Some(revision) =
-                        ::autumn_web::ledger::snapshot_as_of(&revisions, as_of)
+                        self.__autumn_ledger_revision_at(record_id, as_of).await?
                     else {
                         return ::core::result::Result::Ok(::core::option::Option::None);
                     };
-                    let model = Self::__autumn_ledger_model_from_snapshot(record_id, revision)?;
+                    let model = Self::__autumn_ledger_model_from_snapshot(record_id, &revision)?;
                     ::core::result::Result::Ok(::core::option::Option::Some(model))
                 }
 
@@ -18196,16 +18406,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 /// # Errors
                 ///
                 /// Propagates read errors from
-                /// [`ledger_revisions`](Self::ledger_revisions).
+                /// [`__autumn_ledger_revision_at`](Self::__autumn_ledger_revision_at).
                 pub async fn ledger_diff_at(
                     &self,
                     record_id: i64,
                     from: ::autumn_web::ledger::LedgerAsOf,
                     to: ::autumn_web::ledger::LedgerAsOf,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerDiff> {
-                    let revisions = self.ledger_revisions(record_id).await?;
-                    let from_rev = ::autumn_web::ledger::snapshot_as_of(&revisions, from);
-                    let to_rev = ::autumn_web::ledger::snapshot_as_of(&revisions, to);
+                    let from_rev = self.__autumn_ledger_revision_at(record_id, from).await?;
+                    let to_rev = self.__autumn_ledger_revision_at(record_id, to).await?;
+                    let from_seq = from_rev.as_ref().map(|r| r.seq);
+                    let to_seq = to_rev.as_ref().map(|r| r.seq);
                     // Diffing stored snapshots directly would compare the
                     // ciphertext of `#[encrypted]` columns, which carries a fresh
                     // nonce per write and so always differs even when the
@@ -18214,20 +18425,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let empty = ::autumn_web::reexports::serde_json::Value::Object(
                         ::autumn_web::reexports::serde_json::Map::new(),
                     );
-                    let before = match from_rev {
+                    let before = match &from_rev {
                         ::core::option::Option::None => empty.clone(),
                         ::core::option::Option::Some(revision) =>
                             Self::__autumn_ledger_view_of(record_id, revision)?,
                     };
-                    let after = match to_rev {
+                    let after = match &to_rev {
                         ::core::option::Option::None => empty,
                         ::core::option::Option::Some(revision) =>
                             Self::__autumn_ledger_view_of(record_id, revision)?,
                     };
                     ::core::result::Result::Ok(::autumn_web::ledger::LedgerDiff {
                         record_id,
-                        from_seq: from_rev.map(|r| r.seq),
-                        to_seq: to_rev.map(|r| r.seq),
+                        from_seq,
+                        to_seq,
                         changes: ::autumn_web::ledger::diff_snapshots(&before, &after),
                     })
                 }
