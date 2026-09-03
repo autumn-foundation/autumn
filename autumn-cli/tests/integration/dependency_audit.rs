@@ -919,6 +919,34 @@ fn the_guide_no_longer_defers_vulnerability_scanning() {
     );
 }
 
+/// The upgrade path's instruction is a command people run verbatim, and the
+/// policy it tells them to copy is flavor-specific: a `--bundled-pg` app given
+/// the default flavor's policy fails the very audit the instruction exists to
+/// satisfy.
+#[test]
+fn the_migration_note_keeps_the_donor_policy_flavor_correct() {
+    let guide = read_repo_file("docs/migrations/next.md");
+    let note = guide
+        .split("### CI: `autumn upgrade` adds a blocking dependency audit")
+        .nth(1)
+        .expect("the migration guide must carry the deny.toml step")
+        .split("\n### ")
+        .next()
+        .unwrap_or_default();
+
+    assert!(
+        note.contains("--bundled-pg"),
+        "the donor project must be generated with the reader's original flags:\n{note}"
+    );
+    // `autumn new` validates its argument as a Rust package name, so a path
+    // argument is rejected before anything is generated.
+    assert!(
+        !note.contains("autumn new /"),
+        "`autumn new` takes a package name, not a path — this command would fail \
+         for every reader who ran it:\n{note}"
+    );
+}
+
 #[test]
 fn the_release_checklist_documents_the_advisory_gate() {
     let checklist = read_repo_file("docs/release-checklist.md");
