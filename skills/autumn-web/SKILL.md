@@ -1590,6 +1590,40 @@ plugin crate already carries the features its mount needs and Cargo unifies
 them. `autumn plugin-check` is the separate, author-facing conformance gate;
 `autumn generate plugin` scaffolds a new plugin crate.
 
+## Removing a plugin, and installing one on day zero (unreleased, issue #1631)
+
+The lifecycle runs both ways, and a plugin can be wired at scaffold time:
+
+```bash
+autumn new my-app --with autumn-admin-plugin --with autumn-search  # repeatable
+autumn plugin remove autumn-admin-plugin
+autumn plugin remove autumn-media-plugin --dry-run                 # every consequence, no writes
+autumn plugin remove autumn-media-plugin --drop-data --yes         # destructive, opt-in
+```
+
+`remove` is the exact reverse of `add` and refuses in the same spirit:
+
+- **It never touches the database.** A plugin that declares migrations or owns
+  tables gets them listed with a statement that they are still there.
+  `--drop-data` reverts them in one transaction, printing the statements and
+  confirming *before any file is written*; a non-interactive stdin without
+  `--yes` is a refusal, never an assumed yes.
+- **It declines rather than guesses.** A mount it cannot read as a single
+  builder call (built into a variable, sharing a line, or nested inside another
+  plugin's constructor) changes nothing and prints the lines to delete, exit 2.
+  So does a dependency not written as a plain `name = "…"` line.
+- **It keeps a dependency the app still uses**, naming the file under `src/`,
+  `tests/`, `benches/`, `examples/` or `build.rs` that kept it.
+- **Idempotent**, like `add`: removing what is not installed says so and
+  changes nothing.
+- **Exit codes**: `0` removed or nothing to do, `1` refused, `2` nothing was
+  changed automatically (apply the printed lines by hand), `3` `--dry-run`
+  found something a real run would change.
+
+`autumn new --with` resolves and version-checks every name *before* the
+scaffold writes a byte, so a typo leaves no half-built project. `autumn doctor`
+reports leftovers as `plugin_residue` — see the doctor skill.
+
 ## File storage and cache plugins
 
 For local or pluggable file storage:
@@ -2027,6 +2061,48 @@ build?", "where did this binary come from?", or for compliance/audit evidence.
 See `docs/guide/supply-chain.md` for the end-to-end walkthrough, including the
 negative case (tamper with a byte, watch verification fail).
 
+## Dependency advisories — the audit gate (unreleased, issue #1600)
+
+Every app `autumn new` generates audits its whole dependency tree on each push
+and pull request: the scaffolded `.github/workflows/ci.yml` installs a pinned
+cargo-deny and runs `cargo deny check advisories` against a `deny.toml` at the
+project root. A known RustSec advisory that `deny.toml` does not waive fails
+the build.
+
+- **Never "fix" a failing audit by weakening the gate.** `continue-on-error`,
+  `|| true`, and deleting the step turn a security control into a decoration —
+  and an integration test in the framework fails if the generated workflow does
+  any of them. If asked to get CI green, fix or waive the advisory instead.
+- Prefer a real fix: `cargo update -p <crate>` when a patched version is
+  compatible, else bump the direct dependency that pulls it in. Read the
+  dependency path cargo-deny prints bottom-up — the crate to bump is the
+  highest entry in that chain the app controls.
+- Waive only when no fix exists ("no safe upgrade is available") or the
+  vulnerable path is unreachable, by adding to `deny.toml`:
+  `{ id = "RUSTSEC-…", reason = "why this is acceptable here; review-by <date>" }`.
+  A waiver lets exactly one id through; the gate stays on and every other
+  advisory still fails.
+- A fresh scaffold ships one waiver already — RUSTSEC-2023-0071 (`rsa`, reached
+  through the unconditional `jsonwebtoken` dependency, no patched release
+  exists) — which is why day-one CI is green. Do not remove it without checking
+  whether a fixed `rsa` has shipped. `--bundled-pg` apps get a second waiver
+  (RUSTSEC-2024-0384, `instant`, via the embedded-Postgres build stack); other
+  flavors deliberately do not, so an unused-waiver warning still means one of
+  the app author's own waivers went stale.
+- An app upgraded from a release before this gate existed receives the workflow
+  but not `deny.toml` (the policy is the app's, so `autumn upgrade` never
+  writes it). The audit step says so and stops; copy the file from a freshly
+  generated app rather than removing the step.
+- When the advisory database is unreachable the gate **fails closed**: the
+  fetch is a separate step retried 3× with backoff, and the audit then runs
+  `--offline` against it, so a failure in the audit step is always a real
+  advisory rather than a network blip.
+- The framework gates itself the same way in PR CI and the Publish Gate:
+  `./scripts/check-advisories.sh` (and `--self-test`, which proves the gate can
+  still reject an injected known-vulnerable dependency).
+
+`docs/guide/supply-chain.md` "Part 3a" has the failure-reading walkthrough.
+
 ## Observability defaults
 
 Published 0.5.0 behavior:
@@ -2412,6 +2488,8 @@ autumn test                      # provision/target an isolated *_test DB, migra
 autumn test --reset -- --nocapture   # drop+recreate the test DB; forward args to the harness
 autumn db backup --keep 7        # dump control DB + shards to ./backups/<profile>/<ts>/; db restore <artifact> reverses it
 autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/MinIO/R2); db offsite list; db restore offsite:<profile>/latest  # (0.6.0)
+autumn db replica restore --force        # SQLite tier: rebuild from the continuous replica; --timestamp <RFC3339> for PITR, --overwrite to replace an existing file  # (0.7.0)
+autumn db replica status --json          # replica generation, segments, and current replication lag; db replica verify proves it restorable  # (0.7.0)
 autumn db scrub --artifact backups/prod/<run> --force   # restore a prod backup into staging, then anonymize every PII column; --check for CI
 autumn db retention --dry-run    # per-dataset retention window, its source, and rows eligible for purge; --purge to enforce now (needs --force outside dev/test), --dataset X, --json  # (0.7.0)
 autumn seed --count 50 --model Post  # generate+insert 50 faked rows via the model's factory (both flags together)
@@ -2441,6 +2519,8 @@ autumn deploy status --json --strict          # read-only per-host state + versi
 autumn deploy maintenance on --message "…"    # maintenance mode on EVERY deploy host over SSH; `off` reverses (#1621)
 autumn plugin list               # installable plugins + the version compatible with this app's autumn-web; --json, --offline (#1606)
 autumn plugin add autumn-admin-plugin   # dependency + builder-chain mount + post-install steps; idempotent, version-gated, --dry-run (#1606)
+autumn plugin remove autumn-admin-plugin   # reverses both wires; never touches the database (--drop-data does, with confirmation); --dry-run exits 3 when it would change something (#1631)
+autumn new my-app --with autumn-admin-plugin   # scaffold with plugins already wired; repeatable, resolved and version-checked before any file is written (#1631)
 autumn data-flow                 # classified-data flow manifest: one row per `#[classified]` column and every sink a declared declassification boundary releases it to; empty reachable set = the column cannot leave the process (#1654)
 autumn data-flow --manifest data-flow-manifest.json --check data-flow-manifest.json   # write it, and fail on drift from the committed copy so a new release edge is reviewed
 autumn data-flow --release --check data-flow-manifest.json   # audit the profile you deploy: a boundary behind `#[cfg(not(debug_assertions))]` exists only in the release build, so a debug-built manifest would certify edges the shipped binary does not have (and miss the ones it does)
@@ -2811,6 +2891,69 @@ is configured — an email-only `[alerts]` config is not notified (issue #1743).
 Pointing the offsite bucket at the app's
 own `[storage.s3]` bucket at the same endpoint needs `allow_shared_bucket = true`. See
 `docs/guide/daemon.md`.
+
+### Continuous SQLite replication + point-in-time restore (0.7.0, issue #1628)
+
+On the zero-ops **SQLite** tier (#1614), `[replication]` ships the write-ahead
+log to an offsite destination continuously **from inside the running process** —
+no sidecar, no external tools. The contract is *at most `rpo_secs` (default 10)
+of committed writes lost* when the machine dies, versus one whole backup interval
+with snapshots alone. It composes with `autumn db backup`; it does not replace it.
+Postgres targets are refused at boot (use WAL-G / pgBackRest there).
+
+```toml
+[replication]
+enabled = true
+rpo_secs = 10               # the contract; the loop ships every rpo_secs / 2
+snapshot_interval_secs = 3600   # how often a fresh base snapshot is taken
+max_wal_bytes = 16777216    # WAL size that forces a checkpoint (next WAL index)
+retention_hours = 168       # how far back a point-in-time restore can reach
+verify_interval_secs = 21600    # 0 disables the periodic restore verification
+# path = "/mnt/backup-disk/replica"   # a directory destination instead of S3
+
+[replication.s3]
+bucket   = "myapp-replicas"
+region   = "auto"
+endpoint = "https://<accountid>.r2.cloudflarestorage.com"
+force_path_style = true
+access_key_id_env     = "AUTUMN_REPLICA_ACCESS_KEY_ID"    # names, not values
+secret_access_key_env = "AUTUMN_REPLICA_SECRET_ACCESS_KEY"
+```
+
+Same destination conventions as `[backup.offsite]` (#1619): own section, profile
+overlays, an `AUTUMN_REPLICATION__*` override for every key, env-var-indirected
+credentials, and a refusal to share the app's `[storage.s3]` bucket **and**
+endpoint without `allow_shared_bucket = true`.
+
+Recovery on a fresh box that has only the binary, `autumn.toml` and the
+credentials:
+
+```bash
+autumn db replica status --json   # generation, segments, current-as-of, lag
+autumn db replica restore --force # latest state (--force clears the prod guard)
+autumn db replica restore --timestamp 2026-09-02T14:29:00Z --force --overwrite
+autumn db replica verify          # prove the replica restorable, touching nothing
+```
+
+`--force` gates the **profile**; `--overwrite` gates **replacing an existing
+database file** — deliberately separate, so a drill that always passes `--force`
+cannot destroy a live database. Restore refuses rather than best-efforts: a hole
+in the segment sequence, a digest mismatch, a discontinuous segment, a generation
+without its commit marker, or a rebuilt database that fails `PRAGMA
+integrity_check` is an error, and nothing is published until every check passes.
+A `--timestamp` outside the retention window is refused with the oldest reachable
+instant named, never silently rounded.
+
+Operationally: enabling replication makes the replicator the **only** component
+that checkpoints (pooled connections get `PRAGMA wal_autocheckpoint = 0`), so an
+unreachable destination stalls checkpointing and grows the `-wal` — it costs disk,
+never data — and the tier's single-host/single-writer contract stops being
+advisory. Lag, the current generation and the last successful verification appear
+on `/actuator/health` under the `sqlite-replication` indicator; the indicator goes
+`DOWN` past three RPOs of lag or on a failed verification, which the existing
+`[alerts]` pipeline escalates (see `AlertCondition::HealthIndicatorDown`).
+Verification is a **real restore** on an interval, not a checksum. See
+`docs/guide/sqlite-in-production.md`.
 
 ### VPS deploys and fleets — `autumn deploy` (0.6.0; fleets 0.7.0, issues #1607/#1621)
 

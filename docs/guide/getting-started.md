@@ -148,6 +148,7 @@ my-app/
   rust-toolchain.toml
   rustfmt.toml
   clippy.toml
+  deny.toml                 # dependency advisory policy — CI audits against it
   tailwind.config.js        # Tailwind content globs
   .autumn/scaffold.toml     # which release scaffolded this — commit it
   src/
@@ -163,7 +164,7 @@ my-app/
   config/
     master.key              # encrypts credentials — keep secret, never commit
     credentials/development.toml.enc
-  .github/workflows/ci.yml  # fmt, clippy, test, and a11y checks
+  .github/workflows/ci.yml  # fmt, clippy, dependency audit, test, a11y checks
 ```
 
 `.autumn/scaffold.toml` is bookkeeping, but commit it: it records which

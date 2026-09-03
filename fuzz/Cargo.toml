@@ -26,7 +26,7 @@ package = "autumn-web"
 # the parsing seams live in) and add the extra surfaces the fuzz targets reach:
 # inbound-mail MIME parsing, multipart form decoding, and `openapi` (which gates
 # `router::extract_path_params`, the path-parameter extraction seam).
-features = ["inbound-mail", "multipart", "openapi"]
+features = ["inbound-mail", "multipart", "openapi", "acme"]
 
 # cargo-fuzz builds in release mode with ASAN instrumentation, which is the
 # repo's heaviest build; debug info is a large share of that footprint and is
@@ -76,6 +76,13 @@ bench = false
 [[bin]]
 name = "body"
 path = "fuzz_targets/body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
 test = false
 doc = false
 bench = false

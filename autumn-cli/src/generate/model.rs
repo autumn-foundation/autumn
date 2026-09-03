@@ -1243,7 +1243,15 @@ pub fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> Strin
 /// never added by this generator — destroy only reverses lines `generate`
 /// itself would have written.
 #[must_use]
-pub(super) fn remove_cargo_dependencies(existing: &str, names: &[&str]) -> String {
+/// Two callers now: `autumn destroy` (which only ever reverses lines
+/// `generate` itself wrote) and `autumn plugin remove` (issue #1631), which
+/// operates on a manifest the user owns. The second is why every caller must
+/// verify the result — see `plugin::remove::dependency_cleanly_removed`: a
+/// dependency written as a multi-line inline table or a
+/// `[dependencies.<crate>]` subtable is NOT rewritten correctly by this
+/// line-based pass, and writing its output unchecked would leave a `Cargo.toml`
+/// Cargo cannot parse.
+pub fn remove_cargo_dependencies(existing: &str, names: &[&str]) -> String {
     let mut lines: Vec<&str> = existing.lines().collect();
     let Some(deps_idx) = lines
         .iter()

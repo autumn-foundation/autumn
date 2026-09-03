@@ -3929,30 +3929,131 @@ impl AppBuilder {
             }
         }
 
+        // Continuous SQLite replication (#1628). Resolved here, next to the other
+        // indicator registrations, so lag and verification are baked into
+        // `/actuator/health` — and so an indicator that stays non-healthy past
+        // the grace period is escalated by the existing #1610 alerter with no
+        // bespoke alert condition of its own. The destination is built on a
+        // BLOCKING thread: its HTTP client must never be constructed inside the
+        // async runtime. The loop itself is spawned at bind time below.
+        #[cfg(feature = "db")]
+        let mut replication_worker: Option<crate::replication::Replicator> = None;
+        #[cfg(feature = "db")]
+        if let Some(replication_config) = config.replication.clone() {
+            let database_url = config
+                .database
+                .primary_url
+                .clone()
+                .or_else(|| config.database.url.clone())
+                .unwrap_or_default();
+            let profile = config.profile.clone().unwrap_or_else(|| "dev".to_owned());
+            // Only a genuinely S3-backed app has a blob-storage bucket to clash
+            // with; a leftover `[storage.s3]` bucket on the local backend is
+            // inert and must not trip the distinct-destination guard (the same
+            // rule #1619's offsite upload applies).
+            #[cfg(feature = "storage")]
+            let storage_destination = (config.storage.backend
+                == crate::storage::StorageBackend::S3)
+                .then(|| {
+                    config
+                        .storage
+                        .s3
+                        .bucket
+                        .clone()
+                        .map(|bucket| (bucket, config.storage.s3.endpoint.clone()))
+                })
+                .flatten();
+            #[cfg(not(feature = "storage"))]
+            let storage_destination: Option<(String, Option<String>)> = None;
+            // The injected clock, not the wall clock: every artifact the
+            // replicator stamps, and the health indicator's startup grace, are
+            // read from it, so a test that freezes time moves them all (#1797).
+            let clock = state.clock_arc();
+
+            let built = tokio::task::spawn_blocking(move || {
+                crate::replication::build(
+                    &replication_config,
+                    &database_url,
+                    &profile,
+                    storage_destination.as_ref().map(|(bucket, endpoint)| {
+                        crate::replication::StorageDestination {
+                            bucket,
+                            endpoint: endpoint.as_deref(),
+                        }
+                    }),
+                    clock,
+                )
+            })
+            .await;
+
+            match built {
+                Ok(Ok(runtime)) => {
+                    tracing::info!(
+                        database = %runtime.settings.database_path.display(),
+                        destination = %runtime.status.snapshot().destination,
+                        prefix = %runtime.settings.root,
+                        sync_interval_secs = runtime.settings.sync_interval.as_secs(),
+                        "continuous SQLite replication is enabled"
+                    );
+                    if let Err(e) = state.health_indicator_registry.register(
+                        crate::replication::INDICATOR_NAME,
+                        crate::actuator::IndicatorGroup::HealthOnly,
+                        std::sync::Arc::clone(&runtime.indicator)
+                            as std::sync::Arc<dyn crate::actuator::HealthIndicator>,
+                    ) {
+                        tracing::warn!("{e}");
+                    }
+                    replication_worker = Some(runtime.replicator);
+                }
+                Ok(Err(crate::replication::SetupError::Disabled)) => {}
+                // A misconfigured durability story must not boot silently
+                // half-working: the operator asked for replication and is not
+                // getting it, which is exactly the situation this feature exists
+                // to prevent.
+                Ok(Err(e)) => {
+                    tracing::error!("Continuous SQLite replication could not start: {e}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    tracing::error!("Continuous SQLite replication setup panicked: {e}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+            }
+        }
+
         // When ACME is configured, register a `HealthOnly` indicator backed by a
         // shared status the renewal task writes. Built here (before the router)
         // so it is baked into `/actuator/health`; the same `AcmeStatus` handle is
         // reused by the renewal task spawned at bind time below.
         #[cfg(feature = "acme")]
-        let acme_status: Option<crate::acme::renewal::AcmeStatus> = if let Some(acme_cfg) =
-            config.server.tls.as_ref().and_then(|t| t.acme.as_ref())
-        {
-            let status = crate::acme::renewal::AcmeStatus::new();
-            let indicator = std::sync::Arc::new(crate::acme::renewal::AcmeHealthIndicator::new(
-                status.clone(),
-                acme_cfg.renew_before_days,
-            ));
-            if let Err(e) = state.health_indicator_registry.register(
-                "acme",
-                crate::actuator::IndicatorGroup::HealthOnly,
-                indicator,
-            ) {
-                tracing::warn!("{e}");
-            }
-            Some(status)
-        } else {
-            None
-        };
+        let acme_status: Option<crate::acme::renewal::AcmeStatus> =
+            if let Some(acme_cfg) = config.server.tls.as_ref().and_then(|t| t.acme.as_ref()) {
+                let status = crate::acme::renewal::AcmeStatus::new();
+                let indicator = std::sync::Arc::new(
+                    crate::acme::renewal::AcmeHealthIndicator::new(
+                        status.clone(),
+                        acme_cfg.renew_before_days,
+                    )
+                    // Which challenge is in play (and, for DNS-01, which provider)
+                    // is the first thing an operator needs when issuance is failing
+                    // — and is safe to publish: it names no credential (#1620).
+                    .with_dns_provider(acme_cfg.dns.as_ref().map(|dns| dns.provider.as_str())),
+                );
+                if let Err(e) = state.health_indicator_registry.register(
+                    "acme",
+                    crate::actuator::IndicatorGroup::HealthOnly,
+                    indicator,
+                ) {
+                    tracing::warn!("{e}");
+                }
+                Some(status)
+            } else {
+                None
+            };
 
         #[cfg(feature = "db")]
         configure_replica_migration_check(&state, replica_migration_check);
@@ -4462,6 +4563,7 @@ impl AppBuilder {
                             listener,
                             tls_cfg,
                             acme_cfg,
+                            &config.credentials,
                             https_port,
                             acme_status.clone(),
                             server_shutdown.child_token(),
@@ -4653,6 +4755,55 @@ impl AppBuilder {
             );
         }
 
+        // The replication loop runs on a DEDICATED OS thread, not a
+        // `spawn_blocking` task: it lives for the whole process and does
+        // blocking file, SQLite and HTTP work, which would pin a thread in
+        // tokio's blocking pool (sized for short tasks) forever. It stops with
+        // the server and ships one final time on the way out.
+        //
+        // Its token is deliberately NOT a child of `server_shutdown`. That token
+        // fires at phase 5, when the listener stops accepting — requests keep
+        // draining after it, and a request served in that window still commits.
+        // The loop's final tick must come after those commits, so the token is
+        // cancelled explicitly below, once the drain has finished. Same reasoning
+        // as the cluster's token, for the same class of silently-dropped write.
+        #[cfg(feature = "db")]
+        let replication_shutdown = tokio_util::sync::CancellationToken::new();
+        // Signals that `Replicator::run` has returned — i.e. the final flush is
+        // done. A channel rather than a `JoinHandle`: waiting on a join means
+        // blocking, and a blocking wait that times out cannot be cancelled, so a
+        // stuck upload would hold the runtime open past the shutdown budget it
+        // was supposed to be bounded by. Dropping this receiver abandons the
+        // thread instead, which is what the budget expiring is supposed to mean.
+        #[cfg(feature = "db")]
+        let mut replication_done: Option<tokio::sync::oneshot::Receiver<()>> = None;
+        #[cfg(feature = "db")]
+        if let Some(replicator) = replication_worker.take() {
+            let replication_shutdown = replication_shutdown.clone();
+            let (finished, waiter) = tokio::sync::oneshot::channel();
+            match std::thread::Builder::new()
+                .name("autumn-sqlite-replication".to_owned())
+                .spawn(move || {
+                    replicator.run(&replication_shutdown);
+                    // The receiver is gone when shutdown stopped waiting; the
+                    // flush still happened, so there is nothing to report.
+                    let _ = finished.send(());
+                }) {
+                Ok(_handle) => replication_done = Some(waiter),
+                // Serving on without the replicator is the worst of both
+                // worlds: the pool has already disabled auto-checkpointing for
+                // it, so the -wal would grow until the disk filled, and the
+                // operator would believe they were replicating. Fail loudly
+                // instead.
+                Err(e) => {
+                    tracing::error!("Could not start the SQLite replication thread: {e}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+            }
+        }
+
         #[cfg(feature = "presence")]
         {
             let presence = state.presence().clone();
@@ -4698,6 +4849,7 @@ impl AppBuilder {
                 tokens,
                 http_challenge_port,
                 https_port,
+                dns01,
             } = bind_state;
 
             // The `:80` challenge/redirect listener, bound DUAL-STACK so the CA
@@ -4705,11 +4857,32 @@ impl AppBuilder {
             // otherwise unreachable on `:80`). Preferred: one `[::]` socket with
             // IPV6_V6ONLY=false; on a platform that refuses it, a separate
             // IPv4 + IPv6 listener pair (each served below). Fail-fast on a bind
-            // error: `:80` needs privilege (CAP_NET_BIND_SERVICE) and ACME
-            // validation cannot succeed without it.
+            // error under HTTP-01: `:80` needs privilege (CAP_NET_BIND_SERVICE)
+            // and validation cannot succeed without it.
+            //
+            // Under DNS-01 it is only a warning. The CA never connects to this
+            // host — domain control is proved by a TXT record — so the listener
+            // is just the HTTP→HTTPS redirect for visitors who type `http://`.
+            // Exiting here would kill exactly the deployment #1620 exists to
+            // serve: a container without CAP_NET_BIND_SERVICE, using DNS-01
+            // *because* `:80` is unavailable. `autumn doctor` grades this the
+            // same way (`acme_ports` is a Warn under DNS-01), and the runtime
+            // must not refuse a config doctor passes.
             let challenge_listeners =
                 match crate::acme::challenge::bind_challenge_listeners(http_challenge_port).await {
                     Ok(listeners) => listeners,
+                    Err(e) if dns01 => {
+                        tracing::warn!(
+                            port = http_challenge_port,
+                            error = %e,
+                            "Could not bind the ACME challenge/redirect listener. DNS-01 issuance \
+                             does not need it, so startup continues — but visitors who type \
+                             http:// will not be redirected to HTTPS. Grant \
+                             CAP_NET_BIND_SERVICE, or set [server.tls.acme] http_challenge_port \
+                             to a port this process may bind"
+                        );
+                        Vec::new()
+                    }
                     Err(e) => {
                         tracing::error!(
                             port = http_challenge_port,
@@ -4777,37 +4950,26 @@ impl AppBuilder {
                 };
             renewal_task.leadership_degraded = leadership_degraded;
 
-            // HTTP-01 ACME is single-host in this slice: the token map is
-            // per-process and the store is local disk. A distributed scheduler
-            // backend means a multi-replica deployment, where the CA's :80
-            // validation can hit a replica without the token (404) and
-            // non-leaders cannot adopt certs from the non-shared store. Warn
-            // loudly rather than silently mis-serving. See #1620.
-            //
-            // Keyed off the configured backend (operator intent) rather than the
-            // built coordinator, so the warning still fires when
-            // `coordinator_from_config` fell back to in-process after a Postgres
-            // error — exactly the case where the fleet is multi-replica but this
-            // process degraded. Exhaustive `matches!` is compiler-enforced if a
-            // new distributed backend variant is added.
-            if !matches!(
-                config.scheduler.backend,
-                crate::config::SchedulerBackend::InProcess
-            ) {
-                tracing::warn!(
-                    scheduler_backend = coordinator.backend(),
-                    "ACME HTTP-01 validation is not fleet-safe with the local on-disk token \
-                     store: behind a load balancer the CA's :80 challenge may reach a replica \
-                     without the token (404), and non-leader replicas cannot adopt issued \
-                     certificates from a non-shared store. Run ACME on a single host, or use a \
-                     shared token store / DNS-01 (#1620)"
-                );
+            // A distributed scheduler backend means a multi-replica deployment,
+            // where ACME is not fleet-safe: see `acme_fleet_warning` for the two
+            // hazards and why DNS-01 only retires one of them. Warn loudly
+            // rather than silently mis-serving (#1620).
+            if let Some(message) = acme_fleet_warning(config.scheduler.backend, dns01) {
+                tracing::warn!(scheduler_backend = coordinator.backend(), "{message}");
             }
 
             #[cfg(feature = "reporting")]
             let reporter = make_acme_reporter(acme_reporters);
             #[cfg(not(feature = "reporting"))]
             let reporter = make_acme_reporter();
+            // Certificate renewal is a framework-scheduled operation, so a
+            // failed issuance/renewal raises #1610's `scheduled_task_failure`
+            // alert — reaching the operator's configured destination (email,
+            // Slack, PagerDuty) rather than only the error-reporting sink. The
+            // renew-before window (default 30 days) means this fires with weeks
+            // of validity left, not at expiry (#1620).
+            let reporter = compose_acme_alert_reporter(reporter, &state);
+            renewal_task.recovery = Some(make_acme_alert_recovery(&state));
             let renewal_shutdown = server_shutdown.child_token();
             tokio::spawn(async move {
                 renewal_task
@@ -5227,6 +5389,44 @@ impl AppBuilder {
                 })
         };
         let shutdown_budget = std::time::Duration::from_secs(shutdown_timeout);
+
+        // Phase 6a: the replication loop's final flush. Cancelling the token at
+        // phase 5 only *wakes* that loop; the tick that ships the last committed
+        // frames runs after it, and nothing waits for that tick unless this
+        // does. Requests have drained, so no further transaction can commit and
+        // this flush is the last one there will ever be — the difference between
+        // a clean stop that loses nothing and one that leaves the tail of the WAL
+        // only on a machine that may be about to go away.
+        //
+        // Bounded by what the drain left of `shutdown_timeout_secs`, on the same
+        // budget as the departure and the hooks below: a destination that has
+        // gone away must not hold the process open past what a supervisor allows.
+        // Overrunning it is loud rather than silent — the operator's RPO is
+        // exactly what is at stake.
+        #[cfg(feature = "db")]
+        if let Some(waiter) = replication_done.take() {
+            // Only now: every request that will ever commit has committed, so
+            // the tick this releases is genuinely the last one.
+            replication_shutdown.cancel();
+            let wait = shutdown_budget.saturating_sub(elapsed_since_drain_start());
+            match tokio::time::timeout(wait, waiter).await {
+                Ok(Ok(())) => {
+                    tracing::info!("shutdown: SQLite replication flushed and stopped");
+                }
+                Ok(Err(_)) => tracing::error!(
+                    "shutdown: the SQLite replication thread ended without finishing; the \
+                     frames committed since the last successful tick may not be offsite"
+                ),
+                // The thread is left running and the process exits without it.
+                // Waiting further is what the budget exists to prevent, and a
+                // blocking join could not be abandoned at all.
+                Err(_) => tracing::warn!(
+                    timeout_secs = wait.as_secs(),
+                    "shutdown: SQLite replication did not finish its final flush within the \
+                     shutdown budget; the last frames may not be offsite"
+                ),
+            }
+        }
 
         // Phase 6b: the cluster departs only now, once no request can still be
         // running — an increment accepted during the drain must have a push
@@ -8489,6 +8689,10 @@ struct AcmeBindState {
     tokens: crate::acme::challenge::Http01Tokens,
     http_challenge_port: u16,
     https_port: u16,
+    /// Whether DNS-01 is configured. Decides whether a failure to bind the
+    /// challenge/redirect port is fatal (HTTP-01) or a warning (DNS-01, where
+    /// the CA never connects to this host).
+    dns01: bool,
 }
 
 /// Build a TLS listener for ACME mode: serve a stored certificate if one is
@@ -8500,6 +8704,7 @@ async fn build_acme_tls_listener(
     tcp: tokio::net::TcpListener,
     tls_cfg: &crate::config::TlsConfig,
     acme_cfg: &crate::config::AcmeConfig,
+    credentials: &crate::credentials::CredentialsStore,
     https_port: u16,
     status: Option<crate::acme::renewal::AcmeStatus>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -8559,6 +8764,11 @@ async fn build_acme_tls_listener(
     let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout, shutdown);
 
     let tokens = crate::acme::challenge::Http01Tokens::new();
+    // `[server.tls.acme.dns]` selects DNS-01, the only challenge a CA will
+    // validate for a wildcard identifier (#1620). Built here, at bind time, so a
+    // missing or malformed provider credential fails startup with an actionable
+    // message instead of surfacing as a failed order 30 days later.
+    let dns = build_dns_challenge(acme_cfg, credentials)?;
     let renewal_task = crate::acme::renewal::AcmeRenewalTask {
         resolver,
         provider,
@@ -8572,6 +8782,10 @@ async fn build_acme_tls_listener(
         // been built and any distributed → in-process fallback is known.
         leadership_degraded: false,
         renew_window_misconfigured: std::sync::atomic::AtomicBool::new(false),
+        dns,
+        // Filled in at the renewal spawn site, where `AppState` (and so the
+        // operator alerter) is in scope.
+        recovery: None,
     };
     Ok((
         listener,
@@ -8580,8 +8794,91 @@ async fn build_acme_tls_listener(
             tokens,
             http_challenge_port: acme_cfg.http_challenge_port,
             https_port,
+            dns01: acme_cfg.dns.is_some(),
         },
     ))
+}
+
+/// The multi-replica ACME warning for this deployment, or `None` when the
+/// scheduler backend says the deployment is single-replica.
+///
+/// One condition guards two distinct hazards, and DNS-01 only removes the
+/// first:
+///
+/// 1. The HTTP-01 token map is per-process, so behind a load balancer the CA's
+///    `:80` request can land on a replica that never minted the token (404).
+/// 2. The certificate store is local disk, so replicas that did not win the
+///    renewal lease never see the issued certificate and keep serving the
+///    self-signed placeholder.
+///
+/// DNS-01 proves control through a TXT record, which retires (1) — but it does
+/// not distribute certificates, so (2) still mis-serves TLS on every replica
+/// but the leader. Warn either way; only the text differs (issue #1620).
+///
+/// Keyed off the *configured* backend (operator intent) rather than the built
+/// coordinator, so the warning still fires when `coordinator_from_config` fell
+/// back to in-process after a Postgres error — exactly the case where the fleet
+/// is multi-replica but this process degraded. The exhaustive `matches!` is
+/// compiler-enforced if a new distributed backend variant is added.
+#[cfg(feature = "acme")]
+const fn acme_fleet_warning(
+    backend: crate::config::SchedulerBackend,
+    dns01: bool,
+) -> Option<&'static str> {
+    if matches!(backend, crate::config::SchedulerBackend::InProcess) {
+        return None;
+    }
+    Some(if dns01 {
+        "ACME DNS-01 issuance is fleet-safe, but the on-disk certificate store is not: only \
+         the replica holding the renewal lease writes the issued certificate, and the others \
+         cannot adopt it from a non-shared store, so they keep serving the self-signed \
+         placeholder. Run ACME on a single host, or point [server.tls.acme] cache_dir at \
+         storage every replica shares (#1620)"
+    } else {
+        "ACME HTTP-01 validation is not fleet-safe with the local on-disk token store: behind \
+         a load balancer the CA's :80 challenge may reach a replica without the token (404), \
+         and non-leader replicas cannot adopt issued certificates from a non-shared store. Run \
+         ACME on a single host, or terminate TLS at a shared proxy. DNS-01 removes the :80 \
+         hazard but not the store one, so it needs a shared [server.tls.acme] cache_dir too \
+         (#1620)"
+    })
+}
+
+/// Build the DNS-01 challenge wiring for `[server.tls.acme.dns]`, if configured.
+///
+/// The provider credential is read from the encrypted credentials store (or the
+/// documented `AUTUMN_ACME_DNS_*` environment variables) — never from
+/// `autumn.toml`, which has no field that could hold one. A missing or blank
+/// credential is an error **here**, at bind time, rather than a failed order
+/// discovered when the certificate is already near expiry (issue #1620).
+#[cfg(feature = "acme")]
+fn build_dns_challenge(
+    acme_cfg: &crate::config::AcmeConfig,
+    credentials: &crate::credentials::CredentialsStore,
+) -> Result<Option<crate::acme::renewal::DnsChallenge>, String> {
+    use crate::acme::dns;
+
+    let Some(dns_cfg) = acme_cfg.dns.as_ref() else {
+        return Ok(None);
+    };
+    let resolvers = dns_cfg.resolver_addrs()?;
+    let credential = dns::DnsCredential::resolve(dns_cfg, credentials, &dns::process_env);
+    // One bounded HTTP timeout for the provider API and one for each DNS probe,
+    // so neither can park the renewal loop: the whole propagation wait is
+    // already bounded, and a black-holed provider API must not outlive it.
+    let transport: std::sync::Arc<dyn dns::http::HttpTransport> = std::sync::Arc::new(
+        dns::http::ReqwestTransport::new(std::time::Duration::from_secs(30))?,
+    );
+    let provider = dns::build_provider(dns_cfg, &credential, transport)?;
+    Ok(Some(crate::acme::renewal::DnsChallenge {
+        provider,
+        lookup: std::sync::Arc::new(dns::resolver::UdpDnsLookup::new(
+            std::time::Duration::from_secs(5),
+        )),
+        resolvers,
+        propagation_timeout: std::time::Duration::from_secs(dns_cfg.propagation_timeout_secs),
+        poll_interval: std::time::Duration::from_secs(dns_cfg.poll_interval_secs),
+    }))
 }
 
 /// Build a `CertifiedKey` from a fresh self-signed placeholder for `domains`.
@@ -8626,6 +8923,40 @@ fn make_acme_reporter(
                 reporter.report(&event).await;
             }
         });
+    })
+}
+
+/// The scheduled-operation name ACME renewal alerts are keyed on. Stable: the
+/// trigger and its recovery must share it, or the recovery cannot clear the
+/// outstanding alert.
+#[cfg(feature = "acme")]
+const ACME_RENEWAL_TASK_NAME: &str = "acme-renewal";
+
+/// Wrap `inner` so every ACME failure ALSO raises #1610's
+/// `scheduled_task_failure` operator alert.
+///
+/// Composition rather than replacement: the error-reporting chain (Sentry et al)
+/// still sees the failure, and the alerter is an independent destination an
+/// operator actually watches.
+#[cfg(feature = "acme")]
+fn compose_acme_alert_reporter(
+    inner: crate::acme::renewal::ReporterFn,
+    state: &AppState,
+) -> crate::acme::renewal::ReporterFn {
+    let state = state.clone();
+    std::sync::Arc::new(move |message: String| {
+        crate::alerts::notify_scheduled_task_failure(&state, ACME_RENEWAL_TASK_NAME, &message);
+        inner(message);
+    })
+}
+
+/// The callback that clears an outstanding ACME renewal alert once issuance
+/// succeeds again.
+#[cfg(feature = "acme")]
+fn make_acme_alert_recovery(state: &AppState) -> crate::acme::renewal::RecoveryFn {
+    let state = state.clone();
+    std::sync::Arc::new(move || {
+        crate::alerts::notify_scheduled_task_recovered(&state, ACME_RENEWAL_TASK_NAME);
     })
 }
 
@@ -9619,6 +9950,13 @@ async fn setup_database(
     directory_shard_router: bool,
     hook_queue_migration_mode: RepositoryCommitHookQueueMigrationMode,
 ) -> Result<DatabaseBootstrap, String> {
+    // #1628: declare replication BEFORE any pool exists, so every pooled SQLite
+    // connection is created with `wal_autocheckpoint = 0` and the replicator is
+    // the only component that ever checkpoints. The flag latches on and is never
+    // cleared — see `set_sqlite_replication_active`.
+    if config.replication.as_ref().is_some_and(|r| r.enabled) {
+        crate::db::set_sqlite_replication_active();
+    }
     let migrations = migrations_with_repository_framework_migrations(
         migrations,
         crate::repository_commit_hooks::has_repository_commit_hook_descriptors(),
@@ -10959,6 +11297,7 @@ fn is_production_profile(profile: &str) -> bool {
 
 #[cfg(test)]
 mod agent_authority_route_summary_tests {
+
     use super::*;
 
     fn route_with(path: &'static str, mcp_tool: bool) -> Route {
@@ -11767,6 +12106,84 @@ enum DrainCause {
     UpgradeCutover,
 }
 
+/// Environment variable naming a file whose appearance drains this app.
+///
+/// Windows has no `SIGTERM`, so a parent process that supervises an Autumn app
+/// (today: `autumn dev`) could only stop it with `TerminateProcess` — which
+/// skips `on_shutdown` hooks entirely, orphaning a managed Postgres child on
+/// every hot reload (issue #1616). Setting this variable gives such a parent a
+/// portable way to request the *same* graceful drain a signal triggers: create
+/// the file, and the app runs its normal shutdown sequence.
+///
+/// Opt-in: unset (or empty), nothing watches anything. The file's contents are
+/// never read — its existence is the whole signal — so a parent can create it
+/// with a plain zero-byte `File::create`. It must be a regular file; a directory
+/// at that path is ignored.
+///
+/// **Honored on non-Unix targets only.** On Unix `SIGTERM` already does this
+/// job, and arming a file-triggered drain there would put a production
+/// deployment one operator-configured path away from being drainable by anything
+/// that can create a file. The variable is accepted and ignored on Unix.
+pub const SHUTDOWN_SIGNAL_FILE_ENV: &str = "AUTUMN_SHUTDOWN_SIGNAL_FILE";
+
+/// Resolve the cooperative-shutdown file from a raw environment value.
+///
+/// Split out from the env read so it is testable without mutating process-global
+/// state. A blank value is treated as unset: an exported-but-empty variable must
+/// not resolve to the current directory, where an unrelated file would drain the
+/// app.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix drain arm, compiled and tested on every platform"
+    )
+)]
+fn external_shutdown_path_from(value: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    let trimmed = value?.to_string_lossy().trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Trim before building the path, not just before testing for emptiness: a
+    // value with stray whitespace would otherwise resolve to a sibling path the
+    // parent never writes, and the failure would be silent — every reload
+    // stalling the full budget and hard-killing, which is the bug this exists
+    // to fix.
+    Some(std::path::PathBuf::from(trimmed))
+}
+
+/// Resolve when the cooperative-shutdown file at `path` exists.
+///
+/// Never resolves when `path` is `None` (the feature is not configured), so an
+/// app that does not opt in is unaffected. Resolves immediately when the file is
+/// already present at boot: a supervising parent removes a stale file before
+/// spawning, so a file that survives into a fresh process means a stop was
+/// requested and unhandled — draining is the safe direction.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix drain arm, compiled and tested on every platform"
+    )
+)]
+async fn external_shutdown_signal(path: Option<std::path::PathBuf>) {
+    let Some(path) = path else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    let interval = std::time::Duration::from_millis(100);
+    loop {
+        // `is_file`, not "exists": `metadata` succeeds on a directory, so a
+        // variable pointed at one would drain the app on every boot — bind,
+        // drain, exit 0 — which a supervisor reads as a healthy restart loop
+        // rather than the misconfiguration it is.
+        if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_file()) {
+            return;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
 /// Wait for a shutdown signal (Ctrl+C, SIGTERM on Unix, or a canary rollback
 /// flag file written by a controller).
 ///
@@ -11809,6 +12226,29 @@ async fn shutdown_signal(upgrade_cutover: tokio_util::sync::CancellationToken) -
         tracing::info!("Canary rollback signalled, starting graceful shutdown");
     };
 
+    // A supervising parent that has no `SIGTERM` to send — `autumn dev` on
+    // Windows — can request this exact drain by creating a file (#1616).
+    //
+    // Deliberately `cfg`-gated to the platforms that need it, rather than armed
+    // everywhere and left inert by an unset variable. Autumn deploys to Linux,
+    // and on Linux this would be a production drain trigger reachable by
+    // anything that can create a path an operator configured — with no
+    // authentication and no benefit, since `SIGTERM` already exists there. The
+    // helpers stay compiled and unit-tested on every platform.
+    #[cfg(not(unix))]
+    let external_stop = async {
+        let path =
+            external_shutdown_path_from(std::env::var_os(SHUTDOWN_SIGNAL_FILE_ENV).as_deref());
+        external_shutdown_signal(path.clone()).await;
+        tracing::warn!(
+            path = ?path,
+            "Cooperative shutdown requested via {SHUTDOWN_SIGNAL_FILE_ENV}, starting graceful shutdown"
+        );
+    };
+
+    #[cfg(unix)]
+    let external_stop = std::future::pending::<()>();
+
     let upgrade = async {
         upgrade_cutover.cancelled().await;
         tracing::info!("Successor is serving after an in-place upgrade, draining this build");
@@ -11818,6 +12258,7 @@ async fn shutdown_signal(upgrade_cutover: tokio_util::sync::CancellationToken) -
         () = ctrl_c => DrainCause::Signal,
         () = terminate => DrainCause::Signal,
         () = canary_rollback => DrainCause::Signal,
+        () = external_stop => DrainCause::Signal,
         () = upgrade => DrainCause::UpgradeCutover,
     }
 }
@@ -11846,6 +12287,50 @@ async fn canary_rollback_signal(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+    /// Regression (#1620): DNS-01 must not silence the multi-replica warning.
+    ///
+    /// DNS-01 retires the HTTP-01 token-map hazard — the CA never connects to
+    /// this host — but it does not distribute certificates. A Postgres-backed
+    /// (i.e. multi-replica) fleet still has every non-leader replica serving the
+    /// self-signed placeholder off its own empty on-disk store, so it must still
+    /// warn, naming the certificate store rather than tokens.
+    #[cfg(feature = "acme")]
+    #[test]
+    fn acme_fleet_warning_covers_the_certificate_store_under_dns01() {
+        use crate::config::SchedulerBackend;
+
+        // Single-replica: silent under either challenge type.
+        assert!(super::acme_fleet_warning(SchedulerBackend::InProcess, false).is_none());
+        assert!(super::acme_fleet_warning(SchedulerBackend::InProcess, true).is_none());
+
+        // Multi-replica HTTP-01: both hazards named.
+        let http01 = super::acme_fleet_warning(SchedulerBackend::Postgres, false)
+            .expect("a distributed backend under HTTP-01 must warn");
+        assert!(
+            http01.contains("token"),
+            "HTTP-01 warning must name the token store: {http01}"
+        );
+
+        // Multi-replica DNS-01: still warns, about the certificate store.
+        let dns01 = super::acme_fleet_warning(SchedulerBackend::Postgres, true).expect(
+            "a distributed backend under DNS-01 must still warn: DNS-01 proves domain \
+                     control but does not share the certificate store",
+        );
+        assert!(
+            dns01.contains("certificate store"),
+            "DNS-01 warning must name the certificate store as the hazard: {dns01}"
+        );
+        assert!(
+            dns01.contains("cache_dir"),
+            "DNS-01 warning must name the config key an operator would change: {dns01}"
+        );
+        // …and must not repeat the HTTP-01 diagnosis, which does not apply.
+        assert!(
+            !dns01.contains("token") && !dns01.contains("404"),
+            "DNS-01 warning must not blame the HTTP-01 token map: {dns01}"
+        );
+    }
+
     /// A clock near the end of representable time must not kill the scheduler.
     ///
     /// `format_next_task_run_after` runs at the top of every fixed-delay loop.
@@ -12352,6 +12837,137 @@ mod tests {
         crate::router::build_router(routes, &config, state)
     }
 
+    // ── Cooperative external shutdown (#1616) ──────────────────────────────
+    //
+    // On Windows there is no SIGTERM: `autumn dev` could only stop the app with
+    // `TerminateProcess`, which skips `on_shutdown` hooks — so a managed
+    // Postgres child was orphaned on every hot reload. These cover the runtime
+    // half of the fix: an opt-in, env-named flag file that drains the app
+    // through the *same* graceful path a signal takes.
+
+    #[test]
+    fn external_shutdown_path_is_none_when_the_env_var_is_absent() {
+        assert_eq!(external_shutdown_path_from(None), None);
+    }
+
+    #[test]
+    fn external_shutdown_path_ignores_an_empty_env_value() {
+        // An empty value is what an unset-but-exported variable looks like. It
+        // must not resolve to the current directory, where any stray file would
+        // drain the app.
+        assert_eq!(
+            external_shutdown_path_from(Some(std::ffi::OsStr::new(""))),
+            None
+        );
+        assert_eq!(
+            external_shutdown_path_from(Some(std::ffi::OsStr::new("   "))),
+            None
+        );
+    }
+
+    #[test]
+    fn external_shutdown_path_trims_surrounding_whitespace() {
+        // A value that only *looks* blank is rejected above; one with real
+        // content and stray whitespace must resolve to the path the parent
+        // actually wrote, not to a sibling with a leading space that will
+        // never match. Getting this wrong is silent: on Windows every reload
+        // would stall the full budget and hard-kill, reintroducing the
+        // orphaned-cluster bug this seam exists to fix.
+        assert_eq!(
+            external_shutdown_path_from(Some(std::ffi::OsStr::new("  /tmp/autumn-stop  "))),
+            Some(std::path::PathBuf::from("/tmp/autumn-stop"))
+        );
+    }
+
+    #[tokio::test]
+    async fn external_shutdown_signal_ignores_a_directory_at_the_path() {
+        // `metadata()` succeeds on a directory. If existence alone were the
+        // test, pointing the variable at a directory would drain the app on
+        // every boot — bind, drain, exit 0 — which under a supervisor is a
+        // restart loop that reports success on every iteration.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("not-a-signal");
+        std::fs::create_dir(&path).unwrap();
+
+        let resolved = tokio::time::timeout(
+            std::time::Duration::from_millis(400),
+            external_shutdown_signal(Some(path)),
+        )
+        .await;
+        assert!(resolved.is_err(), "a directory must not count as a signal");
+    }
+
+    #[test]
+    fn external_shutdown_path_uses_the_env_value_verbatim() {
+        assert_eq!(
+            external_shutdown_path_from(Some(std::ffi::OsStr::new("/tmp/autumn-stop"))),
+            Some(std::path::PathBuf::from("/tmp/autumn-stop"))
+        );
+    }
+
+    #[tokio::test]
+    async fn external_shutdown_signal_never_resolves_without_a_path() {
+        // Not configured must mean "never drains" — not "drains immediately",
+        // which would take down every app that does not opt in.
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            external_shutdown_signal(None),
+        )
+        .await;
+        assert!(
+            pending.is_err(),
+            "an unconfigured signal must never resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_shutdown_signal_resolves_when_the_file_appears() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("dev-shutdown.signal");
+
+        let writer_path = path.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            std::fs::write(&writer_path, b"stop").unwrap();
+        });
+
+        let signalled = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            external_shutdown_signal(Some(path)),
+        )
+        .await;
+        assert!(signalled.is_ok(), "writing the file must drain the app");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_shutdown_signal_resolves_immediately_when_present_at_boot() {
+        // `autumn dev` removes a stale file before spawning, but a crashed
+        // parent can leave one behind; resolving immediately is the safe
+        // direction — the app exits gracefully rather than ignoring a stop.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("dev-shutdown.signal");
+        std::fs::write(&path, b"stop").unwrap();
+
+        let signalled = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            external_shutdown_signal(Some(path)),
+        )
+        .await;
+        assert!(
+            signalled.is_ok(),
+            "a file present at boot must drain the app"
+        );
+    }
+
+    #[test]
+    fn external_shutdown_env_var_is_the_name_the_cli_writes() {
+        // `autumn-cli` mirrors this constant (it cannot depend on autumn-web's
+        // private items); a rename on either side breaks the dev loop silently,
+        // so pin the wire name here.
+        assert_eq!(SHUTDOWN_SIGNAL_FILE_ENV, "AUTUMN_SHUTDOWN_SIGNAL_FILE");
+    }
+
     #[tokio::test]
     async fn canary_rollback_signal_resolves_when_flag_newly_written() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -12848,6 +13464,74 @@ mod tests {
         assert!(
             source.contains(shard_gate),
             "shard commit-hook workers must be gated on role.runs_workers()"
+        );
+    }
+
+    /// The replication loop's final flush must be *triggered* after the drain.
+    ///
+    /// Cancelling the token only *wakes* the replication thread; the tick that
+    /// ships the last committed frames runs immediately after it. So waiting
+    /// for the thread is not enough on its own — if the token fires at phase 5,
+    /// with `server_shutdown`, that final tick happens while requests are still
+    /// draining, and a request that commits during the drain is never
+    /// replicated even though the wait below succeeds and logs that replication
+    /// flushed. The token must therefore be independent of `server_shutdown`
+    /// and cancelled only once the drain has finished.
+    ///
+    /// The wait must also not be a blocking join: a blocked join cannot be
+    /// cancelled, so a stuck upload would hold the process open past the
+    /// shutdown budget that is supposed to bound it.
+    ///
+    /// Source-order test in the house style, because the ordering is a property
+    /// of this function and nothing smaller: an app-level boot test would need a
+    /// `SQLite` runtime pool, which only exists in the `sqlite` lane.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_replication_final_flush_is_waited_for_after_the_drain() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let server_start = source
+            .find("pub async fn run(self)")
+            .expect("normal server path should exist");
+        // Bounded at the next path so the search cannot match this test's own
+        // source, which necessarily quotes the strings it is looking for.
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should follow server path");
+        let server_source = &source[server_start..build_mode_start];
+
+        let spawn = server_source
+            .find("Ok(_handle) => replication_done = Some(waiter),")
+            .expect("the replication thread's completion signal must be kept, not dropped");
+        let drain = server_source
+            .find("let server_result = server_task.await")
+            .expect("the normal server path should await the drain");
+        let wait = server_source
+            .find("if let Some(waiter) = replication_done.take()")
+            .expect("shutdown must wait for the replication thread");
+        let cancel = server_source
+            .find("replication_shutdown.cancel();")
+            .expect("shutdown must cancel the replication token explicitly");
+
+        assert!(
+            spawn < drain && drain < wait && drain < cancel,
+            "the final flush must be triggered AND awaited AFTER the request drain \
+             (spawn={spawn}, drain={drain}, wait={wait}, cancel={cancel})"
+        );
+        // The token that releases the final tick must not fire with the
+        // listener: that is the whole bug this ordering exists to prevent.
+        assert!(
+            server_source
+                .contains("let replication_shutdown = tokio_util::sync::CancellationToken::new();"),
+            "the replication token must be independent of `server_shutdown`, not a child of it"
+        );
+        assert!(
+            !server_source[..wait].contains("let replication_shutdown = server_shutdown"),
+            "the replication token must not be derived from `server_shutdown`"
+        );
+        // A blocking join cannot be abandoned when the budget runs out.
+        assert!(
+            !server_source[wait..].contains("spawn_blocking"),
+            "the bounded wait must not block on a join it cannot cancel"
         );
     }
 

@@ -19,6 +19,9 @@ glyph-agent becomes the last character of **Autumn's own source code** it eats.
 > `examples/flock/src/main.rs` (the `GET /` route). The crate is a peer of the
 > `flock` example and builds its wasm into `examples/flock/static/islands/`.
 
+<!-- cli-surface-allow: autumn generate island — named above only to state that it does not exist -->
+
+
 ## Why a WASM island (and not htmx)
 
 htmx is a swap engine: an event fires, the browser asks the server for a chunk

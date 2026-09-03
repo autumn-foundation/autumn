@@ -1009,6 +1009,269 @@ pub struct OffsiteS3Config {
     pub force_path_style: bool,
 }
 
+/// `[replication]` — continuous `SQLite` replication to an offsite destination
+/// (issue #1628).
+///
+/// NOT feature-gated, for the same reason `[backup]` is not: a strict-config app
+/// must accept its own `autumn.toml` keys whatever feature set it was compiled
+/// with. The replication engine itself lives behind the `db` feature.
+///
+/// The section is absent by default. Present-but-`enabled = false` is the shape
+/// a profile overlay wants: keep one destination definition in `autumn.toml` and
+/// turn replication off for `dev`/`test`.
+///
+/// ```toml
+/// [replication]
+/// enabled = true
+/// rpo_secs = 10
+/// retention_hours = 168
+///
+/// [replication.s3]
+/// bucket = "myapp-replicas"
+/// region = "auto"
+/// endpoint = "https://<account>.r2.cloudflarestorage.com"
+/// access_key_id_env = "AUTUMN_REPLICA_ACCESS_KEY_ID"
+/// secret_access_key_env = "AUTUMN_REPLICA_SECRET_ACCESS_KEY"
+/// force_path_style = true
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReplicationConfig {
+    /// Master switch. Off by default, so adding the section is not enough to
+    /// start shipping — the operator must say so.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// The recovery point objective in seconds: the steady-state upper bound on
+    /// how much recently committed data a total loss of the machine costs.
+    /// Defaults to 10 (AC #2).
+    #[serde(default = "default_rpo_secs")]
+    pub rpo_secs: u64,
+
+    /// How often the replicator ships, in seconds. Defaults to half the RPO
+    /// (minimum one second) so the steady-state lag stays inside the contract.
+    #[serde(default)]
+    pub sync_interval_secs: Option<u64>,
+
+    /// How old a generation may get before the replicator checkpoints and opens
+    /// a fresh one. Bounds how many segments a restore replays. Default: 1 hour.
+    #[serde(default = "default_snapshot_interval_secs")]
+    pub snapshot_interval_secs: u64,
+
+    /// How large the `-wal` file may grow before the replicator checkpoints.
+    /// Default: 16 MiB.
+    #[serde(default = "default_max_wal_bytes")]
+    pub max_wal_bytes: u64,
+
+    /// How far back a point-in-time restore must stay possible. Older
+    /// generations are pruned. Default: 168 hours (7 days).
+    #[serde(default = "default_retention_hours")]
+    pub retention_hours: u64,
+
+    /// How often to prove the replica restorable by actually restoring it into
+    /// a scratch directory. `0` disables periodic verification. Default: 6 hours.
+    #[serde(default = "default_verify_interval_secs")]
+    pub verify_interval_secs: u64,
+
+    /// Key prefix under the destination. Objects are keyed
+    /// `{prefix}/{profile}/generations/…`. Defaults to the bucket/directory root.
+    #[serde(default)]
+    pub prefix: Option<String>,
+
+    /// Opt in to pointing replication at the same bucket + endpoint as the app's
+    /// user-facing blob storage (`[storage.s3]`). Off by default so a shared
+    /// bucket — where a lifecycle rule written for user uploads could quietly
+    /// expire the replicas — is a deliberate choice. Mirrors #1619.
+    #[serde(default)]
+    pub allow_shared_bucket: bool,
+
+    /// S3-compatible destination (`[replication.s3]`). Mutually exclusive with
+    /// [`path`](Self::path).
+    #[serde(default)]
+    pub s3: Option<ReplicationS3Config>,
+
+    /// Filesystem destination: a directory to replicate into. A second disk, an
+    /// NFS/SSHFS mount or a bind-mounted volume is a legitimate offsite target.
+    /// Mutually exclusive with [`s3`](Self::s3).
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rpo_secs: default_rpo_secs(),
+            sync_interval_secs: None,
+            snapshot_interval_secs: default_snapshot_interval_secs(),
+            max_wal_bytes: default_max_wal_bytes(),
+            retention_hours: default_retention_hours(),
+            verify_interval_secs: default_verify_interval_secs(),
+            prefix: None,
+            allow_shared_bucket: false,
+            s3: None,
+            path: None,
+        }
+    }
+}
+
+impl ReplicationConfig {
+    /// The effective ship interval: the explicit override, else half the RPO,
+    /// never less than one second.
+    #[must_use]
+    pub fn sync_interval(&self) -> std::time::Duration {
+        let secs = self
+            .sync_interval_secs
+            .unwrap_or_else(|| self.rpo_secs.div_euclid(2))
+            .max(1);
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// The RPO as a duration, never zero.
+    #[must_use]
+    pub fn rpo(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.rpo_secs.max(1))
+    }
+
+    /// The periodic-verification interval, or `None` when disabled.
+    #[must_use]
+    pub fn verify_interval(&self) -> Option<std::time::Duration> {
+        (self.verify_interval_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.verify_interval_secs))
+    }
+
+    /// Validate the section on its own terms, returning an operator-facing
+    /// message for each problem. Only meaningful when `enabled`.
+    #[must_use]
+    pub fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !self.enabled {
+            return errors;
+        }
+        match (&self.s3, &self.path) {
+            (Some(_), Some(_)) => errors.push(
+                "[replication] configures both `s3` and `path`; pick exactly one destination"
+                    .to_owned(),
+            ),
+            (None, None) => errors.push(
+                "[replication] enabled = true but no destination is configured; add a \
+                 [replication.s3] section (bucket/region/endpoint plus *_env credential \
+                 indirection) or set `path` to a directory"
+                    .to_owned(),
+            ),
+            (Some(s3), None) => {
+                if s3.bucket.as_deref().unwrap_or("").trim().is_empty() {
+                    errors.push("[replication.s3] bucket is unset".to_owned());
+                }
+                if s3
+                    .access_key_id_env
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+                    || s3
+                        .secret_access_key_env
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+                {
+                    errors.push(
+                        "[replication.s3] needs access_key_id_env and secret_access_key_env \
+                         (the NAMES of the environment variables the credentials are read \
+                         from — never the credentials themselves)"
+                            .to_owned(),
+                    );
+                }
+            }
+            (None, Some(path)) => {
+                if path.trim().is_empty() {
+                    errors.push("[replication] path is empty".to_owned());
+                }
+            }
+        }
+        if self.rpo_secs == 0 {
+            errors.push("[replication] rpo_secs must be at least 1".to_owned());
+        }
+        // An explicit override longer than the RPO quietly invalidates the
+        // objective it sits next to: `rpo_secs = 10` with
+        // `sync_interval_secs = 60` ships once a minute and can lose nearly a
+        // minute of committed writes, while every surface — the docs, the health
+        // detail, the restore report — still promises ten seconds. Refuse the
+        // pair rather than letting the stricter-looking number be the wrong one.
+        if let Some(interval) = self.sync_interval_secs
+            && self.rpo_secs > 0
+            && interval > self.rpo_secs
+        {
+            errors.push(format!(
+                "[replication] sync_interval_secs ({interval}) must not exceed rpo_secs \
+                 ({}): shipping less often than the objective cannot meet it",
+                self.rpo_secs
+            ));
+        }
+        if self.retention_hours == 0 {
+            errors.push("[replication] retention_hours must be at least 1".to_owned());
+        }
+        if self.max_wal_bytes < 32 {
+            errors.push(
+                "[replication] max_wal_bytes must be at least 32 (the size of a WAL header)"
+                    .to_owned(),
+            );
+        }
+        errors
+    }
+}
+
+/// `[replication.s3]` — S3-compatible destination for continuous replication.
+///
+/// Same credential posture as `[backup.offsite.s3]`: the secrets are named by
+/// environment variable, never inlined into config, argv, logs, or errors.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ReplicationS3Config {
+    /// Target bucket.
+    #[serde(default)]
+    pub bucket: Option<String>,
+    /// Region for the `SigV4` credential scope (R2 uses `auto`).
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Custom endpoint URL. Required for non-AWS providers.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Environment variable the access-key id is read from.
+    #[serde(default)]
+    pub access_key_id_env: Option<String>,
+    /// Environment variable the secret access key is read from.
+    #[serde(default)]
+    pub secret_access_key_env: Option<String>,
+    /// Path-style addressing toggle (R2 / `MinIO` need this `true`).
+    #[serde(default)]
+    pub force_path_style: bool,
+}
+
+/// Default RPO: at most ten seconds of potential data loss (#1628 AC #2).
+const fn default_rpo_secs() -> u64 {
+    10
+}
+
+/// Default generation length: one hour.
+const fn default_snapshot_interval_secs() -> u64 {
+    3600
+}
+
+/// Default WAL ceiling before a checkpoint: 16 MiB.
+const fn default_max_wal_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+/// Default point-in-time window: seven days.
+const fn default_retention_hours() -> u64 {
+    168
+}
+
+/// Default restore-verification cadence: every six hours.
+const fn default_verify_interval_secs() -> u64 {
+    21_600
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AutumnConfig {
     /// Active profile name (e.g., "dev", "prod", "staging").
@@ -1223,6 +1486,13 @@ pub struct AutumnConfig {
     /// feature.
     #[serde(default)]
     pub backup: BackupConfig,
+    /// Continuous `SQLite` replication (`[replication]` section, issue #1628).
+    ///
+    /// `None` (the default) means the section is absent and nothing is
+    /// replicated. Boxed so an app that never replicates costs one pointer in
+    /// the app-run future rather than the whole section inline.
+    #[serde(default)]
+    pub replication: Option<Box<ReplicationConfig>>,
     /// Transactional email settings.
     #[cfg(feature = "mail")]
     #[serde(default)]
@@ -4598,6 +4868,19 @@ impl AutumnConfig {
         // Fail fast on an insecure or flapping [cluster] section: a node that
         // would boot without a shared secret must not boot at all.
         self.cluster.validate()?;
+        // A `[replication]` block that is switched on but cannot ship (no
+        // destination, both destinations, no credential indirection) must fail
+        // here — so `autumn check` and `autumn doctor` see it too — rather than
+        // only when the app itself boots (#1628).
+        if let Some(replication) = &self.replication {
+            let errors = replication.validation_errors();
+            if !errors.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "invalid [replication] configuration:\n  - {}",
+                    errors.join("\n  - ")
+                )));
+            }
+        }
         // Session backend validation deliberately lives in
         // `crate::session::build_session_layer`, not here. That function
         // short-circuits when a custom `SessionStore` was installed via
@@ -4834,6 +5117,7 @@ impl AutumnConfig {
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
         self.apply_backup_env_overrides_with_env(env);
+        self.apply_replication_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
         #[cfg(feature = "maud")]
@@ -6329,6 +6613,111 @@ impl AutumnConfig {
         );
     }
 
+    /// Apply `AUTUMN_REPLICATION__*` overrides to the `[replication]` section
+    /// (issue #1628). Mirrors the `[backup.offsite]` convention: a *destination*
+    /// key materializes the section for an all-env deployment, while
+    /// optional-only keys never conjure a section that would then fail
+    /// validation.
+    fn apply_replication_env_overrides_with_env(&mut self, env: &dyn Env) {
+        // Keys that express a real intent to configure a destination. A lone
+        // region/endpoint/prefix cannot replicate anywhere, so it must not
+        // materialize the section; `ENABLED=true` does, because it needs a
+        // destination to act on and the resulting validation error is the honest
+        // answer.
+        const DEST_KEYS: &[&str] = &[
+            "AUTUMN_REPLICATION__S3__BUCKET",
+            "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
+            "AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV",
+            "AUTUMN_REPLICATION__PATH",
+        ];
+        // Only a REQUIRED S3 key materializes the sub-section, exactly as
+        // `OFFSITE_DEST_KEYS` does for `[backup.offsite]`. A stray
+        // `AUTUMN_REPLICATION__S3__REGION` next to a `path` destination must not
+        // conjure an empty `[replication.s3]` — that would make the section
+        // "configures both s3 and path" and fail boot on an otherwise valid
+        // config. The optional keys are still APPLIED once a required one has
+        // materialized the sub-section.
+        const S3_KEYS: &[&str] = &[
+            "AUTUMN_REPLICATION__S3__BUCKET",
+            "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
+            "AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV",
+        ];
+        let has_dest_key = DEST_KEYS.iter().any(|k| env.var(k).is_ok());
+        let enabled_truthy = env
+            .var("AUTUMN_REPLICATION__ENABLED")
+            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
+        if self.replication.is_none() && !has_dest_key && !enabled_truthy {
+            return;
+        }
+        let replication = self
+            .replication
+            .get_or_insert_with(|| Box::new(ReplicationConfig::default()));
+
+        parse_env_bool(env, "AUTUMN_REPLICATION__ENABLED", &mut replication.enabled);
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__RPO_SECS",
+            &mut replication.rpo_secs,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_REPLICATION__SYNC_INTERVAL_SECS",
+            &mut replication.sync_interval_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__SNAPSHOT_INTERVAL_SECS",
+            &mut replication.snapshot_interval_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__MAX_WAL_BYTES",
+            &mut replication.max_wal_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__RETENTION_HOURS",
+            &mut replication.retention_hours,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__VERIFY_INTERVAL_SECS",
+            &mut replication.verify_interval_secs,
+        );
+        parse_env_option_string(env, "AUTUMN_REPLICATION__PREFIX", &mut replication.prefix);
+        parse_env_option_string(env, "AUTUMN_REPLICATION__PATH", &mut replication.path);
+        parse_env_bool(
+            env,
+            "AUTUMN_REPLICATION__ALLOW_SHARED_BUCKET",
+            &mut replication.allow_shared_bucket,
+        );
+
+        if replication.s3.is_none() && !S3_KEYS.iter().any(|k| env.var(k).is_ok()) {
+            return;
+        }
+        let s3 = replication
+            .s3
+            .get_or_insert_with(ReplicationS3Config::default);
+        parse_env_option_string(env, "AUTUMN_REPLICATION__S3__BUCKET", &mut s3.bucket);
+        parse_env_option_string(env, "AUTUMN_REPLICATION__S3__REGION", &mut s3.region);
+        parse_env_option_string(env, "AUTUMN_REPLICATION__S3__ENDPOINT", &mut s3.endpoint);
+        parse_env_option_string(
+            env,
+            "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
+            &mut s3.access_key_id_env,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV",
+            &mut s3.secret_access_key_env,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_REPLICATION__S3__FORCE_PATH_STYLE",
+            &mut s3.force_path_style,
+        );
+    }
+
     #[cfg(feature = "mail")]
     fn apply_mail_env_overrides_with_env(&mut self, env: &dyn Env) {
         if let Ok(val) = env.var("AUTUMN_MAIL__TRANSPORT") {
@@ -6860,6 +7249,16 @@ pub struct AcmeConfig {
     /// the config file.
     #[serde(default)]
     pub ca_root_path: Option<PathBuf>,
+
+    /// DNS-01 challenge settings (issue #1620). Present under
+    /// `[server.tls.acme.dns]`.
+    ///
+    /// When set, every authorization in an order is answered over **DNS-01**
+    /// instead of HTTP-01, which is the only challenge type a CA will accept for
+    /// a **wildcard** identifier — so `domains` may list `*.example.com`. When
+    /// absent, issuance stays on #1608's HTTP-01 path and wildcards are rejected.
+    #[serde(default)]
+    pub dns: Option<AcmeDnsConfig>,
 }
 
 impl AcmeConfig {
@@ -6931,12 +7330,34 @@ impl AcmeConfig {
                      {index} is empty or whitespace-only)"
                 ));
             }
-            if trimmed.starts_with("*.") {
-                return Err(format!(
-                    "[server.tls.acme] wildcard domain `{trimmed}` is not supported: wildcards \
-                     require the DNS-01 challenge, which is out of scope here (tracked in #1620). \
-                     List explicit hostnames instead"
-                ));
+            // A wildcard identifier can only ever be validated over DNS-01, so it
+            // is accepted exactly when `[server.tls.acme.dns]` is configured —
+            // and its shape is checked here rather than surfacing later as an
+            // opaque CA rejection mid-issuance.
+            if trimmed.contains('*') {
+                if self.dns.is_none() {
+                    return Err(format!(
+                        "[server.tls.acme] wildcard domain `{trimmed}` needs the DNS-01 \
+                         challenge: an ACME CA will not validate a wildcard identifier over \
+                         HTTP-01. Add a [server.tls.acme.dns] section naming your DNS provider \
+                         (and the credentials-store key holding its API token), or list explicit \
+                         hostnames instead"
+                    ));
+                }
+                let Some(base) = trimmed.strip_prefix("*.") else {
+                    return Err(format!(
+                        "[server.tls.acme] domain `{trimmed}` is not a usable wildcard: a \
+                         wildcard SAN must be written as `*.` followed by the base domain (e.g. \
+                         `*.myapp.com`) — a `*` anywhere else is not matched by any client"
+                    ));
+                };
+                if base.is_empty() || base.contains('*') {
+                    return Err(format!(
+                        "[server.tls.acme] domain `{trimmed}` is not a usable wildcard: exactly \
+                         one leading `*.` is allowed and the base domain after it must be \
+                         non-empty (e.g. `*.myapp.com`)"
+                    ));
+                }
             }
             // The checks above read `trimmed`, but the entry is stored — and used —
             // UNTRIMMED: it becomes the certificate's SAN via `CertificateParams`,
@@ -6955,8 +7376,276 @@ impl AcmeConfig {
                 ));
             }
         }
+        if let Some(dns) = &self.dns {
+            dns.validate()?;
+        }
         Ok(())
     }
+
+    /// Whether the configured certificate would cover `host`.
+    ///
+    /// Applies RFC 6125 wildcard matching across every entry in
+    /// [`domains`](Self::domains), so a `*.myapp.com` SAN covers
+    /// `tenant42.myapp.com` but not the apex and not a deeper label. Used by
+    /// `autumn doctor` to check a `tenancy.base_domain` against the certificate
+    /// (issue #1620).
+    #[must_use]
+    pub fn covers_host(&self, host: &str) -> bool {
+        self.domains.iter().any(|san| san_covers_host(san, host))
+    }
+}
+
+/// DNS-01 challenge settings for wildcard (and multi-replica) ACME issuance
+/// (issue #1620). Present under `[server.tls.acme.dns]`.
+///
+/// # Secrets never live here
+///
+/// This section names a **credential reference**, never a token. The provider's
+/// API credential is read from the encrypted credentials store
+/// (`autumn credentials edit`, `config/credentials/<env>.toml.enc`) under the
+/// [`credential`](Self::credential) key, or from the documented environment
+/// variables. There is deliberately no field to hold a token, and the section is
+/// `deny_unknown_fields`, so an `api_token = "..."` written into `autumn.toml`
+/// is a **load-time error** rather than a plaintext secret that silently works.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [server.tls.acme]
+/// domains = ["myapp.com", "*.myapp.com"]
+/// contact_email = "ops@myapp.com"
+/// directory = "production"
+///
+/// [server.tls.acme.dns]
+/// provider = "cloudflare"
+/// # optional; the credentials-store key holding the token. Default: "acme_dns".
+/// credential = "acme_dns"
+/// ```
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeDnsConfig {
+    /// Which DNS provider writes the `_acme-challenge` TXT records.
+    pub provider: AcmeDnsProvider,
+
+    /// Key in the encrypted credentials store holding this provider's
+    /// credential. Default: `acme_dns`. Never the credential itself.
+    #[serde(default = "default_acme_dns_credential")]
+    pub credential: String,
+
+    /// How long, in seconds, to wait for a published TXT record to become
+    /// visible on every configured resolver before failing the order.
+    /// Default: `300`.
+    #[serde(default = "default_acme_dns_propagation_timeout_secs")]
+    pub propagation_timeout_secs: u64,
+
+    /// Seconds between propagation probes. Default: `5`.
+    #[serde(default = "default_acme_dns_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+
+    /// Resolvers queried to confirm propagation. Each entry is `IP` (port 53
+    /// implied) or `IP:port`. Default: Cloudflare and Google public DNS.
+    #[serde(default = "default_acme_dns_resolvers")]
+    pub resolvers: Vec<String>,
+
+    /// The hook program for [`AcmeDnsProvider::Exec`], as an **argv array**
+    /// (never a shell string). Autumn appends `present|cleanup`, the record
+    /// FQDN, and the TXT value as three further arguments, so nothing is
+    /// interpolated into a shell. Required for `exec`, rejected for every other
+    /// provider.
+    #[serde(default)]
+    pub command: Vec<String>,
+}
+
+impl AcmeDnsConfig {
+    /// Parse [`resolvers`](Self::resolvers) into socket addresses, defaulting a
+    /// bare IP to port 53.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the first unparseable entry.
+    pub fn resolver_addrs(&self) -> Result<Vec<std::net::SocketAddr>, String> {
+        self.resolvers
+            .iter()
+            .map(|entry| parse_resolver_addr(entry))
+            .collect()
+    }
+
+    /// Validate the DNS-01 wiring.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message describing the first problem found.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.credential.trim().is_empty() {
+            return Err(
+                "[server.tls.acme.dns] credential must name the key in the encrypted \
+                 credentials store that holds the DNS provider's API credential (run \
+                 `autumn credentials edit`). It is a key NAME, never the token itself"
+                    .to_owned(),
+            );
+        }
+        match self.provider {
+            AcmeDnsProvider::Exec => {
+                if self
+                    .command
+                    .first()
+                    .is_some_and(|program| !program.trim().is_empty() && program != program.trim())
+                {
+                    return Err(format!(
+                        "[server.tls.acme.dns] command's program `{}` has leading or trailing \
+                         whitespace: it is passed to the OS verbatim, so the padded value would \
+                         fail to execute. Write it without the padding",
+                        self.command[0]
+                    ));
+                }
+                if self.command.first().is_none_or(|p| p.trim().is_empty()) {
+                    return Err(
+                        "[server.tls.acme.dns] provider = \"exec\" requires a non-empty `command` \
+                         argv array (e.g. command = [\"/usr/local/bin/dns-hook\"]); autumn appends \
+                         `present`/`cleanup`, the record FQDN and the TXT value as further \
+                         arguments"
+                            .to_owned(),
+                    );
+                }
+            }
+            AcmeDnsProvider::Cloudflare | AcmeDnsProvider::Route53 => {
+                if !self.command.is_empty() {
+                    return Err(format!(
+                        "[server.tls.acme.dns] command is set but provider is \"{}\": the command \
+                         would never run. Remove it, or set provider = \"exec\" to use the \
+                         external-hook escape hatch",
+                        self.provider.as_str()
+                    ));
+                }
+            }
+        }
+        if self.propagation_timeout_secs == 0 {
+            return Err(
+                "[server.tls.acme.dns] propagation_timeout_secs must not be 0: a zero budget \
+                 fails every order before a freshly-written TXT record could ever be visible. \
+                 Use the default (300) or a larger value for a slow-propagating zone"
+                    .to_owned(),
+            );
+        }
+        if self.poll_interval_secs == 0 {
+            return Err(
+                "[server.tls.acme.dns] poll_interval_secs must not be 0: it would busy-loop the \
+                 configured resolvers. Use the default (5)"
+                    .to_owned(),
+            );
+        }
+        if self.propagation_timeout_secs > MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS {
+            return Err(format!(
+                "[server.tls.acme.dns] propagation_timeout_secs ({}) must be at most {}: the wait \
+                 is computed as an instant `now + timeout`, and an unbounded value overflows that \
+                 and panics the renewal task, leaving the self-signed placeholder served \
+                 indefinitely. An hour is far past any real provider's propagation time",
+                self.propagation_timeout_secs, MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS
+            ));
+        }
+        if self.poll_interval_secs > self.propagation_timeout_secs {
+            return Err(format!(
+                "[server.tls.acme.dns] poll_interval_secs ({}) is greater than \
+                 propagation_timeout_secs ({}): the record would be probed once and the wait \
+                 would time out without ever re-checking. Lower poll_interval_secs",
+                self.poll_interval_secs, self.propagation_timeout_secs
+            ));
+        }
+        if self.resolvers.is_empty() {
+            return Err(
+                "[server.tls.acme.dns] resolvers must list at least one DNS resolver to confirm \
+                 TXT propagation against (default: 1.1.1.1:53 and 8.8.8.8:53)"
+                    .to_owned(),
+            );
+        }
+        self.resolver_addrs()?;
+        Ok(())
+    }
+}
+
+/// Parse one `[server.tls.acme.dns] resolvers` entry into a socket address,
+/// defaulting a bare IP address to port 53.
+fn parse_resolver_addr(entry: &str) -> Result<std::net::SocketAddr, String> {
+    let trimmed = entry.trim();
+    if let Ok(addr) = trimmed.parse::<std::net::SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, 53));
+    }
+    Err(format!(
+        "[server.tls.acme.dns] resolvers entry `{entry}` is not a resolver address: write it as \
+         an IP (`1.1.1.1`, port 53 implied) or `IP:port` (`1.1.1.1:53`). Hostnames are not \
+         accepted — resolving the resolver would defeat the purpose of the propagation check"
+    ))
+}
+
+/// Which DNS provider writes the ACME DNS-01 `_acme-challenge` TXT records.
+///
+/// The curated set is deliberately small; [`Exec`](Self::Exec) is the documented
+/// escape hatch for everything else (RFC 2136 via `nsupdate`, a registrar CLI, a
+/// webhook shim).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AcmeDnsProvider {
+    /// Cloudflare DNS, via the v4 REST API with a scoped API token.
+    Cloudflare,
+    /// Amazon Route 53, via `ChangeResourceRecordSets` with `SigV4` credentials.
+    Route53,
+    /// An operator-provided hook program — the escape hatch for any other
+    /// provider.
+    Exec,
+}
+
+impl AcmeDnsProvider {
+    /// The provider's stable config spelling (also used in health details).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cloudflare => "cloudflare",
+            Self::Route53 => "route53",
+            Self::Exec => "exec",
+        }
+    }
+}
+
+impl std::fmt::Display for AcmeDnsProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Whether a certificate SAN entry covers `host`, using RFC 6125 wildcard rules.
+///
+/// A `*.example.com` SAN covers exactly one label — `tenant1.example.com` but
+/// neither `a.b.example.com` nor the bare apex `example.com`. Matching is
+/// case-insensitive and tolerates a trailing dot on `host`.
+///
+/// Used by `autumn doctor` to tell an operator that their `tenancy.base_domain`
+/// is not covered by the configured certificate (issue #1620).
+#[must_use]
+pub fn san_covers_host(san: &str, host: &str) -> bool {
+    let san = san.trim().trim_end_matches('.').to_ascii_lowercase();
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if san.is_empty() || host.is_empty() {
+        return false;
+    }
+    let Some(suffix) = san.strip_prefix("*.") else {
+        return san == host;
+    };
+    if suffix.is_empty() {
+        return false;
+    }
+    // Exactly one label may stand in for the `*`: strip the suffix and require
+    // what remains to be a single non-empty, dot-free label.
+    let Some(label) = host
+        .strip_suffix(&suffix)
+        .and_then(|prefix| prefix.strip_suffix('.'))
+    else {
+        return false;
+    };
+    !label.is_empty() && !label.contains('.')
 }
 
 /// Which ACME directory endpoint to provision against.
@@ -8692,6 +9381,40 @@ const fn default_acme_http_challenge_port() -> u16 {
 /// leaves ample slack for retries.
 const fn default_acme_renew_before_days() -> u32 {
     30
+}
+
+/// Default credentials-store key holding the DNS provider credential
+/// (`[server.tls.acme.dns] credential`).
+fn default_acme_dns_credential() -> String {
+    "acme_dns".to_owned()
+}
+
+/// Default bound on the DNS-01 TXT propagation wait, in seconds
+/// (`[server.tls.acme.dns] propagation_timeout_secs`). Five minutes covers the
+/// slow tail of public-resolver caches without parking a renewal indefinitely.
+const fn default_acme_dns_propagation_timeout_secs() -> u64 {
+    300
+}
+
+/// Default gap between propagation probes, in seconds
+/// (`[server.tls.acme.dns] poll_interval_secs`).
+const fn default_acme_dns_poll_interval_secs() -> u64 {
+    5
+}
+
+/// Upper bound on `[server.tls.acme.dns] propagation_timeout_secs`.
+///
+/// The wait is computed as `Instant::now() + Duration::from_secs(timeout)`, which
+/// **panics** on overflow — inside the spawned renewal task, where the panic
+/// silently kills the loop and leaves the self-signed placeholder served
+/// forever. An hour is far past any real provider's propagation time.
+const MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS: u64 = 3600;
+
+/// Default public resolvers the propagation wait queries
+/// (`[server.tls.acme.dns] resolvers`). Two independent operators, so one
+/// operator's stale cache cannot alone declare a record propagated.
+fn default_acme_dns_resolvers() -> Vec<String> {
+    vec!["1.1.1.1:53".to_owned(), "8.8.8.8:53".to_owned()]
 }
 
 const fn default_health_enabled() -> bool {
@@ -12390,6 +13113,214 @@ path = "/healthz"
         assert_eq!(config.storage.variants.max_source_height, 1_500);
     }
 
+    // ── [replication] (issue #1628) ──────────────────────────────────────────
+
+    #[test]
+    fn replication_parses_from_toml() {
+        let toml = r#"
+            [replication]
+            enabled = true
+            rpo_secs = 5
+            sync_interval_secs = 2
+            snapshot_interval_secs = 900
+            max_wal_bytes = 8388608
+            retention_hours = 48
+            verify_interval_secs = 3600
+            prefix = "db"
+            allow_shared_bucket = true
+
+            [replication.s3]
+            bucket = "myapp-replicas"
+            region = "auto"
+            endpoint = "https://acct.r2.cloudflarestorage.com"
+            access_key_id_env = "AUTUMN_REPLICA_ACCESS_KEY_ID"
+            secret_access_key_env = "AUTUMN_REPLICA_SECRET_ACCESS_KEY"
+            force_path_style = true
+        "#;
+        let config: AutumnConfig = toml::from_str(toml).expect("parse");
+        let replication = *config.replication.expect("section present");
+        assert!(replication.enabled);
+        assert_eq!(replication.rpo_secs, 5);
+        assert_eq!(
+            replication.sync_interval(),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(replication.snapshot_interval_secs, 900);
+        assert_eq!(replication.max_wal_bytes, 8_388_608);
+        assert_eq!(replication.retention_hours, 48);
+        assert_eq!(
+            replication.verify_interval(),
+            Some(std::time::Duration::from_secs(3600))
+        );
+        assert_eq!(replication.prefix.as_deref(), Some("db"));
+        assert!(replication.allow_shared_bucket);
+        let s3 = replication.s3.expect("s3 destination");
+        assert_eq!(s3.bucket.as_deref(), Some("myapp-replicas"));
+        assert_eq!(s3.region.as_deref(), Some("auto"));
+        assert_eq!(
+            s3.endpoint.as_deref(),
+            Some("https://acct.r2.cloudflarestorage.com")
+        );
+        assert_eq!(
+            s3.access_key_id_env.as_deref(),
+            Some("AUTUMN_REPLICA_ACCESS_KEY_ID")
+        );
+        assert_eq!(
+            s3.secret_access_key_env.as_deref(),
+            Some("AUTUMN_REPLICA_SECRET_ACCESS_KEY")
+        );
+        assert!(s3.force_path_style);
+    }
+
+    #[test]
+    fn replication_defaults_to_absent_and_carries_the_documented_rpo() {
+        let config = AutumnConfig::default();
+        assert!(config.replication.is_none());
+
+        let defaults = ReplicationConfig::default();
+        assert!(!defaults.enabled, "replication is opt-in");
+        assert_eq!(defaults.rpo_secs, 10, "AC #2: at most 10s of data loss");
+        assert_eq!(defaults.retention_hours, 168);
+        assert_eq!(defaults.max_wal_bytes, 16 * 1024 * 1024);
+        assert!(
+            !defaults.allow_shared_bucket,
+            "#1619's distinct-bucket posture"
+        );
+        assert!(defaults.validation_errors().is_empty(), "disabled is valid");
+    }
+
+    #[test]
+    fn replication_validation_names_every_problem() {
+        let no_destination = ReplicationConfig {
+            enabled: true,
+            ..ReplicationConfig::default()
+        };
+        assert!(
+            no_destination
+                .validation_errors()
+                .iter()
+                .any(|e| e.contains("no destination is configured")),
+            "{:?}",
+            no_destination.validation_errors()
+        );
+
+        let both = ReplicationConfig {
+            enabled: true,
+            path: Some("/mnt/replica".to_owned()),
+            s3: Some(ReplicationS3Config {
+                bucket: Some("b".to_owned()),
+                ..ReplicationS3Config::default()
+            }),
+            ..ReplicationConfig::default()
+        };
+        assert!(
+            both.validation_errors()
+                .iter()
+                .any(|e| e.contains("pick exactly one destination"))
+        );
+
+        let no_credentials = ReplicationConfig {
+            enabled: true,
+            s3: Some(ReplicationS3Config {
+                bucket: Some("b".to_owned()),
+                ..ReplicationS3Config::default()
+            }),
+            rpo_secs: 0,
+            retention_hours: 0,
+            ..ReplicationConfig::default()
+        };
+        let errors = no_credentials.validation_errors();
+        assert!(
+            errors.iter().any(|e| e.contains("access_key_id_env")),
+            "{errors:?}"
+        );
+        assert!(errors.iter().any(|e| e.contains("rpo_secs")), "{errors:?}");
+        assert!(
+            errors.iter().any(|e| e.contains("retention_hours")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn env_override_replication_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_REPLICATION__ENABLED", "true")
+            .with("AUTUMN_REPLICATION__RPO_SECS", "20")
+            .with("AUTUMN_REPLICATION__SYNC_INTERVAL_SECS", "7")
+            .with("AUTUMN_REPLICATION__SNAPSHOT_INTERVAL_SECS", "600")
+            .with("AUTUMN_REPLICATION__MAX_WAL_BYTES", "1048576")
+            .with("AUTUMN_REPLICATION__RETENTION_HOURS", "12")
+            .with("AUTUMN_REPLICATION__VERIFY_INTERVAL_SECS", "0")
+            .with("AUTUMN_REPLICATION__PREFIX", "replicas")
+            .with("AUTUMN_REPLICATION__ALLOW_SHARED_BUCKET", "true")
+            .with("AUTUMN_REPLICATION__S3__BUCKET", "from-env")
+            .with("AUTUMN_REPLICATION__S3__REGION", "auto")
+            .with(
+                "AUTUMN_REPLICATION__S3__ENDPOINT",
+                "https://minio.test:9000",
+            )
+            .with("AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV", "KEY")
+            .with("AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV", "SECRET")
+            .with("AUTUMN_REPLICATION__S3__FORCE_PATH_STYLE", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        let replication = *config.replication.expect("materialized from env alone");
+        assert!(replication.enabled);
+        assert_eq!(replication.rpo_secs, 20);
+        assert_eq!(replication.sync_interval_secs, Some(7));
+        assert_eq!(replication.snapshot_interval_secs, 600);
+        assert_eq!(replication.max_wal_bytes, 1_048_576);
+        assert_eq!(replication.retention_hours, 12);
+        assert_eq!(replication.verify_interval(), None);
+        assert_eq!(replication.prefix.as_deref(), Some("replicas"));
+        assert!(replication.allow_shared_bucket);
+        let s3 = replication.s3.expect("s3 from env");
+        assert_eq!(s3.bucket.as_deref(), Some("from-env"));
+        assert_eq!(s3.endpoint.as_deref(), Some("https://minio.test:9000"));
+        assert!(s3.force_path_style);
+    }
+
+    #[test]
+    fn replication_env_does_not_materialize_a_section_from_optional_keys_alone() {
+        // A lone region/prefix cannot replicate anywhere, so it must NOT conjure
+        // a section that then fails validation (mirrors #1619's #1791 fix).
+        let env = MockEnv::new()
+            .with("AUTUMN_REPLICATION__S3__REGION", "auto")
+            .with("AUTUMN_REPLICATION__PREFIX", "db")
+            .with("AUTUMN_REPLICATION__ENABLED", "false");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.replication.is_none());
+    }
+
+    #[test]
+    fn a_path_destination_from_env_never_grows_an_empty_s3_section() {
+        let env = MockEnv::new()
+            .with("AUTUMN_REPLICATION__ENABLED", "true")
+            .with("AUTUMN_REPLICATION__PATH", "/mnt/replica");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        let replication = *config.replication.expect("materialized");
+        assert_eq!(replication.path.as_deref(), Some("/mnt/replica"));
+        assert!(replication.s3.is_none(), "no S3 key was set");
+        assert!(replication.validation_errors().is_empty());
+    }
+
+    #[test]
+    fn replication_env_overlays_a_toml_section() {
+        let mut config: AutumnConfig = toml::from_str(
+            "[replication]\nenabled = false\nretention_hours = 24\npath = \"/from-toml\"",
+        )
+        .expect("parse");
+        let env = MockEnv::new().with("AUTUMN_REPLICATION__ENABLED", "true");
+        config.apply_env_overrides_with_env(&env);
+        let replication = *config.replication.expect("section");
+        assert!(replication.enabled, "env flips the TOML toggle");
+        assert_eq!(replication.retention_hours, 24, "TOML value survives");
+        assert_eq!(replication.path.as_deref(), Some("/from-toml"));
+    }
+
     #[test]
     fn backup_offsite_parses_from_toml() {
         let toml = r#"
@@ -14511,6 +15442,7 @@ path = "/healthz"
             http_challenge_port: default_acme_http_challenge_port(),
             renew_before_days: default_acme_renew_before_days(),
             ca_root_path: None,
+            dns: None,
         }
     }
 
@@ -14644,11 +15576,11 @@ path = "/healthz"
     }
 
     #[test]
-    fn validate_acme_wildcard_domain_rejected_mentions_1620() {
+    fn validate_acme_wildcard_domain_without_dns_provider_rejected() {
         let mut cfg = tls_static(None, None);
         cfg.acme = Some(acme_cfg(&["*.example.com"], "ops@example.com"));
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("#1620"), "got: {err}");
+        assert!(err.contains("[server.tls.acme.dns]"), "got: {err}");
         assert!(err.contains("wildcard"), "got: {err}");
     }
 
@@ -14768,7 +15700,7 @@ path = "/healthz"
         cfg.acme = Some(acme_cfg(&[" *.example.com "], "ops@example.com"));
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("wildcard"), "got: {err}");
-        assert!(err.contains("#1620"), "got: {err}");
+        assert!(err.contains("[server.tls.acme.dns]"), "got: {err}");
     }
 
     // Regression (#1608, Codex P2): `http_challenge_port = 0` binds an ephemeral
@@ -14824,6 +15756,324 @@ path = "/healthz"
         acme.renew_before_days = 89;
         cfg.acme = Some(acme);
         assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    // ── DNS-01 / wildcard config surface (issue #1620) ───────────────────────
+
+    fn acme_dns_cfg(provider: AcmeDnsProvider) -> AcmeDnsConfig {
+        AcmeDnsConfig {
+            provider,
+            credential: default_acme_dns_credential(),
+            propagation_timeout_secs: default_acme_dns_propagation_timeout_secs(),
+            poll_interval_secs: default_acme_dns_poll_interval_secs(),
+            resolvers: default_acme_dns_resolvers(),
+            command: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn acme_dns_section_parses_with_defaults() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls.acme]
+            domains = ["myapp.com", "*.myapp.com"]
+            contact_email = "ops@myapp.com"
+
+            [server.tls.acme.dns]
+            provider = "cloudflare"
+            "#,
+        )
+        .expect("[server.tls.acme.dns] should parse");
+        let tls = config.server.tls.expect("tls configured");
+        let acme = tls.acme.as_ref().expect("acme configured");
+        let dns = acme.dns.as_ref().expect("dns configured");
+        assert_eq!(dns.provider, AcmeDnsProvider::Cloudflare);
+        // The credential is a NAME in the encrypted credentials store, never a token.
+        assert_eq!(dns.credential, "acme_dns");
+        assert_eq!(dns.propagation_timeout_secs, 300);
+        assert_eq!(dns.poll_interval_secs, 5);
+        assert!(!dns.resolvers.is_empty());
+        assert!(tls.validate().is_ok(), "got: {:?}", tls.validate());
+    }
+
+    #[test]
+    fn acme_dns_provider_names_round_trip() {
+        for (spelling, expected) in [
+            ("cloudflare", AcmeDnsProvider::Cloudflare),
+            ("route53", AcmeDnsProvider::Route53),
+            ("exec", AcmeDnsProvider::Exec),
+        ] {
+            let extra = if expected == AcmeDnsProvider::Exec {
+                "\ncommand = [\"/usr/local/bin/dns-hook\"]"
+            } else {
+                ""
+            };
+            let src = format!(
+                "[server.tls.acme]\ndomains = [\"*.myapp.com\"]\n\
+                 contact_email = \"ops@myapp.com\"\n\
+                 [server.tls.acme.dns]\nprovider = \"{spelling}\"{extra}\n"
+            );
+            let config: AutumnConfig =
+                toml::from_str(&src).unwrap_or_else(|e| panic!("{spelling} should parse: {e}"));
+            let acme = config.server.tls.unwrap().acme.unwrap();
+            assert_eq!(acme.dns.as_ref().unwrap().provider, expected);
+            assert!(acme.validate().is_ok(), "{spelling}: {:?}", acme.validate());
+        }
+    }
+
+    // AC3: DNS provider API tokens are NEVER supplied in plaintext `autumn.toml`.
+    // The section has no field to hold one, and `deny_unknown_fields` turns an
+    // operator's attempt into a load-time error rather than a silently-ignored key
+    // that leaves them wondering why the token "did not work".
+    #[test]
+    fn acme_dns_section_rejects_an_inline_secret() {
+        for secret_key in [
+            "api_token",
+            "token",
+            "secret_access_key",
+            "access_key_id",
+            "api_key",
+        ] {
+            let src = format!(
+                "[server.tls.acme]\ndomains = [\"*.myapp.com\"]\n\
+                 contact_email = \"ops@myapp.com\"\n\
+                 [server.tls.acme.dns]\nprovider = \"cloudflare\"\n{secret_key} = \"s3cret\"\n"
+            );
+            let err = toml::from_str::<AutumnConfig>(&src)
+                .err()
+                .unwrap_or_else(|| panic!("{secret_key} in autumn.toml must be rejected"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(secret_key),
+                "the rejection must name the offending key: {msg}"
+            );
+        }
+    }
+
+    // AC1: a wildcard domain is accepted once — and only once — a DNS-01 provider
+    // is configured, because only DNS-01 can validate a wildcard identifier.
+    #[test]
+    fn validate_acme_wildcard_requires_a_dns_provider() {
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&["*.myapp.com"], "ops@myapp.com"));
+        let err = cfg
+            .validate()
+            .expect_err("a wildcard without [server.tls.acme.dns] must be rejected");
+        assert!(err.contains("wildcard"), "got: {err}");
+        assert!(
+            err.contains("[server.tls.acme.dns]"),
+            "the message must name the section that fixes it: {err}"
+        );
+        assert!(err.contains("DNS-01"), "got: {err}");
+
+        // With the section present it is accepted.
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["myapp.com", "*.myapp.com"], "ops@myapp.com");
+        acme.dns = Some(acme_dns_cfg(AcmeDnsProvider::Cloudflare));
+        cfg.acme = Some(acme);
+        assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    // A malformed wildcard never reaches the CA as an opaque rejection.
+    #[test]
+    fn validate_acme_rejects_malformed_wildcards() {
+        for bad in ["*", "*.", "*myapp.com", "app.*.myapp.com", "*.*.myapp.com"] {
+            let mut cfg = tls_static(None, None);
+            let mut acme = acme_cfg(&[bad], "ops@myapp.com");
+            acme.dns = Some(acme_dns_cfg(AcmeDnsProvider::Cloudflare));
+            cfg.acme = Some(acme);
+            let err = cfg.validate().expect_err(&format!(
+                "`{bad}` is not a usable wildcard and must be rejected"
+            ));
+            assert!(
+                err.contains(bad),
+                "the message must echo the offending entry `{bad}`: {err}"
+            );
+        }
+
+        // The one well-formed shape stays accepted.
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        acme.dns = Some(acme_dns_cfg(AcmeDnsProvider::Cloudflare));
+        cfg.acme = Some(acme);
+        assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    #[test]
+    fn validate_acme_dns_exec_requires_a_command() {
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        acme.dns = Some(acme_dns_cfg(AcmeDnsProvider::Exec));
+        cfg.acme = Some(acme);
+        let err = cfg
+            .validate()
+            .expect_err("provider = \"exec\" with no command must be rejected");
+        assert!(err.contains("command"), "got: {err}");
+
+        // …and a command on a non-exec provider is a misconfiguration too: it
+        // would be silently ignored while the operator believes it runs.
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.command = vec!["/usr/local/bin/dns-hook".to_owned()];
+        acme.dns = Some(dns);
+        cfg.acme = Some(acme);
+        let err = cfg
+            .validate()
+            .expect_err("command on cloudflare is invalid");
+        assert!(err.contains("command"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_acme_dns_rejects_unusable_propagation_bounds() {
+        // A zero timeout would fail every order before a record could ever appear.
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.propagation_timeout_secs = 0;
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("zero timeout is invalid");
+        assert!(err.contains("propagation_timeout_secs"), "got: {err}");
+
+        // A zero poll interval would busy-loop the resolver.
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.poll_interval_secs = 0;
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("zero poll interval is invalid");
+        assert!(err.contains("poll_interval_secs"), "got: {err}");
+
+        // A poll interval longer than the whole budget means exactly one probe.
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.poll_interval_secs = 600;
+        dns.propagation_timeout_secs = 60;
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("interval > timeout is invalid");
+        assert!(err.contains("poll_interval_secs"), "got: {err}");
+    }
+
+    // An unbounded budget reaches `Instant::now() + Duration::from_secs(..)`,
+    // which PANICS on overflow — inside the spawned renewal task, where the
+    // panic kills the loop silently and the placeholder is served forever.
+    #[test]
+    fn validate_acme_dns_rejects_an_unbounded_propagation_timeout() {
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.propagation_timeout_secs = u64::MAX;
+        acme.dns = Some(dns);
+        let err = acme
+            .validate()
+            .expect_err("an unbounded propagation budget is invalid");
+        assert!(err.contains("propagation_timeout_secs"), "got: {err}");
+
+        // The documented ceiling itself is accepted.
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.propagation_timeout_secs = MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS;
+        acme.dns = Some(dns);
+        assert!(acme.validate().is_ok(), "got: {:?}", acme.validate());
+    }
+
+    // `command[0]` is handed to the OS verbatim, so a blank or padded program
+    // would fail at order time with an opaque ENOENT rather than at boot.
+    #[test]
+    fn validate_acme_dns_rejects_an_unusable_exec_program() {
+        for bad in [
+            vec![String::new()],
+            vec!["   ".to_owned(), "arg".to_owned()],
+        ] {
+            let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+            let mut dns = acme_dns_cfg(AcmeDnsProvider::Exec);
+            dns.command = bad.clone();
+            acme.dns = Some(dns);
+            let err = acme
+                .validate()
+                .expect_err(&format!("`{bad:?}` is not a usable exec command"));
+            assert!(err.contains("command"), "got: {err}");
+        }
+
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Exec);
+        dns.command = vec![" /usr/local/bin/hook ".to_owned()];
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("a padded program is invalid");
+        assert!(err.contains("whitespace"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_acme_dns_rejects_a_blank_or_unparseable_resolver() {
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.resolvers = Vec::new();
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("no resolvers is invalid");
+        assert!(err.contains("resolvers"), "got: {err}");
+
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.resolvers = vec!["not a resolver".to_owned()];
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("garbage resolver is invalid");
+        assert!(err.contains("resolvers"), "got: {err}");
+    }
+
+    #[test]
+    fn acme_dns_resolver_addresses_accept_bare_ips_and_explicit_ports() {
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.resolvers = vec!["1.1.1.1".to_owned(), "9.9.9.9:5353".to_owned()];
+        let addrs = dns.resolver_addrs().expect("resolvers parse");
+        assert_eq!(addrs[0].port(), 53, "a bare IP defaults to port 53");
+        assert_eq!(addrs[1].port(), 5353);
+    }
+
+    #[test]
+    fn validate_acme_dns_rejects_a_blank_credential_reference() {
+        for blank in ["", "   "] {
+            let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+            let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+            dns.credential = blank.to_owned();
+            acme.dns = Some(dns);
+            let err = acme.validate().expect_err("a blank credential is invalid");
+            assert!(err.contains("credential"), "got: {err}");
+        }
+    }
+
+    // AC7 support: the grader `autumn doctor` uses to tell an operator that their
+    // `tenancy.base_domain` is not covered by the certificate.
+    #[test]
+    fn san_covers_host_matches_rfc6125_wildcard_rules() {
+        // Exact match.
+        assert!(san_covers_host("myapp.com", "myapp.com"));
+        assert!(
+            san_covers_host("MyApp.COM", "myapp.com"),
+            "case-insensitive"
+        );
+        assert!(!san_covers_host("myapp.com", "tenant1.myapp.com"));
+
+        // A wildcard covers exactly ONE label.
+        assert!(san_covers_host("*.myapp.com", "tenant1.myapp.com"));
+        assert!(
+            !san_covers_host("*.myapp.com", "a.b.myapp.com"),
+            "a wildcard must not span a dot"
+        );
+        assert!(
+            !san_covers_host("*.myapp.com", "myapp.com"),
+            "a wildcard does not cover the apex"
+        );
+        assert!(!san_covers_host("*.myapp.com", "myapp.com.evil.com"));
+        assert!(!san_covers_host("*.myapp.com", ""));
+
+        // A trailing dot on the queried host is the same name.
+        assert!(san_covers_host("*.myapp.com", "tenant1.myapp.com."));
+    }
+
+    #[test]
+    fn acme_config_covers_host_uses_every_san() {
+        let acme = acme_cfg(&["myapp.com", "*.myapp.com"], "ops@myapp.com");
+        assert!(acme.covers_host("myapp.com"));
+        assert!(acme.covers_host("tenant42.myapp.com"));
+        assert!(!acme.covers_host("other.example.com"));
+        assert!(!acme.covers_host("deep.tenant42.myapp.com"));
     }
 
     // Companion: a valid domain list plus the default challenge port is unaffected

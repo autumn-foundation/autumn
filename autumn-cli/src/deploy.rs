@@ -66,6 +66,13 @@ pub enum DeployError {
     #[error("failed to load configuration: {0}")]
     Config(String),
 
+    /// `deploy` was invoked on a platform where it is not supported natively
+    /// (issue #1616). Its own variant rather than [`Self::Config`]: nothing is
+    /// wrong with the configuration, and prefixing this message with "failed to
+    /// load configuration" would send the operator to the wrong file.
+    #[error("{0}")]
+    UnsupportedPlatform(String),
+
     /// One or more preflight graders failed.
     #[error(
         "preflight failed: {0} check(s) did not pass — resolve the issues above and re-run \
@@ -1486,13 +1493,71 @@ pub fn build_rollback_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
 
 // ── Command entrypoint ───────────────────────────────────────────────────────
 
+/// The policy row `autumn deploy`'s remote actions are refused under, quoted
+/// verbatim from [`crate::platform::POLICY`] — `tier_two_windows_error` panics
+/// on a name the policy does not carry, so this is checked by every test that
+/// builds a refusal.
+const DEPLOY_TIER_TWO_POLICY_COMMAND: &str = "autumn deploy up / rollback / status / maintenance";
+
+/// Whether an action opens an SSH session to a remote host.
+///
+/// This is the line the platform policy is drawn on (#1616). The remote actions
+/// shell out to `ssh`/`sh`, and `up`/`rollback`/`maintenance` additionally stage
+/// the environment file — carrying the app's signing secret and database
+/// password — through `exec::stage_temp_file`, whose `chmod 0600` is
+/// `#[cfg(unix)]`. On native Windows that file would be written with whatever
+/// the containing directory's ACLs happen to be, which is the silent
+/// degradation the policy forbids.
+///
+/// `check` and `plan` are on the other side of that line: `plan` renders the
+/// systemd unit and step list from `resolved` alone, and `check` grades the
+/// project config plus an `ssh_reachability` probe that is a portable
+/// [`TcpStream::connect_timeout`] — no `ssh` binary, no staged file, nothing
+/// written anywhere. They are Tier 1 on Windows, and they are precisely how a
+/// Windows developer validates a deploy config *before* switching to WSL2 to
+/// run it.
+///
+/// The match is deliberately exhaustive with no wildcard arm: a new
+/// [`DeployAction`] must be classified here or the crate does not compile, so a
+/// remote action can never default into "runs natively on Windows".
+const fn reaches_a_remote_host(action: DeployAction) -> bool {
+    match action {
+        DeployAction::Check | DeployAction::Plan => false,
+        DeployAction::Up
+        | DeployAction::Rollback
+        | DeployAction::Status
+        | DeployAction::MaintenanceOn
+        | DeployAction::MaintenanceOff => true,
+    }
+}
+
+/// The refusal for a native-Windows `autumn deploy` action that reaches a remote
+/// host, or `None` when the action is local-only or the host is supported.
+///
+/// Refusing up front — before any config load, SSH probe or temp file — is what
+/// keeps Tier 2 from being a silent degradation (#1616).
+///
+/// Takes the OS family as a string so the Windows branch is covered by tests on
+/// every host.
+fn windows_deploy_refusal(os: &str, action: DeployAction) -> Option<String> {
+    (os == "windows" && reaches_a_remote_host(action))
+        .then(|| crate::platform::tier_two_windows_error(DEPLOY_TIER_TWO_POLICY_COMMAND))
+}
+
 /// Run the requested `autumn deploy` subcommand.
 ///
 /// # Errors
 ///
-/// Returns [`DeployError::Config`] when the project config cannot be loaded and
+/// Returns [`DeployError::UnsupportedPlatform`] when a remote-host action is
+/// invoked on native Windows (those paths are Tier 2 / WSL2, see #1616;
+/// `check` and `plan` are local-only and run natively),
+/// [`DeployError::Config`] when the project config cannot be loaded, and
 /// [`DeployError::PreflightFailed`] when `check` finds a failing grader.
 pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployError> {
+    // Refuse before anything else: no config load, no SSH probe, no temp file.
+    if let Some(refusal) = windows_deploy_refusal(std::env::consts::OS, action) {
+        return Err(DeployError::UnsupportedPlatform(refusal));
+    }
     // Ambient load (the operator's shell profile, `dev` by default): used ONLY to
     // read `[deploy]` and compute `resolved` — in particular `resolved.profile`,
     // the profile the deployed service will actually boot under (default `prod`).
@@ -4792,6 +4857,137 @@ fn remote_parent_dir(path: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    // ── Tier 2 fail-fast on Windows (issue #1616) ──────────────────────────
+    //
+    // The remote actions shell out to `ssh`/`sh`, and `up`/`rollback`/
+    // `maintenance` stage secrets with Unix file modes (`exec::stage_temp_file`
+    // skips its `chmod 0600` off Unix), so a native Windows deploy would write
+    // the environment file carrying the signing secret and database password
+    // without an owner-only mode. That is exactly the silent degradation the
+    // platform policy forbids, so those actions refuse up front.
+    //
+    // `check` and `plan` are the other half, and the half that first shipped
+    // wrong: they are local-only, so refusing them claimed something untrue
+    // about the command AND took away the only way a Windows developer can
+    // validate a deploy config before switching to WSL2.
+
+    /// Every [`DeployAction`], for the completeness check below. The real gate
+    /// is the wildcard-free match in `reaches_a_remote_host` — a new variant
+    /// fails to compile until it is classified; this array only keeps the two
+    /// lists in this module honest about covering it.
+    const ALL_DEPLOY_ACTIONS: [DeployAction; 7] = [
+        DeployAction::Check,
+        DeployAction::Plan,
+        DeployAction::Rollback,
+        DeployAction::Up,
+        DeployAction::Status,
+        DeployAction::MaintenanceOn,
+        DeployAction::MaintenanceOff,
+    ];
+
+    /// The actions that open an SSH session to a remote host. These are the
+    /// Tier 2 surface: `up`/`rollback`/`maintenance` also stage secrets through
+    /// `exec::stage_temp_file`, whose `chmod 0600` is `#[cfg(unix)]`.
+    const REMOTE_ACTIONS: [DeployAction; 5] = [
+        DeployAction::Up,
+        DeployAction::Rollback,
+        DeployAction::Status,
+        DeployAction::MaintenanceOn,
+        DeployAction::MaintenanceOff,
+    ];
+
+    /// The actions that never touch a remote host: `plan` renders the unit from
+    /// `resolved` alone, and `check` grades config plus a portable
+    /// `TcpStream::connect_timeout` reachability probe.
+    const LOCAL_ACTIONS: [DeployAction; 2] = [DeployAction::Check, DeployAction::Plan];
+
+    #[test]
+    fn windows_deploys_are_refused_with_the_policy_message() {
+        for action in REMOTE_ACTIONS {
+            let refusal =
+                windows_deploy_refusal("windows", action).expect("windows must be refused");
+            assert!(refusal.contains("Tier 2 (WSL2)"), "{action:?}: {refusal}");
+            assert!(
+                refusal.contains(crate::platform::POLICY_DOC_URL),
+                "{action:?}: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_locally_verifiable_spine_runs_natively_on_windows() {
+        // `deploy check` and `deploy plan` do NOT shell out to ssh and stage no
+        // secrets — they grade config and render the unit. Refusing them would
+        // take away the one way a Windows developer can validate a deploy config
+        // before switching to WSL2 to run it, and it would be a false claim: they
+        // work. (This is the regression the first green `windows-tier1` run hid,
+        // because `Test (windows-latest)` had failed to link before reaching the
+        // `integration::deploy::*` suite that proves it.)
+        for action in LOCAL_ACTIONS {
+            assert!(
+                windows_deploy_refusal("windows", action).is_none(),
+                "{action:?} is local-only and must run natively on Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn unix_deploys_are_not_refused() {
+        for action in REMOTE_ACTIONS.iter().chain(LOCAL_ACTIONS.iter()).copied() {
+            assert!(
+                windows_deploy_refusal("linux", action).is_none(),
+                "{action:?}"
+            );
+            assert!(
+                windows_deploy_refusal("macos", action).is_none(),
+                "{action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_deploy_action_is_classified() {
+        // A new `DeployAction` must be deliberately placed in one list or the
+        // other. Without this, an added remote action would silently default to
+        // "runs natively on Windows" — the silent degradation #1616 forbids.
+        let classified = REMOTE_ACTIONS.len() + LOCAL_ACTIONS.len();
+        assert_eq!(
+            classified,
+            ALL_DEPLOY_ACTIONS.len(),
+            "every DeployAction must be classified as remote or local"
+        );
+        for action in ALL_DEPLOY_ACTIONS {
+            assert!(
+                REMOTE_ACTIONS.contains(&action) || LOCAL_ACTIONS.contains(&action),
+                "{action:?} is not classified"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_is_an_error_so_it_exits_non_zero() {
+        // Fail *fast*: this must surface as an error the caller propagates,
+        // never a warning printed before the deploy proceeds anyway.
+        let err = DeployError::UnsupportedPlatform(
+            windows_deploy_refusal("windows", DeployAction::Up).unwrap(),
+        );
+        assert!(err.to_string().contains("Tier 2 (WSL2)"));
+    }
+
+    #[test]
+    fn the_refusal_does_not_masquerade_as_a_config_failure() {
+        // `DeployError::Config` renders as "failed to load configuration: …",
+        // which would send the operator hunting through autumn.toml for a
+        // problem that is not there.
+        let err = DeployError::UnsupportedPlatform(
+            windows_deploy_refusal("windows", DeployAction::Up).unwrap(),
+        );
+        assert!(
+            !err.to_string().contains("failed to load configuration"),
+            "{err}"
+        );
+    }
+
     use super::*;
 
     fn resolved_defaults() -> ResolvedDeployConfig {
