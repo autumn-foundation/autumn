@@ -436,9 +436,8 @@ fn the_api_flavor_ships_the_same_gate() {
 #[test]
 fn the_auditor_comes_from_its_pin_and_never_from_a_cache() {
     let (_tmp, project) = scaffold("cache-app", &[]);
-    let ci = code_only(&read_project_file(&project, ".github/workflows/ci.yml"));
     for workflow in [
-        ci.clone(),
+        code_only(&read_project_file(&project, ".github/workflows/ci.yml")),
         code_only(&read_repo_file(".github/workflows/ci.yml")),
         code_only(&read_repo_file(".github/workflows/publish-gate.yml")),
     ] {
