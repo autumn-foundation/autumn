@@ -166,11 +166,17 @@ fn from_patch_rejects_custom_invalid_once_merged() {
 
 // ── `must_match` (issue #1751 residual gap) ─────────────────────────────────
 //
-// `must_match` is cross-field: it has no single-field `Patch<T>` trait to
-// attach to at all (unlike `ip`/`does_not_contain`, which at least compile
-// with the wrong semantics). It is dropped from the `Update{Model}` patch
-// field the same way `custom` is, and enforced here on the merged concrete
-// struct, where `password`/`password_confirm` are ordinary `String`s again.
+// `must_match` is cross-field: validator's `validate_must_match<T: Eq>(a, b)`
+// only needs `Eq`, which `Patch<T>` derives, so it DOES compile on a
+// `Patch<T>` field pair -- like `ip`/`does_not_contain`, it compiles with the
+// wrong semantics rather than failing to compile at all. Comparing the raw
+// `Patch<T>` values means `Set(v)` on one side against `Unchanged`/`Clear` on
+// the other (whenever only one of the pair is touched by the patch) would
+// spuriously fail even though nothing invalid was submitted. So it is dropped
+// from the `Update{Model}` patch field the same way `custom` is, and enforced
+// here on the merged concrete struct, where `password`/`password_confirm` are
+// ordinary `String`s being compared to each other, not to a tri-state
+// sentinel.
 
 mod cross_field_schema {
     autumn_web::reexports::diesel::table! {

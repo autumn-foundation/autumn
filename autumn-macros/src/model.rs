@@ -2894,10 +2894,15 @@ fn reject_nested_validator(field: &Field) -> Result<(), syn::Error> {
 /// `Patch<T>`, which only implements validator's per-field *declarative* traits
 /// (`length`, `email`, `url`, `range`, `contains`, `ip`, `regex`, `required`,
 /// …). The validators in [`NON_PATCH_VALIDATORS`] (`custom`, `must_match`,
-/// `nested`, `credit_card`, `non_control_character`) have no `Patch<T>` impl,
-/// so propagating them verbatim would break `UpdateModel` compilation even
-/// though `NewModel` still compiles — a latent footgun for a user who adds e.g.
-/// `#[validate(custom(...))]` to a model field.
+/// `nested`, `credit_card`, `non_control_character`) have no *usable*
+/// `Patch<T>` impl (`must_match` technically compiles via `Patch<T>: Eq`, but
+/// with the wrong semantics — comparing raw `Unchanged`/`Set`/`Clear`
+/// sentinels rather than the underlying values), so propagating them verbatim
+/// would break `UpdateModel` compilation or its correctness even though
+/// `NewModel` still compiles — a latent footgun for a user who adds e.g.
+/// `#[validate(custom(...))]` to a model field. `nested` is the one exception:
+/// it is never reached by this filter at all, because [`reject_nested_validator`]
+/// refuses it outright (on `NewModel` too) before this function ever runs.
 ///
 /// `required` is deliberately NOT in the denylist (#1719 / Codex P2): it must
 /// propagate so the `UpdateModel` rejects an explicit `null` on a required
@@ -2940,10 +2945,15 @@ fn reject_nested_validator(field: &Field) -> Result<(), syn::Error> {
 /// Limitation: a type *alias* to `Option` is not detected (no worse than the
 /// derive's own behaviour, which also inspects the syntactic type).
 ///
-/// Documented limitation: `custom`/`must_match`/`nested`/`does_not_contain`/etc.
-/// are enforced on create (via `NewModel`) but NOT on the PATCH update path; a
-/// follow-up may add merged-model validation for cross-field/custom rules.
-/// (`required` IS enforced on the PATCH path via the tri-state `Patch<T>` impl.)
+/// Documented limitation: `custom`/`must_match`/`does_not_contain`/etc. are
+/// enforced on create (via `NewModel`) but NOT on the PATCH update path unless
+/// the model builds a draft via `from_patch`, which validates the merged
+/// concrete model and closes this gap for `custom`, `must_match`,
+/// `does_not_contain`, and `ip` on `Option<…>` fields (issues #1778/#1751).
+/// `nested` is not part of that coverage: it is refused outright everywhere
+/// (create included) by [`reject_nested_validator`], never merely
+/// create-only. (`required` IS enforced on the PATCH path via the tri-state
+/// `Patch<T>` impl.)
 fn validate_attrs_for_patch(field: &Field) -> Vec<syn::Attribute> {
     let field_is_option = is_option_type(&field.ty);
     let mut out = Vec::new();
@@ -6319,11 +6329,14 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // validated on the update path via `from_patch`. The model's fields
             // are concrete `T` (not `Patch<T>`), so every validator — including
             // the ones the `Patch<T>` path cannot express (`ip` on `Option`,
-            // `does_not_contain`, and the cross-field `custom`/`must_match`/
-            // `nested`) — compiles and runs here without hitting the E0119
-            // trait-coherence walls that block them on `Patch<T>`. The struct
-            // only derives `validator::Validate` when `has_validation` is set
-            // (see below), so the attribute is always registered when present.
+            // `does_not_contain`, and the cross-field `custom`/`must_match`) —
+            // compiles and runs here without hitting the E0119 trait-coherence
+            // walls that block them on `Patch<T>`. (`nested` is not among them:
+            // `reject_nested_validator` refuses it outright earlier in this
+            // function, so a `#[validate(nested)]` field never reaches this
+            // codegen at all — see #1751.) The struct only derives
+            // `validator::Validate` when `has_validation` is set (see below), so
+            // the attribute is always registered when present.
             let val_attrs = validate_attrs(f);
             // Encrypted columns route through an AEAD wrapper transparently:
             // `serialize_as` encrypts on write, `deserialize_as` decrypts on read.
@@ -6433,10 +6446,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     //   mirroring the create path. `required` is the one non-skip rule: its
     //   `Patch<T>` impl fails `Clear`/`Set(None)` so a PATCH can't null a
     //   required column. Non-declarative/struct-level validators (`custom`,
-    //   `must_match`, `nested`, `credit_card`, `non_control_character`) have no
+    //   `must_match`, `credit_card`, `non_control_character`) have no *usable*
     //   `Patch<T>` impl and are filtered out here by `validate_attrs_for_patch`
     //   (they still run on `NewX`); see that helper for the documented
-    //   create-vs-update limitation.
+    //   create-vs-update limitation. `nested` never reaches this filter: it is
+    //   refused outright, on every generated struct, before this point.
     // - #[lock_version] field: plain required T (the client supplies the
     //   version they read; the framework increments it atomically)
     let mut update_fields: Vec<TokenStream> = fields_for_new
@@ -6446,8 +6460,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let ty = &f.ty;
             // #1719: `Patch<T>` only implements validator's per-field
             // declarative traits, so non-declarative/struct-level validators
-            // (`custom`, `must_match`, `nested`, …) must be stripped here or the
-            // `UpdateModel` would fail to compile. `NewModel` keeps them all.
+            // (`custom`, `must_match`, …) must be stripped here or the
+            // `UpdateModel` would fail to compile or misvalidate. `NewModel`
+            // keeps them all. (`nested` cannot reach this field at all --
+            // `reject_nested_validator` already refused it earlier.)
             let val_attrs = validate_attrs_for_patch(f);
             // #1654: see the `NewX` comment -- the patch carries the wrapper for
             // the same reason. `Patch<T>` forwards `Deserialize` and every
@@ -6499,8 +6515,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // — not `Patch<T>` — the model's `#[validate(...)]` rules run against real
     // values, so the validators that hit E0119 coherence walls on `Patch<T>`
     // (`ip` on `Option`, `does_not_contain`) and the cross-field ones
-    // (`custom`, `must_match`, `nested`) are all enforced on the update path,
-    // returning the same 422 field-error map as create. Runs before the
+    // (`custom`, `must_match`) are all enforced on the update path, returning
+    // the same 422 field-error map as create. (`nested` is never among
+    // `#name`'s rules here: it is refused outright at parse time, so no
+    // generated struct ever carries it — #1751.) Runs before the
     // `before_update` hook, mirroring create (where `validate_new` runs before
     // `before_create`). Emitted only when the model declares validation; when it
     // does not there is nothing to check and the model derives no `Validate`.
