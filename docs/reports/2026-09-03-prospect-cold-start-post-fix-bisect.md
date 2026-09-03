@@ -555,8 +555,13 @@ calibrated noise floor in hand:**
 ## 🏁 Verdict
 
 **Undetermined** on the pre-registered falsifiable question specifically
-(*does a single commit explain the shortfall?* — no), but **not** for the
-reason the immediately preceding revision of this section gave. This
+(*does a single commit explain the shortfall?* — **unknown**, not "no":
+this report never disproved the specific-commit hypothesis, it only
+found that no candidate clears a confidence bar this apparatus's own
+noise floor was never rigorously established — a materially weaker,
+still-open claim, corrected here after an earlier revision of this
+sentence stated a flat "no"), but **not** for the reason the immediately
+preceding revision of this section gave. This
 report went through four revisions before landing here, each one caught
 by a different Codex review finding on PR #2477 — worth stating plainly
 rather than only keeping the final number, since the corrections mostly
