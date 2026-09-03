@@ -181,16 +181,27 @@ mod tests {
         // THOSE binds before this test's client connects — observed on
         // windows-latest CI as this assertion failing because the request
         // landed on a live, unrelated mock server instead of getting
-        // refused. Port 1 (tcpmux) is never bound by anything in this
-        // suite or a CI sandbox and needs no privilege to *connect* to
-        // (only to bind), so there is nothing to race against.
+        // refused.
+        //
+        // Instead, keep an ephemeral listener bound (and in scope) for the
+        // whole test but never `accept()` on it: that both reserves the
+        // port so nothing else can grab it (no race to lose) and never
+        // answers, so the client's own short timeout below is what fails
+        // the request — deterministic either way, and unlike connecting to
+        // a fixed low port (e.g. 127.0.0.1:1), it makes no assumption
+        // about what else might be listening on the host or CI runner.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
         let client = Client::builder()
             .no_proxy()
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
-        let val = fetch_endpoint(&client, "http://127.0.0.1:1", "/test");
+        let val = fetch_endpoint(&client, &format!("http://127.0.0.1:{port}"), "/test");
         assert!(val.get("error").is_some());
+
+        drop(listener);
     }
 
     #[test]

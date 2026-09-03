@@ -1464,8 +1464,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connected, landing on a live, unrelated server instead of getting refused.
   The mock server now retries past a transient `accept()`/read failure
   instead of spending one of its `num_requests` slots on it, and the
-  failure-path test connects to a fixed, never-bound port (`127.0.0.1:1`)
-  instead of racing the ephemeral-port allocator.
+  failure-path test now binds its own ephemeral listener and keeps it
+  reserved (bound, unaccepted) for the request instead of dropping it —
+  which both removes the race (nothing else can grab that port) and makes
+  no assumption about what else might be listening on the host.
 
 ### Added
 
