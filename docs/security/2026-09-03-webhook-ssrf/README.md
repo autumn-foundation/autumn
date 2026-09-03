@@ -161,3 +161,34 @@ That is the correct behavior for the documented, subscriber-facing feature,
 matching what `get_ssrf_safe` already enforces elsewhere in the framework, but
 it is a behavior change for any app relying on the previous unrestricted
 delivery. Recorded under `## [Unreleased] → Security` in `CHANGELOG.md`.
+
+## Follow-up: circuit breaker bypass on the fixed path (same day, pre-merge)
+
+Codex's automated review on PR #2480 caught a correctness gap in the fix
+itself: `.ssrf_safe()` routes the request through `RequestBuilder::send_custom`,
+which — like the mock path — deliberately bypasses `send_recorded`'s
+circuit-breaker block. That bypass is right for `get_ssrf_safe`'s usual case
+(a one-off fetch of an arbitrary caller-chosen URL, where per-host breaker
+state is mostly noise), but wrong for `deliver_webhook_job`, which makes
+*repeated* calls to the same subscriber host: without the breaker, a down
+receiver no longer fails fast, and every queued delivery pays a full
+DNS-resolve-and-connect timeout instead of the open-breaker short-circuit
+every other outbound call gets — amplifying exactly the thundering-herd load
+the job's own jitter/backoff exists to avoid. Not a security regression (no
+tenant boundary or SSRF protection is affected), but a resilience regression
+introduced by the security fix.
+
+**Fix:** scoped to the one call site rather than widening `get_ssrf_safe`'s
+global bypass semantics, which other one-off SSRF-safe fetches elsewhere may
+be relying on. `http_client.rs` extracts the existing host-derivation +
+`resilience_config` lookup into `breaker_for_url` (shared by both
+`send_recorded` and the new path, so they cannot drift) and adds
+`pub(crate) BreakerGuardedCall`: `begin()` gates on the breaker exactly like
+`send_recorded`'s own `before_call` check, `record()` applies the same
+`< 500` success threshold. `deliver_webhook_job` wraps its `.ssrf_safe()` send
+with it.
+
+**Verification:** `cargo test -p autumn-web --lib webhook_outbound:: http_client::`
+— 87/87 passed, including `test_http_client_circuit_breaker_integration` and
+`deliver_webhook_job_refuses_ssrf_target_url`; `cargo fmt --all --check`;
+`cargo clippy -p autumn-web --all-targets -- -D warnings` — clean.
