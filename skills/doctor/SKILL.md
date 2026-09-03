@@ -88,9 +88,12 @@ Windows machine. Read its `detail` rather than its status:
   OpenSSL via `vcpkg` with `VCPKG_ROOT` set.
 
 When a user reports that `autumn serve --daemon` (or `stop`/`status`/`restart`),
-`autumn deploy`, or a `scripts/*.sh` gate fails on Windows, that is the
-**documented Tier 2 refusal, not a bug**: those are built on Unix domain
-sockets, POSIX signals, `ssh`, and bash. Tell them to run it from a WSL2 shell.
+`autumn deploy up` (or `rollback`/`status`/`maintenance`), or a `scripts/*.sh`
+gate fails on Windows, that is the **documented Tier 2 refusal, not a bug**:
+those are built on Unix domain sockets, POSIX signals, `ssh`, and bash. Tell
+them to run it from a WSL2 shell. `autumn deploy check` and `autumn deploy plan`
+are the exception and Tier 1 — they are local-only, so a Windows developer can
+validate a deploy config natively before switching to WSL2 to run it.
 Note `autumn serve --bundled-pg` implies `--daemon`, so it is Tier 2 too — on
 Windows use `autumn dev` for a managed-Postgres app. See
 `docs/guide/platform-support.md`.

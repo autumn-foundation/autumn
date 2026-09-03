@@ -1223,15 +1223,29 @@ jobs:
           if ($output -notmatch 'WSL2') { throw "the daemon refusal did not name WSL2: $output" }
           if ($output -notmatch 'platform-support') { throw "the daemon refusal did not link the policy: $output" }
 
-          $output = & $autumn deploy check 2>&1 | Out-String
+          $output = & $autumn deploy up 2>&1 | Out-String
           Write-Host $output
-          if ($LASTEXITCODE -eq 0) { throw "autumn deploy must not succeed on native Windows" }
+          if ($LASTEXITCODE -eq 0) { throw "autumn deploy up must not succeed on native Windows" }
           if ($output -notmatch 'Tier 2') { throw "the deploy refusal did not name the tier: $output" }
+          if ($output -notmatch 'WSL2') { throw "the deploy refusal did not name WSL2: $output" }
           if ($output -match 'failed to load configuration') { throw "the refusal must not masquerade as a config error: $output" }
 
-          # Both commands are SUPPOSED to exit non-zero, and the GitHub pwsh
-          # wrapper appends `exit $LASTEXITCODE` — so without this the step
-          # fails precisely when the policy is working.
+          # The other half of the policy: `deploy check` is Tier 1 (local-only —
+          # it grades config and probes reachability with a portable TCP
+          # connect), so it must NOT be refused. It still exits non-zero here
+          # because the scaffolded app configures no `[deploy] host` — the point
+          # is WHICH failure it is. Refusing it would take away the only way a
+          # Windows developer can validate a deploy config before switching to
+          # WSL2, and would claim something untrue about the command.
+          $output = & $autumn deploy check 2>&1 | Out-String
+          Write-Host $output
+          if ($output -match 'Tier 2') { throw "autumn deploy check is Tier 1 and must run natively: $output" }
+          if ($output -notmatch '\[deploy\] host') { throw "deploy check did not reach its config grading: $output" }
+
+          # All three invocations are SUPPOSED to exit non-zero (the first two
+          # by refusal, the third because the scaffolded app has no deploy
+          # host), and the GitHub pwsh wrapper appends `exit $LASTEXITCODE` — so
+          # without this the step fails precisely when the policy is working.
           exit 0
 
       - name: Upload journey logs

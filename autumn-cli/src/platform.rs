@@ -109,16 +109,23 @@ pub const POLICY: &[PolicyEntry] = &[
                cleanly with the app.",
     },
     PolicyEntry {
+        command: "autumn deploy check / plan",
+        tier: SupportTier::Native,
+        note: "Local-only: plan renders the unit and step list, check grades the \
+               config and probes SSH reachability with a portable TCP connect. \
+               Validate a deploy config here before running it from WSL2.",
+    },
+    PolicyEntry {
         command: "autumn serve --daemon / stop / status / restart",
         tier: SupportTier::Wsl2,
         note: "The daemon lifecycle is built on Unix domain sockets and POSIX \
                signals; run it inside WSL2.",
     },
     PolicyEntry {
-        command: "autumn deploy",
+        command: "autumn deploy up / rollback / status / maintenance",
         tier: SupportTier::Wsl2,
-        note: "Deploys shell out to ssh/sh and stage secrets with Unix file \
-               modes; run them inside WSL2.",
+        note: "These reach the host over ssh/sh, and up/rollback/maintenance \
+               stage secrets with Unix file modes; run them inside WSL2.",
     },
     PolicyEntry {
         command: "scripts/*.sh contributor gates",
@@ -151,7 +158,7 @@ pub const WINDOWS_PREREQUISITES: &[WindowsPrerequisite] = &[
         requirement: "OpenSSL via vcpkg with VCPKG_ROOT set (see docs/guide/generators.md)",
     },
     WindowsPrerequisite {
-        subject: "autumn serve --daemon / deploy / scripts/*.sh",
+        subject: "autumn serve --daemon / deploy up / scripts/*.sh",
         requirement: "WSL2 (Tier 2)",
     },
 ];
@@ -236,7 +243,7 @@ mod tests {
     fn every_ac_named_tier_two_command_is_tier_two() {
         for command in [
             "autumn serve --daemon / stop / status / restart",
-            "autumn deploy",
+            "autumn deploy up / rollback / status / maintenance",
             "scripts/*.sh contributor gates",
         ] {
             assert_eq!(
@@ -245,6 +252,26 @@ mod tests {
                 "{command} must be Tier 2"
             );
         }
+    }
+
+    #[test]
+    fn the_deploy_group_is_split_by_what_actually_reaches_a_host() {
+        // `autumn deploy` is not one tier. `up`/`rollback`/`status`/
+        // `maintenance` open an SSH session (and the mutating ones stage secrets
+        // with Unix file modes), so they are Tier 2. `check` and `plan` are
+        // local-only — config grading, unit rendering, and a portable TCP
+        // reachability probe — so they are Tier 1, and refusing them would both
+        // be untrue and remove the only way a Windows developer can validate a
+        // deploy config before switching to WSL2. `autumn-cli/src/deploy.rs`
+        // draws the same line in `reaches_a_remote_host`.
+        assert_eq!(
+            tier_for("autumn deploy check / plan"),
+            Some(SupportTier::Native)
+        );
+        assert_eq!(
+            tier_for("autumn deploy up / rollback / status / maintenance"),
+            Some(SupportTier::Wsl2)
+        );
     }
 
     #[test]

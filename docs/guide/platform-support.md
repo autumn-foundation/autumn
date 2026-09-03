@@ -22,6 +22,7 @@ MSYS, no Git Bash required.
 | `autumn test` | Delegates to `cargo test`, which is first-class on Windows. |
 | `autumn serve (foreground)` | Builds and runs the app in the foreground, binding TCP per config. |
 | `managed Postgres` | Boots and shuts down cleanly under `autumn dev` and a direct binary run. Note `autumn serve --bundled-pg` implies `--daemon`, so *that* entry point is Tier 2. |
+| `autumn deploy check / plan` | Local-only: `plan` renders the unit and step list, `check` grades the config and probes SSH reachability with a portable TCP connect. Validate a deploy config here before running it from WSL2. |
 
 Tier 1 is a **gate, not an aspiration**: `.github/workflows/ci.yml` runs a
 `windows-tier1` job on `windows-latest` that walks the whole journey — scaffold
@@ -80,8 +81,8 @@ today, so the file inherits its directory's ACLs. Inside your user profile
 (`%USERPROFILE%`, where `autumn new` puts a project by default) that is
 owner-plus-administrators, which is fine. In a shared location such as `C:\dev`
 it may not be — check the file's permissions, or keep projects under your
-profile. This is a known gap, not a promise; `autumn deploy` is Tier 2 for the
-same class of reason.
+profile. This is a known gap, not a promise; the remote `autumn deploy` actions
+are Tier 2 for the same class of reason.
 
 
 **The dev loop stops the app before rebuilding.** A running
@@ -115,7 +116,7 @@ policy; they are fully supported inside [WSL2](https://learn.microsoft.com/windo
 | Command | Why, and what to do |
 | --- | --- |
 | `autumn serve --daemon / stop / status / restart` | The daemon lifecycle is built on Unix domain sockets and POSIX signals; run it inside WSL2. |
-| `autumn deploy` | Deploys shell out to `ssh`/`sh` and stage secrets with Unix file modes; run them inside WSL2. |
+| `autumn deploy up / rollback / status / maintenance` | These reach the host over `ssh`/`sh`, and `up`/`rollback`/`maintenance` stage secrets with Unix file modes; run them inside WSL2. |
 | `scripts/*.sh contributor gates` | The contributor gate scripts are bash; run them inside WSL2. |
 | `SystemTest browser tests` | Chromium version probing is satisfied by file existence on Windows (#1456); the browser suites themselves are gated behind the `system-tests` feature and are exercised on Linux. |
 

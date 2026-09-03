@@ -14,15 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing said what a Windows developer could actually expect, and the native
   journey degraded silently. `autumn dev` stopped the app with
   `TerminateProcess`, which skips `on_shutdown` hooks — so a managed Postgres
-  cluster was orphaned on every hot reload — and `autumn deploy` staged secrets
-  without the `0600` its Unix path applies.
+  cluster was orphaned on every hot reload — and `autumn deploy up` staged
+  secrets without the `0600` its Unix path applies.
 
   There are now two tiers, published in
   [Platform support](docs/guide/platform-support.md) and in the README. **Tier 1
   works natively on Windows**: `new`, `doctor`, `setup`, `dev`, `test`,
-  foreground `serve`, and managed Postgres. **Tier 2 is supported via WSL2**:
-  the `serve --daemon` lifecycle, `deploy`, and the bash contributor gate
-  scripts. Tier 2 commands now **fail fast** on native Windows with an error
+  foreground `serve`, managed Postgres, and the local-only `deploy check` /
+  `deploy plan`. **Tier 2 is supported via WSL2**: the `serve --daemon`
+  lifecycle, the `deploy` actions that reach a host over SSH (`up`, `rollback`,
+  `status`, `maintenance`), and the bash contributor gate scripts. Tier 2
+  commands now **fail fast** on native Windows with an error
   naming the tier, the reason, and the policy — instead of half-working. (The
   two script-shaped Tier 2 entries — `scripts/*.sh` and the browser
   `SystemTest` suites — have no autumn entry point to refuse from, so for those

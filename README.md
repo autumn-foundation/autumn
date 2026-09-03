@@ -310,8 +310,9 @@ Develop on **macOS, Linux, or Windows**; deploy on **Linux**.
 On Windows the core journey — `autumn new`, `doctor`, `setup`, `dev`, `test`,
 foreground `serve`, and managed Postgres — is **Tier 1: works natively**, and a
 `windows-latest` CI job walks that whole journey on every pull request. The
-Unix-native slices — the `autumn serve --daemon` lifecycle, `autumn deploy`, and
-the bash contributor gate scripts — are **Tier 2: supported via WSL2**, and fail
+Unix-native slices — the `autumn serve --daemon` lifecycle, the `autumn deploy`
+actions that reach a host over SSH, and the bash contributor gate scripts — are
+**Tier 2: supported via WSL2**, and fail
 fast on native Windows with an error naming the policy rather than
 half-working.
 
