@@ -20,10 +20,15 @@ daemon feature set (`autumn-web --no-default-features --features
 maud,htmx,tailwind,cache-moka,http-client,reporting`, i.e. exactly
 `DAEMON_NO_DB_FEATURES` from `autumn-cli/src/new.rs`) — enough to plausibly
 account for a material share of the shortfall between the fix's own
-confirmed relative saving and the real CI trajectory (**corrected figure**,
-see Correction below: **~30,697ms** absolute, or **~21.0 percentage
-points** — not the ~15,051ms this question originally named, which is
-CI's own observed saving, not the gap to explain)? Or does no single
+confirmed relative saving and the real CI trajectory (**correction, see
+below: ~15,051ms is CI's own observed saving, not the gap to explain — but
+the actual gap cannot be stated as a precise millisecond or
+percentage-point figure either**, for the same reason the parent report
+gave: `45,748ms`/`-33%` came from PR #2360's local same-box A/B and
+`15,051ms`/`-12.5%` from GitHub-hosted weekly CI runs — different
+hardware, different workload distribution — so subtracting them doesn't
+produce a real, portable shortfall number, only a directional one: CI
+moved *far less* than the confirmed same-box saving)? Or does no single
 commit explain it, meaning the shortfall is better attributed to
 statistical/runner noise (CI's 3-sample p95 vs PR #2360's 1-sample local
 A/B, different runners, a week apart) rather than to a specific regression?
@@ -126,23 +131,63 @@ is supposed to prevent — so this correction reflects fixing a tooling bug
 discovered *after* results existed, not re-drawing the window to fit them.
 
 **A third, unrelated error in the pre-registration itself** (Codex P2 on
-`e5e6eb56`, independent of the shallow-clone bug above): the
-pre-registration's own "Pursue-bisection-further line" and "Kill line"
-text (blockquoted above, not edited) both call `~15,051ms` "the CI
-shortfall," and this report's Question section repeated that framing. It's
-wrong: `15,051ms` (`120,422−105,371`) is CI's own **observed saving**, not
-the gap between what was confirmed and what CI delivered. The actual gap
-is **~30,697ms** absolute (`45,748ms` confirmed same-box saving minus
-CI's `15,051ms`), or **~21.0 percentage points** (`33.49%` confirmed vs.
-`12.50%` observed) — roughly double what "~15,051ms" suggested. This does
+`e5e6eb56`, corrected further on `39ae17a1` — independent of the
+shallow-clone bug above): the pre-registration's own "Pursue-bisection-
+further line" and "Kill line" text (blockquoted above, not edited) both
+call `~15,051ms` "the CI shortfall," and this report's Question section
+repeated that framing. `15,051ms` (`120,422−105,371`) is CI's own
+**observed saving**, not the gap between what was confirmed and what CI
+delivered — that part of the finding stands. What does **not** stand is
+this report's own first attempt at a fix, which replaced it with an
+equally-precise-sounding `~30,697ms`/`~21.0 percentage points` by directly
+subtracting PR #2360's local same-box A/B from CI's weekly numbers — the
+exact kind of cross-hardware precision the parent report deliberately
+avoided, for the same reason: `45,748ms` and `15,051ms` come from
+different runners with a different workload distribution, so their
+difference isn't a real, portable "shortfall" figure any more than
+`15,051ms` alone was. Corrected a second time in the Question section to
+state this directionally, matching the parent report's own established
+caution, rather than trading one false precision for another. This does
 **not** change the pursue/kill lines themselves (the 5,000ms threshold was
-set independently as "large enough to plausibly be a material single
-contributor," not derived as a fraction of the shortfall figure), so it
-doesn't retroactively invalidate any verdict in this report. It does mean
-the Question section's framing was imprecise about the size of what this
-assay was ultimately trying to explain; corrected there, left unedited in
-the frozen pre-registration blockquote per the same policy as the other
-two corrections above.
+set independently), so it doesn't retroactively invalidate any verdict in
+this report.
+
+**A fourth, more consequential limitation** (Codex P1 on `39ae17a1`): this
+report's entire apparatus reuses one warm `target/` directory across the
+whole chronological walk, clearing only workspace-crate artifacts between
+checkpoints — a deliberate design choice (see Apparatus) to keep external
+dependency compiles warm, matching how CI's `Swatinem/rust-cache` persists
+*something* across weekly runs. But per `autumn-cli/src/cold_start_driver.rs`
+(`compile_cold`, confirmed by reading it directly) and
+`.github/workflows/cold-start-latency.yml`, what the CI gate actually
+measures is different in kind, not just in what it additionally includes:
+**every single CI sample scaffolds a brand-new temp project with its own
+empty `target/`, explicitly removes `CARGO_TARGET_DIR`, and disables
+compiler wrappers — so CI pays the full compile cost of every external
+dependency, from scratch, on every sample, forever.** This report's
+warm-target apparatus pays that cost **at most once**, on whichever
+checkpoint first introduces a given dependency — after that, it's cached
+and invisible in every later delta, even though CI keeps paying it every
+week. `git log --name-only -- Cargo.lock` over this window shows **4 of
+the 31 non-fix commits actually touched `Cargo.lock`**: `fec52215`
+(zero-downtime state migration, this report's second-largest post-fix
+delta at +4,591ms), `61bdd9c2` (Web Push, +1,995ms), `bc99a4b8` (scaffold
+DSL constraints, −733ms), and `141f36ef` (a `base64` patch-version bump,
+−2,518ms, unlikely to matter much on its own). **This report's deltas for
+those four commits cannot be trusted as representative of their true,
+CI-relevant recurring contribution** — the apparatus can only undercount,
+never overcount, a genuine per-dependency cost, since it's structurally
+incapable of showing more than a one-time compile for anything new. It
+also means the "total window effect" and "this proxy's absolute saving vs.
+CI's" comparisons throughout Assay and Verdict are weaker than stated
+there: they are not just measuring a narrower workload (library-only, no
+scaffold/server-start) as already disclosed, but a workload measured under
+a fundamentally warmer caching regime than CI ever runs under. Not
+corrected by re-running (out of this session's time box — a true
+apples-to-apples repeat would need an empty `target/` per checkpoint,
+i.e. 32+ fully cold builds, each potentially 60-120s, a materially larger
+apparatus); flagged here as a limitation this report cannot resolve, and
+carried into the Verdict.
 
 ## 🔍 Prior art
 
@@ -431,12 +476,25 @@ live report needs the map:
   draws is itself around 2.5-2.9σ even under the tight estimate. No
   commit in this dataset clears a confident attribution bar under either
   noise scale.
-- **The residual gap to CI is still unexplained.** This proxy's ≈−13,000ms
-  absolute saving sits close to, but not exactly at, CI's own observed
-  −15,051ms — and this proxy still only measures `autumn-web`'s own
-  compile time, not the full `autumn new → first HTTP 200` journey CI
-  gates on. The parent report's CI/runner-variance confound is also still
-  live and undistinguished from either explanation.
+- **This proxy's ≈−13,000ms is not directly comparable to CI's −15,051ms
+  at all, and this report previously overstated how close a match that
+  was** (Codex P1 on `39ae17a1`). Two compounding reasons, not one: this
+  proxy measures a narrower workload (`autumn-web`'s own compile time,
+  not the full `autumn new → first HTTP 200` journey), already disclosed
+  — but more fundamentally, it measures that workload under a **warm**
+  shared `target/` directory reused across the whole chronological walk,
+  while CI's `cold_start_driver.rs` scaffolds a brand-new project with an
+  **empty** `target/` and no compiler-wrapper cache on every single
+  sample (see Apparatus's fourth correction). This apparatus pays each
+  external dependency's compile cost once per introduction; CI pays it on
+  every sample, forever. Four of the 31 non-fix commits touched
+  `Cargo.lock`, so their deltas in this report specifically cannot be
+  trusted as CI-representative — and the apparatus can only *undercount*
+  that cost, never overcount it, so the true CI-relevant total for this
+  window is more likely to exceed this proxy's ≈−13,000ms-implied
+  workspace-only cost than to match it. The parent report's CI/runner-
+  variance confound (1-sample local A/B vs. 3-sample CI p95, different
+  runners) is also still live and undistinguished from any of this.
 
 **What would resolve this, as an explicit follow-up (not chartered or run
 here):**
@@ -451,8 +509,17 @@ here):**
 2. Also calibrate the fix's own delta (`651929b2`, currently n=1 in this
    report) with repeats, and extend the method to the
    scaffold+app-compile+server-start portion of the journey via the real
-   `autumn dev-loop-bench --cold-start` harness, to close the residual gap
-   between this proxy's absolute saving and CI's.
+   `autumn dev-loop-bench --cold-start` harness.
+3. **Use an empty `target/` per checkpoint, matching CI's own
+   `cold_start_driver.rs` methodology, not a warm shared one** — the
+   single biggest change needed before this proxy's numbers can be
+   compared to CI's at all. This is a materially larger apparatus (32+
+   fully cold builds instead of one warm chain; each of the confirmed
+   cold-build samples in this report took 60-120s, so a fully-cold
+   32-checkpoint pass could run 30-60+ minutes on its own) — but without
+   it, any commit touching `Cargo.lock` (4 of 31 here) cannot be trusted,
+   and neither can this proxy's total-window comparison to CI's absolute
+   saving.
 
 ## 💰 Cost to productionize
 
