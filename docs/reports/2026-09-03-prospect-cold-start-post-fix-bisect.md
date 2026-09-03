@@ -19,8 +19,11 @@ any single non-fix commit measurably add compile-time weight to the no-DB
 daemon feature set (`autumn-web --no-default-features --features
 maud,htmx,tailwind,cache-moka,http-client,reporting`, i.e. exactly
 `DAEMON_NO_DB_FEATURES` from `autumn-cli/src/new.rs`) — enough to plausibly
-account for a material share of the ~15,051ms shortfall between the fix's
-own confirmed relative saving and the real CI trajectory? Or does no single
+account for a material share of the shortfall between the fix's own
+confirmed relative saving and the real CI trajectory (**corrected figure**,
+see Correction below: **~30,697ms** absolute, or **~21.0 percentage
+points** — not the ~15,051ms this question originally named, which is
+CI's own observed saving, not the gap to explain)? Or does no single
 commit explain it, meaning the shortfall is better attributed to
 statistical/runner noise (CI's 3-sample p95 vs PR #2360's 1-sample local
 A/B, different runners, a week apart) rather than to a specific regression?
@@ -121,6 +124,25 @@ window (rather than quietly patching the pre-registration's commit list to
 match what was actually measured) is what "committed before measurement"
 is supposed to prevent — so this correction reflects fixing a tooling bug
 discovered *after* results existed, not re-drawing the window to fit them.
+
+**A third, unrelated error in the pre-registration itself** (Codex P2 on
+`e5e6eb56`, independent of the shallow-clone bug above): the
+pre-registration's own "Pursue-bisection-further line" and "Kill line"
+text (blockquoted above, not edited) both call `~15,051ms` "the CI
+shortfall," and this report's Question section repeated that framing. It's
+wrong: `15,051ms` (`120,422−105,371`) is CI's own **observed saving**, not
+the gap between what was confirmed and what CI delivered. The actual gap
+is **~30,697ms** absolute (`45,748ms` confirmed same-box saving minus
+CI's `15,051ms`), or **~21.0 percentage points** (`33.49%` confirmed vs.
+`12.50%` observed) — roughly double what "~15,051ms" suggested. This does
+**not** change the pursue/kill lines themselves (the 5,000ms threshold was
+set independently as "large enough to plausibly be a material single
+contributor," not derived as a fraction of the shortfall figure), so it
+doesn't retroactively invalidate any verdict in this report. It does mean
+the Question section's framing was imprecise about the size of what this
+assay was ultimately trying to explain; corrected there, left unedited in
+the frozen pre-registration blockquote per the same policy as the other
+two corrections above.
 
 ## 🔍 Prior art
 
@@ -463,9 +485,12 @@ set -euo pipefail   # fail loudly, don't silently build the wrong commit
 # IMPORTANT: unshallow first, and treat failure as fatal. A shallow clone
 # silently truncates git log ranges and git merge-base --is-ancestor
 # results without erroring — this is exactly the bug that produced this
-# report's first, wrong revision. `|| true` here would suppress a fetch
-# failure and let the script carry on against a still-shallow repo.
-git fetch --unshallow origin
+# report's first, wrong revision. `--unshallow` itself errors (exit 128,
+# "does not make sense") on an already-complete clone, so only run it when
+# actually shallow — but still verify and fail loudly afterward either way.
+if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+  git fetch --unshallow origin
+fi
 if [ "$(git rev-parse --is-shallow-repository)" != "false" ]; then
   echo "FATAL: repository is still shallow after fetch --unshallow" >&2
   exit 1
