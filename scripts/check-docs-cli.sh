@@ -1949,7 +1949,18 @@ def _from_tokens(tokens, masked=None, classify=None):
         i = _cron_prefix(segment)
         while i < len(segment) and (segment[i] in _PROMPT or segment[i] in _CONTROL
                                     or segment[i] in ('function', 'coproc')
+                                    or _redirect(segment[i])
                                     or _ENV_TOKEN.match(segment[i])):
+            # A redirection may sit ANYWHERE among the prefixes, not only at the
+            # very front: `2>/dev/null sudo autumn …` and `sudo 2>/dev/null
+            # autumn …` both run autumn. Consuming it here, inside the one
+            # prefix loop, means an assignment or wrapper AFTER a leading
+            # redirection is still reached — the separate post-loop redirection
+            # step handled only a redirection with nothing but the command left.
+            eaten = _redirect(segment[i])
+            if eaten:
+                i += eaten
+                continue
             # `function NAME { … }` is bash's other way to declare a function,
             # so the keyword AND the name are stepped over to reach the body's
             # `{`. Without this the segment stayed headed by `function` and the
@@ -2232,6 +2243,13 @@ def invocations(text):
         if not para:
             return
         joined = ' '.join(part for _, _, part in para)
+        # An HTML comment is not rendered and cannot be copied, so a code span
+        # inside `<!-- old: `autumn db` -->` is not a command a reader runs.
+        # The comment is blanked to EQUAL-LENGTH filler rather than removed, so
+        # every following span keeps the offset the line-number map is built
+        # on. An unclosed `<!--` comments to the end of the paragraph.
+        joined = re.sub(r'<!--.*?(?:-->|$)',
+                        lambda m: ' ' * (m.end() - m.start()), joined)
         for m in re.finditer(r'`([^`]+)`', joined):
             at = para[0][1]
             for offset, ln, _ in para:          # map the span back to its line
@@ -5077,6 +5095,35 @@ def self_test():
     expect([(ln, d) for ln, d, _, _ in invocations(dollar_delim)] == [(5, 'after')],
            f'the real terminator matches and the body is data: '
            f'{list(invocations(dollar_delim))}')
+
+    # A redirection may sit among the prefixes, not only at the front, so a
+    # wrapper or assignment AFTER a leading redirection must still be reached.
+    for form in ('2>/dev/null sudo autumn nope',
+                 '2>/dev/null AUTUMN_ENV=prod autumn nope',
+                 'sudo 2>/dev/null autumn nope',
+                 '>/tmp/o timeout 5 autumn nope'):
+        doc = f'```bash\n{form}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{form} reaches its command: {got}')
+    # A trailing redirection is still part of the command it follows.
+    expect([d for _, d, _, _ in invocations('```bash\nautumn db >/tmp/o\n```')]
+           == ['db >/tmp/o'], 'a trailing redirection stays with its command')
+
+    # An HTML comment is not rendered and cannot be copied, so a code span
+    # inside one is not a command a reader runs — it must not report.
+    for doc in ('<!-- Old: `autumn nope` -->\n',
+                '<!--\n`autumn nope`\n-->\n',
+                'text <!-- `autumn nope`\n'):
+        expect(list(invocations(doc)) == [],
+               f'a span inside an HTML comment is not read: {list(invocations(doc))}')
+    # …but a real span beside a comment is still read, at its own line.
+    beside = 'See `autumn migrate`. <!-- was `autumn nope` -->\n'
+    expect([d for _, d, _, _ in invocations(beside)] == ['migrate'],
+           f'a real span beside a comment survives: {list(invocations(beside))}')
+    after = '<!-- `autumn old` -->\nRun `autumn nope`.\n'
+    expect([(ln, d) for ln, d, _, _ in invocations(after)] == [(2, 'nope')],
+           f'the comment is blanked without shifting the line map: '
+           f'{list(invocations(after))}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
