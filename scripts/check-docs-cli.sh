@@ -983,9 +983,16 @@ _RUNNERS = {'kubectl', 'oc', 'docker', 'podman', 'nerdctl', 'ssh', 'sudo',
             'doas', 'nsenter', 'chroot', 'systemd-run', 'fly', 'heroku'}
 
 
-def _runs_argv(segment, j):
-    """True when something before the `--` at `j` executes what follows it."""
-    return any(tok.rsplit('/', 1)[-1] in _RUNNERS for tok in segment[:j])
+def _runs_argv(segment, cmd):
+    """True when the command at `cmd` executes the argv after its `--`.
+
+    The COMMAND POSITION decides, not mere presence: `echo docker -- autumn db`
+    prints five words, and searching every preceding token found `docker` there
+    and read the tail as a command — the same over-broad reading that treating
+    every non-autumn segment as a wrapper had, one step narrower.
+    """
+    return (cmd < len(segment)
+            and segment[cmd].rsplit('/', 1)[-1] in _RUNNERS)
 
 
 def _after_image(segment, k):
@@ -1167,6 +1174,15 @@ def _from_tokens(tokens):
             i += 1
             if wrapper is not None:
                 i = _skip_wrapper_options(segment, i, wrapper)
+        # A redirection may also come BEFORE the command — `>/tmp/out autumn
+        # migrate` is valid and runs autumn — and the prefix walk stopped on
+        # it, so the whole line went unread.
+        while i < len(segment):
+            eaten = _redirect(segment[i])
+            if not eaten:
+                break
+            i += eaten
+        cmd_at = i              # the command position, for `--` grammar below
         head = None
         if i < len(segment):
             if _autumn_exe(segment[i]) or _exec_command(segment[i]):
@@ -1182,7 +1198,7 @@ def _from_tokens(tokens):
                     yield ' '.join(rest[1:]), rest[1:]
             elif tok == '--' and j + 1 < len(segment) \
                     and _autumn_exe(segment[j + 1]) and head is None \
-                    and _runs_argv(segment, j):
+                    and _runs_argv(segment, cmd_at):
                 # Only a command that RUNS what follows its separator
                 # introduces a nested command. Two things had to be excluded,
                 # and `head is None` alone covered just the first:
@@ -1347,12 +1363,13 @@ def invocations(text):
     folded = None           # paragraphs of a folded (`>`) block scalar
     folded_at = None
     folded_indent = 0
+    folded_base = None      # the column its content sits at
 
     def close_folded():
         """Read a folded scalar: one command per paragraph, lines joined."""
-        nonlocal folded, folded_at
+        nonlocal folded, folded_at, folded_base
         paras, at = folded, folded_at
-        folded, folded_at = None, None
+        folded, folded_at, folded_base = None, None, None
         if not paras:
             return
         # Folding joins lines with spaces, but a BLANK line survives as a real
@@ -1432,13 +1449,24 @@ def invocations(text):
             if not line.strip():
                 folded.append([])
                 continue
-            if len(line) - len(line.lstrip()) > folded_indent:
+            depth = len(line) - len(line.lstrip())
+            if depth > folded_indent:
+                # Folding joins lines at the scalar's own column. A MORE
+                # indented line is not folded into the one above it — YAML
+                # keeps the newline around such a block — so a change of
+                # column breaks the paragraph. Joining across it built
+                # `autumn migrate autumn routes` from two valid lines.
+                if folded_base is None:
+                    folded_base = depth
+                elif depth != folded_base:
+                    folded.append([])
+                    folded_base = depth
                 folded[-1].append(line.strip())
                 continue
             yield from close_folded()
         fold = _FOLDED_KEY.match(keyline)
         if fold:
-            folded, folded_at = [[]], lineno
+            folded, folded_at, folded_base = [[]], lineno, None
             folded_indent = len(fold.group(1))
             continue
 
@@ -2069,6 +2097,24 @@ def self_test():
         expect(list(invocations(doc)) == [],
                f'{printer} -- prints its arguments, it does not run them: '
                f'{list(invocations(doc))}')
+    # …and a runner NAME is not a runner: the command position decides.
+    for data in ('echo docker -- autumn db', 'echo kubectl -- autumn db',
+                 'ls docker -- autumn db'):
+        doc = f'```bash\n{data}\n```'
+        expect(list(invocations(doc)) == [],
+               f'a runner named as data does not run anything: {data} -> '
+               f'{list(invocations(doc))}')
+
+    # --- a redirection may also come BEFORE the command, and the prefix walk
+    # stopped on it, so the whole line went unread.
+    for lead in ('>/tmp/out', '> /tmp/out', '2>/dev/null', '<in.txt'):
+        doc = f'```bash\n{lead} autumn migrate run\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'], f'a leading {lead!r} must be stepped over: {got}')
+    lead_bare = '```bash\n>/tmp/out autumn db\n```'
+    got = [resolve(a, surface, runnable=w == FENCED_COMMAND)
+           for _, _, a, w in invocations(lead_bare)]
+    expect(got == ['autumn db'], f'…and the command is still judged complete: {got}')
 
     # --- a brace group runs the commands inside it, so `{` stands in front of
     # a command the way a subshell's `(` does.
@@ -2521,6 +2567,15 @@ def self_test():
     para_drift = '```yaml\nrun: >\n  autumn migrate\n\n  autumn run\n```'
     expect([d for _, d, _, _ in invocations(para_drift)] == ['migrate', 'run'],
            f'drift after a paragraph break is still read: {list(invocations(para_drift))}')
+    # Folding joins lines at the scalar's OWN column. A more-indented line is
+    # kept with its newline rather than folded into the one above, so a change
+    # of column breaks the paragraph the way a blank line does.
+    indented = '```yaml\nrun: >\n  autumn migrate\n    autumn routes\n```'
+    expect([d for _, d, _, _ in invocations(indented)] == ['migrate', 'routes'],
+           f'a more-indented line is not folded in: {list(invocations(indented))}')
+    ind_drift = '```yaml\nrun: >\n  autumn migrate\n    autumn run\n```'
+    expect([d for _, d, _, _ in invocations(ind_drift)] == ['migrate', 'run'],
+           f'drift in a more-indented block is read: {list(invocations(ind_drift))}')
     # A trailing comment is valid on a key line, and these patterns are
     # end-anchored, so the key must be matched without it.
     for label, doc in [
