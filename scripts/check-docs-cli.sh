@@ -785,6 +785,29 @@ _KEY_ONLY = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS + r'):\s*
                        re.I)
 _LIST_ITEM = re.compile(r'^(\s*)-\s+(\S.*?)\s*$')
 
+# The same key with its list written inline, and the sibling `args:` key.
+#
+# Kubernetes splits one argv across two keys: `command:` holds the executable
+# and `args:` the rest. Judged apart, each half is wrong in a different
+# direction — the command half is a lone `autumn` that reads as a bare root on
+# a perfectly correct manifest, and the args half carries the subcommand that
+# would actually drift, attached to no executable at all. Joined, both become
+# the argv the container really runs.
+_KEY_INLINE = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
+                         r'):\s*\[(.*)\]\s*$', re.I)
+_ARGS_ONLY = re.compile(r'^(\s*)' + _QUALIFIED + r'args:\s*$', re.I)
+_ARGS_INLINE = re.compile(r'^(\s*)' + _QUALIFIED + r'args:\s*\[(.*)\]\s*$', re.I)
+
+
+def _list_value(text):
+    """One list item, stripped of the quoting and separators YAML/JSON add."""
+    return text.strip().rstrip(',').strip().strip('\'"')
+
+
+def _inline_items(body):
+    """The items of an inline `[a, b, c]` list."""
+    return [_list_value(part) for part in body.split(',') if part.strip()]
+
 
 def _nested_command(segment, j, tok):
     """True when this token is itself a command line rather than an argument.
@@ -1111,16 +1134,22 @@ def invocations(text):
             yield at, m.group(1)
         para, para_len = [], 0
 
-    # Block-style exec arrays, accumulated across the lines below their key.
-    pending = None          # collected list items, or None when not accumulating
-    pending_at = None       # the line the command key sits on
+    # Exec arrays, inline or block, with a `command:` list held back until the
+    # line after it has been seen — because a sibling `args:` may carry the
+    # rest of the same argv.
+    pending = None          # items being collected right now
+    pending_kind = None     # 'cmd' or 'args'
+    pending_at = None       # the line the key sits on
     pending_indent = 0
+    argv_held = None        # a finished command list awaiting a possible args:
+    argv_at = None
+    argv_indent = 0         # the column its key sat at, to bound the wait
 
-    def take_list():
-        """Read the accumulated block list as a command, then clear it."""
-        nonlocal pending, pending_at
-        items, at = pending, pending_at
-        pending, pending_at = None, None
+    def emit_held():
+        """Read the finished argv as a command, then clear it."""
+        nonlocal argv_held, argv_at
+        items, at = argv_held, argv_at
+        argv_held, argv_at = None, None
         if not items:
             return
         if any(' ' in it for it in items):
@@ -1133,19 +1162,27 @@ def invocations(text):
             # the next item answers.
             for it in items:
                 for display, argv in commands(it):
-                    yield at, display, argv, True
-            return
-        if len(items) == 1:
-            # Kubernetes splits an argv across `command:` and a sibling
-            # `args:`, so a one-item block list is not a bare root — the
-            # subcommand is in the other key. Nothing in this corpus writes
-            # that shape; reading block lists at all is what would make it
-            # reportable, so the limit is taken here rather than risked.
-            # (The inline `command: ["autumn"]` form still reports, which is
-            # the same shape in Compose and Fly, where no `args:` key exists.)
+                    yield at, display, argv, FENCED_COMMAND
             return
         for display, argv in _from_tokens(items):
-            yield at, display, argv, True
+            yield at, display, argv, FENCED_COMMAND
+
+    def close_pending():
+        """Finish the list being collected: hold a command, or join an args."""
+        nonlocal pending, pending_kind, pending_at, argv_held, argv_at, argv_indent
+        items, kind, at = pending, pending_kind, pending_at
+        pending_indent_of = pending_indent
+        pending, pending_kind, pending_at = None, None, None
+        if items is None:
+            return
+        if kind == 'args':
+            if argv_held is None:
+                return                  # args with no command: nothing to run
+            argv_held = argv_held + items
+            yield from emit_held()
+            return
+        yield from emit_held()          # a command with no args sibling
+        argv_held, argv_at, argv_indent = items, at, pending_indent_of
 
     def add_prose(line, lineno):
         """Accumulate one prose line, with any blockquote marker stripped."""
@@ -1158,7 +1195,8 @@ def invocations(text):
         m = re.match(r'^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)', line)
         if m:
             held, held_at = [], None            # a fence boundary ends any hold
-            yield from take_list()              # …and any block list
+            yield from close_pending()          # …and any list
+            yield from emit_held()
             yield from _spans(take_paragraph(), commands)
             if fence is None:
                 fence, lang = m.group(1)[0], m.group(2).lower()
@@ -1178,17 +1216,34 @@ def invocations(text):
         # and the guide writes five of them on that page alone. Scanning the
         # physical lines instead yields the argv `\`, and the command path split
         # across the break goes unchecked.
-        # A command key with no value on its line opens a block list; the items
-        # below it are the argv. Anything else closes it.
+        # A command key opens a list — inline on its own line, or as the block
+        # of items below it. Anything else closes it.
         item = _LIST_ITEM.match(line)
         if pending is not None and item and len(item.group(1)) >= pending_indent:
-            pending.append(item.group(2).strip('\'"').rstrip(','))
+            pending.append(_list_value(item.group(2)))
             continue
-        yield from take_list()
-        key = _KEY_ONLY.match(line)
+        yield from close_pending()
+        inline = _KEY_INLINE.match(line) or _ARGS_INLINE.match(line)
+        key = inline or _KEY_ONLY.match(line) or _ARGS_ONLY.match(line)
         if key:
-            pending, pending_at, pending_indent = [], lineno, len(key.group(1))
-            continue
+            kind = 'args' if (_ARGS_ONLY.match(line) or _ARGS_INLINE.match(line)) \
+                else 'cmd'
+            # An `args:` key with no command before it describes arguments to
+            # an entrypoint this gate never sees, so there is nothing to judge.
+            if kind == 'cmd' or argv_held is not None:
+                pending_kind, pending_at = kind, lineno
+                pending_indent = len(key.group(1))
+                pending = _inline_items(inline.group(2)) if inline else []
+                if inline:
+                    yield from close_pending()
+                continue
+        # A held `command:` waits for its `args:` sibling across intervening
+        # keys, because a YAML mapping is unordered and `image:` sits between
+        # the two often enough. What ends the wait is a NEW list entry at or
+        # left of the command's own column — the next container in the list,
+        # which cannot be the same argv.
+        if item and len(item.group(1)) <= argv_indent:
+            yield from emit_held()
 
         logical, at = flush(line, lineno)
         if logical is None:
@@ -1197,22 +1252,50 @@ def invocations(text):
         # on the raw text, so an operator inside a quoted value cannot cut a
         # command in half.
         for display, argv in commands(logical):
-            yield at, display, argv, True
-        # A span inside a fence (a hint line quoting a command back) is still a
-        # span, and cannot wrap: the fence preserves line breaks.
+            yield at, display, argv, FENCED_COMMAND
+        # Backticks inside a fence are not markdown spans. In a shell block
+        # they are legacy command substitution — `` OUT=`autumn migrate` `` is
+        # a command the reader runs — and elsewhere they are a line quoting a
+        # command back. Either way the text is inside a fence, so it is
+        # RUNNABLE and a waiver must not reach it. Marking these `False` let a
+        # nearby marker suppress a fenced command, contradicting the invariant
+        # stated at the top of this file: a page may name a nonexistent
+        # command, never hand one over to run.
         for span in re.findall(r'`([^`\n]+)`', line):
             for display, argv in commands(span):
-                yield lineno, display, argv, False
+                yield lineno, display, argv, FENCED_SPAN
 
-    yield from take_list()
+    yield from close_pending()
+    yield from emit_held()
     yield from _spans(take_paragraph(), commands)
+
+
+# Where an invocation was found. These decide two DIFFERENT things, and one
+# boolean was conflating them:
+#
+#   * RUNNABLE — is this a line the reader copies and runs? Only then is a bare
+#     command group (`autumn deploy`) a defect, because English names the
+#     family that way constantly.
+#   * FENCED — is this inside a code fence? Then no waiver may reach it: a page
+#     may NAME a command that does not exist, never hand one over to run.
+#
+# A backticked span inside a fence is the case that separates them. It is not
+# a command line — untagged fences in `skills/autumn-web/SKILL.md` hold whole
+# paragraphs of prose, and a `rust` fence's `//! Generated by \`autumn
+# generate\`.` is a doc comment — so bare groups there are not defects. But it
+# IS inside a fence, so a nearby marker must not silence real drift in it.
+# Treating it as neither left `` OUT=`autumn nope` `` waivable; treating it as
+# both reported seven correct pages.
+FENCED_COMMAND = 'fenced-command'       # runnable, not waivable
+FENCED_SPAN = 'fenced-span'             # not runnable, not waivable
+PROSE_SPAN = 'prose-span'               # not runnable, waivable
 
 
 def _spans(pairs, commands):
     """Turn (lineno, span_text) pairs into invocation tuples."""
     for lineno, span in pairs:
         for display, argv in commands(span):
-            yield lineno, display, argv, False
+            yield lineno, display, argv, PROSE_SPAN
 
 
 def blocks(text):
@@ -1396,14 +1479,16 @@ def scan(root, surface, files):
             marker_block = line_block[marker_line]
             allowed[m.group(1).strip()].update({marker_block, marker_block - 1})
 
-        for lineno, display, argv, in_fence in invocations(text):
-            bad = resolve(argv, surface, runnable=in_fence)
+        for lineno, display, argv, where in invocations(text):
+            bad = resolve(argv, surface, runnable=where == FENCED_COMMAND)
             if bad is None:
                 continue
             command = bad[len('autumn '):]
             # A fenced shell block is copyable, so nothing waives it: a page may
             # NAME a command that does not exist, never hand one over to be run.
-            if not in_fence and line_block[lineno] in allowed.get(command, ()):
+            # That covers a backticked span inside a fence too, which is not a
+            # command line but is still fenced.
+            if where == PROSE_SPAN and line_block[lineno] in allowed.get(command, ()):
                 waived += 1
                 continue
             defects.append((f, lineno, bad, display))
@@ -1613,7 +1698,7 @@ def self_test():
     found = list(invocations(doc))
     expect(len(found) == 2, f'expected 2 copyable invocations, got {len(found)}: {found}')
     expect(all(d == 'migrate run' for _, d, _, _ in found), f'bad argv extraction: {found}')
-    expect([fenced for _, _, _, fenced in found] == [True, False],
+    expect([where for _, _, _, where in found] == [FENCED_COMMAND, PROSE_SPAN],
            'a fenced command and an inline one must be told apart')
 
     # --- chains: every command on the line, not just the head. Regression test
@@ -1996,8 +2081,37 @@ def self_test():
     script = '```yaml\nscript:\n  - autumn migrate run\n  - cargo test\n```'
     expect([d for _, d, _, _ in invocations(script)] == ['migrate run'],
            f'a script: list is read as shell lines: {list(invocations(script))}')
-    expect(list(invocations('```yaml\ncommand:\n  - autumn\n```')) == [],
-           'a one-item block list is the k8s command:/args: split, not a bare root')
+    # --- Kubernetes splits one argv across `command:` and a sibling `args:`.
+    # Judged apart, each half is wrong in a different direction: the command
+    # half is a lone `autumn` that reads as a bare root on a correct manifest,
+    # and the args half carries the subcommand that would actually drift,
+    # attached to no executable. Joined, both become the argv the container
+    # runs — which is why an earlier one-item suppression could be deleted.
+    for label, doc in [
+        ('block', '```yaml\ncommand:\n  - autumn\nargs:\n  - migrate\n```'),
+        ('inline', '```yaml\ncommand: ["autumn"]\nargs: ["migrate"]\n```'),
+        # A YAML mapping is unordered and `image:` sits between the two often
+        # enough that the wait has to survive intervening keys.
+        ('split by image:',
+         '```yaml\ncommand: ["autumn"]\nimage: app:1\nargs: ["migrate"]\n```'),
+    ]:
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate'], f'command:/args: ({label}) must join: {got}')
+    for label, doc in [
+        ('block', '```yaml\ncommand:\n  - autumn\nargs:\n  - nope\n```'),
+        ('inline', '```yaml\ncommand: ["autumn"]\nargs: ["nope"]\n```'),
+    ]:
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'drift in the args half ({label}) must be read: {got}')
+    # …but the wait ends at the next container, so two entries never merge.
+    two = ('```yaml\ncontainers:\n  - name: a\n    command: ["autumn"]\n'
+           '  - name: b\n    args: ["migrate"]\n```')
+    expect([d for _, d, _, _ in invocations(two)] == [''],
+           f'a later container must not supply the first one args: {list(invocations(two))}')
+    expect([d for _, d, _, _ in invocations('```yaml\ncommand: ["autumn"]\n```')] == [''],
+           'a command with no args sibling is still a bare root')
+    expect(list(invocations('```yaml\nargs:\n  - nope\n```')) == [],
+           'an args: key with no command before it runs nothing')
     expect(list(invocations('```yaml\ncommand:\n  - sleep\n  - "5"\n```')) == [],
            'a block list for another program stays quiet')
     # The accumulator must never fire outside a fence: the corpus ends
@@ -2045,6 +2159,36 @@ def self_test():
     expect(n_waived == 1, f'the sentence above the marker must be waived, got {n_waived}')
     expect(reported == [6, 9],
            f'a fenced block and a distant paragraph must both still report, got {reported}')
+
+    # A backticked span INSIDE a fence is not a command line, but it is fenced.
+    # The two facts were one boolean, so it was waivable — a marker could
+    # silence real drift in `` OUT=`autumn nope` ``. Splitting them closes that
+    # without reporting the seven prose-in-a-fence mentions this corpus has.
+    subst_page = '\n'.join([
+        '<!-- cli-surface-allow: autumn nope — a waiver must not reach a fence -->',
+        '',
+        '```bash',
+        'OUT=`autumn nope`',
+        '```',
+    ])
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = pathlib.Path(tmpdir) / 'subst-selftest.md'
+        tmp.write_text(subst_page)
+        subst_defects, subst_waived = scan(tmp.parent, surface, [tmp.name])
+    expect(subst_waived == 0 and len(subst_defects) == 1,
+           f'a waiver must not reach a backtick substitution in a fence: '
+           f'{subst_defects}, {subst_waived} waived')
+    # …while a bare GROUP named in prose inside a fence stays quiet, because
+    # such a span is not runnable. This is what `skills/autumn-web/SKILL.md`
+    # and a `rust` fence's `//!` doc comment actually contain.
+    # `db` is the synthetic CLI's group that requires a subcommand, standing in
+    # for the real `autumn deploy` / `autumn generate` these fences name.
+    for prose in ('```\n`autumn db` mirrors `autumn db` argument-for-argument.\n```',
+                  '```rust\n//! Generated by `autumn db`.\n```',
+                  '```bash\n# on every host `autumn db` manages\nautumn migrate\n```'):
+        bad = [d for _, d, a, w in invocations(prose)
+               if resolve(a, surface, runnable=w == FENCED_COMMAND)]
+        expect(bad == [], f'prose inside a fence must not report a bare group: {bad}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
