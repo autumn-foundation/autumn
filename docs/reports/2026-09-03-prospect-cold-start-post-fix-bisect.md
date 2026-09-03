@@ -1,4 +1,4 @@
-# ⛏️ Prospect: which commits ate the missing cold-start savings? (undetermined: no single commit ≥5,000ms, but +10,655ms of diffuse creep across 31 commits closely tracks the CI shortfall in absolute terms)
+# ⛏️ Prospect: which commits ate the missing cold-start savings? (undetermined: total window effect (−13,000ms) is real, but calibrated noise (σ≈1,080-1,527ms) is too close to every individual and cumulative per-commit figure to attribute it)
 
 ## 🎯 Question
 
@@ -167,6 +167,24 @@ discovered *after* results existed, not re-drawing the window to fit them.
   templating and the generated app's own thin compile unit) — the parent
   assay's control used the same proxy for `autumn-macros` alone. This
   assay inherits that same limitation, stated plainly in the Verdict.
+- **A third correction, also from Codex review (P1/P2, on `26e9e040`):**
+  the second revision above treated the single `ef61ae44` repeat (433ms)
+  as *the* noise floor and used it to call the cumulative non-fix sum
+  "real, not noise." Codex pointed out direct counter-evidence already
+  sitting in the table: `dc74ce43` (touches only `autumn-cli` and a
+  benchmark crate's `Cargo.toml` — confirmed via `git show --stat`, neither
+  built by the timed command) shows +4,645ms, and `31423bfc` (touches only
+  `autumn-cache-redis`, a feature this build doesn't enable, and
+  `autumn-cli` — confirmed the same way) shows −4,622ms. Both commits are
+  provable no-ops for `cargo build -p autumn-web` with this feature set,
+  yet swing by multi-second amounts — proof the true noise floor is much
+  larger than one repeat suggested, and the second revision's "very likely
+  real" claim was undersupported. In response, a dedicated noise-floor
+  calibration was run: 7 valid repeated builds of the single fixed commit
+  `ef61ae44` under matching warm-target conditions (an 8th, run first in a
+  freshly-created worktree, hit the same cold-dependency-compile artifact
+  described above — 82,156ms — and is excluded for the same reason). See
+  Assay for the result and its consequence for the verdict.
 
 ## 📊 Assay
 
@@ -216,116 +234,155 @@ the end. All 34 builds (32 checkpoints + 2 warm re-measurements of
 | `9c1ede1e` db scrub (#2365) | 38,107ms | −2,839ms | post-fix |
 | `f15ca1bb` classified-data compile-time proof (#2367) | 42,498ms | +4,391ms | post-fix |
 | `ef61ae44` Bolt form-field escaping (#2376, window end) | 42,637ms | +139ms | window end |
-| `ef61ae44` repeat (noise floor) | 42,204ms | −433ms | same-commit re-run |
 
-**Control comparison (against the pre-registered lines):**
+**Noise-floor calibration** (added after Codex review; not in the original
+pre-registration, run to test its own "433ms noise floor" claim): 7 valid
+repeated builds of the fixed commit `ef61ae44`, same warm-target protocol
+as every checkpoint above (an 8th run, first in a fresh worktree, hit the
+cold-dependency-compile artifact described in Apparatus — 82,156ms —
+and is excluded):
+
+`42,637 / 42,204 / 43,204 / 40,843 / 43,667 / 43,184 / 44,117` ms
+— mean **42,837ms**, sample stdev **1,080ms**, min/max spread **3,274ms**.
+
+**Corrected arithmetic** (Codex P2 on `26e9e040`): the previous revision's
+"+10,655ms" non-fix sum wrongly folded the `ef61ae44` repeat's −433ms into
+the post-fix total — a repeat isn't a commit delta. Removing it: post-fix
+sum across the real 9 commits is **+3,411ms** (not +2,978ms), and the
+total non-fix sum across all 31 commits is **+11,088ms** (+7,677ms
+pre-fix, +3,411ms post-fix), not +10,655ms.
+
+**Control comparison (against the pre-registered lines), with the
+calibrated noise floor in hand:**
 
 - **Pursue line (single commit ≥5,000ms):** not reached by any of the 31
-  non-fix commits. Closest is `6a6610c4` at +4,990ms — 10ms under the line
-  — followed by `fec52215` (+4,591ms) and `f15ca1bb` (+4,391ms). None
-  crosses it, so per the pre-registered rule, no single commit is named as
-  "the" culprit.
-- **Kill line (sum within same-commit noise):** the only valid same-run,
-  same-conditions noise sample is the `ef61ae44` repeat: 433ms. (A
-  cross-run comparison of `651929b`'s two measurements — 36,225ms in the
-  first, shallow-clone run vs. 39,226ms here — looked like a 3,001ms swing
-  at first, but the two runs reached that commit through different warm-cache
-  histories, i.e. different conditions, so it is **not** a valid noise
-  sample and is excluded rather than used as evidence either way.) Against
-  the one valid 433ms sample, the sum of all 31 non-fix deltas is
-  **+10,655ms** (+7,677ms pre-fix across 22 commits, +2,978ms post-fix
-  across 9 commits) — about 25x the noise sample. This is not noise by any
-  reasonable reading, so the kill line's second clause is **not** met
-  either.
-- **Neither pre-registered line is met.** No single commit crosses the
-  pursue threshold, but the cumulative non-fix effect is far too large to
-  call noise. The pre-registration did not provide for this outcome, and
-  per Prospect's own rule against moving the kill line after seeing the
-  data, this assay does not force one — see Verdict.
-- **What the complete data changes vs. the (wrong) partial-window read:**
-  end-to-end across the real window, `d1ecb361` (55,882ms, warm) →
-  `ef61ae44` (42,637ms) is **−13,245ms (−23.7%)**, or −13,678ms (−24.5%)
-  using the repeat. That is a real, large improvement — but it sits
-  *between* PR #2360's confirmed −33% same-box A/B and the real CI
-  trajectory's −12.5%, not above the confirmed figure as the incomplete
-  12-commit run wrongly concluded. In **absolute** terms (the number that
-  should track CI's absolute 15,051ms saving more directly than a
-  relative percentage computed against two very different baselines —
-  this proxy's ~56-65k ms vs CI's ~105-120k ms full-journey baseline), this
-  proxy's −13,245ms to −13,678ms is within ~1,373-1,806ms of CI's own
-  −15,051ms saving. The fix's own raw in-context contribution is
-  −24,333ms; **+10,655ms of that gets eaten back by the other 31 commits
-  in the same window, mostly (+7,677ms) before the fix even landed.**
-
-**Worst case / robustness check:** the same-commit repeat at `ef61ae44`
-(42,204ms vs. the first run's 42,637ms, −433ms) shows single-run noise at
-this scale is on the order of a few hundred milliseconds — small next to
-the ±5,000ms line and tiny next to the +10,655ms cumulative effect, so
-that cumulative figure is not an artifact of one noisy run. It cannot,
-however, rule in or rule out any *individual* sub-5,000ms delta in the
-table as signal vs. noise — that needs repeated measurement per commit,
-not done here (see Verdict).
+  non-fix commits — closest is `6a6610c4` at +4,990ms, followed by
+  `fec52215` (+4,591ms) and `f15ca1bb` (+4,391ms). With the calibration
+  above, none of these can be called real signal either: a single-delta
+  measurement combines two single-run draws, so its expected noise is
+  ≈1,080ms·√2 ≈ 1,527ms by the calibration — meaning +4,990ms is only
+  ≈3.3 calibrated-σ, and the two known-zero-effect commits (`dc74ce43`
+  +4,645ms, `31423bfc` −4,622ms — see Apparatus; both provably cannot
+  touch this build) already swing at almost exactly that same magnitude
+  purely from noise not captured by the clustered same-commit calibration.
+  The 5,000ms pursue line, chosen before any noise measurement existed,
+  turns out to sit barely above the apparatus's own demonstrated noise
+  ceiling — in hindsight, badly calibrated, not a defect in the commits
+  measured.
+- **Kill line (sum within noise):** using the calibrated per-delta
+  combined-noise estimate (≈1,527ms) and treating the 31 non-fix deltas as
+  independent, the expected stdev of their **sum** is ≈1,527ms·√31 ≈
+  8,504ms. The observed sum, +11,088ms, is ≈1.3 of that — not
+  distinguishable from a zero-mean accumulation of per-step noise at any
+  conventional confidence level. (Using the larger, `dc74ce43`/`31423bfc`-
+  implied noise scale instead would widen that expected stdev further,
+  weakening the case for a real cumulative effect even more.) The kill
+  line's second clause is **arguably met** under this analysis — but the
+  pre-registration wrote "stays within run-to-run noise of a repeated
+  build," a bar it did not define numerically, and a single calibration
+  run after the fact is thin evidence to hang a clean "kill" on. This
+  assay does not force that call — see Verdict.
+- **The total-window figure survives, even though attribution inside it
+  does not.** End-to-end, `d1ecb361` (55,882ms, one warm sample) →
+  `ef61ae44` (42,837ms, 7-sample calibrated mean) is **−13,045ms
+  (−23.4%)**, consistent with the single-sample estimate reported before
+  calibration (−13,245ms, −23.7%). At ≈13,000ms, this is roughly 8-9x the
+  calibrated single-measurement stdev (1,080-1,527ms), so the *total*
+  window effect is not plausibly noise. What calibration removes is
+  confidence in *why*: whether that total is the fix's raw −24,333ms
+  partly clawed back by real per-commit compile-time growth (this report's
+  second revision's claim), or whether the raw in-context fix effect
+  itself is simply smaller than PR #2360's isolated same-box A/B for
+  reasons this apparatus can't see (measurement-context differences,
+  since the fix's own delta, −24,333ms, was measured only once and was
+  never itself calibrated against repeats either).
 
 ## 🏁 Verdict
 
-**Undetermined**, against the pre-set lines exactly as written — not
-"kill," which the first, incomplete-window revision of this report
-incorrectly claimed, and not "pursue," since no single commit clears the
-line either. Reporting this as a clean kill would have been moving the
-goalposts after seeing the data (exactly what Prospect's rules forbid);
-the honest reading of the pre-registration's two binary outcomes is that
-neither fired.
+**Undetermined** — against the pre-set lines exactly as written, and this
+time for a directly measured, quantified reason rather than an assumption.
+This report went through three revisions before landing here, each one
+caught by a different Codex review finding on PR #2477; all three are
+worth stating plainly rather than only keeping the final number:
 
-What this assay does establish, and why it changes the parent report's
-open question materially:
+1. **First revision: "Kill."** Wrong — built on a shallow clone that
+   silently measured 12 of the real 32 commits in the window and got a
+   commit-ancestry check backwards. Corrected by unshallowing and
+   re-measuring the complete window.
+2. **Second revision: "the shortfall is very likely a real, diffuse
+   effect."** Also unsupported — it treated one repeat (433ms) as the
+   noise floor and called a +10,655ms cumulative sum "25x noise" without
+   ever testing whether 433ms was representative. It wasn't: two commits
+   in the table (`dc74ce43`, `31423bfc`) are provable no-ops for this
+   build yet swing by ±4,600ms purely from run-to-run variance —
+   caught by Codex, confirmed by a dedicated 7-sample calibration run
+   (mean 42,837ms, stdev 1,080ms) showing the true per-measurement noise
+   is roughly 2.5x what one repeat suggested.
+3. **This revision, with the calibration in hand:** neither pre-registered
+   line can be honestly triggered. No single commit reaches the 5,000ms
+   pursue line — the closest (`6a6610c4`, +4,990ms) is statistically
+   indistinguishable from the noise two known-zero-effect commits already
+   demonstrate at almost the same magnitude. The kill line's "sum stays
+   within noise" clause is arguably satisfiable under a formal
+   independent-noise model (+11,088ms observed vs. ≈8,504ms expected
+   stdev, ≈1.3σ) — but the pre-registration never defined that bar
+   numerically, one post-hoc calibration run is thin evidence to hang a
+   clean verdict on, and the fix's own −24,333ms delta was never itself
+   calibrated against repeats. Forcing either "kill" or "pursue" here
+   would be the same mistake the first two revisions made in different
+   directions.
 
-- **No single commit is "the" cause.** The closest, `6a6610c4` (Reserve
-  "all" as a search index name, #2305) at +4,990ms, is a plausible
-  candidate for a follow-up single-commit re-measurement (repeated runs to
-  separate it from noise), but nothing here names it with confidence.
-- **The CI shortfall is very likely a real, diffuse effect, not
-  measurement noise or an artifact of the earlier incomplete window.**
-  +10,655ms of cumulative compile-time creep, spread across 31 unrelated
-  commits merged in the same week (22 before the fix, 9 after), nets the
-  fix's raw −24,333ms saving down to −13,245ms in this library-only proxy
-  — and that number lands within ~1.8s of CI's own observed −15,051ms
-  absolute saving. That is a materially different, and much better
-  grounded, conclusion than the incomplete-window revision's claim that
-  library compile weight could be ruled out entirely: it cannot. This
-  reverses that claim, per the two Codex review findings that caught it.
-- **This proxy still cannot close the loop on its own.** It measures
-  `autumn-web`'s own compile time, not the full `autumn new → first HTTP
-  200` journey CI actually gates on (scaffolding, the generated app's own
-  compile+link, server start, first request) — the ~1.8s residual gap
-  between this proxy's absolute saving and CI's could easily live there,
-  or in ordinary CI/runner variance (the parent report's already-flagged
-  confound: a 1-sample local A/B vs. 3-sample p95s on shared runners a
-  week apart). Nothing here distinguishes those two.
+**What this assay does establish, robustly:** the total window effect —
+`d1ecb361` → `ef61ae44`, roughly **−13,000ms (−23-24%)** whether measured
+by single sample (−13,245ms) or calibrated mean (−13,045ms) — is real and
+large relative to the now-measured noise floor (≈1,080-1,527ms). In
+**absolute** terms it sits close to CI's own observed −15,051ms saving.
+**What it cannot establish:** whether that −13,000ms is the fix's raw
+effect (−24,333ms) genuinely clawed back by real compile-time growth in
+the other 31 commits, or whether the raw fix effect was simply smaller
+in this full-chronology context than PR #2360's isolated same-box A/B for
+reasons unrelated to any of those 31 commits. Both this proxy's per-commit
+resolution and the parent report's already-flagged CI/runner-variance
+confound remain live, undistinguished explanations.
 
 **What would resolve this, as an explicit follow-up (not chartered or run
 here):**
 
-1. Repeat each of the 31 non-fix checkpoints 2-3x to build real per-commit
-   noise floors and re-test `6a6610c4`, `c9121d5b` (+3,698ms), `eba7fc67`
-   (+3,126ms), `fec52215` (+4,591ms), and `f15ca1bb` (+4,391ms)
-   specifically against the pursue line with that noise floor in hand.
-2. Extend the same chronological-waterfall method to the
-   scaffold+app-compile+server-start portion of the journey, using the
-   real `autumn dev-loop-bench --cold-start` harness (matching what PR
-   #2360 itself used), to close the residual ~1.8s gap between this
-   proxy's absolute saving and CI's.
+1. This apparatus needs roughly 3+ repeats per checkpoint (not one) to
+   reach the resolution its own pursue/kill lines assumed — a materially
+   larger apparatus (≈3x the build wall-clock used here) than "cheap
+   bisection" originally scoped for. That cost-of-precision finding is
+   itself useful: a single-run cold-start bisection at this repo's noise
+   scale cannot resolve sub-5,000ms effects, so nobody should trust one
+   again without calibrating first.
+2. Also calibrate the fix's own delta (`651929b2`, currently n=1 in this
+   report) with repeats, and extend the method to the
+   scaffold+app-compile+server-start portion of the journey via the real
+   `autumn dev-loop-bench --cold-start` harness, to close the residual gap
+   between this proxy's absolute saving and CI's.
 
 ## 💰 Cost to productionize
 
-N/A — undetermined verdict, no build to productionize. This assay's build
-wall-clock: ~11 minutes for the first (shallow-clone, invalidated) pass,
-~34 minutes for the corrected 32-checkpoint pass plus the two warm
-re-measurements — about 45 minutes total across both passes, against the
-pre-registered ≤60-minute *per-pass* box. The shallow-clone bug and its
-correction cost real time; that overhead is itself a data point for anyone
-scoping a repeat of this method (`git fetch --unshallow` first, always).
+N/A — undetermined verdict, no build to productionize. Build wall-clock
+across all passes: ~11 minutes (first, shallow-clone-invalidated pass) +
+~34 minutes (corrected 32-checkpoint pass + 2 warm re-measurements) + ~7
+minutes (noise-floor calibration, 7 valid + 1 discarded cold-artifact run)
+≈ 52 minutes total, against the pre-registered ≤60-minute *per-pass* box.
+Two real costs stand out for anyone scoping a repeat: (1) `git fetch
+--unshallow` before any window-derivation command, always — a shallow
+clone fails silently, not loudly; (2) a single-run-per-checkpoint design
+is cheap but under-powered at this repo's demonstrated noise scale
+(σ≈1,080-1,527ms) — budget for repeats from the start rather than
+retrofitting a calibration run after the fact, as this report had to.
 
 ## 🔬 Reproduce
+
+This matches the actual procedure used (not the naive version): the first
+commit built in a fresh worktree absorbs a one-time cold dependency
+compile that is not representative of any other checkpoint, so `d1ecb361`
+and the window's first commit are measured chronologically like every
+other checkpoint, then **re-measured** once the target directory is fully
+warm, and only the warm numbers are used in the table.
 
 ```bash
 # IMPORTANT: unshallow first. A shallow clone silently truncates git log
@@ -338,25 +395,49 @@ git worktree add --detach /tmp/prospect-coldstart-wt2 d1ecb361
 cd /tmp/prospect-coldstart-wt2
 FEATURES=maud,htmx,tailwind,cache-moka,http-client,reporting
 
-# Full, verified window (d1ecb361 exclusive .. ef61ae44 inclusive, 32 commits):
-COMMITS=(dc74ce43 25ed48ff 31423bfc e2efa9b0 6a6610c4 d81a4449 7dff7e07 c9121d5b \
-         141f36ef 5cdb1e17 747d204b bbac3304 9d99d980 52af191d bc99a4b8 69bb9d18 \
-         55febd8a 1fd62458 eba7fc67 24bf151c 61bdd9c2 28c6fae8 651929b2 d6aa6688 \
-         97a97be4 d96cfab0 fec52215 8f94e60b 76c56b1c 9c1ede1e f15ca1bb ef61ae44)
-
-# Warm baseline first (matches all other checkpoints' conditions):
-for c in d1ecb361 "${COMMITS[@]}"; do
-  git checkout --detach "$c" --quiet
+clear_workspace_artifacts() {
   rm -rf target/debug/deps/libautumn_macros* target/debug/deps/libautumn_web* \
          target/debug/deps/libautumn-* target/debug/deps/autumn_macros-* \
          target/debug/deps/autumn_web-* target/debug/deps/autumn-* \
          target/debug/.fingerprint/autumn-macros-* target/debug/.fingerprint/autumn-web-* \
          target/debug/.fingerprint/autumn-* target/debug/incremental/autumn_macros-* \
          target/debug/incremental/autumn_web-* target/debug/incremental/autumn-*
+}
+
+timed_build() {
+  clear_workspace_artifacts
   START=$(date +%s%3N)
   CARGO_INCREMENTAL=0 cargo build -p autumn-web --no-default-features --features "$FEATURES"
   END=$(date +%s%3N)
-  echo "$c: $((END-START))ms"
+  echo "$1: $((END-START))ms"
+}
+
+# Full, verified window (d1ecb361 exclusive .. ef61ae44 inclusive, 32 commits).
+# The worktree starts with an EMPTY target/, so this first pass's first
+# checkpoint (dc74ce43) unavoidably pays a one-time cold dependency compile
+# — that number is discarded, not used in the table.
+COMMITS=(dc74ce43 25ed48ff 31423bfc e2efa9b0 6a6610c4 d81a4449 7dff7e07 c9121d5b \
+         141f36ef 5cdb1e17 747d204b bbac3304 9d99d980 52af191d bc99a4b8 69bb9d18 \
+         55febd8a 1fd62458 eba7fc67 24bf151c 61bdd9c2 28c6fae8 651929b2 d6aa6688 \
+         97a97be4 d96cfab0 fec52215 8f94e60b 76c56b1c 9c1ede1e f15ca1bb ef61ae44)
+for c in "${COMMITS[@]}"; do
+  git checkout --detach "$c" --quiet
+  timed_build "$c"
+done
+
+# Re-measure d1ecb361 and dc74ce43 now that target/ is fully warm from the
+# pass above — these two (and only these two) replace their earlier numbers.
+for c in d1ecb361 dc74ce43; do
+  git checkout --detach "$c" --quiet
+  timed_build "${c}-warm"
+done
+
+# Noise-floor calibration: repeat the final checkpoint under matching warm
+# conditions. Run at least 3x (this report used 7) before treating any
+# individual or cumulative delta above as signal rather than noise.
+git checkout --detach ef61ae44 --quiet
+for i in 1 2 3 4 5 6 7; do
+  timed_build "ef61ae44-repeat-${i}"
 done
 
 git worktree remove /tmp/prospect-coldstart-wt2 --force   # dismantle
