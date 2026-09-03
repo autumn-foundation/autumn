@@ -201,10 +201,14 @@ fn generated_project_compiles_runs_and_serves() {
 /// generator, not an edge case.
 ///
 /// A red run here means exactly that has recurred: some in-tree commit has
-/// changed a public `autumn-web` API that an `autumn new`/`autumn
-/// generate` template calls, without a release to carry the change to
-/// crates.io yet. Until the next release ships, the workaround `autumn
-/// doctor`'s docs already describe is to point the generated `Cargo.toml`
+/// changed a public `autumn-web` API that the **base `autumn new` template**
+/// calls, without a release to carry the change to crates.io yet. This test
+/// only builds the bare `autumn new` output — it does not run `autumn
+/// generate`, so drift confined to a generator-emitted call site (a
+/// `scaffold`/`auth`/etc. template) is not covered here and would need a
+/// separate, generator-specific version of this same gap. Until the next
+/// release ships, the workaround `autumn doctor`'s docs already describe is
+/// to point the generated `Cargo.toml`
 /// at the checkout with a `[patch.crates-io]` override (exactly what
 /// [`patch_generated_cargo_toml`] does above) instead of building against
 /// the stale-pinned published crate.

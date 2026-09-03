@@ -178,11 +178,14 @@ jobs:
     # that version string is frozen at the last release tag until a
     # maintainer explicitly cuts the next one (CLAUDE.md, "Never bump the
     # workspace version"). Any commit that changes a public autumn-web API
-    # an `autumn new`/`autumn generate` template calls, without a release
-    # to carry it to crates.io yet, breaks exactly this pairing — silently:
-    # `autumn doctor`'s `version_compat` check compares version *strings*
-    # (`0.7.0` matches `0.7.0`) and reports green regardless, because it
-    # has no way to see API drift that a version number does not carry.
+    # the *base* `autumn new` template calls, without a release to carry it
+    # to crates.io yet, breaks exactly this pairing — silently: `autumn
+    # doctor`'s `version_compat` check compares version *strings* (`0.7.0`
+    # matches `0.7.0`) and reports green regardless, because it has no way
+    # to see API drift that a version number does not carry. This job only
+    # runs `autumn new`, not `autumn generate` — drift confined to a
+    # generator-emitted call site is a separate, uncovered instance of the
+    # same gap, not something a red/green here proves either way.
     #
     # A red run here means precisely that has happened. Until the next
     # release ships, the workaround is the one `autumn doctor`'s own docs
