@@ -1117,36 +1117,40 @@ def _embedded_spans(tok):
         i = j + 1
 
 
-def _mask_single_quoted(text):
-    """`text` with single-quoted CONTENT replaced by filler of equal length.
+def _mask_quoted(text, quotes="'\""):
+    """`text` with QUOTED content replaced by filler of equal length.
 
-    shlex removes the quote delimiters before anything downstream can ask, so
-    a literal `'$(autumn db)'` reached the substitution recursion looking
-    exactly like a real one, and a `printf` of that text was reported as a
-    command. Masking answers the question positionally: a body that survives
-    into the masked copy was written outside single quotes and runs.
+    Which quotes count depends on the question being asked, and the two uses
+    here differ:
 
-    Testing instead whether the body TEXT appeared anywhere single-quoted
-    suppressed a real substitution that merely repeated a quoted one —
-    `printf '%s' '$(autumn nope)'; OUT="$(autumn nope)"` runs the second.
+      - a command SUBSTITUTION runs inside double quotes, so only single ones
+        are masked (`_mask_single_quoted`);
+      - a heredoc operator is inert inside EITHER, so both are, and
+        `printf '%s' "<<EOF"` opens nothing.
 
-    Single quotes only: double quotes do not stop substitution.
+    Length is preserved so an offset in the masked copy still refers to the
+    same character, which is what makes the decision positional.
     """
     out, i, n = [], 0, len(text)
     while i < n:
         ch = text[i]
         out.append(ch)
         i += 1
-        if ch != "'":
+        if ch not in quotes:
             continue
-        end = text.find("'", i)
+        end = text.find(ch, i)
         if end < 0:                             # unbalanced: mask the rest
             out.append('x' * (n - i))
             break
         out.append('x' * (end - i))
-        out.append("'")
+        out.append(ch)
         i = end + 1
     return ''.join(out)
+
+
+def _mask_single_quoted(text):
+    """The substitution reading: only single quotes stop `$( … )`."""
+    return _mask_quoted(text, "'")
 
 
 def _in_substitutions(segment, masked=()):
@@ -1437,19 +1441,38 @@ def invocations(text):
         for display, argv in _from_tokens(items):
             yield at, display, argv, FENCED_COMMAND
 
+    fence_len = 0           # how long the opening run was: a closer matches it
     quoted_fence = False    # the open fence sits inside a markdown block quote
     heredoc = None          # the terminator of a heredoc being consumed
     folded = None           # paragraphs of a folded (`>`) block scalar
     folded_at = None
     folded_indent = 0
     folded_base = None      # the column its content sits at
+    folded_slot = None      # which container slot it fills, if any
 
     def close_folded():
         """Read a folded scalar: one command per paragraph, lines joined."""
-        nonlocal folded, folded_at, folded_base
-        paras, at = folded, folded_at
-        folded, folded_at, folded_base = None, None, None
+        nonlocal folded, folded_at, folded_base, folded_slot
+        nonlocal pending, pending_kind, pending_at, pending_indent
+        paras, at, slot = folded, folded_at, folded_slot
+        folded, folded_at, folded_base, folded_slot = None, None, None, None
         if not paras:
+            return
+        # A folded value under an exec-family key is that container's argv,
+        # exactly as the inline, block-list and plain-scalar forms are, so it
+        # fills the slot rather than standing alone. Opening a separate
+        # accumulator for it left `entrypoint: ["autumn"]` with a folded
+        # `command:` reporting a bare root on a correct recipe.
+        #
+        # Only a SINGLE paragraph can be one argv; more than one is more than
+        # one command, and those are read on their own as before.
+        filled = [para for para in paras if para]
+        if slot and len(filled) == 1:
+            value = ' '.join(filled[0])
+            pending_kind, pending_at = slot, at
+            pending_indent = folded_indent
+            pending = tokenize(value) or value.split()
+            yield from close_pending()
             return
         # Folding joins lines with spaces, but a BLANK line survives as a real
         # newline — so it separates two commands. Joining across it built
@@ -1506,9 +1529,17 @@ def invocations(text):
             yield from emit_slots()
             yield from _spans(take_paragraph(), commands)
             if fence is None:
-                fence, lang = m.group(1)[0], m.group(2).lower()
+                # The opening run's LENGTH is remembered, not just its
+                # character. A markdown fence closes only on a run at least as
+                # long as the one that opened it, so a ``` inside a ````
+                # block is content — closing on it ended the fence early and
+                # everything after read as prose, where a runnable command is
+                # not judged.
+                fence, fence_len = m.group(1)[0], len(m.group(1))
+                lang = m.group(2).lower()
                 quoted_fence = bool(_BLOCKQUOTE.match(line))
-            elif line.strip().startswith(fence * 3):
+            elif m.group(1)[0] == fence and len(m.group(1)) >= fence_len \
+                    and not m.group(2):
                 fence, lang, quoted_fence = None, None, False
             continue
 
@@ -1569,6 +1600,10 @@ def invocations(text):
         if fold:
             folded, folded_at, folded_base = [[]], lineno, None
             folded_indent = len(fold.group(1))
+            folded_slot = ('args' if _ARGS_KEY_LINE.match(keyline)
+                           else 'entry' if _ENTRY_KEY_LINE.match(keyline)
+                           else 'cmd' if _EXEC_KEY_LINE.match(keyline)
+                           else None)      # `script:`/`run:` pair with nothing
             continue
 
         # A command key opens a list — inline on its own line, or as the block
@@ -1662,7 +1697,7 @@ def invocations(text):
         # `<<EOF` mentioned in a comment or quoted as an argument opens
         # nothing, and treating it as an opener silenced every line after it.
         stripped = _strip_comment(logical)
-        masked_line = _mask_single_quoted(stripped)
+        masked_line = _mask_quoted(stripped)
         opener = _HEREDOC.search(stripped)
         if opener and masked_line[opener.start():opener.start() + 2] == '<<':
             heredoc = next(g for g in opener.groups() if g)
@@ -2268,8 +2303,9 @@ def self_test():
     hstring = '```bash\ncat <<<EOF\nautumn migrate run\n```'
     expect([d for _, d, _, _ in invocations(hstring)] == ['migrate run'],
            f'a here-string opens no heredoc: {list(invocations(hstring))}')
-    # …and a `<<EOF` that is only mentioned opens nothing either.
-    for mention in ('# see <<EOF below', "echo '<<EOF'"):
+    # …and a `<<EOF` that is only mentioned opens nothing either. BOTH quote
+    # kinds make the operator inert, unlike `$( )`, where only single ones do.
+    for mention in ('# see <<EOF below', "echo '<<EOF'", 'printf \'%s\' "<<EOF"'):
         doc = f'```bash\n{mention}\nautumn migrate run\n```'
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate run'],
@@ -2690,6 +2726,18 @@ def self_test():
 
     # --- a fence nested in a markdown BLOCK QUOTE carries a `>` on every line,
     # so the marker is not at the start of it. This corpus has six such pages.
+    # --- a fence closes only on a run at least as long as the one that opened
+    # it, and a line carrying an info string is content rather than a closer.
+    long_fence = '````markdown\n```\nautumn migrate run\n````'
+    expect([d for _, d, _, _ in invocations(long_fence)] == ['migrate run'],
+           f'a ``` inside a ```` block is content: {list(invocations(long_fence))}')
+    tagged = '```text\n```bash\nautumn migrate run\n```'
+    expect([w for _, _, _, w in invocations(tagged)] == [FENCED_COMMAND],
+           f'a tagged line does not close an open fence: {list(invocations(tagged))}')
+    plain = '```bash\nautumn migrate run\n```'
+    expect([w for _, _, _, w in invocations(plain)] == [FENCED_COMMAND],
+           'an ordinary fence still opens and closes normally')
+
     quoted = '> ```bash\n> autumn migrate run\n> ```'
     expect([d for _, d, _, _ in invocations(quoted)] == ['migrate run'],
            f'a block-quoted fence must be read: {list(invocations(quoted))}')
@@ -2763,6 +2811,26 @@ def self_test():
     # A more-indented block keeps EVERY newline inside it, not just the ones at
     # its edges. Breaking only on a change of depth still joined two of its
     # lines, and since the first accepts arguments the second vanished into it.
+    # A folded value under an exec-family key is that container's argv, so it
+    # fills the slot like the inline, block-list and plain-scalar forms do.
+    # A separate accumulator for it reported a bare root on a correct recipe.
+    for label, doc in [
+        ('entrypoint + folded command',
+         '```yaml\nentrypoint: ["autumn"]\ncommand: >\n  migrate\n```'),
+        ('folded command + args',
+         '```yaml\ncommand: >\n  autumn\nargs: ["migrate"]\n```'),
+        ('folded command alone', '```yaml\ncommand: >\n  autumn migrate\n```'),
+    ]:
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate'], f'{label} must assemble: {got}')
+    fdrift = '```yaml\nentrypoint: ["autumn"]\ncommand: >\n  run\n```'
+    expect([d for _, d, _, _ in invocations(fdrift)] == ['run'],
+           f'drift in a folded slot is read: {list(invocations(fdrift))}')
+    # …but `script:`/`run:` pair with nothing, and more than one paragraph is
+    # more than one command, so both stay standalone.
+    fscript = '```yaml\nscript: >\n  autumn migrate\n  run\n```'
+    expect([d for _, d, _, _ in invocations(fscript)] == ['migrate run'],
+           f'a folded script: is not a slot: {list(invocations(fscript))}')
     ind_pair = ('```yaml\nrun: >\n  autumn migrate\n    autumn routes\n'
                 '    autumn run\n```')
     expect([d for _, d, _, _ in invocations(ind_pair)] == ['migrate', 'routes', 'run'],
