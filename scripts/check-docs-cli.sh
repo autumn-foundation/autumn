@@ -550,7 +550,7 @@ _PROMPT = {'$', '(', '{'}
 # migrate; then …` runs `autumn migrate` as the condition, and leaving `if` as
 # the segment head meant the scan never reached it.
 _CONTROL = {'if', 'elif', 'while', 'until', 'then', 'else', 'do', 'done', 'fi',
-            'time', '!', 'exec', 'command', 'nohup', 'sudo', 'env'}
+            'time', '!', 'exec', 'command', 'nohup', 'sudo', 'env', 'xargs'}
 
 # Options a wrapper takes that consume a SEPARATE value token. `env` and
 # `sudo` both put flags between the keyword and the command they launch —
@@ -574,6 +574,12 @@ _WRAPPER_OPTS = {
     'time': set(),
     'nohup': set(),
     'exec': {'-a'},
+    # `xargs [OPTION]... COMMAND [INITIAL-ARGS]...` runs COMMAND directly, not
+    # only after a `--`. It was recognised for the separator form alone, so
+    # the ordinary `… | xargs autumn migrate` went unread entirely.
+    'xargs': {'-a', '--arg-file', '-E', '-e', '--eof', '-I', '--replace',
+              '-i', '-L', '--max-lines', '-l', '-n', '--max-args',
+              '-P', '--max-procs', '-s', '--max-chars', '-d', '--delimiter'},
 }
 
 
@@ -1490,8 +1496,7 @@ def invocations(text):
 
     fence_len = 0           # how long the opening run was: a closer matches it
     quoted_fence = False    # the open fence sits inside a markdown block quote
-    heredoc = None          # the terminator of a heredoc being consumed
-    heredoc_tabs = False    # …opened with `<<-`, so tabs may indent it
+    heredocs = []           # terminators still to consume, in order
     folded = None           # paragraphs of a folded (`>`) block scalar
     folded_at = None
     folded_indent = 0
@@ -1571,7 +1576,7 @@ def invocations(text):
             line = _BLOCKQUOTE.sub('', line, count=1)
         m = re.match(r'^\s*(?:>\s?)*(`{3,}|~{3,})\s*(.*)$', line)
         if m:
-            held, held_at, heredoc = [], None, None   # a fence boundary ends any hold
+            held, held_at, heredocs = [], None, []   # a fence boundary ends any hold
             yield from close_folded()           # …a folded scalar
             yield from close_pending()          # …and any list
             yield from emit_slots()
@@ -1606,10 +1611,15 @@ def invocations(text):
         # physical lines instead yields the argv `\`, and the command path split
         # across the break goes unchecked.
         # Inside a heredoc the shell is writing data, not running it.
-        if heredoc is not None:
-            candidate = line.lstrip('\t') if heredoc_tabs else line
-            if candidate.rstrip('\r') == heredoc:
-                heredoc = None
+        # One command line may open SEVERAL heredocs — `cat <<ONE <<TWO` —
+        # and bash consumes their bodies in order. Keeping only the first
+        # delimiter resumed scanning inside the second body, so its data read
+        # as commands.
+        if heredocs:
+            delim, tabs = heredocs[0]
+            candidate = line.lstrip('\t') if tabs else line
+            if candidate.rstrip('\r') == delim:
+                heredocs.pop(0)
             continue
 
         # A trailing comment is valid on a key line, and these patterns are
@@ -1756,12 +1766,11 @@ def invocations(text):
         for opener in _HEREDOC.finditer(stripped):
             if masked_line[opener.start():opener.start() + 2] != '<<':
                 continue
-            heredoc = next(g for g in opener.groups() if g)
             # `<<-` allows the terminator to be indented with TABS; a plain
             # `<<` requires it alone on the line. Accepting any indentation
             # closed a heredoc early and reported its data as a command.
-            heredoc_tabs = stripped[opener.start():opener.start() + 3] == '<<-'
-            break
+            heredocs.append((next(g for g in opener.groups() if g),
+                             stripped[opener.start():opener.start() + 3] == '<<-'))
         # Backticks inside a fence are not markdown spans. In a shell block
         # they are legacy command substitution — `` OUT=`autumn migrate` `` is
         # a command the reader runs — and elsewhere they are a line quoting a
@@ -2320,6 +2329,17 @@ def self_test():
         doc = f'```bash\n{builtin} autumn migrate run\n```'
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate run'], f'{builtin!r} must reach the command: {got}')
+    # `xargs [OPTION]... COMMAND` runs COMMAND directly, not only after a
+    # `--`. It was listed as a runner for the separator form alone, so the
+    # ordinary pipeline spelling went unread entirely.
+    for form in ('printf x | xargs', 'xargs', 'xargs -n1', 'xargs -I{}',
+                 'xargs -I {}', 'xargs --max-args 1', 'xargs --'):
+        doc = f'```bash\n{form} autumn migrate run\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate run'], f'{form!r} runs its command: {got}')
+    expect(list(invocations('```bash\ncat list | xargs rm\n```')) == [],
+           'xargs running something else stays quiet')
+
     # …but `-v`/`-V` make `command` DESCRIBE its arguments rather than run
     # them, so nothing there is an invocation. An earlier round asserted the
     # opposite, which encoded the bug rather than the rule.
@@ -2410,6 +2430,13 @@ def self_test():
     expect([d for _, d, _, _ in invocations(after_quoted)] == ['migrate run'],
            f'a quoted candidate must not hide a real opener after it: '
            f'{list(invocations(after_quoted))}')
+    # One command line may open SEVERAL heredocs, and bash consumes their
+    # bodies in order. Keeping only the first delimiter resumed scanning
+    # inside the second body, so its data read as commands.
+    two_docs = ('```bash\ncat <<ONE <<TWO\nautumn db\nONE\nautumn db\nTWO\n'
+                'autumn migrate run\n```')
+    expect([d for _, d, _, _ in invocations(two_docs)] == ['migrate run'],
+           f'both heredoc bodies are data: {list(invocations(two_docs))}')
     # An unterminated heredoc must not swallow the rest of the FILE.
     unterminated = ('```bash\ncat <<EOF\nautumn db\n```\n\n'
                     '```bash\nautumn migrate run\n```')
