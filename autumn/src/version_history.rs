@@ -456,9 +456,181 @@ impl VersionTenantIdValue for Option<String> {
     }
 }
 
+// ── Runtime append (issue #2309 follow-up) ───────────────────────────
+//
+// `#[repository(versioned)]` emits a version-history INSERT at ~30 distinct
+// mutation sites (every insert/update/delete path, single and bulk, hooked and
+// unhooked, plus the dependent-cascade and restore paths). Inlining the
+// statement at each of them expanded the same two backend-forked `sql_query`
+// bind chains 30 times into every versioned repository, for no gain: the write
+// is fully monomorphic — `RuntimeConnection` is a concrete type alias, every
+// bound value is a primitive, and nothing here depends on the model's columns.
+//
+// Hoisting it here compiles it **once** for the whole program instead of once
+// per generated repository. The generated code keeps only the model-specific
+// part (computing the column diff) and calls this.
+
+/// One version-history row, as the generated repository has computed it.
+///
+/// Borrowed throughout: every field is either a `&'static str` baked in by the
+/// macro or a borrow of a local the caller already owns, so building this costs
+/// nothing beyond the pointer copies.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct VersionHistoryWrite<'a> {
+    /// Physical table the mutated record lives in.
+    pub table_name: &'static str,
+    /// Active tenant for a `tenant_scoped` repository, else `None`.
+    pub tenant_id: Option<&'a str>,
+    /// Primary key of the mutated record.
+    pub record_id: i64,
+    /// Which mutation produced this entry.
+    pub op: VersionOp,
+    /// Resolved actor (a `MutationContext` override, the ambient current actor,
+    /// or [`VersionEntry::SYSTEM_ACTOR`]).
+    pub actor: &'a str,
+    /// Originating request id, when one is in scope.
+    pub request_id: Option<&'a str>,
+    /// Pre-serialized `Vec<ColumnChange>` JSON.
+    pub changes_json: &'a str,
+}
+
+/// Append one [`VersionEntry`] row inside the caller's already-open
+/// transaction.
+///
+/// Backend-forked exactly as the generated code was (#1996): the Postgres arm
+/// keeps the `$7::jsonb` cast (`changes` is a JSONB column); the `SQLite` arm
+/// drops it (JSON is stored as TEXT) and binds `recorded_at` explicitly,
+/// because the DDL's `DEFAULT CURRENT_TIMESTAMP` yields `YYYY-MM-DD HH:MM:SS`
+/// with no offset, which is not lexicographically comparable with the
+/// offset-bearing encoding diesel produces for a bound `DateTime<Utc>` filter
+/// value. Binding it here makes stored and filter values share one encoding so
+/// the `recorded_at >= / <=` TEXT comparisons in `version_history()` stay
+/// monotonic.
+///
+/// # Errors
+///
+/// Returns the database error if the INSERT fails.
+/// Postgres form of the version-history INSERT. Keeps the `$7::jsonb` cast —
+/// `changes` is a JSONB column on this tier.
+#[cfg(feature = "db")]
+#[allow(
+    dead_code,
+    reason = "exactly one of the two backend forms is reachable in any given build; \
+              both are asserted by this module's tests so neither can drift unseen"
+)]
+pub(crate) const PG_INSERT_SQL: &str = "INSERT INTO _autumn_version_history \
+     (table_name, tenant_id, record_id, op, actor, request_id, changes) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)";
+
+/// `SQLite` form. Drops the cast (JSON is stored as TEXT) and binds
+/// `recorded_at` as an explicit eighth column — see [`append_version_history`]
+/// for why the DDL default is not usable here.
+#[cfg(feature = "db")]
+#[allow(
+    dead_code,
+    reason = "exactly one of the two backend forms is reachable in any given build; \
+              both are asserted by this module's tests so neither can drift unseen"
+)]
+pub(crate) const SQLITE_INSERT_SQL: &str = "INSERT INTO _autumn_version_history \
+     (table_name, tenant_id, record_id, op, actor, request_id, changes, recorded_at) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)";
+
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub async fn append_version_history(
+    conn: &mut crate::db::RuntimeConnection,
+    write: &VersionHistoryWrite<'_>,
+) -> crate::AutumnResult<()> {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    use diesel_async::RunQueryDsl;
+
+    #[cfg(not(feature = "sqlite"))]
+    {
+        diesel::sql_query(PG_INSERT_SQL)
+            .bind::<Text, _>(write.table_name)
+            .bind::<Nullable<Text>, _>(write.tenant_id)
+            .bind::<BigInt, _>(write.record_id)
+            .bind::<Text, _>(write.op.as_str())
+            .bind::<Text, _>(write.actor)
+            .bind::<Nullable<Text>, _>(write.request_id)
+            .bind::<Text, _>(write.changes_json)
+            .execute(conn)
+            .await
+            .map_err(crate::AutumnError::from)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "sqlite")]
+    {
+        use diesel::sql_types::TimestamptzSqlite;
+
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "no AppState is reachable here to consult the injected clock (autumn #1797); \
+                      this preserves the generated code's previous behaviour verbatim"
+        )]
+        let recorded_at = Utc::now();
+
+        diesel::sql_query(SQLITE_INSERT_SQL)
+            .bind::<Text, _>(write.table_name)
+            .bind::<Nullable<Text>, _>(write.tenant_id)
+            .bind::<BigInt, _>(write.record_id)
+            .bind::<Text, _>(write.op.as_str())
+            .bind::<Text, _>(write.actor)
+            .bind::<Nullable<Text>, _>(write.request_id)
+            .bind::<Text, _>(write.changes_json)
+            .bind::<TimestamptzSqlite, _>(recorded_at)
+            .execute(conn)
+            .await
+            .map_err(crate::AutumnError::from)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two backend forms of the version-history INSERT (#1996).
+    ///
+    /// These assertions used to live in `autumn-macros`, which emitted both arms
+    /// inline at every write site. The statement now compiles once, here, so its
+    /// shape is asserted next to it.
+    #[cfg(feature = "db")]
+    #[test]
+    fn version_history_insert_forks_by_backend() {
+        // Postgres keeps the `$7::jsonb` cast — `changes` is a JSONB column.
+        assert!(
+            PG_INSERT_SQL.contains("$7::jsonb"),
+            "the Postgres write must keep the $7::jsonb cast: {PG_INSERT_SQL}"
+        );
+        assert!(
+            PG_INSERT_SQL
+                .contains("(table_name, tenant_id, record_id, op, actor, request_id, changes)"),
+            "the Postgres write names seven columns: {PG_INSERT_SQL}"
+        );
+
+        // SQLite stores JSON as TEXT, so the cast goes; and because the DDL's
+        // `DEFAULT CURRENT_TIMESTAMP` is not lexicographically comparable with
+        // the encoding diesel binds for a `DateTime<Utc>` filter value, this arm
+        // binds `recorded_at` explicitly as an eighth column.
+        assert!(
+            !SQLITE_INSERT_SQL.contains("::jsonb"),
+            "the SQLite write must drop the jsonb cast: {SQLITE_INSERT_SQL}"
+        );
+        assert!(
+            SQLITE_INSERT_SQL.contains(
+                "(table_name, tenant_id, record_id, op, actor, request_id, changes, recorded_at)"
+            ),
+            "the SQLite write must bind recorded_at as an 8th column: {SQLITE_INSERT_SQL}"
+        );
+        assert!(
+            SQLITE_INSERT_SQL.contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"),
+            "the SQLite write must use uncast $1..$8 placeholders: {SQLITE_INSERT_SQL}"
+        );
+    }
 
     // ── VersionOp ────────────────────────────────────────────────────
 

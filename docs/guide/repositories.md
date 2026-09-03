@@ -424,6 +424,190 @@ the known limits — is in the [votable guide](votable.md).
 
 ---
 
+## 9. Dependent cascades: `dependent = <action>`
+
+Deleting a parent row usually has to do something about its children. Autumn
+generates that cascade for you, transactionally, from a declaration — you never
+hand-write the child SQL or a `Db::tx` wrapper.
+
+### Two places to declare it
+
+**On the model (preferred).** Put the action on the `#[has_many]` / `#[has_one]`
+leg that already describes the association:
+
+```rust
+#[autumn_web::model(table = "posts")]
+#[has_many(Comment,  dependent = destroy)]
+#[has_many(Vote,     dependent = delete_all)]
+#[has_many(Bookmark, dependent = nullify)]   // Bookmark::post_id must be Option<i64>
+#[has_many(Award,    dependent = restrict)]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(Post, table = "posts")]
+pub trait PostRepository {}
+```
+
+`on_delete = <action>` is accepted as an exact synonym of `dependent = <action>`,
+so the two declaration sites can be spelled identically.
+
+This form resolves each child's repository by the **`Pg{Child}Repository` naming
+convention** (`Comment` → `PgCommentRepository`), which is what
+`#[repository(...)]` on a `CommentRepository` trait generates. The name is
+resolved unqualified at the model's definition site, so the child repository
+must be nameable there.
+
+**On the repository (escape hatch).** When the child's repository does not follow
+that convention — a hand-named type, or one imported from another crate — name it
+explicitly:
+
+```rust
+#[autumn_web::repository(
+    Post,
+    dependent(PgCommentRepository, fk = "post_id", on_delete = destroy),
+    dependent(PgVoteRepository,    fk = "post_id", on_delete = delete_all),
+)]
+pub trait PostRepository {}
+```
+
+Here `fk` is required, because there is no association leg to infer it from.
+
+### Which one wins
+
+Both are supported, and they drive **the same** generated cascade — the model
+form dispatches through a generated `Model::dependents()` table, the repository
+form inlines the same calls at compile time. Behavior, ordering, and guarantees
+are identical.
+
+When a repository declares `dependent(...)`, **the repository attribute wins for
+that repository** and any model-side `dependent` on the same model is inert. That
+is deliberate — the repository form exists precisely to override — but a silently
+ignored declaration is a trap, so debug builds emit a `tracing::warn!` naming the
+model when both are present. The warning rides the single-record delete path
+(`delete_by_id`) — an app whose only delete path is `delete_many`
+never sees it — and the check is a const-folded `if false` in release builds, so
+they pay nothing for it.
+
+Pick one site per model. Reach for the repository form only when the naming
+convention cannot reach the child.
+
+### The four actions
+
+| Action       | Effect on matched children                                                              |
+|--------------|-----------------------------------------------------------------------------------------|
+| `destroy`    | Deletes each child through its own delete path: fires the child's `before_delete` hook (and enqueues its `after_delete_commit` hook when the child repository declares `commit_hooks = true`), honors the child's `soft_delete`, and recurses into the child's own dependents. |
+| `delete_all` | One set-based delete of the matched children. No child hooks, **no recursion** — the cheap option for leaf rows. |
+| `nullify`    | Sets the child foreign key to `NULL`, leaving the rows. The child's FK column must be nullable (`Option<i64>`). |
+| `restrict`   | Refuses the delete with a typed `409 Conflict` if any child still references the parent. |
+
+`destroy` follows the parent's delete kind. A soft-deleting parent soft-deletes
+each child that is itself a `#[soft_delete]` model — the live graph stays
+consistent and FKs stay valid — and hard-deletes any child that is not, since
+there is nothing to soft-delete. A hard-deleting parent hard-deletes every
+child, already-soft-deleted rows included, so no row is left dangling behind a
+removed parent.
+
+The one child shape that refuses is a **ledgered** soft-delete child under a
+hard-deleting parent: hard-deleting it would destroy ledger history, so the
+cascade returns a typed conflict instead of removing the row.
+
+### What the cascade guarantees
+
+- **One transaction.** The whole cascade — every level of it — and the parent's
+  own delete run inside a single database transaction. Any failure, including a
+  `restrict` 409, rolls the entire thing back. The generated delete acquires its
+  own connection and opens that transaction itself; it is not `Db::tx` and does
+  not nest inside one.
+- **A *direct* `restrict` blocks before any hook runs.** Every `restrict`
+  declared on the row being deleted is probed up front — before any mutating
+  action and before that row's own `before_delete` hook. Deleting a parent whose
+  own `restrict` leg is occupied therefore fires no hook at all, on either delete
+  path. The probe follows the parent's delete kind: a soft-deleting parent counts
+  only *live* children, so an already-soft-deleted child does not block it, while
+  a hard-deleting parent counts soft-deleted children too — they would still
+  dangle.
+
+  **A deeper `restrict` does not carry that guarantee.** Grandchild and lower
+  `restrict` legs are probed inside the cascade that reaches them, not hoisted to
+  the top, so work already done can have fired hooks by the time one answers 409:
+
+  - across a parent's **sibling associations** — the mutating pass runs them in
+    declaration order, so if the first `destroy` leg's children have hooks and a
+    later leg hits a restricting grandchild, those hooks already fired;
+  - across **parents in a `delete_many` batch** — Phase 1 probes the batch's
+    direct `restrict` legs, but deeper ones wait for each parent's own Phase-2
+    cascade.
+
+  Within one association the ordering *is* safe: a `destroy`d child set pre-scans
+  every sibling's `restrict` grandchildren before any of their hooks run.
+
+  The transaction always rolls back in full. A hook side effect that is not a
+  commit hook does not. So if a `before_delete` hook reaches outside the database,
+  put the `restrict` on the leg you are deleting rather than a level below it —
+  that is the only placement the up-front probe covers. Deleting parents one at a
+  time closes the batch case but not the sibling-association one, since a single
+  parent's legs still run in order. Hoisting deeper probes into the up-front pass
+  is tracked in [#2427](https://github.com/autumn-foundation/autumn/issues/2427).
+- **Both delete paths.** `delete_by_id` and the bulk `delete_many` both run the
+  cascade, and on both the children are handled before the parent row goes, so
+  bulk-deleting parents neither orphans children nor trips a foreign key. A batch
+  is all-or-nothing: a `restrict` 409 anywhere in it rolls back every parent.
+
+  The two paths do **not** interleave hooks identically, and only the database
+  effects are guaranteed to match. `delete_by_id` runs the parent's own
+  `before_delete` before cascading its children; a hooked `delete_many` cascades
+  the whole batch first and runs the parents' `before_delete` hooks after. So a
+  parent hook that rejects a bulk delete does so once child hooks have already
+  run. As above, the transaction still rolls back in full and a non-commit hook's
+  external side effects do not.
+
+  Treat the exact hook interleaving as unspecified beyond what is stated here —
+  #2427 tracks pinning it down.
+- **Multi-level.** A `destroy`d child runs its **own** dependents before its row
+  goes, so `Post → Comment → Reply` cascades end to end. Grandchildren may be
+  declared on either site.
+- **Cycles terminate.** A `(table, id)` guard tracks the active recursion path,
+  so self-referential (`parent_id` on the same table) and mutually-referential
+  graphs finish instead of looping.
+
+### Limits and rejected combinations
+
+- `dependent` / `on_delete` on a **`#[belongs_to]`** is a compile error: the
+  foreign key lives on that side, so there is no dependent set to cascade into.
+  Declare it on the parent's `#[has_many]` / `#[has_one]`.
+- `dependent` / `on_delete` on a **`through = <join_table>`** (many-to-many)
+  association is a compile error: that association's foreign key names a column
+  on the join table, not on the target model, so the cascade would mutate the
+  wrong rows.
+- An unrecognised action is a compile error naming the four supported spellings —
+  never a silently ignored key.
+- `delete_all` does not recurse. If the rows it removes have children of their
+  own, use `destroy` (or rely on a database-level `ON DELETE`).
+- The `delete_many` cascade is **per parent row**: children are cascaded once per
+  parent per association rather than in one set-based statement, so a batch of N
+  parents costs on the order of N times the per-parent cascade. The batch is
+  still one transaction; it is the statement count that scales.
+- `retention(...)` and `dependent(...)` cannot be combined on the same
+  repository. The sweep mutates rows directly rather than going through the
+  cascade-aware delete path, so it would orphan children or ignore a `restrict`
+  rule. The repository-attribute combination is a compile error; a model-declared
+  cascade on a `retention(...)` repository is rejected at startup with the same
+  explanation. Call `delete_many(ids)` from a hand-written `#[scheduled]` sweep
+  instead.
+- `position(...)` and a repository-attribute `dependent(...)` are also rejected
+  together — a move never deletes a row, so the two are independent concerns, but
+  the combination is untested. There is no equivalent runtime rejection for a
+  model-declared cascade.
+
+See also: [counter caches](counter-cache.md) (how each action moves a parent's
+`{child}_count`), [soft delete](soft-delete.md), and
+[macro transparency](macro-transparency.md) for the generated shape.
+
+---
+
 ## Read Replicas: Automatic Read Routing
 
 When `database.replica_url` is configured, every generated **read-only** method — `find_by_id`, `find_all`, `count`, `exists_by_id`, `paginate`, `cursor_page`, derived `find_by_*` / `count_by_*` / `exists_by_*` queries, and full-text `search` / `search_page` — automatically acquires its connection from the replica pool. Mutating methods (`save`, `update`, `delete_by_id`, the bulk operations, hook-driven writes, `with_lock`) always run on the primary. Provisioning a replica therefore offloads your primary with **zero application code changes**.

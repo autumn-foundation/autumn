@@ -166,6 +166,31 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     fn from(err: E) -> Self {
+        // #2423: Postgres refuses an embedded NUL byte in a TEXT/VARCHAR column
+        // (SQLSTATE 22021). That is malformed client input reaching the
+        // database, not a server bug, so it takes the 422 a `#[validate(...)]`
+        // rejection would have produced had a validator been able to see the
+        // byte. Handled first and by returning, so this classification has one
+        // unambiguous precedence rather than depending on where it sits among
+        // the status overrides below.
+        //
+        // The error is re-wrapped rather than merely restatused: the 422 page
+        // renders the message verbatim where the 500 page redacts it, so
+        // downgrading alone would put a raw Postgres message on screen. The
+        // original stays reachable as `source()`.
+        #[cfg(feature = "db")]
+        if error_chain_is_pg_nul_rejection(&err) {
+            return Self {
+                inner: Box::new(NulByteRejected(err)),
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                details: None,
+                problem_type: None,
+                cache_idempotency_response: false,
+                #[cfg(debug_assertions)]
+                backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
+            };
+        }
+
         let mut status = StatusCode::INTERNAL_SERVER_ERROR;
         let any_err: &dyn std::any::Any = &err;
 
@@ -782,6 +807,135 @@ pub fn unique_violation_field<'a>(
         .map(|(_, field, message)| (*field, *message))
 }
 
+// ── #2423: Postgres refuses a NUL byte in TEXT — that is client input ──────
+
+/// The client-facing message substituted for a Postgres NUL-byte rejection.
+///
+/// The raw server message (`invalid byte sequence for encoding "UTF8": 0x00`)
+/// is a database internal. It must not become the visible message, because the
+/// `422` error page renders `message` verbatim where the `500` page
+/// deliberately does not — see `error_pages::defaults`' `render_422` and
+/// `render_500`. Downgrading the status alone would therefore move a database
+/// message onto a page that shows it.
+pub const NUL_BYTE_REJECTED_MESSAGE: &str =
+    "The submitted text contains a NUL character (0x00), which cannot be stored.";
+
+/// Wrapper that gives a classified NUL rejection [`NUL_BYTE_REJECTED_MESSAGE`]
+/// as its `Display` while keeping the original error as its `source()`, so
+/// logs, error reporting and [`AutumnError::downcast_chain_ref`] still reach
+/// the underlying diesel error.
+#[cfg(feature = "db")]
+#[derive(Debug)]
+pub(crate) struct NulByteRejected<E>(E);
+
+#[cfg(feature = "db")]
+impl<E> std::fmt::Display for NulByteRejected<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(NUL_BYTE_REJECTED_MESSAGE)
+    }
+}
+
+#[cfg(feature = "db")]
+impl<E: std::error::Error + 'static> std::error::Error for NulByteRejected<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Whether `err` carries a Postgres rejection of an embedded NUL byte
+/// (SQLSTATE `22021`, issue #2423) — malformed *client* input rather than a
+/// server bug.
+///
+/// A `TEXT`/`VARCHAR` column cannot hold `0x00`, so a value carrying one is
+/// refused at `INSERT`/`UPDATE` time no matter how it arrived. The blanket
+/// [`From`] impl already downgrades such an error to
+/// `422 Unprocessable Entity`; this predicate is for handlers that want to go
+/// further and fold it back into a form as a field error, the way
+/// [`unique_violation_field`] is used for a uniqueness clash.
+///
+/// Walks the whole `source()` chain — the same walk the [`From`] impl makes,
+/// through the one shared helper, so the two can never disagree about whether
+/// a given error is this one.
+///
+/// Prefer preventing it: [`crate::form::ChangesetForm`] already rejects a NUL
+/// at the form boundary with [`crate::form::NUL_CHARACTER_FIELD_ERROR`], so
+/// this only fires for the paths no form extractor sees — a JSON API body, a
+/// hand-written query, a background job.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::error::{AutumnError, is_nul_byte_violation};
+///
+/// let err = AutumnError::internal_server_error_msg("not a db error");
+/// assert!(!is_nul_byte_violation(&err));
+/// ```
+#[cfg(feature = "db")]
+#[must_use]
+pub fn is_nul_byte_violation(err: &AutumnError) -> bool {
+    error_chain_is_pg_nul_rejection(err.inner.as_ref())
+}
+
+/// Whether `err`, or anything in its `source()` chain, is Postgres refusing an
+/// embedded NUL byte.
+///
+/// The single definition of "this was the client's byte, not our bug", shared
+/// by [`is_nul_byte_violation`] and the blanket [`From`] impl. The chain walk
+/// matters because a repository or service may wrap the diesel error in its own
+/// type, and it continues past a non-matching diesel error rather than stopping
+/// at the first one found.
+#[cfg(feature = "db")]
+pub(crate) fn error_chain_is_pg_nul_rejection(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(cause) = current {
+        if cause
+            .downcast_ref::<diesel::result::Error>()
+            .is_some_and(is_pg_nul_byte_error)
+        {
+            return true;
+        }
+        current = cause.source();
+    }
+    false
+}
+
+/// Whether a raw diesel error is Postgres refusing an embedded NUL byte.
+#[cfg(feature = "db")]
+fn is_pg_nul_byte_error(err: &diesel::result::Error) -> bool {
+    let diesel::result::Error::DatabaseError(_, info) = err else {
+        return false;
+    };
+    pg_message_is_nul_rejection(info.message())
+}
+
+/// Classify a Postgres server message as the `22021` NUL rejection.
+///
+/// Message matching, not SQLSTATE matching, because the code is unavailable:
+/// `diesel-async`'s `pg/error_helper.rs` maps every SQLSTATE it does not
+/// special-case (`22021` among them) to `DatabaseErrorKind::Unknown` and keeps
+/// no copy of the code, and diesel's `DatabaseErrorInformation` trait exposes no
+/// accessor for it.
+///
+/// **Anchored on purpose.** Postgres echoes submitted text into the primary
+/// message of other errors (`invalid input syntax for type integer: "…"`,
+/// `column "…" does not exist`), so a substring search for `0x00` is
+/// attacker-satisfiable: a client that submits the right literal could get a
+/// genuine server fault relabelled as its own fault — hidden from 5xx alerting
+/// and rendered on the 422 page. Requiring the message to *end* with `: 0x00`
+/// defeats that, because an echoed value is always followed by a closing quote
+/// or trailing prose. `UTF` must appear too, and always does: `tokio-postgres`
+/// fixes `client_encoding` to `UTF8`, so the encoding the server names in this
+/// message is `UTF8` on every connection this framework opens.
+///
+/// The failure this leaves is a locale whose translation moves the byte literal
+/// off the end of the message — the error then keeps its `500`, which is
+/// exactly the pre-#2423 behavior. Failing back to "server bug" is the safe
+/// direction; failing forward to "client's fault" is not.
+#[cfg(feature = "db")]
+fn pg_message_is_nul_rejection(message: &str) -> bool {
+    message.ends_with(": 0x00") && message.contains("UTF")
+}
+
 impl std::fmt::Display for AutumnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.inner)
@@ -1323,6 +1477,175 @@ mod tests {
             .expect("HX-Trigger header present");
         assert_eq!(hx_trigger, r#"{"autumn:conflict":true}"#);
         Ok(())
+    }
+
+    // ── #2423: Postgres rejects NUL in TEXT — that is client input ──────────
+
+    #[cfg(feature = "db")]
+    mod nul_byte_violation_tests {
+        use super::*;
+        use crate::error::is_nul_byte_violation;
+
+        /// A `DatabaseErrorInformation` carrying only a server message —
+        /// SQLSTATE is not exposed by diesel's trait (see
+        /// `diesel-async`'s `pg/error_helper.rs`, which maps `22021` to
+        /// `DatabaseErrorKind::Unknown` and drops the code), so the message is
+        /// all the classifier has to go on.
+        #[derive(Debug)]
+        struct FakeMessageInfo(&'static str);
+
+        impl diesel::result::DatabaseErrorInformation for FakeMessageInfo {
+            fn message(&self) -> &str {
+                self.0
+            }
+            fn details(&self) -> Option<&str> {
+                None
+            }
+            fn hint(&self) -> Option<&str> {
+                None
+            }
+            fn table_name(&self) -> Option<&str> {
+                None
+            }
+            fn column_name(&self) -> Option<&str> {
+                None
+            }
+            fn constraint_name(&self) -> Option<&str> {
+                None
+            }
+            fn statement_position(&self) -> Option<i32> {
+                None
+            }
+        }
+
+        fn unknown_db_error(message: &'static str) -> diesel::result::Error {
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::Unknown,
+                Box::new(FakeMessageInfo(message)),
+            )
+        }
+
+        /// The exact message Postgres 16 returns for SQLSTATE `22021`.
+        const PG_NUL_MESSAGE: &str = r#"invalid byte sequence for encoding "UTF8": 0x00"#;
+
+        #[test]
+        fn pg_nul_byte_error_maps_to_422_not_500() {
+            let err: AutumnError = unknown_db_error(PG_NUL_MESSAGE).into();
+            assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        #[test]
+        fn predicate_recognizes_the_pg_nul_byte_error() {
+            let err: AutumnError = unknown_db_error(PG_NUL_MESSAGE).into();
+            assert!(is_nul_byte_violation(&err));
+        }
+
+        /// `lc_messages` translates the prose but leaves the encoding name and
+        /// the byte literal alone, so a non-English server still classifies.
+        #[test]
+        fn localized_pg_nul_byte_message_is_still_recognized() {
+            let err: AutumnError =
+                unknown_db_error("ungueltige Byte-Sequenz fuer Kodierung \u{ab}UTF8\u{bb}: 0x00")
+                    .into();
+            assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        /// The raw server message must not reach the client: the 422 error page
+        /// renders `message` verbatim where the 500 page redacts it, so
+        /// downgrading the status without re-wrapping would newly expose a
+        /// database internal on a user-facing page.
+        #[test]
+        fn the_raw_postgres_message_is_not_the_client_facing_message() {
+            let err: AutumnError = unknown_db_error(PG_NUL_MESSAGE).into();
+            assert_eq!(err.to_string(), crate::error::NUL_BYTE_REJECTED_MESSAGE);
+            assert!(!err.to_string().contains("UTF8"));
+        }
+
+        /// ...but the original is still reachable for logs, error reporting and
+        /// handler-side classification.
+        #[test]
+        fn the_original_diesel_error_survives_as_a_source() {
+            let err: AutumnError = unknown_db_error(PG_NUL_MESSAGE).into();
+            let inner = err
+                .downcast_chain_ref::<diesel::result::Error>()
+                .expect("the diesel error must stay reachable through the chain");
+            assert!(inner.to_string().contains("0x00"));
+        }
+
+        /// Narrow by construction: any other database error keeps its 500, so
+        /// a genuine server bug is never relabelled as the client's fault.
+        #[test]
+        fn other_db_errors_still_map_to_500() {
+            for message in [
+                "division by zero",
+                "relation \"posts\" does not exist",
+                // Mentions a byte literal but is not the encoding rejection.
+                "invalid input syntax for type bytea: 0x00",
+            ] {
+                let err: AutumnError = unknown_db_error(message).into();
+                assert_eq!(
+                    err.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "unexpectedly reclassified: {message}"
+                );
+                assert!(!is_nul_byte_violation(&err), "false positive: {message}");
+            }
+        }
+
+        /// Postgres echoes submitted text into the primary message of other
+        /// errors. A client must not be able to spell the classifier's pattern
+        /// inside its own input and so relabel a real server fault as its own
+        /// fault — which would hide it from 5xx alerting and put the message on
+        /// the 422 page. The end-anchor is what defeats this.
+        #[test]
+        fn attacker_supplied_text_echoed_into_a_message_does_not_classify() {
+            for message in [
+                // The value the client submitted, echoed and quoted.
+                "invalid input syntax for type integer: \"UTF: 0x00\"",
+                "invalid input syntax for type uuid: \"0x00 UTF8\"",
+                // A dynamic identifier built from client input.
+                "column \"0x00 UTF8 encoding\" does not exist",
+            ] {
+                let err: AutumnError = unknown_db_error(message).into();
+                assert_eq!(
+                    err.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "client-spellable message was reclassified: {message}"
+                );
+            }
+        }
+
+        /// The chain walk continues past a non-matching diesel error rather
+        /// than stopping at the first one, and the predicate agrees with the
+        /// status the `From` impl assigned.
+        #[test]
+        fn predicate_and_status_agree_through_a_wrapping_error() {
+            #[derive(Debug)]
+            struct Wrapper(diesel::result::Error);
+            impl std::fmt::Display for Wrapper {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "repository failed")
+                }
+            }
+            impl std::error::Error for Wrapper {
+                fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                    Some(&self.0)
+                }
+            }
+
+            let err: AutumnError = Wrapper(unknown_db_error(PG_NUL_MESSAGE)).into();
+            assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(
+                is_nul_byte_violation(&err),
+                "the predicate must agree with the status the From impl chose"
+            );
+        }
+
+        #[test]
+        fn predicate_is_false_for_non_db_errors() {
+            let err = AutumnError::internal_server_error_msg(PG_NUL_MESSAGE);
+            assert!(!is_nul_byte_violation(&err));
+        }
     }
 
     // ── unique_violation_field (issue #1032) ────────────────────────────────
