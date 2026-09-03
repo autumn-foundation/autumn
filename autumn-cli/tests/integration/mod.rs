@@ -5,6 +5,7 @@ mod console;
 mod db;
 mod db_pull;
 mod db_scrub;
+mod dependency_audit;
 mod deploy;
 mod edge;
 mod generate_json_postgres;
@@ -20,7 +21,9 @@ mod migrate_down;
 #[cfg(feature = "sqlite")]
 mod migrate_sqlite;
 mod offsite_backup;
+mod platform_support_policy;
 mod replay;
+mod replica_restore;
 mod repo_hygiene;
 mod scaffold_belongs_to;
 mod scaffold_bulk_delete;

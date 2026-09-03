@@ -57,6 +57,14 @@ On trunk-dev (unreleased — not in the published 0.5.0 CLI) there is also
 local Postgres. See `docs/guide/daemon.md`. Do not suggest it to users on the
 published 0.5.0 CLI.
 
+**Do not suggest the daemon to a user on native Windows** (unreleased —
+trunk-dev, issue #1616). The daemon lifecycle is built on Unix domain sockets
+and POSIX signals, so it is **Tier 2: supported via WSL2** and fails fast on
+native Windows with a message naming the policy. `--bundled-pg` implies
+`--daemon`, so it is Tier 2 too. On Windows, `autumn dev` is the native way to
+run a managed-Postgres app; foreground `autumn serve` is also Tier 1. See
+`docs/guide/platform-support.md`.
+
 ## What gets served
 
 Once running, tell the user what's available:
@@ -88,6 +96,26 @@ On trunk-dev (unreleased — not in the published 0.5.0 CLI), when a rebuild
 clears on the next successful rebuild (issue #1115). See
 `docs/guide/dev-error-overlay.md`.
 
+### On Windows (unreleased — trunk-dev, issue #1616)
+
+Two behaviours differ, both deliberate:
+
+- **The app is stopped before the rebuild, not after.** A running
+  `target\debug\<app>.exe` is locked on Windows, so `cargo build` cannot relink
+  over it. The tradeoff is that a failed rebuild leaves the app down, so the
+  compile-error overlay above is not available there and the browser falls back
+  to a normal reconnect.
+- **The stop is cooperative, not a kill.** Windows has no `SIGTERM`, so
+  `autumn dev` sets `AUTUMN_SHUTDOWN_SIGNAL_FILE` and creates that file to
+  request a drain; the runtime then runs the same graceful shutdown a signal
+  triggers on Unix, so `on_shutdown` hooks — including managed Postgres teardown
+  — actually run. The wait is the app's own configured budget
+  (`prestop_grace_secs + shutdown_timeout_secs`) plus headroom for the hooks
+  that run after the drain, not a fixed constant. If the app misses it,
+  `autumn dev` force-stops it and prints a warning saying the hooks may not have
+  run. If a user reports that warning, the app is genuinely hanging in shutdown;
+  it is not a false alarm. The variable is honored on non-Unix targets only.
+
 ## Common failures
 
 | Symptom | Fix |
@@ -96,6 +124,7 @@ clears on the next successful rebuild (issue #1115). See
 | `Error: connection refused` | Database is not running. Start Postgres first. |
 | Compile error shown in terminal | Fix the Rust error; `autumn dev` will retry on next save. |
 | `autumn setup` not found | Run `cargo install autumn-cli --version 0.5.0` |
+| On Windows: `autumn serve --daemon` / `deploy` refuses with "Tier 2 (WSL2)" | Working as designed (trunk-dev, issue #1616) — those are Unix-native. Run them from a WSL2 shell; see `docs/guide/platform-support.md`. |
 
 ## Stopping
 

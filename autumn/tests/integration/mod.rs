@@ -2,6 +2,8 @@
 mod a11y;
 mod access_log;
 #[cfg(feature = "acme")]
+mod acme_dns01;
+#[cfg(feature = "acme")]
 mod acme_end_to_end;
 #[cfg(feature = "acme")]
 mod acme_fake_ca;
@@ -321,6 +323,12 @@ mod sim_rate_limit_clock;
 mod sim_retry_storm;
 mod sim_strict_wall_clock;
 mod sim_test_smoke;
+#[cfg(feature = "db")]
+mod sqlite_replication;
+#[cfg(all(feature = "db", feature = "http-client"))]
+mod sqlite_replication_s3;
+#[cfg(feature = "db")]
+mod sqlite_replication_wal;
 #[cfg(feature = "ws")]
 mod sse_replay;
 mod static_serving;

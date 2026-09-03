@@ -28,8 +28,8 @@ package = "autumn-web"
 # `router::extract_path_params`, the path-parameter extraction seam).
 # `plugin-sandbox` is here for the `sandbox` target: the container reader, the
 # manifest validator and the guest frame parser all decode bytes an unaudited
-# artifact produced.
-features = ["inbound-mail", "multipart", "openapi", "plugin-sandbox"]
+# artifact produced. `acme` is here for the `dns` target.
+features = ["inbound-mail", "multipart", "openapi", "acme", "plugin-sandbox"]
 
 # cargo-fuzz builds in release mode with ASAN instrumentation, which is the
 # repo's heaviest build; debug info is a large share of that footprint and is
@@ -79,6 +79,13 @@ bench = false
 [[bin]]
 name = "body"
 path = "fuzz_targets/body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
 test = false
 doc = false
 bench = false

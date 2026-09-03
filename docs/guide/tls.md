@@ -426,16 +426,282 @@ Fields:
 > election only decides **which** instance orders a certificate; it does not make
 > multi-replica ACME work — the app logs a loud startup warning when a
 > distributed scheduler backend is configured. For multi-replica or clustered
-> deployments, terminate TLS at a shared reverse proxy / load balancer (or a
-> single dedicated TLS-terminating instance) instead of in-process ACME
-> ([#1620](https://github.com/autumn-foundation/autumn/issues/1620)).
+> deployments, terminate TLS at a shared reverse proxy / load balancer, or use a
+> single dedicated TLS-terminating instance.
+>
+> [DNS-01](#wildcard-certificates-via-dns-01-servertlsacmedns) removes **half**
+> of this: its challenge record lives in your zone rather than in one replica's
+> memory, so the `:80` routing problem goes away and the CA never connects to
+> your host at all. It does not distribute certificates. The store is still
+> local disk, so replicas that did not win the renewal lease never receive the
+> issued certificate and keep serving the self-signed placeholder — the startup
+> warning still fires under DNS-01, naming the certificate store. To run ACME
+> across replicas at all, `cache_dir` must be on storage every replica shares.
 
 ### Scope
 
-This is a **single-host** slice. Wildcard certificates and the DNS-01 challenge
-are out of scope (tracked in
-[#1620](https://github.com/autumn-foundation/autumn/issues/1620)). For multiple replicas
-behind a shared entry point, terminate TLS at the proxy instead — see below.
+HTTP-01 as described above is a **single-host** path: the challenge token lives
+in the process, so behind a load balancer the CA's `:80` probe can land on a
+replica that never published it. For a wildcard certificate — or for a
+multi-replica deployment — use **DNS-01**, next.
+
+---
+
+## Wildcard certificates via DNS-01 (`[server.tls.acme.dns]`)
+
+If you run subdomain-per-tenant (`tenant1.myapp.com`, `tenant2.myapp.com`, …),
+HTTP-01 is the wrong shape: it needs one issuance per hostname, so tenant *N*'s
+first request waits on a certificate order, and Let's Encrypt's rate limits
+become a ceiling on how fast you can onboard. A **wildcard** certificate for
+`*.myapp.com` covers every tenant that exists and every tenant that ever will —
+but no CA will validate a wildcard over HTTP-01. It requires **DNS-01**: proving
+you control the zone by publishing a `_acme-challenge` TXT record.
+
+Add a `[server.tls.acme.dns]` section naming your DNS provider, and list the
+wildcard in `domains`:
+
+```toml
+[server.tls.acme]
+domains = ["myapp.com", "*.myapp.com"]
+contact_email = "ops@myapp.com"
+directory = "production"
+
+[server.tls.acme.dns]
+provider = "cloudflare"
+```
+
+That is the whole configuration. Everything else — issuance on first boot,
+renewal before expiry with no restart, persistence across restarts, the staging
+directory, the health indicator — is the same lifecycle the HTTP-01 path above
+already has; only the challenge answer changes.
+
+Onboarding a tenant after that costs **zero** certificate work: no issuance, no
+restart, no config change. `tenant42.myapp.com` serves valid HTTPS from the
+moment it resolves to your host.
+
+### Supported providers
+
+| `provider` | Credential fields | Notes |
+|---|---|---|
+| `cloudflare` | `api_token` | A scoped API token with **Zone:Read** *and* **DNS:Edit** on the zone — `Zone:Read` because the zone id is discovered from the record name. |
+| `route53` | `access_key_id`, `secret_access_key`, optionally `session_token`, `hosted_zone_id`, `region` | Needs `route53:ChangeResourceRecordSets` and `route53:ListResourceRecordSets` on the zone (plus `route53:ListHostedZonesByName` unless you set `hosted_zone_id`). |
+| `exec` | none — the hook authenticates itself | The escape hatch: any other provider. See below. |
+
+### Where the credential lives
+
+**Never in `autumn.toml`.** The section has no field that could hold a token,
+and it rejects unknown keys — so an `api_token = "..."` written into the config
+file is a startup error naming the key, not a plaintext secret nobody notices.
+
+Put it in the encrypted credentials store:
+
+```console
+$ autumn credentials edit
+```
+
+```console
+$ autumn credentials edit --env prod
+```
+
+```toml
+# config/credentials/prod.toml.enc (decrypted for editing)
+[acme_dns]
+api_token = "your-cloudflare-token"
+```
+
+> Pass the profile you will run under. `AUTUMN_ENV=production` resolves to the
+> **`prod`** profile, so the server reads `config/credentials/prod.toml.enc` —
+> while a bare `autumn credentials edit` writes `development.toml.enc`. A
+> credentials file that does not exist loads as an *empty store*, so the
+> mismatch surfaces as "no Cloudflare API token found" rather than as a missing
+> file.
+
+The table name is the `credential` key from `[server.tls.acme.dns]`, which
+defaults to `acme_dns`. For Route 53 the same table carries the AWS fields:
+
+```toml
+[acme_dns]
+access_key_id = "AKIA..."
+secret_access_key = "..."
+# optional; skips the hosted-zone lookup
+hosted_zone_id = "Z0123456789ABCDEFGHIJ"
+```
+
+The store is decrypted with `AUTUMN_MASTER_KEY` (or `config/master.key`) exactly
+like every other credential — see the [credentials guide](./credentials.md).
+
+If you inject secrets through the environment instead, these variables override
+the store, field for field:
+
+| Variable | Field |
+|---|---|
+| `AUTUMN_ACME_DNS_API_TOKEN` | `api_token` |
+| `AUTUMN_ACME_DNS_ACCESS_KEY_ID` | `access_key_id` |
+| `AUTUMN_ACME_DNS_SECRET_ACCESS_KEY` | `secret_access_key` |
+| `AUTUMN_ACME_DNS_SESSION_TOKEN` | `session_token` |
+| `AUTUMN_ACME_DNS_HOSTED_ZONE_ID` | `hosted_zone_id` |
+| `AUTUMN_ACME_DNS_REGION` | `region` |
+
+Tokens never reach logs, error messages, or `/actuator` output: the secret type
+they are held in renders as `<redacted>`, and provider errors carry the API's
+own message and status, never the request headers.
+
+### The escape hatch: `provider = "exec"`
+
+Any provider autumn does not ship support for — RFC 2136 dynamic updates, a
+registrar's CLI, a webhook shim — is reachable through a hook program:
+
+```toml
+[server.tls.acme.dns]
+provider = "exec"
+command = ["/usr/local/bin/acme-dns-hook"]
+```
+
+Autumn runs it twice per challenge record, appending three arguments:
+
+```console
+$ /usr/local/bin/acme-dns-hook present _acme-challenge.myapp.com <txt-value>
+$ /usr/local/bin/acme-dns-hook cleanup _acme-challenge.myapp.com <txt-value>
+```
+
+Exactly those three arguments are appended — no `--` marker, so `$1` is the
+action. (A hook that forwards `"$@"` on to another CLI should insert its own
+`--` there, since a challenge value is base64url and starts with `-` about once
+in sixty-four.)
+
+Exit `0` means the record was written (or removed); anything else fails the
+order, with the hook's `stderr` quoted in the message. `command` is an **argv
+array** run without a shell, so the record value is never interpreted as shell
+syntax. A hook that has not finished within 120 seconds is killed, and its
+output is read through a bounded buffer, so a hook that never stops writing
+cannot grow the server.
+
+**Credentials.** The hook inherits autumn's environment — that is how an
+`nsupdate` or vendor-CLI hook is expected to authenticate, and autumn passes it
+no secret of its own. Because that `stderr` is published (in logs, in the
+operator alert, on `/actuator/health`), autumn scrubs it: every value the
+environment holds under a credential-shaped name (`*TOKEN*`, `*SECRET*`,
+`*KEY*`, `*PASSWORD*`, `*CREDENTIAL*`, `*AUTH*`) is replaced with `<redacted>`,
+as are the DNS credentials autumn itself holds. That is a backstop, not a
+guarantee — a credential in a variable named something like `MY_THING` is not
+recognisable as one — so a hook still should not trace its own secrets to
+`stderr`.
+
+An RFC 2136 hook is a five-line script:
+
+```sh
+#!/bin/sh
+# $1 = present|cleanup, $2 = fqdn, $3 = value
+[ "$1" = present ] && ACTION="add $2. 60 TXT \"$3\"" || ACTION="delete $2. TXT \"$3\""
+printf 'server ns1.myapp.com\nupdate %s\nsend\n' "$ACTION" | nsupdate -k /etc/autumn/tsig.key
+```
+
+### Waiting for propagation
+
+After writing the records, autumn waits until they are visible before telling
+the CA to validate — signalling early is how a DNS-01 authorization gets burnt.
+
+The probe goes to the zone's **authoritative** nameservers, not to the resolvers
+you configure. That is deliberate, and it is the difference between a feature
+that works and one that fails every renewal: a probe sent to a public recursive
+resolver the instant the provider's API returns arrives *before* the record is
+live on the zone's own servers, so the resolver answers `NXDOMAIN` and **caches
+that negatively** for the zone's SOA minimum — 900s on Route 53, 1800s on
+Cloudflare, both longer than the propagation budget. Every later probe would
+then read the cached "not there". So `resolvers` is used to *discover* the
+zone's nameservers (an `NS` lookup, then an `A` lookup per server), and the
+propagation probe is sent to those directly. When discovery fails — a
+split-horizon setup, a resolver that will not answer `NS` — autumn falls back to
+probing `resolvers` directly and logs a warning.
+
+Discovery runs once per distinct challenge name, so an order spanning several
+domains probes each zone through *its own* nameservers. This matters: a
+nameserver answers only for the zones it is authoritative for, so probing
+`myapp.io`'s challenge record at `myapp.com`'s nameservers can never see the
+record, and the wait would time out on an order that is in fact correct. An
+apex + wildcard order challenges a single name, so the common case still costs
+one discovery. Fallback is per name too — one domain with a broken delegation
+does not pull the others onto recursive resolvers.
+
+`[server.tls.acme.dns]` fields:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `provider` | required | `cloudflare`, `route53`, or `exec`. |
+| `credential` | `acme_dns` | Key in the encrypted credentials store holding the provider credential. A key *name*, never a token. |
+| `propagation_timeout_secs` | `300` | Give up if the records are still not visible after this long. Capped at `3600`. |
+| `poll_interval_secs` | `5` | Gap between propagation probes. |
+| `resolvers` | `["1.1.1.1:53", "8.8.8.8:53"]` | Resolvers used to discover the zone's nameservers, and probed directly if that fails. Each entry is an IP (port 53 implied) or `IP:port`; hostnames are rejected. |
+| `command` | — | The `exec` hook's argv array. Required for `exec`, rejected for the others. |
+
+A timeout names the exact record, the value that never appeared, and the
+resolver that never saw it:
+
+> DNS-01 propagation timed out after 300s: the TXT record
+> `_acme-challenge.myapp.com` still does not carry `LPJNul-w…` at resolver
+> `1.1.1.1:53` (the name does not exist yet). Check that the record was written
+> to the zone that actually serves this name and that its NS delegation is live,
+> then raise `[server.tls.acme.dns] propagation_timeout_secs` if the provider is
+> simply slow.
+
+Challenge records are removed after the order finishes — **including when it
+fails**, so a retrying deployment does not fill the zone with dead
+`_acme-challenge` entries.
+
+### Two records, one name
+
+An order for `myapp.com` **and** `*.myapp.com` produces two authorizations whose
+TXT records share the name `_acme-challenge.myapp.com` but carry different
+values. Both must be live at validation time. Every provider here appends a
+value and deletes by `(name, value)`, never "replace the record set" — worth
+knowing if you write your own `exec` hook, because `nsupdate delete <name> TXT`
+without a value would remove its sibling and fail the order.
+
+Route 53 is the exception that proves the rule: its API has no "append", only
+`ChangeResourceRecordSets`, which replaces the whole set. Autumn therefore
+read-modify-writes — and applies **both** values in a *single* change, because
+Route 53 may keep serving the pre-change values until the first change reaches
+`INSYNC`, so a second read-modify-write could read the old set and write back
+only its own value, dropping the first. The same read-modify-write preserves
+the set's existing **TTL**: the name can already hold another ACME client's
+challenge values, so autumn's own 60-second TTL is written only when it is
+creating the set — and Route 53 rejects a `DELETE` whose TTL differs from the
+live set, so cleanup has to send the TTL that is actually there. If your `exec`
+hook talks to an API shaped like that, batch the same way and preserve what you
+did not set, or make the hook idempotent under a stale read.
+
+### What DNS-01 does *not* need
+
+- **Inbound port 80.** The CA never connects to your host for DNS-01. Autumn
+  still *tries* to bind `http_challenge_port` for the HTTP→HTTPS redirect, but a
+  bind failure is only a warning under DNS-01 — the app starts and serves HTTPS
+  without it, so a container with no `CAP_NET_BIND_SERVICE` is a supported
+  deployment. `autumn doctor` grades an unreachable `:80` the same way.
+- **A record for the wildcard.** `*.myapp.com` has no address record of its own;
+  the tenant subdomains point at your host (a wildcard `A`/`AAAA` record, or one
+  per tenant). Creating those is your one-time job — autumn only writes the
+  ephemeral challenge TXT records.
+
+### `autumn doctor` for DNS-01
+
+Three checks cover the failure classes DNS-01 adds:
+
+| Check | Grades |
+|---|---|
+| `acme_dns_credential` | The provider credential is readable and carries the fields the provider needs. **Fail** when missing — without it every issuance and renewal fails. |
+| `acme_dns_propagation` | (`--online`) Public DNS can answer for `_acme-challenge.<domain>` at all. **Fail** on `SERVFAIL`/timeout — a broken delegation defeats a correctly-written record. **Warn** on leftover records from an interrupted run. |
+| `acme_tenancy_domain` | `[tenancy] base_domain`'s subdomains are actually covered by `[server.tls.acme] domains`. **Fail** otherwise — every tenant host would serve a name mismatch. |
+
+### Failure surfaces through health and alerts
+
+A failed DNS-01 issuance or renewal — an expired provider token, a propagation
+timeout, a provider outage — is recorded on the `acme` health indicator (with
+`challenge: "dns-01"` and the provider name in its details, never a credential)
+and raises the operator-alert
+[`scheduled_task_failure`](./operator-alerts.md) condition for
+`acme-renewal`. Because renewal starts `renew_before_days` (default 30) ahead of
+expiry, that alert fires with weeks of validity left, and clears automatically
+on the first successful renewal.
 
 ---
 

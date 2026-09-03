@@ -31,18 +31,20 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
-use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
-type HmacSha256 = Hmac<Sha256>;
+use autumn_web::sigv4;
 
-const ALGORITHM: &str = "AWS4-HMAC-SHA256";
+/// `SigV4` signing lives in `autumn_web::sigv4` so this client and the in-process
+/// `SQLite` replicator (#1628) sign identically, from one implementation. The
+/// aliases below keep this module's call sites and its published test names
+/// unchanged while the arithmetic itself has a single home.
+const ALGORITHM: &str = sigv4::ALGORITHM;
 const SERVICE: &str = "s3";
-const AWS4_REQUEST: &str = "aws4_request";
+const AWS4_REQUEST: &str = sigv4::AWS4_REQUEST;
 /// SHA-256 of the empty string; the payload hash for bodyless requests (GET /
 /// HEAD / DELETE).
-const EMPTY_PAYLOAD_SHA256: &str =
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const EMPTY_PAYLOAD_SHA256: &str = sigv4::EMPTY_PAYLOAD_SHA256;
 /// Upper bound on `list_objects_v2` pagination. At 1000 objects/page (the S3
 /// maximum) this covers a million objects — far beyond any backup prefix — while
 /// bounding a broken endpoint that never stops returning a continuation token.
@@ -178,9 +180,7 @@ pub struct RemoteObjectInfo {
 
 /// Hex-encoded SHA-256 of `data`.
 fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
+    sigv4::sha256_hex(data)
 }
 
 /// Raw SHA-256 digest of `data`. (Test helper; the streaming upload/verify paths
@@ -192,30 +192,11 @@ fn sha256_raw(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// HMAC-SHA256(`key`, `data`).
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().into()
-}
-
 /// AWS URI-encode `s`. Unreserved characters (`A-Za-z0-9-._~`) pass through;
 /// everything else is percent-encoded uppercase. `/` is passed through when
 /// `encode_slash` is false (used for object-key path components).
 fn aws_uri_encode(s: &str, encode_slash: bool) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char);
-            }
-            b'/' if !encode_slash => out.push('/'),
-            _ => {
-                let _ = write!(out, "%{b:02X}");
-            }
-        }
-    }
-    out
+    sigv4::uri_encode(s, encode_slash)
 }
 
 /// A header name/value pair for signing.
@@ -229,11 +210,7 @@ fn head_extra_headers() -> Vec<Header> {
 
 /// The `SignedHeaders` list: sorted lowercase header names joined by `;`.
 fn signed_headers_list(headers: &[Header]) -> String {
-    headers
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect::<Vec<_>>()
-        .join(";")
+    sigv4::signed_headers_list(headers)
 }
 
 /// Build the `SigV4` canonical request string. `headers` MUST be sorted by
@@ -245,29 +222,13 @@ fn canonical_request(
     headers: &[Header],
     payload_hash: &str,
 ) -> String {
-    let canonical_headers: String = headers
-        .iter()
-        .fold(String::new(), |mut acc, (name, value)| {
-            let _ = writeln!(acc, "{name}:{}", value.trim());
-            acc
-        });
-    let signed = signed_headers_list(headers);
-    format!(
-        "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed}\n{payload_hash}"
+    sigv4::canonical_request(
+        method,
+        canonical_uri,
+        canonical_query,
+        headers,
+        payload_hash,
     )
-}
-
-/// Build the `SigV4` string-to-sign from the canonical-request hash.
-fn string_to_sign(amz_date: &str, scope: &str, canonical_request_hash: &str) -> String {
-    format!("{ALGORITHM}\n{amz_date}\n{scope}\n{canonical_request_hash}")
-}
-
-/// Derive the `SigV4` signing key: a 4-stage HMAC chain over the secret.
-fn signing_key(secret: &str, date: &str, region: &str) -> [u8; 32] {
-    let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, SERVICE.as_bytes());
-    hmac_sha256(&k_service, AWS4_REQUEST.as_bytes())
 }
 
 /// Compute the lowercase hex signature for a fully-assembled canonical request.
@@ -279,9 +240,15 @@ fn compute_signature(
     scope: &str,
     canonical_req: &str,
 ) -> String {
-    let key = signing_key(secret, date, region);
-    let sts = string_to_sign(amz_date, scope, &sha256_hex(canonical_req.as_bytes()));
-    hex::encode(hmac_sha256(&key, sts.as_bytes()))
+    sigv4::signature(
+        secret,
+        date,
+        region,
+        SERVICE,
+        amz_date,
+        scope,
+        canonical_req,
+    )
 }
 
 // ─── Verification comparator (pure, unit-tested without a live endpoint) ──────
@@ -399,16 +366,7 @@ fn parse_error_code(xml: &str) -> Option<String> {
 /// value AWS-URI-encoded (slash encoded), pairs sorted by encoded key. A
 /// value-less flag (e.g. `uploads`) encodes as `key=`.
 fn canonical_query(params: &[(&str, &str)]) -> String {
-    let mut encoded: Vec<(String, String)> = params
-        .iter()
-        .map(|(k, v)| (aws_uri_encode(k, true), aws_uri_encode(v, true)))
-        .collect();
-    encoded.sort_by(|a, b| a.0.cmp(&b.0));
-    encoded
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&")
+    sigv4::canonical_query(params)
 }
 
 /// Number of parts a `len`-byte object splits into at `part_size` bytes/part.
@@ -1317,7 +1275,7 @@ mod tests {
 
     #[test]
     fn string_to_sign_shape() {
-        let sts = string_to_sign(
+        let sts = sigv4::string_to_sign(
             "20130524T000000Z",
             "20130524/us-east-1/s3/aws4_request",
             "abc",

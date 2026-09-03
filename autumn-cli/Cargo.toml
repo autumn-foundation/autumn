@@ -31,7 +31,14 @@ path = "src/main.rs"
 # is refactored so the mutually-exclusive `sqlite` build can select a
 # sqlite-compatible set.
 default = ["tls", "postgres"]
-tls = ["autumn-web/tls"]
+# `autumn-web/acme` rides along because `autumn doctor`'s ACME preflight is not
+# optional to the ACME story: the DNS-01 checks (issue #1620) grade the provider
+# credential with the runtime's OWN `validate_credential`, and probe
+# `_acme-challenge` visibility with the runtime's OWN resolver, so doctor and the
+# server can never disagree about what a usable configuration is. `acme` implies
+# `tls`, so the resolved autumn-web set is a superset of what this feature
+# already selected.
+tls = ["autumn-web/tls", "autumn-web/acme"]
 # The pg-only `autumn-web` features the CLI enables that assume the Postgres
 # runtime and fail to compile under the `sqlite` backend-flip. Only `mail`
 # (its `DbSuppressionStore` is hard-typed to `Pool<AsyncPgConnection>`) is a

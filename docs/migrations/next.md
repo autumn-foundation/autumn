@@ -378,6 +378,46 @@ framework.
 
 ---
 
+### Config: `AutumnConfig` gains a `replication` field
+
+**Why:** Continuous SQLite replication (issue #1628) needs its own configuration
+section, and `AutumnConfig` has all-public fields with no `#[non_exhaustive]`, so
+adding one is a breaking change for anyone constructing the struct literally.
+Almost nobody does — `AutumnConfig::default()` and `..Default::default()` are the
+documented ways to build one, and both keep compiling.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::config::AutumnConfig;
+
+let config = AutumnConfig {
+    server: my_server_config,
+    database: my_database_config,
+    // …every other field spelled out…
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::config::AutumnConfig;
+
+let config = AutumnConfig {
+    server: my_server_config,
+    database: my_database_config,
+    ..AutumnConfig::default()
+};
+```
+
+The new field is `pub replication: Option<Box<ReplicationConfig>>`, `None` by
+default, so `..Default::default()` needs no other change. Nothing about an app
+that does not configure `[replication]` behaves differently.
+
+**Automation:** `manual` — a struct-literal expression can only be rewritten by
+knowing which fields the caller meant to leave defaulted, which a codemod cannot
+infer; the fix is the one-line `..AutumnConfig::default()` above.
+
 ### Capacity contracts: three metadata structs gain fields
 
 Deploys can now carry a proven capacity contract (`autumn calibrate` →
@@ -407,6 +447,70 @@ literal would silently paper over a genuinely missing value on a later field
 addition. Direct struct-literal construction of all three types is rare outside
 the framework: `ApiDoc` and `RouteInfo` are macro-emitted, and `ServerConfig` is
 normally deserialized from `autumn.toml`.
+
+### ACME: `AcmeRenewalTask` gains `dns` and `recovery`, `AcmeConfig` gains `dns`
+
+Wildcard certificates over the DNS-01 challenge
+([the guide](../guide/tls.md#wildcard-certificates-via-dns-01-servertlsacmedns))
+add two fields to `acme::renewal::AcmeRenewalTask` and one to
+`config::AcmeConfig`. Everything here is behind the off-by-default `acme`
+feature, and an app that configures no `[server.tls.acme.dns]` section behaves
+exactly as before — HTTP-01, unchanged.
+
+* `AcmeRenewalTask::dns: Option<acme::renewal::DnsChallenge>` — the DNS-01
+  wiring. `None` keeps issuance on the HTTP-01 path.
+* `AcmeRenewalTask::recovery: Option<acme::renewal::RecoveryFn>` — invoked after
+  an issuance that succeeded following a recorded failure, so the app can clear
+  the operator alert its reporter raised.
+* `AcmeConfig::dns: Option<config::AcmeDnsConfig>` — the deserialized
+  `[server.tls.acme.dns]` section.
+
+Only **struct-literal construction** is affected, which in practice means test
+harnesses: the framework builds `AcmeRenewalTask` itself, and `AcmeConfig` is
+deserialized from `autumn.toml`. Neither type derives `Default`, so the fix is
+to name the fields.
+
+**Before (`{X.Y}`):**
+
+```rust
+let task = AcmeRenewalTask {
+    resolver,
+    provider,
+    store,
+    cert_id,
+    tokens,
+    status,
+    config,
+    serving_stored_cert: false,
+    leadership_degraded: false,
+    renew_window_misconfigured: AtomicBool::new(false),
+};
+```
+
+**After (`{X.Z}`):**
+
+```rust
+let task = AcmeRenewalTask {
+    // …unchanged fields…
+    renew_window_misconfigured: AtomicBool::new(false),
+    dns: None,      // Some(DnsChallenge { .. }) to issue over DNS-01
+    recovery: None, // Some(callback) to clear an operator alert on recovery
+};
+```
+
+The new **output** types in `acme::dns` — the parsed DNS answer, its records,
+the propagation-timeout detail, the credential, and the HTTP request/response —
+are `#[non_exhaustive]` from the start, so fields can be added to those without
+a break. `AcmeConfig`, `AcmeDnsConfig`, `AcmeRenewalTask` and `DnsChallenge`
+deliberately are not: callers construct them by struct literal and they have no constructor, so
+sealing them would make them unbuildable outside this crate. That is the same
+trade-off `config::ServerConfig` makes.
+
+**Automation:** `manual` — `autumn upgrade` ships no codemod. The edit is two
+lines in a test harness, and a rewrite cannot tell an `AcmeRenewalTask` literal
+that means "HTTP-01" from one whose author intended to configure DNS-01;
+defaulting to `None` silently would be right in the first case and wrong in the
+second, which is exactly the choice a human should make.
 
 ## Plugin authors
 
@@ -498,21 +602,95 @@ single most valuable section of the guide — keep it factual and short.
 
 ## Configuration changes
 
-- `autumn.toml` keys that were renamed, removed, or have new defaults.
-- New `AUTUMN_*` environment variables.
-- Default profile changes.
+**New `[server.tls.acme.dns]` section** (additive; absent means HTTP-01, exactly
+as before). It names a DNS provider and the *credentials-store key* holding that
+provider's API credential — never the credential itself. The section is
+`deny_unknown_fields`, so an `api_token = "..."` written into `autumn.toml` is a
+startup error naming the key rather than a plaintext secret nobody notices:
 
-If nothing changed, delete this section.
+```toml
+[server.tls.acme]
+domains = ["myapp.com", "*.myapp.com"]   # a wildcard is now accepted…
+contact_email = "ops@myapp.com"
+
+[server.tls.acme.dns]                    # …when this section is present
+provider = "cloudflare"                  # cloudflare | route53 | exec
+```
+
+A wildcard entry in `[server.tls.acme] domains` is rejected at startup **unless**
+this section is configured, because no CA validates a wildcard identifier over
+HTTP-01.
+
+**New environment variables**, which override the encrypted credentials store
+field for field:
+
+| Variable | Field |
+|---|---|
+| `AUTUMN_ACME_DNS_API_TOKEN` | `api_token` (Cloudflare) |
+| `AUTUMN_ACME_DNS_ACCESS_KEY_ID` | `access_key_id` (Route 53) |
+| `AUTUMN_ACME_DNS_SECRET_ACCESS_KEY` | `secret_access_key` (Route 53) |
+| `AUTUMN_ACME_DNS_SESSION_TOKEN` | `session_token` (Route 53) |
+| `AUTUMN_ACME_DNS_HOSTED_ZONE_ID` | `hosted_zone_id` (Route 53) |
+| `AUTUMN_ACME_DNS_REGION` | `region` (Route 53) |
+
+### New: `[replication]` (continuous SQLite replication)
+
+Optional and off by default; an app that does not add the section is unaffected.
+Every key has an `AUTUMN_REPLICATION__*` environment override, and credentials
+are named by environment variable rather than inlined — the same posture as
+`[backup.offsite]`. See
+[SQLite in production → Durability](../guide/sqlite-in-production.md#durability-continuous-replication-and-point-in-time-restore).
+
+When `[replication] enabled = true`, pooled SQLite connections are created with
+`PRAGMA wal_autocheckpoint = 0` so the replicator is the only component that
+checkpoints. That is a deliberate behaviour change for replicating apps and is
+described in the guide; apps without the section keep SQLite's default
+auto-checkpointing.
 
 ## Behavior changes
 
-Changes that still compile but behave differently at runtime. Examples:
+### CI: `autumn upgrade` adds a blocking dependency audit — add `deny.toml` with it
+
+`.github/workflows/ci.yml` is framework-owned, so `autumn upgrade --apply`
+reconciles it and your project picks up the new dependency-advisory gate
+(issue #1600): it runs `cargo deny check advisories` on every push and fails
+the build on a known RustSec advisory.
+
+That audit reads a `deny.toml` at your project root, which `autumn new` writes
+for new projects and the upgrade deliberately does **not** create — its waiver
+list is yours, and a file you are asked to edit must never come back as an
+upgrade conflict. Add it in the same commit as the upgrade:
+
+Generate a throwaway project with the release you are upgrading to, **using the
+same flags you originally scaffolded with**, and copy its policy in. The flags
+matter: `--bundled-pg` apps pull the embedded-Postgres build stack, so their
+policy carries a second waiver (`RUSTSEC-2024-0384`, `instant`) that other
+flavors deliberately do not ship. A donor generated without your flags installs
+a policy that fails your first audit.
+
+```bash
+cd /tmp
+autumn new policy-donor          # add your original flags here, e.g. --bundled-pg
+cd -
+cp /tmp/policy-donor/deny.toml ./deny.toml
+rm -rf /tmp/policy-donor
+git add deny.toml
+```
+
+Without it the audit step stops before auditing and tells you exactly this —
+it does not fall back to an unwaived default policy and fail on an advisory
+Autumn has already triaged (`rsa`/RUSTSEC-2023-0071, which reaches every
+Autumn app through `jsonwebtoken` and has no patched release).
+
+Then read [the advisory gate](../guide/supply-chain.md#part-3a--the-advisory-gate-known-vulnerable-dependencies)
+for how to read a failure and how to waive an advisory. Never disable the step
+to get green: an edited `ci.yml` becomes a conflict on every later upgrade.
+
+Other changes that still compile but behave differently at runtime. Examples:
 
 - Error responses adopted a new JSON shape.
 - A default middleware is now ordered differently.
 - A scheduled task now runs on a different worker.
-
-If nothing changed, delete this section.
 
 ## Deprecations retained from `{X.Y}`
 

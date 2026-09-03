@@ -19,6 +19,13 @@
 //!   challenge listener and requires a `"{token}.{thumbprint}"`-shaped body, so
 //!   a token that is never published (or removed too early) fails validation
 //!   exactly as it would in production;
+//! - for **DNS-01** (#1620) it derives the account key's RFC 7638 thumbprint
+//!   from the `jwk` in the client's own `newAccount` JWS, computes the exact
+//!   `base64url(sha256("{token}.{thumbprint}"))` RFC 8555 §8.4 requires, and
+//!   demands that value be **visible** in the test zone. A record that is
+//!   published late (or never), or whose value is wrong, fails validation
+//!   exactly as Let's Encrypt would — which is what makes the propagation wait
+//!   testable rather than assumed;
 //! - it parses the finalize CSR and requires its SAN set to equal the order's
 //!   identifiers, and issues against the CSR's own public key — so a malformed
 //!   CSR, a mismatched SAN set, or a CSR whose key does not pair with the key
@@ -109,6 +116,35 @@ pub struct CaState {
     /// When set, `newOrder` answers with an RFC 8555 problem document, so the
     /// failure path (health + error reporter) can be exercised.
     pub reject_orders: AtomicBool,
+
+    /// The account key's RFC 7638 thumbprint, learned from the `jwk` in the
+    /// client's `newAccount` JWS. Needed to derive the exact DNS-01 TXT value.
+    thumbprint: Mutex<Option<String>>,
+    /// Where the CA reads TXT records for DNS-01 validation — the test's zone,
+    /// which only exposes records that have actually "propagated".
+    dns_zone: Mutex<Option<Arc<dyn TxtZoneView>>>,
+    /// DNS-01 challenges the CA validated successfully.
+    pub dns_validations_ok: AtomicUsize,
+    /// DNS-01 challenges the CA rejected (no record, or the wrong value).
+    pub dns_validations_failed: AtomicUsize,
+    /// The `(fqdn, expected value)` pairs the CA looked for, in order.
+    dns_lookups: Mutex<Vec<(String, String)>>,
+    /// When set, `set_ready` only QUEUES validation; it runs on the next poll of
+    /// the order — which is how a real CA behaves (RFC 8555 §7.5.1: the server
+    /// begins validation *after* the request, and the client polls). Inline
+    /// validation would let a client that tore its challenge response down the
+    /// moment `set_ready` returned still pass.
+    pub deferred_validation: AtomicBool,
+}
+
+/// What the CA can see in the test's DNS zone.
+///
+/// Implemented by the test's fake zone, which returns a record only once it has
+/// "propagated" — so an app that signals a challenge ready before waiting fails
+/// validation here exactly as it would against a real CA.
+pub trait TxtZoneView: Send + Sync {
+    /// The TXT values currently VISIBLE at `fqdn`.
+    fn visible_txt(&self, fqdn: &str) -> Vec<String>;
 }
 
 impl CaState {
@@ -116,6 +152,22 @@ impl CaState {
     /// in order.
     pub fn fetched_key_authorizations(&self) -> Vec<String> {
         lock(&self.fetched).clone()
+    }
+
+    /// Point DNS-01 validation at the test's zone. Without this the CA offers
+    /// only HTTP-01, exactly like a deployment with no DNS provider configured.
+    pub fn set_dns_zone(&self, zone: Arc<dyn TxtZoneView>) {
+        *lock(&self.dns_zone) = Some(zone);
+    }
+
+    /// Whether DNS-01 is on offer (i.e. a zone was installed).
+    fn dns_enabled(&self) -> bool {
+        lock(&self.dns_zone).is_some()
+    }
+
+    /// The `(fqdn, expected TXT value)` pairs the CA looked for, in order.
+    pub fn dns_lookups(&self) -> Vec<(String, String)> {
+        lock(&self.dns_lookups).clone()
     }
 }
 
@@ -127,9 +179,16 @@ struct OrderRec {
 }
 
 struct AuthzRec {
+    /// The BASE domain — an authorization for `*.myapp.com` is for `myapp.com`
+    /// with `wildcard: true` (RFC 8555 §7.1.4).
     domain: String,
+    wildcard: bool,
     token: String,
     valid: bool,
+    /// Set when `deferred_validation` is on and the client has signalled the
+    /// challenge ready: validation has been QUEUED but not run. It runs on the
+    /// next poll of the order, the way a real CA works.
+    pending: bool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -203,6 +262,12 @@ pub async fn start(challenge_addr: SocketAddr) -> FakeCa {
         validations_failed: AtomicUsize::new(0),
         cert_lifetime_days: AtomicI64::new(DEFAULT_ISSUED_CERT_DAYS),
         reject_orders: AtomicBool::new(false),
+        thumbprint: Mutex::new(None),
+        dns_zone: Mutex::new(None),
+        dns_validations_ok: AtomicUsize::new(0),
+        dns_validations_failed: AtomicUsize::new(0),
+        dns_lookups: Mutex::new(Vec::new()),
+        deferred_validation: AtomicBool::new(false),
     });
 
     let provider = autumn_web::tls::crypto_provider();
@@ -324,7 +389,14 @@ async fn new_nonce(State(state): State<Arc<CaState>>) -> Response {
     with_nonce(&state, StatusCode::OK, json!({}))
 }
 
-async fn new_account(State(state): State<Arc<CaState>>, _body: axum::body::Bytes) -> Response {
+async fn new_account(State(state): State<Arc<CaState>>, body: axum::body::Bytes) -> Response {
+    // RFC 8555 §7.3: `newAccount` carries the account public key inline as the
+    // `jwk` of its JWS protected header. Deriving its RFC 7638 thumbprint here
+    // is what lets DNS-01 validation check the EXACT value the client should
+    // have published, rather than accepting any non-empty TXT record.
+    if let Some(thumbprint) = jws_key_thumbprint(&body) {
+        *lock(&state.thumbprint) = Some(thumbprint);
+    }
     let id = state.accounts_registered.fetch_add(1, Ordering::SeqCst) + 1;
     let location = format!("{}/acct/{id}", state.base);
     located(
@@ -378,9 +450,11 @@ async fn new_order(State(state): State<Arc<CaState>>, body: axum::body::Bytes) -
         .iter()
         .enumerate()
         .map(|(index, domain)| AuthzRec {
-            domain: domain.clone(),
+            domain: domain.strip_prefix("*.").unwrap_or(domain).to_owned(),
+            wildcard: domain.starts_with("*."),
             token: format!("tok-{id}-{index}"),
             valid: false,
+            pending: false,
         })
         .collect();
     lock(&state.orders).insert(
@@ -410,24 +484,39 @@ async fn authz(State(state): State<Arc<CaState>>, Path(id): Path<String>) -> Res
     let Some(rec) = orders.get(&order_id).and_then(|o| o.authzs.get(index)) else {
         return problem(&state, StatusCode::NOT_FOUND, "malformed", "no such authz");
     };
-    let body = json!({
-        "status": if rec.valid { "valid" } else { "pending" },
-        "identifier": { "type": "dns", "value": rec.domain },
-        "challenges": [{
-            "type": "http-01",
-            "url": format!("{}/chall/{id}", state.base),
+    let status = if rec.valid { "valid" } else { "pending" };
+    let mut challenges = vec![json!({
+        "type": "http-01",
+        "url": format!("{}/chall/{id}-http", state.base),
+        "token": rec.token,
+        "status": status,
+    })];
+    if state.dns_enabled() {
+        challenges.push(json!({
+            "type": "dns-01",
+            "url": format!("{}/chall/{id}-dns", state.base),
             "token": rec.token,
-            "status": if rec.valid { "valid" } else { "pending" },
-        }],
+            "status": status,
+        }));
+    }
+    // A wildcard authorization is flagged, and its identifier is the BASE
+    // domain — the shape RFC 8555 §7.1.4 defines and the one autumn must derive
+    // the `_acme-challenge` record name from.
+    let body = json!({
+        "status": status,
+        "identifier": { "type": "dns", "value": rec.domain },
+        "wildcard": rec.wildcard,
+        "challenges": challenges,
     });
     drop(orders);
     with_nonce(&state, StatusCode::OK, body)
 }
 
-/// The client signalling "the token is published". A real CA queues validation;
-/// we run it inline so the subsequent `poll_ready` sees a settled order.
+/// The client signalling "the challenge response is published". A real CA queues
+/// validation; we run it inline so the subsequent `poll_ready` sees a settled
+/// order.
 async fn challenge(State(state): State<Arc<CaState>>, Path(id): Path<String>) -> Response {
-    let Some((order_id, index)) = split_authz_id(&id) else {
+    let Some((order_id, index, kind)) = split_challenge_id(&id) else {
         return problem(
             &state,
             StatusCode::NOT_FOUND,
@@ -437,14 +526,14 @@ async fn challenge(State(state): State<Arc<CaState>>, Path(id): Path<String>) ->
     };
     let found = {
         let orders = lock(&state.orders);
-        let token = orders
+        let rec = orders
             .get(&order_id)
             .and_then(|order| order.authzs.get(index))
-            .map(|rec| rec.token.clone());
+            .map(|rec| (rec.token.clone(), rec.domain.clone()));
         drop(orders);
-        token
+        rec
     };
-    let Some(token) = found else {
+    let Some((token, domain)) = found else {
         return problem(
             &state,
             StatusCode::NOT_FOUND,
@@ -453,21 +542,59 @@ async fn challenge(State(state): State<Arc<CaState>>, Path(id): Path<String>) ->
         );
     };
 
-    let validated = validate_http01(&state, &token).await;
+    // A real CA queues validation and answers `processing`; the client then
+    // polls the order. With `deferred_validation` set we do the same, so a
+    // client that removed its challenge response the instant `set_ready`
+    // returned would fail — which is exactly the bug this models.
+    if state.deferred_validation.load(Ordering::SeqCst) {
+        let mut orders = lock(&state.orders);
+        if let Some(rec) = orders
+            .get_mut(&order_id)
+            .and_then(|order| order.authzs.get_mut(index))
+        {
+            rec.pending = true;
+        }
+        drop(orders);
+        return with_nonce(
+            &state,
+            StatusCode::OK,
+            json!({
+                "type": kind.as_str(),
+                "url": format!("{}/chall/{id}", state.base),
+                "token": token,
+                "status": "processing",
+            }),
+        );
+    }
+
+    let (validated, detail) = match kind {
+        ChallengeKind::Http01 => (
+            validate_http01(&state, &token).await,
+            "no valid key authorization was served on port 80 for this token",
+        ),
+        ChallengeKind::Dns01 => (
+            validate_dns01(&state, &domain, &token),
+            "the _acme-challenge TXT record for this identifier is missing or carries the wrong \
+             key authorization digest",
+        ),
+    };
     if !validated {
-        state.validations_failed.fetch_add(1, Ordering::SeqCst);
+        match kind {
+            ChallengeKind::Http01 => &state.validations_failed,
+            ChallengeKind::Dns01 => &state.dns_validations_failed,
+        }
+        .fetch_add(1, Ordering::SeqCst);
         // RFC 8555 §6.7: a rejection is a 4xx carrying the problem document.
         // `instant-acme` treats only non-2xx/3xx as problems, so answering 200
         // here would make the client try to deserialize the problem as a
         // `Challenge` and fail with an unrelated serde error instead.
-        return problem(
-            &state,
-            StatusCode::FORBIDDEN,
-            "unauthorized",
-            "no valid key authorization was served on port 80 for this token",
-        );
+        return problem(&state, StatusCode::FORBIDDEN, "unauthorized", detail);
     }
-    state.validations_ok.fetch_add(1, Ordering::SeqCst);
+    match kind {
+        ChallengeKind::Http01 => &state.validations_ok,
+        ChallengeKind::Dns01 => &state.dns_validations_ok,
+    }
+    .fetch_add(1, Ordering::SeqCst);
 
     {
         let mut orders = lock(&state.orders);
@@ -485,7 +612,7 @@ async fn challenge(State(state): State<Arc<CaState>>, Path(id): Path<String>) ->
         &state,
         StatusCode::OK,
         json!({
-            "type": "http-01",
+            "type": kind.as_str(),
             "url": format!("{}/chall/{id}", state.base),
             "token": token,
             "status": "valid",
@@ -493,7 +620,24 @@ async fn challenge(State(state): State<Arc<CaState>>, Path(id): Path<String>) ->
     )
 }
 
+/// Which challenge a `/chall/{id}` URL addresses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChallengeKind {
+    Http01,
+    Dns01,
+}
+
+impl ChallengeKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http01 => "http-01",
+            Self::Dns01 => "dns-01",
+        }
+    }
+}
+
 async fn order(State(state): State<Arc<CaState>>, Path(id): Path<String>) -> Response {
+    settle_pending_validations(&state, &id);
     order_json(&state, &id).map_or_else(
         || problem(&state, StatusCode::NOT_FOUND, "malformed", "no such order"),
         |body| with_nonce(&state, StatusCode::OK, body),
@@ -589,6 +733,48 @@ async fn certificate(State(state): State<Arc<CaState>>, Path(id): Path<String>) 
 
 // ── CA internals ─────────────────────────────────────────────────────────────
 
+/// Run any validation queued by `deferred_validation` for order `id`.
+///
+/// Called when the client polls the order, so the challenge response must still
+/// be published at THAT point — not merely at the moment `set_ready` returned.
+fn settle_pending_validations(state: &CaState, id: &str) {
+    let pending: Vec<(usize, String, String)> = {
+        let orders = lock(&state.orders);
+        let Some(order) = orders.get(id) else {
+            return;
+        };
+        let pending = order
+            .authzs
+            .iter()
+            .enumerate()
+            .filter(|(_, rec)| rec.pending && !rec.valid)
+            .map(|(index, rec)| (index, rec.domain.clone(), rec.token.clone()))
+            .collect();
+        drop(orders);
+        pending
+    };
+    for (index, domain, token) in pending {
+        let ok = validate_dns01(state, &domain, &token);
+        if ok {
+            state.dns_validations_ok.fetch_add(1, Ordering::SeqCst);
+        } else {
+            state.dns_validations_failed.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut orders = lock(&state.orders);
+        if let Some(order) = orders.get_mut(id) {
+            if let Some(rec) = order.authzs.get_mut(index) {
+                rec.pending = false;
+                rec.valid = ok;
+            }
+            if order.authzs.iter().all(|a| a.valid) {
+                order.status = "ready";
+            } else if !ok {
+                order.status = "invalid";
+            }
+        }
+    }
+}
+
 fn order_json(state: &CaState, id: &str) -> Option<Value> {
     let orders = lock(&state.orders);
     let order = orders.get(id)?;
@@ -612,6 +798,64 @@ fn order_json(state: &CaState, id: &str) -> Option<Value> {
 fn split_authz_id(id: &str) -> Option<(String, usize)> {
     let (order, index) = id.rsplit_once('-')?;
     Some((order.to_owned(), index.parse().ok()?))
+}
+
+/// Split a `/chall/{order}-{index}-{kind}` id.
+fn split_challenge_id(id: &str) -> Option<(String, usize, ChallengeKind)> {
+    let (authz, kind) = id.rsplit_once('-')?;
+    let kind = match kind {
+        "http" => ChallengeKind::Http01,
+        "dns" => ChallengeKind::Dns01,
+        _ => return None,
+    };
+    let (order, index) = split_authz_id(authz)?;
+    Some((order, index, kind))
+}
+
+/// The RFC 7638 thumbprint of the account key in a `newAccount` JWS.
+///
+/// The protected header carries the public key inline as `jwk`; the thumbprint
+/// is the SHA-256 of its canonical JSON (required members only, lexicographic,
+/// no whitespace), base64url-encoded without padding. `instant-acme` uses ES256,
+/// so the key is always an EC P-256 key.
+fn jws_key_thumbprint(body: &[u8]) -> Option<String> {
+    use sha2::{Digest as _, Sha256};
+
+    let envelope: Value = serde_json::from_slice(body).ok()?;
+    let protected = envelope.get("protected")?.as_str()?;
+    let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(protected).ok()?).ok()?;
+    let jwk = header.get("jwk")?;
+    let canonical = format!(
+        r#"{{"crv":"{}","kty":"{}","x":"{}","y":"{}"}}"#,
+        jwk.get("crv")?.as_str()?,
+        jwk.get("kty")?.as_str()?,
+        jwk.get("x")?.as_str()?,
+        jwk.get("y")?.as_str()?,
+    );
+    Some(URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes())))
+}
+
+/// Validate a DNS-01 challenge: the zone must VISIBLY carry
+/// `base64url(sha256("{token}.{thumbprint}"))` at `_acme-challenge.{domain}`
+/// (RFC 8555 §8.4).
+///
+/// Reads the zone's *visible* view, so a record published but not yet
+/// propagated fails exactly as it would against a real CA — which is what makes
+/// autumn's propagation wait a tested behaviour rather than an assumption.
+fn validate_dns01(state: &CaState, domain: &str, token: &str) -> bool {
+    use sha2::{Digest as _, Sha256};
+
+    let Some(zone) = lock(&state.dns_zone).clone() else {
+        return false;
+    };
+    let Some(thumbprint) = lock(&state.thumbprint).clone() else {
+        return false;
+    };
+    let key_authorization = format!("{token}.{thumbprint}");
+    let expected = URL_SAFE_NO_PAD.encode(Sha256::digest(key_authorization.as_bytes()));
+    let fqdn = format!("_acme-challenge.{domain}");
+    lock(&state.dns_lookups).push((fqdn.clone(), expected.clone()));
+    zone.visible_txt(&fqdn).contains(&expected)
 }
 
 /// Fetch `http://{challenge_addr}/.well-known/acme-challenge/{token}` and check

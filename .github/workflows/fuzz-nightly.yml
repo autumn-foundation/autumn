@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [idempotency, routing, headers, session, body, sandbox]
+        target: [idempotency, routing, headers, session, body, dns, sandbox]
     steps:
       - uses: actions/checkout@v7
       - name: Install nightly toolchain

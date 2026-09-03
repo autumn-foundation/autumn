@@ -1141,7 +1141,7 @@ fn dotenv_env() -> autumn_web::dotenv::DotenvOsEnv {
 /// `.env.<p>` is honored even when the ambient shell profile differs — otherwise
 /// `autumn db backup --profile test --upload` from a dev/unset shell would miss
 /// `.env.test`-provided offsite settings and credentials.
-fn dotenv_env_for_profile(profile: &str) -> autumn_web::dotenv::DotenvOsEnv {
+pub(super) fn dotenv_env_for_profile(profile: &str) -> autumn_web::dotenv::DotenvOsEnv {
     // Normalize aliases/case to the app's resolved profile FIRST (P2 #20), so
     // `--profile development` / `AUTUMN_ENV=PROD` selects `.env.dev` / `.env.prod`
     // — the same file the running app reads — instead of a literal `.env.development`.
