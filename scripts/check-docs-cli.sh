@@ -716,7 +716,19 @@ def _ungrouped(segment):
 # directions: an exec array with a spaced argument (`--shard "eu west"`) was
 # read as shell lines, leaving a lone `autumn` that reported as a bare root on
 # a valid manifest.
-_EXEC_KEYS = r'command|entrypoint|cmd|exec'
+#
+# The exec family is itself three SLOTS, because a container's argv is
+# assembled from up to three keys and every runtime spells them differently:
+#
+#   Docker/Compose   ENTRYPOINT + CMD          `entrypoint:` + `command:`
+#   Kubernetes       command    + args         `command:`    + `args:`
+#
+# Concatenated in that order, both spellings fall out of one rule. Reading any
+# single key as the whole argv reported `entrypoint: ["autumn"]` with
+# `command: ["serve"]` as a bare root — a valid Compose file.
+_ENTRY_KEYS = r'entrypoint'
+_CMD_KEYS = r'command|cmd|exec'
+_EXEC_KEYS = _ENTRY_KEYS + r'|' + _CMD_KEYS
 _SCRIPT_KEYS = r'script|run'
 _COMMAND_KEYS = _EXEC_KEYS + r'|' + _SCRIPT_KEYS
 # A qualifier may precede the key word: Fly writes `release_command = "autumn
@@ -812,6 +824,7 @@ _KEY_INLINE = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
 _ARGS_ONLY = re.compile(r'^(\s*)' + _QUALIFIED + r'args:\s*$', re.I)
 _ARGS_INLINE = re.compile(r'^(\s*)' + _QUALIFIED + r'args:\s*\[(.*)\]\s*$', re.I)
 _EXEC_KEY_LINE = re.compile(r'^\s*' + _QUALIFIED + r'(?:' + _EXEC_KEYS + r'):', re.I)
+_ENTRY_KEY_LINE = re.compile(r'^\s*' + _QUALIFIED + r'(?:' + _ENTRY_KEYS + r'):', re.I)
 
 
 def _list_value(text):
@@ -1173,56 +1186,51 @@ def invocations(text):
     # line after it has been seen — because a sibling `args:` may carry the
     # rest of the same argv.
     pending = None          # items being collected right now
-    pending_kind = None     # 'exec', 'script' or 'args'
+    pending_kind = None     # 'entry', 'cmd', 'args' or 'script'
     pending_at = None       # the line the key sits on
     pending_indent = 0
-    # The two halves of one container's argv. A YAML mapping is unordered, so
-    # either may arrive first and neither can be judged until the block ends.
-    held_exec = None
-    held_args = None
-    held_at = None
-    held_indent = 0
+    # One container's argv, in three slots. A YAML mapping is unordered, so any
+    # of them may arrive first and none can be judged until the block ends.
+    slots = {}               # slot -> items
+    slots_at = None
+    slots_indent = 0
 
-    def emit_held():
-        """Join whichever halves arrived and read them as one argv."""
-        nonlocal held_exec, held_args, held_at
-        exec_items, args_items, at = held_exec, held_args, held_at
-        held_exec, held_args, held_at = None, None, None
-        if not exec_items:
-            # `args:` with no `command:` describes arguments to an entrypoint
-            # this gate never sees, so there is nothing to resolve.
+    def emit_slots():
+        """Join whichever slots were filled and read them as one argv."""
+        nonlocal slots, slots_at
+        filled, at = slots, slots_at
+        slots, slots_at = {}, None
+        # ENTRYPOINT + CMD + args, which is Docker's rule and Kubernetes'
+        # alike once each runtime's key names are mapped onto the slots.
+        items = (filled.get('entry') or []) + (filled.get('cmd') or []) \
+            + (filled.get('args') or [])
+        if not items:
             return
-        for display, argv in _from_tokens(exec_items + (args_items or [])):
+        for display, argv in _from_tokens(items):
             yield at, display, argv, FENCED_COMMAND
 
     def close_pending():
-        """Finish the list being collected: hold a half, or run script lines."""
+        """Finish the list being collected: fill a slot, or run script lines."""
         nonlocal pending, pending_kind, pending_at
-        nonlocal held_exec, held_args, held_at, held_indent
+        nonlocal slots, slots_at, slots_indent
         items, kind, at = pending, pending_kind, pending_at
         indent = pending_indent
         pending, pending_kind, pending_at = None, None, None
         if items is None:
             return
         if kind == 'script':
-            # Whole shell lines, each its own command; nothing to pair.
+            # Whole shell lines, each its own command; nothing to assemble.
             for it in items:
                 for display, argv in commands(it):
                     yield at, display, argv, FENCED_COMMAND
             return
-        if kind == 'args':
-            if held_args is not None or (held_exec is not None
-                                         and indent != held_indent):
-                yield from emit_held()
-            held_args = items
-            if held_at is None:
-                held_at, held_indent = at, indent
-            return
-        if held_exec is not None:       # a second command key: a new container
-            yield from emit_held()
-        held_exec = items
-        if held_at is None or held_args is None:
-            held_at, held_indent = at, indent
+        # Refilling a slot, or a key at a different depth, means a new
+        # container: judge what was collected before starting on it.
+        if kind in slots or (slots and indent != slots_indent):
+            yield from emit_slots()
+        slots[kind] = items
+        if slots_at is None:
+            slots_at, slots_indent = at, indent
 
     def add_prose(line, lineno):
         """Accumulate one prose line, with any blockquote marker stripped."""
@@ -1236,7 +1244,7 @@ def invocations(text):
         if m:
             held, held_at = [], None            # a fence boundary ends any hold
             yield from close_pending()          # …and any list
-            yield from emit_held()
+            yield from emit_slots()
             yield from _spans(take_paragraph(), commands)
             if fence is None:
                 fence, lang = m.group(1)[0], m.group(2).lower()
@@ -1268,8 +1276,12 @@ def invocations(text):
         if key:
             if _ARGS_ONLY.match(line) or _ARGS_INLINE.match(line):
                 kind = 'args'
+            elif _ENTRY_KEY_LINE.match(line):
+                kind = 'entry'
+            elif _EXEC_KEY_LINE.match(line):
+                kind = 'cmd'
             else:
-                kind = 'exec' if _EXEC_KEY_LINE.match(line) else 'script'
+                kind = 'script'
             pending_kind, pending_at = kind, lineno
             pending_indent = len(key.group(1))
             pending = _inline_items(inline.group(2)) if inline else []
@@ -1281,8 +1293,8 @@ def invocations(text):
         # enough, and `args:` may be written first. What ends the wait is a NEW
         # list entry at or left of the pair's own column: the next container,
         # which cannot be the same argv.
-        if item and len(item.group(1)) <= held_indent:
-            yield from emit_held()
+        if item and len(item.group(1)) <= slots_indent:
+            yield from emit_slots()
 
         logical, at = flush(line, lineno)
         if logical is None:
@@ -1317,7 +1329,7 @@ def invocations(text):
                                               else FENCED_SPAN)
 
     yield from close_pending()
-    yield from emit_held()
+    yield from emit_slots()
     yield from _spans(take_paragraph(), commands)
 
 
@@ -2193,6 +2205,34 @@ def self_test():
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate --shard eu west status'],
                f'a spaced exec element ({label}) stays one argv: {got}')
+    # --- a container's argv comes from up to three keys, and every runtime
+    # spells them differently: Docker/Compose concatenate ENTRYPOINT + CMD,
+    # Kubernetes concatenates command + args. Reading any single key as the
+    # whole argv reported a valid Compose file as a bare root.
+    for label, doc in [
+        ('k8s', '```yaml\ncommand: ["autumn"]\nargs: ["migrate"]\n```'),
+        ('compose', '```yaml\nentrypoint: ["autumn"]\ncommand: ["migrate"]\n```'),
+        ('compose, reversed',
+         '```yaml\ncommand: ["migrate"]\nentrypoint: ["autumn"]\n```'),
+        ('entrypoint alone', '```yaml\nentrypoint: ["autumn", "migrate"]\n```'),
+    ]:
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['migrate'], f'the {label} spelling must assemble: {got}')
+    three = ('```yaml\nentrypoint: ["autumn"]\ncommand: ["migrate"]\n'
+             'args: ["--shard", "eu"]\n```')
+    expect([d for _, d, _, _ in invocations(three)] == ['migrate --shard eu'],
+           f'all three slots concatenate in order: {list(invocations(three))}')
+    drift = '```yaml\nentrypoint: ["autumn"]\ncommand: ["nope"]\n```'
+    expect([d for _, d, _, _ in invocations(drift)] == ['nope'],
+           f'drift in the CMD half must be read: {list(invocations(drift))}')
+    # The accumulator's state must not collide with the backslash-continuation
+    # buffer it shares a scope with — they were both called `held`, and a
+    # continuation inside a fence then reported the wrong line.
+    both = ('```yaml\ncommand: ["autumn"]\nargs: ["migrate"]\n```\n\n'
+            '```bash\nautumn maintenance on \\\n  --reason "x"\n```')
+    lines = [ln for ln, _, _, _ in invocations(both)]
+    expect(lines == [2, 7], f'a continuation and a slot pair keep their own lines: {lines}')
+
     # …and the key, not the contents, is what says a list is shell lines.
     script = '```yaml\nscript:\n  - autumn migrate run\n  - cargo test\n```'
     expect([d for _, d, _, _ in invocations(script)] == ['migrate run'],
