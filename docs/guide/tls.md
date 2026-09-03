@@ -662,9 +662,13 @@ Route 53 is the exception that proves the rule: its API has no "append", only
 read-modify-writes — and applies **both** values in a *single* change, because
 Route 53 may keep serving the pre-change values until the first change reaches
 `INSYNC`, so a second read-modify-write could read the old set and write back
-only its own value, dropping the first. If your `exec` hook talks to an API
-shaped like that, batch the same way or make the hook idempotent under a stale
-read.
+only its own value, dropping the first. The same read-modify-write preserves
+the set's existing **TTL**: the name can already hold another ACME client's
+challenge values, so autumn's own 60-second TTL is written only when it is
+creating the set — and Route 53 rejects a `DELETE` whose TTL differs from the
+live set, so cleanup has to send the TTL that is actually there. If your `exec`
+hook talks to an API shaped like that, batch the same way and preserve what you
+did not set, or make the hook idempotent under a stale read.
 
 ### What DNS-01 does *not* need
 

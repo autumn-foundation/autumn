@@ -161,8 +161,8 @@ impl Route53Provider {
         ))
     }
 
-    /// The TXT values currently published at `fqdn`.
-    async fn current_values(&self, zone: &str, fqdn: &str) -> Result<Vec<String>, String> {
+    /// The TXT record set currently published at `fqdn`, TTL included.
+    async fn current_rrset(&self, zone: &str, fqdn: &str) -> Result<TxtRrset, String> {
         let body = self
             .send(
                 HttpRequest::new(
@@ -174,22 +174,30 @@ impl Route53Provider {
                 "list the Route 53 TXT record set",
             )
             .await?;
-        Ok(txt_values_for(&body, fqdn))
+        Ok(txt_rrset_for(&body, fqdn))
     }
 
     /// Apply `values` at `fqdn`: `UPSERT` the set, or `DELETE` it when empty.
+    ///
+    /// The TTL written is the one `previous` already carries, not autumn's own.
+    /// A Route 53 change replaces the whole set, so writing back
+    /// [`CHALLENGE_TTL_SECS`] would silently re-configure a record set autumn
+    /// does not solely own — another ACME client's challenge values can share
+    /// `_acme-challenge` — and a `DELETE` whose TTL differs from the live set is
+    /// rejected outright, so cleanup would fail and leave the records behind.
+    /// Autumn's own TTL applies only when it is creating the set.
     async fn write_values(
         &self,
         zone: &str,
         fqdn: &str,
         values: &[String],
-        previous: &[String],
+        previous: &TxtRrset,
     ) -> Result<(), String> {
         let (action, applied) = if values.is_empty() {
             // Route 53 rejects an empty ResourceRecords list, so removing the
             // last value means deleting the whole set — and a DELETE must carry
-            // the set exactly as it stands today.
-            ("DELETE", previous)
+            // the set exactly as it stands today, TTL included.
+            ("DELETE", previous.values.as_slice())
         } else {
             ("UPSERT", values)
         };
@@ -197,7 +205,8 @@ impl Route53Provider {
             // Nothing was there and nothing is wanted: a no-op, not an error.
             return Ok(());
         }
-        let body = change_batch_xml(action, fqdn, applied);
+        let ttl = previous.ttl.unwrap_or(CHALLENGE_TTL_SECS);
+        let body = change_batch_xml(action, fqdn, applied, ttl);
         self.send(
             HttpRequest::new(
                 "POST",
@@ -235,9 +244,9 @@ impl Route53Provider {
 
         for (fqdn, values) in groups {
             let zone = self.zone_id(fqdn).await?;
-            let current = self.current_values(&zone, fqdn).await?;
+            let current = self.current_rrset(&zone, fqdn).await?;
             let next: Vec<String> = if add {
-                let mut next = current.clone();
+                let mut next = current.values.clone();
                 for value in &values {
                     if !next.iter().any(|v| v == value) {
                         next.push((*value).to_owned());
@@ -246,12 +255,13 @@ impl Route53Provider {
                 next
             } else {
                 current
+                    .values
                     .iter()
                     .filter(|v| !values.contains(&v.as_str()))
                     .cloned()
                     .collect()
             };
-            if next == current {
+            if next == current.values {
                 continue;
             }
             self.write_values(&zone, fqdn, &next, &current).await?;
@@ -268,11 +278,11 @@ impl DnsProvider for Route53Provider {
     fn upsert_txt<'a>(&'a self, record: &'a TxtRecord) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             let zone = self.zone_id(&record.fqdn).await?;
-            let current = self.current_values(&zone, &record.fqdn).await?;
-            if current.contains(&record.value) {
+            let current = self.current_rrset(&zone, &record.fqdn).await?;
+            if current.values.contains(&record.value) {
                 return Ok(());
             }
-            let mut next = current.clone();
+            let mut next = current.values.clone();
             next.push(record.value.clone());
             self.write_values(&zone, &record.fqdn, &next, &current)
                 .await
@@ -282,11 +292,12 @@ impl DnsProvider for Route53Provider {
     fn delete_txt<'a>(&'a self, record: &'a TxtRecord) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             let zone = self.zone_id(&record.fqdn).await?;
-            let current = self.current_values(&zone, &record.fqdn).await?;
-            if !current.contains(&record.value) {
+            let current = self.current_rrset(&zone, &record.fqdn).await?;
+            if !current.values.contains(&record.value) {
                 return Ok(());
             }
             let next: Vec<String> = current
+                .values
                 .iter()
                 .filter(|v| **v != record.value)
                 .cloned()
@@ -332,7 +343,7 @@ impl Route53Credentials {
 
 /// Build a `ChangeResourceRecordSets` body applying `action` to `fqdn` with
 /// exactly `values`.
-fn change_batch_xml(action: &str, fqdn: &str, values: &[String]) -> String {
+fn change_batch_xml(action: &str, fqdn: &str, values: &[String], ttl: u32) -> String {
     let mut records = String::new();
     for value in values {
         use std::fmt::Write as _;
@@ -348,7 +359,7 @@ fn change_batch_xml(action: &str, fqdn: &str, values: &[String]) -> String {
          xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\">\
          <ChangeBatch><Comment>autumn ACME DNS-01 challenge</Comment><Changes><Change>\
          <Action>{action}</Action>\
-         <ResourceRecordSet><Name>{}.</Name><Type>TXT</Type><TTL>{CHALLENGE_TTL_SECS}</TTL>\
+         <ResourceRecordSet><Name>{}.</Name><Type>TXT</Type><TTL>{ttl}</TTL>\
          <ResourceRecords>{records}</ResourceRecords></ResourceRecordSet>\
          </Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
         xml_escape(fqdn)
@@ -441,12 +452,27 @@ fn is_private_zone(zone: &str) -> bool {
     xml_element(zone, "PrivateZone").is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
 }
 
+/// The `_acme-challenge` TXT record set as Route 53 currently holds it.
+///
+/// The TTL travels with the values because a Route 53 change replaces the whole
+/// set: writing back a different TTL would silently re-configure a record set
+/// autumn may not solely own (another ACME client's challenge values can share
+/// the name), and a `DELETE` whose `TTL` does not match the live set is rejected
+/// outright with `InvalidChangeBatch` — so cleanup would fail and leave the
+/// records behind (issue #1620).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TxtRrset {
+    values: Vec<String>,
+    /// `None` when the set does not exist yet.
+    ttl: Option<u32>,
+}
+
 /// The TXT values of the `ResourceRecordSet` for `fqdn` in a
 /// `ListResourceRecordSets` response.
 ///
 /// Route 53 stores a TXT value quoted; the quotes are stripped so the caller
 /// compares against the raw challenge value.
-fn txt_values_for(xml: &str, fqdn: &str) -> Vec<String> {
+fn txt_rrset_for(xml: &str, fqdn: &str) -> TxtRrset {
     let wanted = format!("{}.", fqdn.trim_end_matches('.').to_ascii_lowercase());
     xml_elements(xml, "ResourceRecordSet")
         .into_iter()
@@ -457,11 +483,15 @@ fn txt_values_for(xml: &str, fqdn: &str) -> Vec<String> {
                 n.to_ascii_lowercase() == wanted
             }) && xml_element(set, "Type") == Some("TXT")
         })
-        .map(|set| {
-            xml_elements(set, "Value")
+        .map(|set| TxtRrset {
+            values: xml_elements(set, "Value")
                 .into_iter()
                 .map(|v| xml_unescape(v).trim_matches('"').to_owned())
-                .collect()
+                .collect(),
+            // Absent or unparseable is treated as "no existing set", which makes
+            // the write use autumn's own short challenge TTL — the same thing it
+            // does when the name does not exist at all.
+            ttl: xml_element(set, "TTL").and_then(|t| t.trim().parse().ok()),
         })
         .unwrap_or_default()
 }
@@ -733,6 +763,10 @@ mod tests {
     }
 
     fn rrset_with(values: &[&str]) -> String {
+        rrset_with_ttl(values, 60)
+    }
+
+    fn rrset_with_ttl(values: &[&str], ttl: u32) -> String {
         let mut records = String::new();
         for value in values {
             use std::fmt::Write as _;
@@ -743,7 +777,7 @@ mod tests {
         }
         format!(
             "<ListResourceRecordSetsResponse><ResourceRecordSets><ResourceRecordSet>\
-             <Name>_acme-challenge.myapp.com.</Name><Type>TXT</Type><TTL>60</TTL>\
+             <Name>_acme-challenge.myapp.com.</Name><Type>TXT</Type><TTL>{ttl}</TTL>\
              <ResourceRecords>{records}</ResourceRecords></ResourceRecordSet>\
              </ResourceRecordSets></ListResourceRecordSetsResponse>"
         )
@@ -764,6 +798,112 @@ mod tests {
             credentials(),
             transport as std::sync::Arc<dyn HttpTransport>,
         )
+    }
+
+    /// Regression (#1620): a Route 53 change replaces the WHOLE record set, so
+    /// the TTL it carries must be the one already there.
+    ///
+    /// `_acme-challenge` is not necessarily autumn's alone — another ACME client
+    /// can hold challenge values at the same name — and writing back autumn's own
+    /// 60s TTL would permanently re-configure that shared set. Worse, Route 53
+    /// rejects a `DELETE` whose `ResourceRecordSet` does not match the live one
+    /// exactly, TTL included, so cleanup would fail outright and leave the
+    /// records behind.
+    #[tokio::test]
+    async fn an_existing_record_sets_ttl_is_preserved_through_the_write() {
+        let transport = RecordingTransport::new(&[
+            (ZONE_LOOKUP, zone_hit()),
+            // A set someone else created, with their TTL, not autumn's.
+            (RRSET_LIST, &rrset_with_ttl(&["someone-elses-value"], 300)),
+            (RRSET_CHANGE, changed()),
+        ]);
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        provider
+            .upsert_txt(&TxtRecord::new("myapp.com", "value-apex"))
+            .await
+            .expect("apex publishes");
+
+        let change = transport
+            .sent()
+            .iter()
+            .find(|r| r.method == "POST")
+            .expect("a change was sent")
+            .body
+            .clone();
+        assert!(
+            change.contains("<TTL>300</TTL>"),
+            "the existing TTL must be carried through, not replaced with autumn's: {change}"
+        );
+        assert!(
+            !change.contains("<TTL>60</TTL>"),
+            "autumn's challenge TTL must not overwrite a set it does not own: {change}"
+        );
+        // The sibling value is still there — this is a read-modify-write.
+        assert!(
+            change.contains("&quot;someone-elses-value&quot;"),
+            "{change}"
+        );
+    }
+
+    /// The mirror: a DELETE must carry the live set exactly, TTL included, or
+    /// Route 53 answers `InvalidChangeBatch` and the records are never removed.
+    #[tokio::test]
+    async fn a_delete_carries_the_live_records_ttl() {
+        let transport = RecordingTransport::new(&[
+            (ZONE_LOOKUP, zone_hit()),
+            (RRSET_LIST, &rrset_with_ttl(&["value-apex"], 900)),
+            (RRSET_CHANGE, changed()),
+        ]);
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        provider
+            .delete_txt(&TxtRecord::new("myapp.com", "value-apex"))
+            .await
+            .expect("the last value is removed");
+
+        let change = transport
+            .sent()
+            .iter()
+            .find(|r| r.method == "POST")
+            .expect("a change was sent")
+            .body
+            .clone();
+        assert!(change.contains("<Action>DELETE</Action>"), "{change}");
+        assert!(
+            change.contains("<TTL>900</TTL>"),
+            "a DELETE whose TTL differs from the live set is rejected outright: {change}"
+        );
+    }
+
+    /// When autumn is CREATING the set, there is no existing TTL to preserve, so
+    /// its own short challenge TTL applies — a challenge record should not linger
+    /// in resolver caches.
+    #[tokio::test]
+    async fn a_new_record_set_gets_autumns_short_challenge_ttl() {
+        let transport = RecordingTransport::new(&[
+            (ZONE_LOOKUP, zone_hit()),
+            (RRSET_LIST, empty_rrset()),
+            (RRSET_CHANGE, changed()),
+        ]);
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        provider
+            .upsert_txt(&TxtRecord::new("myapp.com", "value-apex"))
+            .await
+            .expect("publishes");
+
+        let change = transport
+            .sent()
+            .iter()
+            .find(|r| r.method == "POST")
+            .expect("a change was sent")
+            .body
+            .clone();
+        assert!(
+            change.contains(&format!("<TTL>{CHALLENGE_TTL_SECS}</TTL>")),
+            "a set autumn creates gets autumn's TTL: {change}"
+        );
     }
 
     /// Regression (#1620): a cached PARENT hosted zone must not shadow a
@@ -1344,6 +1484,7 @@ mod tests {
             "UPSERT",
             "_acme-challenge.myapp.com",
             &["value-one".to_owned(), "value-two".to_owned()],
+            CHALLENGE_TTL_SECS,
         );
         assert!(xml.contains("<Action>UPSERT</Action>"), "{xml}");
         assert!(
@@ -1385,11 +1526,17 @@ mod tests {
             </ResourceRecordSet>
             </ResourceRecordSets></ListResourceRecordSetsResponse>";
         assert_eq!(
-            txt_values_for(xml, "_acme-challenge.myapp.com"),
-            vec!["value-one".to_owned(), "value-two".to_owned()]
+            txt_rrset_for(xml, "_acme-challenge.myapp.com"),
+            TxtRrset {
+                values: vec!["value-one".to_owned(), "value-two".to_owned()],
+                ttl: Some(60),
+            }
         );
         // A different name in the same response is not this record's set.
-        assert!(txt_values_for(xml, "_acme-challenge.other.com").is_empty());
+        assert_eq!(
+            txt_rrset_for(xml, "_acme-challenge.other.com"),
+            TxtRrset::default()
+        );
     }
 
     // Route 53's `rrset?name=` list is a *cursor*: it returns the record sets at
@@ -1403,7 +1550,11 @@ mod tests {
               <ResourceRecords><ResourceRecord><Value>&quot;unrelated&quot;</Value></ResourceRecord></ResourceRecords>
             </ResourceRecordSet>
             </ResourceRecordSets></ListResourceRecordSetsResponse>";
-        assert!(txt_values_for(xml, "_acme-challenge.myapp.com").is_empty());
+        assert_eq!(
+            txt_rrset_for(xml, "_acme-challenge.myapp.com"),
+            TxtRrset::default(),
+            "a cursor result for another name must not be read as this name's set"
+        );
     }
 
     #[test]

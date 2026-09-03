@@ -71,6 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Route 53's `ChangeResourceRecordSets` — apply every value sharing a name in
     a single change, because two sequential read-modify-writes race: the second
     read can still return the pre-change values and write back only its own.
+    Such a write also carries the existing set's **TTL** back out unchanged —
+    the name can be shared with another ACME client, so autumn's own 60s
+    challenge TTL applies only to a set it creates, and Route 53 rejects a
+    `DELETE` whose TTL does not match the live set, which would otherwise leave
+    cleanup unable to remove anything.
   - **Lifecycle.** Renewal, persistence, staging selection, hot-swap and health
     are #1608's, unchanged. A failed issuance or renewal now also raises
     #1610's `scheduled_task_failure` operator alert for `acme-renewal` — weeks
