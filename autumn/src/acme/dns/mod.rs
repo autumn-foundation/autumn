@@ -101,6 +101,63 @@ pub trait DnsProvider: Send + Sync {
     fn delete_txt<'a>(&'a self, record: &'a TxtRecord) -> BoxFuture<'a, Result<(), String>>;
 }
 
+/// How much text copied from a DNS provider (an API error body, a hook's
+/// `stderr`) may reach an operator-facing message.
+///
+/// Bounded because that message is published on `/actuator/health` and pushed to
+/// the operator's alert destination; an unbounded upstream body would become an
+/// unbounded health payload.
+pub const UPSTREAM_EXCERPT_CHARS: usize = 400;
+
+/// Make upstream text safe to publish in an issuance error.
+///
+/// Autumn's own error strings never contain a credential, but the text it copies
+/// **in** from a provider is not under its control, and that text is published
+/// verbatim on the unauthenticated `/actuator/health` and to the operator's
+/// alert destination (Slack, PagerDuty, email). Two real shapes make that
+/// dangerous:
+///
+/// - AWS answers a `SignatureDoesNotMatch` by echoing the canonical request it
+///   expected — which contains every signed header line, including
+///   `x-amz-security-token: <the STS session token>`;
+/// - a shell hook written with `set -x` traces its own
+///   `curl -H "Authorization: Bearer $TOKEN"` to `stderr`.
+///
+/// So every secret still live in this process is replaced with `<redacted>`
+/// before publishing, control characters (which would let upstream text forge
+/// log lines or inject ANSI escapes into `autumn doctor` output) are stripped,
+/// and the result is truncated to [`UPSTREAM_EXCERPT_CHARS`].
+#[must_use]
+pub fn sanitize_upstream(text: &str, secrets: &[&str]) -> String {
+    let mut cleaned: String = text
+        .chars()
+        .map(|c| {
+            if c == '\t' {
+                ' '
+            } else if c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    for secret in secrets {
+        let secret = secret.trim();
+        // A very short "secret" would redact half the message; the shortest
+        // credential any supported provider issues is far longer than this.
+        if secret.len() >= 8 {
+            cleaned = cleaned.replace(secret, "<redacted>");
+        }
+    }
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.chars().count() <= UPSTREAM_EXCERPT_CHARS {
+        return cleaned;
+    }
+    let mut truncated: String = cleaned.chars().take(UPSTREAM_EXCERPT_CHARS).collect();
+    truncated.push('…');
+    truncated
+}
+
 /// A string that must not reach a log line, an error message, or actuator
 /// output.
 ///
@@ -363,6 +420,56 @@ mod tests {
             challenge_fqdn("myapp.com"),
             TxtRecord::new("myapp.com", "v").fqdn
         );
+    }
+
+    // AWS answers a SigV4 mismatch by echoing the canonical request, which
+    // contains every signed header — including the STS session token. That reply
+    // is published on the unauthenticated `/actuator/health` and pushed to the
+    // operator's alert destination, so it must be scrubbed on the way in.
+    #[test]
+    fn upstream_text_is_scrubbed_of_live_secrets() {
+        let token = "FwoGZXIvYXdzEHwaDNOT-A-REAL-SESSION-TOKEN";
+        let aws_reply = format!(
+            "The request signature we calculated does not match. The Canonical String for this \
+             request should have been 'POST /2013-04-01/hostedzone/Z1/rrset/ \
+             host:route53.amazonaws.com x-amz-security-token:{token} '"
+        );
+        let safe = sanitize_upstream(&aws_reply, &[token]);
+        assert!(!safe.contains(token), "leaked: {safe}");
+        assert!(safe.contains("<redacted>"), "got: {safe}");
+        // …and the operator-actionable part survives.
+        assert!(
+            safe.contains("signature we calculated does not match"),
+            "got: {safe}"
+        );
+    }
+
+    #[test]
+    fn upstream_text_is_bounded_and_stripped_of_control_characters() {
+        let long = "x".repeat(UPSTREAM_EXCERPT_CHARS * 3);
+        let bounded = sanitize_upstream(&long, &[]);
+        assert!(bounded.chars().count() <= UPSTREAM_EXCERPT_CHARS + 1);
+        assert!(bounded.ends_with('…'));
+
+        // A hook that writes newlines or ANSI escapes must not be able to forge
+        // log lines or repaint `autumn doctor`'s terminal output.
+        let hostile = "line one\n2026-01-01 ERROR forged\r\n\u{1b}[31mred\u{1b}[0m";
+        let safe = sanitize_upstream(hostile, &[]);
+        assert!(!safe.contains('\n'), "got: {safe:?}");
+        assert!(!safe.contains('\r'), "got: {safe:?}");
+        assert!(!safe.contains('\u{1b}'), "got: {safe:?}");
+        assert!(safe.contains("forged"), "the text itself is kept: {safe:?}");
+    }
+
+    // A short string is not treated as a secret: redacting on a 3-character
+    // "secret" would blank out most of any message.
+    #[test]
+    fn a_too_short_secret_is_not_used_as_a_redaction_pattern() {
+        assert_eq!(
+            sanitize_upstream("the zone was not found", &["e"]),
+            "the zone was not found"
+        );
+        assert_eq!(sanitize_upstream("a b c", &[""]), "a b c");
     }
 
     #[test]

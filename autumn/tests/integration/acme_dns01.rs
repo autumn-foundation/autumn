@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use autumn_web::acme::challenge::Http01Tokens;
-use autumn_web::acme::dns::resolver::UdpTxtLookup;
+use autumn_web::acme::dns::resolver::UdpDnsLookup;
 use autumn_web::acme::dns::{DnsProvider, TxtRecord};
 use autumn_web::acme::renewal::{
     AcmeHealthIndicator, AcmeRenewalTask, AcmeStatus, DnsChallenge, ReporterFn,
@@ -421,7 +421,7 @@ fn renewal_task(
         renew_window_misconfigured: AtomicBool::new(false),
         dns: Some(DnsChallenge {
             provider: dns_provider,
-            lookup: Arc::new(UdpTxtLookup::new(Duration::from_secs(2))),
+            lookup: Arc::new(UdpDnsLookup::new(Duration::from_secs(2))),
             resolvers: vec![dns_addr],
             propagation_timeout,
             poll_interval: Duration::from_millis(100),

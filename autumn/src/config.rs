@@ -7097,7 +7097,19 @@ impl AcmeDnsConfig {
         }
         match self.provider {
             AcmeDnsProvider::Exec => {
-                if self.command.iter().all(|arg| arg.trim().is_empty()) {
+                if self
+                    .command
+                    .first()
+                    .is_some_and(|program| !program.trim().is_empty() && program != program.trim())
+                {
+                    return Err(format!(
+                        "[server.tls.acme.dns] command's program `{}` has leading or trailing \
+                         whitespace: it is passed to the OS verbatim, so the padded value would \
+                         fail to execute. Write it without the padding",
+                        self.command[0]
+                    ));
+                }
+                if self.command.first().is_none_or(|p| p.trim().is_empty()) {
                     return Err(
                         "[server.tls.acme.dns] provider = \"exec\" requires a non-empty `command` \
                          argv array (e.g. command = [\"/usr/local/bin/dns-hook\"]); autumn appends \
@@ -7132,6 +7144,15 @@ impl AcmeDnsConfig {
                  configured resolvers. Use the default (5)"
                     .to_owned(),
             );
+        }
+        if self.propagation_timeout_secs > MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS {
+            return Err(format!(
+                "[server.tls.acme.dns] propagation_timeout_secs ({}) must be at most {}: the wait \
+                 is computed as an instant `now + timeout`, and an unbounded value overflows that \
+                 and panics the renewal task, leaving the self-signed placeholder served \
+                 indefinitely. An hour is far past any real provider's propagation time",
+                self.propagation_timeout_secs, MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS
+            ));
         }
         if self.poll_interval_secs > self.propagation_timeout_secs {
             return Err(format!(
@@ -8991,6 +9012,14 @@ const fn default_acme_dns_propagation_timeout_secs() -> u64 {
 const fn default_acme_dns_poll_interval_secs() -> u64 {
     5
 }
+
+/// Upper bound on `[server.tls.acme.dns] propagation_timeout_secs`.
+///
+/// The wait is computed as `Instant::now() + Duration::from_secs(timeout)`, which
+/// **panics** on overflow — inside the spawned renewal task, where the panic
+/// silently kills the loop and leaves the self-signed placeholder served
+/// forever. An hour is far past any real provider's propagation time.
+const MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS: u64 = 3600;
 
 /// Default public resolvers the propagation wait queries
 /// (`[server.tls.acme.dns] resolvers`). Two independent operators, so one
@@ -15324,6 +15353,54 @@ path = "/healthz"
         acme.dns = Some(dns);
         let err = acme.validate().expect_err("interval > timeout is invalid");
         assert!(err.contains("poll_interval_secs"), "got: {err}");
+    }
+
+    // An unbounded budget reaches `Instant::now() + Duration::from_secs(..)`,
+    // which PANICS on overflow — inside the spawned renewal task, where the
+    // panic kills the loop silently and the placeholder is served forever.
+    #[test]
+    fn validate_acme_dns_rejects_an_unbounded_propagation_timeout() {
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.propagation_timeout_secs = u64::MAX;
+        acme.dns = Some(dns);
+        let err = acme
+            .validate()
+            .expect_err("an unbounded propagation budget is invalid");
+        assert!(err.contains("propagation_timeout_secs"), "got: {err}");
+
+        // The documented ceiling itself is accepted.
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.propagation_timeout_secs = MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS;
+        acme.dns = Some(dns);
+        assert!(acme.validate().is_ok(), "got: {:?}", acme.validate());
+    }
+
+    // `command[0]` is handed to the OS verbatim, so a blank or padded program
+    // would fail at order time with an opaque ENOENT rather than at boot.
+    #[test]
+    fn validate_acme_dns_rejects_an_unusable_exec_program() {
+        for bad in [
+            vec![String::new()],
+            vec!["   ".to_owned(), "arg".to_owned()],
+        ] {
+            let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+            let mut dns = acme_dns_cfg(AcmeDnsProvider::Exec);
+            dns.command = bad.clone();
+            acme.dns = Some(dns);
+            let err = acme
+                .validate()
+                .expect_err(&format!("`{bad:?}` is not a usable exec command"));
+            assert!(err.contains("command"), "got: {err}");
+        }
+
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Exec);
+        dns.command = vec![" /usr/local/bin/hook ".to_owned()];
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("a padded program is invalid");
+        assert!(err.contains("whitespace"), "got: {err}");
     }
 
     #[test]

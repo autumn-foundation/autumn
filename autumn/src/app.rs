@@ -4704,6 +4704,7 @@ impl AppBuilder {
                 tokens,
                 http_challenge_port,
                 https_port,
+                dns01,
             } = bind_state;
 
             // The `:80` challenge/redirect listener, bound DUAL-STACK so the CA
@@ -4711,11 +4712,32 @@ impl AppBuilder {
             // otherwise unreachable on `:80`). Preferred: one `[::]` socket with
             // IPV6_V6ONLY=false; on a platform that refuses it, a separate
             // IPv4 + IPv6 listener pair (each served below). Fail-fast on a bind
-            // error: `:80` needs privilege (CAP_NET_BIND_SERVICE) and ACME
-            // validation cannot succeed without it.
+            // error under HTTP-01: `:80` needs privilege (CAP_NET_BIND_SERVICE)
+            // and validation cannot succeed without it.
+            //
+            // Under DNS-01 it is only a warning. The CA never connects to this
+            // host — domain control is proved by a TXT record — so the listener
+            // is just the HTTP→HTTPS redirect for visitors who type `http://`.
+            // Exiting here would kill exactly the deployment #1620 exists to
+            // serve: a container without CAP_NET_BIND_SERVICE, using DNS-01
+            // *because* `:80` is unavailable. `autumn doctor` grades this the
+            // same way (`acme_ports` is a Warn under DNS-01), and the runtime
+            // must not refuse a config doctor passes.
             let challenge_listeners =
                 match crate::acme::challenge::bind_challenge_listeners(http_challenge_port).await {
                     Ok(listeners) => listeners,
+                    Err(e) if dns01 => {
+                        tracing::warn!(
+                            port = http_challenge_port,
+                            error = %e,
+                            "Could not bind the ACME challenge/redirect listener. DNS-01 issuance \
+                             does not need it, so startup continues — but visitors who type \
+                             http:// will not be redirected to HTTPS. Grant \
+                             CAP_NET_BIND_SERVICE, or set [server.tls.acme] http_challenge_port \
+                             to a port this process may bind"
+                        );
+                        Vec::new()
+                    }
                     Err(e) => {
                         tracing::error!(
                             port = http_challenge_port,
@@ -4799,7 +4821,8 @@ impl AppBuilder {
             if !matches!(
                 config.scheduler.backend,
                 crate::config::SchedulerBackend::InProcess
-            ) {
+            ) && !dns01
+            {
                 tracing::warn!(
                     scheduler_backend = coordinator.backend(),
                     "ACME HTTP-01 validation is not fleet-safe with the local on-disk token \
@@ -8503,6 +8526,10 @@ struct AcmeBindState {
     tokens: crate::acme::challenge::Http01Tokens,
     http_challenge_port: u16,
     https_port: u16,
+    /// Whether DNS-01 is configured. Decides whether a failure to bind the
+    /// challenge/redirect port is fatal (HTTP-01) or a warning (DNS-01, where
+    /// the CA never connects to this host).
+    dns01: bool,
 }
 
 /// Build a TLS listener for ACME mode: serve a stored certificate if one is
@@ -8604,6 +8631,7 @@ async fn build_acme_tls_listener(
             tokens,
             http_challenge_port: acme_cfg.http_challenge_port,
             https_port,
+            dns01: acme_cfg.dns.is_some(),
         },
     ))
 }
@@ -8636,7 +8664,7 @@ fn build_dns_challenge(
     let provider = dns::build_provider(dns_cfg, &credential, transport)?;
     Ok(Some(crate::acme::renewal::DnsChallenge {
         provider,
-        lookup: std::sync::Arc::new(dns::resolver::UdpTxtLookup::new(
+        lookup: std::sync::Arc::new(dns::resolver::UdpDnsLookup::new(
             std::time::Duration::from_secs(5),
         )),
         resolvers,

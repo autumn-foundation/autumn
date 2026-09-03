@@ -19,7 +19,7 @@ use std::time::Duration;
 use rustls::crypto::CryptoProvider;
 
 use crate::acme::challenge::Http01Tokens;
-use crate::acme::dns::resolver::TxtLookup;
+use crate::acme::dns::resolver::DnsLookup;
 use crate::acme::dns::{DnsProvider, TxtRecord};
 use crate::acme::store::{AcmeStore, CertId, StoredCert};
 use crate::config::AcmeConfig;
@@ -31,6 +31,11 @@ use crate::tls::ReloadableCertResolver;
 /// enough to act well inside the (default 30-day) renew-before window while
 /// costing almost nothing.
 const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// How long to wait for a DNS-01 order to settle after signalling the challenges
+/// ready. See [`AcmeRenewalTask::await_order_ready`] for why the default is too
+/// short here.
+const DNS01_ORDER_READY_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// The scheduler task name used for ACME renewal leader-election.
 const RENEWAL_TASK_NAME: &str = "acme-renewal";
@@ -60,9 +65,13 @@ pub type RecoveryFn = Arc<dyn Fn() + Send + Sync>;
 pub struct DnsChallenge {
     /// Writes and removes the `_acme-challenge` TXT records.
     pub provider: Arc<dyn DnsProvider>,
-    /// Queries resolvers to confirm the records are visible.
-    pub lookup: Arc<dyn TxtLookup>,
-    /// Resolvers that must all see the record before the CA is told to validate.
+    /// Sends the DNS queries that discover the zone's nameservers and confirm
+    /// the records are visible.
+    pub lookup: Arc<dyn DnsLookup>,
+    /// The resolvers used to DISCOVER the zone's authoritative nameservers — and
+    /// the fallback probed directly when discovery fails. See
+    /// [`resolver`](crate::acme::dns::resolver) for why the propagation probe
+    /// goes to the authoritative servers rather than to these.
     pub resolvers: Vec<std::net::SocketAddr>,
     /// Bound on the propagation wait.
     pub propagation_timeout: Duration,
@@ -752,7 +761,7 @@ impl AcmeRenewalTask {
         order: &mut instant_acme::Order,
         dns: &DnsChallenge,
     ) -> Result<(), String> {
-        let wanted = Self::collect_dns01_records(order).await?;
+        let wanted = self.collect_dns01_records(order).await?;
         if wanted.is_empty() {
             // Every authorization is already valid (a re-used order): nothing to
             // publish, nothing to clean up — but the order still has to settle.
@@ -795,9 +804,18 @@ impl AcmeRenewalTask {
             published.push(record.clone());
         }
 
+        // Probe the zone's OWN nameservers, not the configured recursive
+        // resolvers. Probing a public recursive immediately after the write
+        // plants a negative-cache entry whose TTL (900s for Route 53, 1800s for
+        // Cloudflare) outlives the propagation budget, so every later probe —
+        // and every later renewal — reads the cached "not there" and the wait
+        // can never succeed. The configured resolvers are how the authoritative
+        // set is discovered, and the fallback when that fails.
+        let probe_targets = self.dns01_probe_targets(dns, wanted).await;
+
         crate::acme::dns::resolver::wait_for_propagation(
             wanted,
-            &dns.resolvers,
+            &probe_targets,
             dns.propagation_timeout,
             dns.poll_interval,
             dns.lookup.as_ref(),
@@ -811,6 +829,45 @@ impl AcmeRenewalTask {
         self.await_order_ready(order).await
     }
 
+    /// The servers the propagation wait should probe: the zone's authoritative
+    /// nameservers when they can be discovered, else the configured resolvers.
+    ///
+    /// Discovery is per-order rather than per-boot because the zone's NS set can
+    /// change between renewals, and because a wildcard order's records all live
+    /// in one zone — so this costs one `NS` lookup plus one `A` lookup per
+    /// nameserver, once.
+    async fn dns01_probe_targets(
+        &self,
+        dns: &DnsChallenge,
+        wanted: &[TxtRecord],
+    ) -> Vec<std::net::SocketAddr> {
+        let Some(first) = wanted.first() else {
+            return dns.resolvers.clone();
+        };
+        let authoritative = crate::acme::dns::resolver::authoritative_resolvers(
+            &first.fqdn,
+            &dns.resolvers,
+            dns.lookup.as_ref(),
+        )
+        .await;
+        if authoritative.is_empty() {
+            tracing::warn!(
+                fqdn = first.fqdn,
+                "could not discover the authoritative nameservers for the DNS-01 challenge zone; \
+                 falling back to the configured resolvers. A recursive resolver can cache a \
+                 negative answer for longer than the propagation budget, so raise \
+                 [server.tls.acme.dns] propagation_timeout_secs if issuance times out"
+            );
+            return dns.resolvers.clone();
+        }
+        tracing::debug!(
+            fqdn = first.fqdn,
+            servers = authoritative.len(),
+            "probing the DNS-01 challenge zone's authoritative nameservers"
+        );
+        authoritative
+    }
+
     /// The TXT record each pending authorization needs, in order.
     ///
     /// An authorization for `*.myapp.com` carries the identifier `myapp.com`
@@ -819,6 +876,7 @@ impl AcmeRenewalTask {
     /// live before validation — which is why every provider here appends rather
     /// than replaces.
     async fn collect_dns01_records(
+        &self,
         order: &mut instant_acme::Order,
     ) -> Result<Vec<TxtRecord>, String> {
         use instant_acme::{AuthorizationStatus, ChallengeType, Identifier};
@@ -839,6 +897,20 @@ impl AcmeRenewalTask {
                     ));
                 }
             };
+            // The record name comes from the CA's answer, and writing it commits
+            // a DNS change in whatever zone the provider credential can reach.
+            // The CSR is pinned to `config.domains`, so a hostile directory
+            // cannot obtain a certificate for a name it was not asked for — but
+            // it could still steer autumn into writing `_acme-challenge.<x>`
+            // into an unrelated zone (and, under the exec hook, into an argv
+            // entry). Only answer for a name that was actually ordered.
+            if !Self::is_ordered_identifier(&self.config.domains, &domain) {
+                return Err(format!(
+                    "the CA returned an authorization for `{domain}`, which is not one of the \
+                     configured [server.tls.acme] domains; refusing to publish a challenge record \
+                     for it"
+                ));
+            }
             let challenge = authz.challenge(ChallengeType::Dns01).ok_or_else(|| {
                 format!(
                     "the CA offered no dns-01 challenge for `{domain}`; a wildcard certificate \
@@ -851,6 +923,18 @@ impl AcmeRenewalTask {
             ));
         }
         Ok(records)
+    }
+
+    /// Whether `identifier` is a name this order actually asked for.
+    ///
+    /// An authorization's identifier is the BASE domain, so `*.myapp.com` in the
+    /// config authorises an authorization for `myapp.com` (RFC 8555 §7.1.4).
+    fn is_ordered_identifier(domains: &[String], identifier: &str) -> bool {
+        let identifier = identifier.trim().trim_end_matches('.').to_ascii_lowercase();
+        domains.iter().any(|domain| {
+            let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+            domain == identifier || domain.strip_prefix("*.") == Some(identifier.as_str())
+        })
     }
 
     /// Tell the CA every pending DNS-01 challenge is ready to validate.
@@ -900,11 +984,25 @@ impl AcmeRenewalTask {
     }
 
     /// Wait for the order to leave `pending`, rejecting any state but `ready`.
+    ///
+    /// DNS-01 gets a much longer budget than the default. `RetryPolicy::default()`
+    /// stops after roughly 16 seconds, which is fine for HTTP-01 (the CA fetches
+    /// a URL synchronously) but marginal for DNS-01, where Let's Encrypt
+    /// validates asynchronously from several network perspectives. And giving up
+    /// early is not benign: the caller then runs cleanup, deleting the TXT
+    /// records **while the CA is still reading them**, so the authorizations go
+    /// invalid and the next attempt spends another of the CA's five
+    /// failed-validations-per-hour.
     async fn await_order_ready(&self, order: &mut instant_acme::Order) -> Result<(), String> {
         use instant_acme::{OrderStatus, RetryPolicy};
 
+        let policy = if self.dns.is_some() {
+            RetryPolicy::default().timeout(DNS01_ORDER_READY_TIMEOUT)
+        } else {
+            RetryPolicy::default()
+        };
         let status = order
-            .poll_ready(&RetryPolicy::default())
+            .poll_ready(&policy)
             .await
             .map_err(|e| format!("order did not become ready: {e}"))?;
         if status != OrderStatus::Ready {

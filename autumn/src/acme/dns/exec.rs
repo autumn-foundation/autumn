@@ -15,9 +15,15 @@
 //! Autumn runs `command` with three appended arguments:
 //!
 //! ```text
-//! /usr/local/bin/acme-dns-hook present _acme-challenge.myapp.com <txt-value>
-//! /usr/local/bin/acme-dns-hook cleanup _acme-challenge.myapp.com <txt-value>
+//! /usr/local/bin/acme-dns-hook -- present _acme-challenge.myapp.com <txt-value>
+//! /usr/local/bin/acme-dns-hook -- cleanup _acme-challenge.myapp.com <txt-value>
 //! ```
+//!
+//! The `--` is an end-of-options marker, and it is not optional: the TXT value
+//! is base64url, whose alphabet includes `-`, so roughly one challenge in
+//! sixty-four starts with one. Without the marker a hook using `getopts` — or
+//! one that forwards `"$@"` to a CLI — would read the value as an option
+//! cluster.
 //!
 //! A zero exit status means the record was written (or removed); any other
 //! status fails the order, with the hook's `stderr` carried into the message so
@@ -33,25 +39,43 @@ use std::process::Stdio;
 
 use futures::future::BoxFuture;
 
-use super::{DnsProvider, TxtRecord};
+use super::{DnsProvider, TxtRecord, sanitize_upstream};
 
 /// How long a hook may run before it is killed and the order fails. A hook that
 /// hangs must not park the renewal loop.
 const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// How much of the hook's `stderr` is quoted back in an error message.
-const STDERR_EXCERPT_BYTES: usize = 2000;
-
 /// The `exec` [`DnsProvider`].
 pub struct ExecProvider {
     command: Vec<String>,
+    /// Credential values that must be scrubbed out of the hook's `stderr` before
+    /// it is published. The hook inherits the process environment, so it can
+    /// echo them even though autumn passes it none.
+    secrets: Vec<super::SecretString>,
 }
 
 impl ExecProvider {
     /// Build a provider running `command` (an argv array).
     #[must_use]
     pub const fn new(command: Vec<String>) -> Self {
-        Self { command }
+        Self {
+            command,
+            secrets: Vec::new(),
+        }
+    }
+
+    /// Scrub `secrets` out of anything the hook writes to `stderr`.
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: Vec<super::SecretString>) -> Self {
+        self.secrets = secrets;
+        self
+    }
+
+    fn secrets(&self) -> Vec<&str> {
+        self.secrets
+            .iter()
+            .map(super::SecretString::expose)
+            .collect()
     }
 
     async fn run(&self, action: &str, record: &TxtRecord) -> Result<(), String> {
@@ -62,6 +86,13 @@ impl ExecProvider {
 
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(leading)
+            // A `--` end-of-options marker before the three appended arguments.
+            // The TXT value is base64url, whose alphabet includes `-`, so it
+            // starts with one for roughly 1 in 64 challenges — and a hook using
+            // `getopts` (or forwarding `"$@"` to a CLI) would read that as an
+            // option cluster and write the wrong record. Documented in the guide
+            // so hook authors know to expect it.
+            .arg("--")
             .arg(action)
             .arg(&record.fqdn)
             .arg(&record.value)
@@ -97,7 +128,7 @@ impl ExecProvider {
             "the DNS-01 exec hook `{program}` failed `{action}` for TXT {} ({}){}",
             record.fqdn,
             describe_status(output.status),
-            stderr_excerpt(&output.stderr)
+            stderr_excerpt(&output.stderr, &self.secrets())
         ))
     }
 }
@@ -110,18 +141,21 @@ fn describe_status(status: std::process::ExitStatus) -> String {
     )
 }
 
-/// The hook's `stderr`, trimmed and truncated for an error message.
-fn stderr_excerpt(stderr: &[u8]) -> String {
-    let text = String::from_utf8_lossy(stderr);
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
+/// The hook's `stderr`, made safe to publish in an issuance error.
+///
+/// The hook inherits this process's environment, so a script written with
+/// `set -x` traces its own `curl -H "Authorization: Bearer $TOKEN"` — and this
+/// message is published on the unauthenticated `/actuator/health` and pushed to
+/// the operator's alert destination. `secrets` therefore carries every DNS
+/// credential value still live in this process, and [`sanitize_upstream`] also
+/// bounds the excerpt and strips the control characters a hook could otherwise
+/// use to forge log lines or repaint terminal output.
+fn stderr_excerpt(stderr: &[u8], secrets: &[&str]) -> String {
+    let safe = sanitize_upstream(&String::from_utf8_lossy(stderr), secrets);
+    if safe.is_empty() {
         return String::new();
     }
-    let mut excerpt: String = trimmed.chars().take(STDERR_EXCERPT_BYTES).collect();
-    if excerpt.len() < trimmed.len() {
-        excerpt.push('…');
-    }
-    format!(": {excerpt}")
+    format!(": {safe}")
 }
 
 impl DnsProvider for ExecProvider {
@@ -230,11 +264,56 @@ mod tests {
 
     #[test]
     fn stderr_excerpt_is_bounded_and_omitted_when_empty() {
-        assert_eq!(stderr_excerpt(b"   "), "");
-        assert_eq!(stderr_excerpt(b" boom "), ": boom");
-        let long = vec![b'x'; STDERR_EXCERPT_BYTES * 2];
-        let excerpt = stderr_excerpt(&long);
+        assert_eq!(stderr_excerpt(b"   ", &[]), "");
+        assert_eq!(stderr_excerpt(b" boom ", &[]), ": boom");
+        let long = vec![b'x'; super::super::UPSTREAM_EXCERPT_CHARS * 2];
+        let excerpt = stderr_excerpt(&long, &[]);
         assert!(excerpt.ends_with('…'));
-        assert!(excerpt.chars().count() <= STDERR_EXCERPT_BYTES + 3);
+        assert!(excerpt.chars().count() <= super::super::UPSTREAM_EXCERPT_CHARS + 3);
+    }
+
+    // A hook written with `set -x` traces its own credentials to stderr, and
+    // that stderr is published on `/actuator/health` and to the operator's alert
+    // destination. It must not carry the token through.
+    #[tokio::test]
+    async fn a_hook_cannot_leak_a_traced_credential_through_its_stderr() {
+        const TOKEN: &str = "cf-live-token-DO-NOT-LEAK-9f3a";
+        let provider = ExecProvider::new(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!("echo '+ curl -H \"Authorization: Bearer {TOKEN}\"' >&2; exit 1"),
+            "hook".to_owned(),
+        ])
+        .with_secrets(vec![super::super::SecretString::new(TOKEN)]);
+
+        let err = provider
+            .upsert_txt(&record())
+            .await
+            .expect_err("a failing hook fails the order");
+        assert!(!err.contains(TOKEN), "the hook's credential leaked: {err}");
+        assert!(err.contains("<redacted>"), "got: {err}");
+        // The operator still sees that the hook failed and roughly why.
+        assert!(err.contains("exit status 1"), "got: {err}");
+    }
+
+    // The TXT value is base64url, whose alphabet includes `-`, so ~1 in 64
+    // challenge values starts with one. Without an end-of-options marker a hook
+    // using `getopts` would read it as a flag and write the wrong record.
+    #[tokio::test]
+    async fn a_value_starting_with_a_dash_still_reaches_the_hook_as_a_value() {
+        // `sh -c '…' hook` shifts the appended args into $0.., so `--` is $1 and
+        // the three real arguments follow it.
+        let provider = ExecProvider::new(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            r#"test "$1" = -- && test "$2" = present && test "$4" = -A-leading-dash-value"#
+                .to_owned(),
+            "hook".to_owned(),
+        ]);
+        let dashed = TxtRecord::new("myapp.com", "-A-leading-dash-value");
+        provider
+            .upsert_txt(&dashed)
+            .await
+            .expect("the `--` marker separates options from the record arguments");
     }
 }

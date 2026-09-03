@@ -20,7 +20,7 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 
 use super::http::{HttpRequest, HttpResponse, HttpTransport};
-use super::{DnsProvider, SecretString, TxtRecord};
+use super::{DnsProvider, SecretString, TxtRecord, sanitize_upstream};
 
 /// Cloudflare's API base. A constant rather than config: pointing ACME's DNS
 /// writes at an arbitrary host is not a deployment shape we support, and the
@@ -63,7 +63,7 @@ impl CloudflareProvider {
     async fn send(&self, request: HttpRequest, what: &str) -> Result<Value, String> {
         let url = request.url.clone();
         let response = self.transport.send(self.authorized(request)).await?;
-        parse_api_response(&response, what, &url)
+        parse_api_response(&response, what, &url, &[self.api_token.expose()])
     }
 
     /// Resolve the Cloudflare zone id that owns `fqdn`.
@@ -82,7 +82,13 @@ impl CloudflareProvider {
         for candidate in &candidates {
             let body = self
                 .send(
-                    HttpRequest::new("GET", format!("{API_BASE}/zones?name={candidate}")),
+                    HttpRequest::new(
+                        "GET",
+                        // Encoded, like `list_url`: an unencoded `&` in the
+                        // candidate would add a second `name=` parameter and
+                        // could steer the lookup at somebody else's zone.
+                        format!("{API_BASE}/zones?name={}", urlencode(candidate)),
+                    ),
                     "look up the Cloudflare zone",
                 )
                 .await?;
@@ -114,16 +120,13 @@ impl DnsProvider for CloudflareProvider {
             // If this exact (name, value) is already present — a retried order,
             // or a leftover from an interrupted run — adding it again is a 400.
             // Treat "already there" as success.
-            if !find_record_ids(
-                &self
-                    .send(
-                        HttpRequest::new("GET", list_url(&zone, record)),
-                        "list Cloudflare TXT records",
-                    )
-                    .await?,
-            )
-            .is_empty()
-            {
+            let listed = self
+                .send(
+                    HttpRequest::new("GET", list_url(&zone, record)),
+                    "list Cloudflare TXT records",
+                )
+                .await?;
+            if !matching_record_ids(&listed, record).is_empty() {
                 return Ok(());
             }
             let body = serde_json::json!({
@@ -153,7 +156,7 @@ impl DnsProvider for CloudflareProvider {
                     "list Cloudflare TXT records",
                 )
                 .await?;
-            for id in find_record_ids(&listed) {
+            for id in matching_record_ids(&listed, record) {
                 self.send(
                     HttpRequest::new(
                         "DELETE",
@@ -219,7 +222,12 @@ fn zone_candidates(fqdn: &str) -> Vec<String> {
 /// non-2xx status and `success: false` both mean failure. The message carries
 /// the status and Cloudflare's own error text — never the request headers, so
 /// the bearer token cannot ride along.
-fn parse_api_response(response: &HttpResponse, what: &str, url: &str) -> Result<Value, String> {
+fn parse_api_response(
+    response: &HttpResponse,
+    what: &str,
+    url: &str,
+    secrets: &[&str],
+) -> Result<Value, String> {
     let redacted_url = url.split('?').next().unwrap_or(url);
     let parsed: Value = serde_json::from_str(&response.body).unwrap_or(Value::Null);
     if !response.is_success() || parsed.get("success") == Some(&Value::Bool(false)) {
@@ -234,6 +242,7 @@ fn parse_api_response(response: &HttpResponse, what: &str, url: &str) -> Result<
                     .join("; ")
             })
             .filter(|d| !d.is_empty())
+            .map(|detail| sanitize_upstream(&detail, secrets))
             .unwrap_or_else(|| "no error detail returned".to_owned());
         return Err(format!(
             "could not {what} (HTTP {} from {redacted_url}): {detail}",
@@ -253,13 +262,30 @@ fn first_result_id(result: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Every `id` in a Cloudflare list `result`.
-fn find_record_ids(result: &Value) -> Vec<String> {
+/// The ids of the entries in a Cloudflare list `result` that really are this
+/// `(name, value)` pair.
+///
+/// The request already filters on `type`/`name`/`content`, but the whole
+/// apex-plus-wildcard invariant — never read or remove the sibling challenge
+/// value — would rest on Cloudflare honouring `content=` as an exact match.
+/// Re-checking client-side makes it an invariant this code enforces rather than
+/// one it delegates: a filter that ever loosened to substring semantics would
+/// otherwise make `upsert_txt` skip the second value (the order then never
+/// validates) and `delete_txt` remove both (pulling a record out from under a CA
+/// that is still validating it).
+fn matching_record_ids(result: &Value, record: &TxtRecord) -> Vec<String> {
+    let wanted_name = record.fqdn.to_ascii_lowercase();
     result
         .as_array()
         .map(|entries| {
             entries
                 .iter()
+                .filter(|e| {
+                    e.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| n.trim_end_matches('.').eq_ignore_ascii_case(&wanted_name))
+                        && e.get("content").and_then(Value::as_str) == Some(record.value.as_str())
+                })
                 .filter_map(|e| e.get("id").and_then(Value::as_str).map(str::to_owned))
                 .collect()
         })
@@ -268,7 +294,228 @@ fn find_record_ids(result: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::http::RecordingTransport;
     use super::*;
+
+    const ZONE_LOOKUP: &str = "GET /client/v4/zones";
+    const RECORDS: &str = "GET /client/v4/zones/zone123/dns_records";
+    const CREATE: &str = "POST /client/v4/zones/zone123/dns_records";
+
+    fn zone_hit() -> &'static str {
+        r#"{"success":true,"errors":[],"result":[{"id":"zone123","name":"myapp.com"}]}"#
+    }
+
+    fn empty_list() -> &'static str {
+        r#"{"success":true,"errors":[],"result":[]}"#
+    }
+
+    fn provider(transport: std::sync::Arc<RecordingTransport>) -> CloudflareProvider {
+        CloudflareProvider::new(SecretString::new("cf-test-token"), transport)
+    }
+
+    /// The behaviour the apex+wildcard case depends on: publishing a SECOND
+    /// value at a name that already carries one must ADD it, never replace the
+    /// record set — and must not touch the value already there.
+    #[tokio::test]
+    async fn publishing_a_second_value_at_one_name_adds_it() {
+        let transport = RecordingTransport::new(&[
+            (ZONE_LOOKUP, zone_hit()),
+            // The apex value is not present yet…
+            (RECORDS, empty_list()),
+            (
+                CREATE,
+                r#"{"success":true,"errors":[],"result":{"id":"rec-apex"}}"#,
+            ),
+        ])
+        .then(RECORDS, 200, empty_list())
+        .then(
+            CREATE,
+            200,
+            r#"{"success":true,"errors":[],"result":{"id":"rec-wild"}}"#,
+        );
+        let provider = provider(std::sync::Arc::clone(&transport));
+
+        provider
+            .upsert_txt(&TxtRecord::new("myapp.com", "value-apex"))
+            .await
+            .expect("apex publishes");
+        provider
+            .upsert_txt(&TxtRecord::new("myapp.com", "value-wildcard"))
+            .await
+            .expect("wildcard publishes");
+
+        let calls = transport.calls();
+        assert_eq!(
+            calls.iter().filter(|c| *c == CREATE).count(),
+            2,
+            "both values must be created: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("DELETE")),
+            "publishing must never delete the sibling value: {calls:?}"
+        );
+        // The zone is looked up once and cached for the second record.
+        assert_eq!(
+            calls.iter().filter(|c| *c == ZONE_LOOKUP).count(),
+            1,
+            "the zone id must be cached: {calls:?}"
+        );
+        // Each create carries its own value.
+        let created: Vec<&str> = transport
+            .sent()
+            .iter()
+            .filter(|r| r.method == "POST")
+            .map(|r| {
+                if r.body.contains("value-apex") {
+                    "value-apex"
+                } else {
+                    "value-wildcard"
+                }
+            })
+            .collect();
+        assert_eq!(created, vec!["value-apex", "value-wildcard"]);
+    }
+
+    /// Removing one value must delete exactly that record, leaving the sibling
+    /// challenge value live — the CA may still be validating against it.
+    #[tokio::test]
+    async fn deleting_one_value_leaves_the_sibling_alone() {
+        let transport = RecordingTransport::new(&[
+            (ZONE_LOOKUP, zone_hit()),
+            (
+                RECORDS,
+                r#"{"success":true,"errors":[],"result":[
+                    {"id":"rec-apex","name":"_acme-challenge.myapp.com","content":"value-apex"},
+                    {"id":"rec-wild","name":"_acme-challenge.myapp.com","content":"value-wildcard"}
+                ]}"#,
+            ),
+        ])
+        .then(
+            "DELETE /client/v4/zones/zone123/dns_records/rec-apex",
+            200,
+            r#"{"success":true,"errors":[],"result":{"id":"rec-apex"}}"#,
+        );
+        let provider = provider(std::sync::Arc::clone(&transport));
+
+        provider
+            .delete_txt(&TxtRecord::new("myapp.com", "value-apex"))
+            .await
+            .expect("the apex record is removed");
+
+        let calls = transport.calls();
+        assert!(
+            calls.contains(&"DELETE /client/v4/zones/zone123/dns_records/rec-apex".to_owned()),
+            "the apex record must be deleted: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("rec-wild")),
+            "the sibling wildcard value must survive: {calls:?}"
+        );
+    }
+
+    /// A record already present is not created again: a retried order (or a
+    /// leftover from an interrupted one) would otherwise get a 400.
+    #[tokio::test]
+    async fn an_already_published_value_is_not_created_twice() {
+        let transport = RecordingTransport::new(&[
+            (ZONE_LOOKUP, zone_hit()),
+            (
+                RECORDS,
+                r#"{"success":true,"errors":[],"result":[
+                    {"id":"rec-apex","name":"_acme-challenge.myapp.com","content":"value-apex"}
+                ]}"#,
+            ),
+        ]);
+        let provider = provider(std::sync::Arc::clone(&transport));
+
+        provider
+            .upsert_txt(&TxtRecord::new("myapp.com", "value-apex"))
+            .await
+            .expect("an already-present value is a no-op");
+        assert!(
+            !transport.calls().iter().any(|c| c == CREATE),
+            "got: {:?}",
+            transport.calls()
+        );
+    }
+
+    /// The zone walk goes most-specific-first and stops at the first hit, so a
+    /// delegated sub-zone wins over its parent.
+    #[tokio::test]
+    async fn the_zone_walk_prefers_the_most_specific_zone() {
+        let transport = RecordingTransport::new(&[
+            // `tenants.myapp.com` is not a zone…
+            (ZONE_LOOKUP, empty_list()),
+        ])
+        .then(ZONE_LOOKUP, 200, zone_hit())
+        .then(RECORDS, 200, empty_list())
+        .then(
+            CREATE,
+            200,
+            r#"{"success":true,"errors":[],"result":{"id":"rec"}}"#,
+        );
+        let provider = provider(std::sync::Arc::clone(&transport));
+
+        provider
+            .upsert_txt(&TxtRecord::new("tenants.myapp.com", "v"))
+            .await
+            .expect("falls back to the parent zone");
+
+        let asked: Vec<String> = transport
+            .sent()
+            .iter()
+            .filter(|r| r.url.contains("/zones?"))
+            .map(|r| r.url.clone())
+            .collect();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(asked[0].contains("name=tenants.myapp.com"), "{asked:?}");
+        assert!(asked[1].contains("name=myapp.com"), "{asked:?}");
+    }
+
+    /// The bearer token goes on every request — and only as a header, never in a
+    /// URL that could end up in an error message or a proxy log.
+    #[tokio::test]
+    async fn every_request_carries_the_token_as_a_header_only() {
+        let transport = RecordingTransport::new(&[
+            (ZONE_LOOKUP, zone_hit()),
+            (RECORDS, empty_list()),
+            (
+                CREATE,
+                r#"{"success":true,"errors":[],"result":{"id":"r"}}"#,
+            ),
+        ]);
+        let provider = provider(std::sync::Arc::clone(&transport));
+        provider
+            .upsert_txt(&TxtRecord::new("myapp.com", "v"))
+            .await
+            .expect("publishes");
+
+        for request in transport.sent() {
+            assert_eq!(
+                request.headers.get("authorization").map(String::as_str),
+                Some("Bearer cf-test-token"),
+                "every call must be authenticated"
+            );
+            assert!(
+                !request.url.contains("cf-test-token"),
+                "the token must never reach a URL: {}",
+                request.url
+            );
+        }
+    }
+
+    /// A zone the token cannot see is an actionable error, not a silent write
+    /// into whatever zone came back.
+    #[tokio::test]
+    async fn no_matching_zone_is_an_actionable_error() {
+        let transport = RecordingTransport::new(&[(ZONE_LOOKUP, empty_list())]);
+        let err = provider(transport)
+            .upsert_txt(&TxtRecord::new("myapp.com", "v"))
+            .await
+            .expect_err("no zone means no write");
+        assert!(err.contains("no Cloudflare zone found"), "got: {err}");
+        assert!(err.contains("myapp.com"), "got: {err}");
+    }
 
     #[test]
     fn zone_candidates_are_most_specific_first_and_skip_the_tld() {
@@ -336,7 +583,7 @@ mod tests {
             body: r#"{"success":false,"errors":[{"message":"zone not found"}],"result":null}"#
                 .to_owned(),
         };
-        assert!(parse_api_response(&response, "x", "https://api/y").is_err());
+        assert!(parse_api_response(&response, "x", "https://api/y", &[]).is_err());
     }
 
     // The error message is surfaced to operators through logs, health details and
@@ -348,7 +595,7 @@ mod tests {
             status: 500,
             body: String::new(),
         };
-        let err = parse_api_response(&response, "x", "https://api/y?name=a&content=b")
+        let err = parse_api_response(&response, "x", "https://api/y?name=a&content=b", &[])
             .expect_err("500 is a failure");
         assert!(!err.contains("content=b"), "got: {err}");
         assert!(err.contains("https://api/y"), "got: {err}");
@@ -356,10 +603,52 @@ mod tests {
 
     #[test]
     fn result_ids_are_read_from_a_list_response() {
-        let listed = serde_json::json!([{ "id": "rec1" }, { "id": "rec2" }]);
+        let record = TxtRecord::new("myapp.com", "value-one");
+        let listed = serde_json::json!([
+            { "id": "rec1", "name": "_acme-challenge.myapp.com", "content": "value-one" },
+            { "id": "rec2", "name": "_acme-challenge.myapp.com.", "content": "value-one" },
+        ]);
         assert_eq!(first_result_id(&listed).as_deref(), Some("rec1"));
-        assert_eq!(find_record_ids(&listed), vec!["rec1", "rec2"]);
+        assert_eq!(matching_record_ids(&listed, &record), vec!["rec1", "rec2"]);
         assert!(first_result_id(&serde_json::json!([])).is_none());
-        assert!(find_record_ids(&Value::Null).is_empty());
+        assert!(matching_record_ids(&Value::Null, &record).is_empty());
+    }
+
+    // The apex+wildcard invariant — never read or remove the SIBLING challenge
+    // value — must be enforced here, not delegated to Cloudflare honouring
+    // `content=` as an exact match.
+    #[test]
+    fn a_sibling_value_at_the_same_name_is_never_matched() {
+        let apex = TxtRecord::new("myapp.com", "value-apex");
+        // What a loosened server-side filter would return: both values at the
+        // one name, plus an unrelated record.
+        let listed = serde_json::json!([
+            { "id": "rec-apex", "name": "_acme-challenge.myapp.com", "content": "value-apex" },
+            { "id": "rec-wild", "name": "_acme-challenge.myapp.com", "content": "value-wildcard" },
+            { "id": "rec-other", "name": "_acme-challenge.other.com", "content": "value-apex" },
+        ]);
+        assert_eq!(
+            matching_record_ids(&listed, &apex),
+            vec!["rec-apex"],
+            "only the exact (name, value) pair may be acted on"
+        );
+    }
+
+    // A Cloudflare error body is published on `/actuator/health` and pushed to
+    // the operator's alert destination, so the bearer token must not survive a
+    // round trip through it.
+    #[test]
+    fn api_errors_scrub_the_bearer_token() {
+        const TOKEN: &str = "cf-live-token-DO-NOT-LEAK-9f3a";
+        let response = HttpResponse {
+            status: 400,
+            body: format!(
+                r#"{{"success":false,"errors":[{{"message":"bad request for token {TOKEN}"}}]}}"#
+            ),
+        };
+        let err = parse_api_response(&response, "x", "https://api/y", &[TOKEN])
+            .expect_err("400 is a failure");
+        assert!(!err.contains(TOKEN), "leaked: {err}");
+        assert!(err.contains("<redacted>"), "got: {err}");
     }
 }

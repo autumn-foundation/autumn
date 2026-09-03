@@ -16,9 +16,25 @@
 //! in-process UDP server. It is also the same code `autumn doctor` uses for its
 //! DNS-01 preflight, so the check and the runtime agree by construction.
 //!
-//! This is a **DNS client for one narrow purpose**, not a resolver: it sends a
-//! recursion-desired query straight to the addresses in
-//! `[server.tls.acme.dns] resolvers` and reads the answer section.
+//! This is a **DNS client for one narrow purpose**, not a resolver.
+//!
+//! # Why the probe goes to the AUTHORITATIVE servers
+//!
+//! The obvious implementation — ask `1.1.1.1` whether the record is there yet —
+//! is quietly broken. The first probe fires the instant the provider's API
+//! returns, which is *before* the record is live on the zone's own nameservers,
+//! so the recursive resolver answers `NXDOMAIN` and **caches that negatively**
+//! for the zone's SOA minimum (RFC 2308). Route 53 defaults to 900s and
+//! Cloudflare to 1800s — both longer than the 300s propagation budget. Every
+//! later probe then reads the cached negative answer, the wait times out, and
+//! the next hourly attempt repeats it. Forever.
+//!
+//! So the configured `[server.tls.acme.dns] resolvers` are used to *discover*
+//! the zone's authoritative nameservers ([`authoritative_resolvers`]), and the
+//! propagation probe is sent to those directly with recursion **not** desired —
+//! which is also what the CA effectively does. The configured resolvers remain
+//! the fallback when discovery fails (a split-horizon setup, a resolver that
+//! will not answer `NS`), because a recursive probe is still better than none.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -28,14 +44,25 @@ use futures::future::BoxFuture;
 
 use super::TxtRecord;
 
-/// `TXT` query type (RFC 1035 §3.2.2).
+/// `A` query type (RFC 1035 §3.2.2).
+const QTYPE_A: u16 = 1;
+/// `NS` query type.
+const QTYPE_NS: u16 = 2;
+/// `TXT` query type.
 const QTYPE_TXT: u16 = 16;
+/// `OPT` pseudo-record type (EDNS0, RFC 6891).
+const QTYPE_OPT: u16 = 41;
 /// `IN` class.
 const QCLASS_IN: u16 = 1;
 /// Recursion-desired flag in the header's second 16-bit word.
 const FLAG_RECURSION_DESIRED: u16 = 0x0100;
+/// Query/response flag: set on a response.
+const FLAG_RESPONSE: u16 = 0x8000;
 /// Truncation flag.
 const FLAG_TRUNCATED: u16 = 0x0200;
+/// How many compression pointers a single name may follow before the message is
+/// rejected as malformed. Bounds the classic decompression loop.
+const MAX_NAME_POINTERS: usize = 32;
 /// Fixed DNS header length.
 const HEADER_LEN: usize = 12;
 /// Maximum UDP answer we read. 4 KiB comfortably holds a handful of 43-byte
@@ -61,30 +88,35 @@ impl TxtAnswer {
     }
 }
 
-/// Queries one resolver for a name's TXT values.
+/// Sends one DNS query to one server.
 ///
-/// A trait so the propagation wait can be driven deterministically in tests.
-pub trait TxtLookup: Send + Sync {
-    /// Ask `resolver` for the TXT records at `name`.
+/// A trait so the propagation wait and the authoritative-server discovery can be
+/// driven deterministically in tests, against scripted answers rather than the
+/// network.
+pub trait DnsLookup: Send + Sync {
+    /// Ask `server` a question of type `qtype` about `name`.
     ///
     /// # Errors
     ///
-    /// Returns a message for a transport failure or a server-side failure
-    /// (`SERVFAIL`, `REFUSED`). An absent record is `Ok` with no values, not an
-    /// error — it simply has not propagated yet.
-    fn lookup_txt<'a>(
+    /// Returns a message for a transport failure, a malformed or unrelated
+    /// answer, or a server-side failure (`SERVFAIL`, `REFUSED`). An absent record
+    /// is `Ok` with no matching records, not an error — it simply has not
+    /// propagated yet.
+    fn query<'a>(
         &'a self,
-        resolver: SocketAddr,
+        server: SocketAddr,
         name: &'a str,
-    ) -> BoxFuture<'a, Result<TxtAnswer, String>>;
+        qtype: u16,
+        recursion_desired: bool,
+    ) -> BoxFuture<'a, Result<DnsAnswer, String>>;
 }
 
-/// The production [`TxtLookup`]: a UDP query straight to the resolver.
-pub struct UdpTxtLookup {
+/// The production [`DnsLookup`]: a UDP query straight to the server.
+pub struct UdpDnsLookup {
     timeout: Duration,
 }
 
-impl UdpTxtLookup {
+impl UdpDnsLookup {
     /// Build a lookup with a per-query timeout.
     #[must_use]
     pub const fn new(timeout: Duration) -> Self {
@@ -92,63 +124,122 @@ impl UdpTxtLookup {
     }
 }
 
-impl Default for UdpTxtLookup {
+impl Default for UdpDnsLookup {
     fn default() -> Self {
         Self::new(Duration::from_secs(5))
     }
 }
 
-impl TxtLookup for UdpTxtLookup {
-    fn lookup_txt<'a>(
+impl DnsLookup for UdpDnsLookup {
+    fn query<'a>(
         &'a self,
-        resolver: SocketAddr,
+        server: SocketAddr,
         name: &'a str,
-    ) -> BoxFuture<'a, Result<TxtAnswer, String>> {
+        qtype: u16,
+        recursion_desired: bool,
+    ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
         Box::pin(async move {
             let id = query_id();
-            let query = encode_txt_query(id, name)?;
-            let socket = tokio::net::UdpSocket::bind(unspecified_bind(resolver))
+            let query = encode_query(id, name, qtype, recursion_desired)?;
+            let socket = tokio::net::UdpSocket::bind(unspecified_bind(server))
                 .await
-                .map_err(|e| format!("could not open a UDP socket to query {resolver}: {e}"))?;
+                .map_err(|e| format!("could not open a UDP socket to query {server}: {e}"))?;
             socket
-                .connect(resolver)
+                .connect(server)
                 .await
-                .map_err(|e| format!("could not connect to resolver {resolver}: {e}"))?;
+                .map_err(|e| format!("could not connect to {server}: {e}"))?;
             socket
                 .send(&query)
                 .await
-                .map_err(|e| format!("could not send a TXT query for {name} to {resolver}: {e}"))?;
+                .map_err(|e| format!("could not send a query for {name} to {server}: {e}"))?;
             let mut buf = vec![0_u8; MAX_RESPONSE];
             let read = tokio::time::timeout(self.timeout, socket.recv(&mut buf))
                 .await
                 .map_err(|_| {
                     format!(
-                        "resolver {resolver} did not answer a TXT query for {name} within {}s",
+                        "{server} did not answer a query for {name} within {}s",
                         self.timeout.as_secs()
                     )
                 })?
-                .map_err(|e| format!("could not read the answer from resolver {resolver}: {e}"))?;
-            parse_txt_response(id, name, &buf[..read])
-                .map_err(|e| format!("resolver {resolver} answered a TXT query for {name}: {e}"))
+                .map_err(|e| format!("could not read the answer from {server}: {e}"))?;
+            parse_response(id, name, &buf[..read])
+                .map_err(|e| format!("{server} answered a query for {name}: {e}"))
         })
     }
 }
 
+/// Discover the addresses of the nameservers **authoritative** for `fqdn`.
+///
+/// Walks the label suffixes of `fqdn` from most to least specific asking `NS`
+/// through `recursive` (the configured resolvers), takes the first suffix that
+/// answers with nameserver names, and resolves those names to addresses. The
+/// `_acme-challenge` label is dropped first: it is a record name inside the
+/// zone, never a zone cut of its own.
+///
+/// Returns an empty vector when discovery fails at any step — the caller then
+/// falls back to probing the recursive resolvers, which is worse but not
+/// nothing. See the module docs for why the authoritative probe matters.
+pub async fn authoritative_resolvers(
+    fqdn: &str,
+    recursive: &[SocketAddr],
+    lookup: &dyn DnsLookup,
+) -> Vec<SocketAddr> {
+    let base = normalize_name(fqdn);
+    let base = base.strip_prefix("_acme-challenge.").unwrap_or(&base);
+    let labels: Vec<&str> = base.split('.').filter(|l| !l.is_empty()).collect();
+
+    for start in 0..labels.len().saturating_sub(1) {
+        let zone = labels[start..].join(".");
+        let mut names = Vec::new();
+        for server in recursive {
+            if let Ok(answer) = lookup.query(*server, &zone, QTYPE_NS, true).await {
+                names = answer.ns_names();
+                if !names.is_empty() {
+                    break;
+                }
+            }
+        }
+        if names.is_empty() {
+            continue;
+        }
+        let mut addrs = Vec::new();
+        for name in &names {
+            for server in recursive {
+                if let Ok(answer) = lookup.query(*server, name, QTYPE_A, true).await {
+                    for addr in answer.a_addrs() {
+                        let socket = SocketAddr::new(std::net::IpAddr::V4(addr), 53);
+                        if !addrs.contains(&socket) {
+                            addrs.push(socket);
+                        }
+                    }
+                    if !addrs.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+        if !addrs.is_empty() {
+            return addrs;
+        }
+    }
+    Vec::new()
+}
+
 /// Query one resolver for a name's TXT values, blocking.
 ///
-/// The same wire code as [`UdpTxtLookup`], for `autumn doctor`'s synchronous
+/// The same wire code as [`UdpDnsLookup`], for `autumn doctor`'s synchronous
 /// check path.
 ///
 /// # Errors
 ///
-/// As [`TxtLookup::lookup_txt`].
+/// As [`DnsLookup::query`].
 pub fn lookup_txt_blocking(
     resolver: SocketAddr,
     name: &str,
     timeout: Duration,
 ) -> Result<TxtAnswer, String> {
     let id = query_id();
-    let query = encode_txt_query(id, name)?;
+    let query = encode_query(id, name, QTYPE_TXT, true)?;
     let socket = std::net::UdpSocket::bind(unspecified_bind(resolver))
         .map_err(|e| format!("could not open a UDP socket to query {resolver}: {e}"))?;
     socket
@@ -201,24 +292,51 @@ fn query_id() -> u16 {
     counter ^ clock
 }
 
-/// Encode a recursion-desired `TXT`/`IN` query for `name`.
+/// Encode a `TXT`/`IN` query for `name`, as [`encode_query`] with `QTYPE_TXT`.
+///
+/// # Errors
+///
+/// As [`encode_query`].
+pub fn encode_txt_query(id: u16, name: &str) -> Result<Vec<u8>, String> {
+    encode_query(id, name, QTYPE_TXT, true)
+}
+
+/// Encode a DNS query for `name` of type `qtype`.
+///
+/// An EDNS0 `OPT` record advertising a 4096-byte buffer is always included, so a
+/// record set that would not fit a bare 512-byte UDP answer comes back whole
+/// instead of truncated (see [`MAX_RESPONSE`]).
+///
+/// `recursion_desired` is `false` for the authoritative probe: those servers are
+/// authoritative for the name, so recursion is both unnecessary and usually
+/// refused.
 ///
 /// # Errors
 ///
 /// Returns a message when a label is empty or longer than 63 bytes, or the whole
 /// name exceeds 255 bytes.
-pub fn encode_txt_query(id: u16, name: &str) -> Result<Vec<u8>, String> {
+pub fn encode_query(
+    id: u16,
+    name: &str,
+    qtype: u16,
+    recursion_desired: bool,
+) -> Result<Vec<u8>, String> {
     let name = name.trim().trim_end_matches('.');
     if name.is_empty() {
         return Err("cannot query an empty DNS name".to_owned());
     }
-    let mut out = Vec::with_capacity(HEADER_LEN + name.len() + 6);
+    let mut out = Vec::with_capacity(HEADER_LEN + name.len() + 17);
     out.extend_from_slice(&id.to_be_bytes());
-    out.extend_from_slice(&FLAG_RECURSION_DESIRED.to_be_bytes());
+    let flags = if recursion_desired {
+        FLAG_RECURSION_DESIRED
+    } else {
+        0
+    };
+    out.extend_from_slice(&flags.to_be_bytes());
     out.extend_from_slice(&1_u16.to_be_bytes()); // QDCOUNT
     out.extend_from_slice(&0_u16.to_be_bytes()); // ANCOUNT
     out.extend_from_slice(&0_u16.to_be_bytes()); // NSCOUNT
-    out.extend_from_slice(&0_u16.to_be_bytes()); // ARCOUNT
+    out.extend_from_slice(&1_u16.to_be_bytes()); // ARCOUNT: the EDNS0 OPT below
 
     let mut encoded_len = 1; // the root label
     for label in name.split('.') {
@@ -239,19 +357,125 @@ pub fn encode_txt_query(id: u16, name: &str) -> Result<Vec<u8>, String> {
         ));
     }
     out.push(0); // root label
-    out.extend_from_slice(&QTYPE_TXT.to_be_bytes());
+    out.extend_from_slice(&qtype.to_be_bytes());
     out.extend_from_slice(&QCLASS_IN.to_be_bytes());
+
+    // EDNS0 OPT (RFC 6891 §6.1.2): root name, type OPT, CLASS = the UDP payload
+    // size we can accept, zero TTL/flags, zero RDLENGTH.
+    out.push(0);
+    out.extend_from_slice(&QTYPE_OPT.to_be_bytes());
+    out.extend_from_slice(&u16::try_from(MAX_RESPONSE).unwrap_or(4096).to_be_bytes());
+    out.extend_from_slice(&0_u32.to_be_bytes());
+    out.extend_from_slice(&0_u16.to_be_bytes());
     Ok(out)
+}
+
+/// One resource record's payload, decoded for the types this client asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rdata {
+    /// A `TXT` record's character-strings, concatenated (RFC 1035 §3.3.14).
+    Txt(String),
+    /// The domain name in an `NS` (or `CNAME`) record, decompressed.
+    Name(String),
+    /// An `A` record's address.
+    A(std::net::Ipv4Addr),
+    /// A record type this client does not decode.
+    Other,
+}
+
+/// One decoded answer-section record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceRecord {
+    /// The record's owner name, lowercased and without the trailing dot.
+    pub name: String,
+    /// The record type.
+    pub rtype: u16,
+    /// The decoded payload.
+    pub rdata: Rdata,
+}
+
+/// A parsed DNS response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsAnswer {
+    /// The response code: `0` NOERROR, `3` NXDOMAIN, …
+    pub rcode: u8,
+    /// The answer-section records.
+    pub records: Vec<ResourceRecord>,
+}
+
+impl DnsAnswer {
+    /// The `TXT` values whose owner name is `name`.
+    #[must_use]
+    pub fn txt_values(&self, name: &str) -> Vec<String> {
+        let wanted = normalize_name(name);
+        self.records
+            .iter()
+            .filter(|r| r.name == wanted)
+            .filter_map(|r| match &r.rdata {
+                Rdata::Txt(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `NS` names in the answer.
+    #[must_use]
+    pub fn ns_names(&self) -> Vec<String> {
+        self.records
+            .iter()
+            .filter(|r| r.rtype == QTYPE_NS)
+            .filter_map(|r| match &r.rdata {
+                Rdata::Name(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `A` addresses in the answer.
+    #[must_use]
+    pub fn a_addrs(&self) -> Vec<std::net::Ipv4Addr> {
+        self.records
+            .iter()
+            .filter_map(|r| match &r.rdata {
+                Rdata::A(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Lowercase a domain name and drop any trailing dot, so two spellings of the
+/// same name compare equal.
+fn normalize_name(name: &str) -> String {
+    name.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// Parse a DNS response into the TXT values it carries for `name`.
 ///
 /// # Errors
 ///
-/// Returns a message for a malformed message, a transaction-id mismatch, a
+/// As [`parse_response`].
+pub fn parse_txt_response(id: u16, name: &str, msg: &[u8]) -> Result<TxtAnswer, String> {
+    let answer = parse_response(id, name, msg)?;
+    Ok(TxtAnswer {
+        values: answer.txt_values(name),
+        rcode: answer.rcode,
+    })
+}
+
+/// Parse a DNS response to a query for `name`.
+///
+/// Validates that the message is a *response* to *this* query — the QR bit is
+/// set, the transaction id matches, and the echoed question is the name that was
+/// asked — before reading the answer section. Without those checks an unrelated
+/// or reflected datagram would be read as propagation evidence.
+///
+/// # Errors
+///
+/// Returns a message for a malformed message, a mismatched id or question, a
 /// truncated (`TC`) answer, or a server-side failure rcode. `NXDOMAIN` and an
 /// empty `NOERROR` answer are **not** errors — they mean "not published yet".
-pub fn parse_txt_response(id: u16, name: &str, msg: &[u8]) -> Result<TxtAnswer, String> {
+pub fn parse_response(id: u16, name: &str, msg: &[u8]) -> Result<DnsAnswer, String> {
     if msg.len() < HEADER_LEN {
         return Err(format!(
             "the response is {} bytes, shorter than a DNS header",
@@ -266,9 +490,13 @@ pub fn parse_txt_response(id: u16, name: &str, msg: &[u8]) -> Result<TxtAnswer, 
         ));
     }
     let flags = u16::from_be_bytes([msg[2], msg[3]]);
+    if flags & FLAG_RESPONSE == 0 {
+        return Err("the datagram is a query, not a response".to_owned());
+    }
     if flags & FLAG_TRUNCATED != 0 {
         return Err(
-            "the answer was truncated (TC); the record set is too large for a UDP answer"
+            "the answer was truncated (TC) even with EDNS0; the record set is too large for a \
+             UDP answer"
                 .to_owned(),
         );
     }
@@ -285,18 +513,26 @@ pub fn parse_txt_response(id: u16, name: &str, msg: &[u8]) -> Result<TxtAnswer, 
     let ancount = u16::from_be_bytes([msg[6], msg[7]]);
 
     let mut offset = HEADER_LEN;
-    for _ in 0..qdcount {
-        offset = skip_name(msg, offset)?;
-        // QTYPE + QCLASS
-        offset = offset
+    for index in 0..qdcount {
+        let (question, next) = read_name(msg, offset)?;
+        // The echoed question must be the name that was asked. A server that
+        // answers a different question is answering someone else's query.
+        if index == 0 && question != normalize_name(name) {
+            return Err(format!(
+                "the response echoes the question `{question}`, not the queried `{}`",
+                normalize_name(name)
+            ));
+        }
+        offset = next
             .checked_add(4)
             .filter(|end| *end <= msg.len())
             .ok_or_else(|| "the question section is truncated".to_owned())?;
     }
 
-    let mut values = Vec::new();
+    let mut records = Vec::new();
     for _ in 0..ancount {
-        offset = skip_name(msg, offset)?;
+        let (owner, next) = read_name(msg, offset)?;
+        offset = next;
         let header_end = offset
             .checked_add(10)
             .filter(|end| *end <= msg.len())
@@ -307,39 +543,82 @@ pub fn parse_txt_response(id: u16, name: &str, msg: &[u8]) -> Result<TxtAnswer, 
             .checked_add(rdlength)
             .filter(|end| *end <= msg.len())
             .ok_or_else(|| "an answer record's RDATA is truncated".to_owned())?;
-        if rtype == QTYPE_TXT {
-            values.push(decode_txt_rdata(&msg[header_end..rdata_end])?);
-        }
+        let rdata = match rtype {
+            QTYPE_TXT => Rdata::Txt(decode_txt_rdata(&msg[header_end..rdata_end])?),
+            // An NS target is a domain name in the message, so it may be
+            // compressed against an earlier one — decode it against the WHOLE
+            // message rather than the RDATA slice.
+            QTYPE_NS => Rdata::Name(read_name(msg, header_end)?.0),
+            QTYPE_A if rdlength == 4 => Rdata::A(std::net::Ipv4Addr::new(
+                msg[header_end],
+                msg[header_end + 1],
+                msg[header_end + 2],
+                msg[header_end + 3],
+            )),
+            _ => Rdata::Other,
+        };
+        records.push(ResourceRecord {
+            name: owner,
+            rtype,
+            rdata,
+        });
         offset = rdata_end;
     }
-    let _ = name;
-    Ok(TxtAnswer { values, rcode })
+    Ok(DnsAnswer { rcode, records })
 }
 
-/// Advance past a (possibly compressed) domain name, returning the offset after
-/// it.
-fn skip_name(msg: &[u8], mut offset: usize) -> Result<usize, String> {
+/// Read a (possibly compressed) domain name, returning it and the offset just
+/// past its encoding in the record stream.
+///
+/// Following a compression pointer does not advance the returned offset past the
+/// two pointer bytes — that is what the record stream contains. The number of
+/// pointers followed is bounded by [`MAX_NAME_POINTERS`], so a message whose
+/// pointers form a cycle is rejected instead of looping forever.
+fn read_name(msg: &[u8], start: usize) -> Result<(String, usize), String> {
+    let mut labels: Vec<String> = Vec::new();
+    let mut offset = start;
+    let mut after: Option<usize> = None;
+    let mut pointers = 0;
     loop {
         let len = *msg
             .get(offset)
             .ok_or_else(|| "a domain name runs past the end of the message".to_owned())?;
         if len & 0xC0 == 0xC0 {
-            // A compression pointer is two bytes and always terminates the name.
-            return offset
-                .checked_add(2)
-                .filter(|end| *end <= msg.len())
-                .ok_or_else(|| "a compression pointer is truncated".to_owned());
+            let low = *msg
+                .get(offset + 1)
+                .ok_or_else(|| "a compression pointer is truncated".to_owned())?;
+            pointers += 1;
+            if pointers > MAX_NAME_POINTERS {
+                return Err("a domain name follows too many compression pointers".to_owned());
+            }
+            // The record stream continues after the pointer, wherever the name
+            // itself is stored.
+            after.get_or_insert(offset + 2);
+            let target = usize::from(u16::from_be_bytes([len & 0x3F, low]));
+            if target >= msg.len() || target >= offset {
+                // A pointer must point BACKWARDS; anything else is malformed and
+                // is the shape a decompression cycle takes.
+                return Err("a compression pointer does not point backwards".to_owned());
+            }
+            offset = target;
+            continue;
         }
         if len & 0xC0 != 0 {
             return Err(format!("unsupported DNS label type {:#04x}", len & 0xC0));
         }
-        offset = offset
-            .checked_add(1 + usize::from(len))
+        let label_start = offset + 1;
+        let label_end = label_start
+            .checked_add(usize::from(len))
             .filter(|end| *end <= msg.len())
             .ok_or_else(|| "a domain name label is truncated".to_owned())?;
         if len == 0 {
-            return Ok(offset);
+            return Ok((
+                labels.join(".").to_ascii_lowercase(),
+                after.unwrap_or(label_start),
+            ));
         }
+        labels.push(String::from_utf8_lossy(&msg[label_start..label_end]).into_owned());
+        offset = label_end;
     }
 }
 
@@ -438,7 +717,7 @@ pub async fn wait_for_propagation(
     resolvers: &[SocketAddr],
     timeout: Duration,
     poll_interval: Duration,
-    lookup: &dyn TxtLookup,
+    lookup: &dyn DnsLookup,
 ) -> Result<(), String> {
     if records.is_empty() {
         return Ok(());
@@ -450,38 +729,46 @@ pub async fn wait_for_propagation(
         );
     }
     let wanted = group_by_name(records);
-    let deadline = tokio::time::Instant::now() + timeout;
+    let started = tokio::time::Instant::now();
+    let deadline = started + timeout;
     let mut last_gap: Option<PropagationTimeout> = None;
 
     loop {
         let mut all_visible = true;
         'round: for (fqdn, expected) in &wanted {
             for resolver in resolvers {
-                let (missing, observed) = match lookup.lookup_txt(*resolver, fqdn).await {
-                    Ok(answer) => {
-                        let missing = missing_values(expected, &answer.values);
-                        let observed = if answer.is_nxdomain() {
-                            "the name does not exist yet".to_owned()
-                        } else {
-                            format!(
-                                "that resolver currently returns {} TXT value(s)",
-                                answer.values.len()
-                            )
-                        };
-                        (missing, observed)
-                    }
-                    // A resolver error is a not-yet, not a hard failure: a
-                    // freshly-created name often SERVFAILs while the zone
-                    // catches up. It is recorded so the timeout can report it.
-                    Err(e) => (expected.clone(), e),
-                };
+                // Recursion is deliberately NOT desired: `resolvers` here are
+                // the zone's authoritative servers whenever discovery succeeded,
+                // and they answer for the name directly. A recursive resolver
+                // used as a fallback answers a non-recursive query from its
+                // cache, which is the same thing this probe wants to read.
+                let (missing, observed) =
+                    match lookup.query(*resolver, fqdn, QTYPE_TXT, false).await {
+                        Ok(answer) => {
+                            let values = answer.txt_values(fqdn);
+                            let missing = missing_values(expected, &values);
+                            let observed = if answer.rcode == 3 {
+                                "the name does not exist there yet".to_owned()
+                            } else {
+                                format!("it currently returns {} TXT value(s)", values.len())
+                            };
+                            (missing, observed)
+                        }
+                        // A resolver error is a not-yet, not a hard failure: a
+                        // freshly-created name often SERVFAILs while the zone
+                        // catches up. It is recorded so the timeout can report it.
+                        Err(e) => (expected.clone(), e),
+                    };
                 if !missing.is_empty() {
                     last_gap = Some(PropagationTimeout {
                         fqdn: fqdn.clone(),
                         missing,
                         resolver: resolver.to_string(),
                         observed,
-                        waited_secs: timeout.as_secs(),
+                        // Filled in below with the ELAPSED time; the loop may
+                        // run one round past the deadline, so the configured
+                        // budget would systematically understate the wait.
+                        waited_secs: 0,
                     });
                     all_visible = false;
                     break 'round;
@@ -505,7 +792,10 @@ pub async fn wait_for_propagation(
 
     Err(last_gap.map_or_else(
         || "DNS-01 propagation could not be confirmed".to_owned(),
-        |gap| gap.to_string(),
+        |mut gap| {
+            gap.waited_secs = started.elapsed().as_secs();
+            gap.to_string()
+        },
     ))
 }
 
@@ -528,24 +818,94 @@ mod tests {
         labels.join(".")
     }
 
-    /// Build a TXT answer for `name` carrying `values`, using a compression
-    /// pointer for the answer's owner name — exactly what a real resolver sends.
-    fn txt_response(id: u16, name: &str, values: &[&str], rcode: u8) -> Vec<u8> {
-        let mut msg = encode_txt_query(id, name).expect("question encodes");
-        let flags: u16 = 0x8180 | u16::from(rcode);
+    /// The question section of a query for `name`, with the header's counts
+    /// rewritten for a response — the base every fake answer below is built on.
+    ///
+    /// Deliberately drops the query's EDNS0 OPT record: it lives in the
+    /// ADDITIONAL section, so anything appended here must follow the question
+    /// directly or the parser would read the OPT as the first answer.
+    fn response_head(id: u16, name: &str, ancount: u16, rcode: u8) -> Vec<u8> {
+        let query = encode_txt_query(id, name).expect("question encodes");
+        // Header + QNAME + QTYPE/QCLASS, stopping before the OPT record.
+        let mut end = HEADER_LEN;
+        while query[end] != 0 {
+            end += 1 + usize::from(query[end]);
+        }
+        end += 1 + 4;
+        let mut msg = query[..end].to_vec();
+        let flags: u16 = FLAG_RESPONSE | FLAG_RECURSION_DESIRED | u16::from(rcode);
         msg[2..4].copy_from_slice(&flags.to_be_bytes());
-        let ancount = u16::try_from(values.len()).unwrap();
         msg[6..8].copy_from_slice(&ancount.to_be_bytes());
+        msg[10..12].copy_from_slice(&0_u16.to_be_bytes()); // ARCOUNT: no OPT here
+        msg
+    }
+
+    /// Append one answer record whose owner name is a compression pointer to the
+    /// question's name — the shape a real resolver sends.
+    fn push_answer(msg: &mut Vec<u8>, rtype: u16, rdata: &[u8]) {
+        msg.extend_from_slice(&[0xC0, u8::try_from(HEADER_LEN).expect("header fits u8")]);
+        msg.extend_from_slice(&rtype.to_be_bytes());
+        msg.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        msg.extend_from_slice(&60_u32.to_be_bytes());
+        msg.extend_from_slice(
+            &u16::try_from(rdata.len())
+                .expect("rdata fits u16")
+                .to_be_bytes(),
+        );
+        msg.extend_from_slice(rdata);
+    }
+
+    /// Build a TXT answer for `name` carrying `values`.
+    fn txt_response(id: u16, name: &str, values: &[&str], rcode: u8) -> Vec<u8> {
+        let mut msg = response_head(
+            id,
+            name,
+            u16::try_from(values.len()).expect("answer count fits u16"),
+            rcode,
+        );
         for value in values {
-            // Owner name as a compression pointer to the question's name.
-            msg.extend_from_slice(&[0xC0, u8::try_from(HEADER_LEN).expect("header fits u8")]);
-            msg.extend_from_slice(&QTYPE_TXT.to_be_bytes());
-            msg.extend_from_slice(&QCLASS_IN.to_be_bytes());
-            msg.extend_from_slice(&60_u32.to_be_bytes());
-            let rdata_len = u16::try_from(value.len() + 1).unwrap();
-            msg.extend_from_slice(&rdata_len.to_be_bytes());
-            msg.push(u8::try_from(value.len()).unwrap());
-            msg.extend_from_slice(value.as_bytes());
+            let mut rdata = vec![u8::try_from(value.len()).expect("string fits u8")];
+            rdata.extend_from_slice(value.as_bytes());
+            push_answer(&mut msg, QTYPE_TXT, &rdata);
+        }
+        msg
+    }
+
+    /// Encode a domain name as uncompressed DNS labels.
+    fn encode_labels(name: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for label in name.split('.').filter(|l| !l.is_empty()) {
+            out.push(u8::try_from(label.len()).expect("label fits u8"));
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.push(0);
+        out
+    }
+
+    /// Build an `NS` answer for `zone` naming `servers`.
+    fn ns_response(id: u16, zone: &str, servers: &[&str]) -> Vec<u8> {
+        let mut msg = response_head(
+            id,
+            zone,
+            u16::try_from(servers.len()).expect("answer count fits u16"),
+            0,
+        );
+        for server in servers {
+            push_answer(&mut msg, QTYPE_NS, &encode_labels(server));
+        }
+        msg
+    }
+
+    /// Build an `A` answer for `name` carrying `addrs`.
+    fn a_response(id: u16, name: &str, addrs: &[[u8; 4]]) -> Vec<u8> {
+        let mut msg = response_head(
+            id,
+            name,
+            u16::try_from(addrs.len()).expect("answer count fits u16"),
+            0,
+        );
+        for addr in addrs {
+            push_answer(&mut msg, QTYPE_A, addr);
         }
         msg
     }
@@ -652,6 +1012,324 @@ mod tests {
         assert!(decode_txt_rdata(&[5, b'a']).is_err());
     }
 
+    // EDNS0 (RFC 6891): without an OPT record advertising a bigger buffer, a
+    // server caps the answer at 512 bytes and sets TC — which the propagation
+    // wait would then retry for its whole budget against a record that IS
+    // published.
+    #[test]
+    fn a_query_advertises_an_edns0_buffer() {
+        let msg = encode_txt_query(0x1234, "_acme-challenge.myapp.com").expect("encodes");
+        assert_eq!(u16::from_be_bytes([msg[10], msg[11]]), 1, "ARCOUNT");
+        // The OPT record is the last 11 bytes: root name, type, class (= the
+        // advertised UDP payload size), TTL, RDLENGTH.
+        let opt = &msg[msg.len() - 11..];
+        assert_eq!(opt[0], 0, "OPT's owner name is the root");
+        assert_eq!(u16::from_be_bytes([opt[1], opt[2]]), QTYPE_OPT);
+        assert_eq!(
+            usize::from(u16::from_be_bytes([opt[3], opt[4]])),
+            MAX_RESPONSE,
+            "the advertised buffer must match what we actually read"
+        );
+    }
+
+    // The propagation probe must not be recursive: it goes to the zone's own
+    // nameservers, which answer for the name directly.
+    #[test]
+    fn recursion_can_be_turned_off() {
+        let recursive = encode_query(1, "myapp.com", QTYPE_TXT, true).expect("encodes");
+        let authoritative = encode_query(1, "myapp.com", QTYPE_TXT, false).expect("encodes");
+        assert_eq!(
+            u16::from_be_bytes([recursive[2], recursive[3]]),
+            FLAG_RECURSION_DESIRED
+        );
+        assert_eq!(u16::from_be_bytes([authoritative[2], authoritative[3]]), 0);
+    }
+
+    // A datagram without the QR bit is a query, not an answer — reading one as
+    // propagation evidence would let a reflected packet satisfy the wait.
+    #[test]
+    fn a_query_is_not_accepted_as_a_response() {
+        let mut msg = txt_response(11, "x.myapp.com", &["v"], 0);
+        let flags = u16::from_be_bytes([msg[2], msg[3]]) & !FLAG_RESPONSE;
+        msg[2..4].copy_from_slice(&flags.to_be_bytes());
+        let err = parse_response(11, "x.myapp.com", &msg).expect_err("QR must be set");
+        assert!(err.contains("not a response"), "got: {err}");
+    }
+
+    // An answer to a DIFFERENT question is somebody else's answer.
+    #[test]
+    fn a_response_echoing_another_question_is_rejected() {
+        let msg = txt_response(12, "other.myapp.com", &["v"], 0);
+        let err = parse_response(12, "x.myapp.com", &msg).expect_err("question must match");
+        assert!(err.contains("echoes the question"), "got: {err}");
+    }
+
+    // TXT records belonging to a different owner name in the same answer must
+    // not count towards this name's propagation.
+    #[test]
+    fn txt_values_are_scoped_to_their_owner_name() {
+        let answer = DnsAnswer {
+            rcode: 0,
+            records: vec![
+                ResourceRecord {
+                    name: "_acme-challenge.myapp.com".to_owned(),
+                    rtype: QTYPE_TXT,
+                    rdata: Rdata::Txt("mine".to_owned()),
+                },
+                ResourceRecord {
+                    name: "_acme-challenge.other.com".to_owned(),
+                    rtype: QTYPE_TXT,
+                    rdata: Rdata::Txt("theirs".to_owned()),
+                },
+            ],
+        };
+        assert_eq!(
+            answer.txt_values("_acme-challenge.myapp.com"),
+            vec!["mine".to_owned()]
+        );
+        assert_eq!(
+            answer.txt_values("_ACME-CHALLENGE.MyApp.com."),
+            vec!["mine"]
+        );
+    }
+
+    #[test]
+    fn ns_and_a_records_decode() {
+        let msg = ns_response(21, "myapp.com", &["ns1.provider.net", "ns2.provider.net"]);
+        let answer = parse_response(21, "myapp.com", &msg).expect("parses");
+        assert_eq!(
+            answer.ns_names(),
+            vec!["ns1.provider.net".to_owned(), "ns2.provider.net".to_owned()]
+        );
+
+        let msg = a_response(
+            22,
+            "ns1.provider.net",
+            &[[192, 0, 2, 10], [198, 51, 100, 7]],
+        );
+        let answer = parse_response(22, "ns1.provider.net", &msg).expect("parses");
+        assert_eq!(
+            answer.a_addrs(),
+            vec![
+                std::net::Ipv4Addr::new(192, 0, 2, 10),
+                std::net::Ipv4Addr::new(198, 51, 100, 7)
+            ]
+        );
+    }
+
+    // Decoding a compressed name is the one place a hostile message can loop
+    // forever. A pointer must point strictly backwards, and the hop count is
+    // bounded either way.
+    #[test]
+    fn a_self_referential_compression_pointer_is_rejected_not_looped() {
+        // A pointer at offset 12 that points at itself.
+        let mut msg = vec![0_u8; 14];
+        msg[12] = 0xC0;
+        msg[13] = 12;
+        let err = read_name(&msg, 12).expect_err("a self-pointer must be rejected");
+        assert!(err.contains("backwards"), "got: {err}");
+
+        // …and one pointing forwards, the other half of the same cycle.
+        let mut msg = vec![0_u8; 32];
+        msg[12] = 0xC0;
+        msg[13] = 20;
+        msg[20] = 0xC0;
+        msg[21] = 12;
+        assert!(read_name(&msg, 12).is_err());
+    }
+
+    #[test]
+    fn a_backwards_compression_pointer_resolves_and_advances_past_the_pointer() {
+        // "myapp.com" at offset 12, then a pointer to it at offset 23.
+        let mut msg = vec![0_u8; 12];
+        msg.extend_from_slice(&encode_labels("myapp.com"));
+        let pointer_at = msg.len();
+        msg.extend_from_slice(&[0xC0, 12]);
+        let (name, next) = read_name(&msg, pointer_at).expect("resolves");
+        assert_eq!(name, "myapp.com");
+        assert_eq!(
+            next,
+            pointer_at + 2,
+            "the record stream continues after the two pointer bytes"
+        );
+    }
+
+    /// A lookup that answers `NS` and `A` from a script, so authoritative
+    /// discovery can be driven without a network.
+    struct DiscoveryLookup {
+        ns: std::collections::HashMap<String, Vec<String>>,
+        a: std::collections::HashMap<String, Vec<std::net::Ipv4Addr>>,
+        asked: Mutex<Vec<(String, u16)>>,
+    }
+
+    impl DiscoveryLookup {
+        fn new(ns: &[(&str, &[&str])], a: &[(&str, &[[u8; 4]])]) -> Arc<Self> {
+            Arc::new(Self {
+                ns: ns
+                    .iter()
+                    .map(|(zone, servers)| {
+                        (
+                            (*zone).to_owned(),
+                            servers.iter().map(|s| (*s).to_owned()).collect(),
+                        )
+                    })
+                    .collect(),
+                a: a.iter()
+                    .map(|(name, addrs)| {
+                        (
+                            (*name).to_owned(),
+                            addrs
+                                .iter()
+                                .map(|o| std::net::Ipv4Addr::new(o[0], o[1], o[2], o[3]))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl DnsLookup for DiscoveryLookup {
+        fn query<'a>(
+            &'a self,
+            _server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            _recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            self.asked.lock().unwrap().push((name.to_owned(), qtype));
+            let owner = normalize_name(name);
+            let records = match qtype {
+                QTYPE_NS => self
+                    .ns
+                    .get(&owner)
+                    .map(|servers| {
+                        servers
+                            .iter()
+                            .map(|s| ResourceRecord {
+                                name: owner.clone(),
+                                rtype: QTYPE_NS,
+                                rdata: Rdata::Name(s.clone()),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                QTYPE_A => self
+                    .a
+                    .get(&owner)
+                    .map(|addrs| {
+                        addrs
+                            .iter()
+                            .map(|addr| ResourceRecord {
+                                name: owner.clone(),
+                                rtype: QTYPE_A,
+                                rdata: Rdata::A(*addr),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            Box::pin(async move {
+                Ok(DnsAnswer {
+                    rcode: if records.is_empty() { 3 } else { 0 },
+                    records,
+                })
+            })
+        }
+    }
+
+    // The whole point of the authoritative probe: the zone's own nameservers are
+    // found from the challenge FQDN, with the `_acme-challenge` label dropped and
+    // the NS names resolved to addresses.
+    #[tokio::test]
+    async fn authoritative_discovery_finds_the_zones_nameservers() {
+        let lookup = DiscoveryLookup::new(
+            &[("myapp.com", &["ns1.provider.net", "ns2.provider.net"])],
+            &[
+                ("ns1.provider.net", &[[192, 0, 2, 10]]),
+                ("ns2.provider.net", &[[198, 51, 100, 7]]),
+            ],
+        );
+        let found = authoritative_resolvers(
+            "_acme-challenge.myapp.com",
+            &[resolver(53)],
+            lookup.as_ref(),
+        )
+        .await;
+        assert_eq!(
+            found,
+            vec![
+                SocketAddr::from(([192, 0, 2, 10], 53)),
+                SocketAddr::from(([198, 51, 100, 7], 53)),
+            ]
+        );
+        // The `_acme-challenge` label is a record inside the zone, never a zone
+        // cut, so the NS question is asked about the zone itself.
+        let asked = lookup.asked.lock().unwrap().clone();
+        assert!(
+            asked.contains(&("myapp.com".to_owned(), QTYPE_NS)),
+            "got: {asked:?}"
+        );
+        assert!(
+            !asked
+                .iter()
+                .any(|(name, _)| name.starts_with("_acme-challenge")),
+            "the challenge label must be stripped before the NS lookup: {asked:?}"
+        );
+    }
+
+    // A delegated sub-zone wins over its parent: the most specific suffix that
+    // answers NS is the zone that actually serves the record.
+    #[tokio::test]
+    async fn discovery_prefers_the_most_specific_delegated_zone() {
+        let lookup = DiscoveryLookup::new(
+            &[
+                ("tenants.myapp.com", &["ns1.sub.net"]),
+                ("myapp.com", &["ns1.parent.net"]),
+            ],
+            &[
+                ("ns1.sub.net", &[[192, 0, 2, 1]]),
+                ("ns1.parent.net", &[[192, 0, 2, 2]]),
+            ],
+        );
+        let found = authoritative_resolvers(
+            "_acme-challenge.tenants.myapp.com",
+            &[resolver(53)],
+            lookup.as_ref(),
+        )
+        .await;
+        assert_eq!(found, vec![SocketAddr::from(([192, 0, 2, 1], 53))]);
+    }
+
+    // Discovery is best-effort: when it finds nothing the caller falls back to
+    // the configured resolvers rather than failing the order.
+    #[tokio::test]
+    async fn discovery_returns_empty_when_nothing_answers() {
+        let lookup = DiscoveryLookup::new(&[], &[]);
+        assert!(
+            authoritative_resolvers(
+                "_acme-challenge.myapp.com",
+                &[resolver(53)],
+                lookup.as_ref()
+            )
+            .await
+            .is_empty()
+        );
+        // …and an NS answer whose names do not resolve is also a miss.
+        let lookup = DiscoveryLookup::new(&[("myapp.com", &["ns1.provider.net"])], &[]);
+        assert!(
+            authoritative_resolvers(
+                "_acme-challenge.myapp.com",
+                &[resolver(53)],
+                lookup.as_ref()
+            )
+            .await
+            .is_empty()
+        );
+    }
+
     #[test]
     fn missing_values_compares_sets() {
         let expected = vec!["a".to_owned(), "b".to_owned()];
@@ -707,25 +1385,51 @@ mod tests {
         }
     }
 
-    impl TxtLookup for ScriptedLookup {
-        fn lookup_txt<'a>(
+    impl DnsLookup for ScriptedLookup {
+        fn query<'a>(
             &'a self,
-            resolver: SocketAddr,
+            server: SocketAddr,
             name: &'a str,
-        ) -> BoxFuture<'a, Result<TxtAnswer, String>> {
+            qtype: u16,
+            _recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
             self.calls
                 .lock()
                 .unwrap()
-                .push((resolver.to_string(), name.to_owned()));
+                .push((server.to_string(), name.to_owned()));
+            // These tests script TXT answers only; discovery queries answer
+            // empty so `authoritative_resolvers` falls back, which is the path
+            // under test here.
+            if qtype != QTYPE_TXT {
+                return Box::pin(async move {
+                    Ok(DnsAnswer {
+                        rcode: 0,
+                        records: Vec::new(),
+                    })
+                });
+            }
+            let owner = normalize_name(name);
             let answer = self
                 .answers
-                .get(&resolver.to_string())
+                .get(&server.to_string())
                 .cloned()
                 .unwrap_or_else(|| {
                     Ok(TxtAnswer {
                         values: Vec::new(),
                         rcode: 3,
                     })
+                })
+                .map(|txt| DnsAnswer {
+                    rcode: txt.rcode,
+                    records: txt
+                        .values
+                        .into_iter()
+                        .map(|value| ResourceRecord {
+                            name: owner.clone(),
+                            rtype: QTYPE_TXT,
+                            rdata: Rdata::Txt(value),
+                        })
+                        .collect(),
                 });
             Box::pin(async move { answer })
         }
@@ -886,12 +1590,15 @@ mod tests {
             let _ = server.send_to(&response, peer).await;
         });
 
-        let lookup = UdpTxtLookup::new(Duration::from_secs(5));
+        let lookup = UdpDnsLookup::new(Duration::from_secs(5));
         let answer = lookup
-            .lookup_txt(addr, "_acme-challenge.myapp.com")
+            .query(addr, "_acme-challenge.myapp.com", QTYPE_TXT, false)
             .await
             .expect("the fake resolver answers");
-        assert_eq!(answer.values, vec!["propagated-value"]);
+        assert_eq!(
+            answer.txt_values("_acme-challenge.myapp.com"),
+            vec!["propagated-value"]
+        );
     }
 
     #[tokio::test]
@@ -900,9 +1607,9 @@ mod tests {
             .await
             .expect("bind silent resolver");
         let addr = server.local_addr().expect("local addr");
-        let lookup = UdpTxtLookup::new(Duration::from_millis(50));
+        let lookup = UdpDnsLookup::new(Duration::from_millis(50));
         let err = lookup
-            .lookup_txt(addr, "_acme-challenge.myapp.com")
+            .query(addr, "_acme-challenge.myapp.com", QTYPE_TXT, false)
             .await
             .expect_err("a silent resolver must time out, not hang");
         assert!(err.contains("did not answer"), "got: {err}");
