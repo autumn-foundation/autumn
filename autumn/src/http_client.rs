@@ -2244,7 +2244,30 @@ impl RequestBuilder {
     /// default cap while every per-hop safety step (resolve→validate→pin,
     /// https→http downgrade block, sensitive-header stripping, method/body
     /// rewrite) still applies.
+    /// Runs the whole resolve→validate→pin→redirect operation under one
+    /// outer deadline, so it cannot exceed `timeout` in total.
+    ///
+    /// Without this, `timeout` only bounded each hop's own connect/response
+    /// wait *inside* [`Self::send_ssrf_safe_inner`] — the DNS lookup in
+    /// [`resolve_and_validate`] has no timeout of its own, and a fresh
+    /// `timeout`-length budget is handed to *every* redirect hop rather than
+    /// the operation as a whole. A subscriber-controlled destination (the
+    /// motivating case: outbound webhook delivery, #2480 code review) with
+    /// stalled DNS or a slow multi-hop redirect chain could therefore occupy
+    /// a job worker for `timeout × (hops + 1)` plus unbounded DNS wait,
+    /// rather than the single `timeout` every other outbound call is bounded
+    /// by.
     async fn send_ssrf_safe(self, timeout: Duration) -> Result<Response, ClientError> {
+        tokio::time::timeout(timeout, self.send_ssrf_safe_inner(timeout))
+            .await
+            .unwrap_or_else(|_| {
+                Err(ClientError::InvalidUrl(format!(
+                    "SSRF-safe resolve/redirect operation exceeded the {timeout:?} deadline"
+                )))
+            })
+    }
+
+    async fn send_ssrf_safe_inner(self, timeout: Duration) -> Result<Response, ClientError> {
         let (follow, max) = self.ssrf_redirect_plan();
         let original =
             url::Url::parse(&self.url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
