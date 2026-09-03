@@ -577,6 +577,26 @@ _WRAPPER_OPTS = {
 }
 
 
+# Options that turn a wrapper into an INSPECTION: it describes the names that
+# follow instead of running them. `command -v autumn migrate` performs two
+# lookups and executes nothing, so reading the tail as a command reported drift
+# on a line that runs no autumn at all.
+_INSPECT_OPTS = {'command': 'vV'}
+
+
+def _inspects(segment, i, name):
+    """True when this wrapper is being asked to DESCRIBE rather than run."""
+    letters = _INSPECT_OPTS.get(name)
+    if not letters:
+        return False
+    while i < len(segment) and segment[i].startswith('-') and len(segment[i]) > 1:
+        tok = segment[i]
+        if not tok.startswith('--') and any(ch in letters for ch in tok[1:]):
+            return True
+        i += 1
+    return False
+
+
 def _skip_wrapper_options(segment, i, value_opts):
     """Step past a wrapper's own options so its COMMAND becomes the head."""
     while i < len(segment):
@@ -1247,6 +1267,7 @@ def _from_tokens(tokens, masked=None):
             or any(len(a) != len(b) for a, b in zip(segments, masked_segments)):
         masked_segments = segments
     for segment, masked_segment in zip(segments, masked_segments):
+        inspecting = False
         i = _cron_prefix(segment)
         while i < len(segment) and (segment[i] in _PROMPT or segment[i] in _CONTROL
                                     or _ENV_TOKEN.match(segment[i])):
@@ -1271,9 +1292,13 @@ def _from_tokens(tokens, masked=None):
                     if depth <= 0:              # a coalesced `))` closes both
                         break
                 continue
-            wrapper = _WRAPPER_OPTS.get(segment[i])
+            wrapper_name = segment[i]
+            wrapper = _WRAPPER_OPTS.get(wrapper_name)
             i += 1
             if wrapper is not None:
+                if _inspects(segment, i, wrapper_name):
+                    inspecting = True       # describes its arguments, runs none
+                    break
                 i = _skip_wrapper_options(segment, i, wrapper)
         # A redirection may also come BEFORE the command — `>/tmp/out autumn
         # migrate` is valid and runs autumn — and the prefix walk stopped on
@@ -1283,6 +1308,8 @@ def _from_tokens(tokens, masked=None):
             if not eaten:
                 break
             i += eaten
+        if inspecting:
+            continue
         cmd_at = i              # the command position, for `--` grammar below
         head = None
         if i < len(segment):
@@ -1464,6 +1491,7 @@ def invocations(text):
     fence_len = 0           # how long the opening run was: a closer matches it
     quoted_fence = False    # the open fence sits inside a markdown block quote
     heredoc = None          # the terminator of a heredoc being consumed
+    heredoc_tabs = False    # …opened with `<<-`, so tabs may indent it
     folded = None           # paragraphs of a folded (`>`) block scalar
     folded_at = None
     folded_indent = 0
@@ -1579,7 +1607,8 @@ def invocations(text):
         # across the break goes unchecked.
         # Inside a heredoc the shell is writing data, not running it.
         if heredoc is not None:
-            if line.strip() == heredoc:
+            candidate = line.lstrip('\t') if heredoc_tabs else line
+            if candidate.rstrip('\r') == heredoc:
                 heredoc = None
             continue
 
@@ -1720,9 +1749,19 @@ def invocations(text):
         # nothing, and treating it as an opener silenced every line after it.
         stripped = _strip_comment(logical)
         masked_line = _mask_quoted(stripped)
-        opener = _HEREDOC.search(stripped)
-        if opener and masked_line[opener.start():opener.start() + 2] == '<<':
+        # The FIRST UNMASKED match, not the first textual one: a quoted
+        # `"<<NO"` earlier on the line used to be the only candidate
+        # considered, and rejecting it meant a real `<<EOF` after it was never
+        # seen, so its body was scanned as commands.
+        for opener in _HEREDOC.finditer(stripped):
+            if masked_line[opener.start():opener.start() + 2] != '<<':
+                continue
             heredoc = next(g for g in opener.groups() if g)
+            # `<<-` allows the terminator to be indented with TABS; a plain
+            # `<<` requires it alone on the line. Accepting any indentation
+            # closed a heredoc early and reported its data as a command.
+            heredoc_tabs = stripped[opener.start():opener.start() + 3] == '<<-'
+            break
         # Backticks inside a fence are not markdown spans. In a shell block
         # they are legacy command substitution — `` OUT=`autumn migrate` `` is
         # a command the reader runs — and elsewhere they are a line quoting a
@@ -2276,11 +2315,18 @@ def self_test():
         expect(got == ['migrate run'], f'{runner!r} runs what follows: {got}')
     # The shell BUILTINS take options too, and stepping over the keyword alone
     # left the first of them looking like the executable.
-    for builtin in ('command -p', 'command -v', 'time -p', 'exec -a name',
+    for builtin in ('command -p', 'time -p', 'exec -a name',
                     'command', 'exec', 'nohup'):
         doc = f'```bash\n{builtin} autumn migrate run\n```'
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate run'], f'{builtin!r} must reach the command: {got}')
+    # …but `-v`/`-V` make `command` DESCRIBE its arguments rather than run
+    # them, so nothing there is an invocation. An earlier round asserted the
+    # opposite, which encoded the bug rather than the rule.
+    for inspect in ('command -v', 'command -V', 'command -pv', 'command -vp'):
+        doc = f'```bash\n{inspect} autumn db\n```'
+        expect(list(invocations(doc)) == [],
+               f'{inspect!r} inspects, it does not run: {list(invocations(doc))}')
 
     for printer in ('echo', 'printf', 'ls'):
         doc = f'```bash\n{printer} -- autumn db\n```'
@@ -2344,6 +2390,26 @@ def self_test():
         got = [d for _, d, _, _ in invocations(doc)]
         expect(got == ['migrate run'],
                f'a mentioned <<EOF ({mention}) opens nothing: {got}')
+    # The terminator's indentation is part of the grammar: a plain `<<` ends
+    # only on the delimiter alone, while `<<-` allows leading TABS and not
+    # spaces. Accepting any indentation closed a heredoc early and reported
+    # its data as a runnable command.
+    indented_term = '```bash\ncat <<EOF\n EOF\nautumn db\n```'
+    expect(list(invocations(indented_term)) == [],
+           f'an indented terminator does not end a plain heredoc: '
+           f'{list(invocations(indented_term))}')
+    tab_term = '```bash\ncat <<-EOF\nautumn db\n\tEOF\nautumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(tab_term)] == ['migrate run'],
+           f'`<<-` ends on a tab-indented terminator: {list(invocations(tab_term))}')
+    space_term = '```bash\ncat <<-EOF\nautumn db\n  EOF\n```'
+    expect(list(invocations(space_term)) == [],
+           f'…but not a space-indented one: {list(invocations(space_term))}')
+    # The first UNMASKED match opens the heredoc, not the first textual one.
+    after_quoted = ('```bash\nprintf \'%s\' "<<NO"; cat <<EOF\nautumn db\nEOF\n'
+                    'autumn migrate run\n```')
+    expect([d for _, d, _, _ in invocations(after_quoted)] == ['migrate run'],
+           f'a quoted candidate must not hide a real opener after it: '
+           f'{list(invocations(after_quoted))}')
     # An unterminated heredoc must not swallow the rest of the FILE.
     unterminated = ('```bash\ncat <<EOF\nautumn db\n```\n\n'
                     '```bash\nautumn migrate run\n```')
