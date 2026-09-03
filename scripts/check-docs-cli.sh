@@ -582,7 +582,20 @@ def _segments(tokens):
             current.append(tok)
         prev = tok
     out.append(current)
-    return out
+    # Grouping parens bracket a segment, they are not part of the command:
+    # `(autumn migrate && autumn dev)` ends with a `)` that would otherwise ride
+    # along in the argv and be echoed into the defect report. Only the ENDS are
+    # stripped, so a `$( … )` substitution sitting mid-segment is untouched.
+    return [_ungrouped(seg) for seg in out]
+
+
+def _ungrouped(segment):
+    start, end = 0, len(segment)
+    while start < end and segment[start] in '()':
+        start += 1
+    while end > start and segment[end - 1] in '()':
+        end -= 1
+    return segment[start:end]
 
 
 # A scalar key whose value is a command line. Compose writes `command: autumn
