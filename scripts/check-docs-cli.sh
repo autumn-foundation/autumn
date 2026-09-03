@@ -73,9 +73,10 @@
 #     hostage to the CLI's argument spelling.
 #   - Shell comments inside a block (`# Run migrations first (autumn seed will
 #     error …)`). Prose that happens to sit behind a `#`.
-#   - A command split across a prose line wrap (`… roll ONE back with `autumn
-#     deploy` / `rollback --only <host>``), which no line-oriented scan can
-#     reassemble.
+#   - A command split across a PROSE line wrap (`… roll ONE back with `autumn
+#     deploy` / `rollback --only <host>``). Unlike a backslash continuation,
+#     which is shell syntax and IS folded before scanning, a prose wrap has no
+#     marker saying the sentence continues into a command.
 #   - Instructional prefixes in `skills/` (`2. Run: autumn migrate`). Reading
 #     after an arbitrary prose prefix is the heuristic most likely to start
 #     reporting sentences; the same skills name commands in code spans
@@ -86,11 +87,24 @@
 # …"`), and after env assignments whose value is a command substitution
 # (`AUTUMN_MASTER_KEY=$(cat config/master.key) autumn …`).
 #
-# CHAINS: a line may hold several commands (`autumn migrate && autumn seed &&
-# autumn dev` appears in the guide). Every command in the chain is resolved, not
-# just the first — checking only the head would leave the tail of every chained
-# line ungated, which is where a second command is most easily left behind by a
-# rename.
+# HOW A LINE IS READ. `commands()` scans for each `autumn` standing in a command
+# position rather than matching one anchored pattern, because that pattern was
+# widened four times — chains, environment prefixes, `--` separators, quoted
+# wrappers — and each widening had to re-state the ones before it. The three
+# admissible positions are now independent of each other:
+#   - the head of a segment, after a prompt, an opening paren, or any number of
+#     environment assignments (whose values may be quoted or `$(…)`);
+#   - after a `--` separator (`kubectl exec deploy/app -- autumn …`);
+#   - immediately inside a quote (`fly ssh console -C "autumn …"`), where the
+#     argv ENDS at the closing quote. An anchored `(.+)$` could not express that
+#     and swallowed the quote into the last token, which then stopped looking
+#     like a command name — so the quoted form the gate claimed to cover
+#     accepted anything.
+# Before that scan, a line is split on shell operators, so every command in
+# `autumn migrate && autumn seed && autumn dev` is resolved rather than just the
+# head; and backslash continuations inside a fence are folded into one logical
+# line, so a command path broken across a line break is still read (the defect
+# is reported at the line the command starts on).
 #
 # CORPUS SCOPE: reader-facing task docs only — `docs/guide/`, `docs/migrations/`,
 # `skills/`, `agents/`, and the root `README.md` / `EXAMPLES.md` /
@@ -377,26 +391,59 @@ SHELL_LANGS = {'bash', 'sh', 'shell', 'console', 'zsh', 'terminal', 'text', ''}
 # only segments that then START with `autumn` are read as invocations.
 CHAIN = re.compile(r'&&|\|\||[;|&]')
 
-# `autumn` as the head of a segment, after any prompt or grouping punctuation,
-# and after any leading environment assignments — `AUTUMN_ENV=prod autumn db
-# backup` is how the guide writes most production commands, and requiring
-# `autumn` to head the segment skipped every one of them.
-# The `\s` after the name rejects `autumn-cli`, `autumn-web` and `autumn/src/…`;
-# anchoring to the segment start rejects `./autumn` and `cd autumn`.
-# An env-assignment value may itself be a command substitution containing
-# spaces (`AUTUMN_MASTER_KEY=$(cat config/master.key.new) autumn credentials
-# edit`), so `\S*` alone is not enough to step over it.
-_ENV_ASSIGN = r'[A-Za-z_][A-Za-z0-9_]*=(?:\$\([^)]*\)|\S)*\s+'
+# An environment assignment standing before the command. The VALUE is the
+# fiddly part: it may be bare, double- or single-quoted with spaces inside
+# (`RUSTFLAGS="-C opt-level=3" autumn …`), or a command substitution
+# (`AUTUMN_MASTER_KEY=$(cat config/master.key) autumn …`). A value pattern that
+# stops at the first space swallows the command along with the rest of the line.
+_ENV_VALUE = r'(?:"[^"]*"|\'[^\']*\'|\$\([^)]*\)|[^\s"\'])*'
+_ENV_ASSIGN = r'[A-Za-z_][A-Za-z0-9_]*=' + _ENV_VALUE + r'\s+'
 
-# A wrapper may hand the command to a remote shell, either after an explicit
-# `--` separator (`kubectl exec deploy/app -- autumn canary rollback`) or inside
-# a quoted argument (`fly ssh console -C "autumn canary rollback"`). Both are
-# unambiguous command positions, unlike the prose and program output the head
-# comment lists as out of scope.
-_WRAPPER = r'(?:.*?\s--\s+|.*?["\'])'
+# What may stand between the start of a segment and the command: a prompt, an
+# opening paren, and any number of environment assignments.
+_LEAD = re.compile(r'[\s(]*\$?\s*(?:' + _ENV_ASSIGN + r')*')
 
-INVOCATION = re.compile(
-    r'^(?:[\s(]*\$?\s*|' + _WRAPPER + r')(?:' + _ENV_ASSIGN + r')*autumn\s+(.+)$')
+# A wrapper handing the command to a remote shell, before which `autumn` is
+# still in command position: an explicit `--` separator (`kubectl exec
+# deploy/app -- autumn …`).
+_SEPARATOR = re.compile(r'.*\s--\s+(?:' + _ENV_ASSIGN + r')*', re.S)
+
+# `autumn` as a command name: the trailing `\s` rejects `autumn-cli`,
+# `autumn-web` and `autumn/src/…`.
+_NAME = re.compile(r'autumn\s+')
+
+
+def commands(segment):
+    """Yield the argv of every `autumn …` standing in a command position.
+
+    Written as a position scan rather than one anchored pattern because the
+    pattern had by now been widened four times — for chains, for environment
+    prefixes, for `--` separators, for quoted wrappers — and each widening had
+    to re-state the ones before it. Asking "is THIS occurrence in command
+    position?" keeps the three admissible positions independent, and lets the
+    quoted case bound its argv at the closing quote, which an anchored `(.+)$`
+    could not: `-C "autumn migrate nope"` captured the closing quote into the
+    last token, which then failed to look like a command name and was silently
+    accepted — a form the gate claimed to cover and did not.
+    """
+    for m in _NAME.finditer(segment):
+        before, quote = segment[:m.start()], None
+        if _LEAD.fullmatch(before) or _SEPARATOR.fullmatch(before):
+            pass
+        elif before and before[-1] in '"\'':
+            quote = before[-1]                  # inside a quoted wrapper argument
+        else:
+            continue                            # prose, a path, a comment
+        rest = segment[m.end():]
+        if quote:
+            end = rest.find(quote)
+            if end >= 0:
+                rest = rest[:end]
+        # Collapse runs of whitespace: joining a continuation keeps the next
+        # line's indentation, and the argv is echoed back in the defect report.
+        argv = ' '.join(rest.split())
+        if argv:
+            yield argv
 
 # A token that could name a command. Anything else — a flag, a `<PLACEHOLDER>`,
 # a TOML `= "0.1.0"`, a box-drawing character from a diagram — ends the walk.
@@ -430,23 +477,52 @@ def invocations(text):
     """
     fence = None
     lang = None
+    held = []          # parts of a backslash-continued line, oldest first
+    held_at = None     # the line the continued command STARTED on
+
+    def flush(line, lineno):
+        """Fold a backslash continuation into one logical line."""
+        nonlocal held, held_at
+        if line.rstrip().endswith('\\'):
+            held.append(line.rstrip()[:-1])
+            if held_at is None:
+                held_at = lineno
+            return None, None
+        if held:
+            joined = ' '.join(held) + ' ' + line
+            at = held_at
+            held, held_at = [], None
+            return joined, at
+        return line, lineno
+
     for lineno, line in enumerate(text.split('\n'), 1):
         m = re.match(r'^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)', line)
         if m:
+            held, held_at = [], None            # a fence boundary ends any hold
             if fence is None:
                 fence, lang = m.group(1)[0], m.group(2).lower()
             elif line.strip().startswith(fence * 3):
                 fence, lang = None, None
             continue
         candidates = []
+        report_at = lineno
         if fence is not None and lang in SHELL_LANGS:
-            candidates.append((line, True))
+            # Continuations are shell syntax, so they are joined before
+            # scanning — `autumn maintenance on \` + `--reason "…"` is one
+            # command, and the guide writes five of them on that page alone.
+            # Scanning the physical lines instead yields the argv `\`, and the
+            # command path split across the break goes unchecked.
+            logical, at = flush(line, lineno)
+            if logical is None:
+                continue
+            candidates.append((logical, True))
+            report_at = at
+        # Inline spans are bounded by their backticks, so they never continue.
         candidates.extend((span, False) for span in re.findall(r'`([^`\n]+)`', line))
         for text_, in_fence in candidates:
             for segment in CHAIN.split(text_):
-                hit = INVOCATION.match(segment.rstrip())
-                if hit:
-                    yield lineno, hit.group(1).strip(), in_fence
+                for argv in commands(segment):
+                    yield (report_at if in_fence else lineno), argv, in_fence
 
 
 def blocks(text):
@@ -707,8 +783,23 @@ def self_test():
     expect([a for _, a, _ in invocations(wrapped)] == ['migrate run'],
            f'a command after a `--` separator must be read: {list(invocations(wrapped))}')
     quoted = '```bash\nfly ssh console -C "autumn migrate run"\n```'
-    expect([a for _, a, _ in invocations(quoted)] == ['migrate run"'],
-           f'a command inside a quoted wrapper argument must be read: {list(invocations(quoted))}')
+    expect([a for _, a, _ in invocations(quoted)] == ['migrate run'],
+           f'a quoted wrapper argv must END at the closing quote, not swallow it — '
+           f'otherwise the last token stops looking like a command name and drift '
+           f'there is silently accepted: {list(invocations(quoted))}')
+    qenv = '```bash\nRUSTFLAGS="-C opt-level=3" autumn migrate run\n```'
+    expect([a for _, a, _ in invocations(qenv)] == ['migrate run'],
+           f'a quoted env value containing spaces must not swallow the command: '
+           f'{list(invocations(qenv))}')
+
+    # --- backslash continuations are shell syntax and are folded into one
+    # logical line; the defect is reported where the command STARTS.
+    cont = '```bash\nautumn migrate \\\n    run\n```'
+    expect([(n, a) for n, a, _ in invocations(cont)] == [(2, 'migrate run')],
+           f'a continued command must be joined and reported at its first line: '
+           f'{list(invocations(cont))}')
+    expect(list(invocations('```bash\nautumn migrate \\\n```')) == [],
+           'a hold left open at the fence boundary must not leak into the next block')
     # The quote rule must require `autumn` immediately inside the quote, or
     # every apostrophe in prose becomes a command position.
     expect(list(invocations("```bash\n# don't run autumn migrate here\n```")) == [],
@@ -749,7 +840,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f"self-test: {13 + 16 + 14 + 4 - len(failures)} passed, {len(failures)} failed")
+    print(f"self-test: {13 + 16 + 19 + 4 - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
