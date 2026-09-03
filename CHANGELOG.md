@@ -2102,6 +2102,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **new `repository_crud` profiling harness; findings, no fix (#2486):** added
+  `autumn/benches/repository_crud.rs`, driving real `save`/`find_by_id`/`page`
+  calls through a `#[repository]`-generated repository against a live
+  Postgres — the query-building/row-mapping layer `request_pipeline.rs`
+  deliberately excludes (its handlers are trivial and non-DB by design) and
+  that no other committed bench touches. Profiling it turned up that every
+  repository call currently pays for two liveness-style round trips beyond
+  its actual query — diesel-async's connection pool defaults to a `SELECT 1`
+  ping on every checkout, and `#[repository]`'s generated
+  `__autumn_acquire_from` re-runs `SET statement_timeout` on every checkout
+  too, even though the two overlap: `SET statement_timeout` already fails on
+  a dead connection the same way the ping would. An isolated A/B (the pool's
+  recycling method only, no framework code changed) measured instructions
+  -13.00%, allocation blocks/round -14.44%, allocation bytes/round -16.20%
+  (`valgrind --tool=callgrind`/`dhat`). No source fix here: switching the
+  framework's own pool-builder default changes connection-liveness-detection
+  behavior for every deployed app, which is a maintainer call rather than an
+  unreviewed automated change — see #2485 for the full mechanism and
+  reproduction steps.
+
 - **the DB-backed media-room reaper sweeps in one statement instead of one per
   stale room:** `DbRoomStore::reap_stale`'s second phase — the sweep that drops
   now-empty rooms, run every 60s by the background room reaper in any process

@@ -11,10 +11,16 @@
 //! methods a scaffolded handler calls (`autumn-cli/src/generate/scaffold.rs`),
 //! not internal helpers reached only by this harness.
 //!
-//! **Requires a reachable Postgres.** Point `DATABASE_URL` at one (a local
-//! `postgres` service works — no testcontainer needed, this harness owns its
-//! own table and drops it on start). Defaults to
-//! `postgres://postgres:postgres@127.0.0.1:5432/postgres`.
+//! **Requires a reachable, TLS-free Postgres.** Point `DATABASE_URL` at one
+//! (a local `postgres` service works — no testcontainer needed, this harness
+//! owns its own table and drops it on start). Defaults to
+//! `postgres://postgres:postgres@127.0.0.1:5432/postgres`. Both connections
+//! this harness opens go through diesel's/diesel-async's stock `NoTls`
+//! establish path, not `autumn::db`'s rustls setup callback (`pub(crate)`,
+//! unreachable from a bench) — a `sslmode=require`/`verify-full` URL is
+//! rejected up front with an explanatory error rather than failing deep
+//! inside libpq. Point this at a local/trusted database, not a
+//! TLS-requiring one.
 //!
 //! ```sh
 //! cargo build --release -p autumn-web --bench repository_crud
@@ -98,8 +104,26 @@ const SEEDED_ROWS: i64 = 5_000;
 const PAGE_SIZE: u32 = 20;
 
 fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5432/postgres".to_owned())
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5432/postgres".to_owned());
+    // Both connections this harness opens (the sync `PgConnection` below and
+    // the async pool in `main`) go through diesel's/diesel-async's stock,
+    // `NoTls`-hardcoded establish path — neither reuses `autumn::db`'s rustls
+    // setup callback, which is `pub(crate)` and unreachable from a bench (a
+    // separate crate). `sslmode=require`/`verify-full` would otherwise fail
+    // deep inside libpq/tokio-postgres with a connection-refused-shaped
+    // error that gives no hint why. Reject it here, at the one place both
+    // callers route through, with an error that says why (Codex review on
+    // #2486).
+    let lower = url.to_ascii_lowercase();
+    assert!(
+        !lower.contains("sslmode=require") && !lower.contains("sslmode=verify"),
+        "repository_crud is a local profiling harness: it connects with diesel's/diesel-async's \
+         stock NoTls establish path, not autumn::db's TLS-aware pool (that setup callback is \
+         crate-private). Point DATABASE_URL at a local/trusted Postgres with no `sslmode` (or \
+         sslmode=disable/prefer), not one requiring `sslmode=require`/`verify-full`."
+    );
+    url
 }
 
 /// Fresh table, seeded with a realistic-shaped fixture — skewed enough that
