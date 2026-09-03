@@ -638,8 +638,16 @@ pub fn deliver_webhook_job(
             .header("Autumn-Signature", signature_header)
             .text_body(log.payload.clone());
 
+        // Key the breaker by the request's *resolved* URL, not `target_url`
+        // as the caller wrote it: when `target_url` is a
+        // `[http.client.base_urls]` alias (e.g. `"hook-service"`), `req.url()`
+        // is already expanded to the real destination, while the alias
+        // string itself doesn't parse as a URL at all — every alias-based
+        // subscription would otherwise fall into one shared "unknown"
+        // breaker bucket, letting failures from one receiver reject
+        // deliveries to unrelated healthy ones (PR #2480 review).
         let breaker_call =
-            crate::http_client::BreakerGuardedCall::begin(&manager.client, &sub.target_url);
+            crate::http_client::BreakerGuardedCall::begin(&manager.client, req.url());
         let response = match breaker_call {
             Ok(guarded) => {
                 let result = req.send().await;

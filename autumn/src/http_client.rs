@@ -1738,6 +1738,17 @@ impl RequestBuilder {
         self
     }
 
+    /// The fully-resolved URL this request will dial: an alias passed to
+    /// [`Client::post`]/etc. (e.g. `"hook-service"`) is already expanded
+    /// against `[http.client.base_urls]` by [`Client::build_request`] before
+    /// this builder exists, so this is never the bare alias. A caller that
+    /// needs to key something (a circuit breaker, a log line) by destination
+    /// host must read it from here rather than from whatever string it
+    /// originally passed to `post`/`get`/etc. — see [`BreakerGuardedCall::begin`].
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
     /// Send the request, applying retries and returning a [`Response`].
     ///
     /// # Errors
@@ -3151,6 +3162,36 @@ mod tests {
         // Unknown alias falls back to client-level base_url (None in this case).
         let other = client.named("sendgrid");
         assert!(other.base_url.is_none());
+    }
+
+    // PR #2480 review (P1): a `RequestBuilder`'s `.url()` must be the
+    // *expanded* destination when built through an alias, not the bare alias
+    // string — a caller keying a circuit breaker (or anything else) by
+    // destination host has to read it from here, never from what it
+    // originally passed to `post`/`get`/etc.
+    #[test]
+    fn request_builder_url_is_expanded_not_the_alias() {
+        let mut base_urls = std::collections::HashMap::new();
+        base_urls.insert(
+            "hook-service".to_owned(),
+            "http://mock-receiver/base".to_owned(),
+        );
+        let config = HttpClientConfig {
+            timeout_secs: 30,
+            max_retries: 3,
+            max_retry_after_secs: 10,
+            base_urls,
+        };
+        let client = Client::from_config(&config);
+
+        let req = client.named("hook-service").post("hook-service");
+        assert_eq!(req.url(), "http://mock-receiver/base/hook-service");
+
+        // The bare alias would neither parse as a URL nor name the real
+        // destination host — exactly the bug the P1 finding caught.
+        assert!(url::Url::parse("hook-service").is_err());
+        let breaker = super::breaker_for_url(None, req.url());
+        assert_eq!(breaker.name(), "mock-receiver");
     }
 
     // TEST 26: from_request_parts uses AutumnConfig.http when no HttpConfig extension.
