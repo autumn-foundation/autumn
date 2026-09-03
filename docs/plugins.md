@@ -149,7 +149,8 @@ three things rather than guessing:
   the report says which file kept it. That covers `src/`, `tests/`, `benches/`
   and `examples/`, the build script, and any target the manifest gives an
   explicit `path` to (`[[bin]] path = "cmd/server.rs"` and its sibling
-  modules). Delete that usage and re-run.
+  modules). Every spelling that names the crate counts — a qualified path, a
+  `use` (aliased or not), and `extern crate`. Delete that usage and re-run.
 - **A community mount.** `add` never writes one, so `remove` never deletes one.
   The dependency comes back out once nothing references the crate.
 

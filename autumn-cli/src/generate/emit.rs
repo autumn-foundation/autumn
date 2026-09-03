@@ -1258,8 +1258,7 @@ pub fn crate_reference_site(
     excluding: &[PathBuf],
     overrides: &HashMap<PathBuf, String>,
 ) -> Option<PathBuf> {
-    let ident = crate_name.replace('-', "_");
-    let markers = [format!("{ident}::"), format!("use {ident}")];
+    let markers = crate_reference_markers(crate_name);
     // `examples` alongside the build targets: an example that uses the crate is
     // a target that stops compiling when the dependency goes (issue #1631
     // review). Erring toward retaining a dependency only ever costs an unused
@@ -1269,6 +1268,41 @@ pub fn crate_reference_site(
         .find_map(|dir| {
             rs_tree_marker_site(&project_root.join(dir), &markers, excluding, overrides)
         })
+}
+
+/// The text markers that indicate `crate_name` is in use in Rust source.
+///
+/// One definition, because two callers scan different file sets with them —
+/// [`crate_reference_site`]'s conventional trees and `plugin::remove`'s
+/// explicit Cargo target paths — and a marker present in one set but not the
+/// other is a dependency stripped from under code that still needs it.
+///
+/// Three spellings reach a crate by name:
+///
+/// - `{ident}::` — a qualified path.
+/// - `use {ident}` — an import, including `use {ident} as alias;`, which this
+///   prefix already covers.
+/// - `extern crate {ident}` — the 2015-edition form, still legal in every
+///   edition. It is the one spelling that carries NEITHER of the others when
+///   aliased: `extern crate autumn_admin_plugin as admin;` followed by
+///   `admin::…` contains no `{ident}::` and no `use {ident}` anywhere (issue
+///   #1631 review).
+///
+/// These are substring probes, not a parse. Best-effort in both directions: a
+/// crate reached only through a re-export, or a derive macro that never spells
+/// the crate's own name, is not detected; and a crate whose name EXTENDS this
+/// one (`autumn-admin-plugin-extras`) matches. The two errors are not
+/// symmetric — over-retaining leaves an unused manifest line, under-retaining
+/// strips a dependency out from under code that still compiles against it — so
+/// the loose direction is the deliberate one.
+#[must_use]
+pub fn crate_reference_markers(crate_name: &str) -> Vec<String> {
+    let ident = crate_name.replace('-', "_");
+    vec![
+        format!("{ident}::"),
+        format!("use {ident}"),
+        format!("extern crate {ident}"),
+    ]
 }
 
 /// Text markers that reliably indicate `feature`'s autumn-web API surface
@@ -2839,5 +2873,26 @@ mod tests {
             &excluding,
             &overrides
         ));
+    }
+    /// Every spelling that reaches a crate by name is a marker; a dependency
+    /// used only through an `extern crate … as` alias must not read as unused
+    /// (issue #1631 review).
+    #[test]
+    fn crate_reference_markers_cover_every_spelling_that_names_a_crate() {
+        let markers = crate_reference_markers("autumn-admin-plugin");
+        let matches = |src: &str| markers.iter().any(|m| src.contains(m.as_str()));
+        assert!(matches("let p = autumn_admin_plugin::AdminPlugin::new();"));
+        assert!(matches("use autumn_admin_plugin::AdminPlugin;"));
+        assert!(matches("use autumn_admin_plugin as admin;"));
+        assert!(matches("extern crate autumn_admin_plugin as admin;"));
+        assert!(matches("extern crate autumn_admin_plugin;"));
+        assert!(!matches("let x = 1;"));
+        assert!(!matches("use some_other_crate::Thing;"));
+        // A crate whose name merely EXTENDS this one does match, and that is
+        // deliberate: these are substring probes, and the two possible errors
+        // are not symmetric. Over-retaining leaves an unused manifest line;
+        // under-retaining strips a dependency out from under code that still
+        // compiles against it. The tie goes to the build.
+        assert!(matches("use autumn_admin_plugin_extras::Thing;"));
     }
 }

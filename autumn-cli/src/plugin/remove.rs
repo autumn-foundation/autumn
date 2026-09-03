@@ -307,8 +307,10 @@ fn still_referenced(
     {
         return Some(site);
     }
-    let ident = crate_name.replace('-', "_");
-    let markers = [format!("{ident}::"), format!("use {ident}")];
+    // The SAME marker set the conventional sweep uses — a spelling honoured in
+    // one scan but not the other is a dependency stripped from under a target
+    // that still needs it.
+    let markers = crate::generate::emit::crate_reference_markers(crate_name);
     explicit_target_roots(root)
         .into_iter()
         .find(|path| file_or_tree_contains(path, &markers, root))
@@ -1415,5 +1417,80 @@ autumn-plugin-live-feed = "0.3.1"
         };
         assert!(dependency_retained.is_none(), "{dependency_retained:?}");
         assert!(removed.contains(&Wire::Dependency), "{removed:?}");
+    }
+
+    /// Codex review: `extern crate autumn_admin_plugin as admin;` followed by
+    /// `admin::…` is the one spelling that carries neither `{ident}::` nor
+    /// `use {ident}` anywhere in the file. Missing it strips the dependency out
+    /// from under code that still compiles against it.
+    #[test]
+    fn a_dependency_reached_through_an_extern_crate_alias_is_retained() {
+        let tmp = fake_project(SCAFFOLD_MAIN, SCAFFOLD_CARGO);
+        std::fs::write(
+            tmp.path().join("src/support.rs"),
+            "extern crate autumn_admin_plugin as admin;\n\npub fn panel() -> admin::AdminPlugin { todo!() }\n",
+        )
+        .unwrap();
+        let outcome = plan_remove(tmp.path(), admin()).unwrap();
+        let RemoveOutcome::Removed {
+            removed,
+            dependency_retained,
+            ..
+        } = &outcome
+        else {
+            panic!("expected Removed, got {outcome:?}");
+        };
+        assert_eq!(removed, &vec![Wire::Mount]);
+        assert!(
+            dependency_retained
+                .as_ref()
+                .is_some_and(|kept| kept.reason().contains("support.rs")),
+            "{dependency_retained:?}"
+        );
+    }
+
+    /// The same spelling in a custom Cargo target path, since that scan carries
+    /// its own copy of the marker set.
+    #[test]
+    fn an_extern_crate_alias_in_a_custom_target_path_is_retained() {
+        let cargo =
+            format!("{SCAFFOLD_CARGO}\n[[bin]]\nname = \"server\"\npath = \"cmd/server.rs\"\n");
+        let tmp = fake_project(SCAFFOLD_MAIN, &cargo);
+        std::fs::create_dir_all(tmp.path().join("cmd")).unwrap();
+        std::fs::write(
+            tmp.path().join("cmd/server.rs"),
+            "extern crate autumn_admin_plugin as admin;\nfn main() { let _ = admin::AdminPlugin::new(); }\n",
+        )
+        .unwrap();
+        let outcome = plan_remove(tmp.path(), admin()).unwrap();
+        let RemoveOutcome::Removed {
+            dependency_retained,
+            ..
+        } = &outcome
+        else {
+            panic!("expected Removed, got {outcome:?}");
+        };
+        assert!(dependency_retained.is_some(), "{outcome:?}");
+    }
+
+    /// `use <crate> as alias;` was already covered by the `use {ident}` prefix
+    /// — pinned so a future edit to the marker set cannot quietly drop it.
+    #[test]
+    fn a_dependency_reached_through_a_use_alias_is_retained() {
+        let tmp = fake_project(SCAFFOLD_MAIN, SCAFFOLD_CARGO);
+        std::fs::write(
+            tmp.path().join("src/support.rs"),
+            "use autumn_admin_plugin as admin;\n\npub fn panel() -> admin::AdminPlugin { todo!() }\n",
+        )
+        .unwrap();
+        let outcome = plan_remove(tmp.path(), admin()).unwrap();
+        let RemoveOutcome::Removed {
+            dependency_retained,
+            ..
+        } = &outcome
+        else {
+            panic!("expected Removed, got {outcome:?}");
+        };
+        assert!(dependency_retained.is_some(), "{outcome:?}");
     }
 }
