@@ -33,6 +33,14 @@ copy of the publish order.
 ### Functions
 
 - `autumn_web::app() -> AppBuilder`
+- `autumn_web::slugify(&str) -> String` — URL-safe slug. **Never returns
+  `""`**: input with nothing to slugify (empty, all punctuation, un-folded
+  non-Latin) gets a stable, deterministic hash fallback token instead.
+- `autumn_web::contains_letter_or_number(&str) -> bool` (unreleased, #2424) —
+  the input check `slugify` cannot answer. Reach for it to reject content-free
+  user input (`"***"`, `"🎉🔥💯"`); **never** `slugify(x).is_empty()`, which is
+  always `false` and so is dead code. Deliberately broader than "`slugify`
+  produced a real slug": `"日本語"` passes — real text, hashed URL segment.
 
 ### Common types
 
