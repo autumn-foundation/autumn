@@ -340,15 +340,18 @@ const EDGE_AGENT_OPERABLE_ERROR: &str = "`#[edge]` cannot be combined with `#[ag
      route from the origin.\n\nServe the route from the origin, or drop \
      `#[agent_operable]`. See docs/guide/agent-authority.md.";
 
-/// Marker consts the auth/rate guards inject into a handler body. A guard that
-/// expanded *before* this route macro left one of these behind instead of an
-/// attribute, and missing it would ship a guarded route to the unauthenticated
-/// edge lane.
+/// Marker consts a guard that expanded *before* this route macro left behind
+/// in the handler body instead of an attribute, and missing it would ship a
+/// guarded route to the unauthenticated edge lane.
+///
+/// `#[step_up]`/`#[throttle]` don't appear here: their check moved into a
+/// pre-body `FromRequestParts` gate (#1668) and they never left an
+/// OpenAPI-readable body marker to begin with, so `has_auth_or_rate_guard`
+/// recognizes them via `has_step_up_guard`/`has_throttle_guard`'s own
+/// gate-param check instead of this body scan.
 const GUARD_MARKERS: &[&str] = &[
     "__AUTUMN_SECURED_ROLES",
     "__AUTUMN_SECURED_SCOPES",
-    "__AUTUMN_STEP_UP_MAX_AGE",
-    "__AUTUMN_THROTTLE_ROUTE_ID",
     "__AUTUMN_AUTHORIZE_BINDINGS",
     "__AUTUMN_AGENT_OPERABLE",
 ];
