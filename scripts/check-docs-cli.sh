@@ -902,6 +902,12 @@ _COMMAND_KEYS = _EXEC_KEYS + r'|' + _SCRIPT_KEYS
 # a synthetic `command = "…"` test passed while the real `release_command`
 # lines went ungated, which is how the gap survived a round of review.
 _QUALIFIED = r'(?:[A-Za-z0-9]+[_-])*'
+# A YAML COMPACT SEQUENCE writes the first key of a mapping on the same line
+# as its `- ` marker: `- command: ["autumn"]` with `args:` under it is the
+# ordinary way to spell a Kubernetes container. The key patterns were anchored
+# at the indent, so the marker hid the key, the pair never assembled, and the
+# generic scan reported a bare root on a correct manifest. The marker is
+# counted as part of the INDENT, which is where YAML puts the key's column.
 _COMMAND_KEY = re.compile(r'^' + _QUALIFIED + r'(' + _COMMAND_KEYS + r'):$', re.I)
 # The same keys in TOML, where the value is quoted after an `=`.
 _COMMAND_KEY_BARE = re.compile(r'^' + _QUALIFIED + r'(' + _COMMAND_KEYS + r')$', re.I)
@@ -1015,7 +1021,7 @@ def _shell_c(tok, owner):
 #
 # Items may be indented deeper than the key or sit at the same column — YAML
 # allows both, and Kubernetes manifests in the wild use both.
-_KEY_ONLY = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS + r'):\s*$',
+_KEY_ONLY = re.compile(r'^(\s*(?:-\s+)?)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS + r'):\s*$',
                        re.I)
 _LIST_ITEM = re.compile(r'^(\s*)-\s+(\S.*?)\s*$')
 
@@ -1027,11 +1033,11 @@ _LIST_ITEM = re.compile(r'^(\s*)-\s+(\S.*?)\s*$')
 # a perfectly correct manifest, and the args half carries the subcommand that
 # would actually drift, attached to no executable at all. Joined, both become
 # the argv the container really runs.
-_KEY_INLINE = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
+_KEY_INLINE = re.compile(r'^(\s*(?:-\s+)?)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
                          r'):\s*\[(.*)\]\s*$', re.I)
-_ARGS_ONLY = re.compile(r'^(\s*)' + _QUALIFIED + r'args:\s*$', re.I)
-_ARGS_INLINE = re.compile(r'^(\s*)' + _QUALIFIED + r'args:\s*\[(.*)\]\s*$', re.I)
-_EXEC_KEY_LINE = re.compile(r'^\s*' + _QUALIFIED + r'(?:' + _EXEC_KEYS + r'):', re.I)
+_ARGS_ONLY = re.compile(r'^(\s*(?:-\s+)?)' + _QUALIFIED + r'args:\s*$', re.I)
+_ARGS_INLINE = re.compile(r'^(\s*(?:-\s+)?)' + _QUALIFIED + r'args:\s*\[(.*)\]\s*$', re.I)
+_EXEC_KEY_LINE = re.compile(r'^\s*(?:-\s+)?' + _QUALIFIED + r'(?:' + _EXEC_KEYS + r'):', re.I)
 # A block scalar, folded (`>`) or literal (`|`). A FOLDED one joins its lines
 # with spaces, so a command written across two of them is one command;
 # scanning the physical lines let the first resolve on its own and dropped the
@@ -1048,7 +1054,7 @@ _EXEC_KEY_LINE = re.compile(r'^\s*' + _QUALIFIED + r'(?:' + _EXEC_KEYS + r'):', 
 # forms all fill their slot already. Leaving the block-scalar form out was the
 # same omission as the literal one above, one key over — `command: ["autumn"]`
 # beside `args: >` reported a bare root on a valid manifest.
-_FOLDED_KEY = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
+_FOLDED_KEY = re.compile(r'^(\s*(?:-\s+)?)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
                          r'|args):\s*([>|])[-+]?([0-9]?)[-+]?\s*$', re.I)
 # Any mapping key, used only to spot where one object ends and its sibling
 # begins — Compose names its services this way rather than with list items.
@@ -1098,11 +1104,25 @@ def _heredoc_delim(text, i):
             i += 2
             continue
         if ch in '"\'':
-            end = text.find(ch, i + 1)
-            if end < 0:                     # unterminated: not a delimiter
+            # Inside DOUBLE quotes a backslash escapes the next character, so
+            # searching for the next quote mistook an escaped one for the
+            # terminator and rejected the whole delimiter — the heredoc then
+            # opened nothing and its data was scanned as commands. Inside
+            # SINGLE quotes a backslash is literal, which is why the walk
+            # differs by quote kind, exactly as `_mask_quoted` does.
+            j = i + 1
+            while j < n:
+                if ch == '"' and text[j] == '\\' and j + 1 < n:
+                    out.append(text[j + 1])
+                    j += 2
+                    continue
+                if text[j] == ch:
+                    break
+                out.append(text[j])
+                j += 1
+            if j >= n:                      # unterminated: not a delimiter
                 return None
-            out.append(text[i + 1:end])
-            i = end + 1
+            i = j + 1
             continue
         out.append(ch)
         i += 1
@@ -1114,8 +1134,8 @@ def _heredoc_delim(text, i):
 # those are handled before this, or are not values at all.
 _KEY_SCALAR = re.compile(r'^(\s*)' + _QUALIFIED + r'(?:' + _COMMAND_KEYS +
                          r'|args):\s*(?![>|&*\[])(\S.*)$', re.I)
-_ENTRY_KEY_LINE = re.compile(r'^\s*' + _QUALIFIED + r'(?:' + _ENTRY_KEYS + r'):', re.I)
-_ARGS_KEY_LINE = re.compile(r'^\s*' + _QUALIFIED + r'args:', re.I)
+_ENTRY_KEY_LINE = re.compile(r'^\s*(?:-\s+)?' + _QUALIFIED + r'(?:' + _ENTRY_KEYS + r'):', re.I)
+_ARGS_KEY_LINE = re.compile(r'^\s*(?:-\s+)?' + _QUALIFIED + r'args:', re.I)
 
 
 def _backticks(line):
@@ -1892,7 +1912,24 @@ def invocations(text):
         if fence is not None and quoted_fence:
             line = _BLOCKQUOTE.sub('', line, count=1)
         m = re.match(r'^( *)(?:>\s?)*( *)(`{3,}|~{3,})\s*(.*)$', line)
-        if m:
+        # A line that LOOKS like a fence marker is only a boundary if it can
+        # actually open or close one. Deciding that first matters: the state
+        # reset below is what a boundary does, and running it on a marker that
+        # turns out to be CONTENT threw away the heredoc queue, so an indented
+        # ``` inside a heredoc made the data under it read as commands and
+        # failed a correct page.
+        closes = (m and fence is not None
+                  and m.group(3)[0] == fence and len(m.group(3)) >= fence_len
+                  and not m.group(4).strip()
+                  # Markdown allows a closing fence at most three spaces
+                  # further in than the block it closes; beyond that the line
+                  # is content. The bound is RELATIVE to the opener rather
+                  # than absolute, because a fence nested in a list item is
+                  # legitimately indented — this corpus has none past three
+                  # spaces, but capping absolutely would stop reading the
+                  # first one that appears.
+                  and len(m.group(1)) + len(m.group(2)) <= fence_indent + 3)
+        if m and (fence is None or closes):
             held, held_at, heredocs = [], None, []   # a fence boundary ends any hold
             yield from close_quote()            # …an unterminated quote
             yield from close_folded()           # …a folded scalar
@@ -1912,18 +1949,7 @@ def invocations(text):
                 info = m.group(4).strip()
                 lang = re.split(r'[\s,]', info)[0].lower() if info else ''
                 quoted_fence = bool(_BLOCKQUOTE.match(line))
-            # Markdown allows a closing fence at most three spaces further in
-            # than the block it closes; beyond that the line is CONTENT. The
-            # indent was ignored entirely, so an indented ``` inside a bash
-            # fence ended it early and everything below read as prose, where a
-            # runnable command is not judged. The bound is RELATIVE to the
-            # opener rather than absolute, because a fence nested in a list
-            # item is legitimately indented — this corpus has none past three
-            # spaces, but capping absolutely would stop reading the first one
-            # that appears.
-            elif m.group(3)[0] == fence and len(m.group(3)) >= fence_len \
-                    and not m.group(4).strip() \
-                    and len(m.group(1)) + len(m.group(2)) <= fence_indent + 3:
+            else:
                 fence, lang, quoted_fence = None, None, False
             continue
 
@@ -4049,6 +4075,62 @@ def self_test():
                 got = [d for _, d, _, _ in invocations(doc)]
                 expect(got == ['nope'],
                        f'{wrapper} {opt} ({kind}) must reach its command: {got}')
+
+    # A YAML COMPACT SEQUENCE writes the first key of a mapping on the same
+    # line as its `- ` marker, which is the ordinary way to spell a Kubernetes
+    # container. The marker hid the key, so the pair never assembled and the
+    # generic scan reported a bare root on a correct manifest.
+    compact = '```yaml\n- command: ["autumn"]\n  args: ["migrate"]\n```'
+    expect([d for _, d, _, _ in invocations(compact)] == ['migrate'],
+           f'a compact sequence assembles its pair: {list(invocations(compact))}')
+    for half in ('args: ["nope"]', 'args: |\n    nope'):
+        doc = f'```yaml\n- command: ["autumn"]\n  {half}\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'…and still names drift in it: {got}')
+    # Each item in the sequence is its own container, with its own line.
+    two = ('```yaml\n- command: ["autumn"]\n  args: ["migrate"]\n'
+           '- command: ["autumn"]\n  args: ["nope"]\n```')
+    expect([(ln, d) for ln, d, _, _ in invocations(two)]
+           == [(2, 'migrate'), (4, 'nope')],
+           f'two containers stay two: {list(invocations(two))}')
+    # …and a plain block list item is still an ARGV element, not a key.
+    plain = '```yaml\ncommand:\n  - autumn\n  - nope\n```'
+    expect([d for _, d, _, _ in invocations(plain)] == ['nope'],
+           f'a block list item is not a compact key: {list(invocations(plain))}')
+
+    # Inside DOUBLE quotes a backslash escapes the next character, so hunting
+    # for the next quote mistook an escaped one for the terminator and
+    # rejected the delimiter — the heredoc opened nothing and its data was
+    # scanned as commands, failing a correct page.
+    esc_delim = '```bash\ncat <<"END\\"X"\nautumn db\nEND"X\nautumn migrate\n```'
+    expect([d for _, d, _, _ in invocations(esc_delim)] == ['migrate'],
+           f'an escaped quote inside a delimiter: {list(invocations(esc_delim))}')
+    # Inside SINGLE quotes a backslash is literal, which is why the walk
+    # differs by quote kind.
+    sq_delim = "```bash\ncat <<'END\\\\X'\nautumn db\nEND\\\\X\nautumn migrate\n```"
+    expect([d for _, d, _, _ in invocations(sq_delim)] == ['migrate'],
+           f'a backslash is literal in a single-quoted delimiter: '
+           f'{list(invocations(sq_delim))}')
+    # An unterminated quote is not a delimiter at all, so nothing opens and
+    # the line below is read as the command it is.
+    unterm = '```bash\ncat <<"END\nautumn nope\n```'
+    expect([d for _, d, _, _ in invocations(unterm)] == ['nope'],
+           f'an unterminated delimiter opens nothing: {list(invocations(unterm))}')
+
+    # A line that LOOKS like a fence marker is a boundary only if it can
+    # actually open or close one, and the state reset is what a boundary does.
+    # Running it on a marker that turns out to be CONTENT threw away the
+    # heredoc queue, so the data under it was reported as commands.
+    for label, doc in (
+            ('a heredoc', '```bash\ncat <<EOF\n    ```\nautumn nope\nEOF\n```'),
+            ('a multi-line quote',
+             "```bash\nprintf '%s' '\n    ```\nautumn nope\n'\n```")):
+        expect(list(invocations(doc)) == [],
+               f'an indented ``` inside {label} is data: {list(invocations(doc))}')
+    # …while a REAL closer still ends everything the fence was holding.
+    real = '```bash\ncat <<EOF\ndata\n```\nautumn nope'
+    expect(list(invocations(real)) == [],
+           f'a real closer ends the fence and its heredoc: {list(invocations(real))}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
