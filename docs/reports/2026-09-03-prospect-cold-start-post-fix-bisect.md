@@ -254,9 +254,12 @@ checkpoint specifically, this apparatus likely **overcounts** the
 commit's true CI-relevant marginal cost; at every checkpoint *after* it,
 the dependency is cached and the apparatus shows nothing for it, which
 **undercounts** the recurring cost CI keeps paying. Both directions are
-real, and this report cannot say which dominates for `141f36ef` or
-`61bdd9c2` specifically without a genuinely cold-per-checkpoint rerun.
-Practically, this makes individual per-commit deltas in this dataset
+real, and this report cannot say which dominates for `61bdd9c2`
+specifically (the one commit confirmed graph-relevant above — `141f36ef`
+is a confirmed false positive with no compiled artifact change either
+way, so this caveat doesn't apply to it) without a genuinely
+cold-per-checkpoint rerun. Practically, this makes individual per-commit
+deltas in this dataset
 *less* interpretable than the "undercount only" framing suggested, not
 more — reinforcing the undetermined verdict, not weakening it. Not
 corrected by re-running (out of this session's time box — a true
@@ -463,12 +466,24 @@ calibrated noise floor in hand:**
   calibration interspersed *throughout* a long chronological walk, not a
   clustered batch run separately from it — not done here. See Verdict.
 - **The total-window figure survives, even though attribution inside it
-  does not.** End-to-end, `d1ecb361` (55,882ms, one warm sample) →
+  does not — but at a lower confidence than first stated** (Codex P2 on
+  `c38feaa9`, applying the same walk-noise inflation caveat here that the
+  kill-line discussion above already applied to the pre/post-fix spans,
+  rather than treating this claim as exempt from it). End-to-end,
+  `d1ecb361` (55,882ms, one warm sample from the 32-checkpoint walk) →
   `ef61ae44` (42,837ms, 7-sample calibrated mean) is **−13,045ms
   (−23.4%)**, consistent with the single-sample estimate reported before
-  calibration (−13,245ms, −23.7%). At ≈13,000ms, this is roughly 8-9x the
-  calibrated single-measurement stdev (1,080-1,527ms), so the *total*
-  window effect is not plausibly noise. What calibration removes is
+  calibration (−13,245ms, −23.7%). Using the clustered calibration's
+  σ=1,080ms at face value, that's ≈8-9σ (dominated by the single, n=1
+  `d1ecb361` sample's stdev, since the endpoint's 7-sample mean has a much
+  smaller SE of ≈408ms) — but `d1ecb361` was measured *within* the same
+  noisy 32-checkpoint walk the kill-line discussion flags as possibly
+  2-3x noisier than the clustered calibration. Applying that same 2-3x
+  range to `d1ecb361`'s stdev gives a combined uncertainty of
+  ≈2,200-3,270ms, so the honest range is **≈4.0σ-5.9σ**, not 8-9σ. Still
+  comfortably real at either end of that range — just not as
+  overwhelmingly so as the unadjusted number suggested. What calibration
+  removes is
   confidence in *why*: whether that total is the fix's raw −24,333ms
   partly clawed back by real per-commit compile-time growth (this report's
   second revision's claim), or whether the raw in-context fix effect
@@ -520,11 +535,17 @@ live report needs the map:
 
 **What this assay establishes, and at what confidence:**
 
-- **The total window effect is real and large.** `d1ecb361` → `ef61ae44`,
-  ≈−13,000ms (−23-24%), roughly 8-9x the single-measurement noise floor —
-  not in serious doubt at any point across all five revisions, and not
-  sensitive to the noise-inflation question above (it's a direct 2-point
-  comparison with a huge effect size, not a telescoped sum).
+- **The total window effect is real and large, though not fully immune to
+  the same noise-inflation question as the spans below** (Codex P2 on
+  `c38feaa9`, correcting an earlier claim that this comparison was exempt
+  from the walk-noise caveat; it isn't, since `d1ecb361` was measured
+  within that same noisy walk). `d1ecb361` →
+  `ef61ae44`, ≈−13,000ms (−23-24%), is ≈8-9σ against the clustered
+  calibration's tight noise estimate but ≈4.0-5.9σ against the same
+  2-3x-inflated estimate applied to the spans below (see Assay) — still
+  solidly real at either end, unlike the post-fix span, but with real
+  (if modest, given the size of the effect) uncertainty in exactly how
+  solid.
 - **Whether the pre-fix and post-fix spans individually show real,
   not-noise compile-time growth is genuinely unresolved, not just
   unattributed.** Under the calibration's own tight noise estimate
