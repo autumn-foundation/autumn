@@ -4,10 +4,10 @@
 **Target:** `ledger_as_of_at`/`ledger_diff_at`, the generated ledgered-repository
 read path (`autumn-macros/src/repository.rs`)
 **Outcome:** optimization for the realistic query pattern (near-head as-of:
-buffers −82% to −94%, flat regardless of chain depth), with a disclosed
-regression for the pathological worst case (a query about a record's very
-first revision, on a deep, physically-scattered chain: +619% buffers on this
-fixture)
+buffers −82% to −94%, flat regardless of chain depth; `ledger_diff` stays at
+1 statement, buffers −88%), with a disclosed regression for the pathological
+worst case (a query about a record's very first revision, on a deep,
+physically-scattered chain: +618% buffers on this fixture)
 
 ---
 
@@ -117,12 +117,12 @@ revision:
 
 ```
 Limit  (cost=0.28..173.56 rows=1 width=347) (actual rows=1 loops=1)
-  Buffers: shared hit=949
+  Buffers: shared hit=948
   ->  Index Scan Backward using idx_autumn_ledger_revisions_record
         (actual rows=1 loops=1)
         Filter: (recorded_at <= '...')
         Rows Removed by Filter: 1199
-        Buffers: shared hit=949
+        Buffers: shared hit=948
 ```
 
 1,199 of the chain's 1,200 rows still get examined here — asking about the
@@ -151,14 +151,29 @@ much better distribution of cost than "always expensive."
 
 ## 🔧 Change
 
-`autumn-macros/src/repository.rs`: adds `__autumn_ledger_revision_at`, a new
-generated method that issues the bounded lookup (same guard blocks —
-cross-shard, cross-tenant, tenant setup — as every other ledger query; same
-row shape as `ledger_revisions`, mapped through a new single-row counterpart of
-its row mapper). `ledger_as_of_at` and `ledger_diff_at` now call it instead of
-`ledger_revisions` + `snapshot_as_of`. `ledger_revisions` and `ledger_verify`
-are untouched — they legitimately need the whole chain (verification walks
-every link) and still do.
+`autumn-macros/src/repository.rs` adds two new generated methods (same guard
+blocks — cross-shard, cross-tenant, tenant setup — as every other ledger
+query; same row shape as `ledger_revisions`, mapped through new row-mapper
+counterparts):
+
+- `__autumn_ledger_revision_at` issues the bounded lookup for a single
+  instant. `ledger_as_of_at` calls it instead of `ledger_revisions` +
+  `snapshot_as_of`.
+- `__autumn_ledger_diff_revisions_at` resolves **both** endpoints of a diff
+  window from **one** `UNION ALL` statement on **one** connection, rather
+  than two independent bounded lookups. Two separate calls would each take
+  their own snapshot: a write landing between them (or, on a routed read
+  replica, lag advancing between them) could resolve `from` and `to` against
+  two different database states — exactly the class of bug an initial version
+  of this change had, caught in review (see "Equivalence" below). Postgres
+  assigns one snapshot per top-level SQL command even under `READ COMMITTED`,
+  so wrapping both bounded arms in one `UNION ALL` restores the single-snapshot
+  guarantee the old full-chain `ledger_revisions` read had, while keeping each
+  arm's own `ORDER BY seq DESC LIMIT 1`. `ledger_diff_at` calls it instead of
+  `ledger_revisions` + `snapshot_as_of` twice.
+
+`ledger_revisions` and `ledger_verify` are untouched — they legitimately need
+the whole chain (verification walks every link) and still do.
 
 No migration: the index this query uses
 (`idx_autumn_ledger_revisions_record`) already existed for `ledger_revisions`
@@ -172,11 +187,11 @@ itself. No schema change, no lock beyond the `SELECT`'s own.
 
 | query | depth | before: calls | before: buffers | after: calls | after: buffers | Δ buffers |
 |---|---:|---:|---:|---:|---:|---:|
-| near-head as-of ("5 postings ago") | 300 | 1 | 22 | 1 | 4 | **−82%** |
+| near-head as-of ("5 postings ago") | 300 | 1 | 22 | 1 | 3 | **−86%** |
 | near-head as-of ("5 postings ago") | 700 | 1 | 129 | 1 | 8 | **−94%** |
 | near-head as-of ("5 postings ago") | 1,200 | 1 | 132 | 1 | 8 | **−94%** |
-| worst case: as-of at the FIRST revision | 1,200 | 1 | 132 | 1 | 947 | **+618%** (disclosed) |
-| `ledger_diff` across the last 10 postings | 1,200 | 1 | 129 | 2 | 16 | **−88%** (statements 1→2, disclosed) |
+| worst case: as-of at the FIRST revision | 1,200 | 1 | 132 | 1 | 948 | **+618%** (disclosed) |
+| `ledger_diff` across the last 10 postings | 1,200 | 1 | 129 | 1 | 16 | **−88%** |
 
 The before column is flat at ~130 buffers regardless of *which* instant is
 asked about — direct evidence the old query ignores `as_of` entirely. The
@@ -190,14 +205,10 @@ Temp blocks: zero on every statement, either side (no spill). WAL bytes: N/A
 
 ### Disclosed trade-off
 
-Two costs go up, both disclosed rather than hidden:
+One cost goes up, disclosed rather than hidden:
 
-- **`ledger_diff` issues 2 statements instead of 1** (one bounded lookup per
-  instant, `from` and `to`, instead of one full-chain read shared between
-  them). Buffers still fall sharply (129 → 16) because each lookup is now
-  short — this is a straightforward win, not a wash.
 - **The worst case — asking about a record's very first revision — reads more
-  buffers than before on this fixture (949 vs 132)**, not fewer. Mechanism:
+  buffers than before on this fixture (948 vs 132)**, not fewer. Mechanism:
   `ORDER BY seq DESC LIMIT 1` can only short-circuit when the qualifying row is
   near the *scan's* end (recent history for a transaction-time bound); asking
   about the oldest instant forces the backward index scan to walk almost the
@@ -210,7 +221,7 @@ Two costs go up, both disclosed rather than hidden:
   table exactly once no matter how many distinct records' rows live on it.
   Note the planner's own **cost** estimate for this query (`0.28..173.56`) is
   *lower* than the near-head query's is high in the old plan's terms and
-  nowhere close to predicting the 949-buffer actual — another instance of
+  nowhere close to predicting the 948-buffer actual — another instance of
   "cost estimates are not evidence."
 
   This is a real cost, not a rounding artifact, and it does not clear the
@@ -251,6 +262,18 @@ Two costs go up, both disclosed rather than hidden:
   greatest surviving `seq`) moved into the `WHERE`/`ORDER BY`/`LIMIT` clause —
   `ORDER BY seq DESC LIMIT 1` over a filtered set *is* `max_by_key(seq)` over
   that set, not an approximation of it.
+- **Single-snapshot consistency for `ledger_diff_at`.** An initial version of
+  this change gave `ledger_diff_at` two independent bounded-lookup calls (one
+  per endpoint), each on its own connection acquisition — caught in review
+  (Codex, autumn-foundation/autumn#2490) as a correctness regression: a write
+  landing between the two calls, or replica lag advancing between them, could
+  resolve `from` and `to` against two different database states, something the
+  old single `ledger_revisions` read could never do. Fixed by resolving both
+  endpoints from one `UNION ALL` statement on one connection instead
+  (`__autumn_ledger_diff_revisions_at`) — one top-level SQL command takes one
+  snapshot even under `READ COMMITTED`, so both arms see the same state. This
+  also dropped `ledger_diff`'s statement count back to 1 (matching the old
+  behavior exactly, not the 2 an earlier draft of this PR reported).
 
 ---
 

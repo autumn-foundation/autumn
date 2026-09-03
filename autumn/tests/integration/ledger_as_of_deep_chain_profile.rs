@@ -410,11 +410,13 @@ async fn ledger_as_of_deep_chain_profile() {
     );
 
     // A field-level diff between two RECENT instants -- the other generated
-    // caller of the same bounded lookup, now issuing it twice (from/to)
-    // instead of reading the whole chain once. Disclosed trade: statement
-    // count for this call goes from 1 to (up to) 2, buffers/rows read fall
-    // sharply -- print-only, not asserted, so the same harness also captures
-    // the pre-fix 1-statement shape cleanly.
+    // caller of the bounded lookup. Both endpoints are resolved from one
+    // UNION ALL statement on one connection (not two separate calls), so a
+    // write landing between them can't resolve `from`/`to` against two
+    // different database states -- the same snapshot guarantee the old
+    // single `ledger_revisions` read had. Statement count stays at 1;
+    // buffers/rows read fall sharply -- print-only, not asserted, so the
+    // same harness also captures the pre-fix shape cleanly.
     reset_stats(&mut conn);
     let recent_from = oracle_1200[oracle_1200.len() - 11];
     let recent_to = oracle_1200[oracle_1200.len() - 1];
