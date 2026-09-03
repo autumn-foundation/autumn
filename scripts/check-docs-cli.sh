@@ -711,11 +711,18 @@ def _nested_command(segment, j, tok):
         if not marked and prev == '=' and j > 1:
             marked = bool(_COMMAND_KEY_BARE.match(segment[j - 2]))
         return marked
-    # A SINGLE token is a command line only after `-c`, never after a key: the
-    # key branch already reads `command: autumn migrate` inline, and treating
-    # its bare `autumn` as a nested line too yielded a second, empty invocation
-    # that reported the page as needing a subcommand.
-    return after_c and _autumn_exe(tok)
+    # A SINGLE token is a command line after `-c`, or as the value of a TOML
+    # `key = "autumn"` — where `release_command = "autumn"` really is a broken
+    # release command, exiting with clap's missing-subcommand error.
+    #
+    # NOT after a colon key: the key branch already reads `command: autumn
+    # migrate` inline, and treating its bare `autumn` as a nested line too
+    # yielded a second, empty invocation that reported the page as broken.
+    if not _autumn_exe(tok):
+        return False
+    if after_c:
+        return True
+    return prev == '=' and j > 1 and bool(_COMMAND_KEY_BARE.match(segment[j - 2]))
 
 
 def _after_image(segment, k):
@@ -738,6 +745,24 @@ def _after_image(segment, k):
     k += 1                                      # the IMAGE itself
     if k < len(segment):
         yield ' '.join(segment[k:]), segment[k:]
+
+
+def _unbracket(tokens):
+    """Strip list punctuation from an exec-form command value.
+
+    A deployment recipe may write the command as a list —
+    `command: ["autumn", "migrate"]` — which shlex hands back as `[autumn,` and
+    `migrate]` once the quotes are stripped. The brackets and separating commas
+    are the list's syntax, not the command's, and leaving them attached meant
+    the executable never matched. A value written the plain way passes through
+    unchanged.
+    """
+    out = []
+    for tok in tokens:
+        cleaned = tok.strip('[],')
+        if cleaned:
+            out.append(cleaned)
+    return out
 
 
 def _unwrap(tokens):
@@ -874,10 +899,18 @@ def _from_tokens(tokens):
         if i < len(segment) and head is not None:
             yield ' '.join(segment[i + 1:]), segment[i + 1:]
         for j, tok in enumerate(segment):
-            if _COMMAND_KEY.match(tok) and j + 1 < len(segment) \
-                    and _autumn_exe(segment[j + 1]):
-                yield ' '.join(segment[j + 2:]), segment[j + 2:]
-            elif tok == '--' and j + 1 < len(segment) and _autumn_exe(segment[j + 1]):
+            if _COMMAND_KEY.match(tok) and j + 1 < len(segment):
+                rest = _unbracket(segment[j + 1:])
+                if rest and _autumn_exe(rest[0]):
+                    yield ' '.join(rest[1:]), rest[1:]
+            elif tok == '--' and j + 1 < len(segment) \
+                    and _autumn_exe(segment[j + 1]) and head is None:
+                # Only a WRAPPER's separator introduces a nested command. When
+                # the segment is itself an autumn command the `--` is its own:
+                # `autumn test -- autumn` forwards to the harness
+                # (`Test::cargo_args` is `trailing_var_arg`), and reading the
+                # forwarded word as a second executable reported that valid
+                # line as needing a subcommand.
                 yield ' '.join(segment[j + 2:]), segment[j + 2:]
             elif tok == '--entrypoint' and j + 2 < len(segment) \
                     and _autumn_exe(segment[j + 1]):
@@ -1483,6 +1516,31 @@ def self_test():
            'a skill instruction `Run:` must be read, case-insensitively')
     expect(list(invocations('```yaml\n  image: autumn-cli:1.2\n```')) == [],
            'a key outside the bounded set is not a command position')
+    # --- `--` belongs to the autumn command when the segment IS one. Reading
+    # the forwarded word as a second executable reported a VALID line as broken.
+    fwd = '```bash\nautumn test -- autumn\n```'
+    expect([d for _, d, _, _ in invocations(fwd)] == ['test -- autumn'],
+           f'`autumn test -- autumn` forwards to the harness: {list(invocations(fwd))}')
+    wrapped_sep = '```bash\nkubectl exec x -- autumn migrate run\n```'
+    expect([d for _, d, _, _ in invocations(wrapped_sep)] == ['migrate run'],
+           "a WRAPPER's `--` still introduces a nested command")
+
+    # --- exec-form list values, which shlex hands back with the brackets and
+    # commas still attached to the words.
+    execform = '```yaml\ncommand: ["autumn", "migrate", "run"]\n```'
+    expect([d for _, d, _, _ in invocations(execform)] == ['migrate run'],
+           f'an exec-form command list must be read: {list(invocations(execform))}')
+    expect(_unbracket(['[autumn,', 'migrate]']) == ['autumn', 'migrate'],
+           'list punctuation is the list syntax, not the command')
+    expect(_unbracket(['autumn', 'migrate']) == ['autumn', 'migrate'],
+           'a plainly written value passes through unchanged')
+
+    # --- a single-token TOML value is a command line: `release_command =
+    # "autumn"` really is a broken release command.
+    lone = '```toml\nrelease_command = "autumn"\n```'
+    expect([a for _, _, a, _ in invocations(lone)] == [[]],
+           f'a lone executable after `key =` must reach the root check: {list(invocations(lone))}')
+
     # A qualifier may precede the key word — Fly's `release_command` runs on
     # every deploy. Anchoring to the whole token missed both live uses of it,
     # and a synthetic bare `command = "…"` test passed while the real lines
@@ -1656,7 +1714,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f"self-test: {13 + 47 + 68 + 4 - len(failures)} passed, {len(failures)} failed")
+    print(f"self-test: {13 + 47 + 74 + 4 - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
