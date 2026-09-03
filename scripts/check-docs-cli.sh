@@ -1447,6 +1447,91 @@ def _mask_quoted(text, quotes="'\""):
     return ''.join(out)
 
 
+def _mask_arithmetic(text):
+    """`text` with every `$(( … ))` blanked, length preserved.
+
+    A `<<` inside an arithmetic expression is a LEFT SHIFT, not a heredoc
+    operator: `echo $((1 << 2))` opens nothing at all. Reading it as an opener
+    made the scanner wait for a `2` terminator and eat the rest of the fence,
+    so the command below it was never judged.
+    """
+    out, i, n = list(text), 0, len(text)
+    while True:
+        start = text.find('$((', i)
+        if start < 0:
+            return ''.join(out)
+        depth, j = 0, start + 1
+        while j < n:
+            if text[j] == '(':
+                depth += 1
+            elif text[j] == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        end = min(j, n - 1)
+        for k in range(start, end + 1):
+            out[k] = 'x'
+        i = end + 1
+
+
+def _heredoc_openers(text):
+    """Yield the heredoc (delimiter, allows_tabs) pairs a line opens.
+
+    Quoted operators are inert and so are arithmetic ones, an ESCAPED `<<` is
+    a literal `<`, and the delimiter is a shell word — each of those was a
+    separate round of this review, so they are answered in one place now.
+    """
+    masked = _mask_arithmetic(_mask_quoted(text))
+    for opener in _HEREDOC.finditer(text):
+        if masked[opener.start():opener.start() + 2] != '<<':
+            continue
+        if _escaped(text, opener.start()):
+            continue
+        delim = _heredoc_delim(text, opener.end())
+        if delim is None:
+            continue
+        yield delim, text[opener.start():opener.start() + 3] == '<<-'
+
+
+def _script_lines(lines):
+    """Yield the (lineno, text) of `lines` that are COMMANDS, not data.
+
+    A literal `run: |` block is a shell script, so the same two rules a fence
+    obeys apply inside it: a heredoc body is data the shell writes, and a
+    quote spans physical lines. Emitting each line on its own reported
+    `cat <<EOF` / `autumn db` / `EOF` as if the body were runnable, which
+    fails a correct workflow.
+
+    An unterminated quote hands its lines back one at a time rather than
+    swallowing them, exactly as the fence path does.
+    """
+    heredocs, quoted, quoted_at, quote = [], [], None, None
+    for lineno, text in lines:
+        if heredocs:
+            delim, tabs = heredocs[0]
+            candidate = text.lstrip('\t') if tabs else text
+            if candidate.rstrip('\r') == delim:
+                heredocs.pop(0)
+            continue
+        if quote:
+            quoted.append(text)
+            quote = _open_quote(text, quote)
+            if quote:
+                continue
+            yield quoted_at, '\n'.join(quoted)
+            quoted, quoted_at = [], None
+            continue
+        opening = _open_quote(text)
+        if opening:
+            quote, quoted, quoted_at = opening, [text], lineno
+            continue
+        yield lineno, text
+        heredocs.extend(_heredoc_openers(_strip_comment(text)))
+    for offset, held in enumerate(quoted):
+        yield (quoted_at or 0) + offset, held
+
+
 def _mask_single_quoted(text):
     """The substitution reading: only single quotes stop `$( … )`.
 
@@ -1745,7 +1830,14 @@ def invocations(text):
                 held_at = lineno
             return None, None
         if held:
-            line = ' '.join(held) + ' ' + line
+            # Bash removes the backslash-newline pair and joins what is left
+            # with NOTHING between: `autumn mig\` + `rate` runs `autumn
+            # migrate`. Inserting a space made that `autumn mig rate` and
+            # failed a correct page. Whitespace written before the backslash
+            # is already in the held fragment, and whitespace at the start of
+            # the next line is still there to separate the words — verified
+            # against the installed bash in both directions.
+            line = ''.join(held) + line
             lineno = held_at
             held, held_at = [], None
         if lang in _SHELL_LANGS:
@@ -1839,6 +1931,7 @@ def invocations(text):
         nonlocal folded_literal, folded_cont
         nonlocal pending, pending_kind, pending_at, pending_indent
         paras, at, slot = folded, folded_at, folded_slot
+        folded_literal_here = folded_literal
         folded, folded_at, folded_base, folded_slot = None, None, None, None
         folded_literal, folded_cont = False, False
         if not paras:
@@ -1868,11 +1961,16 @@ def invocations(text):
         # the key sent a reader to the `run: |` three lines above the command
         # that actually fails, and `file:line:` is the whole of what the gate
         # hands them.
-        for para_at, para in paras:
-            if not para:
-                continue
-            for display, argv in commands(' '.join(para)):
-                yield para_at or at, display, argv, FENCED_COMMAND
+        # A LITERAL scalar is a shell script, so its lines carry heredoc and
+        # quote state across one another. A folded one is a single logical
+        # value per paragraph and has no such state to keep.
+        logical = [(para_at or at, ' '.join(para))
+                   for para_at, para in paras if para]
+        if folded_literal_here:
+            logical = list(_script_lines(logical))
+        for para_at, text in logical:
+            for display, argv in commands(text):
+                yield para_at, display, argv, FENCED_COMMAND
 
     def close_pending():
         """Finish the list being collected: fill a slot, or run script lines."""
@@ -2018,7 +2116,13 @@ def invocations(text):
                     if cont:
                         text = body[:-1]
                     if folded_cont:
-                        folded[-1][1].append(text)
+                        # …joined with nothing, as in a fence. (A literal
+                        # scalar's lines are stripped of the block indent, so
+                        # a continuation whose next line is indented FURTHER
+                        # loses that separation — the direction is a missed
+                        # reading, never a false report, and this corpus
+                        # writes none.)
+                        folded[-1][1][-1] += text
                     else:
                         folded.append([lineno, [text]])
                     folded_cont = cont
@@ -2142,29 +2246,11 @@ def invocations(text):
         # whether the operator itself was written inside single quotes. A
         # `<<EOF` mentioned in a comment or quoted as an argument opens
         # nothing, and treating it as an opener silenced every line after it.
-        stripped = _strip_comment(logical)
-        masked_line = _mask_quoted(stripped)
-        # The FIRST UNMASKED match, not the first textual one: a quoted
-        # `"<<NO"` earlier on the line used to be the only candidate
-        # considered, and rejecting it meant a real `<<EOF` after it was never
-        # seen, so its body was scanned as commands.
-        for opener in _HEREDOC.finditer(stripped):
-            if masked_line[opener.start():opener.start() + 2] != '<<':
-                continue
-            # …and not an ESCAPED one. `echo \<<EOF` is a literal `<` followed
-            # by an ordinary input redirection, so nothing below it is heredoc
-            # data — but the operator was queued anyway and the command on the
-            # next line was consumed as the body.
-            if _escaped(stripped, opener.start()):
-                continue
-            delim = _heredoc_delim(stripped, opener.end())
-            if delim is None:
-                continue
-            # `<<-` allows the terminator to be indented with TABS; a plain
-            # `<<` requires it alone on the line. Accepting any indentation
-            # closed a heredoc early and reported its data as a command.
-            heredocs.append((delim,
-                             stripped[opener.start():opener.start() + 3] == '<<-'))
+        # `<<-` allows the terminator to be indented with TABS; a plain `<<`
+        # requires it alone on the line — that pair is carried with each
+        # opener, and every rule about which operators are real lives in
+        # `_heredoc_openers`.
+        heredocs.extend(_heredoc_openers(_strip_comment(logical)))
         # Backticks inside a fence are not markdown spans. In a shell block
         # they are legacy command substitution — `` OUT=`autumn migrate` `` is
         # a command the reader runs — and elsewhere they are a line quoting a
@@ -4131,6 +4217,60 @@ def self_test():
     real = '```bash\ncat <<EOF\ndata\n```\nautumn nope'
     expect(list(invocations(real)) == [],
            f'a real closer ends the fence and its heredoc: {list(invocations(real))}')
+
+    # A literal `run: |` block is a shell SCRIPT, so its lines carry heredoc
+    # and quote state across one another. Emitting each on its own reported a
+    # heredoc body as runnable and failed a correct workflow.
+    hd_body = '```yaml\nrun: |\n  cat <<EOF\n  autumn db\n  EOF\n```'
+    expect(list(invocations(hd_body)) == [],
+           f'a heredoc body inside a literal scalar is data: '
+           f'{list(invocations(hd_body))}')
+    hd_after = ('```yaml\nrun: |\n  cat <<EOF\n  autumn db\n  EOF\n'
+                '  autumn nope\n```')
+    expect([(ln, d) for ln, d, _, _ in invocations(hd_after)] == [(6, 'nope')],
+           f'…and the command after it is still read: {list(invocations(hd_after))}')
+    q_body = "```yaml\nrun: |\n  printf '%s' '\n  autumn db\n  '\n```"
+    expect(list(invocations(q_body)) == [],
+           f'a multi-line quote inside one is data too: {list(invocations(q_body))}')
+    q_frag = "```yaml\nrun: |\n  printf '%s' '\n  autumn nope\n```"
+    expect([d for _, d, _, _ in invocations(q_frag)] == ['nope'],
+           f'an unterminated quote hands its lines back: {list(invocations(q_frag))}')
+    # A FOLDED scalar is one logical value per paragraph and keeps no such
+    # state, so it must not be routed through the script reader.
+    fold_ok = '```yaml\nrun: >\n  autumn migrate\n  status\n```'
+    expect([d for _, d, _, _ in invocations(fold_ok)] == ['migrate status'],
+           f'a folded scalar is unaffected: {list(invocations(fold_ok))}')
+
+    # Bash REMOVES the backslash-newline pair rather than replacing it with a
+    # space, so a continuation may split a word: `autumn mig\` + `rate` runs
+    # `autumn migrate`. Inserting a space made that `autumn mig rate` and
+    # failed a correct page. Whitespace at the start of the next line is still
+    # there to separate the words, which is the second case below — both
+    # verified against the installed bash.
+    for doc, want in (
+            ('```bash\nautumn mig\\\nrate\n```', 'migrate'),
+            ('```bash\nautumn mig\\\n    rate\n```', 'mig rate'),
+            ('```bash\nautumn migrate \\\n  --shard x\n```', 'migrate --shard x'),
+            ('```yaml\nrun: |\n  autumn mig\\\n  rate\n```', 'migrate')):
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == [want], f'a continuation joins with nothing: {got} != {[want]}')
+    # …and a word split across the break is still resolved as one word, so
+    # drift written that way is still named.
+    split = '```bash\nautumn no\\\npe\n```'
+    expect([d for _, d, _, _ in invocations(split)] == ['nope'],
+           f'drift across a word break is named: {list(invocations(split))}')
+
+    # A `<<` inside `$(( … ))` is a LEFT SHIFT, not a heredoc operator.
+    # Reading it as one made the scanner wait for a `2` terminator and eat the
+    # rest of the fence.
+    for shift in ('echo $((1 << 2))', 'echo $(( (1 << 2) + 3 ))'):
+        doc = f'```bash\n{shift}\nautumn nope\n```'
+        got = [d for _, d, _, _ in invocations(doc)]
+        expect(got == ['nope'], f'{shift} opens no heredoc: {got}')
+    # …and a real heredoc on the SAME line as a shift still opens.
+    both = '```bash\necho $((1 << 2)); cat <<EOF\nautumn db\nEOF\nautumn nope\n```'
+    expect([(ln, d) for ln, d, _, _ in invocations(both)] == [(5, 'nope')],
+           f'a shift beside a real heredoc: {list(invocations(both))}')
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
