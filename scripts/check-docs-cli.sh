@@ -560,14 +560,27 @@ def tokenize(text):
 
 
 def _segments(tokens):
-    """Split a token list on shell operators into one list per command."""
-    current, out = [], []
+    """Split a token list on shell operators into one list per command.
+
+    An operator inside a COMMAND SUBSTITUTION does not separate commands:
+    `KEY=$(cat secret | tr -d '\n') autumn migrate` is one command whose
+    assignment happens to contain a pipe, and splitting there threw away the
+    `autumn migrate` that followed. Depth is tracked only for `$(`, not for a
+    plain subshell — `(autumn migrate && autumn seed)` really does hold two
+    commands, and both should still be judged.
+    """
+    current, out, depth, prev = [], [], 0, ''
     for tok in tokens:
-        if tok in _OPERATORS:
+        if tok == '(' and prev.endswith('$'):
+            depth += 1
+        elif tok == ')' and depth:
+            depth -= 1
+        if not depth and tok in _OPERATORS:
             out.append(current)
             current = []
         else:
             current.append(tok)
+        prev = tok
     out.append(current)
     return out
 
@@ -616,6 +629,28 @@ def _exe_path(value):
     A value has to look like a path before it can look like a program.
     """
     return '/' in value and _autumn_exe(value)
+
+
+# A flag whose value is a whole command line for another shell.
+_SHELL_C = re.compile(r'^(-c|-C|--command)$')
+
+
+def _nested_command(segment, j, tok):
+    """True when this token is itself a command line rather than an argument.
+
+    Two shapes: a quoted token carrying arguments (`-C "autumn migrate run"`,
+    which tokenizes as one token containing spaces), and a token standing alone
+    as a shell's `-c` value (`sh -c "autumn"`), which has no space to give it
+    away and would otherwise slip past the bare-root check.
+
+    The `-c` test is what keeps the second shape from over-matching: without it,
+    a bare `autumn` used as an option VALUE — `docker run --entrypoint autumn
+    img sbom` — would read as an empty command line and be reported as needing a
+    subcommand, on a page that is correct.
+    """
+    if ' ' in tok:
+        return _autumn_exe(tok.split(' ', 1)[0])
+    return _autumn_exe(tok) and j > 0 and bool(_SHELL_C.match(segment[j - 1]))
 
 
 def _after_image(segment, k):
@@ -711,13 +746,15 @@ def commands(text):
                 yield from _after_image(segment, j + 2)
             elif tok == '--entrypoint=autumn':
                 yield from _after_image(segment, j + 1)
-            elif tok.startswith('autumn ') and (inner := tokenize(tok)):
+            elif _nested_command(segment, j, tok) and (inner := tokenize(tok)):
                 # The inner command line goes through the SAME segment split as
                 # the outer one: `-C "autumn migrate && autumn nope"` is a chain
                 # too, and yielding it as one argv left everything after the
-                # first operator unjudged.
+                # first operator unjudged. Its head is matched with the same
+                # `_autumn_exe` as the outer line, so a path-qualified spelling
+                # (`sh -c "/usr/local/bin/autumn …"`) is not a second-class one.
                 for part in _segments(inner):
-                    if part and part[0] == 'autumn' and len(part) > 1:
+                    if part and _autumn_exe(part[0]):
                         yield ' '.join(part[1:]), part[1:]
 
 
@@ -1213,6 +1250,29 @@ def self_test():
     unit = '```ini\n[Service]\nExecStart=/usr/local/bin/autumn migrate run\n```'
     expect([d for _, d, _, _ in invocations(unit)] == ['migrate run'],
            f'a systemd ExecStart= recipe must be read: {list(invocations(unit))}')
+    # --- operators inside a command substitution do not separate commands,
+    # but a plain subshell's really do.
+    subst = ('```bash\nKEY=$(cat secret | tr -d \'x\') autumn migrate run\n```')
+    expect([d for _, d, _, _ in invocations(subst)] == ['migrate run'],
+           f'a pipe inside $( ) must not split the command: {list(invocations(subst))}')
+    sub_sh = '```bash\n(autumn migrate && autumn dev)\n```'
+    expect([d for _, d, _, _ in invocations(sub_sh)] == ['migrate', 'dev'],
+           f'a plain subshell still holds two commands: {list(invocations(sub_sh))}')
+
+    # --- a nested command line is matched with the SAME executable rule as the
+    # outer one, and a `-c` value with no arguments still reaches the bare-root
+    # check.
+    nested = '```bash\nsh -c "/usr/local/bin/autumn migrate run"\n```'
+    expect([d for _, d, _, _ in invocations(nested)] == ['migrate run'],
+           f'a path-qualified exe inside a wrapper must be read: {list(invocations(nested))}')
+    bare_c = '```bash\nsh -c "autumn"\n```'
+    expect([a for _, _, a, _ in invocations(bare_c)] == [[]],
+           f'a zero-argument `-c` value must still yield: {list(invocations(bare_c))}')
+    # …but a bare `autumn` used as an option VALUE is not a command line.
+    ep = '```bash\ndocker run --entrypoint autumn img:1 migrate run\n```'
+    expect([d for _, d, _, _ in invocations(ep)] == ['migrate run'],
+           f'--entrypoint autumn is a value, read via the image rule: {list(invocations(ep))}')
+
     # A scalar key that means "a command follows".
     compose = '```yaml\nservices:\n  migrate:\n    command: autumn migrate run\n```'
     expect([d for _, d, _, _ in invocations(compose)] == ['migrate run'],
@@ -1385,7 +1445,7 @@ def self_test():
 
     for f in failures:
         print('SELF-TEST FAILURE: ' + f, file=sys.stderr)
-    print(f"self-test: {13 + 47 + 44 + 4 - len(failures)} passed, {len(failures)} failed")
+    print(f"self-test: {13 + 47 + 50 + 4 - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 
