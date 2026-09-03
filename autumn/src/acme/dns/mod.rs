@@ -604,6 +604,8 @@ mod tests {
     #[test]
     fn a_multiline_secret_is_redacted_despite_control_folding() {
         const KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIBVgIBADANBgkqhkiG9w0BAQ\nSECRETLINE9f3a\n-----END PRIVATE KEY-----";
+        // A TSIG key file's shape: tab-separated rather than newline-separated.
+        const TSIG: &str = "hmac-sha256\tautumn-key\tc3VwZXJzZWNyZXR2YWx1ZQ==";
 
         // The hook traced the key verbatim, newlines and all.
         let traced = format!("+ nsupdate -k {KEY} failed");
@@ -628,7 +630,6 @@ mod tests {
 
         // A tab-separated credential (a TSIG key file's shape) is covered by
         // the same folding.
-        const TSIG: &str = "hmac-sha256\tautumn-key\tc3VwZXJzZWNyZXR2YWx1ZQ==";
         let safe = sanitize_upstream(&format!("key rejected: {TSIG}"), &[TSIG]);
         assert!(
             !safe.contains("c3VwZXJzZWNyZXR2YWx1ZQ=="),
