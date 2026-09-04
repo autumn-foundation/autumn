@@ -2941,6 +2941,33 @@ mod tests {
         );
     }
 
+    /// A missing baseline is a bootstrap exactly once — on the pull request
+    /// that adds the gate. Once the workflow is on the base branch, "no
+    /// baseline committed" is not a repository adopting the gate, it is a
+    /// repository whose gate passes everything while the required check reads
+    /// green. `autumn new` does not generate the manifest, so this is the
+    /// default state of a project that scaffolds the workflow and stops.
+    #[test]
+    fn a_missing_baseline_bootstraps_only_while_the_gate_is_new() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        let step = workflow
+            .split("Check the committed manifest is up to date")
+            .last()
+            .expect("the staleness step");
+        let bootstrap = step
+            .split("no posture baseline")
+            .next()
+            .expect("before the bootstrap notice");
+        assert!(
+            bootstrap.contains("posture-gate.yml") && bootstrap.contains("exit 1"),
+            "a missing baseline must be fatal once the gate is on the base branch: {bootstrap}"
+        );
+    }
+
     /// The boundary between harvested comment bodies must not be forgeable. A
     /// reviewer pasting the separator inside a fenced sample would otherwise
     /// reset the parser's state mid-body and make a following marker live —

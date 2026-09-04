@@ -226,6 +226,17 @@ jobs:
               echo "::error file=$POSTURE_MANIFEST::this pull request deletes the committed posture baseline. Restore it, or land its removal as an explicit, separately reviewed change."
               exit 1
             fi
+            # Bootstrapping is the pull request that ADDS the gate, and only
+            # that one. Once the workflow is on the base branch, "no baseline
+            # committed" is not a repository adopting the gate — it is a
+            # repository whose gate reads green while diffing against nothing,
+            # which is worse than having no gate at all. `autumn new` does not
+            # generate the manifest, so this is exactly the state a project
+            # lands in by scaffolding the workflow and going no further.
+            if git cat-file -e "origin/${BASE_REF}:.github/workflows/posture-gate.yml" 2>/dev/null; then
+              echo "::error file=$POSTURE_MANIFEST::the posture gate is already on ${BASE_REF}, but no baseline manifest is committed — so every pull request bootstraps and nothing is being gated. Run \`autumn routes audit --manifest $POSTURE_MANIFEST\` and commit the result."
+              exit 1
+            fi
             echo "::notice::no posture baseline is committed yet — commit $POSTURE_MANIFEST so the next pull request can be diffed against it"
             exit 0
           fi

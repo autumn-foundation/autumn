@@ -215,6 +215,28 @@ fn effective_posture(
     ]))
 }
 
+/// The postures of every route that inherits a URL set, as one ordered string.
+///
+/// Route identity is kept alongside each posture for the same reason
+/// `checks_on` keeps it: a losing route carrying the same guards would
+/// otherwise mask a change in the one that actually serves the URL.
+fn postures_of(
+    keys: &[RouteKey],
+    routes: &BTreeMap<RouteKey, RouteEntry>,
+    csrf: &BTreeMap<RouteKey, (bool, bool, String)>,
+    bindings: &BTreeMap<AuthzKey, String>,
+) -> String {
+    let mut each: Vec<String> = keys
+        .iter()
+        .filter_map(|key| {
+            effective_posture(key, routes, csrf, bindings)
+                .map(|posture| escape_list(&[key.1.clone(), key.0.clone(), posture]))
+        })
+        .collect();
+    each.sort();
+    escape_list(&each)
+}
+
 /// The `#[authorize]` checks one route performs, sorted and deduplicated.
 fn checks_at(key: &RouteKey, bindings: &BTreeMap<AuthzKey, String>) -> Vec<String> {
     let mut checks: Vec<String> = bindings
@@ -1251,7 +1273,7 @@ fn diff_authorization_policies(
 
 /// Emit the routes that lost CSRF, collapsed into one finding or one each.
 fn report_csrf_loss(
-    lost: BTreeMap<RouteKey, (String, bool, RouteKey)>,
+    lost: BTreeMap<RouteKey, (String, bool, Vec<RouteKey>)>,
     head_routes: &BTreeMap<RouteKey, RouteEntry>,
     head_csrf: &BTreeMap<RouteKey, (bool, bool, String)>,
     head_bindings: &BTreeMap<AuthzKey, String>,
@@ -1273,12 +1295,11 @@ fn report_csrf_loss(
         // swapped for a weaker one would be invisible behind `policy: true`.
         let guarded_keys: Vec<String> = lost
             .iter()
-            .map(|((path, method), (_, _, inheritor))| {
+            .map(|((path, method), (_, _, inheritors))| {
                 escape_list(&[
                     method.clone(),
                     path.clone(),
-                    effective_posture(inheritor, head_routes, head_csrf, head_bindings)
-                        .unwrap_or_default(),
+                    postures_of(inheritors, head_routes, head_csrf, head_bindings),
                 ])
             })
             .collect();
@@ -1302,10 +1323,8 @@ fn report_csrf_loss(
             ),
         });
     } else {
-        for (key, (path, exempt, inheritor)) in lost {
-            let guard = head_routes
-                .get(&inheritor)
-                .map_or_else(String::new, posture_fingerprint);
+        for (key, (path, exempt, inheritors)) in lost {
+            let guard = postures_of(&inheritors, head_routes, head_csrf, head_bindings);
             let (_, method) = key;
             out.push(Finding {
                 kind: "csrf_enforcement_removed",
@@ -1574,12 +1593,15 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
     // why, and the key of the route that answers those URLs now — not always
     // the one that left: a `WS` row gives way to a `GET` at the same path, and
     // the guard posture has to come from the route that inherits it.
-    let mut lost: BTreeMap<RouteKey, (String, bool, RouteKey)> = BTreeMap::new();
+    let mut lost: BTreeMap<RouteKey, (String, bool, Vec<RouteKey>)> = BTreeMap::new();
     let mut gained: Vec<(RouteKey, String)> = Vec::new();
     for (key, (enforced_now, exempt_now, written_as)) in &after {
         match before.get(key).map(|(enforced, ..)| *enforced) {
             Some(true) if !enforced_now => {
-                lost.insert(key.clone(), (written_as.clone(), *exempt_now, key.clone()));
+                lost.insert(
+                    key.clone(),
+                    (written_as.clone(), *exempt_now, vec![key.clone()]),
+                );
             }
             Some(false) if *enforced_now => gained.push((key.clone(), written_as.clone())),
             _ => {}
@@ -1598,12 +1620,18 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
         // handler, so replacing an enforced `WS /x` with a `GET /x` that does
         // not enforce is a lost check, however the manifest spells the method.
         let (path, method) = key;
-        let inheritor = takers((path, method), &routes_before, &routes_after)
+        // Every non-enforcing taker, not the first. A removed route's URLs
+        // split: deleting `/records/me/{id}` sends `/records/me/private` to
+        // `/records/{user}/private` and the rest to `/records/{user}/{id}`, and
+        // `undominated` returns both because neither covers the other's share.
+        // Naming one let the other be weakened after the acknowledgment.
+        let inheritors: Vec<RouteKey> = takers((path, method), &routes_before, &routes_after)
             .into_iter()
-            .find(|taker| after.get(taker).is_none_or(|(enforced, ..)| !enforced));
-        if let Some(inheritor) = inheritor {
+            .filter(|taker| after.get(taker).is_none_or(|(enforced, ..)| !enforced))
+            .collect();
+        if !inheritors.is_empty() {
             lost.entry(key.clone())
-                .or_insert_with(|| (written_as.clone(), false, inheritor));
+                .or_insert_with(|| (written_as.clone(), false, inheritors));
         }
     }
 
@@ -4196,6 +4224,85 @@ mod tests {
             ),
             alongside(""),
             "dropping the compensating header has to re-ask"
+        );
+    }
+    /// A removed route's URLs do not always go to one place: deleting
+    /// `/records/me/{id}` sends `/records/me/private` to a guarded
+    /// `/records/{user}/private` and everything else to `/records/{user}/{id}`,
+    /// and `undominated` returns both because neither covers the other's share.
+    /// Recording the first meant the collapsed finding — the one identity the
+    /// whole-posture pass cannot reach, since its path is `*` — spoke for only
+    /// one of them.
+    #[test]
+    fn a_collapsed_csrf_loss_fingerprints_every_inheritor() {
+        let base = manifest(
+            &format!(
+                "{},{},{},{}",
+                route("/records/me/{id}", "POST", "gated", &["admin"], &[], false),
+                route(
+                    "/records/{user}/private",
+                    "POST",
+                    "gated",
+                    &["admin"],
+                    &[],
+                    false
+                ),
+                route(
+                    "/records/{user}/{id}",
+                    "POST",
+                    "gated",
+                    &["admin"],
+                    &[],
+                    false
+                ),
+                route("/other", "POST", "gated", &["admin"], &[], false),
+            ),
+            r#"{"path":"/records/me/{id}","method":"POST","csrf_enforced":true,"exempt":false},
+               {"path":"/other","method":"POST","csrf_enforced":true,"exempt":false}"#,
+            "",
+            "",
+        );
+        // The *second* taker in key order, so the `.find` that recorded one
+        // inheritor never selected it.
+        let unselected_requiring = |scopes: &[&str]| {
+            let finding = diff(
+                &base,
+                &manifest(
+                    &format!(
+                        "{},{},{}",
+                        route(
+                            "/records/{user}/private",
+                            "POST",
+                            "gated",
+                            &["admin"],
+                            scopes,
+                            false
+                        ),
+                        route(
+                            "/records/{user}/{id}",
+                            "POST",
+                            "gated",
+                            &["admin"],
+                            &[],
+                            false
+                        ),
+                        route("/other", "POST", "gated", &["admin"], &[], false),
+                    ),
+                    r#"{"path":"/other","method":"POST","csrf_enforced":false,"exempt":false}"#,
+                    "",
+                    "",
+                ),
+            )
+            .into_iter()
+            .find(|f| f.kind == "csrf_disabled")
+            .expect("csrf off everywhere collapses");
+            finding.canonical()
+        };
+
+        assert_ne!(
+            unselected_requiring(&["mfa"]),
+            unselected_requiring(&[]),
+            "the inheritor that was not selected still has to move the digest"
         );
     }
 }
