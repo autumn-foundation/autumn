@@ -619,44 +619,53 @@ def _strip_generated_comments(body, cls):
     String contents are kept on purpose — `generate/admin.rs` writes a real
     `std::env::var(\\"AUTUMN_TEST_ADMIN_SESSION\\")` into the code it emits, and
     nine names in the truth set are carried only by accessors like it. But that
-    generated code has comments of its own, and a commented accessor inside it
-    is no more a read than one outside.
+    generated code has comments of its own, and a commented accessor inside a
+    template is no more a read than one outside it — inline as well as opening
+    its line.
 
-    A comment must OPEN its generated line — nothing but whitespace or a
-    line-continuation backslash before it — which is what keeps a `//` that is
-    part of a URL, or a `/*` that is the whole point of a string like `"/*"`,
-    from eating the rest of the literal. The generated code's own string
-    literals are delimited by `\\"`, and a comment marker inside one of those is
-    data twice over.
+    Two things keep a `//` inside a URL from being read as a comment. The
+    generated code's OWN string literals are tracked — delimited by `\\"` in an
+    escaped template and by `"` in a raw one, so either toggles, after the outer
+    delimiter, which is skipped on entering the region or the whole literal
+    would look like one long inner string. And a comment must OPEN A WORD, the
+    same rule the `#` languages use: `https://x` is preceded by a colon, while
+    `const _: () = (); // …` is preceded by a space.
+
+    Blanking stops at the line end and at the region end, so a `/*` that never
+    closes — `let p = "/*";` is a string whose whole content is the marker —
+    costs that line and nothing after it.
 
     Length-preserving, so the caller's classification stays valid.
     """
-    out, i, n, instr, fresh = list(body), 0, len(body), False, True
+    out, i, n, instr = list(body), 0, len(body), False
     while i < n:
         if cls[i] != 's':
-            instr, fresh, i = False, True, i + 1
+            instr, i = False, i + 1
+            continue
+        if i == 0 or cls[i - 1] != 's':
+            # Entering a literal: step over its opening delimiter, `"` or `r#"`.
+            j = body.find('"', i)
+            i = (n if j < 0 else j + 1)
+            instr = False
             continue
         c = body[i]
         if c == '\\':
             if body[i + 1:i + 2] == '"':
                 instr = not instr
-            elif body[i + 1:i + 2] == 'n':
-                fresh = True
             i += 2
             continue
-        if c == '\n':
-            fresh, i = True, i + 1
+        if c == '"':
+            instr, i = not instr, i + 1
             continue
-        if not instr and fresh and c == '/' and body[i + 1:i + 2] in '/*':
+        opens = i == 0 or body[i - 1].isspace() or cls[i - 1] != 's'
+        if not instr and opens and c == '/' and body[i + 1:i + 2] in '/*':
             block = body[i + 1] == '*'
             while i < n and cls[i] == 's' and body[i] != '\n':
                 out[i] = ' '
                 i += 1
-                if block and body[i - 2:i] == '*/' and i - 2 > 0:
+                if block and body[i - 2:i] == '*/':
                     break
             continue
-        if not c.isspace():
-            fresh = False
         i += 1
     return ''.join(out)
 
@@ -908,9 +917,9 @@ BOUND = re.compile(
 # script would. That is a property of counting a publish as evidence, not an
 # oversight, and closing it would mean dropping the four correct
 # `AUTUMN_SYNC__DB_PATH` occurrences above.
-ACCESSOR = re.compile(r'\b(?:var|var_os|set_var|env_trimmed'
+ACCESSOR = re.compile(r'\b(var|var_os|set_var|env_trimmed'
                       r'|parse_env\w*|env_bool\w*|getenv)\s*\('
-                      r'|\benv\w*\.get\s*\(')
+                      r'|\b(env\w*)\.get\s*\(')
 
 # …plus the crates' own env helpers, READ OUT OF THE TREE rather than listed
 # here, the same way the runtime's `format!` templates are. A helper takes an
@@ -924,27 +933,42 @@ ACCESSOR = re.compile(r'\b(?:var|var_os|set_var|env_trimmed'
 # gate did not know the runtime reads. `AUTUMN_MEDIA__FFMPEG__BIN` was in the
 # truth set only by accident — through a `${…}` expansion in a test — so
 # masking test code without this would have reported a correct page.
-ENV_HELPER = re.compile(r'\bfn\s+(\w+)\s*\([^)]*\benv\s*:\s*&[^)]*'
-                        r'\bkey\s*:\s*&str', re.S)
+# The generic parameter list is optional and must be skipped: the house
+# helpers are written `fn parse_env<T: std::str::FromStr>(env: &dyn Env, key:
+# &str, …)`, and requiring `(` straight after the name derived none of them —
+# which silently moved their key to position 0 and cost 85 names.
+ENV_HELPER = re.compile(r'\bfn\s+(\w+)\s*(?:<(?:[^<>]|<[^<>]*>)*>)?\s*'
+                        r'\(([^)]*\benv\s*:\s*&[^)]*\bkey\s*:\s*&str)', re.S)
 
 
 def accessor(root):
-    """`ACCESSOR`, widened by the env helpers this tree declares."""
+    """The accessor pattern, and where each one takes its KEY.
+
+    The key is an argument POSITION, not "the first string literal in the
+    call": `set_var(key, "AUTUMN_LOG__LEVL")` passes its key in a variable and
+    its value as a literal, and reading the literal blessed a name that is
+    nobody's variable. The std accessors take the key first; the helpers take it
+    wherever their signature says, which is read out of the tree along with
+    their names — `env_trimmed(env, key)` second, `override_string(target, env,
+    key)` third.
+    """
     out = subprocess.run(['git', 'ls-files', '-z', '*.rs'], cwd=root,
                          capture_output=True, text=True).stdout
-    names = set()
+    index = {}
     for rel in out.split('\0'):
         if not rel:
             continue
         try:
-            names.update(ENV_HELPER.findall(
-                (root / rel).read_text(encoding='utf-8', errors='replace')))
+            body = (root / rel).read_text(encoding='utf-8', errors='replace')
         except OSError:
             continue
-    if not names:
-        return ACCESSOR
-    return re.compile(ACCESSOR.pattern + r'|\b(?:'
-                      + '|'.join(sorted(map(re.escape, names))) + r')\s*\(')
+        for name, params in ENV_HELPER.findall(body):
+            index[name] = len(_split_args(params)) - 1
+    if not index:
+        return ACCESSOR, {}
+    return (re.compile(ACCESSOR.pattern + r'|\b(' 
+                       + '|'.join(sorted(map(re.escape, index))) + r')\s*\('),
+            index)
 
 
 # …and never where the line asserts the name is absent.
@@ -986,6 +1010,40 @@ NEGATED = re.compile(r'assert(?:_ne)?!\s*\(\s*!|!\s*[\w.]*\bcontains\b|\bassert_
 # unparseable falls through as a free atom, which keeps the code.
 CFG_ATTR = re.compile(r'#\[cfg\(')
 TEST_PATH = re.compile(r'(^|/)(?:tests|benches)/|_test\.rs$')
+
+# A module can be test-only without any of its own contents saying so:
+# `cluster/mod.rs` declares `#[cfg(test)] mod tests;` and the whole of
+# `cluster/tests.rs` is then test code, though nothing in that FILE is marked.
+# Masking its `#[test]` functions left every helper beside them reading as
+# production. The declarations are read out of the tree rather than matched by
+# filename, so a module named anything is covered and a `tests.rs` that is NOT
+# declared test-only keeps being read.
+TEST_MOD = re.compile(r'#\[cfg\(([^\]]*)\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;')
+
+
+def test_module_files(root):
+    """Files a `#[cfg(…test…)] mod x;` declaration makes test-only."""
+    out = subprocess.run(['git', 'ls-files', '-z', '*.rs'], cwd=root,
+                         capture_output=True, text=True).stdout
+    files = set()
+    for rel in out.split('\0'):
+        if not rel:
+            continue
+        try:
+            body = (root / rel).read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            continue
+        if '#[cfg(' not in body:
+            continue
+        skel = _rust_skeleton(body)
+        parent = pathlib.PurePath(rel).parent
+        for pred, name in TEST_MOD.findall(skel):
+            if _cfg_truth(pred)[0]:
+                continue
+            files.add(str(parent / f'{name}.rs'))
+            files.add(str(parent / name / 'mod.rs'))
+    return files
+
 
 # A test function does not need a `cfg` to be test code: `#[test]` marks one on
 # its own, and 692 of them sit outside any `#[cfg(test)]` region here — the
@@ -1076,18 +1134,22 @@ def _split_args(text):
     return parts
 
 
-def key_argument(args):
-    """The argument that names the variable, or '' if none does.
+def key_argument(args, position=0):
+    """The argument at the accessor's KEY position, if it is a literal.
 
     Escaped quotes are normalised first: `generate/admin.rs` writes a real
     `std::env::var(\\"AUTUMN_TEST_ADMIN_SESSION\\")` into generated code, where
     the whole literal reaches this scan backslash-escaped.
+
+    A position rather than "the first literal anywhere in the call", because
+    `set_var(key, \"AUTUMN_LOG__LEVL\")` passes its key in a variable and its
+    value as a literal — and the value is nobody's variable name.
     """
-    for a in _split_args(args):
-        a = a.strip().replace('\\"', '"')
-        if STRING_ARG.match(a):
-            return a
-    return ''
+    parts = _split_args(args)
+    if position >= len(parts):
+        return ''
+    a = parts[position].strip().replace('\\"', '"')
+    return a if STRING_ARG.match(a) else ''
 
 
 def _balanced(s, i, limit=None):
@@ -1179,7 +1241,8 @@ def source_tokens(root):
     """
     out = subprocess.run(['git', 'ls-files', '-z'], cwd=root,
                          capture_output=True, text=True).stdout
-    acc = accessor(root)
+    acc, key_index = accessor(root)
+    test_files = test_module_files(root)
     tokens = set()
     for rel in out.split('\0'):
         # Markdown is prose, and `README.md.tmpl` is prose too — the same
@@ -1190,7 +1253,7 @@ def source_tokens(root):
             continue
         # A file under `tests/` or `benches/` is test code whatever it is
         # written in.
-        if TEST_PATH.search(rel):
+        if TEST_PATH.search(rel) or rel in test_files:
             continue
         try:
             body = (root / rel).read_text(encoding='utf-8', errors='replace')
@@ -1243,7 +1306,9 @@ def source_tokens(root):
                 continue
             args, _ = _balanced(body, m.end() - 1, ARG_SPAN_LIMIT)
             if args:
-                tokens.update(QUOTED.findall(key_argument(args)))
+                called = next((g for g in m.groups() if g), '')
+                tokens.update(QUOTED.findall(
+                    key_argument(args, key_index.get(called, 0))))
     return tokens
 
 
@@ -2183,14 +2248,28 @@ def self_test():
     case('a test path is not swept',
          (bool(TEST_PATH.search('autumn/tests/integration/a11y.rs')),
           bool(TEST_PATH.search('autumn/src/config.rs'))), (True, False))
+    # A module can be test-only without anything in its own FILE saying so:
+    # `cluster/mod.rs` declares `#[cfg(test)] mod tests;`, and helpers in
+    # `cluster/tests.rs` beside the `#[test]` functions were reading as
+    # production. Read out of the tree, so a module named anything is covered.
+    case('an externally declared test module is not swept',
+         'autumn/src/cluster/tests.rs' in test_module_files(ROOT), True)
+    case('the declaration is matched by cfg, not by name',
+         (TEST_MOD.findall('#[cfg(test)]\nmod tests;'),
+          TEST_MOD.findall('#[cfg(feature = "db")]\nmod tests;')),
+         ([('test', 'tests')], [('feature = "db"', 'tests')]))
+    case('…and only a test-only cfg excludes the file',
+         (_cfg_truth('test')[0], _cfg_truth('feature = "db"')[0]),
+         (False, True))
     # The crates' own env helpers are read out of the tree, not listed here: the
     # media plugin reads 17 real variables through `override_string`, and
     # `AUTUMN_MEDIA__FFMPEG__BIN` was in the truth set only through a `${…}`
     # expansion inside a test — so masking tests without this would have
     # reported a correct page.
     case('an env helper declaration is recognised',
-         ENV_HELPER.findall('fn override_string(target: &mut String, '
-                            'env: &HashMap<String, String>, key: &str) {'),
+         [n for n, _ in ENV_HELPER.findall(
+             'fn override_string(target: &mut String, '
+             'env: &HashMap<String, String>, key: &str) {')],
          ['override_string'])
     case('a helper-read name is swept in',
          'AUTUMN_MEDIA__STORAGE__BUCKET' in swept, True)
@@ -2271,17 +2350,22 @@ def self_test():
          bool(ACCESSOR.search('let v = env.get("AUTUMN_LOG__LEVEL");')), True)
     # A quoted name counts as its accessor's ARGUMENT, not as its neighbour. The
     # window this replaced took a name off any line within three of a call.
-    def args_of(text, acc=ACCESSOR):
+    real_acc, real_index = accessor(ROOT)
+
+    def args_of(text, acc=ACCESSOR, index=None):
         m = acc.search(text)
+        called = next((x for x in m.groups() if x), '')
+        pos = (index or {}).get(called, 0)
         return QUOTED.findall(
-            key_argument(_balanced(text, m.end() - 1, ARG_SPAN_LIMIT)[0]))
+            key_argument(_balanced(text, m.end() - 1, ARG_SPAN_LIMIT)[0], pos))
     case('a name outside the call is not its argument',
          args_of('std::env::var(\n  "RUST_LOG",\n);\nlet u = "AUTUMN_LOG__LEVL";'),
          [])
     # …while the house multi-line shape, which the window existed for, still
     # reads through the balanced argument list.
     case('a multi-line argument list still reads',
-         args_of('parse_env(\n    env,\n    "AUTUMN_MEDIA__ROOM_NAMESPACE",\n)'),
+         args_of('parse_env(\n    env,\n    "AUTUMN_MEDIA__ROOM_NAMESPACE",\n)',
+                 real_acc, real_index),
          ['AUTUMN_MEDIA__ROOM_NAMESPACE'])
     # Only ONE argument is the key. Taking every quoted name in the list made
     # the VALUE one too: a name assigned to somebody else's variable.
@@ -2295,8 +2379,22 @@ def self_test():
     # about the calls rather than a table of arities.
     case('a helper key behind other arguments reads',
          args_of('override_string(&mut self.ffmpeg.bin, env, '
-                 '"AUTUMN_MEDIA__FFMPEG__BIN")', accessor(ROOT)),
+                 '"AUTUMN_MEDIA__FFMPEG__BIN")', real_acc, real_index),
          ['AUTUMN_MEDIA__FFMPEG__BIN'])
+    # The key is a POSITION: `set_var(key, "…")` passes its key in a variable
+    # and its value as a literal, and the value is nobody's variable name.
+    case('a literal value with a variable key is not the key',
+         args_of('std::env::set_var(key, "AUTUMN_LOG__LEVL")'), [])
+    # The helpers are written with a generic parameter list, and requiring `(`
+    # straight after the name derived none of them — moving every helper key to
+    # position 0 and costing 85 names. Measured, not assumed.
+    case('a generic helper signature is derived',
+         (real_index.get('parse_env'), real_index.get('parse_env_option'),
+          real_index.get('override_string')), (1, 1, 2))
+    case('a helper key at its derived position reads',
+         args_of('parse_env(env, "AUTUMN_MEDIA__ROOM_NAMESPACE", &mut t)',
+                 real_acc, real_index),
+         ['AUTUMN_MEDIA__ROOM_NAMESPACE'])
     case('an escaped literal in generated code still reads',
          args_of(r'std::env::var(\"AUTUMN_TEST_ADMIN_SESSION\")'),
          ['AUTUMN_TEST_ADMIN_SESSION'])
