@@ -4,11 +4,16 @@
 
 Merging into `trunk-dev` waits on `.github/workflows/ci.yml`'s `pull_request`
 run: `meta` → `lint` (+ `migration-guides`, `plugin-contract`, `supply-chain`
-in parallel) → `test` (matrix: ubuntu/macos/windows-latest) → `coverage`
-(non-blocking, Codecov only) / `loom`, plus `lint` → `windows-tier1`
-(`ci.yml:965-967`, the Windows Tier 1 journey job — this census's failure
-sample includes one hit against it) and the standalone `msrv`,
-`sqlite-runtime`, `sim-sweep`, and `edge-conformance` jobs. No ambient retry
+in parallel) → `test` (matrix: ubuntu/macos/windows-latest) → `coverage` /
+`loom`, plus `lint` → `windows-tier1` (`ci.yml:965-967`, the Windows Tier 1
+journey job — this census's failure sample includes one hit against it)
+and the standalone `msrv`, `sqlite-runtime`, `sim-sweep`, and
+`edge-conformance` jobs. Correction to an earlier revision of this report:
+`coverage` is not "non-blocking, Codecov only" — only its final upload
+step tolerates failure (`fail_ci_if_error: false`, `ci.yml:767`); the many
+`cargo llvm-cov` invocations in its "Generate coverage" step
+(`ci.yml:676-761`) carry no such tolerance, so a real compile or test
+failure there fails the job like any other. No ambient retry
 wrapper exists anywhere in the workflow — a red run stays red until a human
 clicks "Re-run failed jobs" or pushes a fix, so Law 1 (an untrustworthy green
 is worse than a red) is not currently at risk from retry-laundering. That is
@@ -93,15 +98,24 @@ something this census fabricated a rate for).
      unrelated `embedded_saas` drift) and succeeded 11 — and because a
      single failing test fails the whole `cargo test --workspace` step,
      every one of those 11 successes proves `live_upgrade` itself passed.
-     That puts it at **3 failures in at least 14 known macOS executions
-     (≥21%)**, against **0 failures in at least 16 known ubuntu executions**
-     (ubuntu's `Run tests` step failed only once, via the unrelated
-     `embedded_saas` drift; its one other failure, run 8190's Docker step,
-     is a later step in the same job, so that run's `Run tests` step — and
-     `live_upgrade` within it — passed). Thanking Codex review again here:
-     the earlier "3-for-3" phrasing counted only failures and implied a
-     100% macOS fail rate the data doesn't support — ≥21% against 0% is
-     still the strongest repeat signature in the sample, just not that one.
+     That puts the macOS rate for this specific test between **3/17 ≈ 17.6%**
+     (crediting the one run whose `live_upgrade` outcome isn't directly
+     provable — the `embedded_saas` failure — as a pass, since nothing shows
+     otherwise) and **3/14 ≈ 21.4%** (counting only the 14 executions whose
+     `live_upgrade` outcome step-conclusion logic actually proves either
+     way): **3 failures in 17 eligible macOS executions, 14 to 17 of them
+     confirmed**. Against that, **0 failures in 16 to 17 known ubuntu
+     executions** (ubuntu's `Run tests` step failed only once in the 17,
+     via the unrelated `embedded_saas` drift; its one other failure, run
+     8190's Docker step, is a later step in the same job, so that run's
+     `Run tests` step — and `live_upgrade` within it — passed). Thanking
+     Codex review again here, twice over: the earlier "3-for-3" phrasing
+     counted only failures and implied a 100% macOS fail rate, and the
+     revision after that inverted the bound — more confirmed executions can
+     only pull a fixed failure count's rate *down*, not up, so "at least 14
+     known executions" supports *at most* 21.4%, not "≥21%". A rate in the
+     17.6%-21.4% range against 0% is still the strongest repeat signature
+     in the sample, just not the number either earlier revision gave.
   2. **`integration::cache_stampede::swr_serves_stale_and_refreshes_in_
      background`** — the background refresh never published within its
      1,000×25ms (~25s) poll budget (run 8190, macOS). This assertion was
@@ -143,11 +157,11 @@ bearing caveat of this report. The primary evidence is `live_upgrade`,
 which is written with a hard, zero-tolerance assertion
 (`connect_errors == 0`, no slack at all, unlike this same test's own
 300-read floor and 5-second latency ceiling, both explicitly sized "so a
-busy CI runner cannot fail the run") and failed identically in at least 3
-of 14 known macOS executions (≥21%) against 0 of at least 16 known
+busy CI runner cannot fail the run") and failed identically in 3 of 17
+eligible macOS executions (17.6%-21.4% depending on one unresolved run —
+see Symptom above for the derivation) against 0 of 16-17 known
 `ubuntu-latest` executions — the only other platform the unix-gated test
-runs on (see Symptom above for how those counts are derived from job-step
-pass/fail logic, not a fresh rerun). `cache_stampede`
+runs on. `cache_stampede`
 and `sim_fault_plan`, each already written with generous, load-tolerant
 budgets by this codebase's own standards (a 25-second/1,000-attempt poll),
 each failed once, also on macOS, also in tests with no platform gate — one
