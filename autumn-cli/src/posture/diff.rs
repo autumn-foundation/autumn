@@ -109,6 +109,7 @@ pub fn diff(base: &PostureManifest, head: &PostureManifest) -> Vec<Finding> {
     diff_authorization_policies(base, head, &mut findings);
     diff_csrf(base, head, &mut findings);
     diff_headers(base, head, &mut findings);
+    bind_to_effective_posture(&mut findings, head);
     findings.sort_by(|a, b| {
         a.severity
             .cmp(&b.severity)
@@ -118,6 +119,57 @@ pub fn diff(base: &PostureManifest, head: &PostureManifest) -> Vec<Finding> {
             .then_with(|| a.fingerprint.cmp(&b.fingerprint))
     });
     findings
+}
+
+/// Fold the route's whole posture at head into every widening's identity.
+///
+/// A widening is not "the dimension that moved" — it is the state a reviewer
+/// approved. Fingerprinting only the moved dimension let *any other* dimension
+/// be loosened afterwards without disturbing the digest: roles widened behind a
+/// new scope, then the scope dropped; a scope removed while roles narrowed,
+/// then the roles restored; a new public route with CSRF, then without it. In
+/// each the base-to-head diff still holds only the original finding.
+///
+/// Done here, once, rather than in each emitter. Six dimensions learned this
+/// rule one review round at a time, and every one of those fixes was me
+/// remembering a dimension rather than the code making it impossible to forget.
+/// A finding kind added later is covered without anyone remembering anything.
+fn bind_to_effective_posture(findings: &mut [Finding], head: &PostureManifest) {
+    let routes = route_index(head);
+    let csrf = csrf_index(head);
+    let bindings = authz_index(head);
+
+    for finding in findings
+        .iter_mut()
+        .filter(|f| f.severity == Severity::Widening)
+    {
+        let key = (normalize_captures(&finding.path), finding.method.clone());
+        // Findings that name no single route — a collapsed csrf finding, a
+        // header, an exemption prefix — miss every lookup and keep the identity
+        // they built for themselves.
+        let posture = routes.get(&key).map_or_else(String::new, |entry| {
+            let enforced = csrf
+                .get(&key)
+                .map_or(
+                    "absent",
+                    |(enforced, ..)| {
+                        if *enforced { "csrf" } else { "no-csrf" }
+                    },
+                )
+                .to_owned();
+            let mut checks: Vec<String> = bindings
+                .keys()
+                .filter(|(path, method, _, _)| (path, method) == (&key.0, &key.1))
+                .map(|(_, _, action, resource)| format!("{action} on {resource}"))
+                .collect();
+            checks.sort();
+            checks.dedup();
+            escape_list(&[posture_fingerprint(entry), enforced, escape_list(&checks)])
+        });
+        if !posture.is_empty() {
+            finding.fingerprint = escape_list(&[finding.fingerprint.clone(), posture]);
+        }
+    }
 }
 
 /// Only the findings that block.
@@ -2493,6 +2545,66 @@ mod tests {
         assert_eq!(widening[0].kind, "authorization_binding_removed");
     }
 
+    /// A widening's identity is the route's whole posture at head, not the one
+    /// dimension that moved. Three ways the same gap shows up, one per
+    /// dimension a reviewer could see loosened *after* acknowledging:
+    ///
+    /// - roles widen while a scope is added, then the scope goes;
+    /// - a scope is dropped while roles narrow, then the roles come back;
+    /// - a new public route enforces CSRF, then stops.
+    ///
+    /// In each the base-to-head diff still contains only the original finding,
+    /// so a per-dimension fingerprint never moved and the old marker stood.
+    #[test]
+    fn a_widening_acknowledgment_binds_to_the_whole_posture_at_head() {
+        let admin_read = route("/a", "POST", "gated", &["admin"], &["read"], false);
+
+        let roles_then = |scopes: &[&str]| {
+            let head = route("/a", "POST", "gated", &["admin", "editor"], scopes, false);
+            diff(&routes_only(&admin_read), &routes_only(&head))
+                .into_iter()
+                .find(|f| f.kind == "roles_widened")
+                .expect("admitting editor is a widening")
+                .canonical()
+        };
+        assert_ne!(
+            roles_then(&["read", "mfa"]),
+            roles_then(&["read"]),
+            "editor behind `mfa` is not editor without it"
+        );
+
+        let scopes_then = |roles: &[&str]| {
+            let head = route("/a", "POST", "gated", roles, &[], false);
+            diff(&routes_only(&admin_read), &routes_only(&head))
+                .into_iter()
+                .find(|f| f.kind == "scopes_widened")
+                .expect("losing `read` is a widening")
+                .canonical()
+        };
+        assert_ne!(
+            scopes_then(&["admin"]),
+            scopes_then(&["admin", "editor"]),
+            "dropping the scope for admins is not dropping it for editors too"
+        );
+
+        let added_with_csrf = |enforced: bool| {
+            let head = route("/new", "POST", "public", &[], &[], false);
+            let entry = format!(
+                r#"{{"path":"/new","method":"POST","csrf_enforced":{enforced},"exempt":false}}"#
+            );
+            diff(&routes_only(""), &manifest(&head, &entry, "", ""))
+                .into_iter()
+                .find(|f| f.kind == "route_added_open")
+                .expect("a new public route is a widening")
+                .canonical()
+        };
+        assert_ne!(
+            added_with_csrf(true),
+            added_with_csrf(false),
+            "a new public POST with CSRF is not the same endpoint without it"
+        );
+    }
+
     /// A `WS` route and a `GET` route at one path are the same runtime handler,
     /// and the csrf rows are keyed by the *declared* method. Replacing an
     /// enforced `WS /x` with a `GET /x` that does not enforce left the base row
@@ -3704,15 +3816,28 @@ mod tests {
         );
     }
 
-    /// A later *narrowing* on a route whose widening was already acknowledged
-    /// must not change that widening's canonical form — otherwise the gate
-    /// re-asks for an acknowledgment nobody can see a reason for.
+    /// **Any** later change to the route's posture re-asks for the
+    /// acknowledgment, including one that narrows it.
+    ///
+    /// This asserted the opposite until the whole-posture binding landed, and
+    /// the reversal is deliberate rather than a broken test. The two properties
+    /// cannot both hold under a digest compared for equality: an acknowledgment
+    /// must not survive a constraint being *removed* after it was given, and
+    /// the digest is a function of the head posture alone, so it cannot tell a
+    /// constraint that appeared from one that vanished. Something has to give,
+    /// and re-asking after a narrowing costs a reviewer one comment on a diff
+    /// that shows exactly why, while the alternative loses a widening in
+    /// silence.
+    ///
+    /// Expressing "no wider than what I approved" needs the marker to carry the
+    /// approved posture ordinally rather than as a hash — a change to the
+    /// acknowledgment format, tracked in #2497.
     #[test]
-    fn a_later_narrowing_does_not_disturb_an_earlier_findings_identity() {
+    fn any_later_posture_change_re_asks_for_the_acknowledgment() {
         let base = routes_only(&route("/admin", "GET", "gated", &["admin"], &[], false));
         let first = routes_only(&route("/admin", "GET", "public", &[], &[], false));
         // The follow-up commit adds a record-level policy check: strictly
-        // narrower, and it changes the rendered posture label.
+        // narrower, and the gate asks again all the same.
         let second = routes_only(&route("/admin", "GET", "public", &[], &[], true));
 
         let a = only(diff(&base, &first));
@@ -3720,7 +3845,7 @@ mod tests {
             .into_iter()
             .find(|f| f.kind == "classification_downgraded")
             .expect("still the same widening");
-        assert_eq!(a.canonical(), b.canonical());
+        assert_ne!(a.canonical(), b.canonical());
     }
 
     // ── ordering ────────────────────────────────────────────────────────────

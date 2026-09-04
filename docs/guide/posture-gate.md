@@ -244,9 +244,21 @@ Rules worth knowing:
   does not fire on comments. After commenting, re-run the *Security posture*
   check from the Checks tab, or push a commit.
 - **What it binds to.** The digest is computed over the *exact set of widening
-  findings*. Push ten more commits that don't change that set and the
-  acknowledgment stays valid. Widen something **new** and the digest changes,
-  no comment carries it, and the gate blocks again.
+  findings*, and each one carries the whole posture of the route it names —
+  classification, roles, scopes, policy, CSRF, `#[authorize]` bindings. Push ten
+  more commits that touch none of those and the acknowledgment stays valid.
+  Widen something **new** and the digest changes, no comment carries it, and the
+  gate blocks again.
+
+  The route's *whole* posture, because otherwise a second constraint can be
+  added and then quietly withdrawn: acknowledge "public, behind a new `mfa`
+  scope", drop `mfa` next push, and against the base the diff still shows only
+  the original widening. The cost is that a later change which **narrows** that
+  route also re-asks — the digest cannot tell a constraint that appeared from
+  one that vanished. Re-acknowledging costs a comment on a diff that shows
+  exactly what moved; the alternative loses a widening in silence.
+  [#2497](https://github.com/autumn-foundation/autumn/issues/2497) tracks the
+  format change that would satisfy both.
 - **Where it doesn't apply.** Quoted lines (`> /ack-posture …`) and lines
   inside fenced code blocks never acknowledge anything, so quoting a colleague
   — which GitHub's reply button does for you — cannot approve a widening by
