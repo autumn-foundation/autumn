@@ -523,8 +523,16 @@ COMMENT_LEADER = {
     '.rs': '//', '.ts': '//', '.js': '//', '.go': '//',
     # SQL is a third comment family — `--` to the line end and `/* … */` —
     # and the 171 tracked migrations were falling through to the `#` default,
-    # which strips nothing an SQL file actually contains.
-    '.sql': '--',
+    # which strips nothing an SQL file actually contains. Auditing the rest of
+    # what the default was guessing about turned up seven more languages in the
+    # same position, none of which a `#` rule can see a comment in: a name
+    # mentioned in one of their comments counted as a use. `.lua` shares SQL's
+    # `--`; the markup family is block-only and listed by its opening
+    # delimiter. None of these files carries an `AUTUMN_` name today, so this
+    # closes latent holes and moves no counter.
+    '.sql': '--', '.lua': '--', '.java': '//',
+    '.css': '/*', '.html': '<!--', '.xml': '<!--', '.svg': '<!--',
+    '.heex': '<!--', '.erb': '<%#', '.ftl': '<#--',
     # Program output captured as a fixture: nothing in it is a comment, and a
     # line may legitimately begin with `#`.
     '.golden': None, '.stderr': None, '.snap': None, '.json': None,
@@ -1084,6 +1092,32 @@ def _ps_uncommented(body):
     return PS_BLOCK.sub(lambda m: re.sub(r'[^\n]', ' ', m.group(0)), body)
 
 
+# The block-only families, keyed by the opening delimiter `comment_leader`
+# returns. `//` is deliberately NOT a CSS comment — it appears in every `url(…)`
+# — and treating one as a comment would have hidden real text rather than
+# prose.
+BLOCK_CLOSER = {'/*': '*/', '<!--': '-->', '<%#': '%>', '<#--': '-->'}
+
+
+def _block_uncommented(body, opener, closer):
+    """Drop `opener … closer` comments, keeping line numbering intact.
+
+    Length-preserving. An unterminated opener costs the rest of the file, which
+    is what the language itself does with one.
+    """
+    out, i, n = list(body), 0, len(body)
+    while True:
+        start = body.find(opener, i)
+        if start < 0:
+            return ''.join(out)
+        end = body.find(closer, start + len(opener))
+        end = n if end < 0 else end + len(closer)
+        for k in range(start, min(end, n)):
+            if body[k] != '\n':
+                out[k] = ' '
+        i = end
+
+
 def _sql_uncommented(body):
     """Drop SQL's `--` line comments and `/* … */` blocks, keeping strings.
 
@@ -1178,6 +1212,8 @@ def uncommented(body, leader='//', needs_space=False, also_slash=False,
         return _rust_uncommented(body)
     if leader == '--':
         return _sql_uncommented(body)
+    if leader in BLOCK_CLOSER:
+        return _block_uncommented(body, leader, BLOCK_CLOSER[leader])
     if leader == '#':
         if also_block:
             body = _ps_uncommented(body)
@@ -3254,6 +3290,24 @@ def self_test():
     case('a doubled quote keeps one SQL string whole',
          _sql_uncommented("SELECT 'it''s -- fine';\n"),
          "SELECT 'it''s -- fine';\n")
+    # Auditing what else the `#` default was guessing about turned up seven more
+    # languages whose comments a `#` rule cannot see at all.
+    case('every unlisted comment family is stripped',
+         [ASSIGNED_PREFIX.findall(
+             uncommented(probe, comment_leader(rel), hash_needs_space(rel)))
+          for rel, probe in
+          (('a.java', '// AUTUMN_LOG__LEVL=x cmd\nint x;\n'),
+           ('a.css', '/* AUTUMN_LOG__LEVL=x cmd */\na{color:red}\n'),
+           ('a.html', '<!-- AUTUMN_LOG__LEVL=x cmd -->\n<p>hi</p>\n'),
+           ('a.erb', '<%# AUTUMN_LOG__LEVL=x cmd %>\n'),
+           ('a.ftl', '<#-- AUTUMN_LOG__LEVL=x cmd -->\n'),
+           ('a.lua', '-- AUTUMN_LOG__LEVL=x cmd\n'))],
+         [[]] * 6)
+    # `//` is not a CSS comment: it is in every `url(…)`, and reading one as a
+    # comment would hide real text rather than prose.
+    case('a CSS url survives its block-only rule',
+         uncommented('a{background:url(https://x/y)}\n', comment_leader('a.css')),
+         'a{background:url(https://x/y)}\n')
     case('a double-quoted heredoc body is data',
          ASSIGNED_PREFIX.findall(_shell_literals(_shell_heredocs(
              'cat <<"EOF"\nAUTUMN_LOG__LEVL=x cmd\nEOF\n'))),
