@@ -240,6 +240,52 @@ helper's deadline handling — not about the correctness result itself:
 Re-ran 4 more times (20 total across all five passes); see **Assay**.
 Verdict is unchanged.
 
+**An eighth, ninth, and tenth P2 finding**, all on the revision-5 diff
+above:
+
+1. The debounce window (`STABLE_CHECKS=3` × `STABLE_GAP=50ms` ≈ 150ms) was
+   far shorter than the protocol's own `push_interval_ms` (200ms) and
+   `suspicion_timeout_ms` (1000ms) — three reads 50ms apart mostly just
+   re-observe the same pre-gossip state, so "stable across 3 observations"
+   never actually spanned a real gossip round or failure-detector cycle,
+   undermining the "no divergence" claim it was meant to support. Fixed:
+   widened to `STABLE_CHECKS=5`, `STABLE_GAP=250ms` — a 1250ms window,
+   longer than `suspicion_timeout_ms` and several multiples of
+   `push_interval_ms`.
+2. The pre-registration explicitly names a third outcome — "converges, but
+   past the success line and short of the 3x divergence threshold" is
+   undetermined-on-the-line, not a silent pass or a hard failure — but the
+   apparatus only ever implemented pass/fail: it hard-failed the instant
+   the first (success-line) deadline passed, regardless of whether the
+   condition would have converged shortly after, well inside the
+   registered 3x-timeout divergence threshold. No run has ever come
+   remotely close to this boundary (every run is 2-13s against 5-10s
+   phase bounds), so this never affected any actual result — but the
+   apparatus didn't implement the classification the pre-registration
+   promised. Fixed: `poll_until_stable` now returns a tri-state
+   `ConvergenceOutcome` (`Converged` / `LateConverged` / `Diverged`) against
+   `timeout` and `timeout × 3` (the pre-registration's own divergence
+   multiplier); only `Diverged` fails the test, `LateConverged` is reported
+   via `eprintln!` without failing it.
+3. `tokio::time::timeout` is cooperative — it can only fire between
+   `.await` points inside the future it directly wraps. The polled
+   `members()`/`counter()` reads synchronously acquire locks inside the
+   cluster module; a genuine deadlock holding one of those locks would
+   block the very task the revision-5 watchdog was polling, so the 60s
+   timeout could never fire in exactly the scenario ("deadlock or hang,"
+   the kill line's own words) it exists to catch. Fixed: `run_assay()` now
+   runs on its own `tokio::task::spawn`ed task, and the 60s timeout wraps
+   `.await`ing the `JoinHandle` rather than the future directly — waiting
+   on a `JoinHandle`'s completion doesn't require polling the (possibly
+   wedged) task on the same call stack, so the test harness can still
+   report the timeout and produce a result even if the spawned task stays
+   genuinely blocked in the background.
+
+Re-ran 4 more times (24 total across all six passes) with the wider
+debounce window — real per-run wall-clock rose from ~2.6s to ~13.1s purely
+because of the 9 stability checks' now-mandatory ≥1.25s windows each, not
+because convergence itself got slower; see **Assay**. Verdict is unchanged.
+
 ## 🧪 Apparatus
 
 One throwaway test file, `autumn/tests/prospect_cluster_scale.rs` (a
@@ -248,20 +294,23 @@ temporary `[[test]]` entry added to `autumn/Cargo.toml` to build it,
 harness conventions (`ClusterConfig`, `install_from_config`, `ClusterHandle`,
 a two-sided `describe()` failure formatter) and scaling them to 5 members.
 Every check is **debounced**: `poll_until_stable` requires the condition to
-hold on 3 consecutive observations 50ms apart before counting as converged
-(see the third correction above), not a single-instant read, and yields
-`STABLE_GAP` after every observation — success or failure — so a failing
-streak cannot spin-retry without a genuine `.await` point (fourth
-correction above). Step 3's checks use the pre-registered 5s
-`DEPARTURE_TIMEOUT`; every other step uses the 10s `CONVERGE_TIMEOUT`
-(fifth correction above — the debounce refactor had briefly hardcoded 10s
-everywhere). The deadline is checked after *every* observation, not just
-failed ones, so a streak can't be accepted after its window already closed
-(seventh correction above), and the whole test body runs inside
-`tokio::time::timeout(TOTAL_TEST_TIMEOUT, ...)`, `TOTAL_TEST_TIMEOUT` =
-60s, directly enforcing the pre-registered kill line's total-time bound
-rather than relying on per-phase bounds that summed to 75s (sixth
-correction above). One `#[tokio::test(flavor = "multi_thread")]` runs all
+hold on 5 consecutive observations 250ms apart (a ≥1250ms window,
+deliberately longer than `suspicion_timeout_ms`=1000ms and several
+multiples of `push_interval_ms`=200ms — eighth correction above) before
+counting as converged, not a single-instant read, and yields `STABLE_GAP`
+after every observation — success or failure — so a failing streak cannot
+spin-retry without a genuine `.await` point (fourth correction above).
+Step 3's checks use the pre-registered 5s `DEPARTURE_TIMEOUT`; every other
+step uses the 10s `CONVERGE_TIMEOUT` (fifth correction above). Every check
+returns a tri-state `ConvergenceOutcome` — `Converged` inside its timeout,
+`LateConverged` inside 3x the timeout (reported, not failed — the
+pre-registration's own "undetermined-on-the-line" case, ninth correction
+above), or `Diverged` past 3x (a real failure) — rather than plain
+pass/fail, and the whole test body runs on its own spawned task with the
+60s `TOTAL_TEST_TIMEOUT` watchdog waiting on that task's `JoinHandle`
+(tenth correction above — a bare `tokio::time::timeout` around the future
+directly can't preempt a genuine synchronous-lock deadlock, only a
+cooperative one). One `#[tokio::test(flavor = "multi_thread")]` runs all
 steps in sequence against one 5-node cluster:
 
 1. `spawn_star_cluster(5)` — node 0 installs with no seeds; nodes 1-4 each
@@ -409,84 +458,106 @@ across all five passes):
 | 19 | all steps + 60s watchdog + deadline-checked streak pass | 2.58s |
 | 20 | all steps + 60s watchdog + deadline-checked streak pass | 2.58s |
 
-**Against the pre-registered lines (fifth pass, the one whose code
-actually enforces every bound as registered, including the whole-test 60s
-kill line — see note on Step 3 below for why the third pass's runs still
-count as evidence despite the bug in that pass's code):**
+**N=5 assay, sixth pass, 4 more runs** (after widening the debounce window
+past the protocol's own timers, adding the tri-state `ConvergenceOutcome`,
+and moving the watchdog to wrap a spawned task's `JoinHandle`; 24 total
+runs across all six passes):
 
-- **Step 1 (cold-start convergence, line: ≤10s):** passed on 20/20 runs
-  across all five passes. Actual convergence is folded into each run's
-  total ~0.9-2.7s wall-clock (compile excluded) — the third through fifth
-  passes run slower than the first two purely because of the added
-  debounce delay (3×50ms per check × more checks per run, plus the
-  revision-4 unconditional post-check yield), not because convergence
-  itself got slower; still roughly 4-10x inside the bound, not a close
-  call the way the cold-start ledger's margins were.
+| Run | Result | Wall-clock |
+|---|---|---:|
+| 21 | all steps + wider debounce + spawn-watchdog pass (all `Converged`, no `LateConverged`) | 13.08s |
+| 22 | all steps + wider debounce + spawn-watchdog pass (all `Converged`, no `LateConverged`) | 13.08s |
+| 23 | all steps + wider debounce + spawn-watchdog pass (all `Converged`, no `LateConverged`) | 13.08s |
+| 24 | all steps + wider debounce + spawn-watchdog pass (all `Converged`, no `LateConverged`) | 13.08s |
+
+**Against the pre-registered lines (sixth pass, the one whose code
+actually enforces every bound as registered, including the whole-test 60s
+kill line, a debounce window that spans the protocol's own timers, and the
+pre-registration's own tri-state classification — see note on Step 3 below
+for why the third-through-fifth passes' runs still count as evidence
+despite bugs in that code):**
+
+- **Step 1 (cold-start convergence, line: ≤10s):** passed (`Converged`, not
+  `LateConverged`) on 24/24 runs across all six passes. The sixth pass's
+  ~13.08s *total* run time is the sum of 9 mandatory ≥1.25s debounce
+  windows, not slower convergence — no single phase check came close to
+  its own 5s/10s bound; still roughly 4-8x inside the tightest of those,
+  not a close call the way the cold-start ledger's margins were.
 - **Step 2 (counter merge, line: exact sum 15 on every node, ≤10s):**
-  passed on 20/20 runs, stability-checked since run 9, with a membership
-  recheck immediately after confirming no flicker occurred during
-  convergence.
+  passed (`Converged`) on 24/24 runs, stability-checked since run 9 (widened
+  debounce since run 21), with a membership recheck immediately after
+  confirming no flicker occurred during convergence.
 - **Step 3 (departure, line: 4-member view on survivors, ≤5s, AND exact sum
-  15 still held on all 4 survivors):** passed on 20/20 runs — the counter
-  half ran in runs 5-20, held on 16/16 of those; the stability debounce and
-  post-counter membership recheck ran in runs 9-20, held on 12/12. **Caveat
-  on runs 9-12 specifically:** those ran before the fourth correction, so
-  their code was actually bounded by the 10s `CONVERGE_TIMEOUT`, not the
-  registered 5s `DEPARTURE_TIMEOUT` — the *test* didn't enforce the right
-  line, even though it still passed. This is not silently swept in as
-  clean evidence for the 5s bound: it's flagged here, and only runs 13-20
-  (fourth and fifth passes) are code-verified to have actually been gated
-  at 5s. All 20 runs, including 9-12, did *empirically* complete in
-  2.3-2.7s either way — comfortably under 5s regardless of which timeout
-  the code was configured to allow — so the wall-clock evidence itself
-  still supports the line; only the earlier code's enforcement of that
-  specific line was what was broken, not the measured outcome.
+  15 still held on all 4 survivors):** passed (`Converged`) on 24/24 runs —
+  the counter half ran in runs 5-24, held on 20/20 of those; the stability
+  debounce and post-counter membership recheck ran in runs 9-24, held on
+  16/16. **Caveat on runs 9-12 specifically:** those ran before the fourth
+  correction, so their code was actually bounded by the 10s
+  `CONVERGE_TIMEOUT`, not the registered 5s `DEPARTURE_TIMEOUT` — the
+  *test* didn't enforce the right line, even though it still passed. This
+  is not silently swept in as clean evidence for the 5s bound: it's
+  flagged here, and only runs 13-24 (fourth through sixth passes) are
+  code-verified to have actually been gated at 5s. All 24 runs, including
+  9-12, did *empirically* complete step 3 in well under 5s either way — so
+  the wall-clock evidence itself still supports the line; only the earlier
+  code's enforcement of that specific line was what was broken, not the
+  measured outcome.
 - **Step 4 (rejoin, line: 5-member view, ≤10s, AND exact sum 15 relearned
-  by the rejoined node):** passed on 20/20 runs — counter half held on
-  16/16 (runs 5-20), stability + post-counter recheck held on 12/12 (runs
-  9-20), all correctly bounded at 10s throughout (this step was never
-  affected by the Step 3 timeout bug).
+  by the rejoined node):** passed (`Converged`) on 24/24 runs — counter half
+  held on 20/20 (runs 5-24), stability + post-counter recheck held on 16/16
+  (runs 9-24), all correctly bounded at 10s throughout (this step was
+  never affected by the Step 3 timeout bug).
+- **Undetermined-on-the-line classification (`LateConverged`):** never
+  triggered in any of the 24 runs — every check reached `Converged` well
+  inside its `timeout`, so the pre-registration's third outcome remains
+  implemented but empirically unexercised. The apparatus now has the
+  capacity to report it, but this assay's own data never approaches that
+  boundary closely enough to demonstrate the path firing.
 - **Whole-test 60s kill line:** enforced by an explicit
-  `tokio::time::timeout` wrapper since run 17; every run (including all 16
-  before it) completed in under 3s total, ~20-25x inside even this
-  outermost bound.
+  `tokio::time::timeout` wrapper around a spawned task's `JoinHandle` since
+  run 21 (a bare wrapper around the future directly, runs 17-20, is
+  cooperative and can't preempt a genuine synchronous-lock deadlock — see
+  the tenth correction); every run completed in under 14s total, ~4x
+  inside even this outermost bound (the tightest margin of any check in
+  this assay, still comfortable).
 - **Kill-line check:** zero divergent views, zero wrong counter values,
-  zero panics/timeouts/hangs, zero stability-debounce failures (no run
-  ever needed a second debounce window — every 3-observation streak
-  succeeded on the first attempt), zero whole-test watchdog trips across
-  all 20 runs. The "2 of 3 repeats" kill-line threshold was never
-  approached in either direction — this result is not a marginal call the
-  way the cold-start bisection's sub-5,000ms deltas were; every margin
-  here has roughly 2-25x headroom against its line (narrowest: step 3's
-  ~2.3-2.7s actual vs. its 5s line, once correctly enforced), so ordinary
-  run-to-run scheduling noise on this shared sandbox is not a plausible
-  alternative explanation the way it was there.
+  zero panics/timeouts/hangs, zero `Diverged` outcomes, zero
+  `LateConverged` outcomes, zero whole-test watchdog trips across all 24
+  runs. The "2 of 3 repeats" kill-line threshold was never approached in
+  either direction — this result is not a marginal call the way the
+  cold-start bisection's sub-5,000ms deltas were; every margin here has
+  roughly 4-25x headroom against its line, so ordinary run-to-run
+  scheduling noise on this shared sandbox is not a plausible alternative
+  explanation the way it was there.
 
 ## 🏁 Verdict
 
 **Pursue**, against the pre-registered line: all success criteria
 (cold-start convergence, exact counter merge, departure convergence,
-rejoin convergence, and the whole-test 60s kill line) held on every run
-across all five passes, with comfortable margin against every bound — not
-a photo finish, and (per the Step 3 caveat in **Assay**) the narrowest
-margin, departure's 5s line, is only claimed as *code-enforced* for the
-fourth and fifth passes' 8 runs, though the wall-clock evidence supports it
-across all 20. No kill-line condition was observed. After all six
+rejoin convergence, and the whole-test 60s kill line) held — as
+`Converged`, never `LateConverged` or `Diverged` — on every run across all
+six passes, with comfortable margin against every bound — not a photo
+finish, and (per the Step 3 caveat in **Assay**) the narrowest margin,
+departure's 5s line, is only claimed as *code-enforced* for the fourth
+through sixth passes' 12 runs, though the wall-clock evidence supports it
+across all 24. No kill-line condition was observed. After all ten
 corrections above, the counter's exact sum was verified not just once
 before churn but again on the survivors after departure and again on the
 full cluster after rejoin; every convergence/counter observation was
-required to hold across 3 consecutive checks (not a single instant) with a
-membership recheck immediately after every counter check; the debounce
-itself was fixed to always yield rather than risk spinning, and to reject
-a streak whose final observation lands after its own deadline; step 3's
-checks are gated at the registered 5s, not a silently-inherited 10s; and
-the whole test now runs inside an explicit 60s watchdog matching the
-kill line's own total-time bound instead of relying on per-phase bounds
-that could in principle sum past it — the actual claim the guide text
-makes ("no divergence," stable identical views, exact sums through churn)
-is the one actually measured, on 4/4 fifth-pass runs, not the
-progressively weaker versions the first four passes of this report each
-accidentally supported. Within the scope this assay actually tested
+required to hold across a debounce window (widened, in the final revision,
+past the protocol's own gossip and suspicion timers, not just past a
+single instant) with a membership recheck immediately after every counter
+check; the debounce itself always yields rather than risking a spin, and
+rejects a streak whose final observation lands after its own deadline
+while still correctly classifying a genuinely late-but-real convergence as
+undetermined rather than a hard failure; step 3's checks are gated at the
+registered 5s, not a silently-inherited 10s; and the whole test runs on a
+spawned task behind an explicit 60s watchdog that can actually report a
+genuine synchronous-lock deadlock, not just a cooperative one — the actual
+claim the guide text makes ("no divergence," stable identical views, exact
+sums through churn) is the one actually measured, on 4/4 sixth-pass runs,
+not the progressively weaker versions the first five passes of this report
+each accidentally supported. Within the scope this assay actually tested
 (single host, single process, star topology, honest peers, N=5,
 correctness not performance), the full-broadcast/no-quorum gossip design
 does **not** show the split-brain or lost-update failure mode the guide's
@@ -534,7 +605,7 @@ peers, one churn cycle":
 
 The apparatus was never committed (per this ledger's containment rule, it
 is reverted before the report is finalized), so its exact source (revision
-5, post all six Codex corrections above) is embedded below rather than
+6, post all ten Codex corrections above) is embedded below rather than
 referenced by history. This is now the durable artifact.
 
 1. Add this entry to `autumn/Cargo.toml`, immediately after the existing
@@ -560,33 +631,48 @@ referenced by history. This is now the durable artifact.
    //! `[[test]]` Cargo.toml entry are reverted after the assay runs — its
    //! source is embedded verbatim in the report's Reproduce section instead.
    //!
-   //! Revision 2 (Codex P2 on PR #2503): counter sum re-verified after
-   //! departure and after rejoin, not just after step 2.
+   //! Revision 2: counter sum re-verified after departure and after rejoin.
+   //! Revision 3: every check requires 3 consecutive observations (debounce);
+   //! membership rechecked immediately after every counter check.
+   //! Revision 4: the debounce always yields (not just on success); step 3
+   //! uses the pre-registered 5s `DEPARTURE_TIMEOUT`, not 10s.
+   //! Revision 5: the whole test runs inside a 60s `tokio::time::timeout`
+   //! (the registered kill line's total-time bound); the debounce checks its
+   //! deadline after every observation, not just failed ones.
    //!
-   //! Revision 3 (Codex P2 on PR #2503): every check now requires the
-   //! condition to hold across several *consecutive* observations (a
-   //! debounce). A membership recheck runs immediately after every counter
-   //! check.
-   //!
-   //! Revision 4 (two more Codex P2 findings on the revision-3 diff):
-   //! `poll_until_stable` now yields after every observation (not just
-   //! successful ones), and step 3's checks are parameterized to the
-   //! pre-registered 5s `DEPARTURE_TIMEOUT` instead of silently inheriting
-   //! 10s.
-   //!
-   //! Revision 5 (two more Codex P2 findings on the revision-4 diff):
-   //! - The pre-registered kill line includes "test itself times out past 60s
-   //!   total," but the per-phase bounds (10s×6 + 5s×3 = 75s) could in
-   //!   principle sum past that with no single phase ever breaching its own
-   //!   bound, and there was no whole-test watchdog to catch it (or a genuine
-   //!   hang). Fixed: the entire test body now runs inside
-   //!   `tokio::time::timeout(TOTAL_TEST_TIMEOUT, ...)`, `TOTAL_TEST_TIMEOUT`
-   //!   = 60s, matching the registered line exactly.
-   //! - `poll_until_stable` could accept a streak whose *last* observation
-   //!   landed after `deadline` had already passed, silently reporting
-   //!   success outside the window its own message claimed. Fixed: the
-   //!   deadline is now checked after every single observation, success or
-   //!   failure, and any observation past it fails the poll immediately.
+   //! Revision 6 (three more Codex P2 findings on the revision-5 diff):
+   //! - The debounce window (3×50ms≈150ms) was far shorter than the
+   //!   protocol's own `push_interval_ms` (200ms) and `suspicion_timeout_ms`
+   //!   (1000ms) — three reads 50ms apart mostly just re-read the same
+   //!   pre-gossip state, so "stable across 3 observations" didn't actually
+   //!   rule out a flicker on the timescale the protocol itself operates on.
+   //!   Fixed: `STABLE_CHECKS`/`STABLE_GAP` widened so the debounce window
+   //!   (5×250ms=1250ms) exceeds both `suspicion_timeout_ms` and several
+   //!   multiples of `push_interval_ms`.
+   //! - The pre-registration explicitly allows a third outcome — "converges,
+   //!   but past the success line and short of the 3x divergence threshold"
+   //!   should be reported as undetermined-on-the-line, not silently passed
+   //!   *or* hard-failed — but the apparatus only ever hard-failed at the
+   //!   first deadline. Fixed: `poll_until_stable` now returns a tri-state
+   //!   `ConvergenceOutcome` (`Converged` / `LateConverged` / `Diverged`),
+   //!   checked against `timeout` and the pre-registration's own 3x
+   //!   divergence multiplier; only `Diverged` panics, `LateConverged` is
+   //!   reported (not silently passed) via `eprintln!` without failing the
+   //!   test. No run has ever come close to this boundary, but the apparatus
+   //!   now actually implements the classification the pre-registration
+   //!   promised instead of only handling the clean-pass case.
+   //! - `tokio::time::timeout` is cooperative: it can only fire between
+   //!   `.await` points in the future it wraps. The polled `members()`/
+   //!   `counter()` calls synchronously acquire `std::sync::Mutex`/`RwLock`
+   //!   locks inside the cluster module — a genuine deadlock holding one of
+   //!   those locks would block the very task the 60s timeout is polling,
+   //!   so the timeout could never fire in exactly the scenario it exists to
+   //!   catch. Fixed: `run_assay()` now runs on its own spawned task, and the
+   //!   60s timeout wraps `.await`ing the `JoinHandle` instead of the future
+   //!   directly — waiting on a `JoinHandle`'s completion is a separate
+   //!   mechanism from polling the (possibly wedged) task itself, so the test
+   //!   harness can still report the timeout and produce a result even if the
+   //!   spawned task stays genuinely blocked in the background.
 
    use std::sync::Arc;
    use std::time::Duration;
@@ -609,35 +695,55 @@ referenced by history. This is now the durable artifact.
    /// Matches the pre-registration's kill-line total: "test itself times out
    /// past 60s total."
    const TOTAL_TEST_TIMEOUT: Duration = Duration::from_secs(60);
+   /// The pre-registration's own divergence multiplier: "disagree... 3x past
+   /// the relevant timeout" is the kill line: a soft-deadline miss that still
+   /// resolves inside this multiple is "undetermined-on-the-line," not a kill.
+   const DIVERGENCE_MULTIPLIER: u32 = 3;
    /// Consecutive positive observations required before a condition counts as
-   /// "stable," and the gap between them. Adds ~150ms per check on the happy
-   /// path — negligible against the multi-second timeouts above.
-   const STABLE_CHECKS: u32 = 3;
-   const STABLE_GAP: Duration = Duration::from_millis(50);
+   /// "stable," and the gap between them. `STABLE_CHECKS * STABLE_GAP`
+   /// (1250ms) deliberately exceeds both `suspicion_timeout_ms` (1000ms) and
+   /// several multiples of `push_interval_ms` (200ms) — see revision 6 above;
+   /// a shorter window doesn't actually observe across a real gossip/failure-
+   /// detector cycle.
+   const STABLE_CHECKS: u32 = 5;
+   const STABLE_GAP: Duration = Duration::from_millis(250);
+
+   /// The three outcomes a debounced poll can reach, matching the
+   /// pre-registration's own classification (not just pass/fail):
+   /// `Converged` inside the registered line, `LateConverged` past the line
+   /// but short of `DIVERGENCE_MULTIPLIER`x it ("undetermined-on-the-line,
+   /// qualitatively pursue... the margin miss itself is data"), or `Diverged`
+   /// (a genuine kill-line condition).
+   enum ConvergenceOutcome {
+       Converged,
+       LateConverged { elapsed: Duration },
+       Diverged,
+   }
 
    /// Debounced poll: `condition` must return `true` on `STABLE_CHECKS`
-   /// consecutive observations, `STABLE_GAP` apart, before this returns
-   /// success. Any single `false` observation resets the streak. Yields
-   /// `STABLE_GAP` after every observation, success or failure (revision 4 —
-   /// otherwise a failing streak could spin-retry with no genuine `.await`
-   /// point). Checks `deadline` after every single observation, success or
-   /// failure (revision 5) — a streak whose final observation lands past
-   /// `deadline` is *not* accepted, even if every observation up to that
-   /// point was a success; the returned bool is only ever `true` for a streak
-   /// that both succeeded and finished inside `timeout`.
-   async fn poll_until_stable<F, Fut>(timeout: Duration, mut condition: F) -> bool
+   /// consecutive observations, `STABLE_GAP` apart. Yields `STABLE_GAP` after
+   /// every observation, success or failure (revision 4). Checks elapsed time
+   /// after every observation (revision 5) against both `timeout` and
+   /// `timeout * DIVERGENCE_MULTIPLIER` (revision 6): a streak that completes
+   /// inside `timeout` is `Converged`; one that only completes between
+   /// `timeout` and the divergence multiple is `LateConverged`; if no
+   /// observation is ever part of a completed streak before the divergence
+   /// multiple, it's `Diverged`.
+   async fn poll_until_stable<F, Fut>(timeout: Duration, mut condition: F) -> ConvergenceOutcome
    where
        F: FnMut() -> Fut,
        Fut: std::future::Future<Output = bool>,
    {
-       let deadline = tokio::time::Instant::now() + timeout;
+       let start = tokio::time::Instant::now();
+       let soft_deadline = start + timeout;
+       let hard_deadline = start + timeout * DIVERGENCE_MULTIPLIER;
        loop {
            let mut stable = true;
            for _ in 0..STABLE_CHECKS {
                let ok = condition().await;
                tokio::time::sleep(STABLE_GAP).await;
-               if tokio::time::Instant::now() >= deadline {
-                   return false;
+               if tokio::time::Instant::now() >= hard_deadline {
+                   return ConvergenceOutcome::Diverged;
                }
                if !ok {
                    stable = false;
@@ -645,7 +751,12 @@ referenced by history. This is now the durable artifact.
                }
            }
            if stable {
-               return true;
+               let now = tokio::time::Instant::now();
+               return if now <= soft_deadline {
+                   ConvergenceOutcome::Converged
+               } else {
+                   ConvergenceOutcome::LateConverged { elapsed: now - start }
+               };
            }
        }
    }
@@ -729,8 +840,9 @@ referenced by history. This is now the durable artifact.
    }
 
    /// Stable, two-sided membership check: every handle must report exactly
-   /// `expected_n` members with an identical sorted id set, on
-   /// `STABLE_CHECKS` consecutive observations, within `timeout`.
+   /// `expected_n` members with an identical sorted id set. Panics only on
+   /// `Diverged`; `LateConverged` is reported, not failed (see
+   /// `ConvergenceOutcome`).
    async fn assert_stable_membership(
        handles: &[Arc<ClusterHandle>],
        expected_n: usize,
@@ -738,7 +850,7 @@ referenced by history. This is now the durable artifact.
        label: &str,
    ) {
        let hs = handles.to_vec();
-       let ok = poll_until_stable(timeout, || {
+       let outcome = poll_until_stable(timeout, || {
            let hs = hs.clone();
            async move {
                if !hs.iter().all(|h| h.members().len() == expected_n) {
@@ -749,31 +861,48 @@ referenced by history. This is now the durable artifact.
            }
        })
        .await;
-       assert!(
-           ok,
-           "[{label}] all {expected_n} nodes must report an identical {expected_n}-member view, \
-            stable across {STABLE_CHECKS} consecutive observations {STABLE_GAP:?} apart, within \
-            {timeout:?}; {}",
-           describe(handles)
-       );
+       match outcome {
+           ConvergenceOutcome::Converged => {}
+           ConvergenceOutcome::LateConverged { elapsed } => eprintln!(
+               "[{label}] UNDETERMINED-ON-THE-LINE: {expected_n}-member view converged stably at \
+                {elapsed:?}, past the {timeout:?} success line but inside the \
+                {DIVERGENCE_MULTIPLIER}x divergence threshold — per pre-registration this is data, \
+                not a silent pass or a kill; {}",
+               describe(handles)
+           ),
+           ConvergenceOutcome::Diverged => panic!(
+               "[{label}] DIVERGED: all {expected_n} nodes never reported an identical \
+                {expected_n}-member view even within {DIVERGENCE_MULTIPLIER}x {timeout:?} — \
+                kill-line condition; {}",
+               describe(handles)
+           ),
+       }
    }
 
    /// Stable, two-sided counter check: every handle must read exactly
-   /// `EXPECTED_SUM`, on `STABLE_CHECKS` consecutive observations, within
-   /// `timeout`.
+   /// `EXPECTED_SUM`. Panics only on `Diverged`.
    async fn assert_stable_counter_sum(handles: &[Arc<ClusterHandle>], timeout: Duration, label: &str) {
        let hs = handles.to_vec();
-       let ok = poll_until_stable(timeout, || {
+       let outcome = poll_until_stable(timeout, || {
            let hs = hs.clone();
            async move { hs.iter().all(|h| h.counter(COUNTER).get() == EXPECTED_SUM) }
        })
        .await;
-       assert!(
-           ok,
-           "[{label}] every node must read counter={EXPECTED_SUM}, stable across {STABLE_CHECKS} \
-            consecutive observations {STABLE_GAP:?} apart, within {timeout:?}; {}",
-           describe(handles)
-       );
+       match outcome {
+           ConvergenceOutcome::Converged => {}
+           ConvergenceOutcome::LateConverged { elapsed } => eprintln!(
+               "[{label}] UNDETERMINED-ON-THE-LINE: counter={EXPECTED_SUM} converged stably at \
+                {elapsed:?}, past the {timeout:?} success line but inside the \
+                {DIVERGENCE_MULTIPLIER}x divergence threshold — per pre-registration this is data, \
+                not a silent pass or a kill; {}",
+               describe(handles)
+           ),
+           ConvergenceOutcome::Diverged => panic!(
+               "[{label}] DIVERGED: counter never read {EXPECTED_SUM} on every node even within \
+                {DIVERGENCE_MULTIPLIER}x {timeout:?} — kill-line condition; {}",
+               describe(handles)
+           ),
+       }
    }
 
    async fn run_assay() {
@@ -832,13 +961,22 @@ referenced by history. This is now the durable artifact.
 
    #[tokio::test(flavor = "multi_thread")]
    async fn n5_star_cluster_converges_counters_and_survives_departure_and_rejoin() {
-       // Enforces the pre-registered kill line's whole-test 60s bound
-       // directly, rather than relying on per-phase bounds (which sum to
-       // 75s) to never all land near their own ceiling at once, and gives a
-       // genuine hang somewhere to be caught rather than running forever.
-       tokio::time::timeout(TOTAL_TEST_TIMEOUT, run_assay())
-           .await
-           .unwrap_or_else(|_| panic!("assay exceeded the {TOTAL_TEST_TIMEOUT:?} total kill-line bound"));
+       // run_assay() runs on its OWN spawned task; the 60s watchdog waits on
+       // the JoinHandle rather than the future directly, so a genuine
+       // synchronous-lock deadlock inside run_assay() (which tokio::time::
+       // timeout alone cannot preempt — it only fires between .await points
+       // in the future it directly wraps) still lets this test report the
+       // timeout instead of hanging the whole process.
+       let handle = tokio::task::spawn(run_assay());
+       match tokio::time::timeout(TOTAL_TEST_TIMEOUT, handle).await {
+           Ok(Ok(())) => {}
+           Ok(Err(join_err)) => std::panic::resume_unwind(join_err.into_panic()),
+           Err(_) => panic!(
+               "assay exceeded the {TOTAL_TEST_TIMEOUT:?} total kill-line bound (the spawned task \
+                may still be running/blocked in the background, but the test harness itself still \
+                reports this timeout rather than hanging)"
+           ),
+       }
    }
    ```
 
