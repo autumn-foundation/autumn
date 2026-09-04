@@ -105,7 +105,7 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
     // these four: a marker inside a `<div>` is plainly *visible*, so it is a
     // decision like any other, and skipping it would take the escape hatch away
     // from anyone who formats their comments.
-    let mut raw_html: Option<&'static str> = None;
+    let mut raw_html: Option<RawBlock> = None;
     // Inside an HTML tag that has not closed yet. A tag can span lines, and the
     // lines inside it are attribute data — a marker in a `title=` renders as
     // part of the attribute and says nothing to a reader.
@@ -161,15 +161,15 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
         // exactly like a fenced block — so a reviewer showing the marker is not
         // granting it. Tracked only outside a fence, where such a tag is text.
         if fence.is_none() {
-            if let Some(tag) = raw_html {
-                if closes_raw_html(line, tag) {
+            if let Some(block) = raw_html {
+                if block.closed_by(line) {
                     raw_html = None;
                 }
                 continue;
             }
-            if let Some(tag) = opens_raw_html(line) {
-                if !closes_raw_html(line, tag) {
-                    raw_html = Some(tag);
+            if let Some(block) = opens_raw_html(line) {
+                if !block.closed_by(line) {
+                    raw_html = Some(block);
                 }
                 continue;
             }
@@ -343,36 +343,71 @@ struct TagState {
     quote: Option<char>,
 }
 
-/// The raw HTML blocks whose content renders literally or not at all —
-/// `CommonMark`'s type-1 tags, the only ones where a visible marker is a sample
-/// rather than a decision.
+/// The raw HTML tags whose content renders literally — `CommonMark`'s type-1
+/// blocks, where a visible marker is a sample rather than a decision.
 const RAW_HTML_TAGS: [&str; 4] = ["pre", "script", "style", "textarea"];
 
-/// The tag a line opens a raw HTML block with, if it opens one.
-fn opens_raw_html(line: &str) -> Option<&'static str> {
+/// A raw HTML block, by how it ends.
+///
+/// `CommonMark` has five of these openers and the parser tracked one family.
+/// A processing instruction, a declaration and a CDATA section are inert to a
+/// reader in exactly the same way, so they are inert here too. (`<!-- … -->`
+/// is the sixth and is handled earlier, by the comment stripping.)
+#[derive(Debug, Clone, Copy)]
+enum RawBlock {
+    /// `<pre>` and friends: ends at the matching closing tag.
+    Tag(&'static str),
+    /// `<?`, `<!DECLARATION`, `<![CDATA[`: ends at a fixed delimiter.
+    Until(&'static str),
+}
+
+impl RawBlock {
+    /// Whether this line ends the block.
+    fn closed_by(self, line: &str) -> bool {
+        let line = line.to_ascii_lowercase();
+        match self {
+            // The tag has to end where the tag ends: `</prelude>` is not
+            // `</pre>`, and a prefix match closed the block on it.
+            Self::Tag(tag) => {
+                let close = format!("</{tag}");
+                line.match_indices(&close).any(|(at, _)| {
+                    line[at + close.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|next| next == '>' || next.is_whitespace())
+                })
+            }
+            Self::Until(delimiter) => line.contains(delimiter),
+        }
+    }
+}
+
+/// The raw HTML block a line opens, if it opens one.
+fn opens_raw_html(line: &str) -> Option<RawBlock> {
     let trimmed = line.trim_start().to_ascii_lowercase();
-    RAW_HTML_TAGS.into_iter().find(|tag| {
+    if let Some(tag) = RAW_HTML_TAGS.into_iter().find(|tag| {
         let open = format!("<{tag}");
         trimmed
             .strip_prefix(&open)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with(['>', ' ', '\t', '/']))
-    })
-}
-
-/// Whether a line carries the closing tag that ends the block.
-///
-/// The tag has to end where the tag ends: `</prelude>` is not `</pre>`, and a
-/// prefix match closed the block on it, taking the sample's remaining lines
-/// live while GitHub still rendered them as code.
-fn closes_raw_html(line: &str, tag: &str) -> bool {
-    let line = line.to_ascii_lowercase();
-    let close = format!("</{tag}");
-    line.match_indices(&close).any(|(at, _)| {
-        line[at + close.len()..]
-            .chars()
-            .next()
-            .is_none_or(|next| next == '>' || next.is_whitespace())
-    })
+    }) {
+        return Some(RawBlock::Tag(tag));
+    }
+    if trimmed.starts_with("<?") {
+        return Some(RawBlock::Until("?>"));
+    }
+    if trimmed.starts_with("<![cdata[") {
+        return Some(RawBlock::Until("]]>"));
+    }
+    // A declaration — `<!DOCTYPE …`. Not `<!--`, which the comment stripping
+    // above has already consumed.
+    if trimmed
+        .strip_prefix("<!")
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_alphabetic()))
+    {
+        return Some(RawBlock::Until(">"));
+    }
+    None
 }
 
 /// Whether `line` is indented enough to render as a Markdown code block.
@@ -518,6 +553,44 @@ mod tests {
     fn a_quoted_marker_acknowledges_nothing() {
         assert!(parse_acks("> /ack-posture 0123456789abcdef").is_empty());
         assert!(parse_acks(">> /ack-posture 0123456789abcdef").is_empty());
+    }
+
+    /// `<pre>` is one of five raw HTML block openers, and the parser tracked
+    /// only that family. A processing instruction, a declaration and a CDATA
+    /// section are all inert to a reader in the same way, and all three could
+    /// carry a marker to `parse_marker`.
+    #[test]
+    fn a_marker_inside_any_raw_html_block_acknowledges_nothing() {
+        for (open, close) in [
+            ("<?example", "?>"),
+            ("<!DOCTYPE note", ">"),
+            ("<![CDATA[", "]]>"),
+        ] {
+            let text = format!("{open}\n/ack-posture 0123456789abcdef\n{close}\n");
+            assert!(
+                parse_acks(&text).is_empty(),
+                "{open}: {:?}",
+                parse_acks(&text)
+            );
+        }
+    }
+
+    /// Each closes at its own delimiter, and text after it counts again.
+    #[test]
+    fn a_marker_after_a_raw_html_block_of_any_kind_still_acknowledges() {
+        for (open, close) in [
+            ("<?example", "?>"),
+            ("<!DOCTYPE note", ">"),
+            ("<![CDATA[", "]]>"),
+        ] {
+            let text = format!("{open}\nsample\n{close}\n/ack-posture 0123456789abcdef  yes\n");
+            assert_eq!(
+                parse_acks(&text).len(),
+                1,
+                "{open}: {:?}",
+                parse_acks(&text)
+            );
+        }
     }
 
     /// A backtick code span can cross a newline, and `CommonMark` renders what

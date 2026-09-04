@@ -35,9 +35,14 @@ pub const MAX_SCHEMA_VERSION: u32 = 3;
 // Deliberately a literal, not `MANIFEST_SCHEMA_VERSION`. Tracking the emitter
 // would auto-widen what this differ accepts on the very bump whose doc comment
 // says to re-read the rules — the compile error below is the point.
+//
+// Equality, not `<=`: the comment above promises a compile error when the
+// *emitter* is bumped, and `<=` only caught the opposite mistake. A CLI that
+// emitted v4 while refusing to parse anything above v3 would have compiled
+// cleanly and broken every generated gate at run time instead.
 const _: () = assert!(
-    MAX_SCHEMA_VERSION <= MANIFEST_SCHEMA_VERSION,
-    "the differ claims to read a manifest schema the emitter does not produce"
+    MAX_SCHEMA_VERSION == MANIFEST_SCHEMA_VERSION,
+    "bump both: this differ reads exactly the schema this CLI emits, and a bump means re-reading `projection`"
 );
 
 /// Why a manifest could not be turned into a [`PostureManifest`].
