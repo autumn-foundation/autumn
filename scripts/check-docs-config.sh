@@ -832,6 +832,33 @@ HASH_NEEDS_SPACE = ('.sh', '.bash', '.zsh', '.yml', '.yaml', '.env', '.example')
 # quote having opened at a value position — see `_hash_uncommented`.
 YAML_SCALARS = ('.yml', '.yaml')
 
+# A BLOCK scalar (`key: |` or `key: >`) is a string as far as YAML is concerned,
+# so `description: |` holding `AUTUMN_LOG__LEVL=x cmd` is prose — and it was
+# reading as a prefix assignment. Whether such a string is ever executed is the
+# CONSUMER's rule, not YAML's, so the executed keys are enumerated rather than
+# guessed: `run` (GitHub Actions, GitLab), `command` and `entrypoint` (compose,
+# Kubernetes), `script` (GitLab). Measured before narrowing: every name a block
+# scalar carries in this tree — all 31 occurrences, 10 names — is under `run`.
+YAML_BLOCK = re.compile(r'^(\s*)(?:-\s+)?([A-Za-z0-9_.-]+):\s*[|>][-+0-9]*\s*$')
+YAML_EXECUTED = ('run', 'command', 'entrypoint', 'script')
+
+
+def _yaml_blocks(body):
+    """Blank the bodies of block scalars that are data, keeping line numbers."""
+    out, key, indent = [], None, 0
+    for l in body.splitlines():
+        if key is not None:
+            if l.strip() and (len(l) - len(l.lstrip())) <= indent:
+                key = None
+            else:
+                out.append(l if key in YAML_EXECUTED else '')
+                continue
+        out.append(l)
+        m = YAML_BLOCK.match(l)
+        if m:
+            key, indent = m.group(2), len(m.group(1))
+    return '\n'.join(out)
+
 # HCL accepts THREE comment forms — `#`, `//` and `/* … */` — so Terraform files
 # get the C-style scanner as well as the hash one. It is a superset rather than
 # a swap: a `//` in a shell or YAML file is a path, not a comment, which is why
@@ -1569,7 +1596,19 @@ ASSIGNED_ANY = re.compile(r'(?:^|[;&|(\s])(?:export\s+)?(AUTUMN_[A-Z0-9_]+)=')
 # alongside stripping Dockerfile comments rather than after it: the commented
 # `--build-arg` examples were the only thing carrying five of these names, and
 # removing that cover without the declaration would have reported correct pages.
+# A single `ENV` may declare SEVERAL variables across a line continuation —
+# `ENV AUTUMN_ONE=1 \` then `AUTUMN_TWO=2` — and anchoring to the start of the
+# line saw only the first. `DECLARED_CONT` reads the rest, and the caller
+# supplies the continuation state, because whether a line is a continuation is
+# a property of the line ABOVE it.
 DECLARED = re.compile(r'^\s*(?:ARG|ENV)\s+(AUTUMN_[A-Z0-9_]+)')
+DECLARED_CONT = re.compile(r'(?:^|\s)(AUTUMN_[A-Z0-9_]+)=')
+
+# A dotenv file's ENTIRE grammar is `NAME=value`: there is no command for a
+# prefix assignment to reach and nothing script-local to confuse it with, so the
+# bare form is a declaration exactly as `ENV` is in a Dockerfile. Without this a
+# name defined only in `.env.example` could not be documented without a waiver.
+DOTENV = ('.env', '.example')
 EXPANDED = re.compile(r'\$\{?(AUTUMN_[A-Z0-9_]+)\}?')
 
 # A quoted name counts only where the code BINDS it as an environment-variable
@@ -2074,6 +2113,8 @@ def source_tokens(root):
                           effective_suffix(rel) in YAML_SCALARS)
         if rel.endswith('.rs'):
             body = untested(body)
+        if effective_suffix(rel) in YAML_SCALARS:
+            body = _yaml_blocks(body)
         # Heredocs FIRST: blanking single quotes first erases the `'EOF'`
         # marker, and the heredoc body then reads as commands. The self-test for
         # each function passed in isolation while the composition was wrong,
@@ -2097,6 +2138,7 @@ def source_tokens(root):
         local = (set(ASSIGNED_ANY.findall(code))
                  - set(ASSIGNED.findall(code))
                  - set(ASSIGNED_PREFIX.findall(code)))
+        declaring = False
         for n, line in enumerate(lines):
             # `NAME=` is how a SHELL names a variable; in Rust it is just text
             # inside a string, and the text is often not an environment variable
@@ -2120,7 +2162,11 @@ def source_tokens(root):
             if shell_shapes(rel):
                 tokens.update(ASSIGNED.findall(code_lines[n]))
                 tokens.update(ASSIGNED_PREFIX.findall(code_lines[n]))
-                tokens.update(DECLARED.findall(code_lines[n]))
+                if DECLARED.match(code_lines[n]) or declaring:
+                    tokens.update(DECLARED_CONT.findall(code_lines[n]))
+                    declaring = code_lines[n].rstrip().endswith('\\')
+                elif effective_suffix(rel) in DOTENV:
+                    tokens.update(DECLARED_CONT.findall(code_lines[n]))
                 tokens.update(v for v in EXPANDED.findall(line)
                               if v not in local)
                 if effective_suffix(rel) in HAS_HERE_STRING:
@@ -3533,6 +3579,27 @@ def self_test():
            'autumn/src/config.rs', 'autumn-cli/src/templates/main.rs.tmpl',
            'autumn-admin-plugin/src/admin.js', 'autumn/Cargo.toml', 'a.golden')],
          [True] * 5 + [False] * 5)
+    # A YAML block scalar is a string; whether it is ever executed is the
+    # CONSUMER's rule, so the executed keys are enumerated. Every name a block
+    # scalar carries in this tree is under `run`, which really is shell.
+    case('a data block scalar is not commands, but a `run:` block is',
+         (ASSIGNED_PREFIX.findall(_yaml_blocks(
+             'description: |\n  AUTUMN_LOG__LEVL=x cmd\n  more\n')),
+          ASSIGNED_PREFIX.findall(_yaml_blocks(
+              'steps:\n  - run: |\n      AUTUMN_LOG__LEVEL=debug cargo run\n'))),
+         ([], ['AUTUMN_LOG__LEVEL']))
+    # One `ENV` may declare several variables across a continuation, and
+    # anchoring to the line start saw only the first.
+    case('a continued ENV declares every name on it',
+         [DECLARED_CONT.findall(l) for l in
+          'ENV AUTUMN_ONE=1 \\\n    AUTUMN_TWO=2'.splitlines()],
+         [['AUTUMN_ONE'], ['AUTUMN_TWO']])
+    # A dotenv file's whole grammar is `NAME=value`: no command follows, and
+    # there is nothing script-local to confuse it with.
+    case('a bare dotenv assignment is a declaration',
+         ('.example' in DOTENV, effective_suffix('.env.example') in DOTENV,
+          DECLARED_CONT.findall('AUTUMN_LOG__LEVEL="debug"')),
+         (True, True, ['AUTUMN_LOG__LEVEL']))
     # PowerShell reads the environment as `$env:NAME`, not `$NAME`.
     case('a PowerShell environment read is a use',
          (PS_ENV.findall('if ($env:AUTUMN_VERSION) { $env:AUTUMN_VERSION }'),
