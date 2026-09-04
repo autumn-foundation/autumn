@@ -387,6 +387,37 @@ order).
 Re-ran 4 more times (40 total across all ten passes); see **Assay**.
 Verdict is unchanged.
 
+**A seventeenth P2 finding**, on the revision-10 diff above: the
+membership agreement check compared only `ClusterMemberInfo::id` across
+nodes, discarding `addr` and `incarnation` — both of which
+`docs/guide/clustering.md`'s "Replicated status" section documents as
+part of the shared, converged document (merged via a specified rule:
+higher incarnation wins, then `Left` beats `Alive`, then address as a
+commutativity tie-break). An address or incarnation disagreement between
+two nodes that happened to still agree on the member-*id* set would have
+passed this check undetected, even though this report's and the guide's
+"no divergence" / "identical views" language implied more than bare
+id-set agreement. Fixed: the comparison now includes `addr` and
+`incarnation` alongside `id`.
+
+`ClusterMemberInfo::status` (Alive/Suspect) is deliberately still
+excluded from the comparison — checked directly against the guide text
+and the `members()` implementation before deciding this, not assumed:
+`docs/guide/clustering.md` states the view is *"local: replicated `Alive`
+records, minus peers this node currently considers down... Two nodes can
+briefly disagree about the view — that is exactly what eventually
+consistent means here."* `autumn/src/cluster/mod.rs`'s `members()`
+confirms `status` is computed per-node from a local monotonic clock read
+and a never-replicated "overlay," not copied from the merged document.
+Comparing it for cross-node equality would test a property the design
+explicitly disclaims, and risks introducing real flakiness unrelated to
+any actual bug — the opposite of what this correction is for.
+
+Re-ran 4 more times (44 total across all eleven passes) — all still pass,
+confirming `addr` and `incarnation` do converge to bit-for-bit agreement
+across all 5 nodes as the guide's merge rule promises. See **Assay**.
+Verdict is unchanged.
+
 ## 🧪 Apparatus
 
 One throwaway test file, `autumn/tests/prospect_cluster_scale.rs` (a
@@ -394,7 +425,13 @@ temporary `[[test]]` entry added to `autumn/Cargo.toml` to build it,
 `test-support` feature enabled), copying `cluster_two_node.rs`'s own
 harness conventions (`ClusterConfig`, `install_from_config`, `ClusterHandle`,
 a two-sided `describe()` failure formatter) and scaling them to 5 members.
-Every check is **debounced**: `poll_until_stable` requires the condition to
+Membership agreement is checked on `(id, addr, incarnation)` triples, not
+bare ids (seventeenth correction — `addr`/`incarnation` are part of the
+documented, converged replicated document and a mismatch there could
+previously slip past an id-only check); `status` is deliberately excluded
+because the guide documents it as a local, not-replicated overlay that
+can legitimately differ transiently between healthy nodes. Every check is
+**debounced**: `poll_until_stable` requires the condition to
 hold on 6 consecutive observations 250ms apart — the *last read* lands at
 t≈1250ms, strictly past `suspicion_timeout_ms`=1000ms and several
 multiples of `push_interval_ms`=200ms — before counting as converged, not
@@ -638,60 +675,77 @@ finishing past the 3x divergence line is `Diverged` rather than
 | 39 | all steps + hard-deadline-checked streak completion pass | 12.83s |
 | 40 | all steps + hard-deadline-checked streak completion pass | 12.84s |
 
-**Against the pre-registered lines (tenth pass, the one whose code
+**N=5 assay, eleventh pass, 4 more runs** (after extending membership
+agreement to `(id, addr, incarnation)` triples instead of bare ids, with
+`status` deliberately still excluded as a documented local-only field; 44
+total runs across all eleven passes):
+
+| Run | Result | Wall-clock |
+|---|---|---:|
+| 41 | all steps + full (id, addr, incarnation) agreement pass | 13.08s |
+| 42 | all steps + full (id, addr, incarnation) agreement pass | 12.84s |
+| 43 | all steps + full (id, addr, incarnation) agreement pass | 12.82s |
+| 44 | all steps + full (id, addr, incarnation) agreement pass | 13.08s |
+
+**Against the pre-registered lines (eleventh pass, the one whose code
 actually enforces every bound as registered — the whole-test 60s kill
 line via two independent watchdogs (the native one correctly armed
 throughout), a debounce window whose *last read* strictly clears the
 protocol's own timers and is classified before any trailing sleep against
-both the soft and hard deadlines, genuinely concurrent increments, and
-the pre-registration's own tri-state classification — see notes on Step 2
-and Step 3 below for why earlier passes' runs still count as evidence
-despite bugs or claim gaps in that code):**
+both the soft and hard deadlines, genuinely concurrent increments, full
+`(id, addr, incarnation)` membership agreement, and the pre-registration's
+own tri-state classification — see notes on Step 2 and Step 3 below for
+why earlier passes' runs still count as evidence despite bugs or claim
+gaps in that code):**
 
 - **Step 1 (cold-start convergence, line: ≤10s):** passed (`Converged`, not
-  `LateConverged`) on 40/40 runs across all ten passes. The
-  seventh-through-tenth passes' ~12.8-15.6s *total* run time is the sum of
-  9 mandatory debounce windows, not slower convergence — no single phase
-  check came close to its own 5s/10s bound; still roughly 3-8x inside the
-  tightest of those, not a close call the way the cold-start ledger's
-  margins were.
+  `LateConverged`) on 44/44 runs across all eleven passes. The
+  seventh-through-eleventh passes' ~12.8-15.6s *total* run time is the sum
+  of 9 mandatory debounce windows, not slower convergence — no single
+  phase check came close to its own 5s/10s bound; still roughly 3-8x
+  inside the tightest of those, not a close call the way the cold-start
+  ledger's margins were. **Caveat on runs 1-40:** those compared only
+  `ClusterMemberInfo::id` across nodes, not the full `(id, addr,
+  incarnation)` triple — flagged here; only runs 41-44 (eleventh pass) are
+  code-verified to have checked the fuller identity. All 44 runs did
+  converge to agreeing id sets either way.
 
 - **Step 2 (counter merge, line: exact sum 15 on every node, ≤10s):**
-  passed (`Converged`) on 40/40 runs, stability-checked since run 9
+  passed (`Converged`) on 44/44 runs, stability-checked since run 9
   (widened debounce since run 21, 6-observation debounce since run 25,
   pre-sleep classification since run 33, hard-deadline-checked completion
   since run 37), with a membership recheck immediately after confirming
   no flicker occurred during convergence. **Caveat on runs 1-28:** the
   increments driving this check were issued by a plain sequential loop,
   not genuinely concurrently — flagged here, not silently used as
-  evidence for the "concurrent" claim; only runs 29-40 (eighth through
-  tenth passes) are code-verified to have actually issued all 5
-  increments concurrently (barrier-synced spawned tasks). All 40 runs,
+  evidence for the "concurrent" claim; only runs 29-44 (eighth through
+  eleventh passes) are code-verified to have actually issued all 5
+  increments concurrently (barrier-synced spawned tasks). All 44 runs,
   including 1-28, did read the exact sum 15 — so the merge-correctness
   evidence stands regardless, it's specifically the *concurrency* of the
-  input that only runs 29-40 can back.
+  input that only runs 29-44 can back.
 - **Step 3 (departure, line: 4-member view on survivors, ≤5s, AND exact sum
-  15 still held on all 4 survivors):** passed (`Converged`) on 40/40 runs —
-  the counter half ran in runs 5-40, held on 36/36 of those; the stability
-  debounce and post-counter membership recheck ran in runs 9-40, held on
-  32/32. **Caveat on runs 9-12 specifically:** those ran before the fourth
+  15 still held on all 4 survivors):** passed (`Converged`) on 44/44 runs —
+  the counter half ran in runs 5-44, held on 40/40 of those; the stability
+  debounce and post-counter membership recheck ran in runs 9-44, held on
+  36/36. **Caveat on runs 9-12 specifically:** those ran before the fourth
   correction, so their code was actually bounded by the 10s
   `CONVERGE_TIMEOUT`, not the registered 5s `DEPARTURE_TIMEOUT` — the
   *test* didn't enforce the right line, even though it still passed. This
   is not silently swept in as clean evidence for the 5s bound: it's
-  flagged here, and only runs 13-40 (fourth through tenth passes) are
-  code-verified to have actually been gated at 5s. All 40 runs, including
+  flagged here, and only runs 13-44 (fourth through eleventh passes) are
+  code-verified to have actually been gated at 5s. All 44 runs, including
   9-12, did *empirically* complete step 3 in well under 5s either way — so
   the wall-clock evidence itself still supports the line; only the earlier
   code's enforcement of that specific line was what was broken, not the
   measured outcome.
 - **Step 4 (rejoin, line: 5-member view, ≤10s, AND exact sum 15 relearned
-  by the rejoined node):** passed (`Converged`) on 40/40 runs — counter half
-  held on 36/36 (runs 5-40), stability + post-counter recheck held on 32/32
-  (runs 9-40), all correctly bounded at 10s throughout (this step was
+  by the rejoined node):** passed (`Converged`) on 44/44 runs — counter half
+  held on 40/40 (runs 5-44), stability + post-counter recheck held on 36/36
+  (runs 9-44), all correctly bounded at 10s throughout (this step was
   never affected by the Step 3 timeout bug).
 - **Undetermined-on-the-line classification (`LateConverged`):** never
-  triggered in any of the 40 runs — every check reached `Converged` well
+  triggered in any of the 44 runs — every check reached `Converged` well
   inside its `timeout`, so the pre-registration's third outcome remains
   implemented but empirically unexercised. The apparatus now has the
   capacity to report it (including correctly deferring to `Diverged` past
@@ -699,7 +753,7 @@ despite bugs or claim gaps in that code):**
   boundary closely enough to demonstrate either path firing.
 - **Whole-test 60s kill line:** enforced by two independent watchdogs since
   run 25 — the Tokio-scheduled one waiting on a spawned task's
-  `JoinHandle` (runs 21-40; a bare wrapper around the future directly,
+  `JoinHandle` (runs 21-44; a bare wrapper around the future directly,
   runs 17-20, is cooperative and can't preempt a genuine synchronous-lock
   deadlock) and a native `std::thread` outside the Tokio runtime entirely,
   correctly armed throughout its full window since run 33 (runs 25-32 had
@@ -712,7 +766,7 @@ despite bugs or claim gaps in that code):**
 - **Kill-line check:** zero divergent views, zero wrong counter values,
   zero panics/timeouts/hangs, zero `Diverged` outcomes, zero
   `LateConverged` outcomes, zero watchdog trips (Tokio-scheduled *or*
-  native) across all 40 runs. The "2 of 3 repeats" kill-line threshold was
+  native) across all 44 runs. The "2 of 3 repeats" kill-line threshold was
   never approached in either direction — this result is not a marginal
   call the way the cold-start bisection's sub-5,000ms deltas were; every
   margin here has roughly 3-25x headroom against its line, so ordinary
@@ -725,37 +779,41 @@ despite bugs or claim gaps in that code):**
 (cold-start convergence, exact counter merge, departure convergence,
 rejoin convergence, and the whole-test 60s kill line) held — as
 `Converged`, never `LateConverged` or `Diverged` — on every run across all
-ten passes, with comfortable margin against every bound — not a photo
+eleven passes, with comfortable margin against every bound — not a photo
 finish, and (per the Step 3 caveat in **Assay**) the narrowest margin,
 departure's 5s line, is only claimed as *code-enforced* for the fourth
-through tenth passes' 28 runs, though the wall-clock evidence supports it
-across all 40. No kill-line condition was observed. After all sixteen
-corrections above, the counter's exact sum was verified not just once
-before churn but again on the survivors after departure and again on the
-full cluster after rejoin, with the pre-churn increments themselves now
-genuinely concurrent (barrier-synced spawned tasks, not a sequential
-loop); every convergence/counter observation was required to hold across
-a debounce window whose *last read*, not just a naive window-length
-arithmetic, strictly clears the protocol's own gossip and suspicion
-timers, classified immediately upon that read rather than after an
-unconditional trailing sleep and correctly checked against both the soft
-and hard deadlines on the iteration that decides the outcome, with a
-membership recheck immediately after every counter check; the debounce
-itself always yields rather than risking a spin; step 3's checks are
-gated at the registered 5s, not a silently-inherited 10s; and the whole
-test now runs behind two independent 60s watchdogs — a Tokio-scheduled
-one and a native OS-thread one that cannot be starved by the same
-deadlock the first could theoretically miss on a single-worker runtime,
-and which now stays armed until the assay task has genuinely terminated
-rather than disarming the instant the cooperative watchdog's own await
-resolves — the actual claim the guide text makes ("no divergence," stable
-identical views, exact sums through concurrent churn) is the one actually
-measured, on 4/4 tenth-pass runs, not the progressively weaker versions
-the first nine passes of this report each accidentally supported. Within
-the scope this assay actually tested (single host, single process, star
-topology, honest peers, N=5, correctness not performance), the
-full-broadcast/no-quorum gossip design does **not** show the split-brain
-or lost-update failure mode the guide's hedge gestures at.
+through eleventh passes' 32 runs, though the wall-clock evidence supports
+it across all 44. No kill-line condition was observed. After all
+seventeen corrections above, the counter's exact sum was verified not
+just once before churn but again on the survivors after departure and
+again on the full cluster after rejoin, with the pre-churn increments
+themselves now genuinely concurrent (barrier-synced spawned tasks, not a
+sequential loop); membership agreement is checked on the full `(id, addr,
+incarnation)` identity the design actually converges (not bare ids), with
+`status` deliberately excluded as a documented, not-replicated local
+overlay; every convergence/counter observation was required to hold
+across a debounce window whose *last read*, not just a naive
+window-length arithmetic, strictly clears the protocol's own gossip and
+suspicion timers, classified immediately upon that read rather than
+after an unconditional trailing sleep and correctly checked against both
+the soft and hard deadlines on the iteration that decides the outcome,
+with a membership recheck immediately after every counter check; the
+debounce itself always yields rather than risking a spin; step 3's checks
+are gated at the registered 5s, not a silently-inherited 10s; and the
+whole test now runs behind two independent 60s watchdogs — a
+Tokio-scheduled one and a native OS-thread one that cannot be starved by
+the same deadlock the first could theoretically miss on a single-worker
+runtime, and which now stays armed until the assay task has genuinely
+terminated rather than disarming the instant the cooperative watchdog's
+own await resolves — the actual claim the guide text makes ("no
+divergence," stable identical views, exact sums through concurrent
+churn) is the one actually measured, on 4/4 eleventh-pass runs, not the
+progressively weaker versions the first ten passes of this report each
+accidentally supported. Within the scope this assay actually tested
+(single host, single process, star topology, honest peers, N=5,
+correctness not performance), the full-broadcast/no-quorum gossip design
+does **not** show the split-brain or lost-update failure mode the guide's
+hedge gestures at.
 
 This is deliberately a narrower claim than "clustering works past two
 nodes" — see the stubs list above for exactly what was not tested (real
@@ -799,7 +857,7 @@ peers, one churn cycle":
 
 The apparatus was never committed (per this ledger's containment rule, it
 is reverted before the report is finalized), so its exact source (revision
-10, post all sixteen Codex corrections above) is embedded below rather
+11, post all seventeen Codex corrections above) is embedded below rather
 than referenced by history. This is now the durable artifact.
 
 1. Add this entry to `autumn/Cargo.toml`, immediately after the existing
@@ -825,25 +883,42 @@ than referenced by history. This is now the durable artifact.
    //! `[[test]]` Cargo.toml entry are reverted after the assay runs — its
    //! source is embedded verbatim in the report's Reproduce section instead.
    //!
-   //! Revisions 2-9: see the report's Correction sections for the full
+   //! Revisions 2-10: see the report's Correction sections for the full
    //! history (counter re-verified through churn; debounced, yield-safe,
-   //! deadline-aware stability checks spanning the protocol's own timers; a
-   //! tri-state Converged/LateConverged/Diverged outcome; a phase-specific
-   //! departure timeout; dual watchdogs (Tokio-scheduled + native OS thread,
-   //! the latter armed until genuine task completion); genuinely concurrent,
-   //! barrier-synced counter increments; pre-sleep deadline classification.
+   //! deadline-aware stability checks spanning the protocol's own timers,
+   //! classified before any trailing sleep and checked against both the soft
+   //! and hard deadlines on the deciding read; a tri-state
+   //! Converged/LateConverged/Diverged outcome; a phase-specific departure
+   //! timeout; dual watchdogs (Tokio-scheduled + native OS thread, the
+   //! latter armed until genuine task completion); genuinely concurrent,
+   //! barrier-synced counter increments).
    //!
-   //! Revision 10 (one more Codex P2 finding on the revision-9 diff): a
-   //! completed streak's classification checked only `now <= soft_deadline`
-   //! to choose between `Converged` and `LateConverged` — never checking
-   //! whether `now` had *also* already passed `hard_deadline`, which should
-   //! make it `Diverged` instead. The separate `now >= hard_deadline` check
-   //! only runs on the path where the streak does *not* complete this
-   //! iteration, so it was dead code for exactly the case that mattered: a
-   //! streak whose 6th successful read landed past the 3x divergence
-   //! threshold. No run has ever landed there, but the classification logic
-   //! was wrong at that boundary. Fixed: the completed-streak branch now
-   //! checks both deadlines explicitly.
+   //! Revision 11 (Codex P2 on the revision-10 diff): the membership
+   //! agreement check compared only `ClusterMemberInfo::id` across nodes,
+   //! discarding `addr` and `incarnation` — both of which
+   //! `docs/guide/clustering.md`'s "Replicated status" section documents as
+   //! part of the shared, converged document (merged via a real, specified
+   //! rule: higher incarnation wins, then `Left` beats `Alive`, then
+   //! address as a commutativity tie-break) — so an address or incarnation
+   //! disagreement between two nodes that happened to agree on the member-id
+   //! *set* would have passed undetected, even though the report's "no
+   //! divergence" / "identical views" language implied more than id-set
+   //! agreement. Fixed: the comparison now includes `addr` and `incarnation`
+   //! alongside `id`.
+   //!
+   //! `ClusterMemberInfo::status` (Alive/Suspect) is deliberately still
+   //! excluded from the comparison — not an oversight, a documented design
+   //! fact: `docs/guide/clustering.md` states the view is "local: replicated
+   //! `Alive` records, minus peers this node currently considers down... Two
+   //! nodes can briefly disagree about the view — that is exactly what
+   //! eventually consistent means here." `status` in `ClusterMemberInfo` is
+   //! computed per-node from a local suspicion timer
+   //! (`autumn/src/cluster/mod.rs`'s `members()`, confirmed reading it
+   //! directly: it reads `self.inner.clock.monotonic()` and an `overlay`
+   //! that is never itself replicated), not copied from the merged document.
+   //! Comparing it for cross-node equality would test a property the design
+   //! explicitly does not claim to hold, and could introduce genuine
+   //! flakiness unrelated to any real bug.
 
    use std::sync::atomic::{AtomicBool, Ordering};
    use std::sync::Arc;
@@ -896,8 +971,7 @@ than referenced by history. This is now the durable artifact.
    /// consecutive observations, `STABLE_GAP` apart. Classification happens
    /// immediately after each read, before any sleep, and — on the iteration
    /// where the streak actually completes — checks *both* the soft and hard
-   /// deadlines explicitly (revision 10: a streak completing past the hard
-   /// deadline is `Diverged`, not `LateConverged`).
+   /// deadlines explicitly.
    async fn poll_until_stable<F, Fut>(timeout: Duration, mut condition: F) -> ConvergenceOutcome
    where
        F: FnMut() -> Fut,
@@ -950,10 +1024,20 @@ than referenced by history. This is now the durable artifact.
        }
    }
 
-   fn member_ids(handle: &Arc<ClusterHandle>) -> Vec<String> {
-       let mut ids: Vec<String> = handle.members().into_iter().map(|m| m.id).collect();
-       ids.sort();
-       ids
+   /// `(id, addr, incarnation)` triples, sorted — the fields
+   /// `docs/guide/clustering.md`'s "Replicated status" section documents as
+   /// part of the shared, converged document. `ClusterMemberInfo::status` is
+   /// deliberately excluded (see the module doc comment above): it is a
+   /// documented *local* overlay, not gossiped state, and can legitimately
+   /// differ transiently between healthy, fully-converged nodes.
+   fn member_identities(handle: &Arc<ClusterHandle>) -> Vec<(String, String, u64)> {
+       let mut identities: Vec<(String, String, u64)> = handle
+           .members()
+           .into_iter()
+           .map(|m| (m.id, m.addr, m.incarnation))
+           .collect();
+       identities.sort();
+       identities
    }
 
    fn describe(handles: &[Arc<ClusterHandle>]) -> String {
@@ -964,7 +1048,7 @@ than referenced by history. This is now the durable artifact.
                format!(
                    "node{i}(id={}, members={:?}, {COUNTER}={})",
                    h.node_id(),
-                   member_ids(h),
+                   h.members(),
                    h.counter(COUNTER).get()
                )
            })
@@ -1029,9 +1113,9 @@ than referenced by history. This is now the durable artifact.
    }
 
    /// Stable, two-sided membership check: every handle must report exactly
-   /// `expected_n` members with an identical sorted id set. Panics only on
-   /// `Diverged`; `LateConverged` is reported, not failed (see
-   /// `ConvergenceOutcome`).
+   /// `expected_n` members with identical `(id, addr, incarnation)` triples
+   /// (see `member_identities`). Panics only on `Diverged`; `LateConverged`
+   /// is reported, not failed (see `ConvergenceOutcome`).
    async fn assert_stable_membership(
        handles: &[Arc<ClusterHandle>],
        expected_n: usize,
@@ -1045,8 +1129,8 @@ than referenced by history. This is now the durable artifact.
                if !hs.iter().all(|h| h.members().len() == expected_n) {
                    return false;
                }
-               let reference = member_ids(&hs[0]);
-               hs.iter().all(|h| member_ids(h) == reference)
+               let reference = member_identities(&hs[0]);
+               hs.iter().all(|h| member_identities(h) == reference)
            }
        })
        .await;
