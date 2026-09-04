@@ -15266,12 +15266,12 @@ mod tests {
         std::fs::create_dir_all(dist.join("storefront")).expect("mkdir storefront");
         let sentinel = "tenant-a-sentinel-warden-2026-09-04";
         std::fs::write(dist.join("storefront/index.html"), sentinel).expect("seed stale file");
-        let mut routes = std::collections::HashMap::new();
-        routes.insert(
+        let mut seed_routes = std::collections::HashMap::new();
+        seed_routes.insert(
             "/storefront".to_owned(),
             crate::static_gen::ManifestEntry::new("storefront/index.html".to_owned()),
         );
-        let manifest = crate::static_gen::StaticManifest::new(routes);
+        let manifest = crate::static_gen::StaticManifest::new(seed_routes);
         std::fs::write(
             dist.join("manifest.json"),
             serde_json::to_string(&manifest).expect("serialize manifest"),
