@@ -250,7 +250,7 @@ fn report_shadow_exposure(
     out: &mut Vec<Finding>,
 ) {
     for ((survivor_path, survivor_method), survivor) in after {
-        if !methods_overlap(method, survivor_method) || !shapes_overlap(path, survivor_path) {
+        if !methods_overlap(method, survivor_method) || !survivor_gains(path, survivor_path) {
             continue;
         }
         // Only a survivor that admits callers the deleted route refused is a
@@ -338,6 +338,45 @@ fn effective_methods(method: &str) -> BTreeSet<String> {
 /// Whether two routes can answer any of the same requests.
 fn methods_overlap(a: &str, b: &str) -> bool {
     !effective_methods(a).is_disjoint(&effective_methods(b))
+}
+
+/// Whether `survivor` starts answering requests that `removed` used to take.
+///
+/// Overlap alone is not the question, because the router has a precedence rule:
+/// a static segment beats a capture, which beats a catch-all, decided at the
+/// first position where they differ. Deleting a gated `/users/{id}` while a
+/// public `/users/me` survives exposes nothing — that URL was already going to
+/// `/users/me`, and the deletion only takes the remaining dynamic URLs away.
+/// The reverse is the real exposure, and so is a survivor that loses the
+/// overlap on an earlier segment but wins it once the removed route is gone.
+fn survivor_gains(removed: &str, survivor: &str) -> bool {
+    if !shapes_overlap(removed, survivor) {
+        return false;
+    }
+    let removed: Vec<&str> = removed.split('/').collect();
+    let survivor: Vec<&str> = survivor.split('/').collect();
+    for i in 0..removed.len().max(survivor.len()) {
+        // A path that has run out of segments is the less specific of the two:
+        // only a catch-all can be matching in its place.
+        let mine = removed.get(i).map_or(u8::MAX, |s| specificity(s));
+        let theirs = survivor.get(i).map_or(u8::MAX, |s| specificity(s));
+        if mine != theirs {
+            return mine < theirs;
+        }
+    }
+    // Equally specific the whole way down. The router rejects such a pair as a
+    // conflict, so the manifest is malformed — report rather than stay quiet.
+    true
+}
+
+/// How specific a normalized path segment is, lowest first, in the router's own
+/// order: a static segment beats a capture, which beats a catch-all.
+fn specificity(segment: &str) -> u8 {
+    if segment.contains(CATCH_ALL) {
+        2
+    } else {
+        u8::from(segment.contains(CAPTURE))
+    }
 }
 
 /// Whether two route *shapes* can match the same URL.
@@ -685,7 +724,7 @@ fn diff_authorization_policies(
         // really did disappear from something reachable.
         let url_still_answered = routes_after
             .iter()
-            .any(|(p, m)| shapes_overlap(path, p) && methods_overlap(method, m));
+            .any(|(p, m)| survivor_gains(path, p) && methods_overlap(method, m));
         if !url_still_answered {
             continue;
         }
@@ -699,7 +738,7 @@ fn diff_authorization_policies(
             && after.keys().any(|(p, m, a, r)| {
                 a == action
                     && r == resource
-                    && shapes_overlap(path, p)
+                    && survivor_gains(path, p)
                     && methods_overlap(method, m)
             })
         {
@@ -1718,6 +1757,69 @@ mod tests {
             widening[0].detail.contains("/users/{id}"),
             "the finding must name the route that now serves the URL: {:?}",
             widening[0]
+        );
+    }
+
+    /// Overlap is not enough: the router matches a static segment before a
+    /// dynamic one, so a surviving `/users/me` was *already* answering that URL
+    /// before the gated `/users/{id}` was deleted. Nothing falls through to it;
+    /// the deletion only takes the remaining dynamic URLs away. Reporting it
+    /// blocked a pull request over an exposure that cannot happen.
+    #[test]
+    fn a_more_specific_survivor_gains_nothing_and_is_not_exposure() {
+        let survivor = route("/users/me", "GET", "public", &[], &[], false);
+        let removed = route("/users/{id}", "GET", "gated", &["user"], &[], false);
+        let base = routes_only(&format!("{survivor},{removed}"));
+        let head = routes_only(&survivor);
+
+        assert!(
+            widening(&diff(&base, &head)).is_empty(),
+            "{:#?}",
+            diff(&base, &head)
+        );
+    }
+
+    /// Precedence decides it position by position, so a survivor that is less
+    /// specific only where it matters still gains the overlap. `/a/x/{id}` beat
+    /// `/a/{key}/b` at `/a/x/b` while it existed; now it does not.
+    #[test]
+    fn a_survivor_that_wins_the_overlap_only_after_the_deletion_is_exposure() {
+        let survivor = route("/a/{key}/b", "GET", "public", &[], &[], false);
+        let removed = route("/a/x/{id}", "GET", "gated", &["user"], &[], false);
+        let base = routes_only(&format!("{survivor},{removed}"));
+        let head = routes_only(&survivor);
+
+        let findings = diff(&base, &head);
+        let widening = widening(&findings);
+        assert_eq!(widening.len(), 1, "{findings:#?}");
+        assert_eq!(widening[0].kind, "route_shadow_exposed");
+    }
+
+    /// A binding is the same story: the URLs `/records/{id}` served are gone,
+    /// and the static route that survives was already answering its own.
+    #[test]
+    fn a_binding_whose_urls_left_with_it_is_not_a_widening() {
+        let me = route("/records/me", "GET", "gated", &["user"], &[], true);
+        let by_id = route("/records/{id}", "GET", "gated", &["user"], &[], true);
+        let binding = |path: &str, action: &str| {
+            format!(r#"{{"path":"{path}","method":"GET","action":"{action}","resource":"Record"}}"#)
+        };
+        let base = manifest(
+            &format!("{me},{by_id}"),
+            "",
+            "",
+            &format!(
+                "{},{}",
+                binding("/records/me", "read_self"),
+                binding("/records/{id}", "read_any")
+            ),
+        );
+        let head = manifest(&me, "", "", &binding("/records/me", "read_self"));
+
+        assert!(
+            widening(&diff(&base, &head)).is_empty(),
+            "{:#?}",
+            diff(&base, &head)
         );
     }
 
