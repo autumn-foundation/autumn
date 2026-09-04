@@ -363,10 +363,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Only widening blocks — a new public route, a guard removed, a classification
   downgraded — and the rules follow the semantics the framework actually
   implements: roles are OR-ed, so *adding* one widens; scopes are AND-ed, so
-  *removing* one widens. Routes are keyed on `(path, method)`, and handler
-  names and source locations are excluded from both the comparison and the
-  digest, so a refactor produces no finding at all. A change with no posture
-  effect posts nothing.
+  *removing* one widens. Routes are keyed on their *shape* — capture names
+  erased, capture kinds kept — and handler names and source locations are
+  excluded from both the comparison and the digest, so a refactor produces no
+  finding at all. A change with no posture effect posts nothing.
+
+  Because a route is not a URL, the diff follows the router's own precedence:
+  deleting a gated `/users/me` while a public `/users/{id}` remains is a
+  widening (that URL falls through), and adding a route that takes a stricter
+  route's URLs over is one too. Configured `security.csrf.exempt_paths` are
+  compared as posture in their own right, since the per-route rows cannot show
+  them.
 
   A widening is unblocked by one comment on the pull request:
 

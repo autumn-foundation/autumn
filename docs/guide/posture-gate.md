@@ -42,9 +42,13 @@ changes no posture posts nothing at all.
 | Scope **removed** — scopes are AND-ed, so one fewer lets more tokens in | **blocks** |
 | `#[authorize]` binding removed, or a policy check dropped | **blocks** |
 | CSRF enforcement lost on a route (disabled, or newly exempt) | **blocks** |
+| A prefix added to `security.csrf.exempt_paths` | **blocks** |
 | A security header stops being emitted | **blocks** |
+| Route removed, **and a weaker route still answers its URLs** | **blocks** |
+| New `gated` route that **takes a stricter route's URLs over** | **blocks** |
 | New `gated` or framework-owned route | annotates |
 | Route removed, gate strengthened, scope added, policy added | annotates |
+| A prefix withdrawn from `security.csrf.exempt_paths` | annotates |
 | A security header's *value* changed (e.g. a new CSP) | annotates |
 | Handler renamed, moved to another file, re-moduled | **nothing at all** |
 
@@ -54,6 +58,29 @@ Two of those rows are worth dwelling on, because they run against intuition:
   role. Adding `editor` lets a strictly larger set of people through.
 - **Removing a scope widens.** `__check_secured_scopes` requires *all* listed
   scopes. Dropping one lets a strictly larger set of tokens through.
+
+### Deleting a route can widen; adding one can too
+
+The two conditional rows are the gate's least obvious behaviour, and they exist
+because **a route is not a URL**. The router matches a static segment before a
+dynamic one and mounts both happily, so `/users/me` and `/users/{id}` coexist
+with the static one winning.
+
+- **Delete `/users/me`** — gated — while a **public** `/users/{id}` remains, and
+  that URL does not go away. It falls through to the public route, and the guard
+  is gone. Reported as `route_shadow_exposed`.
+- **Add `/users/me`** — restricted to `editor` — beside a `/users/{id}`
+  restricted to `admin`, and the new route takes that URL over. Editors reach
+  what needed `admin` a moment ago, while the `/users/{id}` entry sits unchanged
+  in both manifests. Reported as `route_added_shadowing`.
+
+Both are decided by precedence, not by overlap: a survivor that was *already*
+answering the URL gains nothing, so deleting a gated `/users/{id}` beside a
+public `/users/me` is an ordinary removal. The same analysis covers
+`#[authorize]` bindings — a check that disappears from a URL that is still
+answered is `authorization_binding_displaced` — and it follows the methods a
+route really answers, so a `WS` route mounted as a `GET`, or a `GET` that also
+serves `HEAD`, is compared as the router will compare it.
 
 And one row is deliberately weak: a security header's value changing is
 reported, never blocked. Whether one Content-Security-Policy is weaker than
@@ -327,6 +354,12 @@ doesn't. It inherits every boundary of
   reports about itself. The gate isolates the *verdict* from that code (see
   "How a run works"), not the *measurement*. Review build scripts as the
   privileged code they are.
+- **Which URLs a CSRF exemption prefix actually covers.** `routes audit` asks
+  whether a route *template* matches a configured prefix, while the middleware
+  asks it of the request path — so exempting `/users/me` leaves `POST
+  /users/{id}` recorded as enforced. The gate therefore treats the prefix list
+  itself as posture: adding a prefix blocks, whatever the per-route rows say.
+  Expect the report to name the prefix rather than the routes it touches.
 - **Routes that only exist in your deployed configuration.** `autumn routes
   audit` compiles with Cargo's default profile and default features, while your
   production image is typically `--release` and may enable extra features. A
