@@ -60,7 +60,7 @@ jobs:
         # sometimes cleared, on trunk-dev and on every branch cut from it.
         # Reproduced locally on a 15 GB box: `--workspace --all-targets` is
         # OOM-killed at `-j 4` and completes clean at `-j 2`.
-        run: cargo clippy -j 2 --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked -j 2 --workspace --all-targets -- -D warnings
       - name: Clippy (autumn-web, gated request-path features — panic gate)
         # The default-feature Clippy above does not compile the feature-gated
         # request-path modules (channels→ws, mail→mail, sync/*→offline-sync,
@@ -92,7 +92,7 @@ jobs:
         # webhook route, and `storage` gates the upload path — both are request-path
         # modules carrying the panic gate, so they have to be in this feature list
         # for their `deny(clippy::…)` block to be compiled at all.
-        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" --all-targets -- -D warnings
+        run: cargo clippy --locked -p autumn-web --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" --all-targets -- -D warnings
       - name: Clippy (autumn-web, plugin-sandbox — panic gate)
         # `plugin-sandbox` (#1609) is not a default feature, so neither Clippy run
         # above compiles `plugin_sandbox`'s request-path modules and their
@@ -104,7 +104,7 @@ jobs:
         #
         # Kept as its own lane rather than folded into the list above so a
         # `wasmi`-linking build is not forced on every gated-feature Clippy run.
-        run: cargo clippy -p autumn-web --features "plugin-sandbox,test-support" --all-targets -- -D warnings
+        run: cargo clippy --locked -p autumn-web --features "plugin-sandbox,test-support" --all-targets -- -D warnings
       - name: Panic-free request-path gate
         run: ./scripts/check-panic-gate.sh
       - name: Determinism seam gate
@@ -125,7 +125,7 @@ jobs:
         # `target/`, dot-dirs, and `tests/` directories (test scaffolding and the
         # committed red/green fixtures), so a single invocation over `.` fails the
         # job on any real product finding.
-        run: cargo run -p autumn-cli --bin autumn -- a11y verify .
+        run: cargo run --locked -p autumn-cli --bin autumn -- a11y verify .
 
   migration-guides:
     name: Migration guide coverage
@@ -271,12 +271,12 @@ jobs:
         # DEFAULT features, so a cold cache is a full framework build (tens of
         # minutes), and this job name gets its own `rust-cache` entry against
         # the repo's shared cache budget. Warm runs are a couple of minutes.
-        run: cargo test -p autumn-plugin-reference --all-features
+        run: cargo test --locked -p autumn-plugin-reference --all-features
       - name: Check the flagship first-party plugin still builds
         # The success metric in issue #1601 names both the reference plugin and
         # autumn-admin-plugin. The reference plugin proves the DECLARED surface;
         # the admin plugin proves a real, non-trivial consumer of it.
-        run: cargo check -p autumn-admin-plugin --all-targets
+        run: cargo check --locked -p autumn-admin-plugin --all-targets
 
   supply-chain:
     name: Supply chain (cargo-deny)
@@ -345,7 +345,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
       - name: Run markdown-gated tests (user-content sanitizer)
         # `markdown` is not a default feature, so the `cargo test --workspace`
         # above compiles neither the stored-XSS regression corpus
@@ -354,9 +354,9 @@ jobs:
         # corpus IS the safety guarantee for user-submitted rich text
         # (issue #1255), so it has to run in a lane that blocks merge.
         run: |
-          cargo test -p autumn-web --features markdown --test integration_tests rich_text
-          cargo test -p autumn-web --features markdown --lib markdown::
-          cargo test -p autumn-web --features markdown --doc markdown::
+          cargo test --locked -p autumn-web --features markdown --test integration_tests rich_text
+          cargo test --locked -p autumn-web --features markdown --lib markdown::
+          cargo test --locked -p autumn-web --features markdown --doc markdown::
       - name: Run inbound-mail-gated tests (untrusted MIME parsing)
         # `inbound-mail` and its provider aliases are not default features, so
         # `cargo test --workspace` compiles neither `inbound_mail`'s in-module
@@ -365,8 +365,8 @@ jobs:
         # controlled RFC 5322 / MIME bodies on an unauthenticated webhook route
         # — hostile-input regressions there have to block merge (issue #1611).
         run: |
-          cargo test -p autumn-web --features "inbound-mail,inbound-mailgun,inbound-ses,mail" --lib inbound_mail
-          cargo test -p autumn-web --features "inbound-mail,inbound-mailgun,inbound-ses,mail,test-support" --test integration_tests inbound_mail
+          cargo test --locked -p autumn-web --features "inbound-mail,inbound-mailgun,inbound-ses,mail" --lib inbound_mail
+          cargo test --locked -p autumn-web --features "inbound-mail,inbound-mailgun,inbound-ses,mail,test-support" --test integration_tests inbound_mail
       - name: Run i18n-gated tests (translatable model fields)
         # `i18n` is not a default feature, so the `cargo test --workspace` above
         # compiles neither `i18n::translatable`'s in-module suite nor the two
@@ -378,8 +378,8 @@ jobs:
         # round-trip tests in `translatable_model` are swept separately by the
         # "Run Docker-dependent tests" step below.
         run: |
-          cargo test -p autumn-web --features i18n --lib i18n::
-          cargo test -p autumn-web --features "i18n,test-support" --test integration_tests translatable
+          cargo test --locked -p autumn-web --features i18n --lib i18n::
+          cargo test --locked -p autumn-web --features "i18n,test-support" --test integration_tests translatable
       - name: Run plugin-sandbox tests (untrusted-plugin containment)
         # `plugin-sandbox` is not a default feature, so `cargo test --workspace`
         # compiles neither the sandbox's in-module suites nor
@@ -393,9 +393,9 @@ jobs:
         # `test-support` supplies the shared WAT guest corpus; `wat` (a dev
         # dependency) compiles it, so no `wasm32-wasip1` toolchain is needed.
         run: |
-          cargo test -p autumn-web --features plugin-sandbox --lib plugin_sandbox
-          cargo test -p autumn-web --features "plugin-sandbox,test-support" --test integration_tests plugin_sandbox
-          cargo test -p autumn-web --features plugin-sandbox --doc plugin_sandbox
+          cargo test --locked -p autumn-web --features plugin-sandbox --lib plugin_sandbox
+          cargo test --locked -p autumn-web --features "plugin-sandbox,test-support" --test integration_tests plugin_sandbox
+          cargo test --locked -p autumn-web --features plugin-sandbox --doc plugin_sandbox
 
       - name: Run redis-TLS-gated tests (rediss:// CryptoProvider guard)
         # `redis` and `ws` are not `autumn-web` default features. The
@@ -424,10 +424,10 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
           }
-          cargo test -p autumn-web --features "redis,ws" --lib redis_tls:: \
+          cargo test --locked -p autumn-web --features "redis,ws" --lib redis_tls:: \
             | tee "${RUNNER_TEMP}/redis-tls.log"
           assert_ran "${RUNNER_TEMP}/redis-tls.log" "autumn-web redis_tls unit tests"
-          cargo test -p autumn-cache-redis --lib \
+          cargo test --locked -p autumn-cache-redis --lib \
             | tee "${RUNNER_TEMP}/cache-redis.log"
           assert_ran "${RUNNER_TEMP}/cache-redis.log" "autumn-cache-redis unit tests"
       - name: Run direct-TLS (HTTPS) tests
@@ -459,13 +459,13 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
           }
-          cargo test -p autumn-web --features tls --lib tls:: \
+          cargo test --locked -p autumn-web --features tls --lib tls:: \
             | tee "${RUNNER_TEMP}/tls-lib.log"
           assert_ran "${RUNNER_TEMP}/tls-lib.log" "autumn-web tls unit tests"
-          cargo test -p autumn-web --features "tls,ws,test-support" \
+          cargo test --locked -p autumn-web --features "tls,ws,test-support" \
             --test integration_tests tls_serving:: | tee "${RUNNER_TEMP}/tls-serving.log"
           assert_ran "${RUNNER_TEMP}/tls-serving.log" "tls_serving"
-          cargo test -p autumn-web --features "tls,ws,test-support" \
+          cargo test --locked -p autumn-web --features "tls,ws,test-support" \
             --test integration_tests tls_app_surface:: | tee "${RUNNER_TEMP}/tls-surface.log"
           assert_ran "${RUNNER_TEMP}/tls-surface.log" "tls_app_surface"
       - name: Run ACME-gated tests (certificate provisioning + renewal)
@@ -495,10 +495,10 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
           }
-          cargo test -p autumn-web --features acme --lib acme:: \
+          cargo test --locked -p autumn-web --features acme --lib acme:: \
             | tee "${RUNNER_TEMP}/acme-lib.log"
           assert_ran "${RUNNER_TEMP}/acme-lib.log" "autumn-web acme unit tests"
-          cargo test -p autumn-web --features acme \
+          cargo test --locked -p autumn-web --features acme \
             --test integration_tests acme_end_to_end:: | tee "${RUNNER_TEMP}/acme-e2e.log"
           assert_ran "${RUNNER_TEMP}/acme-e2e.log" "acme_end_to_end"
       - name: Run system-test harness (non-browser) tests
@@ -512,8 +512,8 @@ jobs:
         # browser tests need Chromium and run in publish-gate.yml's
         # browser-provisioned job.
         run: |
-          cargo test -p autumn-web --features system-tests --lib system_test::
-          cargo test -p autumn-web --features system-tests --test integration_tests system_test_api
+          cargo test --locked -p autumn-web --features system-tests --lib system_test::
+          cargo test --locked -p autumn-web --features system-tests --test integration_tests system_test_api
       - name: Install Postgres client tools (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -535,8 +535,8 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 45
         run: |
-          cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
-          cargo test -p autumn-web --test repository_shard_replica_routing -- --ignored
+          cargo test --locked -p autumn-web --test db_hooks_lifecycle -- --ignored
+          cargo test --locked -p autumn-web --test repository_shard_replica_routing -- --ignored
           # NOTE: explicit feature list (NOT `--all-features`). `--all-features`
           # would enable the backend-flip `sqlite` feature, which flips
           # `db::RuntimeConnection` from `AsyncPgConnection` to a SQLite
@@ -544,10 +544,10 @@ jobs:
           # (db.rs/managed_pg.rs/state.rs/job.rs/repository.rs/sharding.rs). This
           # list is every autumn-web feature EXCEPT `sqlite` (i.e. the Postgres
           # backend, which this pg-integration test requires). See #1614.
-          cargo test -p autumn-web --features "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme" --test feature_flags_pg_integration -- --ignored
-          cargo test -p autumn-web --test scoped_tokens_db -- --ignored
-          cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
-          cargo test -p autumn-admin-plugin --test token_admin_bulk_delete_batch_profile -- --ignored
+          cargo test --locked -p autumn-web --features "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme" --test feature_flags_pg_integration -- --ignored
+          cargo test --locked -p autumn-web --test scoped_tokens_db -- --ignored
+          cargo test --locked -p autumn-admin-plugin --test token_admin_db -- --ignored
+          cargo test --locked -p autumn-admin-plugin --test token_admin_bulk_delete_batch_profile -- --ignored
           # Media-room reaper phase-2 profiling harness: asserts the sweep's
           # reap set, its boundary cases (created_at / last_seen_at exactly ON
           # the cutoff), and its namespace isolation against a
@@ -555,14 +555,14 @@ jobs:
           # block. NOTE: autumn-media-plugin has no crate-wide `--ignored`
           # sweep, so `tests/room_store_db.rs`'s own Docker tests still run
           # nowhere in CI — a pre-existing gap, not addressed here.
-          cargo test -p autumn-media-plugin --test room_reaper_batch_profile -- --ignored
-          cargo test -p autumn-cache-redis -- --ignored
+          cargo test --locked -p autumn-media-plugin --test room_reaper_batch_profile -- --ignored
+          cargo test --locked -p autumn-cache-redis -- --ignored
           # autumn-search (#1191): the Postgres SearchBackend + DocumentSource
           # suites are testcontainer-managed, so no `services:` block is needed.
-          cargo test -p autumn-search -- --ignored
-          cargo test -p autumn-cli --test flags -- --ignored
-          cargo test -p autumn-cli --test config -- --ignored
-          cargo test -p autumn-cli --test experiments -- --ignored
+          cargo test --locked -p autumn-search -- --ignored
+          cargo test --locked -p autumn-cli --test flags -- --ignored
+          cargo test --locked -p autumn-cli --test config -- --ignored
+          cargo test --locked -p autumn-cli --test experiments -- --ignored
           # Offsite-backup DR round-trip (#1744): seed -> `autumn db backup
           # --upload` -> restore from offsite -> row-level equality, against real
           # MinIO + Postgres testcontainers. The `offsite` filter selects both
@@ -570,7 +570,7 @@ jobs:
           # Needs Docker (testcontainers) + host pg_dump/pg_restore (installed
           # above). Runs in the existing Docker-dependent Linux step rather than a
           # separate required gate.
-          cargo test -p autumn-cli --test cli_tests -- --ignored offsite
+          cargo test --locked -p autumn-cli --test cli_tests -- --ignored offsite
           # PII scrub round-trip (#1602): seed known PII -> `autumn db backup`
           # -> `autumn db scrub --artifact` into a separate staging database ->
           # assert ZERO occurrences of any original value in the result, plus
@@ -582,7 +582,7 @@ jobs:
           # `scrubbed_database_migrates_clean_and_boots_the_app` is skipped
           # here: it compiles and boots a generated app and needs the diesel
           # CLI, so it runs in generator-conformance.yml's Postgres gate.
-          cargo test -p autumn-cli --test cli_tests -- --ignored db_scrub \
+          cargo test --locked -p autumn-cli --test cli_tests -- --ignored db_scrub \
             --skip scrubbed_database_migrates_clean_and_boots_the_app
           # Consolidated `integration_tests` binary: discover-and-run ALL the
           # Docker/testcontainer `#[ignore]`d DB tests instead of a hand-curated
@@ -627,8 +627,8 @@ jobs:
           # testcontainer) compiles into this binary and is swept. `i18n` is a
           # pure request-path/codegen feature — it pulls in no extra runner
           # service and cannot flip a backend.
-          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --test integration_tests offline_sync
-          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --test integration_tests -- \
+          cargo test --locked -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --test integration_tests offline_sync
+          cargo test --locked -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --test integration_tests -- \
             --ignored \
             --test-threads=1 \
             --skip per_request_overhead_is_under_50_microseconds_p99 \
@@ -641,7 +641,7 @@ jobs:
           # builds its own fixture image (extracting kamal-proxy from the
           # basecamp/kamal-proxy Docker Hub image) and needs the ssh client
           # installed above.
-          cargo test -p autumn-cli --test deploy_e2e -- --ignored
+          cargo test --locked -p autumn-cli --test deploy_e2e -- --ignored
 
   coverage:
     name: Coverage
@@ -776,7 +776,7 @@ jobs:
       - name: Check MSRV alignment
         run: ./scripts/check-msrv.sh
       - name: Check MSRV compiles
-        run: cargo check --workspace
+        run: cargo check --locked --workspace
 
   # SQLite runtime lane gate (issue #1614, AC#11). This is the ONLY place in CI
   # that enables autumn-web's `sqlite` feature, and it does so via an EXPLICIT
@@ -802,24 +802,24 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2.7.8
       - name: Build autumn-web under the sqlite backend
-        run: cargo build -p autumn-web --features sqlite
+        run: cargo build --locked -p autumn-web --features sqlite
       - name: Clippy (autumn-web lib, sqlite backend)
-        run: cargo clippy -p autumn-web --features sqlite --lib -- -D warnings
+        run: cargo clippy --locked -p autumn-web --features sqlite --lib -- -D warnings
       - name: Clippy (autumn-web lib, sim-testing op-driver)
         # `sim-testing` (W6 PR2, issue #1797) promotes `proptest` to a library
         # dependency for `sim::op` — lint it here (alongside the sqlite lib
         # lint above) since it's not part of any other feature combo above.
-        run: cargo clippy -p autumn-web --features "sqlite,sim-testing" --lib -- -D warnings
+        run: cargo clippy --locked -p autumn-web --features "sqlite,sim-testing" --lib -- -D warnings
       - name: Clippy (autumn-web bin, sim-sweep)
         # `sim-sweep` (W6 PR3, issue #1797) is a `[[bin]]`, not part of `--lib`
         # above, so it needs its own explicit clippy invocation.
-        run: cargo clippy -p autumn-web --features "sqlite,sim-testing" --bin sim-sweep -- -D warnings
+        run: cargo clippy --locked -p autumn-web --features "sqlite,sim-testing" --bin sim-sweep -- -D warnings
       - name: Run the sqlite integration suite
         # Named sqlite `[[test]]` targets only. `test-support` is required by the
         # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,
         # sqlite_transactional_url_pool) and is additive/harmless for the rest.
         run: |
-          cargo test -p autumn-web --features "sqlite,test-support,storage" \
+          cargo test --locked -p autumn-web --features "sqlite,test-support,storage" \
             --test sqlite_boot_serve \
             --test sqlite_migrations \
             --test sqlite_foreign_keys \
@@ -851,7 +851,7 @@ jobs:
         # interceptor/transport surface, so it runs as its own invocation to
         # avoid widening the feature set of the other sqlite tests above.
         run: |
-          cargo test -p autumn-web --features "sqlite,test-support,mail" \
+          cargo test --locked -p autumn-web --features "sqlite,test-support,mail" \
             --test sim_chaos_mail
       - name: Run the sim op-driver DoD suite (W6 PR2, issue #1797)
         # `sim_op_driver` needs the `sim-testing` feature (`proptest` as a
@@ -861,7 +861,7 @@ jobs:
         # in this job to keep sim-testing CI coverage co-located with the rest
         # of the sim DoD suites.
         run: |
-          cargo test -p autumn-web --features sim-testing \
+          cargo test --locked -p autumn-web --features sim-testing \
             --test sim_op_driver
       - name: Run the sim seed-sweep DoD suite (W6 PR3, issue #1797)
         # `sim_sweep_driver` proves `sim::sweep::sweep_proptest` itself — finds
@@ -871,7 +871,7 @@ jobs:
         # and rationale as the op-driver DoD suite above; kept as its own step
         # for the same reason (isolated `[[test]]` binary, no `sqlite` need).
         run: |
-          cargo test -p autumn-web --features sim-testing \
+          cargo test --locked -p autumn-web --features sim-testing \
             --test sim_sweep_driver
 
   # Sim seed sweep (W6 PR3, issue #1797): sweeps `AUTUMN_SIM_SEEDS` seeds
@@ -890,7 +890,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.7.8
       - name: Run the sim-sweep seed sweep
-        run: cargo run -p autumn-web --release --features sim-testing --bin sim-sweep
+        run: cargo run --locked -p autumn-web --release --features sim-testing --bin sim-sweep
         env:
           AUTUMN_SIM_SEEDS: "512"
 
@@ -911,7 +911,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.7.8
       - name: Run loom model checks
-        run: cargo test -p autumn-web --release --test loom_models
+        run: cargo test --locked -p autumn-web --release --test loom_models
         env:
           RUSTFLAGS: "--cfg loom_models"
           LOOM_MAX_PREEMPTIONS: "3"
@@ -943,7 +943,7 @@ jobs:
       - name: Build the edge capsule
         # Ahead of the suite (which builds it too) so a wasm-only compile break
         # reports as a build failure rather than as a conformance failure.
-        run: cargo build -p edge-greeting --target wasm32-wasip1 --release --bin edge-capsule
+        run: cargo build --locked -p edge-greeting --target wasm32-wasip1 --release --bin edge-capsule
       - name: Nothing native may reach the capsule
         # `autumn-edge`'s manifest guard asserts this at the source level (one
         # `default-features = true` on axum would undo it); this asserts it on
@@ -960,7 +960,7 @@ jobs:
       - name: Run the origin/edge conformance suite
         # `--test-threads=1`: the suite installs a process-global panic hook
         # around the deliberately-panicking `/boom` handler.
-        run: cargo test -p edge-greeting --test conformance -- --ignored --test-threads=1 --nocapture
+        run: cargo test --locked -p edge-greeting --test conformance -- --ignored --test-threads=1 --nocapture
 
   windows-tier1:
     name: Windows Tier 1 journey
@@ -1052,7 +1052,7 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "AUTUMN_MANAGED_PG_DATA_DIR=$env:RUNNER_TEMP\tier1-pg"
 
       - name: Build the CLI
-        run: cargo build -p autumn-cli --bin autumn
+        run: cargo build --locked -p autumn-cli --bin autumn
 
       - name: "Journey: autumn new (managed Postgres)"
         # `--bundled-pg` is the managed-Postgres starter — the Tier 1 journey
