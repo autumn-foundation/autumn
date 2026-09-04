@@ -990,8 +990,11 @@ COMPOSE_ASSIGNS = 'environment'
 # The three spellings a compose `environment:` entry takes. Only the first has
 # an `=`, which is why the assignment rungs could not see the other two.
 SEQ_ITEM = re.compile(r'^(\s*)-\s+(.*)$')
-COMPOSE_DECLARED = re.compile(r'^\s*(?:-\s+)?(AUTUMN_[A-Z0-9_]+)\s*(?:[:=]|$)',
-                              re.M)
+# …and YAML may quote either spelling: `"AUTUMN_X": v` and `- "AUTUMN_X=v"` are
+# both valid and both were invisible, because the name was required to sit
+# immediately after the indent or the dash.
+COMPOSE_DECLARED = re.compile(
+    r'^\s*(?:-\s+)?[\'"]?(AUTUMN_[A-Z0-9_]+)[\'"]?\s*(?:[:=]|$)', re.M)
 
 # A workflow chooses the SHELL its `run:` blocks are written in, and the two
 # grammars share almost nothing: in PowerShell `$NAME` is an ordinary local and
@@ -1350,7 +1353,7 @@ def _yaml_blocks(body, interpolated=False, consumer='actions',
                     out[i] = ''
         del buf[:]
 
-    seq, seq_indent, seq_shell, seq_dashc = None, 0, None, False
+    seq, seq_indent, seq_shell, seq_dashc = None, 0, None, None
     src, consumed = body.splitlines(), set()
     for index, l in enumerate(src):
         if index in consumed:
@@ -1391,21 +1394,33 @@ def _yaml_blocks(body, interpolated=False, consumer='actions',
             item = SEQ_ITEM.match(l)
             if at and at.group(3) in YAML_EXECUTED and not YAML_INLINE.match(l):
                 seq, seq_indent = at.group(3), column
-                seq_shell, seq_dashc = None, False
+                seq_shell, seq_dashc = None, None
             elif seq is not None and item and len(item.group(1)) > seq_indent:
                 text = item.group(2).strip()
+                bare = text.strip('\'"')
                 if seq_shell is None:
                     # The first item names the executable; a LATER item has to
                     # ask it to run a command string. `- bash` then a block is
                     # bash running a file of that name, not a script.
-                    seq_shell = (pathlib.PurePath(text.strip('\'"')).name
-                                 in DOCKER_SHELLS)
-                elif seq_shell and _command_option(text.strip('\'"')):
-                    seq_dashc = True
-                if seq_shell and seq_dashc and text.rstrip('-+0123456789') in ('|', '>'):
-                    out.append(l)
-                    key, indent = seq, len(item.group(1))
-                    runs, fold = True, text.startswith('>')
+                    seq_shell = pathlib.PurePath(bare).name in DOCKER_SHELLS
+                elif seq_shell and seq_dashc is None:
+                    if _command_option(bare):
+                        seq_dashc = True
+                elif seq_shell and seq_dashc:
+                    # Only the argument IMMEDIATELY after `-c` is the command
+                    # string; everything after it is `$0`, `$1`, … So the flag
+                    # is three-valued — unseen, expecting, spent — and this
+                    # item spends it either way. Leaving it true made every
+                    # later block in the sequence executable.
+                    seq_dashc = False
+                    if text.rstrip('-+0123456789') in ('|', '>'):
+                        out.append(l)
+                        key, indent = seq, len(item.group(1))
+                        runs, fold = True, text.startswith('>')
+                        continue
+                    # An inline command string is executed too; the `- ` is
+                    # YAML, so it is blanked rather than left as a word.
+                    out.append(' ' * len(item.group(0).split(text)[0]) + text)
                     continue
             elif l.strip() and (len(l) - len(l.lstrip())) <= seq_indent:
                 seq = None
@@ -2593,6 +2608,10 @@ ENV_BOUND = re.compile(r'\b([a-z_]\w*)\s*:\s*[^,;{}()=]*\bEnv\b')
 # declared with it mentions no `Env` at all: `struct ForcedProfileEnv<E: Env>`
 # has `inner: E`, whose `self.inner.var(key)` is a real read. Derived per file,
 # since a type parameter is as local as a binding.
+# What a file imports by name, so a module-scoped derivation can be resolved
+# where it is USED and not only where it is written.
+USE_TREE = re.compile(r'\buse\s+([^;]+);')
+USE_NAME = re.compile(r'[A-Za-z_]\w*')
 ENV_GENERIC = re.compile(r'[<,]\s*([A-Z]\w*)\s*:\s*[^,>]*\bEnv\b'
                          r'|\bwhere\s+([A-Z]\w*)\s*:\s*[^,;{]*\bEnv\b')
 
@@ -2630,6 +2649,7 @@ def accessor(root, test_files=frozenset()):
     out = subprocess.run(['git', 'ls-files', '-z', '*.rs'], cwd=root,
                          capture_output=True, text=True).stdout
     index, types, per_file, masked_all = {}, set(), {}, {}
+    helpers, declared, imports = {}, {}, {}
     for rel in out.split('\0'):
         # Test code is skipped outright, as the scan that consumes this index
         # already does — a receiver bound only in a test is used only in a
@@ -2655,9 +2675,13 @@ def accessor(root, test_files=frozenset()):
             if data[m.start()]:
                 continue
             index[m.group(1)] = len(_split_args(m.group(2))) - 1
+            helpers.setdefault(rel, set()).add(m.group(1))
         masked_all[rel] = (masked, data)
-        types.update(m.group(1) for m in ENV_IMPL.finditer(masked)
-                     if not data[m.start()])
+        own = {m.group(1) for m in ENV_IMPL.finditer(masked)
+               if not data[m.start()]}
+        types.update(own)
+        declared[rel] = own
+        imports[rel] = set(USE_NAME.findall(' '.join(USE_TREE.findall(masked))))
         names = per_file.setdefault(rel, set())
         names.update(m.group(1) for m in ENV_BOUND.finditer(masked)
                      if not data[m.start()])
@@ -2679,14 +2703,24 @@ def accessor(root, test_files=frozenset()):
     # for the whole tree. That is the fourth time a derivation has been wider
     # than the rung it feeds, and the second time in this one function: the
     # inputs of a rung are the rung, however many passes they take.
-    if types:
+    # A TYPE name is module-scoped too. Saying otherwise was my mistake one
+    # round ago: two modules may each define a `RootedEnv`, and only one of
+    # them is an environment. A file may use a type it declares, or one it
+    # imports by name — nothing else.
+    def visible(rel, names):
+        return {n for n in names
+                if n in declared.get(rel, ()) or n in imports.get(rel, ())}
+
+    for rel, (masked, data) in masked_all.items():
+        here = visible(rel, types)
+        if not here:
+            continue
         bound = re.compile(
             r'\blet\s+(?:mut\s+)?([a-z_]\w*)\s*(?::[^=;]*)?=\s*&?\s*(?:'
-            + '|'.join(sorted(map(re.escape, types))) + r')\b')
-        for rel, (masked, data) in masked_all.items():
-            per_file.setdefault(rel, set()).update(
-                m.group(1) for m in bound.finditer(masked)
-                if not data[m.start()])
+            + '|'.join(sorted(map(re.escape, here))) + r')\b')
+        per_file.setdefault(rel, set()).update(
+            m.group(1) for m in bound.finditer(masked)
+            if not data[m.start()])
     # A RECEIVER NAME is file-local, and the pattern was global: `base` is
     # derived from `let base = OsEnv` in one module, and an unrelated module's
     # `base.var(…)` on something else then read as an environment call. A type
@@ -2694,20 +2728,27 @@ def accessor(root, test_files=frozenset()):
     # not. So the receiver alternative is built per file, cached by the set of
     # names, and every file that derives none falls back to the `env`-named
     # floor in `ACCESSOR`.
-    base = ACCESSOR.pattern
-    if index:
-        base += (r'|\b(' + '|'.join(sorted(map(re.escape, index)))
-                 + r')\s*\(')
+    # Everything derived from the tree is MODULE-SCOPED — a helper function, a
+    # type, a binding. Rust says so and I did not: each was registered
+    # tree-wide, so `override_string` defined in the media plugin decided what
+    # a same-named three-argument function meant in every other crate. A file
+    # sees what it declares and what it imports by name; the static floor in
+    # `ACCESSOR` is what every file always has.
     cache = {}
 
     def compiled(rel):
-        names = frozenset(per_file.get(rel, ())) | types
-        if names not in cache:
-            cache[names] = re.compile(
-                base + r'|\b(?:' + '|'.join(sorted(map(re.escape, names)))
-                + r')\s*\.\s*(var|var_os|set_var)\s*\(' if names
-                else base)
-        return cache[names]
+        here = frozenset(visible(rel, set(index)) | set(helpers.get(rel, ())))
+        recv = frozenset(set(per_file.get(rel, ())) | visible(rel, types))
+        if (here, recv) not in cache:
+            pattern = ACCESSOR.pattern
+            if here:
+                pattern += (r'|\b(' + '|'.join(sorted(map(re.escape, here)))
+                            + r')\s*\(')
+            if recv:
+                pattern += (r'|\b(?:' + '|'.join(sorted(map(re.escape, recv)))
+                            + r')\s*\.\s*(var|var_os|set_var)\s*\(')
+            cache[(here, recv)] = re.compile(pattern)
+        return cache[(here, recv)]
 
     return compiled, index
 
@@ -4567,9 +4608,13 @@ def self_test():
     # The helpers put the key second or third, behind arguments that are not
     # string literals — which is what makes "first whole string literal" a rule
     # about the calls rather than a table of arities.
+    # …read through the accessor of the module that DEFINES the helper, since
+    # `override_string` is the media plugin's function and means nothing in
+    # `config.rs`. That scoping is the point, so the test asks the right file.
+    _media_acc = _acc_for('autumn-media-plugin/src/config.rs')
     case('a helper key behind other arguments reads',
          args_of('override_string(&mut self.ffmpeg.bin, env, '
-                 '"AUTUMN_MEDIA__FFMPEG__BIN")', real_acc, real_index),
+                 '"AUTUMN_MEDIA__FFMPEG__BIN")', _media_acc, real_index),
          ['AUTUMN_MEDIA__FFMPEG__BIN'])
     # The key is a POSITION: `set_var(key, "…")` passes its key in a variable
     # and its value as a literal, and the value is nobody's variable name.
@@ -5091,6 +5136,22 @@ def self_test():
           ASSIGNED_PREFIX.findall(_yaml_blocks(_seqx, True, 'compose', True)),
           ASSIGNED_PREFIX.findall(_yaml_blocks(_seqn, True, 'compose', True))),
          (['AUTUMN_SEQ'], [], []))
+    # Only the argument IMMEDIATELY after `-c` is the command string; a
+    # later one is `$0`. An inline command string counts as well as a block.
+    _seql = ('services:\n  a:\n    command:\n      - bash\n      - -c\n'
+             '      - echo safe\n      - |\n        AUTUMN_LATE=1 true\n')
+    _seqi = ('services:\n  a:\n    command:\n      - bash\n      - -c\n'
+             '      - AUTUMN_INLINE=1 true\n')
+    case('only the argument after -c is the command string',
+         (ASSIGNED_PREFIX.findall(_yaml_blocks(_seql, True, 'compose', True)),
+          ASSIGNED_PREFIX.findall(_yaml_blocks(_seqi, True, 'compose', True))),
+         ([], ['AUTUMN_INLINE']))
+    # Compose may quote either declaration spelling.
+    case('a quoted compose declaration is still a declaration',
+         COMPOSE_DECLARED.findall('      - AUTUMN_A=1\n      "AUTUMN_B": v\n'
+                                  '      - "AUTUMN_C=1"\n'
+                                  "      'AUTUMN_D': v\n      - AUTUMN_E\n"),
+         ['AUTUMN_A', 'AUTUMN_B', 'AUTUMN_C', 'AUTUMN_D', 'AUTUMN_E'])
     # Naming the shell is half the claim; `-c` is the other half. `bash <text>`
     # runs a FILE of that name.
     case('a shell runs a command string only when asked to',
