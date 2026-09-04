@@ -751,6 +751,51 @@ def _strip_generated_comments(body, cls):
     return ''.join(out)
 
 
+def _generated_nested(body):
+    """A mask of the characters inside a STRING LITERAL of generated code.
+
+    A generated read is a real read: `autumn-cli/src/generate/admin.rs` emits
+    the reader's test file as a Rust string, and the
+    `std::env::var(\\"AUTUMN_TEST_ADMIN_SESSION\\")` inside it is something the
+    reader's project will run. One level further in, though, a string is data
+    again — `const TEXT: &str = r#\\"std::env::var(\\"AUTUMN_X\\")\\"#;` inside
+    such a template DEFINES a string that merely looks like a call.
+
+    So the question is where the accessor SITS, not where the name does: the
+    name is always inside a nested literal, because it is the argument. This
+    marks the interiors only, and the caller tests the position of the accessor
+    token itself.
+    """
+    cls = _rust_classes(body)
+    nested, i, n, instr = bytearray(len(body)), 0, len(body), False
+    while i < n:
+        if cls[i] != 's':
+            instr, i = False, i + 1
+            continue
+        if i == 0 or cls[i - 1] != 's':
+            j = body.find('"', i)          # step over the region's own opener
+            i, instr = (n if j < 0 else j + 1), False
+            continue
+        c = body[i]
+        if c == '\\':
+            if body[i + 1:i + 2] == '"':
+                instr = not instr
+            elif instr:
+                nested[i] = 1
+                if i + 1 < n:
+                    nested[i + 1] = 1
+            i += 2
+            continue
+        if c == '"':
+            instr = not instr
+            i += 1
+            continue
+        if instr:
+            nested[i] = 1
+        i += 1
+    return nested
+
+
 def _rust_uncommented(body):
     """Drop `//` and `/* … */` comments, keeping strings and line numbering."""
     cls = _rust_classes(body)
@@ -860,6 +905,12 @@ def _blank_literals(body, out, i, n, escape, here=False, dq=False):
     while i < n:
         c = body[i]
         if c == escape:
+            # An ESCAPED `$` is a literal one: `"\${AUTUMN_X}"` prints the
+            # syntax and reads nothing. Blanked here rather than taught to
+            # `EXPANDED`, because that pattern also runs over Rust strings and
+            # YAML, where a backslash escapes nothing of the sort.
+            if body[i + 1:i + 2] == '$':
+                out[i + 1] = ' '
             i += 2
             continue
         if c == '$' and body[i + 1:i + 2] == '(':
@@ -1960,7 +2011,12 @@ def source_tokens(root):
         # Taking the balanced argument list also covers the house multi-line
         # shape — `parse_env(\n env,\n "AUTUMN_MEDIA__ROOM_NAMESPACE")` — which
         # is what the window existed for.
+        # An accessor written inside a string of GENERATED code is data, not a
+        # call the generated program makes — see `_generated_nested`.
+        nested = _generated_nested(body) if rel.endswith('.rs') else None
         for m in acc.finditer(body):
+            if nested is not None and nested[m.start()]:
+                continue
             head = body.rfind('\n', 0, m.start()) + 1
             tail = body.find('\n', m.start())
             if NEGATED.search(body[head:tail if tail >= 0 else len(body)]):
@@ -3357,6 +3413,29 @@ def self_test():
     # …and the bound the carry does NOT relax: this pass runs before the heredoc
     # one, so an apostrophe in a sibling gate's embedded Python must still cost
     # one line rather than every comment below it.
+    # An ESCAPED `$` is a literal one, so `"\${AUTUMN_X}"` prints the syntax and
+    # reads nothing. Blanked in the shell pass, not taught to `EXPANDED`, which
+    # also runs over Rust strings and YAML.
+    case('an escaped dollar is not an expansion',
+         (EXPANDED.findall(_shell_literals(
+             'printf \'%s\' "\\${AUTUMN_LOG__LEVL}"')),
+          EXPANDED.findall(_shell_literals('echo "${AUTUMN_LOG__LEVEL}"'))),
+         ([], ['AUTUMN_LOG__LEVEL']))
+    # A generated read is real; a string INSIDE generated code is data again.
+    # The question is where the accessor sits, not where the name does — the
+    # name is always inside a literal, because it is the argument.
+    # The reproducing shape is an outer RAW template — which is how a generator
+    # naturally writes one, since it needs no escaping — holding a nested plain
+    # string. Both spellings of a real generated read have to survive it.
+    case('an accessor inside generated string data is not a call',
+         [[m.group(0) for m in ACCESSOR.finditer(_rust_uncommented(s))
+           if not _generated_nested(_rust_uncommented(s))[m.start()]]
+          for s in
+          ('fn p() -> &\'static str { r#"const T: &str = '
+           '"std::env::var(\\"AUTUMN_X\\")";"# }',
+           'fn p() -> &\'static str { "std::env::var(\\"AUTUMN_X\\")" }',
+           'fn p() -> &\'static str { r#"std::env::var("AUTUMN_X")"# }')],
+         [[], ['var('], ['var(']])
     case('a stray quote outside YAML still costs one line',
          _hash_uncommented("x = 'a\n# AUTUMN_LOG__LEVL=y cmd\nz = 1\n",
                            True).splitlines(),
