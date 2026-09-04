@@ -1522,6 +1522,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🧭 Wayfinder: restored the focus outline on admin-plugin form/search
+  inputs (keyboard focus visible: 0/2 fields → 2/2, forced-colors mode):**
+  the core admin CRUD loop — list → create → edit, the flow every registered
+  model routes through — set `.form-input:focus` and `.search-bar
+  input:focus` to `outline: none`, replacing it with `border-color` +
+  `box-shadow` only. `box-shadow` (and often `border-color`) is suppressed
+  under forced-colors mode (Windows High Contrast and equivalent OS/browser
+  settings), so a keyboard user in that mode tabbing through the create/edit
+  form, or the list page's search box, got no focus indicator on any field —
+  a WCAG 2.4.7 (Focus Visible) failure, and the exact "style away focus
+  outlines without an equal-or-better replacement" anti-pattern this
+  audit is built to catch. Both rules now keep `outline: 2px solid
+  var(--primary); outline-offset: 2px;`, the same convention already used on
+  8 other focus states in `autumn/src/ui/widgets.css` and on this file's own
+  skip-link — forced-colors mode renders a non-`none` outline with the
+  system's focus color regardless of author styling, so it can't be silently
+  stripped the way `box-shadow` is. Audited with the repo's own `autumn a11y
+  verify` (static Maud scan, 77 `html!` blocks, 0 findings before and after —
+  this class of defect is outside its raw-markup rule set) and `autumn check
+  --a11y` against rendered fixtures of the create form, the edit form (with
+  a validation-error state), and the delete-confirmation dialog (0 DOM-level
+  violations before and after); the keyboard walkthrough that surfaced the
+  defect and the regression test pinning it
+  (`form_and_search_input_focus_keeps_a_visible_outline`) are in
+  `autumn-admin-plugin/src/templates.rs`.
 - **`--counter-cache` scaffolds compiled clean now (#2431):** `autumn generate
   scaffold Comment ... --belongs-to Post --counter-cache` — the documented,
   only way to use the flag — generated a child model that failed `cargo check`
