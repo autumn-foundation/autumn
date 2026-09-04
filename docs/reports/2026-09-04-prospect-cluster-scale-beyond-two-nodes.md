@@ -177,6 +177,40 @@ a membership re-check immediately after every counter check (not just
 before it) — so a flicker during counter convergence can't go unobserved
 either. Re-ran 4 more times; see **Assay**. Verdict is unchanged.
 
+**A fourth and fifth P2 finding**, both on the revision-3 diff above, both
+in the debounce refactor itself rather than in what it was testing:
+
+1. `poll_until_stable`'s inner loop slept `STABLE_GAP` only after a
+   *successful* observation; a failed observation `break`ed out with no
+   sleep or `.await` yield at all before the outer loop immediately
+   retried. Since every condition here is a synchronous `ClusterHandle`
+   read wrapped in an `async move` that completes instantly, a failing
+   streak could in principle spin-retry with no genuine yield point — on a
+   single-worker Tokio runtime this can monopolize the only executor
+   thread and starve the very gossip/timer tasks the condition is waiting
+   on, producing a false timeout on an actually-healthy cluster. This
+   sandbox's `#[tokio::test(flavor = "multi_thread")]` has multiple
+   workers, which is almost certainly why it was never observed here — but
+   the apparatus's correctness shouldn't depend on how many cores happen
+   to be available. Fixed: yield `STABLE_GAP` after *every* observation,
+   success or failure, before deciding whether to retry.
+2. The revision-3 refactor consolidated every membership/counter check
+   into two helpers, and both hardcoded `CONVERGE_TIMEOUT` (10s) —
+   silently dropping the pre-registered 5s `DEPARTURE_TIMEOUT` for step
+   3's checks (both the membership check and the post-departure counter
+   check). `DEPARTURE_TIMEOUT` was still declared but had become
+   dead code, which is exactly the kind of drift a compiler warning alone
+   doesn't catch in a `cargo test` invocation. Every run so far still
+   converged in ~2.3-2.7s either way, well under 5s, so no run's *result*
+   was actually affected — but the apparatus as written no longer enforced
+   the bound it claimed to, which matters for anyone who reproduces this
+   and hits a genuinely slow run. Fixed: both helpers now take an explicit
+   `timeout` parameter, and step 3 passes `DEPARTURE_TIMEOUT` while
+   everything else keeps `CONVERGE_TIMEOUT`.
+
+Re-ran 4 more times (16 total across all four passes); see **Assay**.
+Verdict is unchanged.
+
 ## 🧪 Apparatus
 
 One throwaway test file, `autumn/tests/prospect_cluster_scale.rs` (a
@@ -186,33 +220,41 @@ harness conventions (`ClusterConfig`, `install_from_config`, `ClusterHandle`,
 a two-sided `describe()` failure formatter) and scaling them to 5 members.
 Every check is **debounced**: `poll_until_stable` requires the condition to
 hold on 3 consecutive observations 50ms apart before counting as converged
-(see the third correction above), not a single-instant read. One
-`#[tokio::test(flavor = "multi_thread")]` runs all steps in sequence
-against one 5-node cluster:
+(see the third correction above), not a single-instant read, and yields
+`STABLE_GAP` after every observation — success or failure — so a failing
+streak cannot spin-retry without a genuine `.await` point (fourth
+correction above). Step 3's checks use the pre-registered 5s
+`DEPARTURE_TIMEOUT`; every other step uses the 10s `CONVERGE_TIMEOUT`
+(fifth correction above — the debounce refactor had briefly hardcoded 10s
+everywhere). One `#[tokio::test(flavor = "multi_thread")]` runs all steps
+in sequence against one 5-node cluster:
 
 1. `spawn_star_cluster(5)` — node 0 installs with no seeds; nodes 1-4 each
    install seeded only with node 0's observed `local_addr()` (star
    topology, matching the pre-registration). Every node binds
    `127.0.0.1:0`; `push_interval_ms: 200`, `suspicion_timeout_ms: 1_000`,
    identical to `cluster_two_node.rs`'s own `cluster_config()`.
-2. `assert_stable_membership`: all 5 nodes report an identical, full
-   5-member view, stably.
+2. `assert_stable_membership` (10s bound): all 5 nodes report an identical,
+   full 5-member view, stably.
 3. Every node increments the shared counter by a distinct amount
-   (node *i* → `i+1`); `assert_stable_counter_sum`: all 5 nodes read the
-   exact sum, 15, stably — then `assert_stable_membership` again, to catch
-   any membership flicker that happened *during* counter convergence.
+   (node *i* → `i+1`); `assert_stable_counter_sum` (10s bound): all 5 nodes
+   read the exact sum, 15, stably — then `assert_stable_membership` again,
+   to catch any membership flicker that happened *during* counter
+   convergence.
 4. Cancel node 4's shutdown token (clean departure);
-   `assert_stable_membership`: the 4 survivors converge to an identical
-   4-member view, stably; `assert_stable_counter_sum`: the survivors still
-   read the exact sum 15, stably (the departed node's contributed cells
-   must still be present in the merged document); `assert_stable_membership`
-   again, post-counter-check.
+   `assert_stable_membership` (**5s bound**): the 4 survivors converge to
+   an identical 4-member view, stably; `assert_stable_counter_sum`
+   (**5s bound**): the survivors still read the exact sum 15, stably (the
+   departed node's contributed cells must still be present in the merged
+   document); `assert_stable_membership` again (**5s bound**),
+   post-counter-check.
 5. Install a fresh node, re-seeded from node 0, replacing node 4;
-   `assert_stable_membership`: all 5 (4 original + 1 rejoined) reconverge
-   to a full 5-member view, stably; `assert_stable_counter_sum`: all 5 read
-   the exact sum 15 again, stably (the rejoined node must relearn the full
-   total from its peers, not just the membership shape);
-   `assert_stable_membership` again, post-counter-check.
+   `assert_stable_membership` (10s bound): all 5 (4 original + 1 rejoined)
+   reconverge to a full 5-member view, stably; `assert_stable_counter_sum`
+   (10s bound): all 5 read the exact sum 15 again, stably (the rejoined
+   node must relearn the full total from its peers, not just the
+   membership shape); `assert_stable_membership` again (10s bound),
+   post-counter-check.
 
 **Stubs / what this apparatus faked or skipped** (scopes what the result
 below actually proves):
@@ -308,56 +350,92 @@ check; 12 total runs across all three passes):
 | 11 | all steps + stability + post-counter membership rechecks pass | 2.60s |
 | 12 | all steps + stability + post-counter membership rechecks pass | 2.32s |
 
-**Against the pre-registered lines (third pass, the one that actually
-covers the full claim as stated in the guide text):**
+**N=5 assay, fourth pass, 4 more runs** (after fixing the two revision-4
+findings — an unconditional yield in `poll_until_stable`, and step 3's
+checks actually parameterized to the pre-registered 5s `DEPARTURE_TIMEOUT`
+instead of silently inheriting 10s; 16 total runs across all four passes):
 
-- **Step 1 (cold-start convergence, line: ≤10s):** passed on 12/12 runs
-  across all three passes. Actual convergence is folded into each run's
-  total ~0.9-2.6s wall-clock (compile excluded) — the third pass runs
-  slower than the first two purely because of the added debounce delay
-  (3×50ms per check × more checks per run), not because convergence itself
-  got slower; still roughly 4-10x inside the bound, not a close call the
-  way the cold-start ledger's margins were.
+| Run | Result | Wall-clock |
+|---|---|---:|
+| 13 | all steps + fixed yield + phase-specific timeouts pass | 2.44s |
+| 14 | all steps + fixed yield + phase-specific timeouts pass | 2.43s |
+| 15 | all steps + fixed yield + phase-specific timeouts pass | 2.33s |
+| 16 | all steps + fixed yield + phase-specific timeouts pass | 2.68s |
+
+**Against the pre-registered lines (fourth pass, the one whose code
+actually enforces every bound as registered — see note on Step 3 below for
+why the third pass's runs still count as evidence despite the bug in that
+pass's code):**
+
+- **Step 1 (cold-start convergence, line: ≤10s):** passed on 16/16 runs
+  across all four passes. Actual convergence is folded into each run's
+  total ~0.9-2.7s wall-clock (compile excluded) — the third and fourth
+  passes run slower than the first two purely because of the added
+  debounce delay (3×50ms per check × more checks per run, plus the
+  revision-4 unconditional post-check yield), not because convergence
+  itself got slower; still roughly 4-10x inside the bound, not a close
+  call the way the cold-start ledger's margins were.
 - **Step 2 (counter merge, line: exact sum 15 on every node, ≤10s):**
-  passed on 12/12 runs, now stability-checked, with a membership recheck
-  immediately after (runs 9-12) confirming no flicker occurred during
+  passed on 16/16 runs, stability-checked since run 9, with a membership
+  recheck immediately after confirming no flicker occurred during
   convergence.
 - **Step 3 (departure, line: 4-member view on survivors, ≤5s, AND exact sum
-  15 still held on all 4 survivors):** passed on 12/12 runs — the counter
-  half ran in runs 5-12, held on 8/8 of those; the stability debounce and
-  post-counter membership recheck ran in runs 9-12, held on 4/4.
+  15 still held on all 4 survivors):** passed on 16/16 runs — the counter
+  half ran in runs 5-16, held on 12/12 of those; the stability debounce and
+  post-counter membership recheck ran in runs 9-16, held on 8/8. **Caveat
+  on runs 9-12 specifically:** those ran before the fifth correction, so
+  their code was actually bounded by the 10s `CONVERGE_TIMEOUT`, not the
+  registered 5s `DEPARTURE_TIMEOUT` — the *test* didn't enforce the right
+  line, even though it still passed. This is not silently swept in as
+  clean evidence for the 5s bound: it's flagged here, and only runs 13-16
+  (fourth pass) are code-verified to have actually been gated at 5s. All
+  16 runs, including 9-12, did *empirically* complete in 2.3-2.6s either
+  way — comfortably under 5s regardless of which timeout the code was
+  configured to allow — so the wall-clock evidence itself still supports
+  the line; only the earlier code's enforcement of that specific line was
+  what was broken, not the measured outcome.
 - **Step 4 (rejoin, line: 5-member view, ≤10s, AND exact sum 15 relearned
-  by the rejoined node):** passed on 12/12 runs — counter half held on 8/8
-  (runs 5-12), stability + post-counter recheck held on 4/4 (runs 9-12).
+  by the rejoined node):** passed on 16/16 runs — counter half held on
+  12/12 (runs 5-16), stability + post-counter recheck held on 8/8 (runs
+  9-16), all correctly bounded at 10s throughout (this step was never
+  affected by the Step 3 timeout bug).
 - **Kill-line check:** zero divergent views, zero wrong counter values,
   zero panics/timeouts/hangs, zero stability-debounce failures (no run
   ever needed a second debounce window — every 3-observation streak
-  succeeded on the first attempt) across all 12 runs. The "2 of 3 repeats"
+  succeeded on the first attempt) across all 16 runs. The "2 of 3 repeats"
   kill-line threshold was never approached in either direction — this
   result is not a marginal call the way the cold-start bisection's
-  sub-5,000ms deltas were; every margin here has roughly 4-13x headroom
-  against its line, so ordinary run-to-run scheduling noise on this shared
-  sandbox is not a plausible alternative explanation the way it was there.
+  sub-5,000ms deltas were; every margin here has roughly 2-13x headroom
+  against its line (narrowest: step 3's ~2.3-2.6s actual vs. its 5s line,
+  once correctly enforced), so ordinary run-to-run scheduling noise on
+  this shared sandbox is not a plausible alternative explanation the way
+  it was there.
 
 ## 🏁 Verdict
 
 **Pursue**, against the pre-registered line: all four success criteria
 (cold-start convergence, exact counter merge, departure convergence,
-rejoin convergence) held on every run across all three passes, with
-comfortable margin against every bound — not a photo finish. No kill-line
-condition was observed. After the two corrections above, the counter's
-exact sum was verified not just once before churn but again on the
-survivors after departure and again on the full cluster after rejoin, and
-every convergence/counter observation was required to hold across 3
-consecutive checks (not a single instant) with a membership recheck
-immediately after every counter check — the actual claim the guide text
-makes ("no divergence," stable identical views, exact sums through churn)
-is the one actually measured, on 4/4 third-pass runs, not the weaker
-single-read version the first two passes of this report accidentally
-supported. Within the scope this assay actually tested (single host,
-single process, star topology, honest peers, N=5, correctness not
-performance), the full-broadcast/no-quorum gossip design does **not** show
-the split-brain or lost-update failure mode the guide's hedge gestures at.
+rejoin convergence) held on every run across all four passes, with
+comfortable margin against every bound — not a photo finish, and (per the
+Step 3 caveat in **Assay**) the narrowest margin, departure's 5s line, is
+only claimed as *code-enforced* for the fourth pass's 4 runs, though the
+wall-clock evidence supports it across all 16. No kill-line condition was
+observed. After all four corrections above, the counter's exact sum was
+verified not just once before churn but again on the survivors after
+departure and again on the full cluster after rejoin; every
+convergence/counter observation was required to hold across 3 consecutive
+checks (not a single instant) with a membership recheck immediately after
+every counter check; the debounce itself was fixed to always yield rather
+than risk spinning; and step 3's checks are now actually gated at the
+registered 5s, not a silently-inherited 10s — the actual claim the guide
+text makes ("no divergence," stable identical views, exact sums through
+churn) is the one actually measured, on 4/4 fourth-pass runs, not the
+progressively weaker versions the first three passes of this report each
+accidentally supported. Within the scope this assay actually tested
+(single host, single process, star topology, honest peers, N=5,
+correctness not performance), the full-broadcast/no-quorum gossip design
+does **not** show the split-brain or lost-update failure mode the guide's
+hedge gestures at.
 
 This is deliberately a narrower claim than "clustering works past two
 nodes" — see the stubs list above for exactly what was not tested (real
@@ -401,7 +479,7 @@ peers, one churn cycle":
 
 The apparatus was never committed (per this ledger's containment rule, it
 is reverted before the report is finalized), so its exact source (revision
-3, post all three Codex corrections above) is embedded below rather than
+4, post all four Codex corrections above) is embedded below rather than
 referenced by history. This is now the durable artifact.
 
 1. Add this entry to `autumn/Cargo.toml`, immediately after the existing
@@ -433,14 +511,21 @@ referenced by history. This is now the durable artifact.
    //!
    //! Revision 3 (Codex P2 on PR #2503, on the revision-2 diff): every
    //! convergence/counter check now requires the condition to hold across
-   //! several *consecutive* observations (a debounce), not just once at the
-   //! instant the poll loop first sees it — a single-instant read cannot rule
-   //! out a view that flickers (a member briefly evicted by the suspicion
-   //! timeout then re-admitted) between the moment the poll succeeds and the
-   //! moment the test reads it again for the next assertion. Membership is
-   //! also now re-checked for stability immediately after every counter
-   //! check, not just at the four original checkpoints, so a divergence that
-   //! only shows up while counters are converging can't slip through.
+   //! several *consecutive* observations (a debounce), not just once. A
+   //! membership recheck now also runs immediately after every counter check.
+   //!
+   //! Revision 4 (two more Codex P2 findings on the revision-3 diff):
+   //! - `poll_until_stable` retried immediately on a failed check with no
+   //!   sleep/yield, which on a single-worker runtime could spin-monopolize
+   //!   the only executor thread and starve the gossip/timer tasks the
+   //!   condition depends on, producing a false timeout on a healthy cluster.
+   //!   Fixed: yield `STABLE_GAP` after every check, success or failure.
+   //! - The revision-3 refactor consolidated all membership/counter checks
+   //!   into helpers that hardcoded `CONVERGE_TIMEOUT` (10s), silently losing
+   //!   the pre-registered 5s `DEPARTURE_TIMEOUT` for step 3's checks (both
+   //!   membership and the post-departure counter check). Fixed: both helpers
+   //!   now take an explicit `timeout` parameter, and step 3 passes
+   //!   `DEPARTURE_TIMEOUT`.
 
    use std::sync::Arc;
    use std::time::Duration;
@@ -468,9 +553,13 @@ referenced by history. This is now the durable artifact.
 
    /// Debounced poll: `condition` must return `true` on `STABLE_CHECKS`
    /// consecutive observations, `STABLE_GAP` apart, before this returns
-   /// success. Any single `false` observation resets the streak — this is
-   /// what actually rules out a flicker (evicted-then-readmitted member,
-   /// stale counter cell) rather than a single lucky instant.
+   /// success. Any single `false` observation resets the streak. Always
+   /// yields `STABLE_GAP` after each observation, success or failure — the
+   /// condition futures here are synchronous `ClusterHandle` reads that
+   /// complete instantly, so without an unconditional yield, a failed streak
+   /// would spin-retry with no `.await` point, able to monopolize a
+   /// single-worker Tokio runtime and starve the gossip/timer tasks the
+   /// condition is waiting on (Codex P2 on PR #2503, revision 4).
    async fn poll_until_stable<F, Fut>(timeout: Duration, mut condition: F) -> bool
    where
        F: FnMut() -> Fut,
@@ -480,11 +569,12 @@ referenced by history. This is now the durable artifact.
        loop {
            let mut stable = true;
            for _ in 0..STABLE_CHECKS {
-               if !condition().await {
+               let ok = condition().await;
+               tokio::time::sleep(STABLE_GAP).await;
+               if !ok {
                    stable = false;
                    break;
                }
-               tokio::time::sleep(STABLE_GAP).await;
            }
            if stable {
                return true;
@@ -575,10 +665,15 @@ referenced by history. This is now the durable artifact.
 
    /// Stable, two-sided membership check: every handle must report exactly
    /// `expected_n` members with an identical sorted id set, on
-   /// `STABLE_CHECKS` consecutive observations.
-   async fn assert_stable_membership(handles: &[Arc<ClusterHandle>], expected_n: usize, label: &str) {
+   /// `STABLE_CHECKS` consecutive observations, within `timeout`.
+   async fn assert_stable_membership(
+       handles: &[Arc<ClusterHandle>],
+       expected_n: usize,
+       timeout: Duration,
+       label: &str,
+   ) {
        let hs = handles.to_vec();
-       let ok = poll_until_stable(CONVERGE_TIMEOUT, || {
+       let ok = poll_until_stable(timeout, || {
            let hs = hs.clone();
            async move {
                if !hs.iter().all(|h| h.members().len() == expected_n) {
@@ -593,16 +688,17 @@ referenced by history. This is now the durable artifact.
            ok,
            "[{label}] all {expected_n} nodes must report an identical {expected_n}-member view, \
             stable across {STABLE_CHECKS} consecutive observations {STABLE_GAP:?} apart, within \
-            {CONVERGE_TIMEOUT:?}; {}",
+            {timeout:?}; {}",
            describe(handles)
        );
    }
 
    /// Stable, two-sided counter check: every handle must read exactly
-   /// `EXPECTED_SUM`, on `STABLE_CHECKS` consecutive observations.
-   async fn assert_stable_counter_sum(handles: &[Arc<ClusterHandle>], label: &str) {
+   /// `EXPECTED_SUM`, on `STABLE_CHECKS` consecutive observations, within
+   /// `timeout`.
+   async fn assert_stable_counter_sum(handles: &[Arc<ClusterHandle>], timeout: Duration, label: &str) {
        let hs = handles.to_vec();
-       let ok = poll_until_stable(CONVERGE_TIMEOUT, || {
+       let ok = poll_until_stable(timeout, || {
            let hs = hs.clone();
            async move { hs.iter().all(|h| h.counter(COUNTER).get() == EXPECTED_SUM) }
        })
@@ -610,7 +706,7 @@ referenced by history. This is now the durable artifact.
        assert!(
            ok,
            "[{label}] every node must read counter={EXPECTED_SUM}, stable across {STABLE_CHECKS} \
-            consecutive observations {STABLE_GAP:?} apart, within {CONVERGE_TIMEOUT:?}; {}",
+            consecutive observations {STABLE_GAP:?} apart, within {timeout:?}; {}",
            describe(handles)
        );
    }
@@ -619,25 +715,30 @@ referenced by history. This is now the durable artifact.
    async fn n5_star_cluster_converges_counters_and_survives_departure_and_rejoin() {
        // --- Step 1: cold-start convergence to a full N-member view ---
        let (mut handles, mut tokens) = spawn_star_cluster(N);
-       assert_stable_membership(&handles, N, "step1-cold-start").await;
+       assert_stable_membership(&handles, N, CONVERGE_TIMEOUT, "step1-cold-start").await;
 
        // --- Step 2: concurrent counter increments from every node ---
        for (i, h) in handles.iter().enumerate() {
            h.counter(COUNTER).increment_by((i as u64) + 1);
        }
-       assert_stable_counter_sum(&handles, "step2-counter").await;
-       // Codex P2 (revision 3): membership must still be stable after the
-       // counter converges, not just before — a flicker during counter
-       // convergence would otherwise go unobserved.
-       assert_stable_membership(&handles, N, "step2-membership-recheck").await;
+       assert_stable_counter_sum(&handles, CONVERGE_TIMEOUT, "step2-counter").await;
+       assert_stable_membership(&handles, N, CONVERGE_TIMEOUT, "step2-membership-recheck").await;
 
        // --- Step 3: clean departure of node N-1, survivors converge to N-1 ---
+       // Pre-registered bound is 5s here (DEPARTURE_TIMEOUT), not the 10s
+       // CONVERGE_TIMEOUT used everywhere else.
        let departing = N - 1;
        tokens[departing].cancel();
        let survivors: Vec<Arc<ClusterHandle>> = handles[..departing].to_vec();
-       assert_stable_membership(&survivors, N - 1, "step3-departure").await;
-       assert_stable_counter_sum(&survivors, "step3-departure-counter").await;
-       assert_stable_membership(&survivors, N - 1, "step3-departure-membership-recheck").await;
+       assert_stable_membership(&survivors, N - 1, DEPARTURE_TIMEOUT, "step3-departure").await;
+       assert_stable_counter_sum(&survivors, DEPARTURE_TIMEOUT, "step3-departure-counter").await;
+       assert_stable_membership(
+           &survivors,
+           N - 1,
+           DEPARTURE_TIMEOUT,
+           "step3-departure-membership-recheck",
+       )
+       .await;
 
        // --- Step 4: node 5 rejoins (fresh handle, re-seeded from node 0) ---
        let seed = handles[0].local_addr().to_string();
@@ -656,9 +757,9 @@ referenced by history. This is now the durable artifact.
 
        handles[departing] = handle_rejoin;
        tokens[departing] = shutdown_rejoin;
-       assert_stable_membership(&handles, N, "step4-rejoin").await;
-       assert_stable_counter_sum(&handles, "step4-rejoin-counter").await;
-       assert_stable_membership(&handles, N, "step4-rejoin-membership-recheck").await;
+       assert_stable_membership(&handles, N, CONVERGE_TIMEOUT, "step4-rejoin").await;
+       assert_stable_counter_sum(&handles, CONVERGE_TIMEOUT, "step4-rejoin-counter").await;
+       assert_stable_membership(&handles, N, CONVERGE_TIMEOUT, "step4-rejoin-membership-recheck").await;
 
        for t in &tokens {
            t.cancel();
