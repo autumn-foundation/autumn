@@ -2050,6 +2050,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never resubmitted) keep showing their real value instead of going blank.
   Other failure classes (missing pool, unknown model, database outage) are
   unchanged and still render the generic error page.
+- **`distributed_lock`'s `cancelled_release_does_not_leak_lock` de-flaked and
+  un-quarantined:** the test raced a `Duration::ZERO` `tokio::time::timeout`
+  against a real `pg_advisory_unlock` round-trip, on the assumption that an
+  already-elapsed timer always wins. It doesn't: `Timeout::poll` polls the
+  wrapped future *before* checking its timer, so whenever the query happened
+  to resolve within that same first poll the timeout never fired and the
+  future was never actually cancelled mid-flight — measured at 1/30
+  same-commit reruns. It had been `--skip`-listed out of `ci.yml`'s Docker
+  sweep for this since, with no tracking issue. The test now polls
+  `release()` by hand exactly once, asserts `Poll::Pending` (proof the query
+  genuinely had not completed — a real network round-trip cannot resolve
+  synchronously on its first poll) and drops it from there: no timing
+  dependency, 0 failures across 50 reruns. Restored to CI's Docker sweep.
+- **`autumn-cli export`'s `test_fetch_endpoint_success`/`test_fetch_endpoint_failure`
+  de-flaked on `windows-latest` CI:** two independent mechanisms in the same
+  hand-rolled mock-HTTP-server test harness (`export.rs`). The success-path
+  server capped itself at `num_requests` *accept() attempts* rather than
+  *served requests*, so a single transient `accept()` error (seen on
+  windows-latest, where loopback connections are occasionally intercepted by
+  Defender/firewall) silently gave up and left the client to time out with
+  no response. The failure-path test "guaranteed" a closed port by binding
+  an ephemeral port and immediately dropping it — but every test in the
+  module runs concurrently and independently calls
+  `TcpListener::bind("127.0.0.1:0")`, so the just-freed port could be
+  reallocated to another test's mock server before this test's client
+  connected, landing on a live, unrelated server instead of getting refused.
+  The mock server now retries past a transient `accept()`/read failure
+  instead of spending one of its `num_requests` slots on it, and the
+  failure-path test now binds its own ephemeral listener and keeps it
+  reserved (bound, unaccepted) for the request instead of dropping it —
+  which both removes the race (nothing else can grab that port) and makes
+  no assumption about what else might be listening on the host.
 
 ### Added
 

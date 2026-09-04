@@ -632,8 +632,7 @@ jobs:
             --ignored \
             --test-threads=1 \
             --skip per_request_overhead_is_under_50_microseconds_p99 \
-            --skip capture_overhead_on_a_successful_query_request \
-            --skip cancelled_release_does_not_leak_lock # flaky wall-clock zero-duration-timeout race; needs deterministic/paused time to de-flake (tracked as a follow-up)
+            --skip capture_overhead_on_a_successful_query_request
           # AC-7 deploy end-to-end (#1607, Slice 4): drives the real `autumn
           # deploy up`/`rollback` over ssh/scp against a privileged systemd
           # container (first deploy, zero-downtime redeploy, on-demand rollback,
