@@ -4,6 +4,7 @@
 # Project Fluent's `{ $name }` placeable syntax.
 
 # ── Layout ────────────────────────────────────────────────────
+layout.skip_to_content = Skip to main content
 nav.brand = Autumn Blog
 nav.home = Home
 nav.about = About

@@ -22,6 +22,7 @@ mod migrate_down;
 mod migrate_sqlite;
 mod offsite_backup;
 mod platform_support_policy;
+mod posture_gate;
 mod replay;
 mod replica_restore;
 mod repo_hygiene;

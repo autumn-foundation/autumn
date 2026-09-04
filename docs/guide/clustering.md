@@ -780,7 +780,18 @@ member, exactly as with two. It is a `HealthOnly` indicator: it never gates
 node keeps serving its counter and its traffic, and a liveness probe must never
 be able to kill it for being alone.
 
-**Two nodes.** Every push carries the full document to every known peer, there
-are no indirect probes, and there is no quorum anywhere. That is a sound design
-at two nodes and an unproven one beyond that. Treat larger fleets as future
-work, not as a supported configuration.
+**Two nodes, with correctness evidence at five.** Every push carries the full
+document to every known peer, there are no indirect probes, and there is no
+quorum anywhere. That is a sound design at two nodes. A throwaway assay
+(`docs/reports/2026-09-04-prospect-cluster-scale-beyond-two-nodes.md`) ran a
+5-node, star-seeded cluster on one host through cold-start convergence,
+concurrent counter increments from every node, a clean departure, and a
+rejoin — 4/4 runs converged to correct, identical membership views and exact
+counter sums, no divergence. That is evidence the design does not fall over
+outright past two peers under ideal conditions; it is **not** a production
+guarantee. The assay never left one process, one host, or loopback
+networking; it tested only N=5, one churn cycle, and honest peers — it says
+nothing about real multi-host latency, packet loss or partition, N>5, or the
+all-to-all message volume's O(N²) growth. Treat larger fleets, real
+multi-host deployment, and partition tolerance as still future work, not as
+a supported configuration, until a follow-up assay closes those gaps.

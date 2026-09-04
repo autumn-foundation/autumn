@@ -514,6 +514,7 @@ const WORKSPACE_ROOT_OWNED: &[&str] = &[
     "rustfmt.toml",
     "rust-toolchain.toml",
     ".github/workflows/ci.yml",
+    ".github/workflows/posture-gate.yml",
 ];
 
 /// Whether `root` is a crate inside an enclosing Cargo workspace.

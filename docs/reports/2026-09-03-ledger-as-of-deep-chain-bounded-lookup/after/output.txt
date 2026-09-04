@@ -1,0 +1,83 @@
+running 1 test
+test integration::ledger_as_of_deep_chain_profile::ledger_as_of_deep_chain_profile ... 
+=== near-head as-of: statement/buffer scaling across chain depths ===
+chain         depth  unbounded calls  unbounded buffers    bounded calls    bounded buffers
+
+=== pg_stat_statements: hot-300 (depth 300) near-head as-of ===
+calls=1      buffers=3        SELECT id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash FROM _autumn_ledger_revisions WHERE table_name = $1 AND record_id = $2 AND ($3::text IS NULL OR tenant_id = $3) AND ($4::timestamptz IS NULL OR recorded_at <= $4) AND ($5::timestamptz IS NULL OR valid_from <= $5) ORDER BY seq DESC LIMIT $6
+-- unbounded (ledger_revisions) shape: calls=0 buffers=0 -- bounded (as-of) shape: calls=1 buffers=3 --
+hot-300         300                0                  0                1                  3
+
+=== pg_stat_statements: hot-700 (depth 700) near-head as-of ===
+calls=1      buffers=8        SELECT id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash FROM _autumn_ledger_revisions WHERE table_name = $1 AND record_id = $2 AND ($3::text IS NULL OR tenant_id = $3) AND ($4::timestamptz IS NULL OR recorded_at <= $4) AND ($5::timestamptz IS NULL OR valid_from <= $5) ORDER BY seq DESC LIMIT $6
+-- unbounded (ledger_revisions) shape: calls=0 buffers=0 -- bounded (as-of) shape: calls=1 buffers=8 --
+hot-700         700                0                  0                1                  8
+
+=== pg_stat_statements: hot-1200 (depth 1200) near-head as-of ===
+calls=1      buffers=8        SELECT id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash FROM _autumn_ledger_revisions WHERE table_name = $1 AND record_id = $2 AND ($3::text IS NULL OR tenant_id = $3) AND ($4::timestamptz IS NULL OR recorded_at <= $4) AND ($5::timestamptz IS NULL OR valid_from <= $5) ORDER BY seq DESC LIMIT $6
+-- unbounded (ledger_revisions) shape: calls=0 buffers=0 -- bounded (as-of) shape: calls=1 buffers=8 --
+hot-1200       1200                0                  0                1                  8
+
+=== pg_stat_statements: hot-1200 worst case: as-of at the FIRST revision ===
+calls=1      buffers=948      SELECT id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash FROM _autumn_ledger_revisions WHERE table_name = $1 AND record_id = $2 AND ($3::text IS NULL OR tenant_id = $3) AND ($4::timestamptz IS NULL OR recorded_at <= $4) AND ($5::timestamptz IS NULL OR valid_from <= $5) ORDER BY seq DESC LIMIT $6
+-- unbounded (ledger_revisions) shape: calls=0 buffers=0 -- bounded (as-of) shape: calls=1 buffers=948 --
+
+=== pg_stat_statements: hot-1200 ledger_diff across the last 10 postings ===
+calls=1      buffers=16       SELECT * FROM ( SELECT $8 AS which, id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash FROM _autumn_ledger_revisions WHERE table_name = $1 AND record_id = $2 AND ($3::text IS NULL OR tenant_id = $3) AND ($4::timestamptz IS NULL OR recorded_at <= $4) AND ($5::timestamptz IS NULL OR valid_from <= $5) ORDER BY seq DESC LIMIT $9 ) AS __from_rev UNION ALL SELECT * FROM ( SELECT $10 AS which, id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash FROM _autumn_ledger_revisions WHERE table_name = $1 AND record_id = $2 AND ($3::text IS NULL OR tenant_id = $3) AND ($6::timestamptz IS NULL OR recorded_at <= $6) AND ($7::timestamptz IS NULL OR valid_from <= $7) ORDER BY seq DESC LIMIT $11 ) AS __to_rev
+-- unbounded (ledger_revisions) shape: calls=0 buffers=0 -- bounded (as-of) shape: calls=1 buffers=16 --
+
+-- worst-case (first revision) bounded shape: calls=1 buffers=948 --
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): unbounded ledger_revisions shape -- what ledger_as_of currently reads regardless of `as_of` (hot-1200) ===
+SELECT id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash FROM _autumn_ledger_revisions WHERE table_name = 'ledger_deep_chain_accounts' AND record_id = 2 AND (NULL::text IS NULL OR tenant_id = NULL) ORDER BY seq ASC
+Sort  (cost=238.87..241.87 rows=1200 width=347) (actual time=0.822..0.883 rows=1200 loops=1)
+  Output: id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash
+  Sort Key: _autumn_ledger_revisions.seq
+  Sort Method: quicksort  Memory: 433kB
+  Buffers: shared hit=131
+  ->  Seq Scan on public._autumn_ledger_revisions  (cost=0.00..177.50 rows=1200 width=347) (actual time=0.006..0.502 rows=1200 loops=1)
+        Output: id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash
+        Filter: ((_autumn_ledger_revisions.table_name = 'ledger_deep_chain_accounts'::text) AND (_autumn_ledger_revisions.record_id = 2))
+        Rows Removed by Filter: 1900
+        Buffers: shared hit=131
+Query Identifier: -1101199879689280044
+Planning:
+  Buffers: shared hit=83
+Planning Time: 0.487 ms
+Execution Time: 0.995 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): bounded as-of shape, near head -- 'what did it look like 5 postings ago' (hot-1200, at=2026-09-03 20:23:11.129125222 UTC) ===
+SELECT id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash FROM _autumn_ledger_revisions WHERE table_name = 'ledger_deep_chain_accounts' AND record_id = 2 AND (NULL::text IS NULL OR tenant_id = NULL) AND ('2026-09-03T20:23:11.129125222+00:00'::timestamptz IS NULL OR recorded_at <= '2026-09-03T20:23:11.129125222+00:00'::timestamptz) AND (NULL::timestamptz IS NULL OR valid_from <= NULL) ORDER BY seq DESC LIMIT 1
+Limit  (cost=0.28..0.57 rows=1 width=347) (actual time=0.041..0.041 rows=1 loops=1)
+  Output: id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash
+  Buffers: shared hit=11
+  ->  Index Scan Backward using idx_autumn_ledger_revisions_record on public._autumn_ledger_revisions  (cost=0.28..350.90 rows=1198 width=347) (actual time=0.040..0.040 rows=1 loops=1)
+        Output: id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash
+        Index Cond: ((_autumn_ledger_revisions.table_name = 'ledger_deep_chain_accounts'::text) AND (_autumn_ledger_revisions.record_id = 2))
+        Filter: (_autumn_ledger_revisions.recorded_at <= '2026-09-03 20:23:11.129125+00'::timestamp with time zone)
+        Rows Removed by Filter: 5
+        Buffers: shared hit=11
+Query Identifier: -7230372579415535019
+Planning:
+  Buffers: shared hit=3
+Planning Time: 0.099 ms
+Execution Time: 0.060 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): bounded as-of shape, worst case -- record's first revision (hot-1200, at=2026-09-03 20:23:02.284836344 UTC) ===
+SELECT id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash FROM _autumn_ledger_revisions WHERE table_name = 'ledger_deep_chain_accounts' AND record_id = 2 AND (NULL::text IS NULL OR tenant_id = NULL) AND ('2026-09-03T20:23:02.284836344+00:00'::timestamptz IS NULL OR recorded_at <= '2026-09-03T20:23:02.284836344+00:00'::timestamptz) AND (NULL::timestamptz IS NULL OR valid_from <= NULL) ORDER BY seq DESC LIMIT 1
+Limit  (cost=0.28..175.59 rows=1 width=347) (actual time=0.430..0.430 rows=1 loops=1)
+  Output: id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash
+  Buffers: shared hit=948
+  ->  Index Scan Backward using idx_autumn_ledger_revisions_record on public._autumn_ledger_revisions  (cost=0.28..350.90 rows=2 width=347) (actual time=0.429..0.430 rows=1 loops=1)
+        Output: id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash
+        Index Cond: ((_autumn_ledger_revisions.table_name = 'ledger_deep_chain_accounts'::text) AND (_autumn_ledger_revisions.record_id = 2))
+        Filter: (_autumn_ledger_revisions.recorded_at <= '2026-09-03 20:23:02.284836+00'::timestamp with time zone)
+        Rows Removed by Filter: 1199
+        Buffers: shared hit=948
+Query Identifier: -7230372579415535019
+Planning Time: 0.075 ms
+Execution Time: 0.457 ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1924 filtered out; finished in 11.12s
+
