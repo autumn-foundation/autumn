@@ -142,7 +142,11 @@
 #     `"$(printf '%s' '…')"` starts fresh quoting inside the substitution; a
 #     PowerShell here-string is held by `@'` and a line beginning `'@`, not by
 #     the apostrophes in its body; and a heredoc's openers are collected from
-#     the LOGICAL command line, so a `\` continuation still opens both.
+#     the LOGICAL command line, so a `\` continuation still opens both. That
+#     rule was written into `_blank_literals` and not into `_mask_inert` beside
+#     it, so `probe="$(cat <<EOF"` still hid its own heredoc opener and the
+#     body read as commands — the re-entry rule and the fix-it-everywhere rule
+#     failing together, one rung apart.
 #     And as a DEFAULT standing in for a language: `#` covers most of this tree,
 #     so the 171 `.sql` migrations were "commented" by a rule that strips
 #     nothing SQL contains. A default is a guess about files nobody listed;
@@ -922,6 +926,55 @@ def _yaml_interpolated(rel):
     return p.name in COMPOSE_NAMES
 
 
+# What a backslash means in a YAML scalar depends on which quote holds it, and
+# the two are opposites: a SINGLE-quoted scalar has no escapes at all — a
+# backslash is a backslash and `''` is the only sequence — while a
+# DOUBLE-quoted one has C-style escapes that YAML resolves before the value
+# exists. A newline escape becomes `;`, which is the shell's own spelling of the
+# boundary a newline is: it keeps two commands two, without costing the physical
+# line the rest of this function counts on.
+#
+# An escape YAML does not define (`\$`) is left ALONE, backslash included,
+# rather than resolved to its second character. That is the safe direction and
+# not the tidy one: dropping the backslash would turn `\${AUTUMN_X}` into an
+# expansion and put a name into the truth set, which is how a typo'd page
+# passes silently. Keeping it can only cost a name, and a missing name is
+# reported rather than hidden.
+YAML_ESCAPE = {'0': ' ', 'a': ' ', 'b': ' ', 't': '\t', 'v': ' ', 'f': ' ',
+               'e': ' ', '_': ' ', 'n': ';', 'r': ';', 'N': ';', 'L': ';',
+               'P': ';', '\\': '\\', '"': '"', '/': '/', ' ': ' '}
+YAML_HEX = {'x': 2, 'u': 4, 'U': 8}
+
+
+def _yaml_decode(scalar):
+    """The value a quoted YAML scalar actually has, quotes included on input.
+
+    Never longer than what it decodes, so the caller can pad back to the
+    original width and keep every offset on the line usable.
+    """
+    quote, inner = scalar[0], scalar[1:-1]
+    if quote == "'":
+        return inner.replace("''", "'")
+    out, i, n = [], 0, len(inner)
+    while i < n:
+        if inner[i] == '\\' and i + 1 < n:
+            esc = inner[i + 1]
+            width = YAML_HEX.get(esc)
+            digits = inner[i + 2:i + 2 + (width or 0)]
+            if width and len(digits) == width and all(
+                    c in '0123456789abcdefABCDEF' for c in digits):
+                char = chr(int(digits, 16))
+                out.append(char if char.isprintable() else ' ')
+                i += 2 + width
+                continue
+            out.append(YAML_ESCAPE.get(esc, '\\' + esc))
+            i += 2
+            continue
+        out.append(inner[i])
+        i += 1
+    return ''.join(out)
+
+
 def _yaml_blocks(body, interpolated=False):
     """Blank what the consumer never executes, keeping line numbers intact.
 
@@ -995,12 +1048,20 @@ def _yaml_blocks(body, interpolated=False):
             # them before the command reaches the shell — so
             # `run: 'echo ${AUTUMN_X}'` really does expand. Passing them to the
             # shell pass read them as shell quotes and erased the expansion.
+            #
+            # Removing the quotes was only half of it: YAML DECODES a quoted
+            # scalar, it does not merely unwrap it. `run: "echo \\${AUTUMN_X}"`
+            # reaches the shell as `echo \${AUTUMN_X}` — one backslash, an
+            # escaped dollar, no expansion at all — and leaving both backslashes
+            # let the shell pass pair them off and read a real one. Same shape
+            # as the quotes themselves: the consumer's decoding happens before
+            # the shell sees anything, so it has to happen here too.
             head, _, value = l.partition(':')
             body_ = value.strip()
             if len(body_) > 1 and body_[0] == body_[-1] and body_[0] in '\'"':
                 pad = len(value) - len(value.lstrip())
-                l = (head + ':' + ' ' * pad + ' ' + body_[1:-1] + ' '
-                     + ' ' * (len(value) - pad - len(body_)))
+                l = head + ':' + (' ' * (pad + 1)
+                                  + _yaml_decode(body_)).ljust(len(value))
         # A block-opening line carries no value of its own, so it is kept only
         # to preserve the line count, never as evidence.
         out.append(l if (keep or m) else '')
@@ -1216,24 +1277,39 @@ def _mask_inert(text):
     A `<<` inside either opens nothing: `printf '%s' "<<EOF"` is an argument
     and `$((1 << 2))` is a left shift. Length is kept so the decision stays
     positional — the operator is FOUND in the real text and TESTED here.
+
+    A double-quoted span is not opaque, though. `probe="$(cat <<EOF)"` opens a
+    real heredoc: the shell re-enters its own parsing inside `$( … )`, so the
+    `<<` there is an operator and its body is data. Masking the outer span
+    whole hid the opener, the body was never consumed, and its lines read as
+    commands — the same re-entry rule `_blank_literals` already applies one
+    rung over, which is where this one comes from rather than being re-derived.
     """
-    out, i, n = list(text), 0, len(text)
+    out = list(text)
+    _mask_from(text, out, 0, len(text), False)
+    return ''.join(out)
+
+
+def _mask_from(text, out, i, n, dq):
+    """Mask the inert spans of `text[i:n]`; return where it stopped.
+
+    `dq` says we are inside a double-quoted span, which ends at the next
+    unescaped `"` and where an apostrophe is ordinary text rather than an
+    opener. A substitution recurses with `dq` false: quoting starts fresh
+    inside one, and so does everything else the shell reads.
+    """
     while i < n:
         ch = text[i]
-        if ch in '\'"':
-            end = i + 1
-            while end < n:
-                if ch == '"' and text[end] == '\\':
-                    end += 2
-                    continue
-                if text[end] == ch:
-                    break
-                end += 1
-            for k in range(i + 1, min(end, n)):
-                out[k] = 'x'
-            i = min(end, n) + 1
+        if dq and ch == '\\':
+            out[i] = 'x'
+            if i + 1 < n:
+                out[i + 1] = 'x'
+            i += 2
             continue
+        if dq and ch == '"':
+            return i + 1
         if text[i:i + 3] == '$((':
+            # Arithmetic is inert wherever it sits, quoted or not.
             depth, j = 0, i + 1
             while j < n:
                 if text[j] == '(':
@@ -1247,8 +1323,26 @@ def _mask_inert(text):
                 out[k] = 'x'
             i = min(j + 1, n)
             continue
+        if text[i:i + 2] == '$(':
+            end = min(_group_end(text, i + 1, '(', ')'), n)
+            _mask_from(text, out, i + 2, max(end - 1, i + 2), False)
+            i = end
+            continue
+        if ch == '"':
+            i = _mask_from(text, out, i + 1, n, True)
+            continue
+        if ch == "'" and not dq:
+            end = text.find("'", i + 1)
+            if end < 0 or end > n:
+                end = n
+            for k in range(i + 1, end):
+                out[k] = 'x'
+            i = end + 1
+            continue
+        if dq:
+            out[i] = 'x'
         i += 1
-    return ''.join(out)
+    return i
 
 
 def _heredoc_delim(text, i):
@@ -3816,6 +3910,17 @@ def self_test():
          (_heredoc_openers('printf \'%s\' "<<EOF"'),
           _heredoc_openers('echo $((1 << 2))'),
           _heredoc_openers('cat <<<EOF')), ([], [], []))
+    # …but a double-quoted span is not opaque: the shell re-enters inside
+    # `$( … )`, so a `<<` there is a real operator whose body is data. The
+    # negatives above must still hold, since both directions come from the
+    # same mask.
+    case('a heredoc opened inside a quoted substitution is found',
+         (_heredoc_openers('probe="$(cat <<EOF'),
+          _heredoc_openers('probe="$(cat <<\'EOF\''),
+          _heredoc_openers('probe="literal <<EOF"'),
+          _mask_inert('probe="$(cat <<EOF')),
+         ([('EOF', False, True)], [('EOF', False, False)], [],
+          'probe="$(cat <<EOF'))
     # A `<<-` terminator may be indented with TABS, and only tabs.
     case('a tab-stripping heredoc ends on an indented terminator',
          _shell_heredocs("cat <<-'EOF'\nx\n\tEOF\nkeep\n").splitlines(),
@@ -4047,6 +4152,20 @@ def self_test():
          EXPANDED.findall(_shell_literals(_yaml_blocks(
              "steps:\n  - run: 'echo ${AUTUMN_X}'\n", False))),
          ['AUTUMN_X'])
+    # …DECODED, not just unquoted. YAML resolves `\\` to one backslash before
+    # the command exists, so the shell gets an escaped `$` and reads nothing —
+    # while an escape YAML does not define keeps its backslash, because
+    # resolving one that isn't there would invent a name.
+    case('a double-quoted YAML scalar is decoded, not merely unwrapped',
+         (EXPANDED.findall(_shell_literals(_yaml_blocks(
+             'steps:\n  - run: "echo \\\\${AUTUMN_X}"\n', False))),
+          EXPANDED.findall(_shell_literals(_yaml_blocks(
+              'steps:\n  - run: "echo ${AUTUMN_X}"\n', False))),
+          _yaml_decode(r'"say \"hi\""'), _yaml_decode(r"'it''s'"),
+          _yaml_decode(r'"a\nb"'), _yaml_decode(r'"\x41"'),
+          _yaml_decode(r'"\${AUTUMN_X}"')),
+         ([], ['AUTUMN_X'], 'say "hi"', "it's", 'a;b', 'A',
+          r'\${AUTUMN_X}'))
     # Both PowerShell spellings reach the environment.
     case('the braced PowerShell environment form is a use',
          (PS_ENV.findall('${env:AUTUMN_X}'), PS_ENV.findall('$env:AUTUMN_X'),
