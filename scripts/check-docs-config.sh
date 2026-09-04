@@ -96,9 +96,10 @@
 #     placeholder match `_` made it swallow `0__NOPE`. Validate the shape FIRST,
 #     then canonicalise.
 #   * A name that matches NOTHING, rather than matching wrongly. A casing typo,
-#     a trailing separator, a `{i}` placeholder and an escaped quote each made a
-#     claim invisible — and an unresolved name is reported, while an unseen one
-#     cannot be. When tightening a pattern, check what it stops seeing.
+#     a trailing separator, a `{i}` placeholder, an escaped quote and a misspelt
+#     NAMESPACE (`AUTMN_LOG__LEVEL`) each made a claim invisible — and an
+#     unresolved name is reported, while an unseen one cannot be. When
+#     tightening a pattern, check what it stops seeing.
 #   * Proximity used as a proxy for use. "Is there an accessor near this string"
 #     reported 25 correct pages once and would have dropped six real bindings
 #     another time. Prefer a structural signal — the binding form, the naming
@@ -113,9 +114,12 @@
 #     "the `#[cfg(test)]` is not indented" — each held for the cases in front of
 #     me and broke on the first file laid out differently, in both directions:
 #     an attribute inside a generated-code template masked a whole file, and a
-#     brace inside a Rust fixture ended a mask 8,000 lines early. Parse enough
-#     to ask the real question — here, one scan that says which characters are
-#     code, which are string and which are comment.
+#     brace inside a Rust fixture ended a mask 8,000 lines early. "The cfg
+#     mentions `test`" masked `any(test, feature = "mail")`, which is production
+#     code whenever `mail` is on. "A block comment ends at `*/`" forgot that
+#     Rust's nest. Parse enough to ask the real question — here, one scan that
+#     says which characters are code, string and comment, and an evaluation of
+#     the cfg predicate rather than a match against its text.
 #   * A source of coverage removed without checking what was leaning on it.
 #     Masking test code is right, and `AUTUMN_MEDIA__FFMPEG__BIN` was in the
 #     truth set ONLY through a `${…}` expansion inside a test — so the correct
@@ -302,7 +306,35 @@ INDEX_SEG = re.compile(r'^(?:\d+|\{\w+\}|N|I)$')
 CHOSEN = (re.compile(r'_env\s*=\s*"(AUTUMN_[A-Z0-9_]+)"'),
           re.compile(r'from_env\(\s*"(AUTUMN_[A-Z0-9_]+)"'))
 
-WAIVER = re.compile(r'<!--\s*config-key-allow:\s*(AUTUMN_[A-Z0-9_]+)\s*(.*?)\s*-->')
+WAIVER = re.compile(r'<!--\s*config-key-allow:\s*([A-Z][A-Z0-9_]+)\s*(.*?)\s*-->')
+
+# A misspelling of the NAMESPACE itself matches nothing above, so the claim is
+# invisible rather than unresolved — the failure this script keeps relearning.
+# `export AUTMN_LOG__LEVEL=debug` left the occurrence count unmoved and the gate
+# green, though the runtime ignores it exactly as it ignores `AUTUMN_LOG__LEVL`.
+#
+# A near miss is one edit from `AUTUMN` and is not `AUTUMN`: substitution
+# (`AUTUNM`), deletion (`AUTMN`) or insertion (`AUTUUMN`). Anything further away
+# is somebody else's variable — `DATABASE_URL` and `RUST_LOG` are not typos of
+# this namespace — and two edits would start reaching them.
+NEAR = re.compile(r'\b([A-Z][A-Z0-9]{3,8})_(?=[A-Z0-9_]*[A-Z0-9])[A-Z0-9_]+\b')
+
+
+def near_miss(word, target='AUTUMN'):
+    """One insertion, deletion, substitution or transposition from `target`."""
+    if word == target or abs(len(word) - len(target)) > 1:
+        return False
+    if len(word) == len(target):
+        if sum(a != b for a, b in zip(word, target)) == 1:
+            return True
+        # A swap of two adjacent letters is two substitutions and one typo:
+        # `AUTUNM` is the shape a human actually types.
+        return any(word[:k] + word[k + 1] + word[k] + word[k + 2:] == target
+                   for k in range(len(word) - 1))
+    longer, shorter = ((word, target) if len(word) > len(target)
+                       else (target, word))
+    return any(longer[:k] + longer[k + 1:] == shorter
+               for k in range(len(longer)))
 
 # Variable names the runtime BUILDS at load time, for sections whose keys the
 # reader chooses — `format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_ID")`, once
@@ -427,7 +459,7 @@ def _rust_classes(body):
     distinguishable: `'a` is never followed by a closing quote.
     """
     cls = ['c'] * len(body)
-    i, n, state, hashes = 0, len(body), None, 0
+    i, n, state, hashes, depth = 0, len(body), None, 0, 0
     while i < n:
         c = body[i]
         if state is None:
@@ -438,7 +470,7 @@ def _rust_classes(body):
                 continue
             if c == '/' and body[i + 1:i + 2] == '*':
                 cls[i] = cls[i + 1] = 'm'
-                state, i = 'block', i + 2
+                state, depth, i = 'block', 1, i + 2
                 continue
             if c == '"':
                 cls[i] = 's'
@@ -467,9 +499,17 @@ def _rust_classes(body):
             i += 1
         elif state == 'block':
             cls[i] = 'm'
+            # Rust block comments NEST: `/* a /* b */ c */` closes once, at the
+            # end. Leaving at the first `*/` handed `c` back as code.
+            if c == '/' and body[i + 1:i + 2] == '*':
+                cls[i + 1] = 'm'
+                depth, i = depth + 1, i + 2
+                continue
             if c == '*' and body[i + 1:i + 2] == '/':
                 cls[i + 1] = 'm'
-                state, i = None, i + 2
+                depth, i = depth - 1, i + 2
+                if depth == 0:
+                    state = None
                 continue
             i += 1
         elif state == 'str':
@@ -740,22 +780,81 @@ NEGATED = re.compile(r'assert(?:_ne)?!\s*\(\s*!|!\s*[\w.]*\bcontains\b|\bassert_
 # after it back to the truth set. Neither is a rule about braces; both were
 # rules about how the text happens to be laid out.
 #
-# `not(test)` is excluded by construction — that attribute marks code compiled
-# when NOT testing — while `all(test, …)` and `any(test, …)` are included; all
-# four forms occur here.
-CFG_TEST = re.compile(r'#\[cfg\((?:(?:all|any)\()*test[,)]')
+# WHICH cfg is a test cfg is decided by evaluating the predicate, not by
+# matching its text. "Contains `test`" masked `#[cfg(any(test, feature =
+# "mail"))]`, which is ordinary production code whenever `mail` is on — 14 items
+# here are that shape — and "`test` right after `all(`" would miss
+# `#[cfg(all(feature = "redis", test))]`, which is genuinely test-only. Both are
+# rules about the layout of the predicate rather than its meaning.
+#
+# The question is whether the item can compile with `test` OFF. Every other
+# atom is free, so each node reports whether it can be true and whether it can
+# be false, and an item is test-only when the whole predicate can never be true.
+# That gives `cfg(test)`, `all(test, …)` and `all(…, test)` as test-only, and
+# `any(test, …)`, `not(test)` and `feature = "test-support"` as not. Anything
+# unparseable falls through as a free atom, which keeps the code.
+CFG_ATTR = re.compile(r'#\[cfg\(')
 TEST_PATH = re.compile(r'(^|/)(?:tests|benches)/|_test\.rs$')
 
 
+def _split_top(s):
+    """Split on commas that are not inside parentheses."""
+    parts, depth, start = [], 0, 0
+    for i, c in enumerate(s):
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            parts.append(s[start:i])
+            start = i + 1
+    parts.append(s[start:])
+    return [p for p in parts if p.strip()]
+
+
+def _cfg_truth(pred):
+    """`(can be true, can be false)` for a cfg predicate with `test` false."""
+    pred = pred.strip()
+    m = re.match(r'^(all|any|not)\s*\((.*)\)$', pred, re.S)
+    if m:
+        kids = [_cfg_truth(p) for p in _split_top(m.group(2))]
+        if not kids:
+            return True, True
+        if m.group(1) == 'not':
+            return kids[0][1], kids[0][0]
+        if m.group(1) == 'all':
+            return all(k[0] for k in kids), any(k[1] for k in kids)
+        return any(k[0] for k in kids), all(k[1] for k in kids)
+    if pred == 'test':
+        return False, True
+    return True, True
+
+
+def _balanced(s, i):
+    """The text inside the parenthesis at `s[i]`, and the index after it."""
+    depth = 0
+    for j in range(i, len(s)):
+        if s[j] == '(':
+            depth += 1
+        elif s[j] == ')':
+            depth -= 1
+            if depth == 0:
+                return s[i + 1:j], j + 1
+    return None, len(s)
+
+
 def untested(body):
-    """Blank every `#[cfg(…test…)]` item, keeping line numbering intact."""
-    if 'cfg(' not in body:
+    """Blank every test-only `#[cfg(…)]` item, keeping line numbering intact."""
+    if '#[cfg(' not in body:
         return body
     skel = _rust_skeleton(body)
     masked = []
-    for m in CFG_TEST.finditer(skel):
+    for m in CFG_ATTR.finditer(skel):
+        pred, after = _balanced(skel, m.end() - 1)
+        if pred is None or _cfg_truth(pred)[0]:
+            continue
         depth, end = 0, None
-        for i in range(m.end(), len(skel)):
+        for i in range(after, len(skel)):
             c = skel[i]
             if c == '{':
                 depth += 1
@@ -945,13 +1044,22 @@ def scan(files, read, leaves, built, tokens):
         consts = set(DECLARED_CONST.findall(text))
         at, waived = blocks(lines), waivers(lines)
         for i, line in enumerate(lines, 1):
-            if 'AUTUMN_' not in line:
-                continue
             # A waiver marker names the variable in order to waive it. That
             # mention is metadata addressed to this script, not a key claim
             # addressed to a reader, so it is not an occurrence — counting it
             # made an unreasoned waiver report its own subject twice.
             line = WAIVER.sub('', line)
+            # Before the well-formed names, the misspelt namespace — checked
+            # first because it is invisible to every pattern that follows.
+            for m in NEAR.finditer(line):
+                if not near_miss(m.group(1)):
+                    continue
+                if at[i] in waived.get(m.group(0), ()):
+                    stats['waived'] += 1
+                else:
+                    defects.append((rel, i, m.group(0), line.strip()))
+            if 'AUTUMN_' not in line:
+                continue
             for var in VAR.findall(line):
                 if var in chosen:
                     stats['reader-chosen name'] += 1
@@ -1287,6 +1395,29 @@ def self_test():
     case('a casing typo is scanned',
          VAR.findall('export AUTUMN_LOG__LEVeL=debug'), ['AUTUMN_LOG__LEVeL'])
     case('a casing typo is malformed', malformed('AUTUMN_LOG__LEVeL'), True)
+    # A misspelling of the NAMESPACE matches no `AUTUMN_` pattern at all, so it
+    # has to be looked for on its own terms.
+    case('a misspelt namespace is scanned',
+         [m.group(0) for m in NEAR.finditer('export AUTMN_LOG__LEVEL=debug')
+          if near_miss(m.group(1))], ['AUTMN_LOG__LEVEL'])
+    case('one edit away in each direction',
+         (near_miss('AUTMN'), near_miss('AUTUNM'), near_miss('AUTUUMN')),
+         (True, True, True))
+    case('the correct namespace is not a near miss', near_miss('AUTUMN'), False)
+    case('somebody else\'s variable is not a near miss',
+         (near_miss('DATABASE'), near_miss('RUST'), near_miss('CARGO')),
+         (False, False, False))
+    _, dn = scan(['d.md'], lambda _: 'export AUTMN_LOG__LEVEL=debug\n',
+                 leaves, built, tokens)
+    case('a misspelt namespace is reported', len(dn), 1)
+    sn, _ = scan(['d.md'],
+                 lambda _: ('export AUTMN_LOG__LEVEL=debug\n'
+                            '<!-- config-key-allow: AUTMN_LOG__LEVEL — why -->\n'),
+                 leaves, built, tokens)
+    case('and can be waived like any other', sn['waived'], 1)
+    _, dok = scan(['d.md'], lambda _: 'export DATABASE_URL=x\nRUST_LOG=debug\n',
+                  leaves, built, tokens)
+    case('an unrelated variable is not reported', len(dok), 0)
     # A trailing separator: captured, then judged by what follows it.
     case('a trailing separator is scanned',
          VAR.findall('export AUTUMN_LOG__LEVEL_=debug'), ['AUTUMN_LOG__LEVEL_'])
@@ -1461,6 +1592,11 @@ def self_test():
     # from blanking whole lines.
     case('a block comment on one line is stripped',
          uncommented('  /* std::env::var("AUTUMN_LOG__LEVL"); */'), '  ')
+    # Rust block comments NEST. Leaving at the first `*/` handed the rest of the
+    # outer comment back as code.
+    case('a nested block comment closes once, at the end',
+         uncommented('/* a /* b */ std::env::var("AUTUMN_LOG__LEVL"); */ let x = 1;'),
+         ' let x = 1;')
     case('a multi-line block is stripped to its close',
          uncommented('/*\nstd::env::var("AUTUMN_LOG__LEVL");\n*/\nlet x = 1;'),
          '\n\n\nlet x = 1;')
@@ -1518,16 +1654,25 @@ def self_test():
     case('a cfg(test) item with no block ends at its semicolon',
          untested('#[cfg(test)]\nuse uuid::Uuid;\nlet a = 1;'),
          '\n\nlet a = 1;')
-    # `all(test, …)` and `any(test, …)` are test code; `not(test)` is the
-    # opposite, and all four forms occur in this tree.
-    case('all/any forms are regions',
-         (bool(CFG_TEST.search('#[cfg(all(test, feature = "maud"))]')),
-          bool(CFG_TEST.search('#[cfg(any(test, feature = "mail"))]'))),
-         (True, True))
-    case('not(test) is not a region',
-         bool(CFG_TEST.search('#[cfg(not(test))]')), False)
-    case('a feature named test-support is not a region',
-         bool(CFG_TEST.search('#[cfg(feature = "test-support")]')), False)
+    # Which cfg is test-only is decided by evaluating the predicate. A test-only
+    # item is one that can NEVER compile with `test` off.
+    testonly = lambda p: not _cfg_truth(p)[0]
+    case('cfg(test) is test-only', testonly('test'), True)
+    case('all(test, …) is', testonly('all(test, feature = "maud")'), True)
+    # …in either order: `all(feature = "redis", test)` occurs here, and a rule
+    # anchored on `test` following `all(` would have missed it.
+    case('all(…, test) is', testonly('all(feature = "redis", test)'), True)
+    # `any(test, feature = "mail")` compiles in production with `mail` on — 14
+    # items here are that shape, and masking them dropped real reads.
+    case('any(test, …) is NOT', testonly('any(test, feature = "mail")'), False)
+    case('not(test) is NOT', testonly('not(test)'), False)
+    case('a feature named test-support is NOT',
+         testonly('feature = "test-support"'), False)
+    case('a nested predicate still evaluates',
+         (testonly('all(any(test, feature = "mail"), unix)'),
+          testonly('any(all(test, unix), test)')), (False, True))
+    case('an unparseable predicate keeps the code',
+         testonly('some_new_syntax!!'), False)
     # A char literal can hold a `"`. `dotenv.rs:189` writes `quote == b'"'`, and
     # skipping char literals left the rest of that file classified as string —
     # so nothing in it was masked, commented, or read correctly.
