@@ -400,7 +400,7 @@ sha2 = "0.10"
 infer = { version = "0.16", optional = true }
 sha1 = { version = "0.10", optional = true }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"], optional = true }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 # NIST P-256 (prime256v1) for Web Push (issue #1392): ES256 VAPID JWT signing
 # (RFC 8292) and the ECDH half of RFC 8291 payload encryption. Adds NO new
 # crate to the graph — `jsonwebtoken` (a non-optional dependency above) already
