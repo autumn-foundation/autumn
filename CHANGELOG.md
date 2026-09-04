@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **deploy:** `autumn deploy check` now prints the same config-manifest signal
+  `autumn deploy up` already prints (#1952 check/up parity) — a confirming
+  line naming the `autumn.toml` (and, when present, `autumn-<profile>.toml`)
+  that will be uploaded, or the loud "no autumn.toml found" warning when the
+  project has none. Before this, an operator relying on `deploy check` as the
+  documented way to catch a broken deploy before touching the server had no
+  signal at all that the deployed app would silently run built-in defaults —
+  they only found out once they actually ran `up`. Purely informational: it
+  is not a graded preflight check and never affects `check`'s exit code. See
+  `docs/guide/deployment.md`'s "Your `autumn.toml` is deployed alongside the
+  binary" section for the full behavior this closes out.
+
 - **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
   update validation left after #1719/#1742/#1778/#1801 (issue #1751).
   `must_match` — like `custom`, `ip` on `Option<_>` fields, and
