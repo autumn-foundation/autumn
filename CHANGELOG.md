@@ -450,7 +450,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moment any release ships the command it needs. `ci.yml`'s `a11y verify`
   and `routes audit` steps now probe for their subcommand the same way
   `posture-gate.yml` already did, and fail with an actionable message
-  rather than a raw unknown-subcommand error if it is missing.
+  rather than a raw unknown-subcommand error if it is missing. Scaffolded
+  workflow YAML only; no new or changed CLI surface for agents to reach
+  for. [no-plugin]
 
 - **Build-time authority envelope for agent-operable handlers (#1691):** an
   endpoint exposed as an MCP tool is an action an autonomous agent can take
