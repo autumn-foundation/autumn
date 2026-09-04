@@ -835,11 +835,17 @@ fn diff_authorization_policies(
         // — but only when the URL went with it. A surviving route whose shape
         // and methods overlap still answers that URL, so the record-level check
         // really did disappear from something reachable.
-        let url_still_answered = routes_after.iter().any(|(p, m)| {
-            takes_precedence(path, p)
-                && methods_transfer((method, path), &routes_before, (m, p), &routes_after)
-        });
-        if !url_still_answered {
+        // Every surviving route that can take any of this route's URLs.
+        // Precedence sends different URLs to different ones, so there is no
+        // single "the survivor" to ask.
+        let takers: Vec<&RouteKey> = routes_after
+            .iter()
+            .filter(|(p, m)| {
+                takes_precedence(path, p)
+                    && methods_transfer((method, path), &routes_before, (m, p), &routes_after)
+            })
+            .collect();
+        if takers.is_empty() {
             continue;
         }
         // ...unless the route that now answers it performs the very same
@@ -848,12 +854,12 @@ fn diff_authorization_policies(
         // route comparison cannot see *which* check, so `read_self` giving way
         // to `read_any` reads as no change at all up there.
         let fell_through = !routes_after.contains(&(path.clone(), method.clone()));
+        // Preserved only if *every* taker performs the same check: one that
+        // does not means some URL reaches a route without it. Asking whether
+        // any taker carries it let a check survive on the route that loses.
         if fell_through
-            && after.keys().any(|(p, m, a, r)| {
-                a == action
-                    && r == resource
-                    && takes_precedence(path, p)
-                    && methods_transfer((method, path), &routes_before, (m, p), &routes_after)
+            && takers.iter().all(|(p, m)| {
+                after.contains_key(&(p.clone(), m.clone(), action.clone(), resource.clone()))
             })
         {
             continue;
@@ -2083,6 +2089,48 @@ mod tests {
             "the finding must name the route that now serves the URL: {:?}",
             widening[0]
         );
+    }
+
+    /// Several routes can take a deleted route's URLs, and precedence sends
+    /// different URLs to different ones. Accepting the check from *any* of them
+    /// suppressed the finding when the route that actually wins does not carry
+    /// it: removing bound `/records/me/private`, `/records/me/{id}` wins over
+    /// `/records/{user}/private`, so a check only the latter performs is gone
+    /// from the URLs that matter.
+    #[test]
+    fn a_binding_only_some_takers_perform_is_still_a_widening() {
+        let gated = |path: &str| route(path, "GET", "gated", &["user"], &[], true);
+        let binding = |path: &str| {
+            format!(
+                r#"{{"path":"{path}","method":"GET","action":"read_self","resource":"Record"}}"#
+            )
+        };
+        let removed = gated("/records/me/private");
+        let wins = gated("/records/me/{id}");
+        let also_takes = gated("/records/{user}/private");
+
+        let base = manifest(
+            &format!("{removed},{wins},{also_takes}"),
+            "",
+            "",
+            &format!(
+                "{},{}",
+                binding("/records/me/private"),
+                // Only the route that does *not* win carries the same check.
+                binding("/records/{user}/private")
+            ),
+        );
+        let head = manifest(
+            &format!("{wins},{also_takes}"),
+            "",
+            "",
+            &binding("/records/{user}/private"),
+        );
+
+        let findings = diff(&base, &head);
+        let widening = widening(&findings);
+        assert_eq!(widening.len(), 1, "{findings:#?}");
+        assert_eq!(widening[0].kind, "authorization_binding_removed");
     }
 
     /// The round-15 lesson, retrofitted to the binding findings. An
