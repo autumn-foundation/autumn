@@ -379,6 +379,20 @@ def scan(files, read, leaves, leaf_maps, tokens):
 
 TABLE_ROW = re.compile(r'^//! \| `(AUTUMN_[A-Z0-9_{}]+)` \| `([^`]+)` \|')
 
+# The one row whose two columns legitimately disagree. `SigningSecretConfig`
+# has an untagged deserializer that accepts a bare string, so
+# `AUTUMN_SECURITY__SIGNING_SECRET` addresses `security.signing_secret` while
+# the row documents the field that string lands in.
+#
+# Enumerated rather than allowed as a general "the variable may name any prefix
+# of the row's path", which was the first cut: that let ANY truncated variable
+# column pass so long as the declared path existed, so a row edited from
+# `AUTUMN_DATABASE__URL` to `AUTUMN_DATABASE` still "agreed" with
+# `database.url` — defeating the one-sided-edit detection this check exists for.
+# All 135 current rows agree exactly except this one.
+TABLE_PREFIX_OK = {('AUTUMN_SECURITY__SIGNING_SECRET',
+                    'security.signing_secret.secret')}
+
 
 def table_rows(text):
     return [(i, m.group(1), m.group(2))
@@ -404,12 +418,9 @@ def check_table(rows, leaves, leaf_maps):
             out.append((i, var, declared, 'path is not in the schema'))
             continue
         derived = to_path(var)
-        # The variable may address a shorter path than the row documents:
-        # `AUTUMN_SECURITY__SIGNING_SECRET` sets `security.signing_secret`,
-        # whose untagged deserializer accepts a bare string, and the row names
-        # the field that string lands in (`…signing_secret.secret`). A prefix is
-        # therefore agreement; anything else is a row edited on one side only.
-        if not (derived == path or path.startswith(derived + '.')):
+        # Exact agreement, save for the enumerated untagged-deserializer row.
+        # Anything else is a row edited on one side only.
+        if derived != path and (var, path) not in TABLE_PREFIX_OK:
             out.append((i, var, declared,
                         f'variable derives `{derived}`, row says `{path}`'))
     return out
@@ -586,6 +597,15 @@ def self_test():
          len(check_table([(9, 'AUTUMN_LOG__NOPE', 'log.nope')], leaves, maps)), 1)
     case('table row edited on one side fails',
          len(check_table([(9, 'AUTUMN_LOG__LEVEL', 'auth.oauth2')], leaves, maps)), 1)
+    # A truncated variable column must NOT pass just because the row's path
+    # exists: `AUTUMN_DATABASE` is not how you set `database.shards.name`.
+    case('a truncated variable column fails',
+         len(check_table([(9, 'AUTUMN_DATABASE', 'database.shards.name')],
+                         leaves, maps)), 1)
+    # …and the one enumerated untagged-deserializer row still passes.
+    case('the signing-secret exception still passes',
+         check_table([(9, 'AUTUMN_SECURITY__SIGNING_SECRET',
+                       'security.signing_secret.secret')], leaves, maps), [])
 
     for f in failures:
         print(f'FAIL {f}')
