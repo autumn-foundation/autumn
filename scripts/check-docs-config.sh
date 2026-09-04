@@ -90,7 +90,11 @@
 #
 #   * A rule generalised past the single case that motivated it. An exception
 #     written for one real row became "any prefix"; a map section became "any
-#     suffix". Enumerate the exception; do not widen the rule.
+#     suffix". Enumerate the exception; do not widen the rule. Folding a `run:
+#     >` scalar is the same shape: YAML folds a break WITHIN a paragraph, and
+#     joining every non-empty line instead invented a prefix assignment out of
+#     `AUTUMN_X=value`, a blank line, and the next command. A rule taken from
+#     one example is a guess about the examples you did not look at.
 #   * Normalisation discarding information before validation. Erasing every
 #     `[index]` made `shards[i][i]` indistinguishable from `shards[i]`; letting a
 #     placeholder match `_` made it swallow `0__NOPE`. Validate the shape FIRST,
@@ -114,6 +118,11 @@
 #     beside it, and "a `#[cfg(test)] mod x;` makes that file test code" was
 #     true in the token sweep and not in `built_patterns`. Two readers of the
 #     same tree asking the same question need one predicate, not two.
+#     A rung's INPUTS count as the rung: the accessor scan masked comments,
+#     tests and generated data, while the pass that derived its helper names
+#     from the tree read none of them — so one signature in a comment named an
+#     accessor for every file. Mask where the reading happens, not only where
+#     the matching does.
 #   * A construct spelled in a narrower grammar than its language's. A heredoc
 #     delimiter written as `\w+` when Bash takes a word, so `<<'END-CONFIG'` was
 #     rejected and `<<\END-CONFIG` matched the prefix `END` — under- and
@@ -924,14 +933,47 @@ def _yaml_blocks(body, interpolated=False):
     `command` on consecutive lines really are one command, and reading them as
     two made the first a bare local assignment. Its lines are joined onto the
     first of them and the rest blanked, which keeps the line count.
+
+    Folding is not "join everything", though, and the first cut at it was:
+    YAML folds a line break between two lines of the SAME paragraph and keeps
+    every other one. A BLANK line is a paragraph break that survives as a
+    newline, and a MORE-INDENTED line keeps its breaks literally. Joining
+    across either invented a command that never runs — `AUTUMN_X=value`, a
+    blank line, then `printf …` is a bare assignment and a separate command,
+    and folding them made the assignment a prefix on the printf. The failure
+    is the reverse of the one that motivated the fold, which is why it needed
+    a rule about paragraphs rather than a wider or narrower join.
     """
     out, key, indent, fold, buf = [], None, 0, False, []
 
     def flush():
         if buf:
-            out[buf[0]] = ' '.join(out[i].strip() for i in buf if out[i].strip())
-            for i in buf[1:]:
-                out[i] = ''
+            # The block's own indentation is set by its first non-empty line;
+            # anything deeper is a more-indented line, not part of the fold.
+            base = next((len(out[i]) - len(out[i].lstrip())
+                         for i in buf if out[i].strip()), 0)
+            runs, cur = [], []
+            for i in buf:
+                if not out[i].strip():
+                    if cur:
+                        runs.append(cur)
+                    cur = []
+                elif len(out[i]) - len(out[i].lstrip()) > base:
+                    if cur:
+                        runs.append(cur)
+                    runs.append([i])
+                    cur = []
+                else:
+                    cur.append(i)
+            if cur:
+                runs.append(cur)
+            heads = set()
+            for r in runs:
+                out[r[0]] = ' '.join(out[i].strip() for i in r)
+                heads.add(r[0])
+            for i in buf:
+                if i not in heads:
+                    out[i] = ''
         del buf[:]
 
     for l in body.splitlines():
@@ -1898,8 +1940,21 @@ def accessor(root):
             body = (root / rel).read_text(encoding='utf-8', errors='replace')
         except OSError:
             continue
-        for name, params in ENV_HELPER.findall(body):
-            index[name] = len(_split_args(params)) - 1
+        # Masked exactly as the scan that CONSUMES this index is: a signature
+        # inside a comment, inside test-only code, or inside generated DATA
+        # defines nothing the runtime calls. Unmasked, one commented-out `fn
+        # label_lookup(env: &FakeEnv, key: &str)` registered `label_lookup` as
+        # an accessor for the WHOLE TREE, so an ordinary two-argument call
+        # anywhere blessed its second argument. A derivation that reads more
+        # of the file than the rung it feeds is the same shape as reading a
+        # `format!` lookalike out of a comment — the fourth rung to need this
+        # mask, and the first where the leak was global rather than local.
+        masked = untested(_rust_uncommented(body))
+        data = _generated_data(masked)
+        for m in ENV_HELPER.finditer(masked):
+            if data[m.start()]:
+                continue
+            index[m.group(1)] = len(_split_args(m.group(2))) - 1
     if not index:
         return ACCESSOR, {}
     return (re.compile(ACCESSOR.pattern + r'|\b(' 
@@ -3547,6 +3602,20 @@ def self_test():
              'fn override_string(target: &mut String, '
              'env: &HashMap<String, String>, key: &str) {')],
          ['override_string'])
+    # …and derived from EXECUTABLE Rust only. This index is global — one
+    # signature read out of a comment names an accessor for every file in the
+    # tree — so it is masked exactly like the scan it feeds.
+    case('a helper signature that is not code derives nothing',
+         [[n for n, _ in ENV_HELPER.findall(
+              untested(_rust_uncommented(s)))
+           if not _generated_data(untested(_rust_uncommented(s)))[
+               untested(_rust_uncommented(s)).index('fn ' + n)]]
+          for s in
+          ('// fn label_lookup(env: &FakeEnv, key: &str) -> String { }',
+           '#[cfg(test)]\nmod t {\n'
+           '    fn label_lookup(env: &FakeEnv, key: &str) -> String { }\n}',
+           'fn override_string(env: &Env, key: &str) {}')],
+         [[], [], ['override_string']])
     case('a helper-read name is swept in',
          'AUTUMN_MEDIA__STORAGE__BUCKET' in swept, True)
     case('and the one that was only in a test expansion still is',
@@ -3944,6 +4013,20 @@ def self_test():
           _yaml_blocks('steps:\n  - run: |\n      AUTUMN_A=1\n      echo hi\n',
                        False).splitlines()[-2:]),
          (['AUTUMN_X'], ['      AUTUMN_A=1', '      echo hi']))
+    # …but folding is per PARAGRAPH. A blank line survives as a newline and a
+    # more-indented line keeps its breaks, so neither may be joined across —
+    # the joined form invents a prefix assignment the workflow never runs.
+    case('a folded scalar does not join across a blank or indented line',
+         (ASSIGNED_PREFIX.findall(_shell_code(_yaml_blocks(
+             'steps:\n  - run: >\n      AUTUMN_X=value\n\n      printf x\n',
+             False))),
+          ASSIGNED_PREFIX.findall(_shell_code(_yaml_blocks(
+              'steps:\n  - run: >\n      AUTUMN_X=value\n        printf x\n',
+              False))),
+          [l.strip() for l in _yaml_blocks(
+              'steps:\n  - run: >\n      a one\n      a two\n\n      b one\n',
+              False).splitlines()[-4:]]),
+         ([], [], ['a one a two', '', '', 'b one']))
     # PowerShell shares none of the Bourne grammar — `$NAME` is an ordinary
     # variable there, and only `$env:NAME` reaches the environment.
     case('an ordinary PowerShell variable is not an environment read',
