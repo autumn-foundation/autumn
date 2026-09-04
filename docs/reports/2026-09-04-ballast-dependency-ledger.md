@@ -179,11 +179,14 @@ patch-range bump inside someone else's semver contract still broke us.
 
 Re-ran the advisory/license/source gate against the corrected lockfile
 (`./scripts/check-advisories.sh`, `cargo deny check licenses sources` on
-both graphs) — still `ok`. A full `./scripts/pre-push-check.sh` re-run and a
-targeted `cargo clippy -p autumn-web --features acme,mail` (the smallest
-reproduction of the four affected modules) against the corrected lockfile
-were in progress at push time; this report will be updated with their
-result rather than assumed.
+both graphs) — still `ok`. Targeted `cargo clippy -p autumn-web --features
+acme,mail` (the smallest reproduction of the four affected modules) against
+the corrected lockfile: **`Finished` clean, no errors** — confirms the
+`generic-array` exclusion actually fixes the regression it was meant to fix.
+A full `./scripts/pre-push-check.sh` re-run (covering the rest of the
+workspace, not just the four affected modules) was started after this
+targeted confirmation; its actual result is recorded in the next commit,
+not claimed here ahead of it landing.
 
 ## 📊 Measurement
 
@@ -227,8 +230,13 @@ cargo deny --config deny-sqlite.toml check licenses sources
 # version to move to, so it always vacuously reports 0)
 cargo update --dry-run
 
-# Apply the batch, then re-verify the gate against the new lockfile
+# Apply the batch, then re-exclude generic-array (0.14.9 deprecates
+# GenericArray::from_slice, which this repo's -D warnings clippy gate
+# promotes to a hard error at 8 call sites under autumn/src) BEFORE gating —
+# running the bare `cargo update` alone and skipping this step reintroduces
+# the exact failure described above.
 cargo update
+cargo update -p generic-array --precise 0.14.7
 ./scripts/check-advisories.sh
 cargo deny check licenses sources
 cargo deny --config deny-sqlite.toml check licenses sources
