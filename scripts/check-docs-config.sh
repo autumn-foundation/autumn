@@ -120,7 +120,9 @@
 #     same tree asking the same question need one predicate, not two — and two
 #     VIEWS of one file must stay the same length, since they are indexed
 #     together: compose's assignment view is built by a second pass, and a
-#     blanked last line vanishes from `splitlines`.
+#     blanked last line vanishes from `splitlines`. The positional rule
+#     written for prefix assignments was not carried to `export` beside it,
+#     so `printf %s export AUTUMN_X=v` still counted a round later.
 #     A rung's INPUTS count as the rung: the accessor scan masked comments,
 #     tests and generated data, while the pass that derived its helper names
 #     from the tree read none of them — so one signature in a comment named an
@@ -169,7 +171,11 @@
 #     parsing, so it collects the next line's heredoc delimiters first" is a
 #     plausible sentence and it is false — a body begins after the next
 #     newline, whatever the line ends in. It shipped for several rounds on the
-#     strength of the reasoning. Run the language.
+#     strength of the reasoning. Run the language. The pass-through list for
+#     assignment words repeated it one round later: `exec`, `command` and
+#     `nohup` sound like they forward an assignment, and all three exit 127
+#     trying to run a program named `AUTUMN_X=value`. Six words, three wrong,
+#     and bash answers each of them in one line.
 #   * A rule about the LAYOUT of the text standing in for a rule about its
 #     structure. "The comment starts the line", "the `}` is in column zero",
 #     "the `#[cfg(test)]` is not indented" — each held for the cases in front of
@@ -2133,7 +2139,25 @@ QUOTED = re.compile(r'\\?["\'](AUTUMN_[A-Z0-9_]+)\\?["\']')
 # blessing `AUTUMN_MANIFEST` as application configuration. The names this drops
 # that ARE real (`AUTUMN_LOG__LEVEL`, `AUTUMN_SERVER__HOST`, …) resolve through
 # the source rung instead, which is where their evidence actually lives.
-ASSIGNED = re.compile(r'(?:^|[;&|(\s])export\s+(AUTUMN_[A-Z0-9_]+)=')
+#
+# `export` has to BE the command word, for the same reason an assignment does.
+# `printf %s export AUTUMN_X=v` passes two arguments to `printf` and exports
+# nothing — and this rung matched at every whitespace boundary, so it counted.
+# The positional rule was written for prefix assignments one round earlier and
+# not carried to the neighbour asking the same question, which is this script's
+# most repeated mistake and now has a second entry in its own header.
+class _ExportAssignment:
+    """`export NAME=…`, where `export` is the command being run."""
+
+    _start = re.compile(r'(?:^|[;&|(\s])(export)\s+(AUTUMN_[A-Z0-9_]+)=')
+
+    def findall(self, body):
+        return [m.group(2) for m in self._start.finditer(body)
+                if _at_command_word(body, m.start(1),
+                                    _PrefixAssignment._word_end)]
+
+
+ASSIGNED = _ExportAssignment()
 def _dquote_end(body, i):
     """Index just past the `"` closing the double quote that opens at `i`."""
     n, i = len(body), i + 1
@@ -2174,6 +2198,48 @@ def _group_end(body, i, opener, closer):
                 return i + 1
         i += 1
     return n
+
+
+# Words that may precede an assignment without being the command name. Each was
+# RUN under bash rather than reasoned about, and the first list — written from
+# intuition — was wrong in three places: `exec`, `command` and `nohup` do NOT
+# consume an assignment word. Each of those tries to execute a program named
+# `AUTUMN_X=value` and exits 127, so an assignment after them reaches nothing.
+#
+#   env  sudo  time            exported the variable (verified, rc=0)
+#   if  then  else  do  while  until  !   a new command starts after them
+#   exec  command  nohup       "command not found", exit 127 — removed
+#
+# `elif` is not separately tested; it is the same reserved-word position as
+# `then` and `else`, both of which are.
+ASSIGN_WORD = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=')
+PASS_THROUGH = ('env', 'sudo', 'time',
+                'if', 'then', 'elif', 'else', 'do', 'while', 'until', '!')
+
+
+def _at_command_word(body, at, word_end):
+    """Whether `at` is the command-word position of its simple command.
+
+    Everything between the command boundary and `at` must be an assignment
+    word or one of the few words that do not consume one.
+    """
+    i = max((body.rfind(c, 0, at) for c in ';&|()\n'), default=-1) + 1
+    while i < at:
+        while i < at and body[i] in ' \t':
+            i += 1
+        if i >= at:
+            break
+        word = ASSIGN_WORD.match(body, i)
+        if word:
+            i = word_end(body, word.end())
+            continue
+        j = i
+        while j < len(body) and body[j] not in ' \t\n;&|()':
+            j += 1
+        if body[i:j] not in PASS_THROUGH:
+            return False
+        i = j
+    return i == at
 
 
 class _PrefixAssignment:
@@ -2221,34 +2287,12 @@ class _PrefixAssignment:
     # preceding space was standing in for "at the front of a simple command",
     # which is a claim about position that whitespace cannot make.
     #
-    # A few words still pass assignments through to what they run (`env`,
-    # `sudo`, `exec`) or open a command without being one (`if`, `while`), so
-    # they are stepped over rather than treated as the command name. Anything
-    # else ends the assignment prefix, which drops names rather than admitting
-    # them.
-    _assign_word = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=')
-    _pass_through = ('env', 'exec', 'sudo', 'command', 'nohup', 'time',
-                     'if', 'then', 'elif', 'else', 'do', 'while', 'until', '!')
-
+    # A few words are stepped over rather than treated as the command name —
+    # see `PASS_THROUGH`. Anything else ends the assignment prefix, which drops
+    # names rather than admitting them.
     def _prefixes_a_command(self, body, name_at):
         """Whether the name at `name_at` sits before its command's name."""
-        i = max((body.rfind(c, 0, name_at) for c in ';&|()\n'), default=-1) + 1
-        while i < name_at:
-            while i < name_at and body[i] in ' \t':
-                i += 1
-            if i >= name_at:
-                break
-            word = self._assign_word.match(body, i)
-            if word:
-                i = self._word_end(body, word.end())
-                continue
-            j = i
-            while j < len(body) and body[j] not in ' \t\n;&|()':
-                j += 1
-            if body[i:j] not in self._pass_through:
-                return False
-            i = j
-        return i == name_at
+        return _at_command_word(body, name_at, self._word_end)
 
     def findall(self, body):
         out, n = [], len(body)
@@ -2884,19 +2928,41 @@ def source_tokens(root):
         # commented `env::var`, `export`, `${…}` or `const …_ENV` is a note, and
         # the note is often about a name that is deliberately wrong. Neither is
         # a test, which names a variable to prove the runtime ignores it.
+        #
+        # WHICH grammar strips them is the same decision as which grammar
+        # reads them, and it has to be made FIRST: where a comment starts
+        # depends on where the string before it ends, and PowerShell ends a
+        # string by its own escape. `Write-Output "q: `""  # $env:AUTUMN_X`
+        # closes its string at the unescaped quote, so the rest is a comment —
+        # under the Bourne rule it was code. So the effective shell is resolved
+        # on the RAW text, before anything is stripped.
+        yaml_file = effective_suffix(rel) in YAML_SCALARS
+        powershell = set()
+        if yaml_file and _yaml_consumer(rel, body) == 'actions':
+            powershell = _yaml_shells(body)
+        raw = body
         body = uncommented(body, comment_leader(rel),
                           hash_needs_space(rel),
                           effective_suffix(rel) in HASH_AND_SLASH,
                           effective_suffix(rel) in HASH_BLOCK,
                           effective_suffix(rel) in YAML_SCALARS)
+        if powershell:
+            # `also_block` is already the flag that means "PowerShell" to
+            # `uncommented`; each pwsh line is taken from that pass.
+            ps_lines = uncommented(raw, '#', hash_needs_space(rel), False,
+                                   True, True).splitlines()
+            merged = body.splitlines()
+            for i in powershell:
+                if i < len(merged) and i < len(ps_lines):
+                    merged[i] = ps_lines[i]
+            body = '\n'.join(merged)
         # `effective_suffix`, not `rel.endswith('.rs')`: `build.rs.tmpl` is
         # Rust, and the suffix test did not see it, so a `#[test]` in a Rust
         # TEMPLATE went unmasked.
         if effective_suffix(rel) == '.rs':
             body = untested(body)
-        yaml_file = effective_suffix(rel) in YAML_SCALARS
         interpolated = yaml_file and _yaml_interpolated(rel)
-        yaml_code, powershell = None, set()
+        yaml_code = None
         # A Dockerfile's exec-form lines expand nothing — see `_docker_literal`.
         literal = (_docker_literal(body)
                    if pathlib.PurePath(rel).name.split('.')[0] == 'Dockerfile'
@@ -2904,11 +2970,6 @@ def source_tokens(root):
                    else set())
         if yaml_file:
             consumer = _yaml_consumer(rel, body)
-            # Which `run:` blocks the workflow told Actions to run in
-            # PowerShell — read before the blanking passes, since it needs the
-            # `defaults:` and `shell:` keys that blanking removes.
-            if consumer == 'actions':
-                powershell = _yaml_shells(body)
             # Compose needs its own ASSIGNMENT view — see `COMPOSE_ASSIGNS`.
             # Everywhere else the two views coincide, because a non-compose
             # file keeps only what its consumer executes to begin with.
@@ -4403,6 +4464,29 @@ def self_test():
           ASSIGNED_PREFIX.findall('echo hi; AUTUMN_X=1 cmd')),
          ([], [], ['AUTUMN_X'], ['AUTUMN_X'], ['AUTUMN_A', 'AUTUMN_X'],
           ['AUTUMN_X']))
+    # `export` must BE the command word, exactly as an assignment must sit
+    # before one — the same question, asked of the neighbouring rung.
+    case('export counts only as the command word',
+         (ASSIGNED.findall('export AUTUMN_X=1'),
+          ASSIGNED.findall('printf %s export AUTUMN_X=x'),
+          ASSIGNED.findall('foo && export AUTUMN_X=1'),
+          ASSIGNED.findall('env export AUTUMN_X=1')),
+         (['AUTUMN_X'], [], ['AUTUMN_X'], ['AUTUMN_X']))
+    # The pass-through list is what bash DOES, not what sounds right: `exec`,
+    # `command` and `nohup` each try to run a program named `AUTUMN_X=v` and
+    # exit 127, so an assignment after them reaches nothing.
+    case('only words that really pass an assignment through are stepped over',
+         [ASSIGNED_PREFIX.findall(f'{w} AUTUMN_X=1 cmd') for w in
+          ('env', 'sudo', 'time', 'exec', 'command', 'nohup')],
+         [['AUTUMN_X'], ['AUTUMN_X'], ['AUTUMN_X'], [], [], []])
+    # Where a comment STARTS depends on where the string before it ends, and
+    # PowerShell ends a string by its own escape — so the comment grammar is
+    # the same decision as the rung, and has to be made before stripping.
+    _psline = 'Write-Output "quote: `"" # $env:AUTUMN_X "'
+    case('a pwsh comment is stripped with PowerShell quoting',
+         (PS_ENV.findall(uncommented(_psline, '#', True, False, True, True)),
+          PS_ENV.findall(uncommented(_psline, '#', True, False, False, True))),
+         ([], ['AUTUMN_X']))
     # Docker's exec form runs no shell, so its dollars are literal — unless the
     # executable IS a shell, which this tree does use.
     case('a Docker exec form expands nothing unless it names a shell',
