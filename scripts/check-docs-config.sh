@@ -346,6 +346,31 @@ WAIVER = re.compile(r'<!--\s*config-key-allow:\s*([A-Z][A-Z0-9_]+)\s*(.*?)\s*-->
 NEAR = re.compile(r'\b([A-Za-z][A-Za-z0-9]{3,8})_'
                   r'((?:[A-Z0-9]+|\{[a-z_]+\})(?:_+(?:[A-Z0-9]+|\{[a-z_]+\}))*)')
 
+# The missing edit can be the SEPARATOR. `AUTUMNLOG__LEVEL` has no `_` after the
+# namespace at all, so nothing above sees it: `VAR` wants the exact prefix and
+# `NEAR` wants a separator where this token has none. The namespace is still
+# there, fused to the first segment.
+#
+# The head here cannot contain `_` — a token that has one before its `__` was
+# already a candidate for `NEAR` — so the two patterns never claim the same
+# token, and `AUTUMN_LOG__LEVEL` matches neither.
+FUSED = re.compile(r'\b([A-Za-z][A-Za-z0-9]*)__'
+                   r'((?:[A-Z0-9]+|\{[a-z_]+\})(?:_+(?:[A-Z0-9]+|\{[a-z_]+\}))*)')
+
+
+def fused_namespace(head):
+    """`AUTUMNLOG` — the namespace, or one edit from it, then more letters.
+
+    The namespace spelled correctly is never this: `AUTUMN` reads as `AUTUM`
+    plus an `N` under a one-edit prefix rule, so it is excluded up front rather
+    than left to a length coincidence.
+    """
+    up = head.upper()
+    if up == 'AUTUMN':
+        return False
+    return any(len(up) > n and (up[:n] == 'AUTUMN' or near_miss(up[:n]))
+               for n in range(5, 9))
+
 
 def near_miss(word, target='AUTUMN'):
     """One insertion, deletion, substitution or transposition from `target`."""
@@ -607,22 +632,37 @@ def _rust_skeleton(body):
 HASH_NEEDS_SPACE = ('.sh', '.bash', '.zsh', '.yml', '.yaml', '.env', '.example')
 
 
-def _hash_uncommented(body, needs_space=False):
+def _hash_uncommented(body, shell_like=False):
     """Drop `#` comments, respecting the language's rule for where one starts.
+
+    `shell_like` governs two rules that go together, which is why it is one
+    flag: a `#` needs whitespace in front of it to open a comment, and a
+    backslash does NOT escape inside single quotes. Both hold for the shell
+    family and for YAML; neither holds for Python, TOML or HCL.
+
+    Escapes matter because without them `"a\\"b"` reads as a string that ENDS at
+    the escaped quote and reopens at the real one, so a trailing comment lands
+    inside an imaginary string and survives.
 
     Quote state is tracked per line rather than across the file: an unbalanced
     quote then costs one line, not the rest of the file.
     """
     out = []
     for l in body.splitlines():
-        q, cut = None, None
+        q, cut, esc = None, None, False
         for i, c in enumerate(l):
+            if esc:
+                esc = False
+                continue
+            if c == '\\' and not (shell_like and q == "'"):
+                esc = True
+                continue
             if q:
                 if c == q:
                     q = None
             elif c in '"\'':
                 q = c
-            elif c == '#' and (not needs_space or i == 0 or l[i - 1].isspace()):
+            elif c == '#' and (not shell_like or i == 0 or l[i - 1].isspace()):
                 cut = i
                 break
         out.append(l if cut is None else l[:cut])
@@ -1173,6 +1213,13 @@ def scan(files, read, leaves, built, tokens):
                     stats['waived'] += 1
                 else:
                     defects.append((rel, i, m.group(0), line.strip()))
+            for m in FUSED.finditer(line):
+                if not fused_namespace(m.group(1)):
+                    continue
+                if at[i] in waived.get(m.group(0), ()):
+                    stats['waived'] += 1
+                else:
+                    defects.append((rel, i, m.group(0), line.strip()))
             if 'AUTUMN_' not in line:
                 continue
             for var in VAR.findall(line):
@@ -1585,6 +1632,22 @@ def self_test():
                  lambda _: '| `AUTMN_DATABASE__SHARDS__{i}__NAME` | x |\n',
                  leaves, built, tokens)
     case('and reported', len(dp), 1)
+    # The missing edit can be the separator itself: `AUTUMNLOG__LEVEL`.
+    case('a fused namespace is scanned',
+         [m.group(0) for m in FUSED.finditer('export AUTUMNLOG__LEVEL=debug')
+          if fused_namespace(m.group(1))], ['AUTUMNLOG__LEVEL'])
+    _, df2 = scan(['d.md'], lambda _: 'export AUTUMNLOG__LEVEL=debug\n',
+                  leaves, built, tokens)
+    case('a fused namespace is reported', len(df2), 1)
+    # The correct spelling has its separator, so neither pattern claims it —
+    # which is also what keeps the two from reporting the same token twice.
+    case('the correct spelling is claimed by neither',
+         ([m.group(0) for m in FUSED.finditer('export AUTUMN_LOG__LEVEL=x')],
+          [m.group(0) for m in NEAR.finditer('export AUTUMN_LOG__LEVEL=x')
+           if fused_namespace(m.group(1))]), ([], []))
+    case('another project\'s fused name is not a near miss',
+         (fused_namespace('DATABASEURL'), fused_namespace('SERVERPORT'),
+          fused_namespace('LOG')), (False, False, False))
     sn, _ = scan(['d.md'],
                  lambda _: ('export AUTMN_LOG__LEVEL=debug\n'
                             '<!-- config-key-allow: AUTMN_LOG__LEVEL — why -->\n'),
@@ -1839,6 +1902,20 @@ def self_test():
          (True, True, False, False))
     case('a `#` inside a string is not a comment either',
          uncommented('url = "http://x/#frag"', '#'), 'url = "http://x/#frag"')
+    # An escaped quote does not end a string. Without this, `"a\"b"` reads as a
+    # string that ENDS at the escaped quote and reopens at the real one, so a
+    # trailing comment lands inside an imaginary string and survives.
+    case('an escaped quote does not end a shell string',
+         uncommented(r'''printf "a\"b" # env::var("AUTUMN_LOG__LEVL")''',
+                     '#', needs_space=True),
+         r'printf "a\"b" ')
+    # …but a backslash is literal inside shell single quotes, so the quote after
+    # it really does close the string.
+    case('a backslash is literal in shell single quotes',
+         uncommented(r"""echo 'a\' # note""", '#', needs_space=True),
+         r"echo 'a\' ")
+    case('an escape works in both quotes elsewhere',
+         uncommented(r'''x = "a\"b"# note''', '#'), r'x = "a\"b"')
     # Test code is not the runtime: a test names a variable to prove the runtime
     # ignores it. `AUTUMN_DEV` is read exactly once in the whole tree, inside a
     # `#[test]` asserting it is unset.
