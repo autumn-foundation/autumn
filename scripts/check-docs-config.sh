@@ -1870,7 +1870,15 @@ def test_code(rel, test_files):
     `built_patterns` did not, leaving `autumn/src/cluster/tests.rs` able to
     define a name pattern that blesses documentation everywhere.
     """
-    return bool(TEST_PATH.search(rel)) or rel in test_files
+    # Through `.tmpl`, like every other path rule here: `TEST_PATH`'s directory
+    # arm already catches `templates/tests/integration_test.rs.tmpl`, but its
+    # `_test.rs$` arm would not have seen a `foo_test.rs.tmpl`. Nothing in the
+    # tree is spelled that way today; this is the same latent shape as the two
+    # `rel.endswith('.rs')` tests, closed at the same time rather than waiting
+    # for a file to arrive that exercises it.
+    p = pathlib.PurePath(rel)
+    bare = str(pathlib.PurePath(p.parent) / p.stem) if p.suffix == '.tmpl' else rel
+    return bool(TEST_PATH.search(bare)) or rel in test_files
 
 
 # A test function does not need a `cfg` to be test code: `#[test]` marks one on
@@ -2917,6 +2925,12 @@ def self_test():
           test_code('autumn/src/config.rs', test_module_files(ROOT)),
           test_code('autumn/tests/integration/a11y.rs', set())),
          (True, False, True))
+    # …and a path rule reads through `.tmpl` like every other one here.
+    case('a test path is a test path through .tmpl too',
+         (test_code('a/foo_test.rs.tmpl', set()),
+          test_code('autumn-cli/src/templates/tests/x.rs.tmpl', set()),
+          test_code('autumn-cli/src/templates/main.rs.tmpl', set())),
+         (True, True, False))
     case('a fused namespace is scanned',
          [m.group(0) for m in FUSED.finditer('export AUTUMNLOG__LEVEL=debug')
           if fused_namespace(m.group(1))], ['AUTUMNLOG__LEVEL'])
