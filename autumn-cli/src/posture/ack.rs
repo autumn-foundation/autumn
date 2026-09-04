@@ -110,6 +110,10 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
     // lines inside it are attribute data — a marker in a `title=` renders as
     // part of the attribute and says nothing to a reader.
     let mut open_tag = TagState::default();
+    // An unclosed backtick code span, by run length: `CommonMark` closes one
+    // with a run of exactly the same length, and renders everything between as
+    // inline code — including across a newline.
+    let mut code_span: Option<usize> = None;
     for line in text.lines() {
         if line.trim() == SOURCE_SEPARATOR {
             // A new comment body starts here, with a clean slate. Checked
@@ -119,6 +123,7 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
             quote_paragraph = false;
             raw_html = None;
             open_tag = TagState::default();
+            code_span = None;
             continue;
         }
         // A blank line ends the quoted paragraph, so the lazy continuation
@@ -127,6 +132,9 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
         // comment is not a paragraph break.
         if line.trim().is_empty() {
             quote_paragraph = false;
+            // A blank line ends the paragraph, and a code span cannot outlive
+            // the paragraph that opened it.
+            code_span = None;
             continue;
         }
         // An acknowledgment has to be *visible* on the pull request — that is
@@ -211,6 +219,13 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
         if fence.is_some() || quote_paragraph {
             continue;
         }
+        // Inline code, the last of Markdown's three ways to show a sample: a
+        // span open when this line began renders it as code, whatever it says.
+        let inside_span = code_span.is_some();
+        code_span = scan_code_span(line, code_span);
+        if inside_span {
+            continue;
+        }
         if let Some(ack) = parse_marker(trimmed) {
             acks.push(ack);
         }
@@ -255,6 +270,32 @@ fn leading_indent(line: &str) -> usize {
         .take_while(|c| *c == ' ' || *c == '\t')
         .map(|c| if c == '\t' { 4 } else { 1 })
         .sum()
+}
+
+/// The backtick run still open at the end of `line`, if any.
+///
+/// A run of *n* backticks opens a code span and only a run of exactly *n*
+/// closes it, so a longer or shorter run inside is content.
+fn scan_code_span(line: &str, mut open: Option<usize>) -> Option<usize> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '`' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && chars[i] == '`' {
+            i += 1;
+        }
+        let run = i - start;
+        match open {
+            Some(n) if n == run => open = None,
+            Some(_) => {}
+            None => open = Some(run),
+        }
+    }
+    open
 }
 
 /// Whether an HTML tag is still open at the end of `line`.
@@ -477,6 +518,30 @@ mod tests {
     fn a_quoted_marker_acknowledges_nothing() {
         assert!(parse_acks("> /ack-posture 0123456789abcdef").is_empty());
         assert!(parse_acks(">> /ack-posture 0123456789abcdef").is_empty());
+    }
+
+    /// A backtick code span can cross a newline, and `CommonMark` renders what
+    /// is inside it as inline code — so a reviewer displaying the marker that
+    /// way was granting it.
+    #[test]
+    fn a_marker_inside_a_multiline_code_span_acknowledges_nothing() {
+        let text = "like this: `\n/ack-posture 0123456789abcdef\n` — see?\n";
+        assert!(parse_acks(text).is_empty(), "{:?}", parse_acks(text));
+    }
+
+    /// The span closes on a backtick run of the same length, and text after it
+    /// is live again.
+    #[test]
+    fn a_marker_after_a_closed_code_span_still_acknowledges() {
+        let text = "like this: `\nsample\n`\n/ack-posture 0123456789abcdef  yes\n";
+        assert_eq!(parse_acks(text).len(), 1, "{:?}", parse_acks(text));
+    }
+
+    /// A span opened and closed on one line leaves the next line alone.
+    #[test]
+    fn a_balanced_code_span_does_not_swallow_the_next_line() {
+        let text = "the phrase is `/ack-posture`, like so:\n/ack-posture 0123456789abcdef  yes\n";
+        assert_eq!(parse_acks(text).len(), 1, "{:?}", parse_acks(text));
     }
 
     /// An HTML tag can span lines, and the lines inside it are attribute data,

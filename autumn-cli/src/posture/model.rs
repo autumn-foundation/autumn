@@ -352,6 +352,11 @@ impl PostureManifest {
     /// This is what [`Self::posture_digest`] hashes, so two manifests that
     /// differ only cosmetically hash identically.
     #[must_use]
+    /// Paths are normalized here for the same reason the differ normalizes
+    /// them: the router matches on shape, so a renamed capture is not a posture
+    /// change. Hashing the raw path made the scaffolded staleness check reject
+    /// a posture-neutral refactor — the regenerate-and-commit chore that check
+    /// exists to avoid.
     pub fn projection(&self) -> String {
         let mut lines: Vec<String> = Vec::new();
         for r in &self.dimensions.routes.entries {
@@ -359,7 +364,7 @@ impl PostureManifest {
             let scopes: Vec<String> = r.scope_set().into_iter().collect();
             lines.push(format!(
                 "route\t{}\t{}\t{}\troles={}\tscopes={}\tpolicy={}",
-                escape_field(&r.path),
+                escape_field(&normalize_captures(&r.path)),
                 escape_field(&r.method),
                 escape_field(&r.classification),
                 escape_list(&roles),
@@ -376,7 +381,7 @@ impl PostureManifest {
         for c in &self.dimensions.csrf.entries {
             lines.push(format!(
                 "csrf\t{}\t{}\tenforced={}",
-                escape_field(&c.path),
+                escape_field(&normalize_captures(&c.path)),
                 escape_field(&c.method),
                 c.csrf_enforced
             ));
@@ -392,7 +397,7 @@ impl PostureManifest {
         for a in &self.dimensions.authorization_policies.entries {
             lines.push(format!(
                 "authz\t{}\t{}\t{}\t{}",
-                escape_field(&a.path),
+                escape_field(&normalize_captures(&a.path)),
                 escape_field(&a.method),
                 escape_field(&a.action),
                 escape_field(&a.resource)
@@ -536,6 +541,33 @@ mod tests {
         let m = PostureManifest::parse(r#"{"schema_version":3}"#, "m.json").expect("parses");
         assert!(m.dimensions.routes.entries.is_empty());
         assert!(m.dimensions.csrf.entries.is_empty());
+    }
+
+    /// The digest keys on the same shape the differ does. A renamed capture is
+    /// not a posture change, so it must not move the digest — otherwise the
+    /// scaffolded staleness check rejects a posture-neutral refactor and turns
+    /// it into a regenerate-and-commit chore, which is exactly what that check
+    /// promises not to do.
+    #[test]
+    fn renaming_a_capture_does_not_move_the_digest() {
+        let with = |path: &str| {
+            PostureManifest::parse(
+                &manifest(&format!(
+                    r#"{{"path":"{path}","method":"GET","name":"h","classification":"gated",
+                        "roles":["admin"],"scopes":[],"policy":false,"location":"src/a.rs:1"}}"#
+                )),
+                "m",
+            )
+            .expect("fixture parses")
+            .posture_digest()
+        };
+
+        assert_eq!(with("/users/{id}"), with("/users/{user_id}"));
+        assert_ne!(
+            with("/users/{id}"),
+            with("/users/{*rest}"),
+            "a catch-all is a different URL set, not a rename"
+        );
     }
 
     #[test]
