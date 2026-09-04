@@ -355,8 +355,23 @@ EXPANDED = re.compile(r'\$\{?(AUTUMN_[A-Z0-9_]+)\}?')
 # shape here is `const CANARY_ENV: &str = "AUTUMN_CANARY"` — the read happens
 # wherever the constant is later used, arbitrarily far away. Recognising the
 # binding itself covers those without needing to follow the constant.
+# A constant binding a variable name — and the constant must be NAMED as one.
+# A string starting with `AUTUMN_` is not automatically a variable:
+# `const NONCE_PLACEHOLDER: &str = "AUTUMN_CSP_NONCE"` is a token substituted
+# into a CSP template, with no env accessor anywhere, and accepting every
+# binding made it settable in the docs.
+#
+# The repo names these by convention and does so consistently — all 36 bindings
+# of a real variable are `*_ENV`, `ENV_*` or `VAR`, and the CSP placeholder is
+# the only one that is neither. Preferred over "the constant is used near an env
+# accessor", which was measured and is too strict: six real ones
+# (`ENV_API_TOKEN`, `REPLAY_CAPSULE_ENV`, …) reach the accessor through a helper
+# and would have been dropped, reporting correct pages. A future binding named
+# outside the convention reports a correct page rather than hiding a wrong one,
+# which is the safer direction for this rung to fail in.
 BOUND = re.compile(
-    r'\b(?:const|static)\s+\w+\s*:\s*&\s*(?:\'\w+\s+)?str\s*=\s*"(AUTUMN_[A-Z0-9_]+)"')
+    r'\b(?:const|static)\s+((?:\w+_)?(?:ENV|VAR)(?:_\w+)?)\s*:\s*&\s*'
+    r'(?:\'\w+\s+)?str\s*=\s*"(AUTUMN_[A-Z0-9_]+)"')
 
 # The accessors that read or write the environment. `with` is deliberately NOT
 # here: it supplies a fixture environment, which is how a test names a variable
@@ -403,7 +418,7 @@ def source_tokens(root):
             if not rel.endswith('.rs'):
                 tokens.update(ASSIGNED.findall(line))
             tokens.update(EXPANDED.findall(line))
-            tokens.update(BOUND.findall(line))
+            tokens.update(v for _, v in BOUND.findall(line))
             if NEGATED.search(line):
                 continue
             # The accessor may open a line or two above its argument —
@@ -553,7 +568,7 @@ def scan(files, read, leaves, built, tokens):
 # below now accounts for every row it sees rather than quietly dropping the ones
 # it cannot parse.
 TABLE_ROW = re.compile(
-    r'^//! \| `(AUTUMN_(?:[A-Z0-9_]|\{[a-z]\})+)` \| `([^`]+)` \|')
+    r'^//!\s*\|\s*`(AUTUMN_(?:[A-Z0-9_]|\{[a-z]\})+)`\s*\|\s*`([^`]+)`\s*\|')
 
 # The rows whose second cell is prose rather than a backticked path:
 # `AUTUMN_ENV` and `AUTUMN_PROFILE` map to "active profile", not to a config
@@ -568,11 +583,11 @@ TABLE_ROW = re.compile(
 # by being malformed.
 TABLE_PROSE_ROWS = ('AUTUMN_ENV', 'AUTUMN_PROFILE')
 TABLE_PROSE_ROW = re.compile(
-    r'^//! \| `(' + '|'.join(TABLE_PROSE_ROWS) + r')` \| [^`]')
+    r'^//!\s*\|\s*`(' + '|'.join(TABLE_PROSE_ROWS) + r')`\s*\|\s*[^`\s]')
 
 # Anything shaped like a table row at all, used to prove the two patterns above
 # between them account for every one.
-TABLE_ANY_ROW = re.compile(r'^//! \| `?AUTUMN_')
+TABLE_ANY_ROW = re.compile(r'^//!\s*\|\s*`?AUTUMN_')
 
 # The one row whose two columns legitimately disagree. `SigningSecretConfig`
 # has an untagged deserializer that accepts a bare string, so
@@ -889,6 +904,16 @@ def self_test():
          'AUTUMN_TEST_ADMIN_SESSION' in swept, True)
     case('escaped quotes are recognised',
          QUOTED.findall(r'std::env::var(\"AUTUMN_X\")'), ['AUTUMN_X'])
+    # A constant holding an `AUTUMN_`-prefixed string is only a variable if it is
+    # named as one: the CSP template token is not.
+    case('a non-env constant is not swept in',
+         'AUTUMN_CSP_NONCE' in swept, False)
+    case('an env-named binding is recognised',
+         BOUND.findall('const CANARY_ENV: &str = "AUTUMN_CANARY";'),
+         [('CANARY_ENV', 'AUTUMN_CANARY')])
+    case('a placeholder binding is not',
+         BOUND.findall('const NONCE_PLACEHOLDER: &str = "AUTUMN_CSP_NONCE";'),
+         [])
 
     # A mapping row that loses a backtick must not escape by looking like prose.
     broken = '//! | `AUTUMN_DATABASE__URL` | database.urll | `String` |'
@@ -906,6 +931,13 @@ def self_test():
     rows_n, unparsed_n = table_rows(no_tick)
     case('a row missing its opening backtick is reported',
          (len(rows_n), len(unparsed_n)), (0, 1))
+    # Doc-comment whitespace is not significant, so an indented row must still
+    # be PARSED and checked — not merely noticed, and certainly not skipped.
+    indented = '//!  |  `AUTUMN_SERVER__HOST`  |  `server.host`  |  `String` |'
+    rows_i, unparsed_i = table_rows(indented)
+    case('an indented row is parsed, not dropped',
+         (rows_i, unparsed_i),
+         ([(1, 'AUTUMN_SERVER__HOST', 'server.host')], []))
 
     good = [(1, 'AUTUMN_LOG__LEVEL', 'log.level'),
             (2, 'AUTUMN_SECURITY__SIGNING_SECRET', 'security.signing_secret.secret'),
