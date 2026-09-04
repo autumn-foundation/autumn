@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
+  update validation left after #1719/#1742/#1778/#1801 (issue #1751).
+  `must_match` — like `custom`, `ip` on `Option<_>` fields, and
+  `does_not_contain` before it — is now behaviorally proven, not just
+  asserted, to be enforced on the update path via merged-model validation
+  (`from_patch`): `tests/integration/validate_merged_model.rs` gained a
+  dedicated cross-field `password`/`password_confirm` case showing the patch
+  struct alone stays create-only while the merged model correctly rejects a
+  mismatch and accepts a match. Investigating the last item, `nested`,
+  surfaced a real, previously-undiscovered defect rather than a mere test gap:
+  `validator_derive`'s `nested` codegen calls a field's value with bare
+  `(&field).validate()`, which collides with this crate's own `ValidateExt`
+  (`autumn_web::prelude::ValidateExt`, a blanket `impl<T: validator::Validate>
+  ValidateExt for T` also named `validate`) whenever a struct with a
+  `#[validate(nested)]` field is declared in a module that ALSO imports the
+  prelude — a cryptic `E0034: multiple applicable items in scope` pointing
+  into the derive expansion, on **create as much as on update**, and equally
+  possible on `#[autumn_web::model]` structs (which forward `#[validate(...)]`
+  verbatim) as on hand-rolled ones. The collision is scoped to the struct's
+  own defining module, not any downstream consumer's — proven with a
+  compile-fail/compile-pass fixture pair
+  (`tests/compile-fail/validate_nested_collides_with_validate_ext.rs` /
+  `tests/compile-pass/validate_nested_without_validate_ext.rs`) — and a
+  derive/attribute macro cannot see the rest of its enclosing module's `use`
+  statements, so `#[model]` cannot detect or refuse it at expansion time.
+  `ValidateExt`'s doc comment now documents the hazard and its scope, with the
+  workaround (keep the struct's own module free of that import, or use
+  `#[validate(custom(...))]`). `credit_card`/`non_control_character` remain
+  correctly out of scope: they are not in this workspace's enabled `validator`
+  feature set (only `derive`, not `card`/`unic`), so no model can use them
+  today regardless of the update path.
+
 - **A CI gate for `AUTUMN_*` config keys named in the docs [no-plugin]:**
   nothing here is agent-facing — it's a CI/docs-harness addition, not new
   framework surface (`scripts/check-docs-config.sh`, wired into the docs-only
@@ -63,7 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is reported rather than skipped, since a spelling that matches nothing is a
   claim the reader cannot be warned about.
 
-  The baseline run found **0 defects** across 658 occurrences on 175 pages:
+  The baseline run found **0 defects** across 659 occurrences on 176 pages:
   the reader-facing corpus was already accurate, and the gate is here to keep
   it that way. One occurrence is waived in place beside the passage that needs
   it — a migration guide's `rg` pattern for a key that release removed.
@@ -1608,6 +1640,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dev inspector's detail route (`{inspector_path}/requests/{id}`) is claimed
   alongside its index — both now derive from `inspector_endpoint_paths`, so the
   claim set cannot drift from what the router actually mounts.
+
+- **`#[secured]`/`#[step_up]`/`#[authorize]`/`#[throttle]` no longer drop a
+  route's OpenAPI response schema when written above the route attribute
+  (#1677):** all four body guards rewrite a handler's return type to
+  `Response` when they expand, so when one was written *above* `#[get]`/
+  `#[post]`/etc. it expanded first and the route macro's `infer_response_body`
+  read back `Response` instead of the handler's real `Json<T>` — silently
+  dropping the response schema from the generated OpenAPI document (throttling
+  itself, including idempotency-replay accounting, was unaffected in either
+  ordering). Each guard already binds the pre-rewrite type as
+  `let __autumn_inner: T = …` around the guarded body; the route macro now
+  recovers the original type from that binding — matched by its exact
+  structural shape and the presence of the guard's own marker const earlier
+  in the same block, not merely the binding's name or position, so neither
+  an unrelated handler-local nor a coincidentally-shaped fragment of the
+  handler's own body is ever mistaken for a real guard's binding — recursing
+  to the innermost binding when guards stack, instead of trusting
+  `sig.output` alone. The generated schema no longer depends on attribute
+  order. The
+  previously-recommended method-attribute-outermost workaround, documented
+  on `#[throttle]`'s rustdoc and in `docs/guide/rate-limiting.md`, is no
+  longer necessary.
+
+  This is a macro/metadata-only change — no authorization, rate-limiting, or
+  idempotency-replay runtime behavior differs in either attribute ordering.
+  `ApiDoc::response` does have one existing runtime reader, `mount_mcp`'s MCP
+  tool-catalog eligibility gate: a guard-above-route JSON handler explicitly
+  opted in with `#[api_doc(mcp)]` was previously excluded from `tools/list`
+  as "no response schema", and is now correctly listed, matching the
+  developer's existing opt-in — every MCP call still dispatches through the
+  same authenticated handler pipeline, so this closes an availability gap
+  rather than changing what a call is authorized to do.
+
 - **Punctuation- and emoji-only titles no longer slip past the validator that
   exists to stop them (#2424):** `examples/reddit-clone` rejects a post title
   like `***`, `!!!???...:::` or `🎉🔥💯` with "Title must contain at least one

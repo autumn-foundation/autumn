@@ -969,6 +969,20 @@ validators (follow-up: issue #1801). The `Patch<T>` per-field impls and the
 `UpdateModel` denylist are unchanged, so this is backward compatible (issue
 #1778). See `docs/guide/repositories.md`.
 
+**`#[validate(nested)]` hazard (issue #1751):** `validator_derive`'s `nested`
+codegen calls a field's value with a bare `.validate()`, which collides with
+this crate's own `ValidateExt` (also named `validate`, blanket-implemented for
+every `Validate` type and re-exported from `autumn_web::prelude`) whenever the
+struct's own defining module ALSO imports the prelude (or `ValidateExt`
+directly) — a cryptic `E0034: multiple applicable items in scope` pointing
+into the derive expansion, on create as much as on update, and on `#[model]`
+structs as much as hand-rolled ones. It doesn't matter what a downstream
+handler module imports — only the struct's own module's imports matter. Avoid
+it by keeping a `#[validate(nested)]` struct's module free of the prelude/
+`ValidateExt` import (use fully-qualified `Db`/etc. paths there instead), or by
+replacing `nested` with `#[validate(custom(...))]` calling the nested value's
+`validator::Validate::validate` explicitly.
+
 ### Transactions
 
 `Db::tx(f)` runs a READ COMMITTED transaction. Since
