@@ -120,8 +120,14 @@
 #     over-blanking from the same missing rule. An assignment value written as
 #     `\S*` when a shell word holds `$( … )` and its spaces. A quoting rule
 #     stated for "the shell family" and applied to `.sh` alone, while
-#     `install.ps1` quotes the same way. Ask what the language's own grammar
-#     says the thing is, then match that.
+#     `install.ps1` quotes the same way. One scalar terminator where a line may
+#     open several heredocs (`cat <<'ONE' <<'TWO'`), and a per-LINE quote rule
+#     for a quote that spans lines. Ask what the language's own grammar says
+#     the thing is, then match that.
+#     `check-docs-cli.sh` reads the same two languages and had already been
+#     through most of these rounds: its `_heredoc_openers` / `_open_quote` are
+#     where the heredoc and quote rules here come from. Read the sibling gate
+#     before re-deriving one of its answers, and take all of it.
 #   * A rule about the LAYOUT of the text standing in for a rule about its
 #     structure. "The comment starts the line", "the `}` is in column zero",
 #     "the `#[cfg(test)]` is not indented" — each held for the cases in front of
@@ -769,7 +775,11 @@ HASH_BLOCK = ('.ps1', '.psm1')
 # single-quotes freely and whose `${…}` is still interpolated by whatever reads
 # the file, docker-compose among them.
 SHELL_QUOTED = ('.sh', '.bash', '.zsh', '.ps1', '.psm1')
-SINGLE_QUOTED = re.compile(r"'[^']*'")
+
+# The escape character inside a DOUBLE-quoted string, per language: a backslash
+# in the Bourne family, a backtick in PowerShell, where `"C:\dir\"` ends at the
+# second quote and honouring the backslash would run the string past it.
+QUOTE_ESCAPE = {'.ps1': '`', '.psm1': '`'}
 
 # Heredocs are Bourne syntax; PowerShell's here-strings are `@' … '@` and open
 # no `<<`. Kept as its own set so adding a language to one rule does not
@@ -778,10 +788,55 @@ SINGLE_QUOTED = re.compile(r"'[^']*'")
 HAS_HEREDOC = ('.sh', '.bash', '.zsh')
 
 
-def _shell_literals(body):
-    """Blank single-quoted spans, per line so an odd quote costs one line."""
-    return '\n'.join(SINGLE_QUOTED.sub(lambda m: ' ' * len(m.group(0)), l)
-                     for l in body.splitlines())
+def _shell_literals(body, escape='\\'):
+    """Blank single-quoted spans, tracking quote state ACROSS lines.
+
+    A single-quoted string spans physical lines — `printf '%s\\n' '` opens one
+    the next line continues — and its interior lines are string data, not
+    commands. Reading each line on its own left every interior line intact, so
+    a `${AUTUMN_X}` written inside a multi-line literal read as an expansion.
+
+    Doing it across lines is only safe because the scan is quote-AWARE rather
+    than a search for pairs: an apostrophe inside `"don't"` no longer opens a
+    literal, which is what the per-line bound was standing in for. The one
+    remaining hazard is an apostrophe that opens nothing and never closes, and
+    that costs itself and nothing after it — an unterminated span is skipped
+    rather than blanked to the end of the file, since blanking there would hide
+    real uses and report correct pages.
+
+    Length-preserving, newlines kept, so line numbering holds.
+    """
+    out, i, n = list(body), 0, len(body)
+    while i < n:
+        c = body[i]
+        if c == escape:
+            i += 2
+            continue
+        if c == '"':
+            # A double-quoted string is not blanked — `"${AUTUMN_X}"` expands —
+            # but it is CONSUMED, so the apostrophes in it open nothing.
+            i += 1
+            while i < n:
+                if body[i] == escape:
+                    i += 2
+                    continue
+                if body[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == "'":
+            j = body.find("'", i + 1)
+            if j < 0:
+                i += 1
+                continue
+            for k in range(i + 1, j):
+                if body[k] != '\n':
+                    out[k] = ' '
+            i = j + 1
+            continue
+        i += 1
+    return ''.join(out)
 
 
 # A QUOTED heredoc — `<<'EOF'` — is literal data handed to a program or written
@@ -798,30 +853,157 @@ def _shell_literals(body):
 # single-quoted one: `<<"EOF"` and `<<\EOF` do too, and each was letting a
 # fixture body read as commands.
 #
-# The delimiter is a WORD, not an identifier. `<<'END-CONFIG'` is ordinary
-# Bourne syntax and the `\w`-only pattern rejected it outright, so its body read
-# as commands; `<<\END-CONFIG` was worse than rejected — it matched the prefix
-# `END` and set a terminator no line would ever equal, blanking the rest of the
-# file. Both directions came from spelling a shell word as an identifier.
-HEREDOC = re.compile(r'''<<-?\s*(?:'([^'\n]+)'|"([^"\n]+)"'''
-                     r'''|\\([^\s'"<>|&;()]+))''')
+# The delimiter is a WORD, not an identifier, and one command line may open
+# SEVERAL heredocs. Both of those, and the inertness of an operator inside
+# quotes or arithmetic, are questions `check-docs-cli.sh` has already been
+# through several rounds of review on — so the rules here are its rules,
+# restated for this gate's need (blank a body, keep the line count) rather than
+# re-derived. Copying half of a sibling's answer is how the previous two rounds
+# of this went.
+HEREDOC = re.compile(r'(?<!<)<<-?[ \t]*')
+
+
+def _escaped(text, i):
+    """True when the character at `i` is escaped — PARITY, not presence.
+
+    A run of backslashes pairs off, so `\\\\<<EOF` is a literal backslash and a
+    real operator while `\\<<EOF` is a literal `<`.
+    """
+    run = 0
+    while i - run - 1 >= 0 and text[i - run - 1] == '\\':
+        run += 1
+    return run % 2 == 1
+
+
+def _mask_inert(text):
+    """`text` with quoted and arithmetic spans filled, length preserved.
+
+    A `<<` inside either opens nothing: `printf '%s' "<<EOF"` is an argument
+    and `$((1 << 2))` is a left shift. Length is kept so the decision stays
+    positional — the operator is FOUND in the real text and TESTED here.
+    """
+    out, i, n = list(text), 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in '\'"':
+            end = i + 1
+            while end < n:
+                if ch == '"' and text[end] == '\\':
+                    end += 2
+                    continue
+                if text[end] == ch:
+                    break
+                end += 1
+            for k in range(i + 1, min(end, n)):
+                out[k] = 'x'
+            i = min(end, n) + 1
+            continue
+        if text[i:i + 3] == '$((':
+            depth, j = 0, i + 1
+            while j < n:
+                if text[j] == '(':
+                    depth += 1
+                elif text[j] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            for k in range(i, min(j + 1, n)):
+                out[k] = 'x'
+            i = min(j + 1, n)
+            continue
+        i += 1
+    return ''.join(out)
+
+
+def _heredoc_delim(text, i):
+    """The delimiter word at `i` as `(word, quoted)`, or None if there is none.
+
+    A delimiter is a shell WORD, and a word may be spelled in PIECES:
+    `<<'END'.JSON` quotes the first half only, and quote removal joins the two.
+    Any quoted piece suppresses expansion in the body, which is the whole
+    question this answers. Returns None for the here-string `<<<EOF`, whose
+    next character is an operator and so ends the word before it starts.
+    """
+    out, n, quoted = [], len(text), False
+    while i < n:
+        ch = text[i]
+        if text[i:i + 2] == '$(':
+            # A substitution is PART of the word: bash does not expand a
+            # delimiter, so `<<EOF$(printf x)` waits for that literal spelling.
+            depth, j = 0, i + 1
+            while j < n:
+                if text[j] == '(':
+                    depth += 1
+                elif text[j] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            end = min(j, n - 1)
+            out.append(text[i:end + 1])
+            i = end + 1
+            continue
+        if ch in '\'"':
+            j = text.find(ch, i + 1)
+            if j < 0:
+                break
+            out.append(text[i + 1:j])
+            quoted, i = True, j + 1
+            continue
+        if ch == '\\':
+            if i + 1 < n:
+                out.append(text[i + 1])
+                quoted = True
+            i += 2
+            continue
+        if ch.isspace() or ch in '<>|&;()':
+            break
+        out.append(ch)
+        i += 1
+    word = ''.join(out)
+    return (word, quoted) if word else None
+
+
+def _heredoc_openers(line):
+    """The `(delimiter, strips_tabs, expands)` triples a line opens, in order.
+
+    ALL of them: `cat <<'ONE' <<'TWO'` opens two, bash consumes their bodies in
+    that order, and keeping one scalar terminator resumed scanning inside the
+    second body — so its data read as commands.
+    """
+    masked, found = _mask_inert(line), []
+    for op in HEREDOC.finditer(line):
+        if masked[op.start():op.start() + 2] != '<<' or _escaped(line, op.start()):
+            continue
+        delim = _heredoc_delim(line, op.end())
+        if delim is None:
+            continue
+        found.append((delim[0], line[op.start():op.start() + 3] == '<<-',
+                      not delim[1]))
+    return found
 
 
 def _shell_heredocs(body):
-    """Blank the bodies of quoted heredocs, keeping line numbering intact."""
-    out, terminator = [], None
-    for l in body.splitlines():
-        if terminator is None:
-            out.append(l)
-            m = HEREDOC.search(l)
-            if m:
-                terminator = next(g for g in m.groups() if g)
+    """Blank the bodies of quoted heredocs, keeping line numbering intact.
+
+    An UNQUOTED body is not blanked — `<<EOF` expands `${AUTUMN_X}`, so that is
+    a real reference — but it IS consumed, because its length is what puts the
+    next heredoc's body in the right place.
+    """
+    out, queue = [], []
+    for line in body.splitlines():
+        if not queue:
+            out.append(line)
+            queue.extend(_heredoc_openers(line))
             continue
-        if l.strip() == terminator:
-            out.append(l)
-            terminator = None
+        delim, tabs, expands = queue[0]
+        candidate = line.lstrip('\t') if tabs else line
+        if candidate.rstrip('\r') == delim:
+            out.append(line)
+            queue.pop(0)
         else:
-            out.append('')
+            out.append(line if expands else '')
     return '\n'.join(out)
 
 
@@ -1565,7 +1747,8 @@ def source_tokens(root):
         if effective_suffix(rel) in HAS_HEREDOC:
             body = _shell_heredocs(body)
         if effective_suffix(rel) in SHELL_QUOTED:
-            body = _shell_literals(body)
+            body = _shell_literals(
+                body, QUOTE_ESCAPE.get(effective_suffix(rel), '\\'))
         lines = body.splitlines()
         # Names this file assigns without exporting them, and without handing
         # them to a command: its own variables.
@@ -2879,11 +3062,47 @@ def self_test():
          (['AUTUMN_X'], ['AUTUMN_X']))
     # Every form that quotes the delimiter suppresses expansion.
     case('all quoted heredoc delimiters are recognised',
-         [next((g for g in HEREDOC.search(h).groups() if g), None)
+         [_heredoc_openers(h)
           for h in ("cat <<'EOF'", 'cat <<"EOF"', 'cat <<\\EOF')],
-         ['EOF', 'EOF', 'EOF'])
-    case('an unquoted delimiter is not',
-         HEREDOC.search('cat <<EOF'), None)
+         [[('EOF', False, False)]] * 3)
+    # An unquoted one is still an opener — its body has to be CONSUMED so the
+    # next heredoc's body starts in the right place — but it expands, so it is
+    # read rather than blanked.
+    case('an unquoted delimiter opens an expanding body',
+         _heredoc_openers('cat <<EOF'), [('EOF', False, True)])
+    # One command line may open SEVERAL, and bash consumes them in order.
+    # Keeping one scalar terminator resumed scanning inside the second body.
+    case('every heredoc on a line is queued',
+         (_heredoc_openers("cat <<'ONE' <<'TWO'"),
+          _shell_heredocs("cat <<'ONE' <<'TWO'\nAUTUMN_LOG__LEVL=x cmd\nONE\n"
+                          'AUTUMN_LOG__LEVL=y cmd\nTWO\nkeep\n').splitlines()),
+         ([('ONE', False, False), ('TWO', False, False)],
+          ["cat <<'ONE' <<'TWO'", '', 'ONE', '', 'TWO', 'keep']))
+    # An operator inside quotes or arithmetic opens nothing, and a here-string
+    # has no delimiter word at all.
+    case('an inert `<<` is not an opener',
+         (_heredoc_openers('printf \'%s\' "<<EOF"'),
+          _heredoc_openers('echo $((1 << 2))'),
+          _heredoc_openers('cat <<<EOF')), ([], [], []))
+    # A `<<-` terminator may be indented with TABS, and only tabs.
+    case('a tab-stripping heredoc ends on an indented terminator',
+         _shell_heredocs("cat <<-'EOF'\nx\n\tEOF\nkeep\n").splitlines(),
+         ["cat <<-'EOF'", '', '\tEOF', 'keep'])
+    # A single-quoted string spans lines, and its interior lines are data.
+    case('a multi-line literal is blanked throughout',
+         EXPANDED.findall(_shell_literals(
+             "printf '%s\n${AUTUMN_LOG__LEVL}\n%s' a\n")), [])
+    # …which is only safe because the scan is quote-aware: an apostrophe inside
+    # a double-quoted string opens no literal.
+    case('an apostrophe inside double quotes opens nothing',
+         EXPANDED.findall(_shell_literals(
+             'echo "don\'t ${AUTUMN_LOG__LEVEL}"')), ['AUTUMN_LOG__LEVEL'])
+    # An unterminated quote costs itself and nothing after it — blanking to the
+    # end of the file would hide real uses and report correct pages.
+    case('an unterminated quote does not blank the rest',
+         EXPANDED.findall(_shell_literals(
+             "echo it's\nexport AUTUMN_LOG__LEVEL=x\necho \"${AUTUMN_ENV}\"\n")),
+         ['AUTUMN_ENV'])
     case('a double-quoted heredoc body is data',
          ASSIGNED_PREFIX.findall(_shell_literals(_shell_heredocs(
              'cat <<"EOF"\nAUTUMN_LOG__LEVL=x cmd\nEOF\n'))),
