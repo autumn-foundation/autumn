@@ -200,20 +200,25 @@ not claimed here ahead of it landing.
 | Cargo.lock line count | 10111 | see commit |
 | Packages removed entirely (dead transitive weight) | — | 14 |
 
-Duplicate-version census, direct-dependency count, and the reqwest
-ask-before analysis are unaffected by this batch (none of the 32 bumps touch
-`reqwest`, `ryu`, or `serde_urlencoded`) — those numbers from the original
-census stand:
+The reqwest ask-before analysis is unaffected by this batch (none of the 31
+applied bumps touch `reqwest`, `ryu`, or `serde_urlencoded`), but the
+duplicate-version census itself **does** move: `chatgpt-codex-connector`'s
+review on this PR caught that the 14 removed crates (the dead
+`rkyv`/`bytecheck` stack, dropped once `rust_decimal` moved to 1.43.0) all
+have unique names, so the external-package and unique-name counts shrink by
+14 each. Re-ran the census against the actual committed lockfile to confirm
+rather than assume the delta:
 
-| Metric | Value |
-|---|---|
-| Resolved packages (incl. workspace) | 857 |
-| External (non-workspace) packages | 829 |
-| Unique external crate names | 729 |
-| Crate names resolved at >1 version | 84 |
-| Extra copies beyond one-per-name | 100 |
-| Direct `[workspace.dependencies]` entries | 52 |
-| Active advisory ignores, all review-by 2026-10-01 | 3 (RUSTSEC-2023-0071, RUSTSEC-2024-0384, RUSTSEC-2026-0253) |
+| Metric | Before | After |
+|---|---|---|
+| Resolved packages (incl. workspace) | 857 | 843 |
+| External (non-workspace) packages | 829 | 815 |
+| Unique external crate names | 729 | 715 |
+| Crate names resolved at >1 version | 84 | 84 (unchanged — none of the 14 removed crates were themselves duplicated) |
+| Direct `[workspace.dependencies]` entries | 52 | 52 (unchanged — no manifest edits) |
+
+Active advisory ignores, all review-by 2026-10-01: 3 (RUSTSEC-2023-0071,
+RUSTSEC-2024-0384, RUSTSEC-2026-0253) — unaffected by this batch.
 
 ## 🔬 Reproduce
 
