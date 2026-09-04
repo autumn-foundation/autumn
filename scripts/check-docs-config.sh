@@ -107,6 +107,27 @@
 #     question is asked. The placeholder lived in two regexes; the schema-vs-read
 #     question lived in the resolver and the table checker. Grep for the rule.
 #
+# EVERY RUNG HAS NOW BEEN AUDITED against the list above, rather than tightened
+# one at a time as a reviewer found it — which is how five of these survived
+# into later rounds. Where each stands:
+#
+#   * built templates — from `format!(` construction sites only.
+#   * const bindings — must be NAMED as env bindings (`*_ENV`/`ENV_*`/`VAR`).
+#   * quoted names — need an env accessor nearby, never a negative assertion.
+#   * shell assignments — must reach a process (`export`, or a prefix form), and
+#     a file that assigns a name owns its own expansions of it.
+#   * family wildcards — the prefix must begin a real name.
+#   * naming-rule examples — bounded to the root `section`, which is absent from
+#     the schema and cannot become a root; all 8 uses are the two literal
+#     placeholders.
+#   * reader-chosen names and example-code identifiers — page-scoped: a page
+#     vouches for a name it declares. This is deliberate, since the reader
+#     genuinely invents these (`access_key_id_env = "…"`), and audited: all 9
+#     current declarations are S3 credential names and the one const is
+#     `AUTUMN_SOURCE`, none a near-miss of a framework variable. The residual
+#     exposure is that a page could mask a typo by declaring it, which is
+#     narrower than a blanket exemption and is what the `*_env` key signals.
+#
 # The self-tests assert on each STEP — detect, scan, classify, resolve — because
 # a test that checks only the final verdict cannot tell "handled correctly" from
 # "never seen", and that gap let several of the above survive a round each.
