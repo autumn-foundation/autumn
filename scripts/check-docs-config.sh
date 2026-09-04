@@ -275,7 +275,12 @@ def leaf_paths(paths):
 
 # One segment the runtime fills in: an index, a provider name, or — in a page
 # documenting the whole family at once — the `{i}` placeholder itself.
-SEGMENT = r'(?:[A-Z0-9_]+|\{[a-z]+\})'
+# One segment the runtime fills in. It may contain a single `_` (a provider
+# name like `my-idp` uppercases to `MY_IDP`) but never `__`, which is the
+# separator between segments — without that bound the shard placeholder
+# swallowed `0__NOPE`, so `…SHARDS__0__NOPE__NAME` matched a name the runtime
+# builds from an integer and never reads.
+SEGMENT = r'(?:[A-Z0-9]+(?:_[A-Z0-9]+)*|\{[a-z]+\})'
 
 
 def built_patterns(root, leaves):
@@ -336,7 +341,27 @@ def built_patterns(root, leaves):
 # every name in a generated code template — a real read, in the source that
 # writes the reader's project.
 QUOTED = re.compile(r'\\?["\'](AUTUMN_[A-Z0-9_]+)\\?["\']')
-ASSIGNED = re.compile(r'(?:^|[;&|(\s])(?:export\s+)?(AUTUMN_[A-Z0-9_]+)=')
+# A shell assignment counts when it reaches a process: `export NAME=…`, or the
+# prefix form `NAME=… some-command`. A bare `NAME=…` on its own line is a
+# script-local variable — `scripts/check-panic-gate.sh` sets
+# `AUTUMN_MANIFEST="autumn/Cargo.toml"` as a path it reads itself, and that was
+# blessing `AUTUMN_MANIFEST` as application configuration. The names this drops
+# that ARE real (`AUTUMN_LOG__LEVEL`, `AUTUMN_SERVER__HOST`, …) resolve through
+# the source rung instead, which is where their evidence actually lives.
+ASSIGNED = re.compile(r'(?:^|[;&|(\s])export\s+(AUTUMN_[A-Z0-9_]+)=')
+# The separator here is explicitly NOT a newline: `\s` spans line breaks, so
+# applied to a whole file this matched a bare assignment against the first
+# word of the NEXT line and read it as a prefix form.
+ASSIGNED_PREFIX = re.compile(
+    r'(?:^|[;&|(\s])(AUTUMN_[A-Z0-9_]+)=\S*[^\S\n]+\S')
+
+# A file that assigns a name to itself OWNS it: `check-panic-gate.sh` sets
+# `AUTUMN_MANIFEST="autumn/Cargo.toml"` and later reads `"$AUTUMN_MANIFEST"`,
+# which is a script-local variable being used, not evidence that the
+# application reads one. Expansions of a locally-assigned name are therefore
+# ignored in the file that assigns it — while `${AUTUMN_MEDIA__FFMPEG__BIN}`,
+# which nothing assigns, still counts wherever it appears.
+ASSIGNED_ANY = re.compile(r'(?:^|[;&|(\s])(?:export\s+)?(AUTUMN_[A-Z0-9_]+)=')
 EXPANDED = re.compile(r'\$\{?(AUTUMN_[A-Z0-9_]+)\}?')
 
 # A quoted name counts only where the code BINDS it as an environment-variable
@@ -405,6 +430,11 @@ def source_tokens(root):
         if 'AUTUMN_' not in body:
             continue
         lines = body.splitlines()
+        # Names this file assigns without exporting them, and without handing
+        # them to a command: its own variables.
+        local = (set(ASSIGNED_ANY.findall(body))
+                 - set(ASSIGNED.findall(body))
+                 - set(ASSIGNED_PREFIX.findall(body)))
         for n, line in enumerate(lines):
             # `NAME=` is how a SHELL names a variable; in Rust it is just text
             # inside a string, and the text is often not an environment variable
@@ -417,7 +447,8 @@ def source_tokens(root):
             # `${AUTUMN_MEDIA__FFMPEG__BIN}` through to a service file.
             if not rel.endswith('.rs'):
                 tokens.update(ASSIGNED.findall(line))
-            tokens.update(EXPANDED.findall(line))
+                tokens.update(ASSIGNED_PREFIX.findall(line))
+            tokens.update(v for v in EXPANDED.findall(line) if v not in local)
             tokens.update(v for _, v in BOUND.findall(line))
             if NEGATED.search(line):
                 continue
@@ -587,6 +618,10 @@ TABLE_PROSE_ROW = re.compile(
 
 # Anything shaped like a table row at all, used to prove the two patterns above
 # between them account for every one.
+# A declared path: dotted segments, with at most one `[index]` and only
+# between segments.
+INDEXED_PATH = re.compile(r'[a-z0-9_]+(?:\[\w+\])?(?:\.[a-z0-9_]+(?:\[\w+\])?)*')
+
 TABLE_ANY_ROW = re.compile(r'^//!\s*\|\s*`?AUTUMN_')
 
 # The one row whose two columns legitimately disagree. `SigningSecretConfig`
@@ -636,6 +671,14 @@ def check_table(rows, leaves, built, tokens):
     """
     out = []
     for i, var, declared in rows:
+        # The shards list is one-dimensional, so a path may carry AT MOST ONE
+        # index, and it must sit between two segments. Erasing every bracket
+        # group unconditionally let `database.shards[i][i].name` normalise onto
+        # `database.shards.name` and pass, documenting two levels of indexing
+        # into a flat list.
+        if declared.count('[') > 1 or not INDEXED_PATH.fullmatch(declared):
+            out.append((i, var, declared, 'malformed index in the path'))
+            continue
         path = re.sub(r'\[\w+\]', '', declared)
         if path not in leaves:
             out.append((i, var, declared, 'path is not in the schema'))
@@ -870,6 +913,13 @@ def self_test():
          r('AUTUMN_AUTH__OAUTH2__GITLAB__CLIENT_SECRET'), 'runtime-built name')
     case('a typo in the fixed field is caught',
          r('AUTUMN_AUTH__OAUTH2__GITHUB__CLIENT_SECRT'), None)
+    # A filled-in segment is ONE segment: it may hold a single `_` (a provider
+    # name uppercases that way) but never `__`, or it swallows a whole extra
+    # path segment.
+    case('a placeholder does not swallow a path segment',
+         r('AUTUMN_AUTH__OAUTH2__GITHUB__NOPE__CLIENT_SECRET'), None)
+    case('a provider name with one underscore still resolves',
+         r('AUTUMN_AUTH__OAUTH2__MY_IDP__CLIENT_SECRET'), 'runtime-built name')
 
     # Templates are read from the real tree: the oauth2 pair must be found, and
     # `…__SHARDS__{i}__{field}` must be skipped (it would re-admit any field).
@@ -914,6 +964,16 @@ def self_test():
     case('a placeholder binding is not',
          BOUND.findall('const NONCE_PLACEHOLDER: &str = "AUTUMN_CSP_NONCE";'),
          [])
+    # A script-local shell variable is not application configuration.
+    case('a bare shell assignment is not swept in',
+         'AUTUMN_MANIFEST' in swept, False)
+    case('an exported assignment is', ASSIGNED.findall('export AUTUMN_X=1'),
+         ['AUTUMN_X'])
+    case('a prefix assignment is',
+         ASSIGNED_PREFIX.findall('AUTUMN_X=1 cargo run'), ['AUTUMN_X'])
+    case('a bare assignment is not',
+         (ASSIGNED.findall('AUTUMN_X="path/to"'),
+          ASSIGNED_PREFIX.findall('AUTUMN_X="path/to"')), ([], []))
 
     # A mapping row that loses a backtick must not escape by looking like prose.
     broken = '//! | `AUTUMN_DATABASE__URL` | database.urll | `String` |'
@@ -945,6 +1005,14 @@ def self_test():
     case('sound table rows pass', check_table(good, leaves, built, tokens), [])
     # The two columns answer different questions. A row may name a real config
     # path and still document an override that sets nothing.
+    # The shards list is flat: at most one index, between segments.
+    case('a doubly-indexed path fails',
+         len(check_table([(9, 'AUTUMN_DATABASE__SHARDS__{i}__NAME',
+                           'database.shards[i][i].name')],
+                         leaves, built, tokens)), 1)
+    case('a singly-indexed path passes',
+         check_table([(9, 'AUTUMN_DATABASE__SHARDS__{i}__NAME',
+                       'database.shards[i].name')], leaves, built, tokens), [])
     case('a table row whose variable nothing reads fails',
          len(check_table([(9, 'AUTUMN_OPENAPI__ENABLED', 'openapi.enabled')],
                          leaves | {'openapi.enabled'}, built, tokens)), 1)
