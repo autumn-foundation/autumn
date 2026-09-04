@@ -128,12 +128,17 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
         if fence.is_none() && is_indented_code(line) {
             continue;
         }
+        let indent = leading_indent(line);
         let trimmed = line.trim_start();
         match (fence, fence_run(trimmed)) {
             // A fence closes only with the same character, at least as long,
-            // and nothing after it — `CommonMark`'s rule.
+            // nothing after it, and at most three spaces of indentation —
+            // `CommonMark`'s rule. The indent matters: four spaces makes the
+            // line *content* of the block, so GitHub keeps drawing the code
+            // block, and closing there would make every following line live
+            // while the reviewer still sees it as a sample.
             (Some((open_char, open_len)), Some((c, len, bare)))
-                if c == open_char && len >= open_len && bare =>
+                if c == open_char && len >= open_len && bare && indent <= 3 =>
             {
                 fence = None;
                 continue;
@@ -184,6 +189,19 @@ fn strip_html_comments(line: &str, open: &mut bool) -> String {
             return out;
         }
     }
+}
+
+/// How many columns of indentation `line` starts with, tabs counted as four.
+///
+/// Only ever compared against `CommonMark`'s three-space allowance for a fence,
+/// and only ever to *refuse* to close one, so counting a tab as a full stop
+/// rather than to the next one errs toward leaving the block open — which
+/// withholds an acknowledgment instead of granting one.
+fn leading_indent(line: &str) -> usize {
+    line.chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .map(|c| if c == '\t' { 4 } else { 1 })
+        .sum()
 }
 
 /// Whether `line` is indented enough to render as a Markdown code block.
@@ -329,6 +347,27 @@ mod tests {
     fn a_quoted_marker_acknowledges_nothing() {
         assert!(parse_acks("> /ack-posture 0123456789abcdef").is_empty());
         assert!(parse_acks(">> /ack-posture 0123456789abcdef").is_empty());
+    }
+
+    /// A closing fence may be indented at most three spaces. Four or more
+    /// makes the line ordinary *content* of the block, so GitHub keeps drawing
+    /// the code block — and a parser that closed there would treat everything
+    /// after it as live text while the reviewer sees it inside the block.
+    #[test]
+    fn an_over_indented_fence_does_not_close_the_block() {
+        let text = "```\n    ```\n/ack-posture 0123456789abcdef\n";
+        assert!(parse_acks(text).is_empty(), "{:?}", parse_acks(text));
+        let tab = "```\n\t```\n/ack-posture 0123456789abcdef\n";
+        assert!(parse_acks(tab).is_empty(), "{:?}", parse_acks(tab));
+    }
+
+    /// Three spaces is still a fence, though: over-matching here would swallow
+    /// a real acknowledgment written under a slightly indented code sample.
+    #[test]
+    fn a_fence_indented_three_spaces_still_closes_the_block() {
+        let text = "```\n   ```\n/ack-posture 0123456789abcdef  yes\n";
+        let acks = parse_acks(text);
+        assert_eq!(acks.len(), 1, "{acks:?}");
     }
 
     /// `CommonMark` continues a block-quote paragraph across a line that
