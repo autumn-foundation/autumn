@@ -969,6 +969,20 @@ validators (follow-up: issue #1801). The `Patch<T>` per-field impls and the
 `UpdateModel` denylist are unchanged, so this is backward compatible (issue
 #1778). See `docs/guide/repositories.md`.
 
+**`#[validate(nested)]` hazard (issue #1751):** `validator_derive`'s `nested`
+codegen calls a field's value with a bare `.validate()`, which collides with
+this crate's own `ValidateExt` (also named `validate`, blanket-implemented for
+every `Validate` type and re-exported from `autumn_web::prelude`) whenever the
+struct's own defining module ALSO imports the prelude (or `ValidateExt`
+directly) — a cryptic `E0034: multiple applicable items in scope` pointing
+into the derive expansion, on create as much as on update, and on `#[model]`
+structs as much as hand-rolled ones. It doesn't matter what a downstream
+handler module imports — only the struct's own module's imports matter. Avoid
+it by keeping a `#[validate(nested)]` struct's module free of the prelude/
+`ValidateExt` import (use fully-qualified `Db`/etc. paths there instead), or by
+replacing `nested` with `#[validate(custom(...))]` calling the nested value's
+`validator::Validate::validate` explicitly.
+
 ### Transactions
 
 `Db::tx(f)` runs a READ COMMITTED transaction. Since
@@ -2430,6 +2444,92 @@ will see the mirror rather than the real client.
 
 See `docs/guide/staged-deploys.md`.
 
+## Sandboxed plugins (0.7.0, issue #1609, feature `plugin-sandbox`)
+
+Two plugin lanes now. The native `Plugin` trait is unchanged and full-trust: its
+`build(self, app)` gets the whole `AppBuilder`. A **sandboxed** plugin is the
+trade for code nobody audited — it ships as a `.autumn-plugin` artifact (a
+`wasm32-wasip1` module plus a manifest) and the runtime enforces the manifest.
+
+Non-default feature. Experimental: everything in `autumn_web::plugin_sandbox`
+is outside SemVer (see `STABILITY.md`).
+
+```toml
+# plugin.toml — the whole review surface
+name = "autumn-plugin-hello"
+version = "0.1.0"
+wire_version = 1
+prefix = "/hello"
+capabilities = ["http-request"]     # the only capability that exists in slice 1
+sha256 = "0000…"                    # stamped by `autumn plugin package`
+
+[[routes]]
+method = "GET"
+path = "/hello/{name}"
+
+[limits]
+fuel = 200_000_000        # CPU: instructions AND host-side bytes copied (64B/unit)
+memory_bytes = 33_554_432 # per-request instance; footprint × concurrency ≤ 1 GiB
+max_request_body_bytes = 1_048_576
+max_response_bytes = 4_194_304
+max_concurrency = 8       # requests shed with 503, never queued
+request_body_timeout_ms = 5_000  # a dribbled body cannot pin a permit (408)
+```
+
+```bash
+autumn plugin package --manifest plugin.toml --module hello.wasm --out hello.autumn-plugin
+autumn plugin inspect hello.autumn-plugin            # the consent screen; exits 1 if unfit
+autumn plugin inspect hello.autumn-plugin --format json
+```
+
+```rust
+let hello = autumn_web::plugin_sandbox::SandboxedPlugin::from_file(
+    std::path::Path::new("plugins/hello.autumn-plugin"),
+)?;
+autumn_web::app().plugin(hello).run().await;
+```
+
+**What the runtime enforces.** The guest's entire authority is the WASI shim's
+import list: no filesystem, no network, no environment, no database, each
+attempt answered `ENOTCAPABLE`/`EBADF` and logged as a denial. An import the
+shim does not define is refused at load. The manifest's `[[routes]]` *are* the
+router, so an undeclared path under the prefix is a 404 the guest never sees.
+Fuel bounds CPU (including host-side copying done on the guest's behalf), a
+store limiter bounds memory, both per request against a fresh instance; the
+interpreter runs on a blocking worker with the concurrency permit held for its
+actual lifetime. A trap, `proc_exit`, blown budget, malformed frame or missing
+answer is a 502/503/504 **on the plugin's own prefix** — nothing reaches the
+rest of the app.
+
+**Boundary gotchas worth knowing before authoring one.**
+- Request headers are an **allowlist** (`accept*`, `content-type`,
+  `content-length`, `cache-control`, `if-*`, `range`, `user-agent`). Everything
+  else is dropped — a denylist could never name every proxy's identity header.
+- Response headers are a **closed allowlist** (`content-type`, `cache-control`,
+  `etag`, `location`, `vary`, …) with **no** `x-` hatch: `X-Accel-Redirect` /
+  `X-Sendfile` would borrow the reverse proxy's filesystem. `set-cookie`,
+  `strict-transport-security`, framing headers and the host's own
+  `x-autumn-sandboxed` / `x-content-type-options` are stripped and logged.
+- A declared `GET` also serves `HEAD` (HTTP requires it, axum dispatches it);
+  the guest sees `method: "HEAD"` and `route_infos()` reports the extra row —
+  unless the manifest declares HEAD itself, in which case that route mounts
+  alone (two overlapping method routes on one path is an axum panic at boot).
+- Load refuses a module whose WASI import *signatures* disagree with the shim,
+  whose `_start` is not `() -> ()`, which exports no `memory` (or one already
+  over the ceiling), or which carries >4096 / >16 MiB of data and element
+  segments (every request re-instantiates it).
+- Response **content types** are an allowlist too: `text/plain`, `text/csv`,
+  `application/json`, `application/octet-stream`, and raster images. HTML,
+  SVG, JavaScript and CSS are refused — a document or script from your own
+  origin carries your origin's authority.
+- `SystemTime::now()` is a fixed instant; `random_get` is deterministic, seeded
+  from the request. Neither is entropy.
+- One frame in, one frame out, NDJSON over stdio. A frame must end with `\n`
+  (`println!`, not `print!`) or the host reports a partial frame.
+
+Guide: `docs/guide/sandboxed-plugins.md`. Trust model: `docs/plugins.md`.
+
+
 ## CLI
 
 ```bash
@@ -3258,6 +3358,7 @@ touched crate so examples compile from an external-consumer perspective.
 - `docs/guide/experiments.md`
 - `docs/guide/runtime-config.md`
 - `docs/guide/signed-webhooks.md`
+- `docs/guide/sandboxed-plugins.md`
 - `docs/guide/storage.md`
 - `docs/guide/jobs.md`
 - `docs/guide/state-machines.md`

@@ -361,24 +361,13 @@ impl Default for MediaPlugin {
 }
 
 impl Plugin for MediaPlugin {
-    /// The compatibility contract this plugin declares (issue #1601).
-    ///
-    /// First-party plugins ship in lockstep with `autumn-web`, so the declared
-    /// range is this crate's own minor series — the two versions are the same
-    /// number by construction. Below `1.0` a minor bump is breaking (see
-    /// `STABILITY.md`), which is exactly what the `MAJOR.MINOR` requirement
-    /// says.
-    ///
-    /// Nothing experimental is declared: this plugin is built entirely on the
-    /// stable plugin surface.
+    /// This plugin ships in lockstep with `autumn-web` — see
+    /// [`lockstep_contract`](autumn_web::plugin_contract::lockstep_contract).
     fn contract(&self) -> Option<autumn_web::plugin_contract::PluginContract> {
-        Some(
-            autumn_web::plugin_contract::PluginContract::new(env!("CARGO_PKG_NAME"))
-                .plugin_version(env!("CARGO_PKG_VERSION"))
-                .autumn_web(autumn_web::plugin_contract::lockstep_range(env!(
-                    "CARGO_PKG_VERSION"
-                ))),
-        )
+        Some(autumn_web::plugin_contract::lockstep_contract(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
     }
 
     fn name(&self) -> Cow<'static, str> {
@@ -714,6 +703,27 @@ fn arroyo_recordings_root(env: &HashMap<String, String>) -> PathBuf {
             || PathBuf::from(DEFAULT_ARROYO_RECORDINGS_ROOT),
             PathBuf::from,
         )
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::MediaPlugin;
+    use autumn_web::plugin::Plugin;
+
+    #[test]
+    fn contract_declares_lockstep_with_own_crate() {
+        let contract = MediaPlugin::new().contract().expect("a contract");
+        assert_eq!(contract.plugin, env!("CARGO_PKG_NAME"));
+        assert_eq!(
+            contract.plugin_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            contract.autumn_web.as_deref(),
+            Some(autumn_web::plugin_contract::lockstep_range(env!("CARGO_PKG_VERSION")).as_str())
+        );
+        assert!(contract.experimental_surfaces.is_empty());
+    }
 }
 
 // ── Arroyo migration shim (slice 5) ─────────────────────────────────────────

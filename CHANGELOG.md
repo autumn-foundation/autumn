@@ -9,6 +9,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
+  update validation left after #1719/#1742/#1778/#1801 (issue #1751).
+  `must_match` — like `custom`, `ip` on `Option<_>` fields, and
+  `does_not_contain` before it — is now behaviorally proven, not just
+  asserted, to be enforced on the update path via merged-model validation
+  (`from_patch`): `tests/integration/validate_merged_model.rs` gained a
+  dedicated cross-field `password`/`password_confirm` case showing the patch
+  struct alone stays create-only while the merged model correctly rejects a
+  mismatch and accepts a match. Investigating the last item, `nested`,
+  surfaced a real, previously-undiscovered defect rather than a mere test gap:
+  `validator_derive`'s `nested` codegen calls a field's value with bare
+  `(&field).validate()`, which collides with this crate's own `ValidateExt`
+  (`autumn_web::prelude::ValidateExt`, a blanket `impl<T: validator::Validate>
+  ValidateExt for T` also named `validate`) whenever a struct with a
+  `#[validate(nested)]` field is declared in a module that ALSO imports the
+  prelude — a cryptic `E0034: multiple applicable items in scope` pointing
+  into the derive expansion, on **create as much as on update**, and equally
+  possible on `#[autumn_web::model]` structs (which forward `#[validate(...)]`
+  verbatim) as on hand-rolled ones. The collision is scoped to the struct's
+  own defining module, not any downstream consumer's — proven with a
+  compile-fail/compile-pass fixture pair
+  (`tests/compile-fail/validate_nested_collides_with_validate_ext.rs` /
+  `tests/compile-pass/validate_nested_without_validate_ext.rs`) — and a
+  derive/attribute macro cannot see the rest of its enclosing module's `use`
+  statements, so `#[model]` cannot detect or refuse it at expansion time.
+  `ValidateExt`'s doc comment now documents the hazard and its scope, with the
+  workaround (keep the struct's own module free of that import, or use
+  `#[validate(custom(...))]`). `credit_card`/`non_control_character` remain
+  correctly out of scope: they are not in this workspace's enabled `validator`
+  feature set (only `derive`, not `card`/`unic`), so no model can use them
+  today regardless of the update path.
+
+- **A CI gate for the "local development" install path [no-plugin]:** nothing
+  here is agent-facing — it's a CI/test-harness addition, not new framework
+  surface (`local-dev-quickstart` job in
+  `.github/workflows/quickstart-gate.yml`). `cargo install --path
+  autumn-cli` from a source checkout, then `autumn new`, is a first-class path
+  in README.md and `docs/guide/getting-started.md`, but nothing in CI built
+  that exact pairing — a source-built (trunk-dev) CLI's scaffold against the
+  `autumn-web` actually **published** on crates.io. `autumn new` pins the
+  scaffolded `autumn-web` dependency to the CLI's own `CARGO_PKG_VERSION`,
+  which is frozen at the last release tag between releases (this repo's
+  policy: never bump the workspace version except at an explicit release), so
+  a source-built CLI can carry unreleased `autumn-web` API changes while
+  reporting the same version as the last published crate — and `autumn
+  doctor`'s `version_compat` check, a plain version-string comparison, cannot
+  see the difference. Confirmed live: commit 76c56b1 widened
+  `inject_consent_banner`'s `csrf_cookie_name` from `&str` to `Option<&str>`
+  and correctly updated the in-tree scaffold template, but three days later
+  (no release cut since) a freshly `autumn new`-ed project fails its first
+  `cargo build` against published `autumn-web` 0.7.0 with `error[E0308]`,
+  while `autumn doctor` still reports the versions as matching. The new
+  `generated_project_compiles_against_published_autumn_web` test
+  (`autumn-cli/tests/e2e.rs`) reproduces this without the
+  `[patch.crates-io]` override the existing (in-tree-pairing) e2e test
+  applies, and the new job runs it on every `trunk-dev` push and the
+  existing daily schedule — skipped on `workflow_dispatch` release-candidate
+  gating, since it tests trunk-dev source drift rather than the dispatched
+  candidate and would otherwise false-block a healthy release
+  (`docs/release-checklist.md` step 7). This is a harness addition, not a
+  fix: the underlying drift is real and current, and the job is expected to
+  go red between releases until a maintainer addresses `autumn doctor`'s
+  blind spot or the next release ships.
+
 - **Continuous SQLite replication with point-in-time restore (#1628):** the
   zero-ops SQLite tier (#1614) had snapshot backups (#1595/#1619) and nothing
   finer, so a dead VPS cost everything written since the last snapshot — hours.
@@ -318,6 +382,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   --workspace` Windows leg could never see, because it never builds a
   scaffolded app. The workaround is documented in the platform-support guide;
   the product-level fix is tracked separately.
+- **Security posture diffs gate pull requests, and the shipped manifest is
+  signed (#1624):** #1604's manifest proves what an app's security surface
+  *is*; a manifest nobody diffs is a report, not a control. `autumn routes
+  posture` closes that: `diff` compares two manifests and classifies every
+  change as widening, neutral or narrowing; `digest` prints the posture digest
+  a release records; `verify` proves at deploy time that a shipped manifest is
+  the posture CI acknowledged **and** was signed by CI (`gh attestation
+  verify`, reusing #1615's keyless pipeline rather than introducing a second
+  signing story).
+
+  Only widening blocks — a new public route, a guard removed, a classification
+  downgraded — and the rules follow the semantics the framework actually
+  implements: roles are OR-ed, so *adding* one widens; scopes are AND-ed, so
+  *removing* one widens. Routes are keyed on their *shape* — capture names
+  erased, capture kinds kept — and handler names and source locations are
+  excluded from both the comparison and the digest, so a refactor produces no
+  finding at all. A change with no posture effect posts nothing.
+
+  Because a route is not a URL, the diff follows the router's own precedence:
+  deleting a gated `/users/me` while a public `/users/{id}` remains is a
+  widening (that URL falls through), and adding a route that takes a stricter
+  route's URLs over is one too. Configured `security.csrf.exempt_paths` are
+  compared as posture in their own right, since the per-route rows cannot show
+  them.
+
+  A widening is unblocked by one comment on the pull request:
+
+  ```
+  /ack-posture 4f8a1c0d9e2b7a35  intentional: public status page for launch week
+  ```
+
+  The digest binds the acknowledgment to that exact set of widenings, so
+  unrelated pushes keep it valid while a *new* widening re-blocks. That comment
+  is also the documented escape hatch for a false positive: there is no flag
+  that disables the gate or hides the diff, so a wrongly blocked pull request
+  is always unblockable by the team alone, in public, with a reason.
+
+  Both digests use an escaped canonical encoding, so a crafted route path
+  cannot make one finding hash like a set of ordinary ones; every dimension is
+  compared from *both* sides, so a fact that disappears from the manifest (for
+  example every POST leaving the CSRF dimension when `security.csrf.safe_methods`
+  grows) is still reported as the loss it is; and the scaffolded workflow
+  resolves each commenter's real repository permission rather than trusting
+  `author_association`, refuses to run on a pull request that edits the gate
+  itself, and fails rather than bootstrapping when a committed baseline
+  disappears from the base branch.
+
+  The scaffolded workflow is two jobs: one compiles the pull request and emits
+  its manifest with no write permission and no verdict, and one that never
+  compiles anything downloads that manifest, diffs it, and decides — so a build
+  script in the diff cannot replace the binary that computes the verdict.
+
+  `autumn new` scaffolds `.github/workflows/posture-gate.yml` by default;
+  existing apps adopt it with `autumn upgrade --apply`. The scaffolded deploy
+  workflows attest `security-posture.json` with
+  `actions/attest-build-provenance`, and autumn's own `examples/hello` runs the
+  gate in the publish gate (`scripts/check-posture-gate.sh`). See
+  `docs/guide/posture-gate.md`.
+
 - **Build-time authority envelope for agent-operable handlers (#1691):** an
   endpoint exposed as an MCP tool is an action an autonomous agent can take
   with no human in the loop, and nothing said what that action was *allowed*
@@ -1409,6 +1532,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`#[secured]`, `#[step_up]`, and `#[throttle]` now reject a request before
+  its body is ever parsed (#1668):** all three guard checks used to run as
+  statements inside the generated handler body, which Axum only invokes after
+  every extractor — including the body extractor (`Json`/`Form`/`Multipart`)
+  — has already succeeded. An over-limit or unauthenticated request with a
+  malformed body got the extractor's `400`/`422` instead of the guard's
+  intended `429`/`401`/`403`, masking the guard's outcome, and the server paid
+  the cost of parsing and buffering the body (worst for uploads) before a
+  `#[throttle]`-gated route ever got to shed the load. Each macro now emits a
+  `FromRequestParts` gate — a small generated type inserted as the handler's
+  first parameter — so the check runs and can reject the request before
+  Axum's extractor pipeline ever reaches the body extractor, relying on
+  Axum's guarantee that every `FromRequestParts` extractor resolves,
+  left-to-right, strictly before the trailing `FromRequest` one. The macro
+  invocation syntax and handler signatures at call sites are unchanged; a
+  route's role/scope markers still surface in the generated OpenAPI document
+  exactly as before. Fixing this also surfaced a related idempotency-replay
+  gap: when `#[authorize]` is written above one of these guards, a stale scan
+  could let the guard's new pre-body gate wrongly claim replay-serving for
+  itself, which — now that the gate runs before the body — would have let a
+  retried mutation replay its cached response without `#[authorize]`'s policy
+  check ever re-running. That gap is closed in the same change.
+
 - **The idempotency cache is now partitioned by the resolved tenant:** an app
   that turned on Autumn's multi-tenancy (`[tenancy] enabled = true`) *and*
   `AppBuilder::idempotent()` shared one cache slot between tenants. The storage
@@ -1434,8 +1580,144 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handler ran, so a retry after such a switch still replays instead of
   re-running the mutation. See
   `docs/security/2026-09-02-idempotency-tenant-scope/`.
+- **Outbound webhook delivery now dials `target_url` through the SSRF-safe
+  path:** `WebhookSubscription::target_url` is a subscriber-chosen
+  destination — the outbound-webhooks guide describes it as "a consumer's
+  registered endpoint" — and the `autumn_webhook_delivery` background job
+  posted to it with a plain `Client::post()`, which carries none of the
+  private/loopback/link-local/CGNAT/cloud-metadata deny-list
+  `Client::get_ssrf_safe()` already enforces elsewhere in the framework. An
+  app following the documented pattern (letting its own users register a
+  webhook receiver URL) let any such user point delivery at an internal
+  service, the app's own database host, or a cloud metadata endpoint, with
+  Autumn's own backend making the request on their behalf. `get_ssrf_safe`
+  itself only ever built a `GET`; the fix adds a general
+  `RequestBuilder::ssrf_safe()` chainable on any verb (`get_ssrf_safe` is now
+  defined in terms of it, unchanged in behavior) and applies it to the
+  webhook delivery request. Delivery to a blocked destination now fails
+  closed with `SsrfBlocked` before any socket opens and is recorded/retried/
+  DLQ'd exactly like any other transport failure. **Compatibility note:** an
+  app relying on `target_url` reaching a private address (e.g. an
+  internal-only receiver during development) will see those deliveries start
+  failing after upgrade — this is the intended effect of closing the gap. See
+  `docs/security/2026-09-03-webhook-ssrf/`.
 
 ### Fixed
+
+- **🛣️ Onramp: `autumn setup` retries a dropped Tailwind CSS download instead
+  of failing the whole quickstart [no-plugin]:** `autumn setup` — the second
+  documented command in the README quickstart, right after `autumn new` — did
+  a single unretried `GET` for both the Tailwind CSS checksums manifest and
+  the ~10MB platform binary (`autumn-cli/src/http.rs`); any transient
+  transport hiccup (a truncated body, a dropped connection) aborted the whole
+  command with a bare `Error: download failed: error decoding response body`
+  and no second chance. This is not hypothetical: 2 of the last 3
+  `quickstart-gate.yml` runs against published crates.io on 2026-09-03 (runs
+  33784307158 at 17:23 UTC and 33805758766 at 21:02 UTC) failed at exactly
+  this step with exactly this error, with the passing run in between
+  (33797353571, 19:35 UTC) at the same commit — confirming the failure is
+  transient CDN flakiness, not a real break, and that a real fraction of
+  fresh `autumn setup` runs hit it. `fetch_bytes` and the new `fetch_text`
+  (both in `autumn-cli/src/http.rs`, shared by `autumn setup` and `autumn
+  assets`) now retry up to 3 times with a 2s backoff on any non-HTTP-status
+  error (a definitive 404/5xx is not retried — retrying it would just waste
+  the user's time); the retry/backoff bookkeeping is exercised by 4 unit
+  tests against fake failing/succeeding closures, no real networking
+  involved. No public API changed — `fetch_bytes`'s signature and error type
+  are unchanged, `fetch_text` is a new addition. No plugin-facing surface;
+  this is a CLI robustness fix, not new framework surface.
+
+- **`--counter-cache` scaffolds compiled clean now (#2431):** `autumn generate
+  scaffold Comment ... --belongs-to Post --counter-cache` — the documented,
+  only way to use the flag — generated a child model that failed `cargo check`
+  outright, every time. `#[belongs_to(Post, counter_cache)]` landed ABOVE
+  `#[autumn_web::model]` instead of below it: that attribute is a helper only
+  `#[model]`'s own expansion understands, so rustc rejected it as an unknown
+  standalone macro (`cannot find attribute belongs_to in this scope`) whenever
+  the generated file had so much as a blank line before `#[model]` — which
+  every real scaffold does (the `use crate::schema::...;` line that always
+  precedes it). Fixing the position surfaced a second, previously-unreachable
+  gap: the eager-loading codegen a `#[belongs_to]` attribute drives references
+  the parent's type and its Diesel schema module directly, and neither was
+  ever imported into the child's model file — `--counter-cache` was the first
+  feature to put an attribute-driven association on a generated model at all.
+  Both are now added automatically (`use crate::schema::{parents};` and `use
+  crate::models::{parent}::{Parent};`, alongside the child's own), and a new
+  `cargo check`-backed test (`generated_counter_cache_scaffold_cargo_checks`)
+  proves the whole scaffold compiles — the gap the original report called out:
+  no test had ever compiled this flag's output before.
+
+- **A sandboxed plugin can no longer abort the application at boot:** the
+  duplicate-route preflight skips `nest` mounts because axum exposes no way to
+  enumerate a nested router — but a sandboxed plugin's manifest *is* its route
+  table, and `Router::nest` panics with `Overlapping method route` when a
+  declared path is one the host already serves. An untrusted artifact declaring
+  a plausible prefix (`/admin`, `/status`, `/api`) could therefore take down
+  every route in the application, not just its own — containment failing open
+  for exactly the input class the sandbox lane exists to distrust. Routes
+  declared via `AppBuilder::declare_plugin_routes` are now checked against the
+  application's own routes through the same `matchit` oracle axum routes
+  through, so a collision — exact path, shape clash (`/hello/{id}` against a
+  declared `/hello/{slug}`), or catch-all — is a `RouterBuildError` naming the
+  plugin and the contested path, raised before anything mounts. Paths that axum
+  accepts (disjoint siblings under a shared prefix, a route *at* the prefix, a
+  GET and its implied HEAD) are unaffected. `TestApp` carries these
+  declarations too, so a colliding plugin fails in tests rather than only in
+  production. Framework-mounted paths (probes, actuator, htmx assets, mail
+  previews, the story gallery, the tracked-job status route) are covered as
+  well: they are mounted outside the user route list, so a manifest declaring
+  `GET /health` would otherwise still have panicked. A framework path is
+  *refused* rather than yielded — a user route at a probe path legitimately
+  takes it over, but silently handing an unaudited artifact the endpoint
+  orchestrators read to decide whether the process is alive is worse than a
+  loud refusal. Only `GET` is refused there, because only `GET` clashes; a
+  declared `HEAD` or `POST` merges into the same `MethodRouter` cleanly. The
+  framework namespaces `/static` and `/_autumn` are reserved wholesale, for
+  every method: paths under them are not enumerable route-by-route (`ServeDir`
+  serves whatever is on disk), and a declared sub-path there does not even
+  panic — it mounts and *shadows* the framework, so an artifact declaring
+  `/static/app.js` would serve script from the host's own origin. Matching is
+  on segment boundaries, so `/staticky` is unaffected. Probe paths are claimed
+  only when `health.enabled`, matching the mount, so a plugin is never refused
+  over a collision that cannot happen. Framework paths are compared through the
+  same matchit oracle as user routes, not by string equality, so a framework
+  template carrying a capture (`/_stories/{slug}`, or an operator-configured
+  probe or actuator path) is not an exact-string miss and a startup panic. The
+  dev inspector's detail route (`{inspector_path}/requests/{id}`) is claimed
+  alongside its index — both now derive from `inspector_endpoint_paths`, so the
+  claim set cannot drift from what the router actually mounts.
+
+- **`#[secured]`/`#[step_up]`/`#[authorize]`/`#[throttle]` no longer drop a
+  route's OpenAPI response schema when written above the route attribute
+  (#1677):** all four body guards rewrite a handler's return type to
+  `Response` when they expand, so when one was written *above* `#[get]`/
+  `#[post]`/etc. it expanded first and the route macro's `infer_response_body`
+  read back `Response` instead of the handler's real `Json<T>` — silently
+  dropping the response schema from the generated OpenAPI document (throttling
+  itself, including idempotency-replay accounting, was unaffected in either
+  ordering). Each guard already binds the pre-rewrite type as
+  `let __autumn_inner: T = …` around the guarded body; the route macro now
+  recovers the original type from that binding — matched by its exact
+  structural shape and the presence of the guard's own marker const earlier
+  in the same block, not merely the binding's name or position, so neither
+  an unrelated handler-local nor a coincidentally-shaped fragment of the
+  handler's own body is ever mistaken for a real guard's binding — recursing
+  to the innermost binding when guards stack, instead of trusting
+  `sig.output` alone. The generated schema no longer depends on attribute
+  order. The
+  previously-recommended method-attribute-outermost workaround, documented
+  on `#[throttle]`'s rustdoc and in `docs/guide/rate-limiting.md`, is no
+  longer necessary.
+
+  This is a macro/metadata-only change — no authorization, rate-limiting, or
+  idempotency-replay runtime behavior differs in either attribute ordering.
+  `ApiDoc::response` does have one existing runtime reader, `mount_mcp`'s MCP
+  tool-catalog eligibility gate: a guard-above-route JSON handler explicitly
+  opted in with `#[api_doc(mcp)]` was previously excluded from `tools/list`
+  as "no response schema", and is now correctly listed, matching the
+  developer's existing opt-in — every MCP call still dispatches through the
+  same authenticated handler pipeline, so this closes an availability gap
+  rather than changing what a call is authorized to do.
 
 - **Punctuation- and emoji-only titles no longer slip past the validator that
   exists to stop them (#2424):** `examples/reddit-clone` rejects a post title
@@ -1886,6 +2168,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     on `/actuator/prometheus` and under `/actuator/metrics`' `app` key with no
     database, and the Chromium smoke asserts the timer end-to-end against the
     real binary.
+
+- **Capability-sandboxed plugins — install an unaudited plugin without
+  installing its authority (#1609):** every Autumn plugin until now has been
+  full-trust native code. `Plugin::build(self, app)` hands over the entire
+  `AppBuilder`, which is the right trade for a first-party crate and the wrong
+  one for something found on crates.io ten minutes ago — a compromised
+  `autumn-plugin-*` can read your credentials, exfiltrate your database, or take
+  the process down, and dependency auditing catches only the vulnerabilities
+  someone has already named. The new non-default `plugin-sandbox` feature adds
+  the other lane. A sandboxed plugin ships as a `.autumn-plugin` artifact — a
+  `wasm32-wasip1` module plus a manifest declaring its route prefix, the exact
+  `(method, path)` pairs it mounts, its capabilities, and its per-request CPU
+  and memory ceilings — and the runtime enforces every word of it, refusing at load anything it cannot
+  fully understand — including a route path `axum::Router::route` would panic on,
+  which is validated through the same `matchit` engine axum routes through so a
+  manifest can never take the application down at boot.
+  Deny-by-default is structural rather than configured: the guest's whole
+  authority is the host-function table the shim registers, so filesystem,
+  network, environment and database access are not "off" but absent, each
+  attempt answered with `ENOTCAPABLE`/`EBADF` and recorded as a logged denial,
+  and an
+  import no host function defines is refused at load before the artifact runs
+  once. The manifest is the mount, not a description of it: the router is built
+  from its declared routes, so an undeclared path under the prefix is a 404 the
+  guest never sees. Fuel bounds CPU and a store limiter bounds memory, both
+  per request against a fresh instance, and the interpreter runs on a blocking
+  worker — so a spin, a memory bomb, a trap, a `proc_exit`, a malformed answer
+  or no answer at all is a 502/503/504 on the plugin's own prefix while every
+  other route keeps serving, and nothing a plugin does can abort the host
+  process. Credentials are stripped from the request before it crosses, and
+  `Set-Cookie`, framing headers and anything carrying `\r\n` are stripped or
+  refused on the way back, so a plugin cannot forge a session in your origin or
+  split your response. `autumn plugin package` binds a manifest to a module and
+  stamps the digest the author could not know; `autumn plugin inspect` is the
+  consent screen — the grant, the routes, the reviewed digest, every host
+  function imported, the classes of authority denied — and it loads the module
+  into the same sandbox the runtime uses and runs the existing route
+  conformance checks over the manifest, offline. The app still deploys as one
+  binary: `wasmi` is a pure-Rust interpreter, so there is no daemon, no
+  subprocess and no native codegen backend. Purely additive — the native
+  `Plugin` trait and every existing plugin are untouched, and the feature is not
+  in `autumn-web`'s default set. The declared budgets bound the host's own
+  work as well as the guest's: instantiating the module and encoding the request
+  frame are both charged against `fuel` before they are performed, and anything
+  the guest influenced — its error detail, its stderr, the interpreter's account
+  of a trap — is truncated and control-escaped before it is logged, so a plugin
+  cannot flood an operator's log or forge a record in it. First slice: request
+  handling under the declared prefix is the only capability that exists, so no
+  manifest can ask for a database, a session or an outbound call. See
+  `docs/guide/sandboxed-plugins.md`.
 
 - **UI/routing documentation and the flagship example that proves it (#2320):**
   the 0.7.0 docs audit found the UI/Routing block carrying the longest-standing

@@ -93,6 +93,18 @@ jobs:
         # modules carrying the panic gate, so they have to be in this feature list
         # for their `deny(clippy::…)` block to be compiled at all.
         run: cargo clippy --locked -p autumn-web --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" --all-targets -- -D warnings
+      - name: Clippy (autumn-web, plugin-sandbox — panic gate)
+        # `plugin-sandbox` (#1609) is not a default feature, so neither Clippy run
+        # above compiles `plugin_sandbox`'s request-path modules and their
+        # `#![cfg_attr(not(test), deny(clippy::…))]` panic gates never fire. This is
+        # the module set where an unannotated panic matters most: `host.rs` runs an
+        # interpreter over an artifact the operator explicitly did not audit, and
+        # the whole promise of the lane is that nothing a hostile guest does can
+        # abort the host process.
+        #
+        # Kept as its own lane rather than folded into the list above so a
+        # `wasmi`-linking build is not forced on every gated-feature Clippy run.
+        run: cargo clippy --locked -p autumn-web --features "plugin-sandbox,test-support" --all-targets -- -D warnings
       - name: Panic-free request-path gate
         run: ./scripts/check-panic-gate.sh
       - name: Determinism seam gate
@@ -368,6 +380,23 @@ jobs:
         run: |
           cargo test --locked -p autumn-web --features i18n --lib i18n::
           cargo test --locked -p autumn-web --features "i18n,test-support" --test integration_tests translatable
+      - name: Run plugin-sandbox tests (untrusted-plugin containment)
+        # `plugin-sandbox` is not a default feature, so `cargo test --workspace`
+        # compiles neither the sandbox's in-module suites nor
+        # `autumn/tests/integration/plugin_sandbox.rs`. That integration module IS
+        # the containment claim for #1609 — an adversarial corpus of file, network,
+        # environment, database, CPU-spin, memory-bomb, trap and abort attempts,
+        # each asserted to be refused at load or denied at runtime, with the host
+        # process and every other route still serving. A regression there is a
+        # sandbox escape, so it has to run in a lane that blocks merge.
+        #
+        # `test-support` supplies the shared WAT guest corpus; `wat` (a dev
+        # dependency) compiles it, so no `wasm32-wasip1` toolchain is needed.
+        run: |
+          cargo test --locked -p autumn-web --features plugin-sandbox --lib plugin_sandbox
+          cargo test --locked -p autumn-web --features "plugin-sandbox,test-support" --test integration_tests plugin_sandbox
+          cargo test --locked -p autumn-web --features plugin-sandbox --doc plugin_sandbox
+
       - name: Run redis-TLS-gated tests (rediss:// CryptoProvider guard)
         # `redis` and `ws` are not `autumn-web` default features. The
         # workspace `cargo test` above happens to compile this suite anyway,
@@ -685,10 +714,23 @@ jobs:
           # Coverage is not bound by the crates.io baseline, so this list is a
           # deliberate superset (adds `offline-sync`, `embed-assets`, `tls`,
           # `acme`, `managed-pg*`, `system-tests`, `test-support`, …).
-          PG_FEATURES="ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme"
+          PG_FEATURES="ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,plugin-sandbox"
           cargo llvm-cov --workspace --exclude autumn-web --exclude autumn-cli \
             --all-features --no-report
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES"
+          # The plugin-sandbox suites have their own merge-blocking test lane
+          # above; without a coverage leg the whole module is instrumented and
+          # never executed, which reads as a large new uncovered surface.
+          #
+          # The test-name filter goes after `--`, unlike the `cargo test` lane
+          # above where it is a bare positional. `cargo llvm-cov` has its own
+          # subcommands (`report`, `clean`, `nextest`, …), so a bare word in
+          # that position is read as one:
+          #     error: unrecognized subcommand plugin_sandbox
+          cargo llvm-cov --no-report -p autumn-web --features "plugin-sandbox,test-support" \
+            --lib -- plugin_sandbox
+          cargo llvm-cov --no-report -p autumn-web --features "plugin-sandbox,test-support" \
+            --test integration_tests -- plugin_sandbox
           # Explicit sqlite+mail lane (#1614). Excluding autumn-cli above removed
           # the only place the `--all-features` catch-all compiled autumn-web
           # under the `sqlite` + `mail` union — which is exactly the

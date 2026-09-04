@@ -43,6 +43,83 @@ fn pat_binds_name(pat: &syn::Pat, name: &str) -> bool {
     }
 }
 
+/// Type-name prefixes of the pre-body `FromRequestParts` gate parameter each
+/// body-guard macro inserts (issue #1668): `#[secured]`, `#[step_up]`, and
+/// `#[throttle]` each mint a handler-unique gate type named
+/// `__Autumn{Kind}Gate_{fn_name}` and insert it as a new leading parameter, so
+/// its check runs — and can reject — before Axum's body extractor ever runs.
+const GUARD_GATE_TYPE_PREFIXES: &[&str] = &[
+    "__AutumnSecuredGate_",
+    "__AutumnStepUpGate_",
+    "__AutumnThrottleGate_",
+];
+
+/// Whether `func` already carries another guard's pre-body gate parameter.
+///
+/// Used by each of `#[secured]`/`#[step_up]`/`#[throttle]` to decide whether
+/// ITS OWN gate should own idempotency-replay serving: whichever gate is
+/// applied to a still-unguarded function (no earlier gate parameter, and per
+/// [`crate::idempotency_guard::block_has_replay_guard`] no earlier in-body
+/// guard either) is the one whose check every other stacked guard's check is
+/// guaranteed to have already passed by the time it runs, so it — and only
+/// it — may serve a cached replay.
+pub fn has_any_guard_gate_param(func: &ItemFn) -> bool {
+    GUARD_GATE_TYPE_PREFIXES
+        .iter()
+        .any(|prefix| has_guard_gate_param_with_prefix(func, prefix))
+}
+
+/// Whether `func` has a parameter whose type name starts with `prefix` — one
+/// of the [`GUARD_GATE_TYPE_PREFIXES`]. Exposed separately from
+/// [`has_any_guard_gate_param`] so a caller that only cares about ONE guard
+/// kind (e.g. the route macro distinguishing `#[step_up]` from `#[throttle]`
+/// for its own diagnostics) doesn't have to re-derive the naming convention.
+pub fn has_guard_gate_param_with_prefix(func: &ItemFn, prefix: &str) -> bool {
+    func.sig.inputs.iter().any(|arg| {
+        let syn::FnArg::Typed(pat_type) = arg else {
+            return false;
+        };
+        type_name_starts_with(&pat_type.ty, prefix)
+    })
+}
+
+fn type_name_starts_with(ty: &syn::Type, prefix: &str) -> bool {
+    let syn::Type::Path(type_path) = ty else {
+        return false;
+    };
+    let Some(segment) = type_path.path.segments.last() else {
+        return false;
+    };
+    segment.ident.to_string().starts_with(prefix)
+}
+
+/// Test-only helper: pull the `fn` named `name` out of a macro's generated
+/// output.
+///
+/// Since issue #1668, `#[secured]`/`#[step_up]`/`#[throttle]` each emit a
+/// SIBLING gate item (a marker struct plus its `FromRequestParts` impl)
+/// alongside the transformed handler `fn`, rather than a single transformed
+/// item. That mirrors how the real compiler feeds stacked attribute macros:
+/// each attribute macro is invoked with the tokens of the ONE item it is
+/// still attached to, never a bundle of sibling items another macro emitted
+/// alongside it — a still-pending attribute (e.g. `#[get]` written above one
+/// of these guards) travels along on that single `fn` item, and the compiler
+/// re-invokes it with just that item's tokens. A test that hand-simulates
+/// stacking by feeding one macro's raw output into another must reproduce
+/// that same single-item slice, or it exercises a shape the compiler would
+/// never actually produce.
+#[cfg(test)]
+pub fn extract_fn_item(tokens: proc_macro2::TokenStream, name: &str) -> ItemFn {
+    let file: syn::File = syn::parse2(tokens).expect("generated tokens must parse as a file");
+    file.items
+        .into_iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(f) if f.sig.ident == name => Some(f),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("fn `{name}` not found among the generated items"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +155,29 @@ mod tests {
             async fn h(other: i32, __autumn_session: Session) {}
         };
         assert!(has_input_named(&f, "__autumn_session"));
+    }
+
+    #[test]
+    fn has_any_guard_gate_param_detects_each_kind() {
+        let secured: ItemFn = parse_quote! {
+            async fn h(_g: __AutumnSecuredGate_h) {}
+        };
+        let step_up: ItemFn = parse_quote! {
+            async fn h(_g: __AutumnStepUpGate_h) {}
+        };
+        let throttle: ItemFn = parse_quote! {
+            async fn h(_g: __AutumnThrottleGate_h) {}
+        };
+        assert!(has_any_guard_gate_param(&secured));
+        assert!(has_any_guard_gate_param(&step_up));
+        assert!(has_any_guard_gate_param(&throttle));
+    }
+
+    #[test]
+    fn has_any_guard_gate_param_false_without_one() {
+        let f: ItemFn = parse_quote! {
+            async fn h(Json(body): Json<T>) {}
+        };
+        assert!(!has_any_guard_gate_param(&f));
     }
 }

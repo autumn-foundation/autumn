@@ -146,6 +146,30 @@ pub enum RouterBuildError {
         /// the collision.
         incoming: String,
     },
+    /// Two routers were registered at the SAME nest prefix via
+    /// [`AppBuilder::nest`](crate::app::AppBuilder::nest).
+    ///
+    /// Every nested router is given a fallback before it is mounted
+    /// (`mount_raw_routers`), and axum cannot merge two method routers that
+    /// both have one — nesting the second at a prefix the first already owns
+    /// panics with *"Cannot merge two `MethodRouter`s that both have a
+    /// fallback"* while the router is built.
+    ///
+    /// The declared-route preflight cannot catch this: two sandboxed plugins
+    /// sharing a prefix while declaring *disjoint* routes have no route
+    /// collision at all, and are accepted right up until the second nest
+    /// panics. A prefix is therefore owned by whoever nests at it first.
+    #[error(
+        "two routers are nested at {prefix:?} ({owners}); axum gives each nested router a fallback \
+         and cannot merge two that both have one, so the second panics at startup — give each \
+         router its own prefix"
+    )]
+    DuplicateNestPrefix {
+        /// The prefix both routers were nested at.
+        prefix: String,
+        /// Who claims the prefix, as far as the declared routes reveal.
+        owners: String,
+    },
     /// Two user- or plugin-registered routes normalize to the SAME Axum path
     /// shape but use DIFFERENT exact path templates — e.g. their capture names
     /// differ (`/users/{id}` vs `/users/{slug}`) or a normal capture meets a
@@ -232,6 +256,18 @@ pub struct RouterContext {
     pub scoped_groups: Vec<ScopedGroup>,
     pub merge_routers: Vec<axum::Router<AppState>>,
     pub nest_routers: Vec<(String, axum::Router<AppState>)>,
+    /// Route tables declared for otherwise-opaque `nest` mounts via
+    /// [`AppBuilder::declare_plugin_routes`](crate::app::AppBuilder::declare_plugin_routes).
+    ///
+    /// A nested router is normally opaque — axum exposes no way to enumerate
+    /// it — which is why the duplicate-route preflight has to skip it. A plugin
+    /// that declares its routes hands over that table anyway, and for a
+    /// sandboxed plugin the manifest *is* the table. Carrying it here lets
+    /// [`reject_duplicate_user_routes`] check a declared mount against the
+    /// application's own routes, so an artifact declaring a path the app
+    /// already serves is a typed startup error instead of a panic inside
+    /// `Router::nest`.
+    pub declared_routes: Vec<crate::route_listing::RouteInfo>,
     /// Custom Tower layers registered via
     /// [`AppBuilder::layer`](crate::app::AppBuilder::layer). Applied inside
     /// [`RequestIdLayer`] and the session layer on the ingress path so user
@@ -326,6 +362,7 @@ pub fn try_build_router_with_layers(
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
             custom_layers,
             static_gate_layers: Vec::new(),
             #[cfg(feature = "maud")]
@@ -391,6 +428,7 @@ pub fn try_build_router_merged(
             scoped_groups: Vec::new(),
             merge_routers,
             nest_routers,
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             #[cfg(feature = "maud")]
@@ -524,6 +562,8 @@ fn build_router_pre_state(
         &ctx.scoped_groups,
         &ctx.merge_routers,
         &ctx.nest_routers,
+        &ctx.declared_routes,
+        config,
     )?;
 
     // Fail-fast if an OpenAPI mount path collides with a user or
@@ -620,6 +660,7 @@ fn build_router_pre_state(
     let mut router = mount_user_routes(
         route_list,
         &ctx.scoped_groups,
+        &ctx.declared_routes,
         idempotency_layers.as_ref(),
         opaque_app_layers_present,
         state,
@@ -1267,40 +1308,76 @@ fn collect_user_get_paths(
     owned
 }
 
-/// Gather every path that a `GET` (or `WS`, which mounts as a `GET`) handler
-/// will already own by the time a late-merged sub-router (`OpenAPI` or MCP) is
-/// added: user routes (top-level + scoped groups) plus framework-mounted `GET`s
-/// (probes, actuator, htmx assets, dev live-reload, mail previews). Shared by
-/// the `OpenAPI` and MCP mount-collision preflights so they stay in lockstep.
-#[cfg(feature = "openapi")]
-fn collect_claimed_get_paths(
-    route_list: &[Route],
-    scoped_groups: &[ScopedGroup],
-    config: &AutumnConfig,
-) -> std::collections::HashSet<String> {
+/// Path namespaces the framework owns wholesale, rather than as individual
+/// routes.
+///
+/// `/static` is always mounted — as `nest_service` over `ServeDir`, or as
+/// `GET /static/{*path}` under `embed-assets` — and `/_autumn` holds the
+/// inspector, job status, mail previews and the unsubscribe endpoint.
+///
+/// These need namespace treatment rather than an exact-path claim because the
+/// paths under them are not enumerable route-by-route: `ServeDir` serves
+/// whatever is on disk. A plugin nested here is not only a startup panic (a
+/// declared route AT the prefix, or a catch-all, makes `Router::nest` refuse
+/// the overlap) — a declared SUB-path mounts cleanly and then **shadows** the
+/// framework, so an artifact declaring `/static/app.js` would serve script
+/// from the host's own origin. That is the outcome this lane's response
+/// content-type allowlist exists to prevent, arriving by a different door.
+const fn framework_namespaces() -> &'static [&'static str] {
+    &["/static", "/_autumn"]
+}
+
+/// Whether `path` is inside `namespace` — the namespace itself, or anything
+/// below it on a segment boundary. `/staticfoo` is NOT inside `/static`.
+fn path_is_under_namespace(path: &str, namespace: &str) -> bool {
+    path == namespace
+        || path
+            .strip_prefix(namespace)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Every path a framework-mounted `GET` handler owns: probes, actuator, htmx
+/// assets, framework CSS, dev live-reload and inspector, mail previews and
+/// unsubscribe, the story gallery, and the tracked-job status route.
+///
+/// Split out of [`collect_claimed_get_paths`] so the declared-plugin-route
+/// preflight can use it without the `openapi` feature and without duplicating
+/// this list — the two must not drift, or a path one knows about becomes a
+/// startup panic the other never sees.
+fn collect_framework_get_paths(config: &AutumnConfig) -> std::collections::HashSet<String> {
     let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for route in route_list {
-        if route.method == http::Method::GET || route.method.as_str() == "WS" {
-            claimed.insert(route.path.to_owned());
-        }
+    // Framework-mounted GETs. The probes are behind the same `health.enabled`
+    // off-switch `mount_probe_endpoints` checks (#1971): claiming them while
+    // nothing mounts them would refuse a plugin — or an OpenAPI/MCP mount path
+    // — over a collision that cannot happen.
+    if config.health.enabled {
+        claimed.insert(config.health.path.clone());
+        claimed.insert(config.health.live_path.clone());
+        claimed.insert(config.health.ready_path.clone());
+        claimed.insert(config.health.startup_path.clone());
     }
-    for group in scoped_groups {
-        for route in &group.routes {
-            if route.method == http::Method::GET || route.method.as_str() == "WS" {
-                claimed.insert(join_nested_path(&group.prefix, route.path));
-            }
-        }
-    }
-    // Framework-mounted GETs.
-    claimed.insert(config.health.path.clone());
-    claimed.insert(config.health.live_path.clone());
-    claimed.insert(config.health.ready_path.clone());
-    claimed.insert(config.health.startup_path.clone());
+    // Some entries in `actuator_endpoint_paths` exist only to seed the runtime
+    // startup-barrier allow-list (#1627) and are actually mounted with a
+    // mutating method — `/webhooks/replay` is a POST. Claiming those as GETs
+    // refuses a plugin's GET at a path where GET and the framework's POST
+    // merge cleanly. `route_listing` already subtracts them for the same
+    // reason; the two lists must agree or one refuses what the other permits.
+    let actuator_mutating = crate::actuator::actuator_mutating_routes(
+        &config.actuator.prefix,
+        config.actuator.sensitive,
+    );
+    let mutating_paths: std::collections::HashSet<&str> = actuator_mutating
+        .iter()
+        .map(|(_, path)| path.as_str())
+        .collect();
     for path in crate::actuator::actuator_endpoint_paths(
         &config.actuator.prefix,
         config.actuator.sensitive,
         config.actuator.prometheus,
     ) {
+        if mutating_paths.contains(path.as_str()) {
+            continue;
+        }
         claimed.insert(path);
     }
     #[cfg(feature = "htmx")]
@@ -1337,7 +1414,13 @@ fn collect_claimed_get_paths(
     // Reserve it so a mount path colliding with the inspector surfaces a
     // recoverable error instead of panicking in `router.merge`.
     if matches!(config.profile.as_deref(), Some("dev" | "development")) {
-        claimed.insert(config.dev.inspector_path.clone());
+        // Both of them: the inspector mounts a detail template alongside the
+        // index, and claiming only the configured path left
+        // `{inspector_path}/requests/{id}` open whenever the inspector sits
+        // outside the reserved `/_autumn` namespace.
+        claimed.extend(crate::inspector::inspector_endpoint_paths(
+            &config.dev.inspector_path,
+        ));
     }
     #[cfg(feature = "mail")]
     if config
@@ -1373,6 +1456,34 @@ fn collect_claimed_get_paths(
     if config.jobs.tracking.route_enabled {
         claimed.insert(crate::job_tracking::JOB_STATUS_ROUTE_PATH.to_owned());
     }
+    claimed
+}
+
+/// Gather every path that a `GET` (or `WS`, which mounts as a `GET`) handler
+/// will already own by the time a late-merged sub-router (`OpenAPI` or MCP) is
+/// added: user routes (top-level + scoped groups) plus framework-mounted `GET`s
+/// (probes, actuator, htmx assets, dev live-reload, mail previews). Shared by
+/// the `OpenAPI` and MCP mount-collision preflights so they stay in lockstep.
+#[cfg(feature = "openapi")]
+fn collect_claimed_get_paths(
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+    config: &AutumnConfig,
+) -> std::collections::HashSet<String> {
+    let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for route in route_list {
+        if route.method == http::Method::GET || route.method.as_str() == "WS" {
+            claimed.insert(route.path.to_owned());
+        }
+    }
+    for group in scoped_groups {
+        for route in &group.routes {
+            if route.method == http::Method::GET || route.method.as_str() == "WS" {
+                claimed.insert(join_nested_path(&group.prefix, route.path));
+            }
+        }
+    }
+    claimed.extend(collect_framework_get_paths(config));
     claimed
 }
 
@@ -1608,6 +1719,73 @@ fn paths_conflict_under_matchit(existing: &str, incoming: &str) -> bool {
     )
 }
 
+/// Refuse two routers nested at the same prefix.
+///
+/// `mount_raw_routers` gives every nested router a fallback before mounting it,
+/// and axum cannot merge two method routers that both have one — so the second
+/// nest at a prefix the first already owns panics with "Cannot merge two
+/// `MethodRouter`s that both have a fallback" while the router is built.
+///
+/// No route-level check can see this: two sandboxed plugins sharing a prefix
+/// while declaring *disjoint* routes collide nowhere in the route table. The
+/// collision is between the mounts, so a prefix belongs to whoever nests first.
+fn reject_duplicate_nest_prefixes(
+    nest_routers: &[(String, axum::Router<AppState>)],
+    declared_routes: &[crate::route_listing::RouteInfo],
+) -> Result<(), RouterBuildError> {
+    let mut nested_at: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (prefix, _) in nest_routers {
+        if nested_at.insert(prefix.as_str()) {
+            continue;
+        }
+        // Declared routes are the only attribution available — a raw nested
+        // router is anonymous — so name whoever we can, and say so when we
+        // cannot.
+        let mut owners: Vec<&str> = declared_routes
+            .iter()
+            .filter(|declared| declared.path.starts_with(prefix.as_str()))
+            .map(|declared| declared.handler.as_str())
+            .collect();
+        owners.sort_unstable();
+        owners.dedup();
+        let owners = if owners.is_empty() {
+            "two undeclared nested routers".to_owned()
+        } else {
+            owners.join(", ")
+        };
+        return Err(RouterBuildError::DuplicateNestPrefix {
+            prefix: prefix.clone(),
+            owners,
+        });
+    }
+    Ok(())
+}
+
+/// Does a declared route clash with a framework mount, as axum would see it?
+///
+/// The two halves are not symmetric, and conflating them is what this check
+/// kept getting wrong in both directions:
+///
+/// * **The same exact path** merges across methods. `GET /health` and a
+///   declared `POST /health` land in one `MethodRouter` and coexist, so this is
+///   a clash only when the methods are the same.
+/// * **A different template at the same shape** — `/_stories/{slug}` against a
+///   declared `/_stories/{id}` — is a *matchit* conflict, and matchit sits
+///   above method routing: axum refuses the second template whatever method it
+///   carries. Gating this on GET let a declared `POST /_stories/{id}` through
+///   to a startup panic.
+fn framework_route_clashes(
+    framework_path: &str,
+    framework_method: &str,
+    declared_path: &str,
+    declared_method: &str,
+) -> bool {
+    if framework_path == declared_path {
+        return declared_method.eq_ignore_ascii_case(framework_method);
+    }
+    paths_conflict_under_matchit(framework_path, declared_path)
+}
+
 /// Fail-fast preflight for issue #1012: reject two user- or plugin-registered
 /// routes that resolve to the same `(method, path)` before
 /// [`group_and_mount_routes`] hands overlapping method routes to
@@ -1639,6 +1817,8 @@ fn reject_duplicate_user_routes(
     scoped_groups: &[ScopedGroup],
     merge_routers: &[axum::Router<AppState>],
     nest_routers: &[(String, axum::Router<AppState>)],
+    declared_routes: &[crate::route_listing::RouteInfo],
+    config: &AutumnConfig,
 ) -> Result<(), RouterBuildError> {
     // `claimed` keys on `(effective_method, exact_path)`; the value is the
     // first-seen handler name so the error can point at BOTH sides of an
@@ -1747,6 +1927,36 @@ fn reject_duplicate_user_routes(
         }
     }
 
+    // A `nest` mount is opaque to axum's API, but a plugin that declared its
+    // routes handed us the table anyway — and for a sandboxed plugin the
+    // manifest IS the mount, so that table is exactly what `Router::nest` will
+    // register. Run those declarations through the same oracle as the app's
+    // own routes: an artifact declaring `GET /hello/greet` when the
+    // application already serves it would otherwise panic inside
+    // `Router::nest` ("Overlapping method route") and take the whole process
+    // down at boot — containment failing open, for the one input class this
+    // lane exists to distrust. Shape clashes panic identically (`/hello/{id}`
+    // against a nest declaring `/{slug}`, and `/hello/{*rest}` likewise), which
+    // is why these go through `record` — matchit oracle and all — rather than
+    // an exact-path compare. Disjoint paths under the same prefix do NOT
+    // conflict, and neither does a route AT the prefix, so this rejects only
+    // what axum would actually refuse.
+    //
+    // Declared routes are recorded LAST so an application route always wins the
+    // "first-seen is `existing`" convention and the error names the plugin as
+    // the incoming side.
+    for declared in declared_routes {
+        // A method string that is not a valid HTTP token could not have been
+        // mounted by axum either; leave it to the declaring seam rather than
+        // inventing a collision for it here.
+        let Ok(method) = http::Method::from_bytes(declared.method.as_bytes()) else {
+            continue;
+        };
+        record(&method, declared.path.clone(), &declared.handler)?;
+    }
+
+    reject_declared_framework_collisions(declared_routes, config)?;
+
     // Raw merged / nested routers are opaque — axum does not expose their
     // route tables. Warn so operators know the check does not cover those
     // code paths (mirrors the OpenAPI and MCP merge-router warnings).
@@ -1759,16 +1969,133 @@ fn reject_duplicate_user_routes(
              routers on disjoint paths from your `.routes()`/`.scoped()` registrations."
         );
     }
+    reject_duplicate_nest_prefixes(nest_routers, declared_routes)?;
+
     if !nest_routers.is_empty() {
         tracing::warn!(
             nested_routers = nest_routers.len(),
-            "duplicate-route preflight (#1012) skipped for AppBuilder::nest routers: \
-             axum does not expose their route table, so an overlapping handler on a \
-             method+path Autumn already owns will still panic at startup. Keep nested \
-             routers on disjoint prefixes from your `.routes()`/`.scoped()` registrations."
+            declared_routes = declared_routes.len(),
+            "duplicate-route preflight (#1012) covers AppBuilder::nest routers only \
+             through declare_plugin_routes: axum does not expose a nested router's \
+             route table, so any handler it serves that was NOT declared can still \
+             panic at startup if it overlaps a method+path Autumn already owns. \
+             Declared routes — a sandboxed plugin declares its whole manifest — ARE \
+             checked; for anything else keep nested routers on disjoint prefixes \
+             from your `.routes()`/`.scoped()` registrations."
         );
     }
 
+    Ok(())
+}
+
+/// Refuse a declared plugin route that lands on something the framework
+/// mounts.
+///
+/// Split out of [`reject_duplicate_user_routes`] because the framework's own
+/// mounts are not in `route_list` — they are installed separately — so the
+/// `record` oracle there cannot see them at all.
+fn reject_declared_framework_collisions(
+    declared_routes: &[crate::route_listing::RouteInfo],
+    config: &AutumnConfig,
+) -> Result<(), RouterBuildError> {
+    // The framework's own GETs (probes, actuator, htmx assets, mail previews,
+    // …) are mounted separately and are NOT in `route_list`, so the `record`
+    // oracle in `reject_duplicate_user_routes` cannot see them — a manifest
+    // declaring `GET /health` sailed past that check and still panicked at
+    // `Router::nest`. Verified against axum 0.8.9
+    // which methods actually clash there: only GET does. A declared HEAD or
+    // POST at a framework GET path merges cleanly into the same
+    // `MethodRouter`, so refusing those would reject mounts axum accepts.
+    //
+    // Refuse rather than let the framework yield. A user route at a probe path
+    // legitimately takes it over (issue #1971) — the developer owns their app.
+    // An artifact the operator was told is sandboxed is a different principal:
+    // silently handing it `/health`, which orchestrators read to decide whether
+    // the process is alive, would be a worse outcome than a loud refusal. Any
+    // path a user route already owns is caught by the caller's `record` pass
+    // (the framework has yielded it), so this only fires where the framework
+    // really mounts.
+    let framework_get_paths = collect_framework_get_paths(config);
+    // The framework's mutating mounts, carrying their real methods. The GET
+    // claim set deliberately excludes these paths, so without this pass a
+    // declared PUT or POST at one of them is compared against nothing.
+    let actuator_mutating_routes = crate::actuator::actuator_mutating_routes(
+        &config.actuator.prefix,
+        config.actuator.sensitive,
+    );
+    for declared in declared_routes {
+        // Namespaces first, and for EVERY method: `/static` and `/_autumn` are
+        // owned wholesale, so a declared route anywhere beneath them is refused
+        // whether it would panic (at the prefix, or a catch-all) or mount
+        // quietly and shadow what the framework serves there.
+        if let Some(namespace) = framework_namespaces()
+            .iter()
+            .find(|namespace| path_is_under_namespace(&declared.path, namespace))
+        {
+            return Err(RouterBuildError::DuplicateUserRoute {
+                method: declared.method.clone(),
+                path: declared.path.clone(),
+                existing: format!("autumn framework namespace {namespace}"),
+                incoming: declared.handler.clone(),
+            });
+        }
+        // A `WS` upgrade is a GET as far as axum's method router is concerned,
+        // so it clashes wherever a declared GET would.
+        let effective_method = if declared.method.eq_ignore_ascii_case("GET")
+            || declared.method.eq_ignore_ascii_case("WS")
+        {
+            "GET"
+        } else {
+            declared.method.as_str()
+        };
+        // The framework mounts non-GET routes too, and only GET was ever
+        // compared — so a manifest declaring `PUT {prefix}/loggers/{name}`
+        // passed this check and panicked at the nest, because the actuator
+        // mounts exactly that. These carry their real method, so the
+        // comparison is method-aware rather than GET-shaped.
+        for (framework_method, framework_path) in &actuator_mutating_routes {
+            if framework_route_clashes(
+                framework_path,
+                framework_method,
+                &declared.path,
+                effective_method,
+            ) {
+                return Err(RouterBuildError::DuplicateUserRoute {
+                    method: declared.method.clone(),
+                    path: declared.path.clone(),
+                    existing: format!("autumn framework route {framework_path}"),
+                    incoming: declared.handler.clone(),
+                });
+            }
+        }
+        // Compare through matchit, not by string equality: a framework path
+        // that carries a capture conflicts with a DIFFERENTLY-NAMED capture at
+        // the same position, and axum refuses that shape regardless of method.
+        // `/_stories/{slug}` is the live example — a manifest declaring
+        // `/_stories/{id}` is an exact-string miss and a startup panic. The
+        // configurable paths (probes, actuator prefix, dev inspector, job
+        // status) can carry captures too, since an operator sets them.
+        let collision = framework_get_paths.iter().find(|framework_path| {
+            framework_route_clashes(framework_path, "GET", &declared.path, effective_method)
+        });
+        if let Some(framework_path) = collision {
+            // `FrameworkRouteOverlap` would read better, but its `existing` and
+            // `incoming` are `&'static str` and a plugin's handler name is
+            // built at runtime; widening them is a breaking change to a public
+            // enum. `DuplicateUserRoute` carries `String`s and still names the
+            // method, the path and both sides, which is what an operator needs
+            // to act.
+            return Err(RouterBuildError::DuplicateUserRoute {
+                method: declared.method.clone(),
+                path: declared.path.clone(),
+                // Name the framework template, not just the label: when the
+                // clash is a shape conflict the two paths are not the same
+                // string, and the operator needs to see what it collided with.
+                existing: format!("autumn framework route {framework_path}"),
+                incoming: declared.handler.clone(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1864,6 +2191,7 @@ fn group_and_mount_routes(
 fn mount_user_routes(
     route_list: Vec<Route>,
     scoped_groups: &[ScopedGroup],
+    declared_routes: &[crate::route_listing::RouteInfo],
     idempotency_layers: Option<&BuiltIdempotencyLayers>,
     opaque_app_layers_present: bool,
     state: &AppState,
@@ -1888,6 +2216,7 @@ fn mount_user_routes(
     let excluded_path_methods = route_list_path_methods(&excluded);
     let scoped_path_methods = scoped_group_path_methods(scoped_groups);
     let framework_path_methods = framework_probe_path_methods(config);
+    let declared_path_methods = declared_path_methods(declared_routes);
 
     let valid_locales = validated_locale_prefix_locales(&config.i18n);
 
@@ -1896,6 +2225,7 @@ fn mount_user_routes(
         &excluded_path_methods,
         &scoped_path_methods,
         &framework_path_methods,
+        &declared_path_methods,
         &valid_locales,
     ) {
         return Err(err);
@@ -1933,6 +2263,7 @@ fn mount_user_routes(
 fn mount_user_routes(
     route_list: Vec<Route>,
     _scoped_groups: &[ScopedGroup],
+    _declared_routes: &[crate::route_listing::RouteInfo],
     idempotency_layers: Option<&BuiltIdempotencyLayers>,
     opaque_app_layers_present: bool,
     state: &AppState,
@@ -2067,6 +2398,44 @@ fn method_filter_for(method: &http::Method) -> axum::routing::MethodFilter {
         "TRACE" => MethodFilter::TRACE,
         _ => MethodFilter::GET,
     }
+}
+
+/// The same map as [`route_list_path_methods`], for routes a plugin *declared*
+/// rather than routes the application built.
+///
+/// The locale-prefix check compares generated paths against everything already
+/// mounted, and a sandboxed plugin's manifest is a mount like any other — it
+/// was simply not among the things being compared.
+#[cfg(feature = "i18n")]
+fn declared_path_methods(
+    declared: &[crate::route_listing::RouteInfo],
+) -> std::collections::HashMap<String, Vec<http::Method>> {
+    let mut map: std::collections::HashMap<String, Vec<http::Method>> =
+        std::collections::HashMap::new();
+    for route in declared {
+        let Ok(parsed) = http::Method::from_bytes(route.method.as_bytes()) else {
+            // `WS` is not an HTTP method; it mounts as a GET.
+            if route.method.eq_ignore_ascii_case("WS") {
+                let methods = map.entry(route.path.clone()).or_default();
+                if !methods.contains(&http::Method::GET) {
+                    methods.push(http::Method::GET);
+                }
+                if !methods.contains(&http::Method::HEAD) {
+                    methods.push(http::Method::HEAD);
+                }
+            }
+            continue;
+        };
+        let effective = effective_mount_method(&parsed);
+        let methods = map.entry(route.path.clone()).or_default();
+        if !methods.contains(&effective) {
+            methods.push(effective.clone());
+        }
+        if effective == http::Method::GET && !methods.contains(&http::Method::HEAD) {
+            methods.push(http::Method::HEAD);
+        }
+    }
+    map
 }
 
 /// For each DISTINCT path in `routes`, the effective HTTP methods actually
@@ -2224,12 +2593,14 @@ fn detect_locale_prefix_path_collision(
     excluded: &std::collections::HashMap<String, Vec<http::Method>>,
     scoped: &std::collections::HashMap<String, Vec<http::Method>>,
     framework: &std::collections::HashMap<String, Vec<http::Method>>,
+    declared: &std::collections::HashMap<String, Vec<http::Method>>,
     valid_locales: &[String],
 ) -> Option<RouterBuildError> {
     let all_other_paths: Vec<&String> = excluded
         .keys()
         .chain(scoped.keys())
         .chain(framework.keys())
+        .chain(declared.keys())
         .chain(included.keys())
         .collect();
 
@@ -2246,6 +2617,10 @@ fn detect_locale_prefix_path_collision(
                 .into_iter()
                 .chain(scoped.get(&generated))
                 .chain(framework.get(&generated))
+                // A sandboxed plugin's declared mount is a mount: without it
+                // here, a manifest claiming `/en/foo` sailed past this check and
+                // axum panicked at boot on the locale clone of `/foo`.
+                .chain(declared.get(&generated))
                 .chain(included.get(&generated))
                 .any(|other_methods| methods.iter().any(|m| other_methods.contains(m)));
 
@@ -5178,6 +5553,7 @@ pub fn try_build_router_with_static(
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             #[cfg(feature = "maud")]
@@ -8850,6 +9226,7 @@ enabled = true
             scoped_groups: vec![group],
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             #[cfg(feature = "maud")]
@@ -8887,6 +9264,7 @@ enabled = true
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             #[cfg(feature = "maud")]
@@ -8924,6 +9302,7 @@ enabled = true
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             #[cfg(feature = "maud")]
@@ -9294,6 +9673,7 @@ enabled = true
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             #[cfg(feature = "maud")]
@@ -9322,6 +9702,7 @@ enabled = true
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             #[cfg(feature = "maud")]
@@ -9373,6 +9754,7 @@ enabled = true
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             #[cfg(feature = "maud")]
@@ -9404,6 +9786,7 @@ enabled = true
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             #[cfg(feature = "maud")]
@@ -9441,6 +9824,7 @@ enabled = true
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: vec![("/api".to_owned(), nested)],
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             #[cfg(feature = "maud")]
@@ -9479,6 +9863,7 @@ enabled = true
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             #[cfg(feature = "maud")]
@@ -9514,6 +9899,7 @@ enabled = true
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             #[cfg(feature = "maud")]
@@ -9551,6 +9937,7 @@ enabled = true
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             error_page_renderer: None,
@@ -9587,6 +9974,7 @@ enabled = true
                     scoped_groups: Vec::new(),
                     merge_routers: Vec::new(),
                     nest_routers: Vec::new(),
+                    declared_routes: Vec::new(),
                     custom_layers: Vec::new(),
                     static_gate_layers: Vec::new(),
                     error_page_renderer: None,
@@ -9665,6 +10053,7 @@ enabled = true
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             #[cfg(feature = "maud")]
@@ -9720,6 +10109,366 @@ enabled = true
             display.contains('/'),
             "error message must contain the path; got: {display}"
         );
+    }
+
+    /// A declared plugin route helper — the shape
+    /// [`AppBuilder::declare_plugin_routes`](crate::app::AppBuilder::declare_plugin_routes)
+    /// records, and the shape a sandboxed plugin's manifest produces.
+    fn declared_route(method: &str, path: &str, plugin: &str) -> crate::route_listing::RouteInfo {
+        crate::route_listing::RouteInfo {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            handler: format!("sandbox:{plugin}"),
+            source: crate::route_listing::RouteSource::Plugin(plugin.to_owned()),
+            ..crate::route_listing::RouteInfo::default()
+        }
+    }
+
+    /// An untrusted artifact must not be able to abort the host at boot.
+    ///
+    /// A `nest` mount is opaque to axum, so the duplicate-route preflight
+    /// historically skipped it — but a sandboxed plugin's manifest IS its route
+    /// table, and `Router::nest` panics with "Overlapping method route" when a
+    /// declared path is one the application already serves. That panic is a
+    /// denial of service against the WHOLE app reachable from an artifact the
+    /// operator was told the sandbox contains, so it has to surface as a typed
+    /// error before anything mounts.
+    #[tokio::test]
+    async fn try_build_router_rejects_a_declared_plugin_route_the_app_already_serves() {
+        let config = AutumnConfig::default();
+        let app_route = duplicate_test_route(http::Method::GET, "/hello/greet", "app_greet");
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("GET", "/hello/greet", "evil-plugin")];
+        let err = super::try_build_router_inner(vec![app_route], &config, test_state(), ctx)
+            .expect_err("a plugin declaring a path the app serves must be refused");
+        match err {
+            RouterBuildError::DuplicateUserRoute {
+                ref method,
+                ref path,
+                ref existing,
+                ref incoming,
+            } => {
+                assert_eq!(method, "GET");
+                assert_eq!(path, "/hello/greet");
+                // The application route is first-seen, so the plugin is named
+                // as the incoming side — the operator needs to know WHICH
+                // artifact to stop installing.
+                assert_eq!(existing, "app_greet");
+                assert_eq!(incoming, "sandbox:evil-plugin");
+            }
+            other => panic!("expected DuplicateUserRoute, got {other:?}"),
+        }
+    }
+
+    /// The framework's own routes are mounted outside `route_list`, so the
+    /// declared-route check has to know about them separately: a manifest
+    /// declaring `GET /health` reached `Router::nest` and panicked with
+    /// "Overlapping method route" even after declared routes were checked
+    /// against the application's.
+    ///
+    /// Refused rather than yielded: a user route at a probe path legitimately
+    /// takes it over (#1971), but silently handing an unaudited artifact the
+    /// endpoint orchestrators read to decide whether the process is alive is a
+    /// worse outcome than a loud refusal.
+    #[tokio::test]
+    async fn try_build_router_rejects_a_declared_plugin_route_on_a_framework_path() {
+        let config = AutumnConfig::default();
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("GET", &config.health.path, "evil-plugin")];
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("a plugin declaring a framework probe path must be refused");
+        match err {
+            RouterBuildError::DuplicateUserRoute {
+                ref path,
+                ref existing,
+                ref incoming,
+                ..
+            } => {
+                assert_eq!(path, &config.health.path);
+                assert!(
+                    existing.starts_with("autumn framework route")
+                        && existing.contains(&config.health.path),
+                    "the refusal must name the framework route it clashed with; got: {existing}"
+                );
+                assert_eq!(incoming, "sandbox:evil-plugin");
+            }
+            other => panic!("expected the framework-path refusal, got {other:?}"),
+        }
+    }
+
+    /// A shape clash is method-independent, so the check must be too.
+    ///
+    /// matchit sits *above* method routing: two different templates at the same
+    /// shape (`/_stories/{slug}` against `/_stories/{id}`) are a route conflict
+    /// axum refuses whatever method the second carries. Gating the shape check
+    /// on GET let a declared POST through to a startup panic — the same class
+    /// the GET case already covered, reached by choosing a different verb.
+    ///
+    /// The exact-path half stays method-aware: `GET /health` and a declared
+    /// `POST /health` merge into one `MethodRouter` and must keep working.
+    #[tokio::test]
+    async fn try_build_router_rejects_a_non_get_declared_route_that_shape_clashes_with_a_framework_path()
+     {
+        let mut config = AutumnConfig::default();
+        config.health.path = "/probe/{id}".to_owned();
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("POST", "/probe/{slug}", "evil-plugin")];
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("a shape clash must be refused whatever the method");
+        match err {
+            RouterBuildError::DuplicateUserRoute {
+                ref method,
+                ref existing,
+                ..
+            } => {
+                assert_eq!(method, "POST", "the refusal must name the declared method");
+                assert!(
+                    existing.contains("/probe/{id}"),
+                    "the refusal must name the framework template; got: {existing}"
+                );
+            }
+            other => panic!("expected the framework shape refusal, got {other:?}"),
+        }
+    }
+
+    /// The other half of the same rule: an EXACT path match across methods
+    /// merges cleanly, so a declared POST at a framework GET path is allowed.
+    #[tokio::test]
+    async fn try_build_router_allows_a_non_get_declared_route_at_a_framework_get_path() {
+        let config = AutumnConfig::default();
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("POST", &config.health.path, "honest-plugin")];
+        assert!(
+            super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).is_ok(),
+            "a POST at a framework GET path merges into one MethodRouter and must be allowed"
+        );
+    }
+
+    /// The framework mounts non-GET routes too, and only GET was compared.
+    ///
+    /// With sensitive actuator endpoints on, `PUT {prefix}/loggers/{name}` is
+    /// a real mount — so a manifest declaring it passed the preflight and
+    /// panicked at `Router::nest`, which is the whole class this check exists
+    /// to close.
+    #[tokio::test]
+    async fn try_build_router_rejects_a_declared_plugin_route_on_a_framework_mutating_path() {
+        let mut config = AutumnConfig::default();
+        config.actuator.sensitive = true;
+        let loggers =
+            crate::actuator::actuator_route_path(&config.actuator.prefix, "/loggers/{name}");
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("PUT", &loggers, "evil-plugin")];
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("a declared PUT at the actuator's own PUT must be refused");
+        match err {
+            RouterBuildError::DuplicateUserRoute {
+                ref method,
+                ref existing,
+                ..
+            } => {
+                assert_eq!(method, "PUT", "the refusal must name the real method");
+                assert!(
+                    existing.contains(&loggers),
+                    "the refusal must name the framework route; got: {existing}"
+                );
+            }
+            other => panic!("expected the framework mutating-route refusal, got {other:?}"),
+        }
+    }
+
+    /// The other direction: a path the framework mounts only as POST must not
+    /// be claimed as a GET.
+    ///
+    /// `{prefix}/webhooks/replay` is in `actuator_endpoint_paths` solely to
+    /// seed the startup barrier (#1627), and it is mounted POST-only. GET and
+    /// that POST merge into one `MethodRouter` cleanly, so refusing a declared
+    /// GET there rejects a mount axum accepts — the failure mode this check
+    /// has to avoid as much as the panic it prevents.
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn try_build_router_allows_a_declared_get_at_a_post_only_framework_path() {
+        let mut config = AutumnConfig::default();
+        config.actuator.sensitive = true;
+        let replay =
+            crate::actuator::actuator_route_path(&config.actuator.prefix, "/webhooks/replay");
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("GET", &replay, "honest-plugin")];
+        assert!(
+            super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).is_ok(),
+            "a GET at a POST-only framework path merges cleanly and must be allowed"
+        );
+    }
+
+    /// A framework path that carries a capture conflicts with a differently
+    /// NAMED capture at the same position — axum refuses that shape whatever
+    /// the method — so the framework comparison has to go through matchit, not
+    /// string equality. `/_stories/{slug}` is the live example; the
+    /// operator-configurable paths (probes, actuator prefix, dev inspector,
+    /// job status) can carry captures for the same reason.
+    #[tokio::test]
+    async fn try_build_router_rejects_a_declared_plugin_route_that_shape_clashes_with_a_framework_path()
+     {
+        let mut config = AutumnConfig::default();
+        config.health.path = "/probe/{id}".to_owned();
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("GET", "/probe/{slug}", "evil-plugin")];
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("a shape clash with a framework path must be refused");
+        match err {
+            RouterBuildError::DuplicateUserRoute { ref existing, .. } => assert!(
+                existing.contains("/probe/{id}"),
+                "the refusal must name the framework template it clashed with; got: {existing}"
+            ),
+            other => panic!("expected the framework shape refusal, got {other:?}"),
+        }
+    }
+
+    /// The dev inspector mounts TWO routes — an index at the configured path
+    /// and a detail template below it — so claiming only the configured path
+    /// left `{inspector_path}/requests/{id}` open. It is invisible while the
+    /// inspector sits under the reserved `/_autumn` root; move it anywhere
+    /// else, as `dev.inspector_path` invites, and a plugin declaring that
+    /// shape reaches `Router::merge` and panics.
+    #[tokio::test]
+    async fn try_build_router_rejects_a_declared_plugin_route_on_the_inspector_detail_path() {
+        let mut config = AutumnConfig {
+            profile: Some("dev".to_owned()),
+            ..AutumnConfig::default()
+        };
+        config.dev.inspector_path = "/debug".to_owned();
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route(
+            "GET",
+            "/debug/requests/{slug}",
+            "evil-plugin",
+        )];
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("the inspector detail route must be claimed too");
+        match err {
+            RouterBuildError::DuplicateUserRoute { ref existing, .. } => assert!(
+                existing.contains("/debug/requests/{id}"),
+                "the refusal must name the inspector detail template; got: {existing}"
+            ),
+            other => panic!("expected the inspector detail refusal, got {other:?}"),
+        }
+    }
+
+    /// Only `GET` actually clashes at a framework path — axum merges a declared
+    /// `HEAD` or `POST` into the same `MethodRouter` without complaint
+    /// (verified against axum 0.8.9). Refusing those would reject mounts axum
+    /// accepts, so the check must stay method-aware.
+    #[tokio::test]
+    async fn try_build_router_allows_a_declared_plugin_post_on_a_framework_path() {
+        let config = AutumnConfig::default();
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![
+            declared_route("POST", &config.health.path, "good-plugin"),
+            declared_route("HEAD", &config.health.path, "good-plugin"),
+        ];
+        let _router = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect("non-GET declarations at a framework path must mount");
+    }
+
+    /// `/static` and `/_autumn` are framework namespaces, not enumerable
+    /// routes: `ServeDir` serves whatever is on disk, so no exact-path claim
+    /// can cover them. A plugin declaring a sub-path there does not even panic
+    /// — it mounts and SHADOWS the framework, which for `/static/app.js` means
+    /// an unaudited artifact serving script from the host's own origin.
+    /// Refused for every method, at the namespace root and below.
+    #[tokio::test]
+    async fn try_build_router_rejects_declared_plugin_routes_inside_framework_namespaces() {
+        for (method, path) in [
+            ("GET", "/static/app.js"),
+            ("GET", "/static"),
+            ("POST", "/_autumn/unsubscribe"),
+            ("GET", "/_autumn/jobs/abc"),
+        ] {
+            let config = AutumnConfig::default();
+            let mut ctx = duplicate_test_ctx();
+            ctx.declared_routes = vec![declared_route(method, path, "evil-plugin")];
+            let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+                .expect_err("a plugin route inside a framework namespace must be refused");
+            match err {
+                RouterBuildError::DuplicateUserRoute {
+                    path: ref got,
+                    ref existing,
+                    ..
+                } => {
+                    assert_eq!(got, path);
+                    assert!(
+                        existing.contains("framework namespace"),
+                        "the refusal must name the namespace; got: {existing}"
+                    );
+                }
+                other => {
+                    panic!("expected the namespace refusal for {method} {path}, got {other:?}")
+                }
+            }
+        }
+    }
+
+    /// The namespace check matches on segment boundaries, not string prefixes:
+    /// `/staticky` is an ordinary path a plugin may legitimately serve.
+    #[tokio::test]
+    async fn try_build_router_allows_a_plugin_path_that_merely_starts_like_a_namespace() {
+        let config = AutumnConfig::default();
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("GET", "/staticky/thing", "good-plugin")];
+        let _router = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect("/staticky must not be read as /static");
+    }
+
+    /// `mount_probe_endpoints` mounts nothing when `health.enabled = false`, so
+    /// claiming the probe paths anyway would refuse a plugin over a collision
+    /// that cannot happen — turning a working install into a startup failure.
+    #[tokio::test]
+    async fn try_build_router_allows_a_declared_probe_path_when_probes_are_disabled() {
+        let mut config = AutumnConfig::default();
+        config.health.enabled = false;
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("GET", &config.health.path, "good-plugin")];
+        let _router = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect("a disabled probe path must not be claimed");
+    }
+
+    /// The same protection has to cover a *shape* clash, not just an exact
+    /// path: `axum::Router::nest` panics identically when a declared
+    /// `/hello/{slug}` meets an application `/hello/{id}` (matchit rejects the
+    /// second template regardless of method).
+    #[tokio::test]
+    async fn try_build_router_rejects_a_declared_plugin_route_that_shape_clashes() {
+        let config = AutumnConfig::default();
+        let app_route = duplicate_test_route(http::Method::GET, "/hello/{id}", "app_show");
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("POST", "/hello/{slug}", "evil-plugin")];
+        let err = super::try_build_router_inner(vec![app_route], &config, test_state(), ctx)
+            .expect_err("a shape clash between app and plugin routes must be refused");
+        assert!(
+            matches!(err, RouterBuildError::ConflictingRouteShape { .. }),
+            "expected ConflictingRouteShape, got {err:?}"
+        );
+    }
+
+    /// The check must not fire on mounts axum accepts, or every plugin install
+    /// becomes a startup failure. Disjoint paths under a shared prefix, and a
+    /// plugin route sitting AT a path the app serves as a *parent*, both mount
+    /// cleanly — verified against axum itself before this test was written.
+    #[tokio::test]
+    async fn try_build_router_allows_declared_plugin_routes_that_do_not_collide() {
+        let config = AutumnConfig::default();
+        let routes = vec![
+            duplicate_test_route(http::Method::GET, "/hello/other", "app_other"),
+            duplicate_test_route(http::Method::GET, "/hello", "app_index"),
+        ];
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![
+            declared_route("GET", "/hello/greet", "good-plugin"),
+            // A GET route's implied HEAD is declared alongside it; the two
+            // share a path and must not be read as a duplicate of each other.
+            declared_route("HEAD", "/hello/greet", "good-plugin"),
+        ];
+        let _router = super::try_build_router_inner(routes, &config, test_state(), ctx)
+            .expect("non-colliding plugin routes must mount");
     }
 
     /// AC #4: distinct methods on the same path (`GET /admin` + `POST /admin`)
@@ -13004,6 +13753,7 @@ mod trusted_host_tests {
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: vec![gate],
             #[cfg(feature = "maud")]
