@@ -25,6 +25,7 @@ use std::fmt::Write as _;
 
 use super::model::{
     PostureManifest, RouteEntry, RouteKey, escape_field, escape_list, hex_digest, is_open,
+    normalize_captures,
 };
 
 /// Which way a change moves the security surface.
@@ -498,7 +499,7 @@ fn diff_authorization_policies(
     let gained_on: BTreeMap<RouteKey, Vec<String>> = after.difference(&before).fold(
         BTreeMap::new(),
         |mut acc, (path, method, action, resource)| {
-            acc.entry((path.clone(), method.clone()))
+            acc.entry((normalize_captures(path), method.clone()))
                 .or_default()
                 .push(format!("{action} on {resource}"));
             acc
@@ -508,7 +509,9 @@ fn diff_authorization_policies(
     for (path, method, action, resource) in before.difference(&after) {
         // A binding that vanished because the whole route did is already
         // reported as `route_removed`, and that is a narrowing, not a widening.
-        if !routes_after.contains(&(path.clone(), method.clone())) {
+        // Normalized to match how routes are keyed: a binding names the same
+        // route whatever the author called the capture.
+        if !routes_after.contains(&(normalize_captures(path), method.clone())) {
             continue;
         }
         let mut detail =
@@ -519,7 +522,7 @@ fn diff_authorization_policies(
         // — this still blocks — but name the pairing so a reviewer who is
         // looking at a rename can acknowledge it in one step instead of
         // wondering what was lost.
-        if let Some(gained) = gained_on.get(&(path.clone(), method.clone())) {
+        if let Some(gained) = gained_on.get(&(normalize_captures(path), method.clone())) {
             let _ = write!(
                 detail,
                 " (the same route gained: {}; a renamed resource reads as a removal plus an \
@@ -1427,6 +1430,50 @@ mod tests {
             assert_eq!(f.severity, Severity::Widening);
         }
         assert_eq!(diff(&base, &role_first), diff(&base, &none_first));
+    }
+
+    /// The router matches on shape, not on what the author called a capture:
+    /// `/users/{id}` and `/users/{user_id}` accept the same URLs. Keying on the
+    /// raw string let a rename read as one route removed (narrowing) plus one
+    /// guarded route added (neutral) — so renaming the capture in the same
+    /// change that loosened the guard slipped the widening past entirely.
+    #[test]
+    fn renaming_a_capture_does_not_hide_a_loosened_guard() {
+        let base = routes_only(&route(
+            "/users/{id}",
+            "GET",
+            "gated",
+            &["admin"],
+            &[],
+            false,
+        ));
+        let head = routes_only(&route("/users/{user_id}", "GET", "public", &[], &[], false));
+
+        let f = only(diff(&base, &head));
+        assert_eq!(f.kind, "classification_downgraded");
+        assert_eq!(f.severity, Severity::Widening);
+    }
+
+    /// A pure rename, with the guard untouched, is not a change at all.
+    #[test]
+    fn renaming_a_capture_alone_produces_no_finding() {
+        let base = routes_only(&route("/a/{id}", "GET", "gated", &["admin"], &[], false));
+        let head = routes_only(&route("/a/{ident}", "GET", "gated", &["admin"], &[], false));
+        assert!(diff(&base, &head).is_empty());
+    }
+
+    /// Capture *kinds* still differ: one segment is not the rest of the path,
+    /// so those are genuinely different URL sets and must not collapse.
+    #[test]
+    fn a_segment_capture_and_a_wildcard_are_not_the_same_route() {
+        let base = routes_only(&route("/f/{name}", "GET", "gated", &["admin"], &[], false));
+        let head = routes_only(&route("/f/{*rest}", "GET", "public", &[], &[], false));
+
+        let findings = diff(&base, &head);
+        assert!(
+            findings.iter().any(|f| f.kind == "route_added_open"),
+            "the wildcard is a new, wider route, not an edit of the old one: {findings:?}"
+        );
     }
 
     /// Two duplicate entries can be *incomparable*: `["admin"]` and `["editor"]`

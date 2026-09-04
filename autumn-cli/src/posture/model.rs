@@ -172,12 +172,43 @@ pub struct AuthorizationPolicyEntry {
 /// The stable key a route, CSRF entry or authorization binding is compared on.
 pub type RouteKey = (String, String);
 
+/// A path with its capture *names* erased but its capture *kinds* kept.
+///
+/// The router matches on shape, not on what the author called a parameter:
+/// `/users/{id}` and `/users/{user_id}` accept exactly the same URLs. Keying on
+/// the raw string made a rename read as one route removed and a different one
+/// added — both non-blocking — so renaming a capture in the same change that
+/// loosened its guard slipped the widening past the gate entirely.
+///
+/// Kinds stay distinct: `{name}` matches one segment and `{*name}` matches the
+/// rest of the path, so those are genuinely different URL sets and must not
+/// collapse together.
+#[must_use]
+pub fn normalize_captures(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut rest = path;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let Some(close) = rest[open..].find('}') else {
+            // Unbalanced: keep the remainder verbatim rather than inventing a
+            // shape, so a malformed path still compares against itself.
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let inside = &rest[open + 1..open + close];
+        out.push_str(if inside.starts_with('*') { "{*}" } else { "{}" });
+        rest = &rest[open + close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 impl RouteEntry {
     /// `(path, method)` — the identity of a mounted route. Handler name and
     /// source location are not part of it.
     #[must_use]
     pub fn key(&self) -> RouteKey {
-        (self.path.clone(), self.method.clone())
+        (normalize_captures(&self.path), self.method.clone())
     }
 
     /// Roles as a set. `#[secured("a", "b")]` admits *either* role, so ordering

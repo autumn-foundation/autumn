@@ -88,7 +88,24 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
     // block *close* the outer fence, making the quoted marker live — so
     // quoting an acknowledgment would acknowledge it.
     let mut fence: Option<(char, usize)> = None;
+    // Inside a multi-line `<!-- … -->`, which GitHub renders as nothing.
+    let mut html_comment = false;
     for line in text.lines() {
+        if line.trim() == SOURCE_SEPARATOR {
+            // A new comment body starts here, with a clean slate. Checked
+            // first, because the separator is itself an HTML comment.
+            fence = None;
+            html_comment = false;
+            continue;
+        }
+        // An acknowledgment has to be *visible* on the pull request — that is
+        // the whole value of putting it there. Text inside an HTML comment
+        // renders as nothing, so it acknowledges nothing.
+        let visible = strip_html_comments(line, &mut html_comment);
+        if visible.trim().is_empty() {
+            continue;
+        }
+        let line = visible.as_str();
         // Markdown's other code block: four spaces (or a tab) of indentation
         // renders as code, so a marker written that way is a sample, not a
         // grant. Skipping is the safe direction — the worst case is a reviewer
@@ -97,11 +114,6 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
             continue;
         }
         let trimmed = line.trim_start();
-        if trimmed == SOURCE_SEPARATOR {
-            // A new comment body starts here, with a clean slate.
-            fence = None;
-            continue;
-        }
         match (fence, fence_run(trimmed)) {
             // A fence closes only with the same character, at least as long,
             // and nothing after it — `CommonMark`'s rule.
@@ -125,6 +137,32 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
         }
     }
     acks
+}
+
+/// The part of `line` GitHub actually renders, with any `<!-- … -->` removed.
+///
+/// `open` carries the state across lines, since a comment may span several.
+fn strip_html_comments(line: &str, open: &mut bool) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    loop {
+        if *open {
+            match rest.find("-->") {
+                Some(end) => {
+                    *open = false;
+                    rest = &rest[end + 3..];
+                }
+                None => return out,
+            }
+        } else if let Some(start) = rest.find("<!--") {
+            out.push_str(&rest[..start]);
+            *open = true;
+            rest = &rest[start + 4..];
+        } else {
+            out.push_str(rest);
+            return out;
+        }
+    }
 }
 
 /// Whether `line` is indented enough to render as a Markdown code block.
@@ -297,6 +335,43 @@ mod tests {
     #[test]
     fn the_phrase_is_case_insensitive() {
         assert_eq!(parse_acks("/ACK-POSTURE 0123456789abcdef").len(), 1);
+    }
+
+    /// An HTML comment renders as nothing at all. A marker hidden in one would
+    /// acknowledge a widening while the pull request shows no such decision —
+    /// which defeats the whole point of putting the record in public.
+    #[test]
+    fn a_marker_hidden_in_an_html_comment_does_not_acknowledge() {
+        let body = "\
+Looks fine to me.
+
+<!--
+/ack-posture 0123456789abcdef
+-->
+";
+        assert!(parse_acks(body).is_empty());
+    }
+
+    /// The harvester's own separator is an HTML comment, so comment tracking
+    /// must not swallow it — otherwise one body's state leaks into the next.
+    #[test]
+    fn html_comment_tracking_does_not_swallow_the_source_separator() {
+        let harvested = format!(
+            "{SOURCE_SEPARATOR}\n<!-- an unterminated comment\n\
+             {SOURCE_SEPARATOR}\n/ack-posture 0123456789abcdef\n"
+        );
+        assert_eq!(
+            parse_acks(&harvested).len(),
+            1,
+            "a new comment body starts with a clean slate"
+        );
+    }
+
+    /// A marker after a closed comment on the same line still counts.
+    #[test]
+    fn a_marker_after_a_closed_html_comment_still_acknowledges() {
+        let acks = parse_acks("<!-- nit --> /ack-posture 0123456789abcdef  agreed\n");
+        assert_eq!(acks.len(), 1);
     }
 
     /// Markdown's *other* code block: four leading spaces. `trim_start` erased
