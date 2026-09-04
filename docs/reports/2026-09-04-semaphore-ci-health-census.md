@@ -277,7 +277,15 @@ That leaves two tiers, and they are not substitutes for each other:
      RUST_BACKTRACE: 1
      RUST_MIN_STACK: 8388608
    jobs:
-     sample:
+     # Named `test`, not `sample`: Swatinem/rust-cache keys its cache
+     # entry on the job id by default (ci.yml:270-273 notes this itself --
+     # "this job name gets its own `rust-cache` entry"), so a job called
+     # `sample` would never hit the cache the production `test` job has
+     # been warming on this branch and every sample would cold-build the
+     # entire dependency graph -- a different resource profile from the
+     # runs actually being reproduced. Reusing the job id `test` hits that
+     # same cache entry instead.
+     test:
        strategy:
          fail-fast: false
          matrix: { n: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] }
