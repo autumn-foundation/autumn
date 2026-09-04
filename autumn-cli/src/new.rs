@@ -2805,11 +2805,20 @@ mod tests {
 
     // --- issue #1593: the framework-owned file set `autumn upgrade` reconciles ---
 
+    /// The fixed `autumn_version` `owned()` renders its fixtures with —
+    /// deliberately independent of this crate's own `CARGO_PKG_VERSION`, so
+    /// this test module does not need touching on every release. Assertions
+    /// that check a rendered workflow does *not* pin to "this app's autumn
+    /// version" must check against this constant, not `CARGO_PKG_VERSION`:
+    /// the two happen to match today, but only this one is what `owned()`
+    /// actually renders with.
+    const FIXTURE_AUTUMN_VERSION: &str = "0.7.0";
+
     fn owned(opts: GenerateOptions) -> std::collections::BTreeMap<&'static str, String> {
         let vars = TemplateVars {
             project_name: "demo",
             crate_name: "demo",
-            autumn_version: "0.7.0",
+            autumn_version: FIXTURE_AUTUMN_VERSION,
             rust_version: "1.88.0",
         };
         framework_owned_files(&vars, opts)
@@ -2958,7 +2967,7 @@ mod tests {
             .expect("scaffolded");
 
         assert!(
-            !workflow.contains("v0.7.0"),
+            !workflow.contains(&format!("v{FIXTURE_AUTUMN_VERSION}")),
             "posture-gate.yml must not pin the installed CLI to this app's \
              autumn version: {workflow}"
         );

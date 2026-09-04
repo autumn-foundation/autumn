@@ -154,7 +154,9 @@ jobs:
       # the version pinned in this app's Cargo.toml, so the gate starts
       # working on its own the moment a release ships a command it needs
       # (issue #2495) — and scan raw html! markup for a11y violations. This is
-      # an enforcing gate: an a11y violation fails the job.
+      # an enforcing gate: an a11y violation fails the job. See
+      # posture-gate.yml's "Install the autumn CLI" step for why this fetches
+      # install.sh from trunk-dev rather than a version tag.
       - name: Accessibility (a11y) verify
         run: |
           curl -fsSL "https://raw.githubusercontent.com/autumn-foundation/autumn/trunk-dev/scripts/install.sh" \
