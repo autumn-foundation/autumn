@@ -776,6 +776,11 @@ def _rust_skeleton(body):
 # rule written for shell and reading as a real accessor.
 HASH_NEEDS_SPACE = ('.sh', '.bash', '.zsh', '.yml', '.yaml', '.env', '.example')
 
+# Where a quoted scalar may legitimately continue onto the next line, so the
+# closing quote is not read as a new opener. YAML only, and gated further on the
+# quote having opened at a value position — see `_hash_uncommented`.
+YAML_SCALARS = ('.yml', '.yaml')
+
 # HCL accepts THREE comment forms — `#`, `//` and `/* … */` — so Terraform files
 # get the C-style scanner as well as the hash one. It is a superset rather than
 # a swap: a `//` in a shell or YAML file is a path, not a comment, which is why
@@ -1158,7 +1163,7 @@ def _sql_uncommented(body):
     return ''.join(out)
 
 
-def _hash_uncommented(body, shell_like=False):
+def _hash_uncommented(body, shell_like=False, carry_quotes=False):
     """Drop `#` comments, respecting the language's rule for where one starts.
 
     `shell_like` governs two rules that go together, which is why it is one
@@ -1175,12 +1180,33 @@ def _hash_uncommented(body, shell_like=False):
     inside an imaginary string and survives.
 
     Quote state is tracked per line rather than across the file: an unbalanced
-    quote then costs one line, not the rest of the file.
+    quote then costs one line, not the rest of the file. That bound is doing
+    real work and is not a shortcut — the sibling gates embed their Python in
+    `<<'PYEOF'` heredocs, and this pass runs before the heredoc one, so a single
+    apostrophe inside that Python opens a span. Carrying quote state across
+    lines unconditionally left **1192 comment lines** in the tree surviving as
+    code, every one of them able to bless a name. Measured before, not after.
+
+    `carry_quotes` is the one place a quote may legitimately continue: a YAML
+    quoted scalar. It is carried only when the open quote began at a VALUE
+    position — straight after a `:` or `-`, or as the whole of the value —
+    because that is the only place YAML lets a quoted scalar start. An
+    apostrophe inside an unquoted scalar (`name: it's fine`) opens nothing,
+    which is what stops one stray quote swallowing every comment below it.
     """
-    out = []
+    out, carry, qpos = [], None, 0
     for l in body.splitlines():
-        q, cut, esc = None, None, False
-        for i, c in enumerate(l):
+        q, cut, esc, start = carry, None, False, 0
+        if carry is not None:
+            # Inside a scalar that opened on an earlier line: everything up to
+            # its closing quote is string, and the line is code again after it.
+            end = l.find(carry)
+            if end < 0:
+                out.append(l)
+                continue
+            q, start = None, end + 1
+        for i in range(start, len(l)):
+            c = l[i]
             if esc:
                 esc = False
                 continue
@@ -1191,12 +1217,15 @@ def _hash_uncommented(body, shell_like=False):
                 if c == q:
                     q = None
             elif c in '"\'':
-                q = c
+                q, qpos = c, i
             elif c == '#' and (not shell_like or i == 0
                                or l[i - 1].isspace() or l[i - 1] in ';&|()<>'):
                 cut = i
                 break
         out.append(l if cut is None else l[:cut])
+        before = l[:qpos].rstrip() if q else ''
+        carry = (q if carry_quotes and q and cut is None
+                 and (before == '' or before[-1] in ':-') else None)
     return '\n'.join(out)
 
 
@@ -1206,7 +1235,7 @@ def hash_needs_space(rel):
 
 
 def uncommented(body, leader='//', needs_space=False, also_slash=False,
-                also_block=False):
+                also_block=False, carry_quotes=False):
     """Drop comments, keeping string literals and line numbering intact."""
     if leader == '//':
         return _rust_uncommented(body)
@@ -1219,7 +1248,7 @@ def uncommented(body, leader='//', needs_space=False, also_slash=False,
             body = _ps_uncommented(body)
         if also_slash:
             body = _rust_uncommented(body)
-        return _hash_uncommented(body, needs_space)
+        return _hash_uncommented(body, needs_space, carry_quotes)
     return body
 
 
@@ -1888,7 +1917,8 @@ def source_tokens(root):
         body = uncommented(body, comment_leader(rel),
                           hash_needs_space(rel),
                           effective_suffix(rel) in HASH_AND_SLASH,
-                          effective_suffix(rel) in HASH_BLOCK)
+                          effective_suffix(rel) in HASH_BLOCK,
+                          effective_suffix(rel) in YAML_SCALARS)
         if rel.endswith('.rs'):
             body = untested(body)
         # Heredocs FIRST: blanking single quotes first erases the `'EOF'`
@@ -3308,6 +3338,29 @@ def self_test():
     case('a CSS url survives its block-only rule',
          uncommented('a{background:url(https://x/y)}\n', comment_leader('a.css')),
          'a{background:url(https://x/y)}\n')
+    # A YAML quoted scalar may span lines, so the closing quote on the
+    # continuation line was reading as a new opener and the `#` after it
+    # survived as code.
+    case('a multi-line YAML scalar does not reopen the quote',
+         ASSIGNED_PREFIX.findall(uncommented(
+             'value: "first\n second" # AUTUMN_LOG__LEVL=x cmd\n',
+             comment_leader('a.yml'), hash_needs_space('a.yml'),
+             False, False, True)), [])
+    # …carried ONLY from a value position. An apostrophe in an unquoted scalar
+    # opens nothing — carrying from one left 1192 comment lines in this tree
+    # surviving as code, every one of them able to bless a name.
+    case('an apostrophe in an unquoted YAML scalar carries nothing',
+         ASSIGNED_PREFIX.findall(uncommented(
+             "name: it's fine\nother: x # AUTUMN_LOG__LEVL=y cmd\n",
+             comment_leader('a.yml'), hash_needs_space('a.yml'),
+             False, False, True)), [])
+    # …and the bound the carry does NOT relax: this pass runs before the heredoc
+    # one, so an apostrophe in a sibling gate's embedded Python must still cost
+    # one line rather than every comment below it.
+    case('a stray quote outside YAML still costs one line',
+         _hash_uncommented("x = 'a\n# AUTUMN_LOG__LEVL=y cmd\nz = 1\n",
+                           True).splitlines(),
+         ["x = 'a", '', 'z = 1'])
     case('a double-quoted heredoc body is data',
          ASSIGNED_PREFIX.findall(_shell_literals(_shell_heredocs(
              'cat <<"EOF"\nAUTUMN_LOG__LEVL=x cmd\nEOF\n'))),
