@@ -736,6 +736,19 @@ HASH_AND_SLASH = ('.tf', '.tfvars', '.hcl')
 PS_BLOCK = re.compile(r'<#.*?#>', re.S)
 HASH_BLOCK = ('.ps1', '.psm1')
 
+# Bash expands nothing inside single quotes, so `'${AUTUMN_LOG__LEVL}'` names no
+# variable — it is a string that happens to contain the syntax. Blanked for the
+# shell family only: YAML single-quotes freely and its `${…}` is still
+# interpolated by whatever reads the file, docker-compose among them.
+SHELL_QUOTED = ('.sh', '.bash', '.zsh')
+SINGLE_QUOTED = re.compile(r"'[^']*'")
+
+
+def _shell_literals(body):
+    """Blank single-quoted spans, per line so an odd quote costs one line."""
+    return '\n'.join(SINGLE_QUOTED.sub(lambda m: ' ' * len(m.group(0)), l)
+                     for l in body.splitlines())
+
 
 def _ps_uncommented(body):
     return PS_BLOCK.sub(lambda m: re.sub(r'[^\n]', ' ', m.group(0)), body)
@@ -1331,6 +1344,8 @@ def source_tokens(root):
                           effective_suffix(rel) in HASH_BLOCK)
         if rel.endswith('.rs'):
             body = untested(body)
+        if effective_suffix(rel) in SHELL_QUOTED:
+            body = _shell_literals(body)
         lines = body.splitlines()
         # Names this file assigns without exporting them, and without handing
         # them to a command: its own variables.
@@ -1492,10 +1507,17 @@ def scan(files, read, leaves, built, tokens):
             # first because it is invisible to every pattern that follows.
             for m in NEAR.finditer(line):
                 head = m.group(1)
+                # An inserted separator splits the namespace across the boundary
+                # this pattern uses — `AUTU_MN_LOG__LEVEL` leaves `AUTU` as the
+                # head — so the first segment of the tail is joined back on and
+                # judged too. `RUST_LOG` and `DATABASE_URL` survive that, being
+                # nowhere near either way.
+                joined = head + '_' + m.group(2).split('_')[0]
                 # A casing typo of the namespace is zero edits away and still
                 # unreadable by the runtime; anything else must be one edit off.
                 if head == 'AUTUMN' or not (head.upper() == 'AUTUMN'
-                                            or near_miss(head.upper())):
+                                            or near_miss(head.upper())
+                                            or near_miss(joined.upper())):
                     continue
                 if at[i] in waived.get(m.group(0), ()):
                     stats['waived'] += 1
@@ -1921,6 +1943,26 @@ def self_test():
                  leaves, built, tokens)
     case('and reported', len(dp), 1)
     # The missing edit can be the separator itself: `AUTUMNLOG__LEVEL`.
+    # An INSERTED separator splits the namespace across the pattern's own
+    # boundary, leaving `AUTU` as the head — so the first tail segment is joined
+    # back on and judged too.
+    case('an underscore inside the namespace is scanned',
+         [m.group(0) for m in NEAR.finditer('export AUTU_MN_LOG__LEVEL=debug')
+          if near_miss((m.group(1) + '_' + m.group(2).split('_')[0]).upper())],
+         ['AUTU_MN_LOG__LEVEL'])
+    _, du = scan(['d.md'], lambda _: 'export AUTU_MN_LOG__LEVEL=debug\n',
+                 leaves, built, tokens)
+    case('an underscore inside the namespace is reported', len(du), 1)
+    _, dun = scan(['d.md'], lambda _: 'export RUST_LOG=debug\nDATABASE_URL=x y\n',
+                  leaves, built, tokens)
+    case('and a joined head that is nobody\'s typo is not', len(dun), 0)
+    # Bash expands nothing inside single quotes.
+    case('a single-quoted expansion names no variable',
+         EXPANDED.findall(_shell_literals("printf '%s' '${AUTUMN_LOG__LEVL}'")),
+         [])
+    case('…while an unquoted one still does',
+         EXPANDED.findall(_shell_literals('echo "${AUTUMN_LOG__LEVEL}"')),
+         ['AUTUMN_LOG__LEVEL'])
     case('a fused namespace is scanned',
          [m.group(0) for m in FUSED.finditer('export AUTUMNLOG__LEVEL=debug')
           if fused_namespace(m.group(1))], ['AUTUMNLOG__LEVEL'])
