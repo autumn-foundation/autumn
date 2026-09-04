@@ -1131,6 +1131,15 @@ def _shell_heredocs(body):
             if masked.endswith('\\') and not _escaped(masked, len(masked) - 1):
                 logical += line[:-1]
                 continue
+            # A backslash is not the only continuation. `cat <<'ONE' |` leaves
+            # the pipeline unfinished, so bash keeps parsing the next line and
+            # collects ITS delimiters too before consuming any body — the same
+            # for `&&` and `||`. Only a backslash was recognised, so the second
+            # opener was eaten as the first body. A bare `&` is NOT one: it
+            # terminates the command, and the body starts on the next line.
+            if masked.rstrip().endswith(('|', '&&', '|&')):
+                logical += line
+                continue
             queue.extend(_heredoc_openers(logical + line))
             logical = ''
             continue
@@ -1930,6 +1939,17 @@ def untested(body):
     return '\n'.join(out)
 
 
+def shell_shapes(rel):
+    """Whether the SHELL use-shapes apply to this file at all.
+
+    `NAME=…`, `export NAME=…`, `ARG/ENV NAME` and `${NAME}` are shell grammar.
+    In Rust they are text inside a literal, and Rust interpolates none of it.
+    Rust's evidence is its bindings and its accessor calls, which are read
+    separately and are what actually carried the two names this used to add.
+    """
+    return not rel.endswith('.rs')
+
+
 def source_tokens(root):
     """Every `AUTUMN_*` variable the tracked NON-markdown tree actually uses.
 
@@ -1994,15 +2014,26 @@ def source_tokens(root):
             # at all. `autumn-cli/src/db/retention.rs` frames a line of stdout
             # with the prefix `AUTUMN_DB_RETENTION_REPORT=`, and a test fixture
             # contains that framed line verbatim — neither is an env read, and
-            # both were putting the name into the truth set. `${NAME}` has no
-            # such ambiguity: it is a reference wherever it appears, including
-            # inside a Rust string, which is how the media plugin passes
-            # `${AUTUMN_MEDIA__FFMPEG__BIN}` through to a service file.
-            if not rel.endswith('.rs'):
+            # both were putting the name into the truth set.
+            #
+            # `${NAME}` is a SHELL rule too, and it used to be applied to Rust
+            # as well on the grounds that a template string reaches a shell
+            # eventually. That is the mention standard this gate exists to
+            # reject: Rust expands nothing, so `${AUTUMN_X}` in a literal is
+            # text, and whether anything ever interpolates it is not visible
+            # here. Measured before removing it, since a rung that stops
+            # carrying something is how a correct page gets reported: it saw
+            # exactly two names, `AUTUMN_ADMIN_SECRET` and
+            # `AUTUMN_SECURITY__SIGNING_SECRET`, and BOTH are carried by real
+            # evidence elsewhere — the first by `std::env::var(…)` twice in the
+            # same generated file, the second by five compose files. The truth
+            # set is 430 with this rung and 430 without it.
+            if shell_shapes(rel):
                 tokens.update(ASSIGNED.findall(line))
                 tokens.update(ASSIGNED_PREFIX.findall(line))
                 tokens.update(DECLARED.findall(line))
-            tokens.update(v for v in EXPANDED.findall(line) if v not in local)
+                tokens.update(v for v in EXPANDED.findall(line)
+                              if v not in local)
             tokens.update(v for _, v in BOUND.findall(line))
         # A quoted name counts when it is the accessor's own ARGUMENT, not when
         # it merely shares a neighbourhood with one. The four-line window this
@@ -3363,6 +3394,25 @@ def self_test():
          _shell_heredocs("cat <<'ONE' \\\n<<'TWO' >/dev/null\nfirst\nONE\n"
                          'AUTUMN_LOG__LEVL=x cmd\nTWO\nkeep\n').splitlines(),
          ["cat <<'ONE' \\", "<<'TWO' >/dev/null", '', 'ONE', '', 'TWO', 'keep'])
+    # …and a backslash is not the only continuation: an unfinished pipeline or
+    # `&&` chain keeps parsing too. A bare `&` does NOT — it terminates the
+    # command, and the body starts on the next line.
+    case('an unfinished pipeline opens both its heredocs',
+         [_shell_heredocs(f"cat <<'ONE' {op}\ncat <<'TWO'\nfirst\nONE\n"
+                          'AUTUMN_LOG__LEVL=x cmd\nTWO\nkeep\n').splitlines()
+          for op in ('|', '&&')],
+         [[f"cat <<'ONE' {op}", "cat <<'TWO'", '', 'ONE', '', 'TWO', 'keep']
+          for op in ('|', '&&')])
+    case('…while a backgrounding `&` ends the command',
+         _shell_heredocs("cat <<'ONE' &\nfirst\nONE\nkeep\n").splitlines(),
+         ["cat <<'ONE' &", '', 'ONE', 'keep'])
+    # `${NAME}` is a shell rule, and Rust expands nothing. Measured before
+    # removing it: the rung saw exactly two names, both carried by real
+    # evidence elsewhere, and the truth set is 430 either way.
+    case('the shell shapes, `${NAME}` included, do not apply to Rust',
+         (shell_shapes('autumn/src/config.rs'),
+          shell_shapes('docker-compose.yml'), shell_shapes('scripts/x.sh')),
+         (False, True, True))
     # SQL is a third comment family, and the 171 tracked migrations were reading
     # a `-- AUTUMN_LOG__LEVL=x cmd` line as a shell assignment.
     case('a SQL comment is not a use',
