@@ -1019,9 +1019,51 @@ COMPOSE_DECLARED = re.compile(
 # shell as the executable, so its arguments ARE expanded. The first array
 # element decides, which is exactly what Docker does with it.
 DOCKER_EXEC = re.compile(r'^\s*(?:RUN|CMD|ENTRYPOINT)\s*\[')
+DOCKER_RUN = re.compile(r'^\s*(?:RUN|CMD|ENTRYPOINT)\s+')
 DOCKER_FIRST = re.compile(r'\[\s*"([^"]*)"')
 DOCKER_SHELLS = ('sh', 'bash', 'zsh', 'ash', 'dash', 'busybox',
                  'pwsh', 'powershell')
+
+
+def _docker_commands(body):
+    """A Dockerfile with its INSTRUCTION KEYWORDS blanked, and the exec-form
+    lines that expand nothing.
+
+    `RUN` is not part of the command any more than `command:` is in compose:
+    `RUN AUTUMN_X=1 exec app` goes through `/bin/sh -c` and really does export
+    it, but leaving the keyword made `RUN` the command word and the assignment
+    one of its arguments. The exec form is the same construct once more — a
+    payload after `-c` when the executable is a shell, and inert otherwise.
+    This is the fifth spelling of one rule; it is here because auditing the
+    other four turned it up, not because anything reported it.
+    """
+    out, literal, active = [], set(), False
+    for index, l in enumerate(body.splitlines()):
+        if active:
+            out.append(l)
+            if index - 1 in literal:
+                literal.add(index)
+            active = l.rstrip().endswith('\\')
+            continue
+        m = DOCKER_RUN.match(l)
+        if not m:
+            out.append(l)
+            continue
+        head, rest = m.group(0), l[m.end():]
+        active = l.rstrip().endswith('\\')
+        if not rest.lstrip().startswith('['):
+            # Shell form: the keyword is not a word of the command.
+            out.append(' ' * len(head) + rest)
+            continue
+        span = _payload_span(rest)
+        if span is None:
+            literal.add(index)
+            out.append(l)
+            continue
+        at = len(head)
+        out.append(' ' * (at + span[0]) + rest[span[0]:span[1]]
+                   + ' ' * (len(rest) - span[1]))
+    return '\n'.join(out), literal
 
 
 def _docker_literal(body):
@@ -1071,52 +1113,60 @@ def _command_option(word):
             and 'c' in opt and len(opt) <= 4)
 
 
+def _command_tokens(text):
+    """The `(start, end)` spans of a command's words, in EITHER spelling.
+
+    One tokeniser, because the bare form and the JSON list form are the same
+    construct written two ways — and writing a rule for one of them and not the
+    other is how the last several rounds of findings arrived. The list form
+    separates on commas and quotes each word; the bare form separates on
+    whitespace.
+    """
+    n, i, spans = len(text), 0, []
+    while i < n and text[i] in ' \t':
+        i += 1
+    listform = i < n and text[i] == '['
+    if listform:
+        i += 1
+    while i < n:
+        while i < n and (text[i] in ' \t' or (listform and text[i] == ',')):
+            i += 1
+        if i >= n or (listform and text[i] == ']'):
+            break
+        if text[i] in '\'"':
+            quote, i = text[i], i + 1
+            start = i
+            while i < n and text[i] != quote:
+                i += 1
+            spans.append((start, i))
+            i += 1
+            continue
+        start, stop = i, ' \t,]' if listform else ' \t'
+        while i < n and text[i] not in stop:
+            i += 1
+        spans.append((start, i))
+    return spans
+
+
 def _payload_span(text):
     """Where the command STRING sits in `text`, or None.
 
     `command: sh -c 'AUTUMN_X=1 exec app'` executes the quoted argument, and
     scanning the outer line instead sees `sh` as the command word and the
-    assignment as one of its arguments — so the assignment never counted. The
-    sequence form already extracts this argument; the inline form must too.
+    assignment as one of its arguments — so the assignment never counted.
     """
-    i, n, seen, first = 0, len(text), False, True
-    while i < n:
-        while i < n and text[i] in ' \t':
-            i += 1
-        if i >= n:
-            return None
-        start, quote = i, ''
-        if text[i] in '\'"':
-            quote = text[i]
-            i += 1
-            while i < n and text[i] != quote:
-                i += 1
-            end, i = i, i + 1
-            start += 1
-        else:
-            while i < n and text[i] not in ' \t':
-                i += 1
-            end = i
-        word = text[start:end]
-        if first:
-            first = False
-            if pathlib.PurePath(word.strip()).name.lower().rstrip('.exe') \
-                    not in DOCKER_SHELLS and _shell_named(word) not in DOCKER_SHELLS:
-                return None
-            continue
-        if seen:
-            return (start, end)
-        if _command_option(word):
-            seen = True
+    spans = _command_tokens(text)
+    if not spans or _shell_named(text[spans[0][0]:spans[0][1]]) not in DOCKER_SHELLS:
+        return None
+    for n, (start, end) in enumerate(spans[1:], 1):
+        if _command_option(text[start:end]):
+            return spans[n + 1] if n + 1 < len(spans) else None
     return None
 
 
 def _runs_shell(value):
     """Whether a command value runs a shell OVER a command string."""
-    words = _command_words(value)
-    return (bool(words)
-            and pathlib.PurePath(words[0]).name in DOCKER_SHELLS
-            and any(_command_option(w) for w in words[1:]))
+    return _payload_span(value) is not None
 
 
 def _command_words(value):
@@ -1339,7 +1389,7 @@ def _yaml_decode(scalar):
 
 
 def _yaml_blocks(body, interpolated=False, consumer='actions',
-                 assignments=False):
+                 assignments=False, env_lines=None):
     """Blank what the consumer never executes, keeping line numbers intact.
 
     In a compose file only the non-executed BLOCK scalars go, since every value
@@ -1475,9 +1525,15 @@ def _yaml_blocks(body, interpolated=False, consumer='actions',
                                    l.partition(':')[2]))
         # The ASSIGNMENT view of a compose file keeps only what can name a
         # variable to a process; the expansion view keeps everything.
-        keep = ((executed or any(k == COMPOSE_ASSIGNS for _, k in stack))
-                if (interpolated and assignments)
+        declares = any(k == COMPOSE_ASSIGNS for _, k in stack)
+        keep = ((executed or declares) if (interpolated and assignments)
                 else (interpolated or executed))
+        # `COMPOSE_DECLARED` reads a SHAPE, so it has to be told where that
+        # shape means a declaration. The assignment view also keeps shell
+        # payloads, and `AUTUMN_X=1` alone in one is a local, not an export —
+        # counting it as a declaration would admit a name nothing publishes.
+        if declares and env_lines is not None:
+            env_lines.add(len(out))
         if executed:
             # The quotes around an inline scalar are YAML's, and YAML removes
             # them before the command reaches the shell — so
@@ -3249,19 +3305,20 @@ def source_tokens(root):
         if effective_suffix(rel) == '.rs':
             body = untested(body)
         interpolated = yaml_file and _yaml_interpolated(rel)
-        yaml_code = None
+        yaml_code, declared_lines = None, set()
         # A Dockerfile's exec-form lines expand nothing — see `_docker_literal`.
-        literal = (_docker_literal(body)
-                   if pathlib.PurePath(rel).name.split('.')[0] == 'Dockerfile'
-                   or pathlib.PurePath(rel).name.split('.')[0] == 'Containerfile'
-                   else set())
+        literal = set()
+        if pathlib.PurePath(rel).name.split('.')[0] in ('Dockerfile',
+                                                        'Containerfile'):
+            body, literal = _docker_commands(body)
         if yaml_file:
             consumer = _yaml_consumer(rel, body)
             # Compose needs its own ASSIGNMENT view — see `COMPOSE_ASSIGNS`.
             # Everywhere else the two views coincide, because a non-compose
             # file keeps only what its consumer executes to begin with.
             if interpolated:
-                yaml_code = _yaml_blocks(body, interpolated, consumer, True)
+                yaml_code = _yaml_blocks(body, interpolated, consumer, True,
+                                         declared_lines)
             body = _yaml_blocks(body, interpolated, consumer)
         # Heredocs FIRST: blanking single quotes first erases the `'EOF'`
         # marker, and the heredoc body then reads as commands. The self-test for
@@ -3392,7 +3449,7 @@ def source_tokens(root):
                 # The assignment view has already narrowed these lines to the
                 # `environment:` section, so the shape is all that is left to
                 # read.
-                if interpolated:
+                if interpolated and n in declared_lines:
                     tokens.update(COMPOSE_DECLARED.findall(code_lines[n]))
                 if n not in literal:
                     tokens.update(v for v in EXPANDED.findall(line)
@@ -5182,15 +5239,17 @@ def self_test():
              '      - AUTUMN_BARE\n      AUTUMN_MAP: value\n'
              '    command: AUTUMN_CMD=3 serve\n'
              '    entrypoint: ["sh", "-lc", "AUTUMN_SH=1 run"]\n')
-    _cav, _cev = (_yaml_blocks(_comp, True, 'compose', True),
+    _cenv = set()
+    _cav, _cev = (_yaml_blocks(_comp, True, 'compose', True, _cenv),
                   _yaml_blocks(_comp, True, 'compose'))
     case('a compose file has an expansion view and an assignment view',
          (ASSIGNED_PREFIX.findall(_cav), ASSIGNED_ANY.findall(_cav),
-          COMPOSE_DECLARED.findall(_cav),
+          [n for i, line in enumerate(_cav.splitlines()) if i in _cenv
+           for n in COMPOSE_DECLARED.findall(line)],
           ASSIGNED_PREFIX.findall(_cev),
           len(_cev.splitlines()) >= len(_cav.splitlines())),
-         ([], ['AUTUMN_ENVLIST'],
-          ['AUTUMN_ENVLIST', 'AUTUMN_BARE', 'AUTUMN_MAP'], [], True))
+         (['AUTUMN_SH'], ['AUTUMN_ENVLIST', 'AUTUMN_SH'],
+          ['AUTUMN_ENVLIST', 'AUTUMN_BARE', 'AUTUMN_MAP'], ['AUTUMN_SH'], True))
     # A compose command written as a SEQUENCE is a real command: the first
     # item names the executable and the block item is the payload.
     _seqc = ('services:\n  app:\n    command:\n      - bash\n      - -c\n'
@@ -5214,6 +5273,27 @@ def self_test():
          (ASSIGNED_PREFIX.findall(_yaml_blocks(_seql, True, 'compose', True)),
           ASSIGNED_PREFIX.findall(_yaml_blocks(_seqi, True, 'compose', True))),
          ([], ['AUTUMN_INLINE']))
+    # ONE construct, five spellings — found by auditing the other four rather
+    # than by a report. A rule taught to one spelling is a rule the next
+    # spelling does not have.
+    _five = [
+        ("services:\n  a:\n    command: sh -c 'AUTUMN_A=1 exec app'\n", 'compose'),
+        ('services:\n  a:\n    command: ["sh", "-c", "AUTUMN_B=1 exec app"]\n',
+         'compose'),
+        ('services:\n  a:\n    command:\n      - sh\n      - -c\n      - |\n'
+         '        AUTUMN_C=1 exec app\n', 'compose'),
+        ('services:\n  a:\n    command:\n      - sh\n      - -c\n'
+         '      - AUTUMN_D=1 exec app\n', 'compose')]
+    case('one shell payload, every spelling it has',
+         [ASSIGNED_PREFIX.findall(_yaml_blocks(y, True, c, True))
+          for y, c in _five]
+         + [ASSIGNED_PREFIX.findall(_docker_commands(
+             'RUN ["sh", "-c", "AUTUMN_E=1 exec app"]\n')[0]),
+            ASSIGNED_PREFIX.findall(_docker_commands(
+                'RUN AUTUMN_F=1 exec app\n')[0]),
+            sorted(_docker_commands('RUN ["/app/x", "AUTUMN_G=1"]\n')[1])],
+         [['AUTUMN_A'], ['AUTUMN_B'], ['AUTUMN_C'], ['AUTUMN_D'],
+          ['AUTUMN_E'], ['AUTUMN_F'], [0]])
     # Compose may quote either declaration spelling.
     case('a quoted compose declaration is still a declaration',
          COMPOSE_DECLARED.findall('      - AUTUMN_A=1\n      "AUTUMN_B": v\n'
