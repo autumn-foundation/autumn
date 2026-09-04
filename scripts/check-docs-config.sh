@@ -637,6 +637,12 @@ def _rust_skeleton(body):
 # rule written for shell and reading as a real accessor.
 HASH_NEEDS_SPACE = ('.sh', '.bash', '.zsh', '.yml', '.yaml', '.env', '.example')
 
+# HCL accepts THREE comment forms — `#`, `//` and `/* … */` — so Terraform files
+# get the C-style scanner as well as the hash one. It is a superset rather than
+# a swap: a `//` in a shell or YAML file is a path, not a comment, which is why
+# this is a named set and not the default.
+HASH_AND_SLASH = ('.tf', '.tfvars', '.hcl')
+
 
 def _hash_uncommented(body, shell_like=False):
     """Drop `#` comments, respecting the language's rule for where one starts.
@@ -677,17 +683,16 @@ def _hash_uncommented(body, shell_like=False):
 
 def hash_needs_space(rel):
     """Whether this file type needs whitespace before a `#` to open a comment."""
-    p = pathlib.PurePath(rel)
-    if p.suffix == '.tmpl':
-        p = pathlib.PurePath(p.stem)
-    return p.suffix in HASH_NEEDS_SPACE
+    return effective_suffix(rel) in HASH_NEEDS_SPACE
 
 
-def uncommented(body, leader='//', needs_space=False):
+def uncommented(body, leader='//', needs_space=False, also_slash=False):
     """Drop comments, keeping string literals and line numbering intact."""
     if leader == '//':
         return _rust_uncommented(body)
     if leader == '#':
+        if also_slash:
+            body = _rust_uncommented(body)
         return _hash_uncommented(body, needs_space)
     return body
 
@@ -1100,7 +1105,8 @@ def source_tokens(root):
         # the note is often about a name that is deliberately wrong. Neither is
         # a test, which names a variable to prove the runtime ignores it.
         body = uncommented(body, comment_leader(rel),
-                          hash_needs_space(rel))
+                          hash_needs_space(rel),
+                          effective_suffix(rel) in HASH_AND_SLASH)
         if rel.endswith('.rs'):
             body = untested(body)
         lines = body.splitlines()
@@ -1144,11 +1150,21 @@ def source_tokens(root):
 
 
 def corpus(root):
+    """The reader-facing pages, including the ones written into a new project.
+
+    A markdown TEMPLATE is documentation a reader will hold: `new.rs`
+    `include_str!`s `templates/README.md.tmpl` and writes it as every scaffolded
+    application's `README.md`, so its config keys reach more readers than most
+    guide pages. Excluding it from the truth set was right — it is prose, not
+    source — but excluding it from the CORPUS as well left it unchecked in both
+    directions, which is how a page ends up with no owner at all.
+    """
     # NUL-delimited so a path containing whitespace is not split into fragments.
-    out = subprocess.run(['git', 'ls-files', '-z', '*.md'], cwd=root,
-                         capture_output=True, text=True).stdout
+    out = subprocess.run(['git', 'ls-files', '-z', '*.md', '*.md.tmpl'],
+                         cwd=root, capture_output=True, text=True).stdout
     return [f for f in out.split('\0')
-            if f and (f.startswith(INCLUDE_DIRS) or f in INCLUDE_FILES)]
+            if f and (f.startswith(INCLUDE_DIRS) or f in INCLUDE_FILES
+                      or f.endswith('.md.tmpl'))]
 
 
 # -------------------------------------------------------------- resolution
@@ -2099,6 +2115,19 @@ def self_test():
          (effective_suffix('autumn-cli/src/templates/README.md.tmpl'),
           effective_suffix('Cargo.toml.tmpl'), effective_suffix('x.rs')),
          ('.md', '.toml', '.rs'))
+    # …and it is a page a reader holds: `new.rs` writes it as every scaffolded
+    # app's `README.md`, so it belongs in the CORPUS rather than merely being
+    # skipped as source.
+    case('a markdown template is a checked page',
+         'autumn-cli/src/templates/README.md.tmpl' in corpus(ROOT), True)
+    # HCL takes all three comment forms; a `//` in shell or YAML is a path.
+    case('Terraform strips its slash forms too',
+         uncommented('// export AUTUMN_LOG__LEVL=x\nreal = 1 # note', '#',
+                     also_slash=True),
+         '\nreal = 1 ')
+    case('a shell path is not a comment',
+         uncommented('cp //server/share /tmp # note', '#', needs_space=True),
+         'cp //server/share /tmp ')
     # Setting a variable publishes it, as `export` does; removing one does not.
     case('a write that publishes is an accessor',
          bool(ACCESSOR.search('std::env::set_var("AUTUMN_SYNC__DB_PATH", p)')),
