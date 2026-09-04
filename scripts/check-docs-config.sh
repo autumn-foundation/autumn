@@ -757,49 +757,64 @@ def _strip_generated_comments(body, cls):
     return ''.join(out)
 
 
-def _generated_nested(body):
-    """A mask of the characters inside a STRING LITERAL of generated code.
+def _generated_data(body):
+    """A mask of the string content that is NOT generated code.
 
-    A generated read is a real read: `autumn-cli/src/generate/admin.rs` emits
-    the reader's test file as a Rust string, and the
-    `std::env::var(\\"AUTUMN_TEST_ADMIN_SESSION\\")` inside it is something the
-    reader's project will run. One level further in, though, a string is data
-    again — `const TEXT: &str = r#\\"std::env::var(\\"AUTUMN_X\\")\\"#;` inside
-    such a template DEFINES a string that merely looks like a call.
+    Two kinds of data live inside Rust strings, and neither is a call.
 
-    So the question is where the accessor SITS, not where the name does: the
-    name is always inside a nested literal, because it is the argument. This
-    marks the interiors only, and the caller tests the position of the accessor
-    token itself.
+    A NESTED literal inside a template is data one level further in:
+    `const T: &str = \"std::env::var(\\\"AUTUMN_X\\\")\";` inside an emitted
+    program defines a string that merely looks like a call. So the question is
+    where the accessor SITS, not where the name does — the name is always
+    inside a literal, because it is the argument.
+
+    And a SINGLE-LINE string is not a program at all. A template is a file, so
+    it has lines; a one-liner is a CSS declaration, a message, a path. `var(`
+    appears in 55 single-line strings in this tree, every one of them
+    `var(--text-muted)` in an inline style, and a one-line
+    `const HELP: &str = r#\"std::env::var(\\\"AUTUMN_X\\\")\"#;` is that same
+    shape with a name in it. Measured: every real generated accessor here sits
+    in a region of at least eight lines, so the boundary is not close. A
+    generator emitting a one-line snippet would fail CLOSED, which is visible.
     """
     cls = _rust_classes(body)
-    nested, i, n, instr = bytearray(len(body)), 0, len(body), False
+    data, i, n = bytearray(len(body)), 0, len(body)
     while i < n:
         if cls[i] != 's':
-            instr, i = False, i + 1
-            continue
-        if i == 0 or cls[i - 1] != 's':
-            j = body.find('"', i)          # step over the region's own opener
-            i, instr = (n if j < 0 else j + 1), False
-            continue
-        c = body[i]
-        if c == '\\':
-            if body[i + 1:i + 2] == '"':
-                instr = not instr
-            elif instr:
-                nested[i] = 1
-                if i + 1 < n:
-                    nested[i + 1] = 1
-            i += 2
-            continue
-        if c == '"':
-            instr = not instr
             i += 1
             continue
-        if instr:
-            nested[i] = 1
-        i += 1
-    return nested
+        start = i
+        while i < n and cls[i] == 's':
+            i += 1
+        # "Has lines" covers both spellings: a raw template carries real
+        # newlines, and a `format!("fn m() {\\n…")` one carries the escape.
+        region = body[start:i]
+        if '\n' not in region and '\\n' not in region:
+            for k in range(start, i):
+                data[k] = 1
+            continue
+        j = body.find('"', start)          # step over the region's own opener
+        j = i if j < 0 or j >= i else j + 1
+        instr = False
+        while j < i:
+            c = body[j]
+            if c == '\\':
+                if body[j + 1:j + 2] == '"':
+                    instr = not instr
+                elif instr:
+                    data[j] = 1
+                    if j + 1 < i:
+                        data[j + 1] = 1
+                j += 2
+                continue
+            if c == '"':
+                instr = not instr
+                j += 1
+                continue
+            if instr:
+                data[j] = 1
+            j += 1
+    return data
 
 
 def _rust_uncommented(body):
@@ -1197,12 +1212,16 @@ def _heredoc_openers(line):
     return found
 
 
-def _shell_heredocs(body):
+def _shell_heredocs(body, code=False):
     """Blank the bodies of quoted heredocs, keeping line numbering intact.
 
-    An UNQUOTED body is not blanked — `<<EOF` expands `${AUTUMN_X}`, so that is
-    a real reference — but it IS consumed, because its length is what puts the
-    next heredoc's body in the right place.
+    An UNQUOTED body is not blanked in the expansion view — `<<EOF` expands
+    `${AUTUMN_X}`, so that is a real reference — but it IS consumed, because its
+    length is what puts the next heredoc's body in the right place.
+
+    `code` asks for the ASSIGNMENT view, where an unquoted body goes too: its
+    expansions run, but its lines are data being written, not commands the
+    shell executes, so `AUTUMN_X=v cmd` in one is not an assignment.
     """
     out, queue, logical = [], [], ''
     for line in body.splitlines():
@@ -1236,7 +1255,7 @@ def _shell_heredocs(body):
             out.append(line)
             queue.pop(0)
         else:
-            out.append(line if expands else '')
+            out.append(line if expands and not code else '')
     return '\n'.join(out)
 
 
@@ -2140,27 +2159,41 @@ def source_tokens(root):
                           effective_suffix(rel) in HASH_AND_SLASH,
                           effective_suffix(rel) in HASH_BLOCK,
                           effective_suffix(rel) in YAML_SCALARS)
-        if rel.endswith('.rs'):
+        # `effective_suffix`, not `rel.endswith('.rs')`: `build.rs.tmpl` is
+        # Rust, and the suffix test did not see it, so a `#[test]` in a Rust
+        # TEMPLATE went unmasked.
+        if effective_suffix(rel) == '.rs':
             body = untested(body)
-        if effective_suffix(rel) in YAML_SCALARS:
-            body = _yaml_blocks(body, _yaml_interpolated(rel))
+        yaml_file = effective_suffix(rel) in YAML_SCALARS
+        interpolated = yaml_file and _yaml_interpolated(rel)
+        if yaml_file:
+            body = _yaml_blocks(body, interpolated)
         # Heredocs FIRST: blanking single quotes first erases the `'EOF'`
         # marker, and the heredoc body then reads as commands. The self-test for
         # each function passed in isolation while the composition was wrong,
         # which is why the real-tree proof is not optional.
-        if effective_suffix(rel) in HAS_HEREDOC:
-            body = _shell_heredocs(body)
+        # A non-compose YAML file has just been reduced to its executed blocks,
+        # and those blocks ARE shell — so they take the shell passes, which
+        # `.yml` never did: `echo '${AUTUMN_X}'` in a `run:` step is a literal.
+        # A compose file does not take them, because compose interpolates every
+        # value BEFORE any shell sees it, so the quotes there are YAML's.
+        shell = (effective_suffix(rel) in HAS_HEREDOC
+                 or (yaml_file and not interpolated))
+        quoted = (effective_suffix(rel) in SHELL_QUOTED
+                  or (yaml_file and not interpolated))
         # TWO views, because the rungs mean different things inside double
         # quotes: `"${AUTUMN_X}"` is an expansion, while
         # `echo " AUTUMN_X=v cmd"` is a string being printed. The expansion rung
-        # reads `body`; the assignment rungs read `code`, which blanks both
-        # quote kinds. Outside the shell family they are the same text.
+        # reads `body`; the assignment rungs read `code`, which also blanks both
+        # quote kinds and every unquoted heredoc body.
         code = body
-        if effective_suffix(rel) in SHELL_QUOTED:
+        if shell:
+            body, code = _shell_heredocs(body), _shell_heredocs(body, True)
+        if quoted:
             esc = QUOTE_ESCAPE.get(effective_suffix(rel), '\\')
             here = effective_suffix(rel) in HAS_HERE_STRING
             body, code = (_shell_literals(body, esc, here),
-                          _shell_code(body, esc, here))
+                          _shell_code(code, esc, here))
         lines, code_lines = body.splitlines(), code.splitlines()
         # Names this file assigns without exporting them, and without handing
         # them to a command: its own variables.
@@ -2214,9 +2247,10 @@ def source_tokens(root):
         # Taking the balanced argument list also covers the house multi-line
         # shape — `parse_env(\n env,\n "AUTUMN_MEDIA__ROOM_NAMESPACE")` — which
         # is what the window existed for.
-        # An accessor written inside a string of GENERATED code is data, not a
-        # call the generated program makes — see `_generated_nested`.
-        nested = _generated_nested(body) if rel.endswith('.rs') else None
+        # An accessor written inside generated DATA is not a call the generated
+        # program makes — see `_generated_data`.
+        nested = (_generated_data(body)
+                  if effective_suffix(rel) == '.rs' else None)
         for m in acc.finditer(body):
             if nested is not None and nested[m.start()]:
                 continue
@@ -3657,6 +3691,31 @@ def self_test():
          ('.example' in DOTENV, effective_suffix('.env.example') in DOTENV,
           DECLARED_CONT.findall('AUTUMN_LOG__LEVEL="debug"')),
          (True, True, ['AUTUMN_LOG__LEVEL']))
+    # A retained `run:` block IS shell, so it takes the shell passes — which
+    # `.yml` never did. A compose value does not: compose interpolates `${…}`
+    # before any shell sees it, so the quotes there are YAML's.
+    case('a retained run: block is parsed as shell, a compose value is not',
+         (EXPANDED.findall(_shell_literals(_yaml_blocks(
+             "steps:\n  - run: |\n      echo '${AUTUMN_LOG__LEVL}'\n", False))),
+          EXPANDED.findall(_yaml_blocks(
+              'services:\n  a:\n    environment:\n'
+              '      X: "${AUTUMN_LOG__LEVEL:?e}"\n', True))),
+         ([], ['AUTUMN_LOG__LEVEL']))
+    # An unquoted heredoc EXPANDS but does not RUN: its expansions are real
+    # references, its lines are data being written rather than commands.
+    case('an unquoted heredoc body expands but assigns nothing',
+         (EXPANDED.findall(_shell_heredocs(
+             'cat <<EOF\nAUTUMN_LOG__LEVL=x cmd\n${AUTUMN_LOG__LEVEL}\nEOF\n')),
+          ASSIGNED_PREFIX.findall(_shell_heredocs(
+              'cat <<EOF\nAUTUMN_LOG__LEVL=x cmd\n${AUTUMN_LOG__LEVEL}\nEOF\n',
+              True))),
+         (['AUTUMN_LOG__LEVEL'], []))
+    # A Rust TEMPLATE is Rust: `build.rs.tmpl` needs the test mask too, and
+    # `rel.endswith('.rs')` did not see it.
+    case('a Rust template is Rust for the test mask as well',
+         (effective_suffix('autumn-cli/src/templates/build.rs.tmpl'),
+          'autumn-cli/src/templates/build.rs.tmpl'.endswith('.rs')),
+         ('.rs', False))
     # PowerShell reads the environment as `$env:NAME`, not `$NAME`.
     case('a PowerShell environment read is a use',
          (PS_ENV.findall('if ($env:AUTUMN_VERSION) { $env:AUTUMN_VERSION }'),
@@ -3732,18 +3791,22 @@ def self_test():
     # A generated read is real; a string INSIDE generated code is data again.
     # The question is where the accessor sits, not where the name does — the
     # name is always inside a literal, because it is the argument.
-    # The reproducing shape is an outer RAW template — which is how a generator
-    # naturally writes one, since it needs no escaping — holding a nested plain
-    # string. Both spellings of a real generated read have to survive it.
+    # Two kinds of string are DATA. A nested literal inside a template — the
+    # reproducing shape is an outer RAW template, which is how a generator
+    # naturally writes one — and a single-line string, which is not a program
+    # at all. Both spellings of a real multi-line template have to survive.
     case('an accessor inside generated string data is not a call',
          [[m.group(0) for m in ACCESSOR.finditer(_rust_uncommented(s))
-           if not _generated_nested(_rust_uncommented(s))[m.start()]]
+           if not _generated_data(_rust_uncommented(s))[m.start()]]
           for s in
-          ('fn p() -> &\'static str { r#"const T: &str = '
+          ('fn p() -> &\'static str { r#"const T: &str =\n'
            '"std::env::var(\\"AUTUMN_X\\")";"# }',
-           'fn p() -> &\'static str { "std::env::var(\\"AUTUMN_X\\")" }',
-           'fn p() -> &\'static str { r#"std::env::var("AUTUMN_X")"# }')],
-         [[], ['var('], ['var(']])
+           'const HELP: &str = r#"std::env::var("AUTUMN_X")"#;',
+           'fn p() -> &\'static str { "fn m() {\\n'
+           'std::env::var(\\"AUTUMN_X\\");\\n}" }',
+           'fn p() -> &\'static str { r#"fn m() {\n'
+           'std::env::var("AUTUMN_X");\n}"# }')],
+         [[], [], ['var('], ['var(']])
     case('a stray quote outside YAML still costs one line',
          _hash_uncommented("x = 'a\n# AUTUMN_LOG__LEVL=y cmd\nz = 1\n",
                            True).splitlines(),
