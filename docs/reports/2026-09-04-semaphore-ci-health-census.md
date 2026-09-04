@@ -268,9 +268,16 @@ That leaves two tiers, and they are not substitutes for each other:
        steps:
          - uses: actions/checkout@v7
          - uses: dtolnay/rust-toolchain@stable
-         # Deliberately NO cache action here: a warm Swatinem/rust-cache
-         # restore is exactly the shortcut around the cold build-up this
-         # campaign needs to reproduce.
+         # Restore the cache, matching ci.yml:345 exactly. An earlier
+         # revision of this section omitted it on the theory that a warm
+         # cache would shortcut the cold build-up under test -- wrong: the
+         # fresh-VM-per-sample structure above already guarantees a cold
+         # *runner*, and the sampled CI runs themselves all restored this
+         # same cache before "Run tests". Skipping it would make every
+         # sample recompile the entire dependency graph from scratch,
+         # which is slower AND less faithful to the thing being measured,
+         # not more.
+         - uses: Swatinem/rust-cache@v2.7.8
          - name: Run the exact CI command, but keep going past a failure
            # --no-fail-fast matters: plain `cargo test --workspace` stops
            # at the FIRST failing test binary and never runs the rest
@@ -282,10 +289,22 @@ That leaves two tiers, and they are not substitutes for each other:
            # `live_upgrade`'s outcome specifically.
            run: cargo test --workspace --no-fail-fast 2>&1 | tee run.log
          - name: Classify this sample's result for each target test
+           # Three independent checks, not one grep with a single
+           # pass/fail fallback: a single combined grep only reports
+           # "nothing matched at all", so if two of the three targets
+           # produced a result line and one didn't, that one's absence
+           # would silently pass as if the whole sample succeeded.
            if: always()
            run: |
-             grep -E "upgrades_in_place_under_load_without_dropping|cache_stampede::swr_serves_stale_and_refreshes_in_background|sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times" run.log \
-               || echo "none of the three target tests produced a result line -- treat as missing, not passing, for this sample"
+             for pattern in \
+               "upgrades_in_place_under_load_without_dropping" \
+               "cache_stampede::swr_serves_stale_and_refreshes_in_background" \
+               "sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times"
+             do
+               grep -q "$pattern" run.log \
+                 && grep "$pattern" run.log \
+                 || echo "MISSING result line for $pattern -- treat as missing, not passing, for this sample"
+             done
    ```
 
 2. **The isolated rerun (Tier 3, a narrower, cheaper, and strictly weaker
