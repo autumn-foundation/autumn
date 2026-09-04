@@ -1138,6 +1138,79 @@ fn diff_authorization_policies(
     }
 }
 
+/// Emit the routes that lost CSRF, collapsed into one finding or one each.
+fn report_csrf_loss(
+    lost: BTreeMap<RouteKey, (String, bool)>,
+    head_routes: &BTreeMap<RouteKey, RouteEntry>,
+    collapse: bool,
+    out: &mut Vec<Finding>,
+) {
+    if collapse {
+        let routes: Vec<String> = lost
+            .iter()
+            .map(|((_, method), (written_as, _))| format!("{method} {written_as}"))
+            .collect();
+        // The fingerprint names the *routes*, not the spellings: renaming a
+        // capture changes neither the URL set that lost CSRF nor what a
+        // reviewer acknowledged about it.
+        // Each route *and what still guards it*, for the same reason the
+        // per-route fingerprint carries it.
+        let guarded_keys: Vec<String> = lost
+            .keys()
+            .map(|(path, method)| {
+                escape_list(&[
+                    method.clone(),
+                    path.clone(),
+                    head_routes
+                        .get(&(path.clone(), method.clone()))
+                        .map_or_else(String::new, posture_fingerprint),
+                ])
+            })
+            .collect();
+        out.push(Finding {
+            kind: "csrf_disabled",
+            severity: Severity::Widening,
+            method: "*".to_owned(),
+            path: "*".to_owned(),
+            before: "csrf enforced".to_owned(),
+            after: format!("csrf not enforced on {} routes", routes.len()),
+            // The collapsed finding must still say *which* routes lost it, or
+            // an acknowledgment for one set would silently cover another.
+            fingerprint: format!(
+                "csrf-disabled:{}",
+                &hex_digest(escape_list(&guarded_keys).as_bytes())[..16]
+            ),
+            detail: format!(
+                "CSRF enforcement lost on all {} mutating routes: {}",
+                routes.len(),
+                routes.join(", ")
+            ),
+        });
+    } else {
+        for (key, (path, exempt)) in lost {
+            let guard = head_routes
+                .get(&key)
+                .map_or_else(String::new, posture_fingerprint);
+            let (_, method) = key;
+            out.push(Finding {
+                kind: "csrf_enforcement_removed",
+                severity: Severity::Widening,
+                method,
+                path,
+                before: "csrf enforced".to_owned(),
+                after: "csrf not enforced".to_owned(),
+                fingerprint: format!("csrf-removed:{guard}"),
+                detail: if exempt {
+                    "CSRF enforcement lost: this route now matches a configured exempt prefix"
+                        .to_owned()
+                } else {
+                    "CSRF enforcement lost".to_owned()
+                },
+            });
+        }
+    }
+}
+
 /// Whether `prefix` exempts `path`, spelled exactly as the CSRF middleware
 /// spells it — so "is this prefix already covered by that one" is asked in the
 /// same terms the runtime will answer it in.
@@ -1338,15 +1411,14 @@ fn csrf_index(m: &PostureManifest) -> BTreeMap<RouteKey, (bool, bool, String)> {
 
 fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Finding>) {
     diff_csrf_exemptions(base, head, out);
+    // What still guards each route, for the fingerprints below: losing CSRF
+    // behind a newly required scope is not the same decision as losing it with
+    // that scope gone again.
+    let head_routes = route_index(head);
     let before = csrf_index(base);
     let after = csrf_index(head);
-    let routes_after: BTreeSet<RouteKey> = head
-        .dimensions
-        .routes
-        .entries
-        .iter()
-        .map(RouteEntry::key)
-        .collect();
+    let routes_before = route_keys(base);
+    let routes_after = route_keys(head);
 
     // Keyed rather than pushed, so the two passes below cannot report the same
     // route twice and the order is the key order either way.
@@ -1366,7 +1438,18 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
     // `security.csrf.safe_methods` deletes entries rather than flipping them —
     // and at runtime those requests stop being validated.
     for (key, (enforced_before, _, written_as)) in &before {
-        if *enforced_before && !after.contains_key(key) && routes_after.contains(key) {
+        if !*enforced_before || after.contains_key(key) {
+            continue;
+        }
+        // Reachable by the same rule the route findings use, not by an exact
+        // key: a `WS` route and a `GET` route at one path are the same runtime
+        // handler, so replacing an enforced `WS /x` with a `GET /x` that does
+        // not enforce is a lost check, however the manifest spells the method.
+        let (path, method) = key;
+        let still_reachable = takers((path, method), &routes_before, &routes_after)
+            .iter()
+            .any(|taker| after.get(taker).is_none_or(|(enforced, ..)| !enforced));
+        if still_reachable {
             lost.entry(key.clone())
                 .or_insert_with(|| (written_as.clone(), false));
         }
@@ -1375,58 +1458,11 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
     // One collapsed finding when CSRF went off everywhere: an app that flips
     // `security.csrf.enabled` produces one row per mutating route otherwise,
     // and a 200-row table is a table nobody reads.
-    let all_off_now = after.values().all(|(enforced, ..)| !enforced);
-    let any_on_before = before.values().any(|entry| entry.0);
-    if all_off_now && any_on_before && lost.len() > 1 {
-        let routes: Vec<String> = lost
-            .iter()
-            .map(|((_, method), (written_as, _))| format!("{method} {written_as}"))
-            .collect();
-        // The fingerprint names the *routes*, not the spellings: renaming a
-        // capture changes neither the URL set that lost CSRF nor what a
-        // reviewer acknowledged about it.
-        let keys: Vec<String> = lost
-            .keys()
-            .map(|(path, method)| format!("{method} {path}"))
-            .collect();
-        out.push(Finding {
-            kind: "csrf_disabled",
-            severity: Severity::Widening,
-            method: "*".to_owned(),
-            path: "*".to_owned(),
-            before: "csrf enforced".to_owned(),
-            after: format!("csrf not enforced on {} routes", routes.len()),
-            // The collapsed finding must still say *which* routes lost it, or
-            // an acknowledgment for one set would silently cover another.
-            fingerprint: format!(
-                "csrf-disabled:{}",
-                &hex_digest(escape_list(&keys).as_bytes())[..16]
-            ),
-            detail: format!(
-                "CSRF enforcement lost on all {} mutating routes: {}",
-                routes.len(),
-                routes.join(", ")
-            ),
-        });
-    } else {
-        for ((_, method), (path, exempt)) in lost {
-            out.push(Finding {
-                kind: "csrf_enforcement_removed",
-                severity: Severity::Widening,
-                method,
-                path,
-                before: "csrf enforced".to_owned(),
-                after: "csrf not enforced".to_owned(),
-                fingerprint: "csrf-removed".to_owned(),
-                detail: if exempt {
-                    "CSRF enforcement lost: this route now matches a configured exempt prefix"
-                        .to_owned()
-                } else {
-                    "CSRF enforcement lost".to_owned()
-                },
-            });
-        }
-    }
+    let collapse = after.values().all(|(enforced, ..)| !enforced)
+        && before.values().any(|entry| entry.0)
+        && lost.len() > 1;
+    report_csrf_loss(lost, &head_routes, collapse, out);
+
     for ((_, method), path) in gained {
         out.push(Finding {
             kind: "csrf_enforcement_added",
@@ -2455,6 +2491,68 @@ mod tests {
         let widening = widening(&findings);
         assert_eq!(widening.len(), 1, "{findings:#?}");
         assert_eq!(widening[0].kind, "authorization_binding_removed");
+    }
+
+    /// A `WS` route and a `GET` route at one path are the same runtime handler,
+    /// and the csrf rows are keyed by the *declared* method. Replacing an
+    /// enforced `WS /x` with a `GET /x` that does not enforce left the base row
+    /// under a key the head does not have, and the exact-key disappearance
+    /// check skipped it — while the route diff saw an equally guarded
+    /// replacement, so nothing reported the lost CSRF at all.
+    #[test]
+    fn csrf_lost_when_a_ws_route_becomes_a_get_is_still_a_widening() {
+        let base = manifest(
+            &route("/x", "WS", "gated", &["user"], &[], false),
+            r#"{"path":"/x","method":"WS","csrf_enforced":true,"exempt":false}"#,
+            "",
+            "",
+        );
+        let head = manifest(
+            &route("/x", "GET", "gated", &["user"], &[], false),
+            "",
+            "",
+            "",
+        );
+
+        let findings = diff(&base, &head);
+        let widening = widening(&findings);
+        assert_eq!(widening.len(), 1, "{findings:#?}");
+        assert_eq!(widening[0].kind, "csrf_enforcement_removed");
+    }
+
+    /// And the CSRF acknowledgment binds to what still guards the route, like
+    /// every other dimension: losing CSRF behind a new `mfa` scope is not the
+    /// same decision as losing it with the scope gone again.
+    #[test]
+    fn a_csrf_acknowledgment_binds_to_what_still_guards_the_route() {
+        let entry = |enforced: bool| {
+            format!(
+                r#"{{"path":"/pay","method":"POST","csrf_enforced":{enforced},"exempt":false}}"#
+            )
+        };
+        let base = manifest(
+            &route("/pay", "POST", "gated", &["admin"], &[], false),
+            &entry(true),
+            "",
+            "",
+        );
+        let guarded_by = |scopes: &[&str]| {
+            diff(
+                &base,
+                &manifest(
+                    &route("/pay", "POST", "gated", &["admin"], scopes, false),
+                    &entry(false),
+                    "",
+                    "",
+                ),
+            )
+            .into_iter()
+            .find(|f| f.kind == "csrf_enforcement_removed")
+            .expect("losing CSRF is a widening")
+            .canonical()
+        };
+
+        assert_ne!(guarded_by(&["mfa"]), guarded_by(&[]));
     }
 
     /// A policy acknowledgment has the same duty. Removing the record check
