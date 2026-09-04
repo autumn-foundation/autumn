@@ -917,15 +917,32 @@ def _yaml_blocks(body, interpolated=False):
     """Blank what the consumer never executes, keeping line numbers intact.
 
     In a compose file only the non-executed BLOCK scalars go, since every value
-    is interpolated. Anywhere else every line outside an executed block goes.
+    is interpolated. Anywhere else every line outside an executed field goes.
+
+    A FOLDED executed scalar (`run: >`) is joined before the shell ever sees
+    it — YAML turns the physical newline into a space — so `AUTUMN_X=value` and
+    `command` on consecutive lines really are one command, and reading them as
+    two made the first a bare local assignment. Its lines are joined onto the
+    first of them and the rest blanked, which keeps the line count.
     """
-    out, key, indent = [], None, 0
+    out, key, indent, fold, buf = [], None, 0, False, []
+
+    def flush():
+        if buf:
+            out[buf[0]] = ' '.join(out[i].strip() for i in buf if out[i].strip())
+            for i in buf[1:]:
+                out[i] = ''
+        del buf[:]
+
     for l in body.splitlines():
         if key is not None:
             if l.strip() and (len(l) - len(l.lstrip())) <= indent:
+                flush()
                 key = None
             else:
                 out.append(l if key in YAML_EXECUTED else '')
+                if fold and key in YAML_EXECUTED:
+                    buf.append(len(out) - 1)
                 continue
         m = YAML_BLOCK.match(l)
         inline = YAML_INLINE.match(l)
@@ -936,6 +953,8 @@ def _yaml_blocks(body, interpolated=False):
         out.append(l if (keep or m) else '')
         if m:
             key, indent = m.group(2), len(m.group(1))
+            fold = '>' in l.split(':', 1)[1]
+    flush()
     return '\n'.join(out)
 
 # HCL accepts THREE comment forms — `#`, `//` and `/* … */` — so Terraform files
@@ -2318,7 +2337,16 @@ def source_tokens(root):
             # evidence elsewhere — the first by `std::env::var(…)` twice in the
             # same generated file, the second by five compose files. The truth
             # set is 430 with this rung and 430 without it.
-            if shell_shapes(rel):
+            # PowerShell shares none of the Bourne grammar: `NAME=value` is not
+            # an assignment there, `ARG`/`ENV` are Dockerfile words, and
+            # `$NAME` / `${NAME}` name an ORDINARY variable — only `$env:NAME`
+            # reaches the environment. Running the Bourne rungs over it read a
+            # local `$AUTUMN_X` as an environment read. Measured before
+            # narrowing: `.ps1` contributes nothing through those rungs today,
+            # and three names through `PS_ENV`.
+            if effective_suffix(rel) in HAS_HERE_STRING:
+                tokens.update(PS_ENV.findall(line))
+            elif shell_shapes(rel):
                 tokens.update(ASSIGNED.findall(code_lines[n]))
                 tokens.update(ASSIGNED_PREFIX.findall(code_lines[n]))
                 if DECLARED.match(code_lines[n]) or declaring:
@@ -2334,8 +2362,6 @@ def source_tokens(root):
                     tokens.update(DECLARED_CONT.findall(code_lines[n]))
                 tokens.update(v for v in EXPANDED.findall(line)
                               if v not in local)
-                if effective_suffix(rel) in HAS_HERE_STRING:
-                    tokens.update(PS_ENV.findall(line))
             # The generated-data mask applies to BINDINGS as well as
             # accessors: `r#"const FAKE_ENV: &str = "AUTUMN_X";"#` inside an
             # ordinary Rust string is sample text, not a binding. Same rule,
@@ -3871,6 +3897,23 @@ def self_test():
            'steps:\n  - name: echo "${AUTUMN_X}"\n',
            'steps:\n  - run: |\n      echo x\n')],
          ['- run: echo "${AUTUMN_X}"', '', 'echo x'])
+    # A FOLDED executed scalar is joined before the shell sees it, so an
+    # assignment and its command on consecutive lines are one command. A
+    # LITERAL `|` scalar keeps its newlines and must not be joined.
+    case('a folded executed scalar is joined, a literal one is not',
+         (ASSIGNED_PREFIX.findall(_shell_code(_yaml_blocks(
+             'steps:\n  - run: >\n      AUTUMN_X=value\n      some-command\n',
+             False))),
+          _yaml_blocks('steps:\n  - run: |\n      AUTUMN_A=1\n      echo hi\n',
+                       False).splitlines()[-2:]),
+         (['AUTUMN_X'], ['      AUTUMN_A=1', '      echo hi']))
+    # PowerShell shares none of the Bourne grammar — `$NAME` is an ordinary
+    # variable there, and only `$env:NAME` reaches the environment.
+    case('an ordinary PowerShell variable is not an environment read',
+         (EXPANDED.findall('$AUTUMN_LOG__LEVL'),
+          PS_ENV.findall('$AUTUMN_LOG__LEVL'),
+          PS_ENV.findall('$env:AUTUMN_LOG__LEVEL')),
+         (['AUTUMN_LOG__LEVL'], [], ['AUTUMN_LOG__LEVEL']))
     # Lua's long comments are the forms the SQL scanner cannot see, and the
     # delimiter length is part of the syntax — `]]` does not close `--[==[`.
     case('a Lua long comment is a comment',
