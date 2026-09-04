@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A CI gate for `AUTUMN_*` config keys named in the docs [no-plugin]:**
+  nothing here is agent-facing — it's a CI/docs-harness addition, not new
+  framework surface (`scripts/check-docs-config.sh`, wired into the docs-only
+  job in `.github/workflows/ci.yml`). The corpus already gates the link a
+  reader clicks (`check-docs-links.sh`) and the command they run
+  (`check-docs-cli.sh`); this gates the third thing they copy off a page, and
+  the only one of the three that fails **silently**. A wrong link 404s and a
+  wrong command exits 2, but a wrong environment variable is simply not read:
+  the process starts, the default stands, and nothing anywhere reports that
+  the override was ignored. `autumn check --config` and `server.strict_config`
+  reject an unknown key in `autumn.toml`, but neither sees the env layer — an
+  override is applied by name at load time or not at all — so
+  `AUTUMN_DATABASE_URL` (one underscore, the pre-0.2 spelling) beside a
+  production Postgres URL reads exactly like a working line, and the app comes
+  up on the default database. The gate resolves every `AUTUMN_*` variable in
+  the 175-page reader-facing corpus (629 occurrences) against
+  `autumn/tests/fixtures/schema_keys.snapshot` — the same schema walk that
+  backs strict unknown-key validation, already kept honest by
+  `schema_keys_snapshot_guard`, so there is nothing to regenerate and no Rust
+  toolchain needed — falling back to a token sweep of the tracked
+  non-markdown tree for the four subsystems outside `AutumnConfig`
+  (`AUTUMN_SEARCH__*` and `AUTUMN_MEDIA__*` layer their own overrides in their
+  own crates, `autumn-cli` owns `[dev] watch_dirs`, and `AUTUMN_SYNC__*` is
+  read by the Tauri shell the CLI generates). It also gates the hand-
+  maintained 135-row `AUTUMN_* -> config path` table in `config.rs`'s module
+  docs — the mapping readers meet on docs.rs — checking both columns, so a row
+  edited on one side only is caught. The baseline run found **0 defects**: the
+  reader-facing corpus was already accurate, and the gate is here to keep it
+  that way. Three occurrences are waived in place, beside the passage that
+  needs them (a migration guide's `rg` pattern for a removed key, and the
+  `AUTUMN_SECTION__OLD_KEY` placeholder row in `docs/migrations/TEMPLATE.md`
+  and `next.md`).
+
 - **A CI gate for the "local development" install path [no-plugin]:** nothing
   here is agent-facing — it's a CI/test-harness addition, not new framework
   surface (`local-dev-quickstart` job in

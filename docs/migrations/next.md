@@ -712,6 +712,8 @@ For each removed config key, fill in the table below:
 |------------------------------|-------------|------------------|------------|
 | `section.old_key` / `AUTUMN_SECTION__OLD_KEY` | `section.new_key` | `{X.Y}.0` | (link to changelog) |
 
+<!-- config-key-allow: AUTUMN_SECTION__OLD_KEY — placeholder row carried from TEMPLATE.md; replaced when a key is actually removed -->
+
 If no config keys were removed, delete this subsection.
 
 ## Upstream dependency updates

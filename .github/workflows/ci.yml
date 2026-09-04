@@ -226,6 +226,34 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-cli.sh --self-test && ./scripts/check-docs-cli.sh
+      - name: Config key gate
+        # The two gates above cover the link a reader clicks and the command
+        # they run. This covers the third thing they copy off a page — an
+        # `AUTUMN_*` environment variable — and the only one of the three that
+        # fails silently.
+        #
+        # A wrong link 404s and a wrong command exits 2. A wrong env var is
+        # simply not read: the process starts, the default stands, and nothing
+        # says the override was ignored. `autumn check --config` and
+        # `server.strict_config` reject an unknown key in `autumn.toml`, but
+        # neither sees the env layer. So `AUTUMN_DATABASE_URL` (one underscore,
+        # the pre-0.2 spelling) beside a production Postgres URL reads exactly
+        # like a working line, and the app comes up on the default database.
+        #
+        # The reader-facing corpus names 626 of these across 175 pages, and the
+        # baseline run resolved every one — this gate is here to keep it that
+        # way, and to gate the 135-row `AUTUMN_* -> config path` table in
+        # config.rs's module docs, which is hand-maintained and is the mapping
+        # readers meet on docs.rs.
+        #
+        # The truth set is `schema_keys.snapshot` — the same schema walk that
+        # backs strict unknown-key validation, already kept honest by
+        # `schema_keys_snapshot_guard` — so there is nothing to regenerate here
+        # and no Rust toolchain needed.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-config.sh --self-test && ./scripts/check-docs-config.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`
