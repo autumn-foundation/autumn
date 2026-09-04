@@ -1071,6 +1071,46 @@ def _command_option(word):
             and 'c' in opt and len(opt) <= 4)
 
 
+def _payload_span(text):
+    """Where the command STRING sits in `text`, or None.
+
+    `command: sh -c 'AUTUMN_X=1 exec app'` executes the quoted argument, and
+    scanning the outer line instead sees `sh` as the command word and the
+    assignment as one of its arguments — so the assignment never counted. The
+    sequence form already extracts this argument; the inline form must too.
+    """
+    i, n, seen, first = 0, len(text), False, True
+    while i < n:
+        while i < n and text[i] in ' \t':
+            i += 1
+        if i >= n:
+            return None
+        start, quote = i, ''
+        if text[i] in '\'"':
+            quote = text[i]
+            i += 1
+            while i < n and text[i] != quote:
+                i += 1
+            end, i = i, i + 1
+            start += 1
+        else:
+            while i < n and text[i] not in ' \t':
+                i += 1
+            end = i
+        word = text[start:end]
+        if first:
+            first = False
+            if pathlib.PurePath(word.strip()).name.lower().rstrip('.exe') \
+                    not in DOCKER_SHELLS and _shell_named(word) not in DOCKER_SHELLS:
+                return None
+            continue
+        if seen:
+            return (start, end)
+        if _command_option(word):
+            seen = True
+    return None
+
+
 def _runs_shell(value):
     """Whether a command value runs a shell OVER a command string."""
     words = _command_words(value)
@@ -1102,7 +1142,11 @@ def _shell_named(value):
         first = text[1:].split(',')[0]
     else:
         first = text.split()[0] if text.split() else ''
-    return pathlib.PurePath(first.strip().strip('\'"[] ')).name
+    # Normalised for comparison: Windows spells it `pwsh.exe`, and a `shell:`
+    # value is not case-sensitive. Returning the raw basename meant `pwsh.exe`
+    # matched nothing and its block fell back to Bourne.
+    name = pathlib.PurePath(first.strip().strip('\'"[] ')).name.lower()
+    return name[:-4] if name.endswith('.exe') else name
 
 
 def _yaml_shells(body):
@@ -1485,6 +1529,15 @@ def _yaml_blocks(body, interpolated=False, consumer='actions',
             # assignment must come before that name. Blanked rather than cut,
             # so every offset on the line still lines up.
             l = ' ' * (len(head) + 1) + l[len(head) + 1:]
+            # …and when the command runs a SHELL, only its command-string
+            # argument is executed. `sh -c 'AUTUMN_X=1 exec app'` runs the
+            # quoted text; leaving the whole line made `sh` the command word,
+            # so the assignment read as one of its arguments. Everything but
+            # the payload is blanked, which keeps the offsets.
+            span = _payload_span(l) if consumer == 'compose' else None
+            if span:
+                l = (' ' * span[0] + l[span[0]:span[1]]
+                     + ' ' * (len(l) - span[1]))
         # A block-opening line carries no value of its own, so it is kept only
         # to preserve the line count, never as evidence.
         out.append(l if (keep or m) else '')
@@ -2612,6 +2665,7 @@ ENV_BOUND = re.compile(r'\b([a-z_]\w*)\s*:\s*[^,;{}()=]*\bEnv\b')
 # where it is USED and not only where it is written.
 USE_TREE = re.compile(r'\buse\s+([^;]+);')
 USE_NAME = re.compile(r'[A-Za-z_]\w*')
+USE_ALIAS = re.compile(r'\b([A-Za-z_]\w*)\s+as\s+([A-Za-z_]\w*)')
 ENV_GENERIC = re.compile(r'[<,]\s*([A-Z]\w*)\s*:\s*[^,>]*\bEnv\b'
                          r'|\bwhere\s+([A-Z]\w*)\s*:\s*[^,;{]*\bEnv\b')
 
@@ -2649,7 +2703,7 @@ def accessor(root, test_files=frozenset()):
     out = subprocess.run(['git', 'ls-files', '-z', '*.rs'], cwd=root,
                          capture_output=True, text=True).stdout
     index, types, per_file, masked_all = {}, set(), {}, {}
-    helpers, declared, imports = {}, {}, {}
+    helpers, declared, imports, aliases = {}, {}, {}, {}
     for rel in out.split('\0'):
         # Test code is skipped outright, as the scan that consumes this index
         # already does — a receiver bound only in a test is used only in a
@@ -2681,7 +2735,13 @@ def accessor(root, test_files=frozenset()):
                if not data[m.start()]}
         types.update(own)
         declared[rel] = own
-        imports[rel] = set(USE_NAME.findall(' '.join(USE_TREE.findall(masked))))
+        use_text = ' '.join(USE_TREE.findall(masked))
+        imports[rel] = set(USE_NAME.findall(use_text))
+        # `use …::OsEnv as AliasedEnv` puts BOTH names in the identifier set,
+        # and only the original is a derived type — so the local name, which is
+        # the one actually written at the call site, resolved to nothing.
+        aliases[rel] = {local: orig
+                        for orig, local in USE_ALIAS.findall(use_text)}
         names = per_file.setdefault(rel, set())
         names.update(m.group(1) for m in ENV_BOUND.finditer(masked)
                      if not data[m.start()])
@@ -2708,8 +2768,10 @@ def accessor(root, test_files=frozenset()):
     # them is an environment. A file may use a type it declares, or one it
     # imports by name — nothing else.
     def visible(rel, names):
-        return {n for n in names
+        here = {n for n in names
                 if n in declared.get(rel, ()) or n in imports.get(rel, ())}
+        return here | {local for local, orig in aliases.get(rel, {}).items()
+                       if orig in names}
 
     for rel, (masked, data) in masked_all.items():
         here = visible(rel, types)
@@ -2734,6 +2796,12 @@ def accessor(root, test_files=frozenset()):
     # a same-named three-argument function meant in every other crate. A file
     # sees what it declares and what it imports by name; the static floor in
     # `ACCESSOR` is what every file always has.
+    # An aliased helper keeps the ORIGINAL's key position: `use … as f` renames
+    # the call, not the signature.
+    for rel, alias in aliases.items():
+        for local, orig in alias.items():
+            if orig in index:
+                index.setdefault(local, index[orig])
     cache = {}
 
     def compiled(rel):
@@ -5166,7 +5234,18 @@ def self_test():
          [_shell_named(v) for v in
           ('pwsh -NoProfile -Command ". \'{0}\'"', '["sh","-lc","autumn x"]',
            '["/app/x"]', 'AUTUMN_X=v echo', '/bin/sh -c x', 'bash')],
-         ['pwsh', 'sh', 'x', 'AUTUMN_X=v', 'sh', 'bash'])
+         ['pwsh', 'sh', 'x', 'autumn_x=v', 'sh', 'bash'])
+    # …normalised, because Windows spells it `pwsh.exe` and a `shell:` value is
+    # not case-sensitive.
+    case('an executable name is normalised before it is matched',
+         [_shell_named(v) for v in ('pwsh.exe', 'PWSH', 'bash.exe', 'sh')],
+         ['pwsh', 'pwsh', 'bash', 'sh'])
+    # Only the command-STRING argument of an inline shell command is executed.
+    case('an inline -c payload is the part that runs',
+         [(lambda sp, t: t[sp[0]:sp[1]] if sp else None)(_payload_span(t), t)
+          for t in ("sh -c 'AUTUMN_X=1 exec app'", 'sh -c "AUTUMN_Y=1 app"',
+                    '/app/x -c "y"', 'sh "no dash c"')],
+         ['AUTUMN_X=1 exec app', 'AUTUMN_Y=1 app', None, None])
     case('a custom pwsh shell line still selects PowerShell',
          sorted(_yaml_shells('on: push\njobs:\n  a:\n    defaults:\n'
                              '      run:\n'
