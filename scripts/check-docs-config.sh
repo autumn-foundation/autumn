@@ -108,6 +108,12 @@
 #     question lived in the resolver and the table checker; "a comment is not
 #     code" was fixed in the template reader while the token sweep still read
 #     `// std::env::var("AUTUMN_LOG__LEVL")` as a read. Grep for the rule.
+#   * A source of coverage removed without checking what was leaning on it.
+#     Masking test code is right, and `AUTUMN_MEDIA__FFMPEG__BIN` was in the
+#     truth set ONLY through a `${…}` expansion inside a test — so the correct
+#     tightening would have reported a correct page, had measuring it not turned
+#     up the real read (`override_string`) the accessor list was missing. When a
+#     rung stops carrying something, look at what it was carrying first.
 #   * FAILING OPEN — the check not running at all. Every other entry here is the
 #     gate resolving something it should have reported; this one is the gate
 #     asking nothing. Bounding rows to a table region meant a cosmetic header
@@ -124,7 +130,9 @@
 #
 #   * built templates — from `format!(` construction sites only.
 #   * const bindings — must be NAMED as env bindings (`*_ENV`/`ENV_*`/`VAR`).
-#   * quoted names — need an env accessor nearby, never a negative assertion.
+#   * quoted names — need an env accessor nearby, never a negative assertion,
+#     and never inside test code. The accessor list is the STATIC one below plus
+#     every env helper declared in the tree, read out of it like the templates.
 #   * shell assignments — must reach a process (`export`, or a prefix form), and
 #     a file that assigns a name owns its own expansions of it.
 #   * family wildcards — the prefix must begin a real name.
@@ -383,6 +391,14 @@ COMMENT_LEADER = {
     '.toml': '#', '.yml': '#', '.yaml': '#', '.example': '#',
 }
 
+# A `/* … */` block is a comment too, and `//`-only stripping left
+# `/* std::env::var("AUTUMN_LOG__LEVL"); */` reading as a read. Only a block
+# that OPENS a line is stripped, for the same reason a trailing `//` is kept: a
+# `/*` mid-line is usually inside a string, and swallowing to the next `*/`
+# would blank real code.
+BLOCK_OPEN = re.compile(r'^\s*/\*')
+BLOCK_CLOSE = re.compile(r'\*/')
+
 
 def comment_leader(rel):
     p = pathlib.PurePath(rel)
@@ -395,8 +411,18 @@ def uncommented(body, leader='//'):
     """Blank every whole-line comment, keeping line numbering intact."""
     if not leader:
         return body
-    return '\n'.join('' if l.lstrip().startswith(leader) else l
-                      for l in body.splitlines())
+    out, in_block = [], False
+    for l in body.splitlines():
+        if in_block:
+            out.append('')
+            in_block = not BLOCK_CLOSE.search(l)
+            continue
+        if leader == '//' and BLOCK_OPEN.match(l):
+            out.append('')
+            in_block = not BLOCK_CLOSE.search(l[l.index('/*') + 2:])
+            continue
+        out.append('' if l.lstrip().startswith(leader) else l)
+    return '\n'.join(out)
 
 
 def built_patterns(root, leaves):
@@ -414,13 +440,18 @@ def built_patterns(root, leaves):
                          capture_output=True, text=True).stdout
     pats = {}
     for rel in out.split('\0'):
-        if not rel:
+        # Same two exclusions as the token sweep, for the same reason and in the
+        # same order: a comment is not code, and a name a test builds is not a
+        # name the runtime builds. Applied here as well because splitting a rule
+        # across the two readers of the tree is how the last two rounds' defects
+        # got in. Measured: the five templates are unchanged by it.
+        if not rel or TEST_PATH.search(rel):
             continue
         try:
             body = (root / rel).read_text(encoding='utf-8', errors='replace')
         except OSError:
             continue
-        for tpl in TEMPLATE.findall(uncommented(body)):
+        for tpl in TEMPLATE.findall(untested(uncommented(body))):
             segs = tpl[len('AUTUMN_'):].split('__')
             head = re.sub(r'\\\{[a-z_]+\\\}', SEGMENT,
                           re.escape('AUTUMN_' + '__'.join(segs[:-1])))
@@ -530,8 +561,77 @@ ACCESSOR = re.compile(r'\b(?:var|var_os|set_var|remove_var|env_trimmed'
                       r'|parse_env\w*|env_bool\w*|getenv)\s*\('
                       r'|\benv\w*\.get\s*\(')
 
+# …plus the crates' own env helpers, READ OUT OF THE TREE rather than listed
+# here, the same way the runtime's `format!` templates are. A helper takes an
+# environment and a key: `fn override_string(target: &mut String, env: &HashMap<
+# String, String>, key: &str)`. The static list above is the floor, so a helper
+# this misses costs coverage and never correctness.
+#
+# Found by measuring, not by the one report that exposed it: the media plugin's
+# `override_string` / `override_opt` and `arroyo_value` carry SEVENTEEN real
+# variables (`AUTUMN_MEDIA__STORAGE__*`, `AUTUMN_MEDIA__MEDIAMTX__*`) that the
+# gate did not know the runtime reads. `AUTUMN_MEDIA__FFMPEG__BIN` was in the
+# truth set only by accident — through a `${…}` expansion in a test — so
+# masking test code without this would have reported a correct page.
+ENV_HELPER = re.compile(r'\bfn\s+(\w+)\s*\([^)]*\benv\s*:\s*&[^)]*'
+                        r'\bkey\s*:\s*&str', re.S)
+
+
+def accessor(root):
+    """`ACCESSOR`, widened by the env helpers this tree declares."""
+    out = subprocess.run(['git', 'ls-files', '-z', '*.rs'], cwd=root,
+                         capture_output=True, text=True).stdout
+    names = set()
+    for rel in out.split('\0'):
+        if not rel:
+            continue
+        try:
+            names.update(ENV_HELPER.findall(
+                (root / rel).read_text(encoding='utf-8', errors='replace')))
+        except OSError:
+            continue
+    if not names:
+        return ACCESSOR
+    return re.compile(ACCESSOR.pattern + r'|\b(?:'
+                      + '|'.join(sorted(map(re.escape, names))) + r')\s*\(')
+
+
 # …and never where the line asserts the name is absent.
 NEGATED = re.compile(r'assert(?:_ne)?!\s*\(\s*!|!\s*[\w.]*\bcontains\b|\bassert_ne!')
+
+# Test code is not the runtime. A test names a variable to prove the runtime
+# IGNORES it — `temp_env::with_var_unset("AUTUMN_TEST_DOTENV_OVERLAY_UNSET", …)`
+# reads that name through a real accessor, and `AUTUMN_DEV` is read exactly once
+# in the whole tree, inside a `#[test]` asserting it is unset. Excluding the
+# `const VAR` sentinel did not close this: the same class walked in through an
+# accessor instead.
+#
+# Safe because of what this rung IS: names in `AutumnConfig` resolve against the
+# schema, so everything here is a name from OUTSIDE it. A name outside the
+# schema that only test code ever mentions is a sentinel by construction.
+#
+# The region is a `#[cfg(test)]` at COLUMN ZERO, ending at the `}` in column
+# zero. Not brace-counting, which a brace inside a string literal skews, and not
+# any indentation, which matched a `#[cfg(test)]` written INSIDE a generated-code
+# template in two files and masked everything after it to end of file.
+CFG_TEST = re.compile(r'^#\[cfg\((?:all\()?test[,)]')
+TEST_PATH = re.compile(r'(^|/)(?:tests|benches)/|_test\.rs$')
+
+
+def untested(body):
+    """Blank every top-level `#[cfg(test)]` region, keeping line numbering."""
+    out, inside = [], False
+    for l in body.splitlines():
+        if inside:
+            out.append('')
+            inside = l.rstrip() != '}'
+            continue
+        if CFG_TEST.match(l):
+            out.append('')
+            inside = True
+            continue
+        out.append(l)
+    return '\n'.join(out)
 
 
 def source_tokens(root):
@@ -545,9 +645,14 @@ def source_tokens(root):
     """
     out = subprocess.run(['git', 'ls-files', '-z'], cwd=root,
                          capture_output=True, text=True).stdout
+    acc = accessor(root)
     tokens = set()
     for rel in out.split('\0'):
         if not rel or rel.endswith('.md') or rel == SELF:
+            continue
+        # A file under `tests/` or `benches/` is test code whatever it is
+        # written in.
+        if TEST_PATH.search(rel):
             continue
         try:
             body = (root / rel).read_text(encoding='utf-8', errors='replace')
@@ -557,8 +662,11 @@ def source_tokens(root):
             continue
         # Prose about a variable is not a use of it, in any of these rungs: a
         # commented `env::var`, `export`, `${…}` or `const …_ENV` is a note, and
-        # the note is often about a name that is deliberately wrong.
+        # the note is often about a name that is deliberately wrong. Neither is
+        # a test, which names a variable to prove the runtime ignores it.
         body = uncommented(body, comment_leader(rel))
+        if rel.endswith('.rs'):
+            body = untested(body)
         lines = body.splitlines()
         # Names this file assigns without exporting them, and without handing
         # them to a command: its own variables.
@@ -585,7 +693,7 @@ def source_tokens(root):
             # The accessor may open a line or two above its argument —
             # `parse_env(\n    env,\n    "AUTUMN_MEDIA__ROOM_NAMESPACE",` is the
             # house style — so look back a little for it.
-            if ACCESSOR.search('\n'.join(lines[max(0, n - 3):n + 1])):
+            if acc.search('\n'.join(lines[max(0, n - 3):n + 1])):
                 tokens.update(QUOTED.findall(line))
     return tokens
 
@@ -1201,6 +1309,48 @@ def self_test():
                                           comment_leader('x.rs')))), False)
     case('the same read uncommented does',
          bool(ACCESSOR.search(uncommented(read, comment_leader('x.rs')))), True)
+    # A `/* … */` block is a comment too. Only one that OPENS a line, because a
+    # `/*` mid-line is usually inside a string and swallowing to the next `*/`
+    # would blank real code.
+    case('a block comment on one line is stripped',
+         uncommented('  /* std::env::var("AUTUMN_LOG__LEVL"); */'), '')
+    case('a multi-line block is stripped to its close',
+         uncommented('/*\nstd::env::var("AUTUMN_LOG__LEVL");\n*/\nlet x = 1;'),
+         '\n\n\nlet x = 1;')
+    case('code after a closing block survives',
+         uncommented('/* note */ let v = format!("AUTUMN_X__{i}__Y");\nlet y = 2;'),
+         '\nlet y = 2;')
+    case('a mid-line `/*` does not blank the line',
+         uncommented('let p = "/*"; std::env::var("AUTUMN_LOG__LEVEL");'),
+         'let p = "/*"; std::env::var("AUTUMN_LOG__LEVEL");')
+    # Test code is not the runtime: a test names a variable to prove the runtime
+    # ignores it. `AUTUMN_DEV` is read exactly once in the whole tree, inside a
+    # `#[test]` asserting it is unset.
+    case('a `#[cfg(test)]` region is masked',
+         untested('let a = 1;\n#[cfg(test)]\nmod tests {\n  let b = 2;\n}\nlet c = 3;'),
+         'let a = 1;\n\n\n\n\nlet c = 3;')
+    # An INDENTED `#[cfg(test)]` is not a region: two files write one inside a
+    # generated-code string template, and matching it masked the rest of the file.
+    case('an indented cfg(test) is not a region',
+         untested('    #[cfg(test)]\nlet a = 1;'),
+         '    #[cfg(test)]\nlet a = 1;')
+    case('a test-only name is not swept in', 'AUTUMN_DEV' in swept, False)
+    case('a test path is not swept',
+         (bool(TEST_PATH.search('autumn/tests/integration/a11y.rs')),
+          bool(TEST_PATH.search('autumn/src/config.rs'))), (True, False))
+    # The crates' own env helpers are read out of the tree, not listed here: the
+    # media plugin reads 17 real variables through `override_string`, and
+    # `AUTUMN_MEDIA__FFMPEG__BIN` was in the truth set only through a `${…}`
+    # expansion inside a test — so masking tests without this would have
+    # reported a correct page.
+    case('an env helper declaration is recognised',
+         ENV_HELPER.findall('fn override_string(target: &mut String, '
+                            'env: &HashMap<String, String>, key: &str) {'),
+         ['override_string'])
+    case('a helper-read name is swept in',
+         'AUTUMN_MEDIA__STORAGE__BUCKET' in swept, True)
+    case('and the one that was only in a test expansion still is',
+         'AUTUMN_MEDIA__FFMPEG__BIN' in swept, True)
     # The leader is per file type: `#` opens a comment in TOML and shell, but a
     # Rust attribute and a markdown heading, and stripping it there would drop
     # real code.
