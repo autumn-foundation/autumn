@@ -185,6 +185,7 @@ fn widest_of(a: &RouteEntry, b: &RouteEntry) -> RouteEntry {
 fn diff_routes(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Finding>) {
     let before = route_index(base);
     let after = route_index(head);
+    let (keys_before, keys_after) = (route_keys(base), route_keys(head));
 
     for (key, entry) in &after {
         let Some(previous) = before.get(key) else {
@@ -215,7 +216,7 @@ fn diff_routes(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Fin
                 },
             });
             if !open {
-                report_displacement(key, entry, &before, out);
+                report_displacement(key, entry, &before, (&keys_before, &keys_after), out);
             }
             continue;
         };
@@ -234,7 +235,7 @@ fn diff_routes(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Fin
                 fingerprint: "removed".to_owned(),
                 detail: "route no longer mounted".to_owned(),
             });
-            report_shadow_exposure(key, entry, &after, out);
+            report_shadow_exposure(key, entry, &after, (&keys_before, &keys_after), out);
         }
     }
 }
@@ -251,10 +252,18 @@ fn report_displacement(
     (path, method): &RouteKey,
     added: &RouteEntry,
     before: &BTreeMap<RouteKey, RouteEntry>,
+    (keys_before, keys_after): (&BTreeSet<RouteKey>, &BTreeSet<RouteKey>),
     out: &mut Vec<Finding>,
 ) {
     for ((displaced_path, displaced_method), displaced) in before {
-        if !methods_overlap(method, displaced_method) || !takes_precedence(path, displaced_path) {
+        if !takes_precedence(path, displaced_path)
+            || !methods_transfer(
+                (displaced_method, displaced_path),
+                keys_before,
+                (method, path),
+                keys_after,
+            )
+        {
             continue;
         }
         // What changed for those URLs is the posture they used to demand
@@ -306,10 +315,18 @@ fn report_shadow_exposure(
     (path, method): &RouteKey,
     removed: &RouteEntry,
     after: &BTreeMap<RouteKey, RouteEntry>,
+    (keys_before, keys_after): (&BTreeSet<RouteKey>, &BTreeSet<RouteKey>),
     out: &mut Vec<Finding>,
 ) {
     for ((survivor_path, survivor_method), survivor) in after {
-        if !methods_overlap(method, survivor_method) || !takes_precedence(path, survivor_path) {
+        if !takes_precedence(path, survivor_path)
+            || !methods_transfer(
+                (method, path),
+                keys_before,
+                (survivor_method, survivor_path),
+                keys_after,
+            )
+        {
             continue;
         }
         // Only a survivor that admits callers the deleted route refused is a
@@ -397,6 +414,44 @@ fn effective_methods(method: &str) -> BTreeSet<String> {
 /// Whether two routes can answer any of the same requests.
 fn methods_overlap(a: &str, b: &str) -> bool {
     !effective_methods(a).is_disjoint(&effective_methods(b))
+}
+
+/// The methods a route answers *in the manifest it belongs to*.
+///
+/// The `GET`→`HEAD` expansion is a **fallback**, not a takeover: axum keeps an
+/// explicit `HEAD` handler mounted at the same path, so a `GET` there answers
+/// `GET` alone. Without that, a new guarded `GET` read as displacing an
+/// explicit `HEAD` that goes on answering exactly as it did.
+fn answered_methods(method: &str, path: &str, routes: &BTreeSet<RouteKey>) -> BTreeSet<String> {
+    let mut answered = effective_methods(method);
+    if !method.eq_ignore_ascii_case("HEAD")
+        && routes.contains(&(path.to_owned(), "HEAD".to_owned()))
+    {
+        answered.remove("HEAD");
+    }
+    answered
+}
+
+/// Whether requests can pass from one route to the other: what the first
+/// answered before against what the second answers after.
+fn methods_transfer(
+    (from_method, from_path): (&str, &str),
+    from_routes: &BTreeSet<RouteKey>,
+    (to_method, to_path): (&str, &str),
+    to_routes: &BTreeSet<RouteKey>,
+) -> bool {
+    !answered_methods(from_method, from_path, from_routes)
+        .is_disjoint(&answered_methods(to_method, to_path, to_routes))
+}
+
+/// Every `(normalized path, method)` a manifest mounts.
+fn route_keys(m: &PostureManifest) -> BTreeSet<RouteKey> {
+    m.dimensions
+        .routes
+        .entries
+        .iter()
+        .map(RouteEntry::key)
+        .collect()
 }
 
 /// Whether `first` overlaps `second` *and* wins the overlap at the router.
@@ -845,6 +900,7 @@ fn diff_authorization_policies(
             detail,
         });
     }
+    report_displaced_bindings(base, head, &before, &after, out);
     for (key, written_as) in &after {
         if before.contains_key(key) {
             continue;
@@ -864,6 +920,134 @@ fn diff_authorization_policies(
             ),
             detail: format!("record-level authorization `{action}` on `{resource}` now checked"),
         });
+    }
+}
+
+/// Configured exemption prefixes, which the per-route rows cannot show.
+///
+/// The audit asks whether a route *template* matches a prefix; the runtime asks
+/// it of the concrete request path. Exempting `/users/me` therefore leaves
+/// `POST /users/{id}` recorded as enforced while those requests stop being
+/// validated — a widening with no row to carry it. Compared conservatively: any
+/// prefix that was not there before can only exempt more URLs.
+fn diff_csrf_exemptions(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Finding>) {
+    let before: BTreeSet<&String> = base.dimensions.csrf.exempt_paths.iter().collect();
+    let after: BTreeSet<&String> = head.dimensions.csrf.exempt_paths.iter().collect();
+
+    let added: Vec<String> = after.difference(&before).map(|p| (*p).clone()).collect();
+    let removed: Vec<String> = before.difference(&after).map(|p| (*p).clone()).collect();
+
+    if !added.is_empty() {
+        out.push(Finding {
+            kind: "csrf_exemption_added",
+            severity: Severity::Widening,
+            method: "*".to_owned(),
+            path: "*".to_owned(),
+            before: "not exempt".to_owned(),
+            after: added.join(", "),
+            fingerprint: format!("csrf-exempt-added:{}", escape_list(&added)),
+            detail: format!(
+                "CSRF validation is now skipped for {}, which the per-route rows cannot show: \
+                 the audit matches a prefix against a route template, the runtime against the \
+                 request path",
+                added.join(", ")
+            ),
+        });
+    }
+    if !removed.is_empty() {
+        out.push(Finding {
+            kind: "csrf_exemption_removed",
+            severity: Severity::Narrowing,
+            method: "*".to_owned(),
+            path: "*".to_owned(),
+            before: removed.join(", "),
+            after: "not exempt".to_owned(),
+            fingerprint: format!("csrf-exempt-removed:{}", escape_list(&removed)),
+            detail: format!(
+                "CSRF validation is enforced again for {}",
+                removed.join(", ")
+            ),
+        });
+    }
+}
+
+/// Bindings the URLs of a displaced route lose to a new, more specific one.
+///
+/// The mirror of the fall-through case, and just as invisible: a displacement
+/// can change the record-level check while nothing the route comparison sees
+/// has moved — same roles, both `policy: true` — and the binding dimension sees
+/// only an *added* binding, which is a narrowing. The URLs `/records/me` took
+/// over went from `read_self` to `read_any` all the same.
+fn report_displaced_bindings(
+    base: &PostureManifest,
+    head: &PostureManifest,
+    before: &BTreeMap<AuthzKey, String>,
+    after: &BTreeMap<AuthzKey, String>,
+    out: &mut Vec<Finding>,
+) {
+    let keys_before = route_keys(base);
+    let keys_after = route_keys(head);
+    let head_routes = route_index(head);
+    let mut reported: BTreeSet<(RouteKey, String, String)> = BTreeSet::new();
+
+    for added_key in keys_after.difference(&keys_before) {
+        let (added_path, added_method) = added_key;
+        for displaced_key in &keys_before {
+            let (displaced_path, displaced_method) = displaced_key;
+            if !takes_precedence(added_path, displaced_path)
+                || !methods_transfer(
+                    (displaced_method, displaced_path),
+                    &keys_before,
+                    (added_method, added_path),
+                    &keys_after,
+                )
+            {
+                continue;
+            }
+            for ((path, method, action, resource), written_as) in before {
+                if path != displaced_path || method != displaced_method {
+                    continue;
+                }
+                // The new route performing the very same check changes nothing
+                // for the URLs it took over.
+                let carried = (
+                    added_path.clone(),
+                    added_method.clone(),
+                    action.clone(),
+                    resource.clone(),
+                );
+                if after.contains_key(&carried)
+                    || !reported.insert((added_key.clone(), action.clone(), resource.clone()))
+                {
+                    continue;
+                }
+                let written_added = head_routes
+                    .get(added_key)
+                    .map_or_else(|| added_path.clone(), |r| r.path.clone());
+                out.push(Finding {
+                    kind: "authorization_binding_displaced",
+                    severity: Severity::Widening,
+                    method: added_method.clone(),
+                    path: written_added.clone(),
+                    before: format!("authorize({action}, {resource})"),
+                    after: "none".to_owned(),
+                    fingerprint: format!(
+                        "authz-displaced:{}",
+                        escape_list(&[
+                            written_as.clone(),
+                            displaced_method.clone(),
+                            action.clone(),
+                            resource.clone(),
+                        ])
+                    ),
+                    detail: format!(
+                        "this route is more specific than `{displaced_method} {written_as}`, so it \
+                         takes those requests over — and it does not perform that route's \
+                         record-level `{action}` check on `{resource}`"
+                    ),
+                });
+            }
+        }
     }
 }
 
@@ -892,6 +1076,7 @@ fn csrf_index(m: &PostureManifest) -> BTreeMap<RouteKey, (bool, bool, String)> {
 }
 
 fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Finding>) {
+    diff_csrf_exemptions(base, head, out);
     let before = csrf_index(base);
     let after = csrf_index(head);
     let routes_after: BTreeSet<RouteKey> = head
@@ -1097,6 +1282,24 @@ mod tests {
 
     fn routes_only(routes: &str) -> PostureManifest {
         manifest(routes, "", "", "")
+    }
+
+    /// A manifest whose csrf dimension carries configured exemption prefixes.
+    fn manifest_exempt(routes: &str, csrf: &str, exempt: &[&str]) -> PostureManifest {
+        let exempt = exempt
+            .iter()
+            .map(|p| format!("\"{p}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{"schema_version":3,"dimensions":{{
+                 "routes":{{"provenance":"provable","source":"m","entries":[{routes}]}},
+                 "csrf":{{"provenance":"declared","source":"c","exempt_paths":[{exempt}],"entries":[{csrf}]}},
+                 "security_headers":{{"provenance":"declared","source":"c","entries":[]}},
+                 "authorization_policies":{{"provenance":"provable","source":"m","runtime_caveat":"x","entries":[]}}
+               }},"excluded":[]}}"#
+        );
+        PostureManifest::parse(&json, "test.json").expect("fixture parses")
     }
 
     /// One route entry, spelled the way the manifest spells it.
@@ -1821,6 +2024,125 @@ mod tests {
             widening[0].detail.contains("/users/{id}"),
             "the finding must name the route that now serves the URL: {:?}",
             widening[0]
+        );
+    }
+
+    /// An exemption prefix is the one CSRF widening the per-route entries
+    /// cannot show. `path_is_exempt` compares the route *template*, so
+    /// `/users/{id}` stays `enforced` in the manifest, while the runtime
+    /// compares the concrete request path and skips CSRF for `POST /users/me`.
+    /// With `exempt_paths` dropped on parse, neither the digest nor the diff
+    /// moved at all.
+    #[test]
+    fn adding_a_csrf_exemption_prefix_is_a_widening() {
+        let route = route("/users/{id}", "POST", "gated", &["user"], &[], false);
+        let entry = r#"{"path":"/users/{id}","method":"POST","csrf_enforced":true,"exempt":false}"#;
+        let base = manifest_exempt(&route, entry, &[]);
+        let head = manifest_exempt(&route, entry, &["/users/me"]);
+
+        let findings = diff(&base, &head);
+        let widening = widening(&findings);
+        assert_eq!(widening.len(), 1, "{findings:#?}");
+        assert_eq!(widening[0].kind, "csrf_exemption_added");
+        assert!(
+            widening[0].detail.contains("/users/me"),
+            "{:?}",
+            widening[0]
+        );
+    }
+
+    /// Withdrawing one protects more, so it annotates rather than blocks.
+    #[test]
+    fn removing_a_csrf_exemption_prefix_is_a_narrowing() {
+        let route = route("/users/{id}", "POST", "gated", &["user"], &[], false);
+        let entry = r#"{"path":"/users/{id}","method":"POST","csrf_enforced":true,"exempt":false}"#;
+        let base = manifest_exempt(&route, entry, &["/users/me"]);
+        let head = manifest_exempt(&route, entry, &[]);
+
+        let findings = diff(&base, &head);
+        assert_eq!(
+            kinds(&findings),
+            vec!["csrf_exemption_removed"],
+            "{findings:#?}"
+        );
+        assert!(widening(&findings).is_empty());
+    }
+
+    /// An explicit `HEAD` handler is kept by axum even when a `GET` is mounted
+    /// at the same path — the `GET`'s automatic `HEAD` support is a *fallback*,
+    /// not a takeover. Treating the alias as unconditional made a new guarded
+    /// `GET` displace an explicit `HEAD` that keeps answering exactly as before.
+    #[test]
+    fn a_new_get_does_not_displace_an_explicit_head() {
+        let explicit_head = route("/x", "HEAD", "gated", &["admin"], &[], false);
+        let added_get = route("/x", "GET", "gated", &["editor"], &[], false);
+        let base = routes_only(&explicit_head);
+        let head = routes_only(&format!("{explicit_head},{added_get}"));
+
+        let findings = diff(&base, &head);
+        assert!(
+            widening(&findings).is_empty(),
+            "the explicit HEAD still answers HEAD: {findings:#?}"
+        );
+    }
+
+    /// A displacement can change the record-level check without moving
+    /// anything the route comparison sees: same roles, both `policy: true`,
+    /// and the binding differ sees only an *added* binding, which is a
+    /// narrowing. The URLs `/records/me` took over went from `read_self` to
+    /// `read_any` all the same.
+    #[test]
+    fn a_binding_displaced_by_a_more_specific_route_is_a_widening() {
+        let by_id = route("/records/{id}", "GET", "gated", &["user"], &[], true);
+        let me = route("/records/me", "GET", "gated", &["user"], &[], true);
+        let binding = |path: &str, action: &str| {
+            format!(r#"{{"path":"{path}","method":"GET","action":"{action}","resource":"Record"}}"#)
+        };
+        let base = manifest(&by_id, "", "", &binding("/records/{id}", "read_self"));
+        let head = manifest(
+            &format!("{by_id},{me}"),
+            "",
+            "",
+            &format!(
+                "{},{}",
+                binding("/records/{id}", "read_self"),
+                binding("/records/me", "read_any")
+            ),
+        );
+
+        let findings = diff(&base, &head);
+        let widening = widening(&findings);
+        assert_eq!(widening.len(), 1, "{findings:#?}");
+        assert_eq!(widening[0].kind, "authorization_binding_displaced");
+        assert!(
+            widening[0].detail.contains("read_self"),
+            "{:?}",
+            widening[0]
+        );
+    }
+
+    /// The same check carried onto the new route changes nothing.
+    #[test]
+    fn a_binding_carried_onto_the_displacing_route_is_not_a_widening() {
+        let by_id = route("/records/{id}", "GET", "gated", &["user"], &[], true);
+        let me = route("/records/me", "GET", "gated", &["user"], &[], true);
+        let binding = |path: &str| {
+            format!(
+                r#"{{"path":"{path}","method":"GET","action":"read_self","resource":"Record"}}"#
+            )
+        };
+        let base = manifest(&by_id, "", "", &binding("/records/{id}"));
+        let head = manifest(
+            &format!("{by_id},{me}"),
+            "",
+            "",
+            &format!("{},{}", binding("/records/{id}"), binding("/records/me")),
+        );
+
+        assert!(
+            widening(&diff(&base, &head)).is_empty(),
+            "{:#?}",
+            diff(&base, &head)
         );
     }
 

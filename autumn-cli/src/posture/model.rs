@@ -123,6 +123,16 @@ pub struct RouteEntry {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CsrfDimension {
+    /// `security.csrf.exempt_paths`, verbatim.
+    ///
+    /// Not derivable from `entries`: the audit asks whether a route *template*
+    /// matches a prefix, while the runtime asks it of the concrete request
+    /// path. So exempting `/users/me` leaves `POST /users/{id}` recorded as
+    /// enforced, and the requests it stops validating are invisible in the
+    /// per-route rows. Dropping the field on parse kept it out of the digest
+    /// and the diff both.
+    #[serde(default)]
+    pub exempt_paths: Vec<String>,
     #[serde(default)]
     pub entries: Vec<CsrfEntry>,
 }
@@ -356,6 +366,12 @@ impl PostureManifest {
                 escape_list(&scopes),
                 r.policy
             ));
+        }
+        if !self.dimensions.csrf.exempt_paths.is_empty() {
+            let mut prefixes = self.dimensions.csrf.exempt_paths.clone();
+            prefixes.sort();
+            prefixes.dedup();
+            lines.push(format!("csrf-exempt\t{}", escape_list(&prefixes)));
         }
         for c in &self.dimensions.csrf.entries {
             lines.push(format!(
