@@ -451,16 +451,21 @@ EXPANDED = re.compile(r'\$\{?(AUTUMN_[A-Z0-9_]+)\}?')
 # into a CSP template, with no env accessor anywhere, and accepting every
 # binding made it settable in the docs.
 #
-# The repo names these by convention and does so consistently — all 36 bindings
-# of a real variable are `*_ENV`, `ENV_*` or `VAR`, and the CSP placeholder is
-# the only one that is neither. Preferred over "the constant is used near an env
+# The repo names these by convention and does so consistently — every binding of
+# a real variable is `*_ENV` or `ENV_*`.
+#
+# `VAR` alone is NOT accepted, though a binding by that name exists: it is
+# `const VAR: &str = "AUTUMN_TEST_MCP_TOKEN_1970_UNSET"` in `auth.rs`, a
+# deliberately-unset test sentinel whose own assertion is that nothing reads it.
+# I had included it when auditing this rung, reading the name as conventional
+# rather than checking what it bound. Preferred over "the constant is used near an env
 # accessor", which was measured and is too strict: six real ones
 # (`ENV_API_TOKEN`, `REPLAY_CAPSULE_ENV`, …) reach the accessor through a helper
 # and would have been dropped, reporting correct pages. A future binding named
 # outside the convention reports a correct page rather than hiding a wrong one,
 # which is the safer direction for this rung to fail in.
 BOUND = re.compile(
-    r'\b(?:const|static)\s+((?:\w+_)?(?:ENV|VAR)(?:_\w+)?)\s*:\s*&\s*'
+    r'\b(?:const|static)\s+((?:\w+_)?ENV(?:_\w+)?)\s*:\s*&\s*'
     r'(?:\'\w+\s+)?str\s*=\s*"(AUTUMN_[A-Z0-9_]+)"')
 
 # The accessors that read or write the environment. `with` is deliberately NOT
@@ -680,6 +685,10 @@ TABLE_ROW = re.compile(
 # prose, and produces neither a table defect nor an unparsed-row defect. The
 # whole point of accounting for every row is that a row cannot leave the check
 # by being malformed.
+# A ratchet, not an exact count: rows get added, and a real drop means the
+# table stopped being checked rather than that someone removed 100 variables.
+TABLE_ROW_FLOOR = 120
+
 TABLE_PROSE_ROWS = ('AUTUMN_ENV', 'AUTUMN_PROFILE')
 TABLE_PROSE_ROW = re.compile(
     r'^//!\s*\|\s*`(' + '|'.join(TABLE_PROSE_ROWS) + r')`\s*\|\s*[^`\s]')
@@ -725,10 +734,10 @@ def table_rows(text):
     because a row it cannot read is a row it is not checking, and silence about
     that is what let seven shard rows sit unverified.
     """
-    rows, unparsed, inside = [], [], False
+    rows, unparsed, inside, found = [], [], False, 0
     for i, line in enumerate(text.splitlines(), 1):
         if TABLE_HEADER.match(line):
-            inside = True
+            inside, found = True, found + 1
             continue
         if not inside:
             continue
@@ -741,7 +750,21 @@ def table_rows(text):
             rows.append((i, m.group(1), m.group(2)))
         elif not TABLE_PROSE_ROW.match(line):
             unparsed.append((i, line.strip()))
-    return rows, unparsed
+    return rows, unparsed, found
+
+
+def indexable(built, leaves):
+    """Paths the runtime addresses positionally: a list, not a struct or a map."""
+    out = set()
+    for tpl in built:
+        segs = tpl[len('AUTUMN_'):].split('__')
+        for k, seg in enumerate(segs):
+            if not seg.startswith('{') or k == 0:
+                continue
+            head = '.'.join(x.lower() for x in segs[:k])
+            if any(o.startswith(head + '.') for o in leaves):
+                out.add(head)
+    return out
 
 
 def check_table(rows, leaves, built, tokens):
@@ -772,7 +795,13 @@ def check_table(rows, leaves, built, tokens):
         # A segment is indexable when the schema records children beneath it.
         if '[' in declared:
             head = declared[:declared.index('[')]
-            if not any(o.startswith(head + '.') for o in leaves):
+            # Having schema descendants does NOT make a path a list —
+            # `security.headers` and `server.upgrade` are ordinary structs with
+            # children. A list is a path the runtime addresses POSITIONALLY,
+            # which is exactly what a template with a filled-in segment after it
+            # records; the schema children then rule out an open map like
+            # `auth.oauth2`, which has none.
+            if head not in indexable(built, leaves):
                 out.append((i, var, declared,
                             f'`{head}` is not a list, so it cannot be indexed'))
                 continue
@@ -810,7 +839,21 @@ def main():
     read = lambda rel: (ROOT / rel).read_text(encoding='utf-8', errors='replace')
     stats, defects = scan(files, read, leaves, built, tokens)
 
-    rows, unparsed = table_rows(CONFIG_RS.read_text(encoding='utf-8'))
+    rows, unparsed, found = table_rows(CONFIG_RS.read_text(encoding='utf-8'))
+    # FAIL CLOSED. Moving row detection into a region last round created a way
+    # for the whole table to vanish: rename the header cosmetically and `inside`
+    # never turns on, so the checker returns no rows, no unparsed entries, and
+    # nothing to report — silently disabling all 142 mapping checks at once.
+    # Finding no table, or implausibly few rows, is itself the defect.
+    table_missing = []
+    if found != 1:
+        table_missing.append(
+            f'expected exactly one `| Variable | …` table in config.rs module '
+            f'docs, found {found} — the mapping checks did not run')
+    elif len(rows) < TABLE_ROW_FLOOR:
+        table_missing.append(
+            f'only {len(rows)} module-doc table rows parsed, below the floor of '
+            f'{TABLE_ROW_FLOOR} — the table is being skipped, not checked')
     table_defects = check_table(rows, leaves, built, tokens)
 
     print(f'corpus: {len(files)} reader-facing markdown files')
@@ -831,6 +874,8 @@ def main():
                   f'which is not in {SNAPSHOT.relative_to(ROOT)}')
         else:
             print('    nothing in the non-markdown tree reads it')
+    for why in table_missing:
+        print(f'\n{CONFIG_RS.relative_to(ROOT)}: {why}')
     for line, var, declared, why in table_defects:
         print(f'\nautumn/src/config.rs:{line}: '
               f'module-doc row `{var}` -> `{declared}`: {why}')
@@ -839,7 +884,7 @@ def main():
               f'so not checked')
         print(f'    {text}')
 
-    total = len(defects) + len(table_defects) + len(unparsed)
+    total = len(defects) + len(table_defects) + len(unparsed) + len(table_missing)
     print(f'\ndefects: {total}'
           + (f' ({stats["waived"]} waived)' if stats['waived'] else ''))
     if total:
@@ -1031,7 +1076,8 @@ def self_test():
 
     # Templates are read from the real tree: the oauth2 pair must be found, and
     # `…__SHARDS__{i}__{field}` must be skipped (it would re-admit any field).
-    real_built = built_patterns(ROOT, leaf_paths(schema_paths(SNAPSHOT.read_text(encoding="utf-8"))))
+    real_leaves = leaf_paths(schema_paths(SNAPSHOT.read_text(encoding="utf-8")))
+    real_built = built_patterns(ROOT, real_leaves)
     # A template is only truth at a CONSTRUCTION site; a quoted string in a
     # comment or fixture is not.
     case('a bare quoted template is not a construction site',
@@ -1080,6 +1126,11 @@ def self_test():
          BOUND.findall('const NONCE_PLACEHOLDER: &str = "AUTUMN_CSP_NONCE";'),
          [])
     # A script-local shell variable is not application configuration.
+    # A test sentinel is not framework configuration, whatever it is named.
+    case('a test sentinel binding is not swept in',
+         'AUTUMN_TEST_MCP_TOKEN_1970_UNSET' in swept, False)
+    case('a bare VAR binding is not an env binding',
+         BOUND.findall('const VAR: &str = "AUTUMN_X";'), [])
     case('a bare shell assignment is not swept in',
          'AUTUMN_MANIFEST' in swept, False)
     case('an exported assignment is', ASSIGNED.findall('export AUTUMN_X=1'),
@@ -1098,28 +1149,28 @@ def self_test():
 
     # A mapping row that loses a backtick must not escape by looking like prose.
     broken = in_table('//! | `AUTUMN_DATABASE__URL` | database.urll | `String` |')
-    rows_b, unparsed_b = table_rows(broken)
+    rows_b, unparsed_b, _ = table_rows(broken)
     case('a malformed mapping row is reported, not called prose',
          (len(rows_b), len(unparsed_b)), (0, 1))
     prose = in_table('//! | `AUTUMN_ENV` | active profile | `String` |')
-    rows_p, unparsed_p = table_rows(prose)
+    rows_p, unparsed_p, _ = table_rows(prose)
     case('the enumerated prose rows still pass',
          (len(rows_p), len(unparsed_p)), (0, 0))
     # A row that loses its OPENING backtick must still be recognised as a row.
     # Requiring the backtick to detect a candidate dropped it from both lists,
     # taking the row count from 142 to 141 with the gate still green.
     no_tick = in_table('//! | AUTUMN_SERVER__PORT` | `server.port` | `u16` |')
-    rows_n, unparsed_n = table_rows(no_tick)
+    rows_n, unparsed_n, _ = table_rows(no_tick)
     case('a row missing its opening backtick is reported',
          (len(rows_n), len(unparsed_n)), (0, 1))
     # Doc-comment whitespace is not significant, so an indented row must still
     # be PARSED and checked — not merely noticed, and certainly not skipped.
     indented = in_table('//!  |  `AUTUMN_SERVER__HOST`  |  `server.host`  |  `String` |')
-    rows_i, unparsed_i = table_rows(indented)
+    rows_i, unparsed_i, _ = table_rows(indented)
     # A typo BEFORE the underscore must not make the row invisible: candidate
     # rows come from the table region, not from the text being already correct.
     typo = in_table('//! | `AUTMN_SERVER__HOST` | `server.host` | `String` |')
-    rows_t, unparsed_t = table_rows(typo)
+    rows_t, unparsed_t, _ = table_rows(typo)
     case('a misspelled prefix is reported, not skipped',
          (len(rows_t), len(unparsed_t)), (0, 1))
     # …and a line after the table is not a row at all.
@@ -1127,7 +1178,17 @@ def self_test():
                '//! |----------|-------------|------|\n'
                '//! | `AUTUMN_SERVER__PORT` | `server.port` | `u16` |\n'
                '//!\n//! | not a row |\n')
-    rows_o, unparsed_o = table_rows(outside)
+    rows_o, unparsed_o, _ = table_rows(outside)
+    # If the header stops being recognised the whole table silently vanishes,
+    # so finding no table is itself a defect.
+    renamed = ('//! | Variables | Config field | Type |\n'
+               '//! |----------|-------------|------|\n'
+               '//! | `AUTUMN_SERVER__PORT` | `server.port` | `u16` |\n')
+    _, _, found_r = table_rows(renamed)
+    case('a renamed header finds no table', found_r, 0)
+    _, _, found_ok = table_rows(in_table(
+        '//! | `AUTUMN_SERVER__PORT` | `server.port` | `u16` |'))
+    case('the real header is found once', found_ok, 1)
     case('the region ends at the first non-row line',
          (len(rows_o), len(unparsed_o)), (1, 0))
     case('an indented row is parsed, not dropped',
@@ -1146,6 +1207,13 @@ def self_test():
                            'database.shards[i][i].name')],
                          leaves, built, tokens)), 1)
     # An index belongs on the segment that IS a list.
+    # Schema descendants do not make a path a list: only a path the runtime
+    # addresses positionally is one.
+    real_ix = indexable(real_built, real_leaves)
+    case('the shard list is indexable', 'database.shards' in real_ix, True)
+    case('a struct with children is not',
+         {'security.headers', 'server.upgrade'} & real_ix, set())
+    case('an open map is not', 'auth.oauth2' in real_ix, False)
     case('an index on a scalar field fails',
          len(check_table([(9, 'AUTUMN_DATABASE__SHARDS__{i}__NAME',
                            'database.shards.name[i]')],
