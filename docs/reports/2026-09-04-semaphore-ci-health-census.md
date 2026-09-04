@@ -5,7 +5,9 @@
 Merging into `trunk-dev` waits on `.github/workflows/ci.yml`'s `pull_request`
 run: `meta` → `lint` (+ `migration-guides`, `plugin-contract`, `supply-chain`
 in parallel) → `test` (matrix: ubuntu/macos/windows-latest) → `coverage`
-(non-blocking, Codecov only) / `loom`, plus the standalone `msrv`,
+(non-blocking, Codecov only) / `loom`, plus `lint` → `windows-tier1`
+(`ci.yml:965-967`, the Windows Tier 1 journey job — this census's failure
+sample includes one hit against it) and the standalone `msrv`,
 `sqlite-runtime`, `sim-sweep`, and `edge-conformance` jobs. No ambient retry
 wrapper exists anywhere in the workflow — a red run stays red until a human
 clicks "Re-run failed jobs" or pushes a fix, so Law 1 (an untrustworthy green
@@ -27,10 +29,15 @@ post-merge trunk-dev run as a live health signal.
 **Harness**: GitHub Actions API (`actions_list`/`get_job_logs` via the
 `github` MCP server), no new CI spend incurred. Sampled the 100 most recent
 `pull_request`-triggered `ci.yml` runs (2026-09-03 16:13 UTC → 2026-09-04
-10:12 UTC, run numbers 8125-8212 across ~40 distinct PR branches — one
-sitting's worth of this repository's actual PR throughput, not a
-same-commit rerun campaign; see Reproduce below for why that campaign is the
-right next step, not something this census fabricated a rate for).
+10:12 UTC, run numbers 8124-8230 — a 107-wide span for 100 rows because
+`run_number` increments per-workflow across every trigger, `pull_request`
+included but not exclusive, so a handful of numbers in that span belong to
+this same workflow's `push` runs and aren't in this pull_request-only
+sample — across 17 distinct PR branches, i.e. ~6 runs per branch on
+average from iteration/rerun churn — one sitting's worth of this
+repository's actual PR throughput, not a same-commit rerun campaign; see
+Reproduce below for why that campaign is the right next step, not
+something this census fabricated a rate for).
 
 - 97 completed, 78 cancelled (superseded by a same-PR push, expected and
   excluded from the rate below). Of the 19 that reached a real verdict, the
@@ -85,10 +92,13 @@ right next step, not something this census fabricated a rate for).
   2. **`integration::cache_stampede::swr_serves_stale_and_refreshes_in_
      background`** — the background refresh never published within its
      1,000×25ms (~25s) poll budget (run 8190, macOS). This assertion was
-     already hardened once for a documented macOS/windows scheduler-
+     already hardened once for a documented `windows-latest` scheduler-
      starvation flake (`elapsed < 150ms` → a `Notify`-gated deterministic
      wait, issue #1809, see the comment block at
-     `cache_stampede.rs:354-364`); the failure seen here is a *different*
+     `cache_stampede.rs:354-364`) — a different platform than the one this
+     census caught it on, which is itself worth noting: the same test has
+     now shown timing sensitivity on both non-Linux runners, just via
+     different assertions; the failure seen here is a *different*
      assertion in the same test (line 501, the publish-visibility poll), so
      #1809's fix does not cover it. Cross-platform test, one macOS
      occurrence in the sample — suggestive, not yet a repeat signature on
