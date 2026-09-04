@@ -5,8 +5,9 @@
 //! `SIGUSR2`, and proves the properties the issue asks for:
 //!
 //! * zero refused connections, and no request fails twice in a row, across
-//!   the cutover — a single mid-flight reset (`ECONNRESET`/`ECONNABORTED`,
-//!   which a listener handover can legitimately produce) is retried once;
+//!   the cutover — an isolated mid-flight reset (`ECONNRESET`/`ECONNABORTED`)
+//!   is retried once, but only up to `MAX_TOLERATED_RESETS` of them, so a
+//!   systemic source of resets still fails the run rather than being masked;
 //! * a value written before the upgrade is readable after it (from the *new*
 //!   binary, whose state shape is different);
 //! * the state migration ran (`upgrades=1`) and the counter did not reset;
@@ -123,10 +124,19 @@ async fn get(addr: &str, path: &str) -> std::io::Result<Observation> {
     })
 }
 
-/// A connection reset (`ECONNRESET`) or abort (`ECONNABORTED`) mid-flight —
-/// what a listener handover can legitimately produce, e.g. the `SO_REUSEPORT`
-/// accept-queue race on macOS where a connection already queued on the
-/// predecessor's socket is reset rather than migrated when it closes.
+/// A connection reset (`ECONNRESET`) or abort (`ECONNABORTED`) mid-flight.
+///
+/// Autumn's in-place upgrade hands the successor the *same* listening socket
+/// by duplicating its fd across the `exec`
+/// (`HandoffSocket::from_listener`/`upgrade.rs`), not by binding a second
+/// `SO_REUSEPORT` socket — so there is no accept-queue race between two
+/// listeners to blame a reset on; predecessor and successor share one kernel
+/// socket throughout. The one observed instance of this (issue #2462, macOS
+/// only, did not reproduce on a re-run) has no confirmed root cause. Treating
+/// it as retryable-up-to-a-small-bound (`with_reset_retry`, and the count
+/// asserted against `MAX_TOLERATED_RESETS` below) means an isolated anomaly
+/// doesn't fail the run, while a systemic source of resets — which would
+/// point at a genuine defect in the handoff or drain path — still does.
 ///
 /// This is distinct from `ECONNREFUSED`, which means nothing was listening —
 /// the actual zero-downtime violation.
@@ -141,14 +151,23 @@ fn is_connection_refused(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::ConnectionRefused
 }
 
+/// How many mid-flight resets a single run may retry past before the test
+/// fails anyway. One or two is the isolated anomaly issue #2462 observed;
+/// anywhere near double digits stops being noise and starts being evidence of
+/// a real defect in the handoff or drain path, which `with_reset_retry`
+/// retrying past a reset must not be allowed to hide.
+const MAX_TOLERATED_RESETS: u64 = 5;
+
 /// Runs `attempt` once; if it fails with a mid-flight reset, waits out a
 /// short backoff and runs it exactly one more time, returning that outcome.
 /// A refused connection is never retried — there is nothing to wait out, the
 /// guarantee is already broken.
 ///
-/// The backoff (rather than retrying immediately) gives the accept-queue
-/// race a moment to resolve, so the retry lands after the handover rather
-/// than in the same narrow window that reset the first attempt.
+/// The backoff (rather than retrying immediately) gives whatever caused the
+/// reset a moment to resolve, so the retry doesn't land in the same narrow
+/// window that reset the first attempt. The caller is responsible for
+/// bounding how many resets a run may retry past — see
+/// `MAX_TOLERATED_RESETS`.
 ///
 /// A successful retry's `latency` is overwritten to cover the *whole* span
 /// from the first attempt's start through the retry's completion (failed
@@ -477,6 +496,19 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
         hard, 0,
         "a request failed even after retrying once past a mid-flight reset \
          (ECONNRESET/ECONNABORTED); logs:\n{logged}"
+    );
+    // Bounded, not unconditional: the successor is handed the *same*
+    // listening socket (a duplicated fd, not a second `SO_REUSEPORT`
+    // listener — see `is_mid_flight_reset`), so there is no known-benign
+    // mechanism that should reset a connection at all. Tolerating a lone
+    // reset keeps an unreproduced macOS anomaly (#2462) from failing the
+    // run; this bound keeps a *systemic* source of resets — real evidence of
+    // a defect in the handoff or drain path — from silently passing.
+    assert!(
+        retried <= MAX_TOLERATED_RESETS,
+        "{retried} mid-flight resets is too many to be an isolated anomaly \
+         (bound: {MAX_TOLERATED_RESETS}) — this looks like a real handoff/drain \
+         defect, not noise; logs:\n{logged}"
     );
     // Six readers over five seconds put this in the thousands on any machine
     // that is not pathologically loaded; the floor is set well under that so a
