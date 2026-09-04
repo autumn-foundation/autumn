@@ -970,7 +970,7 @@ def _yaml_runs(key, stack, consumer, value=''):
     Dockerfile's exec form needs; a value this cannot read is not one.
     """
     if consumer == 'compose':
-        return key in YAML_EXECUTED and _shell_named(value) in DOCKER_SHELLS
+        return key in YAML_EXECUTED and _runs_shell(value)
     if consumer == 'actions':
         return key == 'run' and bool(stack) and stack[-1][1] == 'steps'
     return False
@@ -1050,6 +1050,40 @@ POWERSHELL = ('pwsh', 'powershell')
 # rejected it, so the block silently fell back to Bourne. What names the
 # grammar is the EXECUTABLE, so the value is read and its first word taken.
 YAML_VALUE = re.compile(r'^\s*(?:-\s+)?[A-Za-z0-9_.-]+:\s*(\S.*?)\s*$')
+
+
+def _command_option(word):
+    """Whether `word` is the option that makes a shell run a command STRING.
+
+    `bash <text>` runs a FILE of that name; only `-c` (and its clustered
+    spellings, and PowerShell's `-Command`) makes the next argument a script to
+    execute. Naming the shell is half the claim — this is the other half.
+    """
+    if not word.startswith('-'):
+        return False
+    opt = word.lstrip('-')
+    if opt.lower() in ('c', 'command', 'encodedcommand'):
+        return True
+    return (not word.startswith('--') and opt.islower()
+            and 'c' in opt and len(opt) <= 4)
+
+
+def _runs_shell(value):
+    """Whether a command value runs a shell OVER a command string."""
+    words = _command_words(value)
+    return (bool(words)
+            and pathlib.PurePath(words[0]).name in DOCKER_SHELLS
+            and any(_command_option(w) for w in words[1:]))
+
+
+def _command_words(value):
+    """The words of a command value, in either the list or the bare form."""
+    text = value.strip()
+    if text.startswith('['):
+        parts = text[1:].split(']')[0].split(',')
+    else:
+        parts = text.split()
+    return [p.strip().strip('\'"') for p in parts if p.strip()]
 
 
 def _shell_named(value):
@@ -1316,7 +1350,7 @@ def _yaml_blocks(body, interpolated=False, consumer='actions',
                     out[i] = ''
         del buf[:]
 
-    seq, seq_indent, seq_shell = None, 0, None
+    seq, seq_indent, seq_shell, seq_dashc = None, 0, None, False
     src, consumed = body.splitlines(), set()
     for index, l in enumerate(src):
         if index in consumed:
@@ -1356,12 +1390,19 @@ def _yaml_blocks(body, interpolated=False, consumer='actions',
         if consumer == 'compose':
             item = SEQ_ITEM.match(l)
             if at and at.group(3) in YAML_EXECUTED and not YAML_INLINE.match(l):
-                seq, seq_indent, seq_shell = at.group(3), column, None
+                seq, seq_indent = at.group(3), column
+                seq_shell, seq_dashc = None, False
             elif seq is not None and item and len(item.group(1)) > seq_indent:
                 text = item.group(2).strip()
                 if seq_shell is None:
-                    seq_shell = _shell_named(text) in DOCKER_SHELLS
-                if seq_shell and text.rstrip('-+0123456789') in ('|', '>'):
+                    # The first item names the executable; a LATER item has to
+                    # ask it to run a command string. `- bash` then a block is
+                    # bash running a file of that name, not a script.
+                    seq_shell = (pathlib.PurePath(text.strip('\'"')).name
+                                 in DOCKER_SHELLS)
+                elif seq_shell and _command_option(text.strip('\'"')):
+                    seq_dashc = True
+                if seq_shell and seq_dashc and text.rstrip('-+0123456789') in ('|', '>'):
                     out.append(l)
                     key, indent = seq, len(item.group(1))
                     runs, fold = True, text.startswith('>')
@@ -2548,6 +2589,12 @@ ACCESSOR = re.compile(r'\b(?:std::)?env::(var|var_os|set_var)\s*\('
 ENV_IMPL = re.compile(r'\bimpl\s*(?:<[^<>]*>)?\s*Env\b[^{]*?\bfor\s+([A-Za-z_]\w*)')
 # …and any binding, parameter or field whose type mentions one.
 ENV_BOUND = re.compile(r'\b([a-z_]\w*)\s*:\s*[^,;{}()=]*\bEnv\b')
+# A GENERIC parameter bounded by `Env` is an environment too, and a field
+# declared with it mentions no `Env` at all: `struct ForcedProfileEnv<E: Env>`
+# has `inner: E`, whose `self.inner.var(key)` is a real read. Derived per file,
+# since a type parameter is as local as a binding.
+ENV_GENERIC = re.compile(r'[<,]\s*([A-Z]\w*)\s*:\s*[^,>]*\bEnv\b'
+                         r'|\bwhere\s+([A-Z]\w*)\s*:\s*[^,;{]*\bEnv\b')
 
 # …plus the crates' own env helpers, READ OUT OF THE TREE rather than listed
 # here, the same way the runtime's `format!` templates are. A helper takes an
@@ -2582,7 +2629,7 @@ def accessor(root, test_files=frozenset()):
     """
     out = subprocess.run(['git', 'ls-files', '-z', '*.rs'], cwd=root,
                          capture_output=True, text=True).stdout
-    index, types, receivers, masked_all = {}, set(), set(), {}
+    index, types, per_file, masked_all = {}, set(), {}, {}
     for rel in out.split('\0'):
         # Test code is skipped outright, as the scan that consumes this index
         # already does — a receiver bound only in a test is used only in a
@@ -2611,8 +2658,16 @@ def accessor(root, test_files=frozenset()):
         masked_all[rel] = (masked, data)
         types.update(m.group(1) for m in ENV_IMPL.finditer(masked)
                      if not data[m.start()])
-        receivers.update(m.group(1) for m in ENV_BOUND.finditer(masked)
-                         if not data[m.start()])
+        names = per_file.setdefault(rel, set())
+        names.update(m.group(1) for m in ENV_BOUND.finditer(masked)
+                     if not data[m.start()])
+        params = {g for m in ENV_GENERIC.finditer(masked) if not data[m.start()]
+                  for g in m.groups() if g}
+        if params:
+            names.update(re.findall(
+                r'\b([a-z_]\w*)\s*:\s*&?\s*(?:'
+                + '|'.join(sorted(map(re.escape, params))) + r')\s*[,;})]',
+                masked))
     # A type that IS an environment can be the receiver itself (`OsEnv.var(…)`),
     # and a binding of one is too — `let denv = DotenvEnv::new(…)` has no
     # annotation to read, so the types are matched on the right of a `let` as
@@ -2624,22 +2679,37 @@ def accessor(root, test_files=frozenset()):
     # for the whole tree. That is the fourth time a derivation has been wider
     # than the rung it feeds, and the second time in this one function: the
     # inputs of a rung are the rung, however many passes they take.
-    receivers |= types
     if types:
         bound = re.compile(
             r'\blet\s+(?:mut\s+)?([a-z_]\w*)\s*(?::[^=;]*)?=\s*&?\s*(?:'
             + '|'.join(sorted(map(re.escape, types))) + r')\b')
-        for masked, data in masked_all.values():
-            receivers.update(m.group(1) for m in bound.finditer(masked)
-                             if not data[m.start()])
-    pattern = ACCESSOR.pattern
-    if receivers:
-        pattern += (r'|\b(?:' + '|'.join(sorted(map(re.escape, receivers)))
-                    + r')\s*\.\s*(var|var_os|set_var)\s*\(')
+        for rel, (masked, data) in masked_all.items():
+            per_file.setdefault(rel, set()).update(
+                m.group(1) for m in bound.finditer(masked)
+                if not data[m.start()])
+    # A RECEIVER NAME is file-local, and the pattern was global: `base` is
+    # derived from `let base = OsEnv` in one module, and an unrelated module's
+    # `base.var(…)` on something else then read as an environment call. A type
+    # name is global (it is the same type wherever it is written); a binding is
+    # not. So the receiver alternative is built per file, cached by the set of
+    # names, and every file that derives none falls back to the `env`-named
+    # floor in `ACCESSOR`.
+    base = ACCESSOR.pattern
     if index:
-        pattern += (r'|\b(' + '|'.join(sorted(map(re.escape, index)))
-                    + r')\s*\(')
-    return re.compile(pattern), index
+        base += (r'|\b(' + '|'.join(sorted(map(re.escape, index)))
+                 + r')\s*\(')
+    cache = {}
+
+    def compiled(rel):
+        names = frozenset(per_file.get(rel, ())) | types
+        if names not in cache:
+            cache[names] = re.compile(
+                base + r'|\b(?:' + '|'.join(sorted(map(re.escape, names)))
+                + r')\s*\.\s*(var|var_os|set_var)\s*\(' if names
+                else base)
+        return cache[names]
+
+    return compiled, index
 
 
 # …and never where the line asserts the name is absent.
@@ -3013,7 +3083,7 @@ def source_tokens(root):
     out = subprocess.run(['git', 'ls-files', '-z'], cwd=root,
                          capture_output=True, text=True).stdout
     test_files = test_module_files(root)
-    acc, key_index = accessor(root, test_files)
+    acc_for, key_index = accessor(root, test_files)
     tokens = set()
     for rel in out.split('\0'):
         # Markdown is prose, and `README.md.tmpl` is prose too — the same
@@ -3252,7 +3322,8 @@ def source_tokens(root):
         # `std::env::var(…)` lines inside a heredoc in
         # `deploy-real-vps-validate.sh` that writes a Rust file, and all three
         # names are carried elsewhere. Truth set 430 either way.
-        for m in (acc.finditer(body) if effective_suffix(rel) == '.rs' else ()):
+        for m in (acc_for(rel).finditer(body)
+                  if effective_suffix(rel) == '.rs' else ()):
             if nested is not None and nested[m.start()]:
                 continue
             head = body.rfind('\n', 0, m.start()) + 1
@@ -4468,7 +4539,8 @@ def self_test():
          bool(ACCESSOR.search('let v = env.get("AUTUMN_LOG__LEVEL");')), True)
     # A quoted name counts as its accessor's ARGUMENT, not as its neighbour. The
     # window this replaced took a name off any line within three of a call.
-    real_acc, real_index = accessor(ROOT, test_module_files(ROOT))
+    _acc_for, real_index = accessor(ROOT, test_module_files(ROOT))
+    real_acc = _acc_for('autumn/src/config.rs')
 
     def args_of(text, acc=ACCESSOR, index=None):
         m = acc.search(text)
@@ -4619,14 +4691,25 @@ def self_test():
     # `off` is bound only inside a test module, so it is not derived — and
     # costs nothing, because the calls that use it are test code too and are
     # masked before this pattern ever reads them.
-    case('an accessor needs a receiver or a path, and an environment one',
-         [bool(real_acc.search(s)) for s in
-          ('var("AUTUMN_X")', 'background: var(--primary)',
-           'css.var("AUTUMN_X")', 'off.var("AUTUMN_X")',
-           'std::env::var("AUTUMN_X")', 'env::var("AUTUMN_X")',
-           'env.var("AUTUMN_X")', 'denv.var("AUTUMN_X")',
-           'self.inner.var("AUTUMN_X")', 'OsEnv.var("AUTUMN_X")')],
-         [False, False, False, False, True, True, True, True, True, True])
+    # …and the receiver must be an ENVIRONMENT one, derived from the tree and
+    # SCOPED to the file that declares it: a binding name is file-local, while
+    # a type name is not. `inner` is a field of a wrapper in `deploy.rs`, so it
+    # is an accessor there and an ordinary method name in `config.rs`. `off` is
+    # bound only inside a test module, so it is derived nowhere — which costs
+    # nothing, since the calls using it are test code and already masked.
+    case('an accessor needs an environment receiver, scoped to its file',
+         (bool(real_acc.search('var("AUTUMN_X")')),
+          bool(real_acc.search('background: var(--primary)')),
+          bool(real_acc.search('css.var("AUTUMN_X")')),
+          bool(real_acc.search('off.var("AUTUMN_X")')),
+          bool(real_acc.search('std::env::var("AUTUMN_X")')),
+          bool(real_acc.search('env::var("AUTUMN_X")')),
+          bool(real_acc.search('env.var("AUTUMN_X")')),
+          bool(real_acc.search('OsEnv.var("AUTUMN_X")')),
+          bool(_acc_for('autumn-cli/src/deploy.rs')
+               .search('self.inner.var("AUTUMN_X")')),
+          bool(real_acc.search('self.inner.var("AUTUMN_X")'))),
+         (False, False, False, False, True, True, True, True, True, False))
     # A redirection is not a command — `AUTUMN_X=1 > out` is a null command
     # that starts no process — but it may PRECEDE one, so it is consumed and
     # the question asked again rather than added to the terminator set.
@@ -5001,10 +5084,21 @@ def self_test():
              '      - |\n        AUTUMN_SEQ=1 true\n    x-after: done\n')
     _seqx = ('services:\n  app:\n    command:\n      - /app/x\n      - -c\n'
              '      - |\n        AUTUMN_NOSEQ=1 true\n')
-    case('a sequence-form compose command is read when it names a shell',
+    _seqn = ('services:\n  app:\n    command:\n      - bash\n'
+             '      - |\n        AUTUMN_NOC=1 true\n')
+    case('a sequence-form compose command is read when it runs a shell',
          (ASSIGNED_PREFIX.findall(_yaml_blocks(_seqc, True, 'compose', True)),
-          ASSIGNED_PREFIX.findall(_yaml_blocks(_seqx, True, 'compose', True))),
-         (['AUTUMN_SEQ'], []))
+          ASSIGNED_PREFIX.findall(_yaml_blocks(_seqx, True, 'compose', True)),
+          ASSIGNED_PREFIX.findall(_yaml_blocks(_seqn, True, 'compose', True))),
+         (['AUTUMN_SEQ'], [], []))
+    # Naming the shell is half the claim; `-c` is the other half. `bash <text>`
+    # runs a FILE of that name.
+    case('a shell runs a command string only when asked to',
+         [_runs_shell(v) for v in
+          ('["sh", "-lc", "autumn migrate"]', '[bash, script]',
+           'sh -c "echo"', 'pwsh -NoProfile -Command "."',
+           'bash', '["/app/x"]', 'AUTUMN_X=v echo')],
+         [True, False, True, True, False, False, False])
     # A custom Actions shell line is still a shell: what names the grammar is
     # the EXECUTABLE, and the JSON list form splits on the comma, not on space.
     case('a shell is named by its executable, in either spelling',
