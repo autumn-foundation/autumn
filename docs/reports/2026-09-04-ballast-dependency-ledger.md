@@ -63,30 +63,48 @@ itself (see "Ask-before candidate").
   1.88.0 MSRV ceiling exist yet (which would let the `lru` 0.16.4 copy
   disappear entirely rather than staying pinned).
 
-## 💡 Ask-before candidate (not executed)
+## 💡 Ask-before candidate (not executed) — corrected
 
 **Upgrade, `reqwest` 0.12 → 0.13** — the one duplicate in the census that
-isn't cosmetic RustCrypto/windows noise:
+isn't cosmetic RustCrypto/windows noise. **Correction**: the first revision
+of this report understated the 0.12 footprint and overstated the win;
+`chatgpt-codex-connector`'s review on this PR caught both, verified directly
+against the graph below and corrected here.
 
-- `autumn/Cargo.toml:393` pins `reqwest = "0.12"` directly (the crate's own
-  `http-client`/`acme`/S3-signing-cert-fetch features), independent of the
-  workspace-level `reqwest` entry.
+- Three workspace members pin `reqwest = "0.12"` **directly and
+  independently** of one another — not just `autumn/Cargo.toml:393`
+  (`http-client`/`acme`/S3-signing-cert-fetch) but also
+  `autumn-media-plugin/Cargo.toml:44` and `example-e2e/Cargo.toml:13`. All
+  three would need to move, not one.
+- A fourth path to 0.12 is transitive and outside this workspace's control:
+  under the full `deny.toml`-audited feature set (`managed-pg-bundled`
+  included), `postgresql_archive` → `reqwest-retry` → `reqwest` resolves to
+  0.12 as well (confirmed via `cargo tree -e normal,build -p autumn-web
+  --features <the deny.toml set> -i reqwest@0.12.28`). Converging our own
+  three pins to 0.13 would **not** remove this copy from the audited graph —
+  it depends on `reqwest-retry`/`postgresql_archive` shipping their own bump.
+  The original report's default-feature `cargo metadata` run missed this
+  entirely because it didn't enable `managed-pg-bundled`.
 - `autumn-cli/Cargo.toml` (two spots) pins `reqwest = "0.13"`, and
-  `chromiumoxide 0.9` (pulled in transitively by `autumn-web`'s
-  `system-tests` feature — the same feature set `deny.toml` audits) also
-  resolves `reqwest` 0.13.
-- Net effect: building with both `http-client`/`acme` and `system-tests`
-  enabled — which is exactly what the CI-audited graph does — carries two
-  full major versions of a TLS+async HTTP client stack simultaneously.
-- Measured overlap: forward-subtree crate-name diff (`cargo tree --package
-  reqwest@0.12.28` vs `--package reqwest@0.13.4`) shows the two subtrees are
-  already deduped for shared infrastructure (hyper, h2, tokio, etc. resolve
-  to one shared version each); only `ryu` and `serde_urlencoded` are
-  exclusive to the 0.12 subtree. So converging `autumn`'s pin to `0.13` would
-  collapse the `reqwest` crate itself plus those two — a 3-node prune, right
-  at this project's own Impact Floor's "duplicate versions of a dep collapsed
-  to one" bar, clearing it on its own with no other forcing fact needed.
-- **Why this isn't already a PR**: `autumn/src/http_client.rs` (the
+  `chromiumoxide 0.9` (via `system-tests`) also resolves `reqwest` 0.13.
+- **The "3-node prune" claim was wrong.** Both crates named as exclusive to
+  the 0.12 subtree are retained independently: `ryu` is also pulled in by
+  `aws-smithy-types` (the AWS SDK stack, unrelated to reqwest), and
+  `serde_urlencoded` is `autumn`'s own direct dependency
+  (`autumn/Cargo.toml:384`), not solely a reqwest transitive. Neither would
+  disappear from the graph under any of the changes above. The only node
+  that would actually leave, even in the best case (all three of our own
+  pins converged, and `reqwest-retry` unrelated), is the `reqwest` 0.12
+  crate itself — a 1-node prune, and one that doesn't clear even under the
+  best case because of the `postgresql_archive` path. **This candidate does
+  not currently clear the Impact Floor** and the recommendation below is
+  narrowed accordingly: still worth converging our *own* three pins for
+  consistency (one fewer major version to reason about in code we control),
+  but it is not the dedup win originally claimed, and a real graph-level
+  collapse also needs `reqwest-retry`/`postgresql_archive` to move upstream
+  first — track that as the actual forcing-fact gap, not something this
+  workspace can close alone.
+- **Why this still isn't a PR**: `autumn/src/http_client.rs` (the
   `autumn_web::http::Client` wrapper Autumn ships as its own public API)
   returns `reqwest::StatusCode` and `Option<&reqwest::Url>` directly from
   public methods (`Response::status()`, `Response::url()`), and takes
@@ -96,14 +114,15 @@ isn't cosmetic RustCrypto/windows noise:
   **ask-before** action — reqwest 0.12→0.13 is a semver-major jump for a 0.x
   crate and could change the shape of `StatusCode`/`Url` a downstream
   `autumn_web` consumer's code touches. Flagging here rather than opening the
-  PR unasked. If the change is wanted: the migration surface is 12 files
-  under `autumn/src` calling `reqwest::` directly (`http_client.rs`,
+  PR unasked. If the change is wanted: the migration surface is at least 12
+  files under `autumn/src` calling `reqwest::` directly (`http_client.rs`,
   `acme/dns/http.rs`, `alerts.rs`, `auth.rs`, `auth/password.rs`,
   `capsule/schema.rs`, `inbound_mail.rs`, `interceptor.rs`,
   `replication/s3.rs`, `security/captcha.rs`, `shadow/transport.rs`,
-  `sync/engine.rs`, `test.rs`) — the reqwest 0.13 changelog/migration notes
-  would need to be read against each of those call sites before any rehearsal,
-  per this policy's Upgrade-class bar.
+  `sync/engine.rs`, `test.rs`), plus whatever `autumn-media-plugin` and
+  `example-e2e` touch directly — the reqwest 0.13 changelog/migration notes
+  would need to be read against each call site before any rehearsal, per
+  this policy's Upgrade-class bar.
 
 ## 🔧 Change
 
