@@ -161,34 +161,58 @@ rather than by softening the claim:
    procedure and results — the verdict is unchanged (still pursue), now on
    stronger evidence than the first pass actually supported.
 
+**A third P2 finding**, on the revision-2 diff above: every
+convergence/counter check up to that point read the condition **once** at
+the instant a poll loop first saw it true, then moved on — it never
+confirmed the view stayed put, and membership was never re-checked
+immediately after a counter check (only before). A member evicted by the
+suspicion timeout and then re-admitted between two checks, or a stale
+counter cell surviving a membership flicker, could in principle slip
+through undetected, and the report's "no divergence" language claimed more
+than a single-instant read can support. Fixed by replacing every
+single-read poll with a debounced one requiring the condition to hold on 3
+consecutive observations 50ms apart (`poll_until_stable`/
+`assert_stable_membership`/`assert_stable_counter_sum` below), and adding
+a membership re-check immediately after every counter check (not just
+before it) — so a flicker during counter convergence can't go unobserved
+either. Re-ran 4 more times; see **Assay**. Verdict is unchanged.
+
 ## 🧪 Apparatus
 
 One throwaway test file, `autumn/tests/prospect_cluster_scale.rs` (a
 temporary `[[test]]` entry added to `autumn/Cargo.toml` to build it,
 `test-support` feature enabled), copying `cluster_two_node.rs`'s own
 harness conventions (`ClusterConfig`, `install_from_config`, `ClusterHandle`,
-a `poll_until` helper, a two-sided `describe()` failure formatter) and
-scaling them to 5 members. One `#[tokio::test(flavor = "multi_thread")]`
-runs all four pre-registered steps in sequence against one 5-node cluster:
+a two-sided `describe()` failure formatter) and scaling them to 5 members.
+Every check is **debounced**: `poll_until_stable` requires the condition to
+hold on 3 consecutive observations 50ms apart before counting as converged
+(see the third correction above), not a single-instant read. One
+`#[tokio::test(flavor = "multi_thread")]` runs all steps in sequence
+against one 5-node cluster:
 
 1. `spawn_star_cluster(5)` — node 0 installs with no seeds; nodes 1-4 each
    install seeded only with node 0's observed `local_addr()` (star
    topology, matching the pre-registration). Every node binds
    `127.0.0.1:0`; `push_interval_ms: 200`, `suspicion_timeout_ms: 1_000`,
    identical to `cluster_two_node.rs`'s own `cluster_config()`.
-2. Poll for all 5 nodes reporting an identical, full 5-member view.
+2. `assert_stable_membership`: all 5 nodes report an identical, full
+   5-member view, stably.
 3. Every node increments the shared counter by a distinct amount
-   (node *i* → `i+1`); poll for all 5 nodes reading the exact sum, 15.
-4. Cancel node 4's shutdown token (clean departure); poll for the 4
-   survivors converging to an identical 4-member view, **then** poll them
-   for the exact sum 15 again (added in the correction above — the
-   departed node's contributed cells must still be present in the merged
-   document the survivors hold).
-5. Install a fresh node, re-seeded from node 0, replacing node 4; poll for
-   all 5 (4 original + 1 rejoined) reconverging to a full 5-member view,
-   **then** poll all 5 for the exact sum 15 again (added in the correction
-   above — the rejoined node must relearn the full total from its peers,
-   not just the membership shape).
+   (node *i* → `i+1`); `assert_stable_counter_sum`: all 5 nodes read the
+   exact sum, 15, stably — then `assert_stable_membership` again, to catch
+   any membership flicker that happened *during* counter convergence.
+4. Cancel node 4's shutdown token (clean departure);
+   `assert_stable_membership`: the 4 survivors converge to an identical
+   4-member view, stably; `assert_stable_counter_sum`: the survivors still
+   read the exact sum 15, stably (the departed node's contributed cells
+   must still be present in the merged document); `assert_stable_membership`
+   again, post-counter-check.
+5. Install a fresh node, re-seeded from node 0, replacing node 4;
+   `assert_stable_membership`: all 5 (4 original + 1 rejoined) reconverge
+   to a full 5-member view, stably; `assert_stable_counter_sum`: all 5 read
+   the exact sum 15 again, stably (the rejoined node must relearn the full
+   total from its peers, not just the membership shape);
+   `assert_stable_membership` again, post-counter-check.
 
 **Stubs / what this apparatus faked or skipped** (scopes what the result
 below actually proves):
@@ -272,29 +296,46 @@ assays in this ledger paid dearly to learn):
 | 7 | all steps + both post-churn counter checks pass | 1.03s |
 | 8 | all steps + both post-churn counter checks pass | 1.11s |
 
-**Against the pre-registered lines (corrected pass, the one that actually
-covers the full claim):**
+**N=5 assay, third pass, 4 more runs** (after switching every check to the
+debounced `poll_until_stable` — 3 consecutive positive observations, 50ms
+apart — and adding a membership re-check immediately after every counter
+check; 12 total runs across all three passes):
 
-- **Step 1 (cold-start convergence, line: ≤10s):** passed on 8/8 runs
-  across both passes. Actual convergence is folded into each run's total
-  ~0.9-1.3s wall-clock (compile excluded) — roughly an order of magnitude
-  inside the bound, not a close call the way the cold-start ledger's
-  margins were.
+| Run | Result | Wall-clock |
+|---|---|---:|
+| 9 | all steps + stability + post-counter membership rechecks pass | 2.39s |
+| 10 | all steps + stability + post-counter membership rechecks pass | 2.46s |
+| 11 | all steps + stability + post-counter membership rechecks pass | 2.60s |
+| 12 | all steps + stability + post-counter membership rechecks pass | 2.32s |
+
+**Against the pre-registered lines (third pass, the one that actually
+covers the full claim as stated in the guide text):**
+
+- **Step 1 (cold-start convergence, line: ≤10s):** passed on 12/12 runs
+  across all three passes. Actual convergence is folded into each run's
+  total ~0.9-2.6s wall-clock (compile excluded) — the third pass runs
+  slower than the first two purely because of the added debounce delay
+  (3×50ms per check × more checks per run), not because convergence itself
+  got slower; still roughly 4-10x inside the bound, not a close call the
+  way the cold-start ledger's margins were.
 - **Step 2 (counter merge, line: exact sum 15 on every node, ≤10s):**
-  passed on 8/8 runs. Every node read exactly 15 on every run — no lost or
-  duplicated increments observed.
+  passed on 12/12 runs, now stability-checked, with a membership recheck
+  immediately after (runs 9-12) confirming no flicker occurred during
+  convergence.
 - **Step 3 (departure, line: 4-member view on survivors, ≤5s, AND exact sum
-  15 still held on all 4 survivors):** passed on 8/8 runs — the counter
-  half of this check only ran in runs 5-8 (the correction), and held on
-  4/4 of those.
+  15 still held on all 4 survivors):** passed on 12/12 runs — the counter
+  half ran in runs 5-12, held on 8/8 of those; the stability debounce and
+  post-counter membership recheck ran in runs 9-12, held on 4/4.
 - **Step 4 (rejoin, line: 5-member view, ≤10s, AND exact sum 15 relearned
-  by the rejoined node):** passed on 8/8 runs — again, the counter half
-  only ran in runs 5-8, and held on 4/4 of those.
+  by the rejoined node):** passed on 12/12 runs — counter half held on 8/8
+  (runs 5-12), stability + post-counter recheck held on 4/4 (runs 9-12).
 - **Kill-line check:** zero divergent views, zero wrong counter values,
-  zero panics/timeouts/hangs across all 8 runs. The "2 of 3 repeats"
+  zero panics/timeouts/hangs, zero stability-debounce failures (no run
+  ever needed a second debounce window — every 3-observation streak
+  succeeded on the first attempt) across all 12 runs. The "2 of 3 repeats"
   kill-line threshold was never approached in either direction — this
   result is not a marginal call the way the cold-start bisection's
-  sub-5,000ms deltas were; every margin here has roughly 8-13x headroom
+  sub-5,000ms deltas were; every margin here has roughly 4-13x headroom
   against its line, so ordinary run-to-run scheduling noise on this shared
   sandbox is not a plausible alternative explanation the way it was there.
 
@@ -302,18 +343,21 @@ covers the full claim):**
 
 **Pursue**, against the pre-registered line: all four success criteria
 (cold-start convergence, exact counter merge, departure convergence,
-rejoin convergence) held on every run across both passes, each with
-roughly an order of magnitude of margin against its bound — not a photo
-finish. No kill-line condition was observed. Critically, after the
-correction above, the counter's exact sum was verified not just once
-before churn but again on the survivors after departure and again on the
-full cluster after rejoin — the stronger claim the guide text now makes is
-the one actually measured, on 4/4 corrected runs, not the weaker one the
-first pass of this report accidentally supported. Within the scope this
-assay actually tested (single host, single process, star topology, honest
-peers, N=5, correctness not performance), the full-broadcast/no-quorum
-gossip design does **not** show the split-brain or lost-update failure
-mode the guide's hedge gestures at.
+rejoin convergence) held on every run across all three passes, with
+comfortable margin against every bound — not a photo finish. No kill-line
+condition was observed. After the two corrections above, the counter's
+exact sum was verified not just once before churn but again on the
+survivors after departure and again on the full cluster after rejoin, and
+every convergence/counter observation was required to hold across 3
+consecutive checks (not a single instant) with a membership recheck
+immediately after every counter check — the actual claim the guide text
+makes ("no divergence," stable identical views, exact sums through churn)
+is the one actually measured, on 4/4 third-pass runs, not the weaker
+single-read version the first two passes of this report accidentally
+supported. Within the scope this assay actually tested (single host,
+single process, star topology, honest peers, N=5, correctness not
+performance), the full-broadcast/no-quorum gossip design does **not** show
+the split-brain or lost-update failure mode the guide's hedge gestures at.
 
 This is deliberately a narrower claim than "clustering works past two
 nodes" — see the stubs list above for exactly what was not tested (real
@@ -356,10 +400,9 @@ peers, one churn cycle":
 ## 🔬 Reproduce
 
 The apparatus was never committed (per this ledger's containment rule, it
-is reverted before the report is finalized), so — fixing the first
-revision of this section, flagged by Codex review as pointing at a commit
-that does not actually contain the file — its exact source is embedded
-below rather than referenced by history. This is now the durable artifact.
+is reverted before the report is finalized), so its exact source (revision
+3, post all three Codex corrections above) is embedded below rather than
+referenced by history. This is now the durable artifact.
 
 1. Add this entry to `autumn/Cargo.toml`, immediately after the existing
    `[[test]] name = "integration_tests"` block:
@@ -376,10 +419,28 @@ below rather than referenced by history. This is now the durable artifact.
    //! PROSPECT ASSAY APPARATUS — throwaway, not for merge.
    //!
    //! Answers the falsifiable question pre-registered in
-   //! docs/reports/2026-09-04-prospect-cluster-scale-beyond-two-nodes.md:
-   //! does the full-broadcast, no-quorum gossip cluster converge correctly
-   //! at N=5? Scales up autumn/tests/integration/cluster_two_node.rs's own
-   //! harness conventions to 5 members, star-seeded from node 1.
+   //! `docs/reports/2026-09-04-prospect-cluster-scale-beyond-two-nodes.md`:
+   //! does the full-broadcast, no-quorum gossip cluster converge correctly at
+   //! N=5? Deliberately copies the existing 2-node test's harness conventions
+   //! (`autumn/tests/integration/cluster_two_node.rs`) scaled up to 5 members,
+   //! star-seeded from node 1. No production code changes; this file and its
+   //! `[[test]]` Cargo.toml entry are reverted after the assay runs — its
+   //! source is embedded verbatim in the report's Reproduce section instead.
+   //!
+   //! Revision 2 (Codex P2 on PR #2503): the counter sum is now re-verified
+   //! after departure (step 3) and after rejoin (step 4), not just after step
+   //! 2.
+   //!
+   //! Revision 3 (Codex P2 on PR #2503, on the revision-2 diff): every
+   //! convergence/counter check now requires the condition to hold across
+   //! several *consecutive* observations (a debounce), not just once at the
+   //! instant the poll loop first sees it — a single-instant read cannot rule
+   //! out a view that flickers (a member briefly evicted by the suspicion
+   //! timeout then re-admitted) between the moment the poll succeeds and the
+   //! moment the test reads it again for the next assertion. Membership is
+   //! also now re-checked for stability immediately after every counter
+   //! check, not just at the four original checkpoints, so a divergence that
+   //! only shows up while counters are converging can't slip through.
 
    use std::sync::Arc;
    use std::time::Duration;
@@ -392,25 +453,45 @@ below rather than referenced by history. This is now the durable artifact.
    const SECRET: &str = "a-shared-cluster-secret-value-32";
    const COUNTER: &str = "prospect_n5";
    const N: usize = 5;
-   const EXPECTED_SUM: u64 = 1 + 2 + 3 + 4 + 5; // 15
+   const EXPECTED_SUM: u64 = 1 + 2 + 3 + 4 + 5; // 15, fixed regardless of who departs/rejoins
 
+   /// Matches the pre-registration's step-1/step-2 bound: 2x the existing
+   /// 2-node test's 5s convergence bound.
    const CONVERGE_TIMEOUT: Duration = Duration::from_secs(10);
+   /// Matches the pre-registration's step-3 departure bound.
    const DEPARTURE_TIMEOUT: Duration = Duration::from_secs(5);
+   /// Consecutive positive observations required before a condition counts as
+   /// "stable," and the gap between them. Adds ~150ms per check on the happy
+   /// path — negligible against the multi-second timeouts above.
+   const STABLE_CHECKS: u32 = 3;
+   const STABLE_GAP: Duration = Duration::from_millis(50);
 
-   async fn poll_until<F, Fut>(timeout: Duration, mut condition: F) -> bool
+   /// Debounced poll: `condition` must return `true` on `STABLE_CHECKS`
+   /// consecutive observations, `STABLE_GAP` apart, before this returns
+   /// success. Any single `false` observation resets the streak — this is
+   /// what actually rules out a flicker (evicted-then-readmitted member,
+   /// stale counter cell) rather than a single lucky instant.
+   async fn poll_until_stable<F, Fut>(timeout: Duration, mut condition: F) -> bool
    where
        F: FnMut() -> Fut,
        Fut: std::future::Future<Output = bool>,
    {
        let deadline = tokio::time::Instant::now() + timeout;
        loop {
-           if condition().await {
+           let mut stable = true;
+           for _ in 0..STABLE_CHECKS {
+               if !condition().await {
+                   stable = false;
+                   break;
+               }
+               tokio::time::sleep(STABLE_GAP).await;
+           }
+           if stable {
                return true;
            }
            if tokio::time::Instant::now() >= deadline {
                return false;
            }
-           tokio::time::sleep(Duration::from_millis(10)).await;
        }
    }
 
@@ -427,7 +508,10 @@ below rather than referenced by history. This is now the durable artifact.
    }
 
    fn app_config(cluster: ClusterConfig) -> AutumnConfig {
-       AutumnConfig { cluster, ..AutumnConfig::default() }
+       AutumnConfig {
+           cluster,
+           ..AutumnConfig::default()
+       }
    }
 
    fn member_ids(handle: &Arc<ClusterHandle>) -> Vec<String> {
@@ -489,94 +573,71 @@ below rather than referenced by history. This is now the durable artifact.
        (handles, tokens)
    }
 
-   async fn assert_full_convergence(handles: &[Arc<ClusterHandle>], expected_n: usize, label: &str) {
+   /// Stable, two-sided membership check: every handle must report exactly
+   /// `expected_n` members with an identical sorted id set, on
+   /// `STABLE_CHECKS` consecutive observations.
+   async fn assert_stable_membership(handles: &[Arc<ClusterHandle>], expected_n: usize, label: &str) {
        let hs = handles.to_vec();
-       let ok = poll_until(CONVERGE_TIMEOUT, || {
+       let ok = poll_until_stable(CONVERGE_TIMEOUT, || {
            let hs = hs.clone();
-           async move { hs.iter().all(|h| h.members().len() == expected_n) }
+           async move {
+               if !hs.iter().all(|h| h.members().len() == expected_n) {
+                   return false;
+               }
+               let reference = member_ids(&hs[0]);
+               hs.iter().all(|h| member_ids(h) == reference)
+           }
        })
        .await;
        assert!(
            ok,
-           "[{label}] all {expected_n} nodes must report a {expected_n}-member view within {CONVERGE_TIMEOUT:?}; {}",
+           "[{label}] all {expected_n} nodes must report an identical {expected_n}-member view, \
+            stable across {STABLE_CHECKS} consecutive observations {STABLE_GAP:?} apart, within \
+            {CONVERGE_TIMEOUT:?}; {}",
            describe(handles)
        );
-
-       let reference = member_ids(&handles[0]);
-       assert_eq!(reference.len(), expected_n, "[{label}] {}", describe(handles));
-       for (i, h) in handles.iter().enumerate() {
-           assert_eq!(
-               member_ids(h),
-               reference,
-               "[{label}] node {i} must agree on the exact same member set as node 0; {}",
-               describe(handles)
-           );
-       }
    }
 
-   /// Poll every handle for the exact expected counter sum, then assert it
-   /// on every one individually (two-sided, not a one-node spot check).
-   async fn assert_counter_sum(handles: &[Arc<ClusterHandle>], label: &str) {
+   /// Stable, two-sided counter check: every handle must read exactly
+   /// `EXPECTED_SUM`, on `STABLE_CHECKS` consecutive observations.
+   async fn assert_stable_counter_sum(handles: &[Arc<ClusterHandle>], label: &str) {
        let hs = handles.to_vec();
-       let ok = poll_until(CONVERGE_TIMEOUT, || {
+       let ok = poll_until_stable(CONVERGE_TIMEOUT, || {
            let hs = hs.clone();
            async move { hs.iter().all(|h| h.counter(COUNTER).get() == EXPECTED_SUM) }
        })
        .await;
        assert!(
            ok,
-           "[{label}] every node must converge on counter={EXPECTED_SUM} within {CONVERGE_TIMEOUT:?}; {}",
+           "[{label}] every node must read counter={EXPECTED_SUM}, stable across {STABLE_CHECKS} \
+            consecutive observations {STABLE_GAP:?} apart, within {CONVERGE_TIMEOUT:?}; {}",
            describe(handles)
        );
-       for (i, h) in handles.iter().enumerate() {
-           assert_eq!(
-               h.counter(COUNTER).get(),
-               EXPECTED_SUM,
-               "[{label}] node {i} must read the exact merged sum, no lost/duplicated increments; {}",
-               describe(handles)
-           );
-       }
    }
 
    #[tokio::test(flavor = "multi_thread")]
    async fn n5_star_cluster_converges_counters_and_survives_departure_and_rejoin() {
        // --- Step 1: cold-start convergence to a full N-member view ---
        let (mut handles, mut tokens) = spawn_star_cluster(N);
-       assert_full_convergence(&handles, N, "step1-cold-start").await;
+       assert_stable_membership(&handles, N, "step1-cold-start").await;
 
        // --- Step 2: concurrent counter increments from every node ---
        for (i, h) in handles.iter().enumerate() {
            h.counter(COUNTER).increment_by((i as u64) + 1);
        }
-       assert_counter_sum(&handles, "step2-counter").await;
+       assert_stable_counter_sum(&handles, "step2-counter").await;
+       // Codex P2 (revision 3): membership must still be stable after the
+       // counter converges, not just before — a flicker during counter
+       // convergence would otherwise go unobserved.
+       assert_stable_membership(&handles, N, "step2-membership-recheck").await;
 
        // --- Step 3: clean departure of node N-1, survivors converge to N-1 ---
        let departing = N - 1;
        tokens[departing].cancel();
        let survivors: Vec<Arc<ClusterHandle>> = handles[..departing].to_vec();
-       let ok = poll_until(DEPARTURE_TIMEOUT, || {
-           let survivors = survivors.clone();
-           async move { survivors.iter().all(|h| h.members().len() == N - 1) }
-       })
-       .await;
-       assert!(
-           ok,
-           "[step3-departure] the {} survivors must converge to a {}-member view within {DEPARTURE_TIMEOUT:?}; {}",
-           departing,
-           N - 1,
-           describe(&handles)
-       );
-       let reference = member_ids(&survivors[0]);
-       for (i, h) in survivors.iter().enumerate() {
-           assert_eq!(
-               member_ids(h),
-               reference,
-               "[step3-departure] survivor {i} must agree with the others on the {}-member view; {}",
-               N - 1,
-               describe(&handles)
-           );
-       }
-       assert_counter_sum(&survivors, "step3-departure-counter").await;
+       assert_stable_membership(&survivors, N - 1, "step3-departure").await;
+       assert_stable_counter_sum(&survivors, "step3-departure-counter").await;
+       assert_stable_membership(&survivors, N - 1, "step3-departure-membership-recheck").await;
 
        // --- Step 4: node 5 rejoins (fresh handle, re-seeded from node 0) ---
        let seed = handles[0].local_addr().to_string();
@@ -595,8 +656,9 @@ below rather than referenced by history. This is now the durable artifact.
 
        handles[departing] = handle_rejoin;
        tokens[departing] = shutdown_rejoin;
-       assert_full_convergence(&handles, N, "step4-rejoin").await;
-       assert_counter_sum(&handles, "step4-rejoin-counter").await;
+       assert_stable_membership(&handles, N, "step4-rejoin").await;
+       assert_stable_counter_sum(&handles, "step4-rejoin-counter").await;
+       assert_stable_membership(&handles, N, "step4-rejoin-membership-recheck").await;
 
        for t in &tokens {
            t.cancel();
