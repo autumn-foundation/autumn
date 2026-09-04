@@ -418,6 +418,37 @@ confirming `addr` and `incarnation` do converge to bit-for-bit agreement
 across all 5 nodes as the guide's merge rule promises. See **Assay**.
 Verdict is unchanged.
 
+**An eighteenth and nineteenth P2 finding**, both on the revision-11 diff
+above:
+
+1. `cluster_config` never set `node_id`, so both the departing node and
+   its step-4 "rejoin" replacement received distinct entropy-derived
+   ids — meaning step 4 actually tested a brand-new member joining after
+   another left, not the same node genuinely rejoining with a higher
+   incarnation (the scenario `docs/guide/clustering.md`'s membership-merge
+   rules are written for, and what "rejoin" means in ordinary usage —
+   including in this very report's own step-4 description). Fixed: every
+   node now gets an explicit, stable `node_id` ("node-0" through
+   "node-4"), and the step-4 replacement reuses the departed node's exact
+   id — a genuine same-identity rejoin, now asserted directly
+   (`handle_rejoin.node_id() == departed_node_id`) rather than assumed.
+2. The native watchdog's `done` flag (which disarms it) was set the
+   instant `run_assay()`'s `JoinHandle` resolved successfully — before the
+   `#[tokio::test]` runtime is torn down. If a background task (for
+   example one still processing a just-issued cancellation) wedged during
+   that teardown, `Runtime::drop` could block indefinitely with no
+   watchdog left armed to catch it — the claimed 60s whole-test bound
+   never actually covered the teardown phase. Fixed: replaced
+   `#[tokio::test]` with a manually-built `tokio::runtime::Runtime`,
+   explicitly bounded with `shutdown_timeout(5s)` after the assay
+   completes; `done` is now only set after that bounded shutdown returns,
+   so the native watchdog stays armed through teardown too, not just the
+   assay body.
+
+Re-ran 4 more times (48 total across all twelve passes) — all pass,
+including the new same-identity-rejoin assertion. See **Assay**. Verdict
+is unchanged.
+
 ## 🧪 Apparatus
 
 One throwaway test file, `autumn/tests/prospect_cluster_scale.rs` (a
@@ -466,13 +497,21 @@ first watchdog too). The native watchdog is only disarmed once the
 spawned assay task has actually terminated — never merely because the
 cooperative timeout's own await resolved (fifteenth correction — a bare
 `Err` there doesn't mean the inner task finished, and disarming on it
-would silence the one scenario the second watchdog exists to catch). One
-`#[tokio::test(flavor = "multi_thread")]` runs all steps in sequence
-against one 5-node cluster:
+would silence the one scenario the second watchdog exists to catch); it
+is now also bounded through runtime teardown itself, not just the assay
+body — the test uses a manually-built `tokio::runtime::Runtime` with an
+explicit `shutdown_timeout(5s)` rather than relying on an implicit
+`Runtime::drop` inside a `#[tokio::test]`, and `done` is only set after
+that bounded shutdown returns (nineteenth correction). A `#[test]`
+(manual runtime, not the `#[tokio::test]` macro) runs all steps in
+sequence against one 5-node cluster:
 
-1. `spawn_star_cluster(5)` — node 0 installs with no seeds; nodes 1-4 each
-   install seeded only with node 0's observed `local_addr()` (star
-   topology, matching the pre-registration). Every node binds
+1. `spawn_star_cluster(5)` — node 0 installs with no seeds and explicit
+   id `"node-0"`; nodes 1-4 each install seeded only with node 0's
+   observed `local_addr()` (star topology, matching the pre-registration)
+   with explicit ids `"node-1"`..`"node-4"` (eighteenth correction — every
+   node now has a stable id, not an entropy-derived one, so departure and
+   rejoin can be about the *same* identity). Every node binds
    `127.0.0.1:0`; `push_interval_ms: 200`, `suspicion_timeout_ms: 1_000`,
    identical to `cluster_two_node.rs`'s own `cluster_config()`.
 2. `assert_stable_membership` (10s bound): all 5 nodes report an identical,
@@ -491,13 +530,15 @@ against one 5-node cluster:
    departed node's contributed cells must still be present in the merged
    document); `assert_stable_membership` again (**5s bound**),
    post-counter-check.
-5. Install a fresh node, re-seeded from node 0, replacing node 4;
-   `assert_stable_membership` (10s bound): all 5 (4 original + 1 rejoined)
-   reconverge to a full 5-member view, stably; `assert_stable_counter_sum`
-   (10s bound): all 5 read the exact sum 15 again, stably (the rejoined
-   node must relearn the full total from its peers, not just the
-   membership shape); `assert_stable_membership` again (10s bound),
-   post-counter-check.
+5. Install a fresh node, re-seeded from node 0, **reusing node 4's exact
+   id `"node-4"`** (eighteenth correction — a genuine rejoin, not a new
+   member with a fresh identity; asserted directly via
+   `handle_rejoin.node_id() == departed_node_id`); `assert_stable_membership`
+   (10s bound): all 5 (4 original + 1 rejoined) reconverge to a full
+   5-member view, stably; `assert_stable_counter_sum` (10s bound): all 5
+   read the exact sum 15 again, stably (the rejoined node must relearn the
+   full total from its peers, not just the membership shape);
+   `assert_stable_membership` again (10s bound), post-counter-check.
 
 **Stubs / what this apparatus faked or skipped** (scopes what the result
 below actually proves):
@@ -687,65 +728,86 @@ total runs across all eleven passes):
 | 43 | all steps + full (id, addr, incarnation) agreement pass | 12.82s |
 | 44 | all steps + full (id, addr, incarnation) agreement pass | 13.08s |
 
-**Against the pre-registered lines (eleventh pass, the one whose code
+**N=5 assay, twelfth pass, 4 more runs** (after making the rejoin reuse
+the departed node's exact id, and bounding runtime teardown with an
+explicit `shutdown_timeout` before disarming the native watchdog; 48
+total runs across all twelve passes):
+
+| Run | Result | Wall-clock |
+|---|---|---:|
+| 45 | all steps + stable-id rejoin + bounded-teardown watchdog pass | 12.83s |
+| 46 | all steps + stable-id rejoin + bounded-teardown watchdog pass | 12.83s |
+| 47 | all steps + stable-id rejoin + bounded-teardown watchdog pass | 13.08s |
+| 48 | all steps + stable-id rejoin + bounded-teardown watchdog pass | 13.10s |
+
+**Against the pre-registered lines (twelfth pass, the one whose code
 actually enforces every bound as registered — the whole-test 60s kill
 line via two independent watchdogs (the native one correctly armed
-throughout), a debounce window whose *last read* strictly clears the
-protocol's own timers and is classified before any trailing sleep against
-both the soft and hard deadlines, genuinely concurrent increments, full
-`(id, addr, incarnation)` membership agreement, and the pre-registration's
-own tri-state classification — see notes on Step 2 and Step 3 below for
-why earlier passes' runs still count as evidence despite bugs or claim
-gaps in that code):**
+through the assay *and* through bounded runtime teardown), a debounce
+window whose *last read* strictly clears the protocol's own timers and
+is classified before any trailing sleep against both the soft and hard
+deadlines, genuinely concurrent increments, full `(id, addr,
+incarnation)` membership agreement, a genuine same-identity rejoin, and
+the pre-registration's own tri-state classification — see notes on Step
+2, Step 3, and Step 4 below for why earlier passes' runs still count as
+evidence despite bugs or claim gaps in that code):**
 
 - **Step 1 (cold-start convergence, line: ≤10s):** passed (`Converged`, not
-  `LateConverged`) on 44/44 runs across all eleven passes. The
-  seventh-through-eleventh passes' ~12.8-15.6s *total* run time is the sum
+  `LateConverged`) on 48/48 runs across all twelve passes. The
+  seventh-through-twelfth passes' ~12.8-15.6s *total* run time is the sum
   of 9 mandatory debounce windows, not slower convergence — no single
   phase check came close to its own 5s/10s bound; still roughly 3-8x
   inside the tightest of those, not a close call the way the cold-start
   ledger's margins were. **Caveat on runs 1-40:** those compared only
   `ClusterMemberInfo::id` across nodes, not the full `(id, addr,
-  incarnation)` triple — flagged here; only runs 41-44 (eleventh pass) are
-  code-verified to have checked the fuller identity. All 44 runs did
-  converge to agreeing id sets either way.
+  incarnation)` triple — flagged here; only runs 41-48 (eleventh and
+  twelfth passes) are code-verified to have checked the fuller identity.
+  All 48 runs did converge to agreeing id sets either way.
 
 - **Step 2 (counter merge, line: exact sum 15 on every node, ≤10s):**
-  passed (`Converged`) on 44/44 runs, stability-checked since run 9
+  passed (`Converged`) on 48/48 runs, stability-checked since run 9
   (widened debounce since run 21, 6-observation debounce since run 25,
   pre-sleep classification since run 33, hard-deadline-checked completion
   since run 37), with a membership recheck immediately after confirming
   no flicker occurred during convergence. **Caveat on runs 1-28:** the
   increments driving this check were issued by a plain sequential loop,
   not genuinely concurrently — flagged here, not silently used as
-  evidence for the "concurrent" claim; only runs 29-44 (eighth through
-  eleventh passes) are code-verified to have actually issued all 5
-  increments concurrently (barrier-synced spawned tasks). All 44 runs,
+  evidence for the "concurrent" claim; only runs 29-48 (eighth through
+  twelfth passes) are code-verified to have actually issued all 5
+  increments concurrently (barrier-synced spawned tasks). All 48 runs,
   including 1-28, did read the exact sum 15 — so the merge-correctness
   evidence stands regardless, it's specifically the *concurrency* of the
-  input that only runs 29-44 can back.
+  input that only runs 29-48 can back.
 - **Step 3 (departure, line: 4-member view on survivors, ≤5s, AND exact sum
-  15 still held on all 4 survivors):** passed (`Converged`) on 44/44 runs —
-  the counter half ran in runs 5-44, held on 40/40 of those; the stability
-  debounce and post-counter membership recheck ran in runs 9-44, held on
-  36/36. **Caveat on runs 9-12 specifically:** those ran before the fourth
+  15 still held on all 4 survivors):** passed (`Converged`) on 48/48 runs —
+  the counter half ran in runs 5-48, held on 44/44 of those; the stability
+  debounce and post-counter membership recheck ran in runs 9-48, held on
+  40/40. **Caveat on runs 9-12 specifically:** those ran before the fourth
   correction, so their code was actually bounded by the 10s
   `CONVERGE_TIMEOUT`, not the registered 5s `DEPARTURE_TIMEOUT` — the
   *test* didn't enforce the right line, even though it still passed. This
   is not silently swept in as clean evidence for the 5s bound: it's
-  flagged here, and only runs 13-44 (fourth through eleventh passes) are
-  code-verified to have actually been gated at 5s. All 44 runs, including
+  flagged here, and only runs 13-48 (fourth through twelfth passes) are
+  code-verified to have actually been gated at 5s. All 48 runs, including
   9-12, did *empirically* complete step 3 in well under 5s either way — so
   the wall-clock evidence itself still supports the line; only the earlier
   code's enforcement of that specific line was what was broken, not the
   measured outcome.
 - **Step 4 (rejoin, line: 5-member view, ≤10s, AND exact sum 15 relearned
-  by the rejoined node):** passed (`Converged`) on 44/44 runs — counter half
-  held on 40/40 (runs 5-44), stability + post-counter recheck held on 36/36
-  (runs 9-44), all correctly bounded at 10s throughout (this step was
-  never affected by the Step 3 timeout bug).
+  by the rejoined node):** passed (`Converged`) on 48/48 runs — counter half
+  held on 44/44 (runs 5-48), stability + post-counter recheck held on 40/40
+  (runs 9-48), all correctly bounded at 10s throughout (this step was
+  never affected by the Step 3 timeout bug). **Caveat on runs 1-44:** the
+  "rejoined" node in those runs actually got a fresh, entropy-derived id —
+  a new member joining, not the departed node genuinely coming back;
+  flagged here, not silently used as evidence for the "rejoin" claim; only
+  runs 45-48 (twelfth pass) are code-verified (via a direct
+  `handle_rejoin.node_id() == departed_node_id` assertion) to test a
+  genuine same-identity rejoin. All 48 runs did reconverge to a correct
+  5-member view either way — it's specifically the *rejoin-vs-new-member*
+  distinction that only runs 45-48 can back.
 - **Undetermined-on-the-line classification (`LateConverged`):** never
-  triggered in any of the 44 runs — every check reached `Converged` well
+  triggered in any of the 48 runs — every check reached `Converged` well
   inside its `timeout`, so the pre-registration's third outcome remains
   implemented but empirically unexercised. The apparatus now has the
   capacity to report it (including correctly deferring to `Diverged` past
@@ -753,20 +815,22 @@ gaps in that code):**
   boundary closely enough to demonstrate either path firing.
 - **Whole-test 60s kill line:** enforced by two independent watchdogs since
   run 25 — the Tokio-scheduled one waiting on a spawned task's
-  `JoinHandle` (runs 21-44; a bare wrapper around the future directly,
+  `JoinHandle` (runs 21-48; a bare wrapper around the future directly,
   runs 17-20, is cooperative and can't preempt a genuine synchronous-lock
   deadlock) and a native `std::thread` outside the Tokio runtime entirely,
   correctly armed throughout its full window since run 33 (runs 25-32 had
   it disarming prematurely on a cooperative-timeout `Err`, not just on
-  genuine task completion — never actually observed firing incorrectly in
-  this assay's clean runs, but a latent bug in the safety net itself).
-  Every run completed in under 14s total, ~4x inside even this outermost
-  bound (the tightest margin of any check in this assay, still
-  comfortable).
+  genuine task completion), and — since run 45 — armed through bounded
+  runtime teardown too, not just the assay body (runs 33-44 disarmed it
+  immediately on the assay's own success, before teardown; never actually
+  observed firing incorrectly in this assay's clean runs, but a latent gap
+  in the safety net itself). Every run completed in under 14s total, ~4x
+  inside even this outermost bound (the tightest margin of any check in
+  this assay, still comfortable).
 - **Kill-line check:** zero divergent views, zero wrong counter values,
   zero panics/timeouts/hangs, zero `Diverged` outcomes, zero
   `LateConverged` outcomes, zero watchdog trips (Tokio-scheduled *or*
-  native) across all 44 runs. The "2 of 3 repeats" kill-line threshold was
+  native) across all 48 runs. The "2 of 3 repeats" kill-line threshold was
   never approached in either direction — this result is not a marginal
   call the way the cold-start bisection's sub-5,000ms deltas were; every
   margin here has roughly 3-25x headroom against its line, so ordinary
@@ -779,41 +843,43 @@ gaps in that code):**
 (cold-start convergence, exact counter merge, departure convergence,
 rejoin convergence, and the whole-test 60s kill line) held — as
 `Converged`, never `LateConverged` or `Diverged` — on every run across all
-eleven passes, with comfortable margin against every bound — not a photo
+twelve passes, with comfortable margin against every bound — not a photo
 finish, and (per the Step 3 caveat in **Assay**) the narrowest margin,
 departure's 5s line, is only claimed as *code-enforced* for the fourth
-through eleventh passes' 32 runs, though the wall-clock evidence supports
-it across all 44. No kill-line condition was observed. After all
-seventeen corrections above, the counter's exact sum was verified not
+through twelfth passes' 36 runs, though the wall-clock evidence supports
+it across all 48. No kill-line condition was observed. After all
+nineteen corrections above, the counter's exact sum was verified not
 just once before churn but again on the survivors after departure and
 again on the full cluster after rejoin, with the pre-churn increments
 themselves now genuinely concurrent (barrier-synced spawned tasks, not a
 sequential loop); membership agreement is checked on the full `(id, addr,
 incarnation)` identity the design actually converges (not bare ids), with
 `status` deliberately excluded as a documented, not-replicated local
-overlay; every convergence/counter observation was required to hold
-across a debounce window whose *last read*, not just a naive
-window-length arithmetic, strictly clears the protocol's own gossip and
-suspicion timers, classified immediately upon that read rather than
-after an unconditional trailing sleep and correctly checked against both
-the soft and hard deadlines on the iteration that decides the outcome,
-with a membership recheck immediately after every counter check; the
-debounce itself always yields rather than risking a spin; step 3's checks
-are gated at the registered 5s, not a silently-inherited 10s; and the
-whole test now runs behind two independent 60s watchdogs — a
+overlay; the step-4 "rejoin" now genuinely reuses the departed node's own
+identity (asserted directly), not a fresh entropy-derived one — a real
+rejoin, not a new member joining; every convergence/counter observation
+was required to hold across a debounce window whose *last read*, not just
+a naive window-length arithmetic, strictly clears the protocol's own
+gossip and suspicion timers, classified immediately upon that read rather
+than after an unconditional trailing sleep and correctly checked against
+both the soft and hard deadlines on the iteration that decides the
+outcome, with a membership recheck immediately after every counter check;
+the debounce itself always yields rather than risking a spin; step 3's
+checks are gated at the registered 5s, not a silently-inherited 10s; and
+the whole test now runs behind two independent 60s watchdogs — a
 Tokio-scheduled one and a native OS-thread one that cannot be starved by
 the same deadlock the first could theoretically miss on a single-worker
-runtime, and which now stays armed until the assay task has genuinely
-terminated rather than disarming the instant the cooperative watchdog's
-own await resolves — the actual claim the guide text makes ("no
-divergence," stable identical views, exact sums through concurrent
-churn) is the one actually measured, on 4/4 eleventh-pass runs, not the
-progressively weaker versions the first ten passes of this report each
-accidentally supported. Within the scope this assay actually tested
-(single host, single process, star topology, honest peers, N=5,
-correctness not performance), the full-broadcast/no-quorum gossip design
-does **not** show the split-brain or lost-update failure mode the guide's
-hedge gestures at.
+runtime, both now armed through bounded runtime teardown as well as the
+assay body itself, rather than disarming the instant the cooperative
+watchdog's own await resolves — the actual claim the guide text makes
+("no divergence," stable identical views, exact sums through concurrent
+churn, a genuine rejoin) is the one actually measured, on 4/4 twelfth-pass
+runs, not the progressively weaker versions the first eleven passes of
+this report each accidentally supported. Within the scope this assay
+actually tested (single host, single process, star topology, honest
+peers, N=5, correctness not performance), the full-broadcast/no-quorum
+gossip design does **not** show the split-brain or lost-update failure
+mode the guide's hedge gestures at.
 
 This is deliberately a narrower claim than "clustering works past two
 nodes" — see the stubs list above for exactly what was not tested (real
@@ -857,7 +923,7 @@ peers, one churn cycle":
 
 The apparatus was never committed (per this ledger's containment rule, it
 is reverted before the report is finalized), so its exact source (revision
-11, post all seventeen Codex corrections above) is embedded below rather
+12, post all nineteen Codex corrections above) is embedded below rather
 than referenced by history. This is now the durable artifact.
 
 1. Add this entry to `autumn/Cargo.toml`, immediately after the existing
@@ -883,7 +949,7 @@ than referenced by history. This is now the durable artifact.
    //! `[[test]]` Cargo.toml entry are reverted after the assay runs — its
    //! source is embedded verbatim in the report's Reproduce section instead.
    //!
-   //! Revisions 2-10: see the report's Correction sections for the full
+   //! Revisions 2-11: see the report's Correction sections for the full
    //! history (counter re-verified through churn; debounced, yield-safe,
    //! deadline-aware stability checks spanning the protocol's own timers,
    //! classified before any trailing sleep and checked against both the soft
@@ -891,34 +957,30 @@ than referenced by history. This is now the durable artifact.
    //! Converged/LateConverged/Diverged outcome; a phase-specific departure
    //! timeout; dual watchdogs (Tokio-scheduled + native OS thread, the
    //! latter armed until genuine task completion); genuinely concurrent,
-   //! barrier-synced counter increments).
+   //! barrier-synced counter increments; membership agreement on the full
+   //! `(id, addr, incarnation)` identity, not bare ids).
    //!
-   //! Revision 11 (Codex P2 on the revision-10 diff): the membership
-   //! agreement check compared only `ClusterMemberInfo::id` across nodes,
-   //! discarding `addr` and `incarnation` — both of which
-   //! `docs/guide/clustering.md`'s "Replicated status" section documents as
-   //! part of the shared, converged document (merged via a real, specified
-   //! rule: higher incarnation wins, then `Left` beats `Alive`, then
-   //! address as a commutativity tie-break) — so an address or incarnation
-   //! disagreement between two nodes that happened to agree on the member-id
-   //! *set* would have passed undetected, even though the report's "no
-   //! divergence" / "identical views" language implied more than id-set
-   //! agreement. Fixed: the comparison now includes `addr` and `incarnation`
-   //! alongside `id`.
-   //!
-   //! `ClusterMemberInfo::status` (Alive/Suspect) is deliberately still
-   //! excluded from the comparison — not an oversight, a documented design
-   //! fact: `docs/guide/clustering.md` states the view is "local: replicated
-   //! `Alive` records, minus peers this node currently considers down... Two
-   //! nodes can briefly disagree about the view — that is exactly what
-   //! eventually consistent means here." `status` in `ClusterMemberInfo` is
-   //! computed per-node from a local suspicion timer
-   //! (`autumn/src/cluster/mod.rs`'s `members()`, confirmed reading it
-   //! directly: it reads `self.inner.clock.monotonic()` and an `overlay`
-   //! that is never itself replicated), not copied from the merged document.
-   //! Comparing it for cross-node equality would test a property the design
-   //! explicitly does not claim to hold, and could introduce genuine
-   //! flakiness unrelated to any real bug.
+   //! Revision 12 (two more Codex P2 findings on the revision-11 diff):
+   //! - `cluster_config` never set `node_id`, so both the departing node and
+   //!   its step-4 "rejoin" replacement received distinct entropy-derived
+   //!   ids — meaning step 4 tested a brand-new member joining after another
+   //!   left, not the same node actually rejoining with a higher incarnation
+   //!   (the scenario `docs/guide/clustering.md`'s membership-merge rules are
+   //!   written for, and what "rejoin" means in ordinary usage). Fixed: every
+   //!   node now gets an explicit, stable `node_id` ("node-0".."node-4"), and
+   //!   the step-4 replacement reuses the departed node's *exact* id, so the
+   //!   cluster observes a genuine same-identity rejoin.
+   //! - The native watchdog's `done` flag was set the instant `run_assay()`'s
+   //!   `JoinHandle` resolved successfully — before the `#[tokio::test]`
+   //!   runtime is torn down. If a background task (e.g. one still
+   //!   processing a just-issued cancellation) wedges during that teardown,
+   //!   `Runtime::drop` can block indefinitely with no watchdog left armed
+   //!   to catch it. Fixed: replaced the `#[tokio::test]` macro with a
+   //!   manually-built `tokio::runtime::Runtime`, explicitly bounded with
+   //!   `shutdown_timeout` (5s) after the assay completes — teardown itself
+   //!   is now bounded, and `done` is only set after that bounded shutdown
+   //!   returns, so the native watchdog stays armed for the whole window,
+   //!   teardown included.
 
    use std::sync::atomic::{AtomicBool, Ordering};
    use std::sync::Arc;
@@ -943,6 +1005,11 @@ than referenced by history. This is now the durable artifact.
    /// Matches the pre-registration's kill-line total: "test itself times out
    /// past 60s total."
    const TOTAL_TEST_TIMEOUT: Duration = Duration::from_secs(60);
+   /// Bound on the manually-triggered runtime shutdown after the assay
+   /// completes — well inside `TOTAL_TEST_TIMEOUT`'s remaining budget, and
+   /// short enough that `done` still gets set (disarming the native
+   /// watchdog) long before that 60s bound in the success case.
+   const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
    /// The pre-registration's own divergence multiplier: "disagree... 3x past
    /// the relevant timeout" is the kill line: a soft-deadline miss that still
    /// resolves inside this multiple is "undetermined-on-the-line," not a kill.
@@ -1005,12 +1072,15 @@ than referenced by history. This is now the durable artifact.
        }
    }
 
-   fn cluster_config(seed_peers: Vec<String>) -> ClusterConfig {
+   /// `node_id`, so departure + rejoin can reuse the exact same identity
+   /// (revision 12) instead of getting a fresh entropy-derived one each time.
+   fn cluster_config(seed_peers: Vec<String>, node_id: &str) -> ClusterConfig {
        ClusterConfig {
            enabled: true,
            secret: Some(secrecy::SecretString::from(SECRET.to_owned())),
            bind_addr: "127.0.0.1:0".to_owned(),
            seed_peers,
+           node_id: Some(node_id.to_owned()),
            push_interval_ms: 200,
            suspicion_timeout_ms: 1_000,
            ..ClusterConfig::default()
@@ -1027,9 +1097,9 @@ than referenced by history. This is now the durable artifact.
    /// `(id, addr, incarnation)` triples, sorted — the fields
    /// `docs/guide/clustering.md`'s "Replicated status" section documents as
    /// part of the shared, converged document. `ClusterMemberInfo::status` is
-   /// deliberately excluded (see the module doc comment above): it is a
-   /// documented *local* overlay, not gossiped state, and can legitimately
-   /// differ transiently between healthy, fully-converged nodes.
+   /// deliberately excluded: it is a documented *local* overlay, not
+   /// gossiped state, and can legitimately differ transiently between
+   /// healthy, fully-converged nodes.
    fn member_identities(handle: &Arc<ClusterHandle>) -> Vec<(String, String, u64)> {
        let mut identities: Vec<(String, String, u64)> = handle
            .members()
@@ -1056,14 +1126,15 @@ than referenced by history. This is now the durable artifact.
            .join(" | ")
    }
 
-   /// Spin up `n` nodes, star-seeded from node 0. Returns handles + their
-   /// shutdown tokens (index-aligned).
+   /// Spin up `n` nodes, star-seeded from node 0, with explicit stable ids
+   /// "node-0".."node-{n-1}". Returns handles + their shutdown tokens
+   /// (index-aligned).
    fn spawn_star_cluster(n: usize) -> (Vec<Arc<ClusterHandle>>, Vec<CancellationToken>) {
        let mut handles = Vec::with_capacity(n);
        let mut tokens = Vec::with_capacity(n);
 
        let shutdown0 = CancellationToken::new();
-       let config0 = cluster_config(Vec::new());
+       let config0 = cluster_config(Vec::new(), "node-0");
        let app0 = TestApp::new().config(app_config(config0.clone())).build();
        install_from_config(app0.state(), &config0, &shutdown0).expect("node 0 must install");
        let handle0 = app0
@@ -1077,7 +1148,7 @@ than referenced by history. This is now the durable artifact.
 
        for i in 1..n {
            let shutdown = CancellationToken::new();
-           let config = cluster_config(vec![seed.clone()]);
+           let config = cluster_config(vec![seed.clone()], &format!("node-{i}"));
            let app = TestApp::new().config(app_config(config.clone())).build();
            install_from_config(app.state(), &config, &shutdown)
                .unwrap_or_else(|e| panic!("node {i} must install: {e:?}"));
@@ -1192,6 +1263,7 @@ than referenced by history. This is now the durable artifact.
        // Pre-registered bound is 5s here (DEPARTURE_TIMEOUT), not the 10s
        // CONVERGE_TIMEOUT used everywhere else.
        let departing = N - 1;
+       let departed_node_id = format!("node-{departing}");
        tokens[departing].cancel();
        let survivors: Vec<Arc<ClusterHandle>> = handles[..departing].to_vec();
        assert_stable_membership(&survivors, N - 1, DEPARTURE_TIMEOUT, "step3-departure").await;
@@ -1204,10 +1276,10 @@ than referenced by history. This is now the durable artifact.
        )
        .await;
 
-       // --- Step 4: node 5 rejoins (fresh handle, re-seeded from node 0) ---
+       // --- Step 4: node N-1 REJOINS — same node_id, not a fresh identity ---
        let seed = handles[0].local_addr().to_string();
        let shutdown_rejoin = CancellationToken::new();
-       let config_rejoin = cluster_config(vec![seed]);
+       let config_rejoin = cluster_config(vec![seed], &departed_node_id);
        let app_rejoin = TestApp::new()
            .config(app_config(config_rejoin.clone()))
            .build();
@@ -1217,6 +1289,12 @@ than referenced by history. This is now the durable artifact.
            .state()
            .extension::<ClusterHandle>()
            .expect("rejoining node must expose a ClusterHandle");
+       assert_eq!(
+           handle_rejoin.node_id(),
+           departed_node_id,
+           "the rejoining node must reuse the departed node's exact id — a genuine rejoin, not a \
+            new member joining"
+       );
        std::mem::forget(app_rejoin);
 
        handles[departing] = handle_rejoin;
@@ -1230,13 +1308,14 @@ than referenced by history. This is now the durable artifact.
        }
    }
 
-   #[tokio::test(flavor = "multi_thread")]
-   async fn n5_star_cluster_converges_counters_and_survives_departure_and_rejoin() {
+   #[test]
+   fn n5_star_cluster_converges_counters_and_survives_departure_and_rejoin() {
        // Second, independent watchdog: a native OS thread outside the Tokio
        // runtime entirely. If a genuine synchronous-lock deadlock inside
-       // run_assay() starves every Tokio worker thread, this thread still
-       // gets its own OS-level timeslice from the OS scheduler, independent
-       // of Tokio, and aborts the process directly.
+       // run_assay() (or, per revision 12, a wedged task during runtime
+       // teardown) starves every Tokio worker thread, this thread still gets
+       // its own OS-level timeslice from the OS scheduler, independent of
+       // Tokio, and aborts the process directly.
        let done = Arc::new(AtomicBool::new(false));
        let watchdog_done = Arc::clone(&done);
        std::thread::spawn(move || {
@@ -1246,37 +1325,46 @@ than referenced by history. This is now the durable artifact.
                    "PROSPECT NATIVE WATCHDOG: assay exceeded {TOTAL_TEST_TIMEOUT:?} total \
                     kill-line bound without completing — aborting the process directly (this \
                     watchdog runs on its own OS thread, outside the Tokio runtime, specifically \
-                    so a wedged single-worker Tokio runtime cannot starve it)."
+                    so a wedged single-worker Tokio runtime, or a wedged runtime teardown, cannot \
+                    starve it)."
                );
                std::process::abort();
            }
        });
 
-       // First, cooperative watchdog: run_assay() on its own spawned Tokio
-       // task, with the 60s timeout waiting on that task's JoinHandle rather
-       // than the future directly.
-       let handle = tokio::task::spawn(run_assay());
-       let result = tokio::time::timeout(TOTAL_TEST_TIMEOUT, handle).await;
+       // A manually-built runtime (revision 12), not `#[tokio::test]`: lets
+       // us bound teardown explicitly with `shutdown_timeout` instead of
+       // letting an implicit `Runtime::drop` block indefinitely on a wedged
+       // background task.
+       let rt = tokio::runtime::Builder::new_multi_thread()
+           .enable_all()
+           .build()
+           .expect("build a multi-thread Tokio runtime for the assay");
 
-       // `done` (which disarms the native watchdog) is set ONLY when the
-       // spawned task has actually terminated — never merely because this
-       // cooperative await resolved. A cooperative-timeout Err means the
-       // spawned task may still be genuinely running or blocked; disarming
-       // the native watchdog there would defeat the one scenario it exists
-       // for.
+       // Cooperative watchdog: run_assay() on its own spawned Tokio task,
+       // with the 60s timeout waiting on that task's JoinHandle rather than
+       // the future directly.
+       let result = rt.block_on(async {
+           let handle = tokio::task::spawn(run_assay());
+           tokio::time::timeout(TOTAL_TEST_TIMEOUT, handle).await
+       });
+
+       // Bound teardown itself rather than trusting an implicit `drop`, and
+       // only disarm the native watchdog once that bounded shutdown has
+       // actually returned — so the native watchdog covers teardown too, not
+       // just the assay body (revision 12).
+       rt.shutdown_timeout(SHUTDOWN_TIMEOUT);
+       done.store(true, Ordering::SeqCst);
+
        match result {
-           Ok(Ok(())) => {
-               done.store(true, Ordering::SeqCst);
-           }
-           Ok(Err(join_err)) => {
-               done.store(true, Ordering::SeqCst);
-               std::panic::resume_unwind(join_err.into_panic());
-           }
+           Ok(Ok(())) => {}
+           Ok(Err(join_err)) => std::panic::resume_unwind(join_err.into_panic()),
            Err(_) => {
                panic!(
                    "assay exceeded the {TOTAL_TEST_TIMEOUT:?} total kill-line bound (reported via \
-                    the cooperative tokio::time::timeout path; the native watchdog stays armed in \
-                    case the spawned task is still genuinely blocked, not merely slow)"
+                    the cooperative tokio::time::timeout path; the native watchdog stays armed \
+                    through this and through the bounded runtime shutdown that follows, in case \
+                    the spawned task is still genuinely blocked, not merely slow)"
                );
            }
        }
