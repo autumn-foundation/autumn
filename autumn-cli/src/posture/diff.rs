@@ -925,6 +925,7 @@ fn compare_scopes(
     }
     let added: Vec<String> = now.difference(&was).cloned().collect();
     let removed: Vec<String> = was.difference(&now).cloned().collect();
+    let now_sorted: Vec<String> = now.iter().cloned().collect();
 
     if !removed.is_empty() {
         out.push(Finding {
@@ -934,7 +935,14 @@ fn compare_scopes(
             path: after.path.clone(),
             before: label_before.to_owned(),
             after: label_after.to_owned(),
-            fingerprint: format!("scopes-{}", escape_list(&removed)),
+            // The scopes still required are part of what was acknowledged:
+            // naming only the lost one let `{read}` → `{mfa}` → `{}` keep a
+            // single identity, so the acknowledgment for the swap covered the
+            // drop as well.
+            fingerprint: format!(
+                "scopes-{}",
+                escape_list(&[escape_list(&removed), escape_list(&now_sorted)])
+            ),
             detail: format!(
                 "scope{} {} no longer required",
                 plural(removed.len()),
@@ -2433,6 +2441,32 @@ mod tests {
         let widening = widening(&findings);
         assert_eq!(widening.len(), 1, "{findings:#?}");
         assert_eq!(widening[0].kind, "authorization_binding_removed");
+    }
+
+    /// A scope acknowledgment has to bind to the constraint that replaced the
+    /// one it approved. Going from `{read}` to `{mfa}` is a widening whose
+    /// fingerprint named only the lost `read`; a later push dropping `mfa`
+    /// leaves the route requiring no scope at all, and neither the finding nor
+    /// the digest moved, so the acknowledgment for one covered the other.
+    #[test]
+    fn a_scope_acknowledgment_binds_to_the_scope_that_replaced_it() {
+        let base = routes_only(&route("/a", "GET", "gated", &["user"], &["read"], false));
+        let now_requiring = |scopes: &[&str]| {
+            diff(
+                &base,
+                &routes_only(&route("/a", "GET", "gated", &["user"], scopes, false)),
+            )
+            .into_iter()
+            .find(|f| f.kind == "scopes_widened")
+            .expect("losing `read` is a widening")
+            .canonical()
+        };
+
+        assert_ne!(
+            now_requiring(&["mfa"]),
+            now_requiring(&[]),
+            "acknowledging a swap to `mfa` must not authorize dropping it too"
+        );
     }
 
     /// The replacement checks must come from the route that actually serves

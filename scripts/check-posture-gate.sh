@@ -171,14 +171,29 @@ for example in "${EXAMPLES[@]}"; do
       ;;
   esac
 
-  # Only worth saying when the posture itself came back clean: then the bytes
-  # moved for a reason the diff deliberately ignores (a line number, a renamed
-  # handler, a framework-owned route that shifted), and the baseline is merely
-  # stale rather than wrong.
-  if [ "$status" = "0" ] && ! diff -q "$baseline" "$fresh" >/dev/null; then
-    note "$example: $baseline no longer matches a fresh build, but the posture it"
-    note "$example: describes is unchanged (line numbers, a renamed handler, or a"
-    note "$example: framework-owned route that moved). Refresh with $0 --update."
+  # The committed baseline has to describe *this* commit's posture, or the next
+  # change diffs against a fiction. Exit 0 above does not establish that: it
+  # also covers a narrowing, a neutral change and an acknowledged widening, any
+  # of which can leave a committed baseline security-stale — and a later change
+  # widening back to that stale baseline would then read as no change at all.
+  #
+  # Compared by digest rather than by bytes, the way the scaffolded workflow
+  # compares it: the digest excludes handler names and source locations, so a
+  # moved line number stays a note and a real drift is an error.
+  if [ -f "$baseline" ] && ! diff -q "$baseline" "$fresh" >/dev/null; then
+    committed_digest=$("$CLI" routes posture digest --manifest "$baseline" 2>/dev/null || echo unreadable)
+    fresh_digest=$("$CLI" routes posture digest --manifest "$fresh" 2>/dev/null || echo unbuildable)
+    if [ "$committed_digest" = "$fresh_digest" ]; then
+      note "$example: $baseline no longer matches a fresh build, but the posture it"
+      note "$example: describes is unchanged (line numbers, a renamed handler, or a"
+      note "$example: framework-owned route that moved). Refresh with $0 --update."
+    else
+      echo "error: $example: $baseline no longer describes this commit's posture" >&2
+      echo "       committed $committed_digest, built $fresh_digest" >&2
+      echo "       Refresh it with $0 --update, or the next change will be" >&2
+      echo "       compared against a posture this commit does not have." >&2
+      failed=1
+    fi
   fi
 done
 
