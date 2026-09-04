@@ -343,7 +343,8 @@ WAIVER = re.compile(r'<!--\s*config-key-allow:\s*([A-Z][A-Z0-9_]+)\s*(.*?)\s*-->
 # namespace was. What follows must be uppercase, though, and that is what keeps
 # the crate name out of it: `autumn_web` and `autumn-macros` are prose about a
 # package, not a claim about an environment variable.
-NEAR = re.compile(r'\b([A-Za-z][A-Za-z0-9]{3,8})_([A-Z0-9]+(?:_+[A-Z0-9]+)*)\b')
+NEAR = re.compile(r'\b([A-Za-z][A-Za-z0-9]{3,8})_'
+                  r'((?:[A-Z0-9]+|\{[a-z_]+\})(?:_+(?:[A-Z0-9]+|\{[a-z_]+\}))*)')
 
 
 def near_miss(word, target='AUTUMN'):
@@ -519,15 +520,23 @@ def _rust_classes(body):
                     state, hashes, i = 'raw', j - i - 1, j + 1
                     continue
             if c == "'":
-                # Skip a char literal whole. An escape is short and ends at the
-                # next quote; a plain one is three characters; anything else is
-                # a lifetime, which needs no handling.
+                # A char literal is CLASSIFIED, not merely skipped. Skipping it
+                # fixed the desync `b'"'` caused and left `'}'` counted as a
+                # brace, which ended a test mask early — the same defect one
+                # question further on: this scan answers "which text is code",
+                # and a literal is not.
+                #
+                # An escape is short and ends at the next quote; a plain one is
+                # three characters; anything else is a lifetime, which needs no
+                # handling.
                 if body[i + 1:i + 2] == '\\':
                     j = body.find("'", i + 2)
                     if 0 <= j - i <= 12:
+                        cls[i:j + 1] = 's' * (j + 1 - i)
                         i = j + 1
                         continue
                 elif body[i + 2:i + 3] == "'":
+                    cls[i:i + 3] = 'sss'
                     i += 3
                     continue
             i += 1
@@ -1517,6 +1526,16 @@ def self_test():
                      lambda _: 'Add `autumn_web` and `autumn-macros` to Cargo.toml.\n',
                      leaves, built, tokens)
     case('the crate name is not a config key claim', len(dcrate), 0)
+    # …and the scan has to cross a `{i}` placeholder, or the seven documented
+    # shard families are the one place a namespace typo stays invisible.
+    case('a misspelt namespace is scanned through a placeholder',
+         [m.group(0) for m in
+          NEAR.finditer('| `AUTMN_DATABASE__SHARDS__{i}__NAME` |')],
+         ['AUTMN_DATABASE__SHARDS__{i}__NAME'])
+    _, dp = scan(['d.md'],
+                 lambda _: '| `AUTMN_DATABASE__SHARDS__{i}__NAME` | x |\n',
+                 leaves, built, tokens)
+    case('and reported', len(dp), 1)
     sn, _ = scan(['d.md'],
                  lambda _: ('export AUTMN_LOG__LEVEL=debug\n'
                             '<!-- config-key-allow: AUTMN_LOG__LEVEL — why -->\n'),
@@ -1809,9 +1828,18 @@ def self_test():
     # A char literal can hold a `"`. `dotenv.rs:189` writes `quote == b'"'`, and
     # skipping char literals left the rest of that file classified as string —
     # so nothing in it was masked, commented, or read correctly.
+    # A char literal is blanked like any other literal, so neither the `"` in
+    # `b'"'` nor the `}` in `'}'` is read as syntax — the braces around it still
+    # are.
     case('a char literal holding a quote does not open a string',
          _rust_skeleton('if q == b\'"\' { let s = "x"; }'),
-         'if q == b\'"\' { let s =    ; }')
+         'if q == b    { let s =    ; }')
+    case('a char literal holding a brace is not a brace',
+         _rust_skeleton("fn t() { let _ = '}'; let s = 1; }"),
+         'fn t() { let _ =    ; let s = 1; }')
+    case('a test item is not ended by a brace in a char literal',
+         untested("#[test]\nfn t() {\n  let _ = '}';\n  let a = 1;\n}\nfn p() { }"),
+         '\n\n\n\n\nfn p() { }')
     case('a lifetime is not a char literal',
          _rust_skeleton("fn f<'a>(s: &'a str) { }"),
          "fn f<'a>(s: &'a str) { }")
