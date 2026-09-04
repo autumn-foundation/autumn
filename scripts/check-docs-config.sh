@@ -108,6 +108,14 @@
 #     question lived in the resolver and the table checker; "a comment is not
 #     code" was fixed in the template reader while the token sweep still read
 #     `// std::env::var("AUTUMN_LOG__LEVL")` as a read. Grep for the rule.
+#   * A rule about the LAYOUT of the text standing in for a rule about its
+#     structure. "The comment starts the line", "the `}` is in column zero",
+#     "the `#[cfg(test)]` is not indented" — each held for the cases in front of
+#     me and broke on the first file laid out differently, in both directions:
+#     an attribute inside a generated-code template masked a whole file, and a
+#     brace inside a Rust fixture ended a mask 8,000 lines early. Parse enough
+#     to ask the real question — here, one scan that says which characters are
+#     code, which are string and which are comment.
 #   * A source of coverage removed without checking what was leaning on it.
 #     Masking test code is right, and `AUTUMN_MEDIA__FFMPEG__BIN` was in the
 #     truth set ONLY through a `${…}` expansion inside a test — so the correct
@@ -402,61 +410,101 @@ def comment_leader(rel):
     return COMMENT_LEADER.get(p.suffix)
 
 
-def _rust_uncommented(body):
-    """Drop `//` and `/* … */` comments, keeping strings and line numbering.
+def _rust_classes(body):
+    """Classify every character: `c`ode, co`m`ment, or `s`tring.
 
-    Character literals are not tracked, deliberately: a `'…'` can never hold
-    `//` or `/*`, while telling one from a lifetime (`&'a str`) is exactly the
-    kind of guess that swallows real code to the next quote.
+    One scan answers both questions this script asks of Rust source — which
+    text is a comment, and which braces are real — and the second is why the
+    classification is kept rather than a stripped string: a `}` inside a string
+    literal is not a closing brace, and reading one as if it were is what ended
+    a `#[cfg(test)]` mask 8,000 lines early.
+
+    Character literals ARE tracked, and my reasoning for skipping them was
+    wrong. A `'…'` cannot hold `//` or `/*` — true, and not the point: it can
+    hold a `"`, and `dotenv.rs:189` writes `quote == b'"'`, which opened a
+    string that ran to the next quote and left the rest of that file classified
+    as string. A lifetime is still left alone, because the two are actually
+    distinguishable: `'a` is never followed by a closing quote.
     """
-    out, i, n, state, hashes = [], 0, len(body), None, 0
+    cls = ['c'] * len(body)
+    i, n, state, hashes = 0, len(body), None, 0
     while i < n:
         c = body[i]
         if state is None:
             if c == '/' and body[i + 1:i + 2] == '/':
                 while i < n and body[i] != '\n':
+                    cls[i] = 'm'
                     i += 1
                 continue
             if c == '/' and body[i + 1:i + 2] == '*':
+                cls[i] = cls[i + 1] = 'm'
                 state, i = 'block', i + 2
                 continue
             if c == '"':
-                state = 'str'
-            elif c == 'r':
+                cls[i] = 's'
+                state, i = 'str', i + 1
+                continue
+            if c == 'r':
                 j = i + 1
                 while body[j:j + 1] == '#':
                     j += 1
                 if body[j:j + 1] == '"':
-                    state, hashes = 'raw', j - i - 1
-                    out.append(body[i:j + 1])
-                    i = j + 1
+                    cls[i:j + 1] = 's' * (j + 1 - i)
+                    state, hashes, i = 'raw', j - i - 1, j + 1
                     continue
-            out.append(c)
+            if c == "'":
+                # Skip a char literal whole. An escape is short and ends at the
+                # next quote; a plain one is three characters; anything else is
+                # a lifetime, which needs no handling.
+                if body[i + 1:i + 2] == '\\':
+                    j = body.find("'", i + 2)
+                    if 0 <= j - i <= 12:
+                        i = j + 1
+                        continue
+                elif body[i + 2:i + 3] == "'":
+                    i += 3
+                    continue
             i += 1
         elif state == 'block':
+            cls[i] = 'm'
             if c == '*' and body[i + 1:i + 2] == '/':
+                cls[i + 1] = 'm'
                 state, i = None, i + 2
                 continue
-            if c == '\n':
-                out.append(c)
             i += 1
         elif state == 'str':
-            out.append(c)
+            cls[i] = 's'
             if c == '\\' and i + 1 < n:
-                out.append(body[i + 1])
+                cls[i + 1] = 's'
                 i += 2
                 continue
             if c == '"':
                 state = None
             i += 1
         else:
-            out.append(c)
+            cls[i] = 's'
             if c == '"' and body[i + 1:i + 1 + hashes] == '#' * hashes:
-                out.append('#' * hashes)
+                cls[i:i + 1 + hashes] = 's' * (1 + hashes)
                 state, i = None, i + 1 + hashes
                 continue
             i += 1
-    return ''.join(out)
+    return cls
+
+
+def _rust_uncommented(body):
+    """Drop `//` and `/* … */` comments, keeping strings and line numbering."""
+    return ''.join(c for c, k in zip(body, _rust_classes(body))
+                   if k != 'm' or c == '\n')
+
+
+def _rust_skeleton(body):
+    """The same text with comments AND string contents blanked to spaces.
+
+    Length-preserving, so an offset in the skeleton is the same offset in the
+    body — which is what makes brace matching on it usable for masking.
+    """
+    return ''.join(c if k == 'c' or c == '\n' else ' '
+                   for c, k in zip(body, _rust_classes(body)))
 
 
 def _hash_uncommented(body):
@@ -516,6 +564,12 @@ def built_patterns(root, leaves):
         try:
             body = (root / rel).read_text(encoding='utf-8', errors='replace')
         except OSError:
+            continue
+        # Every template starts with the literal `AUTUMN_`, so a file without it
+        # cannot hold one — and the comment scanner is per character, so not
+        # running it over the other 3,000 Rust files is most of this gate's
+        # runtime.
+        if 'AUTUMN_' not in body:
             continue
         for tpl in TEMPLATE.findall(untested(uncommented(body))):
             segs = tpl[len('AUTUMN_'):].split('__')
@@ -676,27 +730,54 @@ NEGATED = re.compile(r'assert(?:_ne)?!\s*\(\s*!|!\s*[\w.]*\bcontains\b|\bassert_
 # schema, so everything here is a name from OUTSIDE it. A name outside the
 # schema that only test code ever mentions is a sentinel by construction.
 #
-# The region is a `#[cfg(test)]` at COLUMN ZERO, ending at the `}` in column
-# zero. Not brace-counting, which a brace inside a string literal skews, and not
-# any indentation, which matched a `#[cfg(test)]` written INSIDE a generated-code
-# template in two files and masked everything after it to end of file.
-CFG_TEST = re.compile(r'^#\[cfg\((?:all\()?test[,)]')
+# The region is the whole `#[cfg(…test…)]` ITEM, found by matching braces on the
+# skeleton — where a brace inside a string literal is not a brace. Two cheaper
+# rules failed first, in opposite directions: any indentation matched a
+# `#[cfg(test)]` written inside a generated-code string template and masked the
+# rest of the file, and column-zero-to-column-zero-`}` ended the mask at a `}`
+# that opens column zero inside a multi-line Rust FIXTURE — `doctor.rs:10173`,
+# some 8,000 lines before its test module actually closes, handing every test
+# after it back to the truth set. Neither is a rule about braces; both were
+# rules about how the text happens to be laid out.
+#
+# `not(test)` is excluded by construction — that attribute marks code compiled
+# when NOT testing — while `all(test, …)` and `any(test, …)` are included; all
+# four forms occur here.
+CFG_TEST = re.compile(r'#\[cfg\((?:(?:all|any)\()*test[,)]')
 TEST_PATH = re.compile(r'(^|/)(?:tests|benches)/|_test\.rs$')
 
 
 def untested(body):
-    """Blank every top-level `#[cfg(test)]` region, keeping line numbering."""
-    out, inside = [], False
-    for l in body.splitlines():
-        if inside:
-            out.append('')
-            inside = l.rstrip() != '}'
-            continue
-        if CFG_TEST.match(l):
-            out.append('')
-            inside = True
-            continue
-        out.append(l)
+    """Blank every `#[cfg(…test…)]` item, keeping line numbering intact."""
+    if 'cfg(' not in body:
+        return body
+    skel = _rust_skeleton(body)
+    masked = []
+    for m in CFG_TEST.finditer(skel):
+        depth, end = 0, None
+        for i in range(m.end(), len(skel)):
+            c = skel[i]
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+            elif c == ';' and depth == 0:
+                # `#[cfg(test)] use uuid::Uuid;` — an item with no block, which
+                # a brace search alone would run to the end of the file.
+                end = i
+                break
+        masked.append((m.start(), len(skel) if end is None else end))
+    if not masked:
+        return body
+    lines, out, pos = body.splitlines(), [], 0
+    for l in lines:
+        span = (pos, pos + len(l))
+        out.append('' if any(a <= span[1] and span[0] <= b for a, b in masked)
+                   else l)
+        pos += len(l) + 1
     return '\n'.join(out)
 
 
@@ -1421,11 +1502,41 @@ def self_test():
     case('a `#[cfg(test)]` region is masked',
          untested('let a = 1;\n#[cfg(test)]\nmod tests {\n  let b = 2;\n}\nlet c = 3;'),
          'let a = 1;\n\n\n\n\nlet c = 3;')
-    # An INDENTED `#[cfg(test)]` is not a region: two files write one inside a
-    # generated-code string template, and matching it masked the rest of the file.
-    case('an indented cfg(test) is not a region',
-         untested('    #[cfg(test)]\nlet a = 1;'),
-         '    #[cfg(test)]\nlet a = 1;')
+    # A `#[cfg(test)]` written INSIDE a string is not a region — two files put
+    # one in a generated-code template, and matching it masked the rest of each.
+    case('a cfg(test) inside a string is not a region',
+         untested('let t = "#[cfg(test)]\\nmod tests {";\nlet a = 1;'),
+         'let t = "#[cfg(test)]\\nmod tests {";\nlet a = 1;')
+    # …and a `}` inside a string does not END one. `doctor.rs` embeds a Rust
+    # fixture whose `}` opens column zero, 8,000 lines before the test module
+    # closes; a column-zero rule handed every test after it back to the truth set.
+    case('a brace inside a string does not end the region',
+         untested('#[cfg(test)]\nmod tests {\n  let f = "\n}\n";\n  let b = 2;\n}\nlet c = 3;'),
+         '\n\n\n\n\n\n\nlet c = 3;')
+    # An item with no block ends at its semicolon: `#[cfg(test)] use uuid::Uuid;`
+    # occurs here, and a brace search alone would run to the end of the file.
+    case('a cfg(test) item with no block ends at its semicolon',
+         untested('#[cfg(test)]\nuse uuid::Uuid;\nlet a = 1;'),
+         '\n\nlet a = 1;')
+    # `all(test, …)` and `any(test, …)` are test code; `not(test)` is the
+    # opposite, and all four forms occur in this tree.
+    case('all/any forms are regions',
+         (bool(CFG_TEST.search('#[cfg(all(test, feature = "maud"))]')),
+          bool(CFG_TEST.search('#[cfg(any(test, feature = "mail"))]'))),
+         (True, True))
+    case('not(test) is not a region',
+         bool(CFG_TEST.search('#[cfg(not(test))]')), False)
+    case('a feature named test-support is not a region',
+         bool(CFG_TEST.search('#[cfg(feature = "test-support")]')), False)
+    # A char literal can hold a `"`. `dotenv.rs:189` writes `quote == b'"'`, and
+    # skipping char literals left the rest of that file classified as string —
+    # so nothing in it was masked, commented, or read correctly.
+    case('a char literal holding a quote does not open a string',
+         _rust_skeleton('if q == b\'"\' { let s = "x"; }'),
+         'if q == b\'"\' { let s =    ; }')
+    case('a lifetime is not a char literal',
+         _rust_skeleton("fn f<'a>(s: &'a str) { }"),
+         "fn f<'a>(s: &'a str) { }")
     case('a test-only name is not swept in', 'AUTUMN_DEV' in swept, False)
     case('a test path is not swept',
          (bool(TEST_PATH.search('autumn/tests/integration/a11y.rs')),
