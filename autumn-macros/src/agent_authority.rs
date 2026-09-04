@@ -4103,20 +4103,29 @@ mod tests {
         let start = src
             .find(needle)
             .unwrap_or_else(|| panic!("{needle:?} not found in source"));
+        // Balance from the needle's *own* trailing `open`, not from `start`:
+        // a needle like `"const EXECUTORS: &[&str] = &["` contains an earlier
+        // `[`/`]` pair (the type annotation) that would otherwise be counted
+        // first and stop the scan right after it, truncating the result to
+        // the signature instead of the array contents.
+        let open_pos = start + needle.len() - open.len_utf8();
         let mut depth = 0i32;
-        let mut end = start;
-        for (i, c) in src[start..].char_indices() {
+        let mut end = open_pos;
+        for (i, c) in src[open_pos..].char_indices() {
             if c == open {
                 depth += 1;
             } else if c == close {
                 depth -= 1;
                 if depth == 0 {
-                    end = start + i + c.len_utf8();
+                    end = open_pos + i + c.len_utf8();
                     break;
                 }
             }
         }
-        assert_ne!(end, start, "unbalanced {open:?}/{close:?} after {needle:?}");
+        assert_ne!(
+            end, open_pos,
+            "unbalanced {open:?}/{close:?} after {needle:?}"
+        );
         src[start..end].to_string()
     }
 
