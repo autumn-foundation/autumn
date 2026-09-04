@@ -81,7 +81,9 @@ path answers **405** for the rest. Delete the *last* route at `/users/me` and
 that node goes with it: `POST /users/me`, previously a 405, now reaches
 whatever less specific route covers it. Reported as `route_path_exposed`, and
 blocking only when that route is public — newly reachable but guarded
-annotates, exactly as a new guarded route does.
+annotates, exactly as a new guarded route does. While *any* method stays
+mounted at the path, though, the node keeps answering (with a 405) and nothing
+is inherited at all.
 
 All of them are decided by precedence, not by overlap: a survivor that was
 *already* answering the URL gains nothing, so deleting a gated `/users/{id}`

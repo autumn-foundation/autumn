@@ -280,13 +280,11 @@ fn report_path_exposure(
             .iter()
             .filter(|(p, _)| takes_precedence(path, p))
             .collect();
-        for key in undominated(&candidates) {
+        for key in undominated(path, &candidates) {
             let Some(survivor) = after.get(key) else {
                 continue;
             };
-            if !is_open(&survivor.classification) {
-                continue;
-            }
+            let open = is_open(&survivor.classification);
             let (survivor_path, survivor_method) = key;
             let newly: Vec<String> = answered_methods(survivor_method, survivor_path, &keys_after)
                 .difference(&served)
@@ -301,7 +299,14 @@ fn report_path_exposure(
                 .map_or_else(|| path.clone(), |(_, entry)| entry.path.clone());
             out.push(Finding {
                 kind: "route_path_exposed",
-                severity: Severity::Widening,
+                // Newly reachable through an open route blocks, exactly as a
+                // new open route does; through a guarded one it annotates,
+                // exactly as a new guarded route does.
+                severity: if open {
+                    Severity::Widening
+                } else {
+                    Severity::Neutral
+                },
                 method: newly.join(", "),
                 path: written.clone(),
                 before: "405 (no handler at this path)".to_owned(),
@@ -317,7 +322,7 @@ fn report_path_exposure(
                 ),
                 detail: format!(
                     "nothing is mounted at this path any more, so {} on it no longer stops at a \
-                     405 — `{} {}` answers it now, without a proven guard ({})",
+                     405 — `{} {}` answers it now ({})",
                     newly.join(", "),
                     survivor.method,
                     survivor.path,
@@ -352,7 +357,7 @@ fn report_displacement(
                 && methods_transfer((m, p), keys_before, (method, path), keys_after)
         })
         .collect();
-    for key in undominated(&candidates) {
+    for key in undominated(path, &candidates) {
         let Some(displaced) = before.get(key) else {
             continue;
         };
@@ -408,6 +413,12 @@ fn report_shadow_exposure(
     (keys_before, keys_after): (&BTreeSet<RouteKey>, &BTreeSet<RouteKey>),
     out: &mut Vec<Finding>,
 ) {
+    // While any method stays mounted at this path, the node answers the request
+    // — with a 405 — instead of letting it fall through to a less specific
+    // route. Nothing is inherited until the whole node goes.
+    if keys_after.iter().any(|(p, _)| p == path) {
+        return;
+    }
     let candidates: Vec<&RouteKey> = after
         .keys()
         .filter(|(p, m)| {
@@ -415,7 +426,7 @@ fn report_shadow_exposure(
                 && methods_transfer((method, path), keys_before, (m, p), keys_after)
         })
         .collect();
-    for key in undominated(&candidates) {
+    for key in undominated(path, &candidates) {
         let Some(survivor) = after.get(key) else {
             continue;
         };
@@ -543,23 +554,86 @@ fn route_keys(m: &PostureManifest) -> BTreeSet<RouteKey> {
         .collect()
 }
 
-/// Among the routes that could take a removed route's URLs, the ones that
-/// actually receive them.
+/// Among the routes that could take `subject`'s URLs, the ones that actually
+/// receive some of them.
 ///
-/// Precedence ranks the takers too: `/records/me/{id}` wins
-/// `/records/me/private` over `/records/{user}/private`, so the latter never
-/// sees that URL and its posture is irrelevant to the deletion. Routes sharing
-/// a path never outrank each other — they are the same node.
-fn undominated<'a>(takers: &[&'a RouteKey]) -> Vec<&'a RouteKey> {
+/// Precedence ranks the takers, but it ranks them *per URL*: outranking a
+/// candidate somewhere is not the same as taking everything it would have got.
+/// Removing `/records/me/{id}`, the guarded `/records/{user}/private` wins
+/// `/records/me/private` and nothing else — every other `/records/me/*` still
+/// goes to a public `/records/{user}/{id}`, which a pairwise test discarded.
+///
+/// So a candidate drops out only when another one outranks it *and* covers
+/// every URL it would have taken. Routes sharing a path never outrank each
+/// other: they are the same node.
+fn undominated<'a>(subject: &str, takers: &[&'a RouteKey]) -> Vec<&'a RouteKey> {
     takers
         .iter()
         .filter(|(path, _)| {
-            !takers
-                .iter()
-                .any(|(other, _)| other != path && takes_precedence(other, path))
+            let Some(share) = intersect(subject, path) else {
+                return false;
+            };
+            !takers.iter().any(|(other, _)| {
+                other != path && takes_precedence(other, path) && covers(other, &share)
+            })
         })
         .copied()
         .collect()
+}
+
+/// The pattern matching exactly the URLs both patterns match, if any.
+fn intersect(a: &str, b: &str) -> Option<String> {
+    let a: Vec<&str> = a.split('/').collect();
+    let b: Vec<&str> = b.split('/').collect();
+    let mut out: Vec<String> = Vec::new();
+    for i in 0..a.len().max(b.len()) {
+        match (a.get(i), b.get(i)) {
+            // A catch-all takes the other pattern's remaining segments.
+            (Some(x), Some(_)) if x.contains(CATCH_ALL) => {
+                out.extend(b[i..].iter().map(|s| (*s).to_owned()));
+                return Some(out.join("/"));
+            }
+            (Some(_), Some(y)) if y.contains(CATCH_ALL) => {
+                out.extend(a[i..].iter().map(|s| (*s).to_owned()));
+                return Some(out.join("/"));
+            }
+            (Some(x), Some(y)) if segments_overlap(x, y) => {
+                // The more specific segment is what both match.
+                let narrower = if specificity(x) <= specificity(y) {
+                    x
+                } else {
+                    y
+                };
+                out.push((*narrower).to_owned());
+            }
+            _ => return None,
+        }
+    }
+    Some(out.join("/"))
+}
+
+/// Whether every URL `target` matches is also matched by `pattern`.
+fn covers(pattern: &str, target: &str) -> bool {
+    let pattern: Vec<&str> = pattern.split('/').collect();
+    let target: Vec<&str> = target.split('/').collect();
+    for i in 0..pattern.len().max(target.len()) {
+        match (pattern.get(i), target.get(i)) {
+            (Some(p), Some(_)) if p.contains(CATCH_ALL) => return true,
+            (Some(p), Some(t)) => {
+                // A capture covers anything in its position; a literal covers
+                // only the identical literal, and never a capture.
+                if p.contains(CAPTURE) {
+                    if !segments_overlap(p, t) {
+                        return false;
+                    }
+                } else if p != t {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Whether `first` overlaps `second` *and* wins the overlap at the router.
@@ -956,7 +1030,7 @@ fn diff_authorization_policies(
             .collect();
         // Ranked, so a route another taker outranks cannot vouch for a check it
         // never gets asked to perform.
-        let takers = undominated(&candidates);
+        let takers = undominated(path, &candidates);
         if takers.is_empty() {
             continue;
         }
@@ -2237,6 +2311,76 @@ mod tests {
             "{:#?}",
             diff(&base, &head)
         );
+    }
+
+    /// Pairwise domination is not per-URL domination. Removing gated
+    /// `/records/me/{id}`, the guarded `/records/{user}/private` wins only
+    /// `/records/me/private` — every other `/records/me/*` goes to the public
+    /// `/records/{user}/{id}`. Dropping a candidate because *some* other
+    /// candidate outranks it discarded the public fallback entirely.
+    #[test]
+    fn a_taker_that_keeps_part_of_the_urls_is_not_dominated() {
+        let removed = route("/records/me/{id}", "GET", "gated", &["user"], &[], false);
+        let narrow = route(
+            "/records/{user}/private",
+            "GET",
+            "gated",
+            &["user"],
+            &[],
+            false,
+        );
+        let public_rest = route("/records/{user}/{id}", "GET", "public", &[], &[], false);
+
+        let base = routes_only(&format!("{removed},{narrow},{public_rest}"));
+        let head = routes_only(&format!("{narrow},{public_rest}"));
+
+        let findings = diff(&base, &head);
+        let widening = widening(&findings);
+        assert_eq!(widening.len(), 1, "{findings:#?}");
+        assert_eq!(widening[0].kind, "route_shadow_exposed");
+        assert!(
+            widening[0].detail.contains("/records/{user}/{id}"),
+            "the public route takes every URL the narrow one does not: {:?}",
+            widening[0]
+        );
+    }
+
+    /// While *any* method stays mounted at a path, that path node answers the
+    /// request — with a 405 — rather than letting it fall through. Removing
+    /// `GET /users/me` beside a surviving `POST /users/me` exposes nothing.
+    #[test]
+    fn a_surviving_method_at_the_same_path_blocks_the_fallthrough() {
+        let removed = route("/users/me", "GET", "gated", &["user"], &[], false);
+        let same_path = route("/users/me", "POST", "gated", &["user"], &[], false);
+        let dynamic = route("/users/{id}", "GET", "public", &[], &[], false);
+
+        let base = routes_only(&format!("{removed},{same_path},{dynamic}"));
+        let head = routes_only(&format!("{same_path},{dynamic}"));
+
+        let findings = diff(&base, &head);
+        assert!(
+            widening(&findings).is_empty(),
+            "the path node still answers, with a 405: {findings:#?}"
+        );
+    }
+
+    /// Newly reachable but guarded annotates — which is what the function and
+    /// the guide both say, and what the code did not do: it dropped the change
+    /// entirely rather than reporting it as neutral.
+    #[test]
+    fn a_guarded_route_inheriting_a_vanished_path_is_annotated() {
+        let removed = route("/users/me", "GET", "gated", &["user"], &[], false);
+        let survivor = route("/users/{id}", "POST", "gated", &["admin"], &[], false);
+        let base = routes_only(&format!("{removed},{survivor}"));
+        let head = routes_only(&survivor);
+
+        let findings = diff(&base, &head);
+        assert!(widening(&findings).is_empty(), "{findings:#?}");
+        let exposed = findings
+            .iter()
+            .find(|f| f.kind == "route_path_exposed")
+            .expect("newly reachable, so it is reported");
+        assert_eq!(exposed.severity, Severity::Neutral);
     }
 
     /// A route that another taker outranks never receives the URL, so it is not
