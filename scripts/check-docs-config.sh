@@ -750,6 +750,37 @@ def _shell_literals(body):
                      for l in body.splitlines())
 
 
+# A QUOTED heredoc — `<<'EOF'` — is literal data handed to a program or written
+# to a file. The shell neither runs it nor expands anything in it, so
+# `AUTUMN_LOG__LEVL=x cmd` inside one is not a command this shell runs, exactly
+# as `'${AUTUMN_X}'` is not an expansion. That matters because the house pattern
+# for these gates embeds their self-tests and synthetic corpora in the
+# production script: `check-docs-cli.sh` carries 17 such lines, and this script
+# 303 of them, which is why it excludes itself by name.
+#
+# An UNQUOTED heredoc is a different thing entirely and is left alone: `<<EOF`
+# does expand `${AUTUMN_X}`, so that IS a reference.
+HEREDOC = re.compile(r"<<-?\s*'([A-Za-z_][A-Za-z0-9_]*)'")
+
+
+def _shell_heredocs(body):
+    """Blank the bodies of quoted heredocs, keeping line numbering intact."""
+    out, terminator = [], None
+    for l in body.splitlines():
+        if terminator is None:
+            out.append(l)
+            m = HEREDOC.search(l)
+            if m:
+                terminator = m.group(1)
+            continue
+        if l.strip() == terminator:
+            out.append(l)
+            terminator = None
+        else:
+            out.append('')
+    return '\n'.join(out)
+
+
 def _ps_uncommented(body):
     return PS_BLOCK.sub(lambda m: re.sub(r'[^\n]', ' ', m.group(0)), body)
 
@@ -1345,7 +1376,11 @@ def source_tokens(root):
         if rel.endswith('.rs'):
             body = untested(body)
         if effective_suffix(rel) in SHELL_QUOTED:
-            body = _shell_literals(body)
+            # Heredocs FIRST: blanking single quotes first erases the `'EOF'`
+            # marker, and the heredoc body then reads as commands. The self-test
+            # for each function passed in isolation while the composition was
+            # wrong, which is why the real-tree proof is not optional.
+            body = _shell_literals(_shell_heredocs(body))
         lines = body.splitlines()
         # Names this file assigns without exporting them, and without handing
         # them to a command: its own variables.
@@ -1963,6 +1998,29 @@ def self_test():
     case('…while an unquoted one still does',
          EXPANDED.findall(_shell_literals('echo "${AUTUMN_LOG__LEVEL}"')),
          ['AUTUMN_LOG__LEVEL'])
+    # A QUOTED heredoc is data the shell neither runs nor expands. These gates
+    # embed their self-tests in the production script — `check-docs-cli.sh`
+    # carries 17 such lines — so its fixtures were reading as commands.
+    case('a quoted heredoc body is data',
+         ASSIGNED_PREFIX.findall(_shell_heredocs(
+             "cat <<'EOF'\nAUTUMN_LOG__LEVL=x ignored-command\nEOF\n")),
+         [])
+    # …and an UNQUOTED heredoc is a different thing: `<<EOF` does expand.
+    case('an unquoted heredoc still expands',
+         EXPANDED.findall(_shell_heredocs(
+             'cat <<EOF\n${AUTUMN_LOG__LEVEL}\nEOF\n')),
+         ['AUTUMN_LOG__LEVEL'])
+    case('the terminator line survives, and line numbering with it',
+         _shell_heredocs("a\ncat <<'EOF'\nx\nEOF\nb").splitlines(),
+         ['a', "cat <<'EOF'", '', 'EOF', 'b'])
+    # The ORDER of the two shell passes is load-bearing: blanking single quotes
+    # first erases the `'EOF'` marker, after which the heredoc body reads as
+    # commands. Both functions passed their own tests while the composition was
+    # wrong, and only the real-tree proof caught it.
+    case('heredocs are blanked before single quotes',
+         ASSIGNED_PREFIX.findall(_shell_literals(_shell_heredocs(
+             "cat <<'EOF'\nAUTUMN_LOG__LEVL=x cmd\nEOF\n"))),
+         [])
     case('a fused namespace is scanned',
          [m.group(0) for m in FUSED.finditer('export AUTUMNLOG__LEVEL=debug')
           if fused_namespace(m.group(1))], ['AUTUMNLOG__LEVEL'])
