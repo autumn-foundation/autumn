@@ -2836,6 +2836,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`ledger_as_of`/`ledger_diff` no longer read a ledgered record's entire
+  revision chain to answer a question with one answer:** both are pure
+  functions over `ledger_revisions(record_id)`, which has always had one SQL
+  shape — read every stored revision, every full-column snapshot, in `seq`
+  order — with no bound on the requested instant at all. For a hot ledgered
+  record (an account, invoice, or contract adjusted repeatedly over a long
+  operational life, exactly the shape the feature exists for), an audit query
+  about *recent* history — the overwhelmingly common case — paid for reading
+  the record's whole history regardless. Both now issue a bounded
+  `ORDER BY seq DESC LIMIT 1` lookup instead, using the same index
+  `ledger_revisions` already relied on — no migration, no new index. Because
+  transaction time is monotonic in `seq` (#2323), a transaction-time as-of
+  query's cost is now proportional to how far back the question asks, not to
+  the chain's total length. `ledger_diff`'s two endpoints are resolved from
+  one `UNION ALL` statement on one connection rather than two independent
+  lookups, so it keeps the single-snapshot consistency the old full-chain
+  read had (two separate connection-acquiring calls could otherwise resolve
+  `from`/`to` against two different database states if a write landed, or a
+  read replica advanced, between them) — statement count for `ledger_diff`
+  is unchanged at 1. Measured (`pg_stat_statements`, testcontainer Postgres,
+  three ledgered chains at 300/700/1,200 revisions each, written through the
+  real write path): a near-head as-of query's buffers fall 86–94% and stay
+  flat across all three depths (22/129/132 → 3/8/8), instead of scaling with
+  chain length; `ledger_diff` across a recent window falls 129 → 16 buffers
+  (-88%). Disclosed trade-off: the pathological case — asking about a
+  record's very *first* revision on a deep chain — reads more buffers than
+  before (132 → 948 on the 1,200-revision fixture), because the backward
+  index scan can't short-circuit when the answer sits at the far end of it;
+  this is bounded by the record's own chain depth and only reachable by a
+  query about a record's oldest history, so it does not offset the
+  unconditional win on the realistic (recent-history) query pattern.
+  `ledger_revisions` and `ledger_verify` are unchanged — they legitimately
+  need the whole chain and still read it.
+
 - **the DB-backed media-room reaper sweeps in one statement instead of one per
   stale room:** `DbRoomStore::reap_stale`'s second phase — the sweep that drops
   now-empty rooms, run every 60s by the background room reaper in any process
