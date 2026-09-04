@@ -330,7 +330,12 @@ def built_patterns(root, leaves):
 # resolve the very variable the gate exists to catch — the injected regression
 # probe stopped failing. Requiring a use-shape means a comment can name a
 # variable to explain it without thereby asserting that something reads it.
-QUOTED = re.compile(r'["\'](AUTUMN_[A-Z0-9_]+)["\']')
+# The quote may be escaped: `autumn-cli/src/generate/admin.rs` emits the
+# reader's test file as a Rust string, so the read inside it is written
+# `std::env::var(\"AUTUMN_TEST_ADMIN_SESSION\")`. Requiring a bare quote missed
+# every name in a generated code template — a real read, in the source that
+# writes the reader's project.
+QUOTED = re.compile(r'\\?["\'](AUTUMN_[A-Z0-9_]+)\\?["\']')
 ASSIGNED = re.compile(r'(?:^|[;&|(\s])(?:export\s+)?(AUTUMN_[A-Z0-9_]+)=')
 EXPANDED = re.compile(r'\$\{?(AUTUMN_[A-Z0-9_]+)\}?')
 
@@ -386,7 +391,17 @@ def source_tokens(root):
             continue
         lines = body.splitlines()
         for n, line in enumerate(lines):
-            tokens.update(ASSIGNED.findall(line))
+            # `NAME=` is how a SHELL names a variable; in Rust it is just text
+            # inside a string, and the text is often not an environment variable
+            # at all. `autumn-cli/src/db/retention.rs` frames a line of stdout
+            # with the prefix `AUTUMN_DB_RETENTION_REPORT=`, and a test fixture
+            # contains that framed line verbatim — neither is an env read, and
+            # both were putting the name into the truth set. `${NAME}` has no
+            # such ambiguity: it is a reference wherever it appears, including
+            # inside a Rust string, which is how the media plugin passes
+            # `${AUTUMN_MEDIA__FFMPEG__BIN}` through to a service file.
+            if not rel.endswith('.rs'):
+                tokens.update(ASSIGNED.findall(line))
             tokens.update(EXPANDED.findall(line))
             tokens.update(BOUND.findall(line))
             if NEGATED.search(line):
@@ -592,21 +607,27 @@ def table_rows(text):
     return rows, unparsed
 
 
-def check_table(rows, leaves, built):
-    """The module-doc table must agree with the schema on both columns.
+def check_table(rows, leaves, built, tokens):
+    """Each row is a claim about two different things, checked separately.
 
-    The variable column and the path column are two spellings of one mapping, so
-    each row is checked twice: the path it names must exist, and the variable it
-    names must derive that path. The second check is what catches a row edited
-    on one side only.
+    The PATH column claims a config key exists — answered by the schema. The
+    VARIABLE column claims an environment override exists — answered by what the
+    runtime reads, exactly as for the corpus. Checking the variable against the
+    schema conflated them, so a row could document
+    `AUTUMN_OPENAPI__ENABLED | openapi.enabled` and pass on the strength of the
+    path alone, publishing an override that sets nothing to every reader on
+    docs.rs. Third check: the two columns must still agree with each other,
+    which catches a row edited on one side.
     """
     out = []
     for i, var, declared in rows:
         path = re.sub(r'\[\w+\]', '', declared)
-        segs = path.split('.')
-        known = path in leaves or any(p.match(var) for p in built.values())
-        if not known:
+        if path not in leaves:
             out.append((i, var, declared, 'path is not in the schema'))
+            continue
+        if not (var in tokens or any(p.match(var) for p in built.values())):
+            out.append((i, var, declared,
+                        'nothing reads this variable, so it overrides nothing'))
             continue
         derived = to_path(var)
         # Exact agreement, save for the enumerated untagged-deserializer row.
@@ -635,7 +656,7 @@ def main():
     stats, defects = scan(files, read, leaves, built, tokens)
 
     rows, unparsed = table_rows(CONFIG_RS.read_text(encoding='utf-8'))
-    table_defects = check_table(rows, leaves, built)
+    table_defects = check_table(rows, leaves, built, tokens)
 
     print(f'corpus: {len(files)} reader-facing markdown files')
     print(f'surface: {len(leaves)} schema leaves, '
@@ -858,6 +879,16 @@ def self_test():
          'AUTUMN_SERVER__TLS__ENABLED' in swept, False)
     # …while the binding form, which has no accessor anywhere near it, is.
     case('a const-bound name is swept in', 'AUTUMN_CANARY' in swept, True)
+    # `NAME=` inside a Rust string is text, not a shell assignment:
+    # `AUTUMN_DB_RETENTION_REPORT=` frames a line of stdout.
+    case('an output-framing prefix is not swept in',
+         'AUTUMN_DB_RETENTION_REPORT' in swept, False)
+    # …but a read inside a generated code template, where the quotes are
+    # escaped, IS a read.
+    case('a read in a generated code template is swept in',
+         'AUTUMN_TEST_ADMIN_SESSION' in swept, True)
+    case('escaped quotes are recognised',
+         QUOTED.findall(r'std::env::var(\"AUTUMN_X\")'), ['AUTUMN_X'])
 
     # A mapping row that loses a backtick must not escape by looking like prose.
     broken = '//! | `AUTUMN_DATABASE__URL` | database.urll | `String` |'
@@ -879,20 +910,25 @@ def self_test():
     good = [(1, 'AUTUMN_LOG__LEVEL', 'log.level'),
             (2, 'AUTUMN_SECURITY__SIGNING_SECRET', 'security.signing_secret.secret'),
             (3, 'AUTUMN_DATABASE__SHARDS__{i}__NAME', 'database.shards[i].name')]
-    case('sound table rows pass', check_table(good, leaves, built), [])
+    case('sound table rows pass', check_table(good, leaves, built, tokens), [])
+    # The two columns answer different questions. A row may name a real config
+    # path and still document an override that sets nothing.
+    case('a table row whose variable nothing reads fails',
+         len(check_table([(9, 'AUTUMN_OPENAPI__ENABLED', 'openapi.enabled')],
+                         leaves | {'openapi.enabled'}, built, tokens)), 1)
     case('table row with a dead path fails',
-         len(check_table([(9, 'AUTUMN_LOG__NOPE', 'log.nope')], leaves, built)), 1)
+         len(check_table([(9, 'AUTUMN_LOG__NOPE', 'log.nope')], leaves, built, tokens)), 1)
     case('table row edited on one side fails',
-         len(check_table([(9, 'AUTUMN_LOG__LEVEL', 'auth.oauth2')], leaves, built)), 1)
+         len(check_table([(9, 'AUTUMN_LOG__LEVEL', 'auth.oauth2')], leaves, built, tokens)), 1)
     # A truncated variable column must NOT pass just because the row's path
     # exists: `AUTUMN_DATABASE` is not how you set `database.shards.name`.
     case('a truncated variable column fails',
          len(check_table([(9, 'AUTUMN_DATABASE', 'database.shards.name')],
-                         leaves, built)), 1)
+                         leaves, built, tokens)), 1)
     # …and the one enumerated untagged-deserializer row still passes.
     case('the signing-secret exception still passes',
          check_table([(9, 'AUTUMN_SECURITY__SIGNING_SECRET',
-                       'security.signing_secret.secret')], leaves, built), [])
+                       'security.signing_secret.secret')], leaves, built, tokens), [])
 
     for f in failures:
         print(f'FAIL {f}')
