@@ -214,6 +214,9 @@ fn diff_routes(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Fin
                     "new guarded route".to_owned()
                 },
             });
+            if !open {
+                report_displacement(key, entry, &before, out);
+            }
             continue;
         };
         compare_route(previous, entry, out);
@@ -236,6 +239,62 @@ fn diff_routes(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Fin
     }
 }
 
+/// Adding a route does not always add a URL.
+///
+/// The mirror of [`report_shadow_exposure`]: a new route that is *more
+/// specific* than an existing one takes that route's requests over. A
+/// `/users/me` restricted to `editor`, mounted beside a `/users/{id}`
+/// restricted to `admin`, hands `/users/me` to editors — while the dynamic
+/// entry sits unchanged in both manifests, so the addition read as a neutral
+/// new guarded route and nothing blocked.
+fn report_displacement(
+    (path, method): &RouteKey,
+    added: &RouteEntry,
+    before: &BTreeMap<RouteKey, RouteEntry>,
+    out: &mut Vec<Finding>,
+) {
+    for ((displaced_path, displaced_method), displaced) in before {
+        if !methods_overlap(method, displaced_method) || !takes_precedence(path, displaced_path) {
+            continue;
+        }
+        // What changed for those URLs is the posture they used to demand
+        // against the one they demand now — decided, as everywhere else here,
+        // by `compare_route` rather than by a second opinion.
+        let mut probe = Vec::new();
+        compare_route(displaced, added, &mut probe);
+        if !probe.iter().any(|f| f.severity == Severity::Widening) {
+            continue;
+        }
+        out.push(Finding {
+            kind: "route_added_shadowing",
+            severity: Severity::Widening,
+            method: method.clone(),
+            path: added.path.clone(),
+            before: displaced.posture_label(),
+            after: added.posture_label(),
+            // Both postures, so an acknowledgment binds to the change it was
+            // written for and not merely to the pair of paths.
+            fingerprint: format!(
+                "added-shadowing:{}",
+                escape_list(&[
+                    displaced.method.clone(),
+                    displaced.path.clone(),
+                    posture_fingerprint(displaced),
+                    posture_fingerprint(added),
+                ])
+            ),
+            detail: format!(
+                "this route is more specific than `{} {}`, so it takes those requests over and \
+                 admits callers that one refused ({} → {})",
+                displaced.method,
+                displaced.path,
+                displaced.posture_label(),
+                added.posture_label()
+            ),
+        });
+    }
+}
+
 /// Deleting a route does not always remove the URL.
 ///
 /// The router matches a static segment before a dynamic one and mounts both —
@@ -250,7 +309,7 @@ fn report_shadow_exposure(
     out: &mut Vec<Finding>,
 ) {
     for ((survivor_path, survivor_method), survivor) in after {
-        if !methods_overlap(method, survivor_method) || !survivor_gains(path, survivor_path) {
+        if !methods_overlap(method, survivor_method) || !takes_precedence(path, survivor_path) {
             continue;
         }
         // Only a survivor that admits callers the deleted route refused is a
@@ -340,26 +399,31 @@ fn methods_overlap(a: &str, b: &str) -> bool {
     !effective_methods(a).is_disjoint(&effective_methods(b))
 }
 
-/// Whether `survivor` starts answering requests that `removed` used to take.
+/// Whether `first` overlaps `second` *and* wins the overlap at the router.
 ///
-/// Overlap alone is not the question, because the router has a precedence rule:
-/// a static segment beats a capture, which beats a catch-all, decided at the
-/// first position where they differ. Deleting a gated `/users/{id}` while a
-/// public `/users/me` survives exposes nothing — that URL was already going to
-/// `/users/me`, and the deletion only takes the remaining dynamic URLs away.
-/// The reverse is the real exposure, and so is a survivor that loses the
-/// overlap on an earlier segment but wins it once the removed route is gone.
-fn survivor_gains(removed: &str, survivor: &str) -> bool {
-    if !shapes_overlap(removed, survivor) {
+/// Overlap alone is never the question, because the router has a precedence
+/// rule: a static segment beats a capture, which beats a catch-all, decided at
+/// the first position where the two differ. Both directions of the shadow
+/// analysis are this one predicate.
+///
+/// - **A removal**: `takes_precedence(removed, survivor)` asks whether the
+///   deleted route was the one serving the overlap, so the survivor inherits
+///   it. Deleting a gated `/users/{id}` beside a public `/users/me` exposes
+///   nothing — that URL was already going to `/users/me`.
+/// - **An addition**: `takes_precedence(added, displaced)` asks whether the new
+///   route takes the overlap away from an existing one. A new `/users/me` wins
+///   that URL from `/users/{id}` the moment it is mounted.
+fn takes_precedence(first: &str, second: &str) -> bool {
+    if !shapes_overlap(first, second) {
         return false;
     }
-    let removed: Vec<&str> = removed.split('/').collect();
-    let survivor: Vec<&str> = survivor.split('/').collect();
-    for i in 0..removed.len().max(survivor.len()) {
+    let first: Vec<&str> = first.split('/').collect();
+    let second: Vec<&str> = second.split('/').collect();
+    for i in 0..first.len().max(second.len()) {
         // A path that has run out of segments is the less specific of the two:
         // only a catch-all can be matching in its place.
-        let mine = removed.get(i).map_or(u8::MAX, |s| specificity(s));
-        let theirs = survivor.get(i).map_or(u8::MAX, |s| specificity(s));
+        let mine = first.get(i).map_or(u8::MAX, |s| specificity(s));
+        let theirs = second.get(i).map_or(u8::MAX, |s| specificity(s));
         if mine != theirs {
             return mine < theirs;
         }
@@ -724,7 +788,7 @@ fn diff_authorization_policies(
         // really did disappear from something reachable.
         let url_still_answered = routes_after
             .iter()
-            .any(|(p, m)| survivor_gains(path, p) && methods_overlap(method, m));
+            .any(|(p, m)| takes_precedence(path, p) && methods_overlap(method, m));
         if !url_still_answered {
             continue;
         }
@@ -738,7 +802,7 @@ fn diff_authorization_policies(
             && after.keys().any(|(p, m, a, r)| {
                 a == action
                     && r == resource
-                    && survivor_gains(path, p)
+                    && takes_precedence(path, p)
                     && methods_overlap(method, m)
             })
         {
@@ -1758,6 +1822,76 @@ mod tests {
             "the finding must name the route that now serves the URL: {:?}",
             widening[0]
         );
+    }
+
+    /// The mirror of the removal case. Adding a route that is *more specific*
+    /// than an existing one takes that route's requests over: with a base
+    /// `/users/{id}` restricted to `admin`, a new `/users/me` restricted to
+    /// `editor` wins `/users/me` outright, and editors reach what needed
+    /// `admin` a moment ago. The dynamic entry never moved, so the new route
+    /// was filed as a neutral `route_added_gated` and nothing blocked.
+    #[test]
+    fn adding_a_more_specific_route_that_admits_more_is_a_widening() {
+        let by_id = route("/users/{id}", "GET", "gated", &["admin"], &[], false);
+        let me = route("/users/me", "GET", "gated", &["editor"], &[], false);
+        let base = routes_only(&by_id);
+        let head = routes_only(&format!("{by_id},{me}"));
+
+        let findings = diff(&base, &head);
+        let widening = widening(&findings);
+        assert_eq!(widening.len(), 1, "{findings:#?}");
+        assert_eq!(widening[0].kind, "route_added_shadowing");
+        assert_eq!(widening[0].path, "/users/me");
+        assert!(
+            widening[0].detail.contains("/users/{id}"),
+            "the finding must name the route whose requests it takes: {:?}",
+            widening[0]
+        );
+    }
+
+    /// The same shape, admitting no one new, is the ordinary neutral addition.
+    #[test]
+    fn adding_a_more_specific_route_with_the_same_guard_is_neutral() {
+        let by_id = route("/users/{id}", "GET", "gated", &["admin"], &[], false);
+        let me = route("/users/me", "GET", "gated", &["admin"], &[], false);
+        let base = routes_only(&by_id);
+        let head = routes_only(&format!("{by_id},{me}"));
+
+        let findings = diff(&base, &head);
+        assert_eq!(kinds(&findings), vec!["route_added_gated"], "{findings:#?}");
+    }
+
+    /// And carving a *guarded* route out of a public one narrows those URLs.
+    #[test]
+    fn adding_a_guard_over_part_of_a_public_route_is_not_a_widening() {
+        let by_id = route("/users/{id}", "GET", "public", &[], &[], false);
+        let me = route("/users/me", "GET", "gated", &["admin"], &[], false);
+        let base = routes_only(&by_id);
+        let head = routes_only(&format!("{by_id},{me}"));
+
+        assert!(
+            widening(&diff(&base, &head)).is_empty(),
+            "{:#?}",
+            diff(&base, &head)
+        );
+    }
+
+    /// Same lesson as the fall-through fingerprint: the acknowledgment binds to
+    /// the posture it was given for, on both sides of the displacement.
+    #[test]
+    fn a_displacement_acknowledgment_does_not_survive_a_looser_route() {
+        let by_id = route("/users/{id}", "GET", "gated", &["admin"], &[], false);
+        let base = routes_only(&by_id);
+        let added_with = |roles: &[&str]| {
+            let me = route("/users/me", "GET", "gated", roles, &[], false);
+            diff(&base, &routes_only(&format!("{by_id},{me}")))
+                .into_iter()
+                .find(|f| f.kind == "route_added_shadowing")
+                .expect("the displacement is a widening")
+                .canonical()
+        };
+
+        assert_ne!(added_with(&["editor"]), added_with(&["guest"]));
     }
 
     /// Overlap is not enough: the router matches a static segment before a
