@@ -888,9 +888,18 @@ fn diff_authorization_policies(
             before: format!("authorize({action}, {resource})"),
             after: "none".to_owned(),
             fingerprint: format!(
-                "authz-removed:{}:{}",
-                escape_field(action),
-                escape_field(resource)
+                "authz-removed:{}",
+                escape_list(&[
+                    action.clone(),
+                    resource.clone(),
+                    // Only when the URL survived the route: otherwise there is
+                    // nothing replacing the check and nothing to bind to.
+                    if fell_through {
+                        checks_on((path, method), &after, &routes_after, &routes_before)
+                    } else {
+                        String::new()
+                    },
+                ])
             ),
             detail,
         });
@@ -988,6 +997,37 @@ fn diff_csrf_exemptions(base: &PostureManifest, head: &PostureManifest, out: &mu
     }
 }
 
+/// The checks a manifest performs on the URLs a route answers, as one string.
+///
+/// What an acknowledgment of a fall-through or a displacement actually says is
+/// "I accept that this URL is checked by *that* instead" — so weakening what it
+/// is checked by has to invalidate it. The replacing route is absent from the
+/// base, so its binding reads only as a neutral addition; without this in the
+/// fingerprint the digest never moved.
+fn checks_on(
+    (path, method): (&str, &str),
+    bindings: &BTreeMap<AuthzKey, String>,
+    routes: &BTreeSet<RouteKey>,
+    from_routes: &BTreeSet<RouteKey>,
+) -> String {
+    let mut checks: Vec<String> = routes
+        .iter()
+        .filter(|(p, m)| {
+            takes_precedence(path, p)
+                && methods_transfer((method, path), from_routes, (m, p), routes)
+        })
+        .flat_map(|(p, m)| {
+            bindings
+                .keys()
+                .filter(move |(bp, bm, _, _)| bp == p && bm == m)
+                .map(|(_, _, action, resource)| format!("{action} on {resource}"))
+        })
+        .collect();
+    checks.sort();
+    checks.dedup();
+    escape_list(&checks)
+}
+
 /// Bindings the URLs of a displaced route lose to a new, more specific one.
 ///
 /// The mirror of the fall-through case, and just as invisible: a displacement
@@ -1055,6 +1095,7 @@ fn report_displaced_bindings(
                             displaced_method.clone(),
                             action.clone(),
                             resource.clone(),
+                            checks_on((added_path, added_method), after, &keys_after, &keys_before),
                         ])
                     ),
                     detail: format!(
@@ -2042,6 +2083,79 @@ mod tests {
             "the finding must name the route that now serves the URL: {:?}",
             widening[0]
         );
+    }
+
+    /// The round-15 lesson, retrofitted to the binding findings. An
+    /// acknowledgment of a fall-through says "I accept that this URL is now
+    /// checked by *that* instead" — so weakening what it is now checked by has
+    /// to invalidate it. The survivor is absent from the base, so its binding
+    /// reads only as an addition, and a fingerprint naming the lost check alone
+    /// left the digest unmoved.
+    #[test]
+    fn a_fallthrough_acknowledgment_binds_to_the_checks_that_replace_it() {
+        let me = route("/records/me", "GET", "gated", &["user"], &[], true);
+        let by_id = route("/records/{id}", "GET", "gated", &["user"], &[], true);
+        let binding = |path: &str, action: &str| {
+            format!(r#"{{"path":"{path}","method":"GET","action":"{action}","resource":"Record"}}"#)
+        };
+        let base = manifest(
+            &format!("{me},{by_id}"),
+            "",
+            "",
+            &format!(
+                "{},{}",
+                binding("/records/me", "read_self"),
+                binding("/records/{id}", "read_any")
+            ),
+        );
+        let lost_to = |action: &str| {
+            diff(
+                &base,
+                &manifest(&by_id, "", "", &binding("/records/{id}", action)),
+            )
+            .into_iter()
+            .find(|f| f.kind == "authorization_binding_removed" && f.path == "/records/me")
+            .expect("the fall-through is a widening")
+            .canonical()
+        };
+
+        assert_ne!(
+            lost_to("read_any"),
+            lost_to("read_weak"),
+            "acknowledging a fall-through to `read_any` must not authorize one to `read_weak`"
+        );
+    }
+
+    /// And the displacement side, which has the same shape.
+    #[test]
+    fn a_displaced_binding_acknowledgment_binds_to_the_replacing_checks() {
+        let by_id = route("/records/{id}", "GET", "gated", &["user"], &[], true);
+        let me = route("/records/me", "GET", "gated", &["user"], &[], true);
+        let binding = |path: &str, action: &str| {
+            format!(r#"{{"path":"{path}","method":"GET","action":"{action}","resource":"Record"}}"#)
+        };
+        let base = manifest(&by_id, "", "", &binding("/records/{id}", "read_self"));
+        let displaced_by = |action: &str| {
+            diff(
+                &base,
+                &manifest(
+                    &format!("{by_id},{me}"),
+                    "",
+                    "",
+                    &format!(
+                        "{},{}",
+                        binding("/records/{id}", "read_self"),
+                        binding("/records/me", action)
+                    ),
+                ),
+            )
+            .into_iter()
+            .find(|f| f.kind == "authorization_binding_displaced")
+            .expect("the displacement is a widening")
+            .canonical()
+        };
+
+        assert_ne!(displaced_by("read_any"), displaced_by("read_weak"));
     }
 
     /// The same explicit-`HEAD` lesson, in the binding dimension. With base
