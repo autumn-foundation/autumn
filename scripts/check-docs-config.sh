@@ -2341,8 +2341,15 @@ def source_tokens(root):
             # ordinary Rust string is sample text, not a binding. Same rule,
             # both rungs — applying it to one of the two is this script's most
             # repeated mistake.
-            for at, v in ((mb.start(), mb.group(2))
-                          for mb in BOUND.finditer(line)):
+            # `const NAME: &str = "AUTUMN_X"` is RUST syntax, so like the
+            # accessor rung it belongs to Rust. It was running on every
+            # language: the only rung still reading a `.lua` file was this one,
+            # and it would have read that declaration out of a JavaScript or
+            # Lua string just as happily. Found by checking a claim I had
+            # already written on the review thread; measured at 430 either way.
+            for at, v in (((mb.start(), mb.group(2))
+                           for mb in BOUND.finditer(line))
+                          if effective_suffix(rel) == '.rs' else ()):
                 if nested is None or not nested[offsets[n] + at]:
                     tokens.update([v])
         # A quoted name counts when it is the accessor's own ARGUMENT, not when
@@ -3876,12 +3883,16 @@ def self_test():
           bool(ACCESSOR.search(uncommented(
               'os.getenv("AUTUMN_X")\n', comment_leader('a.lua'))))),
          (True, True, True))
-    # The accessor rung is Rust's: outside Rust this script cannot tell a call
-    # from a string containing one, because `_rust_classes` is what answers it.
-    case('the accessor rung belongs to Rust',
+    # The accessor and binding rungs are Rust's: outside Rust this script
+    # cannot tell a call — or a declaration — from a string containing one,
+    # because `_rust_classes` is what answers that.
+    case('the Rust-shaped rungs belong to Rust',
          (effective_suffix('autumn/src/config.rs') == '.rs',
-          effective_suffix('autumn-admin-plugin/src/admin.js') == '.rs'),
-         (True, False))
+          effective_suffix('autumn-admin-plugin/src/admin.js') == '.rs',
+          effective_suffix('autumn/src/security/rate_limit.lua') == '.rs',
+          [m.group(2) for m in BOUND.finditer(
+              'const FAKE_ENV: &str = "AUTUMN_X";')]),
+         (True, False, False, ['AUTUMN_X']))
     # PowerShell reads the environment as `$env:NAME`, not `$NAME`.
     case('a PowerShell environment read is a use',
          (PS_ENV.findall('if ($env:AUTUMN_VERSION) { $env:AUTUMN_VERSION }'),
