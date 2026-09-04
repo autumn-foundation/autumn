@@ -536,7 +536,7 @@ COMMENT_LEADER = {
     # `--`; the markup family is block-only and listed by its opening
     # delimiter. None of these files carries an `AUTUMN_` name today, so this
     # closes latent holes and moves no counter.
-    '.sql': '--', '.lua': '--', '.java': '//',
+    '.sql': '--', '.lua': 'lua', '.java': '//',
     '.css': '/*', '.html': '<!--', '.xml': '<!--', '.svg': '<!--',
     '.heex': '<!--', '.erb': '<%#', '.ftl': '<#--',
     # Program output captured as a fixture: nothing in it is a comment, and a
@@ -883,6 +883,9 @@ YAML_SCALARS = ('.yml', '.yaml')
 # Kubernetes), `script` (GitLab). Measured before narrowing: every name a block
 # scalar carries in this tree — all 31 occurrences, 10 names — is under `run`.
 YAML_BLOCK = re.compile(r'^(\s*)(?:-\s+)?([A-Za-z0-9_.-]+):\s*[|>][-+0-9]*\s*$')
+# An executed key does not need a block scalar: `- run: echo "${AUTUMN_X}"` is
+# one line and just as real. Blanking every non-block line discarded it.
+YAML_INLINE = re.compile(r'^\s*(?:-\s+)?([A-Za-z0-9_.-]+):[^\S\n]+(?![|>]\s*$)\S')
 YAML_EXECUTED = ('run', 'command', 'entrypoint', 'script')
 
 # Blanking only the non-executed BLOCK scalars was half the rule. An ordinary
@@ -925,8 +928,12 @@ def _yaml_blocks(body, interpolated=False):
                 out.append(l if key in YAML_EXECUTED else '')
                 continue
         m = YAML_BLOCK.match(l)
-        # The opening line itself carries no value, so it is never evidence.
-        out.append(l if interpolated and not m else ('' if not m else l))
+        inline = YAML_INLINE.match(l)
+        keep = (interpolated
+                or (inline is not None and inline.group(1) in YAML_EXECUTED))
+        # A block-opening line carries no value of its own, so it is kept only
+        # to preserve the line count, never as evidence.
+        out.append(l if (keep or m) else '')
         if m:
             key, indent = m.group(2), len(m.group(1))
     return '\n'.join(out)
@@ -1317,6 +1324,47 @@ def _block_uncommented(body, opener, closer):
         i = end
 
 
+LUA_LONG = re.compile(r'--\[(=*)\[')
+
+
+def _lua_uncommented(body):
+    """Drop Lua's `--` line comments AND its long comments.
+
+    `--[[ … ]]` and the equals-delimited `--[==[ … ]==]` are the forms the SQL
+    scanner cannot see: it stops a `--` at the line end, so everything after
+    the first line of a long comment survived as code. The delimiter length is
+    part of the syntax — `]]` does not close `--[==[` — so it is matched, not
+    assumed.
+
+    Length-preserving, newlines kept, so line numbering holds.
+    """
+    out, i, n = list(body), 0, len(body)
+    while i < n:
+        m = LUA_LONG.match(body, i)
+        if m:
+            close = ']' + m.group(1) + ']'
+            end = body.find(close, m.end())
+            end = n if end < 0 else end + len(close)
+            for k in range(i, min(end, n)):
+                if body[k] != '\n':
+                    out[k] = ' '
+            i = end
+            continue
+        if body[i:i + 2] == '--':
+            while i < n and body[i] != '\n':
+                out[i] = ' '
+                i += 1
+            continue
+        if body[i] in '\'"':
+            q, j = body[i], i + 1
+            while j < n and body[j] != q:
+                j += 2 if body[j] == '\\' else 1
+            i = min(j, n) + 1
+            continue
+        i += 1
+    return ''.join(out)
+
+
 def _sql_uncommented(body):
     """Drop SQL's `--` line comments and `/* … */` blocks, keeping strings.
 
@@ -1441,6 +1489,8 @@ def uncommented(body, leader='//', needs_space=False, also_slash=False,
         return _rust_uncommented(body)
     if leader == '--':
         return _sql_uncommented(body)
+    if leader == 'lua':
+        return _lua_uncommented(body)
     if leader in BLOCK_CLOSER:
         return _block_uncommented(body, leader, BLOCK_CLOSER[leader])
     if leader == '#':
@@ -2302,7 +2352,18 @@ def source_tokens(root):
         # Taking the balanced argument list also covers the house multi-line
         # shape — `parse_env(\n env,\n "AUTUMN_MEDIA__ROOM_NAMESPACE")` — which
         # is what the window existed for.
-        for m in acc.finditer(body):
+        # The accessor rung is RUST's. `getenv("AUTUMN_X")` inside a
+        # JavaScript string is text, and outside Rust this script has no way to
+        # tell a call from a string containing one — `_rust_classes` and
+        # `_generated_data` are what make the question answerable, and they are
+        # Rust-only. Same shape as `shell_shapes`: a pattern belongs to the
+        # languages that give it meaning.
+        #
+        # Measured before narrowing: the only non-Rust hits were three
+        # `std::env::var(…)` lines inside a heredoc in
+        # `deploy-real-vps-validate.sh` that writes a Rust file, and all three
+        # names are carried elsewhere. Truth set 430 either way.
+        for m in (acc.finditer(body) if effective_suffix(rel) == '.rs' else ()):
             if nested is not None and nested[m.start()]:
                 continue
             head = body.rfind('\n', 0, m.start()) + 1
@@ -3796,6 +3857,31 @@ def self_test():
           [m.group(2) for m in BOUND.finditer(_rust_uncommented(
               'const CANARY_ENV: &str = "AUTUMN_CANARY";'))]),
          ([], ['AUTUMN_CANARY']))
+    # An executed key does not need a block scalar to be executed.
+    case('an inline executed value is kept, an inline inert one is not',
+         [_yaml_blocks(y, False).splitlines()[-1].strip() for y in
+          ('steps:\n  - run: echo "${AUTUMN_X}"\n',
+           'steps:\n  - name: echo "${AUTUMN_X}"\n',
+           'steps:\n  - run: |\n      echo x\n')],
+         ['- run: echo "${AUTUMN_X}"', '', 'echo x'])
+    # Lua's long comments are the forms the SQL scanner cannot see, and the
+    # delimiter length is part of the syntax — `]]` does not close `--[==[`.
+    case('a Lua long comment is a comment',
+         (ACCESSOR.search(uncommented(
+             '--[[\nos.getenv("AUTUMN_X")\n]]\n', comment_leader('a.lua')))
+          is None,
+          ACCESSOR.search(uncommented(
+              '--[==[\nos.getenv("AUTUMN_X")\n]]\nstill\n]==]\n',
+              comment_leader('a.lua'))) is None,
+          bool(ACCESSOR.search(uncommented(
+              'os.getenv("AUTUMN_X")\n', comment_leader('a.lua'))))),
+         (True, True, True))
+    # The accessor rung is Rust's: outside Rust this script cannot tell a call
+    # from a string containing one, because `_rust_classes` is what answers it.
+    case('the accessor rung belongs to Rust',
+         (effective_suffix('autumn/src/config.rs') == '.rs',
+          effective_suffix('autumn-admin-plugin/src/admin.js') == '.rs'),
+         (True, False))
     # PowerShell reads the environment as `$env:NAME`, not `$NAME`.
     case('a PowerShell environment read is a use',
          (PS_ENV.findall('if ($env:AUTUMN_VERSION) { $env:AUTUMN_VERSION }'),
