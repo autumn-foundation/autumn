@@ -296,7 +296,7 @@ tokio-postgres = { version = "0.7", optional = true }
 # setup callback. `ring` (not the aws-lc default) keeps cross-compilation
 # to mobile targets working; `webpki-roots` provides a deterministic root
 # store on platforms without an accessible native one.
-tokio-postgres-rustls = { version = "0.13", optional = true }
+tokio-postgres-rustls = { version = "0.14", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
 webpki-roots = { version = "1", optional = true }
