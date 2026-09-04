@@ -45,6 +45,7 @@ changes no posture posts nothing at all.
 | A prefix added to `security.csrf.exempt_paths` | **blocks** |
 | A security header stops being emitted | **blocks** |
 | Route removed, **and a weaker route still answers its URLs** | **blocks** |
+| Last route at a path removed, **and a public route inherits the URL** | **blocks** |
 | New `gated` route that **takes a stricter route's URLs over** | **blocks** |
 | New `gated` or framework-owned route | annotates |
 | Route removed, gate strengthened, scope added, policy added | annotates |
@@ -74,9 +75,20 @@ with the static one winning.
   what needed `admin` a moment ago, while the `/users/{id}` entry sits unchanged
   in both manifests. Reported as `route_added_shadowing`.
 
-Both are decided by precedence, not by overlap: a survivor that was *already*
-answering the URL gains nothing, so deleting a gated `/users/{id}` beside a
-public `/users/me` is an ordinary removal. The same analysis covers
+A path is a node, not a set of routes, so there is a third case. Every method
+at one path shares a single handler table, and while any method is mounted the
+path answers **405** for the rest. Delete the *last* route at `/users/me` and
+that node goes with it: `POST /users/me`, previously a 405, now reaches
+whatever less specific route covers it. Reported as `route_path_exposed`, and
+blocking only when that route is public — newly reachable but guarded
+annotates, exactly as a new guarded route does.
+
+All of them are decided by precedence, not by overlap: a survivor that was
+*already* answering the URL gains nothing, so deleting a gated `/users/{id}`
+beside a public `/users/me` is an ordinary removal. Where several routes could
+take a deleted route's URLs, only the one that actually wins them counts —
+`/records/me/{id}` beats `/records/{user}/private`, so the latter's posture is
+irrelevant to that deletion. The same analysis covers
 `#[authorize]` bindings — a check that disappears from a URL that is still
 answered is `authorization_binding_displaced` — and it follows the methods a
 route really answers, so a `WS` route mounted as a `GET`, or a `GET` that also

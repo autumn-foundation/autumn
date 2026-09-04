@@ -238,6 +238,94 @@ fn diff_routes(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Fin
             report_shadow_exposure(key, entry, &after, (&keys_before, &keys_after), out);
         }
     }
+    report_path_exposure(base, head, &before, &after, out);
+}
+
+/// A path is a node, not a set of routes.
+///
+/// Autumn groups every method at one path into a single `MethodRouter`, so
+/// while any method is mounted there the path answers 405 for the rest.
+/// Removing the *last* route at a path takes the node away, and those
+/// previously-405 requests start reaching a less specific route. Filtering by
+/// method intersection first skipped that: the removed `GET` and the surviving
+/// `POST` share nothing, yet `POST` on that URL went from 405 to served.
+///
+/// Newly reachable through an *open* route is a widening, exactly as a new open
+/// route is; newly reachable through a guarded one annotates, exactly as a new
+/// guarded route does.
+fn report_path_exposure(
+    base: &PostureManifest,
+    head: &PostureManifest,
+    before: &BTreeMap<RouteKey, RouteEntry>,
+    after: &BTreeMap<RouteKey, RouteEntry>,
+    out: &mut Vec<Finding>,
+) {
+    let keys_before = route_keys(base);
+    let keys_after = route_keys(head);
+    let paths_after: BTreeSet<&String> = keys_after.iter().map(|(path, _)| path).collect();
+
+    // Every path the head no longer mounts at all, and the methods it answered.
+    let mut vanished: BTreeMap<&String, BTreeSet<String>> = BTreeMap::new();
+    for (path, method) in &keys_before {
+        if !paths_after.contains(path) {
+            vanished
+                .entry(path)
+                .or_default()
+                .extend(answered_methods(method, path, &keys_before));
+        }
+    }
+
+    for (path, served) in vanished {
+        let candidates: Vec<&RouteKey> = keys_after
+            .iter()
+            .filter(|(p, _)| takes_precedence(path, p))
+            .collect();
+        for key in undominated(&candidates) {
+            let Some(survivor) = after.get(key) else {
+                continue;
+            };
+            if !is_open(&survivor.classification) {
+                continue;
+            }
+            let (survivor_path, survivor_method) = key;
+            let newly: Vec<String> = answered_methods(survivor_method, survivor_path, &keys_after)
+                .difference(&served)
+                .cloned()
+                .collect();
+            if newly.is_empty() {
+                continue;
+            }
+            let written = before
+                .iter()
+                .find(|((p, _), _)| p == path)
+                .map_or_else(|| path.clone(), |(_, entry)| entry.path.clone());
+            out.push(Finding {
+                kind: "route_path_exposed",
+                severity: Severity::Widening,
+                method: newly.join(", "),
+                path: written.clone(),
+                before: "405 (no handler at this path)".to_owned(),
+                after: survivor.posture_label(),
+                fingerprint: format!(
+                    "path-exposed:{}",
+                    escape_list(&[
+                        escape_list(&newly),
+                        survivor.method.clone(),
+                        survivor.path.clone(),
+                        posture_fingerprint(survivor),
+                    ])
+                ),
+                detail: format!(
+                    "nothing is mounted at this path any more, so {} on it no longer stops at a \
+                     405 — `{} {}` answers it now, without a proven guard ({})",
+                    newly.join(", "),
+                    survivor.method,
+                    survivor.path,
+                    survivor.posture_label()
+                ),
+            });
+        }
+    }
 }
 
 /// Adding a route does not always add a URL.
@@ -318,17 +406,17 @@ fn report_shadow_exposure(
     (keys_before, keys_after): (&BTreeSet<RouteKey>, &BTreeSet<RouteKey>),
     out: &mut Vec<Finding>,
 ) {
-    for ((survivor_path, survivor_method), survivor) in after {
-        if !takes_precedence(path, survivor_path)
-            || !methods_transfer(
-                (method, path),
-                keys_before,
-                (survivor_method, survivor_path),
-                keys_after,
-            )
-        {
+    let candidates: Vec<&RouteKey> = after
+        .keys()
+        .filter(|(p, m)| {
+            takes_precedence(path, p)
+                && methods_transfer((method, path), keys_before, (m, p), keys_after)
+        })
+        .collect();
+    for key in undominated(&candidates) {
+        let Some(survivor) = after.get(key) else {
             continue;
-        }
+        };
         // Only a survivor that admits callers the deleted route refused is a
         // widening — and "admits more" is decided by the same comparison the
         // rest of this module uses, so the two cannot drift apart.
@@ -450,6 +538,25 @@ fn route_keys(m: &PostureManifest) -> BTreeSet<RouteKey> {
         .entries
         .iter()
         .map(RouteEntry::key)
+        .collect()
+}
+
+/// Among the routes that could take a removed route's URLs, the ones that
+/// actually receive them.
+///
+/// Precedence ranks the takers too: `/records/me/{id}` wins
+/// `/records/me/private` over `/records/{user}/private`, so the latter never
+/// sees that URL and its posture is irrelevant to the deletion. Routes sharing
+/// a path never outrank each other — they are the same node.
+fn undominated<'a>(takers: &[&'a RouteKey]) -> Vec<&'a RouteKey> {
+    takers
+        .iter()
+        .filter(|(path, _)| {
+            !takers
+                .iter()
+                .any(|(other, _)| other != path && takes_precedence(other, path))
+        })
+        .copied()
         .collect()
 }
 
@@ -838,13 +945,16 @@ fn diff_authorization_policies(
         // Every surviving route that can take any of this route's URLs.
         // Precedence sends different URLs to different ones, so there is no
         // single "the survivor" to ask.
-        let takers: Vec<&RouteKey> = routes_after
+        let candidates: Vec<&RouteKey> = routes_after
             .iter()
             .filter(|(p, m)| {
                 takes_precedence(path, p)
                     && methods_transfer((method, path), &routes_before, (m, p), &routes_after)
             })
             .collect();
+        // Ranked, so a route another taker outranks cannot vouch for a check it
+        // never gets asked to perform.
+        let takers = undominated(&candidates);
         if takers.is_empty() {
             continue;
         }
@@ -2091,6 +2201,63 @@ mod tests {
         );
     }
 
+    /// A path is a node, not a set of routes. Autumn groups every method at
+    /// one path into a single `MethodRouter`, so while any method is mounted
+    /// there the path answers 405 for the rest. Delete the *last* route at
+    /// `/users/me` and the node goes with it — `POST /users/me`, previously a
+    /// 405, now reaches the public `POST /users/{id}`. Filtering by method
+    /// intersection first skipped that entirely.
+    #[test]
+    fn removing_the_last_route_at_a_path_exposes_its_other_methods() {
+        let removed = route("/users/me", "GET", "gated", &["user"], &[], false);
+        let survivor = route("/users/{id}", "POST", "public", &[], &[], false);
+        let base = routes_only(&format!("{removed},{survivor}"));
+        let head = routes_only(&survivor);
+
+        let findings = diff(&base, &head);
+        let widening = widening(&findings);
+        assert_eq!(widening.len(), 1, "{findings:#?}");
+        assert_eq!(widening[0].kind, "route_path_exposed");
+        assert!(widening[0].method.contains("POST"), "{:?}", widening[0]);
+    }
+
+    /// Newly reachable but *guarded* is the same verdict as a new gated route:
+    /// annotate, do not block.
+    #[test]
+    fn a_guarded_survivor_taking_a_vanished_path_is_not_a_widening() {
+        let removed = route("/users/me", "GET", "gated", &["user"], &[], false);
+        let survivor = route("/users/{id}", "POST", "gated", &["admin"], &[], false);
+        let base = routes_only(&format!("{removed},{survivor}"));
+        let head = routes_only(&survivor);
+
+        assert!(
+            widening(&diff(&base, &head)).is_empty(),
+            "{:#?}",
+            diff(&base, &head)
+        );
+    }
+
+    /// A route that another taker outranks never receives the URL, so it is not
+    /// the fall-through target. `/records/me/{id}` wins `/records/me/private`
+    /// over `/records/{user}/private`, so the latter being public exposes
+    /// nothing.
+    #[test]
+    fn a_survivor_outranked_by_another_taker_is_not_the_fallthrough() {
+        let gated = |path: &str| route(path, "GET", "gated", &["user"], &[], false);
+        let removed = gated("/records/me/private");
+        let wins = gated("/records/me/{id}");
+        let public_loser = route("/records/{user}/private", "GET", "public", &[], &[], false);
+
+        let base = routes_only(&format!("{removed},{wins},{public_loser}"));
+        let head = routes_only(&format!("{wins},{public_loser}"));
+
+        assert!(
+            widening(&diff(&base, &head)).is_empty(),
+            "the public route never sees that URL: {:#?}",
+            diff(&base, &head)
+        );
+    }
+
     /// Several routes can take a deleted route's URLs, and precedence sends
     /// different URLs to different ones. Accepting the check from *any* of them
     /// suppressed the finding when the route that actually wins does not carry
@@ -2570,13 +2737,10 @@ mod tests {
             let head = routes_only(&survivor);
 
             let findings = diff(&base, &head);
-            let widening = widening(&findings);
-            assert_eq!(
-                widening.len(),
-                1,
+            assert!(
+                findings.iter().any(|f| f.kind == "route_shadow_exposed"),
                 "a GET survivor answers {removed_method} at that URL: {findings:#?}"
             );
-            assert_eq!(widening[0].kind, "route_shadow_exposed");
         }
     }
 
@@ -2591,10 +2755,10 @@ mod tests {
         let base = routes_only(&format!("{survivor},{guarded}"));
         let head = routes_only(&survivor);
 
+        let findings = diff(&base, &head);
         assert!(
-            widening(&diff(&base, &head)).is_empty(),
-            "{:#?}",
-            diff(&base, &head)
+            !findings.iter().any(|f| f.kind == "route_shadow_exposed"),
+            "a websocket upgrade is not served for HEAD: {findings:#?}"
         );
     }
 
@@ -2649,7 +2813,10 @@ mod tests {
         );
     }
 
-    /// And a method the survivor genuinely does not answer is not exposure.
+    /// And a method the survivor genuinely does not answer is not *shadowed* by
+    /// it: the deleted `POST` handler has no `GET` successor to inherit its
+    /// guard. The path node vanishing is a separate finding, covered by
+    /// `removing_the_last_route_at_a_path_exposes_its_other_methods`.
     #[test]
     fn a_survivor_does_not_shadow_a_method_it_never_answers() {
         let survivor = route("/users/{id}", "GET", "public", &[], &[], false);
@@ -2657,7 +2824,11 @@ mod tests {
         let base = routes_only(&format!("{survivor},{guarded}"));
         let head = routes_only(&survivor);
 
-        assert!(widening(&diff(&base, &head)).is_empty());
+        let findings = diff(&base, &head);
+        assert!(
+            !findings.iter().any(|f| f.kind == "route_shadow_exposed"),
+            "{findings:#?}"
+        );
     }
 
     /// The same fall-through, one dimension over. Both routes are `gated` with
