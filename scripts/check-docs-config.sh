@@ -989,6 +989,7 @@ def _yaml_runs(key, stack, consumer, value=''):
 COMPOSE_ASSIGNS = 'environment'
 # The three spellings a compose `environment:` entry takes. Only the first has
 # an `=`, which is why the assignment rungs could not see the other two.
+SEQ_ITEM = re.compile(r'^(\s*)-\s+(.*)$')
 COMPOSE_DECLARED = re.compile(r'^\s*(?:-\s+)?(AUTUMN_[A-Z0-9_]+)\s*(?:[:=]|$)',
                               re.M)
 
@@ -1315,6 +1316,7 @@ def _yaml_blocks(body, interpolated=False, consumer='actions',
                     out[i] = ''
         del buf[:]
 
+    seq, seq_indent, seq_shell = None, 0, None
     src, consumed = body.splitlines(), set()
     for index, l in enumerate(src):
         if index in consumed:
@@ -1339,6 +1341,33 @@ def _yaml_blocks(body, interpolated=False, consumer='actions',
             column = len(at.group(1)) + len(at.group(2) or '')
             while stack and stack[-1][0] >= column:
                 stack.pop()
+        # A compose command is often a SEQUENCE, not a scalar:
+        #
+        #     command:
+        #       - bash
+        #       - -c
+        #       - |
+        #         …the payload…
+        #
+        # which is a real `bash -c` and is how this tree writes its longest
+        # ones. Only a same-line value was read, so the payload was blanked
+        # and every assignment in it was invisible. The first item names the
+        # executable, exactly as it does in the inline and JSON forms.
+        if consumer == 'compose':
+            item = SEQ_ITEM.match(l)
+            if at and at.group(3) in YAML_EXECUTED and not YAML_INLINE.match(l):
+                seq, seq_indent, seq_shell = at.group(3), column, None
+            elif seq is not None and item and len(item.group(1)) > seq_indent:
+                text = item.group(2).strip()
+                if seq_shell is None:
+                    seq_shell = _shell_named(text) in DOCKER_SHELLS
+                if seq_shell and text.rstrip('-+0123456789') in ('|', '>'):
+                    out.append(l)
+                    key, indent = seq, len(item.group(1))
+                    runs, fold = True, text.startswith('>')
+                    continue
+            elif l.strip() and (len(l) - len(l.lstrip())) <= seq_indent:
+                seq = None
         m = YAML_BLOCK.match(l)
         inline = YAML_INLINE.match(l)
         executed = (inline is not None
@@ -2540,7 +2569,7 @@ ENV_HELPER = re.compile(r'\bfn\s+(\w+)\s*(?:<(?:[^<>]|<[^<>]*>)*>)?\s*'
                         r'\(([^)]*\benv\s*:\s*&[^)]*\bkey\s*:\s*&str)', re.S)
 
 
-def accessor(root):
+def accessor(root, test_files=frozenset()):
     """The accessor pattern, and where each one takes its KEY.
 
     The key is an argument POSITION, not "the first string literal in the
@@ -2553,9 +2582,12 @@ def accessor(root):
     """
     out = subprocess.run(['git', 'ls-files', '-z', '*.rs'], cwd=root,
                          capture_output=True, text=True).stdout
-    index, types, receivers = {}, set(), set()
+    index, types, receivers, masked_all = {}, set(), set(), {}
     for rel in out.split('\0'):
-        if not rel:
+        # Test code is skipped outright, as the scan that consumes this index
+        # already does — a receiver bound only in a test is used only in a
+        # test, and that call is masked before it is ever read.
+        if not rel or test_code(rel, test_files):
             continue
         try:
             body = (root / rel).read_text(encoding='utf-8', errors='replace')
@@ -2576,23 +2608,30 @@ def accessor(root):
             if data[m.start()]:
                 continue
             index[m.group(1)] = len(_split_args(m.group(2))) - 1
-        types.update(ENV_IMPL.findall(masked))
-        receivers.update(ENV_BOUND.findall(masked))
+        masked_all[rel] = (masked, data)
+        types.update(m.group(1) for m in ENV_IMPL.finditer(masked)
+                     if not data[m.start()])
+        receivers.update(m.group(1) for m in ENV_BOUND.finditer(masked)
+                         if not data[m.start()])
     # A type that IS an environment can be the receiver itself (`OsEnv.var(…)`),
     # and a binding of one is too — `let denv = DotenvEnv::new(…)` has no
     # annotation to read, so the types are matched on the right of a `let` as
     # well. Every receiver this tree actually uses is derived; `css` is not.
+    #
+    # This second pass reads the SAME masked text as the first. Reading the raw
+    # file here — which is what it did first — let a `let css = OsEnv::new()`
+    # written in a comment, a string, or a test add `css` to the accessor regex
+    # for the whole tree. That is the fourth time a derivation has been wider
+    # than the rung it feeds, and the second time in this one function: the
+    # inputs of a rung are the rung, however many passes they take.
     receivers |= types
-    for rel in out.split('\0'):
-        if not rel or not types:
-            continue
-        try:
-            body = (root / rel).read_text(encoding='utf-8', errors='replace')
-        except OSError:
-            continue
-        receivers.update(re.findall(
+    if types:
+        bound = re.compile(
             r'\blet\s+(?:mut\s+)?([a-z_]\w*)\s*(?::[^=;]*)?=\s*&?\s*(?:'
-            + '|'.join(sorted(map(re.escape, types))) + r')\b', body))
+            + '|'.join(sorted(map(re.escape, types))) + r')\b')
+        for masked, data in masked_all.values():
+            receivers.update(m.group(1) for m in bound.finditer(masked)
+                             if not data[m.start()])
     pattern = ACCESSOR.pattern
     if receivers:
         pattern += (r'|\b(?:' + '|'.join(sorted(map(re.escape, receivers)))
@@ -2973,8 +3012,8 @@ def source_tokens(root):
     """
     out = subprocess.run(['git', 'ls-files', '-z'], cwd=root,
                          capture_output=True, text=True).stdout
-    acc, key_index = accessor(root)
     test_files = test_module_files(root)
+    acc, key_index = accessor(root, test_files)
     tokens = set()
     for rel in out.split('\0'):
         # Markdown is prose, and `README.md.tmpl` is prose too — the same
@@ -4429,7 +4468,7 @@ def self_test():
          bool(ACCESSOR.search('let v = env.get("AUTUMN_LOG__LEVEL");')), True)
     # A quoted name counts as its accessor's ARGUMENT, not as its neighbour. The
     # window this replaced took a name off any line within three of a call.
-    real_acc, real_index = accessor(ROOT)
+    real_acc, real_index = accessor(ROOT, test_module_files(ROOT))
 
     def args_of(text, acc=ACCESSOR, index=None):
         m = acc.search(text)
@@ -4576,12 +4615,18 @@ def self_test():
          [0, 3, 4])
     # A bare `var(` is any function named `var`; the environment API has a
     # receiver or a path. This tree's own `Env` trait is called as a method.
-    case('an accessor needs a receiver or a path',
+    # …and the receiver must be an ENVIRONMENT one, derived from the tree.
+    # `off` is bound only inside a test module, so it is not derived — and
+    # costs nothing, because the calls that use it are test code too and are
+    # masked before this pattern ever reads them.
+    case('an accessor needs a receiver or a path, and an environment one',
          [bool(real_acc.search(s)) for s in
           ('var("AUTUMN_X")', 'background: var(--primary)',
+           'css.var("AUTUMN_X")', 'off.var("AUTUMN_X")',
            'std::env::var("AUTUMN_X")', 'env::var("AUTUMN_X")',
-           'env.var("AUTUMN_X")', 'off.var("AUTUMN_X")')],
-         [False, False, True, True, True, True])
+           'env.var("AUTUMN_X")', 'denv.var("AUTUMN_X")',
+           'self.inner.var("AUTUMN_X")', 'OsEnv.var("AUTUMN_X")')],
+         [False, False, False, False, True, True, True, True, True, True])
     # A redirection is not a command — `AUTUMN_X=1 > out` is a null command
     # that starts no process — but it may PRECEDE one, so it is consumed and
     # the question asked again rather than added to the terminator set.
@@ -4950,6 +4995,16 @@ def self_test():
           len(_cev.splitlines()) >= len(_cav.splitlines())),
          ([], ['AUTUMN_ENVLIST'],
           ['AUTUMN_ENVLIST', 'AUTUMN_BARE', 'AUTUMN_MAP'], [], True))
+    # A compose command written as a SEQUENCE is a real command: the first
+    # item names the executable and the block item is the payload.
+    _seqc = ('services:\n  app:\n    command:\n      - bash\n      - -c\n'
+             '      - |\n        AUTUMN_SEQ=1 true\n    x-after: done\n')
+    _seqx = ('services:\n  app:\n    command:\n      - /app/x\n      - -c\n'
+             '      - |\n        AUTUMN_NOSEQ=1 true\n')
+    case('a sequence-form compose command is read when it names a shell',
+         (ASSIGNED_PREFIX.findall(_yaml_blocks(_seqc, True, 'compose', True)),
+          ASSIGNED_PREFIX.findall(_yaml_blocks(_seqx, True, 'compose', True))),
+         (['AUTUMN_SEQ'], []))
     # A custom Actions shell line is still a shell: what names the grammar is
     # the EXECUTABLE, and the JSON list form splits on the comma, not on space.
     case('a shell is named by its executable, in either spelling',
