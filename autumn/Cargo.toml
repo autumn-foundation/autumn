@@ -513,6 +513,17 @@ harness = false
 name = "form_render"
 harness = false
 
+# Real DB-backed CRUD workload for profilers, driving the `#[repository]`
+# macro's generated save/find_by_id/page methods against a live Postgres
+# connection — the query-building/row-mapping layer `request_pipeline`
+# deliberately excludes (its handlers are trivial and non-DB by design).
+# `required-features` since it needs a real database connection, unlike the
+# other benches in this crate.
+[[bench]]
+name = "repository_crud"
+harness = false
+required-features = ["db"]
+
 # Signed-CSRF-cookie workload for profilers: drives real POST traffic through
 # `security::CsrfLayer` with HMAC signing active so the verification cost is
 # attributable in a profiler. Asserts nothing — see the file header for the
