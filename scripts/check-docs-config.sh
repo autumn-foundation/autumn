@@ -2939,8 +2939,33 @@ def source_tokens(root):
         if quoted:
             esc = QUOTE_ESCAPE.get(effective_suffix(rel), '\\')
             here = effective_suffix(rel) in HAS_HERE_STRING
-            body, code = (_shell_literals(body, esc, here),
-                          _shell_code(code, esc, here))
+            plain, plain_code = body, code
+            body, code = (_shell_literals(plain, esc, here),
+                          _shell_code(plain_code, esc, here))
+            # Choosing WHICH RUNG reads a pwsh line was only half of it: the
+            # preprocessing under it still used the Bourne grammar, so
+            # ``Write-Output "`$env:AUTUMN_X"`` — where PowerShell's backtick
+            # escapes the dollar and the name is printed literally — reached
+            # `PS_ENV` with its `$` intact. The escape character and the
+            # here-string rule belong to the same decision as the rung.
+            #
+            # Both passes run over the whole text and each line is taken from
+            # the one its own shell calls for. The limit, stated rather than
+            # hidden: a pass carries quote state ACROSS lines, so state
+            # entering a pwsh block was accumulated under the other grammar.
+            # Inside a block — which is what a `run:` body is — that state is
+            # this block's own, since `_yaml_blocks` has already blanked
+            # everything between blocks.
+            if powershell:
+                ps_body = _shell_literals(plain, '`', True).splitlines()
+                ps_code = _shell_code(plain_code, '`', True).splitlines()
+                seen, seen_code = body.splitlines(), code.splitlines()
+                for i in powershell:
+                    if i < len(seen) and i < len(ps_body):
+                        seen[i] = ps_body[i]
+                    if i < len(seen_code) and i < len(ps_code):
+                        seen_code[i] = ps_code[i]
+                body, code = '\n'.join(seen), '\n'.join(seen_code)
         lines, code_lines = body.splitlines(), code.splitlines()
         # The two views are indexed together, so they must be the same length.
         # They are by construction when both come from one pass over the same
@@ -4774,6 +4799,19 @@ def self_test():
           PS_ENV.findall('echo $env:AUTUMN_X'),
           EXPANDED.findall('echo $env:AUTUMN_X')),
          ([7, 8], [7], [4], [], ['AUTUMN_X'], []))
+    # …and the grammar under the rung must match it too: PowerShell escapes
+    # with a backtick, so ``"`$env:X"`` prints the name and reads nothing,
+    # while the Bourne pass leaves that dollar intact.
+    case('a pwsh line is preprocessed with PowerShell quoting',
+         (PS_ENV.findall(_shell_literals('Write-Output "`$env:AUTUMN_X"',
+                                         '`', True)),
+          PS_ENV.findall(_shell_literals('Write-Output "`$env:AUTUMN_X"',
+                                         '\\', False)),
+          PS_ENV.findall(_shell_literals('Write-Output "$env:AUTUMN_X"',
+                                         '`', True)),
+          PS_ENV.findall(_shell_literals("Write-Output '$env:AUTUMN_X'",
+                                         '`', True))),
+         ([], ['AUTUMN_X'], ['AUTUMN_X'], []))
     # Both PowerShell spellings reach the environment.
     case('the braced PowerShell environment form is a use',
          (PS_ENV.findall('${env:AUTUMN_X}'), PS_ENV.findall('$env:AUTUMN_X'),
