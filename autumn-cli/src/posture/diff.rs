@@ -250,7 +250,7 @@ fn report_shadow_exposure(
     out: &mut Vec<Finding>,
 ) {
     for ((survivor_path, survivor_method), survivor) in after {
-        if survivor_method != method || !shapes_overlap(path, survivor_path) {
+        if !methods_overlap(method, survivor_method) || !shapes_overlap(path, survivor_path) {
             continue;
         }
         // Only a survivor that admits callers the deleted route refused is a
@@ -279,6 +279,34 @@ fn report_shadow_exposure(
             ),
         });
     }
+}
+
+/// The HTTP methods a declared method actually answers at runtime.
+///
+/// A route's declared method is not the set of requests it takes: the router
+/// mounts `WS` as a plain `GET` (`routes_audit`'s own `effective_mount_method`
+/// does the same), and axum serves `HEAD` through a `#[get]` handler. So a
+/// surviving `GET` route picks up the `HEAD` and `WS` traffic of a deleted one
+/// at the same URL, and comparing declared methods exactly skipped precisely
+/// those survivors.
+fn effective_methods(method: &str) -> BTreeSet<String> {
+    let declared = method.to_ascii_uppercase();
+    let mounted = if declared == "WS" {
+        "GET".to_owned()
+    } else {
+        declared
+    };
+    let mut answered = BTreeSet::new();
+    if mounted == "GET" {
+        answered.insert("HEAD".to_owned());
+    }
+    answered.insert(mounted);
+    answered
+}
+
+/// Whether two routes can answer any of the same requests.
+fn methods_overlap(a: &str, b: &str) -> bool {
+    !effective_methods(a).is_disjoint(&effective_methods(b))
 }
 
 /// Whether two route *shapes* can match the same URL.
@@ -620,12 +648,40 @@ fn diff_authorization_policies(
         }
         let (path, method, action, resource) = key;
         // A binding that vanished because the whole route did is already
-        // reported as `route_removed`, and that is a narrowing, not a widening.
-        if !routes_after.contains(&(path.clone(), method.clone())) {
+        // reported as `route_removed`, and that is a narrowing, not a widening
+        // — but only when the URL went with it. A surviving route whose shape
+        // and methods overlap still answers that URL, so the record-level check
+        // really did disappear from something reachable.
+        let url_still_answered = routes_after
+            .iter()
+            .any(|(p, m)| shapes_overlap(path, p) && methods_overlap(method, m));
+        if !url_still_answered {
+            continue;
+        }
+        // ...unless the route that now answers it performs the very same
+        // check, in which case nothing changed for that URL's callers. Both
+        // routes being `gated` with a record-level check is not enough: the
+        // route comparison cannot see *which* check, so `read_self` giving way
+        // to `read_any` reads as no change at all up there.
+        let fell_through = !routes_after.contains(&(path.clone(), method.clone()));
+        if fell_through
+            && after.keys().any(|(p, m, a, r)| {
+                a == action
+                    && r == resource
+                    && shapes_overlap(path, p)
+                    && methods_overlap(method, m)
+            })
+        {
             continue;
         }
         let mut detail =
             format!("record-level authorization `{action}` on `{resource}` no longer checked");
+        if fell_through {
+            detail.push_str(
+                " (the route carrying it is gone, but the URL is not: another mounted route \
+                 answers it now, without this check)",
+            );
+        }
 
         // A resource *rename* looks exactly like a removal plus an addition,
         // and nothing in the manifest can tell the two apart. Stay conservative
@@ -1674,6 +1730,106 @@ mod tests {
         let widening = widening(&findings);
         assert_eq!(widening.len(), 1, "{findings:#?}");
         assert_eq!(widening[0].kind, "route_shadow_exposed");
+    }
+
+    /// A route's declared method is not the set of requests it answers: the
+    /// router mounts `WS` as a plain `GET`, and axum serves `HEAD` through a
+    /// `#[get]` handler. So a public `GET /users/{id}` picks up the `HEAD` and
+    /// `WS` traffic of a deleted guarded route at the same path, and comparing
+    /// declared methods exactly skipped exactly those survivors.
+    #[test]
+    fn a_survivor_shadows_the_methods_it_actually_answers() {
+        for removed_method in ["HEAD", "WS", "GET"] {
+            let survivor = route("/users/{id}", "GET", "public", &[], &[], false);
+            let guarded = route("/users/me", removed_method, "gated", &["user"], &[], false);
+            let base = routes_only(&format!("{survivor},{guarded}"));
+            let head = routes_only(&survivor);
+
+            let findings = diff(&base, &head);
+            let widening = widening(&findings);
+            assert_eq!(
+                widening.len(),
+                1,
+                "a GET survivor answers {removed_method} at that URL: {findings:#?}"
+            );
+            assert_eq!(widening[0].kind, "route_shadow_exposed");
+        }
+    }
+
+    /// And a method the survivor genuinely does not answer is not exposure.
+    #[test]
+    fn a_survivor_does_not_shadow_a_method_it_never_answers() {
+        let survivor = route("/users/{id}", "GET", "public", &[], &[], false);
+        let guarded = route("/users/me", "POST", "gated", &["user"], &[], false);
+        let base = routes_only(&format!("{survivor},{guarded}"));
+        let head = routes_only(&survivor);
+
+        assert!(widening(&diff(&base, &head)).is_empty());
+    }
+
+    /// The same fall-through, one dimension over. Both routes are `gated` with
+    /// a record-level check, so the route comparison sees no widening — but the
+    /// URL now resolves to a route that checks something *else*, and the
+    /// binding dimension suppressed the loss because the exact route key was
+    /// gone.
+    #[test]
+    fn a_binding_lost_to_fallthrough_is_still_a_widening() {
+        let routes = |extra: &str| {
+            let by_id = route("/records/{id}", "GET", "gated", &["user"], &[], true);
+            if extra.is_empty() {
+                by_id
+            } else {
+                format!("{by_id},{extra}")
+            }
+        };
+        let binding = |path: &str, action: &str| {
+            format!(r#"{{"path":"{path}","method":"GET","action":"{action}","resource":"Record"}}"#)
+        };
+        let base = manifest(
+            &routes(&route("/records/me", "GET", "gated", &["user"], &[], true)),
+            "",
+            "",
+            &format!(
+                "{},{}",
+                binding("/records/{id}", "read_any"),
+                binding("/records/me", "read_self")
+            ),
+        );
+        let head = manifest(&routes(""), "", "", &binding("/records/{id}", "read_any"));
+
+        let findings = diff(&base, &head);
+        let widening = widening(&findings);
+        assert_eq!(widening.len(), 1, "{findings:#?}");
+        assert_eq!(widening[0].kind, "authorization_binding_removed");
+        assert!(
+            widening[0].detail.contains("read_self"),
+            "{:?}",
+            widening[0]
+        );
+    }
+
+    /// But if the route that now serves the URL performs the very same check,
+    /// nothing changed for its callers.
+    #[test]
+    fn a_binding_the_surviving_route_still_performs_is_not_a_widening() {
+        let by_id = route("/records/{id}", "GET", "gated", &["user"], &[], true);
+        let me = route("/records/me", "GET", "gated", &["user"], &[], true);
+        let binding = |path: &str| {
+            format!(r#"{{"path":"{path}","method":"GET","action":"read","resource":"Record"}}"#)
+        };
+        let base = manifest(
+            &format!("{by_id},{me}"),
+            "",
+            "",
+            &format!("{},{}", binding("/records/{id}"), binding("/records/me")),
+        );
+        let head = manifest(&by_id, "", "", &binding("/records/{id}"));
+
+        assert!(
+            widening(&diff(&base, &head)).is_empty(),
+            "{:#?}",
+            diff(&base, &head)
+        );
     }
 
     /// Axum writes a literal brace as `{{`, so `/{{foo}}` and `/{{bar}}` are two
