@@ -202,6 +202,22 @@
 #     its leading pipe read as the end of the table, so 15 mappings went
 #     unchecked at 127 rows — over the floor, and green. Anything that scopes a
 #     check must assert it found its subject AND that it reached the end of it.
+#   * A SAFETY FLOOR that is a guess. Under everything derived from the tree sat
+#     a static list — an `env`-prefixed receiver, four `env`-prefixed helper
+#     names — described on three threads as the net a derivation that finds
+#     nothing falls into. A name prefix is not an interface: `envelope.var(…)`
+#     and `parse_envelope(…)` are ordinary APIs, and both put names the runtime
+#     never reads into the truth set, so a page documenting one passed. The
+#     floor was the hole, and it was measurable all along — the helper list
+#     carried ZERO names the tree does not derive anyway, and the receiver
+#     prefix carried six that a declared TYPE derives better. A fallback is a
+#     rule like any other; ask what it admits, not what it rescues.
+#   * A pass-through word taken for a whole GRAMMAR. `env`, `sudo` and `time`
+#     were verified to forward an assignment, and the walk then assumed the
+#     assignment came first. `env --help` says `env [OPTION]... [-]
+#     [NAME=VALUE]...`, so `env -i AUTUMN_X=v cmd` really exports — and the
+#     option read as the command name, dropping the variable. Running the
+#     language answered half the question; its usage line answers the rest.
 #
 # EVERY RUNG HAS NOW BEEN AUDITED against the list above, rather than tightened
 # one at a time as a reviewer found it — which is how five of these survived
@@ -210,8 +226,10 @@
 #   * built templates — from `format!(` construction sites only.
 #   * const bindings — must be NAMED as env bindings (`*_ENV`/`ENV_*`/`VAR`).
 #   * quoted names — need an env accessor nearby, never a negative assertion,
-#     and never inside test code. The accessor list is the STATIC one below plus
-#     every env helper declared in the tree, read out of it like the templates.
+#     and never inside test code. The accessor pattern is the qualified std path
+#     plus what the tree DERIVES: every env helper it declares, the types that
+#     implement `Env`, and the receivers whose declared type one of those
+#     helpers calls its environment. No static name list stands under it.
 #   * shell assignments — must reach a process (`export`, or a prefix form), and
 #     a file that assigns a name owns its own expansions of it.
 #   * family wildcards — the prefix must begin a real name.
@@ -2479,12 +2497,79 @@ ASSIGN_WORD = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=')
 PASS_THROUGH = ('env', 'sudo', 'time',
                 'if', 'then', 'elif', 'else', 'do', 'while', 'until', '!')
 
+# A pass-through command has a GRAMMAR, and the walk below knew only half of
+# it. `env --help` states it as `env [OPTION]... [-] [NAME=VALUE]...
+# [COMMAND [ARG]...]`, so `env -i AUTUMN_X=value cmd` exports `AUTUMN_X` — and
+# the option was read as the command name, which ended the prefix and dropped
+# the variable. Only the options whose value is a SEPARATE token need listing:
+# a flag consumes itself, `--opt=value` is self-contained, and an option this
+# table does not know is read as a flag — which loses the name rather than
+# inventing one. Both spellings are read off the INSTALLED binary's own usage
+# (`env (GNU coreutils) 9.4`, `sudo --help`), the way the sibling
+# `check-docs-cli.sh` reads its wrapper table; the shell's `time` takes `[-p]`
+# and nothing that carries a value. A word not in this table is not a
+# pass-through command at all, so it never reaches here.
+COMMAND_OPTS = {
+    'env': {'-u', '--unset', '-C', '--chdir', '-S', '--split-string'},
+    # `sudo [-ABbEHkNnPS] [-r role] [-t type] [-C num] [-D directory]
+    #  [-g group] [-h host] [-p prompt] [-R directory] [-T timeout]
+    #  [-u user] [VAR=value] [-i | -s] [command [arg ...]]` — its usage line
+    # names the assignment position outright, after the options.
+    'sudo': {'-u', '--user', '-g', '--group', '-p', '--prompt',
+             '-D', '--chdir', '-R', '--chroot', '-T', '--command-timeout',
+             '-C', '--close-from', '-r', '--role', '-t', '--type',
+             '-U', '--other-user', '-h', '--host'},
+    'time': set(),
+}
+
+
+def _skip_command_options(body, i, limit, name):
+    """Step past a pass-through command's own options, and their values."""
+    value_opts = COMMAND_OPTS.get(name)
+    if value_opts is None:
+        return i
+
+    def word_after(at):
+        while at < limit and body[at] in ' \t':
+            at += 1
+        end = at
+        while end < len(body) and body[end] not in ' \t\n;&|()':
+            end += 1
+        return at, end
+
+    while i < limit:
+        start, end = word_after(i)
+        token = body[start:end]
+        # `env - COMMAND` runs with an empty environment: a lone `-` is an
+        # option spelling, not the operand that ends option parsing.
+        if token == '-':
+            i = end
+            continue
+        if not token.startswith('-') or len(token) < 2:
+            return start
+        i = end
+        if token.startswith('--'):
+            if '=' not in token and token in value_opts:
+                i = word_after(i)[1]
+        else:
+            # A short CLUSTER: only the LAST letter can take a separate token,
+            # because a value-taking letter before the end carries its value
+            # attached — `env -iu FOO` is `-i` then `-u FOO`, `env -uFOO` is
+            # one word. A letter this table does not list is a flag.
+            for pos in range(1, len(token)):
+                if ('-' + token[pos]) in value_opts:
+                    if pos == len(token) - 1:
+                        i = word_after(i)[1]
+                    break
+    return i
+
 
 def _at_command_word(body, at, word_end):
     """Whether `at` is the command-word position of its simple command.
 
     Everything between the command boundary and `at` must be an assignment
-    word or one of the few words that do not consume one.
+    word, or one of the few words that do not consume one — with that word's
+    own options stepped over, since they sit before the assignments it takes.
     """
     i = max((body.rfind(c, 0, at) for c in ';&|()\n'), default=-1) + 1
     while i < at:
@@ -2501,7 +2586,7 @@ def _at_command_word(body, at, word_end):
             j += 1
         if body[i:j] not in PASS_THROUGH:
             return False
-        i = j
+        i = _skip_command_options(body, j, at, body[i:j])
     return i == at
 
 
@@ -2740,13 +2825,25 @@ BOUND = re.compile(
 # method on a stylesheet builder. The receivers are read out of the tree the
 # same way the helper names are — `impl Env for T` gives the types, and a
 # declaration whose type mentions `Env` gives the bindings, which is what
-# `denv: Box<dyn Env>` and the `inner` field of a wrapper need. The static
-# pattern below keeps an `env`-named receiver as its FLOOR, so a derivation
-# that finds nothing still reads the common spelling.
-ACCESSOR = re.compile(r'\b(?:std::)?env::(var|var_os|set_var)\s*\('
-                      r'|\b(env\w*)\s*\.\s*(?:var|var_os|set_var)\s*\('
-                      r'|\b(env_trimmed|parse_env\w*|env_bool\w*|getenv)\s*\('
-                      r'|\b(env\w*)\.get\s*\(')
+# `denv: Box<dyn Env>` and the `inner` field of a wrapper need.
+#
+# THE FLOOR WAS THE HOLE. What stood here kept an `env`-prefixed receiver and a
+# list of `env`-prefixed helper names as a static FLOOR, described on three
+# threads as a safety net for a derivation that finds nothing. A name prefix is
+# not an interface: `envelope.var("AUTUMN_ZZZ__TYPO")` is a method on an
+# envelope, and it blessed a name the runtime never reads — so an invalid page
+# documenting that name passed. `parse_envelope(…)` was the same hole one rung
+# over, which is the recurring shape here: the fix belongs everywhere the
+# question is asked, not where the report found it.
+#
+# Both floors are gone and MEASURED gone: removing the helper-name list costs
+# zero names, because every helper it spelled is derived from the tree by
+# `ENV_HELPER` anyway, and removing the receiver prefix costs six, all of them
+# `env.get(…)` on the media plugin's own environment map — which the type rule
+# below derives back. What is left in this pattern is the one form that needs
+# no derivation: a QUALIFIED std path, where `env::` is the module and not a
+# variable somebody named.
+ACCESSOR = re.compile(r'\b(?:std::)?env::(var|var_os|set_var)\s*\(')
 
 # `impl Env for OsEnv` — the types that ARE an environment.
 ENV_IMPL = re.compile(r'\bimpl\s*(?:<[^<>]*>)?\s*Env\b[^{]*?\bfor\s+([A-Za-z_]\w*)')
@@ -2833,8 +2930,9 @@ ENV_GENERIC = re.compile(r'[<,]\s*([A-Z]\w*)\s*:\s*[^,>]*\bEnv\b'
 # …plus the crates' own env helpers, READ OUT OF THE TREE rather than listed
 # here, the same way the runtime's `format!` templates are. A helper takes an
 # environment and a key: `fn override_string(target: &mut String, env: &HashMap<
-# String, String>, key: &str)`. The static list above is the floor, so a helper
-# this misses costs coverage and never correctness.
+# String, String>, key: &str)`. There is no static list behind this any more, so
+# a helper this misses costs coverage — and, since the receiver types come from
+# the same signatures, it now costs the receivers of that type too.
 #
 # Found by measuring, not by the one report that exposed it: the media plugin's
 # `override_string` / `override_opt` and `arroyo_value` carry SEVENTEEN real
@@ -2848,6 +2946,36 @@ ENV_GENERIC = re.compile(r'[<,]\s*([A-Z]\w*)\s*:\s*[^,>]*\bEnv\b'
 # which silently moved their key to position 0 and cost 85 names.
 ENV_HELPER = re.compile(r'\bfn\s+(\w+)\s*(?:<(?:[^<>]|<[^<>]*>)*>)?\s*'
                         r'\(([^)]*\benv\s*:\s*&[^)]*\bkey\s*:\s*&str)', re.S)
+
+
+def _env_param_type(args):
+    """The TYPE a derived helper declares for its environment argument.
+
+    This is where the tree says what an environment IS, in its own words: the
+    two answers here are `&dyn Env` and `&HashMap<String, String>`. Deriving
+    the type is what replaced the `env`-prefixed receiver floor — the media
+    plugin's environment is a plain map, so no `Env` appears in its declaration
+    and the name was carrying the whole claim.
+    """
+    for arg in _split_args(args):
+        name, _, declared = arg.partition(':')
+        if name.strip() == 'env' and declared.strip():
+            return ' '.join(declared.split())
+    return ''
+
+
+def _type_pattern(declared):
+    """A type written in source, as a regex tolerant of its own whitespace.
+
+    `&HashMap<String, String>` is spelled with and without the space after the
+    comma, and across a line break in a wrapped signature — one string compared
+    literally would answer a question about formatting. A wrapped generic list
+    also carries a TRAILING comma that the one-line spelling does not, which is
+    the same kind of difference and is allowed in the same place.
+    """
+    return r'\s*'.join(r'(?:,\s*)?>' if tok == '>' else re.escape(tok)
+                       for tok in re.findall(r'\w+|\S', declared)
+                       if tok != '&')
 
 
 def accessor(root, test_files=frozenset()):
@@ -2865,6 +2993,7 @@ def accessor(root, test_files=frozenset()):
                          capture_output=True, text=True).stdout
     index, types, per_file, masked_all = {}, set(), {}, {}
     helpers, declared, imports, modules = {}, {}, {}, {}
+    env_type = {}
     crates = _crates(root)
     for rel in out.split('\0'):
         # Test code is skipped outright, as the scan that consumes this index
@@ -2892,6 +3021,9 @@ def accessor(root, test_files=frozenset()):
                 continue
             index[m.group(1)] = len(_split_args(m.group(2))) - 1
             helpers.setdefault(rel, set()).add(m.group(1))
+            declares = _env_param_type(m.group(2))
+            if declares:
+                env_type[m.group(1)] = declares
         masked_all[rel] = (masked, data)
         own = {m.group(1) for m in ENV_IMPL.finditer(masked)
                if not data[m.start()]}
@@ -2974,19 +3106,42 @@ def accessor(root, test_files=frozenset()):
         per_file.setdefault(rel, set()).update(
             m.group(1) for m in bound.finditer(masked)
             if not data[m.start()])
+    # …and a receiver whose type is the one a derived HELPER calls an
+    # environment. `env: &HashMap<String, String>` mentions no `Env` at all, so
+    # `ENV_BOUND` cannot see it and the name prefix was doing the work: six real
+    # `AUTUMN_MEDIA__*` reads rested on the receiver happening to be spelled
+    # `env`. The type is read out of the helper signature (`_env_param_type`),
+    # and it is scoped exactly as the helper is — a file gets the map-typed
+    # receiver rule only where the tree, in that module, has declared or
+    # imported a helper that says this type is its environment. An `envelope:
+    # Envelope` is not one anywhere, which is the whole point.
+    for rel, (masked, data) in masked_all.items():
+        declares = {env_type[h] for h in
+                    visible(rel, set(env_type)) | set(helpers.get(rel, ()))
+                    if h in env_type}
+        # A type that already mentions `Env` is `ENV_BOUND`'s to find, and
+        # matching `&dyn Env` here too would only re-derive what it derives.
+        declares = {d for d in declares if not re.search(r'\bEnv\b', d)}
+        if not declares:
+            continue
+        typed = re.compile(
+            r'\b([a-z_]\w*)\s*:\s*&?\s*(?:\'\w+\s+)?(?:mut\s+)?(?:'
+            + '|'.join(sorted(_type_pattern(d) for d in declares)) + r')')
+        per_file.setdefault(rel, set()).update(
+            m.group(1) for m in typed.finditer(masked)
+            if not data[m.start()])
     # A RECEIVER NAME is file-local, and the pattern was global: `base` is
     # derived from `let base = OsEnv` in one module, and an unrelated module's
     # `base.var(…)` on something else then read as an environment call. A type
     # name is global (it is the same type wherever it is written); a binding is
     # not. So the receiver alternative is built per file, cached by the set of
-    # names, and every file that derives none falls back to the `env`-named
-    # floor in `ACCESSOR`.
+    # names. A file that derives none reads only the qualified std path, which
+    # is the whole of `ACCESSOR` now.
     # Everything derived from the tree is MODULE-SCOPED — a helper function, a
     # type, a binding. Rust says so and I did not: each was registered
     # tree-wide, so `override_string` defined in the media plugin decided what
     # a same-named three-argument function meant in every other crate. A file
-    # sees what it declares and what it imports by name; the static floor in
-    # `ACCESSOR` is what every file always has.
+    # sees what it declares and what it imports by name.
     # An aliased helper keeps the ORIGINAL's key position: `use … as f` renames
     # the call, not the signature — and only when the path really reaches the
     # helper this tree derived.
@@ -3006,8 +3161,13 @@ def accessor(root, test_files=frozenset()):
                 pattern += (r'|\b(' + '|'.join(sorted(map(re.escape, here)))
                             + r')\s*\(')
             if recv:
+                # `get` belongs here and not in a floor: a map-typed
+                # environment is READ with `.get(…)`, and the only receivers
+                # this alternative holds are ones the tree proved are
+                # environments. `map.get("AUTUMN_X")` on an unproven receiver
+                # still means nothing.
                 pattern += (r'|\b(?:' + '|'.join(sorted(map(re.escape, recv)))
-                            + r')\s*\.\s*(var|var_os|set_var)\s*\(')
+                            + r')\s*\.\s*(var|var_os|set_var|get)\s*\(')
             cache[(here, recv)] = re.compile(pattern)
         return cache[(here, recv)]
 
@@ -4846,11 +5006,6 @@ def self_test():
          'AUTUMN_CLI_VERSION' in swept, True)
     case('an unlisted type keeps every line',
          uncommented('# AUTUMN_X', comment_leader('a.golden')), '# AUTUMN_X')
-    case('a collection lookup is not an env accessor',
-         bool(ACCESSOR.search('assert_eq!(map.get("AUTUMN_LOG__LEVL"), None);')),
-         False)
-    case('an environment map lookup is',
-         bool(ACCESSOR.search('let v = env.get("AUTUMN_LOG__LEVEL");')), True)
     # A quoted name counts as its accessor's ARGUMENT, not as its neighbour. The
     # window this replaced took a name off any line within three of a call.
     _acc_for, real_index = accessor(ROOT, test_module_files(ROOT))
@@ -4885,6 +5040,51 @@ def self_test():
     # `override_string` is the media plugin's function and means nothing in
     # `config.rs`. That scoping is the point, so the test asks the right file.
     _media_acc = _acc_for('autumn-media-plugin/src/config.rs')
+    # A NAME PREFIX is not an interface. `env`-prefixed receivers and
+    # `env`-prefixed helper names stood here as a static floor, and an
+    # `envelope.var("AUTUMN_…")` — a method on an envelope — put a name the
+    # runtime never reads into the truth set, so a page documenting it passed.
+    # What replaced the floor is the declared TYPE: the media plugin's helpers
+    # say `env: &HashMap<String, String>`, so a receiver of that type reads the
+    # environment IN THAT MODULE, and nothing is admitted on its spelling.
+    case('an env-prefixed receiver is not an accessor',
+         (bool(_media_acc.search('envelope.var("AUTUMN_LOG__LEVL")')),
+          bool(_acc_for('autumn/src/config.rs')
+               .search('envelope.var("AUTUMN_LOG__LEVL")'))),
+         (False, False))
+    case('…nor is an env-prefixed function name',
+         bool(_media_acc.search('parse_envelope("AUTUMN_LOG__LEVL")')), False)
+    case('a receiver of the declared environment type is',
+         bool(_media_acc.search('if let Some(v) = env.get("AUTUMN_MEDIA__X")')),
+         True)
+    # …and it is SCOPED, like every other derivation here: a module that
+    # declares no environment — no `Env` type, no helper naming its own — reads
+    # nothing off a receiver, whatever the receiver is called. `env` was global
+    # while it sat in the floor, which is exactly what made a name a claim.
+    case('the receiver rules are scoped to the modules that declare them',
+         [bool(_acc_for(f).search('let v = env.get("AUTUMN_LOG__LEVEL");'))
+          for f in ('autumn/src/lib.rs', 'autumn-cli/src/main.rs',
+                    'autumn/src/config.rs')],
+         [False, False, True])
+    # The house `Env` trait is still read as a method, which is what the first
+    # cut of this rule dropped 27 names by refusing.
+    case('an Env-typed receiver still reads',
+         bool(_acc_for('autumn/src/config.rs')
+              .search('env.var("AUTUMN_MASTER_KEY")')), True)
+    case('the environment type is read out of the helper signature',
+         (_env_param_type('target: &mut String, '
+                          'env: &HashMap<String, String>, key: &str'),
+          _env_param_type('env: &dyn Env, key: &str'),
+          _env_param_type('key: &str')),
+         ('&HashMap<String, String>', '&dyn Env', ''))
+    # A type is matched as a type, not as a string: the same one wraps across a
+    # line with a trailing comma, and a different one is a different type.
+    case('a type matches its own spellings and no others',
+         [bool(re.search(_type_pattern('&HashMap<String, String>'), s))
+          for s in ('&HashMap<String,String>', '&HashMap<String, String>',
+                    '&HashMap<\n    String,\n    String,\n>',
+                    '&HashMap<String, usize>')],
+         [True, True, True, False])
     case('a helper key behind other arguments reads',
          args_of('override_string(&mut self.ffmpeg.bin, env, '
                  '"AUTUMN_MEDIA__FFMPEG__BIN")', _media_acc, real_index),
@@ -4987,6 +5187,25 @@ def self_test():
          [ASSIGNED_PREFIX.findall(f'{w} AUTUMN_X=1 cmd') for w in
           ('env', 'sudo', 'time', 'exec', 'command', 'nohup')],
          [['AUTUMN_X'], ['AUTUMN_X'], ['AUTUMN_X'], [], [], []])
+    # …and a pass-through command takes OPTIONS before the assignments it
+    # passes. `env --help` gives the grammar as `env [OPTION]... [-]
+    # [NAME=VALUE]... [COMMAND [ARG]...]`, and each of these was run under the
+    # installed binary: every form below really exports `AUTUMN_X`. Reading the
+    # option as the command name ended the prefix and dropped the name.
+    case('a pass-through command takes options before its assignments',
+         [ASSIGNED_PREFIX.findall(f'{form} AUTUMN_X=1 cmd') for form in
+          ('env -i', 'env -', 'env -u FOO', 'env --unset FOO',
+           'env --chdir=/srv', 'env -uFOO', 'env -iu FOO',
+           'sudo -u postgres', 'time -p')],
+         [['AUTUMN_X']] * 9)
+    # The operand still ends option parsing, which is what keeps this from
+    # becoming "skip anything until an assignment": after the COMMAND, a
+    # `NAME=value` word is that command's argument and exports nothing.
+    case('…and the operand still ends them',
+         (ASSIGNED_PREFIX.findall('env cmd AUTUMN_X=1'),
+          ASSIGNED_PREFIX.findall('echo -n AUTUMN_X=1 cmd'),
+          ASSIGNED_PREFIX.findall('env -u AUTUMN_X=1 cmd')),
+         ([], [], []))
     # Where a comment STARTS depends on where the string before it ends, and
     # PowerShell ends a string by its own escape — so the comment grammar is
     # the same decision as the rung, and has to be made before stripping.
@@ -5575,16 +5794,18 @@ def self_test():
          (['AUTUMN_X'], ['AUTUMN_X'], []))
     # Lua's long comments are the forms the SQL scanner cannot see, and the
     # delimiter length is part of the syntax — `]]` does not close `--[==[`.
+    #
+    # Asked of the COMMENT rule directly. It used to be asked through
+    # `ACCESSOR`, which matched the payload only because `getenv` sat in a
+    # static floor — and the accessor rung is Rust's, so it never runs on a
+    # `.lua` file at all. A test routed through a rung that cannot reach the
+    # file was asserting the right thing for a reason that was not there.
     case('a Lua long comment is a comment',
-         (ACCESSOR.search(uncommented(
-             '--[[\nos.getenv("AUTUMN_X")\n]]\n', comment_leader('a.lua')))
-          is None,
-          ACCESSOR.search(uncommented(
-              '--[==[\nos.getenv("AUTUMN_X")\n]]\nstill\n]==]\n',
-              comment_leader('a.lua'))) is None,
-          bool(ACCESSOR.search(uncommented(
-              'os.getenv("AUTUMN_X")\n', comment_leader('a.lua'))))),
-         (True, True, True))
+         ['os.getenv("AUTUMN_X")' in uncommented(s, comment_leader('a.lua'))
+          for s in ('--[[\nos.getenv("AUTUMN_X")\n]]\n',
+                    '--[==[\nos.getenv("AUTUMN_X")\n]]\nstill\n]==]\n',
+                    'os.getenv("AUTUMN_X")\n')],
+         [False, False, True])
     # The accessor and binding rungs are Rust's: outside Rust this script
     # cannot tell a call — or a declaration — from a string containing one,
     # because `_rust_classes` is what answers that.
