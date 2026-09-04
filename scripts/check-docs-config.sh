@@ -117,7 +117,10 @@
 #     nest" was true in `_rust_classes` and not in the generated-code reader
 #     beside it, and "a `#[cfg(test)] mod x;` makes that file test code" was
 #     true in the token sweep and not in `built_patterns`. Two readers of the
-#     same tree asking the same question need one predicate, not two.
+#     same tree asking the same question need one predicate, not two — and two
+#     VIEWS of one file must stay the same length, since they are indexed
+#     together: compose's assignment view is built by a second pass, and a
+#     blanked last line vanishes from `splitlines`.
 #     A rung's INPUTS count as the rung: the accessor scan masked comments,
 #     tests and generated data, while the pass that derived its helper names
 #     from the tree read none of them — so one signature in a comment named an
@@ -397,13 +400,16 @@ WAIVER = re.compile(r'<!--\s*config-key-allow:\s*([A-Z][A-Z0-9_]+)\s*(.*?)\s*-->
 # namespace was. What follows must be uppercase, though, and that is what keeps
 # the crate name out of it: `autumn_web` and `autumn-macros` are prose about a
 # package, not a claim about an environment variable.
-# The head may be as short as THREE characters, because the inserted separator
-# can land that early: `AUT_UMN_LOG__LEVEL` leaves `AUT`, and a four-character
-# minimum made that one-edit typo match nothing at all — invisible rather than
-# unresolved. What keeps the wider net from reporting anything is `near_miss`,
-# not the length: a head is only judged after the first tail segment is joined
-# back on, and `RUST_LOG` or `AWS_REGION` is nobody's misspelling of `AUTUMN`.
-NEAR = re.compile(r'\b([A-Za-z][A-Za-z0-9]{2,8})_'
+# The head may be as short as ONE character, because the inserted separator can
+# land anywhere: `AUT_UMN` leaves `AUT`, `AU_TUMN` leaves `AU`, `A_UTUMN` leaves
+# `A`. Each minimum in turn — four, then three — made the typos below it match
+# nothing at all, which is invisible rather than unresolved, and each was set by
+# the example in front of me instead of by the range the edit can take. A length
+# floor was never what kept this net tight: `near_miss` is, and it judges the
+# head only after the first tail segment is joined back on, so `RUST_LOG` and
+# `AWS_REGION` are rejected on being nobody's misspelling of `AUTUMN` rather
+# than on being the wrong shape. Measured at every floor: 0 defects either way.
+NEAR = re.compile(r'\b([A-Za-z][A-Za-z0-9]{0,8})_'
                   r'((?:[A-Z0-9]+|\{[a-z_]+\})(?:_+(?:[A-Z0-9]+|\{[a-z_]+\}))*)')
 
 # The missing edit can be the SEPARATOR. `AUTUMNLOG__LEVEL` has no `_` after the
@@ -952,6 +958,19 @@ def _yaml_runs(key, stack, consumer):
         return key == 'run' and bool(stack) and stack[-1][1] == 'steps'
     return False
 
+
+# Compose keeps EVERY value, because compose interpolates every value — but
+# that is an answer to "where can `${…}` be expanded", and the assignment rungs
+# ask a different question. `x-note: AUTUMN_X=v cmd` is an extension field
+# nothing runs, and reading it as a prefix assignment put its name in the truth
+# set. Two questions, two views — the same split the shell files already have,
+# arrived at again one format later.
+#
+# What DOES assign in a compose file is `environment:`, in either spelling
+# (`- AUTUMN_X=v` as a list, `AUTUMN_X: v` as a map), plus the fields that
+# invoke a shell. Nothing else in the file names a variable to a process.
+COMPOSE_ASSIGNS = 'environment'
+
 # Blanking only the non-executed BLOCK scalars was half the rule. An ordinary
 # scalar is just as inert: `name: "${AUTUMN_LOG__LEVL}"` in a workflow is text
 # GitHub Actions never interpolates, and it was reading as an expansion.
@@ -1069,7 +1088,8 @@ def _yaml_decode(scalar):
     return ''.join(out)
 
 
-def _yaml_blocks(body, interpolated=False, consumer='actions'):
+def _yaml_blocks(body, interpolated=False, consumer='actions',
+                 assignments=False):
     """Blank what the consumer never executes, keeping line numbers intact.
 
     In a compose file only the non-executed BLOCK scalars go, since every value
@@ -1155,7 +1175,11 @@ def _yaml_blocks(body, interpolated=False, consumer='actions'):
         inline = YAML_INLINE.match(l)
         executed = (inline is not None
                     and _yaml_runs(inline.group(1), stack, consumer))
-        keep = interpolated or executed
+        # The ASSIGNMENT view of a compose file keeps only what can name a
+        # variable to a process; the expansion view keeps everything.
+        keep = ((executed or any(k == COMPOSE_ASSIGNS for _, k in stack))
+                if (interpolated and assignments)
+                else (interpolated or executed))
         if executed:
             # The quotes around an inline scalar are YAML's, and YAML removes
             # them before the command reaches the shell — so
@@ -2672,9 +2696,15 @@ def source_tokens(root):
             body = untested(body)
         yaml_file = effective_suffix(rel) in YAML_SCALARS
         interpolated = yaml_file and _yaml_interpolated(rel)
+        yaml_code = None
         if yaml_file:
-            body = _yaml_blocks(body, interpolated,
-                                _yaml_consumer(rel, body))
+            consumer = _yaml_consumer(rel, body)
+            # Compose needs its own ASSIGNMENT view — see `COMPOSE_ASSIGNS`.
+            # Everywhere else the two views coincide, because a non-compose
+            # file keeps only what its consumer executes to begin with.
+            if interpolated:
+                yaml_code = _yaml_blocks(body, interpolated, consumer, True)
+            body = _yaml_blocks(body, interpolated, consumer)
         # Heredocs FIRST: blanking single quotes first erases the `'EOF'`
         # marker, and the heredoc body then reads as commands. The self-test for
         # each function passed in isolation while the composition was wrong,
@@ -2693,7 +2723,7 @@ def source_tokens(root):
         # `echo " AUTUMN_X=v cmd"` is a string being printed. The expansion rung
         # reads `body`; the assignment rungs read `code`, which also blanks both
         # quote kinds and every unquoted heredoc body.
-        code = body
+        code = body if yaml_code is None else yaml_code
         if shell:
             body, code = _shell_heredocs(body), _shell_heredocs(body, True)
         if quoted:
@@ -2702,6 +2732,12 @@ def source_tokens(root):
             body, code = (_shell_literals(body, esc, here),
                           _shell_code(code, esc, here))
         lines, code_lines = body.splitlines(), code.splitlines()
+        # The two views are indexed together, so they must be the same length.
+        # They are by construction when both come from one pass over the same
+        # text — but compose builds its assignment view in a SEPARATE pass, and
+        # a view whose last line is blanked loses it to `splitlines`. A missing
+        # trailing line is an empty one by definition, so pad rather than guess.
+        code_lines += [''] * (len(lines) - len(code_lines))
         # Names this file assigns without exporting them, and without handing
         # them to a command: its own variables.
         local = (set(ASSIGNED_ANY.findall(code))
@@ -3338,6 +3374,15 @@ def self_test():
          (near_miss('AUTMN'), near_miss('AUTUNM'), near_miss('AUTUUMN')),
          (True, True, True))
     case('the correct namespace is not a near miss', near_miss('AUTUMN'), False)
+    # The inserted separator can land anywhere in the namespace, so the head
+    # can be one character. Each length floor in turn hid the typos below it.
+    case('a separator inserted anywhere in the namespace is scanned',
+         [[m.group(0) for m in NEAR.finditer(f'export {w}_LOG__LEVEL=debug')
+           if near_miss(m.group(1).upper())
+           or near_miss((m.group(1) + '_' + m.group(2).split('_')[0]).upper())]
+          for w in ('AUT_UMN', 'AU_TUMN', 'A_UTUMN', 'RUST', 'AWS_REGION')],
+         [['AUT_UMN_LOG__LEVEL'], ['AU_TUMN_LOG__LEVEL'], ['A_UTUMN_LOG__LEVEL'],
+          [], []])
     case('somebody else\'s variable is not a near miss',
          (near_miss('DATABASE'), near_miss('RUST'), near_miss('CARGO')),
          (False, False, False))
@@ -4436,6 +4481,21 @@ def self_test():
           (_yaml_consumer('x.yml', _wf), _yaml_consumer('x.yml', 'a: 1\n'),
            _yaml_consumer('docker-compose.yml', 'a: 1\n'))),
          (['AUTUMN_A'], [], [], [], ('actions', None, 'compose')))
+    # Compose keeps every value for EXPANSION and only the assigning ones for
+    # ASSIGNMENT: `x-note:` is an extension field nothing runs. Two questions,
+    # two views — and they are indexed together, so they stay the same length.
+    _comp = ('services:\n  app:\n'
+             '    x-note: AUTUMN_NOTE=x ignored-command\n'
+             '    environment:\n      - AUTUMN_ENVLIST=1\n'
+             '    command: AUTUMN_CMD=3 serve\n')
+    case('a compose file has an expansion view and an assignment view',
+         (ASSIGNED_PREFIX.findall(_yaml_blocks(_comp, True, 'compose', True)),
+          ASSIGNED_ANY.findall(_yaml_blocks(_comp, True, 'compose', True)),
+          ASSIGNED_PREFIX.findall(_yaml_blocks(_comp, True, 'compose')),
+          len(_yaml_blocks(_comp, True, 'compose').splitlines())
+          - len(_yaml_blocks(_comp, True, 'compose', True).splitlines())),
+         (['AUTUMN_CMD'], ['AUTUMN_ENVLIST', 'AUTUMN_CMD'],
+          ['AUTUMN_NOTE', 'AUTUMN_CMD'], 0))
     # Both PowerShell spellings reach the environment.
     case('the braced PowerShell environment form is a use',
          (PS_ENV.findall('${env:AUTUMN_X}'), PS_ENV.findall('$env:AUTUMN_X'),
