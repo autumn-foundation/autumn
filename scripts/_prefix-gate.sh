@@ -153,16 +153,7 @@
 #     And as a DEFAULT standing in for a language: `#` covers most of this tree,
 #     so the 171 `.sql` migrations were "commented" by a rule that strips
 #     nothing SQL contains. A default is a guess about files nobody listed;
-#     check what it is guessing about. The same shape as a KEY NAME standing in
-#     for a schema: `run:` was executed wherever it appeared in any non-compose
-#     YAML, so a `run` field in a data file, or one under a workflow's `env:`,
-#     was scanned as shell. A name means something in a schema, not everywhere.
-#   * A rule believed because it sounds like how the language works, when the
-#     language is right there to ask. "An unfinished pipeline keeps bash
-#     parsing, so it collects the next line's heredoc delimiters first" is a
-#     plausible sentence and it is false — a body begins after the next
-#     newline, whatever the line ends in. It shipped for several rounds on the
-#     strength of the reasoning. Run the language.
+#     check what it is guessing about.
 #   * A rule about the LAYOUT of the text standing in for a rule about its
 #     structure. "The comment starts the line", "the `}` is in column zero",
 #     "the `#[cfg(test)]` is not indented" — each held for the cases in front of
@@ -912,45 +903,6 @@ YAML_BLOCK = re.compile(r'^(\s*)(?:-\s+)?([A-Za-z0-9_.-]+):\s*[|>][-+0-9]*\s*$')
 # one line and just as real. Blanking every non-block line discarded it.
 YAML_INLINE = re.compile(r'^\s*(?:-\s+)?([A-Za-z0-9_.-]+):[^\S\n]+(?![|>]\s*$)\S')
 YAML_EXECUTED = ('run', 'command', 'entrypoint', 'script')
-# Every key line, value or not, so the nesting can be tracked. `steps:` opens a
-# mapping and carries no value, so neither pattern above sees it — and it is
-# exactly the ancestor that decides whether a `run` below it is a command.
-YAML_KEY = re.compile(r'^(\s*)(-\s+)?([A-Za-z0-9_.-]+):(?=\s|$)')
-
-# …and the key NAME alone does not make a value executable. `run` was accepted
-# wherever it appeared in any non-compose YAML, so a `run:` field in a plain
-# data file like `bmad/config.yaml`, or one nested under a workflow's `env:`,
-# was scanned as shell although no consumer runs either. That is the same
-# mistake as reading `#` as every language's comment leader: a name that means
-# something in one schema does not mean it everywhere.
-#
-# So the file says which consumer it has, and the consumer says which POSITION
-# it executes. A workflow is recognised by its shape rather than its path —
-# `autumn-cli/src/templates/release/*-deploy.yml.tmpl` are real GitHub Actions
-# workflows generated into the reader's repo, and 16 of the names here come
-# from them, so a `.github/workflows/` path test would have dropped them.
-# Measured before narrowing, which is what turned that up.
-YAML_WORKFLOW = re.compile(r'^(?:jobs|runs):\s*$', re.M)
-
-
-def _yaml_consumer(rel, body):
-    """Which consumer executes this file's scalars, if any.
-
-    None is the safe answer for a file nothing recognises: its names are
-    dropped, so a page naming one is REPORTED rather than passed.
-    """
-    if _yaml_interpolated(rel):
-        return 'compose'
-    return 'actions' if YAML_WORKFLOW.search(body) else None
-
-
-def _yaml_runs(key, stack, consumer):
-    """Whether a scalar under `key`, nested as `stack` says, is executed."""
-    if consumer == 'compose':
-        return key in YAML_EXECUTED
-    if consumer == 'actions':
-        return key == 'run' and bool(stack) and stack[-1][1] == 'steps'
-    return False
 
 # Blanking only the non-executed BLOCK scalars was half the rule. An ordinary
 # scalar is just as inert: `name: "${AUTUMN_LOG__LEVL}"` in a workflow is text
@@ -1069,14 +1021,11 @@ def _yaml_decode(scalar):
     return ''.join(out)
 
 
-def _yaml_blocks(body, interpolated=False, consumer='actions'):
+def _yaml_blocks(body, interpolated=False):
     """Blank what the consumer never executes, keeping line numbers intact.
 
     In a compose file only the non-executed BLOCK scalars go, since every value
-    is interpolated. Anywhere else every line outside an executed field goes —
-    and which fields those are is `consumer`'s to say, by POSITION and not by
-    key name alone: a `run:` under a workflow's `env:`, or in a file no
-    consumer executes at all, is data like any other value.
+    is interpolated. Anywhere else every line outside an executed field goes.
 
     A FOLDED executed scalar (`run: >`) is joined before the shell ever sees
     it — YAML turns the physical newline into a space — so `AUTUMN_X=value` and
@@ -1095,7 +1044,6 @@ def _yaml_blocks(body, interpolated=False, consumer='actions'):
     a rule about paragraphs rather than a wider or narrower join.
     """
     out, key, indent, fold, buf = [], None, 0, False, []
-    runs, stack = False, []
 
     def flush():
         if buf:
@@ -1139,22 +1087,13 @@ def _yaml_blocks(body, interpolated=False, consumer='actions'):
                 flush()
                 key = None
             else:
-                out.append(l if runs else '')
-                if fold and runs:
+                out.append(l if key in YAML_EXECUTED else '')
+                if fold and key in YAML_EXECUTED:
                     buf.append(len(out) - 1)
                 continue
-        # The nesting, kept for every key line — including the valueless ones
-        # neither pattern below matches, since those are the ancestors that
-        # decide what a key means.
-        at = YAML_KEY.match(l)
-        if at:
-            column = len(at.group(1)) + len(at.group(2) or '')
-            while stack and stack[-1][0] >= column:
-                stack.pop()
         m = YAML_BLOCK.match(l)
         inline = YAML_INLINE.match(l)
-        executed = (inline is not None
-                    and _yaml_runs(inline.group(1), stack, consumer))
+        executed = inline is not None and inline.group(1) in YAML_EXECUTED
         keep = interpolated or executed
         if executed:
             # The quotes around an inline scalar are YAML's, and YAML removes
@@ -1206,10 +1145,7 @@ def _yaml_blocks(body, interpolated=False, consumer='actions'):
         out.append(l if (keep or m) else '')
         if m:
             key, indent = m.group(2), len(m.group(1))
-            runs = _yaml_runs(key, stack, consumer)
             fold = '>' in l.split(':', 1)[1]
-        if at:
-            stack.append((column, at.group(3)))
     flush()
     return '\n'.join(out)
 
@@ -1580,22 +1516,15 @@ def _shell_heredocs(body, code=False):
             if masked.endswith('\\') and not _escaped(masked, len(masked) - 1):
                 logical += line[:-1]
                 continue
-            # A BACKSLASH is the only continuation that matters here, and that
-            # is a fact about bash rather than a simplification. An earlier
-            # round added `|`, `&&` and `|&` on the reasoning that an
-            # unfinished pipeline keeps bash parsing, so it would collect the
-            # next line's delimiters before consuming any body. Checked against
-            # bash rather than reasoned about, that is false: a here-document
-            # body begins after the next NEWLINE, and `cat <<'ONE' |` followed
-            # by a body line pipes that body — the operator defers nothing. A
-            # backslash is different because it splices the two physical lines
-            # into one BEFORE tokenising, so both `<<`s really are on one line.
-            #
-            # The rule was inert on this tree — no tracked file opens a heredoc
-            # on a line ending in an operator — but it left body text readable
-            # as code, which is the direction that admits names. Removed rather
-            # than extended, and the extension I had written for `$( … )` on
-            # the same reasoning went with it.
+            # A backslash is not the only continuation. `cat <<'ONE' |` leaves
+            # the pipeline unfinished, so bash keeps parsing the next line and
+            # collects ITS delimiters too before consuming any body — the same
+            # for `&&` and `||`. Only a backslash was recognised, so the second
+            # opener was eaten as the first body. A bare `&` is NOT one: it
+            # terminates the command, and the body starts on the next line.
+            if masked.rstrip().endswith(('|', '&&', '|&')):
+                logical += line
+                continue
             queue.extend(_heredoc_openers(logical + line))
             logical = ''
             continue
@@ -2631,8 +2560,7 @@ def source_tokens(root):
         yaml_file = effective_suffix(rel) in YAML_SCALARS
         interpolated = yaml_file and _yaml_interpolated(rel)
         if yaml_file:
-            body = _yaml_blocks(body, interpolated,
-                                _yaml_consumer(rel, body))
+            body = _yaml_blocks(body, interpolated)
         # Heredocs FIRST: blanking single quotes first erases the `'EOF'`
         # marker, and the heredoc body then reads as commands. The self-test for
         # each function passed in isolation while the composition was wrong,
@@ -4147,18 +4075,14 @@ def self_test():
          _shell_heredocs("cat <<'ONE' \\\n<<'TWO' >/dev/null\nfirst\nONE\n"
                          'AUTUMN_LOG__LEVL=x cmd\nTWO\nkeep\n').splitlines(),
          ["cat <<'ONE' \\", "<<'TWO' >/dev/null", '', 'ONE', '', 'TWO', 'keep'])
-    # …but an OPERATOR is not a continuation, however unfinished it leaves the
-    # pipeline: a here-document body begins after the next newline, so the
-    # line after `cat <<'ONE' |` is ONE's body and the `<<'TWO'` written there
-    # is body text. Verified by running bash on this exact input, which is why
-    # the expectation changed: an earlier round asserted the opposite from
-    # reasoning alone.
-    case('an operator does not defer a heredoc body',
+    # …and a backslash is not the only continuation: an unfinished pipeline or
+    # `&&` chain keeps parsing too. A bare `&` does NOT — it terminates the
+    # command, and the body starts on the next line.
+    case('an unfinished pipeline opens both its heredocs',
          [_shell_heredocs(f"cat <<'ONE' {op}\ncat <<'TWO'\nfirst\nONE\n"
                           'AUTUMN_LOG__LEVL=x cmd\nTWO\nkeep\n').splitlines()
           for op in ('|', '&&')],
-         [[f"cat <<'ONE' {op}", '', '', 'ONE',
-           'AUTUMN_LOG__LEVL=x cmd', 'TWO', 'keep']
+         [[f"cat <<'ONE' {op}", "cat <<'TWO'", '', 'ONE', '', 'TWO', 'keep']
           for op in ('|', '&&')])
     case('…while a backgrounding `&` ends the command',
          _shell_heredocs("cat <<'ONE' &\nfirst\nONE\nkeep\n").splitlines(),
@@ -4375,25 +4299,6 @@ def self_test():
          (['AUTUMN_X', 'AUTUMN_TAIL'], ['AUTUMN_X', 'AUTUMN_TAIL'],
           ['AUTUMN_X', 'AUTUMN_TAIL'], ['AUTUMN_TAIL'],
           'a one a two ; b one', (7, 4, None), 4))
-    # …and the key NAME does not decide it: a consumer executes a POSITION.
-    # `run` under a workflow's `env:`, or in a file no consumer runs at all, is
-    # data. The consumer is read off the file's SHAPE rather than its path,
-    # because the generated `*-deploy.yml.tmpl` workflows are real workflows
-    # and carry 16 of the names here.
-    _wf = 'name: x\non: push\njobs:\n  build:\n    steps:\n'
-    def _yr(y, consumer='actions'):
-        return EXPANDED.findall(_shell_literals(_yaml_blocks(y, False,
-                                                             consumer)))
-    case('an executed YAML key is one the consumer runs, in position',
-         (_yr(_wf + '      - run: echo ${AUTUMN_A}\n'),
-          _yr(_wf + '      - name: s\n        env:\n'
-                    '          run: "${AUTUMN_B}"\n'),
-          _yr(_wf + '      - env:\n          run: |\n'
-                    '            echo ${AUTUMN_C}\n'),
-          _yr('project: x\nrun: "${AUTUMN_D}"\n', None),
-          (_yaml_consumer('x.yml', _wf), _yaml_consumer('x.yml', 'a: 1\n'),
-           _yaml_consumer('docker-compose.yml', 'a: 1\n'))),
-         (['AUTUMN_A'], [], [], [], ('actions', None, 'compose')))
     # Both PowerShell spellings reach the environment.
     case('the braced PowerShell environment form is a use',
          (PS_ENV.findall('${env:AUTUMN_X}'), PS_ENV.findall('$env:AUTUMN_X'),
