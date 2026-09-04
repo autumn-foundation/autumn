@@ -1026,8 +1026,8 @@ DOCKER_SHELLS = ('sh', 'bash', 'zsh', 'ash', 'dash', 'busybox',
 
 
 def _docker_commands(body):
-    """A Dockerfile with its INSTRUCTION KEYWORDS blanked, and the exec-form
-    lines that expand nothing.
+    """A Dockerfile with its INSTRUCTION KEYWORDS blanked, the exec-form lines
+    that expand nothing, and the ones whose interpreter is PowerShell.
 
     `RUN` is not part of the command any more than `command:` is in compose:
     `RUN AUTUMN_X=1 exec app` goes through `/bin/sh -c` and really does export
@@ -1037,12 +1037,13 @@ def _docker_commands(body):
     This is the fifth spelling of one rule; it is here because auditing the
     other four turned it up, not because anything reported it.
     """
-    out, literal, active = [], set(), False
+    out, literal, powershell, active = [], set(), set(), False
     for index, l in enumerate(body.splitlines()):
         if active:
             out.append(l)
-            if index - 1 in literal:
-                literal.add(index)
+            for carry in (literal, powershell):
+                if index - 1 in carry:
+                    carry.add(index)
             active = l.rstrip().endswith('\\')
             continue
         m = DOCKER_RUN.match(l)
@@ -1052,7 +1053,9 @@ def _docker_commands(body):
         head, rest = m.group(0), l[m.end():]
         active = l.rstrip().endswith('\\')
         if not rest.lstrip().startswith('['):
-            # Shell form: the keyword is not a word of the command.
+            # Shell form: the keyword is not a word of the command, and Docker
+            # runs it through `/bin/sh`, so it is Bourne whatever else is
+            # installed in the image.
             out.append(' ' * len(head) + rest)
             continue
         span = _payload_span(rest)
@@ -1060,10 +1063,17 @@ def _docker_commands(body):
             literal.add(index)
             out.append(l)
             continue
+        # …and an exec form names its own interpreter, which may not be a
+        # Bourne one: `CMD ["pwsh", "-Command", "$AUTUMN_X"]` is PowerShell,
+        # where that is a local and only `$env:` reads the environment. The
+        # payload was extracted correctly and then handed to the wrong grammar.
+        tokens = _command_tokens(rest)
+        if tokens and _shell_named(rest[tokens[0][0]:tokens[0][1]]) in POWERSHELL:
+            powershell.add(index)
         at = len(head)
         out.append(' ' * (at + span[0]) + rest[span[0]:span[1]]
                    + ' ' * (len(rest) - span[1]))
-    return '\n'.join(out), literal
+    return '\n'.join(out), literal, powershell
 
 
 def _docker_literal(body):
@@ -1520,8 +1530,16 @@ def _yaml_blocks(body, interpolated=False, consumer='actions',
                         runs, fold = True, text.startswith('>')
                         continue
                     # An inline command string is executed too; the `- ` is
-                    # YAML, so it is blanked rather than left as a word.
-                    out.append(' ' * len(item.group(0).split(text)[0]) + text)
+                    # YAML, so it is blanked rather than left as a word — and
+                    # so are the QUOTES around it, which are YAML's. Left in
+                    # place, the shell pass read the whole payload as a single
+                    # literal and blanked every assignment inside it.
+                    lead = len(item.group(0).split(text)[0])
+                    if len(text) > 1 and text[0] == text[-1] and text[0] in '\'"':
+                        out.append(' ' * (lead + 1) + _yaml_decode(text)
+                                   + ' ' * (len(l) - lead - len(text) + 1))
+                    else:
+                        out.append(' ' * lead + text)
                     continue
             elif l.strip() and (len(l) - len(l.lstrip())) <= seq_indent:
                 seq = None
@@ -2625,6 +2643,7 @@ DOTENV = ('.env', '.example')
 # construct does. (Compose spells an escaped literal `$` the same way, so the
 # exclusion is right for both consumers.)
 EXPANDED = re.compile(r'(?<!\$)\$\{?(AUTUMN_[A-Z0-9_]+)\}?')
+SELF_DEFAULT = re.compile(r'\b(AUTUMN_[A-Z0-9_]+)=[^\n]*?\$\{?\1\b')
 
 # A quoted name counts only where the code BINDS it as an environment-variable
 # name or READS the environment with it. Any quoted string was the earlier rule
@@ -2661,9 +2680,13 @@ EXPANDED = re.compile(r'(?<!\$)\$\{?(AUTUMN_[A-Z0-9_]+)\}?')
 # and would have been dropped, reporting correct pages. A future binding named
 # outside the convention reports a correct page rather than hiding a wrong one,
 # which is the safer direction for this rung to fail in.
+# A RAW string binds just as well: `const TOKEN_ENV: &str = r"AUTUMN_TOKEN";`
+# is the same declaration, and when the accessor is handed the CONSTANT rather
+# than a literal, this rung is the only one that can see the name at all. The
+# argument parser already accepted raw strings; this one did not.
 BOUND = re.compile(
     r'\b(?:const|static)\s+((?:\w+_)?ENV(?:_\w+)?)\s*:\s*&\s*'
-    r'(?:\'\w+\s+)?str\s*=\s*"(AUTUMN_[A-Z0-9_]+)"')
+    r'(?:\'\w+\s+)?str\s*=\s*r?#*"(AUTUMN_[A-Z0-9_]+)"')
 
 # The accessors that read or write the environment. `with` is deliberately NOT
 # here: it supplies a fixture environment, which is how a test names a variable
@@ -3350,7 +3373,8 @@ def source_tokens(root):
         literal = set()
         if pathlib.PurePath(rel).name.split('.')[0] in ('Dockerfile',
                                                         'Containerfile'):
-            body, literal = _docker_commands(body)
+            body, literal, docker_ps = _docker_commands(body)
+            powershell |= docker_ps
         if yaml_file:
             consumer = _yaml_consumer(rel, body)
             # Compose needs its own ASSIGNMENT view — see `COMPOSE_ASSIGNS`.
@@ -3423,6 +3447,16 @@ def source_tokens(root):
         local = (set(ASSIGNED_ANY.findall(code))
                  - set(ASSIGNED.findall(code))
                  - set(ASSIGNED_PREFIX.findall(code)))
+        # …except where the assignment DEFAULTS TO ITSELF.
+        # `AUTUMN_X="${AUTUMN_X:-fallback}"` is a script-local variable whose
+        # value the incoming environment controls, so the name really is read.
+        # Calling it local suppressed that read and every later one in the
+        # file — the one shape where "assigned here" and "read from outside"
+        # are both true of the same name.
+        # Read on the EXPANSION view: the assignment view blanks both quote
+        # kinds, so `"${AUTUMN_X:-…}"` is already gone by the time `code` is
+        # built — the two views differ precisely where this rule looks.
+        local -= set(SELF_DEFAULT.findall(body))
         # An accessor or a binding written inside generated DATA is not
         # something the generated program does — see `_generated_data`. Built
         # before the per-line loop because both rungs consult it, and paired
@@ -5343,6 +5377,26 @@ def self_test():
                     'bash -l -c "AUTUMN_Z=1 cmd"',
                     'bash -- -c "x"', '["sh","script","-c","x"]')],
          [None, 'AUTUMN_Y=1 cmd', 'AUTUMN_Z=1 cmd', None, None])
+    # A self-defaulting assignment is BOTH: the name is a script-local
+    # variable and the incoming environment supplies its value.
+    case('a self-defaulting assignment is still a read',
+         (SELF_DEFAULT.findall('AUTUMN_X="${AUTUMN_X:-fallback}"'),
+          SELF_DEFAULT.findall('AUTUMN_X=${AUTUMN_X}'),
+          SELF_DEFAULT.findall('AUTUMN_Y="plain"'),
+          SELF_DEFAULT.findall('AUTUMN_Y="${AUTUMN_X}"')),
+         (['AUTUMN_X'], ['AUTUMN_X'], [], []))
+    # A raw string binds a name as well as an escaped one does.
+    case('a raw-string binding is a binding',
+         (BOUND.findall('const TOKEN_ENV: &str = r"AUTUMN_TOKEN";'),
+          BOUND.findall('const CANARY_ENV: &str = "AUTUMN_CANARY";')),
+         ([('TOKEN_ENV', 'AUTUMN_TOKEN')], [('CANARY_ENV', 'AUTUMN_CANARY')]))
+    # A Docker exec form names its own interpreter, which may not be Bourne.
+    case('a Docker payload is read in the shell it names',
+         (lambda r: (sorted(r[1]), sorted(r[2])))(_docker_commands(
+             'CMD ["pwsh", "-Command", "$AUTUMN_PS"]\n'
+             'RUN ["sh","-c","$AUTUMN_SH"]\n'
+             'RUN ["/app/x", "$AUTUMN_NONE"]\n')),
+         ([2], [0]))
     # Compose may quote either declaration spelling.
     case('a quoted compose declaration is still a declaration',
          COMPOSE_DECLARED.findall('      - AUTUMN_A=1\n      "AUTUMN_B": v\n'
