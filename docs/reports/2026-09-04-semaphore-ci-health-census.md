@@ -261,7 +261,12 @@ That leaves two tiers, and they are not substitutes for each other:
 
    ```yaml
    # .github/workflows/manual-contention-check.yml (throwaway, not for ci.yml)
-   on: workflow_dispatch
+   on:
+     workflow_dispatch:
+       inputs:
+         sha:
+           description: "Commit to reproduce (same-commit baseline -- do not leave this to whatever the dispatch branch's tip happens to be)"
+           required: true
    env:
      # Copied from ci.yml:13-22, not reinvented: RUST_MIN_STACK in
      # particular changes how close a deep call frame (clap's derive
@@ -278,18 +283,32 @@ That leaves two tiers, and they are not substitutes for each other:
          matrix: { n: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] }
        runs-on: macos-latest
        steps:
+         # Pinned to the dispatch input, not the branch tip: a
+         # `workflow_dispatch` run with no `ref` checks out whatever the
+         # dispatch branch currently points to, and PR branches in this
+         # sample moved commit-to-commit routinely -- without pinning, the
+         # ten samples could each run different product/test code, which
+         # is a different campaign than the same-commit baseline this
+         # report's own hard gate calls for.
          - uses: actions/checkout@v7
+           with:
+             ref: ${{ inputs.sha }}
          - uses: dtolnay/rust-toolchain@stable
-         # Restore the cache, matching ci.yml:345 exactly. An earlier
-         # revision of this section omitted it on the theory that a warm
-         # cache would shortcut the cold build-up under test -- wrong: the
+         # Restore the cache, matching ci.yml:345-346 exactly -- including
+         # `continue-on-error: true`. An earlier revision of this section
+         # omitted the action entirely on the theory that a warm cache
+         # would shortcut the cold build-up under test -- wrong: the
          # fresh-VM-per-sample structure above already guarantees a cold
          # *runner*, and the sampled CI runs themselves all restored this
          # same cache before "Run tests". Skipping it would make every
          # sample recompile the entire dependency graph from scratch,
          # which is slower AND less faithful to the thing being measured,
-         # not more.
+         # not more; dropping the `continue-on-error` would instead let a
+         # transient cache-service failure abort a sample outright, which
+         # production tolerates by falling through to a cold-cache build
+         # rather than losing the sample.
          - uses: Swatinem/rust-cache@v2.7.8
+           continue-on-error: true
          - name: Run the exact CI command, but keep going past a failure
            # --no-fail-fast matters: plain `cargo test --workspace` stops
            # at the FIRST failing test binary and never runs the rest
