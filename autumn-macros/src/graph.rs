@@ -194,12 +194,16 @@ pub fn emit_symbol_slice(symbols: &[String]) -> TokenStream {
 
 /// Emit the `inventory::submit!` for a `#[route]`/`#[static_get]` handler.
 #[must_use]
-pub fn emit_route_descriptor(input_fn: &syn::ItemFn, method: &str, path: &TokenStream, static_route: bool) -> TokenStream {
+pub fn emit_route_descriptor(
+    input_fn: &syn::ItemFn,
+    method: &str,
+    path: &TokenStream,
+    static_route: bool,
+) -> TokenStream {
     let signature = emit_symbol_slice(&signature_symbols(&input_fn.sig));
     let block = &input_fn.block;
     let body_tokens = quote! { #block };
     let body = emit_symbol_slice(&candidate_symbols(&body_tokens));
-    let mutating = is_mutating(&body_tokens);
     let handler = input_fn.sig.ident.to_string();
     quote! {
         ::autumn_web::reexports::inventory::submit! {
@@ -209,7 +213,6 @@ pub fn emit_route_descriptor(input_fn: &syn::ItemFn, method: &str, path: &TokenS
                 method: #method,
                 path: #path,
                 static_route: #static_route,
-                mutating: #mutating,
                 file: ::core::file!(),
                 line: ::core::line!(),
                 signature_symbols: #signature,
@@ -404,6 +407,11 @@ mod tests {
         assert!(generated.contains(r#"handler : "show""#), "{generated}");
         assert!(generated.contains(r#"method : "GET""#), "{generated}");
         assert!(generated.contains("static_route : false"), "{generated}");
+        assert!(
+            !generated.contains("mutating"),
+            "a route's access comes from its declared HTTP method, so the descriptor \
+             carries no mutation flag: {generated}"
+        );
         assert!(generated.contains(r#""PgPostRepository""#), "{generated}");
         assert!(generated.contains(r#""posts""#), "{generated}");
     }

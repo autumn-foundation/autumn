@@ -43,9 +43,9 @@ pub const LIMITS: &[&str] = &[
      and a model whose name matches a common type is linked wherever that name appears.",
     "Raw SQL is matched by identifier, and only inside string literals that contain a SQL \
      keyword; SQL assembled at runtime from fragments is invisible.",
-    "Access is `write` when the item's tokens carry mutation evidence or the route declares a \
-     non-safe HTTP method, and `read` otherwise — it is the declared intent, not an executed \
-     statement.",
+    "A route's access is its declared HTTP method (safe methods read, everything else writes); a \
+     job's is whether its tokens carry mutation evidence. Either way it is the declared intent, \
+     not an executed statement.",
 ];
 
 // ── Node facts ───────────────────────────────────────────────────────
@@ -68,6 +68,14 @@ pub struct RouteFacts {
     /// A route the app never mounted has no resolved posture to state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<RouteAuth>,
+    /// The repository that generated this route, for a `#[repository(api =
+    /// "...")]` auto-API mount that no `#[route]` declares.
+    ///
+    /// `None` for a hand-written handler. These routes are real served
+    /// endpoints that read and write a table, so omitting them would mean
+    /// `autumn graph touches <table>` missed the whole REST surface of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_by: Option<String>,
 }
 
 /// Facts carried by a model node.
@@ -179,6 +187,10 @@ pub struct Completeness {
     pub repositories: usize,
     /// Declared jobs, scheduled tasks and one-off tasks.
     pub jobs: usize,
+    /// Mounted routes attributed to a `#[repository]` auto-API rather than to
+    /// a `#[route]` declaration.
+    #[serde(default)]
+    pub generated_routes: usize,
     /// Node ids of declared routes that no `routes![]` list mounts, sorted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmounted_routes: Vec<String>,
@@ -241,6 +253,13 @@ impl ArchitectureGraph {
             "  {} routes ({} mounted), {} models, {} repositories, {} jobs",
             c.declared_routes, c.mounted_routes, c.models, c.repositories, c.jobs
         );
+        if c.generated_routes > 0 {
+            let _ = writeln!(
+                out,
+                "  {} repository auto-API route(s)",
+                c.generated_routes
+            );
+        }
 
         for kind in [
             NodeKind::Model,
@@ -319,6 +338,27 @@ fn job_id(module_path: &str, handler: &str) -> String {
 /// A `file:line` location string.
 fn location(file: &str, line: u32) -> String {
     format!("{file}:{line}")
+}
+
+/// The access a declared HTTP method states.
+fn method_access(method: &str) -> Access {
+    if is_safe_method(method) {
+        Access::Read
+    } else {
+        Access::Write
+    }
+}
+
+/// Whether `path` is served by the auto-API mounted at `prefix`.
+///
+/// Segment-aware: `/api/posts` covers `/api/posts` and `/api/posts/{id}`, but
+/// never `/api/postscript`.
+fn is_under_api_prefix(path: &str, prefix: &str) -> bool {
+    !prefix.is_empty()
+        && (path == prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/')))
 }
 
 /// The symbol index: which node ids a candidate name can resolve to.
@@ -484,11 +524,13 @@ pub fn build(
         } else {
             unmounted.push(id.clone());
         }
-        let access = if route.mutating || !is_safe_method(route.method) {
-            Access::Write
-        } else {
-            Access::Read
-        };
+        // A route's access is read off its *declared method*, and not off any
+        // mutation evidence in its tokens. A page that renders `hx-delete=(…)`
+        // on a link names `delete` in its body while being a read-only GET, and
+        // reporting it as a writer would make the write set useless. The method
+        // is the declaration: a GET that mutates is a bug in the handler, not a
+        // fact for this document to launder.
+        let access = method_access(route.method);
         nodes.insert(
             id.clone(),
             GraphNode {
@@ -506,6 +548,7 @@ pub fn build(
                     path: hit.map_or_else(|| route.path.to_owned(), |m| m.path.clone()),
                     mounted: hit.is_some(),
                     auth: hit.map(|m| m.auth.clone()),
+                    generated_by: None,
                 }),
                 model: None,
                 repository: None,
@@ -561,13 +604,60 @@ pub fn build(
         );
     }
 
-    let unmodelled: Vec<String> = mounted
-        .iter()
-        .filter(|m| !matched_mounted.contains(&(m.method.clone(), m.path.clone())))
-        .map(|m| format!("{} {}", m.method, m.path))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    // ── Repository auto-API routes ───────────────────────────────
+    // `#[repository(api = "/api/posts")]` mounts a CRUD surface no `#[route]`
+    // declares. The mount prefix is declared, so attributing these routes to
+    // their repository is a declaration too — and without them a query for the
+    // routes touching a table would miss its entire REST surface.
+    let mut generated_routes = 0usize;
+    let mut unmodelled: BTreeSet<String> = BTreeSet::new();
+    for route in mounted {
+        if matched_mounted.contains(&(route.method.clone(), route.path.clone())) {
+            continue;
+        }
+        let owner = repositories
+            .iter()
+            .find(|repo| is_under_api_prefix(&route.path, repo.api));
+        let Some(repo) = owner else {
+            unmodelled.insert(format!("{} {}", route.method, route.path));
+            continue;
+        };
+        generated_routes += 1;
+        let repo_node = repository_id(repo.module_path, repo.repository);
+        let id = format!("route:auto-api:{} {}", route.method, route.path);
+        let access = method_access(&route.method);
+        nodes.insert(
+            id.clone(),
+            GraphNode {
+                id: id.clone(),
+                kind: NodeKind::Route,
+                name: format!("{}::auto_api", repo.repository),
+                module: repo.module_path.to_owned(),
+                location: location(repo.file, repo.line),
+                route: Some(RouteFacts {
+                    method: route.method.clone(),
+                    path: route.path.clone(),
+                    mounted: true,
+                    auth: Some(route.auth.clone()),
+                    generated_by: Some(repo.repository.to_owned()),
+                }),
+                model: None,
+                repository: None,
+                job: None,
+            },
+        );
+        edges.insert(
+            (id.clone(), repo_node.clone()),
+            GraphEdge {
+                from: id,
+                to: repo_node,
+                access,
+                provenance: Provenance::Declaration,
+                symbol: String::new(),
+            },
+        );
+    }
+    let unmodelled: Vec<String> = unmodelled.into_iter().collect();
 
     unmounted.sort();
     unmounted.dedup();
@@ -580,6 +670,7 @@ pub fn build(
             models: models.len(),
             repositories: repositories.len(),
             jobs: jobs.len(),
+            generated_routes,
             unmounted_routes: unmounted,
             unmodelled_mounted_routes: unmodelled,
         },
@@ -673,6 +764,19 @@ mod tests {
         }
     }
 
+    fn repository_with_api(
+        name: &'static str,
+        implementation: &'static str,
+        model: &'static str,
+        table: &'static str,
+        api: &'static str,
+    ) -> RepositoryGraphDescriptor {
+        RepositoryGraphDescriptor {
+            api,
+            ..repository(name, implementation, model, table)
+        }
+    }
+
     fn route(
         handler: &'static str,
         method: &'static str,
@@ -686,7 +790,6 @@ mod tests {
             method,
             path,
             static_route: false,
-            mutating: false,
             file: "src/routes/posts.rs",
             line: 30,
             signature_symbols,
@@ -896,6 +999,128 @@ mod tests {
             &[],
         );
         assert!(graph.edges.is_empty(), "{:?}", graph.edges);
+    }
+
+    #[test]
+    fn markup_that_merely_names_a_mutation_does_not_make_a_get_a_write() {
+        // A maud template writes `hx-delete=(...)` on a link. The route is a
+        // GET: its declared method is the contract, and reading `delete` out of
+        // an attribute name would report a read-only page as a writer.
+        let graph = build(
+            &[],
+            &[route("show", "GET", "/posts/{id}", &[], &["posts"])],
+            &[model("Post", "app::models::Post", "posts")],
+            &[],
+            &[],
+        );
+        assert_eq!(graph.edges[0].access, Access::Read);
+    }
+
+    #[test]
+    fn a_jobs_access_comes_from_its_mutation_evidence() {
+        // A job declares no HTTP method, so the tokens are all there is.
+        let mut writer = job("hot_rank", JobKind::Scheduled, &["posts"]);
+        writer.mutating = true;
+        let graph = build(
+            &[],
+            &[],
+            &[model("Post", "app::models::Post", "posts")],
+            &[],
+            &[writer],
+        );
+        assert_eq!(graph.edges[0].access, Access::Write);
+    }
+
+    #[test]
+    fn a_repository_auto_api_route_is_attributed_to_its_repository() {
+        // `#[repository(api = "/api/posts")]` mounts CRUD routes that no
+        // `#[route]` declares. Leaving them out would mean `autumn graph
+        // touches posts` missed the entire REST surface of the table.
+        let graph = build(
+            &[
+                mounted("GET", "/api/posts", "list"),
+                mounted("POST", "/api/posts", "create"),
+            ],
+            &[],
+            &[model("Post", "app::models::Post", "posts")],
+            &[repository_with_api(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+                "/api/posts",
+            )],
+            &[],
+        );
+        let generated: Vec<&GraphNode> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.route.as_ref().is_some_and(|r| r.generated_by.is_some()))
+            .collect();
+        assert_eq!(generated.len(), 2, "{:?}", graph.nodes);
+        assert!(
+            graph.completeness.unmodelled_mounted_routes.is_empty(),
+            "an attributed auto-API route is no longer unaccounted for: {:?}",
+            graph.completeness.unmodelled_mounted_routes
+        );
+        assert_eq!(graph.completeness.generated_routes, 2);
+        assert_eq!(
+            graph.completeness.declared_routes, 0,
+            "a generated route is not a macro-declared handler"
+        );
+        let post_edge = graph
+            .edges
+            .iter()
+            .find(|e| e.from.contains("POST") && e.to.starts_with("repository:"))
+            .expect("the mutating auto-API route must link to its repository");
+        assert_eq!(post_edge.access, Access::Write);
+        assert_eq!(post_edge.provenance, Provenance::Declaration);
+    }
+
+    #[test]
+    fn an_auto_api_route_reaches_the_model_through_its_repository() {
+        let graph = build(
+            &[mounted("GET", "/api/posts/{id}", "show")],
+            &[],
+            &[model("Post", "app::models::Post", "posts")],
+            &[repository_with_api(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+                "/api/posts",
+            )],
+            &[],
+        );
+        let answer = crate::graph::query::touches(&graph, "posts").expect("posts must resolve");
+        assert_eq!(
+            answer.routes.len(),
+            1,
+            "the auto-API route must reach the model through its repository: {:?}",
+            answer.routes
+        );
+    }
+
+    #[test]
+    fn a_mounted_route_outside_every_api_prefix_stays_unmodelled() {
+        let graph = build(
+            &[mounted("GET", "/api/postscript", "other")],
+            &[],
+            &[],
+            &[repository_with_api(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+                "/api/posts",
+            )],
+            &[],
+        );
+        assert_eq!(
+            graph.completeness.unmodelled_mounted_routes,
+            vec!["GET /api/postscript"],
+            "a prefix match must respect segment boundaries"
+        );
     }
 
     #[test]

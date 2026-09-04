@@ -3345,6 +3345,20 @@ impl AppBuilder {
             return;
         }
 
+        // ── Architecture-graph dump mode ───────────────────────────────
+        // When AUTUMN_DUMP_GRAPH=1, print the application architecture graph
+        // (#1747) and exit. Triggered by `autumn graph`, which needs the whole
+        // binary's registrations -- every `#[route]`, `#[model]`,
+        // `#[repository]` and `#[job]`, across the app AND its plugins --
+        // joined against this app's mounted route table, because a route's
+        // served path and resolved auth posture are facts about the mount and
+        // not about the annotation alone. Runs before any database or port is
+        // touched.
+        if crate::graph::manifest::is_dump_mode() {
+            self.run_dump_graph_mode();
+            return;
+        }
+
         // ── Jobs manifest dump mode ────────────────────────────────────
         // When AUTUMN_DUMP_JOBS=1, print the effective drained-queue manifest
         // (TOML `queues = [...]`) and exit. Triggered by `autumn jobs manifest`
@@ -5934,6 +5948,13 @@ impl AppBuilder {
         // Refresh the AppState-stored config snapshot — see the matching
         // comment in `run()` (Codex review).
         state.insert_extension(config.clone());
+        // Publish the architecture graph this process serves (#1747) before the
+        // router is built, so `/actuator/graph` can answer from the first
+        // request rather than after some later warm-up.
+        crate::graph::install(crate::graph::manifest::audit(&graph_mounted_routes(
+            &all_routes,
+            &scoped_groups,
+        )));
         let router = crate::router::try_build_router_inner(
             all_routes,
             &config,
@@ -6073,6 +6094,15 @@ impl AppBuilder {
     /// manifest`). Takes `&self` rather than consuming the builder: it reads
     /// the route table and the audit-sink status and touches nothing else, so
     /// there is no database to open and no port to bind.
+    /// Dump the application's architecture graph as JSON and exit.
+    ///
+    /// Triggered when `AUTUMN_DUMP_GRAPH=1` is set (by `autumn graph`).
+    /// Does not connect to a database or bind a TCP port.
+    fn run_dump_graph_mode(&self) {
+        let mounted = graph_mounted_routes(&self.routes, &self.scoped_groups);
+        crate::graph::manifest::print_manifest_dump(&crate::graph::manifest::audit(&mounted));
+    }
+
     fn run_dump_agent_authority_mode(&self) {
         // Whether agent invocations have anywhere to be recorded is a property
         // of the deployment, not of any grant, and it belongs in the document
@@ -7424,6 +7454,12 @@ impl AppBuilder {
         // Cloned before the builder consumes it, so a job capsule can dispatch
         // its handler against the same rebuilt state the router serves from.
         let router_state = state.clone();
+        // See the matching call in `run()`: the graph is published before the
+        // router is built so `/actuator/graph` answers from the first request.
+        crate::graph::install(crate::graph::manifest::audit(&graph_mounted_routes(
+            &routes,
+            &scoped_groups,
+        )));
         let router = crate::router::try_build_router_inner(
             routes,
             &config,
@@ -7550,6 +7586,74 @@ pub(crate) fn is_dump_jobs_mode() -> bool {
 /// section claimed they surfaced there (#1691 P2-6). The same call also
 /// applies the JSON-out eligibility gate, so an HTML route someone tagged
 /// `#[api_doc(mcp)]` is no longer reported as a tool it will never become.
+/// The mounted-route table the architecture graph joins against (issue #1747).
+///
+/// Top-level routes carry their own path; a scoped group's children do not --
+/// the group's prefix is applied at mount time -- so each child is summarised
+/// with its group prefix.
+fn graph_mounted_routes(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+) -> Vec<crate::graph::MountedRoute> {
+    routes
+        .iter()
+        .map(|route| graph_route_summary(route, None))
+        .chain(scoped_groups.iter().flat_map(|group| {
+            group
+                .routes
+                .iter()
+                .map(move |route| graph_route_summary(route, Some(&group.prefix)))
+        }))
+        .collect()
+}
+
+/// The architecture-graph view of one mounted route (issue #1747).
+///
+/// The *mounted* path, not the declared one: a scoped group's children carry
+/// only their child path on the `Route`, and recording `/items` for a route an
+/// operator calls at `/api/v1/items` would make a scope rename invisible.
+/// `join_nested_path` is the same helper the OpenAPI collector and the
+/// agent-authority manifest use, so the three cannot disagree about where a
+/// route lives.
+///
+/// The auth posture is read straight off the route's `ApiDoc` rather than
+/// derived a second time here: `#[secured]`/`#[authorize]`/`#[public]` already
+/// populate it, and a second derivation is a second thing to drift.
+fn graph_route_summary(route: &Route, scope_prefix: Option<&str>) -> crate::graph::MountedRoute {
+    let mut roles: Vec<String> = route
+        .api_doc
+        .required_roles
+        .iter()
+        .map(|r| (*r).to_owned())
+        .collect();
+    roles.sort();
+    roles.dedup();
+    let mut scopes: Vec<String> = route
+        .api_doc
+        .required_scopes
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    scopes.sort();
+    scopes.dedup();
+    crate::graph::MountedRoute {
+        method: route.method.to_string(),
+        path: scope_prefix.map_or_else(
+            || route.path.to_string(),
+            |prefix| crate::router::join_nested_path(prefix, route.path),
+        ),
+        handler: route.name.to_owned(),
+        module_path: route.api_doc.module_path.to_owned(),
+        auth: crate::graph::RouteAuth {
+            secured: route.api_doc.secured,
+            roles,
+            scopes,
+            policy: route.api_doc.has_policy,
+            public: route.api_doc.public,
+        },
+    }
+}
+
 fn agent_authority_route_summary(
     route: &Route,
     scope_prefix: Option<&str>,

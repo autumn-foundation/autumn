@@ -47,7 +47,34 @@
 pub mod manifest;
 pub mod query;
 
+use std::sync::OnceLock;
+
 use serde::{Deserialize, Serialize};
+
+use manifest::ArchitectureGraph;
+
+/// The graph this process serves from `/actuator/graph`.
+///
+/// A process-wide `OnceLock` rather than a field on `AppState`: the graph is a
+/// property of the *binary*, identical for every request and every clone of the
+/// state, and threading an immutable whole-binary fact through the request state
+/// would only create a second place for it to go stale.
+static SERVED_GRAPH: OnceLock<ArchitectureGraph> = OnceLock::new();
+
+/// Publish the graph this process serves.
+///
+/// Idempotent: the first call wins and later ones are ignored, so a test that
+/// builds several routers in one process cannot make the endpoint's answer
+/// depend on which router was built last.
+pub fn install(graph: ArchitectureGraph) {
+    let _ = SERVED_GRAPH.set(graph);
+}
+
+/// The graph this process serves, if one has been installed.
+#[must_use]
+pub fn served() -> Option<&'static ArchitectureGraph> {
+    SERVED_GRAPH.get()
+}
 
 // ── Descriptors published by the macros ──────────────────────────────
 
@@ -72,8 +99,6 @@ pub struct RouteGraphDescriptor {
     pub path: &'static str,
     /// Whether the handler was declared with `#[static_get]`.
     pub static_route: bool,
-    /// Whether the handler's tokens carry evidence of a mutation.
-    pub mutating: bool,
     /// `file!()` of the handler.
     pub file: &'static str,
     /// `line!()` of the handler.
