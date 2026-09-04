@@ -453,19 +453,25 @@ SEGMENT = r'(?:[A-Z0-9]+(?:_[A-Z0-9]+)*|\{[a-z]+\})'
 #
 # The leader is per file type and deliberately not one pattern: `#` opens a
 # comment in TOML, YAML and shell, but a Rust ATTRIBUTE and a markdown HEADING.
-# Keyed on the effective suffix, so `Cargo.toml.tmpl` is read as TOML and
-# `README.md.tmpl` as markdown (no leader, nothing stripped). A type not listed
-# here keeps every line.
+#
+# `#` is now the DEFAULT, and the lists below are the exceptions. An allow-list
+# was the first shape and it failed three rounds running, once per file type
+# nobody had thought of: Dockerfiles (named, not suffixed), then Terraform
+# templates, each with explanatory `#` comments that read as runtime truth until
+# someone noticed. The error directions are not symmetric — not stripping hides
+# a wrong page for ever, while stripping where `#` is not a comment reports a
+# correct page, visibly, once — so the default belongs on the side that fails
+# loudly. Measured over every tracked non-markdown file that mentions
+# `AUTUMN_`: the C-family and the fixture types below are the whole of the
+# exception list.
 COMMENT_LEADER = {
-    '.rs': '//', '.ts': '//', '.js': '//',
-    '.sh': '#', '.bash': '#', '.ps1': '#',
-    '.toml': '#', '.yml': '#', '.yaml': '#', '.example': '#',
+    # `#` opens an attribute, not a comment.
+    '.rs': '//', '.ts': '//', '.js': '//', '.go': '//',
+    # Program output captured as a fixture: nothing in it is a comment, and a
+    # line may legitimately begin with `#`.
+    '.golden': None, '.stderr': None, '.snap': None, '.json': None,
+    '.md': None,
 }
-
-# Some file types are named rather than suffixed. `Dockerfile.api.tmpl` strips
-# to `Dockerfile.api`, whose "suffix" is `.api` — so the whole family was
-# getting no comment handling at all, and its commented `--build-arg
-# AUTUMN_BUILD_*=…` examples were reading as source truth.
 COMMENT_LEADER_NAMED = {'Dockerfile': '#', 'Makefile': '#', 'Justfile': '#'}
 
 
@@ -474,7 +480,9 @@ def comment_leader(rel):
     if p.suffix == '.tmpl':
         p = pathlib.PurePath(p.stem)
     named = COMMENT_LEADER_NAMED.get(p.name.split('.')[0])
-    return named if named else COMMENT_LEADER.get(p.suffix)
+    if named:
+        return named
+    return COMMENT_LEADER.get(p.suffix, '#')
 
 
 def _rust_classes(body):
@@ -1312,8 +1320,24 @@ def check_table(rows, leaves, built, tokens):
     path alone, publishing an override that sets nothing to every reader on
     docs.rs. Third check: the two columns must still agree with each other,
     which catches a row edited on one side.
+
+    Fourth: no variable and no path may appear twice. A count alone is a weak
+    ratchet — replacing the `AUTUMN_SERVER__HOST` row with a second, perfectly
+    valid `AUTUMN_SERVER__PORT` row holds the count at 142 and every row still
+    passes, while the host mapping quietly leaves the published reference. A
+    duplicate is also never right on its own terms: this table maps each name to
+    one key.
     """
     out = []
+    for column, label in ((1, 'variable'), (2, 'config path')):
+        seen = {}
+        for row in rows:
+            first = seen.setdefault(row[column], row[0])
+            if first != row[0]:
+                out.append((row[0], row[1], row[2],
+                            f'this {label} is already documented on line '
+                            f'{first} — a duplicate row can stand in for one '
+                            f'that was removed'))
     for i, var, declared in rows:
         # The shards list is one-dimensional, so a path may carry AT MOST ONE
         # index, and it must sit between two segments. Erasing every bracket
@@ -1874,6 +1898,19 @@ def self_test():
     # A Dockerfile is named, not suffixed. `Dockerfile.api.tmpl` strips to
     # `Dockerfile.api`, whose suffix is `.api`, so the whole family was getting
     # no comment handling and its commented `--build-arg` examples read as truth.
+    # `#` is the DEFAULT, and the map is the exception list. An allow-list
+    # failed three rounds running, once per file type nobody had listed —
+    # Dockerfiles, then Terraform templates.
+    case('an unlisted type gets the default leader',
+         (comment_leader('main.tf.tmpl'), comment_leader('x.py'),
+          comment_leader('x.hcl')), ('#', '#', '#'))
+    case('the C family does not',
+         (comment_leader('x.rs'), comment_leader('x.ts')), ('//', '//'))
+    # Program output captured as a fixture has no comments, and a line in it may
+    # legitimately begin with `#`.
+    case('a fixture keeps every line',
+         (comment_leader('x.golden'), comment_leader('x.stderr'),
+          comment_leader('README.md.tmpl')), (None, None, None))
     case('a Dockerfile is recognised by name',
          (comment_leader('Dockerfile'),
           comment_leader('autumn-cli/src/templates/Dockerfile.api.tmpl'),
@@ -1977,6 +2014,26 @@ def self_test():
     rows_t, unparsed_t, _ = table_rows(typo)
     case('a misspelled prefix is reported, not skipped',
          (len(rows_t), len(unparsed_t)), (0, 1))
+    # A duplicate row holds the count while standing in for a removed one, so
+    # the ratchet alone does not catch it. Each name maps to one key.
+    dup_var = [(1, 'AUTUMN_SERVER__PORT', 'server.port'),
+               (2, 'AUTUMN_SERVER__PORT', 'server.port')]
+    case('a duplicated variable is reported',
+         len([why for _, _, _, why in
+              check_table(dup_var, real_leaves, real_built, tokens)
+              if 'already documented' in why]), 2)
+    dup_path = [(1, 'AUTUMN_SERVER__PORT', 'server.port'),
+                (2, 'AUTUMN_SERVER__HOST', 'server.port')]
+    case('a duplicated config path is too',
+         any('already documented' in why
+             for _, _, _, why in check_table(dup_path, real_leaves,
+                                             real_built, tokens)), True)
+    case('distinct rows are not',
+         [why for _, _, _, why in
+          check_table([(1, 'AUTUMN_SERVER__PORT', 'server.port'),
+                       (2, 'AUTUMN_SERVER__HOST', 'server.host')],
+                      real_leaves, real_built, tokens)
+          if 'already documented' in why], [])
     # A row that loses its LEADING pipe must not end the scan. It did, and every
     # row after it went unchecked in silence: dropping one pipe mid-table left
     # 127 rows parsed — over the floor — and 15 mappings never looked at.
