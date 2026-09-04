@@ -839,47 +839,58 @@ evidence despite bugs or claim gaps in that code):**
 
 ## 🏁 Verdict
 
-**Pursue**, against the pre-registered line: all success criteria
-(cold-start convergence, exact counter merge, departure convergence,
-rejoin convergence, and the whole-test 60s kill line) held — as
-`Converged`, never `LateConverged` or `Diverged` — on every run across all
-twelve passes, with comfortable margin against every bound — not a photo
-finish, and (per the Step 3 caveat in **Assay**) the narrowest margin,
-departure's 5s line, is only claimed as *code-enforced* for the fourth
-through twelfth passes' 36 runs, though the wall-clock evidence supports
-it across all 48. No kill-line condition was observed. After all
-nineteen corrections above, the counter's exact sum was verified not
-just once before churn but again on the survivors after departure and
-again on the full cluster after rejoin, with the pre-churn increments
-themselves now genuinely concurrent (barrier-synced spawned tasks, not a
-sequential loop); membership agreement is checked on the full `(id, addr,
-incarnation)` identity the design actually converges (not bare ids), with
-`status` deliberately excluded as a documented, not-replicated local
-overlay; the step-4 "rejoin" now genuinely reuses the departed node's own
-identity (asserted directly), not a fresh entropy-derived one — a real
-rejoin, not a new member joining; every convergence/counter observation
-was required to hold across a debounce window whose *last read*, not just
-a naive window-length arithmetic, strictly clears the protocol's own
-gossip and suspicion timers, classified immediately upon that read rather
-than after an unconditional trailing sleep and correctly checked against
-both the soft and hard deadlines on the iteration that decides the
-outcome, with a membership recheck immediately after every counter check;
-the debounce itself always yields rather than risking a spin; step 3's
-checks are gated at the registered 5s, not a silently-inherited 10s; and
-the whole test now runs behind two independent 60s watchdogs — a
-Tokio-scheduled one and a native OS-thread one that cannot be starved by
-the same deadlock the first could theoretically miss on a single-worker
-runtime, both now armed through bounded runtime teardown as well as the
-assay body itself, rather than disarming the instant the cooperative
-watchdog's own await resolves — the actual claim the guide text makes
-("no divergence," stable identical views, exact sums through concurrent
-churn, a genuine rejoin) is the one actually measured, on 4/4 twelfth-pass
-runs, not the progressively weaker versions the first eleven passes of
-this report each accidentally supported. Within the scope this assay
-actually tested (single host, single process, star topology, honest
-peers, N=5, correctness not performance), the full-broadcast/no-quorum
-gossip design does **not** show the split-brain or lost-update failure
-mode the guide's hedge gestures at.
+**Pursue**, against the pre-registered line — but the verdict rests on two
+distinct claims, backed by different slices of the evidence, and they
+should not be collapsed into one "held on every run" sentence.
+
+**Claim 1 — no failure mode was ever observed.** This is uniform across
+the full history: all twelve passes (48 runs total, 4 per pass), every
+one of which exercised cold-start convergence, some form of
+departure/rejoin convergence, and the whole-test kill line, produced
+`Converged` and never `LateConverged` or `Diverged`, with comfortable
+margin against every bound — not a photo finish. No kill-line condition
+was observed on any run, at any pass. This claim is fully supported by
+all 48 runs.
+
+**Claim 2 — the final, fully-corrected apparatus cleanly passes every
+registered criterion at once**, matching exactly what the guide edit
+below now cites. This is measured evidence specifically from the
+twelfth pass's 4/4 runs, because the first eleven passes each tested a
+progressively weaker version of the same assay (per the nineteen
+corrections above): the pre-churn increments are genuinely concurrent
+(barrier-synced spawned tasks, not a sequential loop) only from the
+eighth pass on; membership agreement is checked on the full `(id, addr,
+incarnation)` identity the design actually converges (not bare ids,
+with `status` deliberately excluded as a documented, not-replicated
+local overlay) only from the eleventh pass on; the step-4 "rejoin"
+genuinely reuses the departed node's own identity (asserted directly,
+not a fresh entropy-derived member) only from the twelfth pass; the
+departure bound is code-gated at the registered 5s, not a
+silently-inherited 10s, only from the fourth pass on (36 of the 48
+runs, though the wall-clock evidence supports it across all 48); every
+convergence/counter observation holding across a debounce window whose
+*last read* — not a naive window-length arithmetic — strictly clears
+the protocol's own gossip and suspicion timers, classified immediately
+upon that read rather than after an unconditional trailing sleep, and
+correctly checked against both the soft and hard deadlines on the
+deciding iteration, is only true from the ninth or tenth pass on
+depending on the specific defect; and the whole test running behind two
+independent 60s watchdogs — a Tokio-scheduled one and a native
+OS-thread one that cannot be starved by the same deadlock the first
+could theoretically miss on a single-worker runtime — both armed
+through bounded runtime teardown as well as the assay body itself,
+rather than disarming the instant the cooperative watchdog's own await
+resolves, is only true from the twelfth pass. So claim 2 — the one the
+guide text actually asserts ("no divergence," stable identical views,
+exact sums through concurrent churn, a genuine rejoin, measured by an
+apparatus whose own instrumentation is trustworthy) — is supported
+specifically by the twelfth pass's 4/4 runs, not by all 48.
+
+Within the scope this assay actually tested (single host, single
+process, star topology, honest peers, N=5, correctness not
+performance), the full-broadcast/no-quorum gossip design does **not**
+show the split-brain or lost-update failure mode the guide's hedge
+gestures at.
 
 This is deliberately a narrower claim than "clustering works past two
 nodes" — see the stubs list above for exactly what was not tested (real
