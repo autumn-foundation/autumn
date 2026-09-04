@@ -119,6 +119,17 @@ something this census fabricated a rate for).
      known executions" supports *at most* 21.4%, not "≥21%". A rate in the
      17.6%-21.4% range against 0% is still the strongest repeat signature
      in the sample, just not the number either earlier revision gave.
+     One more caveat the range doesn't resolve: `cargo test --workspace`
+     (CI's own "Run tests" command, no `--no-fail-fast`) stops at the
+     *first* failing test binary and never runs the rest — confirmed
+     empirically, not assumed — so each of those 3 unresolved runs is
+     either a confirmed `live_upgrade` pass (if its binary ran before
+     whichever binary's failure stopped the invocation) or a
+     `live_upgrade` non-execution (if not), never an executed-but-unknown
+     outcome. Which of those two it is for each of the 3 depends on
+     cargo's workspace test-binary ordering, which this census did not
+     determine; either way the failure count stays at 3 and the range
+     above still bounds it correctly.
   2. **`integration::cache_stampede::swr_serves_stale_and_refreshes_in_
      background`** — the background refresh never published within its
      1,000×25ms (~25s) poll budget (run 8190, macOS). This assertion was
@@ -229,22 +240,52 @@ That leaves two tiers, and they are not substitutes for each other:
    needs)**: rerun the exact CI command, unfiltered, and grep each run's
    output for the target test's own result line. This is expensive — the
    `Run tests` step itself took 1,501-1,607s (25-27 minutes) in the census
-   sample — so even N=10 here is a ~4-5 hour campaign, not a quick check.
-   It must run on an actual GitHub-hosted `macos-latest` runner (a
-   `workflow_dispatch` job on `ci.yml`'s own matrix leg is the simplest way
-   to get one): the hypothesis under test is contention specific to that
-   *shared, GitHub-hosted* runner class, so a clean result on a personal
-   or otherwise-provisioned Mac tests a different, less contended
-   environment and cannot stand in as evidence against it either way.
+   sample — so even N=10 here is real spend, not a quick check. Two things
+   an earlier revision of this section got wrong, both load-bearing for
+   what the campaign can actually prove:
+   - It must run on an actual GitHub-hosted `macos-latest` runner, not
+     just "macOS hardware": the hypothesis is contention specific to that
+     *shared, hosted* runner class, and a personal or otherwise-provisioned
+     Mac tests a different, less contended environment.
+   - Each of the 10 samples needs its own **fresh runner and checkout**,
+     not 10 loop iterations inside one job: a shared VM and `target/`
+     directory means samples 2-10 inherit sample 1's warm build cache and
+     host state instead of each reproducing the cold, ~25-minute build-up
+     the `live_upgrade` comparison specifically depends on.
 
-   ```
-   # Must run on macos-latest itself (see above) -- not just "any macOS
-   # box". Mirrors the actual failing step; do not add a name filter or
-   # you're back to the isolated case Codex flagged.
-   for i in $(seq 1 10); do
-     cargo test --workspace 2>&1 | tee "run-$i.log"
-     grep -E "upgrades_in_place_under_load_without_dropping|cache_stampede::swr_serves_stale_and_refreshes_in_background|sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times" "run-$i.log"
-   done
+   A `strategy.matrix` dispatch is the natural fit — 10 independent
+   `macos-latest` jobs, each a fresh VM:
+
+   ```yaml
+   # .github/workflows/manual-contention-check.yml (throwaway, not for ci.yml)
+   on: workflow_dispatch
+   jobs:
+     sample:
+       strategy:
+         fail-fast: false
+         matrix: { n: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] }
+       runs-on: macos-latest
+       steps:
+         - uses: actions/checkout@v7
+         - uses: dtolnay/rust-toolchain@stable
+         # Deliberately NO cache action here: a warm Swatinem/rust-cache
+         # restore is exactly the shortcut around the cold build-up this
+         # campaign needs to reproduce.
+         - name: Run the exact CI command, but keep going past a failure
+           # --no-fail-fast matters: plain `cargo test --workspace` stops
+           # at the FIRST failing test binary and never runs the rest
+           # (confirmed empirically: a two-target repro where target A
+           # fails never even started target B). Without it, one sample's
+           # results for the other two tests go silently missing instead
+           # of recording a clean pass -- the same ambiguity that already
+           # left 3 of the census's own 17 macOS runs unresolved for
+           # `live_upgrade`'s outcome specifically.
+           run: cargo test --workspace --no-fail-fast 2>&1 | tee run.log
+         - name: Classify this sample's result for each target test
+           if: always()
+           run: |
+             grep -E "upgrades_in_place_under_load_without_dropping|cache_stampede::swr_serves_stale_and_refreshes_in_background|sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times" run.log \
+               || echo "none of the three target tests produced a result line -- treat as missing, not passing, for this sample"
    ```
 
 2. **The isolated rerun (Tier 3, a narrower, cheaper, and strictly weaker
