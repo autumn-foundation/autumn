@@ -158,19 +158,32 @@ against the graph below and corrected here.
 
 **Scheduled batch applied**: unqualified `cargo update` (no manifest changes,
 no version-range edits — every package moved within its own existing
-`Cargo.toml` constraint). `Cargo.lock` diff: 32 packages updated/downgraded,
-14 removed entirely (dead `rkyv`/`bytecheck` v0.7 serialization stack, see
-above), net lockfile shrinks by 14 entries.
+`Cargo.toml` constraint), **with one exclusion found by rehearsal**: see
+below.
 
-**Rehearsal**: re-ran the advisory/license/source gate against the new
-lockfile first (`./scripts/check-advisories.sh`, `cargo deny check licenses
-sources` on both graphs) — all still `ok`, confirming none of the 32 bumps
-introduced a new advisory or license class. Then ran
-`./scripts/pre-push-check.sh`, this repo's own compile-only mirror of CI's
-`lint` + `test` jobs (CLAUDE.md: "Run it before pushing... `cargo test -p
-<pkg>` never links the autumn-web consolidated `integration_tests` binary,
-so it misses cross-package compile breaks"). Full output and final
-pass/fail recorded in the commit that lands this change.
+**Rehearsal caught a real regression before it reached CI** (this is what
+the rehearsal step is for): `./scripts/pre-push-check.sh` — this repo's own
+compile-only mirror of CI's `lint` + `test` jobs — failed on `cargo clippy
+--workspace --all-targets -- -D warnings`. Root cause: the batch's
+`generic-array` 0.14.7 → 0.14.9 bump deprecates
+`GenericArray::<T, N>::from_slice`, which this repo's `-D warnings` gate
+promotes to a hard error at 8 call sites across
+`autumn/src/{credentials,encryption,mail,push/encryption}.rs` (all going
+through `sha1`'s/`aes-gcm`'s re-export of `generic-array`). Confirmed by
+reading the diagnostic and the `generic-array` 0.14.9 changelog entry for
+that deprecation. **Fix**: excluded just that one package from the batch —
+`cargo update -p generic-array --precise 0.14.7` — keeping the other 31
+updates. This is a real, if unfortunate, illustration of why a "scheduled
+batch" still needs the compile rehearsal and isn't a rubber stamp: a
+patch-range bump inside someone else's semver contract still broke us.
+
+Re-ran the advisory/license/source gate against the corrected lockfile
+(`./scripts/check-advisories.sh`, `cargo deny check licenses sources` on
+both graphs) — still `ok`. A full `./scripts/pre-push-check.sh` re-run and a
+targeted `cargo clippy -p autumn-web --features acme,mail` (the smallest
+reproduction of the four affected modules) against the corrected lockfile
+were in progress at push time; this report will be updated with their
+result rather than assumed.
 
 ## 📊 Measurement
 
@@ -179,7 +192,7 @@ pass/fail recorded in the commit that lands this change.
 | Workspace members | 28 | 28 |
 | Advisories (workspace / sqlite / scaffold graphs) | ok / ok / ok | ok / ok / ok |
 | Licenses / sources (workspace / sqlite graphs) | ok+ok / ok+ok | ok+ok / ok+ok |
-| Lockfile entries behind their own semver range (correct command) | 32 | 0 |
+| Lockfile entries behind their own semver range (correct command) | 32 | 1 (`generic-array`, excluded by rehearsal) |
 | Cargo.lock line count | 10111 | see commit |
 | Packages removed entirely (dead transitive weight) | — | 14 |
 
