@@ -109,7 +109,7 @@ pub fn diff(base: &PostureManifest, head: &PostureManifest) -> Vec<Finding> {
     diff_authorization_policies(base, head, &mut findings);
     diff_csrf(base, head, &mut findings);
     diff_headers(base, head, &mut findings);
-    bind_to_effective_posture(&mut findings, head);
+    bind_to_effective_posture(&mut findings, base, head);
     findings.sort_by(|a, b| {
         a.severity
             .cmp(&b.severity)
@@ -134,42 +134,97 @@ pub fn diff(base: &PostureManifest, head: &PostureManifest) -> Vec<Finding> {
 /// rule one review round at a time, and every one of those fixes was me
 /// remembering a dimension rather than the code making it impossible to forget.
 /// A finding kind added later is covered without anyone remembering anything.
-fn bind_to_effective_posture(findings: &mut [Finding], head: &PostureManifest) {
+fn bind_to_effective_posture(
+    findings: &mut [Finding],
+    base: &PostureManifest,
+    head: &PostureManifest,
+) {
     let routes = route_index(head);
     let csrf = csrf_index(head);
     let bindings = authz_index(head);
+    let base_keys = route_keys(base);
+    let head_keys = route_keys(head);
 
     for finding in findings
         .iter_mut()
         .filter(|f| f.severity == Severity::Widening)
     {
         let key = (normalize_captures(&finding.path), finding.method.clone());
-        // Findings that name no single route — a collapsed csrf finding, a
-        // header, an exemption prefix — miss every lookup and keep the identity
-        // they built for themselves.
-        let posture = routes.get(&key).map_or_else(String::new, |entry| {
-            let enforced = csrf
-                .get(&key)
-                .map_or(
-                    "absent",
-                    |(enforced, ..)| {
-                        if *enforced { "csrf" } else { "no-csrf" }
-                    },
-                )
-                .to_owned();
-            let mut checks: Vec<String> = bindings
-                .keys()
-                .filter(|(path, method, _, _)| (path, method) == (&key.0, &key.1))
-                .map(|(_, _, action, resource)| format!("{action} on {resource}"))
-                .collect();
-            checks.sort();
-            checks.dedup();
-            escape_list(&[posture_fingerprint(entry), enforced, escape_list(&checks)])
-        });
+        let posture = match effective_posture(&key, &routes, &csrf, &bindings) {
+            Some(own) => own,
+            // The route the finding names is gone at head. Its URLs went
+            // somewhere, and *that* is what the reviewer is approving — so bind
+            // to the routes answering them now. Without this the one case where
+            // the whole posture moved wholesale was the one case it bound
+            // nothing, and the replacement could shed a scope afterwards with
+            // the finding's identity unmoved.
+            None if base_keys.contains(&key) => {
+                let mut inherited: Vec<String> = takers((&key.0, &key.1), &base_keys, &head_keys)
+                    .iter()
+                    .filter_map(|taker| {
+                        effective_posture(taker, &routes, &csrf, &bindings).map(|posture| {
+                            escape_list(&[taker.1.clone(), taker.0.clone(), posture])
+                        })
+                    })
+                    .collect();
+                inherited.sort();
+                // Nothing took the URLs: they 404 now, and there is no posture
+                // to bind to. Left empty rather than folding in a constant, so
+                // a plain deletion keeps the identity it had.
+                if inherited.is_empty() {
+                    String::new()
+                } else {
+                    escape_list(&inherited)
+                }
+            }
+            // Findings that name no single route — a collapsed csrf finding, a
+            // header, an exemption prefix — miss every lookup and keep the
+            // identity they built for themselves.
+            None => String::new(),
+        };
         if !posture.is_empty() {
             finding.fingerprint = escape_list(&[finding.fingerprint.clone(), posture]);
         }
     }
+}
+
+/// One route's whole posture at head: its guards, its CSRF state, its checks.
+///
+/// `None` when the manifest does not mount the route, which is the caller's cue
+/// that the question has to be asked of whatever inherited its URLs.
+fn effective_posture(
+    key: &RouteKey,
+    routes: &BTreeMap<RouteKey, RouteEntry>,
+    csrf: &BTreeMap<RouteKey, (bool, bool, String)>,
+    bindings: &BTreeMap<AuthzKey, String>,
+) -> Option<String> {
+    let entry = routes.get(key)?;
+    let enforced = csrf
+        .get(key)
+        .map_or(
+            "absent",
+            |(enforced, ..)| {
+                if *enforced { "csrf" } else { "no-csrf" }
+            },
+        )
+        .to_owned();
+    Some(escape_list(&[
+        posture_fingerprint(entry),
+        enforced,
+        escape_list(&checks_at(key, bindings)),
+    ]))
+}
+
+/// The `#[authorize]` checks one route performs, sorted and deduplicated.
+fn checks_at(key: &RouteKey, bindings: &BTreeMap<AuthzKey, String>) -> Vec<String> {
+    let mut checks: Vec<String> = bindings
+        .keys()
+        .filter(|(path, method, _, _)| (path, method) == (&key.0, &key.1))
+        .map(|(_, _, action, resource)| format!("{action} on {resource}"))
+        .collect();
+    checks.sort();
+    checks.dedup();
+    checks
 }
 
 /// Only the findings that block.
@@ -1198,6 +1253,8 @@ fn diff_authorization_policies(
 fn report_csrf_loss(
     lost: BTreeMap<RouteKey, (String, bool, RouteKey)>,
     head_routes: &BTreeMap<RouteKey, RouteEntry>,
+    head_csrf: &BTreeMap<RouteKey, (bool, bool, String)>,
+    head_bindings: &BTreeMap<AuthzKey, String>,
     collapse: bool,
     out: &mut Vec<Finding>,
 ) {
@@ -1210,16 +1267,18 @@ fn report_csrf_loss(
         // capture changes neither the URL set that lost CSRF nor what a
         // reviewer acknowledged about it.
         // Each route *and what still guards it*, for the same reason the
-        // per-route fingerprint carries it.
+        // per-route fingerprint carries it. The whole posture, not just the
+        // `RouteEntry` half: this finding names `*`, so the pass that folds
+        // head posture into every other widening skips it and a record check
+        // swapped for a weaker one would be invisible behind `policy: true`.
         let guarded_keys: Vec<String> = lost
             .iter()
             .map(|((path, method), (_, _, inheritor))| {
                 escape_list(&[
                     method.clone(),
                     path.clone(),
-                    head_routes
-                        .get(inheritor)
-                        .map_or_else(String::new, posture_fingerprint),
+                    effective_posture(inheritor, head_routes, head_csrf, head_bindings)
+                        .unwrap_or_default(),
                 ])
             })
             .collect();
@@ -1278,6 +1337,20 @@ fn exempts(prefix: &str, path: &str) -> bool {
         .is_some_and(|rest| prefix.ends_with('/') || rest.starts_with('/'))
 }
 
+/// Whether any URL a route template matches falls under an exemption prefix.
+///
+/// The prefix is a concrete URL prefix and the template is a shape, so the
+/// question is whether the two intersect — `/api/me` exempts `/api/{id}` for
+/// exactly the request `/api/me`, which is the whole reason the per-route row
+/// keeps saying "enforced" while those requests stop being validated. Either
+/// the prefix names the route's own URLs or it sits above them, hence the
+/// catch-all form.
+fn exempts_shape(prefix: &str, template: &str) -> bool {
+    let prefix = normalize_captures(prefix);
+    intersect(template, &prefix).is_some()
+        || intersect(template, &format!("{prefix}/{CATCH_ALL}")).is_some()
+}
+
 /// Configured exemption prefixes, which the per-route rows cannot show.
 ///
 /// The audit asks whether a route *template* matches a prefix; the runtime asks
@@ -1304,6 +1377,22 @@ fn diff_csrf_exemptions(base: &PostureManifest, head: &PostureManifest, out: &mu
         .collect();
 
     if !added.is_empty() {
+        // And what those URLs are still checked by. An exemption acknowledgment
+        // says "I accept that these skip CSRF", which is a statement about the
+        // rest of their posture — and no per-route row can show the exemption,
+        // so loosening the routes it covers moves nothing else in the diff.
+        let routes = route_index(head);
+        let csrf = csrf_index(head);
+        let bindings = authz_index(head);
+        let mut guards: Vec<String> = routes
+            .keys()
+            .filter(|(path, _)| added.iter().any(|prefix| exempts_shape(prefix, path)))
+            .filter_map(|key| {
+                effective_posture(key, &routes, &csrf, &bindings)
+                    .map(|posture| escape_list(&[key.1.clone(), key.0.clone(), posture]))
+            })
+            .collect();
+        guards.sort();
         out.push(Finding {
             kind: "csrf_exemption_added",
             severity: Severity::Widening,
@@ -1311,7 +1400,10 @@ fn diff_csrf_exemptions(base: &PostureManifest, head: &PostureManifest, out: &mu
             path: "*".to_owned(),
             before: "not exempt".to_owned(),
             after: added.join(", "),
-            fingerprint: format!("csrf-exempt-added:{}", escape_list(&added)),
+            fingerprint: format!(
+                "csrf-exempt-added:{}",
+                escape_list(&[escape_list(&added), escape_list(&guards)])
+            ),
             detail: format!(
                 "CSRF validation is now skipped for {}, which the per-route rows cannot show: \
                  the audit matches a prefix against a route template, the runtime against the \
@@ -1521,7 +1613,14 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
     let collapse = after.values().all(|(enforced, ..)| !enforced)
         && before.values().any(|entry| entry.0)
         && lost.len() > 1;
-    report_csrf_loss(lost, &head_routes, collapse, out);
+    report_csrf_loss(
+        lost,
+        &head_routes,
+        &after,
+        &authz_index(head),
+        collapse,
+        out,
+    );
 
     for ((_, method), path) in gained {
         out.push(Finding {
@@ -3931,5 +4030,120 @@ mod tests {
         // `findings_do_not_depend_on_manifest_entry_order` for the property
         // that actually matters.
         assert_eq!(findings, diff(&base, &head));
+    }
+    /// A finding names the route the *base* had. When that route is gone at
+    /// head, the whole-posture binding found nothing to fold in — precisely the
+    /// case where the reviewer most needs it, because everything about the
+    /// route they approved now lives on a different one. `checks_on` already
+    /// carried the replacement's `#[authorize]` bindings, so the gap was the
+    /// rest of its posture: the replacement could shed a scope afterwards
+    /// without moving the digest.
+    #[test]
+    fn a_transferred_finding_binds_to_the_route_that_inherits_the_urls() {
+        let base = manifest(
+            &format!(
+                "{},{}",
+                route("/records/me", "POST", "gated", &["admin"], &[], true),
+                route("/records/{id}", "POST", "gated", &["admin"], &[], true),
+            ),
+            "",
+            "",
+            r#"{"path":"/records/me","method":"POST","name":"h","action":"read_self","resource":"Record","provenance":"provable"}"#,
+        );
+        let replacement_requiring = |scopes: &[&str]| {
+            diff(
+                &base,
+                &manifest(
+                    &route("/records/{id}", "POST", "gated", &["admin"], scopes, true),
+                    "",
+                    "",
+                    r#"{"path":"/records/{id}","method":"POST","name":"h","action":"read_any","resource":"Record","provenance":"provable"}"#,
+                ),
+            )
+            .into_iter()
+            .filter(|f| f.severity == Severity::Widening)
+            .map(|f| f.canonical())
+            .collect::<Vec<_>>()
+        };
+
+        assert_ne!(
+            replacement_requiring(&["mfa"]),
+            replacement_requiring(&[]),
+            "dropping the replacement's scope has to re-ask"
+        );
+    }
+
+    /// The collapsed CSRF finding names no route, so the whole-posture pass
+    /// skips it and its own fingerprint has to carry everything. It carried
+    /// each route's `RouteEntry` posture — in which a record check is the bare
+    /// `policy: true` — so swapping one `#[authorize]` check for another left
+    /// the digest still.
+    #[test]
+    fn the_collapsed_csrf_fingerprint_carries_each_routes_bindings() {
+        let base = manifest(
+            &format!(
+                "{},{}",
+                route("/a", "POST", "gated", &["admin"], &[], true),
+                route("/b", "POST", "gated", &["admin"], &[], true),
+            ),
+            r#"{"path":"/a","method":"POST","csrf_enforced":true,"exempt":false},
+               {"path":"/b","method":"POST","csrf_enforced":true,"exempt":false}"#,
+            "",
+            r#"{"path":"/a","method":"POST","name":"h","action":"read","resource":"Record","provenance":"provable"}"#,
+        );
+        let checked_by = |action: &str| {
+            diff(
+                &base,
+                &manifest(
+                    &format!(
+                        "{},{}",
+                        route("/a", "POST", "gated", &["admin"], &[], true),
+                        route("/b", "POST", "gated", &["admin"], &[], true),
+                    ),
+                    r#"{"path":"/a","method":"POST","csrf_enforced":false,"exempt":false},
+                       {"path":"/b","method":"POST","csrf_enforced":false,"exempt":false}"#,
+                    "",
+                    &format!(
+                        r#"{{"path":"/a","method":"POST","name":"h","action":"{action}","resource":"Record","provenance":"provable"}}"#
+                    ),
+                ),
+            )
+            .into_iter()
+            .find(|f| f.kind == "csrf_disabled")
+            .expect("csrf off everywhere collapses")
+            .canonical()
+        };
+
+        assert_ne!(checked_by("read"), checked_by("read_any"));
+    }
+
+    /// An exemption acknowledgment says "I accept that these URLs skip CSRF" —
+    /// which is a statement about what still guards them. The per-route rows
+    /// cannot show the exemption at all (that is why the finding exists), so
+    /// nothing else in the diff moves when the routes it covers are loosened
+    /// afterwards.
+    #[test]
+    fn an_exemption_acknowledgment_binds_to_the_routes_it_exempts() {
+        let base = manifest_exempt(
+            &route("/api/{id}", "POST", "gated", &["admin"], &["mfa"], false),
+            r#"{"path":"/api/{id}","method":"POST","csrf_enforced":true,"exempt":false}"#,
+            &[],
+        );
+        let exempting_with = |scopes: &[&str]| {
+            diff(
+                &base,
+                &manifest_exempt(
+                    &route("/api/{id}", "POST", "gated", &["admin"], scopes, false),
+                    r#"{"path":"/api/{id}","method":"POST","csrf_enforced":true,"exempt":false}"#,
+                    &["/api/me"],
+                ),
+            )
+            .into_iter()
+            .find(|f| f.kind == "csrf_exemption_added")
+            .expect("a new exemption is a widening")
+            .canonical()
+        };
+
+        assert_ne!(exempting_with(&["mfa"]), exempting_with(&[]));
     }
 }
