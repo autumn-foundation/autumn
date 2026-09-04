@@ -509,6 +509,31 @@ longer be accepted as stable convergence. Re-ran 4 more times (56 total
 across all fourteen passes) — all pass. See **Assay**. Verdict is
 unchanged.
 
+**A twenty-third P2 finding**, on the revision-14 diff above, specifically
+on the twentieth correction's own hard-deadline fix: the completing-streak
+branch classified `LateConverged` vs `Diverged` by comparing the
+*completion* time (the instant the required 6th consecutive observation
+lands) against the hard deadline — but a streak that *began* agreeing
+before the hard deadline and simply took past it to accumulate all 6
+required observations (for example agreement starting at 29s against a
+30s hard deadline, with the confirming 6th read landing at 30.25s) was
+misclassified `Diverged`, even though the views had been continuously
+agreeing since before the deadline. That's the exact opposite of the
+pre-registration's own definition of divergence ("views still disagree at
+3x the timeout") and directly undercuts what the twentieth correction was
+supposed to guarantee (letting an in-progress positive streak finish
+rather than killing it mid-stream). Like the twentieth and twenty-first
+findings, this is an edge case at a deadline boundary that none of the 56
+runs so far had exercised. Fixed: the loop now records when the *current*
+streak began (`streak_start`, cleared whenever a streak breaks); the
+completing branch classifies `LateConverged` vs `Diverged` by whether
+that start time is at-or-before the hard deadline — meaning agreement was
+already holding by then, however long full confirmation took — rather
+than by the completion timestamp, correctly reserving `Diverged` for a
+streak that only *began* after the hard deadline (genuine persisted
+disagreement). Re-ran 4 more times (60 total across all fifteen passes)
+— all pass. See **Assay**. Verdict is unchanged.
+
 ## 🧪 Apparatus
 
 One throwaway test file, `autumn/tests/prospect_cluster_scale.rs` (a
@@ -545,14 +570,17 @@ returns a tri-state `ConvergenceOutcome` — `Converged` inside its timeout,
 `LateConverged` inside 3x the timeout (reported, not failed — the
 pre-registration's own "undetermined-on-the-line" case, ninth correction
 above), or `Diverged` past 3x (a real failure) — rather than plain
-pass/fail; the completed-streak branch checks both deadlines explicitly,
-so a streak that only finishes past the 3x line is correctly `Diverged`,
-not `LateConverged` (sixteenth correction — the standalone hard-deadline
-check elsewhere in the loop is dead code for that specific case); that
-standalone check itself now only fires when a streak just broke, not
-while a positive streak is in progress, so an already-agreeing view can't
-be killed mid-streak solely because the clock crossed the hard deadline
-(twentieth correction). **Two independent watchdogs** guard the whole test body: the
+pass/fail; the completed-streak branch classifies `LateConverged` vs
+`Diverged` by whether the *current streak's start time* is at-or-before
+the hard deadline, not by how long the streak's own confirmation
+happened to take afterward (twenty-third correction — using the
+completion timestamp instead misclassified a streak that began agreeing
+before the deadline, and simply needed the rest of its debounce window
+to confirm, as `Diverged`); the standalone hard-deadline check elsewhere
+in the loop only fires when a streak just broke, not while a positive
+streak is in progress, so an already-agreeing view can't be killed
+mid-streak solely because the clock crossed the hard deadline (twentieth
+correction). **Two independent watchdogs** guard the whole test body: the
 primary one runs `run_assay()` on its own spawned Tokio task with the 60s
 `TOTAL_TEST_TIMEOUT` waiting on that task's `JoinHandle` (tenth
 correction — a bare `tokio::time::timeout` around the future directly
@@ -841,41 +869,55 @@ passes):
 | 55 | all steps + stable-id rejoin + snapshot-consistent membership pass | 13.09s |
 | 56 | all steps + stable-id rejoin + snapshot-consistent membership pass | 13.08s |
 
-**Against the pre-registered lines (fourteenth pass, the one whose code
+**N=5 assay, fifteenth pass, 4 more runs** (after classifying a completing
+streak's `LateConverged`/`Diverged` outcome by when the streak *began*
+relative to the hard deadline, not by when its confirmation happened to
+finish; 60 total runs across all fifteen passes):
+
+| Run | Result | Wall-clock |
+|---|---|---:|
+| 57 | all steps + stable-id rejoin + streak-start-based classification pass | 13.08s |
+| 58 | all steps + stable-id rejoin + streak-start-based classification pass | 13.09s |
+| 59 | all steps + stable-id rejoin + streak-start-based classification pass | 13.33s |
+| 60 | all steps + stable-id rejoin + streak-start-based classification pass | 13.09s |
+
+**Against the pre-registered lines (fifteenth pass, the one whose code
 actually enforces every bound as registered — the whole-test 60s kill
 line via two independent watchdogs (the native one correctly armed
 through the assay, through bounded runtime teardown, *and* refusing to
 disarm on an exhausted teardown budget), a debounce window whose *last
 read* strictly clears the protocol's own timers and is classified before
 any trailing sleep against both the soft and hard deadlines without
-killing an in-progress positive streak, genuinely concurrent increments,
-full `(id, addr, incarnation)` membership agreement read from a single
+killing an in-progress positive streak and without misclassifying one
+that began before the hard deadline as `Diverged` just because
+confirmation finished after it, genuinely concurrent increments, full
+`(id, addr, incarnation)` membership agreement read from a single
 snapshot per observation, a genuine same-identity rejoin, and the
 pre-registration's own tri-state classification — see notes on Step 2,
 Step 3, and Step 4 below for why earlier passes' runs still count as
 evidence despite bugs or claim gaps in that code):**
 
 - **Step 1 (cold-start convergence, line: ≤10s):** passed (`Converged`, not
-  `LateConverged`) on 56/56 runs across all fourteen passes. The
-  seventh-through-fourteenth passes' ~12.8-15.6s *total* run time is the
+  `LateConverged`) on 60/60 runs across all fifteen passes. The
+  seventh-through-fifteenth passes' ~12.8-15.6s *total* run time is the
   sum of 9 mandatory debounce windows, not slower convergence — no single
   phase check came close to its own 5s/10s bound; still roughly 3-8x
   inside the tightest of those, not a close call the way the cold-start
   ledger's margins were. **Caveat on runs 1-40:** those compared only
   `ClusterMemberInfo::id` across nodes, not the full `(id, addr,
-  incarnation)` triple — flagged here; only runs 41-56 (eleventh through
-  fourteenth passes) are code-verified to have checked the fuller
-  identity. **Caveat on runs 1-52:** those read each handle's `members()`
-  twice per observation (once for cardinality, once for identity), so a
-  membership transition landing between the two reads could in principle
-  have been accepted as one stable observation — never actually observed
-  to happen in any of those 52 runs, but not code-ruled-out either; only
-  runs 53-56 (fourteenth pass) are code-verified to derive both checks
-  from a single snapshot. All 56 runs did converge to agreeing id sets
-  either way.
+  incarnation)` triple — flagged here; only runs 41-60 (eleventh through
+  fifteenth passes) are code-verified to have checked the fuller identity.
+  **Caveat on runs 1-52:** those read each handle's `members()` twice per
+  observation (once for cardinality, once for identity), so a membership
+  transition landing between the two reads could in principle have been
+  accepted as one stable observation — never actually observed to happen
+  in any of those 52 runs, but not code-ruled-out either; only runs 53-60
+  (fourteenth and fifteenth passes) are code-verified to derive both
+  checks from a single snapshot. All 60 runs did converge to agreeing id
+  sets either way.
 
 - **Step 2 (counter merge, line: exact sum 15 on every node, ≤10s):**
-  passed (`Converged`) on 56/56 runs, stability-checked since run 9
+  passed (`Converged`) on 60/60 runs, stability-checked since run 9
   (widened debounce since run 21, 6-observation debounce since run 25,
   pre-sleep classification since run 33, hard-deadline-checked completion
   since run 37), with a membership recheck immediately after confirming
@@ -884,54 +926,61 @@ evidence despite bugs or claim gaps in that code):**
   same `assert_stable_membership`. **Caveat on runs 1-28:** the increments
   driving this check were issued by a plain sequential loop, not
   genuinely concurrently — flagged here, not silently used as evidence for
-  the "concurrent" claim; only runs 29-56 (eighth through fourteenth
+  the "concurrent" claim; only runs 29-60 (eighth through fifteenth
   passes) are code-verified to have actually issued all 5 increments
-  concurrently (barrier-synced spawned tasks). All 56 runs, including
+  concurrently (barrier-synced spawned tasks). All 60 runs, including
   1-28, did read the exact sum 15 — so the merge-correctness evidence
   stands regardless, it's specifically the *concurrency* of the input
-  that only runs 29-56 can back.
+  that only runs 29-60 can back.
 - **Step 3 (departure, line: 4-member view on survivors, ≤5s, AND exact sum
-  15 still held on all 4 survivors):** passed (`Converged`) on 56/56 runs —
-  the counter half ran in runs 5-56, held on 52/52 of those; the stability
-  debounce and post-counter membership recheck ran in runs 9-56, held on
-  48/48 (subject to the same runs-1-52 membership-snapshot caveat above).
+  15 still held on all 4 survivors):** passed (`Converged`) on 60/60 runs —
+  the counter half ran in runs 5-60, held on 56/56 of those; the stability
+  debounce and post-counter membership recheck ran in runs 9-60, held on
+  52/52 (subject to the same runs-1-52 membership-snapshot caveat above).
   **Caveat on runs 9-12 specifically:** those ran before the fourth
   correction, so their code was actually bounded by the 10s
   `CONVERGE_TIMEOUT`, not the registered 5s `DEPARTURE_TIMEOUT` — the
   *test* didn't enforce the right line, even though it still passed. This
   is not silently swept in as clean evidence for the 5s bound: it's
-  flagged here, and only runs 13-56 (fourth through fourteenth passes) are
-  code-verified to have actually been gated at 5s. All 56 runs, including
+  flagged here, and only runs 13-60 (fourth through fifteenth passes) are
+  code-verified to have actually been gated at 5s. All 60 runs, including
   9-12, did *empirically* complete step 3 in well under 5s either way — so
   the wall-clock evidence itself still supports the line; only the earlier
   code's enforcement of that specific line was what was broken, not the
   measured outcome.
 - **Step 4 (rejoin, line: 5-member view, ≤10s, AND exact sum 15 relearned
-  by the rejoined node):** passed (`Converged`) on 56/56 runs — counter half
-  held on 52/52 (runs 5-56), stability + post-counter recheck held on 48/48
-  (runs 9-56, subject to the same runs-1-52 membership-snapshot caveat
+  by the rejoined node):** passed (`Converged`) on 60/60 runs — counter half
+  held on 56/56 (runs 5-60), stability + post-counter recheck held on 52/52
+  (runs 9-60, subject to the same runs-1-52 membership-snapshot caveat
   above), all correctly bounded at 10s throughout (this step was never
   affected by the Step 3 timeout bug). **Caveat on runs 1-44:** the
   "rejoined" node in those runs actually got a fresh, entropy-derived id —
   a new member joining, not the departed node genuinely coming back;
   flagged here, not silently used as evidence for the "rejoin" claim; only
-  runs 45-56 (twelfth through fourteenth passes) are code-verified (via a
+  runs 45-60 (twelfth through fifteenth passes) are code-verified (via a
   direct `handle_rejoin.node_id() == departed_node_id` assertion) to test
-  a genuine same-identity rejoin. All 56 runs did reconverge to a correct
+  a genuine same-identity rejoin. All 60 runs did reconverge to a correct
   5-member view either way — it's specifically the *rejoin-vs-new-member*
-  distinction that only runs 45-56 can back.
+  distinction that only runs 45-60 can back.
 - **Undetermined-on-the-line classification (`LateConverged`):** never
-  triggered in any of the 56 runs — every check reached `Converged` well
+  triggered in any of the 60 runs — every check reached `Converged` well
   inside its `timeout`, so the pre-registration's third outcome remains
   implemented but empirically unexercised. The apparatus now has the
   capacity to report it (including correctly deferring to `Diverged` past
-  the hard deadline, and correctly letting an in-progress positive streak
-  finish instead of killing it mid-streak at the hard deadline), but this
-  assay's own data never approaches either boundary closely enough to
-  demonstrate any of these paths firing.
+  the hard deadline, correctly letting an in-progress positive streak
+  finish instead of killing it mid-streak at the hard deadline, and —
+  since run 57 — correctly classifying a streak that began before the
+  hard deadline as `LateConverged` rather than `Diverged` regardless of
+  how long its own confirmation took), but this assay's own data never
+  approaches either boundary closely enough to demonstrate any of these
+  paths firing. Notably, had the twenty-third defect ever fired on a real
+  run, it would have shown up as a *false test failure* (an incorrect
+  `Diverged` panic), not a silently-wrong pass — so its absence from runs
+  1-56 is not itself evidence the classification was right, only that no
+  run's timing happened to land in the narrow window where it mattered.
 - **Whole-test 60s kill line:** enforced by two independent watchdogs since
   run 25 — the Tokio-scheduled one waiting on a spawned task's
-  `JoinHandle` (runs 21-56; a bare wrapper around the future directly,
+  `JoinHandle` (runs 21-60; a bare wrapper around the future directly,
   runs 17-20, is cooperative and can't preempt a genuine synchronous-lock
   deadlock) and a native `std::thread` outside the Tokio runtime entirely,
   correctly armed throughout its full window since run 33 (runs 25-32 had
@@ -950,7 +999,7 @@ evidence despite bugs or claim gaps in that code):**
 - **Kill-line check:** zero divergent views, zero wrong counter values,
   zero panics/timeouts/hangs, zero `Diverged` outcomes, zero
   `LateConverged` outcomes, zero watchdog trips (Tokio-scheduled *or*
-  native) across all 56 runs. The "2 of 3 repeats" kill-line threshold was
+  native) across all 60 runs. The "2 of 3 repeats" kill-line threshold was
   never approached in either direction — this result is not a marginal
   call the way the cold-start bisection's sub-5,000ms deltas were; every
   margin here has roughly 3-25x headroom against its line, so ordinary
@@ -964,19 +1013,19 @@ distinct claims, backed by different slices of the evidence, and they
 should not be collapsed into one "held on every run" sentence.
 
 **Claim 1 — no failure mode was ever observed.** This is uniform across
-the full history: all fourteen passes (56 runs total, 4 per pass), every
+the full history: all fifteen passes (60 runs total, 4 per pass), every
 one of which exercised cold-start convergence, some form of
 departure/rejoin convergence, and the whole-test kill line, produced
 `Converged` and never `LateConverged` or `Diverged`, with comfortable
 margin against every bound — not a photo finish. No kill-line condition
 was observed on any run, at any pass. This claim is fully supported by
-all 56 runs.
+all 60 runs.
 
 **Claim 2 — the final, fully-corrected apparatus cleanly passes every
 registered criterion at once**, matching exactly what the guide edit
 below now cites. This is measured evidence specifically from the
-fourteenth pass's 4/4 runs, because the first thirteen passes each tested
-a progressively weaker version of the same assay (per the twenty-two
+fifteenth pass's 4/4 runs, because the first fourteen passes each tested
+a progressively weaker version of the same assay (per the twenty-three
 corrections above): the pre-churn increments are genuinely concurrent
 (barrier-synced spawned tasks, not a sequential loop) only from the
 eighth pass on; membership agreement is checked on the full `(id, addr,
@@ -984,31 +1033,32 @@ incarnation)` identity the design actually converges (not bare ids,
 with `status` deliberately excluded as a documented, not-replicated
 local overlay) only from the eleventh pass on, and derived from a single
 `members()` snapshot per observation rather than two separately-read
-ones only from the fourteenth pass; the step-4 "rejoin" genuinely reuses
-the departed node's own identity (asserted directly, not a fresh
+ones only from the fourteenth pass on; the step-4 "rejoin" genuinely
+reuses the departed node's own identity (asserted directly, not a fresh
 entropy-derived member) only from the twelfth pass on; the departure
 bound is code-gated at the registered 5s, not a silently-inherited 10s,
-only from the fourth pass on (44 of the 56 runs, though the wall-clock
-evidence supports it across all 56); every convergence/counter
+only from the fourth pass on (48 of the 60 runs, though the wall-clock
+evidence supports it across all 60); every convergence/counter
 observation holding across a debounce window whose *last read* — not a
 naive window-length arithmetic — strictly clears the protocol's own
 gossip and suspicion timers, classified immediately upon that read
-rather than after an unconditional trailing sleep, and correctly checked
+rather than after an unconditional trailing sleep, correctly checked
 against both the soft and hard deadlines on the deciding iteration
-without killing an in-progress positive streak mid-way, is only true
-from the thirteenth pass on; and the whole test running behind two
-independent 60s watchdogs — a Tokio-scheduled one and a native
-OS-thread one that cannot be starved by the same deadlock the first
-could theoretically miss on a single-worker runtime — both armed
-through bounded runtime teardown as well as the assay body itself,
-rather than disarming the instant the cooperative watchdog's own await
-resolves, and refusing to disarm on an exhausted teardown budget rather
-than trusting `shutdown_timeout`'s return alone, is only true from the
-thirteenth pass on. So claim 2 — the one the guide text actually asserts
-("no divergence," stable identical views, exact sums through concurrent
-churn, a genuine rejoin, measured by an apparatus whose own
-instrumentation is trustworthy) — is supported specifically by the
-fourteenth pass's 4/4 runs, not by all 56.
+without killing an in-progress positive streak mid-way, and classifying
+a completing streak by when it *began* relative to the hard deadline
+rather than by when its confirmation finished, is only true from the
+fifteenth pass; and the whole test running behind two independent 60s
+watchdogs — a Tokio-scheduled one and a native OS-thread one that cannot
+be starved by the same deadlock the first could theoretically miss on a
+single-worker runtime — both armed through bounded runtime teardown as
+well as the assay body itself, rather than disarming the instant the
+cooperative watchdog's own await resolves, and refusing to disarm on an
+exhausted teardown budget rather than trusting `shutdown_timeout`'s
+return alone, is only true from the thirteenth pass on. So claim 2 — the
+one the guide text actually asserts ("no divergence," stable identical
+views, exact sums through concurrent churn, a genuine rejoin, measured
+by an apparatus whose own instrumentation is trustworthy) — is supported
+specifically by the fifteenth pass's 4/4 runs, not by all 60.
 
 Within the scope this assay actually tested (single host, single
 process, star topology, honest peers, N=5, correctness not
@@ -1058,7 +1108,7 @@ peers, one churn cycle":
 
 The apparatus was never committed (per this ledger's containment rule, it
 is reverted before the report is finalized), so its exact source (revision
-14, post all twenty-two Codex corrections above) is embedded below rather
+15, post all twenty-three Codex corrections above) is embedded below rather
 than referenced by history. This is now the durable artifact.
 
 1. Add this entry to `autumn/Cargo.toml`, immediately after the existing
@@ -1084,34 +1134,38 @@ than referenced by history. This is now the durable artifact.
    //! `[[test]]` Cargo.toml entry are reverted after the assay runs — its
    //! source is embedded verbatim in the report's Reproduce section instead.
    //!
-   //! Revisions 2-13: see the report's Correction sections for the full
+   //! Revisions 2-14: see the report's Correction sections for the full
    //! history (counter re-verified through churn; debounced, yield-safe,
    //! deadline-aware stability checks spanning the protocol's own timers,
-   //! classified before any trailing sleep and checked against both the soft
-   //! and hard deadlines on the deciding read without killing an in-progress
-   //! positive streak; a tri-state Converged/LateConverged/Diverged outcome; a
-   //! phase-specific departure timeout; dual watchdogs (Tokio-scheduled +
-   //! native OS thread, the latter armed until genuine task completion,
-   //! including through bounded runtime teardown, and refusing to disarm if
-   //! that teardown itself exhausts its budget); genuinely concurrent,
-   //! barrier-synced counter increments; membership agreement on the full
-   //! `(id, addr, incarnation)` identity, not bare ids; a genuine
-   //! same-identity rejoin).
+   //! classified before any trailing sleep; a tri-state
+   //! Converged/LateConverged/Diverged outcome; a phase-specific departure
+   //! timeout; dual watchdogs (Tokio-scheduled + native OS thread, the
+   //! latter armed until genuine task completion, including through bounded
+   //! runtime teardown, and refusing to disarm if that teardown itself
+   //! exhausts its budget); genuinely concurrent, barrier-synced counter
+   //! increments; membership agreement on the full `(id, addr, incarnation)`
+   //! identity, read from a single snapshot per observation, not bare ids
+   //! read twice; a genuine same-identity rejoin).
    //!
-   //! Revision 14 (one more Codex P2 finding on the revision-13 diff):
-   //! - `assert_stable_membership`'s condition read each handle's `members()`
-   //!   twice per observation: once in the cardinality (`len() ==
-   //!   expected_n`) loop, and again — separately, per handle — inside
-   //!   `member_identities()` for the identity comparison. Live membership
-   //!   could change between those two reads (e.g. an eviction landing
-   //!   between the length pass and the identity pass), so an observation
-   //!   could validate cardinality against one snapshot and identity
-   //!   agreement against a different, later one — accepting a transition as
-   //!   a single stable read. Fixed: each handle's `members()` is now read
-   //!   exactly once per observation into a local snapshot; both the
-   //!   cardinality check and the identity comparison are derived from that
-   //!   same snapshot, so a transition between the two checks can no longer
-   //!   be accepted as stable convergence.
+   //! Revision 15 (one more Codex P2 finding on the revision-14 diff, on the
+   //! revision-13 hard-deadline fix specifically): the completing-streak
+   //! branch classified `LateConverged` vs `Diverged` by comparing the
+   //! *completion* time (`now`, the instant the STABLE_CHECKS-th observation
+   //! lands) against `hard_deadline`. But a streak that *began* before the
+   //! hard deadline and simply took past it to accumulate all required
+   //! observations (e.g. agreement starting at 29s, hard deadline at 30s,
+   //! the confirming 6th read landing at 30.25s) was misclassified
+   //! `Diverged` even though the views had been continuously agreeing since
+   //! before the deadline — the opposite of what "views still disagree at
+   //! 3x the timeout" (the pre-registration's own definition of divergence)
+   //! describes. Fixed: the loop now records when the *current* streak
+   //! began (`streak_start`, reset to `None` whenever a streak breaks); the
+   //! completing branch classifies `LateConverged` vs `Diverged` by whether
+   //! that start time is at-or-before the hard deadline (agreement already
+   //! held by then, however long confirmation took) rather than by the
+   //! completion timestamp — correctly reserving `Diverged` for a streak
+   //! that only *began* after the hard deadline, meaning disagreement did
+   //! persist through that instant.
 
    use std::sync::Arc;
    use std::sync::atomic::{AtomicBool, Ordering};
@@ -1167,10 +1221,16 @@ than referenced by history. This is now the durable artifact.
 
    /// Debounced poll: `condition` must return `true` on `STABLE_CHECKS`
    /// consecutive observations, `STABLE_GAP` apart. Classification happens
-   /// immediately after each read, before any sleep, and — on the iteration
-   /// where the streak actually completes — checks *both* the soft and hard
-   /// deadlines explicitly. The hard deadline is only checked when a streak
-   /// just broke, not while a positive streak is in progress — letting an
+   /// immediately after each read, before any sleep. `streak_start` tracks
+   /// when the *current* streak began (revision 15): the completing branch
+   /// classifies `LateConverged` vs `Diverged` by whether agreement was
+   /// already holding at the hard deadline (`streak_start <= hard_deadline`),
+   /// not by how long confirmation happened to take afterward — a streak
+   /// that began before the hard deadline and simply needed more time to
+   /// confirm is not the same as one that only started agreeing after
+   /// disagreement had already persisted past the deadline. The hard
+   /// deadline is otherwise only checked when a streak just broke, not
+   /// while a positive streak is in progress (revision 13) — letting an
    /// already-agreeing view finish being classified by the completing-streak
    /// branch instead of being killed mid-streak solely because the clock
    /// crossed the line.
@@ -1183,15 +1243,20 @@ than referenced by history. This is now the durable artifact.
        let soft_deadline = start + timeout;
        let hard_deadline = start + timeout * DIVERGENCE_MULTIPLIER;
        let mut streak: u32 = 0;
+       let mut streak_start: Option<tokio::time::Instant> = None;
        loop {
            let ok = condition().await;
            let now = tokio::time::Instant::now();
            if ok {
+               if streak == 0 {
+                   streak_start = Some(now);
+               }
                streak += 1;
                if streak >= STABLE_CHECKS {
+                   let began = streak_start.expect("streak_start is set on the first positive read");
                    return if now <= soft_deadline {
                        ConvergenceOutcome::Converged
-                   } else if now < hard_deadline {
+                   } else if began <= hard_deadline {
                        ConvergenceOutcome::LateConverged {
                            elapsed: now - start,
                        }
@@ -1201,6 +1266,7 @@ than referenced by history. This is now the durable artifact.
                }
            } else {
                streak = 0;
+               streak_start = None;
                if now >= hard_deadline {
                    return ConvergenceOutcome::Diverged;
                }
