@@ -1159,8 +1159,15 @@ def _payload_span(text):
     if not spans or _shell_named(text[spans[0][0]:spans[0][1]]) not in DOCKER_SHELLS:
         return None
     for n, (start, end) in enumerate(spans[1:], 1):
-        if _command_option(text[start:end]):
+        word = text[start:end]
+        if _command_option(word):
             return spans[n + 1] if n + 1 < len(spans) else None
+        # An OPERAND ends option parsing: `bash script -c 'x'` runs `script`
+        # and hands it `-c` and `x` as arguments — verified against bash. So
+        # does an explicit `--`. Scanning every word for a `-c` anywhere made
+        # a script's own argument look like a command string.
+        if word == '--' or not word.startswith('-'):
+            return None
     return None
 
 
@@ -2720,8 +2727,31 @@ ENV_BOUND = re.compile(r'\b([a-z_]\w*)\s*:\s*[^,;{}()=]*\bEnv\b')
 # What a file imports by name, so a module-scoped derivation can be resolved
 # where it is USED and not only where it is written.
 USE_TREE = re.compile(r'\buse\s+([^;]+);')
-USE_NAME = re.compile(r'[A-Za-z_]\w*')
-USE_ALIAS = re.compile(r'\b([A-Za-z_]\w*)\s+as\s+([A-Za-z_]\w*)')
+USE_AS = re.compile(r'\bas\s+([A-Za-z_]\w*)\s*$')
+
+
+def _use_items(text):
+    """`(local name, full path)` for every item a file imports.
+
+    The PATH matters, not just the final name: a module may import its own
+    `RootedEnv` — or alias one — and a bare-name match made that the
+    environment type declared somewhere else entirely.
+    """
+    out = []
+    for stmt in USE_TREE.findall(text):
+        prefix, _, rest = stmt.strip().partition('{')
+        items = ([prefix + part for part in rest.rstrip('}').split(',')]
+                 if rest else [prefix])
+        for item in items:
+            path = item.strip()
+            if not path:
+                continue
+            alias = USE_AS.search(path)
+            if alias:
+                out.append((alias.group(1), path[:alias.start()].strip()))
+            else:
+                out.append((path.rsplit('::', 1)[-1].strip(), path))
+    return out
 ENV_GENERIC = re.compile(r'[<,]\s*([A-Z]\w*)\s*:\s*[^,>]*\bEnv\b'
                          r'|\bwhere\s+([A-Z]\w*)\s*:\s*[^,;{]*\bEnv\b')
 
@@ -2759,7 +2789,7 @@ def accessor(root, test_files=frozenset()):
     out = subprocess.run(['git', 'ls-files', '-z', '*.rs'], cwd=root,
                          capture_output=True, text=True).stdout
     index, types, per_file, masked_all = {}, set(), {}, {}
-    helpers, declared, imports, aliases = {}, {}, {}, {}
+    helpers, declared, imports, modules = {}, {}, {}, {}
     for rel in out.split('\0'):
         # Test code is skipped outright, as the scan that consumes this index
         # already does — a receiver bound only in a test is used only in a
@@ -2790,14 +2820,13 @@ def accessor(root, test_files=frozenset()):
         own = {m.group(1) for m in ENV_IMPL.finditer(masked)
                if not data[m.start()]}
         types.update(own)
-        declared[rel] = own
-        use_text = ' '.join(USE_TREE.findall(masked))
-        imports[rel] = set(USE_NAME.findall(use_text))
-        # `use …::OsEnv as AliasedEnv` puts BOTH names in the identifier set,
-        # and only the original is a derived type — so the local name, which is
-        # the one actually written at the call site, resolved to nothing.
-        aliases[rel] = {local: orig
-                        for orig, local in USE_ALIAS.findall(use_text)}
+        declared[rel] = own | set(helpers.get(rel, ()))
+        # Where each derived name LIVES, so an import can be checked against it.
+        stem = pathlib.PurePath(rel).stem
+        parent = pathlib.PurePath(rel).parent.name
+        for name in own | set(helpers.get(rel, ())):
+            modules.setdefault(name, set()).update({stem, parent})
+        imports[rel] = _use_items(masked)
         names = per_file.setdefault(rel, set())
         names.update(m.group(1) for m in ENV_BOUND.finditer(masked)
                      if not data[m.start()])
@@ -2823,11 +2852,20 @@ def accessor(root, test_files=frozenset()):
     # round ago: two modules may each define a `RootedEnv`, and only one of
     # them is an environment. A file may use a type it declares, or one it
     # imports by name — nothing else.
+    def resolves(path, name):
+        """Whether `path` names the `name` this tree derived, not a same-named
+        item from somewhere else. The declaring files' module stems are what
+        the path must go through."""
+        segments = set(re.findall(r'[A-Za-z_]\w*', path))
+        return bool(segments & modules.get(name, set()))
+
     def visible(rel, names):
-        here = {n for n in names
-                if n in declared.get(rel, ()) or n in imports.get(rel, ())}
-        return here | {local for local, orig in aliases.get(rel, {}).items()
-                       if orig in names}
+        here = {n for n in names if n in declared.get(rel, ())}
+        for local, path in imports.get(rel, ()):
+            orig = path.rsplit('::', 1)[-1].strip()
+            if orig in names and resolves(path, orig):
+                here.add(local)
+        return here
 
     for rel, (masked, data) in masked_all.items():
         here = visible(rel, types)
@@ -2853,10 +2891,12 @@ def accessor(root, test_files=frozenset()):
     # sees what it declares and what it imports by name; the static floor in
     # `ACCESSOR` is what every file always has.
     # An aliased helper keeps the ORIGINAL's key position: `use … as f` renames
-    # the call, not the signature.
-    for rel, alias in aliases.items():
-        for local, orig in alias.items():
-            if orig in index:
+    # the call, not the signature — and only when the path really reaches the
+    # helper this tree derived.
+    for rel, items in imports.items():
+        for local, path in items:
+            orig = path.rsplit('::', 1)[-1].strip()
+            if orig in index and resolves(path, orig):
                 index.setdefault(local, index[orig])
     cache = {}
 
@@ -5294,6 +5334,15 @@ def self_test():
             sorted(_docker_commands('RUN ["/app/x", "AUTUMN_G=1"]\n')[1])],
          [['AUTUMN_A'], ['AUTUMN_B'], ['AUTUMN_C'], ['AUTUMN_D'],
           ['AUTUMN_E'], ['AUTUMN_F'], [0]])
+    # Option parsing stops at the first operand: `bash script -c 'x'` runs
+    # `script` and hands it `-c` and `x`. Verified against bash.
+    case('an option after a script-file operand is not an option',
+         [(lambda sp, t: t[sp[0]:sp[1]] if sp else None)(_payload_span(t), t)
+          for t in ("bash /safe-script -c 'AUTUMN_X=1 cmd'",
+                    "bash -c 'AUTUMN_Y=1 cmd'",
+                    'bash -l -c "AUTUMN_Z=1 cmd"',
+                    'bash -- -c "x"', '["sh","script","-c","x"]')],
+         [None, 'AUTUMN_Y=1 cmd', 'AUTUMN_Z=1 cmd', None, None])
     # Compose may quote either declaration spelling.
     case('a quoted compose declaration is still a declaration',
          COMPOSE_DECLARED.findall('      - AUTUMN_A=1\n      "AUTUMN_B": v\n'
