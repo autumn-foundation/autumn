@@ -116,7 +116,19 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
         // An acknowledgment has to be *visible* on the pull request — that is
         // the whole value of putting it there. Text inside an HTML comment
         // renders as nothing, so it acknowledges nothing.
-        let visible = strip_html_comments(line, &mut html_comment);
+        //
+        // Inside a fenced block, though, the text is literal: a line that puts
+        // an HTML comment before a fence run is content, because a closing
+        // fence carries no prefix. Stripping the comment there would uncover
+        // a bare run that closed the block early,
+        // making everything after it live while GitHub still drew it as code.
+        // So strip only outside a fence — and an `<!--` inside one opens
+        // nothing, for the same reason.
+        let visible = if fence.is_some() {
+            line.to_owned()
+        } else {
+            strip_html_comments(line, &mut html_comment)
+        };
         if visible.trim().is_empty() {
             continue;
         }
@@ -347,6 +359,25 @@ mod tests {
     fn a_quoted_marker_acknowledges_nothing() {
         assert!(parse_acks("> /ack-posture 0123456789abcdef").is_empty());
         assert!(parse_acks(">> /ack-posture 0123456789abcdef").is_empty());
+    }
+
+    /// Inside a fenced block the text is literal, so a line that puts an HTML
+    /// comment before a fence run is content: a closing fence carries no
+    /// prefix. Stripping the comment first left a bare run that did close it,
+    /// making everything after live while GitHub still drew the code block.
+    #[test]
+    fn an_html_comment_does_not_uncover_a_closing_fence() {
+        let text = "```\n<!-- note --> ```\n/ack-posture 0123456789abcdef\n";
+        assert!(parse_acks(text).is_empty(), "{:?}", parse_acks(text));
+    }
+
+    /// Outside a fence the stripping still applies, and a marker after a
+    /// properly closed block still counts.
+    #[test]
+    fn a_marker_after_a_block_that_really_closed_still_acknowledges() {
+        let text = "```\n<!-- note --> ```\n```\n/ack-posture 0123456789abcdef  yes\n";
+        let acks = parse_acks(text);
+        assert_eq!(acks.len(), 1, "{acks:?}");
     }
 
     /// A closing fence may be indented at most three spaces. Four or more

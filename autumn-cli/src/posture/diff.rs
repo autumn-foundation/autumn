@@ -24,8 +24,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use super::model::{
-    PostureManifest, RouteEntry, RouteKey, escape_field, escape_list, hex_digest, is_open,
-    normalize_captures,
+    CAPTURE, CATCH_ALL, PostureManifest, RouteEntry, RouteKey, escape_field, escape_list,
+    hex_digest, is_open, normalize_captures,
 };
 
 /// Which way a change moves the security surface.
@@ -231,7 +231,104 @@ fn diff_routes(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Fin
                 fingerprint: "removed".to_owned(),
                 detail: "route no longer mounted".to_owned(),
             });
+            report_shadow_exposure(key, entry, &after, out);
         }
+    }
+}
+
+/// Deleting a route does not always remove the URL.
+///
+/// The router matches a static segment before a dynamic one and mounts both —
+/// `/users/me` beside `/users/{id}` is not a conflict, per the conflict matrix
+/// in `router.rs`. So deleting the gated static route hands its URL to whatever
+/// still covers it. Read as a plain removal that is a narrowing, and the guard
+/// is gone with nothing to acknowledge.
+fn report_shadow_exposure(
+    (path, method): &RouteKey,
+    removed: &RouteEntry,
+    after: &BTreeMap<RouteKey, RouteEntry>,
+    out: &mut Vec<Finding>,
+) {
+    for ((survivor_path, survivor_method), survivor) in after {
+        if survivor_method != method || !shapes_overlap(path, survivor_path) {
+            continue;
+        }
+        // Only a survivor that admits callers the deleted route refused is a
+        // widening — and "admits more" is decided by the same comparison the
+        // rest of this module uses, so the two cannot drift apart.
+        let mut probe = Vec::new();
+        compare_route(removed, survivor, &mut probe);
+        if !probe.iter().any(|f| f.severity == Severity::Widening) {
+            continue;
+        }
+        out.push(Finding {
+            kind: "route_shadow_exposed",
+            severity: Severity::Widening,
+            method: method.clone(),
+            path: removed.path.clone(),
+            before: removed.posture_label(),
+            after: survivor.posture_label(),
+            fingerprint: format!("shadow-exposed:{}", escape_field(&survivor.path)),
+            detail: format!(
+                "removing this route does not remove the URL: `{} {}` still matches it and \
+                 admits callers this route refused ({} → {})",
+                survivor.method,
+                survivor.path,
+                removed.posture_label(),
+                survivor.posture_label()
+            ),
+        });
+    }
+}
+
+/// Whether two route *shapes* can match the same URL.
+///
+/// Both paths arrive normalized, so a capture is `CAPTURE` and a catch-all is
+/// `CATCH_ALL`. Overlap, not equality, is the question: the router mounts a
+/// static route beside a dynamic one that covers it, so removing the static one
+/// is only safe if nothing wider is left underneath.
+fn shapes_overlap(a: &str, b: &str) -> bool {
+    let a: Vec<&str> = a.split('/').collect();
+    let b: Vec<&str> = b.split('/').collect();
+    for i in 0..a.len().max(b.len()) {
+        match (a.get(i), b.get(i)) {
+            (Some(x), Some(y)) => {
+                // A catch-all swallows every remaining segment.
+                if x.contains(CATCH_ALL) || y.contains(CATCH_ALL) {
+                    return true;
+                }
+                if !segments_overlap(x, y) {
+                    return false;
+                }
+            }
+            // One path ran out: the other still demands a segment, and a
+            // capture matches text, never nothing.
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether one path segment can match the same text as another.
+fn segments_overlap(a: &str, b: &str) -> bool {
+    if !a.contains(CAPTURE) && !b.contains(CAPTURE) {
+        return a == b;
+    }
+    // A capture matches any non-empty text in its position, but the literal
+    // text around it still has to line up — `/file.{ext}` covers `/file.json`
+    // and not `/other.json`.
+    let (a_prefix, a_suffix) = literal_edges(a);
+    let (b_prefix, b_suffix) = literal_edges(b);
+    (a_prefix.starts_with(b_prefix) || b_prefix.starts_with(a_prefix))
+        && (a_suffix.ends_with(b_suffix) || b_suffix.ends_with(a_suffix))
+}
+
+/// The literal text before the first capture and after the last one. A segment
+/// with no capture is its own prefix and suffix.
+fn literal_edges(segment: &str) -> (&str, &str) {
+    match (segment.find(CAPTURE), segment.rfind(CAPTURE)) {
+        (Some(first), Some(last)) => (&segment[..first], &segment[last + CAPTURE.len_utf8()..]),
+        _ => (segment, segment),
     }
 }
 
@@ -1510,6 +1607,89 @@ mod tests {
             findings.iter().any(|f| f.kind == "route_added_open"),
             "the wildcard is a new, wider route, not an edit of the old one: {findings:?}"
         );
+    }
+
+    /// The router matches a static segment before a dynamic one and mounts
+    /// both — `/users/me` beside `/users/{id}` is not a conflict, per the
+    /// conflict matrix in `router.rs`. So deleting the gated static route does
+    /// not remove the URL; it hands it to the public dynamic one. Read as a
+    /// plain removal, that is a *narrowing*, and authentication vanishes from
+    /// `/users/me` with nothing to acknowledge.
+    #[test]
+    fn removing_a_route_that_a_public_one_still_covers_is_a_widening() {
+        let public_by_id = route("/users/{id}", "GET", "public", &[], &[], false);
+        let gated_me = route("/users/me", "GET", "gated", &["user"], &[], false);
+        let base = routes_only(&format!("{public_by_id},{gated_me}"));
+        let head = routes_only(&public_by_id);
+
+        let findings = diff(&base, &head);
+        let widening = widening(&findings);
+        assert_eq!(widening.len(), 1, "{findings:#?}");
+        assert_eq!(widening[0].kind, "route_shadow_exposed");
+        assert_eq!(widening[0].path, "/users/me");
+        assert!(
+            widening[0].detail.contains("/users/{id}"),
+            "the finding must name the route that now serves the URL: {:?}",
+            widening[0]
+        );
+    }
+
+    /// The survivor has to actually admit more. Deleting a gated route while an
+    /// equally gated dynamic route covers it loses no guard.
+    #[test]
+    fn removing_a_route_a_gated_one_covers_is_not_a_widening() {
+        let by_id = route("/users/{id}", "GET", "gated", &["user"], &[], false);
+        let me = route("/users/me", "GET", "gated", &["user"], &[], false);
+        let base = routes_only(&format!("{by_id},{me}"));
+        let head = routes_only(&by_id);
+
+        let findings = diff(&base, &head);
+        assert!(widening(&findings).is_empty(), "{findings:#?}");
+    }
+
+    /// And a route nothing covers is an ordinary removal.
+    #[test]
+    fn removing_an_uncovered_route_stays_a_narrowing() {
+        let base = routes_only(&format!(
+            "{},{}",
+            route("/health", "GET", "public", &[], &[], false),
+            route("/admin/me", "GET", "gated", &["admin"], &[], false)
+        ));
+        let head = routes_only(&route("/health", "GET", "public", &[], &[], false));
+
+        let findings = diff(&base, &head);
+        assert_eq!(kinds(&findings), vec!["route_removed"], "{findings:#?}");
+    }
+
+    /// A catch-all covers everything below it, so deleting a guarded route that
+    /// sits under one is the same exposure.
+    #[test]
+    fn a_catch_all_that_swallows_a_removed_route_is_a_widening() {
+        let catch_all = route("/files/{*path}", "GET", "public", &[], &[], false);
+        let secret = route("/files/secret", "GET", "gated", &["admin"], &[], false);
+        let base = routes_only(&format!("{catch_all},{secret}"));
+        let head = routes_only(&catch_all);
+
+        let findings = diff(&base, &head);
+        let widening = widening(&findings);
+        assert_eq!(widening.len(), 1, "{findings:#?}");
+        assert_eq!(widening[0].kind, "route_shadow_exposed");
+    }
+
+    /// Axum writes a literal brace as `{{`, so `/{{foo}}` and `/{{bar}}` are two
+    /// different URLs and the conflict matrix mounts both. Reading each escape
+    /// as a capture collapsed them into one key, so adding a second public
+    /// literal-brace route produced no `route_added_open` at all.
+    #[test]
+    fn escaped_literal_braces_are_not_captures() {
+        let foo = route("/{{foo}}", "GET", "public", &[], &[], false);
+        let bar = route("/{{bar}}", "GET", "public", &[], &[], false);
+        let base = routes_only(&foo);
+        let head = routes_only(&format!("{foo},{bar}"));
+
+        let findings = diff(&base, &head);
+        assert_eq!(kinds(&findings), vec!["route_added_open"], "{findings:#?}");
+        assert_eq!(findings[0].path, "/{{bar}}");
     }
 
     /// Normalizing the key widens the class of entries that can collide, so

@@ -183,25 +183,62 @@ pub type RouteKey = (String, String);
 /// Kinds stay distinct: `{name}` matches one segment and `{*name}` matches the
 /// rest of the path, so those are genuinely different URL sets and must not
 /// collapse together.
+///
+/// Axum's escapes for literal braces are decoded rather than read as captures:
+/// `/{{foo}}` is the URL `/{foo}`, and `router.rs`'s conflict matrix mounts it
+/// happily beside `/{{bar}}`. Treating each escape as a capture collapsed two
+/// distinct public routes into one key, so adding the second raised no finding.
 #[must_use]
 pub fn normalize_captures(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     let mut rest = path;
-    while let Some(open) = rest.find('{') {
-        out.push_str(&rest[..open]);
-        let Some(close) = rest[open..].find('}') else {
-            // Unbalanced: keep the remainder verbatim rather than inventing a
-            // shape, so a malformed path still compares against itself.
-            out.push_str(&rest[open..]);
+    loop {
+        let Some(brace) = rest.find(['{', '}']) else {
+            out.push_str(rest);
             return out;
         };
-        let inside = &rest[open + 1..open + close];
-        out.push_str(if inside.starts_with('*') { "{*}" } else { "{}" });
-        rest = &rest[open + close + 1..];
+        out.push_str(&rest[..brace]);
+        let tail = &rest[brace..];
+        if let Some(escaped) = tail.strip_prefix("{{") {
+            out.push('{');
+            rest = escaped;
+            continue;
+        }
+        if let Some(escaped) = tail.strip_prefix("}}") {
+            out.push('}');
+            rest = escaped;
+            continue;
+        }
+        if let Some(stray) = tail.strip_prefix('}') {
+            // Unbalanced: keep it verbatim rather than inventing a shape, so a
+            // malformed path still compares against itself.
+            out.push('}');
+            rest = stray;
+            continue;
+        }
+        let Some(close) = tail.find('}') else {
+            out.push_str(tail);
+            return out;
+        };
+        out.push(if tail[1..close].starts_with('*') {
+            CATCH_ALL
+        } else {
+            CAPTURE
+        });
+        rest = &tail[close + 1..];
     }
-    out.push_str(rest);
-    out
 }
+
+/// A single-segment capture (`{id}`) in a normalized path.
+///
+/// A control character rather than `{}`, because a normalized path also carries
+/// *decoded* literal braces: a route whose URL really contains `{}` would
+/// otherwise be indistinguishable from a capture, and the two must never share
+/// a key.
+pub const CAPTURE: char = '\u{1}';
+
+/// A catch-all capture (`{*rest}`), which matches every remaining segment.
+pub const CATCH_ALL: char = '\u{2}';
 
 impl RouteEntry {
     /// `(path, method)` — the identity of a mounted route. Handler name and
