@@ -124,6 +124,16 @@ ROOT = pathlib.Path(sys.argv[2])
 SNAPSHOT = ROOT / 'autumn' / 'tests' / 'fixtures' / 'schema_keys.snapshot'
 CONFIG_RS = ROOT / 'autumn' / 'src' / 'config.rs'
 
+# This script is not evidence for its own check. Its header documents the waiver
+# syntax with a worked example (`AUTUMN_SECTION__OLD_KEY`), and the moment the
+# file was committed that example landed in the token sweep below and started
+# resolving the very variable the waiver existed for — silently making two
+# waivers inert and leaving the gate green for a key that does not exist. A
+# checker that reads its own prose as truth cannot fail, which is the one
+# outcome worse than not having it. `gate_script_is_not_its_own_truth_set` in
+# --self-test pins this.
+SELF = 'scripts/check-docs-config.sh'
+
 # The corpus a reader lands in, matching check-docs-cli.sh exactly. Kept
 # identical on purpose: three gates disagreeing about what "reader-facing"
 # means is how a page ends up covered by one and not the others.
@@ -163,6 +173,24 @@ WAIVER = re.compile(r'<!--\s*config-key-allow:\s*(AUTUMN_[A-Z0-9_]+)\s*(.*?)\s*-
 READER_KEYED = ('auth.oauth2', 'jobs.queues', 'http.client.base_urls',
                 'resilience.circuit_breaker.hosts')
 
+# Metasyntactic roots: a page teaching the NAMING RULE rather than naming a key.
+# Seven pages write `AUTUMN_SECTION__FIELD` to explain that a double underscore
+# separates section from field, and `docs/migrations/TEMPLATE.md` writes
+# `AUTUMN_SECTION__OLD_KEY` in the row an author fills in per release. `section`
+# is not a config root and cannot become one, so everything under it is a worked
+# example by construction — which is why this is a rule rather than eight waiver
+# markers repeating the same reason on eight pages.
+PLACEHOLDER_ROOTS = ('section',)
+
+# A page may declare a Rust `const`/`static` whose name matches the variable
+# shape — `docs/guide/wasm-islands.md` has
+# `pub const AUTUMN_SOURCE: &str = include_str!("corpus.txt")` — and then use it
+# in later snippets. That is an identifier in example code, not an environment
+# variable, so it is recognised per page: the declaration is the page's own
+# statement of what the name is, and it does not leak to any other page.
+DECLARED_CONST = re.compile(
+    r'\b(?:const|static)\s+(AUTUMN_[A-Z0-9_]+)\s*:')
+
 # --------------------------------------------------------------- truth sets
 
 def schema_leaves(text):
@@ -192,28 +220,43 @@ def map_sections(leaves):
     return out
 
 
-def source_tokens(root):
-    """Every `AUTUMN_*` token in the tracked NON-markdown tree.
+# The shapes in which a file USES an environment variable, as opposed to
+# merely talking about one: a string literal (`env::var("AUTUMN_X")`, a YAML or
+# TOML value), a shell assignment or export, and a shell expansion.
+#
+# The distinction is load-bearing, and was not in the first cut of this script.
+# A plain token sweep counts prose: this gate's own CI step comment explains it
+# with the words `AUTUMN_DATABASE_URL`, and that mention alone was enough to
+# resolve the very variable the gate exists to catch — the injected regression
+# probe stopped failing. Requiring a use-shape means a comment can name a
+# variable to explain it without thereby asserting that something reads it.
+USES = (re.compile(r'["\'](AUTUMN_[A-Z0-9_]+)["\']'),
+        re.compile(r'(?:^|[;&|(\s])(?:export\s+)?(AUTUMN_[A-Z0-9_]+)='),
+        re.compile(r'\$\{?(AUTUMN_[A-Z0-9_]+)\}?'))
 
-    Deliberately a plain token sweep rather than a parse of `env::var` call
-    sites: a variable read through a helper, named in a generated file, or
-    exported by a shell script counts just as much as one read inline, and the
-    cost of the loose reading is that this rung cannot catch a variable that is
-    only ever *mentioned* in a comment. Rung (a) covers everything in the
-    schema; this rung exists for the four subsystems outside it.
+
+def source_tokens(root):
+    """Every `AUTUMN_*` variable the tracked NON-markdown tree actually uses.
+
+    This is the truth set for the four subsystems outside `AutumnConfig`:
+    `autumn-search` and `autumn-media-plugin` layer their own overrides in their
+    own crates, `autumn-cli` owns `[dev] watch_dirs`, and `AUTUMN_SYNC__*` is
+    read by the Tauri shell the CLI generates. Rung (a) covers everything the
+    schema knows; this rung exists for those.
     """
     out = subprocess.run(['git', 'ls-files', '-z'], cwd=root,
                          capture_output=True, text=True).stdout
     tokens = set()
     for rel in out.split('\0'):
-        if not rel or rel.endswith('.md'):
+        if not rel or rel.endswith('.md') or rel == SELF:
             continue
         try:
             body = (root / rel).read_text(encoding='utf-8', errors='replace')
         except OSError:
             continue
         if 'AUTUMN_' in body:
-            tokens.update(VAR.findall(body))
+            for pat in USES:
+                tokens.update(pat.findall(body))
     return tokens
 
 
@@ -250,6 +293,8 @@ def resolve(var, leaves, leaf_maps, tokens):
         if path in leaves:
             return 'schema'
         segs = path.split('.')
+        if segs[0] in PLACEHOLDER_ROOTS:
+            return 'naming-rule example'
         for k in range(1, len(segs)):
             if '.'.join(segs[:k]) in leaf_maps:
                 return 'dynamic-map'
@@ -301,6 +346,9 @@ def scan(files, read, leaves, leaf_maps, tokens):
         text = read(rel)
         lines = text.splitlines()
         chosen = {m for pat in CHOSEN for m in pat.findall(text)}
+        # Names the page itself declares as Rust items: identifiers in example
+        # code, scoped to this page only.
+        consts = set(DECLARED_CONST.findall(text))
         at, waived = blocks(lines), waivers(lines)
         for i, line in enumerate(lines, 1):
             if 'AUTUMN_' not in line:
@@ -313,6 +361,9 @@ def scan(files, read, leaves, leaf_maps, tokens):
             for var in VAR.findall(line):
                 if var in chosen:
                     stats['reader-chosen name'] += 1
+                    continue
+                if var in consts:
+                    stats['example-code identifier'] += 1
                     continue
                 rung = resolve(var, leaves, leaf_maps, tokens)
                 if rung:
@@ -464,6 +515,10 @@ def self_test():
     # first cut of this rung — resolved anything under any scalar and would
     # have hidden drift beneath all 397 of them.
     case('scalar is not a map', r('AUTUMN_LOG__LEVEL__NOPE'), None)
+    case('naming-rule example resolves',
+         r('AUTUMN_SECTION__FIELD'), 'naming-rule example')
+    case('naming-rule root does not cover a real section',
+         r('AUTUMN_LOG__NOPE'), None)
     case('standalone from source', r('AUTUMN_ENV'), 'source')
     case('standalone unknown fails', r('AUTUMN_NOPE'), None)
     case('other crate from source', r('AUTUMN_SEARCH__QUEUE'), 'source')
@@ -485,6 +540,27 @@ def self_test():
     doc3 = 'key_env = "AUTUMN_WHATEVER"\nexport AUTUMN_WHATEVER=x\n'
     s3, d3 = scan(['d.md'], lambda _: doc3, leaves, maps, tokens)
     case('reader-chosen name resolves', (s3['reader-chosen name'], len(d3)), (2, 0))
+
+    # A const the page declares is an identifier in example code, on that page.
+    doc4 = 'pub const AUTUMN_SOURCE: &str = "x";\nWorld::new(AUTUMN_SOURCE)\n'
+    s4, d4 = scan(['d.md'], lambda _: doc4, leaves, maps, tokens)
+    case('declared const is example code',
+         (s4['example-code identifier'], len(d4)), (2, 0))
+    _, d5 = scan(['d.md'], lambda _: 'World::new(AUTUMN_SOURCE)\n',
+                 leaves, maps, tokens)
+    case('an undeclared name is not excused by another page', len(d5), 1)
+
+    # The gate's own header names variables in order to explain itself. If the
+    # sweep reads this file, every one of them resolves for free — including the
+    # waiver example, which is how two live waivers went inert and the gate
+    # stayed green on a key that does not exist.
+    swept = source_tokens(ROOT)
+    case('gate script is not its own truth set',
+         'AUTUMN_SECTION__OLD_KEY' in swept, False)
+    # …while the sweep still does its real job: a variable read by a crate
+    # outside AutumnConfig must resolve.
+    case('other-crate variables still sweep in',
+         'AUTUMN_SEARCH__QUEUE' in swept, True)
 
     # The listed maps must stay maps, or the rung starts hiding drift.
     def raises(leafset):

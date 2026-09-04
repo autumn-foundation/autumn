@@ -28,19 +28,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn/tests/fixtures/schema_keys.snapshot` — the same schema walk that
   backs strict unknown-key validation, already kept honest by
   `schema_keys_snapshot_guard`, so there is nothing to regenerate and no Rust
-  toolchain needed — falling back to a token sweep of the tracked
-  non-markdown tree for the four subsystems outside `AutumnConfig`
-  (`AUTUMN_SEARCH__*` and `AUTUMN_MEDIA__*` layer their own overrides in their
-  own crates, `autumn-cli` owns `[dev] watch_dirs`, and `AUTUMN_SYNC__*` is
-  read by the Tauri shell the CLI generates). It also gates the hand-
-  maintained 135-row `AUTUMN_* -> config path` table in `config.rs`'s module
-  docs — the mapping readers meet on docs.rs — checking both columns, so a row
-  edited on one side only is caught. The baseline run found **0 defects**: the
-  reader-facing corpus was already accurate, and the gate is here to keep it
-  that way. Three occurrences are waived in place, beside the passage that
-  needs them (a migration guide's `rg` pattern for a removed key, and the
-  `AUTUMN_SECTION__OLD_KEY` placeholder row in `docs/migrations/TEMPLATE.md`
-  and `next.md`).
+  toolchain needed — falling back to a sweep of the tracked non-markdown tree
+  for the four subsystems outside `AutumnConfig` (`AUTUMN_SEARCH__*` and
+  `AUTUMN_MEDIA__*` layer their own overrides in their own crates,
+  `autumn-cli` owns `[dev] watch_dirs`, and `AUTUMN_SYNC__*` is read by the
+  Tauri shell the CLI generates). That sweep counts only variables a file
+  actually **uses** — a string literal, a shell assignment or export, an
+  expansion — never one merely named in prose: an earlier plain-token version
+  read this gate's own CI step comment, which explains the check using the
+  words `AUTUMN_DATABASE_URL`, and that mention alone resolved the very
+  variable the gate exists to catch. It also gates the hand-maintained 135-row
+  `AUTUMN_* -> config path` table in `config.rs`'s module docs — the mapping
+  readers meet on docs.rs — checking both columns, so a row edited on one side
+  only is caught. Pages teaching the naming rule rather than naming a key
+  (`AUTUMN_SECTION__FIELD`, across seven pages) and identifiers a page declares
+  in its own example code (`pub const AUTUMN_SOURCE: &str = …` in
+  `docs/guide/wasm-islands.md`) are recognised as such rather than waived. The
+  baseline run found **0 defects**: the reader-facing corpus was already
+  accurate, and the gate is here to keep it that way. One occurrence is waived
+  in place beside the passage that needs it — a migration guide's `rg` pattern
+  for a key that release removed.
 
 - **A CI gate for the "local development" install path [no-plugin]:** nothing
   here is agent-facing — it's a CI/test-harness addition, not new framework
