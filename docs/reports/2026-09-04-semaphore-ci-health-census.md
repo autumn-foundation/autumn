@@ -197,41 +197,70 @@ after-measurement — no change shipped this pass.
 
 ## 🔬 Reproduce
 
-The next legitimate step is Tier 1, not Tier 3: same-commit rerun statistics
-on `examples/hot-upgrade` and the `cache_stampede`/`sim_fault_plan` suites,
-specifically on a macOS runner (or macOS-class local hardware), at N≥20:
+An earlier revision of this section proposed reruns filtered to just the
+named test (`cargo test ... -- <test name>`). Codex review correctly
+rejected that: all three tests live in the consolidated `integration_tests`
+binary (or, for `live_upgrade`, its own binary), and every CI failure this
+census found happened while that binary ran as part of the full `Run
+tests` step (`cargo test --workspace`) — thousands of tests, much of it
+concurrent, on a runner that had already been building and testing for a
+while. A filtered single-test rerun strips out exactly the load the
+runner-contention hypothesis in Diagnosis depends on: a clean result from
+it would show the test has no bug *in isolation*, not that macOS isn't
+contended. It answers a real but different, narrower question than the one
+this report is asking.
 
-```
-# live_upgrade, the strongest repeat signature (3/3 identical failures observed
-# on macOS in the census; run this on macOS hardware/runner to match)
-for i in $(seq 1 20); do
-  cargo test -p hot-upgrade --test live_upgrade -- --test-threads=1 \
-    || echo "FAIL run $i"
-done
+That leaves two tiers, and they are not substitutes for each other:
 
-# cache_stampede's publish-visibility poll
-for i in $(seq 1 20); do
-  cargo test -p autumn-web --test integration_tests -- \
-    cache_stampede::swr_serves_stale_and_refreshes_in_background \
-    || echo "FAIL run $i"
-done
+1. **The load-faithful rerun (Tier 1, the one this diagnosis actually
+   needs)**: rerun the exact CI command, unfiltered, and grep each run's
+   output for the target test's own result line. This is expensive — the
+   `Run tests` step itself took 1,501-1,607s (25-27 minutes) in the census
+   sample — so N=20 here is a multi-hour campaign, not a quick check:
 
-# sim_fault_plan's job-runtime-not-initialized panic. Plain #[test], not
-# #[ignore]d (it runs as part of the base `cargo test --workspace` step, the
-# one that actually failed here) — no `--ignored` flag, or this filters the
-# test out entirely and every iteration "passes" by running nothing.
-for i in $(seq 1 20); do
-  cargo test -p autumn-web --test integration_tests -- \
-    same_seed_replays_a_byte_identical_outcome_100_times \
-    || echo "FAIL run $i"
-done
-```
+   ```
+   # Run on macOS hardware/a macos-latest-class runner. Mirrors the actual
+   # failing step; do not add a name filter or you're back to the isolated
+   # case Codex flagged.
+   for i in $(seq 1 10); do
+     cargo test --workspace 2>&1 | tee "run-$i.log"
+     grep -E "upgrades_in_place_under_load_without_dropping|cache_stampede::swr_serves_stale_and_refreshes_in_background|sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times" "run-$i.log"
+   done
+   ```
 
-Whichever of the three reproduces at a measurable rate names the mechanism;
-whichever doesn't reproduce locally at all is the strongest evidence the
-cause is runner-class contention rather than the test/product code, and
-argues for a shuffled-order + load-experiment pass (Tier 1/3) pinned to
-`macos-latest` specifically before touching any of the three tests.
+2. **The isolated rerun (Tier 3, a narrower, cheaper, and strictly weaker
+   check)**: useful only for ruling out a bug that reproduces with no load
+   at all — a positive result there is still informative (bug confirmed
+   independent of contention), but a clean 0/N is not evidence against the
+   contention hypothesis and must not be read as one, unlike what an
+   earlier revision of this report claimed:
+
+   ```
+   for i in $(seq 1 20); do
+     cargo test -p hot-upgrade --test live_upgrade -- --test-threads=1 \
+       || echo "FAIL run $i"
+   done
+   for i in $(seq 1 20); do
+     cargo test -p autumn-web --test integration_tests -- \
+       cache_stampede::swr_serves_stale_and_refreshes_in_background \
+       || echo "FAIL run $i"
+   done
+   # Plain #[test], not #[ignore]d -- no --ignored flag, or this filters
+   # the test out entirely and every iteration "passes" by running nothing.
+   for i in $(seq 1 20); do
+     cargo test -p autumn-web --test integration_tests -- \
+       same_seed_replays_a_byte_identical_outcome_100_times \
+       || echo "FAIL run $i"
+   done
+   ```
+
+Run (1) first. If it reproduces at a measurable rate, that names the
+mechanism and (2) becomes a useful follow-up to separate "load-dependent"
+from "load-independent." If (1) comes back clean at N=10, that is real
+evidence against the contention hypothesis (unlike a clean (2)) and argues
+for a shuffled-order pass instead. Either way, (2) alone was never enough
+to conclude anything about runner-class contention, and this report was
+wrong to imply otherwise.
 
 This census opens no *fix* PR: it lands as a report, per this role's own
 rule that a report is a legitimate, non-default outcome when the gate isn't
