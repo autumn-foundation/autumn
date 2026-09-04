@@ -84,11 +84,24 @@ something this census fabricated a rate for).
      `examples/hot-upgrade/tests/live_upgrade.rs:268`, on **three** unrelated
      branches within under 2 hours of each other by the job logs' own
      timestamps (20:51:17Z, 22:39:43Z, 22:44:42Z on 2026-09-03; runs 8132,
-     8147, 8161) — all three
-     on `macos-latest`, none on `ubuntu-latest`, the only other platform the
-     test ever runs on. Same test, same line, same value, 3-for-3 on one
-     platform and 0-for-N on the other: the strongest repeat signature in
-     the sample, and the one this report's diagnosis section focuses on.
+     8147, 8161) — all three on `macos-latest`, none on `ubuntu-latest`, the
+     only other platform the test ever runs on. The real denominator, not
+     just the failure count: of the 19 verdicted runs, 2 never reached the
+     `test` matrix at all (blocked by an earlier `lint` failure), leaving 17
+     that did. Of those, macOS's `Run tests` step failed 6 times (this test
+     3 times, `cache_stampede` and `sim_fault_plan` once each, plus the
+     unrelated `embedded_saas` drift) and succeeded 11 — and because a
+     single failing test fails the whole `cargo test --workspace` step,
+     every one of those 11 successes proves `live_upgrade` itself passed.
+     That puts it at **3 failures in at least 14 known macOS executions
+     (≥21%)**, against **0 failures in at least 16 known ubuntu executions**
+     (ubuntu's `Run tests` step failed only once, via the unrelated
+     `embedded_saas` drift; its one other failure, run 8190's Docker step,
+     is a later step in the same job, so that run's `Run tests` step — and
+     `live_upgrade` within it — passed). Thanking Codex review again here:
+     the earlier "3-for-3" phrasing counted only failures and implied a
+     100% macOS fail rate the data doesn't support — ≥21% against 0% is
+     still the strongest repeat signature in the sample, just not that one.
   2. **`integration::cache_stampede::swr_serves_stale_and_refreshes_in_
      background`** — the background refresh never published within its
      1,000×25ms (~25s) poll budget (run 8190, macOS). This assertion was
@@ -130,9 +143,11 @@ bearing caveat of this report. The primary evidence is `live_upgrade`,
 which is written with a hard, zero-tolerance assertion
 (`connect_errors == 0`, no slack at all, unlike this same test's own
 300-read floor and 5-second latency ceiling, both explicitly sized "so a
-busy CI runner cannot fail the run") and failed identically 3-for-3 on
-`macos-latest` against 0-for-however-many-times-it-ran on `ubuntu-latest`
-— the only other platform the unix-gated test executes on. `cache_stampede`
+busy CI runner cannot fail the run") and failed identically in at least 3
+of 14 known macOS executions (≥21%) against 0 of at least 16 known
+`ubuntu-latest` executions — the only other platform the unix-gated test
+runs on (see Symptom above for how those counts are derived from job-step
+pass/fail logic, not a fresh rerun). `cache_stampede`
 and `sim_fault_plan`, each already written with generous, load-tolerant
 budgets by this codebase's own standards (a 25-second/1,000-attempt poll),
 each failed once, also on macOS, also in tests with no platform gate — one
