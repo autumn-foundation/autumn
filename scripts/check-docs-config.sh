@@ -842,9 +842,37 @@ YAML_SCALARS = ('.yml', '.yaml')
 YAML_BLOCK = re.compile(r'^(\s*)(?:-\s+)?([A-Za-z0-9_.-]+):\s*[|>][-+0-9]*\s*$')
 YAML_EXECUTED = ('run', 'command', 'entrypoint', 'script')
 
+# Blanking only the non-executed BLOCK scalars was half the rule. An ordinary
+# scalar is just as inert: `name: "${AUTUMN_LOG__LEVL}"` in a workflow is text
+# GitHub Actions never interpolates, and it was reading as an expansion.
+#
+# The consumers differ, so the file decides which rule applies. Compose
+# interpolates `${…}` in EVERY value — that is what
+# `AUTUMN_SECURITY__SIGNING_SECRET: "${AUTUMN_SECURITY__SIGNING_SECRET:?err}"`
+# relies on — and Docker identifies a compose file by name, so that is the test
+# rather than a guess. Everywhere else the shell syntax only means something
+# inside a block a consumer executes.
+#
+# Measured: all 7 expansions in compose files are values, and all 3 in workflows
+# are inside `run:`. Both populations survive.
+COMPOSE_NAMES = ('compose.yml', 'compose.yaml',
+                 'docker-compose.yml', 'docker-compose.yaml')
 
-def _yaml_blocks(body):
-    """Blank the bodies of block scalars that are data, keeping line numbers."""
+
+def _yaml_interpolated(rel):
+    """Whether this YAML file's consumer expands `${…}` outside a `run:`."""
+    p = pathlib.PurePath(rel)
+    if p.suffix == '.tmpl':
+        p = pathlib.PurePath(p.stem)
+    return p.name in COMPOSE_NAMES
+
+
+def _yaml_blocks(body, interpolated=False):
+    """Blank what the consumer never executes, keeping line numbers intact.
+
+    In a compose file only the non-executed BLOCK scalars go, since every value
+    is interpolated. Anywhere else every line outside an executed block goes.
+    """
     out, key, indent = [], None, 0
     for l in body.splitlines():
         if key is not None:
@@ -853,8 +881,9 @@ def _yaml_blocks(body):
             else:
                 out.append(l if key in YAML_EXECUTED else '')
                 continue
-        out.append(l)
         m = YAML_BLOCK.match(l)
+        # The opening line itself carries no value, so it is never evidence.
+        out.append(l if interpolated and not m else ('' if not m else l))
         if m:
             key, indent = m.group(2), len(m.group(1))
     return '\n'.join(out)
@@ -2114,7 +2143,7 @@ def source_tokens(root):
         if rel.endswith('.rs'):
             body = untested(body)
         if effective_suffix(rel) in YAML_SCALARS:
-            body = _yaml_blocks(body)
+            body = _yaml_blocks(body, _yaml_interpolated(rel))
         # Heredocs FIRST: blanking single quotes first erases the `'EOF'`
         # marker, and the heredoc body then reads as commands. The self-test for
         # each function passed in isolation while the composition was wrong,
@@ -2163,6 +2192,12 @@ def source_tokens(root):
                 tokens.update(ASSIGNED.findall(code_lines[n]))
                 tokens.update(ASSIGNED_PREFIX.findall(code_lines[n]))
                 if DECLARED.match(code_lines[n]) or declaring:
+                    # BOTH: `ARG AUTUMN_X` has no `=` at all, and the legacy
+                    # `ENV AUTUMN_X value` form has none either, so
+                    # `DECLARED_CONT` alone dropped them. Adding the
+                    # continuation reader must not replace the reader it
+                    # extends.
+                    tokens.update(DECLARED.findall(code_lines[n]))
                     tokens.update(DECLARED_CONT.findall(code_lines[n]))
                     declaring = code_lines[n].rstrip().endswith('\\')
                 elif effective_suffix(rel) in DOTENV:
@@ -3588,6 +3623,28 @@ def self_test():
           ASSIGNED_PREFIX.findall(_yaml_blocks(
               'steps:\n  - run: |\n      AUTUMN_LOG__LEVEL=debug cargo run\n'))),
          ([], ['AUTUMN_LOG__LEVEL']))
+    # An ordinary scalar is just as inert as a block one — but only where the
+    # consumer says so. Compose interpolates every value; Actions interpolates
+    # none, so there the shell syntax means something only inside `run:`.
+    case('the consumer decides which YAML values interpolate',
+         (EXPANDED.findall(_yaml_blocks(
+             'name: "${AUTUMN_LOG__LEVL}"\nsteps:\n  - run: |\n'
+             '      echo "${AUTUMN_LOG__LEVEL}"\n',
+             _yaml_interpolated('.github/workflows/ci.yml'))),
+          EXPANDED.findall(_yaml_blocks(
+              'services:\n  app:\n    environment:\n'
+              '      AUTUMN_LOG__LEVEL: "${AUTUMN_LOG__LEVEL:?err}"\n',
+              _yaml_interpolated('examples/x/docker-compose.yml'))),
+          _yaml_interpolated(
+              'autumn-cli/src/templates/release/docker-compose.yml.tmpl')),
+         (['AUTUMN_LOG__LEVEL'], ['AUTUMN_LOG__LEVEL'], True))
+    # A declaration need not carry an `=` at all: `ARG AUTUMN_X` and the legacy
+    # `ENV AUTUMN_X value` are both valid, and the continuation reader must
+    # EXTEND the declaration reader rather than replace it.
+    case('a declaration without an equals sign is kept',
+         (DECLARED.findall('ARG AUTUMN_DOCKER_ONLY'),
+          DECLARED.findall('ENV AUTUMN_DOCKER_ONLY value')),
+         (['AUTUMN_DOCKER_ONLY'], ['AUTUMN_DOCKER_ONLY']))
     # One `ENV` may declare several variables across a continuation, and
     # anchoring to the line start saw only the first.
     case('a continued ENV declares every name on it',
