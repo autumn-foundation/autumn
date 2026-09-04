@@ -240,7 +240,7 @@ jobs:
         # the pre-0.2 spelling) beside a production Postgres URL reads exactly
         # like a working line, and the app comes up on the default database.
         #
-        # The reader-facing corpus names 636 of these across 175 pages, and the
+        # The reader-facing corpus names 658 of these across 175 pages, and the
         # baseline run resolved every one — this gate is here to keep it that
         # way, and to gate the 142-row `AUTUMN_* -> config path` table in
         # config.rs's module docs, which is hand-maintained and is the mapping

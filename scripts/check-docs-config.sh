@@ -17,18 +17,14 @@
 # on the default database. That is the corpus's worst failure mode: the reader
 # cannot detect the wrongness, and neither can the framework.
 #
-# The reader-facing corpus names 636 `AUTUMN_*` variables across 175 pages. This
+# The reader-facing corpus names 658 `AUTUMN_*` variables across 175 pages. This
 # gate resolves every one of them.
 #
 # WHAT IT CHECKS (single fast job, no Rust toolchain needed):
-#   1. A CONFIG-FORM variable (`AUTUMN_SECTION__FIELD`, the double underscore
-#      separating section from field) maps to a config path — `AUTUMN_LOG__LEVEL`
-#      to `log.level` — and that path must exist in the compiled schema.
-#   2. A STANDALONE variable (`AUTUMN_ENV`, `AUTUMN_ROLE` — no `__`, read
-#      directly via `env::var` rather than layered into the config) must appear
-#      somewhere in the tracked non-markdown tree, i.e. something actually reads
-#      it.
-#   3. The hand-maintained `AUTUMN_* -> config path` table in `config.rs`'s
+#   1. Every `AUTUMN_*` name a page tells someone to set must be one the
+#      runtime actually reads — whether it is layered into the config
+#      (`AUTUMN_LOG__LEVEL`) or read directly (`AUTUMN_ENV`).
+#   2. The hand-maintained `AUTUMN_* -> config path` table in `config.rs`'s
 #      module docs — 142 rows, the mapping readers meet on docs.rs — must agree
 #      with the schema, both in the paths it names and in the variable spellings
 #      it derives them from. Every row shaped like a mapping is accounted for:
@@ -36,9 +32,9 @@
 #
 # TRUTH SETS (all already in the tree; nothing to regenerate here):
 #   - `autumn/tests/fixtures/schema_keys.snapshot` — 484 config paths of
-#     `AutumnConfig`, of which the 397 LEAVES are the settable keys (a branch
-#     like `server.upgrade` is not one; the runtime probes the leaves beneath
-#     it). Produced by the same `get_schema_keys()` walk that backs
+#     `AutumnConfig` (397 of them leaves), used to bound the open-ended shard
+#     template and to check the module-doc table's declared paths. Produced by
+#     the same `get_schema_keys()` walk that backs
 #     strict unknown-key validation, and kept honest by
 #     `schema_keys_snapshot_guard`. Using the snapshot rather than a fresh walk
 #     is what keeps this gate toolchain-free; the snapshot cannot drift from the
@@ -55,29 +51,38 @@
 #     Tauri shell the CLI generates into the reader's app. Gating those against
 #     `AutumnConfig` alone would report four subsystems as broken.
 #
-# RESOLUTION, and why each rung is derived rather than listed:
-#   a. The path is a schema LEAF (a branch sets nothing; see SETTABLE_BRANCHES
-#      for the one untagged exception).
-#   b. Sequence indices are elided first: the schema spells a shard field
-#      `database.shards.name`, so `AUTUMN_DATABASE__SHARDS__0__NAME` and the
-#      table's `{i}` placeholder both normalise onto it.
-#   c. The variable matches a name the runtime BUILDS —
-#      `format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_ID")`, once per configured
-#      provider. The provider segment is open and the field is EXACT, which is
-#      the runtime's own behaviour: it probes only the names it builds, so
-#      `…__CLIENT_SECRT` is ignored in production and must be reported here.
-#   d. The variable appears in the non-markdown tree in a shape that USES it (a
-#      string literal, a shell assignment, an expansion) — this is how the
-#      separate-crate configs resolve. A name that appears only in a negative
-#      assertion does not count.
-#   e. The page itself introduces the name as one the READER chooses —
+# RESOLUTION — the question is "does anything READ this name", never "is there a
+# config key spelled like it". Those are different sets: the env layer is
+# written field by field (`parse_env(env, "AUTUMN_LOG__LEVEL", …)`), so a TOML
+# key with no override of its own has no environment spelling at all.
+# `openapi.enabled` is a real schema leaf and `AUTUMN_OPENAPI__ENABLED` is read
+# by nothing; 90 of the 397 leaves are in that position. Resolving against the
+# schema blessed every one of them, so the schema no longer answers this
+# question — it bounds the shard template and checks the module-doc table's
+# declared PATHS, which are questions about config keys.
+#
+#   a. The name is one the tracked non-markdown tree BINDS or READS —
+#      `const CANARY_ENV: &str = "AUTUMN_CANARY"`, or an env accessor. This
+#      carries the bulk, including the four subsystems outside `AutumnConfig`.
+#   b. The name matches one the runtime BUILDS —
+#      `format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_ID")`. The filled-in
+#      segment is open and the rest is exact, which is the runtime's own
+#      behaviour: it probes only the names it builds, so `…__CLIENT_SECRT` is
+#      ignored in production and is reported here. A template whose FINAL
+#      segment is a placeholder (`…SHARDS__{i}__{field}`, a closure parameter)
+#      is bounded by the schema's children of the path it addresses.
+#   c. The page introduces the name as one the READER chooses —
 #      `access_key_id_env = "AUTUMN_OFFSITE_ACCESS_KEY_ID"`, or
-#      `InMemoryApiTokenStore::from_env("AUTUMN_API_TOKEN", …)`. Here the string
-#      is an example of a name the reader invents and the framework reads back;
-#      there is nothing for it to match, and demanding a match would push
-#      13 correct lines into waivers.
-#   f. The variable is a naming-rule example (`AUTUMN_SECTION__FIELD`) or an
-#      identifier the page declares in its own example code.
+#      `InMemoryApiTokenStore::from_env("AUTUMN_API_TOKEN", …)`.
+#   d. The sentence names a FAMILY rather than a variable (`AUTUMN_ALERTS__*`,
+#      `AUTUMN_MEDIA__<TABLE>__<FIELD>`), a naming-rule example
+#      (`AUTUMN_SECTION__FIELD`), or an identifier the page declares in its own
+#      example code.
+#
+# A name that is malformed — lower case outside a placeholder, or a dangling
+# separator with no `*` or `<PLACEHOLDER>` after it — is REPORTED rather than
+# resolved. Both spellings used to match nothing at all, which made the claim
+# invisible: an unresolved name is reported, an unseen one cannot be.
 #
 # WHAT IT DELIBERATELY DOES NOT CHECK:
 #   - TOML config keys in fenced blocks. `[dev] watch_dirs` in the README is an
@@ -168,11 +173,37 @@ INCLUDE_FILES = ('README.md', 'EXAMPLES.md', 'CONTRIBUTING.md', 'STABILITY.md')
 # runtime will not read, but under an upper-case-only pattern it matched nothing
 # at all — the claim was invisible, and the occurrence count did not even move.
 # Case is validated in `malformed` below instead, where it can be reported.
-VAR = re.compile(r'\bAUTUMN_(?:\{[a-z]+\}|[A-Za-z0-9_])*[A-Za-z0-9]\b')
+VAR = re.compile(r'\bAUTUMN_(?:\{[a-z]+\}|[A-Za-z0-9_])*[A-Za-z0-9_]')
 
-# Everything outside a `{placeholder}` must be upper case, digits, or `_`.
+# A trailing `_` is part of the token, so `export AUTUMN_LOG__LEVEL_=debug` is
+# captured and reported rather than skipped — requiring an alphanumeric last
+# character made that whole assignment match nothing at all. Prose wildcards
+# (`AUTUMN_UPGRADE_*`, naming a family rather than a variable) are the reason
+# the trailing separator cannot simply be trimmed: trimming would silently
+# rewrite a typo into the valid name next to it.
+TRAILING_WILDCARD = re.compile(r'^AUTUMN_[A-Za-z0-9_]*_$')
+
+
+def family(var, line):
+    """`AUTUMN_ALERTS__*` — prose naming a family, not a variable to set.
+
+    Written this way on 22 reader-facing lines: 19 with a `*` ("every key has an
+    `AUTUMN_SESSION__*` environment override") and 3 with an angle-bracket
+    stand-in for the part the reader supplies (`AUTUMN_MEDIA__<TABLE>__<FIELD>`,
+    `AUTUMN_ALERTS__<KEY>`).
+
+    What follows the trailing separator is the whole distinction: a `*` or a
+    `<PLACEHOLDER>` means the sentence is describing a family, while nothing at
+    all means `AUTUMN_LOG__LEVEL_=debug` — the same shape with a dangling
+    separator, and a typo the runtime will not read.
+    """
+    return bool(re.search(re.escape(var) + r'(?:\*|<[A-Z_]+>)', line))
+
+
 def malformed(var):
-    return any(c.islower() for c in re.sub(r'\{[a-z]+\}', '', var))
+    """A name the runtime cannot read: wrong case, or a dangling separator."""
+    bare = re.sub(r'\{[a-z]+\}', '', var)
+    return any(c.islower() for c in bare) or bool(TRAILING_WILDCARD.match(var))
 
 # A path segment that is a sequence index rather than a field name: a literal
 # index as written in a shell line, or the `{i}` / `{N}` placeholder the
@@ -215,19 +246,6 @@ TEMPLATE = re.compile(r'"(AUTUMN_[A-Z0-9_]*(?:\{[a-z_]+\}[A-Z0-9_]*)+)"')
 # markers repeating the same reason on eight pages.
 PLACEHOLDER_ROOTS = ('section',)
 
-# The snapshot records BRANCHES as well as settable leaves — `server.upgrade`
-# sits above `server.upgrade.enabled` and `…ready_timeout_secs` — but the
-# runtime probes only the leaf names. Resolving against the whole snapshot
-# therefore blessed a truncated key: `AUTUMN_SERVER__UPGRADE` counted as found
-# while setting nothing, which is precisely the silent no-op this gate exists to
-# catch. Only leaves resolve.
-#
-# One branch really is settable: `SigningSecretConfig`'s untagged deserializer
-# accepts a bare string, so `AUTUMN_SECURITY__SIGNING_SECRET` sets
-# `security.signing_secret` whole (38 occurrences across the corpus). Measured
-# before narrowing the rule — it is the only corpus variable that lands on a
-# branch, and a second one has to be added here deliberately.
-SETTABLE_BRANCHES = ('security.signing_secret',)
 
 # A page may declare a Rust `const`/`static` whose name matches the variable
 # shape — `docs/guide/wasm-islands.md` has
@@ -247,17 +265,29 @@ def schema_paths(text):
 def leaf_paths(paths):
     """Settable keys: a path with nothing below it.
 
-    The snapshot records every node the walk visits, branches included, and a
-    branch is not a key you can set — see SETTABLE_BRANCHES.
+    The snapshot records every node the walk visits, branches included. Used to
+    bound the open-ended shard template and to check the module-doc table's
+    declared paths — NOT to decide whether an environment variable is settable,
+    which is a question about what the runtime reads.
     """
     return {p for p in paths if not any(o.startswith(p + '.') for o in paths)}
 
 
-def built_patterns(root):
+# One segment the runtime fills in: an index, a provider name, or — in a page
+# documenting the whole family at once — the `{i}` placeholder itself.
+SEGMENT = r'(?:[A-Z0-9_]+|\{[a-z]+\})'
+
+
+def built_patterns(root, leaves):
     """Regexes for the variable names the runtime constructs at load time.
 
-    Each `{placeholder}` becomes one reader-chosen segment; a template ending in
-    a placeholder is skipped, since it fixes nothing.
+    Each `{placeholder}` becomes one segment the runtime fills in. A template
+    whose FINAL segment is a placeholder would otherwise fix nothing — `key` in
+    `format!("AUTUMN_DATABASE__SHARDS__{i}__{field}")` is a closure parameter
+    applied to literal field names — so its final segment is constrained to the
+    schema's children of the path it addresses. That is how
+    `…SHARDS__{i}__SLOTS` resolves while `…SHARDS__0__NOPE` does not, without
+    this script holding a list of shard fields.
     """
     out = subprocess.run(['git', 'ls-files', '-z', '*.rs'], cwd=root,
                          capture_output=True, text=True).stdout
@@ -270,11 +300,23 @@ def built_patterns(root):
         except OSError:
             continue
         for tpl in TEMPLATE.findall(body):
-            if tpl.split('__')[-1].startswith('{'):
+            segs = tpl[len('AUTUMN_'):].split('__')
+            head = re.sub(r'\\\{[a-z_]+\\\}', SEGMENT,
+                          re.escape('AUTUMN_' + '__'.join(segs[:-1])))
+            if not segs[-1].startswith('{'):
+                pats[tpl] = re.compile(
+                    '^' + re.sub(r'\\\{[a-z_]+\\\}', SEGMENT, re.escape(tpl))
+                    + '$')
                 continue
-            pats[tpl] = re.compile(
-                '^' + re.sub(r'\\\{[a-z_]+\\\}', '[A-Z0-9_]+',
-                             re.escape(tpl)) + '$')
+            prefix = '.'.join(s.lower() for s in segs[:-1]
+                              if not s.startswith('{'))
+            kids = {p.rsplit('.', 1)[1] for p in leaves
+                    if p.startswith(prefix + '.')
+                    and p.count('.') == prefix.count('.') + 1}
+            if kids:
+                pats[tpl] = re.compile(
+                    '^' + head + '__('
+                    + '|'.join(sorted(k.upper() for k in kids)) + ')$')
     return pats
 
 
@@ -384,13 +426,24 @@ def is_config_form(var):
 
 
 def resolve(var, leaves, built, tokens):
-    """Return the rung that resolves `var`, or None. Order is cost, not rank."""
-    if is_config_form(var):
-        path = to_path(var)
-        if path in leaves or path in SETTABLE_BRANCHES:
-            return 'schema'
-        if path.split('.')[0] in PLACEHOLDER_ROOTS:
-            return 'naming-rule example'
+    """Return the rung that resolves `var`, or None.
+
+    The question is "does anything READ this name", not "is there a config key
+    spelled like it". Those are different sets, and conflating them was the
+    gate's largest hole: the env layer is written field by field
+    (`parse_env(env, "AUTUMN_LOG__LEVEL", …)`), so a TOML key with no override
+    of its own has no environment spelling at all. `openapi.enabled` is a real
+    key in the schema, and `AUTUMN_OPENAPI__ENABLED` is read by nothing —
+    setting it leaves the value untouched. Resolving against schema leaves
+    blessed that name, and 90 of the 397 leaves are in the same position.
+
+    So the schema no longer answers this question. It still bounds the
+    open-ended shard template above, and it still checks the module-doc table's
+    declared PATHS, which is a question about config keys rather than about
+    environment variables.
+    """
+    if is_config_form(var) and to_path(var).split('.')[0] in PLACEHOLDER_ROOTS:
+        return 'naming-rule example'
     if any(p.match(var) for p in built.values()):
         return 'runtime-built name'
     if var in tokens:
@@ -460,6 +513,9 @@ def scan(files, read, leaves, built, tokens):
                 if var in consts:
                     stats['example-code identifier'] += 1
                     continue
+                if family(var, line):
+                    stats['family wildcard'] += 1
+                    continue
                 rung = None if malformed(var) else resolve(
                     var, leaves, built, tokens)
                 if rung:
@@ -501,7 +557,7 @@ TABLE_PROSE_ROW = re.compile(
 
 # Anything shaped like a table row at all, used to prove the two patterns above
 # between them account for every one.
-TABLE_ANY_ROW = re.compile(r'^//! \| `AUTUMN_')
+TABLE_ANY_ROW = re.compile(r'^//! \| `?AUTUMN_')
 
 # The one row whose two columns legitimately disagree. `SigningSecretConfig`
 # has an untagged deserializer that accepts a bare string, so
@@ -565,7 +621,8 @@ def check_table(rows, leaves, built):
 
 def load():
     paths = schema_paths(SNAPSHOT.read_text(encoding='utf-8'))
-    return leaf_paths(paths), built_patterns(ROOT), source_tokens(ROOT)
+    leaves = leaf_paths(paths)
+    return leaves, built_patterns(ROOT, leaves), source_tokens(ROOT)
 
 
 def main():
@@ -639,8 +696,13 @@ def self_test():
         'security.signing_secret.secret\nserver\nserver.upgrade\n'
         'server.upgrade.enabled\n'))
     built = {'AUTUMN_AUTH__OAUTH2__{p}__CLIENT_SECRET':
-             re.compile(r'^AUTUMN_AUTH__OAUTH2__[A-Z0-9_]+__CLIENT_SECRET$')}
-    tokens = {'AUTUMN_ENV', 'AUTUMN_SEARCH__QUEUE'}
+             re.compile(r'^AUTUMN_AUTH__OAUTH2__' + SEGMENT + r'__CLIENT_SECRET$'),
+             'AUTUMN_DATABASE__SHARDS__{i}__{field}':
+             re.compile(r'^AUTUMN_DATABASE__SHARDS__' + SEGMENT + r'__(NAME)$')}
+    # Names something in the tree binds or reads — the only thing that makes an
+    # environment variable settable.
+    tokens = {'AUTUMN_ENV', 'AUTUMN_SEARCH__QUEUE', 'AUTUMN_LOG__LEVEL',
+              'AUTUMN_SERVER__UPGRADE__ENABLED', 'AUTUMN_SECURITY__SIGNING_SECRET'}
     checked, failures = [], []
 
     def case(name, got, want):
@@ -649,18 +711,23 @@ def self_test():
             failures.append(f'{name}: got {got!r}, want {want!r}')
 
     r = lambda v: resolve(v, leaves, built, tokens)
-    case('plain key resolves', r('AUTUMN_LOG__LEVEL'), 'schema')
+    case('a read name resolves', r('AUTUMN_LOG__LEVEL'), 'source')
+    # A config key with no env override of its own has no environment spelling.
+    # `openapi.enabled` is a real schema leaf that nothing reads; resolving
+    # against the schema blessed it, and 90 of 397 leaves are in that position.
+    case('a schema leaf nothing reads does NOT resolve',
+         r('AUTUMN_OPENAPI__ENABLED'), None)
     case('missing key fails', r('AUTUMN_LOG__LEVL'), None)
     # The single-underscore spelling is the whole point of the gate: it derives
     # a one-segment path that no section can match.
     case('single underscore fails', r('AUTUMN_DATABASE_URL'), None)
     case('sequence index elided',
-         r('AUTUMN_DATABASE__SHARDS__0__NAME'), 'schema')
+         r('AUTUMN_DATABASE__SHARDS__0__NAME'), 'runtime-built name')
     # A branch is not a settable key: the runtime probes the leaves under it.
     case('a schema branch is not a key', r('AUTUMN_SERVER__UPGRADE'), None)
-    case('its leaf is', r('AUTUMN_SERVER__UPGRADE__ENABLED'), 'schema')
-    case('the one settable branch still resolves',
-         r('AUTUMN_SECURITY__SIGNING_SECRET'), 'schema')
+    case('its leaf is', r('AUTUMN_SERVER__UPGRADE__ENABLED'), 'source')
+    case('the untagged branch still resolves',
+         r('AUTUMN_SECURITY__SIGNING_SECRET'), 'source')
     # The corpus scanner must SEE a placeholder name at all — before it did not
     # match `…SHARDS__{i}__NAME` in any form, so those seven documented
     # variables were invisible rather than merely unresolved.
@@ -672,17 +739,36 @@ def self_test():
     case('a casing typo is scanned',
          VAR.findall('export AUTUMN_LOG__LEVeL=debug'), ['AUTUMN_LOG__LEVeL'])
     case('a casing typo is malformed', malformed('AUTUMN_LOG__LEVeL'), True)
+    # A trailing separator: captured, then judged by what follows it.
+    case('a trailing separator is scanned',
+         VAR.findall('export AUTUMN_LOG__LEVEL_=debug'), ['AUTUMN_LOG__LEVEL_'])
+    case('a dangling separator is malformed',
+         malformed('AUTUMN_LOG__LEVEL_'), True)
+    case('a `*` family mention is not a variable',
+         family('AUTUMN_ALERTS__', 'set `AUTUMN_ALERTS__*` to override'), True)
+    case('an angle-bracket family mention is not a variable',
+         family('AUTUMN_MEDIA__', '`AUTUMN_MEDIA__<TABLE>__<FIELD>` overrides'),
+         True)
+    case('a dangling separator in an assignment is not a family',
+         family('AUTUMN_LOG__LEVEL_', 'export AUTUMN_LOG__LEVEL_=debug'), False)
+    _, dt = scan(['d.md'], lambda _: 'export AUTUMN_LOG__LEVEL_=debug\n',
+                 leaves, built, tokens)
+    case('a dangling separator is reported', len(dt), 1)
+    st, df = scan(['d.md'], lambda _: 'set `AUTUMN_ALERTS__*` to override\n',
+                  leaves, built, tokens)
+    case('a family mention is not reported',
+         (st['family wildcard'], len(df)), (1, 0))
     case('a placeholder is not malformed',
          malformed('AUTUMN_DATABASE__SHARDS__{i}__NAME'), False)
     _, dm = scan(['d.md'], lambda _: 'export AUTUMN_LOG__LEVeL=debug\n',
                  leaves, built, tokens)
     case('a casing typo is reported', len(dm), 1)
     case('a placeholder name resolves',
-         r('AUTUMN_DATABASE__SHARDS__{i}__NAME'), 'schema')
+         r('AUTUMN_DATABASE__SHARDS__{i}__NAME'), 'runtime-built name')
     case('a typo beside a placeholder is caught',
          r('AUTUMN_DATABASE__SHARDS__{i}__NOPE'), None)
     case('table placeholder elided',
-         r('AUTUMN_DATABASE__SHARDS__{i}__NAME'), 'schema')
+         r('AUTUMN_DATABASE__SHARDS__{i}__NAME'), 'runtime-built name')
     case('unknown shard field fails',
          r('AUTUMN_DATABASE__SHARDS__0__NOPE'), None)
     case('reader-keyed map resolves',
@@ -751,12 +837,15 @@ def self_test():
 
     # Templates are read from the real tree: the oauth2 pair must be found, and
     # `…__SHARDS__{i}__{field}` must be skipped (it would re-admit any field).
-    real_built = built_patterns(ROOT)
+    real_built = built_patterns(ROOT, leaf_paths(schema_paths(SNAPSHOT.read_text(encoding="utf-8"))))
     case('oauth2 templates are derived from source',
          any('OAUTH2' in t and t.endswith('CLIENT_SECRET') for t in real_built),
          True)
-    case('a template ending in a placeholder is skipped',
-         any(t.endswith('{field}') for t in real_built), False)
+    # An open-final template is kept, but its final segment is constrained to
+    # the schema's children of the path it addresses — so the documented shard
+    # fields resolve and an invented one does not.
+    case('an open-final template is schema-constrained',
+         any(t.endswith('{field}') for t in real_built), True)
     case('an unknown shard field is not swallowed by a template',
          any(p.match('AUTUMN_DATABASE__SHARDS__0__NOPE')
              for p in real_built.values()), False)
@@ -779,6 +868,13 @@ def self_test():
     rows_p, unparsed_p = table_rows(prose)
     case('the enumerated prose rows still pass',
          (len(rows_p), len(unparsed_p)), (0, 0))
+    # A row that loses its OPENING backtick must still be recognised as a row.
+    # Requiring the backtick to detect a candidate dropped it from both lists,
+    # taking the row count from 142 to 141 with the gate still green.
+    no_tick = '//! | AUTUMN_SERVER__PORT` | `server.port` | `u16` |'
+    rows_n, unparsed_n = table_rows(no_tick)
+    case('a row missing its opening backtick is reported',
+         (len(rows_n), len(unparsed_n)), (0, 1))
 
     good = [(1, 'AUTUMN_LOG__LEVEL', 'log.level'),
             (2, 'AUTUMN_SECURITY__SIGNING_SECRET', 'security.signing_secret.secret'),
