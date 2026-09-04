@@ -23,31 +23,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   override is applied by name at load time or not at all — so
   `AUTUMN_DATABASE_URL` (one underscore, the pre-0.2 spelling) beside a
   production Postgres URL reads exactly like a working line, and the app comes
-  up on the default database. The gate resolves every `AUTUMN_*` variable in
-  the 175-page reader-facing corpus (629 occurrences) against
+  up on the default database.
+
+  The gate asks whether the runtime **reads** a name, not whether a config key
+  is spelled like it. Those are different sets: the env layer is written field
+  by field (`parse_env(env, "AUTUMN_LOG__LEVEL", …)`), so a TOML key with no
+  override of its own has no environment spelling at all — `openapi.enabled`
+  is a real schema leaf and `AUTUMN_OPENAPI__ENABLED` is read by nothing, as
+  are 90 of the 397 leaves. So a name resolves when something in the tracked
+  non-markdown tree **binds** it (`const CANARY_ENV: &str = "AUTUMN_CANARY"`)
+  or **reads** it through an env accessor, or when it matches one the runtime
+  **builds** (`format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_ID")` — the
+  filled-in segment open, the rest exact, which is the runtime's own
+  behaviour). That covers the four subsystems outside `AutumnConfig`:
+  `autumn-search` and `autumn-media-plugin` layer their own overrides in their
+  own crates, `autumn-cli` owns `[dev] watch_dirs`, and `AUTUMN_SYNC__*` is
+  read by the Tauri shell the CLI generates.
   `autumn/tests/fixtures/schema_keys.snapshot` — the same schema walk that
   backs strict unknown-key validation, already kept honest by
-  `schema_keys_snapshot_guard`, so there is nothing to regenerate and no Rust
-  toolchain needed — falling back to a sweep of the tracked non-markdown tree
-  for the four subsystems outside `AutumnConfig` (`AUTUMN_SEARCH__*` and
-  `AUTUMN_MEDIA__*` layer their own overrides in their own crates,
-  `autumn-cli` owns `[dev] watch_dirs`, and `AUTUMN_SYNC__*` is read by the
-  Tauri shell the CLI generates). That sweep counts only variables a file
-  actually **uses** — a string literal, a shell assignment or export, an
-  expansion — never one merely named in prose: an earlier plain-token version
-  read this gate's own CI step comment, which explains the check using the
-  words `AUTUMN_DATABASE_URL`, and that mention alone resolved the very
-  variable the gate exists to catch. It also gates the hand-maintained 135-row
-  `AUTUMN_* -> config path` table in `config.rs`'s module docs — the mapping
-  readers meet on docs.rs — checking both columns, so a row edited on one side
-  only is caught. Pages teaching the naming rule rather than naming a key
-  (`AUTUMN_SECTION__FIELD`, across seven pages) and identifiers a page declares
-  in its own example code (`pub const AUTUMN_SOURCE: &str = …` in
-  `docs/guide/wasm-islands.md`) are recognised as such rather than waived. The
-  baseline run found **0 defects**: the reader-facing corpus was already
-  accurate, and the gate is here to keep it that way. One occurrence is waived
-  in place beside the passage that needs it — a migration guide's `rg` pattern
-  for a key that release removed.
+  `schema_keys_snapshot_guard`, so nothing needs regenerating and no Rust
+  toolchain is required — bounds the one open-ended template
+  (`…SHARDS__{i}__{field}`) and checks declared config *paths*.
+
+  It also gates the hand-maintained 142-row `AUTUMN_* -> config path` table in
+  `config.rs`'s module docs, the mapping readers meet on docs.rs. Each row
+  makes two claims, checked against their own truth: the path must exist in
+  the schema, the variable must be one the runtime reads, and the two must
+  agree — so neither a row edited on one side nor a row publishing an override
+  that sets nothing gets through. Any row shaped like a mapping that the
+  checker cannot parse is reported rather than skipped.
+
+  Prose that names a family (`AUTUMN_ALERTS__*`,
+  `AUTUMN_MEDIA__<TABLE>__<FIELD>`), pages teaching the naming rule
+  (`AUTUMN_SECTION__FIELD`), reader-chosen names
+  (`access_key_id_env = "AUTUMN_OFFSITE_ACCESS_KEY_ID"`) and identifiers a page
+  declares in its own example code (`pub const AUTUMN_SOURCE: &str = …` in
+  `docs/guide/wasm-islands.md`) are recognised as such rather than waived. A
+  malformed name — lower case outside a placeholder, or a dangling separator —
+  is reported rather than skipped, since a spelling that matches nothing is a
+  claim the reader cannot be warned about.
+
+  The baseline run found **0 defects** across 658 occurrences on 175 pages:
+  the reader-facing corpus was already accurate, and the gate is here to keep
+  it that way. One occurrence is waived in place beside the passage that needs
+  it — a migration guide's `rg` pattern for a key that release removed.
 
 - **A CI gate for the "local development" install path [no-plugin]:** nothing
   here is agent-facing — it's a CI/test-harness addition, not new framework

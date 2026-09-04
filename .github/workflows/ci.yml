@@ -246,10 +246,16 @@ jobs:
         # config.rs's module docs, which is hand-maintained and is the mapping
         # readers meet on docs.rs.
         #
-        # The truth set is `schema_keys.snapshot` — the same schema walk that
-        # backs strict unknown-key validation, already kept honest by
-        # `schema_keys_snapshot_guard` — so there is nothing to regenerate here
-        # and no Rust toolchain needed.
+        # The question is whether the runtime READS a name, not whether a config
+        # key is spelled like it. Those differ: the env layer is written field by
+        # field, so a TOML key with no override of its own has no environment
+        # spelling — `openapi.enabled` is a real schema leaf and
+        # `AUTUMN_OPENAPI__ENABLED` is read by nothing, as are 90 of the 397
+        # leaves. A name resolves when the tree binds or reads it, or when it
+        # matches one the runtime builds. `schema_keys.snapshot` — the same walk
+        # that backs strict unknown-key validation, kept honest by
+        # `schema_keys_snapshot_guard` — bounds the one open-ended template and
+        # checks declared config paths. Nothing to regenerate, no Rust toolchain.
         #
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
