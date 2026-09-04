@@ -209,12 +209,15 @@ after-measurement — no change shipped this pass.
 
 An earlier revision of this section proposed reruns filtered to just the
 named test (`cargo test ... -- <test name>`). Codex review correctly
-rejected that: all three tests live in the consolidated `integration_tests`
-binary (or, for `live_upgrade`, its own binary), and every CI failure this
-census found happened while that binary ran as part of the full `Run
-tests` step (`cargo test --workspace`) — thousands of tests, much of it
-concurrent, on a runner that had already been building and testing for a
-while. A filtered single-test rerun strips out exactly the load the
+rejected that: every CI failure this census found happened while the
+target test ran as part of the full `Run tests` step (`cargo test
+--workspace`), on a runner that had already been compiling and testing for
+a while — `cache_stampede` and `sim_fault_plan` inside the consolidated
+`integration_tests` binary alongside thousands of others running
+concurrently across worker threads, `live_upgrade` alone in its own crate
+but still downstream of that same ~25-minute build-up. A filtered
+single-test rerun strips out exactly the load (or, for `live_upgrade`, the
+cumulative runner history — see tier 2 below for the distinction) the
 runner-contention hypothesis in Diagnosis depends on: a clean result from
 it would show the test has no bug *in isolation*, not that macOS isn't
 contended. It answers a real but different, narrower question than the one
@@ -226,12 +229,18 @@ That leaves two tiers, and they are not substitutes for each other:
    needs)**: rerun the exact CI command, unfiltered, and grep each run's
    output for the target test's own result line. This is expensive — the
    `Run tests` step itself took 1,501-1,607s (25-27 minutes) in the census
-   sample — so even N=10 here is a ~4-5 hour campaign, not a quick check:
+   sample — so even N=10 here is a ~4-5 hour campaign, not a quick check.
+   It must run on an actual GitHub-hosted `macos-latest` runner (a
+   `workflow_dispatch` job on `ci.yml`'s own matrix leg is the simplest way
+   to get one): the hypothesis under test is contention specific to that
+   *shared, GitHub-hosted* runner class, so a clean result on a personal
+   or otherwise-provisioned Mac tests a different, less contended
+   environment and cannot stand in as evidence against it either way.
 
    ```
-   # Run on macOS hardware/a macos-latest-class runner. Mirrors the actual
-   # failing step; do not add a name filter or you're back to the isolated
-   # case Codex flagged.
+   # Must run on macos-latest itself (see above) -- not just "any macOS
+   # box". Mirrors the actual failing step; do not add a name filter or
+   # you're back to the isolated case Codex flagged.
    for i in $(seq 1 10); do
      cargo test --workspace 2>&1 | tee "run-$i.log"
      grep -E "upgrades_in_place_under_load_without_dropping|cache_stampede::swr_serves_stale_and_refreshes_in_background|sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times" "run-$i.log"
@@ -243,7 +252,19 @@ That leaves two tiers, and they are not substitutes for each other:
    at all — a positive result there is still informative (bug confirmed
    independent of contention), but a clean 0/N is not evidence against the
    contention hypothesis and must not be read as one, unlike what an
-   earlier revision of this report claimed:
+   earlier revision of this report claimed. And "isolation" means something
+   different per test here: `cache_stampede` and `sim_fault_plan` share the
+   heavily-parallel `integration_tests` binary with thousands of other
+   tests running across worker threads, so filtering to one name really
+   does remove concurrent *thread* contention within that process.
+   `live_upgrade` is the only test in its own crate (`hot-upgrade` has one
+   `[[test]]` target and cargo runs test binaries one at a time regardless
+   of filtering), so it was never running alongside other tests in the
+   first place — isolating it instead skips the ~25 minutes of prior
+   workspace compilation and testing that could leave the runner's
+   thermal, memory, or disk state different by the time it runs. That is
+   still a real difference from the CI scenario, just a cumulative-history
+   one rather than a concurrency one, and the two shouldn't be conflated:
 
    ```
    for i in $(seq 1 20); do
