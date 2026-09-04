@@ -343,17 +343,19 @@ fn report_displacement(
     (keys_before, keys_after): (&BTreeSet<RouteKey>, &BTreeSet<RouteKey>),
     out: &mut Vec<Finding>,
 ) {
-    for ((displaced_path, displaced_method), displaced) in before {
-        if !takes_precedence(path, displaced_path)
-            || !methods_transfer(
-                (displaced_method, displaced_path),
-                keys_before,
-                (method, path),
-                keys_after,
-            )
-        {
+    // What the new route takes over is whatever *was* serving those URLs — the
+    // most specific base route overlapping them, not every route it outranks.
+    let candidates: Vec<&RouteKey> = before
+        .keys()
+        .filter(|(p, m)| {
+            takes_precedence(path, p)
+                && methods_transfer((m, p), keys_before, (method, path), keys_after)
+        })
+        .collect();
+    for key in undominated(&candidates) {
+        let Some(displaced) = before.get(key) else {
             continue;
-        }
+        };
         // What changed for those URLs is the posture they used to demand
         // against the one they demand now — decided, as everywhere else here,
         // by `compare_route` rather than by a second opinion.
@@ -2570,6 +2572,33 @@ mod tests {
             widening[0].detail.contains("/users/{id}"),
             "the finding must name the route whose requests it takes: {:?}",
             widening[0]
+        );
+    }
+
+    /// Ranking applies to the displacement side too: what a new route takes
+    /// over is whatever *was* serving those URLs, which is the most specific
+    /// base route overlapping them. Comparing against every overlapping base
+    /// route blamed a stricter handler that never served the URL.
+    #[test]
+    fn a_displacement_compares_against_the_route_that_was_serving_the_url() {
+        let prior_owner = route("/records/me/{id}", "GET", "gated", &["user"], &[], false);
+        let never_served = route(
+            "/records/{user}/private",
+            "GET",
+            "gated",
+            &["admin"],
+            &[],
+            false,
+        );
+        let added = route("/records/me/private", "GET", "gated", &["user"], &[], false);
+
+        let base = routes_only(&format!("{prior_owner},{never_served}"));
+        let head = routes_only(&format!("{prior_owner},{never_served},{added}"));
+
+        let findings = diff(&base, &head);
+        assert!(
+            widening(&findings).is_empty(),
+            "the route that was serving that URL has the same guard: {findings:#?}"
         );
     }
 
