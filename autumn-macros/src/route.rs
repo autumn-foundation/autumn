@@ -340,15 +340,18 @@ const EDGE_AGENT_OPERABLE_ERROR: &str = "`#[edge]` cannot be combined with `#[ag
      route from the origin.\n\nServe the route from the origin, or drop \
      `#[agent_operable]`. See docs/guide/agent-authority.md.";
 
-/// Marker consts the auth/rate guards inject into a handler body. A guard that
-/// expanded *before* this route macro left one of these behind instead of an
-/// attribute, and missing it would ship a guarded route to the unauthenticated
-/// edge lane.
+/// Marker consts a guard that expanded *before* this route macro left behind
+/// in the handler body instead of an attribute, and missing it would ship a
+/// guarded route to the unauthenticated edge lane.
+///
+/// `#[step_up]`/`#[throttle]` don't appear here: their check moved into a
+/// pre-body `FromRequestParts` gate (#1668) and they never left an
+/// OpenAPI-readable body marker to begin with, so `has_auth_or_rate_guard`
+/// recognizes them via `has_step_up_guard`/`has_throttle_guard`'s own
+/// gate-param check instead of this body scan.
 const GUARD_MARKERS: &[&str] = &[
     "__AUTUMN_SECURED_ROLES",
     "__AUTUMN_SECURED_SCOPES",
-    "__AUTUMN_STEP_UP_MAX_AGE",
-    "__AUTUMN_THROTTLE_ROUTE_ID",
     "__AUTUMN_AUTHORIZE_BINDINGS",
     "__AUTUMN_AGENT_OPERABLE",
 ];
@@ -598,22 +601,33 @@ fn has_authorize_guard(input_fn: &syn::ItemFn) -> bool {
         || crate::api_doc::has_policy_check_in_stmts(&input_fn.block.stmts)
 }
 
+/// Whether `#[step_up]` applies to `input_fn`, in either attribute order: a
+/// still-unexpanded `#[step_up]` attribute, or (issue #1668) the
+/// `__AutumnStepUpGate_*` pre-body `FromRequestParts` gate parameter it
+/// expands into. The gate parameter check matters because `#[step_up]` no
+/// longer leaves any recognizable shape in the handler *body* — its check now
+/// runs in a sibling gate, before the body ever executes — so `body_guarded_replay`
+/// (which must stay true whenever a gate owns replay-serving, to keep the
+/// standalone `IdempotencyReplayLayer` from serving a cached response ahead of
+/// the gate's check) can no longer rely on a body-shape scan alone.
 fn has_step_up_guard(input_fn: &syn::ItemFn) -> bool {
     input_fn.attrs.iter().any(|attr| {
         attr.path()
             .segments
             .last()
             .is_some_and(|segment| segment.ident == "step_up")
-    })
+    }) || crate::param_helpers::has_guard_gate_param_with_prefix(input_fn, "__AutumnStepUpGate_")
 }
 
+/// Whether `#[throttle]` applies to `input_fn`. See [`has_step_up_guard`] for
+/// why the pre-body gate parameter is checked alongside the attribute.
 fn has_throttle_guard(input_fn: &syn::ItemFn) -> bool {
     input_fn.attrs.iter().any(|attr| {
         attr.path()
             .segments
             .last()
             .is_some_and(|segment| segment.ident == "throttle")
-    })
+    }) || crate::param_helpers::has_guard_gate_param_with_prefix(input_fn, "__AutumnThrottleGate_")
 }
 
 /// Whether a `#[secured]` attribute is still present on the handler (i.e. it has
@@ -1542,7 +1556,14 @@ mod tests {
             },
         );
         let secured = crate::secured::secured_macro(quote! { "admin" }, authorized);
-        let generated = route_macro("POST", "post", quote! { "/notes/{id}" }, secured).to_string();
+        let secured_fn = crate::param_helpers::extract_fn_item(secured, "update_note");
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/notes/{id}" },
+            quote! { #secured_fn },
+        )
+        .to_string();
 
         assert!(
             generated.contains(r#"AuthorizeBinding { action : "update" , resource : "Note" }"#),
@@ -1596,8 +1617,11 @@ mod tests {
                 async fn update_note(note: Note) -> &'static str { "ok" }
             },
         );
-        let authorized =
-            crate::authorize::authorize_macro(quote! { "update", resource = Note }, secured);
+        let secured_fn = crate::param_helpers::extract_fn_item(secured, "update_note");
+        let authorized = crate::authorize::authorize_macro(
+            quote! { "update", resource = Note },
+            quote! { #secured_fn },
+        );
         let generated =
             route_macro("POST", "post", quote! { "/notes/{id}" }, authorized).to_string();
 
@@ -1628,7 +1652,14 @@ mod tests {
                 async fn update_note(note: Note) -> &'static str { "ok" }
             },
         );
-        let generated = route_macro("POST", "post", quote! { "/notes/{id}" }, secured).to_string();
+        let secured_fn = crate::param_helpers::extract_fn_item(secured, "update_note");
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/notes/{id}" },
+            quote! { #secured_fn },
+        )
+        .to_string();
 
         assert!(
             generated.contains(r#"required_roles : & ["admin"]"#),

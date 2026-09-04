@@ -1536,8 +1536,7 @@ mod tests {
         );
         let throttled =
             crate::throttle::throttle_macro(quote::quote! { limit = 5, per = "1m" }, public);
-        let parsed: syn::ItemFn =
-            syn::parse2(throttled).expect("#[throttle] over #[public] output must parse");
+        let parsed = crate::param_helpers::extract_fn_item(throttled, "h");
         assert!(
             is_public(&parsed),
             "the public marker must survive a #[throttle] wrapper"
