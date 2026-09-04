@@ -270,9 +270,28 @@ def family_exists(var, built, tokens):
     short — was accepted as a family mention and skipped, so the shape `*`
     excused any spelling in front of it. The prefix is a claim about a family
     of variables, and it is checked like any other claim.
+
+    It must also END where a family ends. Plain `startswith` accepted
+    `AUTUMN_SESSION_*` — one underscore short of the documented
+    `AUTUMN_SESSION__*` — because real names do begin with those characters,
+    and it would have accepted `AUTUMN_A*` for the same reason. So the mention's
+    separator run has to be the one the real name uses at that position: both
+    depths occur here, `AUTUMN_SESSION__*` in the config namespace and
+    `AUTUMN_ACME_DNS_*` in the flat one, across 14 distinct mentions.
     """
-    return (any(t.startswith(var) for t in tokens)
-            or any(p.pattern.lstrip('^').startswith(var) for p in built.values()))
+    head = var.rstrip('_')
+    seps = len(var) - len(head)
+    if not seps:
+        return False
+    names = [t for t in tokens]
+    names += [p.pattern.lstrip('^') for p in built.values()]
+    for t in names:
+        if not t.startswith(head):
+            continue
+        rest = t[len(head):]
+        if rest[:seps] == '_' * seps and rest[seps:seps + 1] != '_':
+            return True
+    return False
 
 
 def family(var, line):
@@ -435,11 +454,19 @@ COMMENT_LEADER = {
     '.toml': '#', '.yml': '#', '.yaml': '#', '.example': '#',
 }
 
+# Some file types are named rather than suffixed. `Dockerfile.api.tmpl` strips
+# to `Dockerfile.api`, whose "suffix" is `.api` — so the whole family was
+# getting no comment handling at all, and its commented `--build-arg
+# AUTUMN_BUILD_*=…` examples were reading as source truth.
+COMMENT_LEADER_NAMED = {'Dockerfile': '#', 'Makefile': '#', 'Justfile': '#'}
+
+
 def comment_leader(rel):
     p = pathlib.PurePath(rel)
     if p.suffix == '.tmpl':
         p = pathlib.PurePath(p.stem)
-    return COMMENT_LEADER.get(p.suffix)
+    named = COMMENT_LEADER_NAMED.get(p.name.split('.')[0])
+    return named if named else COMMENT_LEADER.get(p.suffix)
 
 
 def _rust_classes(body):
@@ -669,6 +696,13 @@ ASSIGNED_PREFIX = re.compile(
 # ignored in the file that assigns it — while `${AUTUMN_MEDIA__FFMPEG__BIN}`,
 # which nothing assigns, still counts wherever it appears.
 ASSIGNED_ANY = re.compile(r'(?:^|[;&|(\s])(?:export\s+)?(AUTUMN_[A-Z0-9_]+)=')
+
+# A Dockerfile DECLARES a variable with `ARG` or `ENV`, and `ARG AUTUMN_BUILD_
+# GIT_SHA=` — an empty default — matches none of the shell shapes above. Added
+# alongside stripping Dockerfile comments rather than after it: the commented
+# `--build-arg` examples were the only thing carrying five of these names, and
+# removing that cover without the declaration would have reported correct pages.
+DECLARED = re.compile(r'^\s*(?:ARG|ENV)\s+(AUTUMN_[A-Z0-9_]+)')
 EXPANDED = re.compile(r'\$\{?(AUTUMN_[A-Z0-9_]+)\}?')
 
 # A quoted name counts only where the code BINDS it as an environment-variable
@@ -932,6 +966,7 @@ def source_tokens(root):
             if not rel.endswith('.rs'):
                 tokens.update(ASSIGNED.findall(line))
                 tokens.update(ASSIGNED_PREFIX.findall(line))
+                tokens.update(DECLARED.findall(line))
             tokens.update(v for v in EXPANDED.findall(line) if v not in local)
             tokens.update(v for _, v in BOUND.findall(line))
             if NEGATED.search(line):
@@ -1108,9 +1143,19 @@ TABLE_ROW = re.compile(
 # prose, and produces neither a table defect nor an unparsed-row defect. The
 # whole point of accounting for every row is that a row cannot leave the check
 # by being malformed.
-# A ratchet, not an exact count: rows get added, and a real drop means the
-# table stopped being checked rather than that someone removed 100 variables.
-TABLE_ROW_FLOOR = 120
+# A ratchet at the CURRENT count, not a loose floor. At 120 the check answered
+# "is the table still being read at all", and a slack of 22 rows meant deleting
+# a documented override left the gate green: 141 rows, every one of them valid,
+# and a supported variable gone from the published reference without a word.
+#
+# Deliberately a count and not a completeness check, because there is no set to
+# be complete against. `config.rs` reads 309 names and this table documents 142
+# — it is a curated selection, so "every name the runtime reads must appear
+# here" would be a demand for 178 new rows rather than a correctness rule. What
+# a ratchet does state is that removing a row is a decision someone makes on
+# purpose: raise this when rows are added, lower it only in the commit that
+# takes rows away, and say why there.
+TABLE_ROW_FLOOR = 142
 
 TABLE_PROSE_ROWS = ('AUTUMN_ENV', 'AUTUMN_PROFILE')
 TABLE_PROSE_ROW = re.compile(
@@ -1286,8 +1331,11 @@ def main():
             f'docs, found {found} — the mapping checks did not run')
     elif len(rows) < TABLE_ROW_FLOOR:
         table_missing.append(
-            f'only {len(rows)} module-doc table rows parsed, below the floor of '
-            f'{TABLE_ROW_FLOOR} — the table is being skipped, not checked')
+            f'only {len(rows)} module-doc table rows parsed, below the ratchet '
+            f'of {TABLE_ROW_FLOOR} — either the table stopped being read, or a '
+            f'documented override was removed from the published reference. If '
+            f'the removal is deliberate, lower TABLE_ROW_FLOOR in '
+            f'{SELF} in the same commit and say why')
     table_defects = check_table(rows, leaves, built, tokens)
 
     print(f'corpus: {len(files)} reader-facing markdown files')
@@ -1429,6 +1477,21 @@ def self_test():
          family_exists('AUTUMN_SEARCH__', built, tokens), True)
     case('a misspelled family prefix does not',
          family_exists('AUTUMN_SESION__', built, tokens), False)
+    # …and the prefix must end where a family ends. `AUTUMN_SEARCH_*` — one
+    # underscore short — passed on `startswith` alone, because real names do
+    # begin with those characters.
+    case('a prefix ending mid-separator does not',
+         family_exists('AUTUMN_SEARCH_', built, tokens), False)
+    case('nor does a prefix ending mid-segment',
+         family_exists('AUTUMN_S', built, tokens), False)
+    # A single-separator family is real in the flat namespace, so the rule is
+    # "the same separator run the name uses", not "must be `__`".
+    case('a flat-namespace family still resolves',
+         family_exists('AUTUMN_ACME_DNS_',
+                       {}, {'AUTUMN_ACME_DNS_API_TOKEN'}), True)
+    case('and its double-separator spelling does not',
+         family_exists('AUTUMN_ACME_DNS__',
+                       {}, {'AUTUMN_ACME_DNS_API_TOKEN'}), False)
     sf, dfam = scan(['d.md'], lambda _: 'set `AUTUMN_SESION__*` to override\n',
                     leaves, built, tokens)
     case('a misspelled family is reported',
@@ -1710,6 +1773,22 @@ def self_test():
     case('a template is read as its inner type',
          (comment_leader('Cargo.toml.tmpl'), comment_leader('README.md.tmpl')),
          ('#', None))
+    # A Dockerfile is named, not suffixed. `Dockerfile.api.tmpl` strips to
+    # `Dockerfile.api`, whose suffix is `.api`, so the whole family was getting
+    # no comment handling and its commented `--build-arg` examples read as truth.
+    case('a Dockerfile is recognised by name',
+         (comment_leader('Dockerfile'),
+          comment_leader('autumn-cli/src/templates/Dockerfile.api.tmpl'),
+          comment_leader('benchmarks/runtime/autumn/Dockerfile')),
+         ('#', '#', '#'))
+    # …and its declaration form is recognised alongside, because `ARG NAME=`
+    # with an empty default matches none of the shell shapes.
+    case('an ARG/ENV declaration is a declaration',
+         (DECLARED.findall('ARG AUTUMN_BUILD_GIT_SHA='),
+          DECLARED.findall('ENV AUTUMN_PROFILE=prod')),
+         (['AUTUMN_BUILD_GIT_SHA'], ['AUTUMN_PROFILE']))
+    case('a build arg declared in a Dockerfile is swept in',
+         'AUTUMN_CLI_VERSION' in swept, True)
     case('an unlisted type keeps every line',
          uncommented('# AUTUMN_X', comment_leader('a.golden')), '# AUTUMN_X')
     case('a collection lookup is not an env accessor',
