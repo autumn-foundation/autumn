@@ -1604,6 +1604,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🧭 Wayfinder: keyboard bypass-blocks link added to 6 supported example
+  apps (a11y `bypass` Serious 7/8 → 0/8; `landmark-one-main` Moderate 1/8 → 0/8):**
+  `autumn check --a11y` — the framework's own WCAG audit, run against each
+  layout's rendered shell — found `todo-app`, `blog`, `bookmarks`,
+  `bookmarks-distributed`, `wiki`, `saas`, and `teams` (7 of the 8 `supported`-tier
+  example apps with an HTML UI; `reddit-clone` already had it) missing the
+  skip-to-content link that `autumn new`'s own scaffold (`autumn-cli/src/templates/main.rs.tmpl`)
+  ships by default. A keyboard-only user visiting any of these — including
+  `saas`/`teams`, whose nav is the login/signup entry point — must tab through
+  every nav link before reaching the page's actual content on **every single
+  page load**, with no way to jump past it (WCAG 2.4.1 Bypass Blocks). `todo-app`
+  additionally had no `<main>` landmark at all, so a screen-reader user's
+  "jump to main content" shortcut had nothing to land on.
+  Fix: a visually-hidden, focus-revealed `<a href="#main-content">` as the
+  first element inside `<body>` on the 6 apps whose layout has a nav/header
+  preceding the content, plus a `<main id="main-content">` landmark on every
+  affected layout including `todo-app` — the exact skip-link pattern
+  `examples/reddit-clone` already used and the scaffold template establishes,
+  so no new CSS or dependency is introduced. `todo-app`'s page has no
+  nav/header at all (content is the first thing in `<body>`), so it gets only
+  the `<main>` landmark — a skip link there would add a tab stop ahead of the
+  first form control while bypassing nothing, the same reason
+  `examples/media-room` (also audited, also nav-less) was left unchanged.
+  `examples/blog` is i18n-aware (`/es/...` routes via `t!`), so its skip
+  link's label is a new `layout.skip_to_content` Fluent key translated in
+  both `i18n/en.ftl` and `i18n/es.ftl`, not a hardcoded English string,
+  matching the rest of that layout's chrome.
+
+  `autumn check --a11y`'s `bypass` rule (`autumn-cli/src/check.rs`) itself had
+  a false positive this fix exposed: it unconditionally required a skip link
+  as the page's first `<a>`, so `todo-app`'s post-fix shell — `<main>`
+  immediately inside `<body>`, its only link in the footer, after `<main>` —
+  still reported Serious `bypass`, even though there is no nav/header for a
+  skip link to bypass there. The rule now skips the check when nothing
+  (no nav, header, or link) precedes `<main>`, matching the exact reasoning
+  already applied to `todo-app`/`media-room` above; it still fires whenever
+  content — `<nav>`-wrapped or not — precedes `<main>` without a skip link
+  (both pre-existing regression tests plus two new ones cover this).
 - **🛣️ Onramp: `autumn setup` retries a dropped Tailwind CSS download instead
   of failing the whole quickstart [no-plugin]:** `autumn setup` — the second
   documented command in the README quickstart, right after `autumn new` — did
@@ -2050,6 +2088,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never resubmitted) keep showing their real value instead of going blank.
   Other failure classes (missing pool, unknown model, database outage) are
   unchanged and still render the generic error page.
+- **`distributed_lock`'s `cancelled_release_does_not_leak_lock` de-flaked and
+  un-quarantined:** the test raced a `Duration::ZERO` `tokio::time::timeout`
+  against a real `pg_advisory_unlock` round-trip, on the assumption that an
+  already-elapsed timer always wins. It doesn't: `Timeout::poll` polls the
+  wrapped future *before* checking its timer, so whenever the query happened
+  to resolve within that same first poll the timeout never fired and the
+  future was never actually cancelled mid-flight — measured at 1/30
+  same-commit reruns. It had been `--skip`-listed out of `ci.yml`'s Docker
+  sweep for this since, with no tracking issue. The test now polls
+  `release()` by hand exactly once, asserts `Poll::Pending` (proof the query
+  genuinely had not completed — a real network round-trip cannot resolve
+  synchronously on its first poll) and drops it from there: no timing
+  dependency, 0 failures across 50 reruns. Restored to CI's Docker sweep.
+- **`autumn-cli export`'s `test_fetch_endpoint_success`/`test_fetch_endpoint_failure`
+  de-flaked on `windows-latest` CI:** two independent mechanisms in the same
+  hand-rolled mock-HTTP-server test harness (`export.rs`). The success-path
+  server capped itself at `num_requests` *accept() attempts* rather than
+  *served requests*, so a single transient `accept()` error (seen on
+  windows-latest, where loopback connections are occasionally intercepted by
+  Defender/firewall) silently gave up and left the client to time out with
+  no response. The failure-path test "guaranteed" a closed port by binding
+  an ephemeral port and immediately dropping it — but every test in the
+  module runs concurrently and independently calls
+  `TcpListener::bind("127.0.0.1:0")`, so the just-freed port could be
+  reallocated to another test's mock server before this test's client
+  connected, landing on a live, unrelated server instead of getting refused.
+  The mock server now retries past a transient `accept()`/read failure
+  instead of spending one of its `num_requests` slots on it, and the
+  failure-path test now binds its own ephemeral listener and keeps it
+  reserved (bound, unaccepted) for the request instead of dropping it —
+  which both removes the race (nothing else can grab that port) and makes
+  no assumption about what else might be listening on the host.
 
 ### Added
 
@@ -2785,6 +2855,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behavior for every deployed app, which is a maintainer call rather than an
   unreviewed automated change — see #2485 for the full mechanism and
   reproduction steps.
+- **`ledger_as_of`/`ledger_diff` no longer read a ledgered record's entire
+  revision chain to answer a question with one answer:** both are pure
+  functions over `ledger_revisions(record_id)`, which has always had one SQL
+  shape — read every stored revision, every full-column snapshot, in `seq`
+  order — with no bound on the requested instant at all. For a hot ledgered
+  record (an account, invoice, or contract adjusted repeatedly over a long
+  operational life, exactly the shape the feature exists for), an audit query
+  about *recent* history — the overwhelmingly common case — paid for reading
+  the record's whole history regardless. Both now issue a bounded
+  `ORDER BY seq DESC LIMIT 1` lookup instead, using the same index
+  `ledger_revisions` already relied on — no migration, no new index. Because
+  transaction time is monotonic in `seq` (#2323), a transaction-time as-of
+  query's cost is now proportional to how far back the question asks, not to
+  the chain's total length. `ledger_diff`'s two endpoints are resolved from
+  one `UNION ALL` statement on one connection rather than two independent
+  lookups, so it keeps the single-snapshot consistency the old full-chain
+  read had (two separate connection-acquiring calls could otherwise resolve
+  `from`/`to` against two different database states if a write landed, or a
+  read replica advanced, between them) — statement count for `ledger_diff`
+  is unchanged at 1. Measured (`pg_stat_statements`, testcontainer Postgres,
+  three ledgered chains at 300/700/1,200 revisions each, written through the
+  real write path): a near-head as-of query's buffers fall 86–94% and stay
+  flat across all three depths (22/129/132 → 3/8/8), instead of scaling with
+  chain length; `ledger_diff` across a recent window falls 129 → 16 buffers
+  (-88%). Disclosed trade-off: the pathological case — asking about a
+  record's very *first* revision on a deep chain — reads more buffers than
+  before (132 → 948 on the 1,200-revision fixture), because the backward
+  index scan can't short-circuit when the answer sits at the far end of it;
+  this is bounded by the record's own chain depth and only reachable by a
+  query about a record's oldest history, so it does not offset the
+  unconditional win on the realistic (recent-history) query pattern.
+  `ledger_revisions` and `ledger_verify` are unchanged — they legitimately
+  need the whole chain and still read it.
 
 - **the DB-backed media-room reaper sweeps in one statement instead of one per
   stale room:** `DbRoomStore::reap_stale`'s second phase — the sweep that drops
