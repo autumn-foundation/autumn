@@ -128,6 +128,16 @@
 #     through most of these rounds: its `_heredoc_openers` / `_open_quote` are
 #     where the heredoc and quote rules here come from. Read the sibling gate
 #     before re-deriving one of its answers, and take all of it.
+#     The same shape shows up as a container read as OPAQUE where the language
+#     re-enters itself: a double-quoted string is not one context, because
+#     `"$(printf '%s' '…')"` starts fresh quoting inside the substitution; a
+#     PowerShell here-string is held by `@'` and a line beginning `'@`, not by
+#     the apostrophes in its body; and a heredoc's openers are collected from
+#     the LOGICAL command line, so a `\` continuation still opens both.
+#     And as a DEFAULT standing in for a language: `#` covers most of this tree,
+#     so the 171 `.sql` migrations were "commented" by a rule that strips
+#     nothing SQL contains. A default is a guess about files nobody listed;
+#     check what it is guessing about.
 #   * A rule about the LAYOUT of the text standing in for a rule about its
 #     structure. "The comment starts the line", "the `}` is in column zero",
 #     "the `#[cfg(test)]` is not indented" — each held for the cases in front of
@@ -511,6 +521,10 @@ SEGMENT = r'(?:[A-Z0-9]+(?:_[A-Z0-9]+)*|\{[a-z]+\})'
 COMMENT_LEADER = {
     # `#` opens an attribute, not a comment.
     '.rs': '//', '.ts': '//', '.js': '//', '.go': '//',
+    # SQL is a third comment family — `--` to the line end and `/* … */` —
+    # and the 171 tracked migrations were falling through to the `#` default,
+    # which strips nothing an SQL file actually contains.
+    '.sql': '--',
     # Program output captured as a fixture: nothing in it is a comment, and a
     # line may legitimately begin with `#`.
     '.golden': None, '.stderr': None, '.snap': None, '.json': None,
@@ -787,8 +801,13 @@ QUOTE_ESCAPE = {'.ps1': '`', '.psm1': '`'}
 # round, and that tuple then had to mean two different things.
 HAS_HEREDOC = ('.sh', '.bash', '.zsh')
 
+# …and PowerShell's here-string is the other half of that same split: `@' … '@`
+# is held by its own delimiters, not by quotes, so its body may contain the
+# apostrophes an ordinary quoted span would end on.
+HAS_HERE_STRING = ('.ps1', '.psm1')
 
-def _shell_literals(body, escape='\\'):
+
+def _shell_literals(body, escape='\\', here=False):
     """Blank single-quoted spans, tracking quote state ACROSS lines.
 
     A single-quoted string spans physical lines — `printf '%s\\n' '` opens one
@@ -804,30 +823,73 @@ def _shell_literals(body, escape='\\'):
     rather than blanked to the end of the file, since blanking there would hide
     real uses and report correct pages.
 
+    `here` adds PowerShell's here-strings, whose bodies are held by their own
+    delimiters rather than by quotes.
+
     Length-preserving, newlines kept, so line numbering holds.
     """
-    out, i, n = list(body), 0, len(body)
+    out = list(body)
+    _blank_literals(body, out, 0, len(body), escape, here)
+    return ''.join(out)
+
+
+def _blank_literals(body, out, i, n, escape, here=False, dq=False):
+    """Blank the single-quoted spans in `body[i:n]`; return where it stopped.
+
+    A double-quoted string is NOT one opaque context: `"$(printf '%s' '…')"`
+    re-enters shell parsing inside the substitution, where an apostrophe opens
+    a literal again. Consuming the outer span whole left that inner literal
+    readable, so a `${AUTUMN_X}` inside it counted as an expansion. `dq` says
+    we are inside double quotes, where an apostrophe is ordinary text and a `"`
+    ends the span; a substitution recurses with `dq` false, because quoting
+    starts fresh inside one.
+    """
     while i < n:
         c = body[i]
         if c == escape:
             i += 2
             continue
-        if c == '"':
-            # A double-quoted string is not blanked — `"${AUTUMN_X}"` expands —
-            # but it is CONSUMED, so the apostrophes in it open nothing.
-            i += 1
-            while i < n:
-                if body[i] == escape:
-                    i += 2
-                    continue
-                if body[i] == '"':
-                    i += 1
-                    break
+        if c == '$' and body[i + 1:i + 2] == '(':
+            end = min(_group_end(body, i + 1, '(', ')'), n)
+            _blank_literals(body, out, i + 2, max(end - 1, i + 2), escape, here)
+            i = end
+            continue
+        if c == '`':
+            # A backtick substitution, in the shells where a backtick is not
+            # the escape character — the `escape` test above has already taken
+            # it in PowerShell.
+            j = body.find('`', i + 1)
+            if j < 0 or j >= n:
                 i += 1
+                continue
+            _blank_literals(body, out, i + 1, j, escape, here)
+            i = j + 1
+            continue
+        if dq:
+            if c == '"':
+                return i + 1
+            i += 1
+            continue
+        # A PowerShell here-string is held by `@'` and a line beginning `'@`,
+        # NOT by its quotes: its body may contain apostrophes, so reading the
+        # first one as the terminator left the rest of the body visible.
+        if here and body[i:i + 2] in ("@'", '@"') and body[i + 2:i + 3] in '\r\n':
+            quote, end = body[i + 1], body.find('\n' + body[i + 1] + '@', i + 2)
+            if end < 0 or end >= n:
+                i += 2                      # unterminated: costs the opener
+                continue
+            if quote == "'":                # `@" … "@` interpolates; keep it
+                for k in range(i + 2, end):
+                    if body[k] != '\n':
+                        out[k] = ' '
+            i = end + 3
+            continue
+        if c == '"':
+            i = _blank_literals(body, out, i + 1, n, escape, here, True)
             continue
         if c == "'":
             j = body.find("'", i + 1)
-            if j < 0:
+            if j < 0 or j >= n:
                 i += 1
                 continue
             for k in range(i + 1, j):
@@ -836,7 +898,7 @@ def _shell_literals(body, escape='\\'):
             i = j + 1
             continue
         i += 1
-    return ''.join(out)
+    return i
 
 
 # A QUOTED heredoc — `<<'EOF'` — is literal data handed to a program or written
@@ -991,11 +1053,22 @@ def _shell_heredocs(body):
     a real reference — but it IS consumed, because its length is what puts the
     next heredoc's body in the right place.
     """
-    out, queue = [], []
+    out, queue, logical = [], [], ''
     for line in body.splitlines():
         if not queue:
             out.append(line)
-            queue.extend(_heredoc_openers(line))
+            # Bash collects EVERY delimiter on the logical command line before
+            # it consumes any body, so `cat <<'ONE' \` + `<<'TWO'` opens two.
+            # Reading the physical line took the continuation for the first
+            # body and never queued `TWO`, after which its data read as
+            # commands. The continuation test runs on the masked copy, so a
+            # trailing backslash inside a quoted string does not join lines.
+            masked = _mask_inert(line)
+            if masked.endswith('\\') and not _escaped(masked, len(masked) - 1):
+                logical += line[:-1]
+                continue
+            queue.extend(_heredoc_openers(logical + line))
+            logical = ''
             continue
         delim, tabs, expands = queue[0]
         candidate = line.lstrip('\t') if tabs else line
@@ -1009,6 +1082,46 @@ def _shell_heredocs(body):
 
 def _ps_uncommented(body):
     return PS_BLOCK.sub(lambda m: re.sub(r'[^\n]', ' ', m.group(0)), body)
+
+
+def _sql_uncommented(body):
+    """Drop SQL's `--` line comments and `/* … */` blocks, keeping strings.
+
+    A string is single-quoted and escapes its own quote by DOUBLING it, so
+    `'it''s'` is one string and not two; an identifier is double-quoted. Neither
+    holds a comment, which is the whole reason to track them here.
+
+    Length-preserving, newlines kept, so line numbering holds.
+    """
+    out, i, n = list(body), 0, len(body)
+    while i < n:
+        c = body[i]
+        if c in '\'"':
+            j = i + 1
+            while j < n:
+                if body[j] == c:
+                    if body[j + 1:j + 2] == c:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            i = min(j, n) + 1
+            continue
+        if body[i:i + 2] == '--':
+            while i < n and body[i] != '\n':
+                out[i] = ' '
+                i += 1
+            continue
+        if body[i:i + 2] == '/*':
+            j = body.find('*/', i + 2)
+            j = n if j < 0 else j + 2
+            for k in range(i, min(j, n)):
+                if body[k] != '\n':
+                    out[k] = ' '
+            i = j
+            continue
+        i += 1
+    return ''.join(out)
 
 
 def _hash_uncommented(body, shell_like=False):
@@ -1063,6 +1176,8 @@ def uncommented(body, leader='//', needs_space=False, also_slash=False,
     """Drop comments, keeping string literals and line numbering intact."""
     if leader == '//':
         return _rust_uncommented(body)
+    if leader == '--':
+        return _sql_uncommented(body)
     if leader == '#':
         if also_block:
             body = _ps_uncommented(body)
@@ -1748,7 +1863,8 @@ def source_tokens(root):
             body = _shell_heredocs(body)
         if effective_suffix(rel) in SHELL_QUOTED:
             body = _shell_literals(
-                body, QUOTE_ESCAPE.get(effective_suffix(rel), '\\'))
+                body, QUOTE_ESCAPE.get(effective_suffix(rel), '\\'),
+                effective_suffix(rel) in HAS_HERE_STRING)
         lines = body.splitlines()
         # Names this file assigns without exporting them, and without handing
         # them to a command: its own variables.
@@ -3103,6 +3219,41 @@ def self_test():
          EXPANDED.findall(_shell_literals(
              "echo it's\nexport AUTUMN_LOG__LEVEL=x\necho \"${AUTUMN_ENV}\"\n")),
          ['AUTUMN_ENV'])
+    # A double-quoted string is not one opaque context: a substitution inside it
+    # re-enters shell parsing, where an apostrophe opens a literal again.
+    case('a literal inside a substitution inside double quotes is blanked',
+         (EXPANDED.findall(_shell_literals(
+             """probe="$(printf '%s' '${AUTUMN_LOG__LEVL}')" """)),
+          EXPANDED.findall(_shell_literals(
+              'probe="$(id -u) ${AUTUMN_LOG__LEVEL}"'))),
+         ([], ['AUTUMN_LOG__LEVEL']))
+    # A PowerShell here-string is held by `@'` and a line beginning `'@`, so its
+    # body may contain the apostrophes an ordinary quoted span would end on.
+    case('a PowerShell here-string body is literal to its own terminator',
+         (EXPANDED.findall(_shell_literals(
+             "@'\ndon't\n${AUTUMN_LOG__LEVL}\n'@\n", '`', True)),
+          EXPANDED.findall(_shell_literals(
+              '@"\ndon\'t\n${AUTUMN_LOG__LEVEL}\n"@\n', '`', True))),
+         ([], ['AUTUMN_LOG__LEVEL']))
+    # Bash collects every delimiter on the LOGICAL command line before it
+    # consumes a body, so a continuation still opens both.
+    case('a continued command opens both its heredocs',
+         _shell_heredocs("cat <<'ONE' \\\n<<'TWO' >/dev/null\nfirst\nONE\n"
+                         'AUTUMN_LOG__LEVL=x cmd\nTWO\nkeep\n').splitlines(),
+         ["cat <<'ONE' \\", "<<'TWO' >/dev/null", '', 'ONE', '', 'TWO', 'keep'])
+    # SQL is a third comment family, and the 171 tracked migrations were reading
+    # a `-- AUTUMN_LOG__LEVL=x cmd` line as a shell assignment.
+    case('a SQL comment is not a use',
+         (ASSIGNED_PREFIX.findall(uncommented(
+             '-- AUTUMN_LOG__LEVL=x cmd\nSELECT 1;\n', comment_leader('a.sql'))),
+          ASSIGNED_PREFIX.findall(uncommented(
+              '/* AUTUMN_LOG__LEVL=x cmd */\nSELECT 1;\n',
+              comment_leader('a.sql')))),
+         ([], []))
+    # …while a string that merely contains the comment leader is still a string.
+    case('a doubled quote keeps one SQL string whole',
+         _sql_uncommented("SELECT 'it''s -- fine';\n"),
+         "SELECT 'it''s -- fine';\n")
     case('a double-quoted heredoc body is data',
          ASSIGNED_PREFIX.findall(_shell_literals(_shell_heredocs(
              'cat <<"EOF"\nAUTUMN_LOG__LEVL=x cmd\nEOF\n'))),
