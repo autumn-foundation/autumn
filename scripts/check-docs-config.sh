@@ -106,6 +106,12 @@
 #   * A fix applied where the bug was found rather than everywhere the same
 #     question is asked. The placeholder lived in two regexes; the schema-vs-read
 #     question lived in the resolver and the table checker. Grep for the rule.
+#   * FAILING OPEN — the check not running at all. Every other entry here is the
+#     gate resolving something it should have reported; this one is the gate
+#     asking nothing. Bounding rows to a table region meant a cosmetic header
+#     rename turned off all 142 mapping checks with a green result, because
+#     "no defects found" and "no checks run" are indistinguishable from outside.
+#     Anything that scopes a check must assert it found its subject.
 #
 # EVERY RUNG HAS NOW BEEN AUDITED against the list above, rather than tightened
 # one at a time as a reviewer found it — which is how five of these survived
