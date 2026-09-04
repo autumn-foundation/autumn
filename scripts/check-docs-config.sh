@@ -613,10 +613,59 @@ def _rust_classes(body):
     return cls
 
 
+def _strip_generated_comments(body, cls):
+    """Blank comments in the generated code held INSIDE string literals.
+
+    String contents are kept on purpose — `generate/admin.rs` writes a real
+    `std::env::var(\\"AUTUMN_TEST_ADMIN_SESSION\\")` into the code it emits, and
+    nine names in the truth set are carried only by accessors like it. But that
+    generated code has comments of its own, and a commented accessor inside it
+    is no more a read than one outside.
+
+    A comment must OPEN its generated line — nothing but whitespace or a
+    line-continuation backslash before it — which is what keeps a `//` that is
+    part of a URL, or a `/*` that is the whole point of a string like `"/*"`,
+    from eating the rest of the literal. The generated code's own string
+    literals are delimited by `\\"`, and a comment marker inside one of those is
+    data twice over.
+
+    Length-preserving, so the caller's classification stays valid.
+    """
+    out, i, n, instr, fresh = list(body), 0, len(body), False, True
+    while i < n:
+        if cls[i] != 's':
+            instr, fresh, i = False, True, i + 1
+            continue
+        c = body[i]
+        if c == '\\':
+            if body[i + 1:i + 2] == '"':
+                instr = not instr
+            elif body[i + 1:i + 2] == 'n':
+                fresh = True
+            i += 2
+            continue
+        if c == '\n':
+            fresh, i = True, i + 1
+            continue
+        if not instr and fresh and c == '/' and body[i + 1:i + 2] in '/*':
+            block = body[i + 1] == '*'
+            while i < n and cls[i] == 's' and body[i] != '\n':
+                out[i] = ' '
+                i += 1
+                if block and body[i - 2:i] == '*/' and i - 2 > 0:
+                    break
+            continue
+        if not c.isspace():
+            fresh = False
+        i += 1
+    return ''.join(out)
+
+
 def _rust_uncommented(body):
     """Drop `//` and `/* … */` comments, keeping strings and line numbering."""
-    return ''.join(c for c, k in zip(body, _rust_classes(body))
-                   if k != 'm' or c == '\n')
+    cls = _rust_classes(body)
+    body = _strip_generated_comments(body, cls)
+    return ''.join(c for c, k in zip(body, cls) if k != 'm' or c == '\n')
 
 
 def _rust_skeleton(body):
@@ -1990,6 +2039,19 @@ def self_test():
     case('an escaped quote does not end a string',
          uncommented(r'let s = "a\" // b"; let c = 1;'),
          r'let s = "a\" // b"; let c = 1;')
+    # Generated code held in a string has comments of its own, and a commented
+    # accessor inside it is no more a read than one outside.
+    # The blanking runs to the real newline, so the generated line's own `\n\`
+    # terminator goes with it. Nothing re-emits this text — it is only scanned
+    # for names — so losing the marker costs nothing.
+    case('a comment opening a generated line is stripped',
+         uncommented('let t = "\\n\\\n  // std::env::var(\\"AUTUMN_LOG__LEVL\\");\\n\\\n";'),
+         'let t = "\\n\\\n                                            \n";')
+    # …but it must OPEN the line, or a `//` inside a URL eats the rest of the
+    # literal — and a `/*` that is the whole point of a string is not a comment.
+    case('a URL inside a generated string survives',
+         uncommented('let u = "\\n\\\n  let b = \\"https://x\\"; env::var(\\"AUTUMN_ENV\\");\\n\\\n";'),
+         'let u = "\\n\\\n  let b = \\"https://x\\"; env::var(\\"AUTUMN_ENV\\");\\n\\\n";')
     # `#` opens a comment at the start of a WORD, so shell parameter expansion
     # survives.
     case('a trailing shell comment is stripped',
