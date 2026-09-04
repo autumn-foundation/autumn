@@ -48,13 +48,31 @@ audits every crates.io dependency and reported 32 packages behind — 32
   `async-compression`/`compression-codecs`/`compression-core`,
   `cpufeatures`, `borsh`/`borsh-derive`, `rand`), one same-line downgrade
   (`crypto-common` 0.1.7→0.1.6, still within its own `^0.1` range — cargo's
-  resolver settling a different requirement elsewhere in the graph), and 11
+  resolver settling a different requirement elsewhere in the graph), and 14
   crates dropped entirely as dead weight now that their puller moved past
   needing them (`ahash`, `bitvec`, `bytecheck`, `bytecheck_derive`, `funty`,
   `ptr_meta`, `ptr_meta_derive`, `radium`, `rend`, `rkyv`, `rkyv_derive`,
   `seahash`, `tap`, `wyz` — the old `rkyv`/`bytecheck` serialization stack).
-  A further 46 packages remain behind but only across a major-version
-  boundary (a real bump needing a forcing fact, not a free `cargo update`).
+  A further 47 packages remain behind (`cargo update --dry-run --verbose`),
+  but **not uniformly "needs a major bump"** — `chatgpt-codex-connector`'s
+  review on this PR correctly split that claim: **24 of the 47** are
+  same-major releases held back purely by an explicit MSRV/range ceiling
+  already documented in-tree (e.g. `autumn-storage-s3/Cargo.toml`'s
+  `aws-smithy-async = ">=1.2, <1.3"` and `aws-smithy-runtime-api = ">=1.11,
+  <1.11.4"` comments: the newer releases bump their own `rust-version` above
+  this workspace's 1.88.0 MSRV floor; same story for `aws-sdk-s3`'s `<1.123`
+  ceiling and the rest of the `aws-smithy-*`/`aws-sdk-*`/`aws-*` family, plus
+  `aes` and `crc-fast`). These already carry a real revisit trigger — lift
+  once the workspace MSRV moves past 1.94.1 — so they're pins, not open
+  forcing-fact gaps. The remaining **23** are genuine semver-incompatible
+  jumps needing an actual forcing fact before a major bump (`reqwest`,
+  `syn`, `wasmi`, `jsonwebtoken`, `rand`/`rand_chacha`, `sha1`/`sha2`,
+  `p256`, `x509-parser`, `tokio-tungstenite`, `validator`, `testcontainers`,
+  `tokio-postgres-rustls`, `hmac`, `infer`, `getrandom`, `croner`, `brotli`,
+  `aes-gcm`), two of which (`matchit`, `crc`) aren't blocked by this
+  workspace's own manifests at all — they're held at their current version
+  by another dependency's own tighter requirement elsewhere in the graph
+  (not investigated further this cycle).
   This is exactly the "scheduled batch" class from this project's own
   dependency policy — routine, semver-safe, one PR, one rehearsal — so it's
   applied below rather than just reported.
