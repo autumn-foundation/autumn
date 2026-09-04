@@ -3,12 +3,15 @@
 ## 🎯 Verdict path
 
 Merging into `trunk-dev` waits on `.github/workflows/ci.yml`'s `pull_request`
-run: `meta` → `lint` (+ `migration-guides`, `plugin-contract`, `supply-chain`
-in parallel) → `test` (matrix: ubuntu/macos/windows-latest) → `coverage` /
-`loom`, plus `lint` → `windows-tier1` (`ci.yml:965-967`, the Windows Tier 1
-journey job — this census's failure sample includes one hit against it)
-and the standalone `msrv`, `sqlite-runtime`, `sim-sweep`, and
-`edge-conformance` jobs. Correction to an earlier revision of this report:
+run: `meta` and `lint` (+ `migration-guides`, `plugin-contract`,
+`supply-chain`) run in parallel with no dependency between them — `lint`
+has no `needs:` at all — and both gate `test` (`needs: [lint, meta]`,
+matrix: ubuntu/macos/windows-latest), which gates `coverage` / `loom`.
+Separately, `lint` alone gates `windows-tier1` (`ci.yml:965-967`, the
+Windows Tier 1 journey job — this census's failure sample includes one hit
+against it), and the standalone `msrv`, `sqlite-runtime`, `sim-sweep`, and
+`edge-conformance` jobs round out the workflow. Correction to an earlier
+revision of this report:
 `coverage` is not "non-blocking, Codecov only" — only its final upload
 step tolerates failure (`fail_ci_if_error: false`, `ci.yml:767`); the many
 `cargo llvm-cov` invocations in its "Generate coverage" step
@@ -259,6 +262,15 @@ That leaves two tiers, and they are not substitutes for each other:
    ```yaml
    # .github/workflows/manual-contention-check.yml (throwaway, not for ci.yml)
    on: workflow_dispatch
+   env:
+     # Copied from ci.yml:13-22, not reinvented: RUST_MIN_STACK in
+     # particular changes how close a deep call frame (clap's derive
+     # macros were the trigger there) sits to overflowing the default
+     # thread stack, which is exactly the kind of platform-dependent
+     # resource-margin difference this campaign needs to hold constant.
+     CARGO_TERM_COLOR: always
+     RUST_BACKTRACE: 1
+     RUST_MIN_STACK: 8388608
    jobs:
      sample:
        strategy:
