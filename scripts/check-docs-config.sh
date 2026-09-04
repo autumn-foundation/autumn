@@ -613,6 +613,14 @@ def _rust_classes(body):
     return cls
 
 
+# A string region is generated CODE when it carries an inner string literal or
+# spans lines. `"https://example.com/x"` is neither — it is a URL, and reading
+# its `//` as a comment blanked the rest of the literal; `let p = "/*";` is a
+# string whose whole content is a marker. A template that emits Rust always has
+# one or the other, because emitted code quotes things and has lines.
+GENERATED_CODE = re.compile(r'\\"|\n|(?<=[^\\])"')
+
+
 def _strip_generated_comments(body, cls):
     """Blank comments in the generated code held INSIDE string literals.
 
@@ -620,33 +628,39 @@ def _strip_generated_comments(body, cls):
     `std::env::var(\\"AUTUMN_TEST_ADMIN_SESSION\\")` into the code it emits, and
     nine names in the truth set are carried only by accessors like it. But that
     generated code has comments of its own, and a commented accessor inside a
-    template is no more a read than one outside it — inline as well as opening
-    its line.
+    template is no more a read than one outside it.
 
-    Two things keep a `//` inside a URL from being read as a comment. The
-    generated code's OWN string literals are tracked — delimited by `\\"` in an
-    escaped template and by `"` in a raw one, so either toggles, after the outer
-    delimiter, which is skipped on entering the region or the whole literal
-    would look like one long inner string. And a comment must OPEN A WORD, the
-    same rule the `#` languages use: `https://x` is preceded by a colon, while
-    `const _: () = (); // …` is preceded by a space.
+    Inside a code region, Rust's rule applies unchanged: `//` outside an inner
+    literal opens a comment wherever it appears, including straight after a `;`.
+    Requiring whitespace in front was a way of protecting URLs, and it protected
+    `();// env::var(…)` too. What actually separates the two is whether the
+    region is code at all, plus tracking the generated code's OWN literals —
+    delimited by `\\"` in an escaped template and by `"` in a raw one, so either
+    toggles, after the outer delimiter, which is skipped on entering the region.
 
     Blanking stops at the line end and at the region end, so a `/*` that never
-    closes — `let p = "/*";` is a string whose whole content is the marker —
-    costs that line and nothing after it.
+    closes costs that line and nothing after it.
 
     Length-preserving, so the caller's classification stays valid.
     """
-    out, i, n, instr = list(body), 0, len(body), False
+    out, i, n, instr, code = list(body), 0, len(body), False, False
     while i < n:
         if cls[i] != 's':
-            instr, i = False, i + 1
+            instr, code, i = False, False, i + 1
             continue
         if i == 0 or cls[i - 1] != 's':
-            # Entering a literal: step over its opening delimiter, `"` or `r#"`.
+            # Entering a literal: step over its opening delimiter, `"` or `r#"`,
+            # then decide whether what follows is code at all.
             j = body.find('"', i)
             i = (n if j < 0 else j + 1)
+            k = i
+            while k < n and cls[k] == 's':
+                k += 1
+            # The region's own closing delimiter is not evidence of anything,
+            # so it comes off before the test — with it, every string looked
+            # like code because every string ends in a quote.
             instr = False
+            code = bool(GENERATED_CODE.search(body[i:k].rstrip('#').rstrip('"')))
             continue
         c = body[i]
         if c == '\\':
@@ -657,8 +671,7 @@ def _strip_generated_comments(body, cls):
         if c == '"':
             instr, i = not instr, i + 1
             continue
-        opens = i == 0 or body[i - 1].isspace() or cls[i - 1] != 's'
-        if not instr and opens and c == '/' and body[i + 1:i + 2] in '/*':
+        if code and not instr and c == '/' and body[i + 1:i + 2] in '/*':
             block = body[i + 1] == '*'
             while i < n and cls[i] == 's' and body[i] != '\n':
                 out[i] = ' '
@@ -706,9 +719,13 @@ def _hash_uncommented(body, shell_like=False):
     """Drop `#` comments, respecting the language's rule for where one starts.
 
     `shell_like` governs two rules that go together, which is why it is one
-    flag: a `#` needs whitespace in front of it to open a comment, and a
-    backslash does NOT escape inside single quotes. Both hold for the shell
-    family and for YAML; neither holds for Python, TOML or HCL.
+    flag: a `#` opens a comment only at the start of a WORD, and a backslash
+    does NOT escape inside single quotes. Both hold for the shell family and for
+    YAML; neither holds for Python, TOML or HCL.
+
+    A word starts after whitespace and after a control operator — `true;# …` is
+    a comment to bash, and requiring whitespace kept it. `${VAR#prefix}` and
+    `$#` still survive, because `{` and `$` are neither.
 
     Escapes matter because without them `"a\\"b"` reads as a string that ENDS at
     the escaped quote and reopens at the real one, so a trailing comment lands
@@ -732,7 +749,8 @@ def _hash_uncommented(body, shell_like=False):
                     q = None
             elif c in '"\'':
                 q = c
-            elif c == '#' and (not shell_like or i == 0 or l[i - 1].isspace()):
+            elif c == '#' and (not shell_like or i == 0
+                               or l[i - 1].isspace() or l[i - 1] in ';&|()<>'):
                 cut = i
                 break
         out.append(l if cut is None else l[:cut])
@@ -1182,16 +1200,29 @@ def untested(body):
     skel = _rust_skeleton(body)
     masked = []
     for start, after in _test_items(skel):
-        depth, end, opened = 0, None, False
+        depth, end, group, angle = 0, None, 0, 0
         for i in range(after, len(skel)):
             c = skel[i]
-            if c in '({[<':
-                # Anything that opens a group disables the comma rule below: the
-                # comma in `fn f(a: u8, b: u8)` or in `Option<Arc<T>, U>` is
-                # punctuation inside the item, not the end of it.
-                opened = True
+            if c in '([{':
+                # A comma INSIDE a group is punctuation — `fn f(a: u8, b: u8)`.
+                # Counting the group rather than latching a flag is what lets
+                # the comma after a closed group still end the item: a
+                # `#[cfg(test)]` match arm is `0 => var("X"),`, and a latched
+                # flag ignored that comma and masked the arms after it.
+                group += 1
                 if c == '{':
                     depth += 1
+            elif c in ')]':
+                # Clamped, because the scan starts inside the attribute and its
+                # own closing `]` would otherwise take the count negative — and
+                # a negative count made every following comma look top-level.
+                group = max(0, group - 1)
+            elif c == '<' and i > after and (skel[i - 1].isalnum()
+                                             or skel[i - 1] in '_:'):
+                # Generic, not a comparison: `Map<A, B>` opens, `1 < 2` does not.
+                angle += 1
+            elif c == '>' and angle:
+                angle -= 1
             elif c == '}':
                 if depth == 0:
                     # The ENCLOSING block closed first, so this was a field or a
@@ -1213,9 +1244,9 @@ def untested(body):
                 # a brace search alone would run to the end of the file.
                 end = i
                 break
-            elif c == ',' and depth == 0 and not opened:
-                # `#[cfg(test)] pub name: String,` — a field or enum variant,
-                # which ends at its comma.
+            elif c == ',' and depth == 0 and group == 0 and angle == 0:
+                # `#[cfg(test)] pub name: String,` — a field, an enum variant or
+                # a match arm, each of which ends at its comma.
                 end = i
                 break
         masked.append((start, len(skel) if end is None else end))
@@ -2095,12 +2126,16 @@ def self_test():
     case('a mid-line `/*` inside a string does not blank the line',
          uncommented('let p = "/*"; std::env::var("AUTUMN_LOG__LEVEL");'),
          'let p = "/*"; std::env::var("AUTUMN_LOG__LEVEL");')
-    # A raw string keeps its contents, comment markers included. `tauri_mobile.rs`
-    # asserts on generated code containing a commented-out `set_var`, and
-    # truncating at the `//` would have dropped a real read from the truth set.
-    case('a raw string keeps a commented line',
+    # This case asserted the OPPOSITE for ten rounds, on the belief that blanking
+    # would drop a real read. It does not. `tauri_mobile.rs` asserts that the
+    # generated code contains that accessor COMMENTED OUT — evidence of a
+    # non-read — and `AUTUMN_SYNC__TOKEN` is real, reaching the truth set
+    # through the uncommented `set_var` elsewhere in the same template.
+    case('a commented line inside a raw string is stripped',
          uncommented('assert!(x.contains(r#"// set_var("AUTUMN_SYNC__TOKEN");"#));'),
-         'assert!(x.contains(r#"// set_var("AUTUMN_SYNC__TOKEN");"#));')
+         'assert!(x.contains(r#"                                   ));')
+    case('…and the name it names is still read',
+         'AUTUMN_SYNC__TOKEN' in swept, True)
     case('an escaped quote does not end a string',
          uncommented(r'let s = "a\" // b"; let c = 1;'),
          r'let s = "a\" // b"; let c = 1;')
@@ -2185,13 +2220,24 @@ def self_test():
          untested('struct S {\n  #[cfg(test)]\n  probe: bool,\n  real: u8,\n}\n'
                   'fn f() { }'),
          'struct S {\n\n\n  real: u8,\n}\nfn f() { }')
-    # …and a field whose type carries a comma inside generics falls back to the
-    # enclosing brace rather than stopping at that comma — bounded either way,
-    # which is the point.
-    case('a generic field does not end at the comma inside its type',
+    # …and a field whose type carries a comma inside generics ends at its OWN
+    # comma: the generic is counted, so the inner comma is punctuation. This
+    # used to fall back to the enclosing brace and swallow the rest of the
+    # struct — bounded, but twice the lines it needed.
+    case('a generic field ends at its own comma',
          untested('struct S {\n  #[cfg(test)]\n  probe: Map<A, B>,\n}\n'
                   'fn f() { }'),
-         'struct S {\n\n\n\nfn f() { }')
+         'struct S {\n\n\n}\nfn f() { }')
+    # A match arm ends at its comma too, and the call before it must not latch
+    # the item open: `0 => var("X"),` followed by a production arm had the arm
+    # AND the arms after it masked.
+    case('a cfg(test) match arm ends at its comma',
+         untested('match n {\n  #[cfg(test)]\n  0 => var("A"),\n'
+                  '  1 => var("B"),\n}'),
+         'match n {\n\n\n  1 => var("B"),\n}')
+    case('a comparison is not a generic',
+         untested('#[cfg(test)]\nconst X: bool = 1 < 2;\nfn p() { }'),
+         '\n\nfn p() { }')
     case('a fn signature comma is not the end of the item',
          untested('#[cfg(test)]\nfn f(a: u8, b: u8) {\n  let x = 1;\n}\n'
                   'fn p() { }'),
