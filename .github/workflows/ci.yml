@@ -242,7 +242,7 @@ jobs:
         #
         # The reader-facing corpus names 629 of these across 175 pages, and the
         # baseline run resolved every one — this gate is here to keep it that
-        # way, and to gate the 135-row `AUTUMN_* -> config path` table in
+        # way, and to gate the 142-row `AUTUMN_* -> config path` table in
         # config.rs's module docs, which is hand-maintained and is the mapping
         # readers meet on docs.rs.
         #

@@ -17,7 +17,7 @@
 # on the default database. That is the corpus's worst failure mode: the reader
 # cannot detect the wrongness, and neither can the framework.
 #
-# The reader-facing corpus names 626 `AUTUMN_*` variables across 175 pages. This
+# The reader-facing corpus names 629 `AUTUMN_*` variables across 175 pages. This
 # gate resolves every one of them.
 #
 # WHAT IT CHECKS (single fast job, no Rust toolchain needed):
@@ -29,20 +29,25 @@
 #      somewhere in the tracked non-markdown tree, i.e. something actually reads
 #      it.
 #   3. The hand-maintained `AUTUMN_* -> config path` table in `config.rs`'s
-#      module docs — 135 rows, the mapping readers meet on docs.rs — must agree
+#      module docs — 142 rows, the mapping readers meet on docs.rs — must agree
 #      with the schema, both in the paths it names and in the variable spellings
-#      it derives them from.
+#      it derives them from. Every row shaped like a mapping is accounted for:
+#      one this script cannot parse is REPORTED, not skipped.
 #
-# TRUTH SETS (both already in the tree; nothing to regenerate here):
+# TRUTH SETS (all already in the tree; nothing to regenerate here):
 #   - `autumn/tests/fixtures/schema_keys.snapshot` — the 484 leaf paths of
 #     `AutumnConfig`, produced by the same `get_schema_keys()` walk that backs
 #     strict unknown-key validation, and kept honest by
 #     `schema_keys_snapshot_guard`. Using the snapshot rather than a fresh walk
 #     is what keeps this gate toolchain-free; the snapshot cannot drift from the
 #     schema without that test failing first.
-#   - Every `AUTUMN_[A-Z0-9_]+` token in the tracked non-markdown tree. The
-#     snapshot covers `autumn-web` only, and `autumn.toml` has more than one
-#     reader: `autumn-search` and `autumn-media-plugin` layer their own
+#   - The variable names the runtime BUILDS, read from the `format!` calls that
+#     build them. The schema walk cannot enumerate a key that does not exist yet
+#     — an OAuth2 provider the reader has not configured — so these are matched
+#     as patterns instead.
+#   - `AUTUMN_*` names the tracked non-markdown tree USES. The snapshot covers
+#     `autumn-web` only, and `autumn.toml` has more than one reader:
+#     `autumn-search` and `autumn-media-plugin` layer their own
 #     `AUTUMN_SEARCH__*` / `AUTUMN_MEDIA__*` overrides in their own crates,
 #     `autumn-cli` owns `[dev] watch_dirs`, and `AUTUMN_SYNC__*` is read by the
 #     Tauri shell the CLI generates into the reader's app. Gating those against
@@ -53,21 +58,23 @@
 #   b. Sequence indices are elided first: the schema spells a shard field
 #      `database.shards.name`, so `AUTUMN_DATABASE__SHARDS__0__NAME` and the
 #      table's `{i}` placeholder both normalise onto it.
-#   c. A prefix of the path is a CHILDLESS leaf — a map whose keys the reader
-#      chooses. `auth.oauth2`, `jobs.queues` and `http.client.base_urls` are
-#      leaves with no children in the snapshot precisely because the walk cannot
-#      enumerate user keys, so `AUTUMN_AUTH__OAUTH2__GITHUB__CLIENT_SECRET`
-#      resolves under `auth.oauth2` without this script knowing what a provider
-#      is. Listing the three sections by name instead would have gone stale the
-#      first time someone documented a fourth provider.
-#   d. The variable appears verbatim in the non-markdown tree (rung 2's truth
-#      set, reused: this is how the separate-crate configs resolve).
+#   c. The variable matches a name the runtime BUILDS —
+#      `format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_ID")`, once per configured
+#      provider. The provider segment is open and the field is EXACT, which is
+#      the runtime's own behaviour: it probes only the names it builds, so
+#      `…__CLIENT_SECRT` is ignored in production and must be reported here.
+#   d. The variable appears in the non-markdown tree in a shape that USES it (a
+#      string literal, a shell assignment, an expansion) — this is how the
+#      separate-crate configs resolve. A name that appears only in a negative
+#      assertion does not count.
 #   e. The page itself introduces the name as one the READER chooses —
 #      `access_key_id_env = "AUTUMN_OFFSITE_ACCESS_KEY_ID"`, or
 #      `InMemoryApiTokenStore::from_env("AUTUMN_API_TOKEN", …)`. Here the string
 #      is an example of a name the reader invents and the framework reads back;
 #      there is nothing for it to match, and demanding a match would push
 #      13 correct lines into waivers.
+#   f. The variable is a naming-rule example (`AUTUMN_SECTION__FIELD`) or an
+#      identifier the page declares in its own example code.
 #
 # WHAT IT DELIBERATELY DOES NOT CHECK:
 #   - TOML config keys in fenced blocks. `[dev] watch_dirs` in the README is an
@@ -157,21 +164,25 @@ CHOSEN = (re.compile(r'_env\s*=\s*"(AUTUMN_[A-Z0-9_]+)"'),
 
 WAIVER = re.compile(r'<!--\s*config-key-allow:\s*(AUTUMN_[A-Z0-9_]+)\s*(.*?)\s*-->')
 
-# Sections whose child keys the READER names: an OAuth2 provider, a queue, a
-# service under `base_urls`, a host under `circuit_breaker`. These deserialize
-# through `SchemaDeserializer::deserialize_map`, which registers no schema
-# entry, so the walk records the section itself and can never see beneath it.
+# Variable names the runtime BUILDS at load time, for sections whose keys the
+# reader chooses — `format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_ID")`, once
+# per configured provider. The schema walk cannot enumerate these (it never sees
+# a provider that does not exist yet), so they are read from the source that
+# constructs them and matched as patterns.
 #
-# Listed rather than inferred, because the snapshot cannot tell a map from a
-# scalar: both are leaves with no children, so "has no children" would also
-# swallow `AUTUMN_LOG__LEVEL__NOPE` under `log.level` and hide exactly the
-# drift this gate is for. The list cannot go stale silently — `map_sections`
-# below fails the run if an entry stops being a childless leaf, which is what a
-# rename or a newly-enumerable section would look like. The same four are named
-# in `schema_drift_guard.rs`; that test asserts they have no restrictive schema
-# entry, and this one that the docs may key freely under them.
-READER_KEYED = ('auth.oauth2', 'jobs.queues', 'http.client.base_urls',
-                'resilience.circuit_breaker.hosts')
+# Derived rather than listed. An earlier cut named the four map SECTIONS
+# (`auth.oauth2`, `jobs.queues`, …) and accepted any descendant path, which
+# resolved `AUTUMN_AUTH__OAUTH2__GITHUB__CLIENT_SECRT` — a typo the runtime
+# silently ignores, since it probes only the two names it builds. Matching the
+# template instead keeps the provider segment open and the FIELD exact, which
+# is precisely the runtime's own behaviour.
+#
+# A template whose final segment is itself a placeholder
+# (`AUTUMN_DATABASE__SHARDS__{i}__{field}`, where `field` is a closure
+# parameter) constrains nothing and is skipped: it would re-admit
+# `…__SHARDS__0__NOPE`. Shard fields need no template anyway — the schema
+# enumerates them as `database.shards.*`, reached by eliding the index.
+TEMPLATE = re.compile(r'"(AUTUMN_[A-Z0-9_]*(?:\{[a-z_]+\}[A-Z0-9_]*)+)"')
 
 # Metasyntactic roots: a page teaching the NAMING RULE rather than naming a key.
 # Seven pages write `AUTUMN_SECTION__FIELD` to explain that a double underscore
@@ -197,27 +208,29 @@ def schema_leaves(text):
     return {l.strip() for l in text.splitlines() if l.strip()}
 
 
-def map_sections(leaves):
-    """The reader-keyed sections, checked against the snapshot as we go.
+def built_patterns(root):
+    """Regexes for the variable names the runtime constructs at load time.
 
-    Raises if a listed section is missing or has grown children — either means
-    the section is no longer an open map, and resolving arbitrary keys beneath
-    it would start hiding drift.
+    Each `{placeholder}` becomes one reader-chosen segment; a template ending in
+    a placeholder is skipped, since it fixes nothing.
     """
-    out = set()
-    for section in READER_KEYED:
-        if section not in leaves:
-            raise KeyError(
-                f'{section} is listed as a reader-keyed map but is not in the '
-                f'schema snapshot; if it was renamed or removed, update '
-                f'READER_KEYED in this script')
-        if any(o.startswith(section + '.') for o in leaves):
-            raise KeyError(
-                f'{section} is listed as a reader-keyed map but the schema now '
-                f'enumerates keys beneath it; it is a fixed section, so remove '
-                f'it from READER_KEYED and let its children be checked')
-        out.add(section)
-    return out
+    out = subprocess.run(['git', 'ls-files', '-z', '*.rs'], cwd=root,
+                         capture_output=True, text=True).stdout
+    pats = {}
+    for rel in out.split('\0'):
+        if not rel:
+            continue
+        try:
+            body = (root / rel).read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            continue
+        for tpl in TEMPLATE.findall(body):
+            if tpl.split('__')[-1].startswith('{'):
+                continue
+            pats[tpl] = re.compile(
+                '^' + re.sub(r'\\\{[a-z_]+\\\}', '[A-Z0-9_]+',
+                             re.escape(tpl)) + '$')
+    return pats
 
 
 # The shapes in which a file USES an environment variable, as opposed to
@@ -230,9 +243,26 @@ def map_sections(leaves):
 # resolve the very variable the gate exists to catch — the injected regression
 # probe stopped failing. Requiring a use-shape means a comment can name a
 # variable to explain it without thereby asserting that something reads it.
-USES = (re.compile(r'["\'](AUTUMN_[A-Z0-9_]+)["\']'),
-        re.compile(r'(?:^|[;&|(\s])(?:export\s+)?(AUTUMN_[A-Z0-9_]+)='),
-        re.compile(r'\$\{?(AUTUMN_[A-Z0-9_]+)\}?'))
+QUOTED = re.compile(r'["\'](AUTUMN_[A-Z0-9_]+)["\']')
+ASSIGNED = re.compile(r'(?:^|[;&|(\s])(?:export\s+)?(AUTUMN_[A-Z0-9_]+)=')
+EXPANDED = re.compile(r'\$\{?(AUTUMN_[A-Z0-9_]+)\}?')
+
+# A quoted name does NOT count where the line asserts the name is ABSENT. This is a
+# real population, not a hypothetical: `autumn-cli/tests/generate.rs:802` has
+# `assert!(!test.contains("AUTUMN_TEST_SESSION_COOKIE"))`, a variable the
+# scaffolder deliberately does NOT emit. Counting that as evidence of a read
+# would let a page name it and pass — a negative assertion is the strongest
+# possible statement that something is not implemented.
+#
+# Only the negation is excluded, not "every quoted name without a nearby
+# accessor". That stricter reading was tried and reverted: the dominant shape
+# here is `const SHUTDOWN_SIGNAL_FILE_ENV: &str = "AUTUMN_SHUTDOWN_SIGNAL_FILE"`,
+# where the read happens wherever the constant is later used, so requiring an
+# accessor within a few lines reported 25 correct pages — `AUTUMN_CANARY`,
+# `AUTUMN_ACME_DNS_*`, `AUTUMN_DEV_RELOAD` among them. Short of dataflow
+# analysis, a false positive on a correct page is the worse error: it trains
+# authors to reach for a waiver.
+NEGATED = re.compile(r'assert(?:_ne)?!\s*\(\s*!|!\s*[\w.]*\bcontains\b|\bassert_ne!')
 
 
 def source_tokens(root):
@@ -254,9 +284,14 @@ def source_tokens(root):
             body = (root / rel).read_text(encoding='utf-8', errors='replace')
         except OSError:
             continue
-        if 'AUTUMN_' in body:
-            for pat in USES:
-                tokens.update(pat.findall(body))
+        if 'AUTUMN_' not in body:
+            continue
+        lines = body.splitlines()
+        for n, line in enumerate(lines):
+            tokens.update(ASSIGNED.findall(line))
+            tokens.update(EXPANDED.findall(line))
+            if not NEGATED.search(line):
+                tokens.update(QUOTED.findall(line))
     return tokens
 
 
@@ -286,18 +321,16 @@ def is_config_form(var):
     return '__' in body and all(body.split('__'))
 
 
-def resolve(var, leaves, leaf_maps, tokens):
+def resolve(var, leaves, built, tokens):
     """Return the rung that resolves `var`, or None. Order is cost, not rank."""
     if is_config_form(var):
         path = to_path(var)
         if path in leaves:
             return 'schema'
-        segs = path.split('.')
-        if segs[0] in PLACEHOLDER_ROOTS:
+        if path.split('.')[0] in PLACEHOLDER_ROOTS:
             return 'naming-rule example'
-        for k in range(1, len(segs)):
-            if '.'.join(segs[:k]) in leaf_maps:
-                return 'dynamic-map'
+    if any(p.match(var) for p in built.values()):
+        return 'runtime-built name'
     if var in tokens:
         return 'source'
     return None
@@ -340,7 +373,7 @@ def waivers(lines):
 
 # ------------------------------------------------------------- corpus scan
 
-def scan(files, read, leaves, leaf_maps, tokens):
+def scan(files, read, leaves, built, tokens):
     stats, defects = collections.Counter(), []
     for rel in files:
         text = read(rel)
@@ -365,7 +398,7 @@ def scan(files, read, leaves, leaf_maps, tokens):
                 if var in consts:
                     stats['example-code identifier'] += 1
                     continue
-                rung = resolve(var, leaves, leaf_maps, tokens)
+                rung = resolve(var, leaves, built, tokens)
                 if rung:
                     stats[rung] += 1
                 elif at[i] in waived.get(var, ()):
@@ -377,7 +410,25 @@ def scan(files, read, leaves, leaf_maps, tokens):
 
 # --------------------------------------------------- module-doc table scan
 
-TABLE_ROW = re.compile(r'^//! \| `(AUTUMN_[A-Z0-9_{}]+)` \| `([^`]+)` \|')
+# A mapping row: a variable cell, then a backticked config path.
+#
+# The variable class admits a lowercase `{i}` placeholder. Getting that wrong is
+# how the first cut silently skipped all seven `AUTUMN_DATABASE__SHARDS__{i}__*`
+# rows — a class of `[A-Z0-9_{}]` matches the braces but not the `i` between
+# them — so a misspelling in any shard row left the gate green. `table_rows`
+# below now accounts for every row it sees rather than quietly dropping the ones
+# it cannot parse.
+TABLE_ROW = re.compile(
+    r'^//! \| `(AUTUMN_(?:[A-Z0-9_]|\{[a-z]\})+)` \| `([^`]+)` \|')
+
+# A row whose second cell is prose rather than a backticked path: `AUTUMN_ENV`
+# and `AUTUMN_PROFILE` map to "active profile", not to a config key. They are
+# documentation, not a mapping this check can verify.
+TABLE_PROSE_ROW = re.compile(r'^//! \| `(AUTUMN_[A-Z0-9_]+)` \| [^`]')
+
+# Anything shaped like a table row at all, used to prove the two patterns above
+# between them account for every one.
+TABLE_ANY_ROW = re.compile(r'^//! \| `AUTUMN_')
 
 # The one row whose two columns legitimately disagree. `SigningSecretConfig`
 # has an untagged deserializer that accepts a bare string, so
@@ -395,12 +446,24 @@ TABLE_PREFIX_OK = {('AUTUMN_SECURITY__SIGNING_SECRET',
 
 
 def table_rows(text):
-    return [(i, m.group(1), m.group(2))
-            for i, line in enumerate(text.splitlines(), 1)
-            if (m := TABLE_ROW.match(line))]
+    """Mapping rows, plus any row shaped like one that neither pattern claims.
+
+    The unparsed list is returned rather than discarded: a row this script
+    cannot read is a row it is not checking, and silence about that is what let
+    seven shard rows sit unverified.
+    """
+    rows, unparsed = [], []
+    for i, line in enumerate(text.splitlines(), 1):
+        if not TABLE_ANY_ROW.match(line):
+            continue
+        if m := TABLE_ROW.match(line):
+            rows.append((i, m.group(1), m.group(2)))
+        elif not TABLE_PROSE_ROW.match(line):
+            unparsed.append((i, line.strip()))
+    return rows, unparsed
 
 
-def check_table(rows, leaves, leaf_maps):
+def check_table(rows, leaves, built):
     """The module-doc table must agree with the schema on both columns.
 
     The variable column and the path column are two spellings of one mapping, so
@@ -412,8 +475,7 @@ def check_table(rows, leaves, leaf_maps):
     for i, var, declared in rows:
         path = re.sub(r'\[\w+\]', '', declared)
         segs = path.split('.')
-        known = path in leaves or any('.'.join(segs[:k]) in leaf_maps
-                                      for k in range(1, len(segs)))
+        known = path in leaves or any(p.match(var) for p in built.values())
         if not known:
             out.append((i, var, declared, 'path is not in the schema'))
             continue
@@ -430,24 +492,24 @@ def check_table(rows, leaves, leaf_maps):
 
 def load():
     leaves = schema_leaves(SNAPSHOT.read_text(encoding='utf-8'))
-    return leaves, map_sections(leaves), source_tokens(ROOT)
+    return leaves, built_patterns(ROOT), source_tokens(ROOT)
 
 
 def main():
     if not SNAPSHOT.exists():
         print(f'error: schema snapshot missing at {SNAPSHOT}', file=sys.stderr)
         return 2
-    leaves, leaf_maps, tokens = load()
+    leaves, built, tokens = load()
     files = corpus(ROOT)
     read = lambda rel: (ROOT / rel).read_text(encoding='utf-8', errors='replace')
-    stats, defects = scan(files, read, leaves, leaf_maps, tokens)
+    stats, defects = scan(files, read, leaves, built, tokens)
 
-    rows = table_rows(CONFIG_RS.read_text(encoding='utf-8'))
-    table_defects = check_table(rows, leaves, leaf_maps)
+    rows, unparsed = table_rows(CONFIG_RS.read_text(encoding='utf-8'))
+    table_defects = check_table(rows, leaves, built)
 
     print(f'corpus: {len(files)} reader-facing markdown files')
-    print(f'surface: {len(leaves)} schema leaves '
-          f'({len(leaf_maps)} of them reader-keyed maps), '
+    print(f'surface: {len(leaves)} schema leaves, '
+          f'{len(built)} runtime-built name patterns, '
           f'{len(tokens)} variables named in the non-markdown tree')
     print(f'checked: {sum(stats.values())} `AUTUMN_*` occurrences, '
           f'{len(rows)} module-doc table rows')
@@ -466,8 +528,12 @@ def main():
     for line, var, declared, why in table_defects:
         print(f'\nautumn/src/config.rs:{line}: '
               f'module-doc row `{var}` -> `{declared}`: {why}')
+    for line, text in unparsed:
+        print(f'\nautumn/src/config.rs:{line}: module-doc row not understood, '
+              f'so not checked')
+        print(f'    {text}')
 
-    total = len(defects) + len(table_defects)
+    total = len(defects) + len(table_defects) + len(unparsed)
     print(f'\ndefects: {total}'
           + (f' ({stats["waived"]} waived)' if stats['waived'] else ''))
     if total:
@@ -481,9 +547,11 @@ def main():
 
 
 def list_surface():
-    leaves, leaf_maps, tokens = load()
+    leaves, built, tokens = load()
     for leaf in sorted(leaves):
-        print(f'{leaf}{" (reader-keyed map)" if leaf in leaf_maps else ""}')
+        print(leaf)
+    for tpl in sorted(built):
+        print(f'{tpl}  (runtime-built)')
     print(f'\n{len(leaves)} schema leaves; '
           f'{len(tokens)} AUTUMN_* variables in the non-markdown tree')
     return 0
@@ -496,7 +564,8 @@ def self_test():
         'log\nlog.level\nauth\nauth.oauth2\ndatabase\ndatabase.shards\n'
         'database.shards.name\nsecurity\nsecurity.signing_secret\n'
         'security.signing_secret.secret\n')
-    maps = {'auth.oauth2'}
+    built = {'AUTUMN_AUTH__OAUTH2__{p}__CLIENT_SECRET':
+             re.compile(r'^AUTUMN_AUTH__OAUTH2__[A-Z0-9_]+__CLIENT_SECRET$')}
     tokens = {'AUTUMN_ENV', 'AUTUMN_SEARCH__QUEUE'}
     checked, failures = [], []
 
@@ -505,7 +574,7 @@ def self_test():
         if got != want:
             failures.append(f'{name}: got {got!r}, want {want!r}')
 
-    r = lambda v: resolve(v, leaves, maps, tokens)
+    r = lambda v: resolve(v, leaves, built, tokens)
     case('plain key resolves', r('AUTUMN_LOG__LEVEL'), 'schema')
     case('missing key fails', r('AUTUMN_LOG__LEVL'), None)
     # The single-underscore spelling is the whole point of the gate: it derives
@@ -518,7 +587,7 @@ def self_test():
     case('unknown shard field fails',
          r('AUTUMN_DATABASE__SHARDS__0__NOPE'), None)
     case('reader-keyed map resolves',
-         r('AUTUMN_AUTH__OAUTH2__GITLAB__CLIENT_SECRET'), 'dynamic-map')
+         r('AUTUMN_AUTH__OAUTH2__GITLAB__CLIENT_SECRET'), 'runtime-built name')
     # `database.shards` has children, so it is a sequence and not a map: an
     # unknown field under it must NOT be swallowed by the map rung.
     case('sequence is not a map', r('AUTUMN_DATABASE__NOPE'), None)
@@ -540,25 +609,25 @@ def self_test():
     # Waiver scope: covers its own block and the one above, nothing further.
     doc = ('AUTUMN_BAD__ONE\n\nprose\n<!-- config-key-allow: AUTUMN_BAD__ONE — why -->\n'
            '\nAUTUMN_BAD__ONE\n')
-    stats, defects = scan(['d.md'], lambda _: doc, leaves, maps, tokens)
+    stats, defects = scan(['d.md'], lambda _: doc, leaves, built, tokens)
     case('waiver covers block above and its own', stats['waived'], 1)
     case('waiver does not reach further', len(defects), 1)
 
     doc2 = 'AUTUMN_BAD__ONE\n<!-- config-key-allow: AUTUMN_BAD__ONE -->\n'
-    _, d2 = scan(['d.md'], lambda _: doc2, leaves, maps, tokens)
+    _, d2 = scan(['d.md'], lambda _: doc2, leaves, built, tokens)
     case('waiver without a reason does not waive', len(d2), 1)
 
     doc3 = 'key_env = "AUTUMN_WHATEVER"\nexport AUTUMN_WHATEVER=x\n'
-    s3, d3 = scan(['d.md'], lambda _: doc3, leaves, maps, tokens)
+    s3, d3 = scan(['d.md'], lambda _: doc3, leaves, built, tokens)
     case('reader-chosen name resolves', (s3['reader-chosen name'], len(d3)), (2, 0))
 
     # A const the page declares is an identifier in example code, on that page.
     doc4 = 'pub const AUTUMN_SOURCE: &str = "x";\nWorld::new(AUTUMN_SOURCE)\n'
-    s4, d4 = scan(['d.md'], lambda _: doc4, leaves, maps, tokens)
+    s4, d4 = scan(['d.md'], lambda _: doc4, leaves, built, tokens)
     case('declared const is example code',
          (s4['example-code identifier'], len(d4)), (2, 0))
     _, d5 = scan(['d.md'], lambda _: 'World::new(AUTUMN_SOURCE)\n',
-                 leaves, maps, tokens)
+                 leaves, built, tokens)
     case('an undeclared name is not excused by another page', len(d5), 1)
 
     # The gate's own header names variables in order to explain itself. If the
@@ -573,39 +642,48 @@ def self_test():
     case('other-crate variables still sweep in',
          'AUTUMN_SEARCH__QUEUE' in swept, True)
 
-    # The listed maps must stay maps, or the rung starts hiding drift.
-    def raises(leafset):
-        try:
-            map_sections(leafset)
-            return False
-        except KeyError:
-            return True
-    real = schema_leaves(SNAPSHOT.read_text(encoding='utf-8')) \
-        if SNAPSHOT.exists() else set(READER_KEYED)
-    case('listed maps are childless leaves in the real snapshot',
-         raises(real), False)
-    case('a listed map that vanished is caught',
-         raises(real - {'jobs.queues'}), True)
-    case('a listed map that gained children is caught',
-         raises(real | {'jobs.queues.default'}), True)
+    # A runtime-built name keeps the reader-chosen segment open and the field
+    # EXACT — the earlier "any descendant of the map section" rung resolved
+    # `…__CLIENT_SECRT`, a typo the runtime silently ignores.
+    case('runtime-built name resolves any provider',
+         r('AUTUMN_AUTH__OAUTH2__GITLAB__CLIENT_SECRET'), 'runtime-built name')
+    case('a typo in the fixed field is caught',
+         r('AUTUMN_AUTH__OAUTH2__GITHUB__CLIENT_SECRT'), None)
+
+    # Templates are read from the real tree: the oauth2 pair must be found, and
+    # `…__SHARDS__{i}__{field}` must be skipped (it would re-admit any field).
+    real_built = built_patterns(ROOT)
+    case('oauth2 templates are derived from source',
+         any('OAUTH2' in t and t.endswith('CLIENT_SECRET') for t in real_built),
+         True)
+    case('a template ending in a placeholder is skipped',
+         any(t.endswith('{field}') for t in real_built), False)
+    case('an unknown shard field is not swallowed by a template',
+         any(p.match('AUTUMN_DATABASE__SHARDS__0__NOPE')
+             for p in real_built.values()), False)
+
+    # A negative assertion is the strongest statement that a name is NOT read,
+    # so it must not put the name into the truth set.
+    case('a negatively-asserted name is not swept in',
+         'AUTUMN_TEST_SESSION_COOKIE' in swept, False)
 
     good = [(1, 'AUTUMN_LOG__LEVEL', 'log.level'),
             (2, 'AUTUMN_SECURITY__SIGNING_SECRET', 'security.signing_secret.secret'),
             (3, 'AUTUMN_DATABASE__SHARDS__{i}__NAME', 'database.shards[i].name')]
-    case('sound table rows pass', check_table(good, leaves, maps), [])
+    case('sound table rows pass', check_table(good, leaves, built), [])
     case('table row with a dead path fails',
-         len(check_table([(9, 'AUTUMN_LOG__NOPE', 'log.nope')], leaves, maps)), 1)
+         len(check_table([(9, 'AUTUMN_LOG__NOPE', 'log.nope')], leaves, built)), 1)
     case('table row edited on one side fails',
-         len(check_table([(9, 'AUTUMN_LOG__LEVEL', 'auth.oauth2')], leaves, maps)), 1)
+         len(check_table([(9, 'AUTUMN_LOG__LEVEL', 'auth.oauth2')], leaves, built)), 1)
     # A truncated variable column must NOT pass just because the row's path
     # exists: `AUTUMN_DATABASE` is not how you set `database.shards.name`.
     case('a truncated variable column fails',
          len(check_table([(9, 'AUTUMN_DATABASE', 'database.shards.name')],
-                         leaves, maps)), 1)
+                         leaves, built)), 1)
     # …and the one enumerated untagged-deserializer row still passes.
     case('the signing-secret exception still passes',
          check_table([(9, 'AUTUMN_SECURITY__SIGNING_SECRET',
-                       'security.signing_secret.secret')], leaves, maps), [])
+                       'security.signing_secret.secret')], leaves, built), [])
 
     for f in failures:
         print(f'FAIL {f}')
