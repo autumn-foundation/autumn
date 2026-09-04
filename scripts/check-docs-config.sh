@@ -987,6 +987,45 @@ COMPOSE_ASSIGNS = 'environment'
 # job's `defaults.run.shell`, the workflow's. Resolved in a pre-pass because a
 # step may declare its shell AFTER its `run:`, which a single forward walk
 # cannot see.
+# Docker has two forms, and only one of them is shell. `RUN echo $AUTUMN_X`
+# goes through `/bin/sh -c`; `RUN ["echo", "$AUTUMN_X"]` execs the binary
+# directly, so the dollar is literal text handed to `echo` and no variable is
+# read. The scan applied the shell rule to every Dockerfile line because the
+# FILE is shell-shaped — the same suffix-for-grammar mistake as `.yml`, now
+# inside a single file, where the form changes line by line.
+#
+# The exception matters and is in this tree: `CMD ["sh", "-c", "…"]` names a
+# shell as the executable, so its arguments ARE expanded. The first array
+# element decides, which is exactly what Docker does with it.
+DOCKER_EXEC = re.compile(r'^\s*(?:RUN|CMD|ENTRYPOINT)\s*\[')
+DOCKER_FIRST = re.compile(r'\[\s*"([^"]*)"')
+DOCKER_SHELLS = ('sh', 'bash', 'zsh', 'ash', 'dash', 'busybox',
+                 'pwsh', 'powershell')
+
+
+def _docker_literal(body):
+    """Line indices where a Dockerfile expands nothing — the exec form.
+
+    A form that continues with `\\` carries on; a first element this cannot
+    read is treated as non-shell, which drops names rather than admitting them.
+    """
+    out, active = set(), False
+    for index, l in enumerate(body.splitlines()):
+        if active:
+            out.add(index)
+            active = l.rstrip().endswith('\\')
+            continue
+        if not DOCKER_EXEC.match(l):
+            continue
+        first = DOCKER_FIRST.search(l)
+        exe = pathlib.PurePath(first.group(1)).name if first else ''
+        if exe in DOCKER_SHELLS:
+            continue
+        out.add(index)
+        active = l.rstrip().endswith('\\')
+    return out
+
+
 POWERSHELL = ('pwsh', 'powershell')
 YAML_VALUE = re.compile(r'^\s*(?:-\s+)?[A-Za-z0-9_.-]+:\s*(\S+)\s*$')
 
@@ -1317,6 +1356,12 @@ def _yaml_blocks(body, interpolated=False, consumer='actions',
                 pad = len(value) - len(value.lstrip())
                 l = head + ':' + (' ' * (pad + 1)
                                   + _yaml_decode(body_)).ljust(len(value))
+            # The KEY is not part of the command. `command: AUTUMN_X=1 serve`
+            # runs `AUTUMN_X=1 serve`, and leaving `command:` on the line made
+            # it read as the command's name — which matters now that an
+            # assignment must come before that name. Blanked rather than cut,
+            # so every offset on the line still lines up.
+            l = ' ' * (len(head) + 1) + l[len(head) + 1:]
         # A block-opening line carries no value of its own, so it is kept only
         # to preserve the line count, never as evidence.
         out.append(l if (keep or m) else '')
@@ -2170,9 +2215,46 @@ class _PrefixAssignment:
     # question is asked again after them — which is what the shell does.
     _redirect = re.compile(r'[0-9]*(?:&>>?|>>|>\||>&|<&|<>|>|<)')
 
+    # An assignment word only assigns where the shell reads one: BEFORE the
+    # command name. After it, `NAME=value` is an ordinary argument —
+    # `printf '%s' AUTUMN_X=v cmd` prints the text and exports nothing. A
+    # preceding space was standing in for "at the front of a simple command",
+    # which is a claim about position that whitespace cannot make.
+    #
+    # A few words still pass assignments through to what they run (`env`,
+    # `sudo`, `exec`) or open a command without being one (`if`, `while`), so
+    # they are stepped over rather than treated as the command name. Anything
+    # else ends the assignment prefix, which drops names rather than admitting
+    # them.
+    _assign_word = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=')
+    _pass_through = ('env', 'exec', 'sudo', 'command', 'nohup', 'time',
+                     'if', 'then', 'elif', 'else', 'do', 'while', 'until', '!')
+
+    def _prefixes_a_command(self, body, name_at):
+        """Whether the name at `name_at` sits before its command's name."""
+        i = max((body.rfind(c, 0, name_at) for c in ';&|()\n'), default=-1) + 1
+        while i < name_at:
+            while i < name_at and body[i] in ' \t':
+                i += 1
+            if i >= name_at:
+                break
+            word = self._assign_word.match(body, i)
+            if word:
+                i = self._word_end(body, word.end())
+                continue
+            j = i
+            while j < len(body) and body[j] not in ' \t\n;&|()':
+                j += 1
+            if body[i:j] not in self._pass_through:
+                return False
+            i = j
+        return i == name_at
+
     def findall(self, body):
         out, n = [], len(body)
         for m in self._start.finditer(body):
+            if not self._prefixes_a_command(body, m.start(1)):
+                continue
             end = self._word_end(body, m.end())
             gap = end
             while gap < n and body[gap] in ' \t':
@@ -2327,8 +2409,22 @@ BOUND = re.compile(
 # script would. That is a property of counting a publish as evidence, not an
 # oversight, and closing it would mean dropping the four correct
 # `AUTUMN_SYNC__DB_PATH` occurrences above.
-ACCESSOR = re.compile(r'\b(var|var_os|set_var|env_trimmed'
-                      r'|parse_env\w*|env_bool\w*|getenv)\s*\('
+# The std accessors are QUALIFIED, because `var` on its own is not an
+# environment API — it is any Rust function named `var`, and this tree has
+# hundreds of them: `var(--primary)` in the CSS the admin plugin emits from a
+# Rust string. Nothing was resolved through those today, but a bare-name rule
+# was one plausible call from blessing an argument that is nobody's variable.
+#
+# What it needs is a RECEIVER or a path, not the std path specifically. The
+# first cut required `std::env::` and dropped 27 real names, because this
+# tree's own `Env` trait is called as a method — `env.var("AUTUMN_MASTER_KEY")`,
+# and in tests `off.var(…)` / `unset.var(…)` on differently-named bindings. So
+# the rule is that something owns the call: `env::var(…)` or `‹receiver›.var(…)`
+# reads the environment, and a bare `var(…)` reads whatever function is in
+# scope. Measured at each step, which is the only reason the 27 came back.
+ACCESSOR = re.compile(r'\b(?:std::)?env::(var|var_os|set_var)\s*\('
+                      r'|\.\s*(var|var_os|set_var)\s*\('
+                      r'|\b(env_trimmed|parse_env\w*|env_bool\w*|getenv)\s*\('
                       r'|\b(env\w*)\.get\s*\(')
 
 # …plus the crates' own env helpers, READ OUT OF THE TREE rather than listed
@@ -2801,6 +2897,11 @@ def source_tokens(root):
         yaml_file = effective_suffix(rel) in YAML_SCALARS
         interpolated = yaml_file and _yaml_interpolated(rel)
         yaml_code, powershell = None, set()
+        # A Dockerfile's exec-form lines expand nothing — see `_docker_literal`.
+        literal = (_docker_literal(body)
+                   if pathlib.PurePath(rel).name.split('.')[0] == 'Dockerfile'
+                   or pathlib.PurePath(rel).name.split('.')[0] == 'Containerfile'
+                   else set())
         if yaml_file:
             consumer = _yaml_consumer(rel, body)
             # Which `run:` blocks the workflow told Actions to run in
@@ -2910,8 +3011,9 @@ def source_tokens(root):
                     declaring = code_lines[n].rstrip().endswith('\\')
                 elif effective_suffix(rel) in DOTENV:
                     tokens.update(DECLARED_CONT.findall(code_lines[n]))
-                tokens.update(v for v in EXPANDED.findall(line)
-                              if v not in local)
+                if n not in literal:
+                    tokens.update(v for v in EXPANDED.findall(line)
+                                  if v not in local)
             # The generated-data mask applies to BINDINGS as well as
             # accessors: `r#"const FAKE_ENV: &str = "AUTUMN_X";"#` inside an
             # ordinary Rust string is sample text, not a binding. Same rule,
@@ -4264,6 +4366,34 @@ def self_test():
     case('a bare assignment is not',
          (ASSIGNED.findall('AUTUMN_X="path/to"'),
           ASSIGNED_PREFIX.findall('AUTUMN_X="path/to"')), ([], []))
+    # An assignment word assigns only BEFORE the command name; after it, it is
+    # an ordinary argument. A few words pass assignments through, or open a
+    # command without being one.
+    case('an assignment after the command name is an argument',
+         (ASSIGNED_PREFIX.findall("printf '%s' AUTUMN_X=v ignored-command"),
+          ASSIGNED_PREFIX.findall('cmd AUTUMN_X=1 arg'),
+          ASSIGNED_PREFIX.findall('AUTUMN_X=1 cargo run'),
+          ASSIGNED_PREFIX.findall('env AUTUMN_X=1 cmd'),
+          ASSIGNED_PREFIX.findall('AUTUMN_A=1 AUTUMN_X=2 cmd'),
+          ASSIGNED_PREFIX.findall('echo hi; AUTUMN_X=1 cmd')),
+         ([], [], ['AUTUMN_X'], ['AUTUMN_X'], ['AUTUMN_A', 'AUTUMN_X'],
+          ['AUTUMN_X']))
+    # Docker's exec form runs no shell, so its dollars are literal — unless the
+    # executable IS a shell, which this tree does use.
+    case('a Docker exec form expands nothing unless it names a shell',
+         sorted(_docker_literal(
+             'RUN ["echo", "$AUTUMN_A"]\nRUN echo $AUTUMN_B\n'
+             'CMD ["sh", "-c", "echo $AUTUMN_C"]\n'
+             'CMD ["/app/x", \\\n  "$AUTUMN_D"]\nENV AUTUMN_E=1\n')),
+         [0, 3, 4])
+    # A bare `var(` is any function named `var`; the environment API has a
+    # receiver or a path. This tree's own `Env` trait is called as a method.
+    case('an accessor needs a receiver or a path',
+         [bool(real_acc.search(s)) for s in
+          ('var("AUTUMN_X")', 'background: var(--primary)',
+           'std::env::var("AUTUMN_X")', 'env::var("AUTUMN_X")',
+           'env.var("AUTUMN_X")', 'off.var("AUTUMN_X")')],
+         [False, False, True, True, True, True])
     # A redirection is not a command — `AUTUMN_X=1 > out` is a null command
     # that starts no process — but it may PRECEDE one, so it is consumed and
     # the question asked again rather than added to the terminator set.
@@ -4492,7 +4622,7 @@ def self_test():
            '  std::env::var(\\\\"AUTUMN_X\\\\")\\n  and restart.";',
            'fn t() -> &\'static str { r#"use std::env;\nfn main() {\n'
            '    std::env::var("AUTUMN_X");\n}"# }')],
-         [[], ['var(']])
+         [[], ['std::env::var(']])
     # The same mask applies to BINDINGS, not only to accessors — applying a
     # rule to one of the two rungs that ask it is this script's most repeated
     # mistake.
@@ -4510,7 +4640,8 @@ def self_test():
           ('steps:\n  - run: echo "${AUTUMN_X}"\n',
            'steps:\n  - name: echo "${AUTUMN_X}"\n',
            'steps:\n  - run: |\n      echo x\n')],
-         ['- run: echo "${AUTUMN_X}"', '', 'echo x'])
+         # The key is blanked on an executed line: `run:` is YAML, not shell.
+         ['echo "${AUTUMN_X}"', '', 'echo x'])
     # A FOLDED executed scalar is joined before the shell sees it, so an
     # assignment and its command on consecutive lines are one command. A
     # LITERAL `|` scalar keeps its newlines and must not be joined.
@@ -4622,7 +4753,7 @@ def self_test():
           len(_yaml_blocks(_comp, True, 'compose').splitlines())
           - len(_yaml_blocks(_comp, True, 'compose', True).splitlines())),
          (['AUTUMN_CMD'], ['AUTUMN_ENVLIST', 'AUTUMN_CMD'],
-          ['AUTUMN_NOTE', 'AUTUMN_CMD'], 0))
+          ['AUTUMN_CMD'], 0))
     # …and which GRAMMAR a `run:` block is in is the workflow's to say, not the
     # file suffix's. All three declaration sites, including a step whose
     # `shell:` comes AFTER its `run:` — which is why the resolution is a
@@ -4760,7 +4891,7 @@ def self_test():
            'std::env::var(\\"AUTUMN_X\\");\\n}" }',
            'fn p() -> &\'static str { r#"fn m() {\n'
            'std::env::var("AUTUMN_X");\n}"# }')],
-         [[], [], ['var('], ['var(']])
+         [[], [], ['env::var('], ['std::env::var(']])
     case('a stray quote outside YAML still costs one line',
          _hash_uncommented("x = 'a\n# AUTUMN_LOG__LEVL=y cmd\nz = 1\n",
                            True).splitlines(),
