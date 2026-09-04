@@ -100,23 +100,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Fetched from trunk-dev — the branch install.sh's own header comment
-      # already recommends — rather than a version tag, and with no --version
-      # pin, so it always installs the latest published release (issue
-      # #2495: pinning here to this app's own autumn-web version left the
-      # gate red from the day a command it needs merges until the next
-      # release cuts, and stuck red afterwards until someone re-scaffolded).
-      # This job and the `posture` job below each resolve "latest"
-      # independently; a release publishing in the (normally sub-minute)
-      # window between them could in theory hand the two jobs different CLI
-      # versions. That is accepted rather than engineered around: it can only
-      # ever make this job's manifest and the `posture` job's parse of it
-      # disagree, which fails the gate closed (a tool error, not a false
-      # pass) and clears on the next push or re-run.
+      # Pinned to the release this app's own autumn-web version tracks — not
+      # "latest" — because this job compiles the pull request and reads back
+      # its macro-expanded auth posture, and this project's own compatibility
+      # check (`autumn doctor`, doctor.rs) treats a CLI/autumn-web minor
+      # mismatch as a hard incompatibility. Running the one job that touches
+      # generated code under a CLI the project itself calls incompatible is
+      # not a trade this workflow makes silently (issue #2495's own fix
+      # deliberately does not touch this install).
       - name: Install the autumn CLI
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/autumn-foundation/autumn/trunk-dev/scripts/install.sh" \
-            | sh
+          curl -fsSL "https://raw.githubusercontent.com/autumn-foundation/autumn/v{{autumn_version}}/scripts/install.sh" \
+            | sh -s -- --version "v{{autumn_version}}"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # Compiles the app and reads back its macro-expanded auth posture.
@@ -175,20 +170,32 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Installs the latest published release, same as the `manifest` job
-      # above (issue #2495) — see its "Install the autumn CLI" step for why.
+      # Pinned first, same as the `manifest` job (issue #2495) — this job only
+      # ever reads JSON, so it carries none of that job's macro-compilation
+      # risk, and `routes posture` postdating the pinned release is exactly
+      # the gap #2495 exists to close. So: try the pinned, compatible CLI
+      # first; only if it lacks the command, fall back to the latest
+      # published release for THIS RUN ALONE, rather than pinning every app
+      # to "latest" permanently (which this project's own `autumn doctor`
+      # compatibility check would call incompatible the moment a minor
+      # release ships). The fallback stops firing on its own once a release
+      # in this app's own compatible series adds the command.
       - name: Install the autumn CLI
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/autumn-foundation/autumn/trunk-dev/scripts/install.sh" \
-            | sh
+          curl -fsSL "https://raw.githubusercontent.com/autumn-foundation/autumn/v{{autumn_version}}/scripts/install.sh" \
+            | sh -s -- --version "v{{autumn_version}}"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          # `routes posture` is newer than some releases this workflow could
-          # otherwise be stuck pointing at. Fail, never skip, if even the
-          # latest release lacks it: a gate that waves a pull request through
-          # because its own tooling is too old is worse than one that is red.
+          if ! "$HOME/.local/bin/autumn" routes posture --help >/dev/null 2>&1; then
+            echo "::warning::the autumn CLI pinned to this app's autumn-web version (v{{autumn_version}}) has no \`routes posture\` command yet. Falling back to the latest published release for this run only — it may not exactly match this app's autumn-web version. Raise autumn-web and this workflow's pin together once a compatible release ships the command, to remove the mismatch."
+            curl -fsSL "https://raw.githubusercontent.com/autumn-foundation/autumn/trunk-dev/scripts/install.sh" \
+              | sh
+          fi
+          # Fail, never skip, if even the latest release lacks it: a gate
+          # that waves a pull request through because its own tooling is too
+          # old is worse than one that is red.
           installed_version="$("$HOME/.local/bin/autumn" --version 2>/dev/null || echo unknown)"
           if ! "$HOME/.local/bin/autumn" routes posture --help >/dev/null 2>&1; then
-            echo "::error::the latest published autumn CLI (${installed_version}) has no \`routes posture\` command yet, so this gate cannot run. It starts running on its own once a release ships the command — no workflow change needed."
+            echo "::error::even the latest published autumn CLI (${installed_version}) has no \`routes posture\` command yet, so this gate cannot run. It starts running on its own once a release ships the command."
             exit 1
           fi
 

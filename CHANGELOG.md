@@ -441,18 +441,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gate in the publish gate (`scripts/check-posture-gate.sh`). See
   `docs/guide/posture-gate.md`.
 
-  The scaffolded `posture-gate.yml` and `ci.yml` install the *latest
-  published* `autumn` CLI, not the version pinned in the app's own
-  `Cargo.toml` (#2495): pinning to the app's own version left every newly
-  scaffolded gate red between a subcommand landing and the next release —
-  and stuck red afterwards until someone re-ran `autumn upgrade --apply`.
-  Tracking latest instead means the gate starts working on its own the
-  moment any release ships the command it needs. `ci.yml`'s `a11y verify`
-  and `routes audit` steps now probe for their subcommand the same way
-  `posture-gate.yml` already did, and fail with an actionable message
-  rather than a raw unknown-subcommand error if it is missing. Scaffolded
-  workflow YAML only; no new or changed CLI surface for agents to reach
-  for. [no-plugin]
+  `posture-gate.yml` and `ci.yml` still install the `autumn` CLI pinned to
+  the app's own `autumn-web` version by default (#2495): pinning alone left
+  every newly scaffolded gate red between a subcommand landing and the next
+  release, and stuck red afterwards until someone re-ran `autumn upgrade
+  --apply` — but always installing the latest published release instead
+  would trade that for a worse problem, running these gates under a CLI
+  this project's own compatibility check (`autumn doctor`) calls
+  incompatible the moment a minor release ships. So only
+  `posture-gate.yml`'s verdict job — which never compiles the pull request,
+  only reads JSON — falls back to the latest published release, for that
+  run alone, when the pinned CLI lacks `routes posture`; the fallback stops
+  firing on its own once a release in the app's own compatible series adds
+  the command. `ci.yml`'s `a11y verify` and `routes audit` steps (like
+  `posture-gate.yml`'s own `manifest` job) compile and introspect the pull
+  request's own code, so they never fall back — they now probe for their
+  subcommand the same way `posture-gate.yml`'s verdict job already did, and
+  fail with an actionable message naming the pin to raise, rather than a
+  raw unknown-subcommand error. Scaffolded workflow YAML only; no new or
+  changed CLI surface for agents to reach for. [no-plugin]
 
 - **Build-time authority envelope for agent-operable handlers (#1691):** an
   endpoint exposed as an MCP tool is an action an autonomous agent can take

@@ -2920,12 +2920,12 @@ mod tests {
         );
     }
 
-    /// `routes posture` did not exist in every release, and the CLI installed
-    /// here is the latest published one (#2495), not the version pinned in
-    /// this app's `Cargo.toml` — so the gate says which command is missing
-    /// rather than failing with an unknown-subcommand error, and it fails
-    /// rather than skipping, because a gate that waves a pull request through
-    /// when its own tooling is too old is worse than a red one.
+    /// `routes posture` did not exist in every release. The verdict job
+    /// tries the pinned CLI, falls back to the latest published release if
+    /// that lacks the command (#2495), and — even then — says which command
+    /// is missing rather than failing with an unknown-subcommand error, and
+    /// fails rather than skipping, because a gate that waves a pull request
+    /// through when its own tooling is too old is worse than a red one.
     #[test]
     fn the_gate_names_the_release_when_the_latest_cli_is_too_old() {
         let files = owned(GenerateOptions::default());
@@ -2951,31 +2951,44 @@ mod tests {
         );
     }
 
-    /// Issue #2495: a scaffolded workflow that installs "the autumn CLI
-    /// matching this app's autumn-web version" is red from the moment a
-    /// subcommand it calls merges until the next release cuts, and stays red
-    /// afterwards until someone re-runs `autumn upgrade --apply` — because the
-    /// pin is this app's *own* declared version, not "whatever release
-    /// exists". `posture-gate.yml` must install the latest published release
-    /// instead, so the gate starts working on its own the moment any release
-    /// ships the command it needs.
+    /// Issue #2495: `routes posture` can postdate the release pinned to this
+    /// app's own autumn-web version — but always installing "latest" instead
+    /// would run this security gate under a CLI this project's own
+    /// compatibility check (`doctor.rs::check_version_compat`) calls
+    /// incompatible the moment a minor release ships. So the verdict job
+    /// tries the pinned, compatible CLI first and only falls back to the
+    /// latest published release, for that run alone, when the pinned one
+    /// lacks the command. The `manifest` job — which compiles the pull
+    /// request's own code — gets no such fallback at all: nothing in it may
+    /// run under a CLI this project calls incompatible.
     #[test]
-    fn the_posture_gate_installs_latest_cli_not_pinned_to_app_version() {
+    fn the_posture_gate_prefers_the_pinned_compatible_cli_and_falls_back_only_when_needed() {
         let files = owned(GenerateOptions::default());
         let workflow = files
             .get(".github/workflows/posture-gate.yml")
             .expect("scaffolded");
 
+        let pinned = format!("v{FIXTURE_AUTUMN_VERSION}");
         assert!(
-            !workflow.contains(&format!("v{FIXTURE_AUTUMN_VERSION}")),
-            "posture-gate.yml must not pin the installed CLI to this app's \
-             autumn version: {workflow}"
+            workflow.contains(&pinned),
+            "posture-gate.yml must still install the CLI pinned to this \
+             app's autumn version as the default: {workflow}"
+        );
+
+        let (build_job, verdict_job) = workflow
+            .split_once("  posture:")
+            .expect("two jobs: the build and the verdict");
+        assert!(
+            !build_job.contains("trunk-dev"),
+            "the manifest job compiles the pull request's own code and must \
+             never fall back to a CLI this project's own compatibility \
+             check would call incompatible: {build_job}"
         );
         assert!(
-            !workflow.contains("-s -- --version"),
-            "posture-gate.yml's install.sh invocation must not pass \
-             --version, so install.sh's own default (latest) resolves the \
-             release to install: {workflow}"
+            verdict_job.contains("trunk-dev") && verdict_job.contains("::warning::"),
+            "the verdict job must fall back to the latest published \
+             release, visibly, when the pinned CLI lacks routes posture: \
+             {verdict_job}"
         );
     }
 

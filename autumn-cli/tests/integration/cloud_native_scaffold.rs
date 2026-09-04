@@ -397,31 +397,27 @@ fn ci_workflow_runs_a11y_verify() {
     );
 }
 
-/// Issue #2495: a workflow that installs "the autumn CLI matching this app's
-/// autumn-web version" is red from the moment a subcommand it calls lands
-/// until the next release cuts — the version pinned in a freshly scaffolded
-/// app's `Cargo.toml` is whatever the CLI that scaffolded it was built as,
-/// and that can (and, at `routes posture`'s introduction, does) predate a
-/// command the workflow itself calls. `ci.yml` and `posture-gate.yml` must
-/// install the latest published release instead of pinning to this app's own
-/// `autumn-web` version, so the gate starts working on its own the moment any
-/// release ships the command it needs — no re-scaffold, no `autumn upgrade
-/// --apply` required.
+/// Issue #2495: `ci.yml`'s `a11y verify` and `routes audit` steps compile
+/// and introspect the pull request's own code, the same as
+/// posture-gate.yml's `manifest` job — so unlike that job's `posture`
+/// sibling (which only ever reads JSON, and does get a "latest release"
+/// fallback), `ci.yml` must keep installing the CLI pinned to this app's
+/// `autumn-web` version and never silently reach for a CLI this project's
+/// own compatibility check (`autumn doctor`) would call incompatible.
 #[test]
-fn ci_workflow_installs_latest_cli_not_pinned_to_app_version() {
-    let temp_dir = scaffold("ci-latest-cli-app");
-    let project_dir = temp_dir.path().join("ci-latest-cli-app");
+fn ci_workflow_always_installs_the_cli_pinned_to_app_version() {
+    let temp_dir = scaffold("ci-pinned-cli-app");
+    let project_dir = temp_dir.path().join("ci-pinned-cli-app");
     let ci = fs::read_to_string(project_dir.join(".github/workflows/ci.yml")).unwrap();
 
     assert!(
-        !ci.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
-        "ci.yml must not pin the installed CLI to this app's autumn version: {ci}"
+        ci.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+        "ci.yml must install the CLI pinned to this app's autumn version: {ci}"
     );
     assert!(
-        !ci.contains("-s -- --version"),
-        "ci.yml's install.sh invocation must not pass --version, so \
-         install.sh's own default (latest) resolves the release to \
-         install: {ci}"
+        !ci.contains("trunk-dev"),
+        "ci.yml must never fall back to a CLI this project's own \
+         compatibility check would call incompatible: {ci}"
     );
 }
 
@@ -429,8 +425,7 @@ fn ci_workflow_installs_latest_cli_not_pinned_to_app_version() {
 /// CLI that lacks the subcommand fails with a cryptic "unknown subcommand"
 /// error. Mirroring `posture-gate.yml`'s existing `routes posture --help`
 /// probe (#2467), both must be checked for and fail with an actionable
-/// `::error::` message naming the installed version, before either gate
-/// actually runs.
+/// `::error::` message before either gate actually runs.
 #[test]
 fn ci_workflow_probes_for_a11y_and_routes_audit_before_running_them() {
     let temp_dir = scaffold("ci-probe-app");

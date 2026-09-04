@@ -106,10 +106,14 @@ another is not decidable from the strings, and a gate that blocks on
 ## Turning it on
 
 > **The CLI has to be new enough.** The scaffolded workflow installs the
-> latest published `autumn` release — not the version pinned in your app's
-> `Cargo.toml` — so the gate starts working on its own the moment any release
-> ships `routes posture`, with no re-scaffold or `autumn upgrade --apply`
-> needed. Until then, the first run fails, naming the missing command. It
+> `autumn` release your app's `autumn-web` version tracks. If `routes
+> posture` postdates that release, it falls back — for that run only — to
+> the latest published release instead of staying stuck. The fallback isn't
+> permanent: it stops firing on its own once a release in your app's own
+> compatible series adds the command, and until then the gate still runs
+> (rather than staying red until you raise `autumn-web` yourself), just
+> under a CLI that may not exactly match your `autumn-web` version. If even
+> the latest release lacks the command, the first run fails, naming it. It
 > fails rather than skipping on purpose: a gate that waves a pull request
 > through because its own tooling is too old is worse than a red one.
 
