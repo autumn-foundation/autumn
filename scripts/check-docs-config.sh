@@ -17,7 +17,7 @@
 # on the default database. That is the corpus's worst failure mode: the reader
 # cannot detect the wrongness, and neither can the framework.
 #
-# The reader-facing corpus names 629 `AUTUMN_*` variables across 175 pages. This
+# The reader-facing corpus names 636 `AUTUMN_*` variables across 175 pages. This
 # gate resolves every one of them.
 #
 # WHAT IT CHECKS (single fast job, no Rust toolchain needed):
@@ -35,8 +35,10 @@
 #      one this script cannot parse is REPORTED, not skipped.
 #
 # TRUTH SETS (all already in the tree; nothing to regenerate here):
-#   - `autumn/tests/fixtures/schema_keys.snapshot` — the 484 leaf paths of
-#     `AutumnConfig`, produced by the same `get_schema_keys()` walk that backs
+#   - `autumn/tests/fixtures/schema_keys.snapshot` — 484 config paths of
+#     `AutumnConfig`, of which the 397 LEAVES are the settable keys (a branch
+#     like `server.upgrade` is not one; the runtime probes the leaves beneath
+#     it). Produced by the same `get_schema_keys()` walk that backs
 #     strict unknown-key validation, and kept honest by
 #     `schema_keys_snapshot_guard`. Using the snapshot rather than a fresh walk
 #     is what keeps this gate toolchain-free; the snapshot cannot drift from the
@@ -54,7 +56,8 @@
 #     `AutumnConfig` alone would report four subsystems as broken.
 #
 # RESOLUTION, and why each rung is derived rather than listed:
-#   a. The path is a schema leaf.
+#   a. The path is a schema LEAF (a branch sets nothing; see SETTABLE_BRANCHES
+#      for the one untagged exception).
 #   b. Sequence indices are elided first: the schema spells a shard field
 #      `database.shards.name`, so `AUTUMN_DATABASE__SHARDS__0__NAME` and the
 #      table's `{i}` placeholder both normalise onto it.
@@ -150,7 +153,17 @@ INCLUDE_FILES = ('README.md', 'EXAMPLES.md', 'CONTRIBUTING.md', 'STABILITY.md')
 # `AUTUMN_` followed by at least one more character, ending on an
 # alphanumeric so a trailing underscore in prose (`AUTUMN_UPGRADE_*`) is not
 # swallowed into the name.
-VAR = re.compile(r'\bAUTUMN_[A-Z0-9_]*[A-Z0-9]\b')
+#
+# A `{i}`-style placeholder is part of a name, not a delimiter: a page
+# documenting a positional section writes the whole family in one row, as
+# `docs/guide/sharding.md` does for `AUTUMN_DATABASE__SHARDS__{i}__NAME`. Before
+# this admitted lowercase inside braces the pattern matched NOTHING on those
+# seven lines — not a truncated name, no name at all — so the shard family was
+# absent from the corpus scan entirely and a typo there could not be reported.
+# (The same oversight in the module-doc row pattern hid seven table rows; fixing
+# one and not the other is how a gate ends up half-applied.) `to_path` elides
+# the placeholder, so these land on `database.shards.name` like a literal index.
+VAR = re.compile(r'\bAUTUMN_(?:\{[a-z]+\}|[A-Z0-9_])*[A-Z0-9]\b')
 
 # A path segment that is a sequence index rather than a field name: a literal
 # index as written in a shell line, or the `{i}` / `{N}` placeholder the
@@ -193,6 +206,20 @@ TEMPLATE = re.compile(r'"(AUTUMN_[A-Z0-9_]*(?:\{[a-z_]+\}[A-Z0-9_]*)+)"')
 # markers repeating the same reason on eight pages.
 PLACEHOLDER_ROOTS = ('section',)
 
+# The snapshot records BRANCHES as well as settable leaves — `server.upgrade`
+# sits above `server.upgrade.enabled` and `…ready_timeout_secs` — but the
+# runtime probes only the leaf names. Resolving against the whole snapshot
+# therefore blessed a truncated key: `AUTUMN_SERVER__UPGRADE` counted as found
+# while setting nothing, which is precisely the silent no-op this gate exists to
+# catch. Only leaves resolve.
+#
+# One branch really is settable: `SigningSecretConfig`'s untagged deserializer
+# accepts a bare string, so `AUTUMN_SECURITY__SIGNING_SECRET` sets
+# `security.signing_secret` whole (38 occurrences across the corpus). Measured
+# before narrowing the rule — it is the only corpus variable that lands on a
+# branch, and a second one has to be added here deliberately.
+SETTABLE_BRANCHES = ('security.signing_secret',)
+
 # A page may declare a Rust `const`/`static` whose name matches the variable
 # shape — `docs/guide/wasm-islands.md` has
 # `pub const AUTUMN_SOURCE: &str = include_str!("corpus.txt")` — and then use it
@@ -204,8 +231,17 @@ DECLARED_CONST = re.compile(
 
 # --------------------------------------------------------------- truth sets
 
-def schema_leaves(text):
+def schema_paths(text):
     return {l.strip() for l in text.splitlines() if l.strip()}
+
+
+def leaf_paths(paths):
+    """Settable keys: a path with nothing below it.
+
+    The snapshot records every node the walk visits, branches included, and a
+    branch is not a key you can set — see SETTABLE_BRANCHES.
+    """
+    return {p for p in paths if not any(o.startswith(p + '.') for o in paths)}
 
 
 def built_patterns(root):
@@ -325,7 +361,7 @@ def resolve(var, leaves, built, tokens):
     """Return the rung that resolves `var`, or None. Order is cost, not rank."""
     if is_config_form(var):
         path = to_path(var)
-        if path in leaves:
+        if path in leaves or path in SETTABLE_BRANCHES:
             return 'schema'
         if path.split('.')[0] in PLACEHOLDER_ROOTS:
             return 'naming-rule example'
@@ -491,8 +527,8 @@ def check_table(rows, leaves, built):
 # ------------------------------------------------------------------- modes
 
 def load():
-    leaves = schema_leaves(SNAPSHOT.read_text(encoding='utf-8'))
-    return leaves, built_patterns(ROOT), source_tokens(ROOT)
+    paths = schema_paths(SNAPSHOT.read_text(encoding='utf-8'))
+    return leaf_paths(paths), built_patterns(ROOT), source_tokens(ROOT)
 
 
 def main():
@@ -560,10 +596,11 @@ def list_surface():
 # --------------------------------------------------------------- self-test
 
 def self_test():
-    leaves = schema_leaves(
+    leaves = leaf_paths(schema_paths(
         'log\nlog.level\nauth\nauth.oauth2\ndatabase\ndatabase.shards\n'
         'database.shards.name\nsecurity\nsecurity.signing_secret\n'
-        'security.signing_secret.secret\n')
+        'security.signing_secret.secret\nserver\nserver.upgrade\n'
+        'server.upgrade.enabled\n'))
     built = {'AUTUMN_AUTH__OAUTH2__{p}__CLIENT_SECRET':
              re.compile(r'^AUTUMN_AUTH__OAUTH2__[A-Z0-9_]+__CLIENT_SECRET$')}
     tokens = {'AUTUMN_ENV', 'AUTUMN_SEARCH__QUEUE'}
@@ -582,6 +619,21 @@ def self_test():
     case('single underscore fails', r('AUTUMN_DATABASE_URL'), None)
     case('sequence index elided',
          r('AUTUMN_DATABASE__SHARDS__0__NAME'), 'schema')
+    # A branch is not a settable key: the runtime probes the leaves under it.
+    case('a schema branch is not a key', r('AUTUMN_SERVER__UPGRADE'), None)
+    case('its leaf is', r('AUTUMN_SERVER__UPGRADE__ENABLED'), 'schema')
+    case('the one settable branch still resolves',
+         r('AUTUMN_SECURITY__SIGNING_SECRET'), 'schema')
+    # The corpus scanner must SEE a placeholder name at all — before it did not
+    # match `…SHARDS__{i}__NAME` in any form, so those seven documented
+    # variables were invisible rather than merely unresolved.
+    case('a placeholder name is scanned',
+         VAR.findall('| `AUTUMN_DATABASE__SHARDS__{i}__NAME` | x |'),
+         ['AUTUMN_DATABASE__SHARDS__{i}__NAME'])
+    case('a placeholder name resolves',
+         r('AUTUMN_DATABASE__SHARDS__{i}__NAME'), 'schema')
+    case('a typo beside a placeholder is caught',
+         r('AUTUMN_DATABASE__SHARDS__{i}__NOPE'), None)
     case('table placeholder elided',
          r('AUTUMN_DATABASE__SHARDS__{i}__NAME'), 'schema')
     case('unknown shard field fails',
