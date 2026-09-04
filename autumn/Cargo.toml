@@ -307,7 +307,7 @@ webpki-roots = { version = "1", optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"], optional = true }
 # Parse the leaf certificate's `NotAfter` for fail-fast expired-cert detection
 # at startup and the `autumn doctor` near-expiry warning. Only pulled by `tls`.
-x509-parser = { version = "0.16", optional = true }
+x509-parser = { version = "0.18", optional = true }
 # Automatic ACME (Let's Encrypt) provisioning (issue #1608, `acme` feature).
 # Both pinned `default-features = false` + `ring` so the ACME path reuses the
 # SAME crypto backend as the rest of autumn-web — the workspace forbids a second
