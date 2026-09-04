@@ -1649,6 +1649,27 @@ fn diff_headers(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Fi
     let before = headers_index(base);
     let after = headers_index(head);
 
+    // What the app still emits, folded into every removal's identity.
+    //
+    // The last constant fingerprints in the module, and the argument for
+    // leaving them — a header is emitted or it is not, so there is no third
+    // state — was about the *value* and beside the point. Losing HSTS while
+    // gaining CSP is a decision about the set that results: the addition is a
+    // narrowing, so dropping it later leaves the diff holding the identical
+    // HSTS removal and the old acknowledgment covering a posture with neither.
+    //
+    // Values as well as names, since `security_header_value_changed` is
+    // deliberately neutral — weakening a CSP after the fact would otherwise
+    // reach exactly as far. The cost is the one `bind_to_effective_posture`
+    // already pays and #2497 tracks: a cosmetic header edit re-asks.
+    let emitted: Vec<String> = after
+        .iter()
+        .filter(|(_, (emitted, _))| *emitted)
+        .map(|(header, (_, value))| escape_list(&[(*header).to_owned(), (*value).to_owned()]))
+        .collect();
+    // Already ordered by header: `after` is a `BTreeMap` keyed on the name.
+    let remaining = escape_list(&emitted);
+
     let removed = |header: &str, value_before: &str| Finding {
         kind: "security_header_removed",
         severity: Severity::Widening,
@@ -1656,7 +1677,7 @@ fn diff_headers(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Fi
         path: header.to_owned(),
         before: value_before.to_owned(),
         after: "not emitted".to_owned(),
-        fingerprint: "header-removed".to_owned(),
+        fingerprint: escape_list(&["header-removed".to_owned(), remaining.clone()]),
         detail: format!("security header `{header}` is no longer emitted"),
     };
 
@@ -4145,5 +4166,36 @@ mod tests {
         };
 
         assert_ne!(exempting_with(&["mfa"]), exempting_with(&[]));
+    }
+    /// The header findings were the last constant fingerprints, and I said two
+    /// rounds ago that they were fine because a header is emitted or it is not
+    /// — true of the *value*, and beside the point. The identity has to carry
+    /// the rest of the header posture for the same reason every route
+    /// dimension does: removing HSTS while adding CSP is a decision about the
+    /// set that results, and dropping CSP afterwards leaves the diff holding
+    /// the identical HSTS removal.
+    #[test]
+    fn a_header_removal_acknowledgment_binds_to_the_headers_that_remain() {
+        let base = manifest(
+            "",
+            "",
+            r#"{"header":"strict_transport_security","value":"max-age=63072000","emitted":true}"#,
+            "",
+        );
+        let alongside = |remaining: &str| {
+            diff(&base, &manifest("", "", remaining, ""))
+                .into_iter()
+                .find(|f| f.kind == "security_header_removed")
+                .expect("losing HSTS is a widening")
+                .canonical()
+        };
+
+        assert_ne!(
+            alongside(
+                r#"{"header":"content_security_policy","value":"default-src 'self'","emitted":true}"#
+            ),
+            alongside(""),
+            "dropping the compensating header has to re-ask"
+        );
     }
 }
