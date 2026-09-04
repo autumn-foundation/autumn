@@ -410,24 +410,13 @@ fn parse_purge_flag(raw: Option<&str>) -> bool {
 }
 
 impl Plugin for SearchPlugin {
-    /// The compatibility contract this plugin declares (issue #1601).
-    ///
-    /// First-party plugins ship in lockstep with `autumn-web`, so the declared
-    /// range is this crate's own minor series — the two versions are the same
-    /// number by construction. Below `1.0` a minor bump is breaking (see
-    /// `STABILITY.md`), which is exactly what the `MAJOR.MINOR` requirement
-    /// says.
-    ///
-    /// Nothing experimental is declared: this plugin is built entirely on the
-    /// stable plugin surface.
+    /// This plugin ships in lockstep with `autumn-web` — see
+    /// [`lockstep_contract`](autumn_web::plugin_contract::lockstep_contract).
     fn contract(&self) -> Option<autumn_web::plugin_contract::PluginContract> {
-        Some(
-            autumn_web::plugin_contract::PluginContract::new(env!("CARGO_PKG_NAME"))
-                .plugin_version(env!("CARGO_PKG_VERSION"))
-                .autumn_web(autumn_web::plugin_contract::lockstep_range(env!(
-                    "CARGO_PKG_VERSION"
-                ))),
-        )
+        Some(autumn_web::plugin_contract::lockstep_contract(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
     }
 
     fn name(&self) -> Cow<'static, str> {
@@ -632,6 +621,21 @@ mod tests {
     #[test]
     fn the_plugin_name_is_the_crate_name() {
         assert_eq!(SearchPlugin::new().name(), "autumn-search");
+    }
+
+    #[test]
+    fn contract_declares_lockstep_with_own_crate() {
+        let contract = SearchPlugin::new().contract().expect("a contract");
+        assert_eq!(contract.plugin, env!("CARGO_PKG_NAME"));
+        assert_eq!(
+            contract.plugin_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            contract.autumn_web.as_deref(),
+            Some(autumn_web::plugin_contract::lockstep_range(env!("CARGO_PKG_VERSION")).as_str())
+        );
+        assert!(contract.experimental_surfaces.is_empty());
     }
 
     #[test]
