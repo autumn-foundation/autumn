@@ -374,11 +374,15 @@ SEGMENT = r'(?:[A-Z0-9]+(?:_[A-Z0-9]+)*|\{[a-z]+\})'
 # truth set through `source_tokens` — the same defect, found once and fixed in
 # one place. Both readers of the tree strip comments now.
 #
-# Only WHOLE-LINE comments go: a line whose first non-space is the leader. A
-# trailing `// …` after code is left alone, so a leader inside a string literal
-# can never blank the line it sits on — the safe direction, since dropping a
-# real read reports a correct page while keeping a commented one hides a wrong
-# one.
+# EVERY comment goes, not only a whole-line one. Restricting it to whole lines
+# was a way of never mistaking a `//` inside a string literal for a comment, and
+# it left `const _: () = (); // std::env::var("AUTUMN_LOG__LEVL")` reading as a
+# read. The right answer to "is this `//` inside a string" is to know where the
+# strings are, so the Rust reader below is a small scanner over string, raw
+# string and block-comment state rather than a line rule. It is worth the
+# machinery: `tauri_mobile.rs` asserts on a raw string that CONTAINS a
+# commented-out `set_var("AUTUMN_SYNC__TOKEN")`, which a naive truncate-at-`//`
+# would have blanked — a real read dropped, reporting a correct page.
 #
 # The leader is per file type and deliberately not one pattern: `#` opens a
 # comment in TOML, YAML and shell, but a Rust ATTRIBUTE and a markdown HEADING.
@@ -391,15 +395,6 @@ COMMENT_LEADER = {
     '.toml': '#', '.yml': '#', '.yaml': '#', '.example': '#',
 }
 
-# A `/* … */` block is a comment too, and `//`-only stripping left
-# `/* std::env::var("AUTUMN_LOG__LEVL"); */` reading as a read. Only a block
-# that OPENS a line is stripped, for the same reason a trailing `//` is kept: a
-# `/*` mid-line is usually inside a string, and swallowing to the next `*/`
-# would blank real code.
-BLOCK_OPEN = re.compile(r'^\s*/\*')
-BLOCK_CLOSE = re.compile(r'\*/')
-
-
 def comment_leader(rel):
     p = pathlib.PurePath(rel)
     if p.suffix == '.tmpl':
@@ -407,22 +402,93 @@ def comment_leader(rel):
     return COMMENT_LEADER.get(p.suffix)
 
 
-def uncommented(body, leader='//'):
-    """Blank every whole-line comment, keeping line numbering intact."""
-    if not leader:
-        return body
-    out, in_block = [], False
+def _rust_uncommented(body):
+    """Drop `//` and `/* … */` comments, keeping strings and line numbering.
+
+    Character literals are not tracked, deliberately: a `'…'` can never hold
+    `//` or `/*`, while telling one from a lifetime (`&'a str`) is exactly the
+    kind of guess that swallows real code to the next quote.
+    """
+    out, i, n, state, hashes = [], 0, len(body), None, 0
+    while i < n:
+        c = body[i]
+        if state is None:
+            if c == '/' and body[i + 1:i + 2] == '/':
+                while i < n and body[i] != '\n':
+                    i += 1
+                continue
+            if c == '/' and body[i + 1:i + 2] == '*':
+                state, i = 'block', i + 2
+                continue
+            if c == '"':
+                state = 'str'
+            elif c == 'r':
+                j = i + 1
+                while body[j:j + 1] == '#':
+                    j += 1
+                if body[j:j + 1] == '"':
+                    state, hashes = 'raw', j - i - 1
+                    out.append(body[i:j + 1])
+                    i = j + 1
+                    continue
+            out.append(c)
+            i += 1
+        elif state == 'block':
+            if c == '*' and body[i + 1:i + 2] == '/':
+                state, i = None, i + 2
+                continue
+            if c == '\n':
+                out.append(c)
+            i += 1
+        elif state == 'str':
+            out.append(c)
+            if c == '\\' and i + 1 < n:
+                out.append(body[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                state = None
+            i += 1
+        else:
+            out.append(c)
+            if c == '"' and body[i + 1:i + 1 + hashes] == '#' * hashes:
+                out.append('#' * hashes)
+                state, i = None, i + 1 + hashes
+                continue
+            i += 1
+    return ''.join(out)
+
+
+def _hash_uncommented(body):
+    """Drop `#` comments in shell, TOML and YAML — but only where one starts.
+
+    A `#` opens a comment at the start of a word, so `${VAR#prefix}` and `$#`
+    keep their meaning. Quote state is tracked per line rather than across the
+    file: an unbalanced quote then costs one line, not the rest of the file.
+    """
+    out = []
     for l in body.splitlines():
-        if in_block:
-            out.append('')
-            in_block = not BLOCK_CLOSE.search(l)
-            continue
-        if leader == '//' and BLOCK_OPEN.match(l):
-            out.append('')
-            in_block = not BLOCK_CLOSE.search(l[l.index('/*') + 2:])
-            continue
-        out.append('' if l.lstrip().startswith(leader) else l)
+        q, cut = None, None
+        for i, c in enumerate(l):
+            if q:
+                if c == q:
+                    q = None
+            elif c in '"\'':
+                q = c
+            elif c == '#' and (i == 0 or l[i - 1].isspace()):
+                cut = i
+                break
+        out.append(l if cut is None else l[:cut])
     return '\n'.join(out)
+
+
+def uncommented(body, leader='//'):
+    """Drop comments, keeping string literals and line numbering intact."""
+    if leader == '//':
+        return _rust_uncommented(body)
+    if leader == '#':
+        return _hash_uncommented(body)
+    return body
 
 
 def built_patterns(root, leaves):
@@ -1309,20 +1375,46 @@ def self_test():
                                           comment_leader('x.rs')))), False)
     case('the same read uncommented does',
          bool(ACCESSOR.search(uncommented(read, comment_leader('x.rs')))), True)
-    # A `/* … */` block is a comment too. Only one that OPENS a line, because a
-    # `/*` mid-line is usually inside a string and swallowing to the next `*/`
-    # would blank real code.
+    # A `/* … */` block is a comment too, wherever it sits — and the code around
+    # it survives, which is what distinguishes knowing where the strings are
+    # from blanking whole lines.
     case('a block comment on one line is stripped',
-         uncommented('  /* std::env::var("AUTUMN_LOG__LEVL"); */'), '')
+         uncommented('  /* std::env::var("AUTUMN_LOG__LEVL"); */'), '  ')
     case('a multi-line block is stripped to its close',
          uncommented('/*\nstd::env::var("AUTUMN_LOG__LEVL");\n*/\nlet x = 1;'),
          '\n\n\nlet x = 1;')
     case('code after a closing block survives',
          uncommented('/* note */ let v = format!("AUTUMN_X__{i}__Y");\nlet y = 2;'),
-         '\nlet y = 2;')
-    case('a mid-line `/*` does not blank the line',
+         ' let v = format!("AUTUMN_X__{i}__Y");\nlet y = 2;')
+    # A comment marker INSIDE a string is not a comment. Both directions matter:
+    # a trailing comment must go, and a `//` or `/*` in a literal must not take
+    # the code with it.
+    case('a trailing comment is stripped',
+         uncommented('const _: () = (); // std::env::var("AUTUMN_LOG__LEVL");'),
+         'const _: () = (); ')
+    case('a `//` inside a string is not a comment',
+         uncommented('let u = "https://example.com/x"; std::env::var("AUTUMN_LOG__LEVEL");'),
+         'let u = "https://example.com/x"; std::env::var("AUTUMN_LOG__LEVEL");')
+    case('a mid-line `/*` inside a string does not blank the line',
          uncommented('let p = "/*"; std::env::var("AUTUMN_LOG__LEVEL");'),
          'let p = "/*"; std::env::var("AUTUMN_LOG__LEVEL");')
+    # A raw string keeps its contents, comment markers included. `tauri_mobile.rs`
+    # asserts on generated code containing a commented-out `set_var`, and
+    # truncating at the `//` would have dropped a real read from the truth set.
+    case('a raw string keeps a commented line',
+         uncommented('assert!(x.contains(r#"// set_var("AUTUMN_SYNC__TOKEN");"#));'),
+         'assert!(x.contains(r#"// set_var("AUTUMN_SYNC__TOKEN");"#));')
+    case('an escaped quote does not end a string',
+         uncommented(r'let s = "a\" // b"; let c = 1;'),
+         r'let s = "a\" // b"; let c = 1;')
+    # `#` opens a comment at the start of a WORD, so shell parameter expansion
+    # survives.
+    case('a trailing shell comment is stripped',
+         uncommented('export AUTUMN_X=1 # AUTUMN_LOG__LEVL', '#'),
+         'export AUTUMN_X=1 ')
+    case('a parameter expansion is not a comment',
+         uncommented('echo "${AUTUMN_X#prefix}" $#', '#'),
+         'echo "${AUTUMN_X#prefix}" $#')
     # Test code is not the runtime: a test names a variable to prove the runtime
     # ignores it. `AUTUMN_DEV` is read exactly once in the whole tree, inside a
     # `#[test]` asserting it is unset.
