@@ -1,4 +1,4 @@
-use syn::{Block, Expr, ExprIf, Item, Pat, Stmt};
+use syn::{Block, Expr, ExprIf, Item, Pat, Stmt, Type};
 
 const REPLAY_GUARD_IDENT: &str = "__AUTUMN_IDEMPOTENCY_REPLAY_GUARD";
 
@@ -497,6 +497,84 @@ pub fn expr_nested_async_body(expr: &Expr) -> Option<&Block> {
         Expr::Paren(paren) => expr_nested_async_body(&paren.expr),
         _ => None,
     }
+}
+
+/// Marker consts a body guard (`#[secured]`, `#[step_up]`, `#[authorize]`,
+/// `#[throttle]`) unconditionally emits into the same block as its
+/// `__autumn_inner` binding whenever it rewrites a handler's return type —
+/// see `secured_macro`'s `check_call`, `step_up_macro`'s `build_check_call`,
+/// `authorize_macro`'s block prologue, and `throttle_macro`'s `check_call`.
+/// One of these always precedes the binding in real guard output, so its
+/// presence is what [`generated_inner_response_binding`] uses to tell a real
+/// guard's generated wrapper apart from a block that merely has the same
+/// `let __autumn_inner: T = (async move { … }).await; IntoResponse::into_response(__autumn_inner)`
+/// shape by coincidence.
+const RESPONSE_REWRITING_GUARD_MARKERS: &[&str] = &[
+    "__AUTUMN_SECURED_ROLES",
+    "__AUTUMN_STEP_UP_MAX_AGE",
+    "__AUTUMN_THROTTLE_ROUTE_ID",
+    "__AUTUMN_AUTHORIZE_BINDINGS",
+];
+
+/// Whether any statement in `stmts` is a marker const from
+/// [`RESPONSE_REWRITING_GUARD_MARKERS`].
+fn stmts_have_response_rewriting_guard_marker(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|stmt| {
+        matches!(
+            stmt,
+            Stmt::Item(Item::Const(item))
+                if RESPONSE_REWRITING_GUARD_MARKERS.contains(&item.ident.to_string().as_str())
+        )
+    })
+}
+
+/// The exact shape a body guard (`#[secured]`, `#[step_up]`, `#[authorize]`,
+/// `#[throttle]`) emits when it rewrites a non-unit, non-`impl Trait` return
+/// type: a `let __autumn_inner: T = <init>;` binding sitting exactly one
+/// statement before the end of `block`, immediately followed by the
+/// generated `IntoResponse::into_response(__autumn_inner)` tail, with one of
+/// [`RESPONSE_REWRITING_GUARD_MARKERS`] present earlier in the same block
+/// (issue #1677's `api_doc::infer_response_body` recovery relies on this).
+///
+/// Deliberately structural rather than a bare name-and-type scan. Matching
+/// the required *position* (second-to-last, with that exact tail following)
+/// alone rules out a handler that happens to declare its own unrelated local
+/// named `__autumn_inner` elsewhere in the body. But the guard's own
+/// generated wrapper contains the *user's original body* verbatim one level
+/// deeper (`(async move { #original_body }).await`) — so if that original
+/// body itself independently ends in the same two-statement shape, position
+/// and tail alone cannot tell a real guard's own binding apart from the
+/// user's body coincidentally mimicking it. Requiring one of the guard's own
+/// marker consts to also be present closes that gap: no guard ever emits the
+/// `__autumn_inner` binding without one, and a handler's own code has no
+/// reason to declare an identifier the framework treats as reserved.
+///
+/// Returns the local's declared type together with its initializer
+/// expression, so a caller can both read the type and recurse into a deeper
+/// nested guard via [`expr_nested_async_body`].
+pub fn generated_inner_response_binding(block: &Block) -> Option<(&Type, &Expr)> {
+    let len = block.stmts.len();
+    if len < 2 {
+        return None;
+    }
+    let index = len - 2;
+    let Stmt::Local(local) = &block.stmts[index] else {
+        return None;
+    };
+    if !pat_binds_inner_response(&local.pat) {
+        return None;
+    }
+    let Pat::Type(pat_type) = &local.pat else {
+        return None;
+    };
+    if !stmt_is_inner_response_tail(&block.stmts[index + 1]) {
+        return None;
+    }
+    if !stmts_have_response_rewriting_guard_marker(&block.stmts[..index]) {
+        return None;
+    }
+    let init_expr = &local.init.as_ref()?.expr;
+    Some((&pat_type.ty, init_expr))
 }
 
 fn stmt_is_inner_response_tail(stmt: &Stmt) -> bool {

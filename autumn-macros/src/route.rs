@@ -985,6 +985,113 @@ mod tests {
         );
     }
 
+    // ── OpenAPI response schema survives guard-outermost expansion (#1677) ──
+    //
+    // All four body guards rewrite `sig.output` to `Response` when they
+    // expand. When a guard is written ABOVE the route attribute it expands
+    // FIRST, so by the time the route macro runs and calls
+    // `infer_response_body`, the real `Json<T>` return type is already gone
+    // from `sig.output` — unless the route macro recovers it from the
+    // `__autumn_inner: T` binding the guard left behind.
+
+    #[test]
+    fn route_macro_infers_response_schema_when_throttle_expands_first() {
+        let throttled = crate::throttle::throttle_macro(
+            quote! { limit = 5, per = "1m", key = "ip" },
+            quote! {
+                async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
+            },
+        );
+        let generated = route_macro("POST", "post", quote! { "/users" }, throttled).to_string();
+
+        assert!(
+            generated.contains("response : :: core :: option :: Option :: Some")
+                && generated.contains("\"Created\""),
+            "a #[throttle]-above-#[post] route must still document its Json<Created> response: \
+             {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_infers_response_schema_when_secured_expands_first() {
+        let secured = crate::secured::secured_macro(
+            quote! { "admin" },
+            quote! {
+                async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
+            },
+        );
+        let generated = route_macro("POST", "post", quote! { "/users" }, secured).to_string();
+
+        assert!(
+            generated.contains("response : :: core :: option :: Option :: Some")
+                && generated.contains("\"Created\""),
+            "a #[secured]-above-#[post] route must still document its Json<Created> response: \
+             {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_infers_response_schema_when_step_up_expands_first() {
+        let stepped_up = crate::step_up::step_up_macro(
+            quote! {},
+            quote! {
+                async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
+            },
+        );
+        let generated = route_macro("POST", "post", quote! { "/users" }, stepped_up).to_string();
+
+        assert!(
+            generated.contains("response : :: core :: option :: Option :: Some")
+                && generated.contains("\"Created\""),
+            "a #[step_up]-above-#[post] route must still document its Json<Created> response: \
+             {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_infers_response_schema_when_authorize_expands_first() {
+        let authorized = crate::authorize::authorize_macro(
+            quote! { "update", resource = Note },
+            quote! {
+                async fn update_note(note: Note) -> ::autumn_web::reexports::axum::Json<Created> {
+                    todo!()
+                }
+            },
+        );
+        let generated =
+            route_macro("POST", "post", quote! { "/notes/{id}" }, authorized).to_string();
+
+        assert!(
+            generated.contains("response : :: core :: option :: Option :: Some")
+                && generated.contains("\"Created\""),
+            "an #[authorize]-above-#[post] route must still document its Json<Created> response: \
+             {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_infers_response_schema_under_stacked_guards_above_route() {
+        // `#[secured]` above `#[throttle]` above `#[post]`: throttle expands
+        // first and captures the real type, then secured wraps throttle's
+        // whole generated body one level deeper. Only the innermost
+        // `__autumn_inner` binding carries `Json<Created>` — the outer one
+        // reads `Response`.
+        let throttled = crate::throttle::throttle_macro(
+            quote! { limit = 5, per = "1m", key = "ip" },
+            quote! {
+                async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
+            },
+        );
+        let secured = crate::secured::secured_macro(quote! { "admin" }, throttled);
+        let generated = route_macro("POST", "post", quote! { "/users" }, secured).to_string();
+
+        assert!(
+            generated.contains("response : :: core :: option :: Option :: Some")
+                && generated.contains("\"Created\""),
+            "stacked guards above the route macro must not drop the response schema: {generated}"
+        );
+    }
+
     #[test]
     fn route_macro_parses_api_version_and_sunset_opt_out() {
         let generated = route_macro(

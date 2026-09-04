@@ -122,6 +122,22 @@ async fn html_page() -> &'static str {
     "<h1>hi</h1>"
 }
 
+// #1677: `#[throttle]` rewrites the handler's return type to `Response` when
+// it expands. Written above `#[post]`, it expands first, so the route macro
+// used to see `Response` instead of `Json<Todo>` and silently drop the
+// response schema — which in turn made `should_expose()` treat this
+// explicitly-opted-in route as JSON-out-ineligible and exclude it from the
+// tool catalog despite `#[api_doc(mcp)]`.
+#[throttle(limit = 5, per = "1m", key = "ip")]
+#[api_doc(mcp, summary = "Create a guarded todo")]
+#[post("/api/guarded-todos")]
+async fn create_guarded_todo(Json(body): Json<NewTodo>) -> AutumnResult<Json<Todo>> {
+    Ok(Json(Todo {
+        id: 7,
+        title: body.title,
+    }))
+}
+
 // Appends a `Set-Cookie` to every response in the pipeline; used to verify a
 // single `tools/call` propagates the replayed handler's cookie updates while a
 // batch does not.
@@ -278,6 +294,29 @@ async fn tools_list_derives_from_api_doc_and_honors_opt_in() {
     assert!(
         get["inputSchema"]["properties"]["id"].is_object(),
         "path param becomes a property"
+    );
+}
+
+#[tokio::test]
+async fn tools_list_includes_a_body_guard_written_above_the_route_attribute() {
+    let client = TestApp::new()
+        .routes(routes![create_guarded_todo])
+        .mount_mcp("/mcp")
+        .build();
+
+    let out = rpc(
+        &client,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    )
+    .await;
+
+    let tools = out["result"]["tools"].as_array().expect("tools array");
+    assert!(
+        tools
+            .iter()
+            .any(|t| t["name"].as_str() == Some("create_guarded_todo")),
+        "a #[throttle]-above-#[post] route explicitly opted into MCP must not be silently \
+         excluded for lacking a response schema: {out}"
     );
 }
 

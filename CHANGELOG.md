@@ -1581,6 +1581,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dev inspector's detail route (`{inspector_path}/requests/{id}`) is claimed
   alongside its index — both now derive from `inspector_endpoint_paths`, so the
   claim set cannot drift from what the router actually mounts.
+
+- **`#[secured]`/`#[step_up]`/`#[authorize]`/`#[throttle]` no longer drop a
+  route's OpenAPI response schema when written above the route attribute
+  (#1677):** all four body guards rewrite a handler's return type to
+  `Response` when they expand, so when one was written *above* `#[get]`/
+  `#[post]`/etc. it expanded first and the route macro's `infer_response_body`
+  read back `Response` instead of the handler's real `Json<T>` — silently
+  dropping the response schema from the generated OpenAPI document (throttling
+  itself, including idempotency-replay accounting, was unaffected in either
+  ordering). Each guard already binds the pre-rewrite type as
+  `let __autumn_inner: T = …` around the guarded body; the route macro now
+  recovers the original type from that binding — matched by its exact
+  structural shape and the presence of the guard's own marker const earlier
+  in the same block, not merely the binding's name or position, so neither
+  an unrelated handler-local nor a coincidentally-shaped fragment of the
+  handler's own body is ever mistaken for a real guard's binding — recursing
+  to the innermost binding when guards stack, instead of trusting
+  `sig.output` alone. The generated schema no longer depends on attribute
+  order. The
+  previously-recommended method-attribute-outermost workaround, documented
+  on `#[throttle]`'s rustdoc and in `docs/guide/rate-limiting.md`, is no
+  longer necessary.
+
+  This is a macro/metadata-only change — no authorization, rate-limiting, or
+  idempotency-replay runtime behavior differs in either attribute ordering.
+  `ApiDoc::response` does have one existing runtime reader, `mount_mcp`'s MCP
+  tool-catalog eligibility gate: a guard-above-route JSON handler explicitly
+  opted in with `#[api_doc(mcp)]` was previously excluded from `tools/list`
+  as "no response schema", and is now correctly listed, matching the
+  developer's existing opt-in — every MCP call still dispatches through the
+  same authenticated handler pipeline, so this closes an availability gap
+  rather than changing what a call is authorized to do.
+
 - **Punctuation- and emoji-only titles no longer slip past the validator that
   exists to stop them (#2424):** `examples/reddit-clone` rejects a post title
   like `***`, `!!!???...:::` or `🎉🔥💯` with "Title must contain at least one

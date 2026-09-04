@@ -869,3 +869,32 @@ fn handler_without_authorize_has_no_bindings() {
         "…while its role guard is still recorded, unchanged"
     );
 }
+
+// ── #[authorize] response schema survives above-route ordering (#1677) ──
+//
+// `#[authorize]` rewrites the handler's return type to `Response` when it
+// expands, exactly like `#[secured]`/`#[step_up]`/`#[throttle]`. Written
+// above `#[post]`, it expands first, so the route macro must recover the
+// original `Json<T>` return type from the `__autumn_inner` binding the guard
+// leaves behind instead of losing the response schema.
+
+#[autumn_web::authorize("update", resource = Note)]
+#[autumn_web::post("/notes-attr-response/{id}")]
+async fn update_note_authorize_above_route_response(
+    autumn_web::extract::Path(id): autumn_web::extract::Path<i64>,
+    LoadedNote(note): LoadedNote,
+) -> axum::Json<serde_json::Value> {
+    let _ = id;
+    let _ = note;
+    axum::Json(serde_json::json!({}))
+}
+
+#[test]
+fn authorize_above_route_preserves_response_schema() {
+    let route = __autumn_route_info_update_note_authorize_above_route_response();
+    let resp = route.api_doc.response.as_ref().expect(
+        "a Json<...> return type must still be inferred when #[authorize] expands before \
+         the route macro",
+    );
+    assert_eq!(resp.name, "Value");
+}

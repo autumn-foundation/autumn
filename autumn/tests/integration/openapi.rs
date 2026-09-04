@@ -156,6 +156,33 @@ async fn top_first_admin_handler() -> AutumnResult<&'static str> {
     Ok("admin")
 }
 
+// ── Response schema survives a body guard above the route attribute (#1677) ──
+//
+// `#[secured]`, `#[step_up]`, and `#[throttle]` all rewrite the handler's
+// return type to `Response` when they expand. Written above the route
+// attribute, each expands first — before the route macro ever sees the
+// handler — so the route macro must recover the original `Json<T>` return
+// type from the guard's generated body instead of losing the response
+// schema.
+
+#[secured]
+#[get("/secured-top-first-response")]
+async fn secured_top_first_response() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({}))
+}
+
+#[step_up]
+#[get("/step-up-top-first-response")]
+async fn step_up_top_first_response() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({}))
+}
+
+#[throttle(limit = 5, per = "1m", key = "ip")]
+#[post("/throttle-top-first-response")]
+async fn throttle_top_first_response() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({}))
+}
+
 #[test]
 fn get_macro_populates_api_doc() {
     let route = __autumn_route_info_hello();
@@ -611,6 +638,36 @@ fn unsecured_spec_has_no_security_schemes() {
             "unsecured routes must not emit any security schemes"
         );
     }
+}
+
+#[test]
+fn secured_above_route_attribute_preserves_response_schema() {
+    let route = __autumn_route_info_secured_top_first_response();
+    let resp = route.api_doc.response.as_ref().expect(
+        "a Json<...> return type must still be inferred when #[secured] expands before \
+         the route macro",
+    );
+    assert_eq!(resp.name, "Value");
+}
+
+#[test]
+fn step_up_above_route_attribute_preserves_response_schema() {
+    let route = __autumn_route_info_step_up_top_first_response();
+    let resp = route.api_doc.response.as_ref().expect(
+        "a Json<...> return type must still be inferred when #[step_up] expands before \
+         the route macro",
+    );
+    assert_eq!(resp.name, "Value");
+}
+
+#[test]
+fn throttle_above_route_attribute_preserves_response_schema() {
+    let route = __autumn_route_info_throttle_top_first_response();
+    let resp = route.api_doc.response.as_ref().expect(
+        "a Json<...> return type must still be inferred when #[throttle] expands before \
+         the route macro",
+    );
+    assert_eq!(resp.name, "Value");
 }
 
 // ── Spec validation (all $ref backed by components) ───────────────

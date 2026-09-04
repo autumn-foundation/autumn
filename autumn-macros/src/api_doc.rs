@@ -416,12 +416,69 @@ fn unwrap_json_body(ty: &syn::Type) -> Option<syn::Type> {
 /// * `Result<Json<T>, _>` / `AutumnResult<Json<T>>` — fallible JSON
 /// * `(StatusCode, Json<T>)` — JSON with a custom status code
 /// * `Result<(StatusCode, Json<T>), _>` — the two combined
+///
+/// A body guard (`#[secured]`, `#[step_up]`, `#[authorize]`, `#[throttle]`)
+/// written *above* the route attribute expands before this macro runs and
+/// rewrites `sig.output` to `Response`, which would otherwise make every
+/// guarded route's response schema disappear (#1677). When that has
+/// happened, [`recover_guarded_return_type`] reads the pre-rewrite type back
+/// from the `__autumn_inner` binding the guard left in the body, so
+/// inference is independent of attribute expansion order.
 pub fn infer_response_body(input_fn: &syn::ItemFn) -> Option<TokenStream> {
+    let ty = recover_guarded_return_type(&input_fn.block).or_else(|| sig_output_type(input_fn))?;
+    let ty = unwrap_result_ok(&ty).unwrap_or(ty);
+    find_json_in_type(&ty).map(|inner| schema_entry_for_type(&inner))
+}
+
+/// The handler's declared return type, straight off `sig.output` — `None` for
+/// a unit-returning (`ReturnType::Default`) handler.
+fn sig_output_type(input_fn: &syn::ItemFn) -> Option<syn::Type> {
     let syn::ReturnType::Type(_, ty) = &input_fn.sig.output else {
         return None;
     };
-    let ty = unwrap_result_ok(ty).unwrap_or_else(|| (**ty).clone());
-    find_json_in_type(&ty).map(|inner| schema_entry_for_type(&inner))
+    Some((**ty).clone())
+}
+
+/// Recover a handler's pre-rewrite return type from the `__autumn_inner`
+/// binding a body guard leaves behind when it expands before the route macro
+/// (issue #1677).
+///
+/// Every guard that rewrites `sig.output` to `Response` also binds the
+/// original type as `let __autumn_inner: #ty = (async move { … }).await;`
+/// around the handler's real body — see `secured_macro`, `step_up_macro`,
+/// `authorize_macro`, and `throttle_macro`. [`crate::idempotency_guard::generated_inner_response_binding`]
+/// recognizes that binding only by its exact structural position (last-but-one
+/// statement, followed immediately by the generated `IntoResponse::into_response`
+/// tail) *and* the presence of one of the guard's own marker consts earlier in
+/// the same block. Position and tail alone would still be foolable: a guard's
+/// generated wrapper carries the user's own original body one level deeper
+/// (`(async move { #original_body }).await`), so if that body itself
+/// independently ends in the same two-statement shape — whether the handler
+/// is unguarded or the coincidence sits nested inside a real guard — position
+/// and tail cannot tell it apart from a real guard's own binding. The marker
+/// requirement closes that: no guard ever emits the `__autumn_inner` binding
+/// without one, and a handler's own code has no reason to declare an
+/// identifier the framework treats as reserved.
+///
+/// When guards stack, each later-expanding guard wraps the earlier guard's
+/// whole generated body one level deeper in that same shape, so only the
+/// *innermost* binding carries the type as the user actually wrote it: every
+/// outer one necessarily reads back `Response`, because by the time that
+/// guard ran, an inner guard had already rewritten `sig.output`. This walk
+/// therefore recurses into the nested wrapper (via
+/// [`crate::idempotency_guard::expr_nested_async_body`]) before accepting a
+/// level's own binding, so the deepest type found wins.
+///
+/// Returns `None` when no such binding exists — an unguarded handler, a
+/// route-attribute-outermost ordering where no guard has expanded yet, or a
+/// guard wrapping a `()`/`impl Trait` return, for which no guard emits an
+/// explicit annotation (Rust rejects `impl Trait` in a local variable's type
+/// ascription) and there is nothing to recover.
+fn recover_guarded_return_type(block: &syn::Block) -> Option<syn::Type> {
+    let (ty, init_expr) = crate::idempotency_guard::generated_inner_response_binding(block)?;
+    let nested = crate::idempotency_guard::expr_nested_async_body(init_expr)
+        .and_then(recover_guarded_return_type);
+    Some(nested.unwrap_or_else(|| ty.clone()))
 }
 
 /// Look for `Json<T>` either directly or inside a tuple element.
@@ -1529,6 +1586,261 @@ mod tests {
         assert_eq!(
             extract_authorize_bindings(&input_fn),
             Vec::<(String, String)>::new()
+        );
+    }
+
+    // ── Response-schema recovery across guard reordering (#1677) ────────────
+    //
+    // When a body guard (`#[secured]`, `#[step_up]`, `#[authorize]`,
+    // `#[throttle]`) is written ABOVE the route method attribute, it expands
+    // first and rewrites `sig.output` to `Response` before the route macro
+    // ever sees the handler. Each guard leaves the pre-rewrite type behind as
+    // `let __autumn_inner: #ty = (async move { … }).await;`, so
+    // `infer_response_body` must recover it from there instead of reading the
+    // (by then rewritten) `sig.output`.
+
+    #[test]
+    fn infer_response_body_reads_sig_output_when_no_guard_marker_present() {
+        // Baseline: an unguarded handler (or the route-attribute-outermost
+        // ordering, where guards haven't expanded yet) is unaffected — the
+        // plain `sig.output` path must keep working exactly as before.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
+        };
+        let schema = infer_response_body(&input_fn)
+            .expect("a bare Json<T> return type must produce a response schema");
+        assert!(
+            schema.to_string().contains("\"Created\""),
+            "schema should name the Created type: {schema}"
+        );
+    }
+
+    #[test]
+    fn infer_response_body_recovers_type_under_single_guard_wrapper() {
+        // Shape emitted by any one of the four body guards when it expands
+        // before the route macro: `sig.output` already reads `Response`, and
+        // the real type is only recoverable from the `__autumn_inner` binding.
+        // The leading marker const is what every real guard unconditionally
+        // emits ahead of that binding (here, #[throttle]'s).
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::response::Response {
+                const __AUTUMN_THROTTLE_ROUTE_ID: &str = "handler";
+                let __autumn_inner: ::autumn_web::reexports::axum::Json<Created> =
+                    (async move { todo!() }).await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        let schema = infer_response_body(&input_fn).expect(
+            "a Json<T> return type rewritten to Response by a single guard must still be \
+             recoverable from the __autumn_inner marker",
+        );
+        assert!(
+            schema.to_string().contains("\"Created\""),
+            "recovered schema should name the Created type: {schema}"
+        );
+    }
+
+    #[test]
+    fn infer_response_body_recovers_innermost_type_under_stacked_guards() {
+        // Two guards stacked above the route macro: the outer one's own
+        // `__autumn_inner` binding necessarily reads `Response` (the inner
+        // guard already rewrote `sig.output` by the time the outer guard
+        // captured its own binding), so only the innermost binding carries
+        // the type the user actually wrote. Each level carries its own
+        // guard's marker const, matching real (e.g. #[secured] above
+        // #[throttle]) output.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::response::Response {
+                const __AUTUMN_SECURED_ROLES: &[&str] = &[];
+                let __autumn_inner: ::autumn_web::reexports::axum::response::Response = (async move {
+                    const __AUTUMN_THROTTLE_ROUTE_ID: &str = "handler";
+                    let __autumn_inner: ::autumn_web::reexports::axum::Json<Created> =
+                        (async move { todo!() }).await;
+                    ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+                })
+                .await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        let schema = infer_response_body(&input_fn).expect(
+            "the innermost __autumn_inner binding must be recovered even under a second, \
+             outer guard wrapper",
+        );
+        assert!(
+            schema.to_string().contains("\"Created\""),
+            "recovered schema should name the innermost Created type, not Response: {schema}"
+        );
+    }
+
+    #[test]
+    fn infer_response_body_none_when_guard_wraps_unit_return() {
+        // A guard over a `()`-returning handler emits no explicit type
+        // annotation at all (see `original_response`'s `ReturnType::Default`
+        // arm in each guard), so there is nothing to recover — this must not
+        // panic and must simply infer no response schema, same as today.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::response::Response {
+                const __AUTUMN_THROTTLE_ROUTE_ID: &str = "handler";
+                let __autumn_inner: () = (async move { todo!() }).await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        assert!(infer_response_body(&input_fn).is_none());
+    }
+
+    #[test]
+    fn infer_response_body_recovers_result_wrapped_json_under_guard() {
+        // `Result<Json<T>, E>` / `AutumnResult<Json<T>>` returns must still
+        // unwrap the Ok arm after being recovered from the marker, exactly as
+        // they do when read directly off `sig.output`.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::response::Response {
+                const __AUTUMN_THROTTLE_ROUTE_ID: &str = "handler";
+                let __autumn_inner: AutumnResult<::autumn_web::reexports::axum::Json<Created>> =
+                    (async move { todo!() }).await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        let schema = infer_response_body(&input_fn)
+            .expect("Result-wrapped Json<T> recovered from the marker must still be inferred");
+        assert!(
+            schema.to_string().contains("\"Created\""),
+            "recovered schema should name the Created type: {schema}"
+        );
+    }
+
+    #[test]
+    fn infer_response_body_ignores_unrelated_local_named_autumn_inner() {
+        // Recovery must key off the guard's exact structural shape (a
+        // `__autumn_inner: T` binding immediately followed by the generated
+        // `IntoResponse::into_response(__autumn_inner)` tail, with a guard
+        // marker const preceding it), not a bare name-and-type match
+        // anywhere in the body. An UNGUARDED handler whose correctly-declared
+        // `sig.output` is `Json<Real>`, but which happens to also declare an
+        // unrelated local matching the marker's name (not its position),
+        // must still infer `Real` from `sig.output` — never the incidental
+        // local's own type.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::Json<Real> {
+                let __autumn_inner: ::autumn_web::reexports::axum::Json<Fake> =
+                    (async move { compute() }).await;
+                do_something(__autumn_inner);
+                ::autumn_web::reexports::axum::Json(Real::default())
+            }
+        };
+        let schema = infer_response_body(&input_fn)
+            .expect("the correctly-declared sig.output must still be inferred");
+        let rendered = schema.to_string();
+        assert!(
+            rendered.contains("\"Real\""),
+            "must recover the handler's real declared return type, not the incidental local: \
+             {rendered}"
+        );
+        assert!(
+            !rendered.contains("\"Fake\""),
+            "must not be fooled by an unrelated local that merely shares the marker's name: \
+             {rendered}"
+        );
+    }
+
+    #[test]
+    fn infer_response_body_ignores_position_and_tail_match_without_a_guard_marker() {
+        // A deeper trap than the name-only collision above: an UNGUARDED
+        // handler whose body happens to end in the *exact* two-statement
+        // shape a guard emits (right position, right tail call, right
+        // identifier) — but with no guard marker const anywhere, because no
+        // guard actually ran. Position and tail alone cannot tell this apart
+        // from real guard output; only the marker requirement can, and it
+        // must still recover the correctly-declared `Json<Real>` from
+        // `sig.output`, not the coincidental `Json<Fake>`.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::Json<Real> {
+                let __autumn_inner: ::autumn_web::reexports::axum::Json<Fake> =
+                    (async move { compute() }).await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        let schema = infer_response_body(&input_fn)
+            .expect("the correctly-declared sig.output must still be inferred");
+        let rendered = schema.to_string();
+        assert!(
+            rendered.contains("\"Real\""),
+            "must recover the handler's real declared return type: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\"Fake\""),
+            "must not be fooled by a coincidental position+tail match with no guard marker: \
+             {rendered}"
+        );
+    }
+
+    #[test]
+    fn infer_response_body_ignores_a_nested_coincidental_match_with_no_marker_of_its_own() {
+        // The same trap one level deeper: a single REAL guard correctly
+        // wraps a `Json<Real>` handler (marker present, so its own binding is
+        // trusted) — but the user's *original* body, now nested one level
+        // inside the guard's `(async move { … }).await`, itself happens to
+        // end in the same two-statement shape with no marker of its own.
+        // Recursing into that inner block must not find a "deeper" binding
+        // there: the correct answer is the guard's own outer `Real`, not the
+        // inner accidental `Fake`.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::response::Response {
+                const __AUTUMN_THROTTLE_ROUTE_ID: &str = "handler";
+                let __autumn_inner: ::autumn_web::reexports::axum::Json<Real> = (async move {
+                    let __autumn_inner: ::autumn_web::reexports::axum::Json<Fake> =
+                        (async move { compute() }).await;
+                    ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+                })
+                .await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        let schema = infer_response_body(&input_fn)
+            .expect("the real guard's own outer binding must still be recovered");
+        let rendered = schema.to_string();
+        assert!(
+            rendered.contains("\"Real\""),
+            "must recover the real guard's own type, not the nested coincidental one: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\"Fake\""),
+            "must not descend into a nested block that lacks its own guard marker: {rendered}"
+        );
+    }
+
+    #[test]
+    fn infer_response_body_recovers_innermost_type_under_triple_stacked_guards() {
+        // Three guards stacked above the route macro (e.g. #[secured] above
+        // #[authorize] above #[throttle] above #[post]): each of the two
+        // outer __autumn_inner bindings necessarily reads back Response, so
+        // only the third, innermost level carries the real type. Each level
+        // carries its own guard's marker const.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() -> ::autumn_web::reexports::axum::response::Response {
+                const __AUTUMN_SECURED_ROLES: &[&str] = &[];
+                let __autumn_inner: ::autumn_web::reexports::axum::response::Response = (async move {
+                    const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] = &[];
+                    let __autumn_inner: ::autumn_web::reexports::axum::response::Response = (async move {
+                        const __AUTUMN_THROTTLE_ROUTE_ID: &str = "handler";
+                        let __autumn_inner: ::autumn_web::reexports::axum::Json<Created> =
+                            (async move { todo!() }).await;
+                        ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+                    })
+                    .await;
+                    ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+                })
+                .await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        let schema = infer_response_body(&input_fn).expect(
+            "the innermost __autumn_inner binding must be recovered through three levels of \
+             guard wrapping",
+        );
+        assert!(
+            schema.to_string().contains("\"Created\""),
+            "recovered schema should name the innermost Created type: {schema}"
         );
     }
 }
