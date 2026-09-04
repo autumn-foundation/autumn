@@ -40,6 +40,7 @@ use std::hint::black_box;
 
 use autumn_web::config::AutumnConfig;
 use autumn_web::prelude::*;
+use autumn_web::security::{CsrfConfig, SecurityConfig};
 use autumn_web::test::TestApp;
 
 #[get("/notes")]
@@ -64,9 +65,21 @@ fn main() {
         .build()
         .expect("failed to build tokio runtime");
 
-    let mut config = AutumnConfig::default();
-    config.profile = Some("test".into());
-    config.security.csrf.enabled = true;
+    let mut config = AutumnConfig {
+        profile: Some("test".into()),
+        security: SecurityConfig {
+            csrf: CsrfConfig {
+                enabled: true,
+                ..CsrfConfig::default()
+            },
+            ..SecurityConfig::default()
+        },
+        ..AutumnConfig::default()
+    };
+    // `SigningSecretConfig` isn't part of the public API surface (only
+    // `AutumnConfig`/`SecurityConfig`/`CsrfConfig` are re-exported), so its
+    // one field reachable through `SecurityConfig::signing_secret` has to be
+    // set by assignment rather than struct-literal syntax.
     config.security.signing_secret.secret =
         Some("bolt-csrf-bench-signing-secret-0123456789abcdef0123456789abcdef".into());
 
@@ -97,10 +110,14 @@ fn main() {
                 .header("x-csrf-token", &token)
                 .send()
                 .await;
-            assert_eq!(response.status, StatusCode::CREATED, "warm-up POST must pass CSRF");
+            assert_eq!(
+                response.status,
+                StatusCode::CREATED,
+                "warm-up POST must pass CSRF"
+            );
         }
 
-        for i in 0..iterations {
+        for _ in 0..iterations {
             black_box(client.get("/notes").send().await.status);
             black_box(
                 client
@@ -118,7 +135,6 @@ fn main() {
                     .await
                     .status,
             );
-            let _ = i;
         }
     });
 
