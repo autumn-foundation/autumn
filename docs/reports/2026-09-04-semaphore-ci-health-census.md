@@ -99,12 +99,15 @@ something this census fabricated a rate for).
      single failing test fails the whole `cargo test --workspace` step,
      every one of those 11 successes proves `live_upgrade` itself passed.
      That puts the macOS rate for this specific test between **3/17 ≈ 17.6%**
-     (crediting the one run whose `live_upgrade` outcome isn't directly
-     provable — the `embedded_saas` failure — as a pass, since nothing shows
-     otherwise) and **3/14 ≈ 21.4%** (counting only the 14 executions whose
-     `live_upgrade` outcome step-conclusion logic actually proves either
-     way): **3 failures in 17 eligible macOS executions, 14 to 17 of them
-     confirmed**. Against that, **0 failures in 16 to 17 known ubuntu
+     (crediting the three runs whose `live_upgrade` outcome isn't directly
+     provable — the `cache_stampede`, `sim_fault_plan`, and `embedded_saas`
+     failures, none of which was checked for what `live_upgrade` itself did
+     in that same run — as passes, since nothing shows otherwise) and
+     **3/14 ≈ 21.4%** (counting only the 14 executions — 11 successes plus
+     the 3 confirmed `live_upgrade` failures — whose `live_upgrade` outcome
+     step-conclusion logic actually proves either way): **3 failures in 17
+     eligible macOS executions, 14 of them confirmed, 3 unresolved**.
+     Against that, **0 failures in 16 to 17 known ubuntu
      executions** (ubuntu's `Run tests` step failed only once in the 17,
      via the unrelated `embedded_saas` drift; its one other failure, run
      8190's Docker step, is a later step in the same job, so that run's
@@ -158,15 +161,22 @@ which is written with a hard, zero-tolerance assertion
 (`connect_errors == 0`, no slack at all, unlike this same test's own
 300-read floor and 5-second latency ceiling, both explicitly sized "so a
 busy CI runner cannot fail the run") and failed identically in 3 of 17
-eligible macOS executions (17.6%-21.4% depending on one unresolved run —
-see Symptom above for the derivation) against 0 of 16-17 known
+eligible macOS executions (17.6%-21.4% depending on three unresolved runs
+— see Symptom above for the derivation) against 0 of 16-17 known
 `ubuntu-latest` executions — the only other platform the unix-gated test
-runs on. `cache_stampede`
-and `sim_fault_plan`, each already written with generous, load-tolerant
-budgets by this codebase's own standards (a 25-second/1,000-attempt poll),
-each failed once, also on macOS, also in tests with no platform gate — one
-occurrence apiece is corroborating, not yet a repeat signature in its own
-right. Together the pattern is consistent with GitHub's shared macOS
+runs on. `cache_stampede` and `sim_fault_plan` each failed once more, also
+on macOS, also in tests with no platform gate, but they don't share one
+mechanism with each other or with `live_upgrade`: `cache_stampede`'s is a
+generous, load-tolerant real-time poll (25 seconds, 1,000 attempts) by this
+codebase's own standards; `sim_fault_plan` instead runs jobs under a
+process-global lock (`job::global_job_runtime_test_lock`) and a paused,
+single-threaded simulated clock — no wall-clock budget to compare — and
+its failure ("job runtime is not initialized") reads as a setup/shared-
+state defect, not an exhausted wait. One occurrence apiece is
+corroborating that macOS is where this sample's timing- and state-shaped
+failures land, not yet a repeat signature in its own right, and not
+evidence for a single shared mechanism across all three. Together the
+pattern is consistent with GitHub's shared macOS
 runners being more heavily contended than this sample's ubuntu lane — but
 it is equally consistent with a genuine narrow product race that macOS's
 scheduling merely exposes more reliably. Law 3 applies directly here: I
@@ -216,7 +226,7 @@ That leaves two tiers, and they are not substitutes for each other:
    needs)**: rerun the exact CI command, unfiltered, and grep each run's
    output for the target test's own result line. This is expensive — the
    `Run tests` step itself took 1,501-1,607s (25-27 minutes) in the census
-   sample — so N=20 here is a multi-hour campaign, not a quick check:
+   sample — so even N=10 here is a ~4-5 hour campaign, not a quick check:
 
    ```
    # Run on macOS hardware/a macos-latest-class runner. Mirrors the actual
@@ -254,13 +264,18 @@ That leaves two tiers, and they are not substitutes for each other:
    done
    ```
 
-Run (1) first. If it reproduces at a measurable rate, that names the
-mechanism and (2) becomes a useful follow-up to separate "load-dependent"
-from "load-independent." If (1) comes back clean at N=10, that is real
-evidence against the contention hypothesis (unlike a clean (2)) and argues
-for a shuffled-order pass instead. Either way, (2) alone was never enough
-to conclude anything about runner-class contention, and this report was
-wrong to imply otherwise.
+Run (1) first. If it reproduces at a measurable rate, that confirms the
+failure is real under realistic load and gives a rate to work from — it
+does *not* by itself name the mechanism, since a reproducing failure is
+equally consistent with runner contention and with a genuine product race
+that macOS's scheduling exposes more often (the two explanations Diagnosis
+leaves open). Separating them needs (2) run alongside it (does the same
+failure show up with no concurrent load at all?) and a shuffled-order pass
+on the full suite. If (1) instead comes back clean at N=10, that is real
+evidence against the contention hypothesis specifically (unlike a clean
+(2), which never was). Either way, (2) alone was never enough to conclude
+anything about runner-class contention, and this report was wrong to imply
+otherwise.
 
 This census opens no *fix* PR: it lands as a report, per this role's own
 rule that a report is a legitimate, non-default outcome when the gate isn't
