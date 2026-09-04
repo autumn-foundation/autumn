@@ -15092,8 +15092,10 @@ mod tests {
             // `tenancy_middleware` before the handler (and its `Tenant`
             // extraction) ever runs, so a regression that made the extractor's
             // fallback fail *open* would go undetected on a route the app
-            // marks `#[public]` but whose handler still reads `Tenant`
-            // directly.
+            // lists in `[tenancy].public_paths` but whose handler still
+            // reads `Tenant` directly (unrelated to the `#[public]` macro
+            // attribute, which is a compile-time route-audit marker only
+            // and has no effect on `tenancy_middleware`).
             config.tenancy.public_paths = vec!["/storefront".to_owned()];
 
             let state = AppState::for_test();

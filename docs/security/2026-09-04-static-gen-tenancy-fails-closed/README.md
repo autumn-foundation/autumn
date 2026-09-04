@@ -100,10 +100,16 @@ handler — so a naive test would only prove the *middleware* fails closed,
 and would keep passing even if `Tenant::from_request_parts`'s own fallback
 call to the same function later started resolving a default tenant instead
 (exactly the regression this entry exists to catch, and exactly the shape
-that matters for an app that marks the route `#[public]`/lists it in
-`public_paths` — common for a public storefront page — while its handler
-still reads `Tenant` directly). Codex's automated review on the PR caught
-this gap in the first version of the test. The fix: the test config lists
+that matters for an app that lists the route in `[tenancy].public_paths` —
+common for a public storefront page — while its handler still reads
+`Tenant` directly. Note this is unrelated to the `#[public]` macro
+attribute: per `docs/guide/route-auth-coverage.md`, `#[public]` is a
+compile-time route-audit marker only and injects no runtime behavior; it
+does not touch `tenancy_middleware` at all. Only listing a path in
+`public_paths` makes the middleware skip tenant resolution — an earlier
+draft of this entry conflated the two, corrected after Codex's review
+flagged it). Codex's automated review on the PR caught this gap in the
+first version of the test. The fix: the test config lists
 `/storefront` in `config.tenancy.public_paths`, so `is_public_path` makes
 `tenancy_middleware` skip tenant resolution entirely (`return
 next.run(request).await` with `CURRENT_TENANT` never `.scope()`'d) and the
@@ -199,7 +205,7 @@ immediately; see the "Negative result" outcome in Warden's process.)
 ## ✅ Verification
 
 - `cargo fmt --all -- --check` — clean.
-- `cargo test -p autumn-web --lib app::tests::static_get_route_reading_tenant_fails_closed_for_every_tenancy_source` — passes pre-fix (above, `after.txt`); the automated Codex reviewer on PR #2505 then found that the pre-fix version only proved `tenancy_middleware` fails closed, not the `Tenant` extractor's own fallback call on a route exempted from that middleware (the shape that matters for a `#[public]` page whose handler still reads `Tenant`) — fixed by adding `/storefront` to `config.tenancy.public_paths` in the test; see the reproduction section above for why this still passes by inspection. A fresh confirming run could not be completed in this session (see next bullet).
+- `cargo test -p autumn-web --lib app::tests::static_get_route_reading_tenant_fails_closed_for_every_tenancy_source` — passes pre-fix (above, `after.txt`). The automated Codex reviewer on PR #2505 then made two passes: first, that the pre-fix version only proved `tenancy_middleware` fails closed, not the `Tenant` extractor's own fallback call on a route exempted from that middleware (the shape that matters for a route listed in `[tenancy].public_paths` whose handler still reads `Tenant`) — fixed by adding `/storefront` to `config.tenancy.public_paths` in the test. Second, that the fix's own write-up incorrectly implied `#[public]` (a compile-time route-audit marker with no runtime effect, per `docs/guide/route-auth-coverage.md`) was equivalent to `public_paths` membership — corrected throughout this entry to reference `public_paths` only. See the reproduction section above for why the fixed test still passes by inspection. A fresh confirming run could not be completed in this session (see next bullet).
 - `cargo clippy -p autumn-web --all-targets -- -D warnings` and the
   cross-package `--lib --tests` compile of the consolidated
   `integration_tests` binary (`./scripts/pre-push-check.sh`'s mirror) were
