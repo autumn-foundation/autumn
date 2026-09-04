@@ -2163,7 +2163,14 @@ DECLARED_CONT = re.compile(r'(?:^|\s)(AUTUMN_[A-Z0-9_]+)=')
 # bare form is a declaration exactly as `ENV` is in a Dockerfile. Without this a
 # name defined only in `.env.example` could not be documented without a waiver.
 DOTENV = ('.env', '.example')
-EXPANDED = re.compile(r'\$\{?(AUTUMN_[A-Z0-9_]+)\}?')
+# …and the `$` that starts it must not already belong to something else. `$$` is
+# the PID, so `$$AUTUMN_X` is a number followed by literal text and reads no
+# variable at all — but the scan could start at the SECOND dollar and take the
+# name. The lookbehind is the whole fix, and it points at a general hazard in a
+# pattern that begins mid-token: a match is only evidence if it starts where the
+# construct does. (Compose spells an escaped literal `$` the same way, so the
+# exclusion is right for both consumers.)
+EXPANDED = re.compile(r'(?<!\$)\$\{?(AUTUMN_[A-Z0-9_]+)\}?')
 
 # A quoted name counts only where the code BINDS it as an environment-variable
 # name or READS the environment with it. Any quoted string was the earlier rule
@@ -2463,7 +2470,12 @@ ARG_SPAN_LIMIT = 500
 # `parse_env(env, "KEY", &mut target)` and
 # `override_string(&mut target, env, "KEY")` — the helpers put the key second or
 # third, and in none of them does a bare string literal come before it.
-STRING_ARG = re.compile(r'^"(?:[^"\\]|\\.)*"$')
+# A RAW string is a string literal too. `std::env::var(r"AUTUMN_X")` is an
+# ordinary read, and accepting only the escaped spelling made its key invisible,
+# so a variable implemented solely that way had its correct page REPORTED. That
+# direction is loud rather than silent, which is why it survived this long — but
+# a rung that cannot see a valid spelling is the same defect either way.
+STRING_ARG = re.compile(r'^(?:"(?:[^"\\]|\\.)*"|r(#*)"[\s\S]*?"\1)$')
 
 
 def _split_args(text):
@@ -4095,6 +4107,21 @@ def self_test():
          args_of('parse_env(env, "AUTUMN_MEDIA__ROOM_NAMESPACE", &mut t)',
                  real_acc, real_index),
          ['AUTUMN_MEDIA__ROOM_NAMESPACE'])
+    # A raw string is a string literal: `var(r"AUTUMN_X")` is an ordinary read,
+    # and not seeing it REPORTED a correct page.
+    case('a raw-string key argument reads',
+         (args_of('std::env::var(r"AUTUMN_RAW_ONLY")'),
+          args_of('std::env::var(r#"AUTUMN_RAW_HASH"#)'),
+          STRING_ARG.match('key') is None),
+         (['AUTUMN_RAW_ONLY'], ['AUTUMN_RAW_HASH'], True))
+    # `$$` is the PID, so the second dollar does not start an expansion. A
+    # pattern that can begin mid-token has to say where the construct starts.
+    case('a dollar already consumed by $$ starts no expansion',
+         (EXPANDED.findall('echo $$AUTUMN_X'),
+          EXPANDED.findall('echo $${AUTUMN_X}'),
+          EXPANDED.findall('echo $AUTUMN_X'),
+          EXPANDED.findall('echo ${AUTUMN_X}')),
+         ([], [], ['AUTUMN_X'], ['AUTUMN_X']))
     case('an escaped literal in generated code still reads',
          args_of(r'std::env::var(\"AUTUMN_TEST_ADMIN_SESSION\")'),
          ['AUTUMN_TEST_ADMIN_SESSION'])
