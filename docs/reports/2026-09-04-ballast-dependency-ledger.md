@@ -102,15 +102,39 @@ audits every crates.io dependency and reported 32 packages behind — 32
   **all three share the same review-by date: 2026-10-01** (about four weeks
   from today) — `RUSTSEC-2023-0071` (rsa Marvin-attack timing sidechannel, no
   fixed release, RSA-JWT path only), `RUSTSEC-2024-0384` (`instant`
-  unmaintained, build-time only via `postgresql_embedded`), and
-  `RUSTSEC-2026-0253` (`lru` 0.16.4's non-panic-safe `pop()`, pinned in via
-  the MSRV-frozen `aws-sdk-s3` 1.122, unreachable because the S3-cache
-  callsite never calls `pop()`). None is reachable, so none is a fire today,
-  but a future Ballast run around **2026-10-01** should re-check: has `rsa`
-  shipped a fix, has an `instant` successor emerged, and — the more
-  actionable one — does a newer `aws-sdk-s3` compatible with this workspace's
-  1.88.0 MSRV ceiling exist yet (which would let the `lru` 0.16.4 copy
-  disappear entirely rather than staying pinned).
+  unmaintained — see correction below), and `RUSTSEC-2026-0253` (`lru`
+  0.16.4's non-panic-safe `pop()`, pinned in via the MSRV-frozen `aws-sdk-s3`
+  1.122, unreachable because the S3-cache callsite never calls `pop()`). A
+  future Ballast run around **2026-10-01** should re-check: has `rsa` shipped
+  a fix, has an `instant` successor emerged, and — the more actionable one —
+  does a newer `aws-sdk-s3` compatible with this workspace's 1.88.0 MSRV
+  ceiling exist yet (which would let the `lru` 0.16.4 copy disappear entirely
+  rather than staying pinned).
+- **Correction**: this report first repeated `deny.toml`'s own comment
+  verbatim, calling `RUSTSEC-2024-0384` (`instant`, via `postgresql_embedded`)
+  "build-time only." `chatgpt-codex-connector`'s review caught that this is
+  wrong, and traced it to the source: `postgresql_embedded` is declared as a
+  normal (not `[build-dependencies]`) optional dependency
+  (`autumn/Cargo.toml`), gated by the `managed-pg` feature — and
+  `autumn/Cargo.toml`'s own comment on that feature says Postgres binaries
+  are "downloaded on first run." Confirmed directly:
+  `autumn/src/managed_pg.rs`'s `pg.setup().await?` / `pg.start().await?` run
+  inside an `async fn` called when the app boots with `managed-pg` enabled —
+  application runtime, not build time. `deny.toml`'s own ignore-rationale
+  comment for this advisory is therefore itself stale (it predates or
+  mis-traced the dependency, conflating `managed-pg-bundled`'s *build-time*
+  binary embedding with `managed-pg`'s always-present *runtime* dependency on
+  the same `postgresql_embedded` crate — the tree-comment's `(build)`
+  annotation on the `postgresql_embedded` node is the specific error). This
+  doesn't change the advisory's severity (it's "unmaintained," not a
+  specific exploitable call path — `RUSTSEC-2024-0384` has no CVE/exploit to
+  trace a reachability verdict against the way a memory-safety advisory
+  would), but the exposure is broader than "compiles in, never runs":
+  `instant`'s code executes whenever `managed-pg` is enabled and the managed
+  Postgres path boots. Flagged here rather than editing `deny.toml`'s
+  waiver rationale unrehearsed in a docs-only PR — a fix to that comment
+  (and a fresh look at whether `parking_lot`'s own migration off `instant`
+  has landed) is a good candidate for the 2026-10-01 revisit.
 
 ## 💡 Ask-before candidate (not executed) — corrected
 
