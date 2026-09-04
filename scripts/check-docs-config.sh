@@ -105,13 +105,18 @@
 #     convention — and measure it before relying on it.
 #   * A fix applied where the bug was found rather than everywhere the same
 #     question is asked. The placeholder lived in two regexes; the schema-vs-read
-#     question lived in the resolver and the table checker. Grep for the rule.
+#     question lived in the resolver and the table checker; "a comment is not
+#     code" was fixed in the template reader while the token sweep still read
+#     `// std::env::var("AUTUMN_LOG__LEVL")` as a read. Grep for the rule.
 #   * FAILING OPEN — the check not running at all. Every other entry here is the
 #     gate resolving something it should have reported; this one is the gate
 #     asking nothing. Bounding rows to a table region meant a cosmetic header
 #     rename turned off all 142 mapping checks with a green result, because
 #     "no defects found" and "no checks run" are indistinguishable from outside.
-#     Anything that scopes a check must assert it found its subject.
+#     It then recurred at the other end of the same region: a late row that lost
+#     its leading pipe read as the end of the table, so 15 mappings went
+#     unchecked at 127 rows — over the floor, and green. Anything that scopes a
+#     check must assert it found its subject AND that it reached the end of it.
 #
 # EVERY RUNG HAS NOW BEEN AUDITED against the list above, rather than tightened
 # one at a time as a reviewer found it — which is how five of these survived
@@ -354,18 +359,43 @@ def leaf_paths(paths):
 SEGMENT = r'(?:[A-Z0-9]+(?:_[A-Z0-9]+)*|\{[a-z]+\})'
 
 
-# A commented-out `format!` is not a construction site. Requiring `format!(`
-# was the previous fix and still read `// format!("AUTUMN_…__CLIENT_SECRT")` as
-# a name the runtime builds — the same "a shape in text is evidence" mistake,
-# one layer in. Only WHOLE-LINE comments are stripped — a line whose first
-# non-space is `//`. A trailing `// …` after code is left alone, so a `//`
-# inside a string literal can never blank the line it sits on: this errs toward
-# keeping code rather than dropping it, and a construction site is code.
-LINE_COMMENT = re.compile(r'^\s*//')
+# A comment is prose ABOUT the code, never the code. Requiring `format!(` was an
+# earlier fix for a bare quoted string and still read
+# `// format!("AUTUMN_…__CLIENT_SECRT")` as a name the runtime builds; stripping
+# comments only there left `// std::env::var("AUTUMN_LOG__LEVL")` entering the
+# truth set through `source_tokens` — the same defect, found once and fixed in
+# one place. Both readers of the tree strip comments now.
+#
+# Only WHOLE-LINE comments go: a line whose first non-space is the leader. A
+# trailing `// …` after code is left alone, so a leader inside a string literal
+# can never blank the line it sits on — the safe direction, since dropping a
+# real read reports a correct page while keeping a commented one hides a wrong
+# one.
+#
+# The leader is per file type and deliberately not one pattern: `#` opens a
+# comment in TOML, YAML and shell, but a Rust ATTRIBUTE and a markdown HEADING.
+# Keyed on the effective suffix, so `Cargo.toml.tmpl` is read as TOML and
+# `README.md.tmpl` as markdown (no leader, nothing stripped). A type not listed
+# here keeps every line.
+COMMENT_LEADER = {
+    '.rs': '//', '.ts': '//', '.js': '//',
+    '.sh': '#', '.bash': '#', '.ps1': '#',
+    '.toml': '#', '.yml': '#', '.yaml': '#', '.example': '#',
+}
 
 
-def uncommented(body):
-    return '\n'.join('' if LINE_COMMENT.match(l) else l
+def comment_leader(rel):
+    p = pathlib.PurePath(rel)
+    if p.suffix == '.tmpl':
+        p = pathlib.PurePath(p.stem)
+    return COMMENT_LEADER.get(p.suffix)
+
+
+def uncommented(body, leader='//'):
+    """Blank every whole-line comment, keeping line numbering intact."""
+    if not leader:
+        return body
+    return '\n'.join('' if l.lstrip().startswith(leader) else l
                       for l in body.splitlines())
 
 
@@ -525,6 +555,10 @@ def source_tokens(root):
             continue
         if 'AUTUMN_' not in body:
             continue
+        # Prose about a variable is not a use of it, in any of these rungs: a
+        # commented `env::var`, `export`, `${…}` or `const …_ENV` is a note, and
+        # the note is often about a name that is deliberately wrong.
+        body = uncommented(body, comment_leader(rel))
         lines = body.splitlines()
         # Names this file assigns without exporting them, and without handing
         # them to a command: its own variables.
@@ -735,6 +769,7 @@ INDEXED_PATH = re.compile(r'[a-z0-9_]+(?:\[\w+\])?(?:\.[a-z0-9_]+(?:\[\w+\])?)*'
 TABLE_HEADER = re.compile(r'^//!\s*\|\s*Variable\s*\|')
 TABLE_SEPARATOR = re.compile(r'^//!\s*\|[-\s|]+\|\s*$')
 TABLE_ANY_ROW = re.compile(r'^//!\s*\|')
+DOC_BLANK = re.compile(r'^//!\s*$')
 
 # The one row whose two columns legitimately disagree. `SigningSecretConfig`
 # has an untagged deserializer that accepts a bare string, so
@@ -770,7 +805,17 @@ def table_rows(text):
         if TABLE_SEPARATOR.match(line):
             continue
         if not TABLE_ANY_ROW.match(line):
-            inside = False
+            # A markdown table ends at a BLANK line or at the end of the doc
+            # block — never at a line with content, which GFM reads as a
+            # continuation of the row above. Ending the region on any non-row
+            # line meant a late row that lost its leading pipe terminated the
+            # scan: dropping the `AUTUMN_CLUSTER__BIND_ADDR` pipe left 127 rows
+            # parsed, still over the floor, and silently stopped checking the
+            # last 15 mappings with the gate green. Failing open, again.
+            if not line.startswith('//!') or DOC_BLANK.match(line):
+                inside = False
+            else:
+                unparsed.append((i, line.strip()))
             continue
         if m := TABLE_ROW.match(line):
             rows.append((i, m.group(1), m.group(2)))
@@ -1147,6 +1192,28 @@ def self_test():
     # `.get` belongs to every collection, so it is an accessor only on an
     # environment map. A test asserting `map.get("AUTUMN_LOG__LEVL") == None`
     # names a variable precisely to prove nothing reads it.
+    # A commented read is prose about a variable, not a read of it — the same
+    # defect as the commented `format!`, which was fixed only in the template
+    # reader and left this one open.
+    read = '  std::env::var("AUTUMN_LOG__LEVL");'
+    case('a commented read yields no accessor',
+         bool(ACCESSOR.search(uncommented('  //' + read.strip(),
+                                          comment_leader('x.rs')))), False)
+    case('the same read uncommented does',
+         bool(ACCESSOR.search(uncommented(read, comment_leader('x.rs')))), True)
+    # The leader is per file type: `#` opens a comment in TOML and shell, but a
+    # Rust attribute and a markdown heading, and stripping it there would drop
+    # real code.
+    case('a Rust attribute is not a comment',
+         uncommented('#[derive(Deserialize)]', comment_leader('a.rs')),
+         '#[derive(Deserialize)]')
+    case('a shell comment is', uncommented('# export AUTUMN_X=1',
+                                           comment_leader('a.sh')), '')
+    case('a template is read as its inner type',
+         (comment_leader('Cargo.toml.tmpl'), comment_leader('README.md.tmpl')),
+         ('#', None))
+    case('an unlisted type keeps every line',
+         uncommented('# AUTUMN_X', comment_leader('a.golden')), '# AUTUMN_X')
     case('a collection lookup is not an env accessor',
          bool(ACCESSOR.search('assert_eq!(map.get("AUTUMN_LOG__LEVL"), None);')),
          False)
@@ -1222,6 +1289,34 @@ def self_test():
     rows_t, unparsed_t, _ = table_rows(typo)
     case('a misspelled prefix is reported, not skipped',
          (len(rows_t), len(unparsed_t)), (0, 1))
+    # A row that loses its LEADING pipe must not end the scan. It did, and every
+    # row after it went unchecked in silence: dropping one pipe mid-table left
+    # 127 rows parsed — over the floor — and 15 mappings never looked at.
+    lost = ('//! | Variable | Config field | Type |\n'
+            '//! |----------|-------------|------|\n'
+            '//! | `AUTUMN_SERVER__PORT` | `server.port` | `u16` |\n'
+            '//! `AUTUMN_SERVER__HOST` | `server.host` | `String` |\n'
+            '//! | `AUTUMN_LOG__LEVEL` | `log.level` | `String` |\n')
+    rows_l, unparsed_l, _ = table_rows(lost)
+    case('a lost leading pipe does not end the scan',
+         (len(rows_l), len(unparsed_l)), (2, 1))
+    # …while a real end of table is still an end: a markdown table terminates at
+    # a blank line, and at the end of the doc block.
+    ended = ('//! | Variable | Config field | Type |\n'
+             '//! |----------|-------------|------|\n'
+             '//! | `AUTUMN_SERVER__PORT` | `server.port` | `u16` |\n'
+             '//!\n'
+             '//! Prose after the table, mentioning AUTUMN_SERVER__HOST.\n')
+    rows_e, unparsed_e, _ = table_rows(ended)
+    case('a blank doc line ends the table',
+         (len(rows_e), len(unparsed_e)), (1, 0))
+    code = ('//! | Variable | Config field | Type |\n'
+            '//! |----------|-------------|------|\n'
+            '//! | `AUTUMN_SERVER__PORT` | `server.port` | `u16` |\n'
+            '\npub struct AutumnConfig { pub server: ServerConfig }\n')
+    rows_c, unparsed_c, _ = table_rows(code)
+    case('the end of the doc block ends the table',
+         (len(rows_c), len(unparsed_c)), (1, 0))
     # …and a line after the table is not a row at all.
     outside = ('//! | Variable | Config field | Type |\n'
                '//! |----------|-------------|------|\n'
