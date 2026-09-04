@@ -960,10 +960,17 @@ def _yaml_consumer(rel, body):
     return 'actions' if YAML_WORKFLOW.search(body) else None
 
 
-def _yaml_runs(key, stack, consumer):
-    """Whether a scalar under `key`, nested as `stack` says, is executed."""
+def _yaml_runs(key, stack, consumer, value=''):
+    """Whether a scalar under `key`, nested as `stack` says, is executed.
+
+    Compose does NOT put `command:` or `entrypoint:` through a shell — it
+    splits the value and execs it — so `command: AUTUMN_X=v echo` tries to run
+    a program called `AUTUMN_X=v` and exports nothing. Only a value that names
+    a shell as its executable is shell, which is the same first-element rule a
+    Dockerfile's exec form needs; a value this cannot read is not one.
+    """
     if consumer == 'compose':
-        return key in YAML_EXECUTED
+        return key in YAML_EXECUTED and _shell_named(value) in DOCKER_SHELLS
     if consumer == 'actions':
         return key == 'run' and bool(stack) and stack[-1][1] == 'steps'
     return False
@@ -980,6 +987,10 @@ def _yaml_runs(key, stack, consumer):
 # (`- AUTUMN_X=v` as a list, `AUTUMN_X: v` as a map), plus the fields that
 # invoke a shell. Nothing else in the file names a variable to a process.
 COMPOSE_ASSIGNS = 'environment'
+# The three spellings a compose `environment:` entry takes. Only the first has
+# an `=`, which is why the assignment rungs could not see the other two.
+COMPOSE_DECLARED = re.compile(r'^\s*(?:-\s+)?(AUTUMN_[A-Z0-9_]+)\s*(?:[:=]|$)',
+                              re.M)
 
 # A workflow chooses the SHELL its `run:` blocks are written in, and the two
 # grammars share almost nothing: in PowerShell `$NAME` is an ordinary local and
@@ -1033,7 +1044,27 @@ def _docker_literal(body):
 
 
 POWERSHELL = ('pwsh', 'powershell')
-YAML_VALUE = re.compile(r'^\s*(?:-\s+)?[A-Za-z0-9_.-]+:\s*(\S+)\s*$')
+# The whole scalar, not one token: Actions takes a CUSTOM shell line —
+# `shell: pwsh -NoProfile -Command ". '{0}'"` — and a single-token pattern
+# rejected it, so the block silently fell back to Bourne. What names the
+# grammar is the EXECUTABLE, so the value is read and its first word taken.
+YAML_VALUE = re.compile(r'^\s*(?:-\s+)?[A-Za-z0-9_.-]+:\s*(\S.*?)\s*$')
+
+
+def _shell_named(value):
+    """The executable a `shell:` value or a command names.
+
+    Both spellings, because both appear: a bare command line splits on
+    whitespace, and the JSON list form (`["sh", "-lc", "…"]`, which this tree
+    uses) splits on the comma — taking the first word of the list form gives
+    `["sh","-lc","autumn` and recognises nothing.
+    """
+    text = value.strip()
+    if text.startswith('['):
+        first = text[1:].split(',')[0]
+    else:
+        first = text.split()[0] if text.split() else ''
+    return pathlib.PurePath(first.strip().strip('\'"[] ')).name
 
 
 def _yaml_shells(body):
@@ -1064,7 +1095,7 @@ def _yaml_shells(body):
             job = path[1]
         value = YAML_VALUE.match(l)
         if key == 'shell' and value:
-            shell = value.group(1).strip('\'"')
+            shell = _shell_named(value.group(1))
             if path[-2:] == ['defaults', 'run']:
                 if path[:1] == ['jobs']:
                     jobs[job] = shell
@@ -1311,7 +1342,8 @@ def _yaml_blocks(body, interpolated=False, consumer='actions',
         m = YAML_BLOCK.match(l)
         inline = YAML_INLINE.match(l)
         executed = (inline is not None
-                    and _yaml_runs(inline.group(1), stack, consumer))
+                    and _yaml_runs(inline.group(1), stack, consumer,
+                                   l.partition(':')[2]))
         # The ASSIGNMENT view of a compose file keeps only what can name a
         # variable to a process; the expansion view keeps everything.
         keep = ((executed or any(k == COMPOSE_ASSIGNS for _, k in stack))
@@ -1373,6 +1405,9 @@ def _yaml_blocks(body, interpolated=False, consumer='actions',
         out.append(l if (keep or m) else '')
         if m:
             key, indent = m.group(2), len(m.group(1))
+            # A block-opening `command:` carries no value on its own line, so
+            # nothing here names a shell — which is the answer that drops
+            # names rather than admitting them.
             runs = _yaml_runs(key, stack, consumer)
             fold = '>' in l.split(':', 1)[1]
         if at:
@@ -2466,10 +2501,24 @@ BOUND = re.compile(
 # the rule is that something owns the call: `env::var(…)` or `‹receiver›.var(…)`
 # reads the environment, and a bare `var(…)` reads whatever function is in
 # scope. Measured at each step, which is the only reason the 27 came back.
+#
+# …and a RECEIVER is not automatically an environment. `.var(` on anything at
+# all was the next cut and it is still too wide: `css.var("AUTUMN_X")` is a
+# method on a stylesheet builder. The receivers are read out of the tree the
+# same way the helper names are — `impl Env for T` gives the types, and a
+# declaration whose type mentions `Env` gives the bindings, which is what
+# `denv: Box<dyn Env>` and the `inner` field of a wrapper need. The static
+# pattern below keeps an `env`-named receiver as its FLOOR, so a derivation
+# that finds nothing still reads the common spelling.
 ACCESSOR = re.compile(r'\b(?:std::)?env::(var|var_os|set_var)\s*\('
-                      r'|\.\s*(var|var_os|set_var)\s*\('
+                      r'|\b(env\w*)\s*\.\s*(?:var|var_os|set_var)\s*\('
                       r'|\b(env_trimmed|parse_env\w*|env_bool\w*|getenv)\s*\('
                       r'|\b(env\w*)\.get\s*\(')
+
+# `impl Env for OsEnv` — the types that ARE an environment.
+ENV_IMPL = re.compile(r'\bimpl\s*(?:<[^<>]*>)?\s*Env\b[^{]*?\bfor\s+([A-Za-z_]\w*)')
+# …and any binding, parameter or field whose type mentions one.
+ENV_BOUND = re.compile(r'\b([a-z_]\w*)\s*:\s*[^,;{}()=]*\bEnv\b')
 
 # …plus the crates' own env helpers, READ OUT OF THE TREE rather than listed
 # here, the same way the runtime's `format!` templates are. A helper takes an
@@ -2504,7 +2553,7 @@ def accessor(root):
     """
     out = subprocess.run(['git', 'ls-files', '-z', '*.rs'], cwd=root,
                          capture_output=True, text=True).stdout
-    index = {}
+    index, types, receivers = {}, set(), set()
     for rel in out.split('\0'):
         if not rel:
             continue
@@ -2527,11 +2576,31 @@ def accessor(root):
             if data[m.start()]:
                 continue
             index[m.group(1)] = len(_split_args(m.group(2))) - 1
-    if not index:
-        return ACCESSOR, {}
-    return (re.compile(ACCESSOR.pattern + r'|\b(' 
-                       + '|'.join(sorted(map(re.escape, index))) + r')\s*\('),
-            index)
+        types.update(ENV_IMPL.findall(masked))
+        receivers.update(ENV_BOUND.findall(masked))
+    # A type that IS an environment can be the receiver itself (`OsEnv.var(…)`),
+    # and a binding of one is too — `let denv = DotenvEnv::new(…)` has no
+    # annotation to read, so the types are matched on the right of a `let` as
+    # well. Every receiver this tree actually uses is derived; `css` is not.
+    receivers |= types
+    for rel in out.split('\0'):
+        if not rel or not types:
+            continue
+        try:
+            body = (root / rel).read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            continue
+        receivers.update(re.findall(
+            r'\blet\s+(?:mut\s+)?([a-z_]\w*)\s*(?::[^=;]*)?=\s*&?\s*(?:'
+            + '|'.join(sorted(map(re.escape, types))) + r')\b', body))
+    pattern = ACCESSOR.pattern
+    if receivers:
+        pattern += (r'|\b(?:' + '|'.join(sorted(map(re.escape, receivers)))
+                    + r')\s*\.\s*(var|var_os|set_var)\s*\(')
+    if index:
+        pattern += (r'|\b(' + '|'.join(sorted(map(re.escape, index)))
+                    + r')\s*\(')
+    return re.compile(pattern), index
 
 
 # …and never where the line asserts the name is absent.
@@ -3097,6 +3166,16 @@ def source_tokens(root):
                     declaring = code_lines[n].rstrip().endswith('\\')
                 elif effective_suffix(rel) in DOTENV:
                     tokens.update(DECLARED_CONT.findall(code_lines[n]))
+                # Compose declares a variable in three spellings, and only one
+                # of them has an `=`: `- NAME=value`, `- NAME` (inherit from
+                # the host) and `NAME: value` as a mapping key. The assignment
+                # rungs all want `NAME=`, so a variable declared only as a
+                # mapping key was invisible and its correct page was REPORTED.
+                # The assignment view has already narrowed these lines to the
+                # `environment:` section, so the shape is all that is left to
+                # read.
+                if interpolated:
+                    tokens.update(COMPOSE_DECLARED.findall(code_lines[n]))
                 if n not in literal:
                     tokens.update(v for v in EXPANDED.findall(line)
                                   if v not in local)
@@ -4849,20 +4928,41 @@ def self_test():
            _yaml_consumer('docker-compose.yml', 'a: 1\n'))),
          (['AUTUMN_A'], [], [], [], ('actions', None, 'compose')))
     # Compose keeps every value for EXPANSION and only the assigning ones for
-    # ASSIGNMENT: `x-note:` is an extension field nothing runs. Two questions,
-    # two views — and they are indexed together, so they stay the same length.
+    # ASSIGNMENT: `x-note:` is an extension field nothing runs, and `command:`
+    # is exec'd rather than put through a shell unless it names one. Compose
+    # also declares in three spellings and only one has an `=`.
+    #
+    # The assignment view can be SHORTER than the expansion view — blanking
+    # the last line loses it to `splitlines` — which is what the padding in
+    # `source_tokens` is for. What must hold here is that it is never longer.
     _comp = ('services:\n  app:\n'
              '    x-note: AUTUMN_NOTE=x ignored-command\n'
              '    environment:\n      - AUTUMN_ENVLIST=1\n'
-             '    command: AUTUMN_CMD=3 serve\n')
+             '      - AUTUMN_BARE\n      AUTUMN_MAP: value\n'
+             '    command: AUTUMN_CMD=3 serve\n'
+             '    entrypoint: ["sh", "-lc", "AUTUMN_SH=1 run"]\n')
+    _cav, _cev = (_yaml_blocks(_comp, True, 'compose', True),
+                  _yaml_blocks(_comp, True, 'compose'))
     case('a compose file has an expansion view and an assignment view',
-         (ASSIGNED_PREFIX.findall(_yaml_blocks(_comp, True, 'compose', True)),
-          ASSIGNED_ANY.findall(_yaml_blocks(_comp, True, 'compose', True)),
-          ASSIGNED_PREFIX.findall(_yaml_blocks(_comp, True, 'compose')),
-          len(_yaml_blocks(_comp, True, 'compose').splitlines())
-          - len(_yaml_blocks(_comp, True, 'compose', True).splitlines())),
-         (['AUTUMN_CMD'], ['AUTUMN_ENVLIST', 'AUTUMN_CMD'],
-          ['AUTUMN_CMD'], 0))
+         (ASSIGNED_PREFIX.findall(_cav), ASSIGNED_ANY.findall(_cav),
+          COMPOSE_DECLARED.findall(_cav),
+          ASSIGNED_PREFIX.findall(_cev),
+          len(_cev.splitlines()) >= len(_cav.splitlines())),
+         ([], ['AUTUMN_ENVLIST'],
+          ['AUTUMN_ENVLIST', 'AUTUMN_BARE', 'AUTUMN_MAP'], [], True))
+    # A custom Actions shell line is still a shell: what names the grammar is
+    # the EXECUTABLE, and the JSON list form splits on the comma, not on space.
+    case('a shell is named by its executable, in either spelling',
+         [_shell_named(v) for v in
+          ('pwsh -NoProfile -Command ". \'{0}\'"', '["sh","-lc","autumn x"]',
+           '["/app/x"]', 'AUTUMN_X=v echo', '/bin/sh -c x', 'bash')],
+         ['pwsh', 'sh', 'x', 'AUTUMN_X=v', 'sh', 'bash'])
+    case('a custom pwsh shell line still selects PowerShell',
+         sorted(_yaml_shells('on: push\njobs:\n  a:\n    defaults:\n'
+                             '      run:\n'
+                             '        shell: pwsh -NoProfile -Command ". \'{0}\'"\n'
+                             '    steps:\n      - run: echo $AUTUMN_X\n')),
+         [7])
     # …and which GRAMMAR a `run:` block is in is the workflow's to say, not the
     # file suffix's. All three declaration sites, including a step whose
     # `shell:` comes AFTER its `run:` — which is why the resolution is a
