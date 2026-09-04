@@ -15171,6 +15171,145 @@ mod tests {
         }
     }
 
+    // ── Warden 2026-09-04 (Codex review, PR #2505): a failed rebuild does NOT
+    // invalidate a pre-existing static file ──────────────────────────────────
+    //
+    // The test above starts from an empty `dist/`, so "no file is written on
+    // failure" only proves a *fresh* build/regeneration never bakes in a
+    // cross-tenant response. It says nothing about a `dist/<route>/index.html`
+    // that already exists from an earlier, successful render — Codex's review
+    // correctly pointed out that `render_static_routes` stages into a sibling
+    // `dist.staging` directory and only removes/replaces the real `dist_dir`
+    // once every route has rendered successfully (`build.rs`, the loop over
+    // `results` returns on the first `Err` and only then does the atomic
+    // "remove old dist, rename staging -> dist" swap run) — so on failure the
+    // pre-existing file is left completely untouched. ISR's `regenerate_page`
+    // (`static_gen/middleware.rs`) has the same shape: it returns `Err` before
+    // ever calling `std::fs::write`/`rename` on a non-2xx response, so a
+    // repeatedly-failing revalidation serves the same stale file forever
+    // (by design — this is the documented stale-while-revalidate contract).
+    //
+    // This does not reopen the cross-tenant hypothesis: nothing in Autumn ever
+    // *writes* a tenant-scoped response into `dist/` without a resolved
+    // tenant (see the sweep above), so there is no code path here that bakes
+    // in the wrong tenant's data to begin with. The realistic way a
+    // tenant-mismatched file could ever land in `dist/` is an operational one
+    // — building with a different `[tenancy]` config than the one serving
+    // requests — not a bug in this framework code. But once such a file
+    // exists, by whatever means, this test shows Autumn has no mechanism to
+    // detect, invalidate, or expire it: a later tenant-resolution failure
+    // preserves it indefinitely with no operator-visible signal beyond a log
+    // line. Documented here as a known limitation rather than left implicit.
+    #[tokio::test]
+    async fn failed_rebuild_leaves_preexisting_static_file_untouched() {
+        async fn tenant_page(tenant: crate::tenancy::Tenant) -> String {
+            tenant.0
+        }
+
+        let mut config = AutumnConfig::default();
+        config.tenancy.enabled = true;
+        config.tenancy.source = "header".to_owned();
+        config.tenancy.public_paths = vec!["/storefront".to_owned()];
+
+        let state = AppState::for_test();
+        state.insert_extension(config.clone());
+
+        let router = crate::router::try_build_router_inner(
+            vec![Route {
+                method: http::Method::GET,
+                path: "/storefront",
+                handler: axum::routing::get(tenant_page),
+                name: "tenant_page",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path: "/storefront",
+                    operation_id: "tenant_page",
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            }],
+            &config,
+            state,
+            crate::router::RouterContext {
+                exception_filters: Vec::new(),
+                scoped_groups: Vec::new(),
+                merge_routers: Vec::new(),
+                nest_routers: Vec::new(),
+                declared_routes: Vec::new(),
+                custom_layers: Vec::new(),
+                static_gate_layers: Vec::new(),
+                #[cfg(feature = "maud")]
+                error_page_renderer: None,
+                session_store: None,
+                #[cfg(feature = "openapi")]
+                openapi: None,
+                #[cfg(feature = "mcp")]
+                mcp: None,
+            },
+        )
+        .expect("router builds");
+
+        let tmp = tempfile::tempdir().expect("dist parent");
+        let dist = tmp.path().join("dist");
+
+        // Seed `dist/` as if an earlier, successful build/regeneration had
+        // captured tenant A's response (the operationally-realistic route:
+        // a build/serve `[tenancy]` config mismatch, not anything this
+        // framework's own request handling can produce — see the sweep
+        // above).
+        std::fs::create_dir_all(dist.join("storefront")).expect("mkdir storefront");
+        let sentinel = "tenant-a-sentinel-warden-2026-09-04";
+        std::fs::write(dist.join("storefront/index.html"), sentinel).expect("seed stale file");
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "/storefront".to_owned(),
+            crate::static_gen::ManifestEntry::new("storefront/index.html".to_owned()),
+        );
+        let manifest = crate::static_gen::StaticManifest::new(routes);
+        std::fs::write(
+            dist.join("manifest.json"),
+            serde_json::to_string(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let result = crate::static_gen::render_static_routes(
+            router,
+            &[crate::static_gen::StaticRouteMeta {
+                path: "/storefront",
+                name: "tenant_page",
+                revalidate: None,
+                params_fn: None,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+            }],
+            &dist,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "the rebuild must still fail closed (tenant resolution rejects the headerless \
+             synthetic request), same as the fresh-dist case above"
+        );
+
+        let surviving = std::fs::read_to_string(dist.join("storefront/index.html"))
+            .expect("the pre-existing file must still be present after a failed rebuild");
+        assert_eq!(
+            surviving, sentinel,
+            "a failed rebuild must not silently alter or remove a pre-existing static file. \
+             This is Autumn's documented stale-while-revalidate/atomic-swap design working as \
+             intended, but it also means a tenant-mismatched file that reached dist/ by some \
+             other means (an operational build/serve config mismatch, not a code path in this \
+             framework) is served indefinitely with no automatic invalidation — see \
+             docs/security/2026-09-04-static-gen-tenancy-fails-closed/README.md"
+        );
+    }
+
     #[test]
     fn app_builder_routes_adds_routes() {
         let builder = app();

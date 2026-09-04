@@ -9,8 +9,14 @@ rendered by `autumn build` or an ISR background regeneration, on a route
 exempted from `tenancy_middleware` via `[tenancy].public_paths` (so the
 extractor's own fallback resolution runs, not just the middleware's earlier
 call to the same function)
-**Status:** **negative result** — no fix required. Regression test committed:
+**Status:** **negative result** for the hypothesis as stated (a fresh
+build/regeneration never bakes cross-tenant data into `dist/`) — no fix
+required there. A narrower, related limitation was surfaced during review
+(see "Known limitation" below) and is documented, not fixed: it requires an
+operational build/serve config mismatch to trigger, not a code path this
+framework can reach on its own. Regression tests committed:
 `autumn/src/app.rs::tests::static_get_route_reading_tenant_fails_closed_for_every_tenancy_source`
+and `autumn/src/app.rs::tests::failed_rebuild_leaves_preexisting_static_file_untouched`
 
 ## 🎯 Surface
 
@@ -177,6 +183,60 @@ immediately; see the "Negative result" outcome in Warden's process.)
   call sites, which is also why exempting the route from the middleware (via
   `public_paths`) is what it takes to prove the *extractor's* copy of the
   check independently.
+
+## ⚠️ Known limitation surfaced by review: a failed rebuild doesn't invalidate a pre-existing file
+
+Both tests above start from an **empty** `dist/`, which only proves a fresh
+build/regeneration never *writes* cross-tenant data. Codex's review on the
+PR correctly pointed out that this says nothing about a
+`dist/<route>/index.html` that **already exists** from an earlier,
+successful render:
+
+- `render_static_routes` (`build.rs`) stages every route into a sibling
+  `dist.staging` directory and only removes/replaces the real `dist_dir`
+  once **every** route in the build has rendered successfully (the loop over
+  `results` returns on the first `Err`, before the "remove old dist, rename
+  staging → dist" swap ever runs). On failure, `dist_dir` — including
+  anything already in it — is never touched.
+- ISR's `regenerate_page` (`static_gen/middleware.rs`) has the same shape: it
+  returns `Err` on a non-2xx response before ever calling
+  `std::fs::write`/`rename`, so a route whose regeneration keeps failing
+  keeps serving its last successfully-rendered file forever. This is the
+  documented stale-while-revalidate contract working as designed — the
+  whole point of ISR is that a broken rebuild doesn't take the page down.
+
+Added `failed_rebuild_leaves_preexisting_static_file_untouched` to prove
+this directly: seed `dist/storefront/index.html` with a sentinel value (as
+if an earlier build had captured it), point tenancy at the same
+always-fails-closed config as the test above, call `render_static_routes`
+again, and assert both that the rebuild still fails **and** that the
+sentinel file is byte-for-byte unchanged afterward.
+
+**Why this doesn't reopen the cross-tenant hypothesis.** Nothing in Autumn
+ever writes a tenant-scoped response into `dist/` without a resolved
+tenant — that is exactly what the sweep above rules out for every
+`[tenancy] source` and both render entry points. So there is no code path
+*within this framework* that bakes the wrong tenant's data into that
+sentinel file to begin with. The only realistic way a tenant-mismatched
+file lands in `dist/` is operational: building with a different
+`[tenancy]` config than the one that serves requests (e.g. `autumn build`
+run once in CI with tenancy disabled or pointed at a different source than
+production uses). That is a build/serve consistency problem for the
+operator, not a bug in Autumn's request handling.
+
+**What this does leave on the table.** Once a tenant-mismatched file exists
+in `dist/` by whatever means, this test shows Autumn has no mechanism to
+detect, invalidate, or expire it — a subsequent tenant-resolution failure
+preserves it indefinitely, with no operator-visible signal beyond a
+`tracing::warn!`/`tracing::error!` log line for ISR (`autumn build` at
+least fails the whole CI step loudly). A maintainer may want to consider,
+as a separate hardening item (not a security fix, since no attacker action
+is involved): surfacing a stronger signal — a metric, an actuator flag, or
+a build-time check that a `#[static_get]` route's rendered `Content-Type`/
+response doesn't silently vary across `[tenancy]` configurations — for
+detecting this class of build/serve drift. Not implemented here; this is a
+suggestion for follow-up, matching the "findings, not fixes, for
+operational hazards" boundary in Warden's process.
 
 ## 📡 Blast radius / variant sweep
 
