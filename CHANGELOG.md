@@ -1490,6 +1490,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🛣️ Onramp: `autumn setup` retries a dropped Tailwind CSS download instead
+  of failing the whole quickstart [no-plugin]:** `autumn setup` — the second
+  documented command in the README quickstart, right after `autumn new` — did
+  a single unretried `GET` for both the Tailwind CSS checksums manifest and
+  the ~10MB platform binary (`autumn-cli/src/http.rs`); any transient
+  transport hiccup (a truncated body, a dropped connection) aborted the whole
+  command with a bare `Error: download failed: error decoding response body`
+  and no second chance. This is not hypothetical: 2 of the last 3
+  `quickstart-gate.yml` runs against published crates.io on 2026-09-03 (runs
+  33784307158 at 17:23 UTC and 33805758766 at 21:02 UTC) failed at exactly
+  this step with exactly this error, with the passing run in between
+  (33797353571, 19:35 UTC) at the same commit — confirming the failure is
+  transient CDN flakiness, not a real break, and that a real fraction of
+  fresh `autumn setup` runs hit it. `fetch_bytes` and the new `fetch_text`
+  (both in `autumn-cli/src/http.rs`, shared by `autumn setup` and `autumn
+  assets`) now retry up to 3 times with a 2s backoff on any non-HTTP-status
+  error (a definitive 404/5xx is not retried — retrying it would just waste
+  the user's time); the retry/backoff bookkeeping is exercised by 4 unit
+  tests against fake failing/succeeding closures, no real networking
+  involved. No public API changed — `fetch_bytes`'s signature and error type
+  are unchanged, `fetch_text` is a new addition. No plugin-facing surface;
+  this is a CLI robustness fix, not new framework surface.
+
 - **`--counter-cache` scaffolds compiled clean now (#2431):** `autumn generate
   scaffold Comment ... --belongs-to Post --counter-cache` — the documented,
   only way to use the flag — generated a child model that failed `cargo check`
