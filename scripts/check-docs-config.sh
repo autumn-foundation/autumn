@@ -638,8 +638,9 @@ def _strip_generated_comments(body, cls):
     delimited by `\\"` in an escaped template and by `"` in a raw one, so either
     toggles, after the outer delimiter, which is skipped on entering the region.
 
-    Blanking stops at the line end and at the region end, so a `/*` that never
-    closes costs that line and nothing after it.
+    A `//` stops at the line end; a `/* … */` runs to its terminator across
+    generated lines, and both stop at the region end — so a block that never
+    closes costs that one literal and nothing after it.
 
     Length-preserving, so the caller's classification stays valid.
     """
@@ -671,13 +672,27 @@ def _strip_generated_comments(body, cls):
         if c == '"':
             instr, i = not instr, i + 1
             continue
-        if code and not instr and c == '/' and body[i + 1:i + 2] in '/*':
-            block = body[i + 1] == '*'
+        if code and not instr and c == '/' and body[i + 1:i + 2] == '/':
             while i < n and cls[i] == 's' and body[i] != '\n':
                 out[i] = ' '
                 i += 1
-                if block and body[i - 2:i] == '*/':
+            continue
+        if code and not instr and c == '/' and body[i + 1:i + 2] == '*':
+            # A block comment runs to its terminator, ACROSS generated lines.
+            # Stopping at the newline left everything after the first line of a
+            # multi-line `/* … */` reading as executable generated code.
+            out[i] = out[i + 1] = ' '
+            i += 2
+            while i < n and cls[i] == 's':
+                if body[i] == '*' and body[i + 1:i + 2] == '/':
+                    out[i] = ' '
+                    if i + 1 < n and cls[i + 1] == 's':
+                        out[i + 1] = ' '
+                    i += 2
                     break
+                if body[i] != '\n':
+                    out[i] = ' '
+                i += 1
             continue
         i += 1
     return ''.join(out)
@@ -713,6 +728,17 @@ HASH_NEEDS_SPACE = ('.sh', '.bash', '.zsh', '.yml', '.yaml', '.env', '.example')
 # a swap: a `//` in a shell or YAML file is a path, not a comment, which is why
 # this is a named set and not the default.
 HASH_AND_SLASH = ('.tf', '.tfvars', '.hcl')
+
+# PowerShell has a block comment the line stripper cannot see: `<# … #>` spans
+# lines, and `scripts/install.ps1` opens with a 26-line one documenting the very
+# `AUTUMN_*` overrides this gate checks. Blanked before anything else runs, with
+# newlines kept so line numbering holds.
+PS_BLOCK = re.compile(r'<#.*?#>', re.S)
+HASH_BLOCK = ('.ps1', '.psm1')
+
+
+def _ps_uncommented(body):
+    return PS_BLOCK.sub(lambda m: re.sub(r'[^\n]', ' ', m.group(0)), body)
 
 
 def _hash_uncommented(body, shell_like=False):
@@ -762,11 +788,14 @@ def hash_needs_space(rel):
     return effective_suffix(rel) in HASH_NEEDS_SPACE
 
 
-def uncommented(body, leader='//', needs_space=False, also_slash=False):
+def uncommented(body, leader='//', needs_space=False, also_slash=False,
+                also_block=False):
     """Drop comments, keeping string literals and line numbering intact."""
     if leader == '//':
         return _rust_uncommented(body)
     if leader == '#':
+        if also_block:
+            body = _ps_uncommented(body)
         if also_slash:
             body = _rust_uncommented(body)
         return _hash_uncommented(body, needs_space)
@@ -1298,7 +1327,8 @@ def source_tokens(root):
         # a test, which names a variable to prove the runtime ignores it.
         body = uncommented(body, comment_leader(rel),
                           hash_needs_space(rel),
-                          effective_suffix(rel) in HASH_AND_SLASH)
+                          effective_suffix(rel) in HASH_AND_SLASH,
+                          effective_suffix(rel) in HASH_BLOCK)
         if rel.endswith('.rs'):
             body = untested(body)
         lines = body.splitlines()
@@ -2149,6 +2179,22 @@ def self_test():
          'let t = "\\n\\\n                                            \n";')
     # …but it must OPEN the line, or a `//` inside a URL eats the rest of the
     # literal — and a `/*` that is the whole point of a string is not a comment.
+    # A block comment in generated code runs to its terminator ACROSS lines.
+    # Stopping at the first newline left everything after it reading as code.
+    case('a multi-line generated block comment is stripped whole',
+         uncommented('let t = r#"/*\nstd::env::var("AUTUMN_LOG__LEVL");\n*/\n'
+                     'let keep = 1;"#;'),
+         'let t = r#"  \n                                  \n  \n'
+         'let keep = 1;"#;')
+    # PowerShell's block comment spans lines and the line stripper cannot see
+    # it: `install.ps1` opens with a 26-line one documenting these very
+    # variables.
+    case('a PowerShell block comment is blanked, newlines kept',
+         uncommented('<#\n${AUTUMN_LOG__LEVL}\n#>\n$x = 1', '#',
+                     also_block=True),
+         '  \n                   \n  \n$x = 1')
+    case('…and its line count is preserved',
+         uncommented('<#\na\n#>\nx', '#', also_block=True).count('\n'), 3)
     case('a URL inside a generated string survives',
          uncommented('let u = "\\n\\\n  let b = \\"https://x\\"; env::var(\\"AUTUMN_ENV\\");\\n\\\n";'),
          'let u = "\\n\\\n  let b = \\"https://x\\"; env::var(\\"AUTUMN_ENV\\");\\n\\\n";')
