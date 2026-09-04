@@ -211,6 +211,18 @@ VAR = re.compile(r'\bAUTUMN_(?:\{[a-z]+\}|[A-Za-z0-9_])*[A-Za-z0-9_]')
 TRAILING_WILDCARD = re.compile(r'^AUTUMN_[A-Za-z0-9_]*_$')
 
 
+def family_exists(var, built, tokens):
+    """Some real variable must begin with this prefix.
+
+    Without it a wildcard was a blanket exemption: `AUTUMN_SESION__*` — one `S`
+    short — was accepted as a family mention and skipped, so the shape `*`
+    excused any spelling in front of it. The prefix is a claim about a family
+    of variables, and it is checked like any other claim.
+    """
+    return (any(t.startswith(var) for t in tokens)
+            or any(p.pattern.lstrip('^').startswith(var) for p in built.values()))
+
+
 def family(var, line):
     """`AUTUMN_ALERTS__*` — prose naming a family, not a variable to set.
 
@@ -262,7 +274,12 @@ WAIVER = re.compile(r'<!--\s*config-key-allow:\s*(AUTUMN_[A-Z0-9_]+)\s*(.*?)\s*-
 # parameter) constrains nothing and is skipped: it would re-admit
 # `…__SHARDS__0__NOPE`. Shard fields need no template anyway — the schema
 # enumerates them as `database.shards.*`, reached by eliding the index.
-TEMPLATE = re.compile(r'"(AUTUMN_[A-Z0-9_]*(?:\{[a-z_]+\}[A-Z0-9_]*)+)"')
+# Only a CONSTRUCTION SITE counts. Matching any quoted string with a
+# placeholder made a comment or a test fixture into runtime truth: a stray
+# `"AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_SECRT"` anywhere in the tree would have
+# blessed that typo for the whole corpus. All five real templates are arguments
+# to `format!`, which is what actually builds a name at load time.
+TEMPLATE = re.compile(r'format!\(\s*"(AUTUMN_[A-Z0-9_]*(?:\{[a-z_]+\}[A-Z0-9_]*)+)"')
 
 # Metasyntactic roots: a page teaching the NAMING RULE rather than naming a key.
 # Seven pages write `AUTUMN_SECTION__FIELD` to explain that a double underscore
@@ -602,7 +619,10 @@ def scan(files, read, leaves, built, tokens):
                     stats['example-code identifier'] += 1
                     continue
                 if family(var, line):
-                    stats['family wildcard'] += 1
+                    if family_exists(var, built, tokens):
+                        stats['family wildcard'] += 1
+                        continue
+                    defects.append((rel, i, var, line.strip()))
                     continue
                 rung = None if malformed(var) else resolve(
                     var, leaves, built, tokens)
@@ -837,7 +857,8 @@ def self_test():
     # Names something in the tree binds or reads — the only thing that makes an
     # environment variable settable.
     tokens = {'AUTUMN_ENV', 'AUTUMN_SEARCH__QUEUE', 'AUTUMN_LOG__LEVEL',
-              'AUTUMN_SERVER__UPGRADE__ENABLED', 'AUTUMN_SECURITY__SIGNING_SECRET'}
+              'AUTUMN_SERVER__UPGRADE__ENABLED', 'AUTUMN_SECURITY__SIGNING_SECRET',
+              'AUTUMN_ALERTS__ENABLED'}
     checked, failures = [], []
 
     def case(name, got, want):
@@ -879,6 +900,16 @@ def self_test():
          VAR.findall('export AUTUMN_LOG__LEVEL_=debug'), ['AUTUMN_LOG__LEVEL_'])
     case('a dangling separator is malformed',
          malformed('AUTUMN_LOG__LEVEL_'), True)
+    # A wildcard is a claim about a family, checked like any other claim: the
+    # prefix must actually begin a real name, or `*` becomes a blanket excuse.
+    case('a real family prefix exists',
+         family_exists('AUTUMN_SEARCH__', built, tokens), True)
+    case('a misspelled family prefix does not',
+         family_exists('AUTUMN_SESION__', built, tokens), False)
+    sf, dfam = scan(['d.md'], lambda _: 'set `AUTUMN_SESION__*` to override\n',
+                    leaves, built, tokens)
+    case('a misspelled family is reported',
+         (sf['family wildcard'], len(dfam)), (0, 1))
     case('a `*` family mention is not a variable',
          family('AUTUMN_ALERTS__', 'set `AUTUMN_ALERTS__*` to override'), True)
     case('an angle-bracket family mention is not a variable',
@@ -980,6 +1011,13 @@ def self_test():
     # Templates are read from the real tree: the oauth2 pair must be found, and
     # `…__SHARDS__{i}__{field}` must be skipped (it would re-admit any field).
     real_built = built_patterns(ROOT, leaf_paths(schema_paths(SNAPSHOT.read_text(encoding="utf-8"))))
+    # A template is only truth at a CONSTRUCTION site; a quoted string in a
+    # comment or fixture is not.
+    case('a bare quoted template is not a construction site',
+         TEMPLATE.findall('// "AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_SECRT"'), [])
+    case('a format! template is',
+         TEMPLATE.findall('let v = format!("AUTUMN_X__{i}__Y");'),
+         ['AUTUMN_X__{i}__Y'])
     case('oauth2 templates are derived from source',
          any('OAUTH2' in t and t.endswith('CLIENT_SECRET') for t in real_built),
          True)
