@@ -946,8 +946,19 @@ def _yaml_blocks(body, interpolated=False):
                 continue
         m = YAML_BLOCK.match(l)
         inline = YAML_INLINE.match(l)
-        keep = (interpolated
-                or (inline is not None and inline.group(1) in YAML_EXECUTED))
+        executed = inline is not None and inline.group(1) in YAML_EXECUTED
+        keep = interpolated or executed
+        if executed:
+            # The quotes around an inline scalar are YAML's, and YAML removes
+            # them before the command reaches the shell — so
+            # `run: 'echo ${AUTUMN_X}'` really does expand. Passing them to the
+            # shell pass read them as shell quotes and erased the expansion.
+            head, _, value = l.partition(':')
+            body_ = value.strip()
+            if len(body_) > 1 and body_[0] == body_[-1] and body_[0] in '\'"':
+                pad = len(value) - len(value.lstrip())
+                l = (head + ':' + ' ' * pad + ' ' + body_[1:-1] + ' '
+                     + ' ' * (len(value) - pad - len(body_)))
         # A block-opening line carries no value of its own, so it is kept only
         # to preserve the line count, never as evidence.
         out.append(l if (keep or m) else '')
@@ -1489,6 +1500,21 @@ def _hash_uncommented(body, shell_like=False, carry_quotes=False,
                                or l[i - 1].isspace() or l[i - 1] in ';&|()<>'):
                 cut = i
                 break
+        # An UNTERMINATED quote does not protect a `#` later on the same line.
+        # A multi-line string's CLOSING quote reads as a new opener here, and
+        # the trailing comment after it then survived as code — the assignment
+        # rungs took `# AUTUMN_X=v cmd` out of it. Carrying quote state across
+        # lines is the principled repair and is not affordable: measured, it
+        # leaves 1192 comment lines surviving as code, and a heredoc-aware
+        # version 3448, because the sibling gates embed their Python in
+        # heredocs full of apostrophes. This is stateless instead, and fails
+        # toward STRIPPING — three lines in the tree lose comment text they
+        # were keeping, none of which names a variable.
+        if cut is None and q is not None:
+            for i in range(qpos + 1, len(l)):
+                if l[i] == '#' and (l[i - 1].isspace() or l[i - 1] in ';&|()<>'):
+                    cut = i
+                    break
         out.append(l if cut is None else l[:cut])
         before = l[:qpos].rstrip() if q else ''
         carry = (q if carry_quotes and q and cut is None
@@ -1567,7 +1593,15 @@ def built_patterns(root, leaves):
         # runtime.
         if 'AUTUMN_' not in body:
             continue
-        for tpl in TEMPLATE.findall(untested(uncommented(body))):
+        # The generated-data mask again — third rung to consult it, after the
+        # accessor and the binding scans. A one-line `const HELP: &str =
+        # r#"format!("AUTUMN_…{upper}…")"#;` is data, and it was defining a
+        # runtime-built NAME PATTERN, which blesses every documented name that
+        # matches it rather than just one.
+        masked = untested(uncommented(body))
+        data = _generated_data(masked)
+        for tpl in (m.group(1) for m in TEMPLATE.finditer(masked)
+                    if not data[m.start()]):
             segs = tpl[len('AUTUMN_'):].split('__')
             head = re.sub(r'\\\{[a-z_]+\\\}', SEGMENT,
                           re.escape('AUTUMN_' + '__'.join(segs[:-1])))
@@ -2205,7 +2239,10 @@ SHELL_SHAPED_NAMED = ('Dockerfile', 'Containerfile', 'Makefile', 'Justfile')
 # which is an ordinary variable. `scripts/install.ps1` does it three times in
 # its parameter block, so an override implemented only in PowerShell could not
 # be documented without a waiver.
-PS_ENV = re.compile(r'\$[Ee][Nn][Vv]:(AUTUMN_[A-Z0-9_]+)')
+# Both spellings reach the environment: `$env:NAME` and the braced
+# `${env:NAME}`, which is the form needed whenever the name would otherwise run
+# on into the next token.
+PS_ENV = re.compile(r'\$\{?[Ee][Nn][Vv]:(AUTUMN_[A-Z0-9_]+)\}?')
 
 
 def shell_shapes(rel):
@@ -3914,6 +3951,24 @@ def self_test():
           PS_ENV.findall('$AUTUMN_LOG__LEVL'),
           PS_ENV.findall('$env:AUTUMN_LOG__LEVEL')),
          (['AUTUMN_LOG__LEVL'], [], ['AUTUMN_LOG__LEVEL']))
+    # A multi-line string's CLOSING quote reads as an opener here, so an
+    # unterminated quote must not protect a `#` later on the same line.
+    case('an unterminated quote does not protect a trailing comment',
+         (ASSIGNED_PREFIX.findall(_shell_code(uncommented(
+             'printf "first\nsecond" # AUTUMN_X=v cmd\n', '#', True))),
+          uncommented('echo "ok"  # note\n', '#', True).rstrip()),
+         ([], 'echo "ok"'))
+    # A YAML inline scalar's quotes are YAML's: removed before the command
+    # reaches the shell, so the expansion inside really does happen.
+    case('an inline YAML scalar is decoded before the shell pass',
+         EXPANDED.findall(_shell_literals(_yaml_blocks(
+             "steps:\n  - run: 'echo ${AUTUMN_X}'\n", False))),
+         ['AUTUMN_X'])
+    # Both PowerShell spellings reach the environment.
+    case('the braced PowerShell environment form is a use',
+         (PS_ENV.findall('${env:AUTUMN_X}'), PS_ENV.findall('$env:AUTUMN_X'),
+          PS_ENV.findall('${AUTUMN_X}')),
+         (['AUTUMN_X'], ['AUTUMN_X'], []))
     # Lua's long comments are the forms the SQL scanner cannot see, and the
     # delimiter length is part of the syntax — `]]` does not close `--[==[`.
     case('a Lua long comment is a comment',
