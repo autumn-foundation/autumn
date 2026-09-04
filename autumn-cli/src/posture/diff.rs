@@ -1084,13 +1084,13 @@ fn diff_authorization_policies(
                 escape_list(&[
                     action.clone(),
                     resource.clone(),
-                    // Only when the URL survived the route: otherwise there is
-                    // nothing replacing the check and nothing to bind to.
-                    if fell_through {
-                        checks_on((path, method), &after, &routes_after, &routes_before)
-                    } else {
-                        String::new()
-                    },
+                    // Whatever checks these URLs now get, whether that is
+                    // another route's after a fall-through or this route's own
+                    // after a swap. Leaving the exact-route case out let
+                    // `read_any` give way to `read_all` without moving the
+                    // digest, so the acknowledgment for one stood for the
+                    // other.
+                    checks_on((path, method), &after, &routes_after, &routes_before),
                 ])
             ),
             detail,
@@ -1241,18 +1241,22 @@ fn report_displaced_bindings(
 
     for added_key in keys_after.difference(&keys_before) {
         let (added_path, added_method) = added_key;
-        for displaced_key in &keys_before {
+        // Ranked like every other "which route does this URL go to" question:
+        // a base route the prior winner outranks never applied its check here.
+        let candidates: Vec<&RouteKey> = keys_before
+            .iter()
+            .filter(|(p, m)| {
+                takes_precedence(added_path, p)
+                    && methods_transfer(
+                        (m, p),
+                        &keys_before,
+                        (added_method, added_path),
+                        &keys_after,
+                    )
+            })
+            .collect();
+        for displaced_key in undominated(added_path, &candidates) {
             let (displaced_path, displaced_method) = displaced_key;
-            if !takes_precedence(added_path, displaced_path)
-                || !methods_transfer(
-                    (displaced_method, displaced_path),
-                    &keys_before,
-                    (added_method, added_path),
-                    &keys_after,
-                )
-            {
-                continue;
-            }
             for ((path, method, action, resource), written_as) in before {
                 if path != displaced_path || method != displaced_method {
                     continue;
@@ -2444,6 +2448,73 @@ mod tests {
         let widening = widening(&findings);
         assert_eq!(widening.len(), 1, "{findings:#?}");
         assert_eq!(widening[0].kind, "authorization_binding_removed");
+    }
+
+    /// The replacement binding matters when the route *stays* mounted too. A
+    /// route that swaps `read_self` for `read_any` keeps its key, so nothing
+    /// fell through — and with the replacement left out of the fingerprint, a
+    /// later push to `read_all` moved neither the removal finding nor the
+    /// digest, and the acknowledgment for `read_any` still stood.
+    #[test]
+    fn an_exact_route_acknowledgment_binds_to_its_replacement_check() {
+        let by_id = route("/records/{id}", "GET", "gated", &["user"], &[], true);
+        let binding = |action: &str| {
+            format!(
+                r#"{{"path":"/records/{{id}}","method":"GET","action":"{action}","resource":"Record"}}"#
+            )
+        };
+        let base = manifest(&by_id, "", "", &binding("read_self"));
+        let replaced_by = |action: &str| {
+            diff(&base, &manifest(&by_id, "", "", &binding(action)))
+                .into_iter()
+                .find(|f| f.kind == "authorization_binding_removed")
+                .expect("losing `read_self` is a widening")
+                .canonical()
+        };
+
+        assert_ne!(replaced_by("read_any"), replaced_by("read_all"));
+    }
+
+    /// Ranking reaches the binding displacement too: a base route that never
+    /// served the URL cannot have its check "lost" by the route that takes it.
+    #[test]
+    fn a_displaced_binding_is_compared_against_the_prior_winner() {
+        let gated = |path: &str| route(path, "GET", "gated", &["user"], &[], true);
+        let binding = |path: &str, action: &str| {
+            format!(r#"{{"path":"{path}","method":"GET","action":"{action}","resource":"Record"}}"#)
+        };
+        let prior_owner = gated("/records/me/{id}");
+        let never_served = gated("/records/{user}/private");
+        let added = gated("/records/me/private");
+
+        let base = manifest(
+            &format!("{prior_owner},{never_served}"),
+            "",
+            "",
+            &format!(
+                "{},{}",
+                binding("/records/me/{id}", "read_self"),
+                binding("/records/{user}/private", "read_other")
+            ),
+        );
+        let head = manifest(
+            &format!("{prior_owner},{never_served},{added}"),
+            "",
+            "",
+            &format!(
+                "{},{},{}",
+                binding("/records/me/{id}", "read_self"),
+                binding("/records/{user}/private", "read_other"),
+                // The new route carries the check the prior owner performed.
+                binding("/records/me/private", "read_self")
+            ),
+        );
+
+        let findings = diff(&base, &head);
+        assert!(
+            widening(&findings).is_empty(),
+            "`read_other` never applied to that URL: {findings:#?}"
+        );
     }
 
     /// The round-15 lesson, retrofitted to the binding findings. An
