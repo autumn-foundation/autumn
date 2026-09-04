@@ -336,7 +336,14 @@ WAIVER = re.compile(r'<!--\s*config-key-allow:\s*([A-Z][A-Z0-9_]+)\s*(.*?)\s*-->
 # (`AUTUNM`), deletion (`AUTMN`) or insertion (`AUTUUMN`). Anything further away
 # is somebody else's variable — `DATABASE_URL` and `RUST_LOG` are not typos of
 # this namespace — and two edits would start reaching them.
-NEAR = re.compile(r'\b([A-Z][A-Z0-9]{3,8})_(?=[A-Z0-9_]*[A-Z0-9])[A-Z0-9_]+\b')
+#
+# The namespace is matched case-INSENSITIVELY, because `AUTUMn_LOG__LEVEL` is
+# zero edits from `AUTUMN` and still a name the runtime never reads; an
+# uppercase-only class made it invisible in exactly the way the misspelt
+# namespace was. What follows must be uppercase, though, and that is what keeps
+# the crate name out of it: `autumn_web` and `autumn-macros` are prose about a
+# package, not a claim about an environment variable.
+NEAR = re.compile(r'\b([A-Za-z][A-Za-z0-9]{3,8})_([A-Z0-9]+(?:_+[A-Z0-9]+)*)\b')
 
 
 def near_miss(word, target='AUTUMN'):
@@ -830,6 +837,17 @@ NEGATED = re.compile(r'assert(?:_ne)?!\s*\(\s*!|!\s*[\w.]*\bcontains\b|\bassert_
 CFG_ATTR = re.compile(r'#\[cfg\(')
 TEST_PATH = re.compile(r'(^|/)(?:tests|benches)/|_test\.rs$')
 
+# A test function does not need a `cfg` to be test code: `#[test]` marks one on
+# its own, and 692 of them sit outside any `#[cfg(test)]` region here — the
+# whole of `cluster/tests.rs`, and the test blocks in `release.rs`,
+# `generate/auth.rs`, `new.rs` and the two macro crates. Masking only the cfg
+# regions left every one of those reading as production code.
+#
+# `#[cfg(test)]` cannot match this: the name must be `test` itself, optionally
+# behind a path (`tokio::test`) and optionally taking arguments
+# (`tokio::test(flavor = "multi_thread")`).
+TEST_ATTR = re.compile(r'#\[(?:[a-z_]+::)*(?:sim_)?test(?:\([^\]]*\))?\]')
+
 
 def _split_top(s):
     """Split on commas that are not inside parentheses."""
@@ -864,10 +882,19 @@ def _cfg_truth(pred):
     return True, True
 
 
-def _balanced(s, i):
+# How far an argument list may run before this stops trying to find its end. A
+# parenthesis inside a string literal — `env::var("AUTUMN_X(")` — is counted
+# like any other here, because the accessor itself may live inside a string:
+# `generate/admin.rs` emits `std::env::var(\"AUTUMN_TEST_ADMIN_SESSION\")` into
+# generated code, and that is a real read by the code it writes. The limit
+# bounds what a miscount can swallow.
+ARG_SPAN_LIMIT = 500
+
+
+def _balanced(s, i, limit=None):
     """The text inside the parenthesis at `s[i]`, and the index after it."""
     depth = 0
-    for j in range(i, len(s)):
+    for j in range(i, min(len(s), i + limit) if limit else len(s)):
         if s[j] == '(':
             depth += 1
         elif s[j] == ')':
@@ -877,16 +904,23 @@ def _balanced(s, i):
     return None, len(s)
 
 
+def _test_items(skel):
+    """Where each test item starts: a test-only `cfg`, or a test function."""
+    for m in CFG_ATTR.finditer(skel):
+        pred, after = _balanced(skel, m.end() - 1)
+        if pred is not None and not _cfg_truth(pred)[0]:
+            yield m.start(), after
+    for m in TEST_ATTR.finditer(skel):
+        yield m.start(), m.end()
+
+
 def untested(body):
-    """Blank every test-only `#[cfg(…)]` item, keeping line numbering intact."""
-    if '#[cfg(' not in body:
+    """Blank every test item, keeping line numbering intact."""
+    if '#[cfg(' not in body and '#[' not in body:
         return body
     skel = _rust_skeleton(body)
     masked = []
-    for m in CFG_ATTR.finditer(skel):
-        pred, after = _balanced(skel, m.end() - 1)
-        if pred is None or _cfg_truth(pred)[0]:
-            continue
+    for start, after in _test_items(skel):
         depth, end = 0, None
         for i in range(after, len(skel)):
             c = skel[i]
@@ -902,7 +936,7 @@ def untested(body):
                 # a brace search alone would run to the end of the file.
                 end = i
                 break
-        masked.append((m.start(), len(skel) if end is None else end))
+        masked.append((start, len(skel) if end is None else end))
     if not masked:
         return body
     lines, out, pos = body.splitlines(), [], 0
@@ -969,13 +1003,21 @@ def source_tokens(root):
                 tokens.update(DECLARED.findall(line))
             tokens.update(v for v in EXPANDED.findall(line) if v not in local)
             tokens.update(v for _, v in BOUND.findall(line))
-            if NEGATED.search(line):
+        # A quoted name counts when it is the accessor's own ARGUMENT, not when
+        # it merely shares a neighbourhood with one. The four-line window this
+        # replaces read `let unrelated = "AUTUMN_LOG__LEVL";` as an environment
+        # name because an unrelated `env::var("RUST_LOG")` sat three lines up.
+        # Taking the balanced argument list also covers the house multi-line
+        # shape — `parse_env(\n env,\n "AUTUMN_MEDIA__ROOM_NAMESPACE")` — which
+        # is what the window existed for.
+        for m in acc.finditer(body):
+            head = body.rfind('\n', 0, m.start()) + 1
+            tail = body.find('\n', m.start())
+            if NEGATED.search(body[head:tail if tail >= 0 else len(body)]):
                 continue
-            # The accessor may open a line or two above its argument —
-            # `parse_env(\n    env,\n    "AUTUMN_MEDIA__ROOM_NAMESPACE",` is the
-            # house style — so look back a little for it.
-            if acc.search('\n'.join(lines[max(0, n - 3):n + 1])):
-                tokens.update(QUOTED.findall(line))
+            args, _ = _balanced(body, m.end() - 1, ARG_SPAN_LIMIT)
+            if args:
+                tokens.update(QUOTED.findall(args))
     return tokens
 
 
@@ -1087,7 +1129,11 @@ def scan(files, read, leaves, built, tokens):
             # Before the well-formed names, the misspelt namespace — checked
             # first because it is invisible to every pattern that follows.
             for m in NEAR.finditer(line):
-                if not near_miss(m.group(1)):
+                head = m.group(1)
+                # A casing typo of the namespace is zero edits away and still
+                # unreadable by the runtime; anything else must be one edit off.
+                if head == 'AUTUMN' or not (head.upper() == 'AUTUMN'
+                                            or near_miss(head.upper())):
                     continue
                 if at[i] in waived.get(m.group(0), ()):
                     stats['waived'] += 1
@@ -1458,6 +1504,19 @@ def self_test():
     _, dn = scan(['d.md'], lambda _: 'export AUTMN_LOG__LEVEL=debug\n',
                  leaves, built, tokens)
     case('a misspelt namespace is reported', len(dn), 1)
+    # A CASING typo of the namespace is zero edits away and equally unreadable.
+    case('a mixed-case namespace is scanned',
+         [m.group(0) for m in NEAR.finditer('export AUTUMn_LOG__LEVEL=debug')],
+         ['AUTUMn_LOG__LEVEL'])
+    _, dc = scan(['d.md'], lambda _: 'export AUTUMn_LOG__LEVEL=debug\n',
+                 leaves, built, tokens)
+    case('a mixed-case namespace is reported', len(dc), 1)
+    # …while the crate name is prose about a package. What follows the namespace
+    # must be uppercase, which is what keeps `autumn_web` out of this rung.
+    _, dcrate = scan(['d.md'],
+                     lambda _: 'Add `autumn_web` and `autumn-macros` to Cargo.toml.\n',
+                     leaves, built, tokens)
+    case('the crate name is not a config key claim', len(dcrate), 0)
     sn, _ = scan(['d.md'],
                  lambda _: ('export AUTMN_LOG__LEVEL=debug\n'
                             '<!-- config-key-allow: AUTMN_LOG__LEVEL — why -->\n'),
@@ -1717,6 +1776,17 @@ def self_test():
     case('a cfg(test) item with no block ends at its semicolon',
          untested('#[cfg(test)]\nuse uuid::Uuid;\nlet a = 1;'),
          '\n\nlet a = 1;')
+    # A test function needs no `cfg` to be test code, and 692 `#[test]`s here sit
+    # outside any `#[cfg(test)]` region — a whole file of them in `cluster/tests.rs`.
+    case('a bare #[test] function is masked',
+         untested('fn prod() { }\n#[test]\nfn t() {\n  let a = 1;\n}\nfn more() { }'),
+         'fn prod() { }\n\n\n\n\nfn more() { }')
+    case('an async test attribute with arguments is too',
+         untested('#[tokio::test(flavor = "multi_thread")]\nasync fn t() {\n}\nfn p() { }'),
+         '\n\n\nfn p() { }')
+    case('a #[test] inside a string is not',
+         untested('let t = "#[test]\\nfn x() {}";\nfn p() { }'),
+         'let t = "#[test]\\nfn x() {}";\nfn p() { }')
     # Which cfg is test-only is decided by evaluating the predicate. A test-only
     # item is one that can NEVER compile with `test` off.
     testonly = lambda p: not _cfg_truth(p)[0]
@@ -1796,6 +1866,19 @@ def self_test():
          False)
     case('an environment map lookup is',
          bool(ACCESSOR.search('let v = env.get("AUTUMN_LOG__LEVEL");')), True)
+    # A quoted name counts as its accessor's ARGUMENT, not as its neighbour. The
+    # window this replaced took a name off any line within three of a call.
+    def args_of(text):
+        m = ACCESSOR.search(text)
+        return QUOTED.findall(_balanced(text, m.end() - 1, ARG_SPAN_LIMIT)[0])
+    case('a name outside the call is not its argument',
+         args_of('std::env::var(\n  "RUST_LOG",\n);\nlet u = "AUTUMN_LOG__LEVL";'),
+         [])
+    # …while the house multi-line shape, which the window existed for, still
+    # reads through the balanced argument list.
+    case('a multi-line argument list still reads',
+         args_of('parse_env(\n    env,\n    "AUTUMN_MEDIA__ROOM_NAMESPACE",\n)'),
+         ['AUTUMN_MEDIA__ROOM_NAMESPACE'])
     # …while the binding form, which has no accessor anywhere near it, is.
     case('a const-bound name is swept in', 'AUTUMN_CANARY' in swept, True)
     # `NAME=` inside a Rust string is text, not a shell assignment:
