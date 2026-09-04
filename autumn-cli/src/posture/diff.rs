@@ -601,14 +601,18 @@ fn takers(
     if other_keys.iter().any(|(p, _)| p == path) {
         return Vec::new();
     }
+    // Rank the *nodes* first, then dispatch the method at the ones that win.
+    // The router picks the most specific node and answers there — a node
+    // without the method returns 405 rather than yielding to a less specific
+    // one — so filtering by method before ranking dropped the node that answers
+    // and blamed one that never sees the request.
     let candidates: Vec<&RouteKey> = other_keys
         .iter()
-        .filter(|(p, m)| {
-            takes_precedence(path, p) && !answered.is_disjoint(&answered_methods(m, p, other_keys))
-        })
+        .filter(|(p, _)| takes_precedence(path, p))
         .collect();
     undominated(path, &candidates)
         .into_iter()
+        .filter(|(p, m)| !answered.is_disjoint(&answered_methods(m, p, other_keys)))
         .cloned()
         .collect()
 }
@@ -1192,7 +1196,7 @@ fn diff_authorization_policies(
 
 /// Emit the routes that lost CSRF, collapsed into one finding or one each.
 fn report_csrf_loss(
-    lost: BTreeMap<RouteKey, (String, bool)>,
+    lost: BTreeMap<RouteKey, (String, bool, RouteKey)>,
     head_routes: &BTreeMap<RouteKey, RouteEntry>,
     collapse: bool,
     out: &mut Vec<Finding>,
@@ -1200,7 +1204,7 @@ fn report_csrf_loss(
     if collapse {
         let routes: Vec<String> = lost
             .iter()
-            .map(|((_, method), (written_as, _))| format!("{method} {written_as}"))
+            .map(|((_, method), (written_as, ..))| format!("{method} {written_as}"))
             .collect();
         // The fingerprint names the *routes*, not the spellings: renaming a
         // capture changes neither the URL set that lost CSRF nor what a
@@ -1208,13 +1212,13 @@ fn report_csrf_loss(
         // Each route *and what still guards it*, for the same reason the
         // per-route fingerprint carries it.
         let guarded_keys: Vec<String> = lost
-            .keys()
-            .map(|(path, method)| {
+            .iter()
+            .map(|((path, method), (_, _, inheritor))| {
                 escape_list(&[
                     method.clone(),
                     path.clone(),
                     head_routes
-                        .get(&(path.clone(), method.clone()))
+                        .get(inheritor)
                         .map_or_else(String::new, posture_fingerprint),
                 ])
             })
@@ -1239,9 +1243,9 @@ fn report_csrf_loss(
             ),
         });
     } else {
-        for (key, (path, exempt)) in lost {
+        for (key, (path, exempt, inheritor)) in lost {
             let guard = head_routes
-                .get(&key)
+                .get(&inheritor)
                 .map_or_else(String::new, posture_fingerprint);
             let (_, method) = key;
             out.push(Finding {
@@ -1474,12 +1478,16 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
 
     // Keyed rather than pushed, so the two passes below cannot report the same
     // route twice and the order is the key order either way.
-    let mut lost: BTreeMap<RouteKey, (String, bool)> = BTreeMap::new();
+    // Each lost route with the path it was written as, whether an exemption is
+    // why, and the key of the route that answers those URLs now — not always
+    // the one that left: a `WS` row gives way to a `GET` at the same path, and
+    // the guard posture has to come from the route that inherits it.
+    let mut lost: BTreeMap<RouteKey, (String, bool, RouteKey)> = BTreeMap::new();
     let mut gained: Vec<(RouteKey, String)> = Vec::new();
     for (key, (enforced_now, exempt_now, written_as)) in &after {
         match before.get(key).map(|(enforced, ..)| *enforced) {
             Some(true) if !enforced_now => {
-                lost.insert(key.clone(), (written_as.clone(), *exempt_now));
+                lost.insert(key.clone(), (written_as.clone(), *exempt_now, key.clone()));
             }
             Some(false) if *enforced_now => gained.push((key.clone(), written_as.clone())),
             _ => {}
@@ -1498,12 +1506,12 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
         // handler, so replacing an enforced `WS /x` with a `GET /x` that does
         // not enforce is a lost check, however the manifest spells the method.
         let (path, method) = key;
-        let still_reachable = takers((path, method), &routes_before, &routes_after)
-            .iter()
-            .any(|taker| after.get(taker).is_none_or(|(enforced, ..)| !enforced));
-        if still_reachable {
+        let inheritor = takers((path, method), &routes_before, &routes_after)
+            .into_iter()
+            .find(|taker| after.get(taker).is_none_or(|(enforced, ..)| !enforced));
+        if let Some(inheritor) = inheritor {
             lost.entry(key.clone())
-                .or_insert_with(|| (written_as.clone(), false));
+                .or_insert_with(|| (written_as.clone(), false, inheritor));
         }
     }
 
@@ -2603,6 +2611,60 @@ mod tests {
             added_with_csrf(false),
             "a new public POST with CSRF is not the same endpoint without it"
         );
+    }
+
+    /// The router picks the most specific *node* and then dispatches the
+    /// method there — it does not skip a node because that node lacks the
+    /// method. Removing `POST /users/me/42` while `HEAD /users/me/{id}` and a
+    /// public `POST /users/{*rest}` survive is a 405 at the specific node, not
+    /// a fall-through to the catch-all; filtering by method before ranking
+    /// dropped the node that answers and blamed the one that never sees it.
+    #[test]
+    fn a_more_specific_node_returns_405_rather_than_yielding_to_a_catch_all() {
+        let removed = route("/users/me/42", "POST", "gated", &["user"], &[], false);
+        let specific = route("/users/me/{id}", "HEAD", "gated", &["user"], &[], false);
+        let catch_all = route("/users/{*rest}", "POST", "public", &[], &[], false);
+
+        let base = routes_only(&format!("{removed},{specific},{catch_all}"));
+        let head = routes_only(&format!("{specific},{catch_all}"));
+
+        let findings = diff(&base, &head);
+        assert!(
+            widening(&findings).is_empty(),
+            "the specific node answers that URL, with a 405: {findings:#?}"
+        );
+    }
+
+    /// The CSRF loss has to name the route that inherits the URL, not the one
+    /// that left. A `WS`→`GET` replacement is found through `takers`, but the
+    /// guard posture was looked up under the departed `WS` key and came back
+    /// empty — so a later push could weaken the replacement without moving the
+    /// digest.
+    #[test]
+    fn a_transferred_csrf_loss_fingerprints_the_route_that_inherits_it() {
+        let base = manifest(
+            &route("/x", "WS", "gated", &["admin"], &[], false),
+            r#"{"path":"/x","method":"WS","csrf_enforced":true,"exempt":false}"#,
+            "",
+            "",
+        );
+        let replaced_by = |scopes: &[&str]| {
+            diff(
+                &base,
+                &manifest(
+                    &route("/x", "GET", "gated", &["admin"], scopes, false),
+                    "",
+                    "",
+                    "",
+                ),
+            )
+            .into_iter()
+            .find(|f| f.kind == "csrf_enforcement_removed")
+            .expect("the lost CSRF is a widening")
+            .canonical()
+        };
+
+        assert_ne!(replaced_by(&["mfa"]), replaced_by(&[]));
     }
 
     /// A `WS` route and a `GET` route at one path are the same runtime handler,
