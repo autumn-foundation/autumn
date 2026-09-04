@@ -268,7 +268,20 @@ fn report_shadow_exposure(
             path: removed.path.clone(),
             before: removed.posture_label(),
             after: survivor.posture_label(),
-            fingerprint: format!("shadow-exposed:{}", escape_field(&survivor.path)),
+            // The survivor's *posture* is part of what a reviewer acknowledged,
+            // not just its path. When the same pull request removes the guarded
+            // route and adds the one that now covers it, the survivor is absent
+            // from the base — so loosening it later is only a neutral
+            // `route_added_gated`, and a fingerprint naming the path alone left
+            // the digest unmoved and the old acknowledgment standing.
+            fingerprint: format!(
+                "shadow-exposed:{}",
+                escape_list(&[
+                    survivor.method.clone(),
+                    survivor.path.clone(),
+                    posture_fingerprint(survivor),
+                ])
+            ),
             detail: format!(
                 "removing this route does not remove the URL: `{} {}` still matches it and \
                  admits callers this route refused ({} → {})",
@@ -281,6 +294,22 @@ fn report_shadow_exposure(
     }
 }
 
+/// A route's posture, encoded so an acknowledgment binds to exactly it.
+///
+/// Nested `escape_list`s rather than a joined string: role and scope names are
+/// unrestricted string literals, so any separator picked here is one a name can
+/// contain — the same ambiguity the manifest digest already had to close.
+fn posture_fingerprint(entry: &RouteEntry) -> String {
+    let roles: Vec<String> = entry.role_set().into_iter().collect();
+    let scopes: Vec<String> = entry.scope_set().into_iter().collect();
+    escape_list(&[
+        entry.classification.clone(),
+        escape_list(&roles),
+        escape_list(&scopes),
+        entry.policy.to_string(),
+    ])
+}
+
 /// The HTTP methods a declared method actually answers at runtime.
 ///
 /// A route's declared method is not the set of requests it takes: the router
@@ -291,16 +320,18 @@ fn report_shadow_exposure(
 /// those survivors.
 fn effective_methods(method: &str) -> BTreeSet<String> {
     let declared = method.to_ascii_uppercase();
-    let mounted = if declared == "WS" {
+    let mut answered = BTreeSet::new();
+    // Only a *genuine* `GET` is also served for `HEAD`. A websocket upgrade is
+    // not, which the router states in exactly those terms — so the `HEAD` alias
+    // is added before the `WS` fold, never after it.
+    if declared == "GET" {
+        answered.insert("HEAD".to_owned());
+    }
+    answered.insert(if declared == "WS" {
         "GET".to_owned()
     } else {
         declared
-    };
-    let mut answered = BTreeSet::new();
-    if mounted == "GET" {
-        answered.insert("HEAD".to_owned());
-    }
-    answered.insert(mounted);
+    });
     answered
 }
 
@@ -1754,6 +1785,75 @@ mod tests {
             );
             assert_eq!(widening[0].kind, "route_shadow_exposed");
         }
+    }
+
+    /// A websocket upgrade is not served for `HEAD`. The router says so in
+    /// those words — only a genuine `GET` expands, "not the WS→GET alias" — so
+    /// folding `WS` to `GET` and *then* adding `HEAD` invented an overlap and
+    /// blocked a pull request over traffic the survivor never answers.
+    #[test]
+    fn a_websocket_survivor_does_not_answer_head() {
+        let survivor = route("/live/{id}", "WS", "public", &[], &[], false);
+        let guarded = route("/live/me", "HEAD", "gated", &["user"], &[], false);
+        let base = routes_only(&format!("{survivor},{guarded}"));
+        let head = routes_only(&survivor);
+
+        assert!(
+            widening(&diff(&base, &head)).is_empty(),
+            "{:#?}",
+            diff(&base, &head)
+        );
+    }
+
+    /// An acknowledgment of a fall-through has to bind to the posture it was
+    /// given for. When the same pull request removes a guarded route and adds
+    /// the route that now covers it, the new route is absent from the base — so
+    /// loosening it later is only a neutral `route_added_gated`, and with the
+    /// survivor's posture out of the fingerprint the digest never moved and the
+    /// old acknowledgment still stood.
+    #[test]
+    fn a_shadow_acknowledgment_does_not_survive_a_looser_survivor() {
+        let base = routes_only(&route("/users/me", "GET", "gated", &["admin"], &[], false));
+        let shadowed_by = |roles: &[&str]| {
+            let findings = diff(
+                &base,
+                &routes_only(&route("/users/{id}", "GET", "gated", roles, &[], false)),
+            );
+            let shadow = findings
+                .into_iter()
+                .find(|f| f.kind == "route_shadow_exposed")
+                .expect("the fall-through is a widening");
+            shadow.canonical()
+        };
+
+        assert_ne!(
+            shadowed_by(&["editor"]),
+            shadowed_by(&["guest"]),
+            "acknowledging a fall-through to `editor` must not authorize one to `guest`"
+        );
+    }
+
+    /// The other direction: while the survivor itself is untouched, the digest
+    /// must not move. An acknowledgment that a later, unrelated push
+    /// invalidates is an escape hatch nobody can use.
+    #[test]
+    fn a_shadow_fingerprint_survives_an_unrelated_push() {
+        let base = routes_only(&route("/users/me", "GET", "gated", &["admin"], &[], false));
+        let survivor = route("/users/{id}", "GET", "gated", &["editor"], &[], false);
+        let elsewhere = route("/reports", "GET", "gated", &["admin"], &[], false);
+
+        let shadow = |routes: &str| {
+            diff(&base, &routes_only(routes))
+                .into_iter()
+                .find(|f| f.kind == "route_shadow_exposed")
+                .expect("the fall-through is a widening")
+                .canonical()
+        };
+
+        assert_eq!(
+            shadow(&survivor),
+            shadow(&format!("{survivor},{elsewhere}"))
+        );
     }
 
     /// And a method the survivor genuinely does not answer is not exposure.
