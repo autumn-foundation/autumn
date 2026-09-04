@@ -598,12 +598,20 @@ def _rust_skeleton(body):
                    for c, k in zip(body, _rust_classes(body)))
 
 
-def _hash_uncommented(body):
-    """Drop `#` comments in shell, TOML and YAML — but only where one starts.
+# Where a `#` needs whitespace in front of it to open a comment. In the shell
+# family it does — `${VAR#prefix}` and `$#` are parameter expansion, not
+# comments — and in YAML an unquoted `a#b` is a literal scalar. Everywhere else
+# a `#` opens a comment wherever it appears outside a string, which is why
+# `x = 1# std::env::var("AUTUMN_LOG__LEVL")` in a Python file was surviving a
+# rule written for shell and reading as a real accessor.
+HASH_NEEDS_SPACE = ('.sh', '.bash', '.zsh', '.yml', '.yaml', '.env', '.example')
 
-    A `#` opens a comment at the start of a word, so `${VAR#prefix}` and `$#`
-    keep their meaning. Quote state is tracked per line rather than across the
-    file: an unbalanced quote then costs one line, not the rest of the file.
+
+def _hash_uncommented(body, needs_space=False):
+    """Drop `#` comments, respecting the language's rule for where one starts.
+
+    Quote state is tracked per line rather than across the file: an unbalanced
+    quote then costs one line, not the rest of the file.
     """
     out = []
     for l in body.splitlines():
@@ -614,19 +622,27 @@ def _hash_uncommented(body):
                     q = None
             elif c in '"\'':
                 q = c
-            elif c == '#' and (i == 0 or l[i - 1].isspace()):
+            elif c == '#' and (not needs_space or i == 0 or l[i - 1].isspace()):
                 cut = i
                 break
         out.append(l if cut is None else l[:cut])
     return '\n'.join(out)
 
 
-def uncommented(body, leader='//'):
+def hash_needs_space(rel):
+    """Whether this file type needs whitespace before a `#` to open a comment."""
+    p = pathlib.PurePath(rel)
+    if p.suffix == '.tmpl':
+        p = pathlib.PurePath(p.stem)
+    return p.suffix in HASH_NEEDS_SPACE
+
+
+def uncommented(body, leader='//', needs_space=False):
     """Drop comments, keeping string literals and line numbering intact."""
     if leader == '//':
         return _rust_uncommented(body)
     if leader == '#':
-        return _hash_uncommented(body)
+        return _hash_uncommented(body, needs_space)
     return body
 
 
@@ -995,7 +1011,8 @@ def source_tokens(root):
         # commented `env::var`, `export`, `${…}` or `const …_ENV` is a note, and
         # the note is often about a name that is deliberately wrong. Neither is
         # a test, which names a variable to prove the runtime ignores it.
-        body = uncommented(body, comment_leader(rel))
+        body = uncommented(body, comment_leader(rel),
+                          hash_needs_space(rel))
         if rel.endswith('.rs'):
             body = untested(body)
         lines = body.splitlines()
@@ -1329,10 +1346,18 @@ def check_table(rows, leaves, built, tokens):
     one key.
     """
     out = []
-    for column, label in ((1, 'variable'), (2, 'config path')):
+    # Compared CANONICALLY, because two spellings of one mapping are still one
+    # mapping: `…SHARDS__0__NAME | database.shards[0].name` and
+    # `…SHARDS__{i}__NAME | database.shards[i].name` are the same row written
+    # twice, and the raw comparison let the indexed spelling stand in for a
+    # deleted reference entry while the count held at 142.
+    for column, canon, label in ((1, to_path, 'variable'),
+                                 (2, lambda p: re.sub(r'\[\w+\]', '', p),
+                                  'config path')):
         seen = {}
         for row in rows:
-            first = seen.setdefault(row[column], row[0])
+            key = canon(row[column])
+            first = seen.setdefault(key, row[0])
             if first != row[0]:
                 out.append((row[0], row[1], row[2],
                             f'this {label} is already documented on line '
@@ -1794,9 +1819,26 @@ def self_test():
     case('a trailing shell comment is stripped',
          uncommented('export AUTUMN_X=1 # AUTUMN_LOG__LEVL', '#'),
          'export AUTUMN_X=1 ')
+    # Where a `#` opens a comment is per language. In the shell family it needs
+    # whitespace in front — `$#` is parameter expansion — and in YAML an
+    # unquoted `a#b` is a literal scalar. Everywhere else a `#` opens one
+    # wherever it appears outside a string, which is Python's rule and the
+    # default: `x = 1# …` was surviving a rule written for shell.
     case('a parameter expansion is not a comment',
-         uncommented('echo "${AUTUMN_X#prefix}" $#', '#'),
+         uncommented('echo "${AUTUMN_X#prefix}" $#', '#', needs_space=True),
          'echo "${AUTUMN_X#prefix}" $#')
+    case('an inline comment with no space before it is one',
+         uncommented('x = 1# std::env::var("AUTUMN_LOG__LEVL")', '#'),
+         'x = 1')
+    case('…but not in the shell family',
+         uncommented('x=1# not a comment here', '#', needs_space=True),
+         'x=1# not a comment here')
+    case('the boundary follows the file type',
+         (hash_needs_space('x.sh'), hash_needs_space('x.yml'),
+          hash_needs_space('x.py'), hash_needs_space('main.tf.tmpl')),
+         (True, True, False, False))
+    case('a `#` inside a string is not a comment either',
+         uncommented('url = "http://x/#frag"', '#'), 'url = "http://x/#frag"')
     # Test code is not the runtime: a test names a variable to prove the runtime
     # ignores it. `AUTUMN_DEV` is read exactly once in the whole tree, inside a
     # `#[test]` asserting it is unset.
@@ -2027,6 +2069,16 @@ def self_test():
     case('a duplicated config path is too',
          any('already documented' in why
              for _, _, _, why in check_table(dup_path, real_leaves,
+                                             real_built, tokens)), True)
+    # Two spellings of one mapping are still one mapping: an indexed shard row
+    # duplicates the `{i}` row it is written beside.
+    dup_index = [(1, 'AUTUMN_DATABASE__SHARDS__{i}__NAME',
+                  'database.shards[i].name'),
+                 (2, 'AUTUMN_DATABASE__SHARDS__0__NAME',
+                  'database.shards[0].name')]
+    case('an indexed spelling duplicates the placeholder row',
+         any('already documented' in why
+             for _, _, _, why in check_table(dup_index, real_leaves,
                                              real_built, tokens)), True)
     case('distinct rows are not',
          [why for _, _, _, why in
