@@ -84,6 +84,33 @@
 # resolved. Both spellings used to match nothing at all, which made the claim
 # invisible: an unresolved name is reported, an unseen one cannot be.
 #
+# HOW THIS CHECK HAS FAILED BEFORE, so the next change does not repeat it. Every
+# defect found in review has been one of these, and none was caught by the gate
+# being green:
+#
+#   * A rule generalised past the single case that motivated it. An exception
+#     written for one real row became "any prefix"; a map section became "any
+#     suffix". Enumerate the exception; do not widen the rule.
+#   * Normalisation discarding information before validation. Erasing every
+#     `[index]` made `shards[i][i]` indistinguishable from `shards[i]`; letting a
+#     placeholder match `_` made it swallow `0__NOPE`. Validate the shape FIRST,
+#     then canonicalise.
+#   * A name that matches NOTHING, rather than matching wrongly. A casing typo,
+#     a trailing separator, a `{i}` placeholder and an escaped quote each made a
+#     claim invisible — and an unresolved name is reported, while an unseen one
+#     cannot be. When tightening a pattern, check what it stops seeing.
+#   * Proximity used as a proxy for use. "Is there an accessor near this string"
+#     reported 25 correct pages once and would have dropped six real bindings
+#     another time. Prefer a structural signal — the binding form, the naming
+#     convention — and measure it before relying on it.
+#   * A fix applied where the bug was found rather than everywhere the same
+#     question is asked. The placeholder lived in two regexes; the schema-vs-read
+#     question lived in the resolver and the table checker. Grep for the rule.
+#
+# The self-tests assert on each STEP — detect, scan, classify, resolve — because
+# a test that checks only the final verdict cannot tell "handled correctly" from
+# "never seen", and that gap let several of the above survive a round each.
+#
 # WHAT IT DELIBERATELY DOES NOT CHECK:
 #   - TOML config keys in fenced blocks. `[dev] watch_dirs` in the README is an
 #     `autumn.toml` key; `[deploy] release_command` in `deployment.md` is a
