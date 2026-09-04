@@ -1223,7 +1223,11 @@ def _yaml_shells(body):
     file that names no PowerShell anywhere returns an empty set, which is the
     common case and costs one scan.
     """
-    if not any(s in body for s in POWERSHELL):
+    # Lowercased, because this shortcut runs BEFORE `_shell_named` gets to
+    # normalise anything — so `shell: PWSH.EXE` returned no PowerShell lines at
+    # all and the whole block fell back to Bourne. A fast path that answers a
+    # question the slow path answers differently is not a fast path.
+    if not any(s in body.lower() for s in POWERSHELL):
         return set()
     src, stack = body.splitlines(), []
     default, jobs, steps = None, {}, {}
@@ -1515,8 +1519,13 @@ def _yaml_blocks(body, interpolated=False, consumer='actions',
                     # bash running a file of that name, not a script.
                     seq_shell = pathlib.PurePath(bare).name in DOCKER_SHELLS
                 elif seq_shell and seq_dashc is None:
-                    if _command_option(bare):
-                        seq_dashc = True
+                    # …and options end at the first OPERAND here too, exactly
+                    # as they do in the inline form. `[bash, script, -c, …]`
+                    # runs `script`; the later `-c` is one of its arguments.
+                    # Fixed inline last round and not here, which is the same
+                    # one-spelling-at-a-time mistake a fourth time.
+                    seq_dashc = (True if _command_option(bare)
+                                 else False if bare != '--' else False)
                 elif seq_shell and seq_dashc:
                     # Only the argument IMMEDIATELY after `-c` is the command
                     # string; everything after it is `$0`, `$1`, … So the flag
@@ -2753,6 +2762,49 @@ USE_TREE = re.compile(r'\buse\s+([^;]+);')
 USE_AS = re.compile(r'\bas\s+([A-Za-z_]\w*)\s*$')
 
 
+CARGO_NAME = re.compile(r'^\s*name\s*=\s*"([^"]+)"', re.M)
+
+
+def _crates(root):
+    """Directory -> crate name, from each `Cargo.toml`'s package name.
+
+    The directory is NOT the crate: `autumn/` builds `autumn-web`, which is how
+    every other crate spells it in a `use`. Module segments alone are no proof
+    of identity either — every crate here has a `config` under a `src`.
+    """
+    out = subprocess.run(['git', 'ls-files', '-z', 'Cargo.toml', '*/Cargo.toml'],
+                         cwd=root, capture_output=True, text=True).stdout
+    crates = {}
+    for rel in out.split('\0'):
+        if not rel:
+            continue
+        try:
+            text = (root / rel).read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            continue
+        found = CARGO_NAME.search(text.split('[dependencies]')[0])
+        if found:
+            crates[str(pathlib.PurePath(rel).parent)] = (found.group(1)
+                                                         .replace('-', '_'))
+    return crates
+
+
+def _module_of(rel, crates):
+    """`(crate, module segments)` for a Rust file, as a `use` path spells it."""
+    path = pathlib.PurePath(rel)
+    for parent in [str(p) for p in path.parents]:
+        if parent in crates:
+            inner = path.relative_to(parent).parts
+            if inner and inner[0] == 'src':
+                inner = inner[1:]
+            mods = [p for p in inner[:-1]]
+            stem = path.stem
+            if stem not in ('lib', 'main', 'mod'):
+                mods.append(stem)
+            return crates[parent], tuple(mods)
+    return '', ()
+
+
 def _use_items(text):
     """`(local name, full path)` for every item a file imports.
 
@@ -2813,6 +2865,7 @@ def accessor(root, test_files=frozenset()):
                          capture_output=True, text=True).stdout
     index, types, per_file, masked_all = {}, set(), {}, {}
     helpers, declared, imports, modules = {}, {}, {}, {}
+    crates = _crates(root)
     for rel in out.split('\0'):
         # Test code is skipped outright, as the scan that consumes this index
         # already does — a receiver bound only in a test is used only in a
@@ -2844,11 +2897,11 @@ def accessor(root, test_files=frozenset()):
                if not data[m.start()]}
         types.update(own)
         declared[rel] = own | set(helpers.get(rel, ()))
-        # Where each derived name LIVES, so an import can be checked against it.
-        stem = pathlib.PurePath(rel).stem
-        parent = pathlib.PurePath(rel).parent.name
+        # Where each derived name LIVES — crate and module path, not a bare
+        # stem, so an import can be checked against its identity.
+        at = _module_of(rel, crates)
         for name in own | set(helpers.get(rel, ())):
-            modules.setdefault(name, set()).update({stem, parent})
+            modules.setdefault(name, set()).add(at)
         imports[rel] = _use_items(masked)
         names = per_file.setdefault(rel, set())
         names.update(m.group(1) for m in ENV_BOUND.finditer(masked)
@@ -2875,18 +2928,39 @@ def accessor(root, test_files=frozenset()):
     # round ago: two modules may each define a `RootedEnv`, and only one of
     # them is an environment. A file may use a type it declares, or one it
     # imports by name — nothing else.
-    def resolves(path, name):
-        """Whether `path` names the `name` this tree derived, not a same-named
-        item from somewhere else. The declaring files' module stems are what
-        the path must go through."""
-        segments = set(re.findall(r'[A-Za-z_]\w*', path))
-        return bool(segments & modules.get(name, set()))
+    def resolves(rel, path, name):
+        """Whether `path`, written in `rel`, names the `name` this tree
+        derived — rather than a same-named item somewhere else.
+
+        A set of segments was not identity: `OsEnv` lives in
+        `autumn/src/config.rs`, whose segments are `config` and `src`, and
+        every crate in this workspace has both. The crate has to match, and
+        the declaring module has to appear IN ORDER.
+        """
+        segments = [seg for seg in re.split(r'\s*::\s*', path.strip()) if seg]
+        if not segments:
+            return False
+        here = _module_of(rel, crates)[0]
+        for crate, mods in modules.get(name, ()):
+            head, rest = segments[0], segments[1:-1]
+            if head in ('crate', 'self', 'super'):
+                if here != crate:
+                    continue
+            elif head == crate:
+                pass
+            else:
+                continue
+            # The declaring module path, in order, somewhere in what is left.
+            if not mods or any(tuple(rest[i:i + len(mods)]) == mods
+                               for i in range(len(rest) - len(mods) + 1)):
+                return True
+        return False
 
     def visible(rel, names):
         here = {n for n in names if n in declared.get(rel, ())}
         for local, path in imports.get(rel, ()):
             orig = path.rsplit('::', 1)[-1].strip()
-            if orig in names and resolves(path, orig):
+            if orig in names and resolves(rel, path, orig):
                 here.add(local)
         return here
 
@@ -2919,7 +2993,7 @@ def accessor(root, test_files=frozenset()):
     for rel, items in imports.items():
         for local, path in items:
             orig = path.rsplit('::', 1)[-1].strip()
-            if orig in index and resolves(path, orig):
+            if orig in index and resolves(rel, path, orig):
                 index.setdefault(local, index[orig])
     cache = {}
 
@@ -5397,6 +5471,32 @@ def self_test():
              'RUN ["sh","-c","$AUTUMN_SH"]\n'
              'RUN ["/app/x", "$AUTUMN_NONE"]\n')),
          ([2], [0]))
+    # A crate is not its directory and a module stem is not identity: every
+    # crate here has a `config` under a `src`.
+    _cr = _crates(ROOT)
+    case('a Rust file resolves to its crate and module path',
+         (_module_of('autumn/src/config.rs', _cr),
+          _module_of('autumn-cli/src/i18n.rs', _cr),
+          _module_of('autumn/src/lib.rs', _cr)),
+         (('autumn_web', ('config',)), ('autumn_cli', ('i18n',)),
+          ('autumn_web', ())))
+    # Sequence options end at an operand, exactly as the inline ones do.
+    case('a sequence option after an operand is not an option',
+         (ASSIGNED_PREFIX.findall(_yaml_blocks(
+             'services:\n  a:\n    command:\n      - bash\n'
+             '      - safe-script\n      - -c\n      - |\n'
+             '        AUTUMN_OP=1 cmd\n', True, 'compose', True)),
+          ASSIGNED_PREFIX.findall(_yaml_blocks(
+              'services:\n  a:\n    command:\n      - bash\n      - -c\n'
+              '      - |\n        AUTUMN_OK=1 cmd\n', True, 'compose', True))),
+         ([], ['AUTUMN_OK']))
+    # …and the PowerShell shortcut normalises, or it answers differently from
+    # the rule it is a shortcut for.
+    case('an uppercase PowerShell shell still selects PowerShell',
+         sorted(_yaml_shells('on: push\njobs:\n  a:\n    defaults:\n'
+                             '      run:\n        shell: PWSH.EXE\n'
+                             '    steps:\n      - run: echo $AUTUMN_X\n')),
+         [7])
     # Compose may quote either declaration spelling.
     case('a quoted compose declaration is still a declaration',
          COMPOSE_DECLARED.findall('      - AUTUMN_A=1\n      "AUTUMN_B": v\n'
