@@ -1604,6 +1604,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **hot-upgrade example: `live_upgrade` test no longer conflates a mid-flight
+  reset with a refused connection (issue #2462):**
+  `upgrades_in_place_under_load_without_dropping_a_connection_or_the_state`
+  counted every request failure — `ECONNREFUSED` (nothing listening, the
+  actual zero-downtime violation) and `ECONNRESET`/`ECONNABORTED` (a
+  connection torn down mid-flight, which a listener handover can legitimately
+  produce — e.g. macOS's `SO_REUSEPORT` accept-queue race, where a connection
+  already queued on the predecessor's socket is reset rather than migrated
+  when it closes) — into one `connect_errors` counter, then asserted zero on
+  it with a message claiming *"no connection may be refused"*. That failed
+  once, intermittently, on `Test (macos-latest)` with two `ECONNRESET`s, and
+  the message actively misled: it named refusal when the actual cause was a
+  reset. Refused and reset are now classified separately
+  (`is_connection_refused`/`is_mid_flight_reset`); a mid-flight reset gets
+  exactly one retry (`with_reset_retry`) before it counts as a failure, while
+  a refused connection is a hard, zero-tolerance failure on the first
+  attempt — never retried, since there is nothing to wait out. The retry
+  follows a short backoff (20ms) rather than firing immediately, so it lands
+  after the handover settles instead of in the same narrow accept-queue
+  window that reset the first attempt. The failure message and a `println!`
+  summary now say which of the two happened.
+  `with_reset_retry`'s branching (retry-then-succeed, a second reset still
+  fails, a refusal is never retried, an unrelated error kind is never
+  retried) is unit-tested directly against fake attempt closures, independent
+  of the real network/signal machinery the rest of the test drives.
+
 - **🧭 Wayfinder: keyboard bypass-blocks link added to 6 supported example
   apps (a11y `bypass` Serious 7/8 → 0/8; `landmark-one-main` Moderate 1/8 → 0/8):**
   `autumn check --a11y` — the framework's own WCAG audit, run against each
