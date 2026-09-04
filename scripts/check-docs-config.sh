@@ -160,6 +160,10 @@
 #     for a schema: `run:` was executed wherever it appeared in any non-compose
 #     YAML, so a `run` field in a data file, or one under a workflow's `env:`,
 #     was scanned as shell. A name means something in a schema, not everywhere.
+#     And the FILE SUFFIX is the same guess one level up: `.yml` said Bourne,
+#     while `defaults.run.shell: pwsh` says the block is PowerShell, where
+#     `$NAME` is a local and only `$env:NAME` reads the environment. The suffix
+#     does not know what the consumer was told to run.
 #   * A rule believed because it sounds like how the language works, when the
 #     language is right there to ask. "An unfinished pipeline keeps bash
 #     parsing, so it collects the next line's heredoc delimiters first" is a
@@ -970,6 +974,94 @@ def _yaml_runs(key, stack, consumer):
 # (`- AUTUMN_X=v` as a list, `AUTUMN_X: v` as a map), plus the fields that
 # invoke a shell. Nothing else in the file names a variable to a process.
 COMPOSE_ASSIGNS = 'environment'
+
+# A workflow chooses the SHELL its `run:` blocks are written in, and the two
+# grammars share almost nothing: in PowerShell `$NAME` is an ordinary local and
+# only `$env:NAME` reaches the environment, so reading a `pwsh` block with the
+# Bourne rules counts a local as a read AND misses every real one. `.ps1` has
+# been read correctly for several rounds; a `pwsh` block inside a `.yml` was
+# still read as Bourne because the decision was made from the FILE SUFFIX, and
+# the suffix does not know what GitHub Actions was told to run.
+#
+# The choice has three sources, narrowest first: the step's own `shell:`, the
+# job's `defaults.run.shell`, the workflow's. Resolved in a pre-pass because a
+# step may declare its shell AFTER its `run:`, which a single forward walk
+# cannot see.
+POWERSHELL = ('pwsh', 'powershell')
+YAML_VALUE = re.compile(r'^\s*(?:-\s+)?[A-Za-z0-9_.-]+:\s*(\S+)\s*$')
+
+
+def _yaml_shells(body):
+    """Line indices whose `run:` block is written in PowerShell.
+
+    Only the `run` blocks are considered, since nothing else is executed; a
+    file that names no PowerShell anywhere returns an empty set, which is the
+    common case and costs one scan.
+    """
+    if not any(s in body for s in POWERSHELL):
+        return set()
+    src, stack = body.splitlines(), []
+    default, jobs, steps = None, {}, {}
+    job, step = None, None
+    # Pass one: where each shell is declared, and which step each line is in.
+    for index, l in enumerate(src):
+        at = YAML_KEY.match(l)
+        if not at:
+            continue
+        column = len(at.group(1)) + len(at.group(2) or '')
+        while stack and stack[-1][0] >= column:
+            stack.pop()
+        path = [k for _, k in stack]
+        key = at.group(3)
+        if at.group(2) and path[-1:] == ['steps']:
+            step = index
+        if path[:1] == ['jobs'] and len(path) == 2:
+            job = path[1]
+        value = YAML_VALUE.match(l)
+        if key == 'shell' and value:
+            shell = value.group(1).strip('\'"')
+            if path[-2:] == ['defaults', 'run']:
+                if path[:1] == ['jobs']:
+                    jobs[job] = shell
+                else:
+                    default = shell
+            elif 'steps' in path:
+                steps[step] = shell
+        stack.append((column, key))
+    # Pass two: the lines each `run:` block owns, under its effective shell.
+    out, stack, job, step = set(), [], None, None
+    key, indent, block = None, 0, False
+    for index, l in enumerate(src):
+        if key is not None:
+            if l.strip() and (len(l) - len(l.lstrip())) <= indent:
+                key = None
+            elif block:
+                out.add(index)
+                continue
+            else:
+                continue
+        at = YAML_KEY.match(l)
+        if not at:
+            continue
+        column = len(at.group(1)) + len(at.group(2) or '')
+        while stack and stack[-1][0] >= column:
+            stack.pop()
+        path = [k for _, k in stack]
+        if at.group(2) and path[-1:] == ['steps']:
+            step = index
+        if path[:1] == ['jobs'] and len(path) == 2:
+            job = path[1]
+        stack.append((column, at.group(3)))
+        if at.group(3) == 'run' and path[-1:] == ['steps']:
+            shell = steps.get(step, jobs.get(job, default))
+            if shell in POWERSHELL:
+                out.add(index)
+                block = True
+            else:
+                block = False
+            if YAML_BLOCK.match(l):
+                key, indent = 'run', len(at.group(1))
+    return out
 
 # Blanking only the non-executed BLOCK scalars was half the rule. An ordinary
 # scalar is just as inert: `name: "${AUTUMN_LOG__LEVL}"` in a workflow is text
@@ -2708,9 +2800,14 @@ def source_tokens(root):
             body = untested(body)
         yaml_file = effective_suffix(rel) in YAML_SCALARS
         interpolated = yaml_file and _yaml_interpolated(rel)
-        yaml_code = None
+        yaml_code, powershell = None, set()
         if yaml_file:
             consumer = _yaml_consumer(rel, body)
+            # Which `run:` blocks the workflow told Actions to run in
+            # PowerShell — read before the blanking passes, since it needs the
+            # `defaults:` and `shell:` keys that blanking removes.
+            if consumer == 'actions':
+                powershell = _yaml_shells(body)
             # Compose needs its own ASSIGNMENT view — see `COMPOSE_ASSIGNS`.
             # Everywhere else the two views coincide, because a non-compose
             # file keeps only what its consumer executes to begin with.
@@ -2794,7 +2891,10 @@ def source_tokens(root):
             # local `$AUTUMN_X` as an environment read. Measured before
             # narrowing: `.ps1` contributes nothing through those rungs today,
             # and three names through `PS_ENV`.
-            if effective_suffix(rel) in HAS_HERE_STRING:
+            # …and a `run:` block the workflow runs under `pwsh` is PowerShell
+            # wherever it is written. The suffix says `.yml`; what decides is
+            # what Actions was told to run.
+            if effective_suffix(rel) in HAS_HERE_STRING or n in powershell:
                 tokens.update(PS_ENV.findall(line))
             elif shell_shapes(rel):
                 tokens.update(ASSIGNED.findall(code_lines[n]))
@@ -4523,6 +4623,26 @@ def self_test():
           - len(_yaml_blocks(_comp, True, 'compose', True).splitlines())),
          (['AUTUMN_CMD'], ['AUTUMN_ENVLIST', 'AUTUMN_CMD'],
           ['AUTUMN_NOTE', 'AUTUMN_CMD'], 0))
+    # …and which GRAMMAR a `run:` block is in is the workflow's to say, not the
+    # file suffix's. All three declaration sites, including a step whose
+    # `shell:` comes AFTER its `run:` — which is why the resolution is a
+    # pre-pass rather than a forward walk.
+    _ps = ('on: push\njobs:\n  a:\n    defaults:\n      run:\n'
+           '        shell: pwsh\n    steps:\n      - run: |\n'
+           '          echo $env:AUTUMN_X\n')
+    case('a pwsh run block is read as PowerShell',
+         (sorted(_yaml_shells(_ps)),
+          sorted(_yaml_shells('on: push\ndefaults:\n  run:\n    shell: pwsh\n'
+                              'jobs:\n  a:\n    steps:\n'
+                              '      - run: echo $AUTUMN_X\n')),
+          sorted(_yaml_shells('on: push\njobs:\n  a:\n    steps:\n'
+                              '      - run: echo $AUTUMN_X\n'
+                              '        shell: pwsh\n')),
+          sorted(_yaml_shells('on: push\njobs:\n  a:\n    steps:\n'
+                              '      - run: echo $AUTUMN_X\n')),
+          PS_ENV.findall('echo $env:AUTUMN_X'),
+          EXPANDED.findall('echo $env:AUTUMN_X')),
+         ([7, 8], [7], [4], [], ['AUTUMN_X'], []))
     # Both PowerShell spellings reach the environment.
     case('the braced PowerShell environment form is a use',
          (PS_ENV.findall('${env:AUTUMN_X}'), PS_ENV.findall('$env:AUTUMN_X'),
