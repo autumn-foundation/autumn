@@ -1117,22 +1117,14 @@ pub fn step_up(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Attribute ordering
 ///
-/// Place the route method attribute (`#[get]` / `#[post]` / …) *above*
-/// `#[throttle]`, i.e. method attribute outermost:
-///
-/// ```ignore
-/// #[post("/login")]           // method attribute outermost
-/// #[throttle(limit = 5, per = "1m", key = "ip")]
-/// async fn login() -> Json<Session> { /* … */ }
-/// ```
-///
-/// Both orders enforce throttling correctly (including idempotency-replay
-/// accounting). However, only the method-attribute-outermost order lets the
-/// route macro see the handler's real return type for `OpenAPI` response-schema
-/// generation. When `#[throttle]` expands first it rewrites the return type to
-/// `Response` (like the sibling `#[secured]` / `#[step_up]` / `#[authorize]`
-/// guards), so a `Json<T>` response schema would be lost from the generated
-/// `OpenAPI` document.
+/// `#[throttle]` may be written above or below the route method attribute
+/// (`#[get]` / `#[post]` / …) — both orders enforce throttling identically
+/// (including idempotency-replay accounting) and both produce the same
+/// `OpenAPI` response schema. When `#[throttle]` expands first it rewrites
+/// the return type to `Response` (like the sibling `#[secured]` / `#[step_up]`
+/// / `#[authorize]` guards), but the route macro recovers the original
+/// `Json<T>` return type from the guard's generated body, so response-schema
+/// inference does not depend on expansion order (#1677).
 #[proc_macro_attribute]
 pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
     throttle::throttle_macro(attr.into(), item.into()).into()

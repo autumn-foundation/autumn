@@ -79,11 +79,10 @@ impl Plugin for ReferencePlugin {
 
     // surface: Plugin::contract
     fn contract(&self) -> Option<PluginContract> {
-        Some(
-            PluginContract::new(env!("CARGO_PKG_NAME"))
-                .plugin_version(env!("CARGO_PKG_VERSION"))
-                .autumn_web(declared_autumn_web_range()),
-        )
+        Some(autumn_web::plugin_contract::lockstep_contract(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
     }
 
     // surface: Plugin::build

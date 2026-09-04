@@ -6,6 +6,7 @@
 //! affecting sibling routes.
 
 use autumn_web::config::AutumnConfig;
+use autumn_web::reexports::axum::Json;
 use autumn_web::security::{
     KeyStrategy, RateLimitEnvelopeCounted, RateLimitExempt, RateLimitNamedConfig,
     RateLimitPrincipal,
@@ -182,6 +183,18 @@ async fn impl_throttled() -> impl axum::response::IntoResponse {
 #[throttle(limit = 1, per = "1s", key = "ip")]
 async fn response_throttled() -> axum::response::Response {
     axum::response::IntoResponse::into_response("response-throttled-ok")
+}
+
+// A throttled route whose handler extracts a JSON body. Used to prove
+// (issue #1668) that an over-limit request is rejected with 429 WITHOUT ever
+// invoking Axum's `Json` body extractor — the throttle check must run as a
+// `FromRequestParts` gate, before the body is read, not as a statement inside
+// the handler body (which only runs after every extractor, including the body
+// extractor, has already succeeded).
+#[post("/throttled-body")]
+#[throttle(limit = 1, per = "60s", key = "ip")]
+async fn throttled_body(Json(_): Json<serde_json::Value>) -> &'static str {
+    "throttled-body-ok"
 }
 
 // A throttled MUTATING route that also participates in idempotency. Repeat
@@ -1261,4 +1274,51 @@ async fn named_limiter_is_shared_across_two_routes() {
         .send()
         .await
         .assert_status(200);
+}
+
+/// Issue #1668: an over-limit client must be rejected with 429 WITHOUT the
+/// server ever parsing the request body. Proven indirectly: the second
+/// request carries a body that is NOT valid JSON, even though the handler
+/// declares `Json<serde_json::Value>`. If the throttle check ran (as it does
+/// today) *inside* the handler body — i.e. after Axum's `Json` extractor has
+/// already run — the malformed body would fail extraction first and the
+/// client would see a `400`/`422` JSON-parse error instead of the throttle's
+/// `429`. A pre-body throttle gate must reject before the body extractor ever
+/// gets a chance to look at (and reject) the malformed bytes.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn throttled_route_429s_before_parsing_malformed_body() {
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
+
+    let client = TestApp::new()
+        .routes(routes![throttled_body])
+        .config(base_config())
+        .build();
+
+    let ip = "203.0.113.201";
+
+    // First request consumes the single token (limit = 1).
+    client
+        .post("/throttled-body")
+        .header("X-Forwarded-For", ip)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .assert_status(200);
+
+    // Second request: over the limit AND carries a malformed body. The
+    // throttle rejection must win — a body-extraction error would mean the
+    // guard ran too late (after body parsing), which is exactly the ordering
+    // bug this issue tracks.
+    let response = client
+        .post("/throttled-body")
+        .header("X-Forwarded-For", ip)
+        .header("content-type", "application/json")
+        .body("this is not valid json")
+        .send()
+        .await;
+    response.assert_status(429);
 }

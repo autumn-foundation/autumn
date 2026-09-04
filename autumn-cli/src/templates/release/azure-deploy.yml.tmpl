@@ -314,3 +314,26 @@ jobs:
           subject-digest: ${{ steps.image_digest.outputs.value }}
           sbom-path: sbom.cdx.json
 {{sbom_steps_end}}
+
+      # ── Security posture manifest (issue #1624) ─────────────────────────
+      # Sign the posture manifest this release ships — the same bytes the
+      # posture gate diffed and a reviewer acknowledged on the pull request.
+      # Attested as a file rather than baked into the image: the manifest is a
+      # property of the *source revision*, and attesting the committed copy is
+      # what lets a deploy prove the running app's declared security surface is
+      # the one that was reviewed.
+      #
+      # At deploy time, one command proves both halves:
+      #
+      #   autumn routes posture verify --manifest security-posture.json \
+      #     --expect-digest <digest recorded on the PR> --repo <owner>/<repo>
+      #
+      # See docs/guide/posture-gate.md. `continue-on-error` for the same reason
+      # as the attestations above: a Sigstore hiccup is a visible warning, not a
+      # blocked deploy of code that shipped fine.
+      - name: Attest the security posture manifest
+        if: hashFiles('security-posture.json') != ''
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: security-posture.json
