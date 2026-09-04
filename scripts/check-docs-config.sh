@@ -109,6 +109,19 @@
 #     question lived in the resolver and the table checker; "a comment is not
 #     code" was fixed in the template reader while the token sweep still read
 #     `// std::env::var("AUTUMN_LOG__LEVL")` as a read. Grep for the rule.
+#     It recurs one rung deeper than the last fix reached: "Rust block comments
+#     nest" was true in `_rust_classes` and not in the generated-code reader
+#     beside it, and "a `#[cfg(test)] mod x;` makes that file test code" was
+#     true in the token sweep and not in `built_patterns`. Two readers of the
+#     same tree asking the same question need one predicate, not two.
+#   * A construct spelled in a narrower grammar than its language's. A heredoc
+#     delimiter written as `\w+` when Bash takes a word, so `<<'END-CONFIG'` was
+#     rejected and `<<\END-CONFIG` matched the prefix `END` — under- and
+#     over-blanking from the same missing rule. An assignment value written as
+#     `\S*` when a shell word holds `$( … )` and its spaces. A quoting rule
+#     stated for "the shell family" and applied to `.sh` alone, while
+#     `install.ps1` quotes the same way. Ask what the language's own grammar
+#     says the thing is, then match that.
 #   * A rule about the LAYOUT of the text standing in for a rule about its
 #     structure. "The comment starts the line", "the `}` is in column zero",
 #     "the `#[cfg(test)]` is not indented" — each held for the cases in front of
@@ -681,15 +694,27 @@ def _strip_generated_comments(body, cls):
             # A block comment runs to its terminator, ACROSS generated lines.
             # Stopping at the newline left everything after the first line of a
             # multi-line `/* … */` reading as executable generated code.
+            #
+            # And it NESTS, in generated Rust exactly as in ordinary Rust:
+            # `/* a /* b */ std::env::var("AUTUMN_X"); */` closes at the LAST
+            # terminator, so stopping at the first left that accessor reading
+            # as live generated code. Same depth counter `_rust_classes`
+            # already keeps for the enclosing file — the rule belongs to the
+            # language, not to one of its two readers here.
+            depth = 1
             out[i] = out[i + 1] = ' '
             i += 2
             while i < n and cls[i] == 's':
-                if body[i] == '*' and body[i + 1:i + 2] == '/':
+                pair = body[i:i + 2]
+                if pair in ('/*', '*/'):
+                    depth += 1 if pair == '/*' else -1
                     out[i] = ' '
                     if i + 1 < n and cls[i + 1] == 's':
                         out[i + 1] = ' '
                     i += 2
-                    break
+                    if depth == 0:
+                        break
+                    continue
                 if body[i] != '\n':
                     out[i] = ' '
                 i += 1
@@ -737,11 +762,20 @@ PS_BLOCK = re.compile(r'<#.*?#>', re.S)
 HASH_BLOCK = ('.ps1', '.psm1')
 
 # Bash expands nothing inside single quotes, so `'${AUTUMN_LOG__LEVL}'` names no
-# variable — it is a string that happens to contain the syntax. Blanked for the
-# shell family only: YAML single-quotes freely and its `${…}` is still
-# interpolated by whatever reads the file, docker-compose among them.
-SHELL_QUOTED = ('.sh', '.bash', '.zsh')
+# variable — it is a string that happens to contain the syntax. PowerShell has
+# the same rule and the same reason to be here: `'$env:AUTUMN_X'` and
+# `'${AUTUMN_X}'` are literal text in a `.ps1`, and `scripts/install.ps1` is
+# where this project's PowerShell lives. Not applied to YAML, which
+# single-quotes freely and whose `${…}` is still interpolated by whatever reads
+# the file, docker-compose among them.
+SHELL_QUOTED = ('.sh', '.bash', '.zsh', '.ps1', '.psm1')
 SINGLE_QUOTED = re.compile(r"'[^']*'")
+
+# Heredocs are Bourne syntax; PowerShell's here-strings are `@' … '@` and open
+# no `<<`. Kept as its own set so adding a language to one rule does not
+# silently enrol it in the other — the two passes ran off one tuple until this
+# round, and that tuple then had to mean two different things.
+HAS_HEREDOC = ('.sh', '.bash', '.zsh')
 
 
 def _shell_literals(body):
@@ -763,8 +797,14 @@ def _shell_literals(body):
 # Every form that quotes the delimiter suppresses expansion, not just the
 # single-quoted one: `<<"EOF"` and `<<\EOF` do too, and each was letting a
 # fixture body read as commands.
-HEREDOC = re.compile(r'''<<-?\s*(?:'([A-Za-z_]\w*)'|"([A-Za-z_]\w*)"'''
-                     r'''|\\([A-Za-z_]\w*))''')
+#
+# The delimiter is a WORD, not an identifier. `<<'END-CONFIG'` is ordinary
+# Bourne syntax and the `\w`-only pattern rejected it outright, so its body read
+# as commands; `<<\END-CONFIG` was worse than rejected — it matched the prefix
+# `END` and set a terminator no line would ever equal, blanking the rest of the
+# file. Both directions came from spelling a shell word as an identifier.
+HEREDOC = re.compile(r'''<<-?\s*(?:'([^'\n]+)'|"([^"\n]+)"'''
+                     r'''|\\([^\s'"<>|&;()]+))''')
 
 
 def _shell_heredocs(body):
@@ -863,14 +903,20 @@ def built_patterns(root, leaves):
     """
     out = subprocess.run(['git', 'ls-files', '-z', '*.rs'], cwd=root,
                          capture_output=True, text=True).stdout
+    test_files = test_module_files(root)
     pats = {}
     for rel in out.split('\0'):
-        # Same two exclusions as the token sweep, for the same reason and in the
+        # Same exclusions as the token sweep, for the same reason and in the
         # same order: a comment is not code, and a name a test builds is not a
         # name the runtime builds. Applied here as well because splitting a rule
         # across the two readers of the tree is how the last two rounds' defects
-        # got in. Measured: the five templates are unchanged by it.
-        if not rel or TEST_PATH.search(rel):
+        # got in — and the split had survived one rung deeper than that fix
+        # reached. A module is test-only when a `#[cfg(test)] mod x;` says so
+        # and nothing in the FILE does: `autumn/src/cluster/tests.rs` is read as
+        # production here while the token sweep skips it, so a `format!` in it
+        # would bless documentation globally. Measured: the five templates are
+        # unchanged by both exclusions.
+        if not rel or test_code(rel, test_files):
             continue
         try:
             body = (root / rel).read_text(encoding='utf-8', errors='replace')
@@ -927,18 +973,121 @@ QUOTED = re.compile(r'\\?["\'](AUTUMN_[A-Z0-9_]+)\\?["\']')
 # that ARE real (`AUTUMN_LOG__LEVEL`, `AUTUMN_SERVER__HOST`, …) resolve through
 # the source rung instead, which is where their evidence actually lives.
 ASSIGNED = re.compile(r'(?:^|[;&|(\s])export\s+(AUTUMN_[A-Z0-9_]+)=')
-# The separator here is explicitly NOT a newline: `\s` spans line breaks, so
-# applied to a whole file this matched a bare assignment against the first
-# word of the NEXT line and read it as a prefix form.
-# The VALUE is one shell word, quotes included. Treating it as `\S*` made the
-# second word of `AUTUMN_LOG__LEVL="some value"` look like the command that
-# follows a prefix assignment, so a script-local variable read as one handed to
-# a process. The bare-word alternative refuses a leading quote, so the engine
-# cannot backtrack into splitting a quoted value; the empty alternative keeps
-# `AUTUMN_X= cmd`, which really does set an empty value for one command.
-ASSIGNED_PREFIX = re.compile(
-    r'(?:^|[;&|(\s])(AUTUMN_[A-Z0-9_]+)='
-    r'(?:"[^"]*"|\'[^\']*\'|[^\s"\']\S*|)[^\S\n]+\S')
+def _dquote_end(body, i):
+    """Index just past the `"` closing the double quote that opens at `i`."""
+    n, i = len(body), i + 1
+    while i < n:
+        if body[i] == '\\':
+            i += 2
+            continue
+        if body[i] == '"':
+            return i + 1
+        i += 1
+    return n
+
+
+def _group_end(body, i, opener, closer):
+    """Index just past the `closer` matching the `opener` at `i`.
+
+    Quotes inside are consumed whole, so `$(echo ")")` closes where the shell
+    closes it and not at the parenthesis in the string.
+    """
+    n, depth = len(body), 0
+    while i < n:
+        c = body[i]
+        if c == '\\':
+            i += 2
+            continue
+        if c == "'":
+            j = body.find("'", i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        if c == '"':
+            i = _dquote_end(body, i)
+            continue
+        if c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+class _PrefixAssignment:
+    """`NAME=value cmd` — where the VALUE is one shell word that may hold
+    spaces, and only a word after it makes this an assignment reaching a
+    process.
+
+    Spelled as a scanner rather than a regex because a regex can hold quotes
+    but not substitutions. In `AUTUMN_LOG__LEVL=$(printf '%s %s' a b)` the
+    value spans four apparent words and there is no following command at all;
+    a pattern that stopped at the first space read `a b)` as one, and so read
+    a script-local variable as one handed to a process. Command substitutions,
+    backticks, `${…}`, both quote forms and backslash escapes are consumed as
+    part of the word, so the test for a following command asks about the real
+    next word.
+
+    Named `findall` because it stands among regexes at every call site and the
+    callers should not care which it is.
+    """
+
+    # The separator before the name is a shell one; the separator AFTER the
+    # value is explicitly not a newline — `\s` spans line breaks, so applied to
+    # a whole file this matched a bare assignment against the first word of the
+    # NEXT line and read it as a prefix form.
+    _start = re.compile(r'(?:^|[;&|(\s])(AUTUMN_[A-Z0-9_]+)=')
+    # What follows the value without being a command: a list or pipeline
+    # operator, the end of the line, or a comment. `AUTUMN_X=1 ; cmd` sets a
+    # variable for the shell, not for `cmd`.
+    _not_a_command = ';&|)\n#'
+
+    def findall(self, body):
+        out = []
+        for m in self._start.finditer(body):
+            end = self._word_end(body, m.end())
+            gap = end
+            while gap < len(body) and body[gap] in ' \t':
+                gap += 1
+            if (gap > end and gap < len(body)
+                    and body[gap] not in self._not_a_command):
+                out.append(m.group(1))
+        return out
+
+    @staticmethod
+    def _word_end(body, i):
+        """Index just past the one shell word starting at `i` (possibly empty)."""
+        n = len(body)
+        while i < n:
+            c = body[i]
+            if c in ' \t\n' or c in ';&|)':
+                break
+            if c == '\\':
+                i += 2
+                continue
+            if c == "'":
+                j = body.find("'", i + 1)
+                i = n if j < 0 else j + 1
+                continue
+            if c == '"':
+                i = _dquote_end(body, i)
+                continue
+            if c == '`':
+                j = body.find('`', i + 1)
+                i = n if j < 0 else j + 1
+                continue
+            if c == '$' and body[i + 1:i + 2] == '(':
+                i = _group_end(body, i + 1, '(', ')')
+                continue
+            if c == '$' and body[i + 1:i + 2] == '{':
+                i = _group_end(body, i + 1, '{', '}')
+                continue
+            i += 1
+        return i
+
+
+ASSIGNED_PREFIX = _PrefixAssignment()
 
 # A file that assigns a name to itself OWNS it: `check-panic-gate.sh` sets
 # `AUTUMN_MANIFEST="autumn/Cargo.toml"` and later reads `"$AUTUMN_MANIFEST"`,
@@ -1123,8 +1272,18 @@ TEST_PATH = re.compile(r'(^|/)(?:tests|benches)/|_test\.rs$')
 TEST_MOD = re.compile(r'#\[cfg\(([^\]]*)\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;')
 
 
+_TEST_MODULE_FILES = {}
+
+
 def test_module_files(root):
-    """Files a `#[cfg(…test…)] mod x;` declaration makes test-only."""
+    """Files a `#[cfg(…test…)] mod x;` declaration makes test-only.
+
+    Cached: two rungs ask for this now, and answering costs a skeleton pass
+    over every `#[cfg(`-bearing Rust file in the tree.
+    """
+    key = str(root)
+    if key in _TEST_MODULE_FILES:
+        return _TEST_MODULE_FILES[key]
     out = subprocess.run(['git', 'ls-files', '-z', '*.rs'], cwd=root,
                          capture_output=True, text=True).stdout
     files = set()
@@ -1144,7 +1303,20 @@ def test_module_files(root):
                 continue
             files.add(str(parent / f'{name}.rs'))
             files.add(str(parent / name / 'mod.rs'))
+    _TEST_MODULE_FILES[key] = files
     return files
+
+
+def test_code(rel, test_files):
+    """Whether a path's contents are test code — by location or declaration.
+
+    One predicate because two rungs ask the question, and a rule that lives in
+    two places is a rule that gets fixed in one of them. That is exactly what
+    happened: the token sweep learned about `#[cfg(test)] mod x;` modules and
+    `built_patterns` did not, leaving `autumn/src/cluster/tests.rs` able to
+    define a name pattern that blesses documentation everywhere.
+    """
+    return bool(TEST_PATH.search(rel)) or rel in test_files
 
 
 # A test function does not need a `cfg` to be test code: `#[test]` marks one on
@@ -1367,8 +1539,8 @@ def source_tokens(root):
         if not rel or effective_suffix(rel) == '.md' or rel == SELF:
             continue
         # A file under `tests/` or `benches/` is test code whatever it is
-        # written in.
-        if TEST_PATH.search(rel) or rel in test_files:
+        # written in, and so is a module a `#[cfg(test)] mod x;` declares.
+        if test_code(rel, test_files):
             continue
         try:
             body = (root / rel).read_text(encoding='utf-8', errors='replace')
@@ -1386,12 +1558,14 @@ def source_tokens(root):
                           effective_suffix(rel) in HASH_BLOCK)
         if rel.endswith('.rs'):
             body = untested(body)
+        # Heredocs FIRST: blanking single quotes first erases the `'EOF'`
+        # marker, and the heredoc body then reads as commands. The self-test for
+        # each function passed in isolation while the composition was wrong,
+        # which is why the real-tree proof is not optional.
+        if effective_suffix(rel) in HAS_HEREDOC:
+            body = _shell_heredocs(body)
         if effective_suffix(rel) in SHELL_QUOTED:
-            # Heredocs FIRST: blanking single quotes first erases the `'EOF'`
-            # marker, and the heredoc body then reads as commands. The self-test
-            # for each function passed in isolation while the composition was
-            # wrong, which is why the real-tree proof is not optional.
-            body = _shell_literals(_shell_heredocs(body))
+            body = _shell_literals(body)
         lines = body.splitlines()
         # Names this file assigns without exporting them, and without handing
         # them to a command: its own variables.
@@ -2032,6 +2206,59 @@ def self_test():
          ASSIGNED_PREFIX.findall(_shell_literals(_shell_heredocs(
              "cat <<'EOF'\nAUTUMN_LOG__LEVL=x cmd\nEOF\n"))),
          [])
+    # The delimiter is a shell WORD, not an identifier. `<<'END-CONFIG'` was
+    # rejected outright and its body read as commands; `<<\END-CONFIG` matched
+    # the prefix `END` and set a terminator no line equals, blanking the rest of
+    # the file. Both from spelling a word as `\w+`.
+    case('a hyphenated heredoc delimiter is one word',
+         (_shell_heredocs("cat <<'END-CONFIG'\nAUTUMN_LOG__LEVL=x cmd\n"
+                          'END-CONFIG\nkeep\n').splitlines(),
+          _shell_heredocs('cat <<"END-CONFIG"\nx\nEND-CONFIG\nkeep\n'
+                          ).splitlines()[-1],
+          _shell_heredocs('cat <<\\END-CONFIG\nx\nEND-CONFIG\nkeep\n'
+                          ).splitlines()[-1]),
+         (["cat <<'END-CONFIG'", '', 'END-CONFIG', 'keep'], 'keep', 'keep'))
+    # PowerShell suppresses interpolation inside single quotes exactly as Bash
+    # does, and `scripts/install.ps1` is where this project's PowerShell lives.
+    # It gets the literal pass and NOT the heredoc one: its here-strings are
+    # `@' … '@` and open no `<<`.
+    case('a PowerShell single-quoted expansion names no variable',
+         (effective_suffix('scripts/install.ps1') in SHELL_QUOTED,
+          effective_suffix('scripts/install.ps1') in HAS_HEREDOC,
+          EXPANDED.findall(_shell_literals(
+              "Write-Output '${AUTUMN_LOG__LEVL}'"))),
+         (True, False, []))
+    # A value is ONE shell word, and a shell word can hold spaces without being
+    # two. A command substitution is the case a regex cannot reach.
+    case('a substituted value is not a following command',
+         (ASSIGNED_PREFIX.findall("AUTUMN_LOG__LEVL=$(printf '%s %s' a b)"),
+          ASSIGNED_PREFIX.findall('AUTUMN_LOG__LEVL=`echo a b`'),
+          ASSIGNED_PREFIX.findall('AUTUMN_LOG__LEVL=${OTHER:-a b}')),
+         ([], [], []))
+    case('…and a real command after one still is',
+         ASSIGNED_PREFIX.findall('AUTUMN_LOG__LEVEL=$(id -u) cargo run'),
+         ['AUTUMN_LOG__LEVEL'])
+    # What follows the value has to be a command, not a separator.
+    case('a list operator is not a command',
+         (ASSIGNED_PREFIX.findall('AUTUMN_X=1 ; cargo run'),
+          ASSIGNED_PREFIX.findall('AUTUMN_X=1 && cargo run')), ([], []))
+    # Rust block comments NEST, in generated code as much as in ordinary code.
+    case('a nested block comment in generated Rust closes at the last end',
+         QUOTED.findall(_rust_uncommented(
+             'let s = "/* a /* b */ std::env::var(\\"AUTUMN_LOG__LEVL\\"); */";'
+         )), [])
+    case('…and the generated code after one is still read',
+         QUOTED.findall(_rust_uncommented(
+             'let s = "/* a /* b */ */ std::env::var(\\"AUTUMN_LOG__LEVEL\\");";'
+         )), ['AUTUMN_LOG__LEVEL'])
+    # Test code is test code for BOTH readers of the tree. `built_patterns` was
+    # asking only about the path, so a `format!` in a `#[cfg(test)] mod tests;`
+    # module could have blessed documentation globally.
+    case('a cfg-only test module is test code by declaration',
+         (test_code('autumn/src/cluster/tests.rs', test_module_files(ROOT)),
+          test_code('autumn/src/config.rs', test_module_files(ROOT)),
+          test_code('autumn/tests/integration/a11y.rs', set())),
+         (True, False, True))
     case('a fused namespace is scanned',
          [m.group(0) for m in FUSED.finditer('export AUTUMNLOG__LEVEL=debug')
           if fused_namespace(m.group(1))], ['AUTUMNLOG__LEVEL'])
