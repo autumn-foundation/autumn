@@ -2911,6 +2911,36 @@ mod tests {
         );
     }
 
+    /// The pinned CLI is whatever release this app's `autumn-web` tracks, and
+    /// `routes posture` did not exist in every one of them. The gate says which
+    /// release is missing rather than failing with an unknown-subcommand error
+    /// — and it fails rather than skipping, because a gate that waves a pull
+    /// request through when its own tooling is too old is worse than a red one.
+    #[test]
+    fn the_gate_names_the_release_when_the_pinned_cli_is_too_old() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        let verdict: &str = workflow
+            .split("Security posture diff")
+            .last()
+            .expect("the verdict job");
+        assert!(
+            verdict.contains("routes posture --help"),
+            "the verdict job must check the CLI can run this gate: {verdict}"
+        );
+        let probe = verdict
+            .split("routes posture --help")
+            .last()
+            .expect("after the probe");
+        assert!(
+            probe.contains("::error::") && probe.contains("exit 1"),
+            "and fail loudly rather than skipping: {probe}"
+        );
+    }
+
     /// The boundary between harvested comment bodies must not be forgeable. A
     /// reviewer pasting the separator inside a fenced sample would otherwise
     /// reset the parser's state mid-body and make a following marker live —

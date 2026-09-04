@@ -167,6 +167,15 @@ jobs:
           curl -fsSL "https://raw.githubusercontent.com/autumn-foundation/autumn/v{{autumn_version}}/scripts/install.sh" \
             | sh -s -- --version "v{{autumn_version}}"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # `routes posture` arrived after some releases this workflow can be
+          # pinned to. Say which release is missing rather than failing later
+          # with an unknown-subcommand error — and fail, never skip: a gate that
+          # waves a pull request through because its own tooling is too old is
+          # worse than one that is red.
+          if ! "$HOME/.local/bin/autumn" routes posture --help >/dev/null 2>&1; then
+            echo "::error::the pinned autumn CLI (v{{autumn_version}}) has no \`routes posture\` command, so this gate cannot run. Raise this app's autumn-web version and this workflow's pin to the release that introduced it."
+            exit 1
+          fi
 
       # Into the runner's scratch directory, NOT the checkout. Every file this
       # job writes has a fixed name, and the checkout is PR-controlled: a pull

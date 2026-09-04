@@ -105,6 +105,14 @@ another is not decidable from the strings, and a gate that blocks on
 
 ## Turning it on
 
+> **The CLI has to be new enough.** The scaffolded workflow installs the
+> `autumn` release your app's `autumn-web` version tracks, and `routes posture`
+> did not exist in every release. If yours predates it the gate fails on its
+> first run, naming the problem — raise `autumn-web` and the workflow's pin
+> together. It fails rather than skipping on purpose: a gate that waves a pull
+> request through because its own tooling is too old is worse than a red one.
+
+
 **New apps** get it by default: `autumn new` scaffolds
 `.github/workflows/posture-gate.yml` alongside `ci.yml`.
 

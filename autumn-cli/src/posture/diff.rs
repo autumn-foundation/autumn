@@ -87,7 +87,11 @@ impl Finding {
             "{}\t{}\t{}\t{}",
             self.kind,
             escape_field(&self.method),
-            escape_field(&self.path),
+            // Normalized, like the routes and the manifest digest: a capture
+            // rename is not a posture change, so it must not re-block a
+            // widening a reviewer has already approved. The report still shows
+            // the path as the author wrote it.
+            escape_field(&normalize_captures(&self.path)),
             escape_field(&self.fingerprint)
         )
     }
@@ -807,7 +811,10 @@ fn compare_route(before: &RouteEntry, after: &RouteEntry, out: &mut Vec<Finding>
             path: after.path.clone(),
             before: label_before,
             after: label_after,
-            fingerprint: "policy-removed".to_owned(),
+            // What still guards the route is part of what was acknowledged: a
+            // constant identity let the record check go, then the scope that
+            // replaced it, under one marker.
+            fingerprint: format!("policy-removed:{}", posture_fingerprint(after)),
             detail: "record-level policy check removed".to_owned(),
         });
     } else if !before.policy && after.policy {
@@ -2448,6 +2455,49 @@ mod tests {
         let widening = widening(&findings);
         assert_eq!(widening.len(), 1, "{findings:#?}");
         assert_eq!(widening[0].kind, "authorization_binding_removed");
+    }
+
+    /// A policy acknowledgment has the same duty. Removing the record check
+    /// while adding an `mfa` scope is a widening the reviewer weighs against
+    /// what still guards the route; dropping `mfa` later leaves the same
+    /// finding with a constant fingerprint, so the old marker covered a route
+    /// less constrained than the one that was reviewed.
+    #[test]
+    fn a_policy_acknowledgment_binds_to_what_still_guards_the_route() {
+        let base = routes_only(&route("/a", "PUT", "gated", &["user"], &[], true));
+        let guarded_by = |scopes: &[&str]| {
+            diff(
+                &base,
+                &routes_only(&route("/a", "PUT", "gated", &["user"], scopes, false)),
+            )
+            .into_iter()
+            .find(|f| f.kind == "policy_removed")
+            .expect("losing the record check is a widening")
+            .canonical()
+        };
+
+        assert_ne!(guarded_by(&["mfa"]), guarded_by(&[]));
+    }
+
+    /// The acknowledgment digest keys on the same shape everything else does.
+    /// A capture rename is not a posture change, so it must not re-block a
+    /// widening a reviewer has already approved.
+    #[test]
+    fn renaming_a_capture_does_not_invalidate_an_acknowledgment() {
+        let widened = |path: &str| {
+            let base = routes_only(&route(path, "GET", "gated", &["admin"], &[], false));
+            let head = routes_only(&route(
+                path,
+                "GET",
+                "gated",
+                &["admin", "editor"],
+                &[],
+                false,
+            ));
+            only(diff(&base, &head)).canonical()
+        };
+
+        assert_eq!(widened("/users/{id}"), widened("/users/{user_id}"));
     }
 
     /// A scope acknowledgment has to bind to the constraint that replaced the
