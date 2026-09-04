@@ -2911,6 +2911,38 @@ mod tests {
         );
     }
 
+    /// The boundary between harvested comment bodies must not be forgeable. A
+    /// reviewer pasting the separator inside a fenced sample would otherwise
+    /// reset the parser's state mid-body and make a following marker live —
+    /// so the harvest neutralizes any occurrence in a body before writing it,
+    /// which keeps the boundary out of reviewer-controlled text without giving
+    /// up the fence isolation the separator exists for.
+    #[test]
+    fn the_harvest_neutralizes_a_separator_inside_a_comment_body() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        let harvest = workflow
+            .split("- name: Harvest acknowledgments")
+            .nth(1)
+            .expect("the harvest step");
+        let after_decode = harvest
+            .split_once("base64 -d")
+            .expect("bodies are decoded")
+            .1;
+        let neutralized = after_decode
+            .split("acks.txt")
+            .next()
+            .expect("the decode is redirected into the file");
+        assert!(
+            neutralized.contains("autumn:ack-source"),
+            "a decoded body must have the separator neutralized between the \
+             decode and the file: {neutralized}"
+        );
+    }
+
     /// The job that compiles the pull request holds no write permission and
     /// reaches no verdict; the job that decides never runs application code.
     /// A malicious build script therefore cannot replace the binary that later

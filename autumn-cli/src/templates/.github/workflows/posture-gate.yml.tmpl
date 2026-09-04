@@ -293,7 +293,14 @@ jobs:
               *) continue ;;
             esac
             printf '%s\n' '<!-- autumn:ack-source -->' >> "$RUNNER_TEMP/acks.txt"
-            printf '%s\n' "$body64" | base64 -d >> "$RUNNER_TEMP/acks.txt"
+            # Neutralize any separator the body itself contains: it is the one
+            # line the parser trusts, so a reviewer pasting it inside a fenced
+            # sample could otherwise reset the parser mid-body and make the
+            # marker after it live. Rewritten rather than dropped, so a comment
+            # that legitimately quotes it still reads correctly.
+            printf '%s\n' "$body64" | base64 -d \
+              | sed 's|<!-- autumn:ack-source -->|<!-- autumn:ack-source (quoted) -->|g' \
+              >> "$RUNNER_TEMP/acks.txt"
             printf '\n' >> "$RUNNER_TEMP/acks.txt"
           done
         env:

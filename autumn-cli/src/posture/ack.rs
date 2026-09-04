@@ -16,10 +16,15 @@
 //! Everything parsed here came from a pull-request comment, which is to say
 //! from anyone who can type. Two lines of defense: this parser is strict about
 //! *shape*, and the workflow that harvests the comments is strict about *who* —
-//! it passes on only comments whose author association is `OWNER`, `MEMBER` or
-//! `COLLABORATOR`. This module trusts its input to have been filtered already
-//! and says so out loud rather than pretending to an authorization model it has
-//! no identity to enforce.
+//! it passes on only comments from accounts with a real `admin`, `write` or
+//! `maintain` permission on the repository. This module trusts its input to
+//! have been filtered already and says so out loud rather than pretending to an
+//! authorization model it has no identity to enforce.
+//!
+//! The same division applies to [`SOURCE_SEPARATOR`]: it is the one line this
+//! parser takes at face value, so the harvester neutralizes any occurrence
+//! inside a body before writing it. A caller feeding this function unfiltered
+//! text inherits that job.
 
 use super::diff::Finding;
 use super::model::hex_digest;
@@ -256,8 +261,19 @@ fn opens_raw_html(line: &str) -> Option<&'static str> {
 }
 
 /// Whether a line carries the closing tag that ends the block.
+///
+/// The tag has to end where the tag ends: `</prelude>` is not `</pre>`, and a
+/// prefix match closed the block on it, taking the sample's remaining lines
+/// live while GitHub still rendered them as code.
 fn closes_raw_html(line: &str, tag: &str) -> bool {
-    line.to_ascii_lowercase().contains(&format!("</{tag}"))
+    let line = line.to_ascii_lowercase();
+    let close = format!("</{tag}");
+    line.match_indices(&close).any(|(at, _)| {
+        line[at + close.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| next == '>' || next.is_whitespace())
+    })
 }
 
 /// Whether `line` is indented enough to render as a Markdown code block.
@@ -418,6 +434,22 @@ mod tests {
                 parse_acks(&text)
             );
         }
+    }
+
+    /// `\u{3c}/prelude\u{3e}` is not `\u{3c}/pre\u{3e}`. A substring check ended the block on
+    /// it, and the marker after it went live while GitHub still rendered the
+    /// whole thing as a preformatted sample.
+    #[test]
+    fn a_similarly_named_tag_does_not_close_a_raw_html_block() {
+        let text = "<pre>\n</prelude>\n/ack-posture 0123456789abcdef\n</pre>\n";
+        assert!(parse_acks(text).is_empty(), "{:?}", parse_acks(text));
+    }
+
+    /// A closing tag with attributes or spacing still closes it.
+    #[test]
+    fn a_spaced_closing_tag_still_closes_a_raw_html_block() {
+        let text = "<pre>\nsample\n</pre >\n/ack-posture 0123456789abcdef  yes\n";
+        assert_eq!(parse_acks(text).len(), 1, "{:?}", parse_acks(text));
     }
 
     /// The block ends where its closing tag does, and a marker after it counts.
