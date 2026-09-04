@@ -7,8 +7,10 @@ gated behind a public-API sign-off this run can't grant itself (see
 "Ask-before candidate"), but the lockfile-currency check turned out to be
 wrong in its first revision (see "Correction" below) — once run correctly it
 surfaced a real routine batch: 32 packages patch/minor-bumped within their
-existing `Cargo.toml` ranges, rehearsed and applied in this same PR since
-this session is confined to a single branch/PR.
+existing `Cargo.toml` ranges, rehearsed in this same PR since this session is
+confined to a single branch/PR. **31 of those 32 are actually applied** — the
+rehearsal caught a regression in the 32nd (`generic-array`), which is
+excluded and stays exactly where it was before this PR (see "Change" below).
 
 **Correction**: the first revision of this report claimed `cargo update
 --dry-run --workspace` showed the lockfile fully current (0 packages behind).
@@ -18,9 +20,8 @@ restricts `cargo update`'s scope to workspace *member* packages only (per
 that never have a newer version to move to — so it was structurally
 incapable of finding anything and the "0 packages" result was vacuous, not a
 clean bill of health. The unqualified `cargo update --dry-run` actually
-audits every crates.io dependency and reported 32 packages behind. Verified
-directly, and the batch below is that command's real output, applied and
-rehearsed.
+audits every crates.io dependency and reported 32 packages behind — 32
+*candidates*, of which 31 were actually kept (see "Change").
 
 ## 📈 Evidence
 
