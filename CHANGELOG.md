@@ -382,6 +382,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   --workspace` Windows leg could never see, because it never builds a
   scaffolded app. The workaround is documented in the platform-support guide;
   the product-level fix is tracked separately.
+- **Security posture diffs gate pull requests, and the shipped manifest is
+  signed (#1624):** #1604's manifest proves what an app's security surface
+  *is*; a manifest nobody diffs is a report, not a control. `autumn routes
+  posture` closes that: `diff` compares two manifests and classifies every
+  change as widening, neutral or narrowing; `digest` prints the posture digest
+  a release records; `verify` proves at deploy time that a shipped manifest is
+  the posture CI acknowledged **and** was signed by CI (`gh attestation
+  verify`, reusing #1615's keyless pipeline rather than introducing a second
+  signing story).
+
+  Only widening blocks — a new public route, a guard removed, a classification
+  downgraded — and the rules follow the semantics the framework actually
+  implements: roles are OR-ed, so *adding* one widens; scopes are AND-ed, so
+  *removing* one widens. Routes are keyed on their *shape* — capture names
+  erased, capture kinds kept — and handler names and source locations are
+  excluded from both the comparison and the digest, so a refactor produces no
+  finding at all. A change with no posture effect posts nothing.
+
+  Because a route is not a URL, the diff follows the router's own precedence:
+  deleting a gated `/users/me` while a public `/users/{id}` remains is a
+  widening (that URL falls through), and adding a route that takes a stricter
+  route's URLs over is one too. Configured `security.csrf.exempt_paths` are
+  compared as posture in their own right, since the per-route rows cannot show
+  them.
+
+  A widening is unblocked by one comment on the pull request:
+
+  ```
+  /ack-posture 4f8a1c0d9e2b7a35  intentional: public status page for launch week
+  ```
+
+  The digest binds the acknowledgment to that exact set of widenings, so
+  unrelated pushes keep it valid while a *new* widening re-blocks. That comment
+  is also the documented escape hatch for a false positive: there is no flag
+  that disables the gate or hides the diff, so a wrongly blocked pull request
+  is always unblockable by the team alone, in public, with a reason.
+
+  Both digests use an escaped canonical encoding, so a crafted route path
+  cannot make one finding hash like a set of ordinary ones; every dimension is
+  compared from *both* sides, so a fact that disappears from the manifest (for
+  example every POST leaving the CSRF dimension when `security.csrf.safe_methods`
+  grows) is still reported as the loss it is; and the scaffolded workflow
+  resolves each commenter's real repository permission rather than trusting
+  `author_association`, refuses to run on a pull request that edits the gate
+  itself, and fails rather than bootstrapping when a committed baseline
+  disappears from the base branch.
+
+  The scaffolded workflow is two jobs: one compiles the pull request and emits
+  its manifest with no write permission and no verdict, and one that never
+  compiles anything downloads that manifest, diffs it, and decides — so a build
+  script in the diff cannot replace the binary that computes the verdict.
+
+  `autumn new` scaffolds `.github/workflows/posture-gate.yml` by default;
+  existing apps adopt it with `autumn upgrade --apply`. The scaffolded deploy
+  workflows attest `security-posture.json` with
+  `actions/attest-build-provenance`, and autumn's own `examples/hello` runs the
+  gate in the publish gate (`scripts/check-posture-gate.sh`). See
+  `docs/guide/posture-gate.md`.
+
 - **Build-time authority envelope for agent-operable handlers (#1691):** an
   endpoint exposed as an MCP tool is an action an autonomous agent can take
   with no human in the loop, and nothing said what that action was *allowed*

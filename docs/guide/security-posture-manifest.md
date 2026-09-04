@@ -335,3 +335,6 @@ those two guards leave behind.
   `authorization_policies` dimension.
 - [`autumn routes` — Route Inspection CLI](routes-cli.md) — the `audit`
   subcommand that emits this manifest.
+- [The Security Posture Gate](posture-gate.md) — what `autumn routes posture`
+  does with two of these manifests: which differences widen the surface, which
+  only annotate, and how a widening is acknowledged on the pull request.

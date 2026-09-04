@@ -46,6 +46,7 @@ mod platform;
 mod plugin;
 mod plugin_check;
 mod plugin_sandbox;
+mod posture;
 mod process;
 mod release;
 mod replay;
@@ -109,6 +110,98 @@ pub enum RoutesSubcommands {
         /// default behavior.
         #[arg(long)]
         strict: bool,
+    },
+    /// Diff, acknowledge, and verify security posture across commits (#1624).
+    ///
+    /// `routes audit` proves what the security surface *is*; `routes posture`
+    /// answers what a change *did to it*, and whether a human agreed.
+    ///
+    ///   autumn routes posture diff --base base.json --head posture.json
+    ///   autumn routes posture digest --manifest security-posture.json
+    ///   autumn routes posture verify --manifest security-posture.json \
+    ///     --expect-digest <digest> --repo owner/repo
+    #[command(subcommand, verbatim_doc_comment)]
+    Posture(PostureSubcommands),
+}
+
+/// Subcommands for `autumn routes posture` (issue #1624).
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum PostureSubcommands {
+    /// Diff two security posture manifests and gate on surface widening.
+    ///
+    /// Exits 0 when nothing widened (or the widening is acknowledged), 1 when a
+    /// widening is unacknowledged, and 2 on a usage or I/O problem — so CI can
+    /// tell "this PR widens the surface" from "the tool could not run".
+    ///
+    /// A widening blocks until someone comments the marker the report prints:
+    ///
+    ///   /ack-posture <digest>  optional reason
+    ///
+    /// The digest binds the acknowledgment to that exact set of widenings, so
+    /// pushing unrelated commits keeps it valid while a *new* widening
+    /// re-blocks.
+    #[command(verbatim_doc_comment)]
+    Diff {
+        /// The previously accepted manifest (e.g. the base branch's copy).
+        #[arg(long, value_name = "PATH")]
+        base: String,
+        /// The manifest for this commit, as built by `autumn routes audit`.
+        #[arg(long, value_name = "PATH")]
+        head: String,
+        /// Output format: `markdown` (default), `text`, or `json`.
+        #[arg(long, default_value = "markdown", value_name = "FORMAT")]
+        format: String,
+        /// Also write the rendered report to this path.
+        #[arg(long, value_name = "PATH")]
+        output: Option<String>,
+        /// An acknowledgment digest, without the comment ceremony (repeatable).
+        #[arg(long, value_name = "DIGEST")]
+        ack: Vec<String>,
+        /// File of pull-request text to scan for `/ack-posture` markers.
+        ///
+        /// The workflow harvests it from comments whose author is an OWNER,
+        /// MEMBER or COLLABORATOR: this command trusts what it is given and
+        /// enforces no authorization of its own.
+        #[arg(long, value_name = "PATH")]
+        ack_file: Option<String>,
+        /// Treat a missing base manifest as "no baseline yet" (exit 0) instead
+        /// of an error. What a repository enabling the gate wants on its first
+        /// run.
+        #[arg(long)]
+        allow_missing_base: bool,
+    },
+    /// Print a manifest's posture digest — the number a release records.
+    ///
+    /// Computed over the manifest's security-relevant content only, so a
+    /// handler rename or a moved line does not change it.
+    Digest {
+        /// Manifest to digest.
+        #[arg(long, value_name = "PATH")]
+        manifest: String,
+        /// Output format: `text` (default) or `json`.
+        #[arg(long, default_value = "text", value_name = "FORMAT")]
+        format: String,
+    },
+    /// Verify a shipped manifest is the acknowledged one, and genuinely signed.
+    ///
+    /// Two checks: the posture digest matches what CI acknowledged, and
+    /// `gh attestation verify` accepts the file (the same keyless Sigstore
+    /// pipeline the rest of the supply chain uses — see
+    /// docs/guide/supply-chain.md).
+    Verify {
+        /// Manifest to verify.
+        #[arg(long, value_name = "PATH")]
+        manifest: String,
+        /// The digest recorded when the posture was acknowledged.
+        #[arg(long, value_name = "DIGEST")]
+        expect_digest: Option<String>,
+        /// `owner/repo` whose CI minted the attestation.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Skip the signature check. Air-gapped hosts only — it is reported as
+        /// waived, never as passed.
+        #[arg(long)]
+        skip_signature: bool,
     },
 }
 
@@ -4709,6 +4802,42 @@ fn run_command(command: Commands) {
                     json,
                     strict,
                 });
+            }
+            Some(RoutesSubcommands::Posture(command)) => {
+                let code = match &command {
+                    PostureSubcommands::Diff {
+                        base,
+                        head,
+                        format,
+                        output,
+                        ack,
+                        ack_file,
+                        allow_missing_base,
+                    } => posture::run_diff(&posture::DiffOptions {
+                        base,
+                        head,
+                        format,
+                        output: output.as_deref(),
+                        acks: ack,
+                        ack_file: ack_file.as_deref(),
+                        allow_missing_base: *allow_missing_base,
+                    }),
+                    PostureSubcommands::Digest { manifest, format } => {
+                        posture::run_digest(manifest, format)
+                    }
+                    PostureSubcommands::Verify {
+                        manifest,
+                        expect_digest,
+                        repo,
+                        skip_signature,
+                    } => posture::run_verify(&posture::verify::VerifyOptions {
+                        manifest,
+                        expect_digest: expect_digest.as_deref(),
+                        repo: repo.as_deref(),
+                        skip_signature: *skip_signature,
+                    }),
+                };
+                std::process::exit(code);
             }
             None => run_routes_command(
                 package.as_deref(),
