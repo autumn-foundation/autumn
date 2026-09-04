@@ -372,7 +372,13 @@ WAIVER = re.compile(r'<!--\s*config-key-allow:\s*([A-Z][A-Z0-9_]+)\s*(.*?)\s*-->
 # namespace was. What follows must be uppercase, though, and that is what keeps
 # the crate name out of it: `autumn_web` and `autumn-macros` are prose about a
 # package, not a claim about an environment variable.
-NEAR = re.compile(r'\b([A-Za-z][A-Za-z0-9]{3,8})_'
+# The head may be as short as THREE characters, because the inserted separator
+# can land that early: `AUT_UMN_LOG__LEVEL` leaves `AUT`, and a four-character
+# minimum made that one-edit typo match nothing at all — invisible rather than
+# unresolved. What keeps the wider net from reporting anything is `near_miss`,
+# not the length: a head is only judged after the first tail segment is joined
+# back on, and `RUST_LOG` or `AWS_REGION` is nobody's misspelling of `AUTUMN`.
+NEAR = re.compile(r'\b([A-Za-z][A-Za-z0-9]{2,8})_'
                   r'((?:[A-Z0-9]+|\{[a-z_]+\})(?:_+(?:[A-Z0-9]+|\{[a-z_]+\}))*)')
 
 # The missing edit can be the SEPARATOR. `AUTUMNLOG__LEVEL` has no `_` after the
@@ -1978,15 +1984,52 @@ def untested(body):
     return '\n'.join(out)
 
 
+# The formats that actually perform shell-style expansion or declare
+# environment variables as `NAME=value`. An ALLOW-list, because the shapes are
+# grammar: `${AUTUMN_X}` in a JavaScript template literal interpolates a JS
+# variable, in a Rust string it interpolates nothing, and in a `.golden` fixture
+# it is captured output — none of them is evidence that the runtime reads a
+# name. Excluding only Rust left every one of those blessing documentation.
+#
+#   .sh/.bash/.zsh   the shell itself
+#   .env/.example    dotenv, whose whole grammar is `NAME=value`
+#   .yml/.yaml       compose `environment: - NAME=v`, `${NAME}`, and CI `run:`
+#                    blocks, which are shell
+#   Dockerfile*      `ARG`, `ENV`, `${…}` — matched by NAME, because
+#                    `Dockerfile.api.tmpl` has the effective suffix `.api`
+#   .ps1/.psm1       `$env:NAME`, read below
+#   .tf/.tfvars/.hcl HCL interpolates `${…}` in strings
+#
+# Deliberately NOT extended to `.conf`, `.service` or `.properties` on the
+# theory that they might: no such file in this tree names an `AUTUMN_*`
+# variable, and guessing at a format's semantics is what this list replaces. If
+# one appears, it fails CLOSED — a correct page gets reported, which is visible
+# — rather than open.
+SHELL_SHAPED = ('.sh', '.bash', '.zsh', '.env', '.example', '.yml', '.yaml',
+                '.tf', '.tfvars', '.hcl', '.ps1', '.psm1')
+SHELL_SHAPED_NAMED = ('Dockerfile', 'Containerfile', 'Makefile', 'Justfile')
+
+# PowerShell reads and writes the environment as `$env:NAME` — not `$NAME`,
+# which is an ordinary variable. `scripts/install.ps1` does it three times in
+# its parameter block, so an override implemented only in PowerShell could not
+# be documented without a waiver.
+PS_ENV = re.compile(r'\$[Ee][Nn][Vv]:(AUTUMN_[A-Z0-9_]+)')
+
+
 def shell_shapes(rel):
     """Whether the SHELL use-shapes apply to this file at all.
 
-    `NAME=…`, `export NAME=…`, `ARG/ENV NAME` and `${NAME}` are shell grammar.
-    In Rust they are text inside a literal, and Rust interpolates none of it.
-    Rust's evidence is its bindings and its accessor calls, which are read
-    separately and are what actually carried the two names this used to add.
+    `NAME=…`, `export NAME=…`, `ARG/ENV NAME` and `${NAME}` are shell grammar,
+    and a format that does not interpret them is not offering evidence by
+    containing them. Read through `.tmpl` for the same reason
+    `comment_leader` does — `main.rs.tmpl` is Rust, and the previous
+    `rel.endswith('.rs')` test did not see it.
     """
-    return not rel.endswith('.rs')
+    p = pathlib.PurePath(rel)
+    if p.suffix == '.tmpl':
+        p = pathlib.PurePath(p.stem)
+    return (p.name.split('.')[0] in SHELL_SHAPED_NAMED
+            or p.suffix in SHELL_SHAPED)
 
 
 def source_tokens(root):
@@ -2080,6 +2123,8 @@ def source_tokens(root):
                 tokens.update(DECLARED.findall(code_lines[n]))
                 tokens.update(v for v in EXPANDED.findall(line)
                               if v not in local)
+                if effective_suffix(rel) in HAS_HERE_STRING:
+                    tokens.update(PS_ENV.findall(line))
             tokens.update(v for _, v in BOUND.findall(line))
         # A quoted name counts when it is the accessor's own ARGUMENT, not when
         # it merely shares a neighbourhood with one. The four-line window this
@@ -3476,10 +3521,32 @@ def self_test():
                      comment_leader('a.ps1'), hash_needs_space('a.ps1'),
                      False, True).rstrip(),
          'Write-Output "quote: `""')
-    case('the shell shapes, `${NAME}` included, do not apply to Rust',
-         (shell_shapes('autumn/src/config.rs'),
-          shell_shapes('docker-compose.yml'), shell_shapes('scripts/x.sh')),
-         (False, True, True))
+    # The shell shapes are grammar, so they apply to the formats that interpret
+    # them and to nothing else. An ALLOW-list: excluding only Rust left
+    # `${AUTUMN_X}` in a JS template literal, a `.toml`, a `.golden` fixture —
+    # and, because the old test was `rel.endswith('.rs')`, a Rust `.tmpl` —
+    # all reading as evidence.
+    case('the shell shapes apply only to formats that interpret them',
+         [shell_shapes(f) for f in
+          ('scripts/x.sh', 'docker-compose.yml', '.env.example',
+           'autumn-cli/src/templates/Dockerfile.api.tmpl', 'scripts/install.ps1',
+           'autumn/src/config.rs', 'autumn-cli/src/templates/main.rs.tmpl',
+           'autumn-admin-plugin/src/admin.js', 'autumn/Cargo.toml', 'a.golden')],
+         [True] * 5 + [False] * 5)
+    # PowerShell reads the environment as `$env:NAME`, not `$NAME`.
+    case('a PowerShell environment read is a use',
+         (PS_ENV.findall('if ($env:AUTUMN_VERSION) { $env:AUTUMN_VERSION }'),
+          PS_ENV.findall('$env:AUTUMN_PS_ONLY = "yes"'),
+          PS_ENV.findall('$AUTUMN_NOT_ENV')),
+         (['AUTUMN_VERSION', 'AUTUMN_VERSION'], ['AUTUMN_PS_ONLY'], []))
+    # A separator inserted at the THIRD character leaves a three-character head,
+    # and a four-character minimum made that one-edit typo invisible.
+    case('a namespace split at the third character is scanned',
+         [[m.group(0) for m in NEAR.finditer(w)
+           if near_miss((m.group(1) + '_' + m.group(2).split('_')[0]).upper())]
+          for w in ('AUT_UMN_LOG__LEVEL', 'AUTU_MN_LOG__LEVEL',
+                    'AUTUMN_LOG__LEVEL', 'RUST_LOG', 'AWS_REGION')],
+         [['AUT_UMN_LOG__LEVEL'], ['AUTU_MN_LOG__LEVEL'], [], [], []])
     # SQL is a third comment family, and the 171 tracked migrations were reading
     # a `-- AUTUMN_LOG__LEVL=x cmd` line as a shell assignment.
     case('a SQL comment is not a use',
