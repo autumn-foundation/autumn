@@ -865,6 +865,25 @@ HAS_HEREDOC = ('.sh', '.bash', '.zsh')
 HAS_HERE_STRING = ('.ps1', '.psm1')
 
 
+def _shell_code(body, escape='\\', here=False):
+    """The same body with BOTH quote kinds blanked — executable shell only.
+
+    The two views exist because the rungs mean different things.
+    `"${AUTUMN_X}"` inside double quotes IS an expansion, so `_shell_literals`
+    keeps it; `echo " AUTUMN_LOG__LEVL=x cmd"` inside the same quotes is a
+    string being printed, and reading it as a prefix assignment put the typo
+    into the truth set. An assignment is only an assignment where the shell
+    would run it, so the assignment rungs get this view and the expansion rung
+    keeps the other.
+
+    A substitution inside double quotes is still code — `x="$(FOO=1 cmd)"` runs
+    one — and the scan re-enters it, so those assignments survive.
+    """
+    out = list(body)
+    _blank_literals(body, out, 0, len(body), escape, here, also_double=True)
+    return ''.join(out)
+
+
 def _shell_literals(body, escape='\\', here=False):
     """Blank single-quoted spans, tracking quote state ACROSS lines.
 
@@ -891,7 +910,8 @@ def _shell_literals(body, escape='\\', here=False):
     return ''.join(out)
 
 
-def _blank_literals(body, out, i, n, escape, here=False, dq=False):
+def _blank_literals(body, out, i, n, escape, here=False, dq=False,
+                    also_double=False):
     """Blank the single-quoted spans in `body[i:n]`; return where it stopped.
 
     A double-quoted string is NOT one opaque context: `"$(printf '%s' '…')"`
@@ -915,7 +935,8 @@ def _blank_literals(body, out, i, n, escape, here=False, dq=False):
             continue
         if c == '$' and body[i + 1:i + 2] == '(':
             end = min(_group_end(body, i + 1, '(', ')'), n)
-            _blank_literals(body, out, i + 2, max(end - 1, i + 2), escape, here)
+            _blank_literals(body, out, i + 2, max(end - 1, i + 2), escape,
+                            here, also_double=also_double)
             i = end
             continue
         if c == '`':
@@ -926,12 +947,15 @@ def _blank_literals(body, out, i, n, escape, here=False, dq=False):
             if j < 0 or j >= n:
                 i += 1
                 continue
-            _blank_literals(body, out, i + 1, j, escape, here)
+            _blank_literals(body, out, i + 1, j, escape, here,
+                            also_double=also_double)
             i = j + 1
             continue
         if dq:
             if c == '"':
                 return i + 1
+            if also_double and c != '\n':
+                out[i] = ' '
             i += 1
             continue
         # A PowerShell here-string is held by `@'` and a line beginning `'@`,
@@ -949,7 +973,8 @@ def _blank_literals(body, out, i, n, escape, here=False, dq=False):
             i = end + 3
             continue
         if c == '"':
-            i = _blank_literals(body, out, i + 1, n, escape, here, True)
+            i = _blank_literals(body, out, i + 1, n, escape, here, True,
+                                also_double)
             continue
         if c == "'":
             j = body.find("'", i + 1)
@@ -1223,13 +1248,17 @@ def _sql_uncommented(body):
     return ''.join(out)
 
 
-def _hash_uncommented(body, shell_like=False, carry_quotes=False):
+def _hash_uncommented(body, shell_like=False, carry_quotes=False,
+                      escape='\\', raw_single=None):
     """Drop `#` comments, respecting the language's rule for where one starts.
 
-    `shell_like` governs two rules that go together, which is why it is one
-    flag: a `#` opens a comment only at the start of a WORD, and a backslash
-    does NOT escape inside single quotes. Both hold for the shell family and for
-    YAML; neither holds for Python, TOML or HCL.
+    `shell_like` says a `#` opens a comment only at the start of a WORD, which
+    holds for the shell family and for YAML but not for Python, TOML or HCL.
+    `escape` is the language's escape character — a BACKTICK in PowerShell,
+    where reading a backslash instead ended `"quote: `""` at the wrong quote and
+    left the trailing comment standing as code. `raw_single` says single quotes
+    are literal, so the escape is inert inside them; that travels with the
+    shell family and with PowerShell, and defaults to `shell_like`.
 
     A word starts after whitespace and after a control operator — `true;# …` is
     a comment to bash, and requiring whitespace kept it. `${VAR#prefix}` and
@@ -1254,6 +1283,8 @@ def _hash_uncommented(body, shell_like=False, carry_quotes=False):
     apostrophe inside an unquoted scalar (`name: it's fine`) opens nothing,
     which is what stops one stray quote swallowing every comment below it.
     """
+    if raw_single is None:
+        raw_single = shell_like
     out, carry, qpos = [], None, 0
     for l in body.splitlines():
         q, cut, esc, start = carry, None, False, 0
@@ -1270,7 +1301,7 @@ def _hash_uncommented(body, shell_like=False, carry_quotes=False):
             if esc:
                 esc = False
                 continue
-            if c == '\\' and not (shell_like and q == "'"):
+            if c == escape and not (raw_single and q == "'"):
                 esc = True
                 continue
             if q:
@@ -1308,7 +1339,15 @@ def uncommented(body, leader='//', needs_space=False, also_slash=False,
             body = _ps_uncommented(body)
         if also_slash:
             body = _rust_uncommented(body)
-        return _hash_uncommented(body, needs_space, carry_quotes)
+        # PowerShell's escape character is a BACKTICK, not a backslash:
+        # `"quote: `""` ends where the backtick says it does. Reading a
+        # backslash as the escape ended the string early, made the real
+        # terminator look like a new opener, and left the trailing comment —
+        # and its `getenv("AUTUMN_…")` — standing as code. `also_block` is
+        # already the flag that says this file is PowerShell.
+        return _hash_uncommented(body, needs_space, carry_quotes,
+                                 '`' if also_block else '\\',
+                                 needs_space or also_block)
     return body
 
 
@@ -1998,16 +2037,23 @@ def source_tokens(root):
         # which is why the real-tree proof is not optional.
         if effective_suffix(rel) in HAS_HEREDOC:
             body = _shell_heredocs(body)
+        # TWO views, because the rungs mean different things inside double
+        # quotes: `"${AUTUMN_X}"` is an expansion, while
+        # `echo " AUTUMN_X=v cmd"` is a string being printed. The expansion rung
+        # reads `body`; the assignment rungs read `code`, which blanks both
+        # quote kinds. Outside the shell family they are the same text.
+        code = body
         if effective_suffix(rel) in SHELL_QUOTED:
-            body = _shell_literals(
-                body, QUOTE_ESCAPE.get(effective_suffix(rel), '\\'),
-                effective_suffix(rel) in HAS_HERE_STRING)
-        lines = body.splitlines()
+            esc = QUOTE_ESCAPE.get(effective_suffix(rel), '\\')
+            here = effective_suffix(rel) in HAS_HERE_STRING
+            body, code = (_shell_literals(body, esc, here),
+                          _shell_code(body, esc, here))
+        lines, code_lines = body.splitlines(), code.splitlines()
         # Names this file assigns without exporting them, and without handing
         # them to a command: its own variables.
-        local = (set(ASSIGNED_ANY.findall(body))
-                 - set(ASSIGNED.findall(body))
-                 - set(ASSIGNED_PREFIX.findall(body)))
+        local = (set(ASSIGNED_ANY.findall(code))
+                 - set(ASSIGNED.findall(code))
+                 - set(ASSIGNED_PREFIX.findall(code)))
         for n, line in enumerate(lines):
             # `NAME=` is how a SHELL names a variable; in Rust it is just text
             # inside a string, and the text is often not an environment variable
@@ -2029,9 +2075,9 @@ def source_tokens(root):
             # same generated file, the second by five compose files. The truth
             # set is 430 with this rung and 430 without it.
             if shell_shapes(rel):
-                tokens.update(ASSIGNED.findall(line))
-                tokens.update(ASSIGNED_PREFIX.findall(line))
-                tokens.update(DECLARED.findall(line))
+                tokens.update(ASSIGNED.findall(code_lines[n]))
+                tokens.update(ASSIGNED_PREFIX.findall(code_lines[n]))
+                tokens.update(DECLARED.findall(code_lines[n]))
                 tokens.update(v for v in EXPANDED.findall(line)
                               if v not in local)
             tokens.update(v for _, v in BOUND.findall(line))
@@ -3409,6 +3455,27 @@ def self_test():
     # `${NAME}` is a shell rule, and Rust expands nothing. Measured before
     # removing it: the rung saw exactly two names, both carried by real
     # evidence elsewhere, and the truth set is 430 either way.
+    # Two views, because the rungs mean different things inside double quotes:
+    # `"${AUTUMN_X}"` is an expansion, `echo " AUTUMN_X=v cmd"` is a string being
+    # printed. An assignment is only one where the shell would run it.
+    case('a printed string is not an assignment, but is still an expansion',
+         (ASSIGNED_PREFIX.findall(_shell_code('echo " AUTUMN_LOG__LEVL=x cmd"')),
+          ASSIGNED_PREFIX.findall(_shell_code('AUTUMN_LOG__LEVEL=debug cargo run')),
+          EXPANDED.findall(_shell_literals('echo "${AUTUMN_LOG__LEVEL}"'))),
+         ([], ['AUTUMN_LOG__LEVEL'], ['AUTUMN_LOG__LEVEL']))
+    # …and a substitution inside double quotes is still code, so an assignment
+    # written there survives the code view.
+    case('an assignment inside a substitution survives',
+         ASSIGNED_PREFIX.findall(_shell_code('x="$(AUTUMN_LOG__LEVEL=debug cmd)"')),
+         ['AUTUMN_LOG__LEVEL'])
+    # PowerShell's escape is a BACKTICK. Reading a backslash ended the string at
+    # the wrong quote, made the real terminator look like a new opener, and left
+    # the trailing comment — and its accessor — standing as code.
+    case('a PowerShell backtick escape ends the string where it says',
+         uncommented('Write-Output "quote: `"" # getenv("AUTUMN_LOG__LEVL")\n',
+                     comment_leader('a.ps1'), hash_needs_space('a.ps1'),
+                     False, True).rstrip(),
+         'Write-Output "quote: `""')
     case('the shell shapes, `${NAME}` included, do not apply to Rust',
          (shell_shapes('autumn/src/config.rs'),
           shell_shapes('docker-compose.yml'), shell_shapes('scripts/x.sh')),
