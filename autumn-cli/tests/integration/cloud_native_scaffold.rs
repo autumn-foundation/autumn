@@ -395,9 +395,69 @@ fn ci_workflow_runs_a11y_verify() {
         ci.contains("scripts/install.sh"),
         "ci.yml must install the autumn CLI via the install script"
     );
+}
+
+/// Issue #2495: a workflow that installs "the autumn CLI matching this app's
+/// autumn-web version" is red from the moment a subcommand it calls lands
+/// until the next release cuts — the version pinned in a freshly scaffolded
+/// app's `Cargo.toml` is whatever the CLI that scaffolded it was built as,
+/// and that can (and, at `routes posture`'s introduction, does) predate a
+/// command the workflow itself calls. `ci.yml` and `posture-gate.yml` must
+/// install the latest published release instead of pinning to this app's own
+/// `autumn-web` version, so the gate starts working on its own the moment any
+/// release ships the command it needs — no re-scaffold, no `autumn upgrade
+/// --apply` required.
+#[test]
+fn ci_workflow_installs_latest_cli_not_pinned_to_app_version() {
+    let temp_dir = scaffold("ci-latest-cli-app");
+    let project_dir = temp_dir.path().join("ci-latest-cli-app");
+    let ci = fs::read_to_string(project_dir.join(".github/workflows/ci.yml")).unwrap();
+
     assert!(
-        ci.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
-        "ci.yml must pin the installed CLI to this app's autumn version"
+        !ci.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+        "ci.yml must not pin the installed CLI to this app's autumn version: {ci}"
+    );
+    assert!(
+        !ci.contains("-s -- --version"),
+        "ci.yml's install.sh invocation must not pass --version, so \
+         install.sh's own default (latest) resolves the release to \
+         install: {ci}"
+    );
+}
+
+/// A raw `autumn a11y verify` / `autumn routes audit` invocation against a
+/// CLI that lacks the subcommand fails with a cryptic "unknown subcommand"
+/// error. Mirroring `posture-gate.yml`'s existing `routes posture --help`
+/// probe (#2467), both must be checked for and fail with an actionable
+/// `::error::` message naming the installed version, before either gate
+/// actually runs.
+#[test]
+fn ci_workflow_probes_for_a11y_and_routes_audit_before_running_them() {
+    let temp_dir = scaffold("ci-probe-app");
+    let project_dir = temp_dir.path().join("ci-probe-app");
+    let ci = fs::read_to_string(project_dir.join(".github/workflows/ci.yml")).unwrap();
+
+    assert!(
+        ci.contains("a11y verify --help"),
+        "ci.yml must probe for `a11y verify` before running it: {ci}"
+    );
+    assert!(
+        ci.contains("routes audit --help"),
+        "ci.yml must probe for `routes audit` before running it: {ci}"
+    );
+    assert!(
+        ci.contains("::error::"),
+        "ci.yml's probe must fail with an actionable ::error:: message, not \
+         a bare exit: {ci}"
+    );
+
+    let probe_pos = ci.find("a11y verify --help").expect("a11y probe present");
+    let run_pos = ci
+        .rfind("a11y verify .")
+        .expect("a11y verify invocation present");
+    assert!(
+        probe_pos < run_pos,
+        "the a11y probe must run before `autumn a11y verify` itself: {ci}"
     );
 }
 

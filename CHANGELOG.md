@@ -441,6 +441,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gate in the publish gate (`scripts/check-posture-gate.sh`). See
   `docs/guide/posture-gate.md`.
 
+  The scaffolded `posture-gate.yml` and `ci.yml` install the *latest
+  published* `autumn` CLI, not the version pinned in the app's own
+  `Cargo.toml` (#2495): pinning to the app's own version left every newly
+  scaffolded gate red between a subcommand landing and the next release —
+  and stuck red afterwards until someone re-ran `autumn upgrade --apply`.
+  Tracking latest instead means the gate starts working on its own the
+  moment any release ships the command it needs. `ci.yml`'s `a11y verify`
+  and `routes audit` steps now probe for their subcommand the same way
+  `posture-gate.yml` already did, and fail with an actionable message
+  rather than a raw unknown-subcommand error if it is missing.
+
 - **Build-time authority envelope for agent-operable handlers (#1691):** an
   endpoint exposed as an MCP tool is an action an autonomous agent can take
   with no human in the loop, and nothing said what that action was *allowed*

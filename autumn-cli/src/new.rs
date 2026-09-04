@@ -2911,13 +2911,14 @@ mod tests {
         );
     }
 
-    /// The pinned CLI is whatever release this app's `autumn-web` tracks, and
-    /// `routes posture` did not exist in every one of them. The gate says which
-    /// release is missing rather than failing with an unknown-subcommand error
-    /// — and it fails rather than skipping, because a gate that waves a pull
-    /// request through when its own tooling is too old is worse than a red one.
+    /// `routes posture` did not exist in every release, and the CLI installed
+    /// here is the latest published one (#2495), not the version pinned in
+    /// this app's `Cargo.toml` — so the gate says which command is missing
+    /// rather than failing with an unknown-subcommand error, and it fails
+    /// rather than skipping, because a gate that waves a pull request through
+    /// when its own tooling is too old is worse than a red one.
     #[test]
-    fn the_gate_names_the_release_when_the_pinned_cli_is_too_old() {
+    fn the_gate_names_the_release_when_the_latest_cli_is_too_old() {
         let files = owned(GenerateOptions::default());
         let workflow = files
             .get(".github/workflows/posture-gate.yml")
@@ -2938,6 +2939,34 @@ mod tests {
         assert!(
             probe.contains("::error::") && probe.contains("exit 1"),
             "and fail loudly rather than skipping: {probe}"
+        );
+    }
+
+    /// Issue #2495: a scaffolded workflow that installs "the autumn CLI
+    /// matching this app's autumn-web version" is red from the moment a
+    /// subcommand it calls merges until the next release cuts, and stays red
+    /// afterwards until someone re-runs `autumn upgrade --apply` — because the
+    /// pin is this app's *own* declared version, not "whatever release
+    /// exists". `posture-gate.yml` must install the latest published release
+    /// instead, so the gate starts working on its own the moment any release
+    /// ships the command it needs.
+    #[test]
+    fn the_posture_gate_installs_latest_cli_not_pinned_to_app_version() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        assert!(
+            !workflow.contains("v0.7.0"),
+            "posture-gate.yml must not pin the installed CLI to this app's \
+             autumn version: {workflow}"
+        );
+        assert!(
+            !workflow.contains("-s -- --version"),
+            "posture-gate.yml's install.sh invocation must not pass \
+             --version, so install.sh's own default (latest) resolves the \
+             release to install: {workflow}"
         );
     }
 
