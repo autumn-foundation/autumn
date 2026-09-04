@@ -757,6 +757,15 @@ def _strip_generated_comments(body, cls):
     return ''.join(out)
 
 
+# What makes a string a Rust PROGRAM rather than prose that quotes one: an
+# emitted `.rs` file declares things. Anchored to a statement boundary so
+# `perfect` and `constant` inside prose do not match.
+STRING_OPEN = re.compile(r'r#*"|"')
+RUST_ITEM = re.compile(r'(?:^|[\n;{}])\s*(?:pub\s+)?'
+                       r'(?:fn|use|mod|impl|struct|enum|const|static|let|type'
+                       r'|trait)\s')
+
+
 def _generated_data(body):
     """A mask of the string content that is NOT generated code.
 
@@ -768,14 +777,24 @@ def _generated_data(body):
     where the accessor SITS, not where the name does — the name is always
     inside a literal, because it is the argument.
 
-    And a SINGLE-LINE string is not a program at all. A template is a file, so
-    it has lines; a one-liner is a CSS declaration, a message, a path. `var(`
-    appears in 55 single-line strings in this tree, every one of them
-    `var(--text-muted)` in an inline style, and a one-line
-    `const HELP: &str = r#\"std::env::var(\\\"AUTUMN_X\\\")\"#;` is that same
-    shape with a name in it. Measured: every real generated accessor here sits
-    in a region of at least eight lines, so the boundary is not close. A
-    generator emitting a one-line snippet would fail CLOSED, which is visible.
+    And a string that is not a Rust PROGRAM is not generated code. Line count
+    was the first cut at this and it was a proxy, not evidence: a multi-line
+    help constant that happens to quote one `std::env::var(\"…\")` line passed
+    it. The test now asks whether the string contains Rust ITEMS — `fn`, `use`,
+    `impl`, `let`, `const` and the rest — because an emitted `.rs` file has
+    them and prose quoting a call does not.
+
+    Measured: 30 of the 32 name-carrying regions in this tree match on items,
+    the truth set is 430 with the rule and 430 without it, and the 55 `var(`
+    hits in single-line CSS strings match nothing.
+
+    This is still a property of the string rather than proof that something
+    writes it to disk. Dataflow would be needed for that, and the emission
+    signal that looked promising — does the file call `fs::write` — does not
+    discriminate at all: `dotenv.rs` and `config.rs` do too. The residual is a
+    string that contains Rust items AND an accessor naming an `AUTUMN_*` and is
+    never emitted; a generator emitting an item-free snippet fails CLOSED,
+    which is visible.
     """
     cls = _rust_classes(body)
     data, i, n = bytearray(len(body)), 0, len(body)
@@ -786,10 +805,19 @@ def _generated_data(body):
         start = i
         while i < n and cls[i] == 's':
             i += 1
-        # "Has lines" covers both spellings: a raw template carries real
-        # newlines, and a `format!("fn m() {\\n…")` one carries the escape.
+        # The region includes its own opening delimiter, and a template may
+        # begin with its first item straight after it, so the delimiter is
+        # removed rather than left to break the boundary match.
         region = body[start:i]
-        if '\n' not in region and '\\n' not in region:
+        opener = STRING_OPEN.match(region)
+        content = region[opener.end():] if opener else region
+        # An emitted `.rs` file is BOTH: it spans lines, and it declares
+        # things. Each clause alone lets one shape through — a one-line
+        # `r#"const X: &str = "…";"#` declares but is a fragment, and a
+        # multi-line help constant spans lines but declares nothing. Measured
+        # separately and together: 430 either way, so neither costs anything.
+        if not (('\n' in content or '\\n' in content)
+                and RUST_ITEM.search(content)):
             for k in range(start, i):
                 data[k] = 1
             continue
@@ -2208,6 +2236,17 @@ def source_tokens(root):
         local = (set(ASSIGNED_ANY.findall(code))
                  - set(ASSIGNED.findall(code))
                  - set(ASSIGNED_PREFIX.findall(code)))
+        # An accessor or a binding written inside generated DATA is not
+        # something the generated program does — see `_generated_data`. Built
+        # before the per-line loop because both rungs consult it, and paired
+        # with the offset of each line so a per-line match can be located in
+        # the whole-body mask.
+        nested = (_generated_data(body)
+                  if effective_suffix(rel) == '.rs' else None)
+        offsets, at = [], 0
+        for l in lines:
+            offsets.append(at)
+            at += len(l) + 1
         declaring = False
         for n, line in enumerate(lines):
             # `NAME=` is how a SHELL names a variable; in Rust it is just text
@@ -2247,7 +2286,15 @@ def source_tokens(root):
                               if v not in local)
                 if effective_suffix(rel) in HAS_HERE_STRING:
                     tokens.update(PS_ENV.findall(line))
-            tokens.update(v for _, v in BOUND.findall(line))
+            # The generated-data mask applies to BINDINGS as well as
+            # accessors: `r#"const FAKE_ENV: &str = "AUTUMN_X";"#` inside an
+            # ordinary Rust string is sample text, not a binding. Same rule,
+            # both rungs — applying it to one of the two is this script's most
+            # repeated mistake.
+            for at, v in ((mb.start(), mb.group(2))
+                          for mb in BOUND.finditer(line)):
+                if nested is None or not nested[offsets[n] + at]:
+                    tokens.update([v])
         # A quoted name counts when it is the accessor's own ARGUMENT, not when
         # it merely shares a neighbourhood with one. The four-line window this
         # replaces read `let unrelated = "AUTUMN_LOG__LEVL";` as an environment
@@ -2255,10 +2302,6 @@ def source_tokens(root):
         # Taking the balanced argument list also covers the house multi-line
         # shape — `parse_env(\n env,\n "AUTUMN_MEDIA__ROOM_NAMESPACE")` — which
         # is what the window existed for.
-        # An accessor written inside generated DATA is not a call the generated
-        # program makes — see `_generated_data`.
-        nested = (_generated_data(body)
-                  if effective_suffix(rel) == '.rs' else None)
         for m in acc.finditer(body):
             if nested is not None and nested[m.start()]:
                 continue
@@ -3730,6 +3773,29 @@ def self_test():
          (effective_suffix('autumn-cli/src/templates/build.rs.tmpl'),
           'autumn-cli/src/templates/build.rs.tmpl'.endswith('.rs')),
          ('.rs', False))
+    # Line count was a proxy; the test is whether the string is a Rust
+    # PROGRAM. A multi-line help constant that quotes one accessor line is not
+    # one, and passed the proxy.
+    case('a multi-line string is not automatically generated code',
+         [[m.group(0) for m in ACCESSOR.finditer(_rust_uncommented(s))
+           if not _generated_data(_rust_uncommented(s))[m.start()]]
+          for s in
+          ('const HELP: &str = "Usage:\\n  set it, then\\n'
+           '  std::env::var(\\\\"AUTUMN_X\\\\")\\n  and restart.";',
+           'fn t() -> &\'static str { r#"use std::env;\nfn main() {\n'
+           '    std::env::var("AUTUMN_X");\n}"# }')],
+         [[], ['var(']])
+    # The same mask applies to BINDINGS, not only to accessors — applying a
+    # rule to one of the two rungs that ask it is this script's most repeated
+    # mistake.
+    case('a binding inside Rust string data is not a binding',
+         ([m.group(2) for m in BOUND.finditer(_rust_uncommented(
+             'let t = r#"const FAKE_ENV: &str = "AUTUMN_X";"#;'))
+           if not _generated_data(_rust_uncommented(
+               'let t = r#"const FAKE_ENV: &str = "AUTUMN_X";"#;'))[m.start()]],
+          [m.group(2) for m in BOUND.finditer(_rust_uncommented(
+              'const CANARY_ENV: &str = "AUTUMN_CANARY";'))]),
+         ([], ['AUTUMN_CANARY']))
     # PowerShell reads the environment as `$env:NAME`, not `$NAME`.
     case('a PowerShell environment read is a use',
          (PS_ENV.findall('if ($env:AUTUMN_VERSION) { $env:AUTUMN_VERSION }'),
