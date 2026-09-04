@@ -106,6 +106,10 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
     // decision like any other, and skipping it would take the escape hatch away
     // from anyone who formats their comments.
     let mut raw_html: Option<&'static str> = None;
+    // Inside an HTML tag that has not closed yet. A tag can span lines, and the
+    // lines inside it are attribute data — a marker in a `title=` renders as
+    // part of the attribute and says nothing to a reader.
+    let mut open_tag = TagState::default();
     for line in text.lines() {
         if line.trim() == SOURCE_SEPARATOR {
             // A new comment body starts here, with a clean slate. Checked
@@ -114,6 +118,7 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
             html_comment = false;
             quote_paragraph = false;
             raw_html = None;
+            open_tag = TagState::default();
             continue;
         }
         // A blank line ends the quoted paragraph, so the lazy continuation
@@ -169,6 +174,14 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
             continue;
         }
         let indent = leading_indent(line);
+        // Attribute data if a tag was already open when this line began.
+        let inside_tag = open_tag.open;
+        if fence.is_none() {
+            open_tag = scan_html_tag(line, open_tag);
+        }
+        if inside_tag {
+            continue;
+        }
         let trimmed = line.trim_start();
         match (fence, fence_run(trimmed)) {
             // A fence closes only with the same character, at least as long,
@@ -242,6 +255,51 @@ fn leading_indent(line: &str) -> usize {
         .take_while(|c| *c == ' ' || *c == '\t')
         .map(|c| if c == '\t' { 4 } else { 1 })
         .sum()
+}
+
+/// Whether an HTML tag is still open at the end of `line`.
+///
+/// Only a `<` that starts a tag counts — one followed by a letter or a slash —
+/// so `a < b` is a comparison, not an opening. Quoted attribute values are
+/// tracked, since a `>` inside one does not close the tag.
+fn scan_html_tag(line: &str, state: TagState) -> TagState {
+    let TagState {
+        mut open,
+        mut quote,
+    } = state;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if open {
+            match quote {
+                // A quoted attribute value: only its own delimiter ends it, so
+                // a `>` inside one does not close the tag.
+                Some(q) => {
+                    if c == q {
+                        quote = None;
+                    }
+                }
+                None if c == '"' || c == '\'' => quote = Some(c),
+                None if c == '>' => open = false,
+                None => {}
+            }
+        } else if c == '<'
+            && chars
+                .peek()
+                .is_some_and(|next| next.is_ascii_alphabetic() || *next == '/')
+        {
+            open = true;
+        }
+    }
+    TagState { open, quote }
+}
+
+/// How far through an HTML tag the parser is, carried across lines: a tag can
+/// span them, and so can a quoted attribute value inside one — a `>` in a
+/// quote does not close the tag.
+#[derive(Debug, Clone, Copy, Default)]
+struct TagState {
+    open: bool,
+    quote: Option<char>,
 }
 
 /// The raw HTML blocks whose content renders literally or not at all —
@@ -419,6 +477,29 @@ mod tests {
     fn a_quoted_marker_acknowledges_nothing() {
         assert!(parse_acks("> /ack-posture 0123456789abcdef").is_empty());
         assert!(parse_acks(">> /ack-posture 0123456789abcdef").is_empty());
+    }
+
+    /// An HTML tag can span lines, and the lines inside it are attribute data,
+    /// not visible text — a marker on one renders as part of a `title=` and
+    /// acknowledges nothing to a reader.
+    #[test]
+    fn a_marker_inside_a_multiline_html_tag_acknowledges_nothing() {
+        let text = "<a title=\"note\n/ack-posture 0123456789abcdef\n\">link</a>\n";
+        assert!(parse_acks(text).is_empty(), "{:?}", parse_acks(text));
+    }
+
+    /// Once the tag closes, ordinary text resumes.
+    #[test]
+    fn a_marker_after_a_multiline_html_tag_still_acknowledges() {
+        let text = "<a title=\"note\n\">link</a>\n/ack-posture 0123456789abcdef  yes\n";
+        assert_eq!(parse_acks(text).len(), 1, "{:?}", parse_acks(text));
+    }
+
+    /// A line that merely contains a less-than sign is not an open tag.
+    #[test]
+    fn a_comparison_does_not_open_an_html_tag() {
+        let text = "when a < b, use this:\n/ack-posture 0123456789abcdef  yes\n";
+        assert_eq!(parse_acks(text).len(), 1, "{:?}", parse_acks(text));
     }
 
     /// `\u{3c}pre\u{3e}` renders its content as a preformatted sample, exactly like a

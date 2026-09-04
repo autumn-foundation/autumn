@@ -525,19 +525,26 @@ fn takers(
     subject_keys: &BTreeSet<RouteKey>,
     other_keys: &BTreeSet<RouteKey>,
 ) -> Vec<RouteKey> {
-    let exact = (path.to_owned(), method.to_owned());
-    // The same route: it goes on serving its own URLs, and its own posture is
-    // what they get.
-    if other_keys.contains(&exact) {
-        return vec![exact];
+    let answered = answered_methods(method, path, subject_keys);
+    // Within one path node the request never leaves the node, so whichever
+    // handler *there* answers the method takes it. That covers the route
+    // itself, and it covers an explicit `HEAD` trading places with a `GET`'s
+    // `HEAD` fallback — a transfer inside the node, which a bare "the node
+    // exists" test read as no transfer at all.
+    let same_path: Vec<RouteKey> = other_keys
+        .iter()
+        .filter(|(p, m)| p == path && !answered.is_disjoint(&answered_methods(m, p, other_keys)))
+        .cloned()
+        .collect();
+    if !same_path.is_empty() {
+        return same_path;
     }
     // A path node the other side mounts owns that URL for every method — it
     // answers 405 where it has no handler rather than letting the request fall
-    // through — so nothing passes between the two sides.
+    // through — so nothing passes to another path.
     if other_keys.iter().any(|(p, _)| p == path) {
         return Vec::new();
     }
-    let answered = answered_methods(method, path, subject_keys);
     let candidates: Vec<&RouteKey> = other_keys
         .iter()
         .filter(|(p, m)| {
@@ -2509,6 +2516,39 @@ mod tests {
         };
 
         assert_ne!(swapped_to("read_any"), swapped_to("read_all"));
+    }
+
+    /// The reverse of the guarded-`GET` case, and it happens *inside* one path
+    /// node. A `GET` answers `HEAD` by fallback until an explicit `HEAD` is
+    /// mounted beside it, so adding an editor-only `HEAD /x` beside an
+    /// admin-only `GET /x` hands that method to editors. Stopping at "the node
+    /// already exists" made it a neutral new handler.
+    #[test]
+    fn an_explicit_head_takes_the_fallback_from_a_get_at_the_same_path() {
+        let get = route("/x", "GET", "gated", &["admin"], &[], false);
+        let head_route = route("/x", "HEAD", "gated", &["editor"], &[], false);
+        let base = routes_only(&get);
+        let head = routes_only(&format!("{get},{head_route}"));
+
+        let findings = diff(&base, &head);
+        let widening = widening(&findings);
+        assert_eq!(widening.len(), 1, "{findings:#?}");
+        assert_eq!(widening[0].kind, "route_added_shadowing");
+    }
+
+    /// And the same trade in the other direction: removing the explicit `HEAD`
+    /// hands that method back to the `GET`'s fallback.
+    #[test]
+    fn removing_an_explicit_head_hands_it_to_the_get_at_the_same_path() {
+        let get = route("/x", "GET", "gated", &["editor"], &[], false);
+        let head_route = route("/x", "HEAD", "gated", &["admin"], &[], false);
+        let base = routes_only(&format!("{get},{head_route}"));
+        let head = routes_only(&get);
+
+        let findings = diff(&base, &head);
+        let widening = widening(&findings);
+        assert_eq!(widening.len(), 1, "{findings:#?}");
+        assert_eq!(widening[0].kind, "route_shadow_exposed");
     }
 
     /// A path node the base already mounts owns that URL for every method, so
