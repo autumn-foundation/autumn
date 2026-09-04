@@ -2,10 +2,25 @@
 
 ## 🎯 Class
 
-**Ledger report.** No ledger change this cycle — every check below came back
-clean or already covered by an existing waiver, and the one real dedup
-candidate found is gated behind a public-API sign-off this run can't grant
-itself (see "Ask-before candidate").
+**Ledger report, plus a scheduled batch.** The dedup candidate found is
+gated behind a public-API sign-off this run can't grant itself (see
+"Ask-before candidate"), but the lockfile-currency check turned out to be
+wrong in its first revision (see "Correction" below) — once run correctly it
+surfaced a real routine batch: 32 packages patch/minor-bumped within their
+existing `Cargo.toml` ranges, rehearsed and applied in this same PR since
+this session is confined to a single branch/PR.
+
+**Correction**: the first revision of this report claimed `cargo update
+--dry-run --workspace` showed the lockfile fully current (0 packages behind).
+`chatgpt-codex-connector`'s review on this PR caught that `--workspace`
+restricts `cargo update`'s scope to workspace *member* packages only (per
+`cargo update --help`: "Only update the workspace packages") — the path deps
+that never have a newer version to move to — so it was structurally
+incapable of finding anything and the "0 packages" result was vacuous, not a
+clean bill of health. The unqualified `cargo update --dry-run` actually
+audits every crates.io dependency and reported 32 packages behind. Verified
+directly, and the batch below is that command's real output, applied and
+rehearsed.
 
 ## 📈 Evidence
 
@@ -21,12 +36,27 @@ itself (see "Ask-before candidate").
 - **Licenses / sources**: `cargo deny check licenses sources` on both graphs
   → `licenses ok, sources ok`. No new license class, no unknown registry, no
   git source.
-- **Lockfile currency**: `cargo update --dry-run --workspace` → *"Locking 0
-  packages to latest Rust 1.88.0 compatible versions"*. Every direct pin in
-  `Cargo.toml` is already at the newest version its own semver range allows;
-  the 76 packages `--verbose` reports "behind latest" are all held back by a
-  major-version boundary (a real bump, not a free `cargo update`), so there is
-  no routine patch/minor batch to take this cycle.
+- **Lockfile currency** (corrected — see above): the unqualified `cargo
+  update --dry-run` locks 32 packages to newer semver-compatible versions:
+  patch/minor bumps (`tower-http` 0.7.0→0.7.1, `hyper` 1.11.0→1.11.1, `h2`
+  0.4.18→0.4.19, `lru` 0.18.3→0.18.4, `syn` 3.0.3→3.0.4, `rust_decimal`
+  1.42.1→1.43.0, `aws-lc-rs`/`aws-lc-sys`, `diesel`/`diesel_derives`, `mio`,
+  `toml`, `tinyvec`, `smallvec`, `tokio-rustls`, `which`, `cc`,
+  `find-msvc-tools`, `combine`, `generic-array`, `libredox`,
+  `portable-atomic-util`, `proc-macro-error-attr3`/`proc-macro-error3`,
+  `async-compression`/`compression-codecs`/`compression-core`,
+  `cpufeatures`, `borsh`/`borsh-derive`, `rand`), one same-line downgrade
+  (`crypto-common` 0.1.7→0.1.6, still within its own `^0.1` range — cargo's
+  resolver settling a different requirement elsewhere in the graph), and 11
+  crates dropped entirely as dead weight now that their puller moved past
+  needing them (`ahash`, `bitvec`, `bytecheck`, `bytecheck_derive`, `funty`,
+  `ptr_meta`, `ptr_meta_derive`, `radium`, `rend`, `rkyv`, `rkyv_derive`,
+  `seahash`, `tap`, `wyz` — the old `rkyv`/`bytecheck` serialization stack).
+  A further 46 packages remain behind but only across a major-version
+  boundary (a real bump needing a forcing fact, not a free `cargo update`).
+  This is exactly the "scheduled batch" class from this project's own
+  dependency policy — routine, semver-safe, one PR, one rehearsal — so it's
+  applied below rather than just reported.
 - **Duplicate-version census** (`cargo metadata`, default-feature graph — 28
   workspace members, 857 resolved packages, 829 external): 729 unique
   external crate names, 84 of them resolved at more than one version, 100
@@ -126,22 +156,46 @@ against the graph below and corrected here.
 
 ## 🔧 Change
 
-None. No `Cargo.toml`/`Cargo.lock` diff in this cycle — see Class above.
+**Scheduled batch applied**: unqualified `cargo update` (no manifest changes,
+no version-range edits — every package moved within its own existing
+`Cargo.toml` constraint). `Cargo.lock` diff: 32 packages updated/downgraded,
+14 removed entirely (dead `rkyv`/`bytecheck` v0.7 serialization stack, see
+above), net lockfile shrinks by 14 entries.
 
-## 📊 Measurement (baseline for the next cycle)
+**Rehearsal**: re-ran the advisory/license/source gate against the new
+lockfile first (`./scripts/check-advisories.sh`, `cargo deny check licenses
+sources` on both graphs) — all still `ok`, confirming none of the 32 bumps
+introduced a new advisory or license class. Then ran
+`./scripts/pre-push-check.sh`, this repo's own compile-only mirror of CI's
+`lint` + `test` jobs (CLAUDE.md: "Run it before pushing... `cargo test -p
+<pkg>` never links the autumn-web consolidated `integration_tests` binary,
+so it misses cross-package compile breaks"). Full output and final
+pass/fail recorded in the commit that lands this change.
+
+## 📊 Measurement
+
+| Metric | Before | After |
+|---|---|---|
+| Workspace members | 28 | 28 |
+| Advisories (workspace / sqlite / scaffold graphs) | ok / ok / ok | ok / ok / ok |
+| Licenses / sources (workspace / sqlite graphs) | ok+ok / ok+ok | ok+ok / ok+ok |
+| Lockfile entries behind their own semver range (correct command) | 32 | 0 |
+| Cargo.lock line count | 10111 | see commit |
+| Packages removed entirely (dead transitive weight) | — | 14 |
+
+Duplicate-version census, direct-dependency count, and the reqwest
+ask-before analysis are unaffected by this batch (none of the 32 bumps touch
+`reqwest`, `ryu`, or `serde_urlencoded`) — those numbers from the original
+census stand:
 
 | Metric | Value |
 |---|---|
-| Workspace members | 28 |
 | Resolved packages (incl. workspace) | 857 |
 | External (non-workspace) packages | 829 |
 | Unique external crate names | 729 |
 | Crate names resolved at >1 version | 84 |
 | Extra copies beyond one-per-name | 100 |
 | Direct `[workspace.dependencies]` entries | 52 |
-| Advisories (workspace / sqlite / scaffold graphs) | ok / ok / ok |
-| Licenses / sources (workspace / sqlite graphs) | ok+ok / ok+ok |
-| Lockfile packages behind their own semver range | 0 |
 | Active advisory ignores, all review-by 2026-10-01 | 3 (RUSTSEC-2023-0071, RUSTSEC-2024-0384, RUSTSEC-2026-0253) |
 
 ## 🔬 Reproduce
@@ -155,8 +209,17 @@ None. No `Cargo.toml`/`Cargo.lock` diff in this cycle — see Class above.
 cargo deny check licenses sources
 cargo deny --config deny-sqlite.toml check licenses sources
 
-# Lockfile currency (0 packages = nothing behind within semver range)
-cargo update --dry-run --workspace
+# Lockfile currency — unqualified, NOT --workspace (--workspace only
+# considers the workspace's own path members, which never have a newer
+# version to move to, so it always vacuously reports 0)
+cargo update --dry-run
+
+# Apply the batch, then re-verify the gate against the new lockfile
+cargo update
+./scripts/check-advisories.sh
+cargo deny check licenses sources
+cargo deny --config deny-sqlite.toml check licenses sources
+./scripts/pre-push-check.sh
 
 # Duplicate-version census
 cargo metadata --format-version 1 > /tmp/meta.json
