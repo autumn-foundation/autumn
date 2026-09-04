@@ -348,17 +348,10 @@ fn report_displacement(
     (keys_before, keys_after): (&BTreeSet<RouteKey>, &BTreeSet<RouteKey>),
     out: &mut Vec<Finding>,
 ) {
-    // What the new route takes over is whatever *was* serving those URLs — the
-    // most specific base route overlapping them, not every route it outranks.
-    let candidates: Vec<&RouteKey> = before
-        .keys()
-        .filter(|(p, m)| {
-            takes_precedence(path, p)
-                && methods_transfer((m, p), keys_before, (method, path), keys_after)
-        })
-        .collect();
-    for key in undominated(path, &candidates) {
-        let Some(displaced) = before.get(key) else {
+    // What the new route takes over is whatever *was* serving those URLs, asked
+    // of the base with the same predicate a removal asks of the head.
+    for key in takers((path, method), keys_after, keys_before) {
+        let Some(displaced) = before.get(&key) else {
             continue;
         };
         // What changed for those URLs is the posture they used to demand
@@ -413,21 +406,8 @@ fn report_shadow_exposure(
     (keys_before, keys_after): (&BTreeSet<RouteKey>, &BTreeSet<RouteKey>),
     out: &mut Vec<Finding>,
 ) {
-    // While any method stays mounted at this path, the node answers the request
-    // — with a 405 — instead of letting it fall through to a less specific
-    // route. Nothing is inherited until the whole node goes.
-    if keys_after.iter().any(|(p, _)| p == path) {
-        return;
-    }
-    let candidates: Vec<&RouteKey> = after
-        .keys()
-        .filter(|(p, m)| {
-            takes_precedence(path, p)
-                && methods_transfer((method, path), keys_before, (m, p), keys_after)
-        })
-        .collect();
-    for key in undominated(path, &candidates) {
-        let Some(survivor) = after.get(key) else {
+    for key in takers((path, method), keys_before, keys_after) {
+        let Some(survivor) = after.get(&key) else {
             continue;
         };
         // Only a survivor that admits callers the deleted route refused is a
@@ -532,16 +512,42 @@ fn answered_methods(method: &str, path: &str, routes: &BTreeSet<RouteKey>) -> BT
     answered
 }
 
-/// Whether requests can pass from one route to the other: what the first
-/// answered before against what the second answers after.
-fn methods_transfer(
-    (from_method, from_path): (&str, &str),
-    from_routes: &BTreeSet<RouteKey>,
-    (to_method, to_path): (&str, &str),
-    to_routes: &BTreeSet<RouteKey>,
-) -> bool {
-    !answered_methods(from_method, from_path, from_routes)
-        .is_disjoint(&answered_methods(to_method, to_path, to_routes))
+/// The routes on the other side of the change that answer `subject`'s URLs.
+///
+/// Every "which route does this URL go to" question in this module is this one,
+/// and each site that answered it privately needed the same three corrections
+/// in turn: the path node has to be accounted for, the methods have to actually
+/// transfer, and the candidates have to be ranked per URL. So there is one
+/// answer now, and it is symmetric — a removal asks it of the head, an addition
+/// asks it of the base, and the reasoning is identical in both directions.
+fn takers(
+    (path, method): (&str, &str),
+    subject_keys: &BTreeSet<RouteKey>,
+    other_keys: &BTreeSet<RouteKey>,
+) -> Vec<RouteKey> {
+    let exact = (path.to_owned(), method.to_owned());
+    // The same route: it goes on serving its own URLs, and its own posture is
+    // what they get.
+    if other_keys.contains(&exact) {
+        return vec![exact];
+    }
+    // A path node the other side mounts owns that URL for every method — it
+    // answers 405 where it has no handler rather than letting the request fall
+    // through — so nothing passes between the two sides.
+    if other_keys.iter().any(|(p, _)| p == path) {
+        return Vec::new();
+    }
+    let answered = answered_methods(method, path, subject_keys);
+    let candidates: Vec<&RouteKey> = other_keys
+        .iter()
+        .filter(|(p, m)| {
+            takes_precedence(path, p) && !answered.is_disjoint(&answered_methods(m, p, other_keys))
+        })
+        .collect();
+    undominated(path, &candidates)
+        .into_iter()
+        .cloned()
+        .collect()
 }
 
 /// Every `(normalized path, method)` a manifest mounts.
@@ -1018,19 +1024,10 @@ fn diff_authorization_policies(
         // — but only when the URL went with it. A surviving route whose shape
         // and methods overlap still answers that URL, so the record-level check
         // really did disappear from something reachable.
-        // Every surviving route that can take any of this route's URLs.
-        // Precedence sends different URLs to different ones, so there is no
-        // single "the survivor" to ask.
-        let candidates: Vec<&RouteKey> = routes_after
-            .iter()
-            .filter(|(p, m)| {
-                takes_precedence(path, p)
-                    && methods_transfer((method, path), &routes_before, (m, p), &routes_after)
-            })
-            .collect();
-        // Ranked, so a route another taker outranks cannot vouch for a check it
-        // never gets asked to perform.
-        let takers = undominated(path, &candidates);
+        // Every route that answers this one's URLs after the change — none if
+        // the path node is gone entirely, and none if it survives without this
+        // method, since that is a 405 rather than a fall-through.
+        let takers = takers((path, method), &routes_before, &routes_after);
         if takers.is_empty() {
             continue;
         }
@@ -1202,22 +1199,24 @@ fn checks_on(
     routes: &BTreeSet<RouteKey>,
     from_routes: &BTreeSet<RouteKey>,
 ) -> String {
-    let mut checks: Vec<String> = routes
-        .iter()
-        .filter(|(p, m)| {
-            takes_precedence(path, p)
-                && methods_transfer((method, path), from_routes, (m, p), routes)
-        })
-        .flat_map(|(p, m)| {
-            bindings
+    let mut per_route: Vec<String> = takers((path, method), from_routes, routes)
+        .into_iter()
+        .map(|(p, m)| {
+            // Route identity is kept, not just the union of checks: a losing
+            // route carrying the same names would otherwise mask a change in
+            // the one that actually serves the URL.
+            let mut checks: Vec<String> = bindings
                 .keys()
-                .filter(move |(bp, bm, _, _)| bp == p && bm == m)
+                .filter(|(bp, bm, _, _)| *bp == p && *bm == m)
                 .map(|(_, _, action, resource)| format!("{action} on {resource}"))
+                .collect();
+            checks.sort();
+            checks.dedup();
+            escape_list(&[m, p, escape_list(&checks)])
         })
         .collect();
-    checks.sort();
-    checks.dedup();
-    escape_list(&checks)
+    per_route.sort();
+    escape_list(&per_route)
 }
 
 /// Bindings the URLs of a displaced route lose to a new, more specific one.
@@ -1241,22 +1240,8 @@ fn report_displaced_bindings(
 
     for added_key in keys_after.difference(&keys_before) {
         let (added_path, added_method) = added_key;
-        // Ranked like every other "which route does this URL go to" question:
-        // a base route the prior winner outranks never applied its check here.
-        let candidates: Vec<&RouteKey> = keys_before
-            .iter()
-            .filter(|(p, m)| {
-                takes_precedence(added_path, p)
-                    && methods_transfer(
-                        (m, p),
-                        &keys_before,
-                        (added_method, added_path),
-                        &keys_after,
-                    )
-            })
-            .collect();
-        for displaced_key in undominated(added_path, &candidates) {
-            let (displaced_path, displaced_method) = displaced_key;
+        for displaced_key in takers((added_path, added_method), &keys_after, &keys_before) {
+            let (displaced_path, displaced_method) = &displaced_key;
             for ((path, method, action, resource), written_as) in before {
                 if path != displaced_path || method != displaced_method {
                     continue;
@@ -2448,6 +2433,88 @@ mod tests {
         let widening = widening(&findings);
         assert_eq!(widening.len(), 1, "{findings:#?}");
         assert_eq!(widening[0].kind, "authorization_binding_removed");
+    }
+
+    /// The replacement checks must come from the route that actually serves
+    /// the URL. Collecting them from every overlapping route let a losing
+    /// dynamic route's bindings mask the winner's: with `/records/{id}`
+    /// carrying both `read_any` and `read_all`, the flattened set never moved
+    /// when the exact route swapped one for the other.
+    #[test]
+    fn replacement_checks_come_only_from_the_route_that_serves_the_url() {
+        let me = route("/records/me", "GET", "gated", &["user"], &[], true);
+        let by_id = route("/records/{id}", "GET", "gated", &["user"], &[], true);
+        let binding = |path: &str, action: &str| {
+            format!(r#"{{"path":"{path}","method":"GET","action":"{action}","resource":"Record"}}"#)
+        };
+        let losing = format!(
+            "{},{}",
+            binding("/records/{id}", "read_any"),
+            binding("/records/{id}", "read_all")
+        );
+        let base = manifest(
+            &format!("{me},{by_id}"),
+            "",
+            "",
+            &format!("{},{losing}", binding("/records/me", "read_self")),
+        );
+        let swapped_to = |action: &str| {
+            diff(
+                &base,
+                &manifest(
+                    &format!("{me},{by_id}"),
+                    "",
+                    "",
+                    &format!("{},{losing}", binding("/records/me", action)),
+                ),
+            )
+            .into_iter()
+            .find(|f| f.kind == "authorization_binding_removed" && f.path == "/records/me")
+            .expect("losing `read_self` is a widening")
+            .canonical()
+        };
+
+        assert_ne!(swapped_to("read_any"), swapped_to("read_all"));
+    }
+
+    /// A path node the base already mounts owns that URL for every method, so
+    /// adding another method there displaces nothing — it is an ordinary new
+    /// guarded handler on a node that was already answering.
+    #[test]
+    fn adding_a_method_to_an_existing_path_node_displaces_nothing() {
+        let existing = route("/users/me", "POST", "gated", &["user"], &[], false);
+        let dynamic = route("/users/{id}", "GET", "gated", &["admin"], &[], false);
+        let added = route("/users/me", "GET", "gated", &["editor"], &[], false);
+
+        let base = routes_only(&format!("{existing},{dynamic}"));
+        let head = routes_only(&format!("{existing},{dynamic},{added}"));
+
+        let findings = diff(&base, &head);
+        assert!(
+            widening(&findings).is_empty(),
+            "the node already owned that URL: {findings:#?}"
+        );
+    }
+
+    /// And the binding dimension stops at a surviving node too: removing a
+    /// bound `GET /records/me` while `POST /records/me` stays mounted makes
+    /// that URL a 405, not a fall-through.
+    #[test]
+    fn a_binding_does_not_fall_through_a_surviving_path_node() {
+        let bound = route("/records/me", "GET", "gated", &["user"], &[], true);
+        let same_path = route("/records/me", "POST", "gated", &["user"], &[], true);
+        let dynamic = route("/records/{id}", "GET", "gated", &["user"], &[], true);
+        let binding =
+            r#"{"path":"/records/me","method":"GET","action":"read","resource":"Record"}"#;
+
+        let base = manifest(&format!("{bound},{same_path},{dynamic}"), "", "", binding);
+        let head = manifest(&format!("{same_path},{dynamic}"), "", "", "");
+
+        let findings = diff(&base, &head);
+        assert!(
+            widening(&findings).is_empty(),
+            "`GET /records/me` is not reachable at all now: {findings:#?}"
+        );
     }
 
     /// The replacement binding matters when the route *stays* mounted too. A
