@@ -463,17 +463,27 @@ const fn plural(n: usize) -> &'static str {
 }
 
 /// `#[authorize("action", resource = Resource)]` bindings, keyed by route.
-fn authz_index(m: &PostureManifest) -> BTreeSet<(String, String, String, String)> {
+///
+/// The path is normalized exactly as route identity is, so a renamed capture
+/// does not put one untouched binding on both sides of the set difference —
+/// which read as a removal, and blocked a pull request that changed nothing.
+/// The path as the author wrote it is the value, for the finding's text.
+type AuthzKey = (String, String, String, String);
+
+fn authz_index(m: &PostureManifest) -> BTreeMap<AuthzKey, String> {
     m.dimensions
         .authorization_policies
         .entries
         .iter()
         .map(|e| {
             (
+                (
+                    normalize_captures(&e.path),
+                    e.method.clone(),
+                    e.action.clone(),
+                    e.resource.clone(),
+                ),
                 e.path.clone(),
-                e.method.clone(),
-                e.action.clone(),
-                e.resource.clone(),
             )
         })
         .collect()
@@ -496,22 +506,25 @@ fn diff_authorization_policies(
 
     // Bindings the same route *gained*, so a removal that is really half of a
     // rename can say so instead of reading as an unexplained loss.
-    let gained_on: BTreeMap<RouteKey, Vec<String>> = after.difference(&before).fold(
-        BTreeMap::new(),
-        |mut acc, (path, method, action, resource)| {
-            acc.entry((normalize_captures(path), method.clone()))
-                .or_default()
-                .push(format!("{action} on {resource}"));
-            acc
-        },
-    );
+    let gained_on: BTreeMap<RouteKey, Vec<String>> =
+        after.keys().filter(|key| !before.contains_key(*key)).fold(
+            BTreeMap::new(),
+            |mut acc, (path, method, action, resource)| {
+                acc.entry((path.clone(), method.clone()))
+                    .or_default()
+                    .push(format!("{action} on {resource}"));
+                acc
+            },
+        );
 
-    for (path, method, action, resource) in before.difference(&after) {
+    for (key, written_as) in &before {
+        if after.contains_key(key) {
+            continue;
+        }
+        let (path, method, action, resource) = key;
         // A binding that vanished because the whole route did is already
         // reported as `route_removed`, and that is a narrowing, not a widening.
-        // Normalized to match how routes are keyed: a binding names the same
-        // route whatever the author called the capture.
-        if !routes_after.contains(&(normalize_captures(path), method.clone())) {
+        if !routes_after.contains(&(path.clone(), method.clone())) {
             continue;
         }
         let mut detail =
@@ -522,7 +535,7 @@ fn diff_authorization_policies(
         // — this still blocks — but name the pairing so a reviewer who is
         // looking at a rename can acknowledge it in one step instead of
         // wondering what was lost.
-        if let Some(gained) = gained_on.get(&(normalize_captures(path), method.clone())) {
+        if let Some(gained) = gained_on.get(&(path.clone(), method.clone())) {
             let _ = write!(
                 detail,
                 " (the same route gained: {}; a renamed resource reads as a removal plus an \
@@ -534,7 +547,7 @@ fn diff_authorization_policies(
             kind: "authorization_binding_removed",
             severity: Severity::Widening,
             method: method.clone(),
-            path: path.clone(),
+            path: written_as.clone(),
             before: format!("authorize({action}, {resource})"),
             after: "none".to_owned(),
             fingerprint: format!(
@@ -545,12 +558,16 @@ fn diff_authorization_policies(
             detail,
         });
     }
-    for (path, method, action, resource) in after.difference(&before) {
+    for (key, written_as) in &after {
+        if before.contains_key(key) {
+            continue;
+        }
+        let (_, method, action, resource) = key;
         out.push(Finding {
             kind: "authorization_binding_added",
             severity: Severity::Narrowing,
             method: method.clone(),
-            path: path.clone(),
+            path: written_as.clone(),
             before: "none".to_owned(),
             after: format!("authorize({action}, {resource})"),
             fingerprint: format!(
@@ -563,19 +580,28 @@ fn diff_authorization_policies(
     }
 }
 
-/// `(path, method) -> (enforced, exempt)`.
-fn csrf_index(m: &PostureManifest) -> BTreeMap<RouteKey, (bool, bool)> {
-    m.dimensions
-        .csrf
-        .entries
-        .iter()
-        .map(|e| {
-            (
-                (e.path.clone(), e.method.clone()),
-                (e.csrf_enforced, e.exempt),
-            )
-        })
-        .collect()
+/// `(normalized path, method) -> (enforced, exempt, path as written)`.
+///
+/// Keyed the way routes are. Raw paths let a renamed capture hide a CSRF loss
+/// outright: the head entry matched no base entry, and the disappearance check
+/// below could not catch it either, because `routes_after` holds normalized
+/// keys. The path as the author wrote it rides along for the finding's text.
+fn csrf_index(m: &PostureManifest) -> BTreeMap<RouteKey, (bool, bool, String)> {
+    let mut index: BTreeMap<RouteKey, (bool, bool, String)> = BTreeMap::new();
+    for e in &m.dimensions.csrf.entries {
+        let key = (normalize_captures(&e.path), e.method.clone());
+        index
+            .entry(key)
+            .and_modify(|(enforced, exempt, _)| {
+                // Two entries for one route shape merge to the *widest* of
+                // them, exactly as duplicate route entries do: whichever sorts
+                // last must not get to declare the route protected.
+                *enforced = *enforced && e.csrf_enforced;
+                *exempt = *exempt || e.exempt;
+            })
+            .or_insert_with(|| (e.csrf_enforced, e.exempt, e.path.clone()));
+    }
+    index
 }
 
 fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Finding>) {
@@ -589,12 +615,16 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
         .map(RouteEntry::key)
         .collect();
 
-    let mut lost: Vec<(RouteKey, bool)> = Vec::new();
-    let mut gained: Vec<RouteKey> = Vec::new();
-    for (key, (enforced_now, exempt_now)) in &after {
-        match before.get(key).map(|(enforced, _)| *enforced) {
-            Some(true) if !enforced_now => lost.push((key.clone(), *exempt_now)),
-            Some(false) if *enforced_now => gained.push(key.clone()),
+    // Keyed rather than pushed, so the two passes below cannot report the same
+    // route twice and the order is the key order either way.
+    let mut lost: BTreeMap<RouteKey, (String, bool)> = BTreeMap::new();
+    let mut gained: Vec<(RouteKey, String)> = Vec::new();
+    for (key, (enforced_now, exempt_now, written_as)) in &after {
+        match before.get(key).map(|(enforced, ..)| *enforced) {
+            Some(true) if !enforced_now => {
+                lost.insert(key.clone(), (written_as.clone(), *exempt_now));
+            }
+            Some(false) if *enforced_now => gained.push((key.clone(), written_as.clone())),
             _ => {}
         }
     }
@@ -602,23 +632,29 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
     // csrf dimension holds only mutating routes, so widening
     // `security.csrf.safe_methods` deletes entries rather than flipping them —
     // and at runtime those requests stop being validated.
-    for (key, (enforced_before, _)) in &before {
+    for (key, (enforced_before, _, written_as)) in &before {
         if *enforced_before && !after.contains_key(key) && routes_after.contains(key) {
-            lost.push((key.clone(), false));
+            lost.entry(key.clone())
+                .or_insert_with(|| (written_as.clone(), false));
         }
     }
-    lost.sort();
-    lost.dedup();
 
     // One collapsed finding when CSRF went off everywhere: an app that flips
     // `security.csrf.enabled` produces one row per mutating route otherwise,
     // and a 200-row table is a table nobody reads.
-    let all_off_now = after.values().all(|(enforced, _)| !enforced);
-    let any_on_before = before.values().any(|enforced| enforced.0);
+    let all_off_now = after.values().all(|(enforced, ..)| !enforced);
+    let any_on_before = before.values().any(|entry| entry.0);
     if all_off_now && any_on_before && lost.len() > 1 {
         let routes: Vec<String> = lost
             .iter()
-            .map(|((path, method), _)| format!("{method} {path}"))
+            .map(|((_, method), (written_as, _))| format!("{method} {written_as}"))
+            .collect();
+        // The fingerprint names the *routes*, not the spellings: renaming a
+        // capture changes neither the URL set that lost CSRF nor what a
+        // reviewer acknowledged about it.
+        let keys: Vec<String> = lost
+            .keys()
+            .map(|(path, method)| format!("{method} {path}"))
             .collect();
         out.push(Finding {
             kind: "csrf_disabled",
@@ -631,7 +667,7 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
             // an acknowledgment for one set would silently cover another.
             fingerprint: format!(
                 "csrf-disabled:{}",
-                &hex_digest(escape_list(&routes).as_bytes())[..16]
+                &hex_digest(escape_list(&keys).as_bytes())[..16]
             ),
             detail: format!(
                 "CSRF enforcement lost on all {} mutating routes: {}",
@@ -640,7 +676,7 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
             ),
         });
     } else {
-        for ((path, method), exempt) in lost {
+        for ((_, method), (path, exempt)) in lost {
             out.push(Finding {
                 kind: "csrf_enforcement_removed",
                 severity: Severity::Widening,
@@ -658,7 +694,7 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
             });
         }
     }
-    for (path, method) in gained {
+    for ((_, method), path) in gained {
         out.push(Finding {
             kind: "csrf_enforcement_added",
             severity: Severity::Narrowing,
@@ -1474,6 +1510,107 @@ mod tests {
             findings.iter().any(|f| f.kind == "route_added_open"),
             "the wildcard is a new, wider route, not an edit of the old one: {findings:?}"
         );
+    }
+
+    /// Normalizing the key widens the class of entries that can collide, so
+    /// two csrf entries for the same route shape must merge to the *widest*
+    /// reading — as duplicate route entries already do — rather than letting
+    /// whichever sorts last decide whether the route is protected.
+    #[test]
+    fn duplicate_csrf_entries_merge_to_the_widest() {
+        let routes = route("/pay/{id}", "POST", "gated", &["user"], &[], false);
+        let base = manifest(
+            &routes,
+            r#"{"path":"/pay/{id}","method":"POST","csrf_enforced":true,"exempt":false}"#,
+            "",
+            "",
+        );
+        let off = r#"{"path":"/pay/{id}","method":"POST","csrf_enforced":false,"exempt":true}"#;
+        let on = r#"{"path":"/pay/{other}","method":"POST","csrf_enforced":true,"exempt":false}"#;
+
+        for entries in [format!("{off},{on}"), format!("{on},{off}")] {
+            let head = manifest(&routes, &entries, "", "");
+            let findings = diff(&base, &head);
+            assert_eq!(
+                kinds(&findings),
+                vec!["csrf_enforcement_removed"],
+                "one entry says the route is unprotected, so it is: {findings:#?}"
+            );
+        }
+    }
+
+    /// The same rename, one dimension over. CSRF entries were keyed on the raw
+    /// path, so renaming the capture in the change that turned CSRF off left
+    /// the head entry unable to match the base entry — and the disappearance
+    /// check could not save it either, since `routes_after` holds normalized
+    /// keys. The result was a payment route losing CSRF with nothing to
+    /// acknowledge.
+    #[test]
+    fn renaming_a_capture_does_not_hide_a_csrf_loss() {
+        let base = manifest(
+            &route("/pay/{id}", "POST", "gated", &["user"], &[], false),
+            r#"{"path":"/pay/{id}","method":"POST","csrf_enforced":true,"exempt":false}"#,
+            "",
+            "",
+        );
+        let head = manifest(
+            &route("/pay/{payment_id}", "POST", "gated", &["user"], &[], false),
+            r#"{"path":"/pay/{payment_id}","method":"POST","csrf_enforced":false,"exempt":true}"#,
+            "",
+            "",
+        );
+
+        let findings = diff(&base, &head);
+        let f = only(findings.clone());
+        assert_eq!(f.kind, "csrf_enforcement_removed");
+        assert_eq!(f.severity, Severity::Widening);
+        assert_eq!(widening(&findings).len(), 1);
+    }
+
+    /// And the same rename with CSRF *untouched* must stay silent: a route
+    /// keyed two different ways would otherwise read as one entry lost and one
+    /// gained.
+    #[test]
+    fn renaming_a_capture_alone_is_not_a_csrf_change() {
+        let entry = |path: &str| {
+            format!(r#"{{"path":"{path}","method":"POST","csrf_enforced":true,"exempt":false}}"#)
+        };
+        let base = manifest(
+            &route("/pay/{id}", "POST", "gated", &["user"], &[], false),
+            &entry("/pay/{id}"),
+            "",
+            "",
+        );
+        let head = manifest(
+            &route("/pay/{payment_id}", "POST", "gated", &["user"], &[], false),
+            &entry("/pay/{payment_id}"),
+            "",
+            "",
+        );
+        assert!(diff(&base, &head).is_empty(), "{:#?}", diff(&base, &head));
+    }
+
+    /// Authorization bindings, third dimension, same key. Here the raw path
+    /// cost a false *block* rather than a miss: the binding appeared in both
+    /// set differences, so an untouched `#[authorize]` read as a removal.
+    #[test]
+    fn renaming_a_capture_alone_is_not_an_authorization_change() {
+        let binding = |path: &str| {
+            format!(r#"{{"path":"{path}","method":"GET","action":"read","resource":"Note"}}"#)
+        };
+        let base = manifest(
+            &route("/notes/{id}", "GET", "gated", &["user"], &[], true),
+            "",
+            "",
+            &binding("/notes/{id}"),
+        );
+        let head = manifest(
+            &route("/notes/{note_id}", "GET", "gated", &["user"], &[], true),
+            "",
+            "",
+            &binding("/notes/{note_id}"),
+        );
+        assert!(diff(&base, &head).is_empty(), "{:#?}", diff(&base, &head));
     }
 
     /// Two duplicate entries can be *incomparable*: `["admin"]` and `["editor"]`

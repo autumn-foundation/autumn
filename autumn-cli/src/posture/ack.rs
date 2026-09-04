@@ -74,9 +74,10 @@ pub fn short(digest: &str) -> String {
 /// Strict on purpose:
 /// - the phrase must start the line (leading whitespace allowed), so it cannot
 ///   be smuggled into the middle of a sentence;
-/// - a quoted line (`>` …) never acknowledges anything, so quoting somebody
-///   else's comment — which GitHub's own reply UI does automatically — does not
-///   silently re-acknowledge a digest;
+/// - a quoted line (`>` …), and any line the quoted paragraph lazily runs on
+///   into, never acknowledges anything, so quoting somebody else's comment —
+///   which GitHub's own reply UI does automatically — does not silently
+///   re-acknowledge a digest;
 /// - a fenced code block is inert, so the documentation example in a comment
 ///   does not acknowledge anything either;
 /// - the digest must be plain lower/upper-case hex, 8..=64 characters.
@@ -90,12 +91,26 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
     let mut fence: Option<(char, usize)> = None;
     // Inside a multi-line `<!-- … -->`, which GitHub renders as nothing.
     let mut html_comment = false;
+    // Inside a block-quote paragraph. `CommonMark` continues one across a line
+    // that carries no `>` of its own — a *lazy continuation* — and GitHub
+    // renders that line as quoted too, so a marker there is discussion, not a
+    // decision. Checking only the current line let it count as a grant.
+    let mut quote_paragraph = false;
     for line in text.lines() {
         if line.trim() == SOURCE_SEPARATOR {
             // A new comment body starts here, with a clean slate. Checked
             // first, because the separator is itself an HTML comment.
             fence = None;
             html_comment = false;
+            quote_paragraph = false;
+            continue;
+        }
+        // A blank line ends the quoted paragraph, so the lazy continuation
+        // stops here and the rest of the comment is live text again. Read from
+        // the raw line: a line that renders empty because it is all HTML
+        // comment is not a paragraph break.
+        if line.trim().is_empty() {
+            quote_paragraph = false;
             continue;
         }
         // An acknowledgment has to be *visible* on the pull request — that is
@@ -125,11 +140,17 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
             }
             (None, Some((c, len, _))) => {
                 fence = Some((c, len));
+                // A fence can interrupt a paragraph, quoted or not.
+                quote_paragraph = false;
                 continue;
             }
             _ => {}
         }
-        if fence.is_some() || trimmed.starts_with('>') {
+        if trimmed.starts_with('>') {
+            quote_paragraph = true;
+            continue;
+        }
+        if fence.is_some() || quote_paragraph {
             continue;
         }
         if let Some(ack) = parse_marker(trimmed) {
@@ -308,6 +329,36 @@ mod tests {
     fn a_quoted_marker_acknowledges_nothing() {
         assert!(parse_acks("> /ack-posture 0123456789abcdef").is_empty());
         assert!(parse_acks(">> /ack-posture 0123456789abcdef").is_empty());
+    }
+
+    /// `CommonMark` continues a block-quote paragraph across a line that
+    /// carries no `>` of its own, so GitHub renders this whole thing as quoted
+    /// discussion. Checking only the current line let the second line count as
+    /// a live grant — an acknowledgment nobody can see was given.
+    #[test]
+    fn a_lazy_continuation_of_a_quote_acknowledges_nothing() {
+        let text = "> Do not use this marker:\n/ack-posture 0123456789abcdef\n";
+        assert!(parse_acks(text).is_empty(), "{:?}", parse_acks(text));
+    }
+
+    /// The continuation ends where the quoted paragraph does. A blank line
+    /// closes it, and the marker after it is an ordinary comment line again —
+    /// otherwise quoting anything would poison the rest of the comment.
+    #[test]
+    fn a_marker_after_the_quote_ends_still_acknowledges() {
+        let text = "> some quoted context\n\n/ack-posture 0123456789abcdef  yes\n";
+        let acks = parse_acks(text);
+        assert_eq!(acks.len(), 1, "{acks:?}");
+        assert_eq!(acks[0].digest, "0123456789abcdef");
+    }
+
+    /// A new comment body starts with a clean slate here too: an unterminated
+    /// quote in one comment must not swallow the next comment's marker.
+    #[test]
+    fn a_quote_does_not_leak_across_harvested_comments() {
+        let text =
+            format!("> quoted tail\n{SOURCE_SEPARATOR}\n/ack-posture 0123456789abcdef  yes\n");
+        assert_eq!(parse_acks(&text).len(), 1, "{:?}", parse_acks(&text));
     }
 
     #[test]
