@@ -649,7 +649,16 @@ TABLE_PROSE_ROW = re.compile(
 # between segments.
 INDEXED_PATH = re.compile(r'[a-z0-9_]+(?:\[\w+\])?(?:\.[a-z0-9_]+(?:\[\w+\])?)*')
 
-TABLE_ANY_ROW = re.compile(r'^//!\s*\|\s*`?AUTUMN_')
+# Candidate rows are found from the TABLE, not from the text in them. Requiring
+# a well-formed `AUTUMN_` prefix to notice a row was the fourth way a row could
+# leave the check by being malformed — a typo before the underscore
+# (`AUTMN_SERVER__HOST`) made the line invisible and took the count 142 -> 141,
+# green. The three before it were a missing backtick, a non-backticked cell and
+# leading whitespace, each fixed where it was found; this bounds the whole
+# region instead, so a row can only leave the check by leaving the table.
+TABLE_HEADER = re.compile(r'^//!\s*\|\s*Variable\s*\|')
+TABLE_SEPARATOR = re.compile(r'^//!\s*\|[-\s|]+\|\s*$')
+TABLE_ANY_ROW = re.compile(r'^//!\s*\|')
 
 # The one row whose two columns legitimately disagree. `SigningSecretConfig`
 # has an untagged deserializer that accepts a bare string, so
@@ -667,15 +676,25 @@ TABLE_PREFIX_OK = {('AUTUMN_SECURITY__SIGNING_SECRET',
 
 
 def table_rows(text):
-    """Mapping rows, plus any row shaped like one that neither pattern claims.
+    """Mapping rows, plus any row inside the table that neither pattern claims.
 
-    The unparsed list is returned rather than discarded: a row this script
-    cannot read is a row it is not checking, and silence about that is what let
-    seven shard rows sit unverified.
+    The region runs from the `| Variable | …` header to the first line that is
+    no longer a table row. Everything inside it is a row this script is
+    responsible for; the unparsed list is returned rather than discarded,
+    because a row it cannot read is a row it is not checking, and silence about
+    that is what let seven shard rows sit unverified.
     """
-    rows, unparsed = [], []
+    rows, unparsed, inside = [], [], False
     for i, line in enumerate(text.splitlines(), 1):
+        if TABLE_HEADER.match(line):
+            inside = True
+            continue
+        if not inside:
+            continue
+        if TABLE_SEPARATOR.match(line):
+            continue
         if not TABLE_ANY_ROW.match(line):
+            inside = False
             continue
         if m := TABLE_ROW.match(line):
             rows.append((i, m.group(1), m.group(2)))
@@ -706,6 +725,16 @@ def check_table(rows, leaves, built, tokens):
         if declared.count('[') > 1 or not INDEXED_PATH.fullmatch(declared):
             out.append((i, var, declared, 'malformed index in the path'))
             continue
+        # An index belongs on the segment that IS a list. Validating only the
+        # shape let `database.shards.name[i]` through — indexing the scalar
+        # `name` — because erasing the bracket produced the same valid leaf.
+        # A segment is indexable when the schema records children beneath it.
+        if '[' in declared:
+            head = declared[:declared.index('[')]
+            if not any(o.startswith(head + '.') for o in leaves):
+                out.append((i, var, declared,
+                            f'`{head}` is not a list, so it cannot be indexed'))
+                continue
         path = re.sub(r'\[\w+\]', '', declared)
         if path not in leaves:
             out.append((i, var, declared, 'path is not in the schema'))
@@ -1002,29 +1031,49 @@ def self_test():
          (ASSIGNED.findall('AUTUMN_X="path/to"'),
           ASSIGNED_PREFIX.findall('AUTUMN_X="path/to"')), ([], []))
 
+    # Row fixtures live inside a table region, because that is what the checker
+    # is responsible for — a row can only leave the check by leaving the table.
+    def in_table(row):
+        return ('//! | Variable | Config field | Type |\n'
+                '//! |----------|-------------|------|\n' + row)
+
     # A mapping row that loses a backtick must not escape by looking like prose.
-    broken = '//! | `AUTUMN_DATABASE__URL` | database.urll | `String` |'
+    broken = in_table('//! | `AUTUMN_DATABASE__URL` | database.urll | `String` |')
     rows_b, unparsed_b = table_rows(broken)
     case('a malformed mapping row is reported, not called prose',
          (len(rows_b), len(unparsed_b)), (0, 1))
-    prose = '//! | `AUTUMN_ENV` | active profile | `String` |'
+    prose = in_table('//! | `AUTUMN_ENV` | active profile | `String` |')
     rows_p, unparsed_p = table_rows(prose)
     case('the enumerated prose rows still pass',
          (len(rows_p), len(unparsed_p)), (0, 0))
     # A row that loses its OPENING backtick must still be recognised as a row.
     # Requiring the backtick to detect a candidate dropped it from both lists,
     # taking the row count from 142 to 141 with the gate still green.
-    no_tick = '//! | AUTUMN_SERVER__PORT` | `server.port` | `u16` |'
+    no_tick = in_table('//! | AUTUMN_SERVER__PORT` | `server.port` | `u16` |')
     rows_n, unparsed_n = table_rows(no_tick)
     case('a row missing its opening backtick is reported',
          (len(rows_n), len(unparsed_n)), (0, 1))
     # Doc-comment whitespace is not significant, so an indented row must still
     # be PARSED and checked — not merely noticed, and certainly not skipped.
-    indented = '//!  |  `AUTUMN_SERVER__HOST`  |  `server.host`  |  `String` |'
+    indented = in_table('//!  |  `AUTUMN_SERVER__HOST`  |  `server.host`  |  `String` |')
     rows_i, unparsed_i = table_rows(indented)
+    # A typo BEFORE the underscore must not make the row invisible: candidate
+    # rows come from the table region, not from the text being already correct.
+    typo = in_table('//! | `AUTMN_SERVER__HOST` | `server.host` | `String` |')
+    rows_t, unparsed_t = table_rows(typo)
+    case('a misspelled prefix is reported, not skipped',
+         (len(rows_t), len(unparsed_t)), (0, 1))
+    # …and a line after the table is not a row at all.
+    outside = ('//! | Variable | Config field | Type |\n'
+               '//! |----------|-------------|------|\n'
+               '//! | `AUTUMN_SERVER__PORT` | `server.port` | `u16` |\n'
+               '//!\n//! | not a row |\n')
+    rows_o, unparsed_o = table_rows(outside)
+    case('the region ends at the first non-row line',
+         (len(rows_o), len(unparsed_o)), (1, 0))
     case('an indented row is parsed, not dropped',
          (rows_i, unparsed_i),
-         ([(1, 'AUTUMN_SERVER__HOST', 'server.host')], []))
+         ([(3, 'AUTUMN_SERVER__HOST', 'server.host')], []))
 
     good = [(1, 'AUTUMN_LOG__LEVEL', 'log.level'),
             (2, 'AUTUMN_SECURITY__SIGNING_SECRET', 'security.signing_secret.secret'),
@@ -1036,6 +1085,11 @@ def self_test():
     case('a doubly-indexed path fails',
          len(check_table([(9, 'AUTUMN_DATABASE__SHARDS__{i}__NAME',
                            'database.shards[i][i].name')],
+                         leaves, built, tokens)), 1)
+    # An index belongs on the segment that IS a list.
+    case('an index on a scalar field fails',
+         len(check_table([(9, 'AUTUMN_DATABASE__SHARDS__{i}__NAME',
+                           'database.shards.name[i]')],
                          leaves, built, tokens)), 1)
     case('a singly-indexed path passes',
          check_table([(9, 'AUTUMN_DATABASE__SHARDS__{i}__NAME',
