@@ -500,6 +500,12 @@ COMMENT_LEADER = {
 COMMENT_LEADER_NAMED = {'Dockerfile': '#', 'Makefile': '#', 'Justfile': '#'}
 
 
+def effective_suffix(rel):
+    """`Cargo.toml.tmpl` is TOML; `README.md.tmpl` is markdown."""
+    p = pathlib.PurePath(rel)
+    return pathlib.PurePath(p.stem).suffix if p.suffix == '.tmpl' else p.suffix
+
+
 def comment_leader(rel):
     p = pathlib.PurePath(rel)
     if p.suffix == '.tmpl':
@@ -831,7 +837,24 @@ BOUND = re.compile(
 # `map.get("AUTUMN_LOG__LEVL")` in a test was reading as an environment read,
 # while `env.get(…)` in the media plugin is a real one. The other accessors are
 # specific enough to stand alone.
-ACCESSOR = re.compile(r'\b(?:var|var_os|set_var|remove_var|env_trimmed'
+# `set_var` is here and `remove_var` is not, which is a distinction about what
+# the act means. Setting a variable PUBLISHES the name into the environment for
+# something else to read — the same act as `export` in a shell script, which
+# this rung has always counted — and the one name that reaches the truth set
+# only that way is real: the generated Tauri shell exports
+# `AUTUMN_SYNC__DB_PATH` for the app's own routes, and
+# `tauri-mobile-offline-sync.md` shows the read it is exported for
+# (`SyncStore::open(std::env::var("AUTUMN_SYNC__DB_PATH")?)`) in application
+# code, which by definition does not live in this repository. Removing a
+# variable publishes nothing, and costs nothing to drop: measured, no name in
+# the tree depends on it.
+#
+# The residual exposure is real and worth stating: a MISSPELLED `set_var` would
+# bless that spelling, exactly as a misspelled `export` in a tracked shell
+# script would. That is a property of counting a publish as evidence, not an
+# oversight, and closing it would mean dropping the four correct
+# `AUTUMN_SYNC__DB_PATH` occurrences above.
+ACCESSOR = re.compile(r'\b(?:var|var_os|set_var|env_trimmed'
                       r'|parse_env\w*|env_bool\w*|getenv)\s*\('
                       r'|\benv\w*\.get\s*\(')
 
@@ -994,12 +1017,28 @@ def untested(body):
     skel = _rust_skeleton(body)
     masked = []
     for start, after in _test_items(skel):
-        depth, end = 0, None
+        depth, end, opened = 0, None, False
         for i in range(after, len(skel)):
             c = skel[i]
-            if c == '{':
-                depth += 1
+            if c in '({[<':
+                # Anything that opens a group disables the comma rule below: the
+                # comma in `fn f(a: u8, b: u8)` or in `Option<Arc<T>, U>` is
+                # punctuation inside the item, not the end of it.
+                opened = True
+                if c == '{':
+                    depth += 1
             elif c == '}':
+                if depth == 0:
+                    # The ENCLOSING block closed first, so this was a field or a
+                    # variant. Ending here is what bounds the over-mask:
+                    # `#[cfg(test)] release_count: Option<Arc<…>>,` in
+                    # `scheduler.rs` drove the depth NEGATIVE, and the old rule
+                    # — break when the depth returns to zero — then ended the
+                    # item two blocks later. Not a runaway to end of file, but
+                    # twice the lines it should be: 67 masked in `scheduler.rs`
+                    # against 34, and a real read among them is dropped.
+                    end = i
+                    break
                 depth -= 1
                 if depth == 0:
                     end = i
@@ -1007,6 +1046,11 @@ def untested(body):
             elif c == ';' and depth == 0:
                 # `#[cfg(test)] use uuid::Uuid;` — an item with no block, which
                 # a brace search alone would run to the end of the file.
+                end = i
+                break
+            elif c == ',' and depth == 0 and not opened:
+                # `#[cfg(test)] pub name: String,` — a field or enum variant,
+                # which ends at its comma.
                 end = i
                 break
         masked.append((start, len(skel) if end is None else end))
@@ -1035,7 +1079,11 @@ def source_tokens(root):
     acc = accessor(root)
     tokens = set()
     for rel in out.split('\0'):
-        if not rel or rel.endswith('.md') or rel == SELF:
+        # Markdown is prose, and `README.md.tmpl` is prose too — the same
+        # effective-suffix reading `comment_leader` already does, applied here
+        # as well, because a template's example `export AUTUMN_LOG__LEVL=x` was
+        # entering the truth set as a shell assignment.
+        if not rel or effective_suffix(rel) == '.md' or rel == SELF:
             continue
         # A file under `tests/` or `benches/` is test code whatever it is
         # written in.
@@ -1938,6 +1986,24 @@ def self_test():
     case('a cfg(test) item with no block ends at its semicolon',
          untested('#[cfg(test)]\nuse uuid::Uuid;\nlet a = 1;'),
          '\n\nlet a = 1;')
+    # A struct field or enum variant ends at its COMMA. Running past it drove
+    # the brace depth negative and masked to end of file — 717 of 1950 lines in
+    # `live_events.rs`, dropping every real read after the field.
+    case('a cfg(test) field ends at its comma',
+         untested('struct S {\n  #[cfg(test)]\n  probe: bool,\n  real: u8,\n}\n'
+                  'fn f() { }'),
+         'struct S {\n\n\n  real: u8,\n}\nfn f() { }')
+    # …and a field whose type carries a comma inside generics falls back to the
+    # enclosing brace rather than stopping at that comma — bounded either way,
+    # which is the point.
+    case('a generic field does not end at the comma inside its type',
+         untested('struct S {\n  #[cfg(test)]\n  probe: Map<A, B>,\n}\n'
+                  'fn f() { }'),
+         'struct S {\n\n\n\nfn f() { }')
+    case('a fn signature comma is not the end of the item',
+         untested('#[cfg(test)]\nfn f(a: u8, b: u8) {\n  let x = 1;\n}\n'
+                  'fn p() { }'),
+         '\n\n\n\nfn p() { }')
     # A test function needs no `cfg` to be test code, and 692 `#[test]`s here sit
     # outside any `#[cfg(test)]` region — a whole file of them in `cluster/tests.rs`.
     case('a bare #[test] function is masked',
@@ -2027,6 +2093,19 @@ def self_test():
          (comment_leader('x.rs'), comment_leader('x.ts')), ('//', '//'))
     # Program output captured as a fixture has no comments, and a line in it may
     # legitimately begin with `#`.
+    # A markdown TEMPLATE is prose too. Reading it as source made its example
+    # `AUTUMN_DATABASE__URL` a shell assignment in the truth set.
+    case('a markdown template is markdown',
+         (effective_suffix('autumn-cli/src/templates/README.md.tmpl'),
+          effective_suffix('Cargo.toml.tmpl'), effective_suffix('x.rs')),
+         ('.md', '.toml', '.rs'))
+    # Setting a variable publishes it, as `export` does; removing one does not.
+    case('a write that publishes is an accessor',
+         bool(ACCESSOR.search('std::env::set_var("AUTUMN_SYNC__DB_PATH", p)')),
+         True)
+    case('removing a variable is not',
+         bool(ACCESSOR.search('std::env::remove_var("AUTUMN_LOG__LEVL")')),
+         False)
     case('a fixture keeps every line',
          (comment_leader('x.golden'), comment_leader('x.stderr'),
           comment_leader('README.md.tmpl')), (None, None, None))
