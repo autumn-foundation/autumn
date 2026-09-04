@@ -32,10 +32,14 @@ sitting's worth of this repository's actual PR throughput, not a
 same-commit rerun campaign; see Reproduce below for why that campaign is the
 right next step, not something this census fabricated a rate for).
 
-- 97 completed, 78 cancelled (superseded by a same-PR push, expected and not
-  counted below), 10 success, **9 failure** (~9.3% of completed, non-
-  cancelled runs; ~2 automatic reruns among the sample moved 2 of those 9 to
-  green on attempt 2, both `Test (macos-latest)`).
+- 97 completed, 78 cancelled (superseded by a same-PR push, expected and
+  excluded from the rate below), 10 success, **9 failure** — of the 19 runs
+  that actually reached a real verdict (10 + 9, i.e. completed minus
+  cancelled), **9 failed: ~47.4%**. That is the number that matters, not the
+  9.3%-of-all-97 a first pass over this data gives if cancelled runs are left
+  in the denominator after being called out as excluded (~2 automatic
+  reruns among the sample moved 2 of those 9 to green on attempt 2, both
+  `Test (macos-latest)`).
 - Failure-signature clustering, by job:
 
   | Job | Failures | Signature |
@@ -121,7 +125,8 @@ without that work is exactly the laundering this role exists to refuse.
 ## 📊 Measurement
 
 Before: as tabulated above (organic-traffic census, not a controlled rerun;
-n=9 failures, n=97 completed non-cancelled PR runs, one calendar day). No
+n=9 failures, n=19 completed non-cancelled PR runs (97 completed minus 78
+cancelled), one calendar day). No
 after-measurement — no change shipped this pass.
 
 ## 🔬 Reproduce
@@ -144,11 +149,13 @@ for i in $(seq 1 20); do
     || echo "FAIL run $i"
 done
 
-# sim_fault_plan's job-runtime-not-initialized panic
+# sim_fault_plan's job-runtime-not-initialized panic. Plain #[test], not
+# #[ignore]d (it runs as part of the base `cargo test --workspace` step, the
+# one that actually failed here) — no `--ignored` flag, or this filters the
+# test out entirely and every iteration "passes" by running nothing.
 for i in $(seq 1 20); do
-  cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" \
-    --test integration_tests -- --ignored --test-threads=1 \
-    integration::sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times \
+  cargo test -p autumn-web --test integration_tests -- \
+    same_seed_replays_a_byte_identical_outcome_100_times \
     || echo "FAIL run $i"
 done
 ```
