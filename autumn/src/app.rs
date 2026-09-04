@@ -15083,6 +15083,18 @@ mod tests {
             let mut config = AutumnConfig::default();
             config.tenancy.enabled = true;
             config.tenancy.source = source.to_owned();
+            // Exempt the route from `tenancy_middleware` itself (Codex review,
+            // PR #2505) so the request reaches `tenant_page` and the assertion
+            // below exercises `Tenant::from_request_parts`'s OWN fallback call
+            // to `extract_tenant_from_parts` — not just the middleware's
+            // earlier, separate call to the same function. Without this, every
+            // synthetic build/ISR request is non-public and gets rejected by
+            // `tenancy_middleware` before the handler (and its `Tenant`
+            // extraction) ever runs, so a regression that made the extractor's
+            // fallback fail *open* would go undetected on a route the app
+            // marks `#[public]` but whose handler still reads `Tenant`
+            // directly.
+            config.tenancy.public_paths = vec!["/storefront".to_owned()];
 
             let state = AppState::for_test();
             state.insert_extension(config.clone());

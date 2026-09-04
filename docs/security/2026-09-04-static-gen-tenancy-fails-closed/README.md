@@ -5,8 +5,10 @@ composition, with no app-level analogue
 **Surface:** `autumn_web::static_gen` (`render_static_routes` / `autumn build`,
 and ISR's `regenerate_page`) × `[tenancy] enabled = true`
 **Entry point investigated:** `#[static_get]` handler reading `autumn_web::tenancy::Tenant`
-(or any `CURRENT_TENANT`-scoped repository query) rendered by `autumn build`
-or an ISR background regeneration
+rendered by `autumn build` or an ISR background regeneration, on a route
+exempted from `tenancy_middleware` via `[tenancy].public_paths` (so the
+extractor's own fallback resolution runs, not just the middleware's earlier
+call to the same function)
 **Status:** **negative result** — no fix required. Regression test committed:
 `autumn/src/app.rs::tests::static_get_route_reading_tenant_fails_closed_for_every_tenancy_source`
 
@@ -23,10 +25,20 @@ Both features are documented, first-class, and independently unremarkable.
 Composing them is where the question lives: the static-file cache key is the
 URL path alone, with no tenant dimension. If an app pre-renders a page whose
 content is tenant-scoped (e.g. a per-tenant public storefront homepage reading
-`Tenant` or a `#[repository]` query under `CURRENT_TENANT`), *something* has to
-decide which tenant's data gets frozen into that one shared file — and every
-future request to that path, from every tenant, would be served whatever got
-baked in.
+`Tenant`), *something* has to decide which tenant's data gets frozen into that
+one shared file — and every future request to that path, from every tenant,
+would be served whatever got baked in.
+
+A `#[repository(tenant_scoped)]` query is a related but distinct case, not
+exercised by the test in this entry: `repository.rs` (`__autumn_m2m_tenant_scope`,
+~line 853) already documents and codifies the same fail-closed contract for a
+tenant-scoped repository used with `CURRENT_TENANT` unset — "the same 'no
+tenant context was established' failure the derived queries raise, so the
+[surface] fails closed rather than writing unscoped" — and
+`repository_commit_hooks.rs` carries matching comments. Taken at face value
+this covers the repository-query shape of the hypothesis too, but it wasn't
+independently re-verified with a build/ISR-shaped repro here; a maintainer
+who wants that confirmed should ask for it as a follow-up.
 
 ## 🕵️ Threat model (hypothesis)
 
@@ -74,13 +86,34 @@ resolving `None`/a default tenant and continuing:
 | `session` | a `tenant_id` session key | 401 `Tenant ID missing from session key` (or 500 if `SessionLayer` isn't installed) |
 | `jwt` | a Bearer `Authorization` header | 401 `Missing Authorization header for JWT tenancy` |
 
-So a `#[static_get]` (or ISR) handler that extracts `Tenant` (or hits a
-`CURRENT_TENANT`-scoped query, which resolves through the same extractor's
-fallback path) never runs successfully during a build/regeneration: the
-extractor rejects before the handler body executes, the response is non-2xx,
-`render_static_routes`/`regenerate_page` treats that as a build error, and
-**no file is ever written**. There is no tenant whose data could leak,
-because no tenant's render ever succeeds.
+So a `#[static_get]` (or ISR) handler that extracts `Tenant` never runs
+successfully during a build/regeneration: extraction rejects before the
+handler produces a body, the response is non-2xx, `render_static_routes`/
+`regenerate_page` treats that as a build error, and **no file is ever
+written**. There is no tenant whose data could leak, because no tenant's
+render ever succeeds.
+
+**Which call site actually rejects, and why the test pins the route to
+`public_paths`.** On an ordinary (non-public) route, `tenancy_middleware`
+runs first and calls `extract_tenant_from_parts` itself, ahead of the
+handler — so a naive test would only prove the *middleware* fails closed,
+and would keep passing even if `Tenant::from_request_parts`'s own fallback
+call to the same function later started resolving a default tenant instead
+(exactly the regression this entry exists to catch, and exactly the shape
+that matters for an app that marks the route `#[public]`/lists it in
+`public_paths` — common for a public storefront page — while its handler
+still reads `Tenant` directly). Codex's automated review on the PR caught
+this gap in the first version of the test. The fix: the test config lists
+`/storefront` in `config.tenancy.public_paths`, so `is_public_path` makes
+`tenancy_middleware` skip tenant resolution entirely (`return
+next.run(request).await` with `CURRENT_TENANT` never `.scope()`'d) and the
+request reaches `tenant_page`. There, `CURRENT_TENANT.try_with(..)` returns
+`Err` (no scope was ever entered — a different outcome from `Ok(None)`,
+which is what a *resolved-but-absent* tenant would look like), so the `if
+let Ok(Some(tenant_id))` fast path in `Tenant::from_request_parts` does not
+match, and the extractor falls through to its own
+`extract_tenant_from_parts` call — the exact code path the test is meant to
+pin.
 
 Committed as a regression test rather than left as an unverified claim —
 per source, so a future change that makes any one of them fail *open* is
@@ -106,10 +139,19 @@ test app::tests::static_get_route_reading_tenant_fails_closed_for_every_tenancy_
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5575 filtered out; finished in 0.60s
 ```
 
-(Full run log: `after.txt`. There is no `trunk-failure.txt` for this entry —
-unlike a fix PR, a negative result's test is written to assert the *correct*
-behavior and is expected to pass immediately; see the "Negative result"
-outcome in Warden's process.)
+(Full run log: `after.txt`, captured from the *pre-Codex-fix* version of the
+test — identical in setup and assertions except for the `public_paths` line
+described below, which does not change the router's behavior for these
+synthetic requests: `tenancy_middleware` itself calls the same
+`extract_tenant_from_parts` and gets the same rejection either way, so the
+build/ISR outcome — and this log — is unaffected. This session's sandbox
+was too CPU-throttled to complete a fresh compile after the fix (see
+Verification); the reasoning for why the fixed version still passes is laid
+out below and rests on reading `is_public_path`, `tenancy_middleware`, and
+`Tenant::from_request_parts` directly, not on a re-run. There is no
+`trunk-failure.txt` for this entry — unlike a fix PR, a negative result's
+test is written to assert the *correct* behavior and is expected to pass
+immediately; see the "Negative result" outcome in Warden's process.)
 
 ## 🔎 Why this holds (root cause of the fail-closed behavior)
 
@@ -117,14 +159,18 @@ outcome in Warden's process.)
   to begin with — they were built to render tenant-*agnostic* public pages
   (about pages, blog posts, docs), so they simply don't forge one.
 - `Tenant::from_request_parts` (`tenancy.rs`) has a fast path that trusts an
-  already-resolved `CURRENT_TENANT` task-local, but falls back to
-  `extract_tenant_from_parts` when that's absent (as it always is on a bare
-  synthetic request) — and every arm of that function fails closed rather
-  than defaulting.
-- The `tenancy` middleware itself (which normally runs ahead of the extractor
-  on a live request) is likewise scoped by the tenancy `source`'s own
-  extraction — there is no separate "middleware defaults, extractor
-  double-checks" path that could disagree.
+  already-resolved `CURRENT_TENANT` task-local, but falls back to its own
+  call to `extract_tenant_from_parts` when that's absent (`CURRENT_TENANT.try_with`
+  returns `Err` — no scope was ever entered, as on the `public_paths`-exempted
+  synthetic request the test drives) — and every arm of that function fails
+  closed rather than defaulting.
+- `tenancy_middleware` (which normally runs ahead of the extractor on a live,
+  non-public route) calls the very same `extract_tenant_from_parts` function
+  itself before ever reaching the handler — there is no separate "middleware
+  defaults, extractor double-checks" path that could disagree between the two
+  call sites, which is also why exempting the route from the middleware (via
+  `public_paths`) is what it takes to prove the *extractor's* copy of the
+  check independently.
 
 ## 📡 Blast radius / variant sweep
 
@@ -153,7 +199,7 @@ outcome in Warden's process.)
 ## ✅ Verification
 
 - `cargo fmt --all -- --check` — clean.
-- `cargo test -p autumn-web --lib app::tests::static_get_route_reading_tenant_fails_closed_for_every_tenancy_source` — passes (above, `after.txt`).
+- `cargo test -p autumn-web --lib app::tests::static_get_route_reading_tenant_fails_closed_for_every_tenancy_source` — passes pre-fix (above, `after.txt`); the automated Codex reviewer on PR #2505 then found that the pre-fix version only proved `tenancy_middleware` fails closed, not the `Tenant` extractor's own fallback call on a route exempted from that middleware (the shape that matters for a `#[public]` page whose handler still reads `Tenant`) — fixed by adding `/storefront` to `config.tenancy.public_paths` in the test; see the reproduction section above for why this still passes by inspection. A fresh confirming run could not be completed in this session (see next bullet).
 - `cargo clippy -p autumn-web --all-targets -- -D warnings` and the
   cross-package `--lib --tests` compile of the consolidated
   `integration_tests` binary (`./scripts/pre-push-check.sh`'s mirror) were
