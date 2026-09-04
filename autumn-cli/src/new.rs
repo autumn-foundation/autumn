@@ -2860,7 +2860,22 @@ mod tests {
             workflow.contains("--allow-missing-base"),
             "first run must not break a repo"
         );
-        assert!(workflow.contains("--ack-file acks.txt"));
+        assert!(workflow.contains("--ack-file \"$RUNNER_TEMP/acks.txt\""));
+        // Every scratch path lives outside the PR-controlled checkout, so a
+        // committed symlink cannot redirect one write onto another file.
+        for scratch in [
+            "base-posture.json",
+            "committed-posture.json",
+            "acks.txt",
+            "posture-diff.md",
+            "head-posture/posture-manifest.json",
+        ] {
+            assert!(
+                !workflow.contains(&format!(" {scratch}"))
+                    || workflow.contains(&format!("$RUNNER_TEMP/{scratch}")),
+                "{scratch} must be written under $RUNNER_TEMP: {workflow}"
+            );
+        }
         assert!(
             workflow.contains("pull-requests: write"),
             "posting the diff needs it"

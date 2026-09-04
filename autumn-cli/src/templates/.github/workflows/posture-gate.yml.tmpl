@@ -111,17 +111,18 @@ jobs:
         run: |
           set -euo pipefail
           autumn routes audit --manifest "$POSTURE_MANIFEST"
-          # Hand it over under a fixed, flat name. `upload-artifact` makes the
+          # Hand it over under a fixed, flat name, in the runner's scratch
+          # directory rather than the checkout. `upload-artifact` makes the
           # common ancestor of its search path the artifact root, so uploading
           # `apps/my-app/security-posture.json` directly would arrive as
           # `security-posture.json` and the download path would depend on how
           # deep the manifest sits in the repository.
-          cp "$POSTURE_MANIFEST" posture-manifest.json
+          cp "$POSTURE_MANIFEST" "$RUNNER_TEMP/posture-manifest.json"
 
       - uses: actions/upload-artifact@v4
         with:
           name: posture-manifest
-          path: posture-manifest.json
+          path: ${{ runner.temp }}/posture-manifest.json
           retention-days: 7
           if-no-files-found: error
 
@@ -167,10 +168,16 @@ jobs:
             | sh -s -- --version "v{{autumn_version}}"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      # Into the runner's scratch directory, NOT the checkout. Every file this
+      # job writes has a fixed name, and the checkout is PR-controlled: a pull
+      # request that commits `base-posture.json` as a symlink to the downloaded
+      # head manifest would make the redirection below overwrite head with base,
+      # so the diff would compare a manifest against itself and report no
+      # widening. `$RUNNER_TEMP` is outside anything the pull request can place.
       - uses: actions/download-artifact@v4
         with:
           name: posture-manifest
-          path: head-posture
+          path: ${{ runner.temp }}/head-posture
 
       # This workflow decides whether the pull request may merge, and it runs
       # from the pull request's own copy of itself. Editing it in the same
@@ -213,9 +220,9 @@ jobs:
             echo "::notice::no posture baseline is committed yet — commit $POSTURE_MANIFEST so the next pull request can be diffed against it"
             exit 0
           fi
-          git show "HEAD:${POSTURE_MANIFEST}" > committed-posture.json
-          FRESH=$(autumn routes posture digest --manifest head-posture/posture-manifest.json)
-          COMMITTED=$(autumn routes posture digest --manifest committed-posture.json)
+          git show "HEAD:${POSTURE_MANIFEST}" > "$RUNNER_TEMP/committed-posture.json"
+          FRESH=$(autumn routes posture digest --manifest "$RUNNER_TEMP/head-posture/posture-manifest.json")
+          COMMITTED=$(autumn routes posture digest --manifest "$RUNNER_TEMP/committed-posture.json")
           if [ "$FRESH" != "$COMMITTED" ]; then
             echo "::error file=$POSTURE_MANIFEST::the committed posture manifest describes a different security posture than this commit builds ($COMMITTED vs $FRESH) — run \`autumn routes audit --manifest $POSTURE_MANIFEST\` and commit the result"
             exit 1
@@ -236,7 +243,7 @@ jobs:
             exit 1
           }
           if git cat-file -e "origin/${BASE_REF}:${POSTURE_MANIFEST}" 2>/dev/null; then
-            git show "origin/${BASE_REF}:${POSTURE_MANIFEST}" > base-posture.json
+            git show "origin/${BASE_REF}:${POSTURE_MANIFEST}" > "$RUNNER_TEMP/base-posture.json"
           elif git log --oneline -1 "origin/${BASE_REF}" -- "${POSTURE_MANIFEST}" | grep -q .; then
             # The base branch HAD a manifest and no longer does. The deletion is
             # refused at the pull request that makes it (see the step above), so
@@ -244,10 +251,10 @@ jobs:
             # merge that bypassed this gate. Warn loudly and bootstrap: failing
             # here would lock the repository out of its own gate, including the
             # pull request that restores the file.
-            rm -f base-posture.json
+            rm -f "$RUNNER_TEMP/base-posture.json"
             echo "::warning::${POSTURE_MANIFEST} existed on origin/${BASE_REF} and is gone, so this run has no baseline. Restore it in a reviewed change to re-arm the gate."
           else
-            rm -f base-posture.json
+            rm -f "$RUNNER_TEMP/base-posture.json"
             echo "::notice::no posture manifest on origin/${BASE_REF} — nothing to diff against yet"
           fi
         env:
@@ -269,7 +276,7 @@ jobs:
       - name: Harvest acknowledgments from authorized reviewers
         run: |
           set -uo pipefail
-          : > acks.txt
+          : > "$RUNNER_TEMP/acks.txt"
           authors_and_bodies() {
             gh api --paginate "repos/${GITHUB_REPOSITORY}/$1" \
               --jq '.[] | select((.user.login // "") != "github-actions[bot]") | "\(.user.login // "")\t\((.body // "") | @base64)"' || true
@@ -285,9 +292,9 @@ jobs:
               admin|write|maintain) ;;
               *) continue ;;
             esac
-            printf '%s\n' '<!-- autumn:ack-source -->' >> acks.txt
-            printf '%s\n' "$body64" | base64 -d >> acks.txt
-            printf '\n' >> acks.txt
+            printf '%s\n' '<!-- autumn:ack-source -->' >> "$RUNNER_TEMP/acks.txt"
+            printf '%s\n' "$body64" | base64 -d >> "$RUNNER_TEMP/acks.txt"
+            printf '\n' >> "$RUNNER_TEMP/acks.txt"
           done
         env:
           GH_TOKEN: ${{ github.token }}
@@ -298,16 +305,16 @@ jobs:
         run: |
           set +e
           autumn routes posture diff \
-            --base base-posture.json \
-            --head head-posture/posture-manifest.json \
+            --base "$RUNNER_TEMP/base-posture.json" \
+            --head "$RUNNER_TEMP/head-posture/posture-manifest.json" \
             --allow-missing-base \
-            --ack-file acks.txt \
+            --ack-file "$RUNNER_TEMP/acks.txt" \
             --format markdown \
-            --output posture-diff.md
+            --output "$RUNNER_TEMP/posture-diff.md"
           echo "status=$?" >> "$GITHUB_OUTPUT"
           set -e
-          if [ -s posture-diff.md ]; then
-            cat posture-diff.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -s "$RUNNER_TEMP/posture-diff.md" ]; then
+            cat "$RUNNER_TEMP/posture-diff.md" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # One comment, updated in place. `continue-on-error` because a pull
@@ -328,11 +335,11 @@ jobs:
           # `--paginate` applies the filter per page, so several pages can each
           # contribute an id. Take the first.
           EXISTING=${EXISTING%%$'\n'*}
-          if [ -s posture-diff.md ]; then
-            BODY_FILE=posture-diff.md
+          if [ -s "$RUNNER_TEMP/posture-diff.md" ]; then
+            BODY_FILE="$RUNNER_TEMP/posture-diff.md"
           elif [ -n "$EXISTING" ]; then
-            printf 'No security posture change on this pull request.\n\n%s\n' "$MARKER" > resolved.md
-            BODY_FILE=resolved.md
+            printf 'No security posture change on this pull request.\n\n%s\n' "$MARKER" > "$RUNNER_TEMP/resolved.md"
+            BODY_FILE="$RUNNER_TEMP/resolved.md"
           else
             exit 0
           fi

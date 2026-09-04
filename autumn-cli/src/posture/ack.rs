@@ -89,6 +89,13 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
     // quoting an acknowledgment would acknowledge it.
     let mut fence: Option<(char, usize)> = None;
     for line in text.lines() {
+        // Markdown's other code block: four spaces (or a tab) of indentation
+        // renders as code, so a marker written that way is a sample, not a
+        // grant. Skipping is the safe direction — the worst case is a reviewer
+        // re-posting an unindented line, never an acknowledgment nobody meant.
+        if fence.is_none() && is_indented_code(line) {
+            continue;
+        }
         let trimmed = line.trim_start();
         if trimmed == SOURCE_SEPARATOR {
             // A new comment body starts here, with a clean slate.
@@ -118,6 +125,16 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
         }
     }
     acks
+}
+
+/// Whether `line` is indented enough to render as a Markdown code block.
+///
+/// Four spaces, or one tab. Deliberately not a full `CommonMark` block parser:
+/// this only ever *withholds* an acknowledgment, so over-matching costs a
+/// reviewer one re-post while under-matching would grant something nobody
+/// asked for.
+fn is_indented_code(line: &str) -> bool {
+    line.starts_with("    ") || line.starts_with('\t')
 }
 
 /// The leading fence run of `line`, as `(character, length, nothing follows)`.
@@ -280,6 +297,36 @@ mod tests {
     #[test]
     fn the_phrase_is_case_insensitive() {
         assert_eq!(parse_acks("/ACK-POSTURE 0123456789abcdef").len(), 1);
+    }
+
+    /// Markdown's *other* code block: four leading spaces. `trim_start` erased
+    /// the indentation, so a reviewer writing the marker as an indented sample
+    /// — while arguing against it — acknowledged it.
+    #[test]
+    fn an_indented_code_sample_does_not_acknowledge() {
+        let body = "\
+Before anyone runs off and does this:
+
+    /ack-posture 0123456789abcdef
+
+…let us agree it is actually wanted.
+";
+        assert!(parse_acks(body).is_empty());
+    }
+
+    /// A tab indent is an indented code block too.
+    #[test]
+    fn a_tab_indented_sample_does_not_acknowledge() {
+        assert!(parse_acks("here it is:\n\n\t/ack-posture 0123456789abcdef\n").is_empty());
+    }
+
+    /// …but ordinary light indentation is not a code block, and a reviewer who
+    /// indents a line by a space or two still means it.
+    #[test]
+    fn a_slightly_indented_marker_still_acknowledges() {
+        let acks = parse_acks("  /ack-posture 0123456789abcdef  yes, intended\n");
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].reason.as_deref(), Some("yes, intended"));
     }
 
     /// A reviewer quoting the gate's own report wraps it in a *longer* fence,
