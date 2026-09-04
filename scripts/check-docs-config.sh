@@ -163,7 +163,16 @@ INCLUDE_FILES = ('README.md', 'EXAMPLES.md', 'CONTRIBUTING.md', 'STABILITY.md')
 # (The same oversight in the module-doc row pattern hid seven table rows; fixing
 # one and not the other is how a gate ends up half-applied.) `to_path` elides
 # the placeholder, so these land on `database.shards.name` like a literal index.
-VAR = re.compile(r'\bAUTUMN_(?:\{[a-z]+\}|[A-Z0-9_])*[A-Z0-9]\b')
+# Lowercase OUTSIDE a placeholder is admitted here on purpose, so that a casing
+# typo is reported rather than skipped. `AUTUMN_LOG__LEVeL=debug` is a name the
+# runtime will not read, but under an upper-case-only pattern it matched nothing
+# at all — the claim was invisible, and the occurrence count did not even move.
+# Case is validated in `malformed` below instead, where it can be reported.
+VAR = re.compile(r'\bAUTUMN_(?:\{[a-z]+\}|[A-Za-z0-9_])*[A-Za-z0-9]\b')
+
+# Everything outside a `{placeholder}` must be upper case, digits, or `_`.
+def malformed(var):
+    return any(c.islower() for c in re.sub(r'\{[a-z]+\}', '', var))
 
 # A path segment that is a sequence index rather than a field name: a literal
 # index as written in a shell line, or the `{i}` / `{N}` placeholder the
@@ -283,21 +292,32 @@ QUOTED = re.compile(r'["\'](AUTUMN_[A-Z0-9_]+)["\']')
 ASSIGNED = re.compile(r'(?:^|[;&|(\s])(?:export\s+)?(AUTUMN_[A-Z0-9_]+)=')
 EXPANDED = re.compile(r'\$\{?(AUTUMN_[A-Z0-9_]+)\}?')
 
-# A quoted name does NOT count where the line asserts the name is ABSENT. This is a
-# real population, not a hypothetical: `autumn-cli/tests/generate.rs:802` has
-# `assert!(!test.contains("AUTUMN_TEST_SESSION_COOKIE"))`, a variable the
-# scaffolder deliberately does NOT emit. Counting that as evidence of a read
-# would let a page name it and pass — a negative assertion is the strongest
-# possible statement that something is not implemented.
+# A quoted name counts only where the code BINDS it as an environment-variable
+# name or READS the environment with it. Any quoted string was the earlier rule
+# and it kept admitting fixtures: a test may name a variable precisely to prove
+# the runtime ignores it. `autumn-cli/src/doctor.rs` sets
+# `MockEnv::new().with("AUTUMN_SERVER__TLS__ENABLED", "false")` under a test
+# named `unrecognized_tls_env_var_is_not_detected` — the key is absent from the
+# schema and the server serves plain HTTP for it — and
+# `autumn-cli/tests/generate.rs` asserts `!test.contains(
+# "AUTUMN_TEST_SESSION_COOKIE")`. Both are assertions that a name does NOT work,
+# and both were being read as proof that it does.
 #
-# Only the negation is excluded, not "every quoted name without a nearby
-# accessor". That stricter reading was tried and reverted: the dominant shape
-# here is `const SHUTDOWN_SIGNAL_FILE_ENV: &str = "AUTUMN_SHUTDOWN_SIGNAL_FILE"`,
-# where the read happens wherever the constant is later used, so requiring an
-# accessor within a few lines reported 25 correct pages — `AUTUMN_CANARY`,
-# `AUTUMN_ACME_DNS_*`, `AUTUMN_DEV_RELOAD` among them. Short of dataflow
-# analysis, a false positive on a correct page is the worse error: it trains
-# authors to reach for a waiver.
+# The binding form is what makes this affordable. An earlier attempt required an
+# accessor near the string and reported 25 correct pages, because the dominant
+# shape here is `const CANARY_ENV: &str = "AUTUMN_CANARY"` — the read happens
+# wherever the constant is later used, arbitrarily far away. Recognising the
+# binding itself covers those without needing to follow the constant.
+BOUND = re.compile(
+    r'\b(?:const|static)\s+\w+\s*:\s*&\s*(?:\'\w+\s+)?str\s*=\s*"(AUTUMN_[A-Z0-9_]+)"')
+
+# The accessors that read or write the environment. `with` is deliberately NOT
+# here: it supplies a fixture environment, which is how a test names a variable
+# that does not exist.
+ACCESSOR = re.compile(r'\b(?:var|var_os|set_var|remove_var|env_trimmed'
+                      r'|parse_env\w*|env_bool\w*|getenv|get)\s*\(')
+
+# …and never where the line asserts the name is absent.
 NEGATED = re.compile(r'assert(?:_ne)?!\s*\(\s*!|!\s*[\w.]*\bcontains\b|\bassert_ne!')
 
 
@@ -326,7 +346,13 @@ def source_tokens(root):
         for n, line in enumerate(lines):
             tokens.update(ASSIGNED.findall(line))
             tokens.update(EXPANDED.findall(line))
-            if not NEGATED.search(line):
+            tokens.update(BOUND.findall(line))
+            if NEGATED.search(line):
+                continue
+            # The accessor may open a line or two above its argument —
+            # `parse_env(\n    env,\n    "AUTUMN_MEDIA__ROOM_NAMESPACE",` is the
+            # house style — so look back a little for it.
+            if ACCESSOR.search('\n'.join(lines[max(0, n - 3):n + 1])):
                 tokens.update(QUOTED.findall(line))
     return tokens
 
@@ -434,7 +460,8 @@ def scan(files, read, leaves, built, tokens):
                 if var in consts:
                     stats['example-code identifier'] += 1
                     continue
-                rung = resolve(var, leaves, built, tokens)
+                rung = None if malformed(var) else resolve(
+                    var, leaves, built, tokens)
                 if rung:
                     stats[rung] += 1
                 elif at[i] in waived.get(var, ()):
@@ -457,10 +484,20 @@ def scan(files, read, leaves, built, tokens):
 TABLE_ROW = re.compile(
     r'^//! \| `(AUTUMN_(?:[A-Z0-9_]|\{[a-z]\})+)` \| `([^`]+)` \|')
 
-# A row whose second cell is prose rather than a backticked path: `AUTUMN_ENV`
-# and `AUTUMN_PROFILE` map to "active profile", not to a config key. They are
-# documentation, not a mapping this check can verify.
-TABLE_PROSE_ROW = re.compile(r'^//! \| `(AUTUMN_[A-Z0-9_]+)` \| [^`]')
+# The rows whose second cell is prose rather than a backticked path:
+# `AUTUMN_ENV` and `AUTUMN_PROFILE` map to "active profile", not to a config
+# key, so there is no mapping for this check to verify.
+#
+# Enumerated by NAME, not by the shape "second cell is not backticked". The
+# shape was the first cut and it re-opened the hole this pair of patterns was
+# added to close: a mapping row that loses its opening backtick —
+# `| database.urll |` — stops matching TABLE_ROW, gets classified as intentional
+# prose, and produces neither a table defect nor an unparsed-row defect. The
+# whole point of accounting for every row is that a row cannot leave the check
+# by being malformed.
+TABLE_PROSE_ROWS = ('AUTUMN_ENV', 'AUTUMN_PROFILE')
+TABLE_PROSE_ROW = re.compile(
+    r'^//! \| `(' + '|'.join(TABLE_PROSE_ROWS) + r')` \| [^`]')
 
 # Anything shaped like a table row at all, used to prove the two patterns above
 # between them account for every one.
@@ -630,6 +667,16 @@ def self_test():
     case('a placeholder name is scanned',
          VAR.findall('| `AUTUMN_DATABASE__SHARDS__{i}__NAME` | x |'),
          ['AUTUMN_DATABASE__SHARDS__{i}__NAME'])
+    # A casing typo must be SEEN, then reported — under an upper-case-only
+    # pattern it matched nothing and the claim was invisible.
+    case('a casing typo is scanned',
+         VAR.findall('export AUTUMN_LOG__LEVeL=debug'), ['AUTUMN_LOG__LEVeL'])
+    case('a casing typo is malformed', malformed('AUTUMN_LOG__LEVeL'), True)
+    case('a placeholder is not malformed',
+         malformed('AUTUMN_DATABASE__SHARDS__{i}__NAME'), False)
+    _, dm = scan(['d.md'], lambda _: 'export AUTUMN_LOG__LEVeL=debug\n',
+                 leaves, built, tokens)
+    case('a casing typo is reported', len(dm), 1)
     case('a placeholder name resolves',
          r('AUTUMN_DATABASE__SHARDS__{i}__NAME'), 'schema')
     case('a typo beside a placeholder is caught',
@@ -714,10 +761,24 @@ def self_test():
          any(p.match('AUTUMN_DATABASE__SHARDS__0__NOPE')
              for p in real_built.values()), False)
 
-    # A negative assertion is the strongest statement that a name is NOT read,
-    # so it must not put the name into the truth set.
+    # A test may name a variable precisely to prove the runtime ignores it.
+    # Neither shape may enter the truth set.
     case('a negatively-asserted name is not swept in',
          'AUTUMN_TEST_SESSION_COOKIE' in swept, False)
+    case('a fixture environment name is not swept in',
+         'AUTUMN_SERVER__TLS__ENABLED' in swept, False)
+    # …while the binding form, which has no accessor anywhere near it, is.
+    case('a const-bound name is swept in', 'AUTUMN_CANARY' in swept, True)
+
+    # A mapping row that loses a backtick must not escape by looking like prose.
+    broken = '//! | `AUTUMN_DATABASE__URL` | database.urll | `String` |'
+    rows_b, unparsed_b = table_rows(broken)
+    case('a malformed mapping row is reported, not called prose',
+         (len(rows_b), len(unparsed_b)), (0, 1))
+    prose = '//! | `AUTUMN_ENV` | active profile | `String` |'
+    rows_p, unparsed_p = table_rows(prose)
+    case('the enumerated prose rows still pass',
+         (len(rows_p), len(unparsed_p)), (0, 0))
 
     good = [(1, 'AUTUMN_LOG__LEVEL', 'log.level'),
             (2, 'AUTUMN_SECURITY__SIGNING_SECRET', 'security.signing_secret.secret'),
