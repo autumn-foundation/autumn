@@ -1,0 +1,963 @@
+//! The application architecture graph document (issue #1747).
+//!
+//! One node per macro-declared element, one edge per declared or derived
+//! relationship, plus the completeness accounting and the derivation's own
+//! limits. See [the module docs](super) for what the derivation can and cannot
+//! see.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+
+use serde::{Deserialize, Serialize};
+
+use super::{
+    Access, JobGraphDescriptor, JobKind, ModelGraphDescriptor, MountedRoute, NodeKind, Provenance,
+    RepositoryGraphDescriptor, RouteAuth, RouteGraphDescriptor, is_safe_method,
+};
+
+/// Schema version of the emitted architecture graph. Bumped only on breaking
+/// changes to the document shape.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+
+/// Machine-readable stdout marker preceding the graph JSON emitted by the
+/// `AUTUMN_DUMP_GRAPH=1` dump mode.
+///
+/// A process-boundary protocol: `autumn graph` runs the built binary as a child
+/// and scans its stdout for this marker, so an app that prints anything else
+/// during startup cannot corrupt the parse.
+pub const ARCHITECTURE_GRAPH_MARKER: &str = "[autumn:graph] ";
+
+/// The env var selecting the app binary's architecture-graph dump mode.
+pub const DUMP_ENV: &str = "AUTUMN_DUMP_GRAPH";
+
+/// The derivation limits carried in the document itself.
+///
+/// They live here, not only in the guide, for the same reason the
+/// agent-authority manifest carries its `excluded` dimensions: a document read
+/// without its caveats is read as more than it is.
+pub const LIMITS: &[&str] = &[
+    "Edges from a route or job are derived from that item's own tokens: a call into a helper \
+     function in another module is not followed (static derivation only — dynamic call-graph \
+     tracing is out of scope for this slice).",
+    "Symbol resolution is name-based: a type alias or a `use ... as ...` rename is not resolved, \
+     and a model whose name matches a common type is linked wherever that name appears.",
+    "Raw SQL is matched by identifier, and only inside string literals that contain a SQL \
+     keyword; SQL assembled at runtime from fragments is invisible.",
+    "Access is `write` when the item's tokens carry mutation evidence or the route declares a \
+     non-safe HTTP method, and `read` otherwise — it is the declared intent, not an executed \
+     statement.",
+];
+
+// ── Node facts ───────────────────────────────────────────────────────
+
+/// Facts carried by a route node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteFacts {
+    /// Uppercase HTTP method.
+    pub method: String,
+    /// The mounted path when the route is in the route table, otherwise the
+    /// path as declared on the macro.
+    pub path: String,
+    /// Whether the route was found in the application's mounted route table.
+    ///
+    /// A declared handler that no `routes![]` list mounts is still a node: it
+    /// is macro-declared, and a route that silently stopped being served is
+    /// exactly the drift the completeness gate exists to catch.
+    pub mounted: bool,
+    /// The route's declared authorization requirement, when it is mounted.
+    /// A route the app never mounted has no resolved posture to state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<RouteAuth>,
+}
+
+/// Facts carried by a model node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelFacts {
+    /// The database table the model maps to.
+    pub table: String,
+}
+
+/// Facts carried by a repository node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryFacts {
+    /// The generated implementation type, e.g. `PgPostRepository`.
+    pub implementation: String,
+    /// The model the repository is declared over.
+    pub model: String,
+    /// The table that model maps to.
+    pub table: String,
+    /// Mount prefix of the generated REST auto-API, when it declares one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+}
+
+/// Facts carried by a job, scheduled-task or one-off-task node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobFacts {
+    /// Which macro declared it.
+    pub kind: JobKind,
+    /// Schedule expression, for `#[scheduled]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+}
+
+/// One element of the application's architecture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphNode {
+    /// Stable identity, `"{kind}:{module_path}::{name}"` for every kind except
+    /// models, which use their module-qualified type path.
+    ///
+    /// Deliberately independent of the mounted path: a route that moves under a
+    /// renamed scope must read as one node whose path changed, not as one node
+    /// removed and another added.
+    pub id: String,
+    /// What the element is.
+    pub kind: NodeKind,
+    /// Display name — the handler, model, repository trait or job name.
+    pub name: String,
+    /// Module the element was declared in.
+    pub module: String,
+    /// `file:line` of the declaration.
+    pub location: String,
+    /// Route facts, for route and static-route nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<RouteFacts>,
+    /// Model facts, for model nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelFacts>,
+    /// Repository facts, for repository nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<RepositoryFacts>,
+    /// Job facts, for job, scheduled-task and one-off-task nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobFacts>,
+}
+
+impl GraphNode {
+    /// A one-line rendering of the node, for the human report.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match (&self.route, &self.model, &self.repository, &self.job) {
+            (Some(r), ..) => format!("{} {}", r.method, r.path),
+            (_, Some(m), ..) => format!("{} (table {})", self.name, m.table),
+            (_, _, Some(r), _) => format!("{} over {}", self.name, r.model),
+            (.., Some(j)) => match &j.schedule {
+                Some(s) => format!("{} (every {s})", self.name),
+                None => self.name.clone(),
+            },
+            _ => self.name.clone(),
+        }
+    }
+}
+
+/// One relationship between two elements.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphEdge {
+    /// Node id of the acting element — a route, job or repository.
+    pub from: String,
+    /// Node id of the element acted upon — a repository or model.
+    pub to: String,
+    /// Whether the source reads or writes the target.
+    pub access: Access,
+    /// Why the edge exists.
+    pub provenance: Provenance,
+    /// The symbol that resolved the edge; empty for declaration edges.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub symbol: String,
+}
+
+/// The completeness accounting for the graph.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Completeness {
+    /// Macro-declared routes (mounted or not).
+    pub declared_routes: usize,
+    /// Declared routes found in the application's mounted route table.
+    pub mounted_routes: usize,
+    /// Declared models.
+    pub models: usize,
+    /// Declared repositories.
+    pub repositories: usize,
+    /// Declared jobs, scheduled tasks and one-off tasks.
+    pub jobs: usize,
+    /// Node ids of declared routes that no `routes![]` list mounts, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmounted_routes: Vec<String>,
+    /// Mounted routes with no macro-declared node — a route registered by a
+    /// mechanism this graph cannot see (a raw `merge`/`nest` router, or a
+    /// framework endpoint), sorted. Named rather than dropped so the document
+    /// cannot quietly under-report the served surface.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmodelled_mounted_routes: Vec<String>,
+}
+
+/// The application's architecture, as its macros declare it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchitectureGraph {
+    /// Schema version of this document.
+    pub schema_version: u32,
+    /// Every macro-declared element, sorted by [`GraphNode::id`].
+    pub nodes: Vec<GraphNode>,
+    /// Every declared or derived relationship, sorted by `(from, to)`.
+    pub edges: Vec<GraphEdge>,
+    /// What the graph accounts for.
+    pub completeness: Completeness,
+    /// What the derivation cannot see, carried with the document.
+    pub limits: Vec<String>,
+}
+
+impl ArchitectureGraph {
+    /// Serialize the graph as pretty JSON.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: every field is a plain serializable value.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_else(|e| {
+            panic!("architecture graph is not serializable: {e}");
+        })
+    }
+
+    /// Look a node up by id.
+    #[must_use]
+    pub fn node(&self, id: &str) -> Option<&GraphNode> {
+        self.nodes.iter().find(|n| n.id == id)
+    }
+
+    /// The human report.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut out = String::new();
+        let _ = writeln!(out, "Application architecture graph (schema v{})", self.schema_version);
+        let _ = writeln!(
+            out,
+            "  {} nodes, {} edges",
+            self.nodes.len(),
+            self.edges.len()
+        );
+        let c = &self.completeness;
+        let _ = writeln!(
+            out,
+            "  {} routes ({} mounted), {} models, {} repositories, {} jobs",
+            c.declared_routes, c.mounted_routes, c.models, c.repositories, c.jobs
+        );
+
+        for kind in [
+            NodeKind::Model,
+            NodeKind::Repository,
+            NodeKind::Route,
+            NodeKind::StaticRoute,
+            NodeKind::Job,
+            NodeKind::ScheduledTask,
+            NodeKind::OneOffTask,
+        ] {
+            let nodes: Vec<&GraphNode> = self.nodes.iter().filter(|n| n.kind == kind).collect();
+            if nodes.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "\n{kind}s ({}):", nodes.len());
+            for node in nodes {
+                let _ = writeln!(out, "  {}", node.label());
+                for edge in self.edges.iter().filter(|e| e.from == node.id) {
+                    let target = self.node(&edge.to).map_or(edge.to.as_str(), |n| n.name.as_str());
+                    let _ = writeln!(
+                        out,
+                        "      {} {} ({})",
+                        edge.access, target, edge.provenance
+                    );
+                }
+            }
+        }
+
+        if !c.unmounted_routes.is_empty() {
+            let _ = writeln!(out, "\nDeclared but not mounted ({}):", c.unmounted_routes.len());
+            for id in &c.unmounted_routes {
+                let _ = writeln!(out, "  {id}");
+            }
+        }
+        if !c.unmodelled_mounted_routes.is_empty() {
+            let _ = writeln!(
+                out,
+                "\nMounted with no macro declaration ({}):",
+                c.unmodelled_mounted_routes.len()
+            );
+            for id in &c.unmodelled_mounted_routes {
+                let _ = writeln!(out, "  {id}");
+            }
+        }
+
+        let _ = writeln!(out, "\nLimits of this derivation:");
+        for limit in &self.limits {
+            let _ = writeln!(out, "  - {limit}");
+        }
+        out
+    }
+}
+
+// ── Building ─────────────────────────────────────────────────────────
+
+/// The id of a route node.
+fn route_id(module_path: &str, handler: &str) -> String {
+    format!("route:{module_path}::{handler}")
+}
+
+/// The id of a model node.
+fn model_id(model_path: &str) -> String {
+    format!("model:{model_path}")
+}
+
+/// The id of a repository node.
+fn repository_id(module_path: &str, repository: &str) -> String {
+    format!("repository:{module_path}::{repository}")
+}
+
+/// The id of a job node.
+fn job_id(module_path: &str, handler: &str) -> String {
+    format!("job:{module_path}::{handler}")
+}
+
+/// A `file:line` location string.
+fn location(file: &str, line: u32) -> String {
+    format!("{file}:{line}")
+}
+
+/// The symbol index: which node ids a candidate name can resolve to.
+///
+/// A name maps to *every* node that answers to it, never to a best guess: two
+/// crates that each declare a `Post` produce two edges, which is the honest
+/// answer to a name-based derivation and keeps recall total.
+fn symbol_index(
+    models: &[ModelGraphDescriptor],
+    repositories: &[RepositoryGraphDescriptor],
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut index: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for model in models {
+        let id = model_id(model.model_path);
+        index.entry(model.model.to_owned()).or_default().insert(id.clone());
+        index.entry(model.table.to_owned()).or_default().insert(id);
+    }
+    for repo in repositories {
+        let id = repository_id(repo.module_path, repo.repository);
+        index.entry(repo.repository.to_owned()).or_default().insert(id.clone());
+        index.entry(repo.implementation.to_owned()).or_default().insert(id);
+    }
+    index
+}
+
+/// Resolve one item's symbols into edges, strongest provenance winning.
+fn resolve_edges(
+    from: &str,
+    signature_symbols: &[&str],
+    body_symbols: &[&str],
+    access: Access,
+    index: &BTreeMap<String, BTreeSet<String>>,
+    edges: &mut BTreeMap<(String, String), GraphEdge>,
+) {
+    for (symbols, provenance) in [
+        (signature_symbols, Provenance::Signature),
+        (body_symbols, Provenance::Body),
+    ] {
+        for symbol in symbols {
+            let Some(targets) = index.get(*symbol) else {
+                continue;
+            };
+            for target in targets {
+                let key = (from.to_owned(), target.clone());
+                let candidate = GraphEdge {
+                    from: from.to_owned(),
+                    to: target.clone(),
+                    access,
+                    provenance,
+                    symbol: (*symbol).to_owned(),
+                };
+                match edges.get(&key) {
+                    // A signature edge outranks a body edge for the same pair:
+                    // an extractor is a stronger statement than a name in the
+                    // body, and the report should say the stronger one.
+                    Some(existing) if existing.provenance <= candidate.provenance => {}
+                    _ => {
+                        edges.insert(key, candidate);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Assemble the graph from macro-declared elements and the mounted route table.
+///
+/// `mounted` supplies the served path and resolved auth posture for routes the
+/// application actually mounts; everything else is a macro declaration, so a
+/// declared element is in the graph whether or not the app wired it up.
+#[must_use]
+pub fn build(
+    mounted: &[MountedRoute],
+    routes: &[RouteGraphDescriptor],
+    models: &[ModelGraphDescriptor],
+    repositories: &[RepositoryGraphDescriptor],
+    jobs: &[JobGraphDescriptor],
+) -> ArchitectureGraph {
+    let index = symbol_index(models, repositories);
+    let mut nodes: BTreeMap<String, GraphNode> = BTreeMap::new();
+    let mut edges: BTreeMap<(String, String), GraphEdge> = BTreeMap::new();
+
+    // ── Models ───────────────────────────────────────────────────
+    for model in models {
+        let id = model_id(model.model_path);
+        nodes.insert(
+            id.clone(),
+            GraphNode {
+                id,
+                kind: NodeKind::Model,
+                name: model.model.to_owned(),
+                module: model.module_path.to_owned(),
+                location: location(model.file, model.line),
+                route: None,
+                model: Some(ModelFacts {
+                    table: model.table.to_owned(),
+                }),
+                repository: None,
+                job: None,
+            },
+        );
+    }
+
+    // ── Repositories ─────────────────────────────────────────────
+    for repo in repositories {
+        let id = repository_id(repo.module_path, repo.repository);
+        nodes.insert(
+            id.clone(),
+            GraphNode {
+                id: id.clone(),
+                kind: NodeKind::Repository,
+                name: repo.repository.to_owned(),
+                module: repo.module_path.to_owned(),
+                location: location(repo.file, repo.line),
+                route: None,
+                model: None,
+                repository: Some(RepositoryFacts {
+                    implementation: repo.implementation.to_owned(),
+                    model: repo.model.to_owned(),
+                    table: repo.table.to_owned(),
+                    api: (!repo.api.is_empty()).then(|| repo.api.to_owned()),
+                }),
+                job: None,
+            },
+        );
+        // `#[repository(Post)]` states its model outright, so this edge is a
+        // declaration rather than a name match. It is resolved through the
+        // symbol index all the same, so a repository over a model no `#[model]`
+        // declared produces no dangling edge.
+        for target in index
+            .get(repo.model)
+            .into_iter()
+            .flatten()
+            .filter(|t| t.starts_with("model:"))
+        {
+            edges.insert(
+                (id.clone(), target.clone()),
+                GraphEdge {
+                    from: id.clone(),
+                    to: target.clone(),
+                    access: Access::ReadWrite,
+                    provenance: Provenance::Declaration,
+                    symbol: String::new(),
+                },
+            );
+        }
+    }
+
+    // ── Routes ───────────────────────────────────────────────────
+    let mut mounted_count = 0usize;
+    let mut unmounted: Vec<String> = Vec::new();
+    let mut matched_mounted: BTreeSet<(String, String)> = BTreeSet::new();
+    for route in routes {
+        let id = route_id(route.module_path, route.handler);
+        let hit = mounted.iter().find(|m| {
+            m.handler == route.handler
+                && m.module_path == route.module_path
+                && m.method.eq_ignore_ascii_case(route.method)
+        });
+        if let Some(m) = hit {
+            mounted_count += 1;
+            matched_mounted.insert((m.method.clone(), m.path.clone()));
+        } else {
+            unmounted.push(id.clone());
+        }
+        let access = if route.mutating || !is_safe_method(route.method) {
+            Access::Write
+        } else {
+            Access::Read
+        };
+        nodes.insert(
+            id.clone(),
+            GraphNode {
+                id: id.clone(),
+                kind: if route.static_route {
+                    NodeKind::StaticRoute
+                } else {
+                    NodeKind::Route
+                },
+                name: route.handler.to_owned(),
+                module: route.module_path.to_owned(),
+                location: location(route.file, route.line),
+                route: Some(RouteFacts {
+                    method: route.method.to_owned(),
+                    path: hit.map_or_else(|| route.path.to_owned(), |m| m.path.clone()),
+                    mounted: hit.is_some(),
+                    auth: hit.map(|m| m.auth.clone()),
+                }),
+                model: None,
+                repository: None,
+                job: None,
+            },
+        );
+        resolve_edges(
+            &id,
+            route.signature_symbols,
+            route.body_symbols,
+            access,
+            &index,
+            &mut edges,
+        );
+    }
+
+    // ── Jobs ─────────────────────────────────────────────────────
+    for job in jobs {
+        let id = job_id(job.module_path, job.handler);
+        nodes.insert(
+            id.clone(),
+            GraphNode {
+                id: id.clone(),
+                kind: match job.kind {
+                    JobKind::Job => NodeKind::Job,
+                    JobKind::Scheduled => NodeKind::ScheduledTask,
+                    JobKind::Task => NodeKind::OneOffTask,
+                },
+                name: job.name.to_owned(),
+                module: job.module_path.to_owned(),
+                location: location(job.file, job.line),
+                route: None,
+                model: None,
+                repository: None,
+                job: Some(JobFacts {
+                    kind: job.kind,
+                    schedule: (!job.schedule.is_empty()).then(|| job.schedule.to_owned()),
+                }),
+            },
+        );
+        let access = if job.mutating {
+            Access::Write
+        } else {
+            Access::Read
+        };
+        resolve_edges(
+            &id,
+            job.signature_symbols,
+            job.body_symbols,
+            access,
+            &index,
+            &mut edges,
+        );
+    }
+
+    let unmodelled: Vec<String> = mounted
+        .iter()
+        .filter(|m| !matched_mounted.contains(&(m.method.clone(), m.path.clone())))
+        .map(|m| format!("{} {}", m.method, m.path))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    unmounted.sort();
+    unmounted.dedup();
+
+    ArchitectureGraph {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        completeness: Completeness {
+            declared_routes: routes.len(),
+            mounted_routes: mounted_count,
+            models: models.len(),
+            repositories: repositories.len(),
+            jobs: jobs.len(),
+            unmounted_routes: unmounted,
+            unmodelled_mounted_routes: unmodelled,
+        },
+        nodes: nodes.into_values().collect(),
+        edges: edges.into_values().collect(),
+        limits: LIMITS.iter().map(|l| (*l).to_owned()).collect(),
+    }
+}
+
+/// Assemble the graph from this binary's link-time registrations.
+#[must_use]
+pub fn audit(mounted: &[MountedRoute]) -> ArchitectureGraph {
+    let routes: Vec<RouteGraphDescriptor> = inventory::iter::<RouteGraphDescriptor>
+        .into_iter()
+        .copied()
+        .collect();
+    let models: Vec<ModelGraphDescriptor> = inventory::iter::<ModelGraphDescriptor>
+        .into_iter()
+        .copied()
+        .collect();
+    let repositories: Vec<RepositoryGraphDescriptor> =
+        inventory::iter::<RepositoryGraphDescriptor>
+            .into_iter()
+            .copied()
+            .collect();
+    let jobs: Vec<JobGraphDescriptor> = inventory::iter::<JobGraphDescriptor>
+        .into_iter()
+        .copied()
+        .collect();
+    build(mounted, &routes, &models, &repositories, &jobs)
+}
+
+// ── Dump-mode protocol ───────────────────────────────────────────────
+
+/// Whether the process was started in architecture-graph dump mode.
+#[must_use]
+pub fn is_dump_mode() -> bool {
+    std::env::var(DUMP_ENV).as_deref() == Ok("1")
+}
+
+/// Print the graph to stdout behind [`ARCHITECTURE_GRAPH_MARKER`].
+pub fn print_manifest_dump(graph: &ArchitectureGraph) {
+    let json = serde_json::to_string(graph).unwrap_or_else(|e| {
+        panic!("architecture graph is not serializable: {e}");
+    });
+    println!("{ARCHITECTURE_GRAPH_MARKER}{json}");
+}
+
+/// Recover a graph from a child process's stdout.
+///
+/// Scans for [`ARCHITECTURE_GRAPH_MARKER`] rather than parsing the whole stream,
+/// so an app that prints anything else during startup cannot corrupt the parse.
+#[must_use]
+pub fn parse_manifest_dump(stdout: &str) -> Option<ArchitectureGraph> {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(ARCHITECTURE_GRAPH_MARKER))
+        .and_then(|json| serde_json::from_str(json).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model(name: &'static str, path: &'static str, table: &'static str) -> ModelGraphDescriptor {
+        ModelGraphDescriptor {
+            model: name,
+            model_path: path,
+            table,
+            module_path: "app::models",
+            file: "src/models.rs",
+            line: 10,
+        }
+    }
+
+    fn repository(
+        name: &'static str,
+        implementation: &'static str,
+        model: &'static str,
+        table: &'static str,
+    ) -> RepositoryGraphDescriptor {
+        RepositoryGraphDescriptor {
+            repository: name,
+            implementation,
+            model,
+            table,
+            api: "",
+            module_path: "app::repositories",
+            file: "src/repositories.rs",
+            line: 20,
+        }
+    }
+
+    fn route(
+        handler: &'static str,
+        method: &'static str,
+        path: &'static str,
+        signature_symbols: &'static [&'static str],
+        body_symbols: &'static [&'static str],
+    ) -> RouteGraphDescriptor {
+        RouteGraphDescriptor {
+            handler,
+            module_path: "app::routes::posts",
+            method,
+            path,
+            static_route: false,
+            mutating: false,
+            file: "src/routes/posts.rs",
+            line: 30,
+            signature_symbols,
+            body_symbols,
+        }
+    }
+
+    fn job(
+        name: &'static str,
+        kind: JobKind,
+        body_symbols: &'static [&'static str],
+    ) -> JobGraphDescriptor {
+        JobGraphDescriptor {
+            name,
+            kind,
+            handler: name,
+            module_path: "app::jobs",
+            schedule: "",
+            mutating: false,
+            file: "src/jobs.rs",
+            line: 40,
+            signature_symbols: &[],
+            body_symbols,
+        }
+    }
+
+    fn mounted(method: &str, path: &str, handler: &str) -> MountedRoute {
+        MountedRoute {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            handler: handler.to_owned(),
+            module_path: "app::routes::posts".to_owned(),
+            auth: RouteAuth {
+                secured: true,
+                roles: vec!["admin".to_owned()],
+                ..RouteAuth::default()
+            },
+        }
+    }
+
+    #[test]
+    fn every_declared_element_becomes_a_node() {
+        let graph = build(
+            &[],
+            &[route("index", "GET", "/posts", &[], &[])],
+            &[model("Post", "app::models::Post", "posts")],
+            &[repository("PostRepository", "PgPostRepository", "Post", "posts")],
+            &[job("send_digest", JobKind::Job, &[])],
+        );
+        let kinds: Vec<NodeKind> = graph.nodes.iter().map(|n| n.kind).collect();
+        assert!(kinds.contains(&NodeKind::Route), "{kinds:?}");
+        assert!(kinds.contains(&NodeKind::Model), "{kinds:?}");
+        assert!(kinds.contains(&NodeKind::Repository), "{kinds:?}");
+        assert!(kinds.contains(&NodeKind::Job), "{kinds:?}");
+        assert_eq!(graph.completeness.declared_routes, 1);
+        assert_eq!(graph.completeness.models, 1);
+        assert_eq!(graph.completeness.repositories, 1);
+        assert_eq!(graph.completeness.jobs, 1);
+    }
+
+    #[test]
+    fn a_repository_declares_its_model_edge() {
+        let graph = build(
+            &[],
+            &[],
+            &[model("Post", "app::models::Post", "posts")],
+            &[repository("PostRepository", "PgPostRepository", "Post", "posts")],
+            &[],
+        );
+        let edge = graph
+            .edges
+            .iter()
+            .find(|e| e.to == "model:app::models::Post")
+            .expect("repository must declare an edge to its model");
+        assert_eq!(edge.provenance, Provenance::Declaration);
+        assert_eq!(edge.access, Access::ReadWrite);
+    }
+
+    #[test]
+    fn a_repository_extractor_links_the_route_to_the_repository() {
+        let graph = build(
+            &[],
+            &[route("show", "GET", "/posts/{id}", &["PgPostRepository"], &[])],
+            &[model("Post", "app::models::Post", "posts")],
+            &[repository("PostRepository", "PgPostRepository", "Post", "posts")],
+            &[],
+        );
+        let edge = graph
+            .edges
+            .iter()
+            .find(|e| e.from.starts_with("route:") && e.to.starts_with("repository:"))
+            .expect("a repository extractor must link the route to the repository");
+        assert_eq!(edge.provenance, Provenance::Signature);
+        assert_eq!(edge.symbol, "PgPostRepository");
+    }
+
+    #[test]
+    fn a_table_module_named_in_the_body_links_the_route_to_the_model() {
+        let graph = build(
+            &[],
+            &[route("show", "GET", "/posts/{id}", &[], &["posts"])],
+            &[model("Post", "app::models::Post", "posts")],
+            &[],
+            &[],
+        );
+        let edge = graph
+            .edges
+            .iter()
+            .find(|e| e.to == "model:app::models::Post")
+            .expect("a table module named in the body must link the route to the model");
+        assert_eq!(edge.provenance, Provenance::Body);
+        assert_eq!(edge.access, Access::Read);
+    }
+
+    #[test]
+    fn a_non_safe_method_makes_the_edge_a_write() {
+        let graph = build(
+            &[],
+            &[route("create", "POST", "/posts", &[], &["posts"])],
+            &[model("Post", "app::models::Post", "posts")],
+            &[],
+            &[],
+        );
+        assert_eq!(graph.edges[0].access, Access::Write);
+    }
+
+    #[test]
+    fn a_signature_edge_outranks_a_body_edge_for_the_same_pair() {
+        let graph = build(
+            &[],
+            &[route(
+                "show",
+                "GET",
+                "/posts/{id}",
+                &["PgPostRepository"],
+                &["PgPostRepository"],
+            )],
+            &[],
+            &[repository("PostRepository", "PgPostRepository", "Post", "posts")],
+            &[],
+        );
+        assert_eq!(graph.edges.len(), 1, "{:?}", graph.edges);
+        assert_eq!(graph.edges[0].provenance, Provenance::Signature);
+    }
+
+    #[test]
+    fn a_job_that_names_a_table_gets_a_model_edge() {
+        let graph = build(
+            &[],
+            &[],
+            &[model("Post", "app::models::Post", "posts")],
+            &[],
+            &[job("hot_rank", JobKind::Scheduled, &["posts"])],
+        );
+        let edge = graph
+            .edges
+            .iter()
+            .find(|e| e.from.starts_with("job:"))
+            .expect("a job that names a table must link to the model");
+        assert_eq!(edge.to, "model:app::models::Post");
+    }
+
+    #[test]
+    fn a_mounted_route_carries_its_served_path_and_auth() {
+        let graph = build(
+            &[mounted("GET", "/api/v1/posts", "index")],
+            &[route("index", "GET", "/posts", &[], &[])],
+            &[],
+            &[],
+            &[],
+        );
+        let facts = graph.nodes[0].route.as_ref().expect("route facts");
+        assert!(facts.mounted);
+        assert_eq!(facts.path, "/api/v1/posts", "the mounted path must win");
+        assert_eq!(facts.auth.as_ref().expect("auth").roles, vec!["admin"]);
+        assert_eq!(graph.completeness.mounted_routes, 1);
+        assert!(graph.completeness.unmounted_routes.is_empty());
+    }
+
+    #[test]
+    fn a_declared_route_the_app_never_mounts_is_still_a_node() {
+        let graph = build(&[], &[route("orphan", "GET", "/orphan", &[], &[])], &[], &[], &[]);
+        assert_eq!(graph.nodes.len(), 1);
+        assert!(!graph.nodes[0].route.as_ref().expect("route facts").mounted);
+        assert_eq!(
+            graph.completeness.unmounted_routes,
+            vec!["route:app::routes::posts::orphan"]
+        );
+    }
+
+    #[test]
+    fn a_mounted_route_with_no_declaration_is_named_not_dropped() {
+        let graph = build(&[mounted("GET", "/actuator/health", "actuator")], &[], &[], &[], &[]);
+        assert_eq!(
+            graph.completeness.unmodelled_mounted_routes,
+            vec!["GET /actuator/health"]
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_symbol_produces_no_edge() {
+        let graph = build(
+            &[],
+            &[route("show", "GET", "/posts", &["Db"], &["Ok", "Vec", "String"])],
+            &[model("Post", "app::models::Post", "posts")],
+            &[],
+            &[],
+        );
+        assert!(graph.edges.is_empty(), "{:?}", graph.edges);
+    }
+
+    #[test]
+    fn the_document_carries_its_own_limits() {
+        let graph = build(&[], &[], &[], &[], &[]);
+        assert_eq!(graph.limits.len(), LIMITS.len());
+        assert!(graph.limits.iter().any(|l| l.contains("helper function")));
+    }
+
+    #[test]
+    fn the_graph_round_trips_through_json() {
+        let graph = build(
+            &[mounted("POST", "/posts", "create")],
+            &[route("create", "POST", "/posts", &["PgPostRepository"], &["posts"])],
+            &[model("Post", "app::models::Post", "posts")],
+            &[repository("PostRepository", "PgPostRepository", "Post", "posts")],
+            &[job("digest", JobKind::Job, &["posts"])],
+        );
+        let decoded: ArchitectureGraph =
+            serde_json::from_str(&graph.to_json()).expect("graph must round-trip");
+        assert_eq!(decoded, graph);
+    }
+
+    #[test]
+    fn the_dump_is_recovered_from_a_noisy_stdout() {
+        let graph = build(&[], &[], &[], &[], &[]);
+        let json = serde_json::to_string(&graph).expect("serialize");
+        let stdout = format!("starting up\n{ARCHITECTURE_GRAPH_MARKER}{json}\ndone\n");
+        assert_eq!(parse_manifest_dump(&stdout), Some(graph));
+    }
+
+    #[test]
+    fn parsing_stdout_without_the_marker_yields_nothing() {
+        assert!(parse_manifest_dump("nothing to see here").is_none());
+    }
+
+    #[test]
+    fn nodes_and_edges_are_emitted_in_a_stable_order() {
+        let models = [
+            model("Zebra", "app::models::Zebra", "zebras"),
+            model("Alpha", "app::models::Alpha", "alphas"),
+        ];
+        let first = build(&[], &[], &models, &[], &[]);
+        let reversed: Vec<ModelGraphDescriptor> = models.iter().rev().copied().collect();
+        let second = build(&[], &[], &reversed, &[], &[]);
+        assert_eq!(first, second, "registration order must not change the document");
+        assert_eq!(first.nodes[0].name, "Alpha");
+    }
+
+    #[test]
+    fn the_summary_names_every_section_it_has_rows_for() {
+        let graph = build(
+            &[mounted("POST", "/posts", "create")],
+            &[route("create", "POST", "/posts", &["PgPostRepository"], &[])],
+            &[model("Post", "app::models::Post", "posts")],
+            &[repository("PostRepository", "PgPostRepository", "Post", "posts")],
+            &[job("digest", JobKind::Job, &["posts"])],
+        );
+        let summary = graph.summary();
+        assert!(summary.contains("POST /posts"), "{summary}");
+        assert!(summary.contains("Post (table posts)"), "{summary}");
+        assert!(summary.contains("PostRepository over Post"), "{summary}");
+        assert!(summary.contains("Limits of this derivation"), "{summary}");
+    }
+}

@@ -611,6 +611,11 @@ pub mod experiments;
 pub mod feature_flags;
 pub mod form;
 pub mod gdpr;
+// A plain comment, not a doc comment, for the same reason `classify` carries
+// one: an outer `///` here is merged with the module's `//!` docs and the whole
+// block then resolves its intra-doc links in *this* scope. The module
+// documents itself.
+pub mod graph;
 pub mod job;
 pub mod job_tracking;
 /// Safe, method-aware link helpers: [`links::link_to`] anchors and
