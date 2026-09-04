@@ -1536,6 +1536,36 @@ def _heredoc_delim(text, i):
     return (word, quoted) if word else None
 
 
+def _open_command(text):
+    """True when `text` leaves a construct open that keeps bash reading.
+
+    Runs on the masked copy, so a parenthesis or quote inside a string is
+    already filled and cannot hold the command open by itself.
+    """
+    i, n, depth = 0, len(text), 0
+    while i < n:
+        c = text[i]
+        if c == '\\':
+            i += 2
+            continue
+        if c in '\'"':
+            j = text.find(c, i + 1)
+            if j < 0:
+                return True
+            i = j + 1
+            continue
+        if text[i:i + 2] == '$(':
+            depth += 1
+            i += 2
+            continue
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        i += 1
+    return depth > 0
+
+
 def _heredoc_openers(line):
     """The `(delimiter, strips_tabs, expands)` triples a line opens, in order.
 
@@ -1596,7 +1626,19 @@ def _shell_heredocs(body, code=False):
             # as code, which is the direction that admits names. Removed rather
             # than extended, and the extension I had written for `$( … )` on
             # the same reasoning went with it.
-            queue.extend(_heredoc_openers(logical + line))
+            openers = _heredoc_openers(logical + line)
+            # When the line leaves a substitution or quote OPEN, this cannot
+            # say where the bodies belong: `cat <<OUTER $(` + `cat <<'INNER'`
+            # is accepted by bash, and the inner text is demonstrably not
+            # expanded (checked with the variable exported — it printed
+            # literally), but which body owns which line is not something the
+            # rules here derive. So the uncertainty is resolved toward
+            # REPORTING: an opener on an unfinished line is treated as
+            # non-expanding, its body blanked in both views. That can only drop
+            # names, which shows up as a page reported — never as one passed.
+            if _open_command(_mask_inert(logical + line)):
+                openers = [(d, t, False) for d, t, _ in openers]
+            queue.extend(openers)
             logical = ''
             continue
         delim, tabs, expands = queue[0]
