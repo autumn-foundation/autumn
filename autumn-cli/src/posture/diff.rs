@@ -411,12 +411,11 @@ fn effective_methods(method: &str) -> BTreeSet<String> {
     answered
 }
 
-/// Whether two routes can answer any of the same requests.
-fn methods_overlap(a: &str, b: &str) -> bool {
-    !effective_methods(a).is_disjoint(&effective_methods(b))
-}
-
 /// The methods a route answers *in the manifest it belongs to*.
+///
+/// Every comparison goes through here rather than through the declared method:
+/// there is no context-free "do these two methods overlap" left, because the
+/// answer always depended on what else the manifest mounts.
 ///
 /// The `GET`→`HEAD` expansion is a **fallback**, not a takeover: axum keeps an
 /// explicit `HEAD` handler mounted at the same path, so a `GET` there answers
@@ -810,13 +809,8 @@ fn diff_authorization_policies(
 ) {
     let before = authz_index(base);
     let after = authz_index(head);
-    let routes_after: BTreeSet<RouteKey> = head
-        .dimensions
-        .routes
-        .entries
-        .iter()
-        .map(RouteEntry::key)
-        .collect();
+    let routes_before = route_keys(base);
+    let routes_after = route_keys(head);
 
     // Bindings the same route *gained*, so a removal that is really half of a
     // rename can say so instead of reading as an unexplained loss.
@@ -841,9 +835,10 @@ fn diff_authorization_policies(
         // — but only when the URL went with it. A surviving route whose shape
         // and methods overlap still answers that URL, so the record-level check
         // really did disappear from something reachable.
-        let url_still_answered = routes_after
-            .iter()
-            .any(|(p, m)| takes_precedence(path, p) && methods_overlap(method, m));
+        let url_still_answered = routes_after.iter().any(|(p, m)| {
+            takes_precedence(path, p)
+                && methods_transfer((method, path), &routes_before, (m, p), &routes_after)
+        });
         if !url_still_answered {
             continue;
         }
@@ -858,7 +853,7 @@ fn diff_authorization_policies(
                 a == action
                     && r == resource
                     && takes_precedence(path, p)
-                    && methods_overlap(method, m)
+                    && methods_transfer((method, path), &routes_before, (m, p), &routes_after)
             })
         {
             continue;
@@ -923,6 +918,17 @@ fn diff_authorization_policies(
     }
 }
 
+/// Whether `prefix` exempts `path`, spelled exactly as the CSRF middleware
+/// spells it — so "is this prefix already covered by that one" is asked in the
+/// same terms the runtime will answer it in.
+fn exempts(prefix: &str, path: &str) -> bool {
+    if path == prefix {
+        return true;
+    }
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| prefix.ends_with('/') || rest.starts_with('/'))
+}
+
 /// Configured exemption prefixes, which the per-route rows cannot show.
 ///
 /// The audit asks whether a route *template* matches a prefix; the runtime asks
@@ -934,8 +940,19 @@ fn diff_csrf_exemptions(base: &PostureManifest, head: &PostureManifest, out: &mu
     let before: BTreeSet<&String> = base.dimensions.csrf.exempt_paths.iter().collect();
     let after: BTreeSet<&String> = head.dimensions.csrf.exempt_paths.iter().collect();
 
-    let added: Vec<String> = after.difference(&before).map(|p| (*p).clone()).collect();
-    let removed: Vec<String> = before.difference(&after).map(|p| (*p).clone()).collect();
+    // Coverage, not spelling. Replacing `/api` with `/api/private` exempts a
+    // strict subset of what was exempt before, so calling the new prefix a
+    // widening blocks a change that restores CSRF for most of `/api`.
+    let added: Vec<String> = after
+        .iter()
+        .filter(|p| !before.iter().any(|old| exempts(old, p)))
+        .map(|p| (*p).clone())
+        .collect();
+    let removed: Vec<String> = before
+        .iter()
+        .filter(|p| !after.iter().any(|new| exempts(new, p)))
+        .map(|p| (*p).clone())
+        .collect();
 
     if !added.is_empty() {
         out.push(Finding {
@@ -2025,6 +2042,62 @@ mod tests {
             "the finding must name the route that now serves the URL: {:?}",
             widening[0]
         );
+    }
+
+    /// The same explicit-`HEAD` lesson, in the binding dimension. With base
+    /// `GET /x` (bound) and `HEAD /x` both mounted, deleting only the `GET`
+    /// takes its URL away — the explicit `HEAD` owned `HEAD` all along and
+    /// gains nothing. Reading the alias unconditionally reported the binding as
+    /// lost from a still-reachable URL and blocked.
+    #[test]
+    fn a_binding_removed_beside_an_explicit_head_is_not_a_widening() {
+        let get = route("/x", "GET", "gated", &["user"], &[], true);
+        let head_route = route("/x", "HEAD", "gated", &["user"], &[], true);
+        let binding = r#"{"path":"/x","method":"GET","action":"read","resource":"Thing"}"#;
+        let base = manifest(&format!("{get},{head_route}"), "", "", binding);
+        let head = manifest(&head_route, "", "", "");
+
+        let findings = diff(&base, &head);
+        assert!(
+            widening(&findings).is_empty(),
+            "the GET URL left with the route: {findings:#?}"
+        );
+    }
+
+    /// Narrowing an exemption is not adding one. Every URL `/api/private`
+    /// exempts was already exempt under `/api`, so replacing the broad prefix
+    /// with the narrow one restores CSRF for most of `/api` — a literal set
+    /// difference called the new spelling a widening and blocked it.
+    #[test]
+    fn narrowing_a_csrf_exemption_prefix_is_not_a_widening() {
+        let route = route("/api/{rest}", "POST", "gated", &["user"], &[], false);
+        let entry = r#"{"path":"/api/{rest}","method":"POST","csrf_enforced":false,"exempt":true}"#;
+        let base = manifest_exempt(&route, entry, &["/api"]);
+        let head = manifest_exempt(&route, entry, &["/api/private"]);
+
+        let findings = diff(&base, &head);
+        assert!(
+            widening(&findings).is_empty(),
+            "every URL still exempt was already exempt: {findings:#?}"
+        );
+        assert!(
+            findings.iter().any(|f| f.kind == "csrf_exemption_removed"),
+            "and the narrowing is still reported: {findings:#?}"
+        );
+    }
+
+    /// Broadening one still blocks.
+    #[test]
+    fn broadening_a_csrf_exemption_prefix_is_a_widening() {
+        let route = route("/api/{rest}", "POST", "gated", &["user"], &[], false);
+        let entry = r#"{"path":"/api/{rest}","method":"POST","csrf_enforced":false,"exempt":true}"#;
+        let base = manifest_exempt(&route, entry, &["/api/private"]);
+        let head = manifest_exempt(&route, entry, &["/api"]);
+
+        let findings = diff(&base, &head);
+        let widening = widening(&findings);
+        assert_eq!(widening.len(), 1, "{findings:#?}");
+        assert_eq!(widening[0].kind, "csrf_exemption_added");
     }
 
     /// An exemption prefix is the one CSRF widening the per-route entries

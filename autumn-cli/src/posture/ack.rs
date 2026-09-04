@@ -96,6 +96,11 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
     // renders that line as quoted too, so a marker there is discussion, not a
     // decision. Checking only the current line let it count as a grant.
     let mut quote_paragraph = false;
+    // Inside a raw HTML block whose content GitHub renders literally. Only
+    // these four: a marker inside a `<div>` is plainly *visible*, so it is a
+    // decision like any other, and skipping it would take the escape hatch away
+    // from anyone who formats their comments.
+    let mut raw_html: Option<&'static str> = None;
     for line in text.lines() {
         if line.trim() == SOURCE_SEPARATOR {
             // A new comment body starts here, with a clean slate. Checked
@@ -103,6 +108,7 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
             fence = None;
             html_comment = false;
             quote_paragraph = false;
+            raw_html = None;
             continue;
         }
         // A blank line ends the quoted paragraph, so the lazy continuation
@@ -133,6 +139,23 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
             continue;
         }
         let line = visible.as_str();
+        // `<pre>` and friends render their content as a preformatted sample,
+        // exactly like a fenced block — so a reviewer showing the marker is not
+        // granting it. Tracked only outside a fence, where such a tag is text.
+        if fence.is_none() {
+            if let Some(tag) = raw_html {
+                if closes_raw_html(line, tag) {
+                    raw_html = None;
+                }
+                continue;
+            }
+            if let Some(tag) = opens_raw_html(line) {
+                if !closes_raw_html(line, tag) {
+                    raw_html = Some(tag);
+                }
+                continue;
+            }
+        }
         // Markdown's other code block: four spaces (or a tab) of indentation
         // renders as code, so a marker written that way is a sample, not a
         // grant. Skipping is the safe direction — the worst case is a reviewer
@@ -214,6 +237,27 @@ fn leading_indent(line: &str) -> usize {
         .take_while(|c| *c == ' ' || *c == '\t')
         .map(|c| if c == '\t' { 4 } else { 1 })
         .sum()
+}
+
+/// The raw HTML blocks whose content renders literally or not at all —
+/// `CommonMark`'s type-1 tags, the only ones where a visible marker is a sample
+/// rather than a decision.
+const RAW_HTML_TAGS: [&str; 4] = ["pre", "script", "style", "textarea"];
+
+/// The tag a line opens a raw HTML block with, if it opens one.
+fn opens_raw_html(line: &str) -> Option<&'static str> {
+    let trimmed = line.trim_start().to_ascii_lowercase();
+    RAW_HTML_TAGS.into_iter().find(|tag| {
+        let open = format!("<{tag}");
+        trimmed
+            .strip_prefix(&open)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['>', ' ', '\t', '/']))
+    })
+}
+
+/// Whether a line carries the closing tag that ends the block.
+fn closes_raw_html(line: &str, tag: &str) -> bool {
+    line.to_ascii_lowercase().contains(&format!("</{tag}"))
 }
 
 /// Whether `line` is indented enough to render as a Markdown code block.
@@ -359,6 +403,39 @@ mod tests {
     fn a_quoted_marker_acknowledges_nothing() {
         assert!(parse_acks("> /ack-posture 0123456789abcdef").is_empty());
         assert!(parse_acks(">> /ack-posture 0123456789abcdef").is_empty());
+    }
+
+    /// `\u{3c}pre\u{3e}` renders its content as a preformatted sample, exactly like a
+    /// fenced block. The parser tracked HTML *comments* and nothing else, so a
+    /// reviewer merely showing the marker granted it.
+    #[test]
+    fn a_marker_inside_a_raw_html_block_acknowledges_nothing() {
+        for tag in ["pre", "textarea", "script", "style"] {
+            let text = format!("<{tag}>\n/ack-posture 0123456789abcdef\n</{tag}>\n");
+            assert!(
+                parse_acks(&text).is_empty(),
+                "{tag}: {:?}",
+                parse_acks(&text)
+            );
+        }
+    }
+
+    /// The block ends where its closing tag does, and a marker after it counts.
+    #[test]
+    fn a_marker_after_a_raw_html_block_still_acknowledges() {
+        let text = "<pre>\nsample\n</pre>\n/ack-posture 0123456789abcdef  yes\n";
+        let acks = parse_acks(text);
+        assert_eq!(acks.len(), 1, "{acks:?}");
+    }
+
+    /// Ordinary block-level HTML is *visible*, so a marker inside a `\u{3c}div\u{3e}` is
+    /// a decision like any other. Skipping it would take the escape hatch away
+    /// from anyone who formats their comments.
+    #[test]
+    fn a_marker_inside_a_visible_html_block_still_acknowledges() {
+        let text = "<div>\n/ack-posture 0123456789abcdef  yes\n</div>\n";
+        let acks = parse_acks(text);
+        assert_eq!(acks.len(), 1, "{acks:?}");
     }
 
     /// Inside a fenced block the text is literal, so a line that puts an HTML
