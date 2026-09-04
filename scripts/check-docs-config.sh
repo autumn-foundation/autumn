@@ -354,6 +354,21 @@ def leaf_paths(paths):
 SEGMENT = r'(?:[A-Z0-9]+(?:_[A-Z0-9]+)*|\{[a-z]+\})'
 
 
+# A commented-out `format!` is not a construction site. Requiring `format!(`
+# was the previous fix and still read `// format!("AUTUMN_…__CLIENT_SECRT")` as
+# a name the runtime builds — the same "a shape in text is evidence" mistake,
+# one layer in. Only WHOLE-LINE comments are stripped — a line whose first
+# non-space is `//`. A trailing `// …` after code is left alone, so a `//`
+# inside a string literal can never blank the line it sits on: this errs toward
+# keeping code rather than dropping it, and a construction site is code.
+LINE_COMMENT = re.compile(r'^\s*//')
+
+
+def uncommented(body):
+    return '\n'.join('' if LINE_COMMENT.match(l) else l
+                      for l in body.splitlines())
+
+
 def built_patterns(root, leaves):
     """Regexes for the variable names the runtime constructs at load time.
 
@@ -375,7 +390,7 @@ def built_patterns(root, leaves):
             body = (root / rel).read_text(encoding='utf-8', errors='replace')
         except OSError:
             continue
-        for tpl in TEMPLATE.findall(body):
+        for tpl in TEMPLATE.findall(uncommented(body)):
             segs = tpl[len('AUTUMN_'):].split('__')
             head = re.sub(r'\\\{[a-z_]+\\\}', SEGMENT,
                           re.escape('AUTUMN_' + '__'.join(segs[:-1])))
@@ -477,8 +492,13 @@ BOUND = re.compile(
 # The accessors that read or write the environment. `with` is deliberately NOT
 # here: it supplies a fixture environment, which is how a test names a variable
 # that does not exist.
+# `get` is qualified by its receiver, because every collection has one:
+# `map.get("AUTUMN_LOG__LEVL")` in a test was reading as an environment read,
+# while `env.get(…)` in the media plugin is a real one. The other accessors are
+# specific enough to stand alone.
 ACCESSOR = re.compile(r'\b(?:var|var_os|set_var|remove_var|env_trimmed'
-                      r'|parse_env\w*|env_bool\w*|getenv|get)\s*\(')
+                      r'|parse_env\w*|env_bool\w*|getenv)\s*\('
+                      r'|\benv\w*\.get\s*\(')
 
 # …and never where the line asserts the name is absent.
 NEGATED = re.compile(r'assert(?:_ne)?!\s*\(\s*!|!\s*[\w.]*\bcontains\b|\bassert_ne!')
@@ -1091,6 +1111,21 @@ def self_test():
     case('a format! template is',
          TEMPLATE.findall('let v = format!("AUTUMN_X__{i}__Y");'),
          ['AUTUMN_X__{i}__Y'])
+    # …and a whole `format!` call sitting in a comment is not one either. The
+    # bare-string case above was the previous fix; it left the commented CALL
+    # matching, so a typo written in a comment became a name the gate believed
+    # the runtime builds.
+    case('a commented format! is not a construction site',
+         TEMPLATE.findall(uncommented(
+             '    // let v = format!("AUTUMN_AUTH__OAUTH2__{u}__CLIENT_SECRT");')),
+         [])
+    case('an uncommented format! survives stripping',
+         TEMPLATE.findall(uncommented('    let v = format!("AUTUMN_X__{i}__Y");')),
+         ['AUTUMN_X__{i}__Y'])
+    # A trailing comment must not blank the code before it.
+    case('a trailing comment does not drop the code on its line',
+         TEMPLATE.findall(uncommented('let v = format!("AUTUMN_X__{i}__Y"); // note')),
+         ['AUTUMN_X__{i}__Y'])
     case('oauth2 templates are derived from source',
          any('OAUTH2' in t and t.endswith('CLIENT_SECRET') for t in real_built),
          True)
@@ -1109,6 +1144,14 @@ def self_test():
          'AUTUMN_TEST_SESSION_COOKIE' in swept, False)
     case('a fixture environment name is not swept in',
          'AUTUMN_SERVER__TLS__ENABLED' in swept, False)
+    # `.get` belongs to every collection, so it is an accessor only on an
+    # environment map. A test asserting `map.get("AUTUMN_LOG__LEVL") == None`
+    # names a variable precisely to prove nothing reads it.
+    case('a collection lookup is not an env accessor',
+         bool(ACCESSOR.search('assert_eq!(map.get("AUTUMN_LOG__LEVL"), None);')),
+         False)
+    case('an environment map lookup is',
+         bool(ACCESSOR.search('let v = env.get("AUTUMN_LOG__LEVEL");')), True)
     # …while the binding form, which has no accessor anywhere near it, is.
     case('a const-bound name is swept in', 'AUTUMN_CANARY' in swept, True)
     # `NAME=` inside a Rust string is text, not a shell assignment:
