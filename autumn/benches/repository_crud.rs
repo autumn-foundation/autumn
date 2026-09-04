@@ -243,15 +243,18 @@ impl Drop for TableGuard {
 
 /// Fresh table, seeded with a realistic-shaped fixture — skewed enough that
 /// no two rows are identical, cheap enough to seed in one `INSERT ... SELECT`.
+/// Returns the [`TableGuard`] that owns cleanup.
 ///
 /// Refuses to touch a pre-existing `bolt_bench_products` table rather than
 /// dropping it: `DATABASE_URL` only promises a reachable, TLS-free Postgres,
 /// not a disposable/scratch one, so this harness must not assume it owns
-/// whatever happens to already be there (Codex review on #2486). Callers
-/// clean up after themselves via [`TableGuard`], so a table surviving to the
-/// next run is itself a signal something is wrong — worth surfacing, not
-/// silently clearing.
-fn setup_and_seed(url: &str) {
+/// whatever happens to already be there (Codex review on #2486). The guard
+/// is constructed immediately after `CREATE TABLE` commits and before the
+/// seed `INSERT` runs, so a panic partway through seeding (a lost
+/// connection, a statement timeout) still drops the table on unwind instead
+/// of leaving it behind to block every subsequent run's existence check
+/// (Codex review follow-up).
+fn setup_and_seed(url: &str) -> TableGuard {
     // Imported locally, not at module scope: an outer `use diesel::prelude::*`
     // (the sync `RunQueryDsl`) would make method resolution ambiguous against
     // the async `RunQueryDsl` the `#[repository]`-generated `save`/
@@ -288,6 +291,12 @@ fn setup_and_seed(url: &str) {
          )",
     )
     .expect("create table");
+    // Constructed right after the table commits, before the fallible seed
+    // INSERT below: if that INSERT panics, unwinding still drops the guard
+    // (and therefore the table) instead of leaving it behind.
+    let guard = TableGuard {
+        url: url.to_owned(),
+    };
     conn.batch_execute(&format!(
         "INSERT INTO bolt_bench_products (name, description, price_cents, in_stock) \
          SELECT \
@@ -298,6 +307,7 @@ fn setup_and_seed(url: &str) {
          FROM generate_series(1, {SEEDED_ROWS}) AS i"
     ))
     .expect("seed bolt_bench_products");
+    guard
 }
 
 fn main() {
@@ -308,11 +318,10 @@ fn main() {
         .unwrap_or(500);
 
     let url = database_url();
-    setup_and_seed(&url);
     // Must outlive everything below, including `rt`: dropped last, at the end
     // of `main` (or while unwinding a panic), so a run cleans up its own
     // table instead of leaving it for the next invocation to trip over.
-    let _table_guard = TableGuard { url: url.clone() };
+    let _table_guard = setup_and_seed(&url);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
