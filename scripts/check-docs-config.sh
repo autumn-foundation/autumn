@@ -131,8 +131,11 @@
 #     stated for "the shell family" and applied to `.sh` alone, while
 #     `install.ps1` quotes the same way. One scalar terminator where a line may
 #     open several heredocs (`cat <<'ONE' <<'TWO'`), and a per-LINE quote rule
-#     for a quote that spans lines. Ask what the language's own grammar says
-#     the thing is, then match that.
+#     for a quote that spans lines — which recurred in YAML, where a quoted
+#     `run:` scalar may also run onto later lines. A terminator set that names
+#     `;`, `&`, `|` and `)` but not `>` and `<`, so a redirection-only null
+#     command (`AUTUMN_X=1 > out`, which starts no process) read as a command.
+#     Ask what the language's own grammar says the thing is, then match that.
 #     `check-docs-cli.sh` reads the same two languages and had already been
 #     through most of these rounds: its `_heredoc_openers` / `_open_quote` are
 #     where the heredoc and quote rules here come from. Read the sibling gate
@@ -946,6 +949,49 @@ YAML_ESCAPE = {'0': ' ', 'a': ' ', 'b': ' ', 't': '\t', 'v': ' ', 'f': ' ',
 YAML_HEX = {'x': 2, 'u': 4, 'U': 8}
 
 
+def _flow_close(seg, quote):
+    """Where `seg` closes a flow scalar already open in `quote`, else None.
+
+    The escape that hides a closing quote differs by style, the same way the
+    decoding does: `''` inside a single-quoted scalar, a backslash inside a
+    double-quoted one.
+    """
+    j, n = 0, len(seg)
+    while j < n:
+        if quote == '"' and seg[j] == '\\':
+            j += 2
+            continue
+        if seg[j] == quote:
+            if quote == "'" and seg[j + 1:j + 2] == "'":
+                j += 2
+                continue
+            return j
+        j += 1
+    return None
+
+
+def _fold_flow(parts):
+    """The folded value of a multi-line flow scalar, one line per part.
+
+    Folding is YAML's, so it matches `flush()`: a break between two lines of a
+    paragraph becomes a space, and a blank line is a paragraph break that
+    survives — spelled `;` here, the shell's own name for the boundary a
+    newline is, so two commands stay two.
+    """
+    runs, cur = [], []
+    for part in parts:
+        text = part.strip()
+        if text:
+            cur.append(text)
+            continue
+        if cur:
+            runs.append(' '.join(cur))
+        cur = []
+    if cur:
+        runs.append(' '.join(cur))
+    return ' ; '.join(runs)
+
+
 def _yaml_decode(scalar):
     """The value a quoted YAML scalar actually has, quotes included on input.
 
@@ -1029,7 +1075,13 @@ def _yaml_blocks(body, interpolated=False):
                     out[i] = ''
         del buf[:]
 
-    for l in body.splitlines():
+    src, consumed = body.splitlines(), set()
+    for index, l in enumerate(src):
+        if index in consumed:
+            # A continuation of a flow scalar already folded onto its first
+            # line. Emitted empty so the line count holds.
+            out.append('')
+            continue
         if key is not None:
             if l.strip() and (len(l) - len(l.lstrip())) <= indent:
                 flush()
@@ -1056,8 +1108,34 @@ def _yaml_blocks(body, interpolated=False):
             # let the shell pass pair them off and read a real one. Same shape
             # as the quotes themselves: the consumer's decoding happens before
             # the shell sees anything, so it has to happen here too.
+            #
+            # And a flow scalar is not bounded by the line it starts on. A
+            # quoted `run:` value may run onto later lines, which YAML folds
+            # and unquotes exactly as it does the one-line form — while this
+            # read the opener as an unterminated scalar and blanked every
+            # continuation as an unrelated line, dropping the reads on them.
+            # That direction costs coverage rather than admitting a name, so
+            # it reported correct pages instead of passing wrong ones; both
+            # are wrong, and only one is loud.
             head, _, value = l.partition(':')
             body_ = value.strip()
+            if body_ and body_[0] in '\'"' and _flow_close(body_[1:],
+                                                           body_[0]) is None:
+                quote, parts, j = body_[0], [body_[1:]], index + 1
+                while j < len(src):
+                    seg = src[j].strip()
+                    shut = _flow_close(seg, quote)
+                    parts.append(seg if shut is None else seg[:shut])
+                    if shut is not None:
+                        break
+                    j += 1
+                # An unterminated scalar is left exactly as it was: guessing
+                # where it ends would invent a command nobody wrote.
+                if j < len(src):
+                    consumed.update(range(index + 1, j + 1))
+                    body_ = quote + _fold_flow(parts) + quote
+                    value = ' ' + body_
+                    l = head + ':' + value
             if len(body_) > 1 and body_[0] == body_[-1] and body_[0] in '\'"':
                 pad = len(value) - len(value.lstrip())
                 l = head + ':' + (' ' * (pad + 1)
@@ -1851,18 +1929,42 @@ class _PrefixAssignment:
     # operator, the end of the line, or a comment. `AUTUMN_X=1 ; cmd` sets a
     # variable for the shell, not for `cmd`.
     _not_a_command = ';&|)\n#'
+    # A REDIRECTION is not a command either, and it was the one non-command
+    # this set could not name: `AUTUMN_X=1 > /tmp/out` is a null command — bash
+    # opens the file, assigns in the CURRENT shell and starts no process, so
+    # nothing is exported. `>` and `<` were simply absent, so the operator read
+    # as the following command's first word.
+    #
+    # They cannot just join the set, because a redirection may also PRECEDE a
+    # real command: `AUTUMN_X=1 >out cmd` does run `cmd` with the variable in
+    # its environment. So the operator and its target word are consumed and the
+    # question is asked again after them — which is what the shell does.
+    _redirect = re.compile(r'[0-9]*(?:&>>?|>>|>\||>&|<&|<>|>|<)')
 
     def findall(self, body):
-        out = []
+        out, n = [], len(body)
         for m in self._start.finditer(body):
             end = self._word_end(body, m.end())
             gap = end
-            while gap < len(body) and body[gap] in ' \t':
+            while gap < n and body[gap] in ' \t':
                 gap += 1
-            if (gap > end and gap < len(body)
-                    and body[gap] not in self._not_a_command):
+            if gap == end:
+                continue
+            while True:
+                red = self._redirect.match(body, gap)
+                if not red:
+                    break
+                gap = self._word_end(body, self._skip_blanks(body, red.end()))
+                gap = self._skip_blanks(body, gap)
+            if gap < n and body[gap] not in self._not_a_command:
                 out.append(m.group(1))
         return out
+
+    @staticmethod
+    def _skip_blanks(body, i):
+        while i < len(body) and body[i] in ' \t':
+            i += 1
+        return i
 
     @staticmethod
     def _word_end(body, i):
@@ -3876,6 +3978,17 @@ def self_test():
     case('a bare assignment is not',
          (ASSIGNED.findall('AUTUMN_X="path/to"'),
           ASSIGNED_PREFIX.findall('AUTUMN_X="path/to"')), ([], []))
+    # A redirection is not a command — `AUTUMN_X=1 > out` is a null command
+    # that starts no process — but it may PRECEDE one, so it is consumed and
+    # the question asked again rather than added to the terminator set.
+    case('a redirection is not the command a prefix assignment needs',
+         (ASSIGNED_PREFIX.findall('AUTUMN_X=1 > /tmp/out'),
+          ASSIGNED_PREFIX.findall('AUTUMN_X=1 >> log'),
+          ASSIGNED_PREFIX.findall('AUTUMN_X=1 &> f'),
+          ASSIGNED_PREFIX.findall('AUTUMN_X=1 >out cmd'),
+          ASSIGNED_PREFIX.findall('AUTUMN_X=1 2>&1 cmd'),
+          ASSIGNED_PREFIX.findall('AUTUMN_X=1 < in cmd')),
+         ([], [], [], ['AUTUMN_X'], ['AUTUMN_X'], ['AUTUMN_X']))
     # The value is one shell WORD, quotes included. Reading it as `\S*` made the
     # second word of a quoted value look like the command that follows a prefix
     # assignment, so a script-local variable read as one handed to a process.
@@ -4166,6 +4279,26 @@ def self_test():
           _yaml_decode(r'"\${AUTUMN_X}"')),
          ([], ['AUTUMN_X'], 'say "hi"', "it's", 'a;b', 'A',
           r'\${AUTUMN_X}'))
+    # …and a flow scalar is not bounded by its first line. Both quote styles
+    # fold and decode the same way across lines; an UNTERMINATED one is left
+    # alone, since guessing its end would invent a command. Line count holds
+    # either way — the continuations are blanked, not dropped.
+    def _yb(y):
+        return EXPANDED.findall(_shell_literals(_yaml_blocks(y, False)))
+    _tail = '  - run: echo ${AUTUMN_TAIL}\n'
+    case('a multi-line flow scalar is folded, decoded and kept',
+         (_yb("steps:\n  - run: 'printf x\n      ${AUTUMN_X}'\n" + _tail),
+          _yb('steps:\n  - run: "printf x\n      ${AUTUMN_X}"\n' + _tail),
+          _yb("steps:\n  - run: 'unterminated ${AUTUMN_X}\n" + _tail),
+          _yb("steps:\n  - name: 'printf x\n      ${AUTUMN_X}'\n" + _tail),
+          _fold_flow(['a one', 'a two', '', 'b one']),
+          (_flow_close("it''s x' rest", "'"), _flow_close(r'a\"b" rest', '"'),
+           _flow_close('no close here', "'")),
+          len(_yaml_blocks("steps:\n  - run: 'printf x\n      ${AUTUMN_X}'\n"
+                           + _tail, False).splitlines())),
+         (['AUTUMN_X', 'AUTUMN_TAIL'], ['AUTUMN_X', 'AUTUMN_TAIL'],
+          ['AUTUMN_X', 'AUTUMN_TAIL'], ['AUTUMN_TAIL'],
+          'a one a two ; b one', (7, 4, None), 4))
     # Both PowerShell spellings reach the environment.
     case('the braced PowerShell environment form is a use',
          (PS_ENV.findall('${env:AUTUMN_X}'), PS_ENV.findall('$env:AUTUMN_X'),
