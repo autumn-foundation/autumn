@@ -760,7 +760,11 @@ def _shell_literals(body):
 #
 # An UNQUOTED heredoc is a different thing entirely and is left alone: `<<EOF`
 # does expand `${AUTUMN_X}`, so that IS a reference.
-HEREDOC = re.compile(r"<<-?\s*'([A-Za-z_][A-Za-z0-9_]*)'")
+# Every form that quotes the delimiter suppresses expansion, not just the
+# single-quoted one: `<<"EOF"` and `<<\EOF` do too, and each was letting a
+# fixture body read as commands.
+HEREDOC = re.compile(r'''<<-?\s*(?:'([A-Za-z_]\w*)'|"([A-Za-z_]\w*)"'''
+                     r'''|\\([A-Za-z_]\w*))''')
 
 
 def _shell_heredocs(body):
@@ -771,7 +775,7 @@ def _shell_heredocs(body):
             out.append(l)
             m = HEREDOC.search(l)
             if m:
-                terminator = m.group(1)
+                terminator = next(g for g in m.groups() if g)
             continue
         if l.strip() == terminator:
             out.append(l)
@@ -926,8 +930,15 @@ ASSIGNED = re.compile(r'(?:^|[;&|(\s])export\s+(AUTUMN_[A-Z0-9_]+)=')
 # The separator here is explicitly NOT a newline: `\s` spans line breaks, so
 # applied to a whole file this matched a bare assignment against the first
 # word of the NEXT line and read it as a prefix form.
+# The VALUE is one shell word, quotes included. Treating it as `\S*` made the
+# second word of `AUTUMN_LOG__LEVL="some value"` look like the command that
+# follows a prefix assignment, so a script-local variable read as one handed to
+# a process. The bare-word alternative refuses a leading quote, so the engine
+# cannot backtrack into splitting a quoted value; the empty alternative keeps
+# `AUTUMN_X= cmd`, which really does set an empty value for one command.
 ASSIGNED_PREFIX = re.compile(
-    r'(?:^|[;&|(\s])(AUTUMN_[A-Z0-9_]+)=\S*[^\S\n]+\S')
+    r'(?:^|[;&|(\s])(AUTUMN_[A-Z0-9_]+)='
+    r'(?:"[^"]*"|\'[^\']*\'|[^\s"\']\S*|)[^\S\n]+\S')
 
 # A file that assigns a name to itself OWNS it: `check-panic-gate.sh` sets
 # `AUTUMN_MANIFEST="autumn/Cargo.toml"` and later reads `"$AUTUMN_MANIFEST"`,
@@ -2629,6 +2640,27 @@ def self_test():
     case('a bare assignment is not',
          (ASSIGNED.findall('AUTUMN_X="path/to"'),
           ASSIGNED_PREFIX.findall('AUTUMN_X="path/to"')), ([], []))
+    # The value is one shell WORD, quotes included. Reading it as `\S*` made the
+    # second word of a quoted value look like the command that follows a prefix
+    # assignment, so a script-local variable read as one handed to a process.
+    case('a quoted value with a space is not a command',
+         (ASSIGNED_PREFIX.findall('AUTUMN_LOG__LEVL="some value"'),
+          ASSIGNED_PREFIX.findall("AUTUMN_LOG__LEVL='some value'")), ([], []))
+    case('…while a real prefix assignment still is',
+         (ASSIGNED_PREFIX.findall('AUTUMN_X="a b" cargo run'),
+          ASSIGNED_PREFIX.findall('AUTUMN_X= cmd')),
+         (['AUTUMN_X'], ['AUTUMN_X']))
+    # Every form that quotes the delimiter suppresses expansion.
+    case('all quoted heredoc delimiters are recognised',
+         [next((g for g in HEREDOC.search(h).groups() if g), None)
+          for h in ("cat <<'EOF'", 'cat <<"EOF"', 'cat <<\\EOF')],
+         ['EOF', 'EOF', 'EOF'])
+    case('an unquoted delimiter is not',
+         HEREDOC.search('cat <<EOF'), None)
+    case('a double-quoted heredoc body is data',
+         ASSIGNED_PREFIX.findall(_shell_literals(_shell_heredocs(
+             'cat <<"EOF"\nAUTUMN_LOG__LEVL=x cmd\nEOF\n'))),
+         [])
 
     # Row fixtures live inside a table region, because that is what the checker
     # is responsible for — a row can only leave the check by leaving the table.
