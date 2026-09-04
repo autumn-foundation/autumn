@@ -15046,6 +15046,117 @@ mod tests {
         assert_eq!(html, "Home");
     }
 
+    // ── Warden 2026-09-04: `#[static_get]` × multi-tenancy fails closed ──────
+    //
+    // Hypothesis: an app that turns on documented multi-tenancy
+    // (`[tenancy] enabled = true`, any `source`) and pre-renders a
+    // `#[static_get]` route that reads tenant-scoped state (e.g. a per-tenant
+    // storefront page via the `Tenant` extractor, or a `#[repository]` query
+    // scoped by `CURRENT_TENANT`) might have `autumn build` / ISR
+    // regeneration silently resolve to a missing/default tenant and bake that
+    // tenant's response into the single `dist/` file every tenant's request
+    // to the same path then shares — a cross-tenant read through a
+    // documented, first-class feature composition, with no app-level
+    // analogue (the app never chose which tenant's data to freeze into a
+    // globally-shared cache key).
+    //
+    // It does not. `render_static_routes` (`autumn build`) and ISR's
+    // `regenerate_page` (`static_gen/middleware.rs`) both send a bare
+    // synthetic request through the *full* router to render each static
+    // route — path only, no `Host`, no tenant header, no session, no
+    // `Authorization` — and every tenancy `source` in `tenancy.rs`
+    // (`extract_tenant_from_parts_inner`) rejects with a non-2xx
+    // `AutumnError` when its required signal is absent rather than resolving
+    // a default tenant. A non-2xx response is `BuildError::NonSuccessStatus`
+    // to the build/ISR caller, so the handler's output is never written to
+    // disk. Asserted here per tenancy source (the variant sweep) so a future
+    // change that makes any one of them fail *open* — resolve `None`/a
+    // default tenant instead of erroring — is caught immediately rather than
+    // silently shipping a cross-tenant static-file leak.
+    #[tokio::test]
+    async fn static_get_route_reading_tenant_fails_closed_for_every_tenancy_source() {
+        async fn tenant_page(tenant: crate::tenancy::Tenant) -> String {
+            tenant.0
+        }
+
+        for source in ["header", "subdomain", "session", "jwt"] {
+            let mut config = AutumnConfig::default();
+            config.tenancy.enabled = true;
+            config.tenancy.source = source.to_owned();
+
+            let state = AppState::for_test();
+            state.insert_extension(config.clone());
+
+            let router = crate::router::try_build_router_inner(
+                vec![Route {
+                    method: http::Method::GET,
+                    path: "/storefront",
+                    handler: axum::routing::get(tenant_page),
+                    name: "tenant_page",
+                    api_doc: crate::openapi::ApiDoc {
+                        method: "GET",
+                        path: "/storefront",
+                        operation_id: "tenant_page",
+                        success_status: 200,
+                        ..Default::default()
+                    },
+                    repository: None,
+                    idempotency: crate::route::RouteIdempotency::Direct,
+                    timeout: crate::route::RouteTimeout::Inherit,
+                    seo: crate::seo::SeoRouteDefaults::EMPTY,
+                    api_version: None,
+                    sunset_opt_out: false,
+                }],
+                &config,
+                state,
+                crate::router::RouterContext {
+                    exception_filters: Vec::new(),
+                    scoped_groups: Vec::new(),
+                    merge_routers: Vec::new(),
+                    nest_routers: Vec::new(),
+                    declared_routes: Vec::new(),
+                    custom_layers: Vec::new(),
+                    static_gate_layers: Vec::new(),
+                    #[cfg(feature = "maud")]
+                    error_page_renderer: None,
+                    session_store: None,
+                    #[cfg(feature = "openapi")]
+                    openapi: None,
+                    #[cfg(feature = "mcp")]
+                    mcp: None,
+                },
+            )
+            .unwrap_or_else(|e| panic!("tenancy source {source:?}: router builds: {e}"));
+
+            let tmp = tempfile::tempdir().expect("dist parent");
+            let dist = tmp.path().join("dist");
+
+            let result = crate::static_gen::render_static_routes(
+                router,
+                &[crate::static_gen::StaticRouteMeta {
+                    path: "/storefront",
+                    name: "tenant_page",
+                    revalidate: None,
+                    params_fn: None,
+                    seo: crate::seo::SeoRouteDefaults::EMPTY,
+                }],
+                &dist,
+            )
+            .await;
+
+            assert!(
+                result.is_err(),
+                "tenancy source {source:?}: a #[static_get] route reading `Tenant` must fail \
+                 the build rather than silently bake a default/missing tenant's response into \
+                 a dist/ file every tenant's requests would then share"
+            );
+            assert!(
+                !dist.join("storefront/index.html").exists(),
+                "tenancy source {source:?}: no file must be written when tenant resolution fails"
+            );
+        }
+    }
+
     #[test]
     fn app_builder_routes_adds_routes() {
         let builder = app();
