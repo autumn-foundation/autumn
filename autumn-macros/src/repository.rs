@@ -12362,6 +12362,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     };
+    // ── Architecture-graph node (#1747) ─────────────────────────────────
+    // A repository states its model outright, so this is the one edge in the
+    // graph that is a declaration rather than a name match. The generated
+    // `Pg*` implementation name is published alongside the trait name because
+    // that is what a handler writes when it takes the repository as an
+    // extractor — the strongest evidence a route touches this model.
+    let graph_api_path = config.api_path.clone().unwrap_or_default();
+    let graph_inventory_registration = {
+        let trait_name_lit = trait_name.to_string();
+        let pg_name_lit = pg_name.to_string();
+        let model_name_lit = config.model_name.to_string();
+        quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::graph::RepositoryGraphDescriptor {
+                    repository: #trait_name_lit,
+                    implementation: #pg_name_lit,
+                    model: #model_name_lit,
+                    table: #table_name,
+                    api: #graph_api_path,
+                    module_path: module_path!(),
+                    file: file!(),
+                    line: line!(),
+                }
+            }
+        }
+    };
     let versioned_inventory_registration = if config.versioned {
         quote! {
             ::autumn_web::reexports::inventory::submit! {
@@ -20073,6 +20099,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #hook_inventory_registration
         #versioned_inventory_registration
         #sharded_inventory_registration
+        #graph_inventory_registration
         #retention_inventory_registration
 
         #api_handlers

@@ -8386,6 +8386,20 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // expands to nothing, so models compile unchanged when seeding is off.
         ::autumn_web::__autumn_register_fake_seeder!(#name, stringify!(#name));
 
+        // ── Architecture-graph node (#1747) ────────────────────────────
+        // The model's own declaration of the table it maps to: the join key
+        // every route, job and repository edge resolves against.
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::graph::ModelGraphDescriptor {
+                model: stringify!(#name),
+                model_path: concat!(module_path!(), "::", stringify!(#name)),
+                table: #table_name,
+                module_path: module_path!(),
+                file: file!(),
+                line: line!(),
+            }
+        }
+
         // ── Durable commit-hook codec ───────────────────────────────────
         // Hidden durable commit-hook codec. These methods serialize fields
         // individually so public serde visibility attributes do not drop

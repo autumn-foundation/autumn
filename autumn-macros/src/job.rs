@@ -377,8 +377,18 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { #fn_name(state, args).await }
     };
 
+    // ── Architecture-graph node (#1747) ─────────────────────────
+    let graph_descriptor = crate::graph::emit_job_descriptor(
+        &input_fn,
+        &quote! { #job_name },
+        "Job",
+        &quote! { "" },
+    );
+
     quote! {
         #input_fn
+
+        #graph_descriptor
 
         pub struct #api_name;
 
