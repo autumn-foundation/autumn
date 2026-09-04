@@ -34,6 +34,12 @@ pub mod templates {
     pub const SEED_CARGO_TOML: &str = include_str!("templates/seed_Cargo.toml.tmpl");
     pub const INTEGRATION_TEST: &str = include_str!("templates/tests/integration_test.rs.tmpl");
     pub const CI_WORKFLOW: &str = include_str!("templates/.github/workflows/ci.yml.tmpl");
+    pub const POSTURE_GATE_WORKFLOW: &str =
+        include_str!("templates/.github/workflows/posture-gate.yml.tmpl");
+    /// Dependency advisory policy read by the generated CI's `cargo deny check
+    /// advisories` gate (issue #1600). Deliberately *not* framework-owned — see
+    /// [`super::framework_owned_files`].
+    pub const DENY_TOML: &str = include_str!("templates/deny.toml.tmpl");
     pub const RUST_TOOLCHAIN: &str = include_str!("templates/rust-toolchain.toml.tmpl");
     pub const RUSTFMT: &str = include_str!("templates/rustfmt.toml.tmpl");
     pub const CLIPPY: &str = include_str!("templates/clippy.toml.tmpl");
@@ -261,6 +267,16 @@ fn generate_inner(
         render_readme(render(templates::README), opts, &vars),
     )?;
 
+    // The dependency advisory policy the generated CI enforces (issue #1600).
+    // Written here rather than through `framework_owned_files` because its
+    // waiver list is the app author's to grow: a file the developer is *asked*
+    // to edit would otherwise come back as a scaffold-reconciliation conflict
+    // on every `autumn upgrade`, exactly like `Cargo.toml` would.
+    fs::write(
+        project_dir.join("deny.toml"),
+        render_deny_toml(&render(templates::DENY_TOML), opts),
+    )?;
+
     let main_template = if opts.with_api {
         templates::MAIN_API_RS
     } else {
@@ -416,6 +432,14 @@ pub fn framework_owned_files(
     files.insert(".gitignore", render(templates::GITIGNORE));
     files.insert(".env.example", render(templates::ENV_EXAMPLE));
     files.insert(".github/workflows/ci.yml", ci_yml);
+    // The security posture gate (issue #1624) is a separate workflow rather
+    // than another job in `ci.yml`: it needs `pull-requests: write` to post the
+    // diff, and that permission has no business on the job that runs the test
+    // suite.
+    files.insert(
+        ".github/workflows/posture-gate.yml",
+        render(templates::POSTURE_GATE_WORKFLOW),
+    );
     files.insert("rust-toolchain.toml", render(templates::RUST_TOOLCHAIN));
     files.insert("rustfmt.toml", render(templates::RUSTFMT));
     files.insert("clippy.toml", render(templates::CLIPPY));
@@ -431,6 +455,38 @@ pub fn framework_owned_files(
         "application source is out of bounds for scaffold reconciliation"
     );
     files
+}
+
+/// Anchors around the waiver that only a `--bundled-pg` app's tree can reach.
+const DENY_BUNDLED_PG_OPEN: &str = "    # >>> autumn:bundled-pg-waiver\n";
+const DENY_BUNDLED_PG_CLOSE: &str = "    # <<< autumn:bundled-pg-waiver\n";
+
+/// Resolve the scaffolded `deny.toml` for `opts`.
+///
+/// `managed-pg-bundled` drags the embedded-Postgres build stack — and with it
+/// `instant` (RUSTSEC-2024-0384, unmaintained, no fix) — into the tree, so a
+/// `--bundled-pg` app needs that waiver on day one or its first CI run is red.
+/// Every other flavor would be carrying a waiver for a crate it does not have,
+/// and cargo-deny warns about unused waivers by design: that warning is how a
+/// developer learns one of *their* waivers has gone stale, so it must not be
+/// spent on one the framework shipped for a feature they never enabled.
+fn render_deny_toml(rendered: &str, opts: GenerateOptions) -> String {
+    if opts.with_bundled_pg {
+        return rendered
+            .replace(DENY_BUNDLED_PG_OPEN, "")
+            .replace(DENY_BUNDLED_PG_CLOSE, "");
+    }
+    let (open, close) = (
+        rendered.find(DENY_BUNDLED_PG_OPEN),
+        rendered.find(DENY_BUNDLED_PG_CLOSE),
+    );
+    let (Some(open), Some(close)) = (open, close) else {
+        debug_assert!(false, "deny.toml.tmpl lost its bundled-pg waiver anchors");
+        return rendered.to_owned();
+    };
+    let mut out = rendered.to_owned();
+    out.replace_range(open..close + DENY_BUNDLED_PG_CLOSE.len(), "");
+    out
 }
 
 fn scaffold_vendor_assets(project_dir: &Path) -> Result<(), NewError> {
@@ -538,6 +594,10 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     println!("  Created {name}/rust-toolchain.toml");
     println!("  Created {name}/rustfmt.toml");
     println!("  Created {name}/clippy.toml");
+    // Named with its purpose attached: when the advisory gate first fires, a
+    // developer who does not know this file exists reaches for disabling the CI
+    // step instead of recording a waiver here.
+    println!("  Created {name}/deny.toml (dependency advisory policy — CI audits against it)");
     println!("  Created {name}/migrations/");
     println!("  Created {name}/tests/integration_test.rs");
     println!("  Created {name}/config/master.key (keep secret — never commit)");
@@ -1794,6 +1854,53 @@ mod tests {
         );
     }
 
+    /// The first unsubstituted **autumn** template token in `content`, if any.
+    ///
+    /// Autumn's tokens are `{{lower_snake}}`; GitHub Actions expressions are
+    /// `${{ github.token }}`. Both contain `{{`, so a bare `contains("{{")`
+    /// would forbid every scaffolded workflow from using an Actions expression.
+    /// This looks for our shape specifically, which is what the check was ever
+    /// about.
+    fn unsubstituted_token(content: &str) -> Option<String> {
+        let bytes = content.as_bytes();
+        let mut from = 0;
+        while let Some(offset) = content[from..].find("{{") {
+            let open = from + offset;
+            // `${{ … }}` is a GitHub Actions expression, not ours.
+            let escaped = open > 0 && bytes[open - 1] == b'$';
+            if !escaped && let Some(len) = content[open + 2..].find("}}") {
+                let token = &content[open + 2..open + 2 + len];
+                if !token.is_empty()
+                    && token
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                {
+                    return Some(token.to_owned());
+                }
+            }
+            from = open + 2;
+        }
+        None
+    }
+
+    #[test]
+    fn placeholder_scanner_tells_our_tokens_from_actions_expressions() {
+        assert_eq!(
+            unsubstituted_token("name: ${{ github.token }} and {{project_name}}").as_deref(),
+            Some("project_name"),
+            "an Actions expression is fine; ours is not"
+        );
+        assert_eq!(
+            unsubstituted_token("${{ github.event.pull_request.number }}"),
+            None
+        );
+        assert_eq!(
+            unsubstituted_token("run: exit ${{ steps.diff.outputs.status }}"),
+            None
+        );
+        assert_eq!(unsubstituted_token("nothing templated here"), None);
+    }
+
     #[test]
     fn no_unsubstituted_placeholders() {
         let tmp = TempDir::new().unwrap();
@@ -1803,8 +1910,9 @@ mod tests {
         for entry in walkdir(&p) {
             let content = fs::read_to_string(&entry).unwrap();
             assert!(
-                !content.contains("{{"),
-                "unsubstituted placeholder in {}",
+                unsubstituted_token(&content).is_none(),
+                "unsubstituted placeholder {:?} in {}",
+                unsubstituted_token(&content),
                 entry.display()
             );
         }
@@ -2329,8 +2437,9 @@ mod tests {
         for entry in walkdir(&p) {
             let content = fs::read_to_string(&entry).unwrap();
             assert!(
-                !content.contains("{{"),
-                "unsubstituted placeholder in {}",
+                unsubstituted_token(&content).is_none(),
+                "unsubstituted placeholder {:?} in {}",
+                unsubstituted_token(&content),
                 entry.display()
             );
         }
@@ -2717,6 +2826,7 @@ mod tests {
             ".gitignore",
             ".env.example",
             ".github/workflows/ci.yml",
+            ".github/workflows/posture-gate.yml",
             "rust-toolchain.toml",
             "rustfmt.toml",
             "clippy.toml",
@@ -2729,6 +2839,335 @@ mod tests {
                 files.keys()
             );
         }
+    }
+
+    /// The posture gate (issue #1624) ships turned on, and the pieces that make
+    /// it a *gate* rather than a report are all present: the fresh manifest, a
+    /// staleness check that compares postures rather than bytes, the
+    /// base-branch side read out of git, an acknowledgment harvest restricted
+    /// to accounts with real write permission, and a final step that actually
+    /// fails the job.
+    #[test]
+    fn the_scaffolded_posture_gate_is_wired_end_to_end() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded by default");
+
+        assert!(workflow.contains("autumn routes audit --manifest"));
+        assert!(workflow.contains("autumn routes posture diff"));
+        assert!(
+            workflow.contains("--allow-missing-base"),
+            "first run must not break a repo"
+        );
+        assert!(workflow.contains("--ack-file \"$RUNNER_TEMP/acks.txt\""));
+        // Every scratch path lives outside the PR-controlled checkout, so a
+        // committed symlink cannot redirect one write onto another file.
+        for scratch in [
+            "base-posture.json",
+            "committed-posture.json",
+            "acks.txt",
+            "posture-diff.md",
+            "head-posture/posture-manifest.json",
+        ] {
+            assert!(
+                !workflow.contains(&format!(" {scratch}"))
+                    || workflow.contains(&format!("$RUNNER_TEMP/{scratch}")),
+                "{scratch} must be written under $RUNNER_TEMP: {workflow}"
+            );
+        }
+        assert!(
+            workflow.contains("pull-requests: write"),
+            "posting the diff needs it"
+        );
+        assert!(
+            !workflow.contains("contents: write"),
+            "the gate never writes to the repository"
+        );
+    }
+
+    /// Who may acknowledge is the only authorization control in the feature, so
+    /// it must ask GitHub for a real repository permission — `author_association`
+    /// reports organization affiliation, and would let any org member with read
+    /// access unblock a widening.
+    #[test]
+    fn the_scaffolded_gate_checks_real_write_permission_to_acknowledge() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+        assert!(
+            workflow.contains("collaborators/${login}/permission"),
+            "must resolve each commenter's actual permission: {workflow}"
+        );
+        assert!(
+            !workflow.contains("select(.author_association"),
+            "affiliation is not permission — it may be named in a comment \
+             explaining why, never used as the filter"
+        );
+        assert!(
+            workflow.contains("admin|write|maintain"),
+            "and only write-or-better may acknowledge"
+        );
+    }
+
+    /// The pinned CLI is whatever release this app's `autumn-web` tracks, and
+    /// `routes posture` did not exist in every one of them. The gate says which
+    /// release is missing rather than failing with an unknown-subcommand error
+    /// — and it fails rather than skipping, because a gate that waves a pull
+    /// request through when its own tooling is too old is worse than a red one.
+    #[test]
+    fn the_gate_names_the_release_when_the_pinned_cli_is_too_old() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        let verdict: &str = workflow
+            .split("Security posture diff")
+            .last()
+            .expect("the verdict job");
+        assert!(
+            verdict.contains("routes posture --help"),
+            "the verdict job must check the CLI can run this gate: {verdict}"
+        );
+        let probe = verdict
+            .split("routes posture --help")
+            .last()
+            .expect("after the probe");
+        assert!(
+            probe.contains("::error::") && probe.contains("exit 1"),
+            "and fail loudly rather than skipping: {probe}"
+        );
+    }
+
+    /// A missing baseline is a bootstrap exactly once — on the pull request
+    /// that adds the gate. Once the workflow is on the base branch, "no
+    /// baseline committed" is not a repository adopting the gate, it is a
+    /// repository whose gate passes everything while the required check reads
+    /// green. `autumn new` does not generate the manifest, so this is the
+    /// default state of a project that scaffolds the workflow and stops.
+    #[test]
+    fn a_missing_baseline_bootstraps_only_while_the_gate_is_new() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        let step = workflow
+            .split("Check the committed manifest is up to date")
+            .last()
+            .expect("the staleness step");
+        let bootstrap = step
+            .split("no posture baseline")
+            .next()
+            .expect("before the bootstrap notice");
+        assert!(
+            bootstrap.contains("posture-gate.yml") && bootstrap.contains("exit 1"),
+            "a missing baseline must be fatal once the gate is on the base branch: {bootstrap}"
+        );
+    }
+
+    /// The boundary between harvested comment bodies must not be forgeable. A
+    /// reviewer pasting the separator inside a fenced sample would otherwise
+    /// reset the parser's state mid-body and make a following marker live —
+    /// so the harvest neutralizes any occurrence in a body before writing it,
+    /// which keeps the boundary out of reviewer-controlled text without giving
+    /// up the fence isolation the separator exists for.
+    #[test]
+    fn the_harvest_neutralizes_a_separator_inside_a_comment_body() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        let harvest = workflow
+            .split("- name: Harvest acknowledgments")
+            .nth(1)
+            .expect("the harvest step");
+        let after_decode = harvest
+            .split_once("base64 -d")
+            .expect("bodies are decoded")
+            .1;
+        let neutralized = after_decode
+            .split("acks.txt")
+            .next()
+            .expect("the decode is redirected into the file");
+        assert!(
+            neutralized.contains("autumn:ack-source"),
+            "a decoded body must have the separator neutralized between the \
+             decode and the file: {neutralized}"
+        );
+    }
+
+    /// The job that compiles the pull request holds no write permission and
+    /// reaches no verdict; the job that decides never runs application code.
+    /// A malicious build script therefore cannot replace the binary that later
+    /// computes the diff, resolves acknowledgments, and sets the exit code.
+    #[test]
+    fn the_gate_decides_in_a_job_that_never_compiles_the_pull_request() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        let (build_job, verdict_job) = workflow
+            .split_once("  posture:")
+            .expect("two jobs: the build and the verdict");
+
+        assert!(
+            build_job.contains("autumn routes audit --manifest"),
+            "the build job is the one that compiles: {build_job}"
+        );
+        assert!(
+            !build_job.contains("pull-requests: write"),
+            "the job that runs the pull request's build scripts gets no write token"
+        );
+        assert!(
+            !build_job.contains("routes posture diff"),
+            "and reaches no verdict"
+        );
+
+        // Structural, not textual: the verdict job's comments and diagnostics
+        // legitimately *mention* `autumn routes audit`. What it must not do is
+        // set up a toolchain or run the build step.
+        assert!(
+            !verdict_job.contains("dtolnay/rust-toolchain")
+                && !verdict_job.contains("Swatinem/rust-cache")
+                && !verdict_job.contains("Build this commit's posture manifest"),
+            "the verdict job must never compile the pull request: {verdict_job}"
+        );
+        assert!(verdict_job.contains("routes posture diff"));
+        assert!(
+            verdict_job.contains("download-artifact"),
+            "it reads the manifest as data"
+        );
+        assert!(
+            verdict_job.contains("Install the autumn CLI"),
+            "with a CLI it installs itself, not one the build job left behind"
+        );
+    }
+
+    /// Bypasses the review found, each pinned by the thing that closes it.
+    #[test]
+    fn the_scaffolded_gate_closes_its_own_bypasses() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        // Editing the gate in the pull request the gate is judging — but NOT
+        // the pull request that adds it, which is how a repository adopts the
+        // gate at all (`autumn upgrade --apply`).
+        assert!(workflow.contains("Refuse a pull request that edits this gate"));
+        assert!(
+            workflow.contains("adding the security posture gate for the first time"),
+            "the adoption pull request must not be refused by the gate it adds: {workflow}"
+        );
+        // Deleting the baseline in this pull request, to disarm the gate — and
+        // to brick it for everyone afterwards.
+        assert!(
+            workflow.contains("this pull request deletes the committed posture baseline"),
+            "deleting the baseline must fail here: {workflow}"
+        );
+        // …but a baseline that went missing some other way must not lock the
+        // repository out, including the pull request that restores it.
+        assert!(
+            workflow.contains("::warning::${POSTURE_MANIFEST} existed on origin/"),
+            "a baseline missing for other reasons warns and bootstraps: {workflow}"
+        );
+        // A failing build must not skip the verdict: GitHub counts a skipped
+        // required check as satisfied.
+        assert!(
+            workflow.contains("if: always()") && workflow.contains("needs.manifest.result"),
+            "the verdict job runs even when the manifest job fails: {workflow}"
+        );
+        // A base ref that is not in the checkout at all.
+        assert!(workflow.contains("git rev-parse --verify"));
+        // Rewriting someone else's comment, or updating a quoted copy.
+        assert!(workflow.contains("github-actions[bot]"));
+        // A failed comment post (every fork pull request) swallowing the verdict.
+        assert!(
+            workflow.contains("if: always() && steps.diff.outcome == 'success'"),
+            "the verdict must survive a failed comment post: {workflow}"
+        );
+        // One comment per pull request, not one per concurrent push.
+        assert!(workflow.contains("cancel-in-progress: true"));
+        // One comment's unbalanced code fence swallowing another's marker.
+        assert!(workflow.contains("<!-- autumn:ack-source -->"));
+    }
+
+    /// It is a workflow of its own, not another job on `ci.yml`: `ci.yml` must
+    /// not acquire the `pull-requests: write` token the gate needs.
+    #[test]
+    fn the_posture_gate_does_not_widen_the_ci_workflows_permissions() {
+        let files = owned(GenerateOptions::default());
+        let ci = files.get(".github/workflows/ci.yml").expect("scaffolded");
+        assert!(!ci.contains("pull-requests: write"));
+    }
+
+    /// The bundled-pg waiver is resolved by flag, and its anchors are internal
+    /// bookkeeping — a leaked `>>> autumn:` marker would ship in every app.
+    #[test]
+    fn the_advisory_policy_resolves_its_flavor_anchors() {
+        let vars = TemplateVars {
+            project_name: "demo",
+            crate_name: "demo",
+            autumn_version: "0.7.0",
+            rust_version: "1.88.0",
+        };
+        let rendered = render_template(templates::DENY_TOML, &vars);
+        for opts in [
+            GenerateOptions::default(),
+            GenerateOptions {
+                with_bundled_pg: true,
+                with_daemon: true,
+                ..GenerateOptions::default()
+            },
+        ] {
+            let policy = render_deny_toml(&rendered, opts);
+            assert!(
+                !policy.contains("autumn:bundled-pg-waiver"),
+                "template anchors must never reach a generated project:\n{policy}"
+            );
+            assert_eq!(
+                policy.contains("RUSTSEC-2024-0384"),
+                opts.with_bundled_pg,
+                "the managed-pg-bundled waiver belongs to exactly the flavor whose \
+                 tree can reach it"
+            );
+            assert!(
+                policy.contains("RUSTSEC-2023-0071"),
+                "every flavor's tree reaches rsa through jsonwebtoken"
+            );
+        }
+    }
+
+    /// The advisory policy is generated but deliberately *not* reconciled
+    /// (issue #1600): its waiver list is the app author's, and a file the
+    /// developer is asked to edit would come back as a conflict on every
+    /// `autumn upgrade` — the same reason `Cargo.toml` is not owned either.
+    #[test]
+    fn the_advisory_policy_is_generated_but_not_framework_owned() {
+        for opts in [
+            GenerateOptions::default(),
+            GenerateOptions {
+                with_api: true,
+                ..GenerateOptions::default()
+            },
+        ] {
+            assert!(
+                !owned(opts).contains_key("deny.toml"),
+                "deny.toml carries the app's own waivers; reconciling it would \
+                 conflict with every waiver its author adds"
+            );
+        }
+        let tmp = TempDir::new().unwrap();
+        generate("policy-owner-app", tmp.path()).unwrap();
+        assert!(
+            tmp.path().join("policy-owner-app/deny.toml").is_file(),
+            "…but `autumn new` must still write it"
+        );
     }
 
     #[test]

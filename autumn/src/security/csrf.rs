@@ -644,6 +644,14 @@ fn scan_multipart_field<'a>(bytes: &'a [u8], boundary: &str, field_name: &str) -
     None
 }
 
+/// Verify the submitted token against `cookie_token`.
+///
+/// `cookie_token` is already known HMAC-valid by the time it gets here:
+/// `CsrfService::call` only ever passes `Some` after `validate_cookie_token_hmac`
+/// confirmed it (or signing is inactive, where that check is trivially `true`).
+/// The candidate-location checks below must not re-run
+/// `validate_cookie_token_hmac` on it — that would recompute the same
+/// HMAC-SHA256 the caller already paid for, on every mutating request.
 async fn verify_csrf_token(
     req: &mut Request<axum::body::Body>,
     settings: &CsrfSettings,
@@ -660,7 +668,6 @@ async fn verify_csrf_token(
     if let (Some(c), Some(h)) = (cookie_token, header_token)
         && !c.is_empty()
         && !h.is_empty()
-        && validate_cookie_token_hmac(c, settings)
         && constant_time_eq(c, h)
     {
         token_found = true;
@@ -680,7 +687,6 @@ async fn verify_csrf_token(
     if let (Some(c), Some(q)) = (cookie_token, &query_token)
         && !c.is_empty()
         && !q.is_empty()
-        && validate_cookie_token_hmac(c, settings)
         && constant_time_eq(c, q)
     {
         token_found = true;
@@ -751,7 +757,6 @@ async fn verify_csrf_token(
                 if let Some(c) = cookie_token
                     && !c.is_empty()
                     && !value.is_empty()
-                    && validate_cookie_token_hmac(c, settings)
                     && constant_time_eq(c, value.as_ref())
                 {
                     token_found = true;
@@ -765,7 +770,6 @@ async fn verify_csrf_token(
             if let Some(c) = cookie_token
                 && !c.is_empty()
                 && !value.is_empty()
-                && validate_cookie_token_hmac(c, settings)
                 && constant_time_eq(c, value)
             {
                 token_found = true;

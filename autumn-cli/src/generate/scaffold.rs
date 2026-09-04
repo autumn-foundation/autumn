@@ -833,6 +833,8 @@ fn plan_scaffold_with_options_impl(
                     contents,
                     &pascal_name,
                     &n.parent_pascal,
+                    &n.parent_snake,
+                    &n.parent_plural,
                 );
             }
         }
@@ -23379,6 +23381,24 @@ exempt_paths = [
             model.contains("#[belongs_to(Post, counter_cache)]"),
             "the child model must carry the attribute that drives the maintenance: {model}"
         );
+        // Issue #2431: a substring check alone let a build-breaking ordering
+        // bug ship — `#[belongs_to(...)]` is a helper attribute that only
+        // `#[autumn_web::model]`'s own expansion understands, so rustc
+        // accepts it only BELOW `#[model]`; emitted above, `cargo check`
+        // fails with `cannot find attribute belongs_to in this scope` on
+        // every real scaffold (which always has at least a blank line
+        // between the doc header and `#[model]`, unlike this test's old
+        // bare fixture).
+        let model_pos = model
+            .find("#[autumn_web::model]")
+            .expect("model attribute present");
+        let belongs_to_pos = model
+            .find("#[belongs_to(Post, counter_cache)]")
+            .expect("belongs_to attribute present");
+        assert!(
+            model_pos < belongs_to_pos,
+            "#[belongs_to] must be emitted below #[autumn_web::model], not above it: {model}"
+        );
     }
 
     #[test]
@@ -23392,6 +23412,50 @@ exempt_paths = [
             .expect("the parent-side lines must be surfaced");
         assert!(warning.contains("comment_count -> Int8,"), "{warning}");
         assert!(warning.contains("pub comment_count: i64,"), "{warning}");
+    }
+
+    #[test]
+    fn counter_cache_survives_a_force_regeneration_without_stacking_attributes_or_imports() {
+        // `--counter-cache` is typed once; a later `generate … --force` (e.g.
+        // after adding a field) is the ordinary way it gets repeated, and must
+        // not stack a second `#[belongs_to]` or duplicate `use` line onto the
+        // freshly-rendered model. The parent-side warning is generate-only
+        // (never persisted anywhere the scaffold could read back), so it must
+        // still be surfaced on every run, not just the first.
+        let tmp = project_with_scaffolded_parent();
+        counter_cached_comment_plan(&tmp)
+            .execute(Flags::default())
+            .unwrap();
+
+        let regen = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &counter_cache_options(),
+        )
+        .unwrap();
+
+        let model = action_contents(&regen, "src/models/comment.rs");
+        assert_eq!(
+            model.matches("#[belongs_to(Post, counter_cache)]").count(),
+            1,
+            "a --force regeneration must not stack the attribute: {model}"
+        );
+        assert_eq!(
+            model.matches("use crate::schema::posts;").count(),
+            1,
+            "a --force regeneration must not stack the schema import: {model}"
+        );
+        assert_eq!(
+            model.matches("use crate::models::post::Post;").count(),
+            1,
+            "a --force regeneration must not stack the model import: {model}"
+        );
+        assert!(
+            regen.warnings.iter().any(|w| w.contains("--counter-cache")),
+            "the parent-side lines must still be surfaced on a regeneration"
+        );
     }
 
     #[test]

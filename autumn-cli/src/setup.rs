@@ -124,7 +124,7 @@ fn install_path(dir: &Path) -> PathBuf {
 }
 
 fn fetch_expected_checksum(url: &str, binary_name: &str) -> Result<String, SetupError> {
-    let body = reqwest::blocking::get(url)?.error_for_status()?.text()?;
+    let body = crate::http::fetch_text(url)?;
     parse_checksum_file(&body, binary_name)
 }
 

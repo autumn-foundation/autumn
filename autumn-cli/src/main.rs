@@ -42,8 +42,11 @@ mod new;
 mod overload_driver;
 mod paths;
 mod pg;
+mod platform;
 mod plugin;
 mod plugin_check;
+mod plugin_sandbox;
+mod posture;
 mod process;
 mod release;
 mod replay;
@@ -107,6 +110,98 @@ pub enum RoutesSubcommands {
         /// default behavior.
         #[arg(long)]
         strict: bool,
+    },
+    /// Diff, acknowledge, and verify security posture across commits (#1624).
+    ///
+    /// `routes audit` proves what the security surface *is*; `routes posture`
+    /// answers what a change *did to it*, and whether a human agreed.
+    ///
+    ///   autumn routes posture diff --base base.json --head posture.json
+    ///   autumn routes posture digest --manifest security-posture.json
+    ///   autumn routes posture verify --manifest security-posture.json \
+    ///     --expect-digest <digest> --repo owner/repo
+    #[command(subcommand, verbatim_doc_comment)]
+    Posture(PostureSubcommands),
+}
+
+/// Subcommands for `autumn routes posture` (issue #1624).
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum PostureSubcommands {
+    /// Diff two security posture manifests and gate on surface widening.
+    ///
+    /// Exits 0 when nothing widened (or the widening is acknowledged), 1 when a
+    /// widening is unacknowledged, and 2 on a usage or I/O problem — so CI can
+    /// tell "this PR widens the surface" from "the tool could not run".
+    ///
+    /// A widening blocks until someone comments the marker the report prints:
+    ///
+    ///   /ack-posture <digest>  optional reason
+    ///
+    /// The digest binds the acknowledgment to that exact set of widenings, so
+    /// pushing unrelated commits keeps it valid while a *new* widening
+    /// re-blocks.
+    #[command(verbatim_doc_comment)]
+    Diff {
+        /// The previously accepted manifest (e.g. the base branch's copy).
+        #[arg(long, value_name = "PATH")]
+        base: String,
+        /// The manifest for this commit, as built by `autumn routes audit`.
+        #[arg(long, value_name = "PATH")]
+        head: String,
+        /// Output format: `markdown` (default), `text`, or `json`.
+        #[arg(long, default_value = "markdown", value_name = "FORMAT")]
+        format: String,
+        /// Also write the rendered report to this path.
+        #[arg(long, value_name = "PATH")]
+        output: Option<String>,
+        /// An acknowledgment digest, without the comment ceremony (repeatable).
+        #[arg(long, value_name = "DIGEST")]
+        ack: Vec<String>,
+        /// File of pull-request text to scan for `/ack-posture` markers.
+        ///
+        /// The workflow harvests it from comments whose author is an OWNER,
+        /// MEMBER or COLLABORATOR: this command trusts what it is given and
+        /// enforces no authorization of its own.
+        #[arg(long, value_name = "PATH")]
+        ack_file: Option<String>,
+        /// Treat a missing base manifest as "no baseline yet" (exit 0) instead
+        /// of an error. What a repository enabling the gate wants on its first
+        /// run.
+        #[arg(long)]
+        allow_missing_base: bool,
+    },
+    /// Print a manifest's posture digest — the number a release records.
+    ///
+    /// Computed over the manifest's security-relevant content only, so a
+    /// handler rename or a moved line does not change it.
+    Digest {
+        /// Manifest to digest.
+        #[arg(long, value_name = "PATH")]
+        manifest: String,
+        /// Output format: `text` (default) or `json`.
+        #[arg(long, default_value = "text", value_name = "FORMAT")]
+        format: String,
+    },
+    /// Verify a shipped manifest is the acknowledged one, and genuinely signed.
+    ///
+    /// Two checks: the posture digest matches what CI acknowledged, and
+    /// `gh attestation verify` accepts the file (the same keyless Sigstore
+    /// pipeline the rest of the supply chain uses — see
+    /// docs/guide/supply-chain.md).
+    Verify {
+        /// Manifest to verify.
+        #[arg(long, value_name = "PATH")]
+        manifest: String,
+        /// The digest recorded when the posture was acknowledged.
+        #[arg(long, value_name = "DIGEST")]
+        expect_digest: Option<String>,
+        /// `owner/repo` whose CI minted the attestation.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Skip the signature check. Air-gapped hosts only — it is reported as
+        /// waived, never as passed.
+        #[arg(long)]
+        skip_signature: bool,
     },
 }
 
@@ -431,8 +526,12 @@ pub enum SearchSubcommands {
     },
 }
 
-/// `autumn plugin ...` — consumer-facing plugin discovery and install
-/// (issue #1606). The author-facing conformance gate stays at
+/// Subcommands for `autumn plugin` — both plugin lanes.
+///
+/// `list`/`add` are consumer-facing discovery and install for a native plugin
+/// crate (issue #1606); `package`/`inspect` build and review a
+/// `.autumn-plugin` artifact for the capability-sandboxed lane (issue #1609).
+/// The author-facing conformance gate for a native plugin stays at
 /// `autumn plugin-check`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum PluginSubcommands {
@@ -459,6 +558,86 @@ pub enum PluginSubcommands {
         /// a community crate cannot have its version resolved and is refused.
         #[arg(long)]
         offline: bool,
+    },
+    /// Remove a plugin: dependency and builder-chain mount. Never the database.
+    ///
+    /// The exact reverse of `add`, and safe in the same ways: it refuses to
+    /// edit a builder chain it cannot read (printing the lines to delete
+    /// instead), keeps a dependency the app still names elsewhere, and never
+    /// touches the database — it lists what the plugin owns there and leaves
+    /// it in place unless `--drop-data` is given.
+    ///
+    /// Examples:
+    ///   autumn plugin remove autumn-admin-plugin
+    ///   autumn plugin remove autumn-media-plugin --dry-run
+    ///   autumn plugin remove autumn-media-plugin --drop-data --yes
+    Remove {
+        /// Plugin crate name, e.g. `autumn-admin-plugin`.
+        name: String,
+        /// Print every file edit and every data consequence without writing
+        /// anything. Exits 3 when there is something to change, 0 when there
+        /// is not.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also revert the plugin's declared migrations and drop the tables it
+        /// owns. Destructive and irreversible; asks for confirmation first.
+        #[arg(long)]
+        drop_data: bool,
+        /// Answer the `--drop-data` confirmation with "yes". Required to drop
+        /// data non-interactively.
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Bind a manifest to a `wasm32-wasip1` module and write a
+    /// `.autumn-plugin` artifact.
+    ///
+    /// The module's SHA-256 is computed here and stamped into the manifest, so
+    /// an author never types the digest and can never ship one that describes
+    /// different bytes. The module is loaded into the same sandbox the runtime
+    /// uses before anything is written: an artifact that could not run is
+    /// refused at the author's desk rather than at the operator's boot.
+    ///
+    /// # Examples
+    ///
+    ///   autumn plugin package --manifest plugin.toml \
+    ///       --module target/wasm32-wasip1/release/plugin.wasm \
+    ///       --out hello.autumn-plugin
+    #[command(verbatim_doc_comment)]
+    Package {
+        /// The authored manifest, as TOML.
+        #[arg(long, value_name = "FILE")]
+        manifest: String,
+        /// The `wasm32-wasip1` module the manifest describes.
+        #[arg(long, value_name = "FILE")]
+        module: String,
+        /// Where to write the artifact.
+        #[arg(long, value_name = "FILE")]
+        out: String,
+    },
+
+    /// Review a `.autumn-plugin` artifact before installing it.
+    ///
+    /// Prints the capability grant, the routes it may serve, the module digest
+    /// that was reviewed, every host function it imports, and the classes of
+    /// authority the sandbox denies unconditionally. Then it loads the module
+    /// into this build's sandbox and runs the same route-conformance checks
+    /// `autumn plugin-check` runs against a native plugin — with no binary to
+    /// build and no process to start. Exits 1 if the artifact is not fit to
+    /// install.
+    ///
+    /// # Examples
+    ///
+    ///   autumn plugin inspect hello.autumn-plugin
+    ///   autumn plugin inspect hello.autumn-plugin --format json
+    #[command(verbatim_doc_comment)]
+    Inspect {
+        /// The artifact to review.
+        #[arg(value_name = "ARTIFACT")]
+        artifact: String,
+        /// Output format: `text` (default) or `json`.
+        #[arg(long, default_value = "text", value_name = "FORMAT")]
+        format: String,
     },
 }
 
@@ -623,6 +802,14 @@ enum Commands {
         /// and --with-seed; not combinable with --daemon or --bundled-pg.
         #[arg(long)]
         api: bool,
+        /// Scaffold the app with this plugin already wired (repeatable).
+        ///
+        /// Takes the same names as `autumn plugin add`: a first-party plugin,
+        /// or a community `autumn-plugin-<name>` crate. Every name is resolved
+        /// and version-checked BEFORE any file is written, so an unknown or
+        /// incompatible plugin leaves no half-scaffolded project behind.
+        #[arg(long = "with", value_name = "PLUGIN", conflicts_with = "list_starters")]
+        with: Vec<String>,
     },
     /// Pre-render static routes to dist/
     Build {
@@ -1458,15 +1645,21 @@ enum Commands {
         action: SearchSubcommands,
     },
 
-    /// Discover and install Autumn plugins.
+    /// Discover, install, package and review Autumn plugins.
     ///
     /// `list` shows every installable plugin with the version compatible with
     /// this app (querying crates.io for community crates unless `--offline`);
     /// `add` writes the dependency, mounts the plugin in the
     /// `autumn_web::app()` builder chain, and prints the post-install steps.
     ///
-    /// Writing a plugin instead? `autumn generate plugin`. Auditing one you
-    /// wrote? `autumn plugin-check`.
+    /// `package` and `inspect` are the capability-sandboxed lane: a sandboxed
+    /// plugin runs as a `wasm32-wasip1` module inside a deny-by-default
+    /// sandbox, serving HTTP under the one prefix its manifest declares with no
+    /// filesystem, no network, no environment and no database. See
+    /// `docs/guide/sandboxed-plugins.md`.
+    ///
+    /// Writing a native plugin instead? `autumn generate plugin`. Auditing one
+    /// you wrote? `autumn plugin-check`.
     ///
     /// # Examples
     ///
@@ -1474,6 +1667,9 @@ enum Commands {
     ///   autumn plugin list --json --offline
     ///   autumn plugin add autumn-admin-plugin
     ///   autumn plugin add autumn-cache-redis --dry-run
+    ///   autumn plugin package --manifest plugin.toml --module hello.wasm \
+    ///       --out hello.autumn-plugin
+    ///   autumn plugin inspect hello.autumn-plugin
     #[command(verbatim_doc_comment)]
     Plugin {
         /// The plugin subcommand to run.
@@ -1492,6 +1688,11 @@ enum Commands {
     ///
     /// This is the AUTHOR-facing gate. To discover and install a plugin as a
     /// consumer, use `autumn plugin list` / `autumn plugin add`.
+    ///
+    /// A *sandboxed* plugin is checked with `autumn plugin inspect` instead,
+    /// which runs these same checks over its manifest with no binary to build.
+    /// A sandboxed plugin mounted into an app also passes this command's
+    /// route-attribution and route-prefix checks unchanged.
     ///
     /// # Examples
     ///
@@ -2218,6 +2419,25 @@ enum DbCommands {
     /// Inspect the offsite backup destination ([backup.offsite], issue #1619).
     #[command(subcommand)]
     Offsite(OffsiteCommands),
+    /// Restore, inspect or verify a continuously replicated `SQLite` database.
+    ///
+    /// `[replication]` ships this app's `SQLite` write-ahead log to an offsite
+    /// destination as it is written (issue #1628). These commands are the other
+    /// half: rebuilding the database on a fresh machine that has nothing but
+    /// this binary, autumn.toml and the destination credentials.
+    ///
+    /// # Examples
+    ///
+    ///   # Fresh box, latest replicated state:
+    ///   autumn db replica restore --profile prod
+    ///
+    ///   # Point-in-time, over the existing database:
+    ///   autumn db replica restore --timestamp 2026-09-02T14:29:00Z --force --overwrite
+    ///
+    ///   # How fresh is the replica right now?
+    ///   autumn db replica status
+    #[command(subcommand, verbatim_doc_comment)]
+    Replica(ReplicaCommands),
 }
 
 /// Subcommands for `autumn db offsite` (issue #1619).
@@ -2229,6 +2449,80 @@ enum OffsiteCommands {
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
     },
+}
+
+/// Subcommands of `autumn db replica` (issue #1628).
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+enum ReplicaCommands {
+    /// Rebuild the database from the replica, optionally at a point in time.
+    ///
+    /// Verifies the whole chain before anything is written: a hole in the
+    /// segment sequence, a payload whose digest does not match, or a rebuilt
+    /// database that fails `PRAGMA integrity_check` is refused rather than
+    /// restored. Gated by the same production guard as `autumn db restore`, and
+    /// overwriting an existing database always needs `--force`.
+    #[command(verbatim_doc_comment)]
+    Restore {
+        /// Resolve the destination under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Restore to this RFC 3339 instant instead of the latest state.
+        #[arg(long, value_name = "RFC3339")]
+        timestamp: Option<String>,
+        /// Write the database here instead of the configured database.url.
+        ///
+        /// A restore to an explicit path writes nothing the app uses, so it is
+        /// not subject to the production guard (the overwrite guard still applies).
+        #[arg(long, value_name = "PATH")]
+        output: Option<std::path::PathBuf>,
+        /// Allow the restore against a non-dev/test (e.g. production) profile.
+        #[arg(long)]
+        force: bool,
+        /// Allow replacing a database file that already exists.
+        ///
+        /// Separate from `--force`, which is about the profile: a drill that
+        /// always passes `--force` must not silently also destroy a database.
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// Report the replica's current generation, segment count and lag.
+    Status {
+        /// Resolve the destination under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Print the report as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Prove the replica restorable by restoring it into a scratch directory.
+    Verify {
+        /// Resolve the destination under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+    },
+}
+
+impl ReplicaCommands {
+    /// Translate the parsed CLI shape into the `db::replica` command.
+    fn into_command(self) -> db::replica::ReplicaCommand {
+        match self {
+            Self::Restore {
+                profile,
+                timestamp,
+                output,
+                force,
+                overwrite,
+            } => db::replica::ReplicaCommand::Restore {
+                profile,
+                timestamp,
+                output,
+                force,
+                overwrite,
+            },
+            Self::Status { profile, json } => db::replica::ReplicaCommand::Status { profile, json },
+            Self::Verify { profile } => db::replica::ReplicaCommand::Verify { profile },
+        }
+    }
 }
 
 impl DbCommands {
@@ -2246,10 +2540,11 @@ impl DbCommands {
             | Self::Restore { .. }
             | Self::Scrub { .. }
             | Self::Retention { .. }
-            | Self::Offsite(_) => {
+            | Self::Offsite(_)
+            | Self::Replica(_) => {
                 unreachable!(
-                    "db pull/backup/restore/scrub/retention/offsite are dispatched before \
-                     into_command"
+                    "db pull/backup/restore/scrub/retention/offsite/replica are dispatched \
+                     before into_command"
                 )
             }
         }
@@ -4096,6 +4391,7 @@ fn run_command(command: Commands) {
             DbCommands::Offsite(OffsiteCommands::List { profile }) => {
                 db::backup::run_offsite_list(profile.as_deref());
             }
+            DbCommands::Replica(cmd) => db::replica::run(&cmd.into_command()),
             other => {
                 let (command, profile) = other.into_command();
                 db::run(&command, profile.as_deref());
@@ -4200,6 +4496,7 @@ fn run_command(command: Commands) {
             daemon,
             bundled_pg,
             api,
+            with,
         } => {
             if list_starters {
                 starters::print_list();
@@ -4223,6 +4520,10 @@ fn run_command(command: Commands) {
                     );
                     std::process::exit(1);
                 }
+                // AC #6: every `--with` name is resolved and version-checked
+                // BEFORE the scaffold writes a byte, so a typo or an
+                // incompatible plugin never leaves a half-built project behind.
+                let plugins = resolve_scaffold_plugins(&with, None);
                 starters::run(
                     &name,
                     &starter,
@@ -4230,7 +4531,9 @@ fn run_command(command: Commands) {
                     yes,
                     generate::Flags::default(),
                 );
+                wire_scaffold_plugins_into(&name, &plugins);
             } else {
+                let plugins = resolve_scaffold_plugins(&with, Some(plugin::first_party_version()));
                 new::run(
                     &name,
                     new::GenerateOptions {
@@ -4242,6 +4545,7 @@ fn run_command(command: Commands) {
                         with_api: api,
                     },
                 );
+                wire_scaffold_plugins_into(&name, &plugins);
             }
         }
 
@@ -4499,6 +4803,42 @@ fn run_command(command: Commands) {
                     strict,
                 });
             }
+            Some(RoutesSubcommands::Posture(command)) => {
+                let code = match &command {
+                    PostureSubcommands::Diff {
+                        base,
+                        head,
+                        format,
+                        output,
+                        ack,
+                        ack_file,
+                        allow_missing_base,
+                    } => posture::run_diff(&posture::DiffOptions {
+                        base,
+                        head,
+                        format,
+                        output: output.as_deref(),
+                        acks: ack,
+                        ack_file: ack_file.as_deref(),
+                        allow_missing_base: *allow_missing_base,
+                    }),
+                    PostureSubcommands::Digest { manifest, format } => {
+                        posture::run_digest(manifest, format)
+                    }
+                    PostureSubcommands::Verify {
+                        manifest,
+                        expect_digest,
+                        repo,
+                        skip_signature,
+                    } => posture::run_verify(&posture::verify::VerifyOptions {
+                        manifest,
+                        expect_digest: expect_digest.as_deref(),
+                        repo: repo.as_deref(),
+                        skip_signature: *skip_signature,
+                    }),
+                };
+                std::process::exit(code);
+            }
             None => run_routes_command(
                 package.as_deref(),
                 bin.as_deref(),
@@ -4730,6 +5070,38 @@ fn run_command(command: Commands) {
                     dry_run,
                     offline,
                 }),
+                PluginSubcommands::Remove {
+                    name,
+                    dry_run,
+                    drop_data,
+                    yes,
+                } => plugin::run_remove(&plugin::RemoveOptions {
+                    root,
+                    name: &name,
+                    dry_run,
+                    drop_data,
+                    yes,
+                }),
+                PluginSubcommands::Package {
+                    manifest,
+                    module,
+                    out,
+                } => {
+                    plugin_sandbox::run_package(&plugin_sandbox::PackageOptions {
+                        manifest: std::path::Path::new(&manifest),
+                        module: std::path::Path::new(&module),
+                        out: std::path::Path::new(&out),
+                    });
+                    0
+                }
+                PluginSubcommands::Inspect { artifact, format } => {
+                    let format = format.parse().unwrap_or_else(|e| {
+                        eprintln!("autumn plugin inspect: {e}");
+                        std::process::exit(1);
+                    });
+                    plugin_sandbox::run_inspect(std::path::Path::new(&artifact), &format);
+                    0
+                }
             };
             if code != 0 {
                 std::process::exit(code);
@@ -4977,6 +5349,57 @@ fn run_task_command(
         name,
         args,
     });
+}
+
+/// Resolve every `autumn new --with` name, exiting before the scaffold runs if
+/// any of them cannot be installed (issue #1631, AC #6).
+///
+/// The whole point of doing this here is ordering: `autumn new` creates a
+/// directory tree, and a project that exists but is missing the plugin the user
+/// asked for is worse than no project at all.
+///
+/// `scaffold_autumn_web` is the `autumn-web` the scaffold will pin, or `None`
+/// when that is not knowable yet. `autumn new`'s own template pins this CLI's
+/// version, so the gate is exact there. A `--starter` brings its own manifest,
+/// which does not exist until the starter is fetched — so only the half that
+/// IS knowable (does this name resolve at all, and to what version) runs
+/// before the write, and the compatibility answer comes from
+/// `plugin::wire_scaffold_plugins` reading the starter's real manifest
+/// afterwards.
+fn resolve_scaffold_plugins(
+    names: &[String],
+    scaffold_autumn_web: Option<&str>,
+) -> Vec<plugin::ScaffoldPlugin> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    match plugin::preflight_scaffold_plugins(
+        names,
+        scaffold_autumn_web,
+        plugin::registry::latest_version,
+    ) {
+        Ok(plugins) => plugins,
+        Err(err) => {
+            eprintln!("autumn new: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Wire the preflighted plugins into the project `autumn new` just created.
+fn wire_scaffold_plugins_into(project_name: &str, plugins: &[plugin::ScaffoldPlugin]) {
+    if plugins.is_empty() {
+        return;
+    }
+    // Built the same way the scaffolders build it (`new::run` joins onto
+    // `current_dir`), rather than leaning on the process CWD staying put.
+    let root = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(project_name);
+    let code = plugin::wire_scaffold_plugins(&root, plugins);
+    if code != 0 {
+        std::process::exit(code);
+    }
 }
 
 fn run_plugin_check_command(
@@ -8500,6 +8923,79 @@ mod tests {
     #[test]
     fn parse_token_revoke_without_token_is_error() {
         assert!(Cli::try_parse_from(["autumn", "token", "revoke"]).is_err());
+    }
+
+    // ── autumn plugin (sandboxed) tests ────────────────────────────────────
+
+    #[test]
+    fn parse_plugin_package_requires_all_three_paths() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "package",
+            "--manifest",
+            "plugin.toml",
+            "--module",
+            "plugin.wasm",
+            "--out",
+            "hello.autumn-plugin",
+        ])
+        .expect("parses");
+        match cli.command {
+            Commands::Plugin {
+                action:
+                    PluginSubcommands::Package {
+                        manifest,
+                        module,
+                        out,
+                    },
+            } => {
+                assert_eq!(manifest, "plugin.toml");
+                assert_eq!(module, "plugin.wasm");
+                assert_eq!(out, "hello.autumn-plugin");
+            }
+            _ => panic!("expected plugin package"),
+        }
+        assert!(
+            Cli::try_parse_from(["autumn", "plugin", "package", "--manifest", "plugin.toml"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_plugin_inspect_defaults_to_text() {
+        let cli = Cli::try_parse_from(["autumn", "plugin", "inspect", "hello.autumn-plugin"])
+            .expect("parses");
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::Inspect { artifact, format },
+            } => {
+                assert_eq!(artifact, "hello.autumn-plugin");
+                assert_eq!(format, "text");
+            }
+            _ => panic!("expected plugin inspect"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_inspect_accepts_json() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "inspect",
+            "hello.autumn-plugin",
+            "--format",
+            "json",
+        ])
+        .expect("parses");
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::Inspect { format, .. },
+            } => {
+                assert_eq!(format, "json");
+            }
+            _ => panic!("expected plugin inspect"),
+        }
     }
 
     // ── autumn plugin (list/add) tests ─────────────────────────────────────

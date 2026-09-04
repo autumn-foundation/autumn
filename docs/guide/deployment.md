@@ -90,10 +90,102 @@ kamal-proxy if you use `autumn deploy` (see the note under
 [`autumn deploy`](#push-button-deploy-to-your-own-server-autumn-deploy) — do not
 combine the two). In-process ACME is a **single-host** feature: behind a load
 balancer the CA's challenge can land on a replica that never published the
-token. Terminate TLS at the proxy for multi-replica deployments.
+token, and the issued certificate is cached on one replica's local disk where
+the others cannot read it. DNS-01 fixes the first of those, not the second.
+Terminate TLS at the proxy for multi-replica deployments.
 
 Full reference, including the private-CA / Pebble setup and the renewal
 internals: [TLS & HTTPS guide](./tls.md).
+
+### Subdomain-per-tenant: wildcard HTTPS on a VPS
+
+The `saas` starter is built for multi-tenancy — it ships session-based tenant
+resolution, which you switch to `source = "subdomain"` to give each tenant its
+own hostname. That is what the single-hostname setup above cannot serve: one certificate per tenant means an issuance on
+tenant *N*'s first request and Let's Encrypt rate limits as an onboarding
+ceiling. A **wildcard** certificate covers every tenant, existing and future,
+and needs the DNS-01 challenge — which needs your DNS provider's API token.
+
+Zero to wildcard HTTPS, start to finish — sixteen lines of configuration across
+three files, twelve of them in `autumn.toml`:
+
+```console
+$ autumn new myapp --starter saas
+$ cd myapp
+```
+
+**1.** Point DNS at the box, once, by hand: an `A` record for `myapp.com` and a
+wildcard `A` record for `*.myapp.com`, both at the VPS's public IP. (Autumn
+writes only the ephemeral ACME challenge records, never these.)
+
+**2.** Store the DNS provider token. `autumn credentials edit` opens the
+encrypted store in `$EDITOR` — pass the profile you will run under, because that
+is the file the server reads (`AUTUMN_ENV=production` resolves to the `prod`
+profile):
+
+```console
+$ autumn credentials edit --env prod
+```
+
+```toml
+[acme_dns]
+api_token = "your-cloudflare-token"
+```
+
+A Cloudflare token needs **Zone:Read** (to find the zone) and **DNS:Edit** (to
+write the challenge record), scoped to the zone.
+
+**3.** Turn on the `acme` feature in the app's `Cargo.toml` — it is off by
+default:
+
+```toml
+[features]
+acme = ["autumn-web/acme"]
+```
+
+**4.** Edit `autumn.toml`. The starter already ships a `[server]` and a
+`[tenancy]` table, so change those in place rather than adding second ones, and
+append the two ACME tables — twelve lines, of which four are the ACME wiring
+itself:
+
+```toml
+[server]
+host = "0.0.0.0"   # the starter's default, 127.0.0.1, is loopback-only
+port = 443         # ACME wraps THIS listener in TLS
+
+[tenancy]
+source = "subdomain"     # the starter ships "session"
+base_domain = "myapp.com"
+
+[server.tls.acme]
+domains = ["myapp.com", "*.myapp.com"]
+contact_email = "ops@myapp.com"
+directory = "production"
+
+[server.tls.acme.dns]
+provider = "cloudflare"
+```
+
+**5.** Check it before spending a rate limit, then build:
+
+```console
+$ autumn doctor --online
+$ AUTUMN_ENV=production autumn build --embed --features acme
+```
+
+On first boot the app publishes the two `_acme-challenge` TXT records, waits for
+them to propagate, obtains the wildcard, removes the records, and serves HTTPS
+on `:443`. Every tenant subdomain works immediately — and so does the next one
+you create, with no certificate work at all.
+
+Leave `directory` unset (Let's Encrypt **staging**) for the first run: the
+certificate is untrusted, but the rate limits are generous enough to iterate
+against. Switch to `production` once `autumn doctor --online` is clean and the
+staging issuance succeeded.
+
+Provider list, the escape hatch for providers not listed, propagation tuning and
+the DNS-01 `autumn doctor` checks:
+[TLS & HTTPS guide](./tls.md#wildcard-certificates-via-dns-01-servertlsacmedns).
 
 ---
 

@@ -38,8 +38,18 @@ mcp = ["openapi"]
 # allowlist HTML sanitizer `markdown::render_user_content` runs its output
 # through, so a content app can accept user Markdown without stored XSS.
 markdown = ["dep:pulldown-cmark", "dep:ammonia"]
+# `reqwest?/blocking` powers the replication S3 destination (#1628), which needs
+# BOTH `db` and `http-client`. The `?` means it is enabled only when something
+# else already pulled reqwest in, so an app on `http-client` alone (no database,
+# and therefore no replication) does not compile the blocking client. The
+# replication loop runs on its own OS thread — file, SQLite and network I/O all
+# off the reactor — and `autumn db replica restore` is a synchronous CLI with no
+# runtime at all, so a blocking client is the one shape both can share. It is
+# constructed, used and dropped only on those threads, never inside the async
+# runtime.
 db = [
     "autumn-macros/db",
+    "reqwest?/blocking",
     "dep:deadpool",
     "dep:diesel",
     "dep:diesel-async",
@@ -211,7 +221,7 @@ tls = ["dep:tokio-rustls", "dep:x509-parser", "dep:rustls", "dep:rustls-pki-type
 # ACME order state machine) and `rcgen` (account/cert key + CSR + self-signed
 # placeholder), both pinned to `ring` so no second crypto backend enters the
 # graph.
-acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2"]
+acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2", "dep:reqwest"]
 # Origin-side half of the edge capsule (issue #1790). Adds the `autumn_web::edge`
 # re-export of the `autumn-edge` crate, the `CacheEdgeKv` adapter that projects
 # the app's `Cache` onto the `EdgeKv` seam, and `AppBuilder::with_edge_kv`, which
@@ -224,9 +234,34 @@ acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2"]
 # `edge_routes!` macros are re-exported unconditionally — a route can be *marked*
 # without this feature; the feature is what wires the seam at the origin.
 edge = ["dep:autumn-edge"]
+# Capability-sandboxed WASM plugins (issue #1609). Loads a third-party plugin as
+# a portable `.autumn-plugin` artifact — a manifest plus a `wasm32-wasip1`
+# module — and serves HTTP requests from it under the manifest's declared
+# prefix, in-process, with deny-by-default ambient authority, hard CPU/memory
+# ceilings and fault isolation.
+#
+# Purely additive and host-only: the native `Plugin` trait is untouched and no
+# existing app changes shape. `wasmi` is a pure-Rust interpreter (no codegen
+# backend, no C toolchain), so enabling this keeps the single-binary deploy
+# story intact.
+#
+# Not a default feature of `autumn-web`: an application opts in explicitly.
+# Note that `autumn-cli` enables it unconditionally (its `plugin package` /
+# `plugin inspect` commands read and write the container and load the module
+# into the same sandbox the runtime uses), so a `--workspace` build of this
+# repo does compile it via feature unification. That is deliberate — it means
+# the always-on workspace clippy and test lanes cover the module — but it is
+# why "off by default" is a statement about `autumn-web`'s feature set, not
+# about every build in the tree.
+plugin-sandbox = ["dep:wasmi"]
 
 [dependencies]
 autumn-edge = { version = "0.7.0", path = "../autumn-edge", optional = true }
+# Pure-Rust WebAssembly interpreter behind the `plugin-sandbox` feature. Already
+# resolved in `Cargo.lock` via `autumn-edge`'s reference host, so this adds no
+# new crate to the workspace graph. MSRV 1.86 (below this workspace's 1.88
+# floor); licensed MIT OR Apache-2.0.
+wasmi = { version = "0.40", optional = true }
 # `default-features = false` drops the `#[model]` / `#[repository]` codegen from
 # the macro crate; the `db` feature above forwards it back on. A no-database app
 # could never reach either macro anyway (both re-exports are `#[cfg(feature =
@@ -234,7 +269,9 @@ autumn-edge = { version = "0.7.0", path = "../autumn-edge", optional = true }
 # time by ~90% on the no-DB onboarding path (issue #2309).
 autumn-macros = { version = "0.7.0", path = "../autumn-macros", default-features = false }
 axum.workspace = true
-bytes = "1"
+# 1.9 for `Bytes::from_owner`, which is what lets a response buffer own the
+# sandbox concurrency permit and release it exactly when the last handle drops.
+bytes = "1.9"
 # Best-effort ASCII folding for `slug::slugify` (issue #1260, e.g. "café" ->
 # "cafe"). Already resolved transitively (via `stringprep`, the Postgres
 # SCRAM-auth crate), so this adds no new entry to the dependency graph.
@@ -413,6 +450,11 @@ tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["timeout", "util"] }
 trybuild = "1"
+# Compiles the hand-written WAT guest modules the plugin-sandbox suite uses as
+# fixtures (a hello guest and the adversarial escape corpus) into wasm bytes at
+# test time. Pure Rust, so the escape suite runs on any CI runner with no
+# `wasm32-wasip1` toolchain installed. Test-only.
+wat = "1"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 redis.workspace = true
@@ -438,6 +480,7 @@ features = [
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi", "mcp",
   "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
   "reporting", "csv", "embed-assets", "offline-sync", "pdf", "edge",
+  "plugin-sandbox",
   # Direct HTTPS termination (#1603). Pure Rust (rustls/ring), no system
   # libraries, so it builds in the docs.rs sandbox — and without it the whole
   # `tls` module (TlsListener, CertReloader, load_certified_key) is missing
@@ -481,6 +524,14 @@ name = "repository_crud"
 harness = false
 required-features = ["db"]
 
+# Signed-CSRF-cookie workload for profilers: drives real POST traffic through
+# `security::CsrfLayer` with HMAC signing active so the verification cost is
+# attributable in a profiler. Asserts nothing — see the file header for the
+# exact commands.
+[[bench]]
+name = "csrf_verify"
+harness = false
+
 # W6 PR3 seed-sweep runner (issue #1797): CI-facing driver for
 # `sim::sweep::sweep_proptest`. `required-features` (not a `#![cfg(...)]` file
 # guard, since a `[[bin]]` target — unlike a `[[test]]` — is simply skipped by
@@ -512,6 +563,39 @@ path = "tests/config_alloc_gate.rs"
 [[test]]
 name = "password_policy_alloc_gate"
 path = "tests/password_policy_alloc_gate.rs"
+
+# Allocation gate for the sandbox's request-header canonicalisation: a header
+# the allowlist drops must not be cloned on its way to being discarded. The
+# function's output is identical either way, so this has to be judged on
+# allocations. Own binary for the same `allocation-counter` global-allocator
+# reason as `config_alloc_gate` above.
+[[test]]
+name = "sandbox_header_alloc_gate"
+path = "tests/sandbox_header_alloc_gate.rs"
+
+# Allocation gate for the guest-stderr excerpt: a 64 KiB stderr of invalid
+# bytes must not be expanded into a 192 KiB replacement string to keep 512
+# characters of it. Its own binary for the same reason as the header gate —
+# `allocation-counter` installs a process-wide `#[global_allocator]`.
+[[test]]
+name = "sandbox_stderr_alloc_gate"
+path = "tests/sandbox_stderr_alloc_gate.rs"
+
+# Allocation gate for the response-side wire checks: a `Location` segment and a
+# declared content type are both guest-chosen strings the wire asks a yes/no
+# question about, and both were lower-cased whole to answer it. Its own binary
+# for the same reason as the gates above — `allocation-counter` installs a
+# process-wide global allocator.
+[[test]]
+name = "sandbox_response_alloc_gate"
+path = "tests/sandbox_response_alloc_gate.rs"
+
+# Allocation gate for `SandboxArtifact::seal`: a hand-built manifest refusable
+# from its own fields must not be rendered to TOML on the way to being rejected.
+# The verdict is identical either way, so allocation is the observable.
+[[test]]
+name = "sandbox_manifest_seal_alloc_gate"
+path = "tests/sandbox_manifest_seal_alloc_gate.rs"
 
 # Allocation gate for the scaffolded form-render helpers on the same 12-field
 # workload as `benches/form_render.rs` (Bolt follow-up to #2295/#2298, looking

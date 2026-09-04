@@ -137,7 +137,19 @@ REQUEST_PATH_MODULES=(
   autumn/src/shadow/transport.rs:default
   autumn/src/shadow/layer.rs:default
   autumn/src/shadow/registry.rs:default
+  autumn/src/plugin_sandbox/host.rs:plugin-sandbox
+  autumn/src/plugin_sandbox/wire.rs:plugin-sandbox
+  autumn/src/plugin_sandbox/plugin.rs:plugin-sandbox
   autumn-search/src/lib.rs:default
+  autumn/src/replication/wal.rs:db
+  autumn/src/replication/segment.rs:db
+  autumn/src/replication/destination.rs:db
+  autumn/src/replication/sqlite.rs:db
+  autumn/src/replication/restore.rs:db
+  autumn/src/replication/engine.rs:db
+  autumn/src/replication/status.rs:db
+  autumn/src/replication/s3.rs:http-client
+  autumn/src/sigv4.rs:default
 )
 
 # The manifest may grow, never shrink. Deleting a gated module is a deliberate
@@ -145,7 +157,7 @@ REQUEST_PATH_MODULES=(
 # cannot quietly shrink the gate's surface. It tracks the manifest's length, so
 # it moves with every addition too — otherwise a one-entry revert would shrink
 # the manifest back under the floor while the gate still passed.
-MODULE_COUNT_FLOOR=50
+MODULE_COUNT_FLOOR=64
 
 # Gated modules whose feature is KNOWINGLY not enabled by any enforcing CI clippy
 # lane, as `<path>:<feature>`. Their headers are real but unenforced: the deny

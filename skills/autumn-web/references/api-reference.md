@@ -1502,9 +1502,11 @@ In-process HTTPS termination on the same host:port (off by default).
 Automatic ACME certificate provisioning + renewal; builds on `tls`, off by
 default. Mutually exclusive with static `cert_path` / `key_path`.
 
-- `domains` (required, non-wildcard), `contact_email` (required). Each domain is
-  used verbatim as the certificate's SAN and the ACME order's DNS identifier, so
-  an entry with leading/trailing whitespace is rejected at startup (#1874).
+- `domains` (required), `contact_email` (required). Each domain is used verbatim
+  as the certificate's SAN and the ACME order's DNS identifier, so an entry with
+  leading/trailing whitespace is rejected at startup (#1874). A **wildcard**
+  (`*.myapp.com`) is accepted only when `[server.tls.acme.dns]` is configured —
+  no CA validates a wildcard identifier over HTTP-01 (#1620).
 - `directory` — Let's Encrypt staging by default; `production` or a custom URL.
 - `cache_dir` (default `config/acme`).
 - `http_challenge_port` (default `80`).
@@ -1516,8 +1518,58 @@ default. Mutually exclusive with static `cert_path` / `key_path`.
   and only the file's **first** certificate is installed, so pass the root
   alone, not a bundle. Affects the ACME control plane only, never what browsers
   accept from the site.
-- Automatic HTTP-01 provisioning + hourly leader-elected renewal. DNS-01 and
-  wildcard certs are out of scope (#1620).
+- Automatic HTTP-01 provisioning + hourly leader-elected renewal.
+
+### `[server.tls.acme.dns]` (feature `acme`, unreleased — trunk-dev, #1620)
+
+Answers every authorization over **DNS-01** instead of HTTP-01, which is what a
+**wildcard** certificate requires — so one `*.myapp.com` covers every tenant
+subdomain, and onboarding tenant N+1 costs no certificate work at all. Renewal,
+persistence, staging selection and health are #1608's, unchanged.
+
+```toml
+[server.tls.acme]
+domains = ["myapp.com", "*.myapp.com"]
+contact_email = "ops@myapp.com"
+
+[server.tls.acme.dns]
+provider = "cloudflare"
+```
+
+- `provider` (required) — `cloudflare`, `route53`, or `exec`.
+- `credential` (default `acme_dns`) — the key in the **encrypted credentials
+  store** holding the provider's API credential. A key NAME, never a token: the
+  section has no field that could hold one and is `deny_unknown_fields`, so an
+  `api_token = "..."` in `autumn.toml` is a startup error. Values come from
+  `autumn credentials edit` or the `AUTUMN_ACME_DNS_*` environment variables
+  (`API_TOKEN`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`, `SESSION_TOKEN`,
+  `HOSTED_ZONE_ID`, `REGION`), which override the store field for field.
+- `propagation_timeout_secs` (default `300`, max `3600`) — bound on the wait for
+  the TXT record to become visible. The timeout error names the exact record,
+  the value and the server that never saw it.
+- `poll_interval_secs` (default `5`), `resolvers` (default Cloudflare + Google
+  public DNS; each entry an IP or `IP:port`, hostnames rejected). The resolvers
+  DISCOVER the zone's authoritative nameservers; the propagation probe goes to
+  those, because a recursive resolver caches a negative answer for longer than
+  the budget. Discovery runs per distinct challenge name, so a multi-domain
+  order probes each zone through its own servers. Authoritative probes are sent
+  with recursion NOT desired; the fallback to the configured resolvers sets it,
+  since a recursive resolver asked without it answers from cache only.
+- `command` — the `exec` hook's argv array, run without a shell as
+  `hook present|cleanup <fqdn> <value>` (exactly three appended arguments, no
+  `--` marker, so `$1` is the action). Required for `exec`, rejected for the
+  others. This is the escape hatch for any provider not listed (RFC 2136 via
+  `nsupdate`, a registrar CLI, a webhook shim). The hook's `stderr` is read
+  through a bounded buffer and scrubbed of credential-shaped environment values
+  before it reaches a log, an alert, or `/actuator/health`.
+- Under DNS-01 the CA never connects to this host, so a failure to bind
+  `http_challenge_port` is a warning rather than a fatal error — the listener is
+  then only the HTTP→HTTPS redirect.
+- A failed issuance/renewal raises #1610's `scheduled_task_failure` operator
+  alert for `acme-renewal` and clears it on the next success; the `acme` health
+  indicator reports `challenge` and `dns_provider`.
+
+See `docs/guide/tls.md`.
 
 ## reexports module
 

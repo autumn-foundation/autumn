@@ -2,6 +2,8 @@
 mod a11y;
 mod access_log;
 #[cfg(feature = "acme")]
+mod acme_dns01;
+#[cfg(feature = "acme")]
 mod acme_end_to_end;
 #[cfg(feature = "acme")]
 mod acme_fake_ca;
@@ -226,6 +228,12 @@ mod preload_scoping;
 mod problem_details;
 #[cfg(feature = "redis")]
 mod process_role_worker_gating;
+// The capability-sandboxed plugin lane (#1609). Gated on `plugin-sandbox` (the
+// runtime) and `test-support` (the shared WAT escape corpus), neither of which
+// the Docker sweep's feature set enables — so the ignored timing benchmark in
+// here is never picked up by that bare `--ignored` run.
+#[cfg(all(feature = "plugin-sandbox", feature = "test-support"))]
+mod plugin_sandbox;
 mod push_end_to_end;
 mod push_router;
 #[cfg(feature = "db")]
@@ -286,6 +294,7 @@ mod schema_drift_guard;
 mod scoped_tokens;
 #[cfg(feature = "db")]
 mod search_index_definition;
+mod secured_route;
 mod security;
 mod seo;
 mod server_timing;
@@ -315,9 +324,16 @@ mod sim_rate_limit_clock;
 mod sim_retry_storm;
 mod sim_strict_wall_clock;
 mod sim_test_smoke;
+#[cfg(feature = "db")]
+mod sqlite_replication;
+#[cfg(all(feature = "db", feature = "http-client"))]
+mod sqlite_replication_s3;
+#[cfg(feature = "db")]
+mod sqlite_replication_wal;
 #[cfg(feature = "ws")]
 mod sse_replay;
 mod static_serving;
+mod step_up_route;
 #[cfg(feature = "storage")]
 mod storage_local_integration;
 #[cfg(feature = "maud")]

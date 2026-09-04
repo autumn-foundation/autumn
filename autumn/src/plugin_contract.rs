@@ -424,6 +424,47 @@ pub fn lockstep_range(version: &str) -> String {
     }
 }
 
+/// Builds the compatibility contract a first-party plugin declares from
+/// [`Plugin::contract`](crate::plugin::Plugin::contract) (issue #1601).
+///
+/// First-party plugins ship in lockstep with `autumn-web`, so the declared
+/// range is this crate's own minor series — the two versions are the same
+/// number by construction. Below `1.0` a minor bump is breaking (see
+/// `STABILITY.md`), which is exactly what the `MAJOR.MINOR` requirement says.
+///
+/// Pass `env!("CARGO_PKG_NAME")` / `env!("CARGO_PKG_VERSION")` so both fields
+/// describe the calling crate, not this one:
+///
+/// ```rust
+/// use autumn_web::app::AppBuilder;
+/// use autumn_web::plugin::Plugin;
+/// use autumn_web::plugin_contract::{PluginContract, lockstep_contract};
+///
+/// struct MyFirstPartyPlugin;
+///
+/// impl Plugin for MyFirstPartyPlugin {
+///     fn contract(&self) -> Option<PluginContract> {
+///         Some(lockstep_contract(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+///     }
+///
+///     fn build(self, app: AppBuilder) -> AppBuilder {
+///         app
+///     }
+/// }
+/// ```
+///
+/// # This is for lockstep crates only
+///
+/// Same restriction as [`lockstep_range`]: a plugin that versions
+/// independently of `autumn-web` must declare its own literal range instead
+/// (see that function's docs for why).
+#[must_use]
+pub fn lockstep_contract(name: &str, version: &str) -> PluginContract {
+    PluginContract::new(name)
+        .plugin_version(version)
+        .autumn_web(lockstep_range(version))
+}
+
 // ── Evaluation ─────────────────────────────────────────────────────────────
 
 /// The outcome of checking a [`PluginContract`] against a framework version.
@@ -615,6 +656,15 @@ mod tests {
         for odd in ["", "1", "not.a.version", "x.y.z", ".7.0"] {
             assert_eq!(lockstep_range(odd), odd, "input {odd:?}");
         }
+    }
+
+    #[test]
+    fn lockstep_contract_combines_name_version_and_lockstep_range() {
+        let contract = lockstep_contract("my-plugin", "0.7.3");
+        assert_eq!(contract.plugin, "my-plugin");
+        assert_eq!(contract.plugin_version.as_deref(), Some("0.7.3"));
+        assert_eq!(contract.autumn_web.as_deref(), Some("0.7"));
+        assert!(contract.experimental_surfaces.is_empty());
     }
 
     #[test]
