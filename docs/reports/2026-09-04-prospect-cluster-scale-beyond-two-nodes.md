@@ -133,6 +133,34 @@ Committed before any node is ever started or any assertion is written.
   this report's final commit; only the report and its embedded results
   survive. No production data, no external network, no spend.
 
+### 🛠️ Correction (Codex review on PR #2503, before merge)
+
+Two P2 findings, both fixed by strengthening the apparatus and re-running
+rather than by softening the claim:
+
+1. **The reproduce recipe pointed at a file that was never committed
+   anywhere.** The original Apparatus/Reproduce text said to "restore
+   `autumn/tests/prospect_cluster_scale.rs` from git history" — but per
+   this ledger's own containment rule the file was written, run, and
+   reverted *before* the first commit, so no commit on this branch ever
+   contained it. Reproduction was actually impossible from the instructions
+   as written. Fixed below: the full apparatus source is now embedded
+   verbatim in **Reproduce**, which is the durable artifact from here on.
+2. **"Exact counter sums" was asserted for the whole run, but only checked
+   before churn.** The original apparatus polled the counter for the exact
+   sum (15) once, right after step 2's increments, then only checked
+   *membership* (not the counter) through the departure (step 3) and
+   rejoin (step 4) steps — while the pre-registration's own kill line
+   ("the converged counter value on any node is not exactly 15 once every
+   node reports a stable 5-member view for 2 consecutive polls") was never
+   scoped to step 2 alone. This was a real gap between what was promised
+   and what was measured, not a new criterion invented after the fact.
+   Fixed by adding the same counter-sum assertion after step 3 (on the 4
+   survivors) and after step 4 (on all 5, including the rejoined node),
+   and re-running. See **Apparatus** and **Assay** below for the corrected
+   procedure and results — the verdict is unchanged (still pursue), now on
+   stronger evidence than the first pass actually supported.
+
 ## 🧪 Apparatus
 
 One throwaway test file, `autumn/tests/prospect_cluster_scale.rs` (a
@@ -152,9 +180,15 @@ runs all four pre-registered steps in sequence against one 5-node cluster:
 3. Every node increments the shared counter by a distinct amount
    (node *i* → `i+1`); poll for all 5 nodes reading the exact sum, 15.
 4. Cancel node 4's shutdown token (clean departure); poll for the 4
-   survivors converging to an identical 4-member view.
+   survivors converging to an identical 4-member view, **then** poll them
+   for the exact sum 15 again (added in the correction above — the
+   departed node's contributed cells must still be present in the merged
+   document the survivors hold).
 5. Install a fresh node, re-seeded from node 0, replacing node 4; poll for
-   all 5 (4 original + 1 rejoined) reconverging to a full 5-member view.
+   all 5 (4 original + 1 rejoined) reconverging to a full 5-member view,
+   **then** poll all 5 for the exact sum 15 again (added in the correction
+   above — the rejoined node must relearn the full total from its peers,
+   not just the membership shape).
 
 **Stubs / what this apparatus faked or skipped** (scopes what the result
 below actually proves):
@@ -213,33 +247,51 @@ test integration::cluster_two_node::tcp_two_nodes_converge_and_counter_replicate
 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 1916 filtered out
 ```
 
-**N=5 assay, 4 runs** (`cargo test -p autumn-web --features test-support
---test prospect_cluster_scale`, run back-to-back in this sandbox — repeated
-beyond the pre-registration's implicit single run because a single pass is
-weak evidence for "pursue" on its own, matching the lesson the prior
-cold-start assays in this ledger paid dearly to learn):
+**N=5 assay, first pass, 4 runs** (before the correction above — counter
+verified only at step 2):
 
 | Run | Result | Wall-clock |
 |---|---|---:|
-| 1 | all 4 steps pass | 1.16s |
-| 2 | all 4 steps pass | 1.27s |
-| 3 | all 4 steps pass | 1.32s |
-| 4 | all 4 steps pass | 1.03s |
+| 1 | all steps pass | 1.16s |
+| 2 | all steps pass | 1.27s |
+| 3 | all steps pass | 1.32s |
+| 4 | all steps pass | 1.03s |
 
-**Against the pre-registered lines:**
+**N=5 assay, corrected pass, 4 more runs** (`cargo test -p autumn-web
+--features test-support --test prospect_cluster_scale`, run back-to-back in
+this sandbox after adding the post-departure and post-rejoin counter
+assertions — 8 total runs across both passes, repeated beyond the
+pre-registration's implicit single run because a single pass is weak
+evidence for "pursue" on its own, matching the lesson the prior cold-start
+assays in this ledger paid dearly to learn):
 
-- **Step 1 (cold-start convergence, line: ≤10s):** passed on 4/4 runs.
-  Actual convergence is folded into each run's total ~1-1.3s wall-clock
-  (compile excluded) — roughly an order of magnitude inside the bound, not
-  a close call the way the cold-start ledger's margins were.
+| Run | Result | Wall-clock |
+|---|---|---:|
+| 5 | all steps + both post-churn counter checks pass | 0.91s |
+| 6 | all steps + both post-churn counter checks pass | 1.23s |
+| 7 | all steps + both post-churn counter checks pass | 1.03s |
+| 8 | all steps + both post-churn counter checks pass | 1.11s |
+
+**Against the pre-registered lines (corrected pass, the one that actually
+covers the full claim):**
+
+- **Step 1 (cold-start convergence, line: ≤10s):** passed on 8/8 runs
+  across both passes. Actual convergence is folded into each run's total
+  ~0.9-1.3s wall-clock (compile excluded) — roughly an order of magnitude
+  inside the bound, not a close call the way the cold-start ledger's
+  margins were.
 - **Step 2 (counter merge, line: exact sum 15 on every node, ≤10s):**
-  passed on 4/4 runs. Every node read exactly 15 on every run — no lost or
+  passed on 8/8 runs. Every node read exactly 15 on every run — no lost or
   duplicated increments observed.
-- **Step 3 (departure, line: 4-member view on survivors, ≤5s):** passed on
-  4/4 runs.
-- **Step 4 (rejoin, line: 5-member view, ≤10s):** passed on 4/4 runs.
+- **Step 3 (departure, line: 4-member view on survivors, ≤5s, AND exact sum
+  15 still held on all 4 survivors):** passed on 8/8 runs — the counter
+  half of this check only ran in runs 5-8 (the correction), and held on
+  4/4 of those.
+- **Step 4 (rejoin, line: 5-member view, ≤10s, AND exact sum 15 relearned
+  by the rejoined node):** passed on 8/8 runs — again, the counter half
+  only ran in runs 5-8, and held on 4/4 of those.
 - **Kill-line check:** zero divergent views, zero wrong counter values,
-  zero panics/timeouts/hangs across all 4 runs. The "2 of 3 repeats"
+  zero panics/timeouts/hangs across all 8 runs. The "2 of 3 repeats"
   kill-line threshold was never approached in either direction — this
   result is not a marginal call the way the cold-start bisection's
   sub-5,000ms deltas were; every margin here has roughly 8-13x headroom
@@ -250,13 +302,18 @@ cold-start assays in this ledger paid dearly to learn):
 
 **Pursue**, against the pre-registered line: all four success criteria
 (cold-start convergence, exact counter merge, departure convergence,
-rejoin convergence) held on every one of 4 runs, each with roughly an
-order of magnitude of margin against its bound — not a photo finish. No
-kill-line condition was observed. Within the scope this assay actually
-tested (single host, single process, star topology, honest peers, N=5,
-correctness not performance), the full-broadcast/no-quorum gossip design
-does **not** show the split-brain or lost-update failure mode the guide's
-hedge gestures at.
+rejoin convergence) held on every run across both passes, each with
+roughly an order of magnitude of margin against its bound — not a photo
+finish. No kill-line condition was observed. Critically, after the
+correction above, the counter's exact sum was verified not just once
+before churn but again on the survivors after departure and again on the
+full cluster after rejoin — the stronger claim the guide text now makes is
+the one actually measured, on 4/4 corrected runs, not the weaker one the
+first pass of this report accidentally supported. Within the scope this
+assay actually tested (single host, single process, star topology, honest
+peers, N=5, correctness not performance), the full-broadcast/no-quorum
+gossip design does **not** show the split-brain or lost-update failure
+mode the guide's hedge gestures at.
 
 This is deliberately a narrower claim than "clustering works past two
 nodes" — see the stubs list above for exactly what was not tested (real
@@ -298,19 +355,265 @@ peers, one churn cycle":
 
 ## 🔬 Reproduce
 
-```bash
-# 1. Add the temporary [[test]] entry to autumn/Cargo.toml:
-#      [[test]]
-#      name = "prospect_cluster_scale"
-#      path = "tests/prospect_cluster_scale.rs"
-# 2. Restore autumn/tests/prospect_cluster_scale.rs from this report's PR
-#    diff (reverted before the final commit; see git history on the commit
-#    that pre-registered this assay for the version right before revert,
-#    or the PR's own diff for this report).
+The apparatus was never committed (per this ledger's containment rule, it
+is reverted before the report is finalized), so — fixing the first
+revision of this section, flagged by Codex review as pointing at a commit
+that does not actually contain the file — its exact source is embedded
+below rather than referenced by history. This is now the durable artifact.
 
-cargo test -p autumn-web --features test-support --test integration_tests \
-  cluster_two_node -- --nocapture   # control: existing 2-node suite
+1. Add this entry to `autumn/Cargo.toml`, immediately after the existing
+   `[[test]] name = "integration_tests"` block:
 
-cargo test -p autumn-web --features test-support \
-  --test prospect_cluster_scale -- --nocapture   # the N=5 assay, repeat 3-4x
-```
+   ```toml
+   [[test]]
+   name = "prospect_cluster_scale"
+   path = "tests/prospect_cluster_scale.rs"
+   ```
+
+2. Save the following as `autumn/tests/prospect_cluster_scale.rs`:
+
+   ```rust
+   //! PROSPECT ASSAY APPARATUS — throwaway, not for merge.
+   //!
+   //! Answers the falsifiable question pre-registered in
+   //! docs/reports/2026-09-04-prospect-cluster-scale-beyond-two-nodes.md:
+   //! does the full-broadcast, no-quorum gossip cluster converge correctly
+   //! at N=5? Scales up autumn/tests/integration/cluster_two_node.rs's own
+   //! harness conventions to 5 members, star-seeded from node 1.
+
+   use std::sync::Arc;
+   use std::time::Duration;
+
+   use autumn_web::cluster::{ClusterHandle, install_from_config};
+   use autumn_web::config::{AutumnConfig, ClusterConfig};
+   use autumn_web::test::TestApp;
+   use tokio_util::sync::CancellationToken;
+
+   const SECRET: &str = "a-shared-cluster-secret-value-32";
+   const COUNTER: &str = "prospect_n5";
+   const N: usize = 5;
+   const EXPECTED_SUM: u64 = 1 + 2 + 3 + 4 + 5; // 15
+
+   const CONVERGE_TIMEOUT: Duration = Duration::from_secs(10);
+   const DEPARTURE_TIMEOUT: Duration = Duration::from_secs(5);
+
+   async fn poll_until<F, Fut>(timeout: Duration, mut condition: F) -> bool
+   where
+       F: FnMut() -> Fut,
+       Fut: std::future::Future<Output = bool>,
+   {
+       let deadline = tokio::time::Instant::now() + timeout;
+       loop {
+           if condition().await {
+               return true;
+           }
+           if tokio::time::Instant::now() >= deadline {
+               return false;
+           }
+           tokio::time::sleep(Duration::from_millis(10)).await;
+       }
+   }
+
+   fn cluster_config(seed_peers: Vec<String>) -> ClusterConfig {
+       ClusterConfig {
+           enabled: true,
+           secret: Some(secrecy::SecretString::from(SECRET.to_owned())),
+           bind_addr: "127.0.0.1:0".to_owned(),
+           seed_peers,
+           push_interval_ms: 200,
+           suspicion_timeout_ms: 1_000,
+           ..ClusterConfig::default()
+       }
+   }
+
+   fn app_config(cluster: ClusterConfig) -> AutumnConfig {
+       AutumnConfig { cluster, ..AutumnConfig::default() }
+   }
+
+   fn member_ids(handle: &Arc<ClusterHandle>) -> Vec<String> {
+       let mut ids: Vec<String> = handle.members().into_iter().map(|m| m.id).collect();
+       ids.sort();
+       ids
+   }
+
+   fn describe(handles: &[Arc<ClusterHandle>]) -> String {
+       handles
+           .iter()
+           .enumerate()
+           .map(|(i, h)| {
+               format!(
+                   "node{i}(id={}, members={:?}, {COUNTER}={})",
+                   h.node_id(),
+                   member_ids(h),
+                   h.counter(COUNTER).get()
+               )
+           })
+           .collect::<Vec<_>>()
+           .join(" | ")
+   }
+
+   /// Spin up `n` nodes, star-seeded from node 0. Returns handles + their
+   /// shutdown tokens (index-aligned).
+   fn spawn_star_cluster(n: usize) -> (Vec<Arc<ClusterHandle>>, Vec<CancellationToken>) {
+       let mut handles = Vec::with_capacity(n);
+       let mut tokens = Vec::with_capacity(n);
+
+       let shutdown0 = CancellationToken::new();
+       let config0 = cluster_config(Vec::new());
+       let app0 = TestApp::new().config(app_config(config0.clone())).build();
+       install_from_config(app0.state(), &config0, &shutdown0).expect("node 0 must install");
+       let handle0 = app0
+           .state()
+           .extension::<ClusterHandle>()
+           .expect("node 0 must expose a ClusterHandle");
+       let seed = handle0.local_addr().to_string();
+       handles.push(handle0);
+       tokens.push(shutdown0);
+       std::mem::forget(app0); // keep the app (and its background tasks) alive
+
+       for i in 1..n {
+           let shutdown = CancellationToken::new();
+           let config = cluster_config(vec![seed.clone()]);
+           let app = TestApp::new().config(app_config(config.clone())).build();
+           install_from_config(app.state(), &config, &shutdown)
+               .unwrap_or_else(|e| panic!("node {i} must install: {e:?}"));
+           let handle = app
+               .state()
+               .extension::<ClusterHandle>()
+               .unwrap_or_else(|| panic!("node {i} must expose a ClusterHandle"));
+           handles.push(handle);
+           tokens.push(shutdown);
+           std::mem::forget(app);
+       }
+
+       (handles, tokens)
+   }
+
+   async fn assert_full_convergence(handles: &[Arc<ClusterHandle>], expected_n: usize, label: &str) {
+       let hs = handles.to_vec();
+       let ok = poll_until(CONVERGE_TIMEOUT, || {
+           let hs = hs.clone();
+           async move { hs.iter().all(|h| h.members().len() == expected_n) }
+       })
+       .await;
+       assert!(
+           ok,
+           "[{label}] all {expected_n} nodes must report a {expected_n}-member view within {CONVERGE_TIMEOUT:?}; {}",
+           describe(handles)
+       );
+
+       let reference = member_ids(&handles[0]);
+       assert_eq!(reference.len(), expected_n, "[{label}] {}", describe(handles));
+       for (i, h) in handles.iter().enumerate() {
+           assert_eq!(
+               member_ids(h),
+               reference,
+               "[{label}] node {i} must agree on the exact same member set as node 0; {}",
+               describe(handles)
+           );
+       }
+   }
+
+   /// Poll every handle for the exact expected counter sum, then assert it
+   /// on every one individually (two-sided, not a one-node spot check).
+   async fn assert_counter_sum(handles: &[Arc<ClusterHandle>], label: &str) {
+       let hs = handles.to_vec();
+       let ok = poll_until(CONVERGE_TIMEOUT, || {
+           let hs = hs.clone();
+           async move { hs.iter().all(|h| h.counter(COUNTER).get() == EXPECTED_SUM) }
+       })
+       .await;
+       assert!(
+           ok,
+           "[{label}] every node must converge on counter={EXPECTED_SUM} within {CONVERGE_TIMEOUT:?}; {}",
+           describe(handles)
+       );
+       for (i, h) in handles.iter().enumerate() {
+           assert_eq!(
+               h.counter(COUNTER).get(),
+               EXPECTED_SUM,
+               "[{label}] node {i} must read the exact merged sum, no lost/duplicated increments; {}",
+               describe(handles)
+           );
+       }
+   }
+
+   #[tokio::test(flavor = "multi_thread")]
+   async fn n5_star_cluster_converges_counters_and_survives_departure_and_rejoin() {
+       // --- Step 1: cold-start convergence to a full N-member view ---
+       let (mut handles, mut tokens) = spawn_star_cluster(N);
+       assert_full_convergence(&handles, N, "step1-cold-start").await;
+
+       // --- Step 2: concurrent counter increments from every node ---
+       for (i, h) in handles.iter().enumerate() {
+           h.counter(COUNTER).increment_by((i as u64) + 1);
+       }
+       assert_counter_sum(&handles, "step2-counter").await;
+
+       // --- Step 3: clean departure of node N-1, survivors converge to N-1 ---
+       let departing = N - 1;
+       tokens[departing].cancel();
+       let survivors: Vec<Arc<ClusterHandle>> = handles[..departing].to_vec();
+       let ok = poll_until(DEPARTURE_TIMEOUT, || {
+           let survivors = survivors.clone();
+           async move { survivors.iter().all(|h| h.members().len() == N - 1) }
+       })
+       .await;
+       assert!(
+           ok,
+           "[step3-departure] the {} survivors must converge to a {}-member view within {DEPARTURE_TIMEOUT:?}; {}",
+           departing,
+           N - 1,
+           describe(&handles)
+       );
+       let reference = member_ids(&survivors[0]);
+       for (i, h) in survivors.iter().enumerate() {
+           assert_eq!(
+               member_ids(h),
+               reference,
+               "[step3-departure] survivor {i} must agree with the others on the {}-member view; {}",
+               N - 1,
+               describe(&handles)
+           );
+       }
+       assert_counter_sum(&survivors, "step3-departure-counter").await;
+
+       // --- Step 4: node 5 rejoins (fresh handle, re-seeded from node 0) ---
+       let seed = handles[0].local_addr().to_string();
+       let shutdown_rejoin = CancellationToken::new();
+       let config_rejoin = cluster_config(vec![seed]);
+       let app_rejoin = TestApp::new()
+           .config(app_config(config_rejoin.clone()))
+           .build();
+       install_from_config(app_rejoin.state(), &config_rejoin, &shutdown_rejoin)
+           .expect("rejoining node must install");
+       let handle_rejoin = app_rejoin
+           .state()
+           .extension::<ClusterHandle>()
+           .expect("rejoining node must expose a ClusterHandle");
+       std::mem::forget(app_rejoin);
+
+       handles[departing] = handle_rejoin;
+       tokens[departing] = shutdown_rejoin;
+       assert_full_convergence(&handles, N, "step4-rejoin").await;
+       assert_counter_sum(&handles, "step4-rejoin-counter").await;
+
+       for t in &tokens {
+           t.cancel();
+       }
+   }
+   ```
+
+3. Run it:
+
+   ```bash
+   cargo test -p autumn-web --features test-support --test integration_tests \
+     cluster_two_node -- --nocapture   # control: existing 2-node suite
+
+   cargo test -p autumn-web --features test-support \
+     --test prospect_cluster_scale -- --nocapture   # the N=5 assay, repeat 3-4x
+   ```
+
+4. Revert `autumn/Cargo.toml` and delete
+   `autumn/tests/prospect_cluster_scale.rs` afterward — per this ledger's
+   containment rule, the apparatus does not merge.
