@@ -3190,12 +3190,25 @@ fn path_string(path: &syn::Path) -> String {
 
 // ── Shared with `query_budget` ───────────────────────────────────────
 //
-// Everything from here to `expr_attrs_mut`, plus `EXECUTORS` and
-// `INERT_MACROS`, is a deliberate copy of `query_budget.rs`: the *rules* above
-// diverge (that analyser can key on "every query names the request's `Db`";
-// this one cannot), but these helpers do not. Fix a bug in one and fix it in
-// the other; extracting them into a shared `handle_analysis.rs` is a
-// follow-up, not a drive-by.
+// This module forks `query_budget.rs`'s handle tracking (see the module doc
+// comment), and most of what looks like a sibling function below has since
+// diverged on purpose: `pattern_bindings`/`container_bindings`/`select_part`,
+// `type_handle`, `is_constructor_call`, `signature_handles` and friends carry
+// this analyser's richer `Handle` enum, where `query_budget` only needs a
+// flat set of handle names. `INERT_MACROS` looks identical but is not — see
+// the comment on `mac()` below for why `vec!`/`format!` are excluded here.
+//
+// A handful of items *are* still byte-for-byte copies, because they just
+// enumerate `syn`'s own `Expr`/`Item` variants or do generic token-tree
+// plumbing that owes nothing to either analyser's rules: `expr_attrs`,
+// `expr_attrs_mut`, `item_attrs_mut`, `immediately_invoked_closure`,
+// `call_path_name`, `tokens_contain_await`, `collect_pat_idents`, and the
+// `StripAnnotations`/`VisitMut` impl, plus the `EXECUTORS` list above. Fix a
+// bug in one of *those* and fix it in the other — `shared_helpers_match_query_budget`
+// below fails the build if they drift. Two instances is not enough to extract
+// them into their own module today (Echo's rule of three), so they stay
+// duplicated on purpose rather than becoming a `handle_analysis.rs` nobody
+// asked for.
 
 fn expr_attrs(expr: &Expr) -> &[Attribute] {
     match expr {
@@ -4077,6 +4090,97 @@ mod tests {
     use quote::quote;
 
     use super::*;
+
+    /// Extracts the balanced `open`..`close` span starting at the first
+    /// occurrence of `needle` (which must itself end with `open`), e.g.
+    /// `"fn expr_attrs(expr: &Expr) -> &[Attribute] {"` with `('{', '}')`
+    /// returns the whole function including its signature and closing brace.
+    fn extract_balanced(src: &str, needle: &str, open: char, close: char) -> String {
+        assert!(
+            needle.ends_with(open),
+            "needle {needle:?} must end at the opening delimiter"
+        );
+        let start = src
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not found in source"));
+        let mut depth = 0i32;
+        let mut end = start;
+        for (i, c) in src[start..].char_indices() {
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    end = start + i + c.len_utf8();
+                    break;
+                }
+            }
+        }
+        assert_ne!(end, start, "unbalanced {open:?}/{close:?} after {needle:?}");
+        src[start..end].to_string()
+    }
+
+    /// Drops every whole-line `//` comment, so two copies that carry
+    /// different (per-file, correctly-adapted) prose over identical code
+    /// still compare equal. Does not handle a trailing same-line comment or a
+    /// `/* */` block — none of the items this test checks use either.
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `expr_attrs`, `expr_attrs_mut`, `item_attrs_mut`,
+    /// `immediately_invoked_closure`, `call_path_name`, `tokens_contain_await`,
+    /// `collect_pat_idents`, `StripAnnotations`'s `VisitMut` impl, and
+    /// `EXECUTORS` are a deliberate copy of `query_budget.rs`, modulo
+    /// comments (see the comment above `expr_attrs` in this file, and its
+    /// mirror in `query_budget.rs`) — everything else nearby has since
+    /// diverged on purpose and is *not* covered here. This test enforces that
+    /// promise: it fails the build the moment either copy's *code* drifts,
+    /// instead of relying on a maintainer noticing.
+    #[test]
+    fn shared_helpers_match_query_budget() {
+        let this = include_str!("agent_authority.rs");
+        let sibling = include_str!("query_budget.rs");
+
+        let braced_items = [
+            "fn expr_attrs(expr: &Expr) -> &[Attribute] {",
+            "const fn expr_attrs_mut(expr: &mut Expr) -> Option<&mut Vec<Attribute>> {",
+            "const fn item_attrs_mut(item: &mut syn::Item) -> Option<&mut Vec<Attribute>> {",
+            "fn immediately_invoked_closure(func: &Expr) -> Option<&syn::ExprClosure> {",
+            "fn call_path_name(call: &ExprCall) -> Option<String> {",
+            "fn tokens_contain_await(tokens: &TokenStream) -> bool {",
+            "fn collect_pat_idents(pat: &Pat, out: &mut HashSet<String>) {",
+            "impl VisitMut for StripAnnotations {",
+        ];
+        for sig in braced_items {
+            let a = strip_line_comments(&extract_balanced(this, sig, '{', '}'));
+            let b = strip_line_comments(&extract_balanced(sibling, sig, '{', '}'));
+            assert_eq!(
+                a, b,
+                "{sig} has drifted between agent_authority.rs and query_budget.rs"
+            );
+        }
+
+        let a = strip_line_comments(&extract_balanced(
+            this,
+            "const EXECUTORS: &[&str] = &[",
+            '[',
+            ']',
+        ));
+        let b = strip_line_comments(&extract_balanced(
+            sibling,
+            "const EXECUTORS: &[&str] = &[",
+            '[',
+            ']',
+        ));
+        assert_eq!(
+            a, b,
+            "EXECUTORS has drifted between agent_authority.rs and query_budget.rs"
+        );
+    }
 
     /// The attribute every corpus entry is expanded under. The grant itself is
     /// declared elsewhere (and may live in another crate), so the macro never
