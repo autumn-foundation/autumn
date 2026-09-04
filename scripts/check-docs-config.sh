@@ -991,6 +991,55 @@ def _cfg_truth(pred):
 # bounds what a miscount can swallow.
 ARG_SPAN_LIMIT = 500
 
+# Only one argument in a call is the KEY, and taking every quoted name in the
+# list made the VALUE one too: `set_var("RUST_LOG", "AUTUMN_LOG__LEVL")` blessed
+# a name that is a value assigned to somebody else's variable.
+#
+# The key is the first argument that is ENTIRELY a string literal. That is a
+# rule about the calls rather than a table of arities, and it reads every shape
+# here: `var("KEY")`, `set_var("KEY", value)`, `env.get("KEY")`,
+# `parse_env(env, "KEY", &mut target)` and
+# `override_string(&mut target, env, "KEY")` — the helpers put the key second or
+# third, and in none of them does a bare string literal come before it.
+STRING_ARG = re.compile(r'^"(?:[^"\\]|\\.)*"$')
+
+
+def _split_args(text):
+    """Top-level arguments of a call: commas outside brackets and strings."""
+    parts, depth, quote, esc, start = [], 0, False, False, 0
+    for i, c in enumerate(text):
+        if esc:
+            esc = False
+        elif c == '\\':
+            esc = True
+        elif quote:
+            quote = c != '"'
+        elif c == '"':
+            quote = True
+        elif c in '([{<':
+            depth += 1
+        elif c in ')]}>':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return parts
+
+
+def key_argument(args):
+    """The argument that names the variable, or '' if none does.
+
+    Escaped quotes are normalised first: `generate/admin.rs` writes a real
+    `std::env::var(\\"AUTUMN_TEST_ADMIN_SESSION\\")` into generated code, where
+    the whole literal reaches this scan backslash-escaped.
+    """
+    for a in _split_args(args):
+        a = a.strip().replace('\\"', '"')
+        if STRING_ARG.match(a):
+            return a
+    return ''
+
 
 def _balanced(s, i, limit=None):
     """The text inside the parenthesis at `s[i]`, and the index after it."""
@@ -1145,7 +1194,7 @@ def source_tokens(root):
                 continue
             args, _ = _balanced(body, m.end() - 1, ARG_SPAN_LIMIT)
             if args:
-                tokens.update(QUOTED.findall(args))
+                tokens.update(QUOTED.findall(key_argument(args)))
     return tokens
 
 
@@ -2160,9 +2209,10 @@ def self_test():
          bool(ACCESSOR.search('let v = env.get("AUTUMN_LOG__LEVEL");')), True)
     # A quoted name counts as its accessor's ARGUMENT, not as its neighbour. The
     # window this replaced took a name off any line within three of a call.
-    def args_of(text):
-        m = ACCESSOR.search(text)
-        return QUOTED.findall(_balanced(text, m.end() - 1, ARG_SPAN_LIMIT)[0])
+    def args_of(text, acc=ACCESSOR):
+        m = acc.search(text)
+        return QUOTED.findall(
+            key_argument(_balanced(text, m.end() - 1, ARG_SPAN_LIMIT)[0]))
     case('a name outside the call is not its argument',
          args_of('std::env::var(\n  "RUST_LOG",\n);\nlet u = "AUTUMN_LOG__LEVL";'),
          [])
@@ -2171,6 +2221,25 @@ def self_test():
     case('a multi-line argument list still reads',
          args_of('parse_env(\n    env,\n    "AUTUMN_MEDIA__ROOM_NAMESPACE",\n)'),
          ['AUTUMN_MEDIA__ROOM_NAMESPACE'])
+    # Only ONE argument is the key. Taking every quoted name in the list made
+    # the VALUE one too: a name assigned to somebody else's variable.
+    case('a value argument is not the key',
+         args_of('std::env::set_var("RUST_LOG", "AUTUMN_LOG__LEVL")'), [])
+    case('…and the key still is',
+         args_of('std::env::set_var("AUTUMN_SYNC__DB_PATH", path)'),
+         ['AUTUMN_SYNC__DB_PATH'])
+    # The helpers put the key second or third, behind arguments that are not
+    # string literals — which is what makes "first whole string literal" a rule
+    # about the calls rather than a table of arities.
+    case('a helper key behind other arguments reads',
+         args_of('override_string(&mut self.ffmpeg.bin, env, '
+                 '"AUTUMN_MEDIA__FFMPEG__BIN")', accessor(ROOT)),
+         ['AUTUMN_MEDIA__FFMPEG__BIN'])
+    case('an escaped literal in generated code still reads',
+         args_of(r'std::env::var(\"AUTUMN_TEST_ADMIN_SESSION\")'),
+         ['AUTUMN_TEST_ADMIN_SESSION'])
+    case('a comma inside a string does not split the arguments',
+         _split_args('"a,b", c'), ['"a,b"', ' c'])
     # …while the binding form, which has no accessor anywhere near it, is.
     case('a const-bound name is swept in', 'AUTUMN_CANARY' in swept, True)
     # `NAME=` inside a Rust string is text, not a shell assignment:
