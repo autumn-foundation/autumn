@@ -383,6 +383,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
+        with:
+          # This job and every `trybuild` shard run the IDENTICAL `cargo test
+          # --workspace` build and differ only in which tests they then run, so
+          # they share one cache entry instead of five near-identical copies.
+          # This job is the only writer (the shards set `save-if: false`).
+          shared-key: workspace-test
       - name: Run tests
         # `--skip compile_fail::` hands the trybuild module to the `trybuild`
         # job below. It is a substring skip and `compile_fail::` is the module
@@ -428,10 +434,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
-        # Deliberately NO per-shard cache key: every shard of this job runs the
-        # identical `cargo test --workspace` build and differs only in which
-        # tests it then runs, so they should share one warm target dir. (The
-        # default key already varies by job name and by runner OS/arch.)
+        with:
+          # Restore the entry the `test` job writes: same build, same features.
+          shared-key: workspace-test
+          # RESTORE ONLY. Four shards racing to upload the same multi-GB target
+          # dir buys nothing, and on windows-latest that upload is what killed
+          # `Trybuild pass_a` in run 8362 — the shard itself had already passed
+          # at 53m, then the cache-save post step ran 47 more minutes and the
+          # runner dropped the job. `test` is the single writer.
+          save-if: false
       - name: Run the trybuild shard
         # `cargo test --workspace` (not `-p autumn-web --test integration_tests`)
         # on purpose: the fixtures registered by `compile_fail.rs` are
@@ -459,6 +470,18 @@ jobs:
           cargo test --workspace -- "${filter[@]}" | tee "${RUNNER_TEMP}/trybuild.log"
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/trybuild.log" \
             || { echo "::error::trybuild shard ${{ matrix.shard }} ran no tests — the filter no longer matches anything in compile_fail.rs"; exit 1; }
+      - name: Drop the trybuild scratch tree
+        if: always()
+        # trybuild compiles every case as a real crate under
+        # `target/tests/trybuild`; that tree measures ~16 GB after a full
+        # `compile_pass` shard. It is pure scratch — regenerated each run,
+        # never a build input — but no cache action's prune knows that layout,
+        # so leaving it in place makes any post-run upload try to ship all of
+        # it. `save-if: false` above already prevents that; this keeps the
+        # disk bounded too, and keeps the hazard from returning silently if
+        # anyone ever flips that flag back.
+        shell: bash
+        run: rm -rf target/tests
 
   test-features:
     name: Test ${{ matrix.lane }} (${{ matrix.os }})
