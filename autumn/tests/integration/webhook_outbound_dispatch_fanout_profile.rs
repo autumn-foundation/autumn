@@ -142,8 +142,7 @@ fn seed_fixture(conn: &mut PgConnection) {
     ))
     .expect("seed historical autumn_jobs history");
 
-    conn.batch_execute("ANALYZE autumn_jobs")
-        .expect("analyze");
+    conn.batch_execute("ANALYZE autumn_jobs").expect("analyze");
 }
 
 #[derive(QueryableByName, Debug)]
