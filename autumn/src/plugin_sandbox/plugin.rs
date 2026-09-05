@@ -125,6 +125,44 @@ impl From<SandboxLoadError> for SandboxPluginError {
     }
 }
 
+/// The most context entries one render hook is handed.
+///
+/// A slot's context is a handful of values a panel needs — an id, a locale, a
+/// count. Far above that, and far below anything that could matter.
+pub const MAX_RENDER_CONTEXT_ENTRIES: usize = 32;
+
+/// The most bytes one render hook's context may carry across all its entries.
+pub const MAX_RENDER_CONTEXT_BYTES: usize = 16 * 1024;
+
+/// Take as much of `context` as the ceilings above allow.
+///
+/// Per-entry overhead is counted, not just the strings: a thousand empty pairs
+/// cost real allocation and real serialization, and a budget measured only in
+/// string length prices them at nothing.
+fn bounded_context(context: &[(String, String)]) -> Vec<(String, String)> {
+    /// What one entry costs beyond its bytes: two `String` headers, a tuple, and
+    /// the JSON punctuation it becomes on the wire.
+    const PER_ENTRY: usize = 64;
+
+    let mut out = Vec::with_capacity(context.len().min(MAX_RENDER_CONTEXT_ENTRIES));
+    let mut total = 0_usize;
+    for (name, value) in context {
+        if out.len() >= MAX_RENDER_CONTEXT_ENTRIES {
+            break;
+        }
+        let weight = name
+            .len()
+            .saturating_add(value.len())
+            .saturating_add(PER_ENTRY);
+        if total.saturating_add(weight) > MAX_RENDER_CONTEXT_BYTES {
+            break;
+        }
+        total = total.saturating_add(weight);
+        out.push((name.clone(), value.clone()));
+    }
+    out
+}
+
 /// A sandboxed plugin, ready to mount.
 ///
 /// `Clone` shares the compiled host, the concurrency permits, the capability

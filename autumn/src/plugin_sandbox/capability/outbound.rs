@@ -116,6 +116,21 @@ pub struct OutboundRequest {
     /// the answer against it either way — a backend an embedder wrote is not
     /// where this bound may be missing.
     pub max_response_bytes: usize,
+    /// The most response headers this call may return, and the most bytes they
+    /// may carry between them.
+    ///
+    /// Carried for the same reason `max_response_bytes` is, and it was missing
+    /// for the same reason it would have been easy to leave missing: the
+    /// allow-list says *which* headers come back and nothing about how many or
+    /// how large, and every one of them is the upstream's choice. Bounding only
+    /// the vector the host rebuilds afterwards bounds the reply and not the
+    /// allocation — by then the backend has already materialised whatever the
+    /// upstream sent. An implementation MUST stop reading headers once either
+    /// ceiling is reached. The host re-applies both to what comes back, because
+    /// a backend an embedder wrote is not where this bound may be missing.
+    pub max_response_headers: usize,
+    /// See [`max_response_headers`](Self::max_response_headers).
+    pub max_response_header_bytes: usize,
     /// Every hostname this plugin was granted.
     ///
     /// The host has already checked `url` against it. It is carried anyway so an
@@ -367,6 +382,8 @@ pub(super) fn perform(
         headers: allowed,
         body: body.clone(),
         max_response_bytes: ceiling,
+        max_response_headers: MAX_OUTBOUND_HEADERS,
+        max_response_header_bytes: MAX_RESPONSE_HEADER_BYTES,
         allowed_hosts: runtime
             .grants
             .list_for(super::super::manifest::SandboxCapability::HttpOutbound)

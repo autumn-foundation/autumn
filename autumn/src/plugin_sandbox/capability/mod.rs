@@ -264,9 +264,12 @@ pub fn row_weight(row: &PluginRow) -> usize {
 /// implementation and "the host does not hold more than this" cannot rest on
 /// someone else's loop.
 ///
-/// At least one row always survives: a row is bounded by [`MAX_ROW_BYTES`],
-/// which is under this ceiling, so a `db-get` of a legally-stored row is never
-/// answered with nothing.
+/// A row the host would have accepted always survives: [`MAX_ROW_BYTES`] is
+/// under this ceiling, so a `db-get` of a legally-stored row is never answered
+/// with nothing. A row *larger* than the whole result budget is dropped rather
+/// than exempted — it can only have come from a store that returned what the
+/// host would never have stored, and passing it through is exactly the
+/// oversized reply this exists to refuse.
 ///
 /// [`PluginStore::query`]: db::PluginStore::query
 #[must_use]
@@ -276,7 +279,11 @@ pub fn bounded_rows(rows: Vec<PluginRow>) -> (Vec<PluginRow>, bool) {
     let mut truncated = false;
     for row in rows {
         let weight = row_weight(&row);
-        if !kept.is_empty() && total.saturating_add(weight) > MAX_RESULT_BYTES {
+        // No "but keep the first one" exemption. Letting an empty `kept` skip
+        // the ceiling meant one corrupt or oversized row from an embedder's
+        // store was serialized in full — and a single row can be arbitrarily
+        // large when it did not come through `check_row`.
+        if total.saturating_add(weight) > MAX_RESULT_BYTES {
             truncated = true;
             break;
         }

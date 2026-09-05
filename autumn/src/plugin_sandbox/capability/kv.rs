@@ -295,14 +295,26 @@ impl std::fmt::Debug for CacheKvStore {
 }
 
 impl KvStore for CacheKvStore {
+    // `get_cached`/`insert_cached` rather than `get_value`/`insert_value`, and
+    // the difference is the whole of whether this type works at all against the
+    // cross-replica backend it exists to reach. The erased pair is the
+    // *in-process* half of the `Cache` trait: a serializing backend implements
+    // `insert_value` as a no-op and answers `get_value` with `RawCacheBytes`,
+    // which no `downcast_ref::<PluginValue>` can see. Over Redis this stored
+    // nothing, reported success, and missed every read afterwards — a plugin
+    // told its write succeeded, on the one backend the module documents for
+    // more than one replica. The serde pair takes both paths: the downcast when
+    // the backend keeps values, JSON when it keeps bytes.
     fn get(&self, key: &str) -> Option<PluginValue> {
-        self.0
-            .get_value(key)
-            .and_then(|value| value.downcast_ref::<PluginValue>().cloned())
+        crate::cache::get_cached::<PluginValue>(self.0.as_ref(), key)
     }
 
     fn set(&self, key: &str, value: PluginValue) -> Result<(), String> {
-        self.0.insert_value(key, std::sync::Arc::new(value));
+        // No TTL: a plugin's KV entry lives until the plugin deletes it or the
+        // backend evicts it. A ceiling on *lifetime* is not one of the grants an
+        // operator gave, and inventing one here would make a plugin's data
+        // disappear on a schedule nothing in the manifest mentions.
+        crate::cache::insert_cached(self.0.as_ref(), key, value, None);
         Ok(())
     }
 
