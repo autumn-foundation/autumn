@@ -1323,7 +1323,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **ci:** the test suite is now **sharded across runners** instead of running as
-  one job per OS. On the 2026-08-26 trunk run the `Test (windows-latest)` job
+  one job per OS [no-plugin] — this is CI scheduling only; it adds no framework
+  surface an agent could reach for, and the one behavioural note for humans
+  editing tests lives in CLAUDE.md rather than the plugin. On the 2026-08-26 trunk run the `Test (windows-latest)` job
   alone was 128 minutes and *was* the critical path of a 2h27m CI run. Measured
   from that run's logs, two things dominated. First, `compile_fail::` — the
   trybuild module — accounted for 37.1 of the 46.8 minutes the consolidated
