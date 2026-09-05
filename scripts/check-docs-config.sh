@@ -5476,6 +5476,25 @@ def source_tokens(root):
         for l in lines:
             offsets.append(at)
             at += len(l) + 1
+        # …and the SAME table for the assignment view, because the two views
+        # are the same length only LINE for line, never character for
+        # character. `_shell_code` blanks both quote kinds and drops every
+        # unquoted heredoc body, so on `scripts/check-advisories.sh` the two
+        # differ by 131 characters — and `scoped` and `local_at` are character
+        # offsets into `code` that were being compared against `offsets[n]`,
+        # which counts `body`. Every such comparison was off by however much
+        # the file's quoting happened to remove above it.
+        #
+        # This is what put two of the four probes that "routed around their
+        # rung" out of reach: the bare-`local` region and the shell assignment
+        # point are both computed on `code`, and both were asked about a
+        # position in `body`. The rules were right and were being asked in the
+        # wrong coordinate system — an offset crossing between two views, which
+        # is exactly what the Rust side refuses to do on principle.
+        code_offsets, at = [], 0
+        for l in code_lines:
+            code_offsets.append(at)
+            at += len(l) + 1
         declaring = False
         for n, line in enumerate(lines):
             # `NAME=` is how a SHELL names a variable; in Rust it is just text
@@ -5535,14 +5554,17 @@ def source_tokens(root):
                     declares.update(COMPOSE_DECLARED.findall(code_lines[n]))
                 if n not in literal:
                     here, shadowing = set(local), set()
+                    # Both of these are positions in `code`, so they are asked
+                    # about this line's position in `code` — see the note on
+                    # `code_offsets`.
                     for start, end, names in scoped:
-                        if start <= offsets[n] < end:
+                        if start <= code_offsets[n] < end:
                             shadowing |= names
                     here |= shadowing
                     for v in EXPANDED.findall(line):
                         # An assignment suppresses only what comes after it.
                         if (v in here and v not in shadowing
-                                and offsets[n] < local_at.get(v, 0)):
+                                and code_offsets[n] < local_at.get(v, 0)):
                             tokens.add(v)
                         elif v not in here:
                             tokens.add(v)
@@ -7779,6 +7801,25 @@ def self_test():
              'fn one(e: OsEnv) { let c = \'{\'; let s = "${"; e.var("X"); }\n'
              'fn two(q: Other) { q.var("Y"); }\n'),
          [('fn one(e: OsEnv)',), ('fn two(q: Other)',)])
+    # The two shell views are the same length LINE for line and not character
+    # for character: the assignment view blanks both quote kinds and drops an
+    # unquoted heredoc body outright. So a position taken in one is not a
+    # position in the other, and `scoped` and `local_at` — both computed on
+    # the assignment view — have to be asked about a line's offset in THAT
+    # view. Comparing them against the expansion view's offsets put every such
+    # test off by whatever the quoting above it happened to remove: 131
+    # characters on `scripts/check-advisories.sh`, which is why two correct
+    # rules could not be shown working on the real tree.
+    case('the shell views share a line count, not character offsets',
+         (lambda b, c: (len(b.splitlines()) == len(c.splitlines()),
+                        len(b) == len(c)))(
+             _shell_literals(_shell_heredocs(
+                 'f() {\n  local AUTUMN_A\n}\ncat <<EOF\nAUTUMN_B=x cmd\nEOF\n'
+                 'echo "$AUTUMN_A"\n')),
+             _shell_code(_shell_heredocs(
+                 'f() {\n  local AUTUMN_A\n}\ncat <<EOF\nAUTUMN_B=x cmd\nEOF\n'
+                 'echo "$AUTUMN_A"\n', True))),
+         (True, False))
     # …and the mask has to be cut the way `untested` cuts the body, or every
     # offset past the first test item names a different character. Missing that
     # on the scan side cost a real read its resolution.
