@@ -2840,18 +2840,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn/benches/throttle_check.rs`, driving real traffic through a
   `#[throttle]`-guarded route and an identical unthrottled route (issue
   #1350's per-route rate limiter had no committed benchmark before this).
-  Profiling the warm steady-state path (limiter already cached, request
-  always `Decision::Allowed`) found two `format!` calls that run on every
-  throttled request purely to build a `HashMap` lookup key —
+  Uses `key = "token"` with an `Authorization: Bearer` header on every call
+  (not `key = "ip"` — `TestApp`'s in-process requests carry no `ConnectInfo`,
+  which would make `extract_throttle_key` return `None` and every call take
+  `__check_throttle`'s no-client bypass instead of the real
+  `limiter.decide()` bucket lookup/lock/refill path; caught in review before
+  merge). An isolated `--route throttled` vs. `--route plain` DHAT A/B (no
+  framework code changed) attributed the full added per-request cost —
+  ~11 allocation blocks / ~1.85KB — against the ~140-block/~27.3KB
+  per-request baseline `config_alloc_gate` already gates (#2232): ~7.9%
+  blocks, ~6.8% bytes, both under the 10% floor. Of that, the two `format!`
+  calls that build a `HashMap` lookup key on every request despite the
+  lookup almost always hitting a warm cache —
   `resolve_throttle_params`'s `registry_key` and `__check_throttle`'s
-  `cache_key`, both of which reallocate once a lookup that only ever hits
-  after the route's first request. An isolated `--route throttled` vs.
-  `--route plain` DHAT A/B (no framework code changed) attributed ~6
-  allocation blocks and ~247 bytes of the added per-request cost directly to
-  those two call sites — under 5% of the ~140-block/~26KB per-request
-  allocation budget `config_alloc_gate` already gates (#2232), so it clears
-  neither the 10%-of-allocations nor the 5%-of-instructions impact floor.
-  Recorded as a negative result rather than shipped; the harness itself is
+  `cache_key` — account for ~6 blocks / ~247 bytes (~4.3%/~0.9%), clearing
+  neither the 10%-of-allocations nor the 5%-of-instructions impact floor on
+  their own. Recorded as a negative result rather than shipped; the harness
+  itself is
   the lasting artifact, giving `#[throttle]` its first profiling coverage.
 - **new `repository_crud` profiling harness; findings, no fix (#2486):** added
   `autumn/benches/repository_crud.rs`, driving real `save`/`find_by_id`/`page`

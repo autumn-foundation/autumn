@@ -5,16 +5,27 @@
 //! `#[throttle]` attribute) and that no other committed bench touches.
 //!
 //! Two otherwise-identical trivial handlers are mounted: `/throttled` carries
-//! `#[throttle(limit = 1_000_000, per = "1h", key = "ip")]` (a limit high
+//! `#[throttle(limit = 1_000_000, per = "1h", key = "token")]` (a limit high
 //! enough that no request in this bench is ever denied — every call takes the
 //! real `Decision::Allowed` steady-state path through a WARM registry entry,
 //! not the one-time `Limiter` construction on the first request to the
-//! route), `/plain` has no throttle at all. Both are driven through the real
-//! production router via `TestApp::build()` (same `try_build_router_inner`
-//! production apps use), interleaved in the same run, so DHAT's per-route
-//! marginal allocation difference isolates exactly what `#[throttle]` adds on
-//! top of the same ingress stack `request_pipeline.rs` already profiles — an
-//! isolated A/B, no framework code changed for this bench.
+//! route), `/plain` has no throttle at all. `key = "token"` rather than the
+//! more obvious `key = "ip"`: `TestApp`'s in-process requests carry no
+//! `ConnectInfo` and this bench configures no trusted-proxy forwarding
+//! headers, so an IP-keyed limiter's `extract_throttle_key` would return
+//! `None` on every call and `__check_throttle` would take its no-client
+//! bypass — profiling that early-return instead of the real bucket
+//! lookup/lock/refill path `limiter.decide()` does (caught in review on the
+//! first version of this bench). Every `/throttled` request instead carries
+//! a `Authorization: Bearer <token>` header, which `extract_bearer_token`
+//! reads directly off the request with no dependency on peer/proxy info, so
+//! `limiter.decide()` genuinely runs on every measured call. Both routes are
+//! driven through the real production router via `TestApp::build()` (same
+//! `try_build_router_inner` production apps use), interleaved in the same
+//! run, so DHAT's per-route marginal allocation difference isolates exactly
+//! what `#[throttle]` adds on top of the same ingress stack
+//! `request_pipeline.rs` already profiles — an isolated A/B, no framework
+//! code changed for this bench.
 //!
 //! Like the other benches in this crate it is `harness = false` and asserts
 //! nothing beyond a sanity check that traffic isn't silently being denied: it
@@ -49,7 +60,7 @@ use autumn_web::prelude::*;
 use autumn_web::test::TestApp;
 
 #[get("/throttled")]
-#[throttle(limit = 1_000_000, per = "1h", key = "ip")]
+#[throttle(limit = 1_000_000, per = "1h", key = "token")]
 async fn throttled() -> &'static str {
     "throttled-ok"
 }
@@ -58,6 +69,8 @@ async fn throttled() -> &'static str {
 async fn plain() -> &'static str {
     "plain-ok"
 }
+
+const BEARER_TOKEN: &str = "bolt-throttle-bench-client";
 
 fn main() {
     let iterations: u32 = std::env::args()
@@ -91,7 +104,11 @@ fn main() {
     rt.block_on(async {
         for _ in 0..50 {
             if hit_throttled {
-                let resp = client.get("/throttled").send().await;
+                let resp = client
+                    .get("/throttled")
+                    .header("authorization", &format!("Bearer {BEARER_TOKEN}"))
+                    .send()
+                    .await;
                 assert_eq!(resp.status, StatusCode::OK, "warm-up must not be denied");
             }
             if hit_plain {
@@ -102,7 +119,14 @@ fn main() {
 
         for _ in 0..iterations {
             if hit_throttled {
-                black_box(client.get("/throttled").send().await.status);
+                black_box(
+                    client
+                        .get("/throttled")
+                        .header("authorization", &format!("Bearer {BEARER_TOKEN}"))
+                        .send()
+                        .await
+                        .status,
+                );
             }
             if hit_plain {
                 black_box(client.get("/plain").send().await.status);
