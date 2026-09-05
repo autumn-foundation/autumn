@@ -1642,6 +1642,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alongside the real one in the gate, mirroring `#[secured]`'s existing
   `role_scope_consts`/`markers` split.
 
+- **macros: `#[secured]` above `#[static_get]` was protected at runtime but
+  reported unsecured to `routes audit`:** the fix above taught
+  `#[static_get]` to accept a guard's leading gate items via
+  `parse::parse_async_handler_with_leading_items`, but its generated
+  `ApiDoc` still hardcoded `secured: false, required_roles: &[]` instead of
+  reading the `#[secured]` marker back off the handler the way the
+  `#[get]`/`#[post]` route macro does — a `#[secured("admin")]`-guarded
+  static route was correctly gated on every request, yet `routes audit`
+  classified it `unclassified` and its declared roles were missing from
+  posture output. Fixed by deriving all three fields from
+  `api_doc::extract_secured_info(&input_fn)`, mirroring `crate::route`
+  exactly (found by Codex review on #2513).
+
 - **🔒 `autumn generate auth`: a concurrent successful login could be silently
   re-locked by a racing failed attempt (issue #2500):** the generated
   `login` handler (and the duplicated `reauth` step-up block) counted a

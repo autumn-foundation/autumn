@@ -178,6 +178,15 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // wired.
     let is_public = crate::api_doc::is_public(&input_fn);
 
+    // Derive `secured`/`required_roles`/`required_scopes` from any `#[secured]`
+    // markers on the handler, the same way `crate::route` does. Without this a
+    // `#[secured(...)]` stacked above `#[static_get]` (guard expands first, so
+    // this macro sees its leading gate items and marker via
+    // `parse_async_handler_with_leading_items`) would be protected at runtime
+    // but reported as `unclassified`/roleless to `routes audit`.
+    let (secured, required_roles, required_scopes) =
+        crate::api_doc::extract_secured_info(&input_fn);
+
     // Build the revalidate expression
     let revalidate_expr = attrs.revalidate.map_or_else(
         || quote! { ::core::option::Option::None },
@@ -230,8 +239,9 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     success_status: 200,
                     hidden: false,
                     query_schema: ::core::option::Option::None,
-                    secured: false,
-                    required_roles: &[],
+                    secured: #secured,
+                    required_roles: #required_roles,
+                    required_scopes: #required_scopes,
                     register_schemas: ::core::option::Option::None,
                     api_version: ::core::option::Option::None,
                     public: #is_public,
@@ -289,6 +299,48 @@ mod tests {
         );
         // The handler's module path is captured for audit diagnostics.
         assert!(generated.contains("module_path"));
+    }
+
+    #[test]
+    fn static_get_derives_secured_metadata_when_guard_expands_first() {
+        // `#[secured("admin")]` above `#[static_get]`: the guard expands
+        // first and leaves its role marker in the handler body, which
+        // `static_get_macro` must now read via `extract_secured_info` (#2513
+        // Codex review) instead of hardcoding `secured: false`.
+        let secured = crate::secured::secured_macro(
+            quote! { "admin" },
+            quote! {
+                async fn about() -> &'static str { "about" }
+            },
+        );
+        let generated = static_get_macro(quote! { "/about" }, secured).to_string();
+
+        assert!(
+            generated.contains("secured : true"),
+            "a #[secured]-above-#[static_get] route must record secured = true: {generated}"
+        );
+        assert!(
+            generated.contains(r#"required_roles : & ["admin"]"#),
+            "roles from a #[secured] guard must survive into the static route's ApiDoc: \
+             {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_defaults_unsecured_when_no_guard_present() {
+        let generated = static_get_macro(
+            quote! { "/about" },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("secured : false"),
+            "an unguarded static route must record secured = false: {generated}"
+        );
+        assert!(
+            generated.contains("required_roles : & []"),
+            "an unguarded static route must have no required roles: {generated}"
+        );
     }
 
     #[test]
