@@ -1655,20 +1655,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `api_doc::extract_secured_info(&input_fn)`, mirroring `crate::route`
   exactly (found by Codex review on #2513).
 
-- **macros: `#[secured]`/`#[step_up]`/`#[throttle]` above `#[ws]` failed to
-  compile, and once fixed would have had the same `routes audit` gap as
-  `#[static_get]` above:** `ws_macro` builds a two-function wrapper that
-  calls the user's handler by hand, and for each non-`AppState` parameter it
-  echoed that parameter's *pattern* straight back as the call argument. A
-  guard expanded above `#[ws]` inserts a leading `_: __AutumnXGate`
-  parameter (same `parse_async_handler_with_leading_items` leading-item
-  support the fix above added), and `_` is a pattern, not a valid
-  expression — `#fn_name(_)` does not compile (Codex review on #2513,
-  P1). Fixed by binding every forwarded extractor to a freshly generated
-  identifier instead of reusing its original pattern. Separately, `#[ws]`'s
-  `ApiDoc` had the identical hardcoded `secured: false, required_roles: &[]`
-  gap `#[static_get]` had — fixed the same way, via
-  `api_doc::extract_secured_info` (Codex review on #2513, P2).
+- **macros: `#[secured]`/`#[step_up]`/`#[throttle]` above `#[ws]` never
+  actually worked, and generated silently-broken code rather than a clear
+  error:** `ws_macro` builds a two-function wrapper that calls the user's
+  handler by hand, and for each non-`AppState` parameter it echoed that
+  parameter's *pattern* straight back as the call argument. A guard expanded
+  above `#[ws]` inserts a leading `_: __AutumnXGate` parameter, and `_` is a
+  pattern, not a valid expression — `#fn_name(_)` does not compile (Codex
+  review on #2513, P1). Fixing that forwarding surfaced a deeper,
+  pre-existing incompatibility Codex caught on the very next review pass:
+  every one of those three guards unconditionally rewrites the wrapped
+  function's return type to `Response` and threads its original return value
+  through `IntoResponse::into_response`, which cannot hold for a `#[ws]`
+  handler — it returns `impl WsHandler` (a plain closure), not something
+  `IntoResponse`. Properly supporting the combination would mean teaching
+  all three guard macros to special-case a WebSocket handler's return type,
+  a cross-cutting redesign out of scope here. `#[ws]` now rejects the
+  combination outright with a purpose-written compile error (mirroring the
+  existing `#[edge]`-on-`#[ws]` rejection) instead of ever emitting code that
+  fails to compile deep inside guard-generated internals; the error explains
+  the incompatibility and suggests checking authorization via an extractor
+  inside the upgrade handler instead. Separately, `#[ws]`'s `ApiDoc` had the
+  same hardcoded `secured: false, required_roles: &[]` gap `#[static_get]`
+  had for the (still-supported) case of a live `#[authorize]` attribute or
+  policy check — fixed the same way, via `api_doc::extract_secured_info`
+  (Codex review on #2513, P2).
 
 - **🔒 `autumn generate auth`: a concurrent successful login could be silently
   re-locked by a racing failed attempt (issue #2500):** the generated

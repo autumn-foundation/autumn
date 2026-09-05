@@ -96,6 +96,32 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err,
     };
 
+    // A body guard (`#[secured]`/`#[step_up]`/`#[throttle]`) expanded above
+    // `#[ws]` leaves its `FromRequestParts` gate as a leading sibling item
+    // (`parse::split_leading_items_and_fn`) — but every one of those guards
+    // unconditionally rewrites the wrapped function's return type to
+    // `Response` and threads its original return value through
+    // `IntoResponse::into_response` (see `secured.rs`/`step_up.rs`/
+    // `throttle.rs`). That does not hold for a `#[ws]` handler: it returns
+    // `impl WsHandler` (a plain closure), not something `IntoResponse`, and
+    // this macro's two-function wrapper expects to call it and get a
+    // `WsHandler` back, not a `Response` (#2513 Codex review — binding the
+    // gate parameter to a real identifier fixed the forwarding call but left
+    // this deeper return-type mismatch). Reject the combination outright
+    // rather than emit code that fails to compile deep inside guard-generated
+    // code with a confusing error.
+    if !leading_guard_items.is_empty() {
+        return syn::Error::new_spanned(
+            leading_guard_items,
+            "`#[secured]`/`#[step_up]`/`#[throttle]` cannot be stacked above `#[ws]`: \
+             those guards rewrite the handler to return an HTTP `Response`, but a `#[ws]` \
+             handler must return `impl WsHandler`. Check authorization inside the upgrade \
+             handler instead — add a `Session` (or other) extractor parameter and reject \
+             the upgrade before returning a `WsHandler`.",
+        )
+        .to_compile_error();
+    }
+
     let fn_name = &input_fn.sig.ident;
     let vis = &input_fn.vis;
     let upgrade_name = format_ident!("__autumn_ws_upgrade_{}", fn_name);
@@ -282,14 +308,19 @@ mod tests {
     }
 
     #[test]
-    fn ws_compiles_when_secured_guard_expands_first() {
+    fn ws_rejects_a_secured_guard_expanded_above_it() {
         // `#[secured("admin")]` above `#[ws]`: the guard expands first and
         // inserts a leading `_: __AutumnSecuredGate_echo` gate parameter.
-        // Before the fix, `ws_macro` echoed that parameter's wildcard
-        // pattern (`_`) straight back as a call argument, producing
-        // `echo (_)` — invalid Rust, since `_` is a pattern, not an
-        // expression (#2513 Codex review). It must instead bind the
-        // parameter to a generated identifier and forward that.
+        // Binding that parameter to a generated identifier (rather than
+        // echoing its wildcard pattern back as a call argument) fixes the
+        // immediate forwarding error, but `#[secured]` also unconditionally
+        // rewrites the handler's return type to `Response` and wraps its
+        // original return value through `IntoResponse` — which cannot hold
+        // for a `#[ws]` handler, whose return type is `impl WsHandler`, a
+        // plain closure (second Codex finding on #2513, deeper than the
+        // first). Rather than emit code that fails to compile in
+        // guard-generated internals, `#[ws]` must reject the combination
+        // outright with a clear error.
         let secured = crate::secured::secured_macro(
             quote! { "admin" },
             quote! {
@@ -299,21 +330,45 @@ mod tests {
         let generated = ws_macro(quote! { "/echo" }, secured).to_string();
 
         assert!(
-            !generated.contains("echo (_ )") && !generated.contains("echo (_)"),
-            "the gate's wildcard pattern must never be forwarded as a call argument: {generated}"
+            generated.contains("compile_error"),
+            "a #[secured] guard stacked above #[ws] must be a compile error, not silently \
+             broken codegen: {generated}"
         );
         assert!(
-            generated.contains("__autumn_ws_extractor_0"),
-            "the gate parameter must be bound to a generated identifier and forwarded by \
-             name: {generated}"
+            generated.contains("cannot be stacked above"),
+            "the error must explain why the combination is rejected: {generated}"
         );
-        assert!(
-            generated.contains("secured : true"),
-            "a #[secured]-above-#[ws] route must record secured = true: {generated}"
+    }
+
+    #[test]
+    fn ws_rejects_a_step_up_guard_expanded_above_it() {
+        let stepped_up = crate::step_up::step_up_macro(
+            quote! {},
+            quote! {
+                async fn echo() -> impl WsHandler { |socket| async move {} }
+            },
         );
+        let generated = ws_macro(quote! { "/echo" }, stepped_up).to_string();
+
         assert!(
-            generated.contains(r#"required_roles : & ["admin"]"#),
-            "roles from a #[secured] guard must survive into the ws route's ApiDoc: {generated}"
+            generated.contains("compile_error"),
+            "a #[step_up] guard stacked above #[ws] must be a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_rejects_a_throttle_guard_expanded_above_it() {
+        let throttled = crate::throttle::throttle_macro(
+            quote! { limit = 10, per = "1m" },
+            quote! {
+                async fn echo() -> impl WsHandler { |socket| async move {} }
+            },
+        );
+        let generated = ws_macro(quote! { "/echo" }, throttled).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a #[throttle] guard stacked above #[ws] must be a compile error: {generated}"
         );
     }
 
