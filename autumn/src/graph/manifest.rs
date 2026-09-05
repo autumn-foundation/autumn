@@ -172,10 +172,10 @@ impl GraphNode {
             (Some(r), ..) => format!("{} {}", r.method, r.path),
             (_, Some(m), ..) => format!("{} (table {})", self.name, m.table),
             (_, _, Some(r), _) => format!("{} over {}", self.name, r.model),
-            (.., Some(j)) => match &j.schedule {
-                Some(s) => format!("{} (every {s})", self.name),
-                None => self.name.clone(),
-            },
+            (.., Some(j)) => j.schedule.as_ref().map_or_else(
+                || self.name.clone(),
+                |s| format!("{} (every {s})", self.name),
+            ),
             _ => self.name.clone(),
         }
     }
@@ -391,10 +391,14 @@ fn job_id(module_path: &str, handler: &str) -> String {
 /// differ between two developers for reasons that have nothing to do with the
 /// app. The crate-relative tail is the part that identifies anything.
 fn location(file: &str, line: u32) -> String {
+    // Separators first: on Windows `file!()` yields backslashes, so a graph
+    // committed from Linux would otherwise read as drift on every node, and the
+    // registry shortening below would not match at all.
+    let file = file.replace('\\', "/");
     let normalized = file
         .split_once("/registry/src/")
         .and_then(|(_, tail)| tail.split_once('/'))
-        .map_or(file, |(_, crate_relative)| crate_relative);
+        .map_or(file.as_str(), |(_, crate_relative)| crate_relative);
     format!("{normalized}:{line}")
 }
 
@@ -443,7 +447,19 @@ fn symbol_index(
             .entry(model.model.to_owned())
             .or_default()
             .insert(id.clone());
-        index.entry(model.table.to_owned()).or_default().insert(id);
+        index
+            .entry(model.table.to_owned())
+            .or_default()
+            .insert(id.clone());
+        // A table name is also registered lowercased, because an unquoted SQL
+        // identifier is case-insensitive: `sql_query("SELECT * FROM POSTS")`
+        // names the same table as `posts`, and dropping that edge would be a
+        // false negative in an impact answer. Type names are *not* folded —
+        // `Post` and `post` are different Rust items.
+        index
+            .entry(model.table.to_ascii_lowercase())
+            .or_default()
+            .insert(id);
     }
     for repo in repositories {
         let id = repository_id(repo.module_path, repo.repository);
@@ -473,7 +489,13 @@ fn resolve_edges(
         (body_symbols, Provenance::Body),
     ] {
         for symbol in symbols {
-            let Some(targets) = index.get(*symbol) else {
+            // The lowercase fallback is what makes an unquoted SQL identifier
+            // (`FROM POSTS`) resolve to the `posts` table; it can only ever
+            // match a table entry, since type names are indexed verbatim.
+            let targets = index
+                .get(*symbol)
+                .or_else(|| index.get(&symbol.to_ascii_lowercase()));
+            let Some(targets) = targets else {
                 continue;
             };
             for target in targets {
@@ -517,7 +539,43 @@ pub fn build(
     let mut nodes: BTreeMap<String, GraphNode> = BTreeMap::new();
     let mut edges: BTreeMap<(String, String), GraphEdge> = BTreeMap::new();
 
-    // ── Models ───────────────────────────────────────────────────
+    add_model_nodes(models, &mut nodes);
+    add_repository_nodes(repositories, models, &index, &mut nodes, &mut edges);
+    let route_totals = add_route_nodes(routes, mounted, &index, &mut nodes, &mut edges);
+    add_job_nodes(jobs, &index, &mut nodes, &mut edges);
+    let surface = add_auto_api_nodes(
+        mounted,
+        repositories,
+        &route_totals.matched,
+        &mut nodes,
+        &mut edges,
+    );
+
+    let mut unmounted = route_totals.unmounted;
+    unmounted.sort();
+    unmounted.dedup();
+
+    ArchitectureGraph {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        completeness: Completeness {
+            declared_routes: routes.len(),
+            mounted_routes: route_totals.mounted,
+            models: models.len(),
+            repositories: repositories.len(),
+            jobs: jobs.len(),
+            generated_routes: surface.generated,
+            opaque_mounted_routers,
+            unmounted_routes: unmounted,
+            unmodelled_mounted_routes: surface.unmodelled,
+        },
+        nodes: nodes.into_values().collect(),
+        edges: edges.into_values().collect(),
+        limits: LIMITS.iter().map(|l| (*l).to_owned()).collect(),
+    }
+}
+
+/// One model node per `#[model]`.
+fn add_model_nodes(models: &[ModelGraphDescriptor], nodes: &mut BTreeMap<String, GraphNode>) {
     for model in models {
         let id = model_id(model.model_path);
         nodes.insert(
@@ -538,8 +596,16 @@ pub fn build(
             },
         );
     }
+}
 
-    // ── Repositories ─────────────────────────────────────────────
+/// One repository node per `#[repository]`, with its declared model edges.
+fn add_repository_nodes(
+    repositories: &[RepositoryGraphDescriptor],
+    models: &[ModelGraphDescriptor],
+    index: &BTreeMap<String, BTreeSet<String>>,
+    nodes: &mut BTreeMap<String, GraphNode>,
+    edges: &mut BTreeMap<(String, String), GraphEdge>,
+) {
     for repo in repositories {
         let id = repository_id(repo.module_path, repo.repository);
         nodes.insert(
@@ -595,8 +661,26 @@ pub fn build(
             }
         }
     }
+}
 
-    // ── Routes ───────────────────────────────────────────────────
+/// What [`add_route_nodes`] accounts for.
+struct RouteTotals {
+    /// Declared routes found in the mounted route table.
+    mounted: usize,
+    /// Node ids of declared routes nothing mounts.
+    unmounted: Vec<String>,
+    /// `(method, path)` pairs a declared route claimed.
+    matched: BTreeSet<(String, String)>,
+}
+
+/// One route node per `#[route]`/`#[static_get]`, with its resolved edges.
+fn add_route_nodes(
+    routes: &[RouteGraphDescriptor],
+    mounted: &[MountedRoute],
+    index: &BTreeMap<String, BTreeSet<String>>,
+    nodes: &mut BTreeMap<String, GraphNode>,
+    edges: &mut BTreeMap<(String, String), GraphEdge>,
+) -> RouteTotals {
     let mut mounted_count = 0usize;
     let mut unmounted: Vec<String> = Vec::new();
     let mut matched_mounted: BTreeSet<(String, String)> = BTreeSet::new();
@@ -667,12 +751,24 @@ pub fn build(
             route.signature_symbols,
             route.body_symbols,
             access,
-            &index,
-            &mut edges,
+            index,
+            edges,
         );
     }
+    RouteTotals {
+        mounted: mounted_count,
+        unmounted,
+        matched: matched_mounted,
+    }
+}
 
-    // ── Jobs ─────────────────────────────────────────────────────
+/// One node per `#[job]`/`#[scheduled]`/`#[task]`, with its resolved edges.
+fn add_job_nodes(
+    jobs: &[JobGraphDescriptor],
+    index: &BTreeMap<String, BTreeSet<String>>,
+    nodes: &mut BTreeMap<String, GraphNode>,
+    edges: &mut BTreeMap<(String, String), GraphEdge>,
+) {
     for job in jobs {
         let id = job_id(job.module_path, job.handler);
         nodes.insert(
@@ -706,12 +802,28 @@ pub fn build(
             job.signature_symbols,
             job.body_symbols,
             access,
-            &index,
-            &mut edges,
+            index,
+            edges,
         );
     }
+}
 
-    // ── Repository auto-API routes ───────────────────────────────
+/// What [`add_auto_api_nodes`] accounts for.
+struct MountedSurface {
+    /// Mounted routes attributed to a repository auto-API.
+    generated: usize,
+    /// Mounted routes no declaration and no auto-API accounts for.
+    unmodelled: Vec<String>,
+}
+
+/// One node per mounted route a `#[repository(api = "...")]` generated.
+fn add_auto_api_nodes(
+    mounted: &[MountedRoute],
+    repositories: &[RepositoryGraphDescriptor],
+    matched_mounted: &BTreeSet<(String, String)>,
+    nodes: &mut BTreeMap<String, GraphNode>,
+    edges: &mut BTreeMap<(String, String), GraphEdge>,
+) -> MountedSurface {
     // `#[repository(api = "/api/posts")]` mounts a CRUD surface no `#[route]`
     // declares. The mount prefix is declared, so attributing these routes to
     // their repository is a declaration too — and without them a query for the
@@ -778,27 +890,10 @@ pub fn build(
             },
         );
     }
-    let unmodelled: Vec<String> = unmodelled.into_iter().collect();
 
-    unmounted.sort();
-    unmounted.dedup();
-
-    ArchitectureGraph {
-        schema_version: MANIFEST_SCHEMA_VERSION,
-        completeness: Completeness {
-            declared_routes: routes.len(),
-            mounted_routes: mounted_count,
-            models: models.len(),
-            repositories: repositories.len(),
-            jobs: jobs.len(),
-            generated_routes,
-            opaque_mounted_routers,
-            unmounted_routes: unmounted,
-            unmodelled_mounted_routes: unmodelled,
-        },
-        nodes: nodes.into_values().collect(),
-        edges: edges.into_values().collect(),
-        limits: LIMITS.iter().map(|l| (*l).to_owned()).collect(),
+    MountedSurface {
+        generated: generated_routes,
+        unmodelled: unmodelled.into_iter().collect(),
     }
 }
 
@@ -840,6 +935,11 @@ pub fn is_dump_mode() -> bool {
 }
 
 /// Print the graph to stdout behind [`ARCHITECTURE_GRAPH_MARKER`].
+///
+/// # Panics
+///
+/// Never in practice: every field is a plain serializable value, and a failure
+/// here would mean the dump protocol is broken rather than that this app is.
 pub fn print_manifest_dump(graph: &ArchitectureGraph) {
     let json = serde_json::to_string(graph).unwrap_or_else(|e| {
         panic!("architecture graph is not serializable: {e}");
@@ -1519,6 +1619,56 @@ mod tests {
             "plug-0.1.0/src/r.rs:7"
         );
         assert_eq!(location("src/models.rs", 7), "src/models.rs:7");
+    }
+
+    #[test]
+    fn an_uppercase_raw_sql_table_still_resolves() {
+        // PostgreSQL folds unquoted identifiers, so `FROM POSTS` is the `posts`
+        // table. Dropping the edge would be a false negative in an impact
+        // answer — the one failure this feature cannot afford.
+        let graph = build(
+            &[],
+            0,
+            &[route(
+                "report",
+                "GET",
+                "/report",
+                &[],
+                &["POSTS", "SELECT", "FROM"],
+            )],
+            &[model("Post", "app::models::Post", "posts")],
+            &[],
+            &[],
+        );
+        assert_eq!(
+            graph.edges.len(),
+            1,
+            "an uppercase table name must resolve: {:?}",
+            graph.edges
+        );
+        assert_eq!(graph.edges[0].to, "model:app::models::Post");
+    }
+
+    #[test]
+    fn a_type_name_is_not_matched_case_insensitively() {
+        // `Post` and `post` are different Rust items; only SQL folds case.
+        let graph = build(
+            &[],
+            0,
+            &[route("show", "GET", "/show", &[], &["POST"])],
+            &[model("Comment", "app::models::Comment", "comments")],
+            &[],
+            &[],
+        );
+        assert!(graph.edges.is_empty(), "{:?}", graph.edges);
+    }
+
+    #[test]
+    fn a_windows_source_path_is_normalized() {
+        assert_eq!(
+            location(r"C:\src\app\src\models.rs", 3),
+            "C:/src/app/src/models.rs:3"
+        );
     }
 
     #[test]

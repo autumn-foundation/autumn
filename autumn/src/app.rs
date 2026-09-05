@@ -4384,7 +4384,7 @@ impl AppBuilder {
         // graph installed on only some of them is an endpoint that answers 503
         // in production while every unit test passes.
         crate::graph::install(crate::graph::manifest::audit(
-            &graph_mounted_routes(&all_routes, &scoped_groups),
+            &graph_mounted_routes(&all_routes, &scoped_groups, &declared_routes),
             omitted_router_count(
                 merge_routers.len(),
                 nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
@@ -5968,7 +5968,7 @@ impl AppBuilder {
         // router is built, so `/actuator/graph` can answer from the first
         // request rather than after some later warm-up.
         crate::graph::install(crate::graph::manifest::audit(
-            &graph_mounted_routes(&all_routes, &scoped_groups),
+            &graph_mounted_routes(&all_routes, &scoped_groups, &[]),
             // The static-build path builds its router with no nest mounts and
             // no declared plugin routes (see the `RouterContext` below), so the
             // merge count is the whole opaque surface here.
@@ -6111,7 +6111,8 @@ impl AppBuilder {
     /// Triggered when `AUTUMN_DUMP_GRAPH=1` is set (by `autumn graph`).
     /// Does not connect to a database or bind a TCP port.
     fn run_dump_graph_mode(&self) {
-        let mounted = graph_mounted_routes(&self.routes, &self.scoped_groups);
+        let mounted =
+            graph_mounted_routes(&self.routes, &self.scoped_groups, &self.declared_routes);
         crate::graph::manifest::print_manifest_dump(&crate::graph::manifest::audit(
             &mounted,
             self.graph_opaque_router_count(),
@@ -7492,7 +7493,7 @@ impl AppBuilder {
         // See the matching call in `run()`: the graph is published before the
         // router is built so `/actuator/graph` answers from the first request.
         crate::graph::install(crate::graph::manifest::audit(
-            &graph_mounted_routes(&routes, &scoped_groups),
+            &graph_mounted_routes(&routes, &scoped_groups, &declared_routes),
             omitted_router_count(
                 merge_routers.len(),
                 nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
@@ -7619,6 +7620,7 @@ pub(crate) fn is_dump_jobs_mode() -> bool {
 fn graph_mounted_routes(
     routes: &[Route],
     scoped_groups: &[ScopedGroup],
+    declared_routes: &[crate::route_listing::RouteInfo],
 ) -> Vec<crate::graph::MountedRoute> {
     routes
         .iter()
@@ -7629,7 +7631,42 @@ fn graph_mounted_routes(
                 .iter()
                 .map(move |route| graph_route_summary(route, Some(&group.prefix)))
         }))
+        .chain(declared_routes.iter().map(graph_declared_route_summary))
         .collect()
+}
+
+/// The architecture-graph view of a route declared through
+/// `declare_plugin_routes` (issue #1747).
+///
+/// These are real served endpoints behind an otherwise opaque `nest` mount, and
+/// declaring them is what stops `omitted_router_count` counting that nest as
+/// unenumerable. Without them here the graph would report *neither* an opaque
+/// router nor a mounted route for that surface — a hole that reads as complete
+/// coverage. They carry no `#[route]` descriptor in this binary, so they land
+/// in `unmodelled_mounted_routes`: named, which is the honest answer, rather
+/// than silently absent.
+fn graph_declared_route_summary(
+    route: &crate::route_listing::RouteInfo,
+) -> crate::graph::MountedRoute {
+    let mut roles = route.roles.clone();
+    roles.sort();
+    roles.dedup();
+    let mut scopes = route.scopes.clone();
+    scopes.sort();
+    scopes.dedup();
+    crate::graph::MountedRoute {
+        method: route.method.clone(),
+        path: route.path.clone(),
+        handler: route.handler.clone(),
+        module_path: route.module.clone().unwrap_or_default(),
+        auth: crate::graph::RouteAuth {
+            secured: route.classification == crate::route_listing::RouteClassification::Gated,
+            roles,
+            scopes,
+            policy: route.policy,
+            public: route.classification == crate::route_listing::RouteClassification::Public,
+        },
+    }
 }
 
 /// The architecture-graph view of one mounted route (issue #1747).
@@ -7637,7 +7674,7 @@ fn graph_mounted_routes(
 /// The *mounted* path, not the declared one: a scoped group's children carry
 /// only their child path on the `Route`, and recording `/items` for a route an
 /// operator calls at `/api/v1/items` would make a scope rename invisible.
-/// `join_nested_path` is the same helper the OpenAPI collector and the
+/// `join_nested_path` is the same helper the `OpenAPI` collector and the
 /// agent-authority manifest use, so the three cannot disagree about where a
 /// route lives.
 ///

@@ -12,6 +12,7 @@
 //! this feature cannot afford.
 
 use std::collections::{BTreeSet, VecDeque};
+use std::fmt::Write as _;
 
 use super::NodeKind;
 use super::manifest::{ArchitectureGraph, GraphNode};
@@ -201,14 +202,10 @@ pub fn format_touches(answer: &Touches<'_>) -> String {
         answer.jobs.len()
     );
     for node in &answer.routes {
-        out.push_str(&format!("  route  {}\n", node.label()));
+        let _ = writeln!(out, "  route  {}", node.label());
     }
     for node in &answer.jobs {
-        out.push_str(&format!(
-            "  {:<6} {}\n",
-            node.kind.to_string(),
-            node.label()
-        ));
+        let _ = writeln!(out, "  {:<6} {}", node.kind.to_string(), node.label());
     }
     out
 }
@@ -225,17 +222,13 @@ pub fn format_impact(answer: &Impact<'_>) -> String {
         answer.jobs.len()
     );
     for node in &answer.repositories {
-        out.push_str(&format!("  repository {}\n", node.label()));
+        let _ = writeln!(out, "  repository {}", node.label());
     }
     for node in &answer.routes {
-        out.push_str(&format!("  route      {}\n", node.label()));
+        let _ = writeln!(out, "  route      {}", node.label());
     }
     for node in &answer.jobs {
-        out.push_str(&format!(
-            "  {:<10} {}\n",
-            node.kind.to_string(),
-            node.label()
-        ));
+        let _ = writeln!(out, "  {:<10} {}", node.kind.to_string(), node.label());
     }
     out
 }
