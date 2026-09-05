@@ -189,7 +189,12 @@ fn main() {
                 // partway through a long run would corrupt every DHAT/callgrind
                 // number after it without this failing loudly (caught in
                 // review). The `THROTTLE_LIMIT` guard above should make this
-                // unreachable; this is the backstop.
+                // unreachable; this is the backstop. The `/route-b` arm below
+                // asserts too, not just `black_box`es — an asymmetric check
+                // would put the assertion's own comparison/branch instructions
+                // on only one side of the `--route throttled` vs. `--route
+                // plain` callgrind delta, again not `#[throttle]` itself
+                // (caught in review).
                 assert_eq!(
                     resp.status,
                     StatusCode::OK,
@@ -198,14 +203,17 @@ fn main() {
                 black_box(resp.status);
             }
             if hit_plain {
-                black_box(
-                    client
-                        .get("/route-b")
-                        .header("authorization", &format!("Bearer {BEARER_TOKEN}"))
-                        .send()
-                        .await
-                        .status,
+                let resp = client
+                    .get("/route-b")
+                    .header("authorization", &format!("Bearer {BEARER_TOKEN}"))
+                    .send()
+                    .await;
+                assert_eq!(
+                    resp.status,
+                    StatusCode::OK,
+                    "measured baseline request unexpectedly failed"
                 );
+                black_box(resp.status);
             }
         }
     });

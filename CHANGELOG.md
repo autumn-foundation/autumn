@@ -2852,18 +2852,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   response bodies also leaked into the byte delta; a `THROTTLE_LIMIT` guard
   plus an assertion on every measured response, so a large `--iterations`
   can never silently drain the bucket and profile denials instead of the
-  documented warm `Decision::Allowed` path; and widening the frame-level
-  DHAT attribution beyond `rate_limit::`-named frames to also catch
-  `#[throttle]`'s generated `FromRequestParts` gate cloning `parts.headers`
-  *before* ever calling into the `rate_limit` module (`autumn-macros/src/
-  throttle.rs`), which the first attribution pass missed entirely. Full,
-  corrected `#[throttle]` overhead against the ~140-151-block/~27.3-28.7KB
-  per-request baseline `config_alloc_gate` already gates (#2232): ~10 blocks
-  / ~885 bytes per request (~6.6%/~3.1%, under the 10%-of-allocations
-  floor) and ~6.1% more instructions than an unthrottled route (callgrind,
-  `--route throttled` vs. `--route plain`) — which, read as "would a fix
-  removing this entire overhead clear the 5%-of-instructions floor,"
-  technically says yes. But no *safe, autonomous, smallest-fix* candidate
+  documented warm `Decision::Allowed` path; asserting (not just
+  `black_box`ing) the measured status on BOTH routes, since an earlier
+  version asserted only the throttled side, putting that assertion's own
+  comparison/branch instructions asymmetrically into the callgrind delta;
+  and widening the frame-level DHAT attribution beyond `rate_limit::`-named
+  frames to also catch `#[throttle]`'s generated `FromRequestParts` gate
+  cloning `parts.headers` *before* ever calling into the `rate_limit` module
+  (`autumn-macros/src/throttle.rs`), which the first attribution pass missed
+  entirely. Full, corrected `#[throttle]` overhead against the
+  ~140-151-block/~27.3-28.7KB per-request baseline `config_alloc_gate`
+  already gates (#2232): ~10 blocks / ~885 bytes per request (~6.6%/~3.1%,
+  under the 10%-of-allocations floor) and ~6-7% more instructions than an
+  unthrottled route (callgrind, `--route throttled` vs. `--route plain`;
+  the range reflects run-to-run measurement noise on this hardware, not a
+  precisely pinned figure) — which, read as "would a fix removing this
+  entire overhead clear the 5%-of-instructions floor," technically says yes.
+  But no *safe, autonomous, smallest-fix* candidate
   gets there: the only narrowly-scoped, mechanistically-clear piece —
   two redundant `format!` calls building an almost-always-cache-hit
   `HashMap` key (`resolve_throttle_params`'s `registry_key`,
