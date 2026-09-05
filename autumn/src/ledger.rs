@@ -855,20 +855,18 @@ fn live_state_break(
 ) -> Option<LedgerBreakReport> {
     // An empty chain is never a break, whatever the live row says.
     //
-    // A record may simply never have been written — or may predate the day its
-    // model was ledgered. Ledgering is non-destructive but not retroactive, so
-    // rows written before the marker went on legitimately have no chain until
-    // their first subsequent write: that is the documented, expected state of
-    // every existing row on the day a team adopts the feature, and accusing it
-    // would put a false positive in front of every such deployment, against the
-    // one metric this module is held to.
+    // A record may simply never have been written, or may predate the day its model was
+    // ledgered. Ledgering is non-destructive but not retroactive, so rows written before
+    // the marker went on legitimately have no chain until their first subsequent write:
+    // that is the documented, expected state of every existing row on the day a team
+    // adopts the feature, and accusing it would put a false positive in front of every
+    // such deployment, against the one metric this module is held to.
     //
-    // A *wholly* erased chain used to be indistinguishable from a pre-ledgering
-    // row from inside the database. `high_water_break` tells them apart now
-    // (#2323): the mark lives outside the deletable rows and survives the
-    // erasure, so a chain that has a mark and no revisions is reported while one
-    // with neither stays silent. `revisions_checked == 0` on the report is still
-    // what makes the empty case visible to a caller that cares.
+    // A wholly erased chain used to be indistinguishable from a pre-ledgering row from
+    // inside the database. `high_water_break` tells them apart now (#2323): the mark lives
+    // outside the deletable rows and survives the erasure, so a chain with a mark and no
+    // revisions is reported while one with neither stays silent. `revisions_checked == 0`
+    // on the report is still what makes the empty case visible to a caller that cares.
     let head = revisions.last()?;
 
     match live {
@@ -1465,19 +1463,17 @@ impl LedgerValidTimeValue for Option<chrono::NaiveDateTime> {
     }
 }
 
-// ── Runtime append (issue #2309 follow-up) ───────────────────────────
+// ── Runtime append (#2309 follow-up) ─────────────────────────────────
 //
-// `#[repository(ledgered)]` used to expand this entire read-then-write —
-// including a local chain-state struct and two `QueryableByName` derives — at
-// every one of the ~30 mutation sites `vh_insert_ts` covers. That alone took a
-// ledgered repository's generated source from 72 KB to 508 KB, and none of it
-// was model-specific: `RuntimeConnection` is a concrete type alias and every
-// bound value is a primitive or a `serde_json::Value` the caller already built.
-//
-// Hoisted here it compiles once per program instead of once per repository.
-// The generated code keeps only the parts that genuinely need the model — the
-// durable per-field snapshot codec, the typed `deleted_at` read-back on the
-// soft-delete path, and `LedgeredRecord::ledger_valid_from` — and calls this.
+// `#[repository(ledgered)]` used to expand this whole read-then-write — a local
+// chain-state struct and two `QueryableByName` derives included — at every one of the
+// ~30 mutation sites `vh_insert_ts` covers. That alone took a ledgered repository's
+// generated source from 72 KB to 508 KB, and none of it was model-specific:
+// `RuntimeConnection` is a concrete type alias and every bound value is a primitive or a
+// `serde_json::Value` the caller already built. Hoisted here it compiles once per program
+// instead of once per repository. The generated code keeps only the parts that genuinely
+// need the model — the durable per-field snapshot codec, the typed `deleted_at` read-back
+// on the soft-delete path, and `LedgeredRecord::ledger_valid_from` — and calls this.
 
 /// Everything the append reads before it can decide its own sequence number and
 /// transaction time.
@@ -1816,31 +1812,27 @@ pub async fn append_revision(
 
     let state = read_chain_state(conn, table_name, record_id, tenant_id).await?;
 
-    // #2323: the mark is cross-checked on the WRITE path too, not only by
-    // `ledger_verify`. Without this the append is a free repair — delete the
-    // newest revision *and* the mark, wait for ordinary traffic, and the append
-    // would re-create both consistently, which is exactly the laundering this
-    // issue exists to stop.
+    // #2323: the mark is cross-checked on the write path too, not only by
+    // `ledger_verify`. Without this the append is a free repair — delete the newest
+    // revision and the mark, wait for ordinary traffic, and the append would re-create
+    // both consistently, exactly the laundering this issue exists to stop.
     //
-    // One rule decides which disagreements refuse: **refuse where appending
-    // would destroy the evidence, allow where the evidence survives the
-    // append.**
+    // One rule decides which disagreements refuse: refuse where appending would destroy
+    // the evidence, allow where the evidence survives the append.
     //
-    //   * mark gone beside a live chain, and mark describing a different
-    //     revision (a different hash *or* a different instant) at the head's own
-    //     sequence number — the append would overwrite the mark and the
-    //     disagreement with it. Refuse. The second test is kept identical to the
-    //     one `head_versus_mark` reports `HighWaterMismatch` on, so nothing
-    //     verify can see is something an ordinary write can erase.
-    //   * mark *behind* the head — legitimate: a pre-#2323 node in a
-    //     mixed-version fleet appends without raising the mark. Allow; the write
-    //     heals it, as `HighWaterBehind`'s docs promise.
-    //   * mark *ahead* of the head (a deleted tail) — the append allocates past
-    //     the gap, which is permanent. Allow.
-    //   * mark present with no chain at all (a wholly erased chain) — the append
-    //     starts above seq 1, which `verify` reports as a `MissingRevision`
-    //     forever. Allow: bricking the record would buy no evidence that is not
-    //     already permanent.
+    //   * Mark gone beside a live chain, and mark describing a different revision — a
+    //     different hash or a different instant — at the head's own sequence number: the
+    //     append would overwrite the mark and the disagreement with it. Refuse. The second
+    //     test is identical to the one `head_versus_mark` reports `HighWaterMismatch` on,
+    //     so nothing verify can see is something an ordinary write can erase.
+    //   * Mark behind the head: legitimate, since a pre-#2323 node in a mixed-version
+    //     fleet appends without raising the mark. Allow; the write heals it, as
+    //     `HighWaterBehind`'s docs promise.
+    //   * Mark ahead of the head, a deleted tail: the append allocates past the gap, which
+    //     is permanent. Allow.
+    //   * Mark present with no chain at all, a wholly erased chain: the append starts above
+    //     seq 1, which `verify` reports as a `MissingRevision` forever. Allow — bricking
+    //     the record would buy no evidence that is not already permanent.
     if state.head_seq.is_some() && state.mark_seq.is_none() {
         return Err(unreadable(
             "the record has revisions but no high-water mark; the mark that makes a \

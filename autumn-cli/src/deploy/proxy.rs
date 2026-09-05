@@ -392,25 +392,23 @@ impl KamalProxyController {
         force: bool,
         tls_host: Option<&str>,
     ) -> String {
-        // Every string parameter is shell-quoted so a service name, upstream, or
-        // health-check path carrying query params / special chars can't break out
+        // Every string parameter is shell-quoted, so a service name, upstream, or
+        // health-check path carrying query params or special characters cannot break out
         // of the command. The numeric timeouts need no quoting.
         //
-        // Control-socket fidelity (issue #1948 item 4): kamal-proxy resolves its
-        // control socket at `$XDG_RUNTIME_DIR/kamal-proxy.sock`, falling back to
-        // `/tmp/kamal-proxy.sock` when unset. The supervised `kamal-proxy run`
-        // systemd SERVICE has no `XDG_RUNTIME_DIR` (-> `/tmp`), but the ssh
-        // session this command runs in gets `XDG_RUNTIME_DIR=/run/user/0` from
-        // pam_systemd on a real host — a DIFFERENT path — so a naive invocation
-        // fails with "connect: no such file or directory". Prefixing with
-        // `env -u XDG_RUNTIME_DIR` pins the CLI to the same `/tmp` fallback the
-        // service used, so both agree regardless of pam_systemd — no need to
-        // disable pam_systemd on the host (the container e2e fixture used to work
-        // around this by disabling it; the real-VPS shape does not).
+        // Control-socket fidelity (#1948 item 4): kamal-proxy resolves its control socket
+        // at `$XDG_RUNTIME_DIR/kamal-proxy.sock`, falling back to `/tmp/kamal-proxy.sock`
+        // when unset. The supervised `kamal-proxy run` systemd service has no
+        // `XDG_RUNTIME_DIR`, so it uses `/tmp`, but the ssh session this command runs in
+        // gets `XDG_RUNTIME_DIR=/run/user/0` from pam_systemd on a real host — a different
+        // path — so a naive invocation fails with "connect: no such file or directory".
+        // Prefixing with `env -u XDG_RUNTIME_DIR` pins the CLI to the same `/tmp` fallback
+        // the service used, so both agree regardless of pam_systemd, with no need to
+        // disable pam_systemd on the host.
         //
-        // TLS (opt-in): `--host <host> --tls` sits in a STABLE position between
-        // the health-check path and the timeouts. When `tls_host` is `None` the
-        // segment is empty and the command is byte-for-byte the HTTP-only form.
+        // TLS is opt-in: `--host <host> --tls` sits in a stable position between the
+        // health-check path and the timeouts. When `tls_host` is `None` the segment is
+        // empty and the command is byte for byte the HTTP-only form.
         let tls = tls_host.map_or_else(String::new, |host| {
             format!("--host {host} --tls ", host = shell_quote(host))
         });
@@ -698,52 +696,50 @@ impl ProxyController for KamalProxyController {
         // never relaunches an already-active unit, so a live proxy keeps serving with
         // its old settings until the change-gated restart below (if any).
         ops.extend(self.ensure_installed_ops(public_port));
-        // (4) Restart ONLY when the unit CONTENT actually changed AND the proxy is
-        // live, then IMMEDIATELY re-register the current live upstream. Rationale:
-        //   * A fresh `kamal-proxy run` restores its LAST-SAVED routing table on
-        //     start; on the first upgrade onto the persistent `StateDirectory` that
-        //     table is empty, so a bare restart would leave the public port routeless
-        //     until the next deploy step re-registered it — and a naive restart at
-        //     cutover-start would strand :80 for the WHOLE candidate-start + migrate +
-        //     readiness window (a zero-downtime violation). Re-registering the CURRENT
-        //     live upstream (the slot serving at cutover-start) right after the
-        //     restart bounds the routeless window to ~the restart itself.
-        //   * The re-register uses `--force` (#2071). It is re-pinning a route to the
-        //     release that is ALREADY LIVE and serving, so a fresh readiness gate is
-        //     both unnecessary and DANGEROUS: a health-gated re-register would block
-        //     on a fresh `/ready` pass, and a transient `/ready` blip during the
-        //     one-time restart could strand :80 or abort the whole deploy (up to
-        //     30×deploy-timeout). `--force` makes kamal-proxy install+persist the
-        //     route IMMEDIATELY (it skips `WaitUntilHealthy` but still runs
-        //     `saveStateSnapshot`), and the target self-heals via background health
-        //     checks (~1s) — during a real blip it starts serving the instant
-        //     `/ready` recovers, WITHOUT failing the deploy. (A residual ~1s
-        //     `TargetStateAdding` window before the first background `/ready` pass
-        //     remains — kamal-proxy won't route to an unready backend — a documented
-        //     footnote, not a hard failure.)
-        //   * The restart and the re-register are ONE remote command, so no SSH
-        //     round-trip can interpose between them. Because `--force` returns
-        //     WITHOUT waiting for readiness, the re-register succeeds on the first
-        //     attempt in the normal case; the long 30×deploy-timeout burn is gone.
-        //     A SMALL bounded retry (5) is kept only to ride out a transient CLI /
-        //     control-socket hiccup in the brief window before the just-restarted
-        //     proxy's socket accepts a connection.
-        //   * An UNCHANGED unit (steady-state redeploy) takes NEITHER branch — today's
-        //     no-restart behavior is preserved exactly, so a routine redeploy never
-        //     churns the shared proxy.
-        // The re-register uses `deploy_shell_with_tls` (with `force = true`), so it
-        // keeps the `env -u XDG_RUNTIME_DIR` control-socket pin (#2019). It carries
-        // `reregister_options`' `--host/--tls` — the still-live OLD release's OWN
-        // options recovered from the `shared/proxy-options` marker (issue #2074), NOT
-        // this controller's new config — so a failed rollback leaves the old release
-        // on its own host/TLS instead of stranding it behind the new/removed host.
-        // The candidate flip (`flip_op`) still uses `self.tls_host` (the new config),
-        // so the new release gets the new host. The `|| exit 1` fail-fast on
-        // `systemctl restart` is unchanged. On an ABSENT marker the redeploy arm
-        // passes the new config as `reregister_options` (proceed-as-legacy: the
-        // durability-upgrade deploy's kamal-proxy table is empty, so there is nothing
-        // to preserve — refusing there would deadlock every pre-#2074 host's first
-        // redeploy); an UNREADABLE marker is refused at pre-flight before this runs.
+        // (4) Restart only when the unit content actually changed and the proxy is live,
+        // then immediately re-register the current live upstream.
+        //
+        //   * A fresh `kamal-proxy run` restores its last-saved routing table on start. On
+        //     the first upgrade onto the persistent `StateDirectory` that table is empty,
+        //     so a bare restart would leave the public port routeless until the next deploy
+        //     step re-registered it — and a naive restart at cutover-start would strand :80
+        //     for the whole candidate-start, migrate, and readiness window, a zero-downtime
+        //     violation. Re-registering the live upstream, the slot serving at
+        //     cutover-start, right after the restart bounds the routeless window to about
+        //     the restart itself.
+        //   * The re-register uses `--force` (#2071). It re-pins a route to the release
+        //     that is already live and serving, so a fresh readiness gate is both
+        //     unnecessary and dangerous: a health-gated re-register would block on a fresh
+        //     `/ready` pass, and a transient blip during the one-time restart could strand
+        //     :80 or abort the whole deploy, up to 30x the deploy timeout. `--force` makes
+        //     kamal-proxy install and persist the route immediately — it skips
+        //     `WaitUntilHealthy` but still runs `saveStateSnapshot` — and the target
+        //     self-heals via background health checks in about a second, so during a real
+        //     blip it starts serving the instant `/ready` recovers without failing the
+        //     deploy. A residual ~1s `TargetStateAdding` window before the first background
+        //     `/ready` pass remains, since kamal-proxy will not route to an unready
+        //     backend: a documented footnote, not a hard failure.
+        //   * The restart and the re-register are one remote command, so no SSH round-trip
+        //     can interpose between them. Because `--force` returns without waiting for
+        //     readiness, the re-register succeeds on the first attempt in the normal case.
+        //     A small bounded retry (5) rides out a transient CLI or control-socket hiccup
+        //     in the brief window before the just-restarted proxy's socket accepts a
+        //     connection.
+        //   * An unchanged unit, the steady-state redeploy, takes neither branch, so a
+        //     routine redeploy never churns the shared proxy.
+        //
+        // The re-register uses `deploy_shell_with_tls` with `force = true`, so it keeps the
+        // `env -u XDG_RUNTIME_DIR` control-socket pin (#2019). It carries
+        // `reregister_options`' `--host`/`--tls` — the still-live old release's own options
+        // recovered from the `shared/proxy-options` marker (#2074), not this controller's
+        // new config — so a failed rollback leaves the old release on its own host and TLS
+        // instead of stranding it behind the new or removed host. The candidate flip
+        // (`flip_op`) still uses `self.tls_host`, the new config, so the new release gets
+        // the new host. The `|| exit 1` fail-fast on `systemctl restart` is unchanged. On an
+        // absent marker the redeploy arm passes the new config as `reregister_options`,
+        // proceeding as legacy: the durability-upgrade deploy's kamal-proxy table is empty,
+        // so there is nothing to preserve, and refusing would deadlock every pre-#2074
+        // host's first redeploy. An unreadable marker is refused at pre-flight.
         ops.push(DeployOp::Run(RemoteCommand::new(
             "proxy-restart-if-changed",
             format!(
