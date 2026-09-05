@@ -319,7 +319,17 @@ impl SandboxedPlugin {
         };
         let host = Arc::clone(&self.host);
         let slot_owned = slot.to_owned();
-        let context = context.to_vec();
+        // Bounded before it is cloned onto the worker. The context is the
+        // *host's* — a handler builds it — but "the host built it" is not the
+        // same as "the host chose its size": it is routinely assembled from a
+        // row, a query string or a form, and none of it appears in the
+        // per-request footprint `max_concurrency` is validated against. An
+        // unbounded `to_vec` duplicates every string of it per render, at every
+        // concurrent render at once. Truncated rather than refused: a fragment
+        // rendered with fewer context entries is a panel missing a value, and a
+        // page losing its panel over a caller's mistake is the outcome this
+        // whole path exists to avoid.
+        let context = bounded_context(context);
         let outcome = tokio::task::spawn_blocking(move || {
             let outcome = host.render(&slot_owned, &context, services);
             drop(permit);
