@@ -1079,6 +1079,23 @@ def _rust_uncommented(body):
     return ''.join(c for c, k in zip(body, cls) if k != 'm' or c == '\n')
 
 
+def _rust_literal_mask(body):
+    """The class of every character of `_rust_uncommented(body)`, aligned to it.
+
+    The scope walks below count braces, and a brace inside a literal is not a
+    brace — but the text they are handed has already had its comments DROPPED,
+    so a classification recomputed from that text is not the file's. Both
+    attempts to recompute it regressed a real file in opposite directions (see
+    the note above `MOD_BLOCK`): the classification has to be the one taken
+    from the RAW body and carried, which is what this does. Dropping comment
+    characters from the class string in the same pass that drops them from the
+    text is what keeps the two aligned.
+    """
+    cls = _rust_classes(body)
+    body = _strip_generated_comments(body, cls)
+    return ''.join(k for c, k in zip(body, cls) if k != 'm' or c == '\n')
+
+
 def _rust_skeleton(body):
     """The same text with comments AND string contents blanked to spaces.
 
@@ -3352,48 +3369,59 @@ def _module_of(rel, crates):
 # unrelated type be an environment, and a `.var(…)` on its value read as a real
 # accessor. `_module_of` answers where the FILE sits; this answers where an
 # OFFSET sits, which is the question a declaration and a `use` both ask.
-# KNOWN AND NOT FIXED HERE: the brace walks below count braces over the masked
-# text, and the mask keeps LITERALS — so a `'{'` or a `"${"` counts as a brace.
-# `autumn-cli/src/i18n.rs` matches on brace characters to decode escaped braces
-# and opens three scopes that never close; `autumn/src/router.rs` opens one. A
-# scope whose brace never balances runs to the end of the file, so
-# `build_router_pre_state`'s `env` is visible to every function written after
-# it — the over-admission this rung exists to remove, one level under it.
+# A brace inside a LITERAL is not a brace, and the walks below count braces. A
+# `'{'` in `autumn-cli/src/i18n.rs`, which matches on brace characters to decode
+# escaped braces, opened three scopes that never closed; `autumn/src/router.rs`
+# opened one. A scope whose brace never balances runs to the end of the file, so
+# `build_router_pre_state`'s `env` reached every function written after it — the
+# over-admission this rung exists to remove, one level under it.
 #
-# Found by MEASURING, not reported: the per-file derivation diff showed two
-# files changing scope paths under a closure fix that had no business touching
-# them, which is why that comparison is taken.
-#
-# It is not fixed here because the two obvious repairs each regress a different
-# file, and the reason is worth recording. Blanking CHARACTER literals alone
-# unbalances `autumn-media-plugin/src/config.rs`, which writes
+# The classification is CARRIED from the raw body (`_rust_literal_mask`), not
+# recomputed from the text these walks are handed, and that distinction is the
+# whole fix. I tried recomputing it twice and each attempt regressed a different
+# file in a different direction. Blanking character literals alone unbalances
+# `autumn-media-plugin/src/config.rs`, which writes
 # `strip_prefix("${")?.strip_suffix('}')?` — a `{` in a string and a `}` in a
-# char literal, two wrong counts that cancel — and nests five sibling functions
-# inside `resolve_placeholder`. Blanking BOTH, by re-running `_rust_classes`
-# over the masked text, unbalances `autumn-cli/src/migrate.rs` instead and lets
-# `fn run` swallow the four functions after it: re-classifying text that has
-# already had its comments DROPPED is not the same as classifying the file.
-# Half a fix to a symmetric bug is a new bug, and a fix that widens a scope is
-# worse than the bug it closes.
+# char literal, two wrong counts that cancel — and nested five sibling functions
+# inside `resolve_placeholder`. Blanking both by re-running `_rust_classes` over
+# the masked text unbalanced `autumn-cli/src/migrate.rs` instead and let `fn
+# run` swallow the four functions after it, because text whose comments have
+# already been DROPPED is not the file, and classifying it is not the same
+# question. Half a fix to a symmetric bug is a new bug.
 #
-# The repair is to carry the classification taken from the RAW body through to
-# both walks rather than recompute it from their input, which is a change to
-# what `_lexical_spans` is given and belongs in its own commit with its own
-# proof — not bolted onto a round that is measured clean without it.
+# The mask is a class string the same length as the walk's input, so an offset
+# means the same thing on both sides of it, and both the derivation and the scan
+# build it from their own copy of the raw file — no offset crosses between them.
+def _in_literal(literals):
+    """`offset -> bool`, or a constant `False` when no mask was carried.
+
+    A missing mask means "every character is code", which is what these walks
+    did before one was carried — so a caller with only masked text in hand (the
+    self-tests, mostly) gets the old behaviour rather than a wrong guess at the
+    classification.
+    """
+    if not literals:
+        return lambda i: False
+    return lambda i: i < len(literals) and literals[i] == 's'
+
 
 MOD_BLOCK = re.compile(r'\bmod\s+([a-z_]\w*)\s*\{')
 
 
-def _module_spans(masked):
+def _module_spans(masked, literals=None):
     """`([start], [module path])` for a masked Rust body, in offset order.
 
     Reads the masked text, so a `mod x {` inside a string, a comment or
     generated data opens nothing — the same rule the derivations that consume
     this run under, and the difference between a scope and a lookalike.
     """
-    opens = {m.end() - 1: m.group(1) for m in MOD_BLOCK.finditer(masked)}
+    lit = _in_literal(literals)
+    opens = {m.end() - 1: m.group(1) for m in MOD_BLOCK.finditer(masked)
+             if not lit(m.end() - 1)}
     starts, mods, stack, here, depth = [0], [()], [], (), 0
     for i, c in enumerate(masked):
+        if lit(i):
+            continue
         if c == '{':
             if i in opens:
                 stack.append(depth)
@@ -3469,7 +3497,7 @@ def _fn_returns(masked):
     return out
 
 
-def _scope_opens(masked):
+def _scope_opens(masked, literals=None):
     """`{brace offset: (header offset, label)}` for every scope opened.
 
     The HEADER offset matters as much as the brace: a parameter is written
@@ -3477,10 +3505,16 @@ def _scope_opens(masked):
     the enclosing module rather than in the function it binds. The declaration
     and its uses have to land in the same scope or the whole rule is inert.
     """
+    lit = _in_literal(literals)
     out = {}
     for m in SCOPE_HEAD.finditer(masked):
+        if lit(m.start()):
+            continue
         i, depth = m.end(), 0
         while i < len(masked):
+            if lit(i):
+                i += 1
+                continue
             c = masked[i]
             if c in '([':
                 depth += 1
@@ -3554,7 +3588,7 @@ def _closure_end(masked, i):
     return len(masked)
 
 
-def _lexical_spans(masked):
+def _lexical_spans(masked, literals=None):
     """`([start], [scope path])` — the binding scope each offset sits in.
 
     Two kinds of scope, one sweep. An item scope runs from its HEADER to its
@@ -3564,9 +3598,12 @@ def _lexical_spans(masked):
     stops at a closer it did not open — so a single stack orders them, and the
     walk that used to key everything on a `{` no longer has to.
     """
-    opens = _scope_opens(masked)
+    lit = _in_literal(literals)
+    opens = _scope_opens(masked, literals)
     spans, stack, depth = [], [], 0
     for i, c in enumerate(masked):
+        if lit(i):
+            continue
         if c == '{':
             if i in opens:
                 head, label = opens[i]
@@ -3587,6 +3624,8 @@ def _lexical_spans(masked):
     for _, head, label in stack:
         spans.append((head, len(masked), label))
     for m in CLOSURE_HEAD.finditer(masked):
+        if lit(m.start()):
+            continue
         # The header text is the label, exactly as it is for an item: two
         # sibling closures with identical parameter lists share a scope, which
         # is the same bounded over-admission two identically-headed items get.
@@ -3876,7 +3915,7 @@ def accessor(root, test_files=frozenset()):
     index, types, per_file, masked_all = {}, set(), {}, {}
     helpers, declared, imports, modules = {}, {}, {}, {}
     env_type, impls, trait_at, scopes = {}, {}, set(), {}
-    shadowed, returns, aliases = {}, {}, {}
+    shadowed, returns, aliases, local_types = {}, {}, {}, {}
     macro_at, macro_imports, factory_at = {}, {}, {}
     crates = _crates(root)
     for rel in out.split('\0'):
@@ -3898,16 +3937,16 @@ def accessor(root, test_files=frozenset()):
         # of the file than the rung it feeds is the same shape as reading a
         # `format!` lookalike out of a comment — the fourth rung to need this
         # mask, and the first where the leak was global rather than local.
-        masked = untested(_rust_uncommented(body))
+        masked, literals = masked_with_literals(body)
         data = _generated_data(masked)
         # Every derivation below is filed under the INLINE MODULE it was
         # written in, not under the file. Two sibling `mod` blocks are two
         # scopes, and a bare name in one does not reach the other.
-        spans = _module_spans(masked)
+        spans = _module_spans(masked, literals)
         # …and a BINDING has a narrower scope than its module. Items, imports
         # and types stay modular; a receiver name is filed under the function
         # or block it is declared in.
-        lex = _lexical_spans(masked)
+        lex = _lexical_spans(masked, literals)
         crate, filemods = _module_of(rel, crates)
         seen = scopes.setdefault(rel, set())
         for m in ENV_HELPER.finditer(masked):
@@ -3942,8 +3981,13 @@ def accessor(root, test_files=frozenset()):
         impls[rel] = [(m.group(1), m.group(2), _scope_at(spans, m.start()))
                       for m in ENV_IMPL.finditer(masked)
                       if not data[m.start()]]
+        # …with its BINDING scope beside its module, because `type Local =
+        # OsEnv` written inside a function is not a type the module has. Filing
+        # it modularly let a sibling function's unrelated `Local` be an
+        # environment — the alias rung repeating, one commit later, the mistake
+        # the receiver rung took three rounds to stop making.
         aliases[rel] = [(m.group(1), ' '.join(m.group(2).split()),
-                         _scope_at(spans, m.start()))
+                         _scope_at(spans, m.start()), _scope_at(lex, m.start()))
                         for m in TYPE_ALIAS.finditer(masked)
                         if not data[m.start()]]
         # Where each derived name LIVES — crate and module path, not a bare
@@ -4032,6 +4076,16 @@ def accessor(root, test_files=frozenset()):
         where = _absolute_path(rel, path, crates, at)
         return where is not None and where in modules.get(name, ())
 
+    def local_type(rel, at, kind):
+        """Whether a BINDING-scoped alias in scope at `at` names `kind`.
+
+        Read back by prefix, the way a receiver is: an alias declared in a
+        function reaches that function and what is written inside it, and
+        nothing else in the file.
+        """
+        return any(kind in local_types.get((rel, at[:n]), ())
+                   for n in range(len(at) + 1))
+
     def visible(rel, at, names):
         here = {n for n in names if n in declared.get((rel, at), ())}
         for local, path in imports.get((rel, at), ()):
@@ -4048,7 +4102,7 @@ def accessor(root, test_files=frozenset()):
         grew = False
         for rel, found in aliases.items():
             crate, filemods = _module_of(rel, crates)
-            for name, rhs, at in found:
+            for name, rhs, at, lex_at in found:
                 if name in types:
                     continue
                 bare = re.sub(r'^(?:impl|dyn)\s+', '', rhs).strip()
@@ -4057,12 +4111,20 @@ def accessor(root, test_files=frozenset()):
                 if kind not in types:
                     continue
                 if not (resolves(rel, at, path + kind, kind) if path.strip()
-                        else kind in visible(rel, at, types)):
+                        else (kind in visible(rel, at, types)
+                              or local_type(rel, lex_at, kind))):
                     continue
                 types.add(name)
-                scopes.setdefault(rel, set()).add(at)
-                declared.setdefault((rel, at), set()).add(name)
-                modules.setdefault(name, set()).add((crate, filemods + at))
+                # An alias written INSIDE a function is that function's, so it
+                # is filed by binding scope and read back by prefix — exactly
+                # as a receiver is. Only a module-level one becomes a name the
+                # module has.
+                if any('fn ' in seg for seg in lex_at):
+                    local_types.setdefault((rel, lex_at), set()).add(name)
+                else:
+                    scopes.setdefault(rel, set()).add(at)
+                    declared.setdefault((rel, at), set()).add(name)
+                    modules.setdefault(name, set()).add((crate, filemods + at))
                 grew = True
         if not grew:
             break
@@ -4149,7 +4211,8 @@ def accessor(root, test_files=frozenset()):
                 if path:
                     if not resolves(rel, at, path + kind, kind):
                         continue
-                elif kind not in here:
+                elif not (kind in here
+                          or local_type(rel, _scope_at(lex, m.start()), kind)):
                     continue
                 per_file.setdefault((rel, _scope_at(lex, m.start())),
                                     set()).add(m.group(1))
@@ -4587,6 +4650,37 @@ def untested(body):
     return '\n'.join(out)
 
 
+def realign_mask(before, mask, after):
+    """Cut `mask` the way `untested` cut `before` into `after`.
+
+    `untested` replaces a masked item's LINES with empty ones, keeping the line
+    count but not the character offsets — so a mask taken from the raw file,
+    which is aligned to the uncommented text, has to be cut the same way or
+    every offset past the first test item points at the wrong character. Line
+    by line is exact because that is the granularity `untested` works at: a
+    line is kept verbatim or replaced wholesale.
+
+    Both the derivation and the scan call `untested`, and MISSING that on the
+    scan side is what cost `AUTUMN_OFFSITE_MULTIPART_PART_SIZE_BYTES` — a mask
+    that is merely plausible is worse than none, because it silently moves the
+    literals somewhere else in the file.
+    """
+    if after == before:
+        return mask
+    out, pos = [], 0
+    for b_line, a_line in zip(before.split('\n'), after.split('\n')):
+        out.append(mask[pos:pos + len(b_line)] if a_line else '')
+        pos += len(b_line) + 1
+    return '\n'.join(out)
+
+
+def masked_with_literals(body):
+    """The derivation's Rust view and the literal mask aligned to it."""
+    unc = _rust_uncommented(body)
+    text = untested(unc)
+    return text, realign_mask(unc, _rust_literal_mask(body), text)
+
+
 # The formats that actually perform shell-style expansion or declare
 # environment variables as `NAME=value`. An ALLOW-list, because the shapes are
 # grammar: `${AUTUMN_X}` in a JavaScript template literal interpolates a JS
@@ -4705,7 +4799,13 @@ def source_tokens(root):
         # `effective_suffix`, not `rel.endswith('.rs')`: `build.rs.tmpl` is
         # Rust, and the suffix test did not see it, so a `#[test]` in a Rust
         # TEMPLATE went unmasked.
+        literals = None
         if effective_suffix(rel) == '.rs':
+            # The mask has to be cut exactly as `untested` cuts the body, or
+            # every offset after the first test item names a different
+            # character — see `realign_mask`.
+            literals = realign_mask(body, _rust_literal_mask(raw),
+                                    untested(body))
             body = untested(body)
         interpolated = yaml_file and _yaml_interpolated(rel)
         yaml_code, declared_lines = None, set()
@@ -4822,7 +4922,7 @@ def source_tokens(root):
         # accessor is about to be run on. That is what makes call-site scoping
         # cost nothing: no offset ever crosses between this body and the one
         # the derivation read, only a module name.
-        spans = (_lexical_spans(body)
+        spans = (_lexical_spans(body, literals)
                  if effective_suffix(rel) == '.rs' else None)
         offsets, at = [], 0
         for l in lines:
@@ -6470,6 +6570,21 @@ def self_test():
     # An ALIAS is a second name for a type that already is one, and the
     # receiver pattern was built from the concrete names alone — so `fn
     # load(source: AppEnv)` declared an environment nothing here could see.
+    # …and an alias declared INSIDE a function is that function's. Filed
+    # modularly it made a sibling function's unrelated same-named type an
+    # environment — the alias rung repeating, one commit later, the mistake the
+    # receiver rung took three rounds to stop making.
+    case('an alias knows the binding scope it was written in',
+         [(n, [s[:24] for s in lex])
+          for n, _, _, lex in (lambda text, lits: [
+              (m.group(1), m.group(2), _scope_at(_module_spans(text, lits),
+                                                 m.start()),
+               _scope_at(_lexical_spans(text, lits), m.start()))
+              for m in TYPE_ALIAS.finditer(text)])(
+                  *masked_with_literals(
+                      'type Top = OsEnv;\n'
+                      'fn one() { type Local = OsEnv; }\n'))],
+         [('Top', []), ('Local', ['fn one()'])])
     case('a type alias is read with its right-hand side',
          [TYPE_ALIAS.findall(t) for t in
           ('type AppEnv = OsEnv;',
@@ -6659,6 +6774,29 @@ def self_test():
              "fn one(e: OsEnv) { let c = '{'; e.var(\"X\"); }\n"
              'fn two(q: Other) { q.var("Y"); }\n'),
          [('fn one(e: OsEnv)',), ('fn one(e: OsEnv)', 'fn two(q: Other)')])
+    # A brace inside a LITERAL is not a brace. Counted as one it left
+    # `build_router_pre_state` open to the end of its file, so its `env`
+    # reached every function written after it.
+    case('a brace in a literal opens no scope',
+         (lambda src: (lambda text, lits:
+                       [_scope_at(_lexical_spans(text, lits), text.index(p))
+                        for p in ('e.var("X")', 'q.var("Y")')])(
+             *masked_with_literals(src)))(
+             'fn one(e: OsEnv) { let c = \'{\'; let s = "${"; e.var("X"); }\n'
+             'fn two(q: Other) { q.var("Y"); }\n'),
+         [('fn one(e: OsEnv)',), ('fn two(q: Other)',)])
+    # …and the mask has to be cut the way `untested` cuts the body, or every
+    # offset past the first test item names a different character. Missing that
+    # on the scan side cost a real read its resolution.
+    case('the literal mask is cut with the body',
+         (lambda text, lits: len(text) == len(lits))(
+             *masked_with_literals(
+                 'fn a() { let c = \'{\'; }\n#[cfg(test)]\nmod t { fn b() { } }\n'
+                 'fn c() { }\n')),
+         True)
+    case('realigning drops exactly the blanked lines',
+         realign_mask('aa\nbb\ncc', 'ss\ncc\nss', 'aa\n\ncc'),
+         'ss\n\nss')
     case('logical or and pattern alternatives open no scope',
          [CLOSURE_HEAD.search(t) is not None for t in
           ('if a || b { }', 'match x { Some(a) | Some(b) => 1 }',
