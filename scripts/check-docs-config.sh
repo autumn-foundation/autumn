@@ -6,7 +6,7 @@
 # off a page. `scripts/check-docs-links.sh` gates its *links*, so nobody is sent
 # to a page that does not exist; `scripts/check-docs-cli.sh` gates its
 # *commands*, so nobody is handed an `autumn …` line clap will reject. Nothing
-# checked the third: the **config key**. The reader-facing corpus carries 168
+# checked the third: the **config key**. The reader-facing corpus carries 171
 # `autumn.toml` fences judged against 484 schema leaves, and a renamed or
 # never-shipped key leaves behind a line that looks exactly like a working one.
 #
@@ -109,7 +109,7 @@
 #      nothing and the gate fails loudly on README.md rather than silently
 #      widening.
 #
-# WHICH FENCES ARE READ. Of the corpus's 248 ```toml fences, 168 are read. A
+# WHICH FENCES ARE READ. Of the corpus's 251 ```toml fences, 171 are read. A
 # fence is read only on POSITIVE identification — it names `autumn.toml` (or a
 # profile overlay / the `.example` template), or it carries a section the config
 # surface recognizes.
@@ -129,6 +129,25 @@
 # admits that whole fence and reports its five correct sections as drift, while
 # distance 1 admits none of them and still catches `telemettry`, `sesion`,
 # `databse`, `serverr` and their transposed forms.
+#
+# A near miss catches a MISSPELLED root; it cannot catch a WRONG one. The wiki
+# example's rendered `/docs/configuration` page documented `[logging] level`
+# where the root is `log`, and `logging` is four edits away — a plausible
+# different word, not a typo. So one further signal: an unrecognized root whose
+# child keys resolve under EXACTLY ONE known root is that root, misnamed.
+# Uniqueness is what makes it evidence rather than a guess — `level` fits `log`
+# and nothing else, while a common child like `enabled` fits 14 roots and proves
+# nothing, and every other-file fence's children (`api_token`, `net`, `purge`,
+# `autumn_version`, `primary_key`) fit no root at all.
+#
+# `examples/<app>/content/` is IN the corpus, and excluding it was a mistake worth
+# recording: `check-docs-links.sh` skips that tree because its paths are app
+# ROUTES rather than file paths — a fact about link resolution that says nothing
+# about whether the prose documents real config keys. `examples/wiki` embeds
+# `content/configuration.md` via `include_str!` and serves it at
+# `/docs/configuration`, where it documents `autumn.toml`'s `[server]` keys and
+# profile-merge order — and got `[logging]` wrong. Borrowing the sibling gate's
+# exclusion past its justification hid a live defect for four review rounds.
 #
 # MARKERS BEAT HEURISTICS — all of them. The rules below are guesses about what a
 # fence IS; a marker is the page SAYING so, and a guess must never overrule a
@@ -234,9 +253,6 @@
 #     `check-docs-cli.sh` learned this the same way: a live `autumn migrate run`
 #     hid behind a `\n> ` break in migrations.md.
 #
-#   - **`examples/<app>/content/`.** Seed content for an example app, rendered by
-#     that app's own routes — the same exclusion, for the same reason,
-#     `check-docs-links.sh` makes.
 #   - **The CHILDREN of a plugin root** (`[media] …`, `[search] …`). Opacity
 #     mirrors the runtime, whose contract is that the plugin owns validation of
 #     its own subtree, and `SearchConfig` holds up that end —
@@ -424,14 +440,6 @@ ARCHIVE_FILES = (
 )
 
 
-# `examples/<app>/content/…` is seed content for an example app, rendered by
-# that app's own routes — it documents the example's subject matter, not
-# Autumn's config. Anchored to `examples/<app>/content/` rather than any path
-# containing `/content/`, for the reason check-docs-links.sh gives: a substring
-# test would silently drop a real docs tree named `content`.
-EXAMPLE_CONTENT = re.compile(r"^examples/[^/]+/content/")
-
-
 def corpus():
     # NUL-delimited for the same reason check-docs-links.sh uses it: a path with
     # whitespace would otherwise split into fragments and be silently skipped.
@@ -445,9 +453,7 @@ def corpus():
     return [
         f
         for f in filter(None, files)
-        if not f.startswith(ARCHIVE_PREFIXES)
-        and f not in ARCHIVE_FILES
-        and not EXAMPLE_CONTENT.match(f)
+        if not f.startswith(ARCHIVE_PREFIXES) and f not in ARCHIVE_FILES
     ]
 
 
@@ -565,7 +571,7 @@ def named_toml_files(text):
     return ours, theirs
 
 
-def classify(body, lead_in, known_roots):
+def classify(body, lead_in, known_roots, schema=None):
     """Why this fence is not read as `autumn.toml`, or None if it is.
 
     A fence is read only on POSITIVE identification — it says it is
@@ -605,6 +611,25 @@ def classify(body, lead_in, known_roots):
 # admits that whole fence and reports its five correct sections as drift, while
 # distance 1 admits none of them and still catches `telemettry`, `sesion`,
 # `databse`, `serverr` and their transposed forms.
+#
+# A near miss catches a MISSPELLED root; it cannot catch a WRONG one. The wiki
+# example's rendered `/docs/configuration` page documented `[logging] level`
+# where the root is `log`, and `logging` is four edits away — a plausible
+# different word, not a typo. So one further signal: an unrecognized root whose
+# child keys resolve under EXACTLY ONE known root is that root, misnamed.
+# Uniqueness is what makes it evidence rather than a guess — `level` fits `log`
+# and nothing else, while a common child like `enabled` fits 14 roots and proves
+# nothing, and every other-file fence's children (`api_token`, `net`, `purge`,
+# `autumn_version`, `primary_key`) fit no root at all.
+#
+# `examples/<app>/content/` is IN the corpus, and excluding it was a mistake worth
+# recording: `check-docs-links.sh` skips that tree because its paths are app
+# ROUTES rather than file paths — a fact about link resolution that says nothing
+# about whether the prose documents real config keys. `examples/wiki` embeds
+# `content/configuration.md` via `include_str!` and serves it at
+# `/docs/configuration`, where it documents `autumn.toml`'s `[server]` keys and
+# profile-merge order — and got `[logging]` wrong. Borrowing the sibling gate's
+# exclusion past its justification hid a live defect for four review rounds.
 #
 # MARKERS BEAT HEURISTICS — all of them. The Cargo-root and headerless rules
     # below are guesses about what a fence IS; a marker is the page SAYING so, and
@@ -674,6 +699,20 @@ def classify(body, lead_in, known_roots):
     # transposed forms.
     if any(near_known_root(r, known_roots) for r in roots):
         return None
+    # A near miss catches a MISSPELLED root. It cannot catch a WRONG one: the
+    # wiki example's rendered `/docs/configuration` page documents `[logging]
+    # level = "info"` where the root is `log`, and `logging` is four edits from
+    # `log` — a plausible different word, not a typo.
+    #
+    # So one more signal, and only one: an unrecognized root whose child keys
+    # resolve under EXACTLY ONE known root is that root, misnamed. Uniqueness is
+    # what makes this safe rather than a guess — `level` resolves under `log` and
+    # nothing else, while a common child like `enabled` resolves under 14 roots
+    # and is therefore no evidence at all. Measured against the other-file fences,
+    # whose children resolve under nothing: `api_token`, `net`, `purge`,
+    # `autumn_version`, `primary_key` — 0 roots each.
+    if schema is not None and unique_host_root(body, schema) is not None:
+        return None
     return "no-autumn-section"
 
 
@@ -701,6 +740,30 @@ def edit_distance(a, b, limit=1):
             return limit + 1
         prev2, prev = prev, cur
     return prev[-1]
+
+
+def unique_host_root(body, schema):
+    """The single known root that this fence's sections' children all fit, or None.
+
+    Identifies a fence whose section is named WRONG rather than misspelled. Only
+    an unambiguous fit counts: children that fit two or more roots (`enabled`
+    fits 14) are no evidence, and children that fit none — every other-file
+    fence in this corpus — are evidence against.
+    """
+    try:
+        table = tomllib.loads(body)
+    except (tomllib.TOMLDecodeError, ValueError):
+        return None
+    for key, value in table.items():
+        if not isinstance(value, dict) or key in schema.get("", set()):
+            continue
+        children = {k for k in value}
+        if not children:
+            continue
+        hosts = [r for r in schema.get("", set()) if children <= schema.get(r, set())]
+        if len(hosts) == 1:
+            return hosts[0]
+    return None
 
 
 def near_known_root(root, known_roots):
@@ -865,7 +928,7 @@ def scan(schema, plugin_root_set=frozenset()):
             body = match.group(2)
             line = text[: match.start()].count("\n") + 1
             lead_in = "\n".join(text[: match.start()].split("\n")[-(LEAD_IN_LINES + 1) : -1])
-            skip = classify(body, lead_in, known_roots)
+            skip = classify(body, lead_in, known_roots, schema)
             if skip:
                 fences.append((rel, line, skip, []))
                 continue
@@ -1133,7 +1196,7 @@ def self_test():
             print(f"  FAIL [{name}]: expected {expected}, got {got}")
 
     for name, body, lead_in, expected in classify_cases:
-        got = classify(body, lead_in, known_roots)
+        got = classify(body, lead_in, known_roots, schema)
         if got == expected:
             passed += 1
         else:
@@ -1207,7 +1270,7 @@ def self_test():
             "no-section-header",
         ),
     ):
-        got = classify(body, "", known_roots)
+        got = classify(body, "", known_roots, schema)
         if got == expected:
             passed += 1
         else:
@@ -1235,7 +1298,7 @@ def self_test():
             "other-file:Cargo.toml",
         ),
     ):
-        got = classify(body, lead_in, known_roots)
+        got = classify(body, lead_in, known_roots, schema)
         if got == expected:
             passed += 1
         else:
@@ -1329,6 +1392,14 @@ def self_test():
     # be identified, or the gate goes quiet on the defect it exists for.
     for label, body, expected in (
         ("typo'd sole header is read", "[telemettry]\nenabled = true\n", None),
+        # A WRONG root, not a misspelled one: `logging` is 4 edits from `log`, so
+        # only the unique-child-host signal reaches it. This is the wiki example's
+        # rendered `/docs/configuration` page, verbatim.
+        ("wrong-word root is read", '[logging]\nlevel = "info"\n', None),
+        # ...and the signal must stay silent when the children are ambiguous or
+        # belong to no root at all, which is what keeps other files out.
+        ("ambiguous child is not evidence", "[widget]\nenabled = true\n", "no-autumn-section"),
+        ("children of no root are not evidence", '[acme_dns]\napi_token = "x"\n', "no-autumn-section"),
         ("transposed sole header is read", "[teleemtry]\nenabled = true\n", None),
         ("truncated sole header is read", "[telemetr]\nenabled = true\n", None),
         # ...while genuinely other-file roots stay skipped. `version` is the
@@ -1340,7 +1411,7 @@ def self_test():
         ("credentials root stays skipped", '[acme_dns]\napi_token = "x"\n', "no-autumn-section"),
         ("plugin-manifest root stays skipped", "[capabilities]\nnet = false\n", "no-autumn-section"),
     ):
-        got = classify(body, "", known_roots)
+        got = classify(body, "", known_roots, schema)
         if got == expected:
             passed += 1
         else:
