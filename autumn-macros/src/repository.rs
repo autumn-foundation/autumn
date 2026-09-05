@@ -12381,9 +12381,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     model: #model_name_lit,
                     table: #table_name,
                     api: #graph_api_path,
-                    module_path: module_path!(),
-                    file: file!(),
-                    line: line!(),
+                    module_path: ::core::module_path!(),
+                    file: ::core::file!(),
+                    line: ::core::line!(),
                 }
             }
         }

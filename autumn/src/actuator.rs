@@ -3589,7 +3589,7 @@ pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
 /// rather than `404`, so an operator can tell "this process has not published
 /// one" apart from "this build has no such endpoint".
 pub(crate) async fn graph_endpoint() -> axum::response::Response {
-    graph_response(crate::graph::served())
+    graph_response(crate::graph::served_json())
 }
 
 /// Render the `/actuator/graph` response for a given installed graph.
@@ -3598,9 +3598,7 @@ pub(crate) async fn graph_endpoint() -> axum::response::Response {
 /// `OnceLock`: a test that installed one to exercise the "present" branch would
 /// decide the answer for every other test in the process. The branch is the
 /// behaviour worth testing, and it is testable here without that coupling.
-fn graph_response(
-    graph: Option<&crate::graph::manifest::ArchitectureGraph>,
-) -> axum::response::Response {
+fn graph_response(graph: Option<&'static [u8]>) -> axum::response::Response {
     graph.map_or_else(
         || {
             (
@@ -3614,7 +3612,14 @@ fn graph_response(
             )
                 .into_response()
         },
-        |graph| (StatusCode::OK, Json(graph)).into_response(),
+        |json| {
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                json,
+            )
+                .into_response()
+        },
     )
 }
 
@@ -5590,9 +5595,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actuator_graph_serves_the_installed_graph_over_http() {
+        // The one test that proves the endpoint works end to end: install a
+        // graph, mount the real sensitive actuator router, and GET it. The
+        // `graph_response` unit tests below cannot catch a missing or misplaced
+        // `crate::graph::install` call — Codex round 1 found exactly that, with
+        // every unit test passing while a running app answered 503 forever.
+        //
+        // Sole installer in this test binary, on purpose: the installed graph
+        // is a process-wide `OnceLock`, so a second test installing its own
+        // would decide this one's answer. The install-site guard lives in
+        // `app::tests::graph_installed_before_every_router_build`.
+        crate::graph::install(crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]));
+
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/graph")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let decoded: crate::graph::manifest::ArchitectureGraph =
+            serde_json::from_slice(&body).expect("the endpoint must serve the graph document");
+        assert_eq!(
+            decoded.schema_version,
+            crate::graph::manifest::MANIFEST_SCHEMA_VERSION
+        );
+    }
+
+    #[tokio::test]
     async fn actuator_graph_serves_the_installed_graph() {
-        let graph = crate::graph::manifest::build(&[], &[], &[], &[], &[]);
-        let resp = graph_response(Some(&graph));
+        let graph = crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]);
+        let json = serde_json::to_vec(&graph).expect("serialize");
+        let resp = graph_response(Some(json.leak()));
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await

@@ -40,7 +40,7 @@ pub struct Impact<'g> {
     pub jobs: Vec<&'g GraphNode>,
 }
 
-/// Resolve a query string to a node.
+/// Resolve a query string to every node that answers to it.
 ///
 /// Accepts, in order of specificity: an exact node id, a model's
 /// module-qualified path, a model or repository name, a table name, a
@@ -48,32 +48,48 @@ pub struct Impact<'g> {
 /// case-sensitive for type names — `Post` and `post` are different Rust
 /// items — but a table name is matched case-insensitively, because SQL is.
 ///
-/// Returns `None` when nothing answers to the name, and the *first* match in
-/// node-id order when several do, so the answer is deterministic.
+/// Returns *every* match at the most specific tier that matched, not the first.
+/// [`symbol_index`](super::manifest) deliberately links a name to every node
+/// answering to it, so two crates that each declare a `Post` produce edges to
+/// both; answering a query from only one of them would drop every route whose
+/// edge landed on the other — a false negative in exactly the metric this
+/// feature is measured on. Ties are returned in node-id order, so the answer is
+/// deterministic.
 #[must_use]
-pub fn resolve<'g>(graph: &'g ArchitectureGraph, name: &str) -> Option<&'g GraphNode> {
-    if let Some(node) = graph.node(name) {
-        return Some(node);
-    }
-    let by = |f: &dyn Fn(&GraphNode) -> bool| graph.nodes.iter().find(|n| f(n));
-    by(&|n: &GraphNode| n.id.strip_prefix("model:") == Some(name))
-        .or_else(|| by(&|n: &GraphNode| n.kind == NodeKind::Model && n.name == name))
-        .or_else(|| {
-            by(&|n: &GraphNode| {
-                n.model
-                    .as_ref()
-                    .is_some_and(|m| m.table.eq_ignore_ascii_case(name))
-            })
-        })
-        .or_else(|| by(&|n: &GraphNode| n.kind == NodeKind::Repository && n.name == name))
-        .or_else(|| {
-            by(&|n: &GraphNode| {
-                n.repository
+pub fn resolve_all<'g>(graph: &'g ArchitectureGraph, name: &str) -> Vec<&'g GraphNode> {
+    let all = |f: &dyn Fn(&GraphNode) -> bool| -> Vec<&'g GraphNode> {
+        graph.nodes.iter().filter(|n| f(n)).collect()
+    };
+    let tiers: [Vec<&'g GraphNode>; 6] = [
+        all(&|n: &GraphNode| n.id == name),
+        all(&|n: &GraphNode| n.id.strip_prefix("model:") == Some(name)),
+        all(&|n: &GraphNode| n.kind == NodeKind::Model && n.name == name),
+        all(&|n: &GraphNode| {
+            n.model
+                .as_ref()
+                .is_some_and(|m| m.table.eq_ignore_ascii_case(name))
+        }),
+        all(&|n: &GraphNode| {
+            (n.kind == NodeKind::Repository && n.name == name)
+                || n.repository
                     .as_ref()
                     .is_some_and(|r| r.implementation == name)
-            })
-        })
-        .or_else(|| by(&|n: &GraphNode| n.job.is_some() && n.name == name))
+        }),
+        all(&|n: &GraphNode| n.job.is_some() && n.name == name),
+    ];
+    tiers
+        .into_iter()
+        .find(|tier| !tier.is_empty())
+        .unwrap_or_default()
+}
+
+/// The single node a query string names, for reporting.
+///
+/// The first of [`resolve_all`]'s matches in node-id order. The *answer* always
+/// unions every match; this is only what the report calls the target.
+#[must_use]
+pub fn resolve<'g>(graph: &'g ArchitectureGraph, name: &str) -> Option<&'g GraphNode> {
+    resolve_all(graph, name).into_iter().next()
 }
 
 /// Every node that reaches `target`, walking edges backwards.
@@ -97,11 +113,32 @@ fn dependents<'g>(graph: &'g ArchitectureGraph, target: &str) -> Vec<&'g GraphNo
     found.into_iter().filter_map(|id| graph.node(id)).collect()
 }
 
+/// The union of [`dependents`] over several targets, minus the targets
+/// themselves, in node-id order.
+fn dependents_of_all<'g>(
+    graph: &'g ArchitectureGraph,
+    targets: &[&'g GraphNode],
+) -> Vec<&'g GraphNode> {
+    let target_ids: BTreeSet<&str> = targets.iter().map(|n| n.id.as_str()).collect();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut out: Vec<&'g GraphNode> = Vec::new();
+    for target in targets {
+        for node in dependents(graph, &target.id) {
+            if !target_ids.contains(node.id.as_str()) && seen.insert(node.id.as_str()) {
+                out.push(node);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
 /// Which routes and jobs touch the model, table or repository `name` denotes.
 #[must_use]
 pub fn touches<'g>(graph: &'g ArchitectureGraph, name: &str) -> Option<Touches<'g>> {
-    let target = resolve(graph, name)?;
-    let dependents = dependents(graph, &target.id);
+    let targets = resolve_all(graph, name);
+    let target = *targets.first()?;
+    let dependents = dependents_of_all(graph, &targets);
     Some(Touches {
         target,
         routes: dependents
@@ -125,8 +162,9 @@ pub fn touches<'g>(graph: &'g ArchitectureGraph, name: &str) -> Option<Touches<'
 /// The transitive set of elements a change to `name` would affect.
 #[must_use]
 pub fn impact<'g>(graph: &'g ArchitectureGraph, name: &str) -> Option<Impact<'g>> {
-    let target = resolve(graph, name)?;
-    let dependents = dependents(graph, &target.id);
+    let targets = resolve_all(graph, name);
+    let target = *targets.first()?;
+    let dependents = dependents_of_all(graph, &targets);
     Some(Impact {
         target,
         repositories: dependents
@@ -285,7 +323,7 @@ mod tests {
     }];
 
     fn graph() -> ArchitectureGraph {
-        build(&[], ROUTES, MODELS, REPOSITORIES, JOBS)
+        build(&[], 0, ROUTES, MODELS, REPOSITORIES, JOBS)
     }
 
     #[test]
@@ -321,6 +359,56 @@ mod tests {
                 "{name} must resolve to the repository"
             );
         }
+    }
+
+    #[test]
+    fn a_name_two_crates_both_answer_to_unions_their_dependents() {
+        // The symbol index deliberately links a name to every node answering to
+        // it, so a route's edge can land on either `Post`. Answering from one
+        // node alone would silently drop every route whose edge landed on the
+        // other — a false negative in the one metric this feature is measured
+        // on.
+        const TWO_POSTS: &[ModelGraphDescriptor] = &[
+            ModelGraphDescriptor {
+                model: "Post",
+                model_path: "app::models::Post",
+                table: "posts",
+                relations: &[],
+                module_path: "app::models",
+                file: "src/models.rs",
+                line: 1,
+            },
+            ModelGraphDescriptor {
+                model: "Post",
+                model_path: "plugin::models::Post",
+                table: "plugin_posts",
+                relations: &[],
+                module_path: "plugin::models",
+                file: "src/lib.rs",
+                line: 1,
+            },
+        ];
+        let g = build(&[], 0, ROUTES, TWO_POSTS, REPOSITORIES, JOBS);
+        assert_eq!(resolve_all(&g, "Post").len(), 2);
+        let answer = impact(&g, "Post").expect("Post must resolve");
+        assert!(
+            answer.routes.iter().any(|n| n.name == "index"),
+            "the route naming the `posts` table must be reported: {:?}",
+            answer.routes
+        );
+        assert!(
+            answer.routes.iter().any(|n| n.name == "create"),
+            "so must the route reaching Post through the repository: {:?}",
+            answer.routes
+        );
+    }
+
+    #[test]
+    fn a_target_is_never_reported_as_its_own_dependent() {
+        let g = graph();
+        let answer = impact(&g, "Post").expect("resolve");
+        assert!(!answer.routes.iter().any(|n| n.id == answer.target.id));
+        assert!(!answer.repositories.iter().any(|n| n.id == answer.target.id));
     }
 
     #[test]
@@ -392,7 +480,7 @@ mod tests {
 
     #[test]
     fn an_element_nothing_touches_reports_an_empty_answer() {
-        let g = build(&[], &[], MODELS, &[], &[]);
+        let g = build(&[], 0, &[], MODELS, &[], &[]);
         let answer = impact(&g, "Post").expect("Post must resolve");
         assert!(answer.routes.is_empty());
         assert!(answer.jobs.is_empty());

@@ -8412,13 +8412,17 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // every route, job and repository edge resolves against.
         ::autumn_web::reexports::inventory::submit! {
             ::autumn_web::graph::ModelGraphDescriptor {
-                model: stringify!(#name),
-                model_path: concat!(module_path!(), "::", stringify!(#name)),
+                model: ::core::stringify!(#name),
+                model_path: ::core::concat!(
+                    ::core::module_path!(),
+                    "::",
+                    ::core::stringify!(#name)
+                ),
                 table: #table_name,
                 relations: #graph_relations,
-                module_path: module_path!(),
-                file: file!(),
-                line: line!(),
+                module_path: ::core::module_path!(),
+                file: ::core::file!(),
+                line: ::core::line!(),
             }
         }
 

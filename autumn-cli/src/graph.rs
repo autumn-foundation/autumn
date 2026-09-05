@@ -62,7 +62,7 @@ pub struct GraphOptions<'a> {
     pub bin: Option<&'a str>,
     /// Write the JSON graph to this path (in addition to any stdout).
     pub manifest: Option<&'a str>,
-    /// Emit JSON to stdout instead of the human report.
+    /// Emit JSON to stdout instead of the human report, for every verb.
     pub json: bool,
     /// Compare against a committed graph and fail on drift.
     pub check: Option<&'a str>,
@@ -201,6 +201,61 @@ pub fn answer(graph: &ArchitectureGraph, query: &Query) -> Option<String> {
     }
 }
 
+/// Answer the query as JSON, so `--json` means the same thing for every verb.
+///
+/// A flag the command accepts and silently ignores is worse than one it
+/// rejects: a script piping `autumn graph impact Post --json` into `jq` would
+/// otherwise get a human report and no error.
+#[must_use]
+pub fn answer_json(graph: &ArchitectureGraph, query: &Query) -> Option<String> {
+    let ids = |nodes: &[&autumn_web::graph::manifest::GraphNode]| -> Vec<String> {
+        nodes.iter().map(|n| n.id.clone()).collect()
+    };
+    let value = match query {
+        Query::Show => serde_json::to_value(graph).ok()?,
+        Query::Touches(name) => {
+            let a = query::touches(graph, name)?;
+            serde_json::json!({
+                "target": a.target,
+                "routes": ids(&a.routes),
+                "jobs": ids(&a.jobs),
+            })
+        }
+        Query::Impact(name) => {
+            let a = query::impact(graph, name)?;
+            serde_json::json!({
+                "target": a.target,
+                "repositories": ids(&a.repositories),
+                "routes": ids(&a.routes),
+                "jobs": ids(&a.jobs),
+            })
+        }
+    };
+    serde_json::to_string_pretty(&value).ok()
+}
+
+/// Explain a name nothing answers to, and exit non-zero.
+fn report_unresolved(graph: &ArchitectureGraph, query: &Query) -> ! {
+    let name = match query {
+        Query::Show => unreachable!("`show` always resolves"),
+        Query::Touches(name) | Query::Impact(name) => name,
+    };
+    eprintln!("\u{2717} Nothing in this application answers to {name:?}.");
+    let names = queryable_names(graph);
+    if names.is_empty() {
+        eprintln!(
+            "This binary declares no `#[model]` or `#[repository]`, so there is nothing to \
+             query yet."
+        );
+    } else {
+        eprintln!(
+            "Known models, tables and repositories: {}",
+            names.join(", ")
+        );
+    }
+    std::process::exit(1);
+}
+
 /// The names a failed query could have meant, for the "did you mean" line.
 #[must_use]
 pub fn queryable_names(graph: &ArchitectureGraph) -> Vec<String> {
@@ -311,28 +366,14 @@ pub fn run(opts: &GraphOptions<'_>) {
         eprintln!("\u{2713} Wrote architecture graph \u{2192} {path}");
     }
 
-    if opts.json && opts.query == Query::Show {
-        println!("{}", graph.to_json());
+    if opts.json {
+        let Some(json) = answer_json(&graph, &opts.query) else {
+            report_unresolved(&graph, &opts.query);
+        };
+        println!("{json}");
     } else {
         let Some(report) = answer(&graph, &opts.query) else {
-            let name = match &opts.query {
-                Query::Show => unreachable!("`show` always resolves"),
-                Query::Touches(name) | Query::Impact(name) => name,
-            };
-            eprintln!("\u{2717} Nothing in this application answers to {name:?}.");
-            let names = queryable_names(&graph);
-            if names.is_empty() {
-                eprintln!(
-                    "This binary declares no `#[model]` or `#[repository]`, so there is nothing \
-                     to query yet."
-                );
-            } else {
-                eprintln!(
-                    "Known models, tables and repositories: {}",
-                    names.join(", ")
-                );
-            }
-            std::process::exit(1);
+            report_unresolved(&graph, &opts.query);
         };
         print!("{report}");
     }
@@ -406,7 +447,7 @@ mod tests {
     }];
 
     fn graph() -> ArchitectureGraph {
-        build(&[], ROUTES, MODELS, REPOSITORIES, JOBS)
+        build(&[], 0, ROUTES, MODELS, REPOSITORIES, JOBS)
     }
 
     #[test]
@@ -450,7 +491,7 @@ mod tests {
     #[test]
     fn a_removed_node_is_named_in_the_drift_report() {
         let before = graph();
-        let after = build(&[], &[], MODELS, REPOSITORIES, JOBS);
+        let after = build(&[], 0, &[], MODELS, REPOSITORIES, JOBS);
         let drift = format_drift(&before, &after).expect("removing a route is drift");
         assert!(drift.contains("- route"), "{drift}");
         assert!(drift.contains("GET /posts"), "{drift}");
@@ -463,7 +504,7 @@ mod tests {
             signature_symbols: &[],
             ..ROUTES[0]
         }];
-        let after = build(&[], STRIPPED, MODELS, REPOSITORIES, JOBS);
+        let after = build(&[], 0, STRIPPED, MODELS, REPOSITORIES, JOBS);
         let drift = format_drift(&before, &after).expect("losing an edge is drift");
         assert!(
             drift.contains("- read route:app::routes::posts::index"),
@@ -483,8 +524,8 @@ mod tests {
                 ..autumn_web::graph::RouteAuth::default()
             },
         };
-        let before = build(&[mounted(true)], ROUTES, MODELS, REPOSITORIES, JOBS);
-        let after = build(&[mounted(false)], ROUTES, MODELS, REPOSITORIES, JOBS);
+        let before = build(&[mounted(true)], 0, ROUTES, MODELS, REPOSITORIES, JOBS);
+        let after = build(&[mounted(false)], 0, ROUTES, MODELS, REPOSITORIES, JOBS);
         let drift = format_drift(&before, &after).expect("dropping #[secured] is drift");
         assert!(drift.contains("auth secured -> none"), "{drift}");
     }

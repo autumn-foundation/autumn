@@ -74,7 +74,12 @@ $ curl -s localhost:3000/actuator/graph | jq '.completeness'
   "models": 4,
   "repositories": 3,
   "jobs": 4,
-  "generated_routes": 4
+  "generated_routes": 4,
+  "opaque_mounted_routers": 1,
+  "unmodelled_mounted_routes": [
+    "WS /ws/feed",
+    "WS /ws/r/{slug}"
+  ]
 }
 ```
 
@@ -94,7 +99,7 @@ differently from "this build has no such endpoint".
 | Node kind        | Declared by                        | Carries |
 |------------------|------------------------------------|---------|
 | `route`          | `#[get]`, `#[post]`, …             | method, mounted path, auth requirement |
-| `static_route`   | `#[static_get]`                    | the same, plus its pre-rendered marking |
+| `static_route`   | `#[static_get]`                    | the same; the node kind is the pre-rendered marking |
 | `model`          | `#[model]`                         | its table, and its relations' edge tables |
 | `repository`     | `#[repository]`                    | its model, table, `Pg*` type, auto-API prefix |
 | `job`            | `#[job]`                           | the registered job name |
@@ -156,11 +161,18 @@ read as more than it is:
 * **Access is declared intent.** A route's access is its HTTP method — safe
   methods read, everything else writes. A job's is whether its tokens carry
   mutation evidence. Neither is an executed statement.
-* **Routes mounted by other mechanisms.** A `#[ws]` handler, a raw
-  `merge`/`nest` router, or a framework endpoint is not a `#[route]` and is not
-  a node. Those mounts are named in
-  `completeness.unmodelled_mounted_routes` rather than dropped, so the document
-  never under-reports the served surface.
+* **Routes mounted by other mechanisms.** A `#[ws]` handler or a framework
+  endpoint is not a `#[route]` and is not a node; those mounts are *named* in
+  `completeness.unmodelled_mounted_routes`. A raw `merge`/`nest` router is
+  worse than unmodelled — it exposes no API to list its endpoints at all, so
+  they cannot be named, only counted, in
+  `completeness.opaque_mounted_routers` (the same count `autumn routes audit`
+  hard-fails its coverage gate on). Either way the document says what it could
+  not see rather than reading as a complete account of the served surface.
+* **Cross-module `use`.** Only an item's own tokens are read, so a
+  module-level `use crate::schema::posts::dsl::*` followed by a bare
+  `posts.filter(…)` names no candidate. Write `posts::table` or the model type
+  in the handler to be linked.
 
 ## Keeping it honest
 
@@ -172,7 +184,7 @@ fails when the two disagree. It also pins the recall claim — `impact Post` mus
 return every hand-verified handler and job that reaches the `posts` table,
 listed by name.
 
-Wire the drift gate into CI next to the other manifest checks:
+Wire the drift gate into CI wherever you run the app's build:
 
 ```yaml
 - run: autumn graph show --check architecture-graph.json --release

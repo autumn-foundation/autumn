@@ -59,21 +59,44 @@ use manifest::ArchitectureGraph;
 /// property of the *binary*, identical for every request and every clone of the
 /// state, and threading an immutable whole-binary fact through the request state
 /// would only create a second place for it to go stale.
-static SERVED_GRAPH: OnceLock<ArchitectureGraph> = OnceLock::new();
+static SERVED_GRAPH: OnceLock<ServedGraph> = OnceLock::new();
+
+/// The installed graph, alongside the bytes `/actuator/graph` serves.
+///
+/// The document can never change once installed, so re-serializing it per
+/// request would walk every node and edge and allocate the whole body again —
+/// on what is comfortably the largest actuator payload an app has.
+struct ServedGraph {
+    graph: ArchitectureGraph,
+    json: Vec<u8>,
+}
 
 /// Publish the graph this process serves.
 ///
-/// Idempotent: the first call wins and later ones are ignored, so a test that
-/// builds several routers in one process cannot make the endpoint's answer
-/// depend on which router was built last.
-pub fn install(graph: ArchitectureGraph) {
-    let _ = SERVED_GRAPH.set(graph);
+/// `pub(crate)` on purpose: whichever caller wins decides what
+/// `/actuator/graph` reports for the life of the process, and that is the
+/// framework's own account of the binary — not something a dependency should
+/// be able to pre-empt during static initialization.
+///
+/// Idempotent: the first call wins and later ones are ignored, so a process
+/// that builds several routers cannot make the endpoint's answer depend on
+/// which one was built last.
+pub(crate) fn install(graph: ArchitectureGraph) {
+    let _ = SERVED_GRAPH.set(ServedGraph {
+        json: serde_json::to_vec(&graph).unwrap_or_default(),
+        graph,
+    });
 }
 
 /// The graph this process serves, if one has been installed.
 #[must_use]
 pub fn served() -> Option<&'static ArchitectureGraph> {
-    SERVED_GRAPH.get()
+    SERVED_GRAPH.get().map(|served| &served.graph)
+}
+
+/// The pre-serialized bytes of [`served`], if one has been installed.
+pub(crate) fn served_json() -> Option<&'static [u8]> {
+    SERVED_GRAPH.get().map(|served| served.json.as_slice())
 }
 
 // ── Descriptors published by the macros ──────────────────────────────

@@ -39,7 +39,8 @@ struct Declared {
     kind: DeclKind,
     /// Handler / struct / trait name.
     name: String,
-    /// Module path, derived from the file's location under `src/`.
+    /// Module path: the file's location under `src/`, plus any enclosing
+    /// inline `mod` blocks.
     module: String,
 }
 
@@ -103,6 +104,26 @@ fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The name of an inline `mod` a line opens, when it opens one.
+///
+/// A `mod foo;` declaration is not one — the walk visits that file itself. An
+/// inline module IS part of the `module_path!()` a graph node reports but is
+/// not part of the file's path, so the census has to track it or an element
+/// declared inside one reads as absent from the graph when it is only named
+/// differently.
+fn inline_module_name(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let rest = trimmed
+        .strip_prefix("pub mod ")
+        .or_else(|| trimmed.strip_prefix("pub(crate) mod "))
+        .or_else(|| trimmed.strip_prefix("mod "))?;
+    let split = rest
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(rest.len());
+    let (name, tail) = rest.split_at(split);
+    (!name.is_empty() && tail.trim_start().starts_with('{')).then(|| name.to_owned())
+}
+
 /// The attribute name a line opens with, when the line *is* an attribute.
 ///
 /// Only lines whose trimmed form starts with `#[` are considered, so the
@@ -141,13 +162,34 @@ fn census() -> BTreeSet<Declared> {
 
     let mut found = BTreeSet::new();
     for file in files {
-        let module = module_path_of(&file, &src);
+        let file_module = module_path_of(&file, &src);
         let text = std::fs::read_to_string(&file).expect("source must be readable");
         let lines: Vec<&str> = text.lines().collect();
+        let mut open_mods: Vec<(usize, String)> = Vec::new();
+        let mut depth: usize = 0;
         for (i, line) in lines.iter().enumerate() {
+            let opening = inline_module_name(line);
+            if let Some(name) = opening {
+                open_mods.push((depth, name));
+            }
+            let opened = line.matches('{').count();
+            let closed = line.matches('}').count();
+            depth = (depth + opened).saturating_sub(closed);
+            while open_mods.last().is_some_and(|(at, _)| depth <= *at) {
+                open_mods.pop();
+            }
+            let module = std::iter::once(file_module.clone())
+                .chain(open_mods.iter().map(|(_, name)| name.clone()))
+                .collect::<Vec<_>>()
+                .join("::");
             let Some(attr) = attribute_name(line) else {
                 continue;
             };
+            // A declaration the build compiles out has no node, so censusing it
+            // would fail the gate for an element that correctly does not exist.
+            if i > 0 && lines[i - 1].trim_start().starts_with("#[cfg(") {
+                continue;
+            }
             let kind = if ROUTE_ATTRS.contains(&attr) {
                 DeclKind::Route
             } else if attr == "model" {
@@ -174,11 +216,7 @@ fn census() -> BTreeSet<Declared> {
                     i + 1
                 );
             };
-            found.insert(Declared {
-                kind,
-                name,
-                module: module.clone(),
-            });
+            found.insert(Declared { kind, name, module });
         }
     }
     found
@@ -242,9 +280,11 @@ fn the_census_finds_the_elements_this_app_is_known_to_declare() {
     assert_eq!(count(DeclKind::Model), 4, "{found:#?}");
     assert_eq!(count(DeclKind::Repository), 3, "{found:#?}");
     assert_eq!(count(DeclKind::Job), 4, "{found:#?}");
-    assert!(
-        count(DeclKind::Route) >= 39,
-        "the app declares at least 39 routes: {found:#?}"
+    assert_eq!(
+        count(DeclKind::Route),
+        39,
+        "an exact count, so a census regression that stops seeing routes fails here rather \
+         than sliding under a lower bound: {found:#?}"
     );
 }
 
@@ -302,17 +342,19 @@ fn ws_routes_are_named_as_unmodelled_rather_than_dropped() {
 /// repository plus `show_by_id`, which queries `posts::table` directly),
 /// `routes/subreddits.rs::show` counts posts for a community, and both vote
 /// routes hold `PgPostRepository`.
+/// Node ids, not bare handler names: two of these are called `show`, and a
+/// swap between them would be invisible to a name-only comparison.
 const POSTS_ROUTE_GROUND_TRUTH: &[&str] = &[
-    "delete_post",
-    "downvote",
-    "front_page",
-    "manage_tags",
-    "show", // routes::posts::show
-    "show", // routes::subreddits::show
-    "show_by_id",
-    "submit",
-    "update",
-    "upvote",
+    "route:reddit_clone::routes::posts::delete_post",
+    "route:reddit_clone::routes::posts::front_page",
+    "route:reddit_clone::routes::posts::manage_tags",
+    "route:reddit_clone::routes::posts::show",
+    "route:reddit_clone::routes::posts::show_by_id",
+    "route:reddit_clone::routes::posts::submit",
+    "route:reddit_clone::routes::posts::update",
+    "route:reddit_clone::routes::subreddits::show",
+    "route:reddit_clone::routes::votes::downvote",
+    "route:reddit_clone::routes::votes::upvote",
 ];
 
 /// Hand-verified ground truth: the background work that touches `posts`.
@@ -330,7 +372,7 @@ fn impact_of_the_post_model_has_total_recall() {
         .routes
         .iter()
         .filter(|n| n.route.as_ref().is_some_and(|r| r.generated_by.is_none()))
-        .map(|n| n.name.clone())
+        .map(|n| n.id.clone())
         .collect();
     handlers.sort();
     assert_eq!(

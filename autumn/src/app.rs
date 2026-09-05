@@ -4376,6 +4376,22 @@ impl AppBuilder {
         // Web and combined roles build the full application router. All the
         // route/router-context inputs assembled above are simply dropped in the
         // worker branch.
+        // Publish the architecture graph this process serves (#1747) before the
+        // router is built, so `/actuator/graph` answers from the first request
+        // rather than after some later warm-up. This is the *serving* path —
+        // the static-build and capsule-replay paths publish their own below.
+        // `graph_installed_before_every_router_build` pins all three, because a
+        // graph installed on only some of them is an endpoint that answers 503
+        // in production while every unit test passes.
+        crate::graph::install(crate::graph::manifest::audit(
+            &graph_mounted_routes(&all_routes, &scoped_groups),
+            omitted_router_count(
+                merge_routers.len(),
+                nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
+                &declared_routes,
+            ),
+        ));
+
         let router_build = if role.serves_http() {
             crate::router::try_build_router_with_static_inner(
                 all_routes,
@@ -5951,10 +5967,13 @@ impl AppBuilder {
         // Publish the architecture graph this process serves (#1747) before the
         // router is built, so `/actuator/graph` can answer from the first
         // request rather than after some later warm-up.
-        crate::graph::install(crate::graph::manifest::audit(&graph_mounted_routes(
-            &all_routes,
-            &scoped_groups,
-        )));
+        crate::graph::install(crate::graph::manifest::audit(
+            &graph_mounted_routes(&all_routes, &scoped_groups),
+            // The static-build path builds its router with no nest mounts and
+            // no declared plugin routes (see the `RouterContext` below), so the
+            // merge count is the whole opaque surface here.
+            omitted_router_count(merge_routers.len(), std::iter::empty::<&str>(), &[]),
+        ));
         let router = crate::router::try_build_router_inner(
             all_routes,
             &config,
@@ -6087,6 +6106,31 @@ impl AppBuilder {
         crate::managed_pg::emergency_stop_async().await;
     }
 
+    /// Dump the application's architecture graph as JSON and exit.
+    ///
+    /// Triggered when `AUTUMN_DUMP_GRAPH=1` is set (by `autumn graph`).
+    /// Does not connect to a database or bind a TCP port.
+    fn run_dump_graph_mode(&self) {
+        let mounted = graph_mounted_routes(&self.routes, &self.scoped_groups);
+        crate::graph::manifest::print_manifest_dump(&crate::graph::manifest::audit(
+            &mounted,
+            self.graph_opaque_router_count(),
+        ));
+    }
+
+    /// Raw `merge`/`nest` routers whose endpoints the graph cannot enumerate.
+    ///
+    /// The same count `autumn routes audit` hard-fails its coverage gate on
+    /// (`omitted_router_count`), so the graph and the route audit cannot
+    /// disagree about how much of the served surface is opaque.
+    fn graph_opaque_router_count(&self) -> usize {
+        omitted_router_count(
+            self.merge_routers.len(),
+            self.nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
+            &self.declared_routes,
+        )
+    }
+
     /// Dump the agent-authority manifest as one marker-prefixed JSON line and
     /// exit.
     ///
@@ -6094,15 +6138,6 @@ impl AppBuilder {
     /// manifest`). Takes `&self` rather than consuming the builder: it reads
     /// the route table and the audit-sink status and touches nothing else, so
     /// there is no database to open and no port to bind.
-    /// Dump the application's architecture graph as JSON and exit.
-    ///
-    /// Triggered when `AUTUMN_DUMP_GRAPH=1` is set (by `autumn graph`).
-    /// Does not connect to a database or bind a TCP port.
-    fn run_dump_graph_mode(&self) {
-        let mounted = graph_mounted_routes(&self.routes, &self.scoped_groups);
-        crate::graph::manifest::print_manifest_dump(&crate::graph::manifest::audit(&mounted));
-    }
-
     fn run_dump_agent_authority_mode(&self) {
         // Whether agent invocations have anywhere to be recorded is a property
         // of the deployment, not of any grant, and it belongs in the document
@@ -7456,10 +7491,14 @@ impl AppBuilder {
         let router_state = state.clone();
         // See the matching call in `run()`: the graph is published before the
         // router is built so `/actuator/graph` answers from the first request.
-        crate::graph::install(crate::graph::manifest::audit(&graph_mounted_routes(
-            &routes,
-            &scoped_groups,
-        )));
+        crate::graph::install(crate::graph::manifest::audit(
+            &graph_mounted_routes(&routes, &scoped_groups),
+            omitted_router_count(
+                merge_routers.len(),
+                nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
+                &declared_routes,
+            ),
+        ));
         let router = crate::router::try_build_router_inner(
             routes,
             &config,
@@ -7572,20 +7611,6 @@ pub(crate) fn is_dump_jobs_mode() -> bool {
     std::env::var("AUTUMN_DUMP_JOBS").as_deref() == Ok("1")
 }
 
-/// The slice of a [`Route`] the agent-authority manifest needs (#1691).
-///
-/// Built here rather than in `agent_authority::manifest` so that module needs
-/// no dependency on the router, and unconditionally rather than behind the
-/// `openapi` feature: which handlers an agent can reach is not an
-/// documentation concern.
-///
-/// `expose_all` is the app's whole-API MCP hatch. It has to be threaded in:
-/// deriving tool-ness from `#[api_doc(mcp)]` alone made every route
-/// `expose_all_as_mcp()` swept up invisible to this document — in neither
-/// `actions` nor `ungoverned_tools` — while the document's own `excluded`
-/// section claimed they surfaced there (#1691 P2-6). The same call also
-/// applies the JSON-out eligibility gate, so an HTML route someone tagged
-/// `#[api_doc(mcp)]` is no longer reported as a tool it will never become.
 /// The mounted-route table the architecture graph joins against (issue #1747).
 ///
 /// Top-level routes carry their own path; a scoped group's children do not --
@@ -7654,6 +7679,20 @@ fn graph_route_summary(route: &Route, scope_prefix: Option<&str>) -> crate::grap
     }
 }
 
+/// The slice of a [`Route`] the agent-authority manifest needs (#1691).
+///
+/// Built here rather than in `agent_authority::manifest` so that module needs
+/// no dependency on the router, and unconditionally rather than behind the
+/// `openapi` feature: which handlers an agent can reach is not an
+/// documentation concern.
+///
+/// `expose_all` is the app's whole-API MCP hatch. It has to be threaded in:
+/// deriving tool-ness from `#[api_doc(mcp)]` alone made every route
+/// `expose_all_as_mcp()` swept up invisible to this document — in neither
+/// `actions` nor `ungoverned_tools` — while the document's own `excluded`
+/// section claimed they surfaced there (#1691 P2-6). The same call also
+/// applies the JSON-out eligibility gate, so an HTML route someone tagged
+/// `#[api_doc(mcp)]` is no longer reported as a tool it will never become.
 fn agent_authority_route_summary(
     route: &Route,
     scope_prefix: Option<&str>,
@@ -13882,6 +13921,65 @@ mod tests {
             state_initializer < router_build,
             "static builds must install state-initialized resources before rendering routes"
         );
+    }
+
+    #[test]
+    fn graph_installed_before_every_router_build() {
+        // The architecture graph (#1747) is published by whichever path is
+        // about to build a router, and `/actuator/graph` answers from what was
+        // published. Codex round 1 found the install wired into the
+        // static-build and capsule-replay paths but NOT into `run()` — so every
+        // unit test passed while a normally running app answered 503 forever.
+        // A structural assertion, because the serving path ends in `serve()`
+        // and cannot be driven from a unit test.
+        let whole = include_str!("app.rs").replace("\r\n", "\n");
+        // Only the non-test source: this test names both strings itself.
+        let source = whole
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map_or(whole.as_str(), |(before, _)| before)
+            .to_owned();
+        let builds: Vec<usize> = source
+            .match_indices("crate::router::try_build_router")
+            .map(|(i, _)| i)
+            // Skip doc-comment and test references; only real call sites are
+            // followed by an open paren on the same expression.
+            .filter(|i| source[*i..].starts_with("crate::router::try_build_router"))
+            .filter(|i| {
+                let tail = &source[*i..*i + 80];
+                tail.contains("_inner(") || tail.contains("_with_static_inner(")
+            })
+            .collect();
+        assert!(
+            builds.len() >= 3,
+            "expected the serving, static-build and replay router builds: {}",
+            builds.len()
+        );
+        let installs: Vec<usize> = source
+            .match_indices("crate::graph::install(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            installs.len(),
+            3,
+            "every path that builds an application router must publish the graph \
+             it is about to serve"
+        );
+        // Each install precedes a router build with no other install between.
+        for install in &installs {
+            assert!(
+                builds.iter().any(|build| build > install),
+                "an install with no router build after it is dead code"
+            );
+        }
+        for build in &builds {
+            // A probe-only router (worker role) serves the actuator too, but it
+            // is built inside the same `run()` block the serving install covers.
+            assert!(
+                installs.iter().any(|install| install < build),
+                "a router built with no graph published before it answers 503 at \
+                 /actuator/graph"
+            );
+        }
     }
 
     #[test]

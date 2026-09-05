@@ -21,36 +21,52 @@
 use proc_macro2::{Ident, Spacing, TokenStream, TokenTree};
 use quote::quote;
 
-/// SQL keywords that mark a string literal as worth scanning for table names.
+/// SQL statement shapes a string literal must match to be scanned for table
+/// names.
 ///
-/// The gate exists so a `maud` template's prose is not swept in: only literals
-/// that read as SQL contribute identifiers.
-const SQL_KEYWORDS: &[&str] = &[
-    "SELECT", "INSERT", "UPDATE", "DELETE", "FROM", "JOIN", "INTO", "TRUNCATE",
+/// A *shape*, not a keyword, because `FROM`, `INTO`, `JOIN`, `DELETE` and
+/// `UPDATE` are ordinary English words. `hx-confirm="Delete this post? This
+/// cannot be undone."` and `"… for auto-slug generation and logging on post
+/// create/update"` are both real literals in this workspace's example app, and
+/// a bare keyword test opens the whole string to the scan — minting table edges
+/// for a page that touches no database and, worse, reporting a read-only job as
+/// a writer, because mutation evidence is a *claim* rather than a superset.
+///
+/// Each entry is `(leading verb, required companion, mutating)`. The literal
+/// must start with the verb and also carry the companion — which no prose in
+/// the example app does, and every real statement does.
+const SQL_SHAPES: &[(&str, &str, bool)] = &[
+    ("SELECT", "FROM", false),
+    ("WITH", "SELECT", false),
+    ("INSERT", "INTO", true),
+    ("UPDATE", "SET", true),
+    ("DELETE", "FROM", true),
+    ("TRUNCATE", "TABLE", true),
 ];
-
-/// SQL keywords that mark a literal as a mutation.
-const SQL_MUTATIONS: &[&str] = &["INSERT", "UPDATE", "DELETE", "TRUNCATE"];
 
 /// Identifiers that are evidence the item mutates something.
 ///
-/// Names, not types — the same "provable subset" reading as
-/// `RouteInfo::pools`. A handler that mutates through a helper in another
-/// module reads as a read here, which is why `Access` is documented as the
-/// declared intent rather than an executed statement.
+/// Two tiers, because the obvious names are not the framework's. `insert`,
+/// `create`, `update` and `delete` are ubiquitous on `HashMap`, `Vec`, caches
+/// and metrics, and `maud`'s `hx-delete=(…)` lexes the bare ident `delete` into
+/// a read-only page — so those count only when written as a qualified path
+/// (`diesel::update`, `diesel::delete`), which is how the query builder is
+/// actually called. The unambiguous names count anywhere.
+///
+/// Under-claiming is the safe direction — the same reading `RouteInfo::pools`
+/// carries. This decides an edge's `access`, never whether the edge exists.
 const MUTATION_IDENTS: &[&str] = &[
-    "create",
     "create_many",
-    "delete",
     "delete_by_id",
     "delete_from",
-    "insert",
     "insert_into",
     "save",
-    "update",
     "update_by_id",
     "upsert",
 ];
+
+/// Mutation names that count only when written as a qualified path.
+const QUALIFIED_MUTATION_IDENTS: &[&str] = &["create", "delete", "insert", "update"];
 
 /// Flatten a token stream into a single list, descending into every group.
 ///
@@ -85,6 +101,24 @@ fn is_type_shaped(ident: &Ident) -> bool {
         .is_some_and(|c| c.is_ascii_uppercase())
 }
 
+/// The text a string literal carries, with its source sigils removed.
+///
+/// `Literal::to_string()` hands back the *source* form, so a raw string still
+/// wears its `r#"…"#` and a byte string its `b`. Left in place they contribute
+/// the candidate symbols `r` and `b`, and escape sequences leak `n`/`t`/`u`.
+fn literal_text(literal: &str) -> String {
+    let trimmed = literal.trim_start_matches(['b', 'r', 'c']);
+    let hashes = trimmed.len() - trimmed.trim_start_matches('#').len();
+    let closing = format!("\"{}", "#".repeat(hashes));
+    let inner = trimmed
+        .trim_start_matches('#')
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix(&closing))
+        .unwrap_or(trimmed);
+    // Escapes are neutralised rather than decoded, so `\n` cannot contribute `n`.
+    inner.replace('\\', " ")
+}
+
 /// Identifier-shaped words inside a string literal.
 fn sql_words(literal: &str) -> Vec<String> {
     let mut words = Vec::new();
@@ -99,23 +133,32 @@ fn sql_words(literal: &str) -> Vec<String> {
     if !current.is_empty() {
         words.push(current);
     }
+    // A bare number is never a table name, and a statement's literals would
+    // otherwise contribute a handful of them.
+    words.retain(|word| !word.chars().all(|c| c.is_ascii_digit()));
     words
 }
 
-/// Whether a literal contains any of `keywords` as a whole word.
+/// The SQL statement shape a literal matches, if any; `true` when it mutates.
 ///
-/// Word-boundary aware, so `"your selection of posts"` does not read as a
-/// `SELECT` and pull prose into the SQL scan.
-fn contains_sql_keyword(literal: &str, keywords: &[&str]) -> bool {
-    literal
-        .to_ascii_uppercase()
+/// Word-boundary aware in both directions, so `"selection"` is not a `SELECT`
+/// and `"Delete this post?"` is not a `DELETE` — it carries no `FROM`.
+fn sql_shape(literal: &str) -> Option<bool> {
+    let text = literal_text(literal).to_ascii_uppercase();
+    let mut words = text
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .any(|word| keywords.contains(&word))
+        .filter(|w| !w.is_empty());
+    let first = words.next()?;
+    let rest: Vec<&str> = words.collect();
+    SQL_SHAPES
+        .iter()
+        .find(|(verb, companion, _)| first == *verb && rest.contains(companion))
+        .map(|(_, _, mutating)| *mutating)
 }
 
-/// Whether a string literal reads as SQL.
+/// Whether a string literal reads as a SQL statement.
 fn looks_like_sql(literal: &str) -> bool {
-    contains_sql_keyword(literal, SQL_KEYWORDS)
+    sql_shape(literal).is_some()
 }
 
 /// Candidate names read off a token stream.
@@ -128,21 +171,25 @@ fn looks_like_sql(literal: &str) -> bool {
 pub fn candidate_symbols(stream: &TokenStream) -> Vec<String> {
     let mut tokens = Vec::new();
     flatten(stream, &mut tokens);
+    symbols_of(&tokens)
+}
 
+/// [`candidate_symbols`] over an already-flattened stream.
+fn symbols_of(tokens: &[TokenTree]) -> Vec<String> {
     let mut symbols: Vec<String> = Vec::new();
     for (i, tree) in tokens.iter().enumerate() {
         match tree {
             TokenTree::Ident(ident) => {
-                let followed = is_path_sep(&tokens, i + 1);
-                let preceded = i >= 2 && is_path_sep(&tokens, i - 2);
+                let followed = is_path_sep(tokens, i + 1);
+                let preceded = i >= 2 && is_path_sep(tokens, i - 2);
                 if followed || preceded || is_type_shaped(ident) {
                     symbols.push(ident.to_string());
                 }
             }
             TokenTree::Literal(literal) => {
-                let text = literal.to_string();
-                if looks_like_sql(&text) {
-                    symbols.extend(sql_words(&text));
+                let source = literal.to_string();
+                if looks_like_sql(&source) {
+                    symbols.extend(sql_words(&literal_text(&source)));
                 }
             }
             TokenTree::Punct(_) | TokenTree::Group(_) => {}
@@ -166,20 +213,23 @@ pub fn signature_symbols(sig: &syn::Signature) -> Vec<String> {
     candidate_symbols(&stream)
 }
 
-/// Whether a token stream carries evidence that the item mutates something.
-#[must_use]
-pub fn is_mutating(stream: &TokenStream) -> bool {
-    let mut tokens = Vec::new();
-    flatten(stream, &mut tokens);
-    tokens.iter().any(|tree| match tree {
+/// Whether an already-flattened token stream carries evidence that the item
+/// mutates something.
+///
+/// Takes the flattened form so a caller that needs both the symbols and this
+/// answer pays for one walk. See [`MUTATION_IDENTS`] for why the ambiguous
+/// names require a qualified path, and [`SQL_SHAPES`] for why a literal must
+/// read as a statement.
+fn mutates(tokens: &[TokenTree]) -> bool {
+    tokens.iter().enumerate().any(|(i, tree)| match tree {
         TokenTree::Ident(ident) => {
             let name = ident.to_string();
-            MUTATION_IDENTS.binary_search(&name.as_str()).is_ok()
+            MUTATION_IDENTS.contains(&name.as_str())
+                || (QUALIFIED_MUTATION_IDENTS.contains(&name.as_str())
+                    && i >= 2
+                    && is_path_sep(tokens, i - 2))
         }
-        TokenTree::Literal(literal) => {
-            let text = literal.to_string();
-            looks_like_sql(&text) && contains_sql_keyword(&text, SQL_MUTATIONS)
-        }
+        TokenTree::Literal(literal) => sql_shape(&literal.to_string()) == Some(true),
         TokenTree::Punct(_) | TokenTree::Group(_) => false,
     })
 }
@@ -236,8 +286,12 @@ pub fn emit_job_descriptor(
     let signature = emit_symbol_slice(&signature_symbols(&input_fn.sig));
     let block = &input_fn.block;
     let body_tokens = quote! { #block };
-    let body = emit_symbol_slice(&candidate_symbols(&body_tokens));
-    let mutating = is_mutating(&body_tokens);
+    // One walk for both answers: the symbols and the mutation evidence come
+    // from the same flattened stream.
+    let mut flat = Vec::new();
+    flatten(&body_tokens, &mut flat);
+    let body = emit_symbol_slice(&symbols_of(&flat));
+    let mutating = mutates(&flat);
     let handler = input_fn.sig.ident.to_string();
     let kind_ident = syn::Ident::new(kind, proc_macro2::Span::call_site());
     quote! {
@@ -263,11 +317,73 @@ mod tests {
     use super::*;
     use quote::quote;
 
+    /// [`mutates`] from a token stream, which is how every test spells it.
+    fn is_mutating(stream: &TokenStream) -> bool {
+        let mut tokens = Vec::new();
+        flatten(stream, &mut tokens);
+        mutates(&tokens)
+    }
+
     #[test]
-    fn mutation_idents_are_sorted_for_the_binary_search() {
-        let mut sorted = MUTATION_IDENTS.to_vec();
-        sorted.sort_unstable();
-        assert_eq!(MUTATION_IDENTS, sorted.as_slice());
+    fn ui_copy_that_reads_like_sql_is_not_scanned() {
+        // Both of these are real literals in `examples/reddit-clone`. A bare
+        // keyword test made `about` — a static page that touches no database —
+        // claim edges to `post`, `create`, `update` and `delete`.
+        for prose in [
+            " for auto-slug generation and logging on post create/update",
+            "Delete this post? This cannot be undone.",
+            "{n} new posts from your subreddits",
+        ] {
+            let symbols = candidate_symbols(&quote! { let msg = #prose; });
+            assert!(
+                !symbols.iter().any(|s| s == "posts" || s == "post"),
+                "prose must not open the SQL scan ({prose:?}): {symbols:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ui_copy_that_reads_like_sql_is_not_mutation_evidence() {
+        assert!(
+            !is_mutating(&quote! { let label = "Delete this post? This cannot be undone."; }),
+            "a page that renders the word Delete is not a writer"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_mutation_name_counts_only_as_a_qualified_path() {
+        assert!(
+            !is_mutating(&quote! { vars.insert("name", user.name) }),
+            "`HashMap::insert` is not a database write"
+        );
+        assert!(
+            !is_mutating(&quote! { div hx-delete=(paths::delete_post(&slug)) }),
+            "maud lexes `hx-delete` into a bare `delete` ident"
+        );
+        assert!(
+            is_mutating(&quote! { diesel::update(posts::table).set(x.eq(1)) }),
+            "the query builder is called as a qualified path"
+        );
+        assert!(is_mutating(&quote! { diesel::delete(posts::table) }));
+    }
+
+    #[test]
+    fn a_raw_string_contributes_no_sigil_symbols() {
+        let symbols = candidate_symbols(&quote! { sql_query(r#"SELECT id FROM posts"#) });
+        assert!(symbols.contains(&"posts".to_owned()), "{symbols:?}");
+        assert!(!symbols.contains(&"r".to_owned()), "{symbols:?}");
+    }
+
+    #[test]
+    fn numbers_inside_a_statement_are_not_candidates() {
+        let symbols = candidate_symbols(&quote! {
+            sql_query("UPDATE posts SET hot_rank = 3600 / 1.5")
+        });
+        assert!(symbols.contains(&"posts".to_owned()), "{symbols:?}");
+        assert!(
+            !symbols.iter().any(|s| s == "3600" || s == "1"),
+            "{symbols:?}"
+        );
     }
 
     #[test]
@@ -386,6 +502,12 @@ mod tests {
     fn mutation_is_detected_from_a_diesel_call() {
         assert!(is_mutating(&quote! { diesel::insert_into(posts::table) }));
         assert!(is_mutating(&quote! { repo.delete_by_id(id).await }));
+    }
+
+    #[test]
+    fn a_statement_verb_without_its_companion_is_not_sql() {
+        assert!(!looks_like_sql("\"Delete this post?\""));
+        assert!(looks_like_sql("\"DELETE FROM posts WHERE id = $1\""));
     }
 
     #[test]

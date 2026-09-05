@@ -43,10 +43,17 @@ pub const LIMITS: &[&str] = &[
      and a model whose name matches a common type is linked wherever that name appears.",
     "Raw SQL is matched by identifier, and only inside string literals that contain a SQL \
      keyword; SQL assembled at runtime from fragments is invisible.",
+    "A router mounted with `merge`/`nest` is opaque: its endpoints cannot be enumerated at all, \
+     so `completeness.opaque_mounted_routers` counts them rather than naming them.",
     "A model's declared relations (`#[votable]`, `#[commentable]`) are attributed to its \
      repository as a whole, because that is where the generated methods live — so a route \
      holding the repository is reported as reaching the edge table whether or not it calls \
-     them.",
+     them. The edge exists only when some `#[model]` maps that table; `#[commentable]`'s \
+     shared comments table in an app with no comment model is a relation with nothing to \
+     point at.",
+    "Only the item's own tokens are read, so a module-level `use crate::schema::posts::dsl::*` \
+     followed by a bare `posts.filter(…)` in the body names no candidate and produces no edge. \
+     Write the table module (`posts::table`) or the model in the handler to be linked.",
     "A route's access is its declared HTTP method (safe methods read, everything else writes); a \
      job's is whether its tokens carry mutation evidence. Either way it is the declared intent, \
      not an executed statement.",
@@ -72,6 +79,14 @@ pub struct RouteFacts {
     /// A route the app never mounted has no resolved posture to state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<RouteAuth>,
+    /// Further mounted paths for the same handler, sorted.
+    ///
+    /// A handler passed to more than one `routes![]` list — a top-level one and
+    /// a scoped group, say — is served at every one of them. Recording only the
+    /// first would report the rest as mounts with no declaration, sending a
+    /// reader hunting for a handler that is right there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_mounted_at: Vec<String>,
     /// The repository that generated this route, for a `#[repository(api =
     /// "...")]` auto-API mount that no `#[route]` declares.
     ///
@@ -199,6 +214,17 @@ pub struct Completeness {
     /// a `#[route]` declaration.
     #[serde(default)]
     pub generated_routes: usize,
+    /// Raw routers mounted with `merge`/`nest` whose endpoints this graph
+    /// cannot enumerate at all.
+    ///
+    /// An opaque router exposes no API to list its routes, so — unlike
+    /// [`Self::unmodelled_mounted_routes`] — the paths behind it cannot be
+    /// *named*, only counted. Carrying the count is what stops the document
+    /// from reading as a complete account of the served surface when it is
+    /// not: it is the same count `autumn routes audit` hard-fails its
+    /// coverage gate on.
+    #[serde(default)]
+    pub opaque_mounted_routers: usize,
     /// Node ids of declared routes that no `routes![]` list mounts, sorted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmounted_routes: Vec<String>,
@@ -267,6 +293,13 @@ impl ArchitectureGraph {
         );
         if c.generated_routes > 0 {
             let _ = writeln!(out, "  {} repository auto-API route(s)", c.generated_routes);
+        }
+        if c.opaque_mounted_routers > 0 {
+            let _ = writeln!(
+                out,
+                "  {} mounted router(s) this graph cannot enumerate (raw merge/nest)",
+                c.opaque_mounted_routers
+            );
         }
 
         for kind in [
@@ -349,9 +382,20 @@ fn job_id(module_path: &str, handler: &str) -> String {
     format!("job:{module_path}::{handler}")
 }
 
-/// A `file:line` location string.
+/// A `file:line` location string, with a dependency's registry path shortened.
+///
+/// `file!()` for an element declared in a non-path dependency is the absolute
+/// checkout path — `/home/<user>/.cargo/registry/src/index.crates.io-<hash>/
+/// plugin-0.1.0/src/routes.rs`. Left whole it puts the build machine's username
+/// and layout into a document served over HTTP, and makes the committed graph
+/// differ between two developers for reasons that have nothing to do with the
+/// app. The crate-relative tail is the part that identifies anything.
 fn location(file: &str, line: u32) -> String {
-    format!("{file}:{line}")
+    let normalized = file
+        .split_once("/registry/src/")
+        .and_then(|(_, tail)| tail.split_once('/'))
+        .map_or(file, |(_, crate_relative)| crate_relative);
+    format!("{normalized}:{line}")
 }
 
 /// The access a declared HTTP method states.
@@ -362,6 +406,14 @@ fn method_access(method: &str) -> Access {
         Access::Write
     }
 }
+
+/// The HTTP methods a `#[repository(api = "...")]` CRUD surface mounts.
+///
+/// The prefix alone is not enough to claim a route: a `#[ws]` handler mounted
+/// under the same prefix is in the route table and has no `#[route]`
+/// descriptor, and attributing it would report a read-only socket as a REST
+/// endpoint that writes the table.
+const AUTO_API_METHODS: &[&str] = &["DELETE", "GET", "PATCH", "POST", "PUT"];
 
 /// Whether `path` is served by the auto-API mounted at `prefix`.
 ///
@@ -455,6 +507,7 @@ fn resolve_edges(
 #[must_use]
 pub fn build(
     mounted: &[MountedRoute],
+    opaque_mounted_routers: usize,
     routes: &[RouteGraphDescriptor],
     models: &[ModelGraphDescriptor],
     repositories: &[RepositoryGraphDescriptor],
@@ -549,17 +602,29 @@ pub fn build(
     let mut matched_mounted: BTreeSet<(String, String)> = BTreeSet::new();
     for route in routes {
         let id = route_id(route.module_path, route.handler);
-        let hit = mounted.iter().find(|m| {
-            m.handler == route.handler
-                && m.module_path == route.module_path
-                && m.method.eq_ignore_ascii_case(route.method)
-        });
-        if let Some(m) = hit {
-            mounted_count += 1;
-            matched_mounted.insert((m.method.clone(), m.path.clone()));
-        } else {
+        // Every mount of this handler, not just the first: a handler passed to
+        // both a top-level `routes![]` and a scoped group is served at both,
+        // and claiming only one leaves the other looking undeclared.
+        let hits: Vec<&MountedRoute> = mounted
+            .iter()
+            .filter(|m| {
+                m.handler == route.handler
+                    && m.module_path == route.module_path
+                    && m.method.eq_ignore_ascii_case(route.method)
+            })
+            .collect();
+        if hits.is_empty() {
             unmounted.push(id.clone());
+        } else {
+            mounted_count += 1;
+            for m in &hits {
+                matched_mounted.insert((m.method.clone(), m.path.clone()));
+            }
         }
+        let mut paths: Vec<String> = hits.iter().map(|m| m.path.clone()).collect();
+        paths.sort();
+        paths.dedup();
+        let hit = hits.first().copied();
         // A route's access is read off its *declared method*, and not off any
         // mutation evidence in its tokens. A page that renders `hx-delete=(…)`
         // on a link names `delete` in its body while being a read-only GET, and
@@ -581,7 +646,13 @@ pub fn build(
                 location: location(route.file, route.line),
                 route: Some(RouteFacts {
                     method: route.method.to_owned(),
-                    path: hit.map_or_else(|| route.path.to_owned(), |m| m.path.clone()),
+                    // Sorted, so which mount is "the" path does not depend on
+                    // registration order; the rest are carried alongside.
+                    path: paths
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| route.path.to_owned()),
+                    also_mounted_at: paths.iter().skip(1).cloned().collect(),
                     mounted: hit.is_some(),
                     auth: hit.map(|m| m.auth.clone()),
                     generated_by: None,
@@ -651,9 +722,22 @@ pub fn build(
         if matched_mounted.contains(&(route.method.clone(), route.path.clone())) {
             continue;
         }
+        // The *longest* matching prefix owns the route, and ties break on the
+        // repository's node id. Taking the first match would make attribution
+        // depend on link order when one auto-API is mounted under another's
+        // prefix, which `--check` would then report as phantom drift.
         let owner = repositories
             .iter()
-            .find(|repo| is_under_api_prefix(&route.path, repo.api));
+            .filter(|repo| {
+                AUTO_API_METHODS.contains(&route.method.to_ascii_uppercase().as_str())
+                    && is_under_api_prefix(&route.path, repo.api)
+            })
+            .max_by_key(|repo| {
+                (
+                    repo.api.len(),
+                    std::cmp::Reverse(repository_id(repo.module_path, repo.repository)),
+                )
+            });
         let Some(repo) = owner else {
             unmodelled.insert(format!("{} {}", route.method, route.path));
             continue;
@@ -673,6 +757,7 @@ pub fn build(
                 route: Some(RouteFacts {
                     method: route.method.clone(),
                     path: route.path.clone(),
+                    also_mounted_at: Vec::new(),
                     mounted: true,
                     auth: Some(route.auth.clone()),
                     generated_by: Some(repo.repository.to_owned()),
@@ -707,6 +792,7 @@ pub fn build(
             repositories: repositories.len(),
             jobs: jobs.len(),
             generated_routes,
+            opaque_mounted_routers,
             unmounted_routes: unmounted,
             unmodelled_mounted_routes: unmodelled,
         },
@@ -718,7 +804,7 @@ pub fn build(
 
 /// Assemble the graph from this binary's link-time registrations.
 #[must_use]
-pub fn audit(mounted: &[MountedRoute]) -> ArchitectureGraph {
+pub fn audit(mounted: &[MountedRoute], opaque_mounted_routers: usize) -> ArchitectureGraph {
     let routes: Vec<RouteGraphDescriptor> = inventory::iter::<RouteGraphDescriptor>
         .into_iter()
         .copied()
@@ -735,7 +821,14 @@ pub fn audit(mounted: &[MountedRoute]) -> ArchitectureGraph {
         .into_iter()
         .copied()
         .collect();
-    build(mounted, &routes, &models, &repositories, &jobs)
+    build(
+        mounted,
+        opaque_mounted_routers,
+        &routes,
+        &models,
+        &repositories,
+        &jobs,
+    )
 }
 
 // ── Dump-mode protocol ───────────────────────────────────────────────
@@ -870,6 +963,7 @@ mod tests {
     fn every_declared_element_becomes_a_node() {
         let graph = build(
             &[],
+            0,
             &[route("index", "GET", "/posts", &[], &[])],
             &[model("Post", "app::models::Post", "posts")],
             &[repository(
@@ -895,6 +989,7 @@ mod tests {
     fn a_repository_declares_its_model_edge() {
         let graph = build(
             &[],
+            0,
             &[],
             &[model("Post", "app::models::Post", "posts")],
             &[repository(
@@ -918,6 +1013,7 @@ mod tests {
     fn a_repository_extractor_links_the_route_to_the_repository() {
         let graph = build(
             &[],
+            0,
             &[route(
                 "show",
                 "GET",
@@ -947,6 +1043,7 @@ mod tests {
     fn a_table_module_named_in_the_body_links_the_route_to_the_model() {
         let graph = build(
             &[],
+            0,
             &[route("show", "GET", "/posts/{id}", &[], &["posts"])],
             &[model("Post", "app::models::Post", "posts")],
             &[],
@@ -965,6 +1062,7 @@ mod tests {
     fn a_non_safe_method_makes_the_edge_a_write() {
         let graph = build(
             &[],
+            0,
             &[route("create", "POST", "/posts", &[], &["posts"])],
             &[model("Post", "app::models::Post", "posts")],
             &[],
@@ -977,6 +1075,7 @@ mod tests {
     fn a_signature_edge_outranks_a_body_edge_for_the_same_pair() {
         let graph = build(
             &[],
+            0,
             &[route(
                 "show",
                 "GET",
@@ -1001,6 +1100,7 @@ mod tests {
     fn a_job_that_names_a_table_gets_a_model_edge() {
         let graph = build(
             &[],
+            0,
             &[],
             &[model("Post", "app::models::Post", "posts")],
             &[],
@@ -1018,6 +1118,7 @@ mod tests {
     fn a_mounted_route_carries_its_served_path_and_auth() {
         let graph = build(
             &[mounted("GET", "/api/v1/posts", "index")],
+            0,
             &[route("index", "GET", "/posts", &[], &[])],
             &[],
             &[],
@@ -1035,6 +1136,7 @@ mod tests {
     fn a_declared_route_the_app_never_mounts_is_still_a_node() {
         let graph = build(
             &[],
+            0,
             &[route("orphan", "GET", "/orphan", &[], &[])],
             &[],
             &[],
@@ -1052,6 +1154,7 @@ mod tests {
     fn a_mounted_route_with_no_declaration_is_named_not_dropped() {
         let graph = build(
             &[mounted("GET", "/actuator/health", "actuator")],
+            0,
             &[],
             &[],
             &[],
@@ -1067,6 +1170,7 @@ mod tests {
     fn an_unresolvable_symbol_produces_no_edge() {
         let graph = build(
             &[],
+            0,
             &[route(
                 "show",
                 "GET",
@@ -1092,6 +1196,7 @@ mod tests {
         post.relations = &["votes"];
         let graph = build(
             &[],
+            0,
             &[route(
                 "upvote",
                 "POST",
@@ -1135,6 +1240,7 @@ mod tests {
         post.relations = &["comments"];
         let graph = build(
             &[],
+            0,
             &[],
             &[post],
             &[repository(
@@ -1157,7 +1263,7 @@ mod tests {
     fn a_models_relation_tables_are_visible_in_the_document() {
         let mut post = model("Post", "app::models::Post", "posts");
         post.relations = &["votes"];
-        let graph = build(&[], &[], &[post], &[], &[]);
+        let graph = build(&[], 0, &[], &[post], &[], &[]);
         assert_eq!(
             graph.nodes[0]
                 .model
@@ -1175,6 +1281,7 @@ mod tests {
         // an attribute name would report a read-only page as a writer.
         let graph = build(
             &[],
+            0,
             &[route("show", "GET", "/posts/{id}", &[], &["posts"])],
             &[model("Post", "app::models::Post", "posts")],
             &[],
@@ -1190,6 +1297,7 @@ mod tests {
         writer.mutating = true;
         let graph = build(
             &[],
+            0,
             &[],
             &[model("Post", "app::models::Post", "posts")],
             &[],
@@ -1208,6 +1316,7 @@ mod tests {
                 mounted("GET", "/api/posts", "list"),
                 mounted("POST", "/api/posts", "create"),
             ],
+            0,
             &[],
             &[model("Post", "app::models::Post", "posts")],
             &[repository_with_api(
@@ -1248,6 +1357,7 @@ mod tests {
     fn an_auto_api_route_reaches_the_model_through_its_repository() {
         let graph = build(
             &[mounted("GET", "/api/posts/{id}", "show")],
+            0,
             &[],
             &[model("Post", "app::models::Post", "posts")],
             &[repository_with_api(
@@ -1269,9 +1379,118 @@ mod tests {
     }
 
     #[test]
+    fn a_ws_mount_under_an_api_prefix_is_not_claimed_as_an_auto_api_route() {
+        // A `#[ws("/api/posts/live")]` handler is in the mounted table and has
+        // no route descriptor, but it is not a CRUD route the repository
+        // generated. Claiming it would report a read-only socket as a REST
+        // endpoint that writes `posts`.
+        let graph = build(
+            &[mounted("WS", "/api/posts/live", "live")],
+            0,
+            &[],
+            &[model("Post", "app::models::Post", "posts")],
+            &[repository_with_api(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+                "/api/posts",
+            )],
+            &[],
+        );
+        assert_eq!(graph.completeness.generated_routes, 0, "{:?}", graph.nodes);
+        assert_eq!(
+            graph.completeness.unmodelled_mounted_routes,
+            vec!["WS /api/posts/live"]
+        );
+    }
+
+    #[test]
+    fn nested_api_prefixes_attribute_to_the_longest_match() {
+        // Two repositories, one mounted under the other's prefix. Taking the
+        // first match would make the answer depend on link order, which
+        // `--check` would then report as phantom drift.
+        let outer = RepositoryGraphDescriptor {
+            api: "/api",
+            module_path: "app::repositories::outer",
+            ..repository("RootRepository", "PgRootRepository", "Root", "roots")
+        };
+        let inner = repository_with_api(
+            "PostRepository",
+            "PgPostRepository",
+            "Post",
+            "posts",
+            "/api/posts",
+        );
+        let forward = build(
+            &[mounted("GET", "/api/posts/{id}", "show")],
+            0,
+            &[],
+            &[],
+            &[outer, inner],
+            &[],
+        );
+        let reversed = build(
+            &[mounted("GET", "/api/posts/{id}", "show")],
+            0,
+            &[],
+            &[],
+            &[inner, outer],
+            &[],
+        );
+        assert_eq!(
+            forward, reversed,
+            "attribution must not depend on link order"
+        );
+        let edge = &forward.edges[0];
+        assert!(
+            edge.to.ends_with("PostRepository"),
+            "the longest matching prefix owns the route: {edge:?}"
+        );
+    }
+
+    #[test]
+    fn a_handler_mounted_twice_accounts_for_both_mounts() {
+        // The same handler in a top-level `routes![]` and in a scoped group.
+        // Reporting the second mount as "no macro declaration" would send a
+        // reader hunting for a handler that is right there.
+        let graph = build(
+            &[
+                mounted("GET", "/posts", "index"),
+                mounted("GET", "/admin/posts", "index"),
+            ],
+            0,
+            &[route("index", "GET", "/posts", &[], &[])],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            graph.completeness.unmodelled_mounted_routes.is_empty(),
+            "{:?}",
+            graph.completeness.unmodelled_mounted_routes
+        );
+        let facts = graph.nodes[0].route.as_ref().expect("route facts");
+        assert_eq!(facts.path, "/admin/posts");
+        assert_eq!(facts.also_mounted_at, vec!["/posts"]);
+    }
+
+    #[test]
+    fn the_document_counts_routers_it_cannot_enumerate() {
+        let graph = build(&[], 3, &[], &[], &[], &[]);
+        assert_eq!(graph.completeness.opaque_mounted_routers, 3);
+        assert!(
+            graph.summary().contains("cannot enumerate"),
+            "{}",
+            graph.summary()
+        );
+    }
+
+    #[test]
     fn a_mounted_route_outside_every_api_prefix_stays_unmodelled() {
         let graph = build(
             &[mounted("GET", "/api/postscript", "other")],
+            0,
             &[],
             &[],
             &[repository_with_api(
@@ -1291,8 +1510,20 @@ mod tests {
     }
 
     #[test]
+    fn a_dependencys_registry_path_is_shortened_to_its_crate_relative_tail() {
+        assert_eq!(
+            location(
+                "/home/someone/.cargo/registry/src/index.crates.io-6f17d22b/plug-0.1.0/src/r.rs",
+                7
+            ),
+            "plug-0.1.0/src/r.rs:7"
+        );
+        assert_eq!(location("src/models.rs", 7), "src/models.rs:7");
+    }
+
+    #[test]
     fn the_document_carries_its_own_limits() {
-        let graph = build(&[], &[], &[], &[], &[]);
+        let graph = build(&[], 0, &[], &[], &[], &[]);
         assert_eq!(graph.limits.len(), LIMITS.len());
         assert!(graph.limits.iter().any(|l| l.contains("helper function")));
     }
@@ -1301,6 +1532,7 @@ mod tests {
     fn the_graph_round_trips_through_json() {
         let graph = build(
             &[mounted("POST", "/posts", "create")],
+            0,
             &[route(
                 "create",
                 "POST",
@@ -1324,7 +1556,7 @@ mod tests {
 
     #[test]
     fn the_dump_is_recovered_from_a_noisy_stdout() {
-        let graph = build(&[], &[], &[], &[], &[]);
+        let graph = build(&[], 0, &[], &[], &[], &[]);
         let json = serde_json::to_string(&graph).expect("serialize");
         let stdout = format!("starting up\n{ARCHITECTURE_GRAPH_MARKER}{json}\ndone\n");
         assert_eq!(parse_manifest_dump(&stdout), Some(graph));
@@ -1341,9 +1573,9 @@ mod tests {
             model("Zebra", "app::models::Zebra", "zebras"),
             model("Alpha", "app::models::Alpha", "alphas"),
         ];
-        let first = build(&[], &[], &models, &[], &[]);
+        let first = build(&[], 0, &[], &models, &[], &[]);
         let reversed: Vec<ModelGraphDescriptor> = models.iter().rev().copied().collect();
-        let second = build(&[], &[], &reversed, &[], &[]);
+        let second = build(&[], 0, &[], &reversed, &[], &[]);
         assert_eq!(
             first, second,
             "registration order must not change the document"
@@ -1355,6 +1587,7 @@ mod tests {
     fn the_summary_names_every_section_it_has_rows_for() {
         let graph = build(
             &[mounted("POST", "/posts", "create")],
+            0,
             &[route(
                 "create",
                 "POST",
