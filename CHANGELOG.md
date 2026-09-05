@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they only found out once they actually ran `up`. Purely informational: it
   is not a graded preflight check and never affects `check`'s exit code. See
   `docs/guide/deployment.md`'s "Your `autumn.toml` is deployed alongside the
-  binary" section for the full behavior this closes out.
+  binary" section for the full behavior this closes out. [no-plugin]
 
 - **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
   update validation left after #1719/#1742/#1778/#1801 (issue #1751).
