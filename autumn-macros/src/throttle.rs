@@ -21,7 +21,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ItemFn, Lit, LitInt, LitStr, parse_quote};
+use syn::{Expr, Lit, LitInt, LitStr, parse_quote};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -251,9 +251,9 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
+    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(item) {
         Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+        Err(err) => return err,
     };
 
     if input_fn.sig.asyncness.is_none() {
@@ -273,6 +273,28 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // `should_own_replay` for the full ordering rationale (issue #1668's
     // pre-body gates and `#[authorize]`'s in-body check must never both skip
     // replay-ownership, nor both claim it).
+    // A single `TokenStream` (cheaply `Clone`) so the marker const can be
+    // emitted twice — once in the handler body for OpenAPI extraction (where
+    // nothing in the body reads it any more, hence `allow(dead_code)`), once
+    // inside the gate for the actual runtime check — matching the pattern
+    // `#[secured]`'s `role_scope_consts`/`markers` split already establishes
+    // (see `secured_macro`). `api_doc::infer_response_body`'s
+    // `recover_guarded_return_type` requires one of
+    // `idempotency_guard::RESPONSE_REWRITING_GUARD_MARKERS` to be present in
+    // the handler's OWN body (not just the gate) before it will trust the
+    // body's `__autumn_inner` binding — without this, a `#[throttle]`-above-
+    // `#[post]` route silently loses its documented response schema (#1677).
+    let route_id_const = quote! {
+        // Stable per-handler bucket namespace. Two routes pointing
+        // at the same named limiter share their bucket via the
+        // runtime registry — the route_id here is only used for
+        // inline limiters and for uniqueness when a named entry is
+        // missing from config.
+        #[allow(dead_code)]
+        const __AUTUMN_THROTTLE_ROUTE_ID: &str =
+            ::core::concat!(::core::module_path!(), "::", #fn_name_str);
+    };
+
     let owns_replay = should_own_replay(&input_fn);
     let replay_check = if owns_replay {
         quote! {
@@ -322,13 +344,7 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> impl ::core::future::Future<Output = ::core::result::Result<Self, Self::Rejection>>
                 + Send {
                 async move {
-                    // Stable per-handler bucket namespace. Two routes pointing
-                    // at the same named limiter share their bucket via the
-                    // runtime registry — the route_id here is only used for
-                    // inline limiters and for uniqueness when a named entry is
-                    // missing from config.
-                    const __AUTUMN_THROTTLE_ROUTE_ID: &str =
-                        ::core::concat!(::core::module_path!(), "::", #fn_name_str);
+                    #route_id_const
                     let __autumn_throttle_headers = parts.headers.clone();
                     // Optional because `MatchedPath` is absent for some routes
                     // (fallbacks, unnested handlers). When present, the
@@ -439,11 +455,13 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     input_fn.block = syn::parse_quote! {
         {
+            #route_id_const
             #original_response
         }
     };
 
     quote! {
+        #leading_items
         #gate_item
         #input_fn
     }

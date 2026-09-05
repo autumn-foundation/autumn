@@ -17,7 +17,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{ItemFn, LitStr, parse_quote};
+use syn::{LitStr, parse_quote};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -196,9 +196,9 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(v) => v,
         Err(err) => return err.to_compile_error(),
     };
-    let mut input_fn: ItemFn = match syn::parse2(item) {
+    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(item) {
         Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+        Err(err) => return err,
     };
     if input_fn.sig.asyncness.is_none() {
         return syn::Error::new_spanned(
@@ -216,6 +216,19 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
     let check_call = build_check_call(&max_age_tokens);
+    // A duplicate of the marker const `build_check_call` also declares inside
+    // the gate, emitted again in the handler body for OpenAPI extraction —
+    // matching the pattern `#[secured]`'s `role_scope_consts`/`markers` split
+    // establishes (see `secured_macro`). `api_doc::infer_response_body`'s
+    // `recover_guarded_return_type` requires one of
+    // `idempotency_guard::RESPONSE_REWRITING_GUARD_MARKERS` to be present in
+    // the handler's OWN body (not just the gate) before it will trust the
+    // body's `__autumn_inner` binding — without this, a `#[step_up]`-above-
+    // `#[post]` route silently loses its documented response schema (#1677).
+    let max_age_const = quote! {
+        #[allow(dead_code)]
+        const __AUTUMN_STEP_UP_MAX_AGE: ::core::option::Option<u64> = #max_age_tokens;
+    };
     let fn_name = input_fn.sig.ident.clone();
     let gate_ident = format_ident!("__AutumnStepUpGate_{}", fn_name);
 
@@ -331,11 +344,13 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     input_fn.block = syn::parse_quote! {
         {
+            #max_age_const
             #original_response
         }
     };
 
     quote! {
+        #leading_items
         #gate_item
         #input_fn
     }

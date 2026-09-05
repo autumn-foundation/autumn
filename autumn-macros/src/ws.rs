@@ -90,7 +90,7 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err,
     };
 
-    let input_fn = match parse::parse_async_handler(item) {
+    let (leading_items, input_fn) = match parse::parse_async_handler(item) {
         Ok(f) => f,
         Err(err) => return err,
     };
@@ -162,6 +162,8 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let path_params_tokens = crate::api_doc::emit_path_param_slice(&path_params);
 
     quote! {
+        #leading_items
+
         #input_fn
 
         #upgrade_handler
