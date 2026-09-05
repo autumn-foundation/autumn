@@ -1,7 +1,7 @@
 //! Cross-tenant `#[cached]` read (Warden 2026-09-05).
 //!
 //! Composes two documented framework features exactly as the framework's own
-//! SaaS starter does (`examples/saas/src/repositories.rs`): `[tenancy]
+//! `SaaS` starter does (`examples/saas/src/repositories.rs`): `[tenancy]
 //! enabled = true` (`docs/guide/tenant-cells.md`) and `#[cached]` memoizing a
 //! read over a `tenant_scoped` `#[repository]` (`docs/guide/cache-coherence.md`).
 //!
@@ -11,7 +11,7 @@
 //! `CURRENT_TENANT` task-local that a `tenant_scoped` repository read filters
 //! by — so a cached function whose only *other* varying parameter is not the
 //! tenant (a `page`, a `format`, a filter — anything that is not the literal
-//! `tenant_id` the SaaS starter's own `cached_project_count` goes out of its
+//! `tenant_id` the `SaaS` starter's own `cached_project_count` goes out of its
 //! way to thread through `key(tenant_id)`) shares one cache slot across every
 //! tenant that ever calls it with the same non-tenant arguments.
 //!
@@ -61,7 +61,7 @@ pub struct CtsWidget {
 #[autumn_web::repository(CtsWidget, table = "cts_widgets", tenant_scoped)]
 pub trait CtsWidgetRepository {}
 
-/// The buggy-but-natural sibling of the SaaS starter's `cached_project_count`:
+/// The buggy-but-natural sibling of the `SaaS` starter's `cached_project_count`:
 /// keyed on a real, legitimate, non-tenant parameter (`format`) instead of
 /// `tenant_id`. `repo` is correctly kept out of the key (it is a per-request
 /// handle, not part of the value's identity — exactly per the starter's own
