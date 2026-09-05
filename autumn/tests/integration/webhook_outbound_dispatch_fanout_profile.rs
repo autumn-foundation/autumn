@@ -83,23 +83,118 @@
     clippy::cast_precision_loss
 )]
 
-use autumn_web::AppState;
-use autumn_web::config::JobConfig;
-use autumn_web::job::{self, JobInfo};
 use autumn_web::webhook_outbound::{
-    InMemoryOutboundWebhookHandler, WebhookOutboundManager, WebhookSubscription,
+    OutboundWebhookHandler, WebhookDeliveryLog, WebhookOutboundManager, WebhookSubscription,
     WebhookSubscriptionStatus,
 };
+use autumn_web::{AppState, AutumnResult};
+use autumn_web::config::JobConfig;
+use autumn_web::job::{self, JobInfo};
 use diesel::connection::SimpleConnection;
 use diesel::sql_types::{BigInt, Text};
 use diesel::{Connection, PgConnection, QueryableByName};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
+
+/// A test-only handler that returns every subscription matching the topic
+/// **regardless of status**. `InMemoryOutboundWebhookHandler::get_subscriptions`
+/// already filters to `Active` per its own doc contract ("Retrieve active
+/// subscriptions..."), so seeding disabled subscriptions into it never
+/// exercises `dispatch`'s own `WebhookSubscriptionStatus::Disabled` skip
+/// (`webhook_outbound.rs` `dispatch()` ~412-414) — the handler would have
+/// already dropped them, making a "disabled subs cost zero enqueues"
+/// assertion vacuous (caught by Codex review on PR #2532). This handler
+/// hands disabled subscriptions through so dispatch's own guard is the thing
+/// actually under test.
+#[derive(Default)]
+struct AllStatusHandler {
+    subscriptions: RwLock<HashMap<String, WebhookSubscription>>,
+    logs: RwLock<HashMap<String, WebhookDeliveryLog>>,
+}
+
+impl AllStatusHandler {
+    fn seed(&self, sub: WebhookSubscription) {
+        self.subscriptions
+            .write()
+            .expect("subscriptions write lock poisoned")
+            .insert(sub.id.clone(), sub);
+    }
+}
+
+impl OutboundWebhookHandler for AllStatusHandler {
+    fn get_subscriptions(
+        &self,
+        topic: &str,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<Vec<WebhookSubscription>>> + Send>> {
+        let subs = self
+            .subscriptions
+            .read()
+            .expect("subscriptions read lock poisoned");
+        let topic = topic.to_owned();
+        let list: Vec<WebhookSubscription> = subs
+            .values()
+            .filter(|sub| sub.event_topics.iter().any(|t| t == &topic))
+            .cloned()
+            .collect();
+        Box::pin(async move { Ok(list) })
+    }
+
+    fn log_delivery(
+        &self,
+        log: WebhookDeliveryLog,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
+        self.logs
+            .write()
+            .expect("logs write lock poisoned")
+            .insert(log.id.clone(), log);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn replace_delivery_log(
+        &self,
+        log: WebhookDeliveryLog,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
+        self.logs
+            .write()
+            .expect("logs write lock poisoned")
+            .insert(log.id.clone(), log);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn get_subscription(
+        &self,
+        id: &str,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookSubscription>>> + Send>> {
+        let sub = self
+            .subscriptions
+            .read()
+            .expect("subscriptions read lock poisoned")
+            .get(id)
+            .cloned();
+        Box::pin(async move { Ok(sub) })
+    }
+
+    fn get_delivery_log(
+        &self,
+        id: &str,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookDeliveryLog>>> + Send>> {
+        let log = self
+            .logs
+            .read()
+            .expect("logs read lock poisoned")
+            .get(id)
+            .cloned();
+        Box::pin(async move { Ok(log) })
+    }
+}
 
 const CREATE_AUTUMN_JOBS: &str =
     include_str!("../../migrations/20260513000000_create_job_queue/up.sql");
@@ -303,7 +398,7 @@ async fn webhook_outbound_dispatch_fanout_profile() {
 
     let mut tier_results = Vec::new();
     for (label, n) in tiers {
-        let handler = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let handler = Arc::new(AllStatusHandler::default());
         let disabled_count = n / 10;
         let active_count = n - disabled_count;
         for i in 0..n {
@@ -313,10 +408,7 @@ async fn webhook_outbound_dispatch_fanout_profile() {
                 WebhookSubscriptionStatus::Active
             };
             let sub = subscription(&format!("{label}_{i}"), TOPIC, status);
-            handler
-                .create_subscription(sub)
-                .await
-                .expect("seed subscription");
+            handler.seed(sub);
         }
 
         let manager = WebhookOutboundManager::new(handler);
