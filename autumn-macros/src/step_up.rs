@@ -216,6 +216,20 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
     let check_call = build_check_call(&max_age_tokens);
+    // Emitted a second time into the handler body below (issue #2516): the
+    // gate redesign (#2488) moved the freshness check into the gate's own
+    // `from_request_parts`, but `api_doc::infer_response_body`'s recovery of
+    // the pre-rewrite return type (#1677/#2484) still requires one of
+    // `RESPONSE_REWRITING_GUARD_MARKERS` to be present in the *handler's own*
+    // block, structurally distinguishing a real guard-generated
+    // `__autumn_inner` binding from a handler that coincidentally ends the
+    // same way. Nothing in the body reads this copy, hence `allow(dead_code)`
+    // — see `secured_macro`'s identically-shaped `role_scope_consts` for the
+    // established pattern.
+    let markers = quote! {
+        #[allow(dead_code)]
+        const __AUTUMN_STEP_UP_MAX_AGE: ::core::option::Option<u64> = #max_age_tokens;
+    };
     let fn_name = input_fn.sig.ident.clone();
     let gate_ident = format_ident!("__AutumnStepUpGate_{}", fn_name);
 
@@ -331,6 +345,7 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     input_fn.block = syn::parse_quote! {
         {
+            #markers
             #original_response
         }
     };
