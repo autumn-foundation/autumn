@@ -3518,6 +3518,25 @@ def _bound_name(match):
     """The name a `LET_BIND` match binds, whichever binder form it is."""
     return next((g for g in match.groups() if g), None)
 
+
+def _binder_is_let(match):
+    """Whether the binder runs to the end of its block, or only over a body.
+
+    A `let` is in scope for the rest of the block that holds it; a `for` or an
+    `if let` binds only over its own body, and treating the two alike suppressed
+    the receiver AFTER the loop as well as inside it — the mirror of the
+    reaching-backwards mistake, one round later and one binder over.
+    """
+    return match.group(1) is not None
+
+
+def _binder_body_end(text, offset, literals=None):
+    """Where the body a pattern binder introduces closes."""
+    brace = text.find('{', offset)
+    if brace < 0:
+        return len(text)
+    return _block_end(text, brace + 1, literals)
+
 MOD_BLOCK = re.compile(r'\bmod\s+([a-z_]\w*)\s*\{')
 
 
@@ -5420,9 +5439,21 @@ def source_tokens(root):
             # env helper's call, so only names this file imports that way are
             # asked the question.
             bare = re.match(r'([A-Za-z_]\w*)\s*\(', m.group(0))
-            if (bare and spans and bare.group(1) in acc_for(rel).direct_names()
-                    and not acc_for(rel).direct_here(bare.group(1), here)):
-                continue
+            if bare and spans and bare.group(1) in acc_for(rel).direct_names():
+                if not acc_for(rel).direct_here(bare.group(1), here):
+                    continue
+                # …and Rust's VALUE namespace can take the name back: `let
+                # getenv = |_| String::new()` after the import shadows it, and
+                # the import being in scope says nothing about that. Same
+                # question as a rebound receiver, same answer — found here, on
+                # the scan's own text, from the binding onward.
+                start = _scope_start(spans, m.start())
+                if any(_bound_name(d) == bare.group(1)
+                       and (_binder_is_let(d)
+                            or m.start() < _binder_body_end(
+                                body, start + d.start(), literals))
+                       for d in LET_BIND.finditer(body[start:m.start()])):
+                    continue
             alias = ALIAS_CALL.match(m.group(0))
             if (alias and spans and alias.group(1) != 'env'
                     and not acc_for(rel).alias_here(alias.group(1), here)):
@@ -5431,12 +5462,19 @@ def source_tokens(root):
             # rebinding. The derivation names it; where the `let` sits is found
             # here, on the scan's own text, so a call written before it still
             # resolves and one after it does not.
-            if (through is not None and spans
-                    and acc_for(rel).rebinds(through, here)
-                    and any(_bound_name(d) == through
-                            for d in LET_BIND.finditer(
-                                body[_scope_start(spans, m.start()):m.start()]))):
-                continue
+            if through is not None and spans and acc_for(rel).rebinds(
+                    through, here):
+                start = _scope_start(spans, m.start())
+                # …and a binder covers the call only while it is in SCOPE. A
+                # `let` runs to the end of its block; a `for` or `if let` binds
+                # over its own body, so a read after the loop is the outer
+                # receiver again.
+                if any(_bound_name(d) == through
+                       and (_binder_is_let(d)
+                            or m.start() < _binder_body_end(
+                                body, start + d.start(), literals))
+                       for d in LET_BIND.finditer(body[start:m.start()])):
+                    continue
             head = body.rfind('\n', 0, m.start()) + 1
             tail = body.find('\n', m.start())
             if NEGATED.search(body[head:tail if tail >= 0 else len(body)]):
@@ -7273,6 +7311,19 @@ def self_test():
              _Accessor(re.compile('x'), {}, frozenset(), frozenset(), None,
                        {('fn one()',): frozenset({'process_env'})})),
          [True, True, False, False])
+    # A `let` is in scope for the rest of its block; a `for` or `if let` binds
+    # over its own body only. Treating them alike suppressed the receiver after
+    # the loop as well as inside it — the reaching-backwards mistake mirrored,
+    # one round later and one binder over.
+    case('a let runs on and a pattern binder does not',
+         [_binder_is_let(m) for m in LET_BIND.finditer(
+             'let a = 1; for b in xs { } if let Some(c) = d { }')],
+         [True, False, False])
+    case('a pattern binder covers its body and no more',
+         (lambda src: (src.index('INSIDE') < _binder_body_end(src, src.index('for ')),
+                       src.index('AFTER') < _binder_body_end(src, src.index('for '))))(
+             'for s in xs {\n  s.var("INSIDE");\n}\ns.var("AFTER");\n'),
+         (True, False))
     case('a macro call is recognised for the shadow test',
          [(lambda m: m.group('name') if m else None)(MACRO_CALL.match(t))
           for t in ('option_env!("X")', 'env!("X")', 'std::env!("X")',
