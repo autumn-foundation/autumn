@@ -3345,6 +3345,20 @@ impl AppBuilder {
             return;
         }
 
+        // ── Architecture-graph dump mode ───────────────────────────────
+        // When AUTUMN_DUMP_GRAPH=1, print the application architecture graph
+        // (#1747) and exit. Triggered by `autumn graph`, which needs the whole
+        // binary's registrations -- every `#[route]`, `#[model]`,
+        // `#[repository]` and `#[job]`, across the app AND its plugins --
+        // joined against this app's mounted route table, because a route's
+        // served path and resolved auth posture are facts about the mount and
+        // not about the annotation alone. Runs before any database or port is
+        // touched.
+        if crate::graph::manifest::is_dump_mode() {
+            self.run_dump_graph_mode();
+            return;
+        }
+
         // ── Jobs manifest dump mode ────────────────────────────────────
         // When AUTUMN_DUMP_JOBS=1, print the effective drained-queue manifest
         // (TOML `queues = [...]`) and exit. Triggered by `autumn jobs manifest`
@@ -4362,6 +4376,36 @@ impl AppBuilder {
         // Web and combined roles build the full application router. All the
         // route/router-context inputs assembled above are simply dropped in the
         // worker branch.
+        // Publish the architecture graph this process serves (#1747) before the
+        // router is built, so `/actuator/graph` answers from the first request
+        // rather than after some later warm-up. This is the *serving* path —
+        // the static-build and capsule-replay paths publish their own below.
+        // `graph_installed_before_every_router_build` pins all three, because a
+        // graph installed on only some of them is an endpoint that answers 503
+        // in production while every unit test passes.
+        //
+        // A worker serves the probe-only router: it mounts no application route
+        // at all, and drops every raw router the builder collected. Publishing
+        // the full route table there would have `/actuator/graph` — which a
+        // worker can expose — describe endpoints this process does not serve
+        // (Codex round 4). The declared elements are still nodes, because they
+        // are still compiled in; they simply report `mounted: false`, and the
+        // completeness section names them, which is the honest answer to "what
+        // does this process serve".
+        let (graph_mounted, graph_opaque) = if role.serves_http() {
+            (
+                graph_mounted_routes(&all_routes, &scoped_groups, &declared_routes, &config),
+                omitted_router_count(
+                    merge_routers.len(),
+                    nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
+                    &declared_routes,
+                ),
+            )
+        } else {
+            (Vec::new(), 0)
+        };
+        crate::graph::install(crate::graph::manifest::audit(&graph_mounted, graph_opaque));
+
         let router_build = if role.serves_http() {
             crate::router::try_build_router_with_static_inner(
                 all_routes,
@@ -5934,6 +5978,16 @@ impl AppBuilder {
         // Refresh the AppState-stored config snapshot — see the matching
         // comment in `run()` (Codex review).
         state.insert_extension(config.clone());
+        // Publish the architecture graph this process serves (#1747) before the
+        // router is built, so `/actuator/graph` can answer from the first
+        // request rather than after some later warm-up.
+        crate::graph::install(crate::graph::manifest::audit(
+            &graph_mounted_routes(&all_routes, &scoped_groups, &[], &config),
+            // The static-build path builds its router with no nest mounts and
+            // no declared plugin routes (see the `RouterContext` below), so the
+            // merge count is the whole opaque surface here.
+            omitted_router_count(merge_routers.len(), std::iter::empty::<&str>(), &[]),
+        ));
         let router = crate::router::try_build_router_inner(
             all_routes,
             &config,
@@ -6064,6 +6118,45 @@ impl AppBuilder {
         // without this even a *successful* `autumn build` would leak the cluster.
         #[cfg(feature = "managed-pg")]
         crate::managed_pg::emergency_stop_async().await;
+    }
+
+    /// Dump the application's architecture graph as JSON and exit.
+    ///
+    /// Triggered when `AUTUMN_DUMP_GRAPH=1` is set (by `autumn graph`).
+    /// Does not connect to a database or bind a TCP port.
+    fn run_dump_graph_mode(&self) {
+        // The framework's mounts depend on configuration — the health probe
+        // paths and the actuator prefix are both configurable — so the census
+        // needs the app's own config, not defaults. `AutumnConfig::load()` is
+        // the plain five-layer TOML + env read with no telemetry or database
+        // work, which keeps this dump's promise of touching neither. A config
+        // that fails to load is not this command's error to report: fall back
+        // to defaults so the graph still dumps, exactly as the routes listing
+        // would still list.
+        let config = crate::config::AutumnConfig::load().unwrap_or_default();
+        let mounted = graph_mounted_routes(
+            &self.routes,
+            &self.scoped_groups,
+            &self.declared_routes,
+            &config,
+        );
+        crate::graph::manifest::print_manifest_dump(&crate::graph::manifest::audit(
+            &mounted,
+            self.graph_opaque_router_count(),
+        ));
+    }
+
+    /// Raw `merge`/`nest` routers whose endpoints the graph cannot enumerate.
+    ///
+    /// The same count `autumn routes audit` hard-fails its coverage gate on
+    /// (`omitted_router_count`), so the graph and the route audit cannot
+    /// disagree about how much of the served surface is opaque.
+    fn graph_opaque_router_count(&self) -> usize {
+        omitted_router_count(
+            self.merge_routers.len(),
+            self.nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
+            &self.declared_routes,
+        )
     }
 
     /// Dump the agent-authority manifest as one marker-prefixed JSON line and
@@ -7424,6 +7517,16 @@ impl AppBuilder {
         // Cloned before the builder consumes it, so a job capsule can dispatch
         // its handler against the same rebuilt state the router serves from.
         let router_state = state.clone();
+        // See the matching call in `run()`: the graph is published before the
+        // router is built so `/actuator/graph` answers from the first request.
+        crate::graph::install(crate::graph::manifest::audit(
+            &graph_mounted_routes(&routes, &scoped_groups, &declared_routes, &config),
+            omitted_router_count(
+                merge_routers.len(),
+                nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
+                &declared_routes,
+            ),
+        ));
         let router = crate::router::try_build_router_inner(
             routes,
             &config,
@@ -7534,6 +7637,131 @@ pub(crate) fn is_dump_security_mode() -> bool {
 
 pub(crate) fn is_dump_jobs_mode() -> bool {
     std::env::var("AUTUMN_DUMP_JOBS").as_deref() == Ok("1")
+}
+
+/// The mounted-route table the architecture graph joins against (issue #1747).
+///
+/// Top-level routes carry their own path; a scoped group's children do not --
+/// the group's prefix is applied at mount time -- so each child is summarised
+/// with its group prefix.
+fn graph_mounted_routes(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+    declared_routes: &[crate::route_listing::RouteInfo],
+    config: &crate::config::AutumnConfig,
+) -> Vec<crate::graph::MountedRoute> {
+    // The framework's own mounts — probes, the actuator, htmx assets, the docs
+    // UI — are served by `router.rs` and belong in the census: the manifest and
+    // the guide both promise a framework endpoint is *named* in
+    // `unmodelled_mounted_routes`, and without them the completeness report
+    // systematically understated the served surface (Codex round 5). Built with
+    // the same helper `autumn routes` uses, so the two cannot disagree about
+    // what the framework mounts.
+    let mut framework: Vec<crate::route_listing::RouteInfo> = Vec::new();
+    crate::route_listing::append_framework_routes(&mut framework, config);
+
+    routes
+        .iter()
+        .map(|route| graph_route_summary(route, None))
+        .chain(scoped_groups.iter().flat_map(|group| {
+            group
+                .routes
+                .iter()
+                .map(move |route| graph_route_summary(route, Some(&group.prefix)))
+        }))
+        .chain(declared_routes.iter().map(graph_declared_route_summary))
+        .chain(framework.iter().map(graph_declared_route_summary))
+        .collect()
+}
+
+/// The architecture-graph view of a route declared through
+/// `declare_plugin_routes` (issue #1747).
+///
+/// These are real served endpoints behind an otherwise opaque `nest` mount, and
+/// declaring them is what stops `omitted_router_count` counting that nest as
+/// unenumerable. Without them here the graph would report *neither* an opaque
+/// router nor a mounted route for that surface — a hole that reads as complete
+/// coverage. They carry no `#[route]` descriptor in this binary, so they land
+/// in `unmodelled_mounted_routes`: named, which is the honest answer, rather
+/// than silently absent.
+fn graph_declared_route_summary(
+    route: &crate::route_listing::RouteInfo,
+) -> crate::graph::MountedRoute {
+    let mut roles = route.roles.clone();
+    roles.sort();
+    roles.dedup();
+    let mut scopes = route.scopes.clone();
+    scopes.sort();
+    scopes.dedup();
+    crate::graph::MountedRoute {
+        method: route.method.clone(),
+        path: route.path.clone(),
+        handler: route.handler.clone(),
+        module_path: route.module.clone().unwrap_or_default(),
+        auth: crate::graph::RouteAuth {
+            secured: route.classification == crate::route_listing::RouteClassification::Gated,
+            roles,
+            scopes,
+            policy: route.policy,
+            public: route.classification == crate::route_listing::RouteClassification::Public,
+        },
+        // A `RouteInfo` carries no repository metadata: these are plugin and
+        // framework mounts, which no `#[repository]` generated.
+        repository_api: None,
+    }
+}
+
+/// The architecture-graph view of one mounted route (issue #1747).
+///
+/// The *mounted* path, not the declared one: a scoped group's children carry
+/// only their child path on the `Route`, and recording `/items` for a route an
+/// operator calls at `/api/v1/items` would make a scope rename invisible.
+/// `join_nested_path` is the same helper the `OpenAPI` collector and the
+/// agent-authority manifest use, so the three cannot disagree about where a
+/// route lives.
+///
+/// The auth posture is read straight off the route's `ApiDoc` rather than
+/// derived a second time here: `#[secured]`/`#[authorize]`/`#[public]` already
+/// populate it, and a second derivation is a second thing to drift.
+fn graph_route_summary(route: &Route, scope_prefix: Option<&str>) -> crate::graph::MountedRoute {
+    let mut roles: Vec<String> = route
+        .api_doc
+        .required_roles
+        .iter()
+        .map(|r| (*r).to_owned())
+        .collect();
+    roles.sort();
+    roles.dedup();
+    let mut scopes: Vec<String> = route
+        .api_doc
+        .required_scopes
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    scopes.sort();
+    scopes.dedup();
+    crate::graph::MountedRoute {
+        method: route.method.to_string(),
+        path: scope_prefix.map_or_else(
+            || route.path.to_string(),
+            |prefix| crate::router::join_nested_path(prefix, route.path),
+        ),
+        handler: route.name.to_owned(),
+        module_path: route.api_doc.module_path.to_owned(),
+        auth: crate::graph::RouteAuth {
+            secured: route.api_doc.secured,
+            roles,
+            scopes,
+            policy: route.api_doc.has_policy,
+            public: route.api_doc.public,
+        },
+        // Declared ownership, straight off the route the `#[repository(api =
+        // "...")]` macro generated. Never re-derived from the served path.
+        repository_api: route
+            .repository
+            .as_ref()
+            .map(|meta| meta.api_path.to_owned()),
+    }
 }
 
 /// The slice of a [`Route`] the agent-authority manifest needs (#1691).
@@ -13778,6 +14006,65 @@ mod tests {
             state_initializer < router_build,
             "static builds must install state-initialized resources before rendering routes"
         );
+    }
+
+    #[test]
+    fn graph_installed_before_every_router_build() {
+        // The architecture graph (#1747) is published by whichever path is
+        // about to build a router, and `/actuator/graph` answers from what was
+        // published. Codex round 1 found the install wired into the
+        // static-build and capsule-replay paths but NOT into `run()` — so every
+        // unit test passed while a normally running app answered 503 forever.
+        // A structural assertion, because the serving path ends in `serve()`
+        // and cannot be driven from a unit test.
+        let whole = include_str!("app.rs").replace("\r\n", "\n");
+        // Only the non-test source: this test names both strings itself.
+        let source = whole
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map_or(whole.as_str(), |(before, _)| before)
+            .to_owned();
+        let builds: Vec<usize> = source
+            .match_indices("crate::router::try_build_router")
+            .map(|(i, _)| i)
+            // Skip doc-comment and test references; only real call sites are
+            // followed by an open paren on the same expression.
+            .filter(|i| source[*i..].starts_with("crate::router::try_build_router"))
+            .filter(|i| {
+                let tail = &source[*i..*i + 80];
+                tail.contains("_inner(") || tail.contains("_with_static_inner(")
+            })
+            .collect();
+        assert!(
+            builds.len() >= 3,
+            "expected the serving, static-build and replay router builds: {}",
+            builds.len()
+        );
+        let installs: Vec<usize> = source
+            .match_indices("crate::graph::install(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            installs.len(),
+            3,
+            "every path that builds an application router must publish the graph \
+             it is about to serve"
+        );
+        // Each install precedes a router build with no other install between.
+        for install in &installs {
+            assert!(
+                builds.iter().any(|build| build > install),
+                "an install with no router build after it is dead code"
+            );
+        }
+        for build in &builds {
+            // A probe-only router (worker role) serves the actuator too, but it
+            // is built inside the same `run()` block the serving install covers.
+            assert!(
+                installs.iter().any(|install| install < build),
+                "a router built with no graph published before it answers 503 at \
+                 /actuator/graph"
+            );
+        }
     }
 
     #[test]
