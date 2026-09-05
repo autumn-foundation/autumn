@@ -1016,7 +1016,14 @@ mod tests {
                 async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
             },
         );
-        let generated = route_macro("POST", "post", quote! { "/users" }, throttled).to_string();
+        let throttled_fn = crate::param_helpers::extract_fn_item(throttled, "create");
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/users" },
+            quote! { #throttled_fn },
+        )
+        .to_string();
 
         assert!(
             generated.contains("response : :: core :: option :: Option :: Some")
@@ -1034,7 +1041,9 @@ mod tests {
                 async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
             },
         );
-        let generated = route_macro("POST", "post", quote! { "/users" }, secured).to_string();
+        let secured_fn = crate::param_helpers::extract_fn_item(secured, "create");
+        let generated =
+            route_macro("POST", "post", quote! { "/users" }, quote! { #secured_fn }).to_string();
 
         assert!(
             generated.contains("response : :: core :: option :: Option :: Some")
@@ -1052,7 +1061,14 @@ mod tests {
                 async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
             },
         );
-        let generated = route_macro("POST", "post", quote! { "/users" }, stepped_up).to_string();
+        let stepped_up_fn = crate::param_helpers::extract_fn_item(stepped_up, "create");
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/users" },
+            quote! { #stepped_up_fn },
+        )
+        .to_string();
 
         assert!(
             generated.contains("response : :: core :: option :: Option :: Some")
@@ -1096,8 +1112,11 @@ mod tests {
                 async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
             },
         );
-        let secured = crate::secured::secured_macro(quote! { "admin" }, throttled);
-        let generated = route_macro("POST", "post", quote! { "/users" }, secured).to_string();
+        let throttled_fn = crate::param_helpers::extract_fn_item(throttled, "create");
+        let secured = crate::secured::secured_macro(quote! { "admin" }, quote! { #throttled_fn });
+        let secured_fn = crate::param_helpers::extract_fn_item(secured, "create");
+        let generated =
+            route_macro("POST", "post", quote! { "/users" }, quote! { #secured_fn }).to_string();
 
         assert!(
             generated.contains("response : :: core :: option :: Option :: Some")

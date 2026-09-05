@@ -648,8 +648,16 @@ fn stmts_have_response_rewriting_guard_marker(stmts: &[Stmt]) -> bool {
 /// type: a `let __autumn_inner: T = <init>;` binding sitting exactly one
 /// statement before the end of `block`, immediately followed by the
 /// generated `IntoResponse::into_response(__autumn_inner)` tail, with one of
-/// [`RESPONSE_REWRITING_GUARD_MARKERS`] present earlier in the same block
-/// (issue #1677's `api_doc::infer_response_body` recovery relies on this).
+/// [`RESPONSE_REWRITING_GUARD_MARKERS`] present earlier in the same block, or
+/// `has_gate_param` true (issue #1677's `api_doc::infer_response_body`
+/// recovery relies on this).
+///
+/// `has_gate_param` covers `#[step_up]`/`#[throttle]`: their marker consts
+/// moved out of the body and into their gate's own impl block (#1668), so
+/// they can never appear in `block` for this scan to find — the caller
+/// computes it once, from the enclosing function's signature, and passes it
+/// down through every recursive call, since it does not change per nesting
+/// level (stacked guards still share one signature).
 ///
 /// Deliberately structural rather than a bare name-and-type scan. Matching
 /// the required *position* (second-to-last, with that exact tail following)
@@ -660,14 +668,18 @@ fn stmts_have_response_rewriting_guard_marker(stmts: &[Stmt]) -> bool {
 /// body itself independently ends in the same two-statement shape, position
 /// and tail alone cannot tell a real guard's own binding apart from the
 /// user's body coincidentally mimicking it. Requiring one of the guard's own
-/// marker consts to also be present closes that gap: no guard ever emits the
-/// `__autumn_inner` binding without one, and a handler's own code has no
-/// reason to declare an identifier the framework treats as reserved.
+/// marker consts (or `has_gate_param`) to also be present closes that gap: no
+/// guard ever emits the `__autumn_inner` binding without one, and a
+/// handler's own code has no reason to declare an identifier the framework
+/// treats as reserved.
 ///
 /// Returns the local's declared type together with its initializer
 /// expression, so a caller can both read the type and recurse into a deeper
 /// nested guard via [`expr_nested_async_body`].
-pub fn generated_inner_response_binding(block: &Block) -> Option<(&Type, &Expr)> {
+pub fn generated_inner_response_binding(
+    block: &Block,
+    has_gate_param: bool,
+) -> Option<(&Type, &Expr)> {
     let len = block.stmts.len();
     if len < 2 {
         return None;
@@ -685,7 +697,7 @@ pub fn generated_inner_response_binding(block: &Block) -> Option<(&Type, &Expr)>
     if !stmt_is_inner_response_tail(&block.stmts[index + 1]) {
         return None;
     }
-    if !stmts_have_response_rewriting_guard_marker(&block.stmts[..index]) {
+    if !has_gate_param && !stmts_have_response_rewriting_guard_marker(&block.stmts[..index]) {
         return None;
     }
     let init_expr = &local.init.as_ref()?.expr;

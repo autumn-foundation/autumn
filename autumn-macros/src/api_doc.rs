@@ -425,7 +425,19 @@ fn unwrap_json_body(ty: &syn::Type) -> Option<syn::Type> {
 /// from the `__autumn_inner` binding the guard left in the body, so
 /// inference is independent of attribute expansion order.
 pub fn infer_response_body(input_fn: &syn::ItemFn) -> Option<TokenStream> {
-    let ty = recover_guarded_return_type(&input_fn.block).or_else(|| sig_output_type(input_fn))?;
+    // #[step_up]/#[throttle] moved their marker consts out of the body and
+    // into their gate's own impl block (#1668), so
+    // `generated_inner_response_binding`'s in-body marker check can never see
+    // them again — a route stacked under either now recognizes the binding
+    // via the gate parameter #1668 left in the signature instead.
+    let has_gate_param =
+        crate::param_helpers::has_guard_gate_param_with_prefix(input_fn, "__AutumnStepUpGate_")
+            || crate::param_helpers::has_guard_gate_param_with_prefix(
+                input_fn,
+                "__AutumnThrottleGate_",
+            );
+    let ty = recover_guarded_return_type(&input_fn.block, has_gate_param)
+        .or_else(|| sig_output_type(input_fn))?;
     let ty = unwrap_result_ok(&ty).unwrap_or(ty);
     find_json_in_type(&ty).map(|inner| schema_entry_for_type(&inner))
 }
@@ -449,16 +461,21 @@ fn sig_output_type(input_fn: &syn::ItemFn) -> Option<syn::Type> {
 /// `authorize_macro`, and `throttle_macro`. [`crate::idempotency_guard::generated_inner_response_binding`]
 /// recognizes that binding only by its exact structural position (last-but-one
 /// statement, followed immediately by the generated `IntoResponse::into_response`
-/// tail) *and* the presence of one of the guard's own marker consts earlier in
-/// the same block. Position and tail alone would still be foolable: a guard's
-/// generated wrapper carries the user's own original body one level deeper
-/// (`(async move { #original_body }).await`), so if that body itself
+/// tail) *and* one of two signals that a real guard, not a coincidence, put it
+/// there: one of the guard's own marker consts earlier in the same block
+/// (`#[secured]`/`#[authorize]`), or `has_gate_param` (`#[step_up]`/
+/// `#[throttle]`, whose marker consts moved out of the body and into their
+/// gate's own impl block with #1668, so the body has nothing left to scan
+/// for — `infer_response_body` computes it from the signature instead, once,
+/// outside this recursion). Position and tail alone would still be foolable:
+/// a guard's generated wrapper carries the user's own original body one level
+/// deeper (`(async move { #original_body }).await`), so if that body itself
 /// independently ends in the same two-statement shape — whether the handler
 /// is unguarded or the coincidence sits nested inside a real guard — position
-/// and tail cannot tell it apart from a real guard's own binding. The marker
-/// requirement closes that: no guard ever emits the `__autumn_inner` binding
-/// without one, and a handler's own code has no reason to declare an
-/// identifier the framework treats as reserved.
+/// and tail cannot tell it apart from a real guard's own binding. Requiring
+/// one of those two signals closes that: no guard ever emits the
+/// `__autumn_inner` binding without one, and a handler's own code has no
+/// reason to declare an identifier the framework treats as reserved.
 ///
 /// When guards stack, each later-expanding guard wraps the earlier guard's
 /// whole generated body one level deeper in that same shape, so only the
@@ -474,10 +491,11 @@ fn sig_output_type(input_fn: &syn::ItemFn) -> Option<syn::Type> {
 /// guard wrapping a `()`/`impl Trait` return, for which no guard emits an
 /// explicit annotation (Rust rejects `impl Trait` in a local variable's type
 /// ascription) and there is nothing to recover.
-fn recover_guarded_return_type(block: &syn::Block) -> Option<syn::Type> {
-    let (ty, init_expr) = crate::idempotency_guard::generated_inner_response_binding(block)?;
+fn recover_guarded_return_type(block: &syn::Block, has_gate_param: bool) -> Option<syn::Type> {
+    let (ty, init_expr) =
+        crate::idempotency_guard::generated_inner_response_binding(block, has_gate_param)?;
     let nested = crate::idempotency_guard::expr_nested_async_body(init_expr)
-        .and_then(recover_guarded_return_type);
+        .and_then(|block| recover_guarded_return_type(block, has_gate_param));
     Some(nested.unwrap_or_else(|| ty.clone()))
 }
 
