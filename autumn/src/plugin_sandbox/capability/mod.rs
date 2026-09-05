@@ -98,7 +98,7 @@ pub use jobs::{JobSink, PluginJob};
 pub use kv::{CacheKvStore, KvStore, MemoryKvStore};
 pub use outbound::{
     ALLOWED_OUTBOUND_REQUEST_HEADERS, ALLOWED_OUTBOUND_RESPONSE_HEADERS, MAX_OUTBOUND_HEADERS,
-    OutboundHttp, OutboundRequest, OutboundResponse, RecordingHttp,
+    MAX_RESPONSE_HEADER_BYTES, OutboundHttp, OutboundRequest, OutboundResponse, RecordingHttp,
 };
 pub use quota::CapabilityRateLimiter;
 pub use render::{ALLOWED_ATTRIBUTES, ALLOWED_TAGS, FragmentNode, RenderError};
@@ -371,6 +371,17 @@ pub enum CapabilityCall {
         /// Largest number of rows to return, capped by the `db_rows` quota.
         #[serde(default)]
         limit: u32,
+        /// Resume after this `row_id`, for reading past one page.
+        ///
+        /// A page can end early on the `db_rows` quota or on
+        /// [`MAX_RESULT_BYTES`], and `truncated` tells the guest that happened —
+        /// but without a place to say "carry on from here", the same filter
+        /// would return the same prefix forever and the rows behind it would be
+        /// unreachable. Rows come back in ascending `row_id` order (see
+        /// [`PluginStore::query`](db::PluginStore::query)), so the last
+        /// `row_id` of one page is the `after` of the next.
+        #[serde(default)]
+        after: Option<String>,
     },
     /// Replace one row by id.
     DbUpdate {
@@ -1303,6 +1314,7 @@ path = "/shop/panel"
             table: "users".to_owned(),
             filter: PluginRow::new(),
             limit: 1,
+            after: None,
         });
         let _ = granted.runtime.dispatch(&CapabilityCall::JobEnqueue {
             id: 3,
@@ -1797,6 +1809,7 @@ path = "/shop/panel"
             table: "orders".to_owned(),
             filter: row(&[("kind", "wide")]),
             limit: 0,
+            after: None,
         });
         let CallResult::Ok {
             value: CallValue::Rows { rows, truncated },
@@ -1875,6 +1888,7 @@ path = "/shop/panel"
                 table: table.to_owned(),
                 filter: PluginRow::new(),
                 limit: 10,
+                after: None,
             });
             assert_eq!(
                 result.denial(),
@@ -1921,6 +1935,7 @@ path = "/shop/panel"
             table: "orders".to_owned(),
             filter: PluginRow::new(),
             limit: 100,
+            after: None,
         });
         assert_eq!(
             listed,
@@ -2586,6 +2601,7 @@ path = "/shop/panel"
                 table: "orders".to_owned(),
                 filter: PluginRow::new(),
                 limit,
+                after: None,
             });
             let CallResult::Ok {
                 value: CallValue::Rows { rows, .. },

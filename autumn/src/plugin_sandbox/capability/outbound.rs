@@ -54,6 +54,15 @@ use super::{CallResult, CallValue, CapabilityCall, CapabilityRuntime, DenialReas
 /// The most headers a guest may set on one outbound request.
 pub const MAX_OUTBOUND_HEADERS: usize = 16;
 
+/// The most bytes the *response* headers of one outbound call may carry.
+///
+/// The allow-list says which headers come back; it says nothing about how big
+/// they are, and every one of them is chosen by an upstream rather than by the
+/// plugin or the host. Comfortably under the reply-queue ceiling, so a response
+/// that is otherwise legal cannot be made to fail the request by its headers
+/// alone.
+pub const MAX_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
+
 /// Request headers a sandboxed plugin may set on an outbound call.
 ///
 /// An allow-list, like every other header list in this subsystem. The ones that
@@ -403,19 +412,37 @@ pub(super) fn perform(
                     ),
                 );
             }
+            // Headers are bounded here, not only by the allow-list. The
+            // list says *which* headers pass; it says nothing about how many
+            // or how long, and an upstream the plugin was granted can answer
+            // with a body inside `outbound_response_bytes` and megabytes of
+            // `etag`. The reply is serialized in full before the queue ceiling
+            // is checked, so an unbounded collect here is an upstream's way to
+            // make the host allocate and then fail the plugin's request.
+            let mut headers = Vec::new();
+            let mut header_bytes = 0_usize;
+            for (name, value) in response.headers {
+                if !ALLOWED_OUTBOUND_RESPONSE_HEADERS
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&name))
+                {
+                    continue;
+                }
+                if headers.len() >= MAX_OUTBOUND_HEADERS {
+                    break;
+                }
+                let weight = name.len().saturating_add(value.len());
+                if header_bytes.saturating_add(weight) > MAX_RESPONSE_HEADER_BYTES {
+                    break;
+                }
+                header_bytes = header_bytes.saturating_add(weight);
+                headers.push((name, value));
+            }
             CallResult::Ok {
                 id,
                 value: CallValue::Http {
                     status: response.status,
-                    headers: response
-                        .headers
-                        .into_iter()
-                        .filter(|(name, _)| {
-                            ALLOWED_OUTBOUND_RESPONSE_HEADERS
-                                .iter()
-                                .any(|known| known.eq_ignore_ascii_case(name))
-                        })
-                        .collect(),
+                    headers,
                     body: response.body,
                 },
             }

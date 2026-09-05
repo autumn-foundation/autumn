@@ -95,6 +95,14 @@ pub const MAX_DEPTH: usize = 8;
 /// How many nodes one fragment may carry, counted across the whole tree.
 pub const MAX_NODES: usize = 512;
 
+/// The most attributes one element may carry.
+///
+/// The allow-list bounds *which* attributes appear and says nothing about how
+/// many: an element repeating `title` a thousand times is inside every other
+/// ceiling. Above the widest legal element — the allow-list itself is shorter
+/// than this — so it never refuses a fragment anyone would write.
+pub const MAX_ATTRIBUTES: usize = 32;
+
 /// Longest accepted text run or attribute value, in bytes.
 pub const MAX_TEXT_BYTES: usize = 8 * 1024;
 
@@ -151,6 +159,8 @@ pub enum RenderError {
     TooDeep,
     /// The tree carries more than [`MAX_NODES`] nodes.
     TooManyNodes,
+    /// One element carries more than [`MAX_ATTRIBUTES`] attributes.
+    TooManyAttributes(usize),
     /// A text run or attribute value is over [`MAX_TEXT_BYTES`].
     TextTooLong(usize),
     /// The rendered fragment is over the `render_bytes` quota.
@@ -180,6 +190,10 @@ impl std::fmt::Display for RenderError {
             }
             Self::TooDeep => write!(f, "a fragment may nest at most {MAX_DEPTH} deep"),
             Self::TooManyNodes => write!(f, "a fragment may carry at most {MAX_NODES} nodes"),
+            Self::TooManyAttributes(found) => write!(
+                f,
+                "an element may carry at most {MAX_ATTRIBUTES} attributes; this one carries {found}"
+            ),
             Self::TextTooLong(found) => write!(
                 f,
                 "a text run or attribute value of {found} bytes is over the \
@@ -255,10 +269,25 @@ fn write_node(
                     &tag,
                 )));
             }
+            if attributes.len() > MAX_ATTRIBUTES {
+                return Err(RenderError::TooManyAttributes(attributes.len()));
+            }
             out.push('<');
             out.push_str(&tag);
             for (name, value) in attributes {
                 write_attribute(out, &tag, name, value)?;
+                // Re-checked per attribute, not once per node. Escaping expands
+                // a value severalfold — `&` becomes `&amp;` — so an element
+                // inside every structural bound can still render megabytes
+                // before the check at the top of the next node runs, and the
+                // point of the ceiling is to stop the string being built rather
+                // than to report its size afterwards.
+                if out.len() > max_bytes {
+                    return Err(RenderError::TooLarge {
+                        found: out.len(),
+                        max: max_bytes,
+                    });
+                }
             }
             if VOID_TAGS.contains(&tag.as_str()) {
                 // Rendered `<br />` rather than `<br>`: the fragment is spliced

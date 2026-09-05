@@ -2948,6 +2948,20 @@ struct HostState {
     /// Fuel owed for capability work done while the guest was inside a
     /// `fd_write`, where the `Caller` needed to charge it is not in scope.
     pending_charge: u64,
+    /// Calls parsed out of a completed stdout line and **not yet dispatched**.
+    ///
+    /// Queued rather than serviced where they are parsed, so the shim can take
+    /// each call's fixed fuel charge *before* it reaches a backend. Charging
+    /// afterwards let a budget that could pay for the `fd_write` copy but not
+    /// for the call itself perform a KV write, a job enqueue or an outbound
+    /// POST and *then* end the request as `FuelExhausted` — an effect that
+    /// happened, on a request whose caller was told it did not, which a retry
+    /// then does again.
+    ///
+    /// Bounded by the chunk that produced it: one `fd_write` copies at most
+    /// `HOST_IO_CHUNK_BYTES`, and every queued call was parsed out of those
+    /// bytes.
+    pending_calls: VecDeque<super::capability::CapabilityCall>,
     /// Bytes of capability replies **currently resident** in `stdin`.
     ///
     /// Counted apart from `stdin.len()`, which also holds the unread tail of
@@ -3009,6 +3023,7 @@ impl HostState {
             exchange,
             runtime,
             pending_charge: 0,
+            pending_calls: VecDeque::new(),
             queued_replies: 0,
             denials: Vec::new(),
             random_state: Self::seed_from(frame),
@@ -3066,7 +3081,9 @@ impl HostState {
         }
         self.answer = Some(match from_line::<GuestFrame>(line) {
             Ok(GuestFrame::Call(call)) => {
-                self.service(&call);
+                // Queued, not serviced: the fixed charge is the shim's to take
+                // first. See `pending_calls`.
+                self.pending_calls.push_back(call);
                 return;
             }
             Ok(GuestFrame::Response(response)) => match self.exchange {
@@ -3116,16 +3133,35 @@ impl HostState {
             ))));
             return;
         }
-        // Charged here, spent by `fd_write` once it has a `Caller` again. The
-        // fixed part prices the dispatch — a lock, a lookup, a frame built —
-        // and the per-byte part prices the reply the host just materialised, at
-        // the same rate every other host-side copy pays.
+        // Only the per-byte part. The fixed part — which prices the dispatch: a
+        // lock, a lookup, a frame built — is taken by the shim *before* this
+        // runs, so a budget that cannot cover it never reaches a backend. What
+        // is left is the reply the host has just materialised, priced at the
+        // same rate every other host-side copy pays; it cannot be charged
+        // earlier because it cannot be measured before the call is answered.
         self.pending_charge = self
             .pending_charge
-            .saturating_add(CAPABILITY_CALL_FUEL)
             .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX) / BYTES_PER_FUEL);
         self.queued_replies = self.queued_replies.saturating_add(line.len());
         self.stdin.extend(line.as_bytes());
+    }
+
+    /// Dispatch the next queued call, if any.
+    ///
+    /// Returns `false` when the queue is empty. The caller charges
+    /// [`CAPABILITY_CALL_FUEL`] before each `true` step, which is the whole
+    /// point of the queue: see [`pending_calls`](Self::pending_calls).
+    fn service_next(&mut self) -> bool {
+        let Some(call) = self.pending_calls.pop_front() else {
+            return false;
+        };
+        self.service(&call);
+        true
+    }
+
+    /// Whether a parsed call is waiting for its fixed charge.
+    fn has_pending_call(&self) -> bool {
+        !self.pending_calls.is_empty()
     }
 
     /// Take the fuel owed for capability work, leaving nothing owed.
@@ -3831,12 +3867,23 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                         }
                         if fd == 1 {
                             let accepted = caller.data_mut().write_stdout(&scratch);
-                            // Charged whether the write was accepted or not: a
-                            // capability call the guest made inside this chunk
-                            // has already cost the host its dispatch and its
-                            // encoded reply, and a refusal on a later byte of
-                            // the same chunk does not give that work back.
-                            // Drained before the branch below so no exit from
+                            // Fixed charge, dispatch, byte charge — in that
+                            // order, once per call the chunk completed. The
+                            // fixed charge is taken *before* the call reaches a
+                            // backend, so a budget too small to pay for it
+                            // cannot leave a KV write, a job enqueue or an
+                            // outbound POST behind on a request that then ends
+                            // as `FuelExhausted`. A trap here leaves the rest of
+                            // the queue undispatched, which is the same
+                            // property one level up.
+                            while caller.data().has_pending_call() {
+                                charge_units(&mut caller, CAPABILITY_CALL_FUEL)?;
+                                let _ = caller.data_mut().service_next();
+                                let owed = caller.data_mut().take_pending_charge();
+                                charge_units(&mut caller, owed)?;
+                            }
+                            // Charged whether the write was accepted or not, and
+                            // drained before the branch below, so no exit from
                             // this arm can leave fuel owed.
                             let owed = caller.data_mut().take_pending_charge();
                             charge_units(&mut caller, owed)?;

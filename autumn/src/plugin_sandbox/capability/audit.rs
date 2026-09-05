@@ -321,10 +321,17 @@ impl ActivitySummary {
                     DenialReason::ResponseTooLarge | DenialReason::BackendError
                 )
         );
+        // Jobs are the exception to "reached the host counts": `job_types` is
+        // rendered as *jobs enqueued*, and a sink that refused — a queue at its
+        // depth ceiling — enqueued nothing. Counting it would put a job in the
+        // report that no runner will ever run, which is the one number an
+        // operator reading this would act on.
+        let enqueued = matches!(event.outcome, CapabilityOutcome::Allowed);
         let bucket = match (event.capability, allowed) {
             (SandboxCapability::HttpOutbound, true) => Some(&mut self.hosts),
             (SandboxCapability::Db, true) => Some(&mut self.tables),
-            (SandboxCapability::Jobs, true) => Some(&mut self.job_types),
+            (SandboxCapability::Jobs, true) if enqueued => Some(&mut self.job_types),
+            (SandboxCapability::Jobs, true) => Some(&mut self.refused_targets),
             (
                 SandboxCapability::HttpOutbound | SandboxCapability::Db | SandboxCapability::Jobs,
                 false,

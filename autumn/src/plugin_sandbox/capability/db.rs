@@ -282,7 +282,14 @@ pub trait PluginStore: Send + Sync + 'static {
     fn get(&self, scope: &Scope, row_id: &str) -> Result<Option<PluginRow>, StoreError>;
 
     /// Rows matching every column in `filter`, capped at `limit` rows and
-    /// `max_bytes` of row weight.
+    /// `max_bytes` of row weight, resuming after `after`.
+    ///
+    /// **Rows come back in ascending [`ID_COLUMN`] order, and `after` excludes
+    /// every id at or below it.** That ordering is the whole of paging: a page
+    /// can end early on either cap, and the guest continues by passing the last
+    /// `row_id` it saw. An implementation free to return matches in any order
+    /// would make `after` meaningless and the rows behind a truncated page
+    /// unreachable.
     ///
     /// Each returned row must carry its [`ID_COLUMN`]; see the contract on
     /// [`insert`](Self::insert).
@@ -308,6 +315,7 @@ pub trait PluginStore: Send + Sync + 'static {
         filter: &PluginRow,
         limit: usize,
         max_bytes: usize,
+        after: Option<&str>,
     ) -> Result<QueryPage, StoreError>;
 
     /// Replace the row with this id.
@@ -387,9 +395,19 @@ pub(super) fn perform(
                 Err(err) => CallResult::denied(id, DenialReason::BackendError, err.to_string()),
             }
         }
-        CapabilityCall::DbQuery { filter, limit, .. } => match validated_row(filter) {
+        CapabilityCall::DbQuery {
+            filter,
+            limit,
+            after,
+            ..
+        } => match validated_filter(filter) {
             Err(result) => result(id),
             Ok(filter) => {
+                if let Some(after) = after
+                    && let Err(result) = check_row_id(after)
+                {
+                    return result(id);
+                }
                 // A limit of zero means "as many as the quota allows", which is
                 // what a guest that omits the field gets. Anything larger is
                 // clamped rather than refused: the quota is the operator's
@@ -399,7 +417,13 @@ pub(super) fn perform(
                 } else {
                     (*limit as usize).min(row_limit)
                 };
-                match store.query(&scope, &filter, want, super::MAX_RESULT_BYTES) {
+                match store.query(
+                    &scope,
+                    &filter,
+                    want,
+                    super::MAX_RESULT_BYTES,
+                    after.as_deref(),
+                ) {
                     Ok(page) => {
                         let mut rows = page.rows;
                         rows.truncate(want);
@@ -483,6 +507,29 @@ fn validated_row(row: &PluginRow) -> Result<PluginRow, Denial> {
     // Stripped rather than refused; see `RESERVED_COLUMNS`.
     row.remove(ID_COLUMN);
     Ok(row)
+}
+
+/// The same checks for a `db-query` *filter*, where stripping is not an option.
+///
+/// [`validated_row`] strips [`ID_COLUMN`] because a row echoing the id it was
+/// read with is the obvious code and means nothing on a write. On a filter it
+/// means everything: stripping it turns "the row with this id" into "every row
+/// this tenant has", so a guest narrowing a query would silently widen it — the
+/// one direction a containment bug can go and still look like it worked.
+/// Refused instead, naming the call that does take an id.
+fn validated_filter(row: &PluginRow) -> Result<PluginRow, Denial> {
+    if row.contains_key(ID_COLUMN) {
+        return Err(Box::new(move |id| {
+            CallResult::denied(
+                id,
+                DenialReason::Malformed,
+                format!(
+                    "a query filter may not carry {ID_COLUMN:?}; use `db-get` to read one row                      by its id"
+                ),
+            )
+        }));
+    }
+    validated_row(row)
 }
 
 fn check_row_id(row_id: &str) -> Result<(), Denial> {
@@ -632,6 +679,7 @@ impl PluginStore for MemoryPluginStore {
         filter: &PluginRow,
         limit: usize,
         max_bytes: usize,
+        after: Option<&str>,
     ) -> Result<QueryPage, StoreError> {
         let rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
         // Ids first, values second. Sorting borrowed ids rather than cloned
@@ -649,6 +697,7 @@ impl PluginStore for MemoryPluginStore {
                     .iter()
                     .all(|(column, want)| row.get(column) == Some(want))
             })
+            .filter(|((_, _, row_id), _)| after.is_none_or(|after| row_id.as_str() > after))
             .map(|(key, _)| key)
             .collect();
         matched.sort_by(|left, right| left.2.cmp(&right.2));
