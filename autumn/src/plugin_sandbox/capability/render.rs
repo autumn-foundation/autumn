@@ -629,4 +629,41 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn one_element_may_not_carry_unbounded_attributes() {
+        // The allow-list bounds *which* attributes appear and says nothing
+        // about how many. An element repeating `title` is inside every other
+        // ceiling — depth, node count, per-value length — and still renders
+        // megabytes, because escaping expands each value severalfold and the
+        // byte check used to run once per node rather than per attribute.
+        // `a`, because `title` is the one free-form value the allow-list
+        // permits and it permits it there. On any other tag this would be
+        // refused for the attribute's *name* and prove nothing about its size.
+        let wide = FragmentNode::Element {
+            tag: "a".to_owned(),
+            attributes: (0..=MAX_ATTRIBUTES)
+                .map(|_| ("title".to_owned(), "x".to_owned()))
+                .collect(),
+            children: Vec::new(),
+        };
+        assert!(matches!(
+            render(&[wide], 1024 * 1024),
+            Err(RenderError::TooManyAttributes(_))
+        ));
+
+        // And the byte ceiling stops the string being *built*, not merely
+        // reports its size: every value here escapes to five bytes.
+        let heavy = FragmentNode::Element {
+            tag: "a".to_owned(),
+            attributes: (0..MAX_ATTRIBUTES)
+                .map(|_| ("title".to_owned(), "&".repeat(MAX_TEXT_BYTES)))
+                .collect(),
+            children: Vec::new(),
+        };
+        assert!(
+            matches!(render(&[heavy], 4096), Err(RenderError::TooLarge { .. })),
+            "a fragment far over the ceiling should be refused"
+        );
+    }
 }

@@ -558,4 +558,41 @@ mod tests {
             "and still reports the drops"
         );
     }
+
+    #[test]
+    fn a_refused_enqueue_is_not_reported_as_a_job() {
+        // `job_types` renders as "jobs enqueued". A sink at its depth ceiling
+        // enqueued nothing, so counting it puts a job in the operator's report
+        // that no runner will ever run — and that count is the number they
+        // would act on.
+        let log = PluginActivityLog::new();
+        log.ingest(
+            "shop",
+            [
+                CapabilityEvent {
+                    capability: SandboxCapability::Jobs,
+                    operation: "job-enqueue",
+                    target: "reindex".to_owned(),
+                    outcome: CapabilityOutcome::Allowed,
+                },
+                CapabilityEvent {
+                    capability: SandboxCapability::Jobs,
+                    operation: "job-enqueue",
+                    target: "reindex".to_owned(),
+                    outcome: CapabilityOutcome::Denied(DenialReason::BackendError),
+                },
+            ],
+        );
+        let summary = log.summary("shop", Duration::from_secs(3600));
+        assert_eq!(
+            summary.job_types.get("reindex").copied(),
+            Some(1),
+            "only the accepted enqueue is a job: {summary:?}"
+        );
+        assert_eq!(
+            summary.refused_targets.get("reindex").copied(),
+            Some(1),
+            "and the refusal is still visible: {summary:?}"
+        );
+    }
 }

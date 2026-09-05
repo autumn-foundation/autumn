@@ -1531,6 +1531,81 @@ path = "/shop/panel"
         );
     }
 
+    #[test]
+    fn a_query_filter_may_not_carry_the_row_id_that_would_widen_it() {
+        // `validated_row` strips `row_id` on a write, which is right: a row read
+        // back carries its id and echoing it means nothing. On a *filter* the
+        // same strip turns "the row with this id" into "every row this tenant
+        // has" — narrowing that silently widens, which is the one direction a
+        // containment bug can go and still look like it worked.
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        for sku in ["A-1", "A-2", "A-3"] {
+            let inserted = fixture.runtime.dispatch(&CapabilityCall::DbInsert {
+                id: 1,
+                table: "orders".to_owned(),
+                row: row(&[("sku", sku)]),
+            });
+            assert!(inserted.denial().is_none(), "{inserted:?}");
+        }
+        let result = fixture.runtime.dispatch(&CapabilityCall::DbQuery {
+            id: 2,
+            table: "orders".to_owned(),
+            filter: row(&[(db::ID_COLUMN, "r1")]),
+            limit: 0,
+            after: None,
+        });
+        assert_eq!(result.denial(), Some(DenialReason::Malformed), "{result:?}");
+    }
+
+    #[test]
+    fn a_truncated_page_can_be_continued_from_where_it_stopped() {
+        // A ceiling the guest is told about and cannot act on is worse than no
+        // ceiling: `truncated` would say "there is more" while the same filter
+        // returned the same prefix forever.
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        for sku in ["A-1", "A-2", "A-3", "A-4"] {
+            let inserted = fixture.runtime.dispatch(&CapabilityCall::DbInsert {
+                id: 1,
+                table: "orders".to_owned(),
+                row: row(&[("sku", sku)]),
+            });
+            assert!(inserted.denial().is_none(), "{inserted:?}");
+        }
+
+        let page = |runtime: &mut CapabilityRuntime, after: Option<String>| {
+            let result = runtime.dispatch(&CapabilityCall::DbQuery {
+                id: 2,
+                table: "orders".to_owned(),
+                filter: PluginRow::new(),
+                limit: 2,
+                after,
+            });
+            let CallResult::Ok {
+                value: CallValue::Rows { rows, .. },
+                ..
+            } = result
+            else {
+                panic!("the query should have succeeded: {result:?}")
+            };
+            rows
+        };
+
+        let first = page(&mut fixture.runtime, None);
+        assert_eq!(first.len(), 2, "{first:?}");
+        let last = first
+            .last()
+            .and_then(|row| row.get(db::ID_COLUMN))
+            .map(ToString::to_string)
+            .expect("every returned row carries its id");
+        let second = page(&mut fixture.runtime, Some(last));
+        assert_eq!(second.len(), 2, "{second:?}");
+        // Disjoint, which is the whole property: a cursor that returned the
+        // same rows again would page forever without advancing.
+        for row in &second {
+            assert!(!first.contains(row), "{row:?} came back twice");
+        }
+    }
+
     // ── Outbound containment ─────────────────────────────────────────
 
     #[test]
@@ -1824,6 +1899,45 @@ path = "/shop/panel"
         assert!(
             carried <= MAX_RESULT_BYTES.saturating_add(MAX_ROW_BYTES),
             "the answer carried {carried} bytes"
+        );
+    }
+
+    #[test]
+    fn an_upstream_cannot_answer_with_unbounded_headers() {
+        // The allow-list says which response headers come back and nothing
+        // about their size, and every one of them is the *upstream's* choice
+        // rather than the plugin's or the host's. A legal body plus megabytes
+        // of `etag` is an oversized allocation the host makes and then fails
+        // the plugin's request over.
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        let mut answer = OutboundResponse::from_url("https://api.example.com/", 200, "ok");
+        answer.headers = (0..64)
+            .map(|_| ("etag".to_owned(), "x".repeat(4096)))
+            .collect();
+        fixture.http.answer("https://api.example.com/", answer);
+
+        let result = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
+            id: 1,
+            method: "GET".to_owned(),
+            url: "https://api.example.com/".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        });
+        let CallResult::Ok {
+            value: CallValue::Http { headers, .. },
+            ..
+        } = result
+        else {
+            panic!("the fetch should have succeeded: {result:?}")
+        };
+        assert!(headers.len() <= MAX_OUTBOUND_HEADERS, "{}", headers.len());
+        let carried: usize = headers
+            .iter()
+            .map(|(name, value)| name.len().saturating_add(value.len()))
+            .sum();
+        assert!(
+            carried <= MAX_RESPONSE_HEADER_BYTES,
+            "the reply carried {carried} bytes of headers"
         );
     }
 
