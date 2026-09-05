@@ -527,7 +527,23 @@ FAMILY_TAIL = re.compile(r'^[A-Za-z0-9_<>*]*$')
 # The word before an `=`, where the name has to BE the word. The lookbehind is
 # what keeps `$AUTUMN_X=`, `FOO_AUTUMN_X=` and `${AUTUMN_X}` out: an expansion
 # or a longer identifier is not this page assigning to the name.
-ASSIGNED_CLAIM = re.compile(r'(?<![\w$/{-])(AUTUMN_[A-Za-z0-9_{}<>*.\-]*)=')
+#
+# The word is bounded by what ENDS a shell word, not by a list of characters a
+# name may contain — and getting that backwards is the third instance of "a
+# name matching nothing rather than matching wrongly" on this one rung. An
+# allowed-character class of `[A-Za-z0-9_{}<>*.-]` stopped before `:`, so
+# `export AUTUMN_LOG__LEVEL:TYPO=debug` matched nothing at all as an
+# assignment, fell through to the plain name sweep, and resolved on the valid
+# prefix `AUTUMN_LOG__LEVEL`. Bash rejects that operand outright — `help
+# export` says `name[=value]`, and `AUTUMN_LOG__LEVEL:TYPO` is not a valid
+# identifier — so the line sets nothing and the page passed.
+#
+# So the class is the complement: everything up to the `=` that is not
+# whitespace, a quote, or one of the shell metacharacters that end a word.
+# `<` and `>` stay IN, because the corpus writes family placeholders like
+# `AUTUMN_MEDIA__<TABLE>__<FIELD>` that `FAMILY_TAIL` recognises; `[`, `]` and
+# `,` stay out so a markdown link or list around a name is not swallowed.
+ASSIGNED_CLAIM = re.compile(r'(?<![\w$/{-])(AUTUMN_[^\s`\'";&|()\[\],=]*)=')
 
 
 def _overstates(token):
@@ -3235,7 +3251,14 @@ ENV_MACRO = r'|\b(?:(?:core|std)::)?((?:option_)?env)!\s*\('
 MACRO_SHADOW = re.compile(r'\bmacro_rules!\s*(option_env|env)\b')
 # …and what a MATCH of the macro alternative looks like, so the scan can ask
 # which macro it is without re-deriving the pattern.
-MACRO_CALL = re.compile(r'(?:(?:core|std)::)?((?:option_)?env)!')
+#
+# The PATH is captured too, because only the unqualified spelling is
+# shadowable. `macro_rules! env` takes over the bare name in its textual scope;
+# `std::env!("AUTUMN_X")` resolves through the path to the std macro and is
+# unaffected — so suppressing the qualified call alongside the bare one
+# reported a page documenting a key the runtime really does read. The shadow is
+# a rule about a NAME, and a path is not that name.
+MACRO_CALL = re.compile(r'(?P<path>(?:core|std)::)?(?P<name>(?:option_)?env)!')
 
 # `impl Env for OsEnv` — the types that ARE an environment.
 #
@@ -4913,14 +4936,19 @@ def source_tokens(root):
             # `macro_rules!` that takes it, and inside that declaration's scope
             # thereafter. Found on the SCAN's own text, so no offset crosses
             # from the derivation.
+            # …and only the UNQUALIFIED spelling is shadowable: `std::env!` and
+            # `core::env!` resolve through the path to the std macro whatever
+            # a local `macro_rules! env` does, so suppressing them alongside
+            # the bare form reported a page whose key the runtime does read.
             macro = MACRO_CALL.match(m.group(0))
-            if macro and acc_for(rel).shadows(macro.group(1)):
+            if (macro and not macro.group('path')
+                    and acc_for(rel).shadows(macro.group('name'))):
                 mine = _scope_at(spans, m.start())
                 if any(d.start() < m.start()
                        and mine[:len(_scope_at(spans, d.start()))]
                        == _scope_at(spans, d.start())
                        for d in MACRO_SHADOW.finditer(body)
-                       if d.group(1) == macro.group(1)):
+                       if d.group(1) == macro.group('name')):
                     continue
             through = acc_for(rel).receiver(m)
             if through is not None and not acc_for(rel).allows(
@@ -5699,6 +5727,24 @@ def self_test():
            'echo $AUTUMN_X=1', 'PATH=$AUTUMN_X', 'FOO_AUTUMN_X-Y=1')],
          [['AUTUMN_LOG__LEVEL-TYPO'], ['AUTUMN_LOG__LEVEL.TYPO'],
           [], [], [], [], [], []])
+    # …and the word ends where a SHELL WORD ends, not where a list of allowed
+    # characters runs out. An allowed-character class stopped before `:`, so
+    # `AUTUMN_LOG__LEVEL:TYPO=debug` matched nothing as an assignment and the
+    # valid prefix resolved instead — the third time on this rung that a name
+    # matched nothing rather than matching wrongly.
+    case('every non-delimiter suffix is part of the assignment word',
+         [span_defects(t) for t in
+          ('export AUTUMN_LOG__LEVEL:TYPO=debug',
+           'AUTUMN_X+junk=1', 'AUTUMN_X@host=1', 'AUTUMN_X/y=1')],
+         [['AUTUMN_LOG__LEVEL:TYPO'], ['AUTUMN_X+junk'],
+          ['AUTUMN_X@host'], ['AUTUMN_X/y']])
+    # …and the delimiters themselves still end it, so an expansion, a quoted
+    # value and a markdown link around a name stay out.
+    case('a shell delimiter still ends the word',
+         [span_defects(t) for t in
+          ('${AUTUMN_X:=y}', 'echo "AUTUMN_X:v" ; AUTUMN_LOG__LEVEL=debug',
+           '[AUTUMN_X](https://x/?a=1)', 'run: AUTUMN_A=1 AUTUMN_B=2')],
+         [[], [], [], []])
     # …and a span that is CODE is left alone, because the characters after the
     # name are the language's and not the reader's typo.
     case('a code span is not a bare token',
@@ -6552,10 +6598,19 @@ def self_test():
     # above one is still the std macro. A file-wide flag withheld the
     # alternative from the whole file, the lines before it included.
     case('a macro call is recognised for the shadow test',
-         [(lambda m: m.group(1) if m else None)(MACRO_CALL.match(t)) for t in
-          ('option_env!("X")', 'env!("X")', 'std::env!("X")',
-           'envelope!("X")')],
+         [(lambda m: m.group('name') if m else None)(MACRO_CALL.match(t))
+          for t in ('option_env!("X")', 'env!("X")', 'std::env!("X")',
+                    'envelope!("X")')],
          ['option_env', 'env', 'env', None])
+    # …and only the UNQUALIFIED name is shadowable. `macro_rules! env` takes
+    # over the bare name in its textual scope; `std::env!` resolves through the
+    # path to the std macro regardless, so suppressing it too reported a page
+    # whose key the runtime really does read. A path is not the name.
+    case('a qualified macro call is not shadowable',
+         [(lambda m: bool(m.group('path')))(MACRO_CALL.match(t)) for t in
+          ('env!("X")', 'option_env!("X")', 'std::env!("X")',
+           'core::option_env!("X")')],
+         [False, False, True, True])
     case('a function that returns an environment is read from its signature',
          [(n, r) for n, r, _ in _fn_returns(
              'fn a(p: &str) -> autumn_web::dotenv::DotenvOsEnv { x }\n'
