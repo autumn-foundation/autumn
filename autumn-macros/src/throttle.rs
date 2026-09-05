@@ -268,6 +268,21 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let spec_tokens = build_spec_tokens(&attrs);
     let gate_ident = format_ident!("__AutumnThrottleGate_{}", fn_name);
+    // Emitted a second time into the handler body below (issue #2516): the
+    // gate redesign (#2488) moved the rate-limit check into the gate's own
+    // `from_request_parts`, but `api_doc::infer_response_body`'s recovery of
+    // the pre-rewrite return type (#1677/#2484) still requires one of
+    // `RESPONSE_REWRITING_GUARD_MARKERS` to be present in the *handler's own*
+    // block, structurally distinguishing a real guard-generated
+    // `__autumn_inner` binding from a handler that coincidentally ends the
+    // same way. Nothing in the body reads this copy, hence `allow(dead_code)`
+    // — see `secured_macro`'s identically-shaped `role_scope_consts` for the
+    // established pattern.
+    let markers = quote! {
+        #[allow(dead_code)]
+        const __AUTUMN_THROTTLE_ROUTE_ID: &str =
+            ::core::concat!(::core::module_path!(), "::", #fn_name_str);
+    };
 
     // Whether THIS gate should also serve a cached idempotency replay: see
     // `should_own_replay` for the full ordering rationale (issue #1668's
@@ -439,6 +454,7 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     input_fn.block = syn::parse_quote! {
         {
+            #markers
             #original_response
         }
     };
