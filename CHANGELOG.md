@@ -1671,6 +1671,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   internal-only receiver during development) will see those deliveries start
   failing after upgrade — this is the intended effect of closing the gap. See
   `docs/security/2026-09-03-webhook-ssrf/`.
+- **`#[cached]`'s generated cache key now folds in the ambient resolved
+  tenant:** the key was built exclusively from the function's own explicit
+  arguments (every parameter by default, or exactly the parameters named in
+  `key(...)`) and never consulted the `CURRENT_TENANT` task-local a
+  `tenant_scoped` repository read filters by. An app that turned on Autumn's
+  multi-tenancy (`[tenancy] enabled = true`) and cached a `tenant_scoped`
+  read keyed on any parameter *other* than the tenant itself — a page, an
+  export format, a filter, anything but the literal `tenant_id` the SaaS
+  starter's own `cached_project_count` goes out of its way to thread through
+  `key(tenant_id)` — shared one cache slot across every tenant that called it
+  with the same non-tenant arguments: tenant B received **tenant A's cached
+  response** for the remainder of the entry's TTL. Nothing in the macro, the
+  build-time cache-coherence gate (`autumn cache audit`), or `autumn routes
+  audit` detected or prevented the omission, and Autumn's own tenancy idiom
+  never requires threading `tenant_id` through a function signature for any
+  *other* tenant-scoped operation (`tenant_scoped` finders resolve it from
+  `CURRENT_TENANT` automatically) — so the omission was an easy, natural
+  mistake, not a documented misuse. The generated wrapper now reads
+  `CURRENT_TENANT` (when tenancy is enabled and a tenant has been resolved)
+  and folds it into the key unconditionally, in addition to whatever `key(...)`
+  already names. Apps without tenancy enabled, or calling a `#[cached]`
+  function outside a request (a background job, a scheduled sweep), compute
+  the same key as before — `CURRENT_TENANT` resolves to `None` in both cases.
+  **Compatibility note:** a `#[cached]` function that intentionally serves one
+  shared, cross-tenant value (a genuinely global computation, not a
+  `tenant_scoped` read) now partitions its cache per resolved tenant too when
+  called from within a tenant's request — a harmless drop in hit rate, not a
+  correctness change, since the computed value does not vary by tenant. See
+  `docs/security/2026-09-05-cached-tenant-key/`.
 
 ### Fixed
 
@@ -3288,6 +3317,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity between the input buffers and the emitted ones, so an `_owned`
   function that quietly delegated to its borrowed twin would fail even though
   its output is correct.
+
+### Fixed
+
+- **macros: `#[throttle]`/`#[secured]`/`#[step_up]` above the route macro no
+  longer fail to compile, or silently drop the OpenAPI response schema, once
+  stacked (#1668 regression):** #1668 moved these three guards' runtime
+  checks out of the handler body into each guard's own handler-unique
+  `FromRequestParts` gate — `struct` + `impl`, emitted as a sibling item
+  ahead of the (still single) handler function. Every route macro's own
+  `item` parser (`parse::parse_async_handler`, plus the three guard macros'
+  own parsers, needed when one guard expands above another) only ever
+  accepted a lone `ItemFn`, so a guard macro receiving that two-item output
+  as `item` — any of `#[throttle]`/`#[secured]`/`#[step_up]`/`#[route]`
+  written *above* another guard already using the #1668 gate shape — hit a
+  spurious `route macros can only be applied to functions` compile error.
+  `parse::parse_async_handler_with_preamble` now accepts zero or more
+  leading item definitions ahead of the trailing function, returning them
+  separately so the route/guard macro re-emits that preamble (the gate type
+  the function's new first parameter names) verbatim instead of choking on
+  it.
+
+  Fixing the parse gap surfaced a second, previously-masked bug: with
+  parsing no longer failing first, `#[throttle]`/`#[step_up]` above
+  `#[route]` still resolved to no OpenAPI response schema, because
+  `api_doc::infer_response_body`'s `__autumn_inner`-binding recovery (#1677)
+  only trusts that binding when one of `RESPONSE_REWRITING_GUARD_MARKERS`'s
+  marker consts sits earlier in the *same* handler-body block — and #1668
+  moved `#[throttle]`'s/`#[step_up]`'s marker consts into their gate's
+  `impl` block, out of the body, while `#[secured]`'s marker consts stayed
+  in-body for exactly this reason. Both guards now also leave a dead-code
+  copy of their marker const in the handler body (mirroring `#[secured]`'s
+  existing `role_scope_consts` pattern), restoring the invariant
+  `infer_response_body` relies on — including through stacked guards, where
+  only the innermost binding carries the handler's real return type.
+
+  Regression-proven at both the macro-expansion level (`route.rs`'s
+  existing `route_macro_infers_response_schema_when_throttle_expands_first`
+  / `..._when_step_up_expands_first` / `..._under_stacked_guards_above_route`
+  tests, which predate this fix but never previously reached the code path
+  they exercise) and end to end: `cargo test -p autumn-macros --lib` (1073
+  passed), `cargo fmt --all -- --check`, `cargo clippy -p autumn-macros
+  --all-targets -- -D warnings` all clean.
 
 ## [0.7.0] - 2026-08-23
 
