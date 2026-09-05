@@ -1715,6 +1715,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **ci: `live_upgrade` no longer fails because the hot-upgrade example inherits
+  the dev profile's 1-second drain budget:** the test asserts the production
+  guarantee that a predecessor drains and exits 0 after handing over, but ran
+  under the `dev` profile, which shortens `shutdown_timeout_secs` from the 30s
+  default to 1s so Ctrl-C is snappy while developing. The load loop keeps
+  driving traffic for 3.5s past the cutover, so that budget expires while
+  requests are still arriving and whatever is in flight is aborted
+  (`exit_code: 1`) — nothing wrong with the upgrade path, just a budget shorter
+  than the load window. The test now pins `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS`
+  to the production default, exactly as it already pins the prestop grace.
+  Reproduced locally under CPU oversubscription (which also disproved the
+  intuitive "slow cutover" explanation — it reproduces with the cutover
+  completing in 135 ms), and verified non-hiding: the `connect_errors == 0`
+  assertion of #2372 still fires under the same load, so that defect remains
+  visible. [no-plugin] — test-only; no API or behaviour change. (#1747, #2372)
 - **🔒 `autumn generate auth`: a concurrent successful login could be silently
   re-locked by a racing failed attempt (issue #2500):** the generated
   `login` handler (and the duplicated `reauth` step-up block) counted a
