@@ -17,7 +17,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{ItemFn, LitStr, parse_quote};
+use syn::{LitStr, parse_quote};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -196,9 +196,13 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(v) => v,
         Err(err) => return err.to_compile_error(),
     };
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    // Guards stack, so the input may already be an *earlier* guard's output:
+    // its gate type followed by the function it rewrote. Parsing that as a bare
+    // `ItemFn` failed, which is why two guards above one route did not compile.
+    // The leading items are re-emitted below, ahead of this guard's own.
+    let (leading_items, mut input_fn) = match crate::parse::parse_async_handler_with_items(item) {
+        Ok(parsed) => parsed,
+        Err(err) => return err,
     };
     if input_fn.sig.asyncness.is_none() {
         return syn::Error::new_spanned(
@@ -329,13 +333,22 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     input_fn.sig.output = parse_quote! {
         -> ::autumn_web::reexports::axum::response::Response
     };
+    // See the matching note in `throttle_macro`: the marker const has to stay
+    // in this block for `api_doc::infer_response_body` to trust the
+    // `__autumn_inner` binding and recover the handler's real return type.
+    let response_schema_marker = quote! {
+        #[allow(dead_code, reason = "read by the route macro, not by this body")]
+        const __AUTUMN_STEP_UP_MAX_AGE: ::core::option::Option<u64> = #max_age_tokens;
+    };
     input_fn.block = syn::parse_quote! {
         {
+            #response_schema_marker
             #original_response
         }
     };
 
     quote! {
+        #(#leading_items)*
         #gate_item
         #input_fn
     }

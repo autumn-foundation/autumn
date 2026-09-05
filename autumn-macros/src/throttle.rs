@@ -21,7 +21,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ItemFn, Lit, LitInt, LitStr, parse_quote};
+use syn::{Expr, Lit, LitInt, LitStr, parse_quote};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -251,9 +251,13 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    // Guards stack, so the input may already be an *earlier* guard's output:
+    // its gate type followed by the function it rewrote. Parsing that as a bare
+    // `ItemFn` failed, which is why two guards above one route did not compile.
+    // The leading items are re-emitted below, ahead of this guard's own.
+    let (leading_items, mut input_fn) = match crate::parse::parse_async_handler_with_items(item) {
+        Ok(parsed) => parsed,
+        Err(err) => return err,
     };
 
     if input_fn.sig.asyncness.is_none() {
@@ -437,13 +441,30 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     input_fn.sig.output = parse_quote! {
         -> ::autumn_web::reexports::axum::response::Response
     };
+    // The marker const stays in the handler body as well as in the gate, for
+    // the same reason `#[secured]` keeps its role/scope consts there:
+    // `api_doc::infer_response_body` recovers this handler's pre-rewrite return
+    // type from the `__autumn_inner` binding below, and it only trusts that
+    // binding when one of the guards' own marker consts sits in the same block
+    // (otherwise a user body that coincidentally ends in the same two
+    // statements would be mistaken for a guard's). Moving the check into a
+    // `FromRequestParts` gate took the const out of this block and silently
+    // dropped the `Json<T>` response schema from the OpenAPI document for every
+    // `#[throttle]`-above-`#[post]` route.
+    let response_schema_marker = quote! {
+        #[allow(dead_code, reason = "read by the route macro, not by this body")]
+        const __AUTUMN_THROTTLE_ROUTE_ID: &str =
+            ::core::concat!(::core::module_path!(), "::", #fn_name_str);
+    };
     input_fn.block = syn::parse_quote! {
         {
+            #response_schema_marker
             #original_response
         }
     };
 
     quote! {
+        #(#leading_items)*
         #gate_item
         #input_fn
     }

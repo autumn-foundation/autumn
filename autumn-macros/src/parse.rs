@@ -321,11 +321,54 @@ fn validate_path(path: &LitStr) -> Result<(), TokenStream> {
 ///
 /// Returns `Ok(func)` if valid, or a compile error `TokenStream` if not.
 /// Validates: is a function, is async.
+///
+/// Prefer [`parse_async_handler_with_items`] in a macro that re-emits what it
+/// was given: this discards any item a guard expanded *alongside* the function,
+/// which for `#[secured]`, `#[step_up]` and `#[throttle]` is the gate type the
+/// rewritten signature refers to.
 pub fn parse_async_handler(item: TokenStream) -> Result<ItemFn, TokenStream> {
-    let input_fn: ItemFn = syn::parse2(item.clone()).map_err(|_| {
-        syn::Error::new_spanned(item, "route macros can only be applied to functions")
+    parse_async_handler_with_items(item).map(|(_, input_fn)| input_fn)
+}
+
+/// Parse an async handler that may arrive with items in front of it.
+///
+/// A guard applied *above* a route attribute expands first, and since #1668
+/// `#[secured]`, `#[step_up]` and `#[throttle]` each expand to two items — the
+/// gate type, then the rewritten function:
+///
+/// ```text
+/// struct __AutumnThrottleGate_create { /* … */ }   // ← the leading item
+/// async fn create(_: __AutumnThrottleGate_create, …) -> Response { … }
+/// ```
+///
+/// Parsing that as a bare [`ItemFn`] fails, and the route macro reported it as
+/// "can only be applied to functions" — pointing at the handler, which was
+/// fine, rather than at the guard above it. Every item but the last is returned
+/// for the caller to re-emit ahead of its own output; the last must be the
+/// function, because that is what the guard leaves for the next macro to see.
+pub fn parse_async_handler_with_items(
+    item: TokenStream,
+) -> Result<(Vec<syn::Item>, ItemFn), TokenStream> {
+    // Kept only to span the error: `parse2` consumes the stream, and a failure
+    // still has to point at what the caller was given.
+    let spanned = item.clone();
+    let cannot_parse = move || {
+        syn::Error::new_spanned(spanned, "route macros can only be applied to functions")
             .to_compile_error()
-    })?;
+    };
+
+    // A `File` rather than an `ItemFn`, so a guard's gate type and its function
+    // both survive. `syn::File` parses a bare item sequence with no shebang or
+    // inner attributes, which is exactly what a macro expansion is.
+    let parsed: syn::File = syn::parse2(item).map_err(|_| cannot_parse())?;
+    let mut items = parsed.items;
+    let Some(syn::Item::Fn(input_fn)) = items.pop() else {
+        return Err(syn::Error::new_spanned(
+            quote::quote! { #(#items)* },
+            "route macros can only be applied to functions",
+        )
+        .to_compile_error());
+    };
 
     if input_fn.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
@@ -335,7 +378,7 @@ pub fn parse_async_handler(item: TokenStream) -> Result<ItemFn, TokenStream> {
         .to_compile_error());
     }
 
-    Ok(input_fn)
+    Ok((items, input_fn))
 }
 
 /// Extract `#[intercept(LayerType)]` attributes from a function's attribute

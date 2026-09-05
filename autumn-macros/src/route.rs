@@ -37,8 +37,12 @@ pub fn route_macro(
     };
     let path = route_args.path.clone();
 
-    let mut input_fn = match parse::parse_async_handler(item) {
-        Ok(f) => f,
+    // `_with_items`, because a guard written ABOVE this attribute expands first
+    // and leaves its gate type in front of the function it rewrote. Those items
+    // are re-emitted verbatim below: the rewritten signature names the gate, so
+    // dropping it here would turn a working stack into an unresolved type.
+    let (leading_items, mut input_fn) = match parse::parse_async_handler_with_items(item) {
+        Ok(parsed) => parsed,
         Err(err) => return err,
     };
 
@@ -256,6 +260,10 @@ pub fn route_macro(
     };
 
     quote! {
+        // Whatever a guard above this attribute expanded alongside the handler,
+        // put back ahead of it and otherwise untouched.
+        #(#leading_items)*
+
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
         // to import axum manually. However, the path resolution in Axum macros makes this impossible
         // natively. Custom compile errors handle the type checks.
