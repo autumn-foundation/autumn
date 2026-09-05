@@ -350,6 +350,41 @@ async fn signup_and_login_failures_redisplay_the_form_with_email_preserved() {
     assert!(resp.text().contains(r#"value="nobody@acme.test""#));
 }
 
+/// A "Remember me" opt-in must survive a rejected login (Codex review
+/// finding): if the user ticks the box, mistypes the password, and corrects
+/// it on the redisplayed form without re-checking a box they already
+/// checked, the eventual successful login must still honor their original
+/// choice — so the checkbox itself must come back checked.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn login_failure_preserves_the_remember_me_choice() {
+    let client = db_client().await;
+
+    let checked = client
+        .post("/login")
+        .form("email=nobody@acme.test&password=wrong-password&remember=on")
+        .send()
+        .await;
+    checked.assert_ok();
+    assert!(
+        checked.text().contains("checked"),
+        "expected the Remember-me checkbox to stay checked after a rejected login, got: {}",
+        checked.text()
+    );
+
+    let unchecked = client
+        .post("/login")
+        .form("email=nobody@acme.test&password=wrong-password")
+        .send()
+        .await;
+    unchecked.assert_ok();
+    assert!(
+        !unchecked.text().contains("checked"),
+        "an unticked box must not come back checked, got: {}",
+        unchecked.text()
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn tenants_are_isolated() {

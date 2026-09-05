@@ -150,7 +150,16 @@ pub async fn signup(
     let tx_result: Result<(User, Organization), AutumnError> = db
         .tx(move |conn| {
             async move {
-                let user: User = diesel::insert_into(users::table)
+                // A duplicate email hits the UNIQUE constraint; classified here
+                // (rather than folded into the blanket `?` below) so the handler
+                // can redisplay the signup form inline instead of navigating to
+                // a generic error page (Wayfinder: error-path inventory) — see
+                // the match on `tx_result` below. Matched specifically on
+                // `UniqueViolation` (Codex review finding) so a transient DB
+                // failure (connection drop, permission error, schema mismatch)
+                // still propagates as the real 500/503 it is, rather than
+                // being masked as a fake "duplicate email" conflict.
+                let user: User = match diesel::insert_into(users::table)
                     .values(&NewUser {
                         email: email.clone(),
                         password_hash,
@@ -158,12 +167,14 @@ pub async fn signup(
                     .returning(User::as_returning())
                     .get_result(conn)
                     .await
-                    // A duplicate email hits the UNIQUE constraint; classified here
-                    // (rather than folded into the blanket `?` below) so the handler
-                    // can redisplay the signup form inline instead of navigating to
-                    // a generic error page (Wayfinder: error-path inventory) — see
-                    // the match on `tx_result` below.
-                    .map_err(|_| AutumnError::conflict_msg("Could not create account"))?;
+                {
+                    Ok(user) => user,
+                    Err(diesel::result::Error::DatabaseError(
+                        diesel::result::DatabaseErrorKind::UniqueViolation,
+                        _,
+                    )) => return Err(AutumnError::conflict_msg("Could not create account")),
+                    Err(err) => return Err(err.into()),
+                };
 
                 let org: Organization = diesel::insert_into(organizations::table)
                     .values(&InsertOrganization {

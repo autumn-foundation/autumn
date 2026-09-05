@@ -171,7 +171,7 @@ pub async fn signup(
     let tenant_id = email.clone();
     let password_hash = hash_password(&form.password).await?;
 
-    let inserted: Result<User, _> = diesel::insert_into(users::table)
+    let inserted = diesel::insert_into(users::table)
         .values(&NewUser {
             email,
             password_hash,
@@ -185,8 +185,17 @@ pub async fn signup(
         // A duplicate email hits the UNIQUE constraint; surface the same generic
         // message a failed login does so the form does not enumerate accounts —
         // now as an inline redisplay rather than a full navigation away from the
-        // form, matching every other signup failure mode above.
-        Err(_) => {
+        // form, matching every other signup failure mode above. Matched
+        // specifically on `UniqueViolation` (Codex review finding) so a
+        // transient DB failure (connection drop, permission error, schema
+        // mismatch) propagates as the real error it is — masking one as a
+        // fake-successful 200 "could not create account" page would both hide
+        // it from availability monitoring and let `SubmitTokenLayer` cache
+        // that 200 as a completed submission.
+        Err(diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            _,
+        )) => {
             return Ok(signup_page(
                 password_cfg.min_length,
                 submit_token.token(),
@@ -195,6 +204,7 @@ pub async fn signup(
             )
             .into_response());
         }
+        Err(err) => return Err(err.into()),
     };
 
     establish_session(&session, &user).await;
@@ -205,14 +215,16 @@ pub async fn signup(
 
 #[get("/login")]
 pub async fn login_form() -> Markup {
-    login_page("", None)
+    login_page("", false, None)
 }
 
-/// `email` re-populates the field on an error redisplay; `error`, when
+/// `email` re-populates the field and `remember` re-checks the "Remember me"
+/// box on an error redisplay (Codex review finding: a corrected resubmit
+/// must not silently drop an opt-in the user already made); `error`, when
 /// present, is shown above the form (Wayfinder: error-path inventory — the
-/// message must sit adjacent to the form that caused it, and the email the
-/// user already typed must not be thrown away).
-fn login_page(email: &str, error: Option<&str>) -> Markup {
+/// message must sit adjacent to the form that caused it, and what the user
+/// already entered/chose must not be thrown away).
+fn login_page(email: &str, remember: bool, error: Option<&str>) -> Markup {
     layout(
         "Log in",
         false,
@@ -233,7 +245,7 @@ fn login_page(email: &str, error: Option<&str>) -> Markup {
                           autocomplete="current-password" class="w-full border rounded px-3 py-2";
                 }
                 label class="flex items-center gap-2 text-sm text-gray-600" {
-                    input #remember type="checkbox" name="remember" value="on"
+                    input #remember type="checkbox" name="remember" value="on" checked[remember]
                           class="rounded border-gray-300";
                     "Remember me on this device"
                 }
@@ -257,6 +269,7 @@ pub async fn login(
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> AutumnResult<Response> {
+    let remember = form.remember.is_some();
     let email = form.email.trim().to_lowercase();
     // Reject over-long inputs before any DB query or bcrypt work — they can never
     // match a stored account and only waste CPU. Redisplayed inline rather than
@@ -264,7 +277,9 @@ pub async fn login(
     // navigating browser was on the login form and should stay there
     // (Wayfinder: error-path inventory).
     if email.len() > 254 || form.password.len() > 128 {
-        return Ok(login_page(&form.email, Some("Invalid email or password")).into_response());
+        return Ok(
+            login_page(&form.email, remember, Some("Invalid email or password")).into_response(),
+        );
     }
 
     let user: Option<User> = users::table
@@ -281,11 +296,16 @@ pub async fn login(
         Some(u) => u,
         None => {
             let _ = verify_password(&form.password, DUMMY_HASH).await;
-            return Ok(login_page(&form.email, Some("Invalid email or password")).into_response());
+            return Ok(
+                login_page(&form.email, remember, Some("Invalid email or password"))
+                    .into_response(),
+            );
         }
     };
     if !verify_password(&form.password, &user.password_hash).await? {
-        return Ok(login_page(&form.email, Some("Invalid email or password")).into_response());
+        return Ok(
+            login_page(&form.email, remember, Some("Invalid email or password")).into_response(),
+        );
     }
 
     establish_session(&session, &user).await;
@@ -299,7 +319,7 @@ pub async fn login(
     // `[auth.remember]` section below — `config()` would deep-clone the whole
     // config twice per login.
     let config = state.config_arc();
-    if form.remember.is_some() && config.auth.remember.enabled {
+    if remember && config.auth.remember.enabled {
         // Thread the resolved `[auth.remember]` config so cookie_name/duration
         // overrides are honoured (issue #1397.2).
         let remember_cfg = &config.auth.remember;
