@@ -1675,7 +1675,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing `#[edge]`-on-`#[ws]` rejection) instead of ever emitting code that
   fails to compile deep inside guard-generated internals; the error explains
   the incompatibility and suggests checking authorization via an extractor
-  inside the upgrade handler instead. Separately, `#[ws]`'s `ApiDoc` had the
+  inside the upgrade handler instead. That rejection initially only checked
+  for an already-*expanded* guard above `#[ws]` (a non-empty leading-items
+  stream); a third Codex pass caught that the *other* attribute order —
+  `#[ws]` outermost, the guard still a live, unexpanded attribute below it —
+  slips past that check entirely (nothing has expanded yet, so there are no
+  leading items) and generates the same silently-broken code, just one macro
+  expansion later. The rejection now also scans the handler's still-live
+  attributes for `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]`, so
+  both stacking orders are caught. Separately, `#[ws]`'s `ApiDoc` had the
   same hardcoded `secured: false, required_roles: &[]` gap `#[static_get]`
   had for the (still-supported) case of a live `#[authorize]` attribute or
   policy check — fixed the same way, via `api_doc::extract_secured_info`

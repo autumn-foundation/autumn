@@ -30,6 +30,20 @@ fn reject_seo_argument(attr: &TokenStream) -> Option<TokenStream> {
     )
 }
 
+/// Attribute names of the body-guard macros that unconditionally rewrite a
+/// handler's return type to `Response` — incompatible with `#[ws]`'s
+/// `impl WsHandler` return type. See `ws_macro`'s rejection of the
+/// combination in either attribute order.
+const INCOMPATIBLE_GUARD_ATTRS: [&str; 4] = ["secured", "step_up", "throttle", "authorize"];
+
+/// Error message for `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]`
+/// combined with `#[ws]`, in either attribute order.
+const INCOMPATIBLE_GUARD_MSG: &str = "`#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` cannot be combined with `#[ws]`, \
+     in either attribute order: those guards rewrite the handler to return an HTTP \
+     `Response`, but a `#[ws]` handler must return `impl WsHandler`. Check authorization \
+     inside the upgrade handler instead — add a `Session` (or other) extractor parameter and \
+     reject the upgrade before returning a `WsHandler`.";
+
 fn is_app_state_type(ty: &syn::Type) -> bool {
     if let syn::Type::Path(type_path) = ty
         && type_path.qself.is_none()
@@ -96,30 +110,40 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err,
     };
 
-    // A body guard (`#[secured]`/`#[step_up]`/`#[throttle]`) expanded above
-    // `#[ws]` leaves its `FromRequestParts` gate as a leading sibling item
-    // (`parse::split_leading_items_and_fn`) — but every one of those guards
-    // unconditionally rewrites the wrapped function's return type to
-    // `Response` and threads its original return value through
+    // A body guard (`#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]`)
+    // expanded above `#[ws]` leaves its `FromRequestParts` gate as a leading
+    // sibling item (`parse::split_leading_items_and_fn`) — but every one of
+    // those guards unconditionally rewrites the wrapped function's return
+    // type to `Response` and threads its original return value through
     // `IntoResponse::into_response` (see `secured.rs`/`step_up.rs`/
-    // `throttle.rs`). That does not hold for a `#[ws]` handler: it returns
-    // `impl WsHandler` (a plain closure), not something `IntoResponse`, and
-    // this macro's two-function wrapper expects to call it and get a
-    // `WsHandler` back, not a `Response` (#2513 Codex review — binding the
-    // gate parameter to a real identifier fixed the forwarding call but left
-    // this deeper return-type mismatch). Reject the combination outright
-    // rather than emit code that fails to compile deep inside guard-generated
-    // code with a confusing error.
-    if !leading_guard_items.is_empty() {
-        return syn::Error::new_spanned(
-            leading_guard_items,
-            "`#[secured]`/`#[step_up]`/`#[throttle]` cannot be stacked above `#[ws]`: \
-             those guards rewrite the handler to return an HTTP `Response`, but a `#[ws]` \
-             handler must return `impl WsHandler`. Check authorization inside the upgrade \
-             handler instead — add a `Session` (or other) extractor parameter and reject \
-             the upgrade before returning a `WsHandler`.",
-        )
-        .to_compile_error();
+    // `throttle.rs`/`authorize.rs`). That does not hold for a `#[ws]`
+    // handler: it returns `impl WsHandler` (a plain closure), not something
+    // `IntoResponse`, and this macro's two-function wrapper expects to call
+    // it and get a `WsHandler` back, not a `Response` (#2513 Codex review —
+    // binding the gate parameter to a real identifier fixed the forwarding
+    // call but left this deeper return-type mismatch). Reject the
+    // combination outright rather than emit code that fails to compile deep
+    // inside guard-generated code with a confusing error.
+    //
+    // The same incompatibility exists in the *other* stacking order —
+    // `#[ws]` outermost, the guard still a live, unexpanded attribute below
+    // it — which leaves `leading_guard_items` empty (nothing has expanded
+    // yet) but `input_fn.attrs` still carrying the guard attribute; that
+    // guard then rewrites `echo`'s return type to `Response` *after* this
+    // macro has already generated a wrapper expecting `impl WsHandler`
+    // (second Codex review pass on #2513). Check both.
+    let unexpanded_guard_attr = input_fn.attrs.iter().find(|attr| {
+        attr.path().segments.last().is_some_and(|segment| {
+            INCOMPATIBLE_GUARD_ATTRS.contains(&segment.ident.to_string().as_str())
+        })
+    });
+    if !leading_guard_items.is_empty() || unexpanded_guard_attr.is_some() {
+        return unexpanded_guard_attr
+            .map_or_else(
+                || syn::Error::new_spanned(leading_guard_items, INCOMPATIBLE_GUARD_MSG),
+                |attr| syn::Error::new_spanned(attr, INCOMPATIBLE_GUARD_MSG),
+            )
+            .to_compile_error();
     }
 
     let fn_name = &input_fn.sig.ident;
@@ -335,7 +359,37 @@ mod tests {
              broken codegen: {generated}"
         );
         assert!(
-            generated.contains("cannot be stacked above"),
+            generated.contains("cannot be combined with"),
+            "the error must explain why the combination is rejected: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_rejects_a_live_unexpanded_secured_attribute() {
+        // The *other* stacking order: `#[ws("/echo")]` outermost, `#[secured]`
+        // still a live, unexpanded attribute below it. `#[ws]` sees a single
+        // function with `#[secured]` still attached — `leading_guard_items`
+        // is empty, since nothing has expanded yet — so the check above (on
+        // `leading_guard_items`) alone misses this order entirely: `#[ws]`
+        // would generate its wrapper assuming `impl WsHandler`, then
+        // `#[secured]` expands afterward and rewrites `echo`'s return type
+        // to `Response` out from under it (third Codex finding on #2513).
+        let generated = ws_macro(
+            quote! { "/echo" },
+            quote! {
+                #[secured("admin")]
+                async fn echo() -> impl WsHandler { |socket| async move {} }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a live, unexpanded #[secured] attribute below #[ws] must also be a compile \
+             error: {generated}"
+        );
+        assert!(
+            generated.contains("cannot be combined with"),
             "the error must explain why the combination is rejected: {generated}"
         );
     }
