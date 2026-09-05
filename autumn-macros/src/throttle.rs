@@ -21,7 +21,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ItemFn, Lit, LitInt, LitStr, parse_quote};
+use syn::{Expr, Lit, LitInt, LitStr, parse_quote};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -245,15 +245,19 @@ fn build_spec_tokens(attrs: &ThrottleAttrs) -> TokenStream {
 
 /// Expand the `#[throttle(...)]` attribute.
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_throttle_args(attr) {
         Ok(a) => a,
         Err(err) => return err.to_compile_error(),
     };
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
 
     if input_fn.sig.asyncness.is_none() {
@@ -268,6 +272,16 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let spec_tokens = build_spec_tokens(&attrs);
     let gate_ident = format_ident!("__AutumnThrottleGate_{}", fn_name);
+
+    // The marker const also stays in the handler body (not just inside the
+    // gate below) so `api_doc::recover_guarded_return_type` can still
+    // recover the pre-rewrite return type for OpenAPI when #[throttle]
+    // expands before the route macro (#1677).
+    let route_id_marker = quote! {
+        #[allow(dead_code)]
+        const __AUTUMN_THROTTLE_ROUTE_ID: &str =
+            ::core::concat!(::core::module_path!(), "::", #fn_name_str);
+    };
 
     // Whether THIS gate should also serve a cached idempotency replay: see
     // `should_own_replay` for the full ordering rationale (issue #1668's
@@ -439,11 +453,13 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     input_fn.block = syn::parse_quote! {
         {
+            #route_id_marker
             #original_response
         }
     };
 
     quote! {
+        #leading_items
         #gate_item
         #input_fn
     }

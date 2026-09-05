@@ -37,8 +37,8 @@ pub fn route_macro(
     };
     let path = route_args.path.clone();
 
-    let mut input_fn = match parse::parse_async_handler(item) {
-        Ok(f) => f,
+    let (leading_items, mut input_fn) = match parse::parse_async_handler_with_leading_items(item) {
+        Ok(v) => v,
         Err(err) => return err,
     };
 
@@ -256,6 +256,12 @@ pub fn route_macro(
     };
 
     quote! {
+        // A guard macro that already expanded above this route attribute
+        // (#[secured]/#[step_up]/#[throttle], #1668) leaves its hidden
+        // `FromRequestParts` gate type here, ahead of the handler — re-emit
+        // it verbatim; empty when no such guard expanded first.
+        #leading_items
+
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
         // to import axum manually. However, the path resolution in Axum macros makes this impossible
         // natively. Custom compile errors handle the type checks.
