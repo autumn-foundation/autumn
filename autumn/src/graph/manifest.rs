@@ -415,26 +415,6 @@ fn method_access(method: &str) -> Access {
     }
 }
 
-/// The HTTP methods a `#[repository(api = "...")]` CRUD surface mounts.
-///
-/// The prefix alone is not enough to claim a route: a `#[ws]` handler mounted
-/// under the same prefix is in the route table and has no `#[route]`
-/// descriptor, and attributing it would report a read-only socket as a REST
-/// endpoint that writes the table.
-const AUTO_API_METHODS: &[&str] = &["DELETE", "GET", "PATCH", "POST", "PUT"];
-
-/// Whether `path` is served by the auto-API mounted at `prefix`.
-///
-/// Segment-aware: `/api/posts` covers `/api/posts` and `/api/posts/{id}`, but
-/// never `/api/postscript`.
-fn is_under_api_prefix(path: &str, prefix: &str) -> bool {
-    !prefix.is_empty()
-        && (path == prefix
-            || path
-                .strip_prefix(prefix)
-                .is_some_and(|rest| rest.starts_with('/')))
-}
-
 /// The symbol index: which node ids a candidate name can resolve to.
 ///
 /// A name maps to *every* node that answers to it, never to a best guess: two
@@ -485,20 +465,34 @@ fn sql_table_index(models: &[ModelGraphDescriptor]) -> BTreeMap<String, BTreeSet
     index
 }
 
+/// The candidate names one item published, by where they were read from.
+///
+/// Grouped rather than passed as three parallel slices: they always travel
+/// together, and which list a name came from decides how it may be matched.
+#[derive(Debug, Clone, Copy)]
+struct Candidates<'a> {
+    /// Names from the item's signature — the extractors it declares.
+    signature: &'a [&'a str],
+    /// Names from the item's body.
+    body: &'a [&'a str],
+    /// The subset of `body` that came from a SQL literal, and so may be
+    /// matched against a table name case-insensitively.
+    sql: &'a [&'a str],
+}
+
 /// Resolve one item's symbols into edges, strongest provenance winning.
 fn resolve_edges(
     from: &str,
-    signature_symbols: &[&str],
-    body_symbols: &[&str],
-    sql_symbols: &[&str],
+    candidates: Candidates<'_>,
     access: Access,
     index: &BTreeMap<String, BTreeSet<String>>,
     sql_tables: &BTreeMap<String, BTreeSet<String>>,
     edges: &mut BTreeMap<(String, String), GraphEdge>,
 ) {
+    let sql_symbols = candidates.sql;
     for (symbols, provenance) in [
-        (signature_symbols, Provenance::Signature),
-        (body_symbols, Provenance::Body),
+        (candidates.signature, Provenance::Signature),
+        (candidates.body, Provenance::Body),
     ] {
         for symbol in symbols {
             // A SQL-derived candidate also matches a table name case-folded,
@@ -766,9 +760,11 @@ fn add_route_nodes(
         );
         resolve_edges(
             &id,
-            route.signature_symbols,
-            route.body_symbols,
-            route.sql_symbols,
+            Candidates {
+                signature: route.signature_symbols,
+                body: route.body_symbols,
+                sql: route.sql_symbols,
+            },
             access,
             index,
             sql_tables,
@@ -820,9 +816,11 @@ fn add_job_nodes(
         };
         resolve_edges(
             &id,
-            job.signature_symbols,
-            job.body_symbols,
-            job.sql_symbols,
+            Candidates {
+                signature: job.signature_symbols,
+                body: job.body_symbols,
+                sql: job.sql_symbols,
+            },
             access,
             index,
             sql_tables,
