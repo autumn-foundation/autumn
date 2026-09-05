@@ -2840,24 +2840,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn/benches/throttle_check.rs`, driving real traffic through a
   `#[throttle]`-guarded route and an identical unthrottled route (issue
   #1350's per-route rate limiter had no committed benchmark before this).
-  Uses `key = "token"` with an `Authorization: Bearer` header on every call
-  (not `key = "ip"` — `TestApp`'s in-process requests carry no `ConnectInfo`,
-  which would make `extract_throttle_key` return `None` and every call take
-  `__check_throttle`'s no-client bypass instead of the real
-  `limiter.decide()` bucket lookup/lock/refill path; caught in review before
-  merge). An isolated `--route throttled` vs. `--route plain` DHAT A/B (no
-  framework code changed) attributed the full added per-request cost —
-  ~11 allocation blocks / ~1.85KB — against the ~140-block/~27.3KB
-  per-request baseline `config_alloc_gate` already gates (#2232): ~7.9%
-  blocks, ~6.8% bytes, both under the 10% floor. Of that, the two `format!`
-  calls that build a `HashMap` lookup key on every request despite the
-  lookup almost always hitting a warm cache —
-  `resolve_throttle_params`'s `registry_key` and `__check_throttle`'s
-  `cache_key` — account for ~6 blocks / ~247 bytes (~4.3%/~0.9%), clearing
-  neither the 10%-of-allocations nor the 5%-of-instructions impact floor on
-  their own. Recorded as a negative result rather than shipped; the harness
-  itself is
-  the lasting artifact, giving `#[throttle]` its first profiling coverage.
+  Uses `key = "token"` with an identical `Authorization: Bearer` header sent
+  to BOTH routes on every call: not `key = "ip"` (`TestApp`'s in-process
+  requests carry no `ConnectInfo`, which would make `extract_throttle_key`
+  return `None` and every call take `__check_throttle`'s no-client bypass
+  instead of the real `limiter.decide()` bucket lookup/lock/refill path),
+  and not a throttled-route-only header either (an asymmetric header would
+  fold its own construction/parsing cost into the "cost of `#[throttle]`"
+  measurement) — both caught in review before merge. Cross-checked two
+  measurement methods against the ~140-151-block/~27.3-28.4KB per-request
+  baseline `config_alloc_gate` already gates (#2232): a same-process,
+  frame-level DHAT attribution (summing allocations whose call stack passes
+  through a `rate_limit::`-module frame) puts the full `#[throttle]` cost at
+  ~9 blocks / ~853 bytes per request (~6.4%/~3.0% of baseline); an isolated
+  `--route throttled` vs. `--route plain` DHAT subtraction across separate
+  process runs agrees closely on bytes (~845/request) but is noisier on
+  block count (inter-process allocator/hash-table-growth variance swamps a
+  delta this small). Both methods land well under the 10%-of-allocations
+  floor; neither instruction count nor allocation count clears the bar to
+  ship a fix. Recorded as a negative result rather than shipped; the harness
+  itself is the lasting artifact, giving `#[throttle]` its first profiling
+  coverage.
 - **new `repository_crud` profiling harness; findings, no fix (#2486):** added
   `autumn/benches/repository_crud.rs`, driving real `save`/`find_by_id`/`page`
   calls through a `#[repository]`-generated repository against a live

@@ -16,16 +16,21 @@
 //! `None` on every call and `__check_throttle` would take its no-client
 //! bypass — profiling that early-return instead of the real bucket
 //! lookup/lock/refill path `limiter.decide()` does (caught in review on the
-//! first version of this bench). Every `/throttled` request instead carries
-//! a `Authorization: Bearer <token>` header, which `extract_bearer_token`
-//! reads directly off the request with no dependency on peer/proxy info, so
-//! `limiter.decide()` genuinely runs on every measured call. Both routes are
-//! driven through the real production router via `TestApp::build()` (same
-//! `try_build_router_inner` production apps use), interleaved in the same
-//! run, so DHAT's per-route marginal allocation difference isolates exactly
-//! what `#[throttle]` adds on top of the same ingress stack
-//! `request_pipeline.rs` already profiles — an isolated A/B, no framework
-//! code changed for this bench.
+//! first version of this bench). Every request to EITHER route carries the
+//! identical `Authorization: Bearer <token>` header — `/plain` ignores it,
+//! but sending it there too means the two workloads differ only by the
+//! `#[throttle]` guard itself, not by one of them also paying for building
+//! and parsing an extra header (also caught in review: an earlier version
+//! sent the header to `/throttled` only, which folded the header's own
+//! allocation and ingress cost into the "cost of `#[throttle]`" measurement).
+//! `extract_bearer_token` reads the header directly off the request with no
+//! dependency on peer/proxy info, so `limiter.decide()` genuinely runs on
+//! every measured `/throttled` call. Both routes are driven through the real
+//! production router via `TestApp::build()` (same `try_build_router_inner`
+//! production apps use), interleaved in the same run, so DHAT's per-route
+//! marginal allocation difference isolates exactly what `#[throttle]` adds on
+//! top of the same ingress stack `request_pipeline.rs` already profiles — an
+//! isolated A/B, no framework code changed for this bench.
 //!
 //! Like the other benches in this crate it is `harness = false` and asserts
 //! nothing beyond a sanity check that traffic isn't silently being denied: it
@@ -112,7 +117,11 @@ fn main() {
                 assert_eq!(resp.status, StatusCode::OK, "warm-up must not be denied");
             }
             if hit_plain {
-                let resp = client.get("/plain").send().await;
+                let resp = client
+                    .get("/plain")
+                    .header("authorization", &format!("Bearer {BEARER_TOKEN}"))
+                    .send()
+                    .await;
                 assert_eq!(resp.status, StatusCode::OK, "warm-up baseline must succeed");
             }
         }
@@ -129,7 +138,14 @@ fn main() {
                 );
             }
             if hit_plain {
-                black_box(client.get("/plain").send().await.status);
+                black_box(
+                    client
+                        .get("/plain")
+                        .header("authorization", &format!("Bearer {BEARER_TOKEN}"))
+                        .send()
+                        .await
+                        .status,
+                );
             }
         }
     });
