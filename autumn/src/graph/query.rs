@@ -94,10 +94,7 @@ fn dependents<'g>(graph: &'g ArchitectureGraph, target: &str) -> Vec<&'g GraphNo
             }
         }
     }
-    found
-        .into_iter()
-        .filter_map(|id| graph.node(id))
-        .collect()
+    found.into_iter().filter_map(|id| graph.node(id)).collect()
 }
 
 /// Which routes and jobs touch the model, table or repository `name` denotes.
@@ -169,7 +166,11 @@ pub fn format_touches(answer: &Touches<'_>) -> String {
         out.push_str(&format!("  route  {}\n", node.label()));
     }
     for node in &answer.jobs {
-        out.push_str(&format!("  {:<6} {}\n", node.kind.to_string(), node.label()));
+        out.push_str(&format!(
+            "  {:<6} {}\n",
+            node.kind.to_string(),
+            node.label()
+        ));
     }
     out
 }
@@ -192,7 +193,11 @@ pub fn format_impact(answer: &Impact<'_>) -> String {
         out.push_str(&format!("  route      {}\n", node.label()));
     }
     for node in &answer.jobs {
-        out.push_str(&format!("  {:<10} {}\n", node.kind.to_string(), node.label()));
+        out.push_str(&format!(
+            "  {:<10} {}\n",
+            node.kind.to_string(),
+            node.label()
+        ));
     }
     out
 }
@@ -286,7 +291,12 @@ mod tests {
     #[test]
     fn a_model_resolves_by_name_path_and_table() {
         let g = graph();
-        for name in ["Post", "app::models::Post", "posts", "model:app::models::Post"] {
+        for name in [
+            "Post",
+            "app::models::Post",
+            "posts",
+            "model:app::models::Post",
+        ] {
             assert_eq!(
                 resolve(&g, name).map(|n| n.id.as_str()),
                 Some("model:app::models::Post"),
@@ -298,10 +308,7 @@ mod tests {
     #[test]
     fn a_table_name_resolves_case_insensitively() {
         let g = graph();
-        assert_eq!(
-            resolve(&g, "POSTS").map(|n| n.name.as_str()),
-            Some("Post")
-        );
+        assert_eq!(resolve(&g, "POSTS").map(|n| n.name.as_str()), Some("Post"));
     }
 
     #[test]
@@ -342,7 +349,11 @@ mod tests {
         let g = graph();
         let answer = touches(&g, "posts").expect("posts must resolve");
         assert_eq!(
-            answer.jobs.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+            answer
+                .jobs
+                .iter()
+                .map(|n| n.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["hot-rank"]
         );
     }
@@ -368,7 +379,11 @@ mod tests {
         let g = graph();
         let answer = impact(&g, "PostRepository").expect("repository must resolve");
         assert_eq!(
-            answer.routes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+            answer
+                .routes
+                .iter()
+                .map(|n| n.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["create"],
             "only the route holding the extractor depends on the repository"
         );

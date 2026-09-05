@@ -97,10 +97,7 @@ fn node_key(node: &autumn_web::graph::manifest::GraphNode) -> &str {
 /// moved, because "the graph changed" is not reviewable but "`front_page` lost
 /// its read of `posts`" is the one line a reviewer needs.
 #[must_use]
-pub fn format_drift(
-    committed: &ArchitectureGraph,
-    current: &ArchitectureGraph,
-) -> Option<String> {
+pub fn format_drift(committed: &ArchitectureGraph, current: &ArchitectureGraph) -> Option<String> {
     if committed == current {
         return None;
     }
@@ -114,7 +111,11 @@ pub fn format_drift(
     }
 
     for node in &current.nodes {
-        match committed.nodes.iter().find(|c| node_key(c) == node_key(node)) {
+        match committed
+            .nodes
+            .iter()
+            .find(|c| node_key(c) == node_key(node))
+        {
             None => lines.push(format!("  + {} {}", node.kind, node.label())),
             Some(before) if before != node => {
                 lines.push(format!("  ~ {} {}", node.kind, node.label()));
@@ -194,7 +195,9 @@ pub fn answer(graph: &ArchitectureGraph, query: &Query) -> Option<String> {
         Query::Touches(name) => query::touches(graph, name)
             .as_ref()
             .map(query::format_touches),
-        Query::Impact(name) => query::impact(graph, name).as_ref().map(query::format_impact),
+        Query::Impact(name) => query::impact(graph, name)
+            .as_ref()
+            .map(query::format_impact),
     }
 }
 
@@ -324,7 +327,10 @@ pub fn run(opts: &GraphOptions<'_>) {
                      to query yet."
                 );
             } else {
-                eprintln!("Known models, tables and repositories: {}", names.join(", "));
+                eprintln!(
+                    "Known models, tables and repositories: {}",
+                    names.join(", ")
+                );
             }
             std::process::exit(1);
         };

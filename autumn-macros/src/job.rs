@@ -378,12 +378,8 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // ── Architecture-graph node (#1747) ─────────────────────────
-    let graph_descriptor = crate::graph::emit_job_descriptor(
-        &input_fn,
-        &quote! { #job_name },
-        "Job",
-        &quote! { "" },
-    );
+    let graph_descriptor =
+        crate::graph::emit_job_descriptor(&input_fn, &quote! { #job_name }, "Job", &quote! { "" });
 
     quote! {
         #input_fn

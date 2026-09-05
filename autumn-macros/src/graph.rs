@@ -102,12 +102,20 @@ fn sql_words(literal: &str) -> Vec<String> {
     words
 }
 
+/// Whether a literal contains any of `keywords` as a whole word.
+///
+/// Word-boundary aware, so `"your selection of posts"` does not read as a
+/// `SELECT` and pull prose into the SQL scan.
+fn contains_sql_keyword(literal: &str, keywords: &[&str]) -> bool {
+    literal
+        .to_ascii_uppercase()
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|word| keywords.contains(&word))
+}
+
 /// Whether a string literal reads as SQL.
 fn looks_like_sql(literal: &str) -> bool {
-    let upper = literal.to_ascii_uppercase();
-    SQL_KEYWORDS
-        .iter()
-        .any(|kw| upper.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == *kw))
+    contains_sql_keyword(literal, SQL_KEYWORDS)
 }
 
 /// Candidate names read off a token stream.
@@ -169,13 +177,8 @@ pub fn is_mutating(stream: &TokenStream) -> bool {
             MUTATION_IDENTS.binary_search(&name.as_str()).is_ok()
         }
         TokenTree::Literal(literal) => {
-            let upper = literal.to_string().to_ascii_uppercase();
-            looks_like_sql(&literal.to_string())
-                && SQL_MUTATIONS.iter().any(|kw| {
-                    upper
-                        .split(|c: char| !c.is_ascii_alphanumeric())
-                        .any(|w| w == *kw)
-                })
+            let text = literal.to_string();
+            looks_like_sql(&text) && contains_sql_keyword(&text, SQL_MUTATIONS)
         }
         TokenTree::Punct(_) | TokenTree::Group(_) => false,
     })
@@ -312,6 +315,17 @@ mod tests {
     }
 
     #[test]
+    fn a_word_that_merely_contains_a_sql_keyword_does_not_open_the_scan() {
+        let symbols = candidate_symbols(&quote! {
+            let msg = "your selection of posts is ready";
+        });
+        assert!(
+            !symbols.contains(&"posts".to_owned()),
+            "`selection` must not read as `SELECT`: {symbols:?}"
+        );
+    }
+
+    #[test]
     fn prose_string_literals_are_not_scanned() {
         let symbols = candidate_symbols(&quote! {
             let msg = "no database pool available for posts right now";
@@ -326,10 +340,7 @@ mod tests {
     fn candidates_are_sorted_and_deduplicated() {
         let symbols = candidate_symbols(&quote! { Post::find(); Post::all(); Alpha::x(); });
         assert_eq!(
-            symbols
-                .iter()
-                .filter(|s| s.as_str() == "Post")
-                .count(),
+            symbols.iter().filter(|s| s.as_str() == "Post").count(),
             1,
             "{symbols:?}"
         );
@@ -344,7 +355,10 @@ mod tests {
             async fn show(mut db: Db, repo: PgPostRepository) -> Markup { todo!() }
         };
         let symbols = signature_symbols(&input.sig);
-        assert!(symbols.contains(&"PgPostRepository".to_owned()), "{symbols:?}");
+        assert!(
+            symbols.contains(&"PgPostRepository".to_owned()),
+            "{symbols:?}"
+        );
         assert!(symbols.contains(&"Db".to_owned()), "{symbols:?}");
     }
 
@@ -401,8 +415,8 @@ mod tests {
                 todo!()
             }
         };
-        let generated = emit_route_descriptor(&input, "GET", &quote! { "/posts" }, false)
-            .to_string();
+        let generated =
+            emit_route_descriptor(&input, "GET", &quote! { "/posts" }, false).to_string();
         assert!(generated.contains("RouteGraphDescriptor"), "{generated}");
         assert!(generated.contains(r#"handler : "show""#), "{generated}");
         assert!(generated.contains(r#"method : "GET""#), "{generated}");

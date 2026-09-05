@@ -89,8 +89,12 @@ pub fn task_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // ── Architecture-graph node (#1747) ─────────────────────────
-    let graph_descriptor =
-        crate::graph::emit_job_descriptor(&input_fn, &quote! { #task_name }, "Task", &quote! { "" });
+    let graph_descriptor = crate::graph::emit_job_descriptor(
+        &input_fn,
+        &quote! { #task_name },
+        "Task",
+        &quote! { "" },
+    );
 
     quote! {
         #input_fn

@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **graph:** a queryable architecture graph derived from the app's own macros
+  (issue #1747). Autumn already declares every architectural element through
+  proc-macros it owns, but none of that survived expansion as something you
+  could ask a question of. It does now: `#[route]`/`#[static_get]`,
+  `#[model]`, `#[repository]` and `#[job]`/`#[scheduled]`/`#[task]` each
+  register a node, and the framework assembles them into a typed graph at link
+  time — nodes for every declared element (each route carrying its mounted path
+  and declared auth requirement, each model its table), edges for
+  repository→model declarations, for the repository a handler takes as an
+  extractor, and for every model, table or raw-SQL table name a route or job
+  body mentions. `autumn graph show|touches <NAME>|impact <NAME>` answers
+  against it — "which routes and jobs touch `posts`", "what does changing
+  `Post` break" — and `--check` fails the build when a declared element or an
+  edge quietly disappears. The same graph is served from `/actuator/graph`
+  (sensitive-gated, like `/env`) so a running single binary can answer
+  questions about itself with no side file to go stale. Because node identity
+  comes from the declaration, nothing can fall out silently:
+  `examples/reddit-clone/tests/architecture_graph.rs` censuses the reference
+  app's *sources* for every declaring attribute, runs the binary's own graph
+  dump, and fails when the two disagree — including a hand-verified
+  ground-truth list that pins `impact Post` to total recall over both access
+  styles the app uses (repository extractors and raw Diesel), the
+  `#[repository(api = …)]` auto-API routes, and a scheduled task that reaches
+  the table only through `sql_query("UPDATE posts …")`. Edges from a route or
+  job are a name-based derivation over that item's own tokens, deliberately
+  biased toward over-reporting; every edge carries its provenance
+  (`declaration`/`signature`/`body`) and the document carries the derivation's
+  limits, so it cannot be read as more than it is. See
+  `docs/guide/architecture-graph.md`.
 - **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
   update validation left after #1719/#1742/#1778/#1801 (issue #1751).
   `must_match` — like `custom`, `ip` on `Option<_>` fields, and

@@ -248,7 +248,11 @@ impl ArchitectureGraph {
     #[must_use]
     pub fn summary(&self) -> String {
         let mut out = String::new();
-        let _ = writeln!(out, "Application architecture graph (schema v{})", self.schema_version);
+        let _ = writeln!(
+            out,
+            "Application architecture graph (schema v{})",
+            self.schema_version
+        );
         let _ = writeln!(
             out,
             "  {} nodes, {} edges",
@@ -262,11 +266,7 @@ impl ArchitectureGraph {
             c.declared_routes, c.mounted_routes, c.models, c.repositories, c.jobs
         );
         if c.generated_routes > 0 {
-            let _ = writeln!(
-                out,
-                "  {} repository auto-API route(s)",
-                c.generated_routes
-            );
+            let _ = writeln!(out, "  {} repository auto-API route(s)", c.generated_routes);
         }
 
         for kind in [
@@ -286,7 +286,9 @@ impl ArchitectureGraph {
             for node in nodes {
                 let _ = writeln!(out, "  {}", node.label());
                 for edge in self.edges.iter().filter(|e| e.from == node.id) {
-                    let target = self.node(&edge.to).map_or(edge.to.as_str(), |n| n.name.as_str());
+                    let target = self
+                        .node(&edge.to)
+                        .map_or(edge.to.as_str(), |n| n.name.as_str());
                     let _ = writeln!(
                         out,
                         "      {} {} ({})",
@@ -297,7 +299,11 @@ impl ArchitectureGraph {
         }
 
         if !c.unmounted_routes.is_empty() {
-            let _ = writeln!(out, "\nDeclared but not mounted ({}):", c.unmounted_routes.len());
+            let _ = writeln!(
+                out,
+                "\nDeclared but not mounted ({}):",
+                c.unmounted_routes.len()
+            );
             for id in &c.unmounted_routes {
                 let _ = writeln!(out, "  {id}");
             }
@@ -381,13 +387,22 @@ fn symbol_index(
     let mut index: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for model in models {
         let id = model_id(model.model_path);
-        index.entry(model.model.to_owned()).or_default().insert(id.clone());
+        index
+            .entry(model.model.to_owned())
+            .or_default()
+            .insert(id.clone());
         index.entry(model.table.to_owned()).or_default().insert(id);
     }
     for repo in repositories {
         let id = repository_id(repo.module_path, repo.repository);
-        index.entry(repo.repository.to_owned()).or_default().insert(id.clone());
-        index.entry(repo.implementation.to_owned()).or_default().insert(id);
+        index
+            .entry(repo.repository.to_owned())
+            .or_default()
+            .insert(id.clone());
+        index
+            .entry(repo.implementation.to_owned())
+            .or_default()
+            .insert(id);
     }
     index
 }
@@ -712,11 +727,10 @@ pub fn audit(mounted: &[MountedRoute]) -> ArchitectureGraph {
         .into_iter()
         .copied()
         .collect();
-    let repositories: Vec<RepositoryGraphDescriptor> =
-        inventory::iter::<RepositoryGraphDescriptor>
-            .into_iter()
-            .copied()
-            .collect();
+    let repositories: Vec<RepositoryGraphDescriptor> = inventory::iter::<RepositoryGraphDescriptor>
+        .into_iter()
+        .copied()
+        .collect();
     let jobs: Vec<JobGraphDescriptor> = inventory::iter::<JobGraphDescriptor>
         .into_iter()
         .copied()
@@ -858,7 +872,12 @@ mod tests {
             &[],
             &[route("index", "GET", "/posts", &[], &[])],
             &[model("Post", "app::models::Post", "posts")],
-            &[repository("PostRepository", "PgPostRepository", "Post", "posts")],
+            &[repository(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+            )],
             &[job("send_digest", JobKind::Job, &[])],
         );
         let kinds: Vec<NodeKind> = graph.nodes.iter().map(|n| n.kind).collect();
@@ -878,7 +897,12 @@ mod tests {
             &[],
             &[],
             &[model("Post", "app::models::Post", "posts")],
-            &[repository("PostRepository", "PgPostRepository", "Post", "posts")],
+            &[repository(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+            )],
             &[],
         );
         let edge = graph
@@ -894,9 +918,20 @@ mod tests {
     fn a_repository_extractor_links_the_route_to_the_repository() {
         let graph = build(
             &[],
-            &[route("show", "GET", "/posts/{id}", &["PgPostRepository"], &[])],
+            &[route(
+                "show",
+                "GET",
+                "/posts/{id}",
+                &["PgPostRepository"],
+                &[],
+            )],
             &[model("Post", "app::models::Post", "posts")],
-            &[repository("PostRepository", "PgPostRepository", "Post", "posts")],
+            &[repository(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+            )],
             &[],
         );
         let edge = graph
@@ -950,7 +985,12 @@ mod tests {
                 &["PgPostRepository"],
             )],
             &[],
-            &[repository("PostRepository", "PgPostRepository", "Post", "posts")],
+            &[repository(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+            )],
             &[],
         );
         assert_eq!(graph.edges.len(), 1, "{:?}", graph.edges);
@@ -993,7 +1033,13 @@ mod tests {
 
     #[test]
     fn a_declared_route_the_app_never_mounts_is_still_a_node() {
-        let graph = build(&[], &[route("orphan", "GET", "/orphan", &[], &[])], &[], &[], &[]);
+        let graph = build(
+            &[],
+            &[route("orphan", "GET", "/orphan", &[], &[])],
+            &[],
+            &[],
+            &[],
+        );
         assert_eq!(graph.nodes.len(), 1);
         assert!(!graph.nodes[0].route.as_ref().expect("route facts").mounted);
         assert_eq!(
@@ -1004,7 +1050,13 @@ mod tests {
 
     #[test]
     fn a_mounted_route_with_no_declaration_is_named_not_dropped() {
-        let graph = build(&[mounted("GET", "/actuator/health", "actuator")], &[], &[], &[], &[]);
+        let graph = build(
+            &[mounted("GET", "/actuator/health", "actuator")],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
         assert_eq!(
             graph.completeness.unmodelled_mounted_routes,
             vec!["GET /actuator/health"]
@@ -1015,7 +1067,13 @@ mod tests {
     fn an_unresolvable_symbol_produces_no_edge() {
         let graph = build(
             &[],
-            &[route("show", "GET", "/posts", &["Db"], &["Ok", "Vec", "String"])],
+            &[route(
+                "show",
+                "GET",
+                "/posts",
+                &["Db"],
+                &["Ok", "Vec", "String"],
+            )],
             &[model("Post", "app::models::Post", "posts")],
             &[],
             &[],
@@ -1034,14 +1092,29 @@ mod tests {
         post.relations = &["votes"];
         let graph = build(
             &[],
-            &[route("upvote", "POST", "/upvote", &["PgPostRepository"], &[])],
+            &[route(
+                "upvote",
+                "POST",
+                "/upvote",
+                &["PgPostRepository"],
+                &[],
+            )],
             &[post, model("Vote", "app::models::Vote", "votes")],
-            &[repository("PostRepository", "PgPostRepository", "Post", "posts")],
+            &[repository(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+            )],
             &[],
         );
         let answer = crate::graph::query::touches(&graph, "votes").expect("votes must resolve");
         assert_eq!(
-            answer.routes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+            answer
+                .routes
+                .iter()
+                .map(|n| n.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["upvote"],
         );
         let edge = graph
@@ -1064,7 +1137,12 @@ mod tests {
             &[],
             &[],
             &[post],
-            &[repository("PostRepository", "PgPostRepository", "Post", "posts")],
+            &[repository(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+            )],
             &[],
         );
         assert_eq!(
@@ -1081,7 +1159,11 @@ mod tests {
         post.relations = &["votes"];
         let graph = build(&[], &[], &[post], &[], &[]);
         assert_eq!(
-            graph.nodes[0].model.as_ref().expect("model facts").relations,
+            graph.nodes[0]
+                .model
+                .as_ref()
+                .expect("model facts")
+                .relations,
             vec!["votes"]
         );
     }
@@ -1219,9 +1301,20 @@ mod tests {
     fn the_graph_round_trips_through_json() {
         let graph = build(
             &[mounted("POST", "/posts", "create")],
-            &[route("create", "POST", "/posts", &["PgPostRepository"], &["posts"])],
+            &[route(
+                "create",
+                "POST",
+                "/posts",
+                &["PgPostRepository"],
+                &["posts"],
+            )],
             &[model("Post", "app::models::Post", "posts")],
-            &[repository("PostRepository", "PgPostRepository", "Post", "posts")],
+            &[repository(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+            )],
             &[job("digest", JobKind::Job, &["posts"])],
         );
         let decoded: ArchitectureGraph =
@@ -1251,7 +1344,10 @@ mod tests {
         let first = build(&[], &[], &models, &[], &[]);
         let reversed: Vec<ModelGraphDescriptor> = models.iter().rev().copied().collect();
         let second = build(&[], &[], &reversed, &[], &[]);
-        assert_eq!(first, second, "registration order must not change the document");
+        assert_eq!(
+            first, second,
+            "registration order must not change the document"
+        );
         assert_eq!(first.nodes[0].name, "Alpha");
     }
 
@@ -1259,9 +1355,20 @@ mod tests {
     fn the_summary_names_every_section_it_has_rows_for() {
         let graph = build(
             &[mounted("POST", "/posts", "create")],
-            &[route("create", "POST", "/posts", &["PgPostRepository"], &[])],
+            &[route(
+                "create",
+                "POST",
+                "/posts",
+                &["PgPostRepository"],
+                &[],
+            )],
             &[model("Post", "app::models::Post", "posts")],
-            &[repository("PostRepository", "PgPostRepository", "Post", "posts")],
+            &[repository(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+            )],
             &[job("digest", JobKind::Job, &["posts"])],
         );
         let summary = graph.summary();
