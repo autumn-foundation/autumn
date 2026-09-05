@@ -649,15 +649,19 @@ fn stmts_have_response_rewriting_guard_marker(stmts: &[Stmt]) -> bool {
 /// statement before the end of `block`, immediately followed by the
 /// generated `IntoResponse::into_response(__autumn_inner)` tail, with one of
 /// [`RESPONSE_REWRITING_GUARD_MARKERS`] present earlier in the same block, or
-/// `has_gate_param` true (issue #1677's `api_doc::infer_response_body`
-/// recovery relies on this).
+/// `markerless_gate_budget` above zero (issue #1677's
+/// `api_doc::infer_response_body` recovery relies on this).
 ///
-/// `has_gate_param` covers `#[step_up]`/`#[throttle]`: their marker consts
-/// moved out of the body and into their gate's own impl block (#1668), so
-/// they can never appear in `block` for this scan to find — the caller
-/// computes it once, from the enclosing function's signature, and passes it
-/// down through every recursive call, since it does not change per nesting
-/// level (stacked guards still share one signature).
+/// `markerless_gate_budget` covers `#[step_up]`/`#[throttle]`: their marker
+/// consts moved out of the body and into their gate's own impl block
+/// (#1668), so they can never appear in `block` for this scan to find. The
+/// caller counts it once, from the enclosing function's signature — one unit
+/// per such gate parameter present — and this function returns the balance
+/// left after spending one unit to accept the *current* level, so a caller
+/// recursing into a deeper, nested block cannot spend the same real guard's
+/// unit a second time on an unrelated coincidental match there (a marker-const
+/// acceptance spends nothing, since a real marker is level-local proof on its
+/// own).
 ///
 /// Deliberately structural rather than a bare name-and-type scan. Matching
 /// the required *position* (second-to-last, with that exact tail following)
@@ -667,19 +671,21 @@ fn stmts_have_response_rewriting_guard_marker(stmts: &[Stmt]) -> bool {
 /// deeper (`(async move { #original_body }).await`) — so if that original
 /// body itself independently ends in the same two-statement shape, position
 /// and tail alone cannot tell a real guard's own binding apart from the
-/// user's body coincidentally mimicking it. Requiring one of the guard's own
-/// marker consts (or `has_gate_param`) to also be present closes that gap: no
-/// guard ever emits the `__autumn_inner` binding without one, and a
-/// handler's own code has no reason to declare an identifier the framework
-/// treats as reserved.
+/// user's body coincidentally mimicking it. Requiring a marker const (or an
+/// unspent budget unit) to also be present closes that gap: no guard ever
+/// emits the `__autumn_inner` binding without one, a handler's own code has
+/// no reason to declare an identifier the framework treats as reserved, and
+/// the budget cap means a coincidence *beyond* the real guards' own levels
+/// still has nothing left to spend.
 ///
-/// Returns the local's declared type together with its initializer
-/// expression, so a caller can both read the type and recurse into a deeper
-/// nested guard via [`expr_nested_async_body`].
+/// Returns the local's declared type, its initializer expression, and the
+/// remaining budget, so a caller can read the type, recurse into a deeper
+/// nested guard via [`expr_nested_async_body`], and thread the correct
+/// balance through that recursion.
 pub fn generated_inner_response_binding(
     block: &Block,
-    has_gate_param: bool,
-) -> Option<(&Type, &Expr)> {
+    markerless_gate_budget: usize,
+) -> Option<(&Type, &Expr, usize)> {
     let len = block.stmts.len();
     if len < 2 {
         return None;
@@ -697,11 +703,15 @@ pub fn generated_inner_response_binding(
     if !stmt_is_inner_response_tail(&block.stmts[index + 1]) {
         return None;
     }
-    if !has_gate_param && !stmts_have_response_rewriting_guard_marker(&block.stmts[..index]) {
+    let remaining_budget = if stmts_have_response_rewriting_guard_marker(&block.stmts[..index]) {
+        markerless_gate_budget
+    } else if markerless_gate_budget > 0 {
+        markerless_gate_budget - 1
+    } else {
         return None;
-    }
+    };
     let init_expr = &local.init.as_ref()?.expr;
-    Some((&pat_type.ty, init_expr))
+    Some((&pat_type.ty, init_expr, remaining_budget))
 }
 
 fn stmt_is_inner_response_tail(stmt: &Stmt) -> bool {

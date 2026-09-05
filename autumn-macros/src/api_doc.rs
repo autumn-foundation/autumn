@@ -429,14 +429,17 @@ pub fn infer_response_body(input_fn: &syn::ItemFn) -> Option<TokenStream> {
     // into their gate's own impl block (#1668), so
     // `generated_inner_response_binding`'s in-body marker check can never see
     // them again — a route stacked under either now recognizes the binding
-    // via the gate parameter #1668 left in the signature instead.
-    let has_gate_param =
-        crate::param_helpers::has_guard_gate_param_with_prefix(input_fn, "__AutumnStepUpGate_")
-            || crate::param_helpers::has_guard_gate_param_with_prefix(
-                input_fn,
-                "__AutumnThrottleGate_",
-            );
-    let ty = recover_guarded_return_type(&input_fn.block, has_gate_param)
+    // via the gate parameter #1668 left in the signature instead. Budgeted
+    // (not a bare bool) to one accepted markerless level per such gate
+    // parameter present, so a coincidental match nested *deeper* than any
+    // real guard wrapper — the exact false positive the marker check exists
+    // to rule out — still gets rejected once the budget the real gates
+    // earned is spent.
+    let markerless_gate_budget = ["__AutumnStepUpGate_", "__AutumnThrottleGate_"]
+        .into_iter()
+        .filter(|prefix| crate::param_helpers::has_guard_gate_param_with_prefix(input_fn, prefix))
+        .count();
+    let ty = recover_guarded_return_type(&input_fn.block, markerless_gate_budget)
         .or_else(|| sig_output_type(input_fn))?;
     let ty = unwrap_result_ok(&ty).unwrap_or(ty);
     find_json_in_type(&ty).map(|inner| schema_entry_for_type(&inner))
@@ -463,11 +466,13 @@ fn sig_output_type(input_fn: &syn::ItemFn) -> Option<syn::Type> {
 /// statement, followed immediately by the generated `IntoResponse::into_response`
 /// tail) *and* one of two signals that a real guard, not a coincidence, put it
 /// there: one of the guard's own marker consts earlier in the same block
-/// (`#[secured]`/`#[authorize]`), or `has_gate_param` (`#[step_up]`/
-/// `#[throttle]`, whose marker consts moved out of the body and into their
-/// gate's own impl block with #1668, so the body has nothing left to scan
-/// for — `infer_response_body` computes it from the signature instead, once,
-/// outside this recursion). Position and tail alone would still be foolable:
+/// (`#[secured]`/`#[authorize]`), or a spend against `markerless_gate_budget`
+/// (`#[step_up]`/`#[throttle]`, whose marker consts moved out of the body and
+/// into their gate's own impl block with #1668, so the body has nothing left
+/// to scan for — `infer_response_body` counts the budget from the signature
+/// instead, once, outside this recursion, and each level that spends it
+/// returns the balance one lower so a deeper level cannot spend the same unit
+/// twice). Position and tail alone would still be foolable:
 /// a guard's generated wrapper carries the user's own original body one level
 /// deeper (`(async move { #original_body }).await`), so if that body itself
 /// independently ends in the same two-statement shape — whether the handler
@@ -491,11 +496,14 @@ fn sig_output_type(input_fn: &syn::ItemFn) -> Option<syn::Type> {
 /// guard wrapping a `()`/`impl Trait` return, for which no guard emits an
 /// explicit annotation (Rust rejects `impl Trait` in a local variable's type
 /// ascription) and there is nothing to recover.
-fn recover_guarded_return_type(block: &syn::Block, has_gate_param: bool) -> Option<syn::Type> {
-    let (ty, init_expr) =
-        crate::idempotency_guard::generated_inner_response_binding(block, has_gate_param)?;
+fn recover_guarded_return_type(
+    block: &syn::Block,
+    markerless_gate_budget: usize,
+) -> Option<syn::Type> {
+    let (ty, init_expr, remaining_budget) =
+        crate::idempotency_guard::generated_inner_response_binding(block, markerless_gate_budget)?;
     let nested = crate::idempotency_guard::expr_nested_async_body(init_expr)
-        .and_then(|block| recover_guarded_return_type(block, has_gate_param));
+        .and_then(|block| recover_guarded_return_type(block, remaining_budget));
     Some(nested.unwrap_or_else(|| ty.clone()))
 }
 
@@ -1823,6 +1831,43 @@ mod tests {
         assert!(
             !rendered.contains("\"Fake\""),
             "must not descend into a nested block that lacks its own guard marker: {rendered}"
+        );
+    }
+
+    #[test]
+    fn infer_response_body_ignores_a_nested_coincidental_match_under_a_markerless_gate() {
+        // The gate-parameter counterpart of the test above (Codex review,
+        // #2508): #[step_up]/#[throttle] leave no marker const in the body,
+        // so their single real wrapper is accepted by spending the one unit
+        // of `markerless_gate_budget` the `__AutumnThrottleGate_` parameter
+        // earns — but that budget must not also cover a *second*,
+        // coincidental match nested one level deeper inside the user's own
+        // body. If it did, recovery would report the inner accidental
+        // `Fake` instead of the real guard's own `Real`.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler(
+                _: __AutumnThrottleGate_handler,
+            ) -> ::autumn_web::reexports::axum::response::Response {
+                let __autumn_inner: ::autumn_web::reexports::axum::Json<Real> = (async move {
+                    let __autumn_inner: ::autumn_web::reexports::axum::Json<Fake> =
+                        (async move { compute() }).await;
+                    ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+                })
+                .await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+            }
+        };
+        let schema = infer_response_body(&input_fn)
+            .expect("the real gate's own outer binding must still be recovered");
+        let rendered = schema.to_string();
+        assert!(
+            rendered.contains("\"Real\""),
+            "must recover the real gate's own type, not the nested coincidental one: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\"Fake\""),
+            "must not spend the same gate parameter's budget twice on an unrelated nested \
+             coincidence: {rendered}"
         );
     }
 
