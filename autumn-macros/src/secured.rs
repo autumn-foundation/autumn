@@ -112,21 +112,28 @@ fn parse_scope_array(expr: &Expr) -> syn::Result<Vec<String>> {
 }
 
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let SecuredArgs { roles, scopes } = match parse_secured_args(attr) {
         Ok(r) => r,
         Err(err) => return err.to_compile_error(),
     };
 
-    // `parse_async_handler_with_preamble` also tolerates zero or more item
-    // definitions ahead of the function — the gate `struct` + `impl
-    // FromRequestParts` a guard macro that already expanded above this one
-    // (e.g. `#[secured]` above `#[throttle]`) leaves behind — and already
-    // validates the trailing function is async.
-    let (preamble, mut input_fn) = match crate::parse::parse_async_handler_with_preamble(item) {
+    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
         Ok(v) => v,
         Err(err) => return err,
     };
+
+    if input_fn.sig.asyncness.is_none() {
+        return syn::Error::new_spanned(
+            input_fn.sig.fn_token,
+            "#[secured] can only be applied to async functions",
+        )
+        .to_compile_error();
+    }
 
     // The session/role check is emitted for the classic forms (`#[secured]`,
     // `#[secured("admin")]`) and whenever a role is required. It is OMITTED for
@@ -309,7 +316,7 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     quote! {
-        #preamble
+        #leading_items
         #gate_item
         #input_fn
     }

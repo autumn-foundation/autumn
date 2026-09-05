@@ -37,7 +37,7 @@ pub fn route_macro(
     };
     let path = route_args.path.clone();
 
-    let (preamble, mut input_fn) = match parse::parse_async_handler_with_preamble(item) {
+    let (leading_items, mut input_fn) = match parse::parse_async_handler_with_leading_items(item) {
         Ok(v) => v,
         Err(err) => return err,
     };
@@ -256,12 +256,11 @@ pub fn route_macro(
     };
 
     quote! {
-        // A guard macro that already expanded above this route macro (#1668:
-        // #[throttle]/#[secured]/#[step_up]) leaves its handler-unique gate
-        // `struct` + `impl FromRequestParts` here, ahead of the function —
-        // the function's new first parameter names that gate type, so it
-        // must be re-emitted verbatim for the gate type to exist.
-        #preamble
+        // A guard macro that already expanded above this route attribute
+        // (#[secured]/#[step_up]/#[throttle], #1668) leaves its hidden
+        // `FromRequestParts` gate type here, ahead of the handler — re-emit
+        // it verbatim; empty when no such guard expanded first.
+        #leading_items
 
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
         // to import axum manually. However, the path resolution in Axum macros makes this impossible
@@ -1023,7 +1022,14 @@ mod tests {
                 async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
             },
         );
-        let generated = route_macro("POST", "post", quote! { "/users" }, throttled).to_string();
+        let throttled_fn = crate::param_helpers::extract_fn_item(throttled, "create");
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/users" },
+            quote! { #throttled_fn },
+        )
+        .to_string();
 
         assert!(
             generated.contains("response : :: core :: option :: Option :: Some")
@@ -1041,7 +1047,9 @@ mod tests {
                 async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
             },
         );
-        let generated = route_macro("POST", "post", quote! { "/users" }, secured).to_string();
+        let secured_fn = crate::param_helpers::extract_fn_item(secured, "create");
+        let generated =
+            route_macro("POST", "post", quote! { "/users" }, quote! { #secured_fn }).to_string();
 
         assert!(
             generated.contains("response : :: core :: option :: Option :: Some")
@@ -1059,7 +1067,14 @@ mod tests {
                 async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
             },
         );
-        let generated = route_macro("POST", "post", quote! { "/users" }, stepped_up).to_string();
+        let stepped_up_fn = crate::param_helpers::extract_fn_item(stepped_up, "create");
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/users" },
+            quote! { #stepped_up_fn },
+        )
+        .to_string();
 
         assert!(
             generated.contains("response : :: core :: option :: Option :: Some")
@@ -1103,8 +1118,11 @@ mod tests {
                 async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
             },
         );
-        let secured = crate::secured::secured_macro(quote! { "admin" }, throttled);
-        let generated = route_macro("POST", "post", quote! { "/users" }, secured).to_string();
+        let throttled_fn = crate::param_helpers::extract_fn_item(throttled, "create");
+        let secured = crate::secured::secured_macro(quote! { "admin" }, quote! { #throttled_fn });
+        let secured_fn = crate::param_helpers::extract_fn_item(secured, "create");
+        let generated =
+            route_macro("POST", "post", quote! { "/users" }, quote! { #secured_fn }).to_string();
 
         assert!(
             generated.contains("response : :: core :: option :: Option :: Some")

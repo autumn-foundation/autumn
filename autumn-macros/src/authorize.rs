@@ -18,7 +18,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ExprLit, Ident, ItemFn, Lit, LitStr, Meta, Token, parse_quote};
+use syn::{Expr, ExprLit, Ident, Lit, LitStr, Meta, Token, parse_quote};
 
 /// Parsed `#[authorize(...)]` arguments.
 ///
@@ -146,6 +146,10 @@ fn snake_case(name: &str) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse the args first; the parser may surface a leading `"action"`
     // string literal as the bare-Path action via the `Meta::Path` branch
@@ -176,9 +180,9 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         format_ident!("{}", name)
     });
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
 
     if input_fn.sig.asyncness.is_none() {
@@ -325,7 +329,10 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    quote! { #input_fn }
+    quote! {
+        #leading_items
+        #input_fn
+    }
 }
 
 /// Variant of [`parse_authorize_args`] that allows a leading bare
