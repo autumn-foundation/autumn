@@ -1703,19 +1703,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **macros:** `#[ws]` and `#[static_get]` accept a guard attribute stacked
-  **above** them (`#[secured]` / `#[step_up]` / `#[throttle]` / `#[authorize]`).
-  Since #1668 each guard emits a handler-unique `FromRequestParts` gate type
-  *alongside* the handler, so a guard written above a route attribute expands
-  first and hands the route macro `[items…] fn` rather than a lone function.
-  #1677 taught `#[get]`/`#[post]`/… to tolerate that via
-  `parse_async_handler_with_leading_items`, but left `#[ws]` and
-  `#[static_get]` on the single-item parse, where the same ordering still fails
-  with `route macros can only be applied to functions`. Both now use the same
-  helper and re-emit the leading items, so the gate type stays in scope for the
-  `_: Gate` parameter the guard inserted, and both gained a regression test for
-  the stacked ordering — neither had any. [no-plugin] — a macro-expansion fix
-  with no new agent-facing surface.
 - **🔒 `autumn generate auth`: a concurrent successful login could be silently
   re-locked by a racing failed attempt (issue #2500):** the generated
   `login` handler (and the duplicated `reauth` step-up block) counted a

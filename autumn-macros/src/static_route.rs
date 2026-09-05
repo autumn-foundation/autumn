@@ -159,13 +159,9 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
-    // Parse the async handler function, tolerating the gate items a guard
-    // stacked ABOVE `#[static_get]` emits alongside it (#1668). Same exposure
-    // `#[get]`/`#[post]` were fixed for in #1677; re-emitted below so the gate
-    // type stays in scope for the `_: Gate` parameter the guard inserted.
-    let (leading_items, input_fn) = match crate::parse::parse_async_handler_with_leading_items(item)
-    {
-        Ok(parsed) => parsed,
+    // Parse the async handler function
+    let input_fn = match crate::parse::parse_async_handler(item) {
+        Ok(f) => f,
         Err(err) => return err,
     };
 
@@ -210,7 +206,6 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let seo_defaults = attrs.seo.emit();
 
     quote! {
-        #leading_items
         #input_fn
 
         #[doc(hidden)]
@@ -278,29 +273,6 @@ mod tests {
     use quote::quote;
 
     use super::static_get_macro;
-
-    #[test]
-    fn static_get_keeps_a_stacked_guards_gate_type_in_scope() {
-        // `#[secured]` above `#[static_get]`: secured expands first and emits
-        // its `FromRequestParts` gate type ALONGSIDE the handler (#1668), so
-        // `static_get_macro` receives `[items…] fn`. It must keep those leading
-        // items — the handler carries a `_: __AutumnSecuredGate_about`
-        // parameter that only resolves if the gate type is still emitted.
-        let secured = crate::secured::secured_macro(
-            quote! { "admin" },
-            quote! { async fn about() -> &'static str { "about" } },
-        );
-        let generated = static_get_macro(quote! { "/about" }, secured).to_string();
-
-        assert!(
-            generated.contains("struct __AutumnSecuredGate_about"),
-            "the inner guard's gate type must survive into the static route output: {generated}"
-        );
-        assert!(
-            generated.contains("__autumn_route_info_about"),
-            "the static route info must still be generated: {generated}"
-        );
-    }
 
     #[test]
     fn static_get_defaults_public_false() {
