@@ -28,6 +28,8 @@ mod broadcast_recorder;
 mod cache_coherence;
 #[cfg(feature = "cache-moka")]
 mod cache_stampede;
+#[cfg(all(feature = "db", feature = "cache-moka"))]
+mod cached_tenant_scope;
 #[cfg(feature = "ws")]
 mod chaos_channels;
 #[cfg(feature = "ws")]
