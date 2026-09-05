@@ -37,8 +37,8 @@ pub fn route_macro(
     };
     let path = route_args.path.clone();
 
-    let mut input_fn = match parse::parse_async_handler(item) {
-        Ok(f) => f,
+    let (leading_items, mut input_fn) = match parse::parse_async_handler_with_leading_items(item) {
+        Ok(v) => v,
         Err(err) => return err,
     };
 
@@ -256,6 +256,12 @@ pub fn route_macro(
     };
 
     quote! {
+        // A guard macro that already expanded above this route attribute
+        // (#[secured]/#[step_up]/#[throttle], #1668) leaves its hidden
+        // `FromRequestParts` gate type here, ahead of the handler — re-emit
+        // it verbatim; empty when no such guard expanded first.
+        #leading_items
+
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
         // to import axum manually. However, the path resolution in Axum macros makes this impossible
         // natively. Custom compile errors handle the type checks.
@@ -1016,13 +1022,6 @@ mod tests {
                 async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
             },
         );
-        // #2488 redesigned throttle_macro to emit a SIBLING gate item (a
-        // marker struct + its FromRequestParts impl) alongside the
-        // transformed handler fn, rather than a single transformed item —
-        // see param_helpers::extract_fn_item's doc comment. The real
-        // compiler re-invokes a still-pending attribute (here, #[post])
-        // with only the one fn item's tokens, never the sibling gate item
-        // too, so the test has to reproduce that same slice.
         let throttled_fn = crate::param_helpers::extract_fn_item(throttled, "create");
         let generated = route_macro(
             "POST",
@@ -1048,9 +1047,6 @@ mod tests {
                 async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
             },
         );
-        // See the comment in the throttle sibling test above: secured_macro
-        // returns the gate item and the transformed fn as siblings now, so
-        // only the fn item goes on to route_macro.
         let secured_fn = crate::param_helpers::extract_fn_item(secured, "create");
         let generated =
             route_macro("POST", "post", quote! { "/users" }, quote! { #secured_fn }).to_string();
@@ -1071,9 +1067,6 @@ mod tests {
                 async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
             },
         );
-        // See the comment in the throttle sibling test above: step_up_macro
-        // returns the gate item and the transformed fn as siblings now, so
-        // only the fn item goes on to route_macro.
         let stepped_up_fn = crate::param_helpers::extract_fn_item(stepped_up, "create");
         let generated = route_macro(
             "POST",
@@ -1118,11 +1111,7 @@ mod tests {
         // first and captures the real type, then secured wraps throttle's
         // whole generated body one level deeper. Only the innermost
         // `__autumn_inner` binding carries `Json<Created>` — the outer one
-        // reads `Response`. Each guard returns its gate item and the
-        // transformed fn as SIBLINGS (#2488), and the real compiler only
-        // ever re-invokes the next still-pending attribute with that one fn
-        // item's tokens — so extract_fn_item has to run after every hop,
-        // not just before the final one into route_macro.
+        // reads `Response`.
         let throttled = crate::throttle::throttle_macro(
             quote! { limit = 5, per = "1m", key = "ip" },
             quote! {
