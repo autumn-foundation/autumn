@@ -7703,6 +7703,12 @@ fn graph_declared_route_summary(
             roles,
             scopes,
             policy: route.policy,
+            // A `RouteInfo`'s `classification` already comes from
+            // `route_listing::classify`, which folds a repository's own policy
+            // and scope guard into `Gated` — so unlike the `Route` path above
+            // there is nothing further to recover here, and no separate
+            // repository scope to name.
+            repository_scope: false,
             public: route.classification == crate::route_listing::RouteClassification::Public,
         },
         // A `RouteInfo` carries no repository metadata: these are plugin and
@@ -7748,11 +7754,24 @@ fn graph_route_summary(route: &Route, scope_prefix: Option<&str>) -> crate::grap
         ),
         handler: route.name.to_owned(),
         module_path: route.api_doc.module_path.to_owned(),
+        // A repository auto-API route registers its guard on the *repository*,
+        // not on the generated handler, so `ApiDoc` alone reports it as
+        // unauthenticated. `route_listing::classify` — the derivation `autumn
+        // routes audit` proves the posture with — ORs in the repository's own
+        // `has_policy` and treats a registered `scope_check` as gated. The graph
+        // claims to state that same posture, so it has to read the same two
+        // sources; reading `ApiDoc` alone made a `#[repository(api = "...",
+        // policy = ...)]` endpoint serialize as `auth: none`.
         auth: crate::graph::RouteAuth {
             secured: route.api_doc.secured,
             roles,
             scopes,
-            policy: route.api_doc.has_policy,
+            policy: route.api_doc.has_policy
+                || route.repository.as_ref().is_some_and(|meta| meta.has_policy),
+            repository_scope: route
+                .repository
+                .as_ref()
+                .is_some_and(|meta| meta.scope_check.is_some()),
             public: route.api_doc.public,
         },
         // Declared ownership, straight off the route the `#[repository(api =

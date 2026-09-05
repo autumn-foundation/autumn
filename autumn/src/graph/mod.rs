@@ -250,9 +250,21 @@ inventory::collect!(JobGraphDescriptor);
 
 /// The declared authorization requirement of a mounted route.
 ///
-/// Read off the route's `ApiDoc`, which the `#[secured]`/`#[authorize]`/
-/// `#[public]` macros already populate, so the graph states the same auth
-/// posture `autumn routes audit` proves rather than a second derivation of it.
+/// Read off the two sources `route_listing::classify` reads, so the graph
+/// states the same auth posture `autumn routes audit` proves rather than a
+/// second derivation of it: the route's `ApiDoc`, which the
+/// `#[secured]`/`#[authorize]`/`#[public]` macros populate, **and** its
+/// `RepositoryApiMeta`, which is where a `#[repository(api = "...")]` auto-API
+/// route's own policy and scope guards live. Reading only the first reported
+/// those generated-but-guarded endpoints as `auth: none`.
+///
+/// The bools are deliberately independent rather than one enum: a route can be
+/// `#[secured]` *and* policy-guarded, and the document has to say which of the
+/// declarations is present, not merely how protected the route ends up.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "a serialized document field per independent, co-occurring declaration"
+)]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteAuth {
     /// Whether the handler carries `#[secured]`.
@@ -264,8 +276,26 @@ pub struct RouteAuth {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
     /// Whether the route is guarded by dynamic policy authorization.
+    ///
+    /// True for a handler carrying `#[authorize]`, and also for a repository
+    /// auto-API route whose `#[repository(api = "...", policy = ...)]` registers
+    /// the guard on the *repository* rather than the generated handler — the
+    /// generated `ApiDoc` leaves this at its default in that case, which is why
+    /// `route_listing::classify` ORs the two and why this does too.
     #[serde(default)]
     pub policy: bool,
+    /// Whether a repository auto-API route is gated by a registered scope check.
+    ///
+    /// Separate from [`scopes`](Self::scopes) because there is no scope *name*
+    /// to record: `#[repository(api = "...", scope = ...)]` enforces the scope
+    /// through a type-erased registry probe, leaving both the handler `ApiDoc`
+    /// and `RepositoryApiMeta::has_policy` at their defaults. Without this the
+    /// route would serialize as `auth: none` despite being gated.
+    ///
+    /// Omitted from the document when false, so a graph containing no such
+    /// route serializes exactly as it did before this field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repository_scope: bool,
     /// Whether the route is explicitly declared `#[public]`.
     #[serde(default)]
     pub public: bool,
@@ -287,6 +317,9 @@ impl RouteAuth {
         }
         if self.policy {
             parts.push("policy".to_owned());
+        }
+        if self.repository_scope {
+            parts.push("repository-scope".to_owned());
         }
         if self.public {
             parts.push("public".to_owned());
@@ -453,6 +486,7 @@ mod tests {
             roles: vec!["admin".to_owned()],
             scopes: vec!["posts:write".to_owned()],
             policy: true,
+            repository_scope: false,
             public: false,
         };
         assert_eq!(
@@ -464,6 +498,37 @@ mod tests {
     #[test]
     fn route_auth_label_says_none_when_nothing_is_declared() {
         assert_eq!(RouteAuth::default().label(), "none");
+    }
+
+    /// A repository auto-API route gated only by a registered scope check has
+    /// nothing in `ApiDoc` to show for it — no `secured`, no policy, and no
+    /// scope *name*, because the check is a type-erased registry probe. It must
+    /// still not read as unauthenticated.
+    #[test]
+    fn a_repository_scope_guard_is_never_reported_as_no_auth() {
+        let auth = RouteAuth {
+            repository_scope: true,
+            ..RouteAuth::default()
+        };
+        assert_ne!(auth.label(), "none");
+        assert_eq!(auth.label(), "repository-scope");
+    }
+
+    /// The field is omitted when false, so adding it did not rewrite the
+    /// serialization of every route node that has no repository scope guard.
+    #[test]
+    fn the_repository_scope_flag_is_absent_from_a_document_that_has_none() {
+        let json = serde_json::to_string(&RouteAuth::default()).expect("serializable");
+        assert!(
+            !json.contains("repository_scope"),
+            "an unguarded route must serialize as it did before the field existed: {json}"
+        );
+        let guarded = serde_json::to_string(&RouteAuth {
+            repository_scope: true,
+            ..RouteAuth::default()
+        })
+        .expect("serializable");
+        assert!(guarded.contains("\"repository_scope\":true"), "{guarded}");
     }
 
     #[test]
