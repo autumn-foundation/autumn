@@ -122,6 +122,14 @@ pub struct ModelGraphDescriptor {
     pub model_path: &'static str,
     /// The database table the model maps to.
     pub table: &'static str,
+    /// Further tables the model's *declared relations* touch, sorted.
+    ///
+    /// `#[votable(by = User)]` puts `react`/`reaction_of` on the model's
+    /// repository, and those write the `votes` edge table; `#[commentable]`
+    /// does the same for the shared comments table. A route holding the
+    /// repository reaches those tables without ever naming them, so the
+    /// relation has to be declared here or the edge cannot exist at all.
+    pub relations: &'static [&'static str],
     /// Module path the model was declared in.
     pub module_path: &'static str,
     /// `file!()` of the declaration.

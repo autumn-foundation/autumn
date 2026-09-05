@@ -210,6 +210,7 @@ mod tests {
         model: "Post",
         model_path: "app::models::Post",
         table: "posts",
+        relations: &[],
         module_path: "app::models",
         file: "src/models.rs",
         line: 1,

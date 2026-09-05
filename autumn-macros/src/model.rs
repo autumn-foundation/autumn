@@ -5263,6 +5263,27 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
+    // ── Architecture-graph relation tables (#1747) ───────────────────────
+    // The edge tables this model's declared relations write. `#[votable]` and
+    // `#[commentable]` generate methods on the model's *repository*, so a route
+    // holding that repository reaches these tables without ever naming them.
+    // Sorted and deduplicated so the emitted graph is byte-deterministic.
+    let mut graph_relation_tables: Vec<String> = Vec::new();
+    if let Some(spec) = votable.as_ref() {
+        graph_relation_tables.push(spec.table.clone());
+    }
+    if let Some(spec) = commentable.as_ref() {
+        graph_relation_tables.push(spec.table.clone());
+    }
+    graph_relation_tables.sort();
+    graph_relation_tables.dedup();
+    let graph_relations = if graph_relation_tables.is_empty() {
+        quote! { &[] }
+    } else {
+        let tables = graph_relation_tables.iter().map(String::as_str);
+        quote! { &[#(#tables),*] }
+    };
+
     let filtered_outer_attrs: Vec<&syn::Attribute> = outer_attrs
         .iter()
         .filter(|a| {
@@ -8394,6 +8415,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 model: stringify!(#name),
                 model_path: concat!(module_path!(), "::", stringify!(#name)),
                 table: #table_name,
+                relations: #graph_relations,
                 module_path: module_path!(),
                 file: file!(),
                 line: line!(),

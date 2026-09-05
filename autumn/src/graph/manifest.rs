@@ -43,6 +43,10 @@ pub const LIMITS: &[&str] = &[
      and a model whose name matches a common type is linked wherever that name appears.",
     "Raw SQL is matched by identifier, and only inside string literals that contain a SQL \
      keyword; SQL assembled at runtime from fragments is invisible.",
+    "A model's declared relations (`#[votable]`, `#[commentable]`) are attributed to its \
+     repository as a whole, because that is where the generated methods live — so a route \
+     holding the repository is reported as reaching the edge table whether or not it calls \
+     them.",
     "A route's access is its declared HTTP method (safe methods read, everything else writes); a \
      job's is whether its tokens carry mutation evidence. Either way it is the declared intent, \
      not an executed statement.",
@@ -83,6 +87,10 @@ pub struct RouteFacts {
 pub struct ModelFacts {
     /// The database table the model maps to.
     pub table: String,
+    /// Further tables the model's declared relations touch (`#[votable]`'s
+    /// edge table, `#[commentable]`'s comments table), sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relations: Vec<String>,
 }
 
 /// Facts carried by a repository node.
@@ -455,6 +463,7 @@ pub fn build(
                 route: None,
                 model: Some(ModelFacts {
                     table: model.table.to_owned(),
+                    relations: model.relations.iter().map(|t| (*t).to_owned()).collect(),
                 }),
                 repository: None,
                 job: None,
@@ -488,22 +497,34 @@ pub fn build(
         // declaration rather than a name match. It is resolved through the
         // symbol index all the same, so a repository over a model no `#[model]`
         // declared produces no dangling edge.
-        for target in index
-            .get(repo.model)
-            .into_iter()
-            .flatten()
-            .filter(|t| t.starts_with("model:"))
-        {
-            edges.insert(
-                (id.clone(), target.clone()),
-                GraphEdge {
-                    from: id.clone(),
-                    to: target.clone(),
-                    access: Access::ReadWrite,
-                    provenance: Provenance::Declaration,
-                    symbol: String::new(),
-                },
-            );
+        //
+        // The model's declared *relations* are folded in for the same reason
+        // and at the same strength: `#[votable]` and `#[commentable]` put their
+        // generated methods on this repository, so a route holding it reaches
+        // those edge tables too — without ever naming them.
+        let relation_tables: Vec<&str> = models
+            .iter()
+            .filter(|m| m.model == repo.model)
+            .flat_map(|m| m.relations.iter().copied())
+            .collect();
+        for name in std::iter::once(repo.model).chain(relation_tables) {
+            for target in index
+                .get(name)
+                .into_iter()
+                .flatten()
+                .filter(|t| t.starts_with("model:"))
+            {
+                edges.insert(
+                    (id.clone(), target.clone()),
+                    GraphEdge {
+                        from: id.clone(),
+                        to: target.clone(),
+                        access: Access::ReadWrite,
+                        provenance: Provenance::Declaration,
+                        symbol: String::new(),
+                    },
+                );
+            }
         }
     }
 
@@ -740,6 +761,7 @@ mod tests {
             model: name,
             model_path: path,
             table,
+            relations: &[],
             module_path: "app::models",
             file: "src/models.rs",
             line: 10,
@@ -999,6 +1021,69 @@ mod tests {
             &[],
         );
         assert!(graph.edges.is_empty(), "{:?}", graph.edges);
+    }
+
+    #[test]
+    fn a_repository_also_declares_its_models_relation_tables() {
+        // `#[votable(by = User)]` on `Post` puts `react`/`reaction_of` on
+        // `PgPostRepository`, and those write the `votes` edge table. A route
+        // holding the repository can reach `votes` without ever naming it, so
+        // without this edge `autumn graph touches votes` misses the upvote and
+        // downvote routes entirely.
+        let mut post = model("Post", "app::models::Post", "posts");
+        post.relations = &["votes"];
+        let graph = build(
+            &[],
+            &[route("upvote", "POST", "/upvote", &["PgPostRepository"], &[])],
+            &[post, model("Vote", "app::models::Vote", "votes")],
+            &[repository("PostRepository", "PgPostRepository", "Post", "posts")],
+            &[],
+        );
+        let answer = crate::graph::query::touches(&graph, "votes").expect("votes must resolve");
+        assert_eq!(
+            answer.routes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+            vec!["upvote"],
+        );
+        let edge = graph
+            .edges
+            .iter()
+            .find(|e| e.from.starts_with("repository:") && e.to.ends_with("::Vote"))
+            .expect("the repository must declare the relation edge");
+        assert_eq!(edge.provenance, Provenance::Declaration);
+        assert_eq!(edge.access, Access::ReadWrite);
+    }
+
+    #[test]
+    fn a_relation_table_no_model_maps_produces_no_edge() {
+        // `#[commentable]` defaults to a shared `comments` table. An app with
+        // no `Comment` model has nothing for that to point at, and a dangling
+        // edge would be worse than none.
+        let mut post = model("Post", "app::models::Post", "posts");
+        post.relations = &["comments"];
+        let graph = build(
+            &[],
+            &[],
+            &[post],
+            &[repository("PostRepository", "PgPostRepository", "Post", "posts")],
+            &[],
+        );
+        assert_eq!(
+            graph.edges.len(),
+            1,
+            "only the repository's own model edge: {:?}",
+            graph.edges
+        );
+    }
+
+    #[test]
+    fn a_models_relation_tables_are_visible_in_the_document() {
+        let mut post = model("Post", "app::models::Post", "posts");
+        post.relations = &["votes"];
+        let graph = build(&[], &[], &[post], &[], &[]);
+        assert_eq!(
+            graph.nodes[0].model.as_ref().expect("model facts").relations,
+            vec!["votes"]
+        );
     }
 
     #[test]
