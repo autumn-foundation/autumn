@@ -1604,6 +1604,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🧭 Wayfinder: signup/login redisplay inline on failure in `saas` and
+  `teams` (error-path 1/6 → 6/6 redisplaying the form; 0/6 → 6/6 preserving
+  the entered email):** an error-path inventory of both starters' auth
+  flows — signup and login in the two `supported`-tier examples whose whole
+  purpose is demonstrating that journey — found 5 of 6 recoverable failure
+  modes (malformed email, over-long password, and duplicate email at signup;
+  invalid credentials and over-long input at login) returning
+  `AutumnError`'s generic `application/problem+json`/error-page response
+  instead of redisplaying the form; the sixth (a weak password at signup)
+  did redisplay but still dropped the email the user had already typed, since
+  neither `signup_page` nor `login_form` accepted an `email` parameter to
+  preserve it. Fix: every recoverable failure now redisplays the same form at
+  HTTP 200 with the message adjacent to the fields (the existing `role="alert"`
+  paragraph) and the entered email preserved via a new `value=` attribute —
+  the one convention the weak-password branch already established, now
+  applied consistently. `teams`'s duplicate-email case needed one extra step:
+  its three signup inserts run inside one DB transaction, so that failure is
+  classified (`AutumnError::conflict_msg`, matched by status after the
+  transaction) precisely on Diesel's `UniqueViolation` rather than any insert
+  error, so a real mid-transaction failure (a dropped connection, a
+  permission error) still propagates as the 500/503 it is instead of
+  rendering a fake-successful "could not create account" page — the same
+  precise match was applied to `saas`'s non-transactional insert. `saas`'s
+  login redisplay also threads the submitted "Remember me" checkbox state
+  back through (`checked[remember]`), so a user who ticks it, mistypes their
+  password, and corrects it without re-checking the box does not silently
+  lose that opt-in. Zero-membership and corrupt-role login failures in
+  `teams` (real server-side conditions no resubmit can fix) are left as
+  real error responses. Two new `#[ignore = "requires Docker
+  (testcontainers)"]` integration tests (one per app) prove all 6 cases
+  end-to-end; a third proves the remember-me checkbox survives a rejected
+  login both ticked and unticked.
+
 - **🔒 `autumn generate auth`: a concurrent successful login could be silently
   re-locked by a racing failed attempt (issue #2500):** the generated
   `login` handler (and the duplicated `reauth` step-up block) counted a
