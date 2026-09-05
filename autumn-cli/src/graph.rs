@@ -91,6 +91,31 @@ fn node_key(node: &autumn_web::graph::manifest::GraphNode) -> &str {
     &node.id
 }
 
+/// A copy of the graph with every `file:line` blanked.
+///
+/// Locations are worth having in the document — they point a reader at the
+/// declaration — but they are not worth *gating* on: adding a blank line above
+/// a handler would fail `--check` with a diff the report cannot explain, and a
+/// gate that cries wolf on every cosmetic line shift gets regenerated
+/// reflexively, which is exactly how a `#[secured]` → `#[public]` flip rides
+/// along unreviewed.
+fn without_locations(graph: &ArchitectureGraph) -> ArchitectureGraph {
+    let mut copy = graph.clone();
+    for node in &mut copy.nodes {
+        node.location = String::new();
+    }
+    copy
+}
+
+/// The symbol that resolved an edge, or `declared` for a declaration edge.
+fn symbol_or_declared(symbol: &str) -> &str {
+    if symbol.is_empty() {
+        "declared"
+    } else {
+        symbol
+    }
+}
+
 /// Describe the difference between a committed graph and a fresh one.
 ///
 /// Returns `None` when they agree. The report names *which* elements and edges
@@ -98,6 +123,7 @@ fn node_key(node: &autumn_web::graph::manifest::GraphNode) -> &str {
 /// its read of `posts`" is the one line a reviewer needs.
 #[must_use]
 pub fn format_drift(committed: &ArchitectureGraph, current: &ArchitectureGraph) -> Option<String> {
+    let (committed, current) = (&without_locations(committed), &without_locations(current));
     if committed == current {
         return None;
     }
@@ -162,6 +188,28 @@ pub fn format_drift(committed: &ArchitectureGraph, current: &ArchitectureGraph) 
             Some(after) if after.access != edge.access => lines.push(format!(
                 "  ~ {} -> {}: {} -> {}",
                 edge.from, edge.to, edge.access, after.access
+            )),
+            // A route that stopped taking the repository as an extractor and
+            // now only names it in its body keeps the edge but weakens the
+            // evidence for it; one that reaches the same target through a
+            // different name has swapped its resolving symbol. Both are changes
+            // the report has in hand, and neither should hide behind "the
+            // documents differ in a field this report does not name".
+            Some(after) if after.provenance != edge.provenance => lines.push(format!(
+                "  ~ {} -> {}: evidence {} ({}) -> {} ({})",
+                edge.from,
+                edge.to,
+                edge.provenance,
+                symbol_or_declared(&edge.symbol),
+                after.provenance,
+                symbol_or_declared(&after.symbol),
+            )),
+            Some(after) if after.symbol != edge.symbol => lines.push(format!(
+                "  ~ {} -> {}: resolved by {} -> {}",
+                edge.from,
+                edge.to,
+                symbol_or_declared(&edge.symbol),
+                symbol_or_declared(&after.symbol),
             )),
             Some(_) => {}
         }
@@ -510,6 +558,38 @@ mod tests {
             drift.contains("- read route:app::routes::posts::index"),
             "{drift}"
         );
+    }
+
+    #[test]
+    fn a_weakened_edge_evidence_is_named_in_the_drift_report() {
+        // The route stops taking the repository as an extractor and reaches it
+        // only by naming it in the body. Same endpoints, same access — but the
+        // evidence changed, and "the documents differ in a field this report
+        // does not name" is not something a reviewer can approve.
+        let before = graph();
+        const BODY_ONLY: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+            signature_symbols: &[],
+            body_symbols: &["PgPostRepository"],
+            ..ROUTES[0]
+        }];
+        let after = build(&[], 0, BODY_ONLY, MODELS, REPOSITORIES, JOBS);
+        let drift = format_drift(&before, &after).expect("weakened evidence is drift");
+        assert!(drift.contains("evidence signature"), "{drift}");
+        assert!(drift.contains("-> body"), "{drift}");
+    }
+
+    #[test]
+    fn a_cosmetic_line_move_is_not_drift() {
+        // `location` is worth having in the document and not worth gating on: a
+        // gate that fails on every blank line added above a handler gets
+        // regenerated reflexively, and an auth change rides along in the same
+        // regeneration.
+        let before = graph();
+        let mut after = graph();
+        for node in &mut after.nodes {
+            node.location = format!("{}:999", node.location);
+        }
+        assert!(format_drift(&before, &after).is_none());
     }
 
     #[test]
