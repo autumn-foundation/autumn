@@ -60,6 +60,14 @@ Two rules matter when editing tests:
   gaps (863s) to full parallelism (61s), and on the 4-vCPU `ubuntu-latest`
   runner that flipped them. Name a new simulation module `sim_*` and it lands
   in the quiet lane; name it something else and it will not.
+- **A sim wall-clock budget must start after `sim.build`.** The `sim_` lane is
+  a short, freshly-started process, so whichever test mounts the first app in
+  it pays the one-time warm-up for every lazy static behind that app —
+  measured at 2.25s on `macos-latest`. A `let wall_start = Instant::now()`
+  placed above `sim.build(...)` charges that warm-up to the virtual-time
+  budget and fails on the slow runners only. Start the clock immediately
+  before the `advance`/`run_to_idle` under test, as
+  `sim_strict_wall_clock`, `sim_advance_to` and `sim_clock_drain` all do.
 
 The split is not cosmetic: on the 2026-08-26 trunk run, `compile_fail::` alone
 was 37 of the 47 minutes the consolidated `integration_tests` binary spent
