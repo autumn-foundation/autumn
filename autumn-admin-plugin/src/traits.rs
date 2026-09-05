@@ -809,6 +809,24 @@ pub struct ListParams {
     pub filters: Vec<(String, String)>,
 }
 
+impl ListParams {
+    /// SQL `OFFSET`/`LIMIT` for this page, ready to bind directly.
+    ///
+    /// `per_page == 0` means "no limit": offset 0, limit `i64::MAX`. Every
+    /// built-in `AdminModel::list()` shares this convention.
+    #[must_use]
+    pub fn sql_offset_limit(&self) -> (i64, i64) {
+        if self.per_page == 0 {
+            return (0, i64::MAX);
+        }
+        let offset = self.page.saturating_sub(1) * self.per_page;
+        (
+            i64::try_from(offset).unwrap_or(0),
+            i64::try_from(self.per_page).unwrap_or(i64::MAX),
+        )
+    }
+}
+
 /// Sort direction for list queries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1699,5 +1717,37 @@ mod tests {
         assert_eq!(row[4], "true");
         assert_eq!(row[5], "", "null becomes empty string");
         assert_eq!(row[6], "", "missing column becomes empty string");
+    }
+
+    fn list_params(page: u64, per_page: u64) -> ListParams {
+        ListParams {
+            page,
+            per_page,
+            search: None,
+            sort_by: None,
+            sort_dir: SortDirection::default(),
+            filters: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sql_offset_limit_treats_per_page_zero_as_unlimited() {
+        assert_eq!(list_params(1, 0).sql_offset_limit(), (0, i64::MAX));
+        // Even on page 3 — "no limit" ignores paging entirely.
+        assert_eq!(list_params(3, 0).sql_offset_limit(), (0, i64::MAX));
+    }
+
+    #[test]
+    fn sql_offset_limit_paginates_from_page_one() {
+        assert_eq!(list_params(1, 25).sql_offset_limit(), (0, 25));
+        assert_eq!(list_params(2, 25).sql_offset_limit(), (25, 25));
+        assert_eq!(list_params(3, 10).sql_offset_limit(), (20, 10));
+    }
+
+    #[test]
+    fn sql_offset_limit_treats_page_zero_like_page_one() {
+        // `page.saturating_sub(1)` — page 0 behaves like page 1 rather than
+        // underflowing.
+        assert_eq!(list_params(0, 25).sql_offset_limit(), (0, 25));
     }
 }

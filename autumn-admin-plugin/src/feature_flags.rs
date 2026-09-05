@@ -123,16 +123,7 @@ impl AdminModel for FeatureFlagAdminModel {
                 .map_err(|e| AdminError::Database(e.to_string()))?;
 
             let per_page = params.per_page;
-            let offset = if per_page == 0 {
-                0
-            } else {
-                params.page.saturating_sub(1) * per_page
-            };
-            let limit = if per_page == 0 {
-                i64::MAX
-            } else {
-                i64::try_from(per_page).unwrap_or(i64::MAX)
-            };
+            let (offset, limit) = params.sql_offset_limit();
 
             // Parameterized search — `%` alone matches everything (no search case).
             let search_pattern = format!("%{}%", params.search.as_deref().unwrap_or(""));
@@ -156,7 +147,7 @@ impl AdminModel for FeatureFlagAdminModel {
             )
             .bind::<diesel::sql_types::Text, _>(&search_pattern)
             .bind::<diesel::sql_types::BigInt, _>(limit)
-            .bind::<diesel::sql_types::BigInt, _>(i64::try_from(offset).unwrap_or(0))
+            .bind::<diesel::sql_types::BigInt, _>(offset)
             .load::<FlagRow>(&mut conn)
             .await
             .map(|rows| rows.into_iter().map(FlagRow::into_json).collect())
