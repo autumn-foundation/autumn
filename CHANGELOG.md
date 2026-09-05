@@ -2836,6 +2836,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **new `throttle_check` profiling harness; negative result, no fix:** added
+  `autumn/benches/throttle_check.rs`, driving real traffic through a
+  `#[throttle]`-guarded route and an identical unthrottled route (issue
+  #1350's per-route rate limiter had no committed benchmark before this).
+  Profiling the warm steady-state path (limiter already cached, request
+  always `Decision::Allowed`) found two `format!` calls that run on every
+  throttled request purely to build a `HashMap` lookup key —
+  `resolve_throttle_params`'s `registry_key` and `__check_throttle`'s
+  `cache_key`, both of which reallocate once a lookup that only ever hits
+  after the route's first request. An isolated `--route throttled` vs.
+  `--route plain` DHAT A/B (no framework code changed) attributed ~6
+  allocation blocks and ~247 bytes of the added per-request cost directly to
+  those two call sites — under 5% of the ~140-block/~26KB per-request
+  allocation budget `config_alloc_gate` already gates (#2232), so it clears
+  neither the 10%-of-allocations nor the 5%-of-instructions impact floor.
+  Recorded as a negative result rather than shipped; the harness itself is
+  the lasting artifact, giving `#[throttle]` its first profiling coverage.
 - **new `repository_crud` profiling harness; findings, no fix (#2486):** added
   `autumn/benches/repository_crud.rs`, driving real `save`/`find_by_id`/`page`
   calls through a `#[repository]`-generated repository against a live
