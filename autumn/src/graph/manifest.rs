@@ -43,6 +43,9 @@ pub const LIMITS: &[&str] = &[
      and a model whose name matches a common type is linked wherever that name appears.",
     "Raw SQL is matched by identifier, and only inside string literals that contain a SQL \
      keyword; SQL assembled at runtime from fragments is invisible.",
+    "The served-surface census does not yet reach the OpenAPI JSON and Swagger routes an app \
+     enables with `.openapi(...)`, nor a worker replica\'s own probe and actuator mounts: those \
+     are served but appear in no section.",
     "A router mounted with `merge`/`nest` is opaque: its endpoints cannot be enumerated at all, \
      so `completeness.opaque_mounted_routers` counts them rather than naming them. The \
      `AUTUMN_DUMP_GRAPH` count covers the routers the *builder* declares; a router the \

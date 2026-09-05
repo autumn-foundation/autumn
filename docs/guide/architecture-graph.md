@@ -105,7 +105,9 @@ A **worker** (`AUTUMN_ROLE=worker`) serves the probe-only router and mounts no
 application route, so its graph reports every declared route as
 `mounted: false` and names them under `unmounted_routes`. That is the honest
 answer to "what does *this process* serve" — the elements are still compiled
-in, they are just not being served here.
+in, they are just not being served here. Its
+`unmodelled_mounted_routes` is empty rather than listing the probes and
+actuator it does serve; that gap is tracked separately.
 
 One number can legitimately differ between `autumn graph show` and
 `/actuator/graph`: `opaque_mounted_routers`. The dump exits before startup
@@ -184,7 +186,9 @@ read as more than it is:
   mutation evidence. Neither is an executed statement.
 * **Routes mounted by other mechanisms.** A `#[ws]` handler or a framework
   endpoint is not a `#[route]` and is not a node; those mounts are *named* in
-  `completeness.unmodelled_mounted_routes`. A raw `merge`/`nest` router is
+  `completeness.unmodelled_mounted_routes` — with two exceptions still to
+  close: the OpenAPI JSON and Swagger routes an app enables with
+  `.openapi(...)`, and a worker's own probe and actuator mounts. A raw `merge`/`nest` router is
   worse than unmodelled — it exposes no API to list its endpoints at all, so
   they cannot be named, only counted, in
   `completeness.opaque_mounted_routers` (the same count `autumn routes audit`
