@@ -1399,7 +1399,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shows the "`per_page == 0`" special case was fixed in two of the three in
   one commit and copy-pasted into the third when it was added later. A custom
   `AdminModel::list()` implementation can now reuse the same helper instead of
-  re-deriving it.
+  re-deriving it. `[no-plugin]`: internal dedup, no new agent-facing surface.
 - **plugin-conformance:** **Breaking:** `plugin_conformance::ConformanceConfig`
   gains a `contract` field and is now `#[non_exhaustive]`, so it can no longer
   be built with a struct literal — use `ConformanceConfig::new(name)` and the
