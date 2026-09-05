@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
+  update validation left after #1719/#1742/#1778/#1801 (issue #1751).
+  `must_match` — like `custom`, `ip` on `Option<_>` fields, and
+  `does_not_contain` before it — is now behaviorally proven, not just
+  asserted, to be enforced on the update path via merged-model validation
+  (`from_patch`): `tests/integration/validate_merged_model.rs` gained a
+  dedicated cross-field `password`/`password_confirm` case showing the patch
+  struct alone stays create-only while the merged model correctly rejects a
+  mismatch and accepts a match. Investigating the last item, `nested`,
+  surfaced a real, previously-undiscovered defect rather than a mere test gap:
+  `validator_derive`'s `nested` codegen calls a field's value with bare
+  `(&field).validate()`, which collides with this crate's own `ValidateExt`
+  (`autumn_web::prelude::ValidateExt`, a blanket `impl<T: validator::Validate>
+  ValidateExt for T` also named `validate`) whenever a struct with a
+  `#[validate(nested)]` field is declared in a module that ALSO imports the
+  prelude — a cryptic `E0034: multiple applicable items in scope` pointing
+  into the derive expansion, on **create as much as on update**, and equally
+  possible on `#[autumn_web::model]` structs (which forward `#[validate(...)]`
+  verbatim) as on hand-rolled ones. The collision is scoped to the struct's
+  own defining module, not any downstream consumer's — proven with a
+  compile-fail/compile-pass fixture pair
+  (`tests/compile-fail/validate_nested_collides_with_validate_ext.rs` /
+  `tests/compile-pass/validate_nested_without_validate_ext.rs`) — and a
+  derive/attribute macro cannot see the rest of its enclosing module's `use`
+  statements, so `#[model]` cannot detect or refuse it at expansion time.
+  `ValidateExt`'s doc comment now documents the hazard and its scope, with the
+  workaround (keep the struct's own module free of that import, or use
+  `#[validate(custom(...))]`). `credit_card`/`non_control_character` remain
+  correctly out of scope: they are not in this workspace's enabled `validator`
+  feature set (only `derive`, not `card`/`unic`), so no model can use them
+  today regardless of the update path.
+
 - **A CI gate for the "local development" install path [no-plugin]:** nothing
   here is agent-facing — it's a CI/test-harness addition, not new framework
   surface (`local-dev-quickstart` job in
@@ -350,6 +382,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   --workspace` Windows leg could never see, because it never builds a
   scaffolded app. The workaround is documented in the platform-support guide;
   the product-level fix is tracked separately.
+- **Security posture diffs gate pull requests, and the shipped manifest is
+  signed (#1624):** #1604's manifest proves what an app's security surface
+  *is*; a manifest nobody diffs is a report, not a control. `autumn routes
+  posture` closes that: `diff` compares two manifests and classifies every
+  change as widening, neutral or narrowing; `digest` prints the posture digest
+  a release records; `verify` proves at deploy time that a shipped manifest is
+  the posture CI acknowledged **and** was signed by CI (`gh attestation
+  verify`, reusing #1615's keyless pipeline rather than introducing a second
+  signing story).
+
+  Only widening blocks — a new public route, a guard removed, a classification
+  downgraded — and the rules follow the semantics the framework actually
+  implements: roles are OR-ed, so *adding* one widens; scopes are AND-ed, so
+  *removing* one widens. Routes are keyed on their *shape* — capture names
+  erased, capture kinds kept — and handler names and source locations are
+  excluded from both the comparison and the digest, so a refactor produces no
+  finding at all. A change with no posture effect posts nothing.
+
+  Because a route is not a URL, the diff follows the router's own precedence:
+  deleting a gated `/users/me` while a public `/users/{id}` remains is a
+  widening (that URL falls through), and adding a route that takes a stricter
+  route's URLs over is one too. Configured `security.csrf.exempt_paths` are
+  compared as posture in their own right, since the per-route rows cannot show
+  them.
+
+  A widening is unblocked by one comment on the pull request:
+
+  ```
+  /ack-posture 4f8a1c0d9e2b7a35  intentional: public status page for launch week
+  ```
+
+  The digest binds the acknowledgment to that exact set of widenings, so
+  unrelated pushes keep it valid while a *new* widening re-blocks. That comment
+  is also the documented escape hatch for a false positive: there is no flag
+  that disables the gate or hides the diff, so a wrongly blocked pull request
+  is always unblockable by the team alone, in public, with a reason.
+
+  Both digests use an escaped canonical encoding, so a crafted route path
+  cannot make one finding hash like a set of ordinary ones; every dimension is
+  compared from *both* sides, so a fact that disappears from the manifest (for
+  example every POST leaving the CSRF dimension when `security.csrf.safe_methods`
+  grows) is still reported as the loss it is; and the scaffolded workflow
+  resolves each commenter's real repository permission rather than trusting
+  `author_association`, refuses to run on a pull request that edits the gate
+  itself, and fails rather than bootstrapping when a committed baseline
+  disappears from the base branch.
+
+  The scaffolded workflow is two jobs: one compiles the pull request and emits
+  its manifest with no write permission and no verdict, and one that never
+  compiles anything downloads that manifest, diffs it, and decides — so a build
+  script in the diff cannot replace the binary that computes the verdict.
+
+  `autumn new` scaffolds `.github/workflows/posture-gate.yml` by default;
+  existing apps adopt it with `autumn upgrade --apply`. The scaffolded deploy
+  workflows attest `security-posture.json` with
+  `actions/attest-build-provenance`, and autumn's own `examples/hello` runs the
+  gate in the publish gate (`scripts/check-posture-gate.sh`). See
+  `docs/guide/posture-gate.md`.
+
 - **Build-time authority envelope for agent-operable handlers (#1691):** an
   endpoint exposed as an MCP tool is an action an autonomous agent can take
   with no human in the loop, and nothing said what that action was *allowed*
@@ -1441,6 +1532,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`#[secured]`, `#[step_up]`, and `#[throttle]` now reject a request before
+  its body is ever parsed (#1668):** all three guard checks used to run as
+  statements inside the generated handler body, which Axum only invokes after
+  every extractor — including the body extractor (`Json`/`Form`/`Multipart`)
+  — has already succeeded. An over-limit or unauthenticated request with a
+  malformed body got the extractor's `400`/`422` instead of the guard's
+  intended `429`/`401`/`403`, masking the guard's outcome, and the server paid
+  the cost of parsing and buffering the body (worst for uploads) before a
+  `#[throttle]`-gated route ever got to shed the load. Each macro now emits a
+  `FromRequestParts` gate — a small generated type inserted as the handler's
+  first parameter — so the check runs and can reject the request before
+  Axum's extractor pipeline ever reaches the body extractor, relying on
+  Axum's guarantee that every `FromRequestParts` extractor resolves,
+  left-to-right, strictly before the trailing `FromRequest` one. The macro
+  invocation syntax and handler signatures at call sites are unchanged; a
+  route's role/scope markers still surface in the generated OpenAPI document
+  exactly as before. Fixing this also surfaced a related idempotency-replay
+  gap: when `#[authorize]` is written above one of these guards, a stale scan
+  could let the guard's new pre-body gate wrongly claim replay-serving for
+  itself, which — now that the gate runs before the body — would have let a
+  retried mutation replay its cached response without `#[authorize]`'s policy
+  check ever re-running. That gap is closed in the same change.
+
 - **The idempotency cache is now partitioned by the resolved tenant:** an app
   that turned on Autumn's multi-tenancy (`[tenancy] enabled = true`) *and*
   `AppBuilder::idempotent()` shared one cache slot between tenants. The storage
@@ -1489,6 +1603,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/security/2026-09-03-webhook-ssrf/`.
 
 ### Fixed
+
+- **🧭 Wayfinder: keyboard bypass-blocks link added to 6 supported example
+  apps (a11y `bypass` Serious 7/8 → 0/8; `landmark-one-main` Moderate 1/8 → 0/8):**
+  `autumn check --a11y` — the framework's own WCAG audit, run against each
+  layout's rendered shell — found `todo-app`, `blog`, `bookmarks`,
+  `bookmarks-distributed`, `wiki`, `saas`, and `teams` (7 of the 8 `supported`-tier
+  example apps with an HTML UI; `reddit-clone` already had it) missing the
+  skip-to-content link that `autumn new`'s own scaffold (`autumn-cli/src/templates/main.rs.tmpl`)
+  ships by default. A keyboard-only user visiting any of these — including
+  `saas`/`teams`, whose nav is the login/signup entry point — must tab through
+  every nav link before reaching the page's actual content on **every single
+  page load**, with no way to jump past it (WCAG 2.4.1 Bypass Blocks). `todo-app`
+  additionally had no `<main>` landmark at all, so a screen-reader user's
+  "jump to main content" shortcut had nothing to land on.
+  Fix: a visually-hidden, focus-revealed `<a href="#main-content">` as the
+  first element inside `<body>` on the 6 apps whose layout has a nav/header
+  preceding the content, plus a `<main id="main-content">` landmark on every
+  affected layout including `todo-app` — the exact skip-link pattern
+  `examples/reddit-clone` already used and the scaffold template establishes,
+  so no new CSS or dependency is introduced. `todo-app`'s page has no
+  nav/header at all (content is the first thing in `<body>`), so it gets only
+  the `<main>` landmark — a skip link there would add a tab stop ahead of the
+  first form control while bypassing nothing, the same reason
+  `examples/media-room` (also audited, also nav-less) was left unchanged.
+  `examples/blog` is i18n-aware (`/es/...` routes via `t!`), so its skip
+  link's label is a new `layout.skip_to_content` Fluent key translated in
+  both `i18n/en.ftl` and `i18n/es.ftl`, not a hardcoded English string,
+  matching the rest of that layout's chrome.
+
+  `autumn check --a11y`'s `bypass` rule (`autumn-cli/src/check.rs`) itself had
+  a false positive this fix exposed: it unconditionally required a skip link
+  as the page's first `<a>`, so `todo-app`'s post-fix shell — `<main>`
+  immediately inside `<body>`, its only link in the footer, after `<main>` —
+  still reported Serious `bypass`, even though there is no nav/header for a
+  skip link to bypass there. The rule now skips the check when nothing
+  (no nav, header, or link) precedes `<main>`, matching the exact reasoning
+  already applied to `todo-app`/`media-room` above; it still fires whenever
+  content — `<nav>`-wrapped or not — precedes `<main>` without a skip link
+  (both pre-existing regression tests plus two new ones cover this).
+- **🛣️ Onramp: `autumn setup` retries a dropped Tailwind CSS download instead
+  of failing the whole quickstart [no-plugin]:** `autumn setup` — the second
+  documented command in the README quickstart, right after `autumn new` — did
+  a single unretried `GET` for both the Tailwind CSS checksums manifest and
+  the ~10MB platform binary (`autumn-cli/src/http.rs`); any transient
+  transport hiccup (a truncated body, a dropped connection) aborted the whole
+  command with a bare `Error: download failed: error decoding response body`
+  and no second chance. This is not hypothetical: 2 of the last 3
+  `quickstart-gate.yml` runs against published crates.io on 2026-09-03 (runs
+  33784307158 at 17:23 UTC and 33805758766 at 21:02 UTC) failed at exactly
+  this step with exactly this error, with the passing run in between
+  (33797353571, 19:35 UTC) at the same commit — confirming the failure is
+  transient CDN flakiness, not a real break, and that a real fraction of
+  fresh `autumn setup` runs hit it. `fetch_bytes` and the new `fetch_text`
+  (both in `autumn-cli/src/http.rs`, shared by `autumn setup` and `autumn
+  assets`) now retry up to 3 times with a 2s backoff on any non-HTTP-status
+  error (a definitive 404/5xx is not retried — retrying it would just waste
+  the user's time); the retry/backoff bookkeeping is exercised by 4 unit
+  tests against fake failing/succeeding closures, no real networking
+  involved. No public API changed — `fetch_bytes`'s signature and error type
+  are unchanged, `fetch_text` is a new addition. No plugin-facing surface;
+  this is a CLI robustness fix, not new framework surface.
 
 - **`--counter-cache` scaffolds compiled clean now (#2431):** `autumn generate
   scaffold Comment ... --belongs-to Post --counter-cache` — the documented,
@@ -1549,6 +1724,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dev inspector's detail route (`{inspector_path}/requests/{id}`) is claimed
   alongside its index — both now derive from `inspector_endpoint_paths`, so the
   claim set cannot drift from what the router actually mounts.
+
+- **`#[secured]`/`#[step_up]`/`#[authorize]`/`#[throttle]` no longer drop a
+  route's OpenAPI response schema when written above the route attribute
+  (#1677):** all four body guards rewrite a handler's return type to
+  `Response` when they expand, so when one was written *above* `#[get]`/
+  `#[post]`/etc. it expanded first and the route macro's `infer_response_body`
+  read back `Response` instead of the handler's real `Json<T>` — silently
+  dropping the response schema from the generated OpenAPI document (throttling
+  itself, including idempotency-replay accounting, was unaffected in either
+  ordering). Each guard already binds the pre-rewrite type as
+  `let __autumn_inner: T = …` around the guarded body; the route macro now
+  recovers the original type from that binding — matched by its exact
+  structural shape and the presence of the guard's own marker const earlier
+  in the same block, not merely the binding's name or position, so neither
+  an unrelated handler-local nor a coincidentally-shaped fragment of the
+  handler's own body is ever mistaken for a real guard's binding — recursing
+  to the innermost binding when guards stack, instead of trusting
+  `sig.output` alone. The generated schema no longer depends on attribute
+  order. The
+  previously-recommended method-attribute-outermost workaround, documented
+  on `#[throttle]`'s rustdoc and in `docs/guide/rate-limiting.md`, is no
+  longer necessary.
+
+  This is a macro/metadata-only change — no authorization, rate-limiting, or
+  idempotency-replay runtime behavior differs in either attribute ordering.
+  `ApiDoc::response` does have one existing runtime reader, `mount_mcp`'s MCP
+  tool-catalog eligibility gate: a guard-above-route JSON handler explicitly
+  opted in with `#[api_doc(mcp)]` was previously excluded from `tools/list`
+  as "no response schema", and is now correctly listed, matching the
+  developer's existing opt-in — every MCP call still dispatches through the
+  same authenticated handler pipeline, so this closes an availability gap
+  rather than changing what a call is authorized to do.
+
 - **Punctuation- and emoji-only titles no longer slip past the validator that
   exists to stop them (#2424):** `examples/reddit-clone` rejects a post title
   like `***`, `!!!???...:::` or `🎉🔥💯` with "Title must contain at least one
@@ -1880,6 +2088,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never resubmitted) keep showing their real value instead of going blank.
   Other failure classes (missing pool, unknown model, database outage) are
   unchanged and still render the generic error page.
+- **`distributed_lock`'s `cancelled_release_does_not_leak_lock` de-flaked and
+  un-quarantined:** the test raced a `Duration::ZERO` `tokio::time::timeout`
+  against a real `pg_advisory_unlock` round-trip, on the assumption that an
+  already-elapsed timer always wins. It doesn't: `Timeout::poll` polls the
+  wrapped future *before* checking its timer, so whenever the query happened
+  to resolve within that same first poll the timeout never fired and the
+  future was never actually cancelled mid-flight — measured at 1/30
+  same-commit reruns. It had been `--skip`-listed out of `ci.yml`'s Docker
+  sweep for this since, with no tracking issue. The test now polls
+  `release()` by hand exactly once, asserts `Poll::Pending` (proof the query
+  genuinely had not completed — a real network round-trip cannot resolve
+  synchronously on its first poll) and drops it from there: no timing
+  dependency, 0 failures across 50 reruns. Restored to CI's Docker sweep.
+- **`autumn-cli export`'s `test_fetch_endpoint_success`/`test_fetch_endpoint_failure`
+  de-flaked on `windows-latest` CI:** two independent mechanisms in the same
+  hand-rolled mock-HTTP-server test harness (`export.rs`). The success-path
+  server capped itself at `num_requests` *accept() attempts* rather than
+  *served requests*, so a single transient `accept()` error (seen on
+  windows-latest, where loopback connections are occasionally intercepted by
+  Defender/firewall) silently gave up and left the client to time out with
+  no response. The failure-path test "guaranteed" a closed port by binding
+  an ephemeral port and immediately dropping it — but every test in the
+  module runs concurrently and independently calls
+  `TcpListener::bind("127.0.0.1:0")`, so the just-freed port could be
+  reallocated to another test's mock server before this test's client
+  connected, landing on a live, unrelated server instead of getting refused.
+  The mock server now retries past a transient `accept()`/read failure
+  instead of spending one of its `num_requests` slots on it, and the
+  failure-path test now binds its own ephemeral listener and keeps it
+  reserved (bound, unaccepted) for the request instead of dropping it —
+  which both removes the race (nothing else can grab that port) and makes
+  no assumption about what else might be listening on the host.
 
 ### Added
 
@@ -2595,6 +2835,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every other decline, so the origin serves the request instead.
 
 ### Performance
+
+- **new `repository_crud` profiling harness; findings, no fix (#2486):** added
+  `autumn/benches/repository_crud.rs`, driving real `save`/`find_by_id`/`page`
+  calls through a `#[repository]`-generated repository against a live
+  Postgres — the query-building/row-mapping layer `request_pipeline.rs`
+  deliberately excludes (its handlers are trivial and non-DB by design) and
+  that no other committed bench touches. Profiling it turned up that every
+  repository call currently pays for two liveness-style round trips beyond
+  its actual query — diesel-async's connection pool defaults to a `SELECT 1`
+  ping on every checkout, and `#[repository]`'s generated
+  `__autumn_acquire_from` re-runs `SET statement_timeout` on every checkout
+  too, even though the two overlap: `SET statement_timeout` already fails on
+  a dead connection the same way the ping would. An isolated A/B (the pool's
+  recycling method only, no framework code changed) measured instructions
+  -13.00%, allocation blocks/round -14.44%, allocation bytes/round -16.20%
+  (`valgrind --tool=callgrind`/`dhat`). No source fix here: switching the
+  framework's own pool-builder default changes connection-liveness-detection
+  behavior for every deployed app, which is a maintainer call rather than an
+  unreviewed automated change — see #2485 for the full mechanism and
+  reproduction steps.
+- **`ledger_as_of`/`ledger_diff` no longer read a ledgered record's entire
+  revision chain to answer a question with one answer:** both are pure
+  functions over `ledger_revisions(record_id)`, which has always had one SQL
+  shape — read every stored revision, every full-column snapshot, in `seq`
+  order — with no bound on the requested instant at all. For a hot ledgered
+  record (an account, invoice, or contract adjusted repeatedly over a long
+  operational life, exactly the shape the feature exists for), an audit query
+  about *recent* history — the overwhelmingly common case — paid for reading
+  the record's whole history regardless. Both now issue a bounded
+  `ORDER BY seq DESC LIMIT 1` lookup instead, using the same index
+  `ledger_revisions` already relied on — no migration, no new index. Because
+  transaction time is monotonic in `seq` (#2323), a transaction-time as-of
+  query's cost is now proportional to how far back the question asks, not to
+  the chain's total length. `ledger_diff`'s two endpoints are resolved from
+  one `UNION ALL` statement on one connection rather than two independent
+  lookups, so it keeps the single-snapshot consistency the old full-chain
+  read had (two separate connection-acquiring calls could otherwise resolve
+  `from`/`to` against two different database states if a write landed, or a
+  read replica advanced, between them) — statement count for `ledger_diff`
+  is unchanged at 1. Measured (`pg_stat_statements`, testcontainer Postgres,
+  three ledgered chains at 300/700/1,200 revisions each, written through the
+  real write path): a near-head as-of query's buffers fall 86–94% and stay
+  flat across all three depths (22/129/132 → 3/8/8), instead of scaling with
+  chain length; `ledger_diff` across a recent window falls 129 → 16 buffers
+  (-88%). Disclosed trade-off: the pathological case — asking about a
+  record's very *first* revision on a deep chain — reads more buffers than
+  before (132 → 948 on the 1,200-revision fixture), because the backward
+  index scan can't short-circuit when the answer sits at the far end of it;
+  this is bounded by the record's own chain depth and only reachable by a
+  query about a record's oldest history, so it does not offset the
+  unconditional win on the realistic (recent-history) query pattern.
+  `ledger_revisions` and `ledger_verify` are unchanged — they legitimately
+  need the whole chain and still read it.
 
 - **the DB-backed media-room reaper sweeps in one statement instead of one per
   stale room:** `DbRoomStore::reap_stale`'s second phase — the sweep that drops

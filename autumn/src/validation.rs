@@ -74,6 +74,27 @@ impl<T> AsRef<T> for Validated<T> {
 ///
 /// Returns `AutumnResult<Validated<Self>>` so the `?` operator works
 /// in handlers.
+///
+/// # Hazard: don't combine with `#[validate(nested)]`
+///
+/// This blanket `impl<T: validator::Validate> ValidateExt for T` applies to
+/// *every* `Validate` type, including one used as a `#[validate(nested)]`
+/// field inside another `#[derive(validator::Validate)]` struct. `nested`'s
+/// generated code calls that field with bare method syntax —
+/// `(&self.field).validate()` — and if this trait is ALSO in scope in the
+/// **struct's own defining module** at that point (it is, the moment that
+/// module does `use autumn_web::prelude::*;`), rustc reports `E0034: multiple
+/// applicable items in scope`, pointing at the derive expansion rather than
+/// at anything you wrote. This applies equally to `#[autumn_web::model]`
+/// structs (issue #1751) — the macro forwards `#[validate(...)]` verbatim and
+/// cannot detect the collision at expansion time, since a derive/attribute
+/// macro only sees the item it's attached to, not the rest of its enclosing
+/// module's `use` statements, so it does not (and cannot reliably) refuse
+/// `nested` on your behalf. The collision is scoped to that one module,
+/// though: importing this trait in some *other* module that merely uses the
+/// nested-validating type does not trigger it. So keep a nested-validating
+/// struct's own module free of this trait (and of `autumn_web::prelude`), or
+/// express the rule with `#[validate(custom(function = "..."))]` instead.
 pub trait ValidateExt: validator::Validate + Sized {
     /// Validate this value and wrap it in [`Validated`].
     ///

@@ -1,8 +1,13 @@
 //! `#[step_up]` proc macro implementation.
 //!
-//! Generates a step-up authentication guard that runs before the handler
-//! body. Injects hidden extractors and prepends a call to the runtime
-//! check function.
+//! Generates a step-up authentication guard that runs as a
+//! `FromRequestParts` gate — a hidden, handler-unique parameter inserted
+//! ahead of the handler's own parameters — instead of a statement inside the
+//! handler body (issue #1668). Axum resolves every `FromRequestParts`
+//! extractor, left to right, *before* it ever reaches a `FromRequest` body
+//! extractor (`Json` / `Form` / `Multipart`) and short-circuits on the first
+//! rejection, so a stale/missing step-up session is rejected before the
+//! request body is parsed, rather than after.
 //!
 //! ## Forms
 //!
@@ -11,11 +16,10 @@
 //! - `#[step_up(max_age = "1h")]` -- require fresh auth within 1 hour
 
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{ItemFn, LitStr, parse_quote};
 
-use crate::idempotency_guard::block_has_replay_guard;
-use crate::param_helpers::has_input_named;
+use crate::idempotency_guard::should_own_replay;
 
 /// Parse the `#[step_up(max_age = "…")]` attribute arguments.
 ///
@@ -82,31 +86,33 @@ fn parse_max_age_str_at_compile_time(lit: &LitStr) -> Result<u64, String> {
         .map_err(|_| format!("invalid max_age: '{s}' (expected seconds or e.g. \"5m\")"))
 }
 
-/// Build the runtime freshness-check token stream injected at the top of
-/// the handler body.
+/// Build the runtime freshness-check token stream that runs inside the gate's
+/// `from_request_parts`, after the extractor prelude has bound `state`,
+/// `__autumn_session`, `__autumn_step_up_headers`, `__autumn_step_up_uri`,
+/// `__autumn_step_up_method`, and `__autumn_idempotency_replay`.
 fn build_check_call(max_age_tokens: &TokenStream) -> TokenStream {
     quote! {
         const __AUTUMN_STEP_UP_MAX_AGE: ::core::option::Option<u64> = #max_age_tokens;
         // Resolve max_age before the check so the response can advertise the
         // exact value actually enforced (not the compile-time default).
         let __max_age_secs: u64 =
-            ::autumn_web::step_up::__resolve_step_up_max_age(&__autumn_state, __AUTUMN_STEP_UP_MAX_AGE);
+            ::autumn_web::step_up::__resolve_step_up_max_age(state, __AUTUMN_STEP_UP_MAX_AGE);
         if let ::core::result::Result::Err(__autumn_step_up_error) =
             ::autumn_web::step_up::__check_step_up_with_config(
                 &__autumn_session,
-                &__autumn_state,
+                state,
                 __AUTUMN_STEP_UP_MAX_AGE,
             ).await
         {
             if let ::core::option::Option::Some(__autumn_response) =
                 ::autumn_web::idempotency::__replay_finalized_session_response_for_anonymous(
                     &__autumn_session,
-                    __autumn_state.auth_session_key(),
+                    state.auth_session_key(),
                     &__autumn_idempotency_replay,
                 )
                 .await
             {
-                return __autumn_response;
+                return ::core::result::Result::Err(__autumn_response);
             }
             let __wants_json: bool = __autumn_step_up_headers
                 .get(::autumn_web::reexports::axum::http::header::ACCEPT)
@@ -114,7 +120,9 @@ fn build_check_call(max_age_tokens: &TokenStream) -> TokenStream {
                 .map(|s| s.contains("application/json") || s.contains("+json"))
                 .unwrap_or(false);
             if __wants_json {
-                return ::autumn_web::step_up::__step_up_json_response(__max_age_secs);
+                return ::core::result::Result::Err(
+                    ::autumn_web::step_up::__step_up_json_response(__max_age_secs),
+                );
             } else {
                 // For non-GET requests: prefer Referer so the user returns to
                 // the page with the form after reauth rather than a POST/DELETE
@@ -142,59 +150,15 @@ fn build_check_call(max_age_tokens: &TokenStream) -> TokenStream {
                             .unwrap_or_else(|| __autumn_step_up_uri.path()),
                     )
                 };
-                return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-                    ::autumn_web::reexports::axum::response::Redirect::to(
-                        &::std::format!("/reauth?return_to={__return_to}")
-                    )
+                return ::core::result::Result::Err(
+                    ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                        ::autumn_web::reexports::axum::response::Redirect::to(
+                            &::std::format!("/reauth?return_to={__return_to}")
+                        )
+                    ),
                 );
             }
         }
-    }
-}
-
-/// Inject the four hidden extractors required by the step-up check, guarding
-/// against duplication when `#[step_up]` is stacked with `#[secured]`.
-fn inject_step_up_params(input_fn: &mut ItemFn) {
-    if !has_input_named(input_fn, "__autumn_state") {
-        let p: syn::FnArg = parse_quote! {
-            ::autumn_web::reexports::axum::extract::State(__autumn_state):
-                ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>
-        };
-        input_fn.sig.inputs.insert(0, p);
-    }
-    if !has_input_named(input_fn, "__autumn_session") {
-        let p: syn::FnArg = parse_quote! {
-            __autumn_session: ::autumn_web::session::Session
-        };
-        input_fn.sig.inputs.insert(0, p);
-    }
-    if !has_input_named(input_fn, "__autumn_step_up_headers") {
-        let p: syn::FnArg = parse_quote! {
-            __autumn_step_up_headers: ::autumn_web::reexports::axum::http::HeaderMap
-        };
-        input_fn.sig.inputs.insert(0, p);
-    }
-    if !has_input_named(input_fn, "__autumn_step_up_uri") {
-        let p: syn::FnArg = parse_quote! {
-            __autumn_step_up_uri: ::autumn_web::reexports::axum::http::Uri
-        };
-        input_fn.sig.inputs.insert(0, p);
-    }
-    if !has_input_named(input_fn, "__autumn_step_up_method") {
-        let p: syn::FnArg = parse_quote! {
-            __autumn_step_up_method: ::autumn_web::reexports::axum::http::Method
-        };
-        input_fn.sig.inputs.insert(0, p);
-    }
-    if !has_input_named(input_fn, "__autumn_idempotency_replay") {
-        let p: syn::FnArg = parse_quote! {
-            __autumn_idempotency_replay: ::core::option::Option<
-                ::autumn_web::reexports::axum::extract::Extension<
-                    ::autumn_web::idempotency::IdempotencyReplayResponse
-                >
-            >
-        };
-        input_fn.sig.inputs.insert(0, p);
     }
 }
 
@@ -226,6 +190,7 @@ fn type_contains_impl_trait(ty: &syn::Type) -> bool {
 }
 
 /// Expand the `#[step_up]` / `#[step_up(max_age = "Nm")]` attribute.
+#[allow(clippy::too_many_lines)]
 pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let max_age_opt = match parse_step_up_args(attr) {
         Ok(v) => v,
@@ -251,6 +216,86 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
     let check_call = build_check_call(&max_age_tokens);
+    let fn_name = input_fn.sig.ident.clone();
+    let gate_ident = format_ident!("__AutumnStepUpGate_{}", fn_name);
+
+    // Whether THIS gate should also serve a cached idempotency replay: see
+    // `should_own_replay` for the full ordering rationale (issue #1668's
+    // pre-body gates and `#[authorize]`'s in-body check must never both skip
+    // replay-ownership, nor both claim it). Replay is checked BEFORE the
+    // step-up freshness check (unchanged from before this gate existed): a
+    // cached response for an already-completed mutation needs no fresh
+    // step-up to replay, since replaying serves the exact stored bytes rather
+    // than re-executing the handler.
+    let owns_replay = should_own_replay(&input_fn);
+    let replay_check = if owns_replay {
+        quote! {
+            let __autumn_idempotency_replay = parts
+                .extensions
+                .get::<::autumn_web::idempotency::IdempotencyReplayResponse>()
+                .cloned()
+                .map(::autumn_web::reexports::axum::extract::Extension);
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return ::core::result::Result::Err(__autumn_response);
+            }
+        }
+    } else {
+        quote! {
+            let __autumn_idempotency_replay = parts
+                .extensions
+                .get::<::autumn_web::idempotency::IdempotencyReplayResponse>()
+                .cloned()
+                .map(::autumn_web::reexports::axum::extract::Extension);
+        }
+    };
+
+    // Both the freshness check and the replay lookup run inside a
+    // `FromRequestParts` gate: a hidden parameter inserted ahead of the
+    // handler's own parameters, rather than as a statement inside the handler
+    // body. Axum resolves every `FromRequestParts` extractor before it ever
+    // reaches a `FromRequest` body extractor (`Json` / `Form` / `Multipart`)
+    // and short-circuits on the first rejection, so a stale/missing step-up
+    // session never causes the body to be parsed.
+    let gate_item = quote! {
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        pub struct #gate_ident;
+
+        #[doc(hidden)]
+        impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState>
+            for #gate_ident
+        {
+            type Rejection = ::autumn_web::reexports::axum::response::Response;
+
+            fn from_request_parts(
+                parts: &mut ::autumn_web::reexports::axum::http::request::Parts,
+                state: &::autumn_web::AppState,
+            ) -> impl ::core::future::Future<Output = ::core::result::Result<Self, Self::Rejection>>
+                + Send {
+                async move {
+                    // A real `Session` extraction (not a raw extensions
+                    // lookup) so a missing `SessionLayer` still fails loudly,
+                    // exactly as the hidden `__autumn_session: Session`
+                    // handler parameter this replaces did.
+                    let __autumn_session: ::autumn_web::session::Session = match
+                        <::autumn_web::session::Session as ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState>>
+                            ::from_request_parts(parts, state).await
+                    {
+                        ::core::result::Result::Ok(__session) => __session,
+                        ::core::result::Result::Err(__never) => match __never {},
+                    };
+                    let __autumn_step_up_headers = parts.headers.clone();
+                    let __autumn_step_up_uri = parts.uri.clone();
+                    let __autumn_step_up_method = parts.method.clone();
+                    #replay_check
+                    #check_call
+                    ::core::result::Result::Ok(#gate_ident)
+                }
+            }
+        }
+    };
 
     let original_body = input_fn.block.clone();
     let original_response = match &input_fn.sig.output {
@@ -272,35 +317,28 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     };
 
-    inject_step_up_params(&mut input_fn);
+    // Insert the gate as the FIRST parameter — ahead of every other
+    // extractor, including any earlier-inserted guard gate (which then
+    // correctly runs AFTER this one; see `should_own_replay`'s doc comment).
+    let gate_param: syn::FnArg = parse_quote! { _: #gate_ident };
+    input_fn.sig.inputs.insert(0, gate_param);
+
     input_fn
         .attrs
         .push(parse_quote!(#[allow(clippy::too_many_arguments)]));
     input_fn.sig.output = parse_quote! {
         -> ::autumn_web::reexports::axum::response::Response
     };
-    let body_already_has_replay_guard = block_has_replay_guard(&original_body);
-    let replay_stop = if body_already_has_replay_guard {
-        quote! {}
-    } else {
-        quote! {
-            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
-            if let ::core::option::Option::Some(__autumn_response) =
-                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
-            {
-                return __autumn_response;
-            }
-        }
-    };
     input_fn.block = syn::parse_quote! {
         {
-            #replay_stop
-            #check_call
             #original_response
         }
     };
 
-    quote! { #input_fn }
+    quote! {
+        #gate_item
+        #input_fn
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -395,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn step_up_injects_state_parameter() {
+    fn check_runs_in_a_from_request_parts_gate() {
         let generated = step_up_macro(
             quote! {},
             quote! {
@@ -404,8 +442,17 @@ mod tests {
         )
         .to_string();
         assert!(
-            generated.contains("__autumn_state"),
-            "should inject state parameter:\n{generated}"
+            generated.contains("FromRequestParts"),
+            "the check must run in a FromRequestParts gate, not a body statement:\n{generated}"
+        );
+        assert!(
+            generated.contains("struct __AutumnStepUpGate_handler"),
+            "should emit a handler-unique gate marker struct:\n{generated}"
+        );
+        assert!(
+            !generated.contains("__autumn_state"),
+            "the old hidden State<AppState> handler parameter should be gone — the gate reads \
+             state from its own `from_request_parts` argument instead:\n{generated}"
         );
     }
 
@@ -502,30 +549,63 @@ mod tests {
     }
 
     #[test]
-    fn step_up_does_not_duplicate_session_when_stacked_with_secured() {
-        // Simulate what happens when both #[secured] and #[step_up] are applied:
-        // both macros try to inject __autumn_session. The has_input_named guard
-        // should prevent duplicates.
-        let after_secured = step_up_macro(
+    fn inserts_gate_as_first_parameter_when_stacked_with_secured() {
+        // Simulate `#[secured]` having already expanded and inserted its own
+        // gate parameter ahead of `#[step_up]`'s. Each gate is now an
+        // independent `FromRequestParts` parameter (issue #1668) rather than a
+        // shared hidden `Session`/`State` pair, so there is no more
+        // duplicate-parameter risk to guard against — but `#[step_up]`'s own
+        // gate must still land as the new FIRST parameter, ahead of
+        // `#[secured]`'s (which then correctly runs second; see
+        // `should_own_replay`'s doc comment).
+        let generated_fn = {
+            let generated = step_up_macro(
+                quote! {},
+                quote! {
+                    async fn handler(_g: __AutumnSecuredGate_handler) -> &'static str { "ok" }
+                },
+            );
+            let items: syn::File = syn::parse2(generated).expect("generated tokens must parse");
+            items
+                .items
+                .into_iter()
+                .find_map(|item| match item {
+                    syn::Item::Fn(f) if f.sig.ident == "handler" => Some(f),
+                    _ => None,
+                })
+                .expect("handler fn must be present in the expansion")
+        };
+        let first_param = generated_fn
+            .sig
+            .inputs
+            .first()
+            .expect("handler must have at least the gate parameter");
+        let syn::FnArg::Typed(pat_type) = first_param else {
+            panic!("first parameter must be a typed gate parameter");
+        };
+        let syn::Type::Path(type_path) = pat_type.ty.as_ref() else {
+            panic!("gate parameter must be a named type");
+        };
+        assert_eq!(
+            type_path.path.segments.last().unwrap().ident,
+            "__AutumnStepUpGate_handler",
+            "the newly-inserted gate must be the FIRST parameter"
+        );
+    }
+
+    #[test]
+    fn defers_replay_when_authorize_still_pending() {
+        let generated = step_up_macro(
             quote! {},
-            // Function already has __autumn_session (as if #[secured] ran first)
             quote! {
-                async fn handler(
-                    __autumn_session: ::autumn_web::session::Session,
-                    __autumn_state: ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>,
-                ) -> &'static str { "ok" }
+                #[authorize("update", resource = Post)]
+                async fn handler() -> &'static str { "ok" }
             },
         )
         .to_string();
-        // Count occurrences of "__autumn_session" — should appear multiple times
-        // in generated code (parameter, call site) but the *parameter declaration*
-        // should only appear once.
-        let session_decl_count = after_secured
-            .matches("__autumn_session : :: autumn_web :: session :: Session")
-            .count();
-        assert_eq!(
-            session_decl_count, 1,
-            "should not duplicate __autumn_session parameter:\n{after_secured}"
+        assert!(
+            !generated.contains("__replay_response"),
+            "must defer replay-ownership while #[authorize] is still pending:\n{generated}"
         );
     }
 
