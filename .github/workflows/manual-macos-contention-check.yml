@@ -1,45 +1,14 @@
 name: Manual macOS contention check (Semaphore rerun harness)
 
-# Not part of the merge gate and never runs on push/pull_request. This is the
-# Tier 1 load-faithful rerun protocol from
-# docs/reports/2026-09-04-semaphore-ci-health-census.md's Reproduce section,
-# committed so a human can dispatch it with one click instead of hand-rolling
-# it each time the macOS timing-cluster hypothesis needs re-checking.
-#
-# It exists to answer one question: does `cargo test --workspace` on a real,
-# freshly-provisioned GitHub-hosted `macos-latest` runner reproduce the
-# `live_upgrade` / `cache_stampede` / `sim_fault_plan` failures the 2026-09-04
-# census clustered on macOS (3/17, 1/17, 1/17) against 0/16-17 on
-# `ubuntu-latest`? Ten independent fresh-VM samples, each running the exact
-# CI command unfiltered, is real GitHub Actions spend (macOS is the most
-# expensive hosted runner class) -- ask before dispatching this, per
-# Semaphore's own "Ask before: New CI spend" rule. This commit only adds the
-# capability; it does not run it.
-#
-# Two things this harness must get right or the samples don't mean anything
-# (both called out explicitly in the census this harness implements):
-#   - each sample needs its OWN fresh runner/VM, not a loop inside one job,
-#     since a shared target/ and warm build cache would let samples 2-10
-#     inherit sample 1's state instead of each reproducing the same cold,
-#     ~25-minute build-up the macOS-vs-ubuntu comparison depends on -- a
-#     `strategy.matrix` dispatch gives that for free;
-#   - it must run on actual `macos-latest`, not "some Mac", since the
-#     hypothesis under test is contention specific to that shared, hosted
-#     runner class.
+# Manual dispatch only. Uses real macOS CI minutes. Ask before running.
+# Reruns cargo test --workspace on fresh macos-latest VMs to check for the
+# live_upgrade/cache_stampede/sim_fault_plan timing cluster. Each sample
+# gets its own VM, so no sample starts with a warm cache from another.
 on:
   workflow_dispatch:
     inputs:
       sha:
-        description: >-
-          Commit to reproduce. Pin this explicitly -- do not leave it to
-          whatever the dispatching branch's tip happens to be, or the ten
-          samples are not a same-commit baseline. As of 2026-09-05, trunk-dev's
-          own tip is red (autumn-macros guard-stacking regression, #2516/#1668
-          -- see docs/reports/2026-09-05-semaphore-ci-health-followup.md), so
-          pin to a commit where `cargo test --workspace` can actually complete
-          -- e.g. trunk-dev's tip once #2517 or #2518 merges -- or every
-          sample will abort at the first failing binary before ever reaching
-          the three target tests.
+        description: "Commit to test. Must build and run cargo test --workspace."
         required: true
       samples:
         description: "Number of independent fresh-VM samples to run"
@@ -49,60 +18,30 @@ on:
         options: ["5", "10", "20"]
 
 env:
-  # Copied from ci.yml's top-level `env:` block, not reinvented:
-  # RUST_MIN_STACK in particular changes how close a deep call frame sits to
-  # overflowing the default thread stack, which is exactly the kind of
-  # platform-dependent resource-margin difference this campaign needs to hold
-  # constant against the runs it's reproducing.
+  # Same values as ci.yml.
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RUST_MIN_STACK: 8388608
 
 jobs:
-  # Named `test`, not `sample`: Swatinem/rust-cache keys its cache entry on
-  # the job id by default, so a job called `sample` would never hit the cache
-  # ci.yml's own `test` job has been warming on this branch, and every sample
-  # would cold-build the entire dependency graph -- a different resource
-  # profile from the runs actually being reproduced. Reusing the job id `test`
-  # hits that same cache entry (best-effort: `continue-on-error: true` below,
-  # matching ci.yml:346, means a cache-service miss falls through to a cold
-  # build rather than failing the sample).
+  # Job id must stay "test" to reuse ci.yml's cache entry.
   test:
     strategy:
       fail-fast: false
       matrix:
-        # Static 20-wide matrix with a `sample_count` filter, not a dynamic
-        # `fromJSON` range: workflow_dispatch `choice` inputs are strings
-        # evaluated at trigger time, and the simplest thing that reliably
-        # gives "the first N of a fixed list" without a matrix-generation
-        # job is to always define all 20 and skip past `samples`.
         n: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     runs-on: macos-latest
     if: fromJSON(inputs.samples) >= matrix.n
     steps:
-      # Pinned to the dispatch input, not the branch tip: a workflow_dispatch
-      # run with no `ref` checks out whatever the dispatching branch currently
-      # points to, which could drift between samples -- pinning `sha` is what
-      # makes this a same-commit baseline instead of a moving target.
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
-      - name: Run the exact CI command, but keep going past a failure
-        # --no-fail-fast matters: plain `cargo test --workspace` (what ci.yml
-        # actually runs) stops at the FIRST failing test binary and never
-        # runs the rest -- confirmed empirically in the 2026-09-04 census.
-        # Without it, one sample's results for the other two target tests go
-        # silently missing instead of recording a clean pass.
+      - name: Run tests, do not stop at the first failure
         run: cargo test --workspace --no-fail-fast 2>&1 | tee run.log
-      - name: Classify this sample's result for each target test
-        # Three independent checks, not one grep with a single pass/fail
-        # fallback: a combined grep only reports "nothing matched at all", so
-        # if two of the three targets produced a result line and one didn't,
-        # that one's absence would silently read as a pass for the whole
-        # sample instead of "missing, treat separately."
+      - name: Check each target test's result
         if: always()
         run: |
           for pattern in \
@@ -112,7 +51,7 @@ jobs:
           do
             grep -q "$pattern" run.log \
               && grep "$pattern" run.log \
-              || echo "MISSING result line for $pattern -- treat as missing, not passing, for this sample"
+              || echo "MISSING: no result line for $pattern"
           done
       - name: Upload this sample's full log
         if: always()
