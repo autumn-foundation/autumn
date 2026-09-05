@@ -460,23 +460,45 @@ def malformed(var):
 #
 # Measured on the whole corpus before landing: zero new defects, so this
 # reports nothing that is written today.
+# There are TWO presentations that make this claim, and I wrote the rule for
+# the one that was reported. A bare backticked token is the first; an
+# ASSIGNMENT WORD in copyable shell is the second, and `export
+# AUTUMN_LOG__LEVEL-TYPO=debug` in a fenced block validated its prefix exactly
+# as the span did. Bash will not even accept it — `AUTUMN_LOG__LEVEL-TYPO` is
+# not a valid identifier, so `export` errors and the line sets nothing — and
+# the page still passed. One function answers both, because "a fix applied
+# where the bug was found, not everywhere the question is asked" is the entry
+# in this file's header with the most recurrences and this is the second
+# spelling of a rule I added one round ago.
 CODE_SPAN = re.compile(r'`([^`\n]+)`')
 BARE_TOKEN = re.compile(r'^[A-Za-z0-9_{}<>*.\-]+$')
 FAMILY_TAIL = re.compile(r'^[A-Za-z0-9_<>*]*$')
+# The word before an `=`, where the name has to BE the word. The lookbehind is
+# what keeps `$AUTUMN_X=`, `FOO_AUTUMN_X=` and `${AUTUMN_X}` out: an expansion
+# or a longer identifier is not this page assigning to the name.
+ASSIGNED_CLAIM = re.compile(r'(?<![\w$/{-])(AUTUMN_[A-Za-z0-9_{}<>*.\-]*)=')
+
+
+def _overstates(token):
+    """Whether a token claiming to BE a name is more than the name in it."""
+    found = VAR.match(token)
+    if not found:
+        return False
+    rest = token[found.end():]
+    return bool(rest) and not FAMILY_TAIL.match(rest)
 
 
 def span_defects(line):
-    """Bare code spans on this line whose token is more than the name in it."""
-    out = []
-    for content in CODE_SPAN.findall(line):
-        if not BARE_TOKEN.match(content):
-            continue
-        found = VAR.match(content)
-        if not found:
-            continue
-        rest = content[found.end():]
-        if rest and not FAMILY_TAIL.match(rest):
-            out.append(content)
+    """Tokens on this line offered AS a variable name that are not one.
+
+    Two presentations, one question. A bare code span is the thing to type; an
+    assignment word is the thing to run. Everything else — prose around a name,
+    a path, an expansion — belongs to its own language and is left alone.
+    """
+    out = [content for content in CODE_SPAN.findall(line)
+           if BARE_TOKEN.match(content) and _overstates(content)]
+    out += [m.group(1) for m in ASSIGNED_CLAIM.finditer(line)
+            if _overstates(m.group(1))]
     return out
 
 # A path segment that is a sequence index rather than a field name: a literal
@@ -4998,6 +5020,19 @@ def self_test():
            'AUTUMN_DATABASE__SHARDS__{i}__NAME')],
          [['AUTUMN_LOG__LEVEL-TYPO'], ['AUTUMN_LOG__LEVEL.TYPO'],
           [], [], [], []])
+    # …and the same claim in its OTHER presentation: an assignment word in
+    # copyable shell. `export AUTUMN_LOG__LEVEL-TYPO=debug` is not even a
+    # valid identifier, so bash sets nothing — and the prefix validated.
+    case('an assignment word must be exactly the name',
+         [span_defects(t) for t in
+          ('export AUTUMN_LOG__LEVEL-TYPO=debug',
+           'AUTUMN_LOG__LEVEL.TYPO=x',
+           'export AUTUMN_LOG__LEVEL=debug',
+           'AUTUMN_MEDIA__<TABLE>__<FIELD>=v',
+           'AUTUMN_DATABASE__SHARDS__{i}__NAME=v',
+           'echo $AUTUMN_X=1', 'PATH=$AUTUMN_X', 'FOO_AUTUMN_X-Y=1')],
+         [['AUTUMN_LOG__LEVEL-TYPO'], ['AUTUMN_LOG__LEVEL.TYPO'],
+          [], [], [], [], [], []])
     # …and a span that is CODE is left alone, because the characters after the
     # name are the language's and not the reader's typo.
     case('a code span is not a bare token',
