@@ -150,15 +150,35 @@ pub async fn signup(
     let tx_result: Result<(User, Organization), AutumnError> = db
         .tx(move |conn| {
             async move {
-                // A duplicate email hits the UNIQUE constraint; classified here
-                // (rather than folded into the blanket `?` below) so the handler
-                // can redisplay the signup form inline instead of navigating to
-                // a generic error page (Wayfinder: error-path inventory) — see
-                // the match on `tx_result` below. Matched specifically on
-                // `UniqueViolation` (Codex review finding) so a transient DB
-                // failure (connection drop, permission error, schema mismatch)
-                // still propagates as the real 500/503 it is, rather than
-                // being masked as a fake "duplicate email" conflict.
+                // A duplicate email hits the `users_email_key` UNIQUE
+                // constraint (Postgres's default name for an unnamed
+                // `UNIQUE` column, per `autumn-cli/src/schema/diff.rs`'s own
+                // brownfield-introspection tests); classified here (rather
+                // than folded into the blanket `?` below) so the handler can
+                // redisplay the signup form inline instead of navigating to
+                // a generic error page (Wayfinder: error-path inventory) —
+                // see the match on `tx_result` below. Checked via the
+                // framework's own `unique_violation_field` (the same helper
+                // `examples/teams/src/routes/invitations.rs` already uses
+                // for a different constraint), matched on the specific
+                // constraint name rather than any `UniqueViolation` (Codex
+                // review finding: `users_pkey` — e.g. a sequence left behind
+                // the table by an import — would otherwise also be
+                // misreported as "duplicate email"). Any other error,
+                // including a `UniqueViolation` on a different constraint,
+                // still propagates as the real 500/503 it is.
+                let insert_err_to_conflict = |err: AutumnError| {
+                    if autumn_web::error::unique_violation_field(
+                        &err,
+                        &[("users_email_key", "email", "Could not create account")],
+                    )
+                    .is_some()
+                    {
+                        AutumnError::conflict_msg("Could not create account")
+                    } else {
+                        err
+                    }
+                };
                 let user: User = match diesel::insert_into(users::table)
                     .values(&NewUser {
                         email: email.clone(),
@@ -169,11 +189,7 @@ pub async fn signup(
                     .await
                 {
                     Ok(user) => user,
-                    Err(diesel::result::Error::DatabaseError(
-                        diesel::result::DatabaseErrorKind::UniqueViolation,
-                        _,
-                    )) => return Err(AutumnError::conflict_msg("Could not create account")),
-                    Err(err) => return Err(err.into()),
+                    Err(err) => return Err(insert_err_to_conflict(err.into())),
                 };
 
                 let org: Organization = diesel::insert_into(organizations::table)

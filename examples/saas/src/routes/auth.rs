@@ -182,29 +182,42 @@ pub async fn signup(
         .await;
     let user = match inserted {
         Ok(user) => user,
-        // A duplicate email hits the UNIQUE constraint; surface the same generic
-        // message a failed login does so the form does not enumerate accounts —
-        // now as an inline redisplay rather than a full navigation away from the
-        // form, matching every other signup failure mode above. Matched
-        // specifically on `UniqueViolation` (Codex review finding) so a
-        // transient DB failure (connection drop, permission error, schema
-        // mismatch) propagates as the real error it is — masking one as a
-        // fake-successful 200 "could not create account" page would both hide
-        // it from availability monitoring and let `SubmitTokenLayer` cache
-        // that 200 as a completed submission.
-        Err(diesel::result::Error::DatabaseError(
-            diesel::result::DatabaseErrorKind::UniqueViolation,
-            _,
-        )) => {
-            return Ok(signup_page(
-                password_cfg.min_length,
-                submit_token.token(),
-                &form.email,
-                Some("Could not create account"),
+        Err(err) => {
+            let err: AutumnError = err.into();
+            // A duplicate email hits the `users_email_key` UNIQUE constraint
+            // (Postgres's default name for an unnamed `UNIQUE` column, per
+            // `autumn-cli/src/schema/diff.rs`'s own brownfield-introspection
+            // tests); surface the same generic message a failed login does
+            // so the form does not enumerate accounts — now as an inline
+            // redisplay rather than a full navigation away from the form,
+            // matching every other signup failure mode above. Checked via
+            // the framework's own `unique_violation_field` (the same helper
+            // `examples/teams/src/routes/invitations.rs` uses), matched on
+            // the specific constraint name rather than any `UniqueViolation`
+            // (Codex review finding: `users_pkey` — e.g. a sequence left
+            // behind the table by an import — would otherwise also be
+            // misreported as "duplicate email"). Any other error, including
+            // a `UniqueViolation` on a different constraint, propagates as
+            // the real error it is — masking one as a fake-successful 200
+            // "could not create account" page would both hide it from
+            // availability monitoring and let `SubmitTokenLayer` cache that
+            // 200 as a completed submission.
+            if autumn_web::error::unique_violation_field(
+                &err,
+                &[("users_email_key", "email", "Could not create account")],
             )
-            .into_response());
+            .is_some()
+            {
+                return Ok(signup_page(
+                    password_cfg.min_length,
+                    submit_token.token(),
+                    &form.email,
+                    Some("Could not create account"),
+                )
+                .into_response());
+            }
+            return Err(err);
         }
-        Err(err) => return Err(err.into()),
     };
 
     establish_session(&session, &user).await;

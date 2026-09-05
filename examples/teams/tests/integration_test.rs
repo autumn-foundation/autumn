@@ -96,10 +96,23 @@ async fn protected_route_redirects_to_login_when_unauthenticated() {
 /// mailbox").
 async fn db_client(mail_dir: &std::path::Path) -> TestClient {
     let db = TestDb::shared().await;
-    db.execute_sql(include_str!(
-        "../migrations/00000000000000_create_teams/up.sql"
-    ))
-    .await;
+    // The migration's `CREATE TABLE` statements (no `IF NOT EXISTS` — this is
+    // the same SQL `diesel migration run` applies in production, so it isn't
+    // weakened here) must run exactly once against the process-global shared
+    // container, or the second ignored test in this binary panics with
+    // "relation already exists" (Codex review finding, surfaced once CI
+    // started actually running every ignored test in this file — see
+    // ci.yml's `-p teams -- --ignored` sweep). `TRUNCATE` below still runs
+    // before every test, matching `examples/saas`'s per-test reset.
+    static SCHEMA_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    SCHEMA_READY
+        .get_or_init(|| async {
+            db.execute_sql(include_str!(
+                "../migrations/00000000000000_create_teams/up.sql"
+            ))
+            .await;
+        })
+        .await;
     db.execute_sql("TRUNCATE invitations, memberships, organizations, users RESTART IDENTITY")
         .await;
 
