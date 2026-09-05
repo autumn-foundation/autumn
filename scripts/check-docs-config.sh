@@ -1074,7 +1074,12 @@ YAML_KEY = re.compile(r'^(\s*)(-\s+)?' + YAML_KEY_NAME + r':(?=\s|$)')
 # workflows generated into the reader's repo, and 16 of the names here come
 # from them, so a `.github/workflows/` path test would have dropped them.
 # Measured before narrowing, which is what turned that up.
-YAML_WORKFLOW = re.compile(r'^(?:jobs|runs):\s*$', re.M)
+# …and this root key may be quoted like any other. I taught the five key
+# PATTERNS about quoting one commit ago and left the consumer test alone, so
+# a workflow written `"jobs":` was no workflow at all and every `run:` body
+# and `env:` mapping in it was discarded. Same fix, missed neighbour — the
+# entry in this file's header with the most recurrences, again.
+YAML_WORKFLOW = re.compile(r'^[\'"]?(?:jobs|runs)[\'"]?:\s*$', re.M)
 
 
 def _yaml_consumer(rel, body):
@@ -2977,7 +2982,63 @@ DOTENV = ('.env', '.example')
 # construct does. (Compose spells an escaped literal `$` the same way, so the
 # exclusion is right for both consumers.)
 EXPANDED = re.compile(r'(?<!\$)\$\{?(AUTUMN_[A-Z0-9_]+)\}?')
-SELF_DEFAULT = re.compile(r'\b(AUTUMN_[A-Z0-9_]+)=[^\n]*?\$\{?\1\b')
+class _SelfDefault:
+    """`AUTUMN_X="${AUTUMN_X:-fallback}"` — an assignment that reads itself.
+
+    The expansion has to be in the assignment's own VALUE. `[^\\n]*?` took the
+    rest of the physical LINE, so `AUTUMN_X=x; echo "$AUTUMN_X"` matched, the
+    name stopped being local, and its later expansion entered the truth set —
+    for a variable the script sets and never reads from the environment. A
+    shell word is the unit here, the same one `_PrefixAssignment` already
+    reads, so the value is taken with quotes and substitutions intact and the
+    `;` ends it.
+
+    Named `findall` because it stands among regexes at its call site.
+    """
+
+    _start = re.compile(r'\b(AUTUMN_[A-Z0-9_]+)=')
+
+    def findall(self, body):
+        out = []
+        for m in self._start.finditer(body):
+            value = body[m.end():_PrefixAssignment._word_end(body, m.end())]
+            if re.search(r'(?<!\$)\$\{?' + re.escape(m.group(1)) + r'\b',
+                         value):
+                out.append(m.group(1))
+        return out
+
+
+SELF_DEFAULT = _SelfDefault()
+
+# `local NAME=v` inside a shell function is the ONE assignment that does not
+# outlive its function — every other assignment there is global, which bash
+# says plainly and which was run to check: `f() { AUTUMN_ZZ=x; }; f; echo
+# "$AUTUMN_ZZ"` prints `x`, and the same with `local` prints nothing. Treating
+# a function-local name as local to the whole FILE suppressed genuine reads of
+# the incoming environment after the binding had gone out of scope.
+SHELL_FN = re.compile(r'(?:^|[;&|\s])(?:function\s+)?([A-Za-z_]\w*)\s*\(\s*\)\s*\{')
+SHELL_LOCAL = re.compile(
+    r'(?:^|[;&|\s])(?:local|declare|typeset)\s+(?!-g\b)(?:-\w+\s+)*'
+    r'(AUTUMN_[A-Z0-9_]+)=')
+
+
+def _shell_function_locals(code):
+    """`[(start, end, names)]` — names local to one shell function's body."""
+    out = []
+    for m in SHELL_FN.finditer(code):
+        i, depth = m.end() - 1, 0
+        while i < len(code):
+            if code[i] == '{':
+                depth += 1
+            elif code[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        names = set(SHELL_LOCAL.findall(code[m.end():i]))
+        if names:
+            out.append((m.end(), i, names))
+    return out
 
 # A quoted name counts only where the code BINDS it as an environment-variable
 # name or READS the environment with it. Any quoted string was the earlier rule
@@ -3559,6 +3620,7 @@ def accessor(root, test_files=frozenset()):
     helpers, declared, imports, modules = {}, {}, {}, {}
     env_type, impls, trait_at, scopes = {}, {}, set(), {}
     shadowed, returns = {}, {}
+    macro_at, macro_imports = {}, {}
     crates = _crates(root)
     for rel in out.split('\0'):
         # Test code is skipped outright, as the scan that consumes this index
@@ -3605,10 +3667,19 @@ def accessor(root, test_files=frozenset()):
         masked_all[rel] = (masked, data, spans, lex)
         # A locally declared macro takes the name over; an imported one does
         # the same. Either way this file's `env!` is not the std one.
-        shadowed[rel] = bool(
-            [m for m in MACRO_SHADOW.finditer(masked) if not data[m.start()]]
-            or [1 for local, _, _ in _use_items(masked)
-                if local in ('env', 'option_env')])
+        # A MODULE import is not a macro shadow. Rust keeps the two namespaces
+        # apart, so `use std::env;` leaves `env!` the std macro — and reading
+        # the local spelling alone withheld the macro alternative from every
+        # file that imports the module, which is most of them. An import
+        # shadows only when it names a `macro_rules!` this tree declares.
+        declares_macro = [m for m in MACRO_SHADOW.finditer(masked)
+                          if not data[m.start()]]
+        for m in declares_macro:
+            macro_at.setdefault(m.group(1), set()).add((crate, filemods))
+        macro_imports[rel] = [(local, path) for local, path, _
+                              in _use_items(masked)
+                              if local in ('env', 'option_env')]
+        shadowed[rel] = bool(declares_macro)
         if TRAIT_DECL.search(masked):
             trait_at.add((crate, filemods))
         impls[rel] = [(m.group(1), m.group(2), _scope_at(spans, m.start()))
@@ -3813,6 +3884,14 @@ def accessor(root, test_files=frozenset()):
     # An aliased helper keeps the ORIGINAL's key position: `use … as f` renames
     # the call, not the signature — and only when the path really reaches the
     # helper this tree derived.
+    # …resolved once every `macro_rules!` in the tree is known, the same way a
+    # qualified `impl` path is: an import shadows when it reaches a macro this
+    # tree declares, and `use std::env;` reaches a module in another crate.
+    for rel, items in macro_imports.items():
+        for local, path in items:
+            if _absolute_path(rel, path, crates) in macro_at.get(local, ()):
+                shadowed[rel] = True
+
     def imports_of(rel):
         return [(local, path, at) for (r, at), items in imports.items()
                 if r == rel for local, path in items]
@@ -4412,6 +4491,13 @@ def source_tokens(root):
         # kinds, so `"${AUTUMN_X:-…}"` is already gone by the time `code` is
         # built — the two views differ precisely where this rule looks.
         local -= set(SELF_DEFAULT.findall(body))
+        # …and a name `local` to a shell FUNCTION is not local to the file: it
+        # is gone once the function returns, so an expansion outside really
+        # does read the incoming environment. Those names are suppressed
+        # inside their own function's body and nowhere else.
+        scoped = _shell_function_locals(code) if shell else []
+        for _, _, names in scoped:
+            local -= names
         # An accessor or a binding written inside generated DATA is not
         # something the generated program does — see `_generated_data`. Built
         # before the per-line loop because both rungs consult it, and paired
@@ -4487,8 +4573,12 @@ def source_tokens(root):
                 if n in declared_lines:
                     tokens.update(COMPOSE_DECLARED.findall(code_lines[n]))
                 if n not in literal:
+                    here = set(local)
+                    for start, end, names in scoped:
+                        if start <= offsets[n] < end:
+                            here |= names
                     tokens.update(v for v in EXPANDED.findall(line)
-                                  if v not in local)
+                                  if v not in here)
             # The generated-data mask applies to BINDINGS as well as
             # accessors: `r#"const FAKE_ENV: &str = "AUTUMN_X";"#` inside an
             # ordinary Rust string is sample text, not a binding. Same rule,
@@ -5252,6 +5342,28 @@ def self_test():
     _, dok = scan(['d.md'], lambda _: 'export DATABASE_URL=x\nRUST_LOG=debug\n',
                   leaves, built, tokens)
     case('an unrelated variable is not reported', len(dok), 0)
+    # A self-defaulting assignment reads the incoming environment; the
+    # expansion has to be in the assignment's own VALUE. Taking the rest of
+    # the physical line let `AUTUMN_X=x; echo "$AUTUMN_X"` count, so a name
+    # the script only sets stopped being local and its later expansion
+    # entered the truth set.
+    case('a self-default is bounded by the value it assigns',
+         [SELF_DEFAULT.findall(t) for t in
+          ('AUTUMN_X="${AUTUMN_X:-fallback}"', 'AUTUMN_X=${AUTUMN_X}',
+           'AUTUMN_X="$AUTUMN_X"', 'AUTUMN_X=x; echo "$AUTUMN_X"',
+           'AUTUMN_X=x', 'AUTUMN_X="$AUTUMN_Y"', 'AUTUMN_X="$$AUTUMN_X"')],
+         [['AUTUMN_X'], ['AUTUMN_X'], ['AUTUMN_X'], [], [], [], []])
+    # `local NAME=v` in a shell function is the one assignment that does not
+    # outlive it — verified under bash, where a plain assignment in a
+    # function is global and the `local` one is not.
+    case('a shell function local is scoped to its body',
+         [(sorted(n), c[a:b].strip().splitlines()[0])
+          for c in ('f() {\n  local AUTUMN_X=x\n  echo "$AUTUMN_X"\n}\n'
+                    'printf %s "$AUTUMN_X"\n',)
+          for a, b, n in _shell_function_locals(c)],
+         [(['AUTUMN_X'], 'local AUTUMN_X=x')])
+    case('…and a global declaration inside one is not local',
+         _shell_function_locals('f() { declare -g AUTUMN_Y=1; }'), [])
     # A trailing separator: captured, then judged by what follows it.
     case('a trailing separator is scanned',
          VAR.findall('export AUTUMN_LOG__LEVEL_=debug'), ['AUTUMN_LOG__LEVEL_'])
@@ -5866,6 +5978,17 @@ def self_test():
     # …read through the accessor of the module that DEFINES the helper, since
     # `override_string` is the media plugin's function and means nothing in
     # `config.rs`. That scoping is the point, so the test asks the right file.
+    # A MODULE import is not a macro shadow: Rust keeps the namespaces apart,
+    # so `use std::env;` leaves `env!` the std macro. Reading the local
+    # spelling alone withheld the alternative from most of the tree.
+    case('importing the module does not shadow the macro',
+         bool(_acc_for('autumn-macros/src/main_macro.rs')
+              .search('option_env!("AUTUMN_BUILD_GIT_SHA")')), True)
+    case('only a macro_rules declaration shadows',
+         [bool(MACRO_SHADOW.search(t)) for t in
+          ('macro_rules! env {', 'macro_rules! option_env {',
+           'use std::env;', 'macro_rules! envelope {')],
+         [True, True, False, False])
     case('a compile-time env macro is an accessor',
          [bool(_acc_for('autumn-macros/src/main_macro.rs').search(t)) for t in
           ('option_env!("AUTUMN_BUILD_GIT_SHA")', 'env!("AUTUMN_X")',
@@ -6773,6 +6896,14 @@ def self_test():
     # spelling, so a quoted `shell:` selected no grammar and fell back to
     # Bourne. One fragment, all the key patterns, one capture group so no
     # caller's positions moved.
+    # …and the CONSUMER test reads a root key, which may be quoted like any
+    # other. Teaching the five key patterns and not this one made a workflow
+    # written `"jobs":` no workflow at all.
+    case('a quoted root key still names the consumer',
+         [bool(YAML_WORKFLOW.search(t)) for t in
+          ('on: push\njobs:\n', 'on: push\n"jobs":\n',
+           "on: push\n'runs':\n", 'on: push\nnotjobs:\n')],
+         [True, True, True, False])
     case('a quoted YAML key is the same key',
          [(lambda m: m.groups() if m else None)(pat.match(t)) for pat, t in
           ((YAML_KEY, '  "shell": pwsh'), (YAML_KEY, '  shell: pwsh'),
