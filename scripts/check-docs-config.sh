@@ -2483,15 +2483,43 @@ def _shell_heredocs(body, code=False):
             # than extended, and the extension I had written for `$( … )` on
             # the same reasoning went with it.
             openers = _heredoc_openers(logical + line)
-            # When the line leaves a substitution or quote OPEN, this cannot
-            # say where the bodies belong: `cat <<OUTER $(` + `cat <<'INNER'`
-            # is accepted by bash, and the inner text is demonstrably not
-            # expanded (checked with the variable exported — it printed
-            # literally), but which body owns which line is not something the
-            # rules here derive. So the uncertainty is resolved toward
-            # REPORTING: an opener on an unfinished line is treated as
-            # non-expanding, its body blanked in both views. That can only drop
-            # names, which shows up as a page reported — never as one passed.
+            # When the line leaves a substitution or quote OPEN, the bodies are
+            # resolved toward REPORTING: an opener on an unfinished line is
+            # treated as non-expanding, its body blanked in both views. That
+            # can only drop names, which shows up as a page reported — never as
+            # one passed.
+            #
+            # This was first written because I could not state the parse. I can
+            # now, and it is recorded here because the rule below is
+            # deliberately NOT it. Asked of bash directly:
+            #
+            #   cat <<OUTER $(        cat: 'inner-${ZZZ}': No such file
+            #   cat <<'INNER'         — so INNER's body is the substitution's,
+            #   inner-${ZZZ}            resolved to a string that becomes an
+            #   INNER                   ARGUMENT to the outer `cat`, and
+            #   )                       OUTER's body starts after the `)`.
+            #   outer-${ZZZ}
+            #   OUTER
+            #
+            # A command substitution opens a nested command context with its
+            # own heredoc queue: openers inside it are that context's and their
+            # bodies follow immediately, while the enclosing command's bodies
+            # begin after the newline ending the LOGICAL line, which the open
+            # `$(` extends. Each heredoc's own quoting governs its own body —
+            # an UNQUOTED `<<INNER` inside a substitution really does expand
+            # (`ARG=[inner-EXPANDED_VALUE]`), which is exactly the case this
+            # rule over-blanks.
+            #
+            # So the residual is known and bounded: an unquoted heredoc opened
+            # inside a substitution has its expansions dropped, and a page
+            # documenting a name read only there would be reported. Not
+            # replaced with the real parse, because modelling it needs a
+            # substitution depth carried ACROSS lines — and `case` patterns
+            # write a bare `start)` with no opener, so that counter drifts on
+            # any script with a `case`, silently misplacing every body after
+            # it. That trades a bounded fail-closed residual for unbounded
+            # misplacement in files that do exist, to fix a shape no file here
+            # writes. See the header on state that outlives what set it.
             if _open_command(_mask_inert(logical + line)):
                 openers = [(d, t, False) for d, t, _ in openers]
             queue.extend(openers)
