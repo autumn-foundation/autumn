@@ -36,7 +36,7 @@ host = "0.0.0.0"  # default
 ## Logging
 
 ```toml
-[logging]
+[log]
 level = "info"  # trace | debug | info | warn | error
 ```
 

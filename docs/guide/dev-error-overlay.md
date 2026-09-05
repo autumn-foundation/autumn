@@ -85,20 +85,19 @@ production.
 
 ## Opt-out
 
-If you prefer the plain 500 page without the badge overlay, set the profile to
-production:
-
-```toml
-# autumn.toml
-[app]
-profile = "production"
-```
-
-Or at runtime:
+If you prefer the plain 500 page without the badge overlay, run under a
+non-dev profile:
 
 ```sh
 AUTUMN_ENV=production cargo run
 ```
+
+The profile is resolved at startup, not from `autumn.toml`: `AUTUMN_ENV` (or
+its legacy alias `AUTUMN_PROFILE`), then the `--profile` flag, then the
+debug/release build mode. There is no config-file key for it — a release build
+already resolves to `prod`, and `AUTUMN_ENV=production` normalises to the same
+profile. See [Configuration](getting-started.md#configuration) for the full
+layering.
 
 You can also provide a custom `ErrorPageRenderer` that renders whatever HTML you
 prefer — the badge is only injected by the default pipeline when `is_dev` is
