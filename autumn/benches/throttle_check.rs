@@ -107,21 +107,51 @@ const BEARER_TOKEN: &str = "bolt-throttle-bench-client";
 const THROTTLE_LIMIT: u32 = 1_000_000;
 
 fn main() {
-    // `.parse().ok()` alone would collapse a present-but-malformed value
-    // (a typo like `--iterations 20O0`, or a missing value that swallows the
-    // next flag) into `None`, and `unwrap_or` would then silently run the
-    // 2,000-iteration default for a workload the caller didn't ask for
-    // (caught in review). Reserve the default for an ABSENT flag only; an
-    // unparseable supplied value panics naming it.
-    let iterations: u32 = std::env::args()
-        .position(|a| a == "--iterations")
-        .map_or(2_000, |i| {
-            let raw = std::env::args()
-                .nth(i + 1)
-                .expect("--iterations requires a value");
-            raw.parse()
-                .unwrap_or_else(|e| panic!("--iterations value {raw:?} is not a valid u32: {e}"))
-        });
+    // A single sequential pass over the full argument list, rather than
+    // separate `.position()`/`.nth()` lookups per flag: those only matched
+    // the exact flag spelling, so a typo'd flag name (`--rouet`, `--iteratoin`)
+    // or a stray positional argument was invisible to both lookups and left
+    // every flag silently at its default — the same "wrong workload, no
+    // error" risk already fixed per-flag for a malformed *value*, just one
+    // level up, at the flag name itself (caught in review). Every argument
+    // must now be a recognized flag or a value immediately following one;
+    // anything else panics naming it.
+    let mut iterations: u32 = 2_000;
+    let mut route: String = "both".to_owned();
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let mut i = 0;
+    while i < raw_args.len() {
+        match raw_args[i].as_str() {
+            "--iterations" => {
+                let raw = raw_args.get(i + 1).expect("--iterations requires a value");
+                // `.parse().ok()` alone would collapse a malformed value (a
+                // typo like `20O0`) into `None`, silently keeping the
+                // 2,000-iteration default for a workload the caller didn't
+                // ask for (caught in review).
+                iterations = raw.parse().unwrap_or_else(|e| {
+                    panic!("--iterations value {raw:?} is not a valid u32: {e}")
+                });
+                i += 2;
+            }
+            "--route" => {
+                // `--route throttled|plain|both` (default `both`) isolates
+                // one route's marginal DHAT cost from the other's — an A/B
+                // knob for the profiler, like `repository_crud.rs`'s
+                // `--fast-recycle`. No framework code changes with this
+                // flag; it only decides which of the two already-mounted
+                // routes this run's loop sends traffic to.
+                raw_args
+                    .get(i + 1)
+                    .expect("--route requires a value")
+                    .clone_into(&mut route);
+                i += 2;
+            }
+            other => panic!(
+                "unrecognized argument {other:?}; this bench only accepts \
+                 --iterations <N> and --route throttled|plain|both"
+            ),
+        }
+    }
     // Compared as `iterations < THROTTLE_LIMIT - 50` (a compile-time-constant
     // subtraction), not `iterations + 50 < THROTTLE_LIMIT`: the addition form
     // wraps silently in a release build for an `iterations` near `u32::MAX`
@@ -135,25 +165,10 @@ fn main() {
          of the intended warm Decision::Allowed path"
     );
 
-    // `--route throttled|plain|both` (default `both`) isolates one route's
-    // marginal DHAT cost from the other's — an A/B knob for the profiler,
-    // like `repository_crud.rs`'s `--fast-recycle`. No framework code changes
-    // with this flag; it only decides which of the two already-mounted
-    // routes this run's loop sends traffic to. An unrecognized value is
-    // rejected rather than silently falling back to `both` (caught in
-    // review): a typo'd `--route` would otherwise record a mixed, doubled
-    // workload and produce an invalid A/B with no indication why.
-    // Same "absent flag vs. present-but-missing-value" distinction as
-    // `--iterations` above: a `--route` with nothing after it must not
-    // silently default to `both`.
-    let route: String = std::env::args().position(|a| a == "--route").map_or_else(
-        || "both".to_owned(),
-        |i| {
-            std::env::args()
-                .nth(i + 1)
-                .expect("--route requires a value")
-        },
-    );
+    // An unrecognized `--route` value is rejected rather than silently
+    // falling back to `both` (caught in review): a typo'd value would
+    // otherwise record a mixed, doubled workload and produce an invalid A/B
+    // with no indication why.
     let (hit_throttled, hit_plain) = match route.as_str() {
         "throttled" => (true, false),
         "plain" => (false, true),
