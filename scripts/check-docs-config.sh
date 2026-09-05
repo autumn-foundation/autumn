@@ -3503,7 +3503,20 @@ def _in_literal(literals):
 # call on `Other`, and prefix lookup — which knows a scope but not an offset —
 # cannot tell the two apart. `if let Some(x)` and `while let Ok(v)` are not
 # matched, because a pattern is not a plain binding name.
-LET_BIND = re.compile(r'\blet\s+(?:mut\s+)?([a-z_]\w*)\s*[:=]')
+# `let` is not the only way Rust REBINDS a name. `for source in values` binds
+# `source` to an element for the loop body, and `if let Some(source) = …` binds
+# it for the arm — neither is a `let` binding, and an outer environment receiver
+# went on being trusted inside both. The binder is whichever group matched;
+# `_bound_name` reads it so callers need not know which.
+LET_BIND = re.compile(
+    r'\blet\s+(?:mut\s+)?([a-z_]\w*)\s*[:=]'
+    r'|\bfor\s+(?:mut\s+)?([a-z_]\w*)\s+in\b'
+    r'|\b(?:if|while)\s+let\s+\w+\s*\(\s*(?:mut\s+)?([a-z_]\w*)\s*\)\s*=')
+
+
+def _bound_name(match):
+    """The name a `LET_BIND` match binds, whichever binder form it is."""
+    return next((g for g in match.groups() if g), None)
 
 MOD_BLOCK = re.compile(r'\bmod\s+([a-z_]\w*)\s*\{')
 
@@ -3537,6 +3550,30 @@ def _module_spans(masked, literals=None):
                 starts.append(i)
                 mods.append(here)
     return starts, mods
+
+
+def _block_end(text, offset, literals=None):
+    """Where the innermost block containing `offset` closes.
+
+    A `macro_rules!` takes the name over for the rest of its textual scope, and
+    that scope ends with the BLOCK it is written in — Rust restores the standard
+    macro outside it. `_scope_at` knows items, not ordinary blocks, so a
+    definition inside a nested block read as enclosing every later call in the
+    function. Walking forward to the first unmatched `}` answers it exactly,
+    over the same literal mask the scope walks use.
+    """
+    lit = _in_literal(literals)
+    depth = 0
+    for i in range(offset, len(text)):
+        if lit(i):
+            continue
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            if depth == 0:
+                return i
+            depth -= 1
+    return len(text)
 
 
 def _scope_start(spans, offset):
@@ -3925,7 +3962,8 @@ class _Accessor:
     _receiver = re.compile(r'([A-Za-z_]\w*)\s*\.')
 
     def __init__(self, pattern, by_scope, shadowed=frozenset(),
-                 imported=frozenset(), rebound=None, alias_scopes=None):
+                 imported=frozenset(), rebound=None, alias_scopes=None,
+                 direct_scopes=None):
         self.pattern = pattern
         self.by_scope = by_scope
         # The macro names this file takes over. WHERE it takes them over is the
@@ -3938,12 +3976,22 @@ class _Accessor:
         self.imported = imported
         self.rebound = rebound
         self.alias_scopes = alias_scopes or {}
+        self.direct_scopes = direct_scopes or {}
 
     def finditer(self, body):
         return self.pattern.finditer(body)
 
     def search(self, text):
         return self.pattern.search(text)
+
+    def direct_names(self):
+        """Every name this file imports as a bare `std::env` accessor."""
+        return {n for names in self.direct_scopes.values() for n in names}
+
+    def direct_here(self, name, scope):
+        """Whether that import is in scope of `scope`, by prefix."""
+        return any(name in self.direct_scopes.get(scope[:n], ())
+                   for n in range(len(scope) + 1))
 
     def alias_here(self, name, scope):
         """Whether `name` is an alias of `std::env` imported in scope of `scope`.
@@ -4447,7 +4495,7 @@ def accessor(root, test_files=frozenset()):
     for (rel, at), mine in per_file.items():
         masked, data, _, lex = masked_all[rel]
         for m in LET_BIND.finditer(masked):
-            name = m.group(1)
+            name = _bound_name(m)
             if (name not in mine or data[m.start()]
                     or _scope_at(lex, m.start()) != at):
                 continue
@@ -4525,12 +4573,28 @@ def accessor(root, test_files=frozenset()):
         # written for one of the two spellings Rust offers and I taught it that
         # one; this is the other, and it needs no receiver because the accessor
         # IS the name.
+        def direct_accessor(path):
+            return re.fullmatch(r'(?:std|core)\s*::\s*env\s*::\s*'
+                                r'(?:var|var_os|set_var)', path.strip())
+
         direct = frozenset(
             local for local, path, _ in imports_of(rel)
-            if re.fullmatch(r'(?:std|core)\s*::\s*env\s*::\s*'
-                            r'(?:var|var_os|set_var)', path.strip()))
+            if direct_accessor(path))
+        # …scoped exactly as the module alias is. I added the direct import in
+        # the same commit that scoped the module alias and did not scope it,
+        # which is the half-fix pattern this file keeps repeating: a sibling
+        # function may define its own `getenv`, and the file-wide set made its
+        # call a std read.
+        direct_scopes = {}
+        for (r, at), items in import_lex.items():
+            if r != rel:
+                continue
+            for local, path in items:
+                if direct_accessor(path):
+                    direct_scopes.setdefault(at, set()).add(local)
         key = (here, recv, aliases, direct)
         alias_scopes = {k: frozenset(v) for k, v in alias_scopes.items()}
+        direct_scopes = {k: frozenset(v) for k, v in direct_scopes.items()}
         if key not in cache:
             pattern = ACCESSOR.pattern
             if aliases:
@@ -4559,7 +4623,7 @@ def accessor(root, test_files=frozenset()):
                          frozenset(imported_shadow.get(rel, ())),
                          {at: frozenset(names)
                           for (r, at), names in rebound.items() if r == rel},
-                         alias_scopes)
+                         alias_scopes, direct_scopes)
 
     return compiled, index
 
@@ -5156,6 +5220,15 @@ def source_tokens(root):
         local = (set(ASSIGNED_ANY.findall(code))
                  - set(ASSIGNED.findall(code))
                  - set(ASSIGNED_PREFIX.findall(code)))
+        # …and an assignment takes effect where it is WRITTEN. A script that
+        # prints `"$AUTUMN_X"` and assigns `AUTUMN_X=…` afterwards really does
+        # read the incoming environment on that first line, and a file-wide
+        # local set suppressed it — the same before-and-after mistake the Rust
+        # rebinding rung made, in the shell rung. The earliest assignment of
+        # each name bounds the suppression.
+        local_at = {}
+        for m in ASSIGNED_ANY.finditer(code):
+            local_at.setdefault(m.group(1), m.start())
         # …except where the assignment DEFAULTS TO ITSELF.
         # `AUTUMN_X="${AUTUMN_X:-fallback}"` is a script-local variable whose
         # value the incoming environment controls, so the name really is read.
@@ -5254,7 +5327,11 @@ def source_tokens(root):
                             shadowing |= names
                     here |= shadowing
                     for v in EXPANDED.findall(line):
-                        if v not in here:
+                        # An assignment suppresses only what comes after it.
+                        if (v in here and v not in shadowing
+                                and offsets[n] < local_at.get(v, 0)):
+                            tokens.add(v)
+                        elif v not in here:
                             tokens.add(v)
                         elif v not in shadowing:
                             # Suppressed because THIS file assigns the name —
@@ -5323,6 +5400,7 @@ def source_tokens(root):
                     continue
                 mine = _scope_at(spans, m.start())
                 if any(d.start() < m.start()
+                       and m.start() < _block_end(body, d.start(), literals)
                        and mine[:len(_scope_at(spans, d.start()))]
                        == _scope_at(spans, d.start())
                        for d in MACRO_SHADOW.finditer(body)
@@ -5337,6 +5415,14 @@ def source_tokens(root):
             # An alias of `std::env` renames the module only where it was
             # imported: a `use` inside one function does not make an unrelated
             # `process_env` elsewhere in the file the std module.
+            # …and a DIRECT accessor import is scoped the same way. The
+            # match is a bare `name(`, indistinguishable at the scan from an
+            # env helper's call, so only names this file imports that way are
+            # asked the question.
+            bare = re.match(r'([A-Za-z_]\w*)\s*\(', m.group(0))
+            if (bare and spans and bare.group(1) in acc_for(rel).direct_names()
+                    and not acc_for(rel).direct_here(bare.group(1), here)):
+                continue
             alias = ALIAS_CALL.match(m.group(0))
             if (alias and spans and alias.group(1) != 'env'
                     and not acc_for(rel).alias_here(alias.group(1), here)):
@@ -5347,7 +5433,7 @@ def source_tokens(root):
             # resolves and one after it does not.
             if (through is not None and spans
                     and acc_for(rel).rebinds(through, here)
-                    and any(d.group(1) == through
+                    and any(_bound_name(d) == through
                             for d in LET_BIND.finditer(
                                 body[_scope_start(spans, m.start()):m.start()]))):
                 continue
@@ -7089,14 +7175,35 @@ def self_test():
     # A `let` REBINDS: a receiver name is filed by scope, and a scope has no
     # before and after, so an outer environment parameter blessed a call on an
     # inner unrelated value. A pattern binding is not a plain name.
-    case('a plain let binding is distinguished from a pattern',
-         [LET_BIND.findall(t) for t in
+    # …and `let` is not the only binder. `for source in values` binds for the
+    # loop body and `if let Some(source) = …` for the arm, and an outer
+    # environment receiver was trusted inside both.
+    case('every binder form yields the name it binds',
+         [[_bound_name(m) for m in LET_BIND.finditer(t)] for t in
           ('let source = Other;', 'let mut env = x;', 'let denv: Box<dyn Env> =',
-           'if let Some(x) = y {', 'while let Ok(v) = r {')],
-         [['source'], ['env'], ['denv'], [], []])
+           'for source in values {', 'for mut e in xs {',
+           'if let Some(x) = y {', 'while let Ok(v) = r {',
+           'formatter(x)', 'let Some(p) = q else')],
+         [['source'], ['env'], ['denv'], ['source'], ['e'], ['x'], ['v'],
+          [], []])
     # An ALIAS of `std::env` renames the module where it is imported, and a
     # `use` inside a function is that function's. Unioned across the file, an
     # unrelated `process_env` module elsewhere read as the std one.
+    # A `macro_rules!` takes the name over for the rest of its BLOCK, and Rust
+    # restores the standard macro outside it. `_scope_at` knows items, not
+    # ordinary blocks, so a definition in a nested block read as enclosing
+    # every later call in the function.
+    case('a shadow ends where its block does',
+         (lambda src: (_block_end(src, src.index('macro_rules!')),
+                       src.index('option_env!("AFTER")')))(
+             'fn f() {\n  {\n    macro_rules! option_env { () => {} }\n  }\n'
+             '  option_env!("AFTER");\n}\n'),
+         (56, 60))
+    case('…and a shadow at item level still runs to the item end',
+         (lambda src: _block_end(src, src.index('macro_rules!')) > src.index('AFTER'))(
+             'fn f() {\n  macro_rules! option_env { () => {} }\n'
+             '  option_env!("AFTER");\n}\n'),
+         True)
     case('an alias call is recognised, and the std path is not one',
          [(lambda m: m.group(1) if m else None)(ALIAS_CALL.match(t)) for t in
           ('process_env::var("X")', 'env::var("X")', 'other::get("X")')],
