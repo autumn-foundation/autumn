@@ -23,8 +23,8 @@
 use std::path::Path;
 
 use autumn_web::plugin_sandbox::{
-    MAX_MANIFEST_BYTES, MAX_MODULE_BYTES, SandboxArtifact, SandboxHost, SandboxManifest,
-    read_bounded,
+    ConsentDelta, MAX_MANIFEST_BYTES, MAX_MODULE_BYTES, SandboxArtifact, SandboxHost,
+    SandboxManifest, read_bounded,
 };
 use serde::Serialize;
 
@@ -87,6 +87,19 @@ pub fn inspect(path: &Path) -> Result<SandboxArtifact, String> {
     SandboxArtifact::read_file(path).map_err(|err| err.to_string())
 }
 
+/// What each granted capability is scoped to, as the JSON report renders it.
+#[derive(Debug, Default, Serialize)]
+pub struct ReportGrants {
+    /// Hostnames `http-outbound` may call.
+    pub hosts: Vec<String>,
+    /// Logical tables `db` owns.
+    pub tables: Vec<String>,
+    /// Job types `jobs` may enqueue.
+    pub job_types: Vec<String>,
+    /// Render slots `render` may fill.
+    pub slots: Vec<String>,
+}
+
 /// One declared route, as the JSON report renders it.
 #[derive(Debug, Serialize)]
 pub struct ReportRoute {
@@ -118,6 +131,15 @@ pub struct Report {
     pub artifact_sha256: Option<String>,
     /// Capabilities the manifest asks for.
     pub capabilities: Vec<String>,
+    /// What each granted capability is scoped to (issue #1632).
+    ///
+    /// A capability name answers "may it?" and nothing in it answers "to
+    /// what?", so an automated policy check reading only `capabilities` would
+    /// approve `http-outbound` without ever seeing which hosts. These are the
+    /// manifest's `[grants]` lists, verbatim.
+    pub grants: ReportGrants,
+    /// The per-request capability quotas the manifest declares.
+    pub quotas: std::collections::BTreeMap<String, u32>,
     /// Classes of authority this build denies unconditionally.
     pub denied: Vec<String>,
     /// The routes it serves.
@@ -140,6 +162,10 @@ pub struct Report {
     pub conformance: ConformanceReport,
     /// The full consent summary, verbatim.
     pub consent: String,
+    /// What this manifest asks for that the one named by `--against` did not
+    /// (issue #1632). `None` when no previous artifact was named.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<ConsentDelta>,
 }
 
 /// Authority the sandbox denies unconditionally in this version.
@@ -153,6 +179,25 @@ const DENIED_CLASSES: &[&str] = &[
     "database",
     "process-control",
 ];
+
+/// Whether this manifest was granted the authority `class` names.
+///
+/// Maps the coarse class names an operator reads on the consent screen onto the
+/// capability vocabulary, so the "denied" list shrinks as a manifest asks for
+/// more rather than contradicting it.
+fn granted_class(manifest: &SandboxManifest, class: &str) -> bool {
+    use autumn_web::plugin_sandbox::SandboxCapability;
+    match class {
+        "network" => manifest.grants(SandboxCapability::HttpOutbound),
+        "database" => {
+            manifest.grants(SandboxCapability::Db) || manifest.grants(SandboxCapability::Kv)
+        }
+        // Filesystem, environment and process control have no capability that
+        // grants them and are not on the roadmap to; they stay in the list
+        // whatever the manifest asks for.
+        _ => false,
+    }
+}
 
 /// Characters of artifact-supplied text this screen will render.
 const EXCERPT: usize = 512;
@@ -214,7 +259,28 @@ impl Report {
                 .iter()
                 .map(|capability| capability.as_str().to_owned())
                 .collect(),
-            denied: DENIED_CLASSES.iter().map(|&name| name.to_owned()).collect(),
+            grants: ReportGrants {
+                hosts: manifest.grants.hosts.clone(),
+                tables: manifest.grants.tables.clone(),
+                job_types: manifest.grants.job_types.clone(),
+                slots: manifest.grants.slots.clone(),
+            },
+            quotas: manifest
+                .quotas
+                .fields()
+                .into_iter()
+                .map(|(field, value)| (field.to_owned(), value))
+                .collect(),
+            // Only the classes this build cannot grant *at all*, minus anything
+            // this manifest was actually granted. A screen that printed "no
+            // database access" under a manifest holding `db` would be a consent
+            // screen contradicting itself, and a reader believes the reassuring
+            // half.
+            denied: DENIED_CLASSES
+                .iter()
+                .filter(|class| !granted_class(manifest, class))
+                .map(|&name| name.to_owned())
+                .collect(),
             // From `route_infos`, not from `manifest.routes`: HTTP serves HEAD
             // wherever it serves GET, and the runtime mounts it, so a manifest
             // declaring only GET serves a method its own literal route list
@@ -236,6 +302,7 @@ impl Report {
             load_error,
             conformance: conformance(manifest),
             consent: manifest.consent_summary(),
+            upgrade: None,
         }
     }
 
@@ -251,7 +318,18 @@ impl Report {
     /// nothing to record when it is missing.
     #[must_use]
     pub fn passed(&self) -> bool {
-        self.loads && self.artifact_sha256.is_some() && self.conformance.passed()
+        self.loads
+            && self.artifact_sha256.is_some()
+            && self.conformance.passed()
+            // An upgrade that asks for more authority is not a failed artifact
+            // — it may be exactly what the operator wants — but it is not one
+            // an unattended `inspect` may wave through. Failing here is what
+            // makes `--against` a gate rather than a note: a pipeline that
+            // installs on a passing verdict stops and asks.
+            && self
+                .upgrade
+                .as_ref()
+                .is_none_or(|delta| !delta.requires_consent())
     }
 
     /// Render the report for a human.
@@ -272,6 +350,21 @@ impl Report {
             None => out.push_str(
                 "  artifact sha256: (could not be computed; review the manifest by hand)\n",
             ),
+        }
+        // Above the imports and right under the digest, because it is the one
+        // block on this screen that answers "has anything changed since I
+        // agreed" — an operator re-reading a familiar screen needs it before
+        // their eyes glaze.
+        if let Some(delta) = self.upgrade.as_ref() {
+            if delta.requires_consent() {
+                out.push_str("  \u{26A0} ");
+                out.push_str(&delta.summary().replace('\n', "\n  "));
+                out.push('\n');
+            } else {
+                out.push_str(
+                    "  this upgrade asks for no authority the installed version did not\n",
+                );
+            }
         }
         out.push_str("  host functions it imports:\n");
         match self.imports.as_ref() {
@@ -352,18 +445,35 @@ fn conformance(manifest: &SandboxManifest) -> ConformanceReport {
         })
         .collect();
 
-    // A sandboxed plugin holds no session, auth or database capability, so a
-    // route it serves is unauthenticated by construction. Declaring that here
-    // is the honest answer to the sensitive-surface check — the gating is the
-    // sandbox itself.
+    // A sandboxed plugin holds no session or auth capability, so a route it
+    // serves is unauthenticated by construction. Declaring that here is the
+    // honest answer to the sensitive-surface check — the gating is the sandbox
+    // itself.
+    //
+    // The grant is named in full rather than summarised as "no database or
+    // network": since #1632 a manifest may hold `db`, `kv`, `http-outbound`,
+    // `jobs` or `render`, and a check line that says otherwise would be wrong
+    // about exactly the artifacts whose authority matters. `capabilities`
+    // answers "may it?"; the scope lists answer "to what?", and an automated
+    // reader needs both.
+    let mut granted: Vec<String> = manifest
+        .capabilities
+        .iter()
+        .map(|capability| capability.as_str().to_owned())
+        .collect();
+    for (label, entries) in [
+        ("hosts", &manifest.grants.hosts),
+        ("tables", &manifest.grants.tables),
+        ("job_types", &manifest.grants.job_types),
+        ("slots", &manifest.grants.slots),
+    ] {
+        if !entries.is_empty() {
+            granted.push(format!("{label}={}", entries.join("|")));
+        }
+    }
     let gating = format!(
-        "sandboxed: no session, auth, filesystem, network or database capability ({granted})",
-        granted = manifest
-            .capabilities
-            .iter()
-            .map(|capability| capability.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
+        "sandboxed: no session, auth, filesystem or environment capability ({granted})",
+        granted = granted.join(", ")
     );
     let sensitive = vec![plugin_check::SensitiveRouteDecl {
         path_pattern: manifest.prefix.clone(),
@@ -415,7 +525,7 @@ pub fn run_package(opts: &PackageOptions<'_>) {
 
 /// Run `autumn plugin inspect`, printing the consent screen and exiting
 /// non-zero when the artifact is not fit to install.
-pub fn run_inspect(path: &Path, format: &ReportFormat) {
+pub fn run_inspect(path: &Path, format: &ReportFormat, against: Option<&Path>) {
     if matches!(format, ReportFormat::Text) {
         eprintln!("\u{1F342} autumn plugin inspect\n");
     }
@@ -423,7 +533,18 @@ pub fn run_inspect(path: &Path, format: &ReportFormat) {
         eprintln!("\u{2717} {err}");
         std::process::exit(1);
     });
-    let report = Report::of(&artifact);
+    let mut report = Report::of(&artifact);
+    if let Some(previous) = against {
+        let previous = inspect(previous).unwrap_or_else(|err| {
+            eprintln!("\u{2717} {err}");
+            std::process::exit(1);
+        });
+        report.upgrade = Some(
+            artifact
+                .manifest()
+                .consent_delta_from(previous.manifest()),
+        );
+    }
     match format {
         ReportFormat::Text => print!("{}", report.to_text()),
         ReportFormat::Json => match report.to_json() {
@@ -532,6 +653,120 @@ path = "/hello/greet"
             out: &fixture.out,
         })
         .expect("packages")
+    }
+
+    // ── The grown vocabulary (issue #1632) ───────────────────────────
+
+    /// The same plugin, asking for the whole vocabulary.
+    fn granted_manifest_toml() -> String {
+        format!(
+            r#"
+name = "autumn-plugin-hello"
+version = "0.1.0"
+wire_version = 1
+prefix = "/hello"
+capabilities = ["http-request", "kv", "http-outbound", "db", "jobs"]
+sha256 = "{digest}"
+
+[[routes]]
+method = "GET"
+path = "/hello/greet"
+
+[grants]
+hosts = ["api.example.com"]
+tables = ["orders"]
+job_types = ["reindex"]
+"#,
+            digest = "0".repeat(64)
+        )
+    }
+
+    fn granted_fixture() -> Fixture {
+        fixture(
+            &granted_manifest_toml(),
+            wat::parse_str(MODULE).expect("valid WAT"),
+        )
+    }
+
+    #[test]
+    fn the_report_names_what_each_capability_is_scoped_to() {
+        let fixture = granted_fixture();
+        let report = Report::of(&pack(&fixture));
+        assert_eq!(report.grants.hosts, vec!["api.example.com".to_owned()]);
+        assert_eq!(report.grants.tables, vec!["orders".to_owned()]);
+        assert_eq!(report.grants.job_types, vec!["reindex".to_owned()]);
+        assert!(report.quotas.contains_key("kv_reads"));
+
+        let text = report.to_text();
+        for expected in ["api.example.com", "orders", "reindex", "kv_reads"] {
+            assert!(text.contains(expected), "{expected} missing from:\n{text}");
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&report.to_json().expect("json")).expect("parses");
+        assert_eq!(value["grants"]["hosts"][0], "api.example.com");
+        assert!(value["quotas"]["outbound_calls"].is_number());
+    }
+
+    #[test]
+    fn the_consent_screen_stops_denying_what_the_manifest_was_just_granted() {
+        // A screen that prints "no database access" over a manifest holding
+        // `db` is a screen contradicting itself, and the reader believes the
+        // reassuring half.
+        let granted = Report::of(&pack(&granted_fixture()));
+        assert!(!granted.denied.contains(&"database".to_owned()));
+        assert!(!granted.denied.contains(&"network".to_owned()));
+        assert!(granted.denied.contains(&"filesystem".to_owned()));
+
+        let bare = Report::of(&pack(&good_fixture()));
+        for class in ["database", "network", "filesystem", "environment"] {
+            assert!(bare.denied.contains(&class.to_owned()), "{class}");
+        }
+    }
+
+    #[test]
+    fn the_plugin_check_gating_line_carries_the_grant_and_its_scope() {
+        // `autumn plugin-check` reads this line, and since #1632 a summary that
+        // said "no database or network" would be wrong about exactly the
+        // artifacts whose authority matters most.
+        let report = conformance(pack(&granted_fixture()).manifest());
+        let text = report.to_text_report();
+        for expected in ["http-outbound", "hosts=api.example.com", "tables=orders"] {
+            assert!(text.contains(expected), "{expected} missing from:\n{text}");
+        }
+        assert!(!text.contains("or database capability"), "{text}");
+    }
+
+    #[test]
+    fn an_upgrade_that_asks_for_more_fails_the_verdict_until_a_human_agrees() {
+        let previous = pack(&good_fixture());
+        let next = pack(&granted_fixture());
+
+        let mut report = Report::of(&next);
+        assert!(report.passed(), "the artifact itself is fit to install");
+        report.upgrade = Some(next.manifest().consent_delta_from(previous.manifest()));
+        assert!(
+            !report.passed(),
+            "an upgrade that grows authority must stop an unattended install"
+        );
+        let text = report.to_text();
+        assert!(text.contains("api.example.com"), "{text}");
+        assert!(text.contains("http-outbound"), "{text}");
+
+        // The same artifact against itself asks for nothing new.
+        let mut same = Report::of(&next);
+        same.upgrade = Some(next.manifest().consent_delta_from(next.manifest()));
+        assert!(same.passed());
+        assert!(
+            same.to_text().contains("asks for no authority"),
+            "{}",
+            same.to_text()
+        );
+
+        // Asking for *less* is not a prompt: re-prompting for a narrowed grant
+        // trains operators to click through the prompt that matters.
+        let mut narrowed = Report::of(&previous);
+        narrowed.upgrade = Some(previous.manifest().consent_delta_from(next.manifest()));
+        assert!(narrowed.passed());
     }
 
     #[test]

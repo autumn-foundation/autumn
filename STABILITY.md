@@ -112,10 +112,15 @@ The concrete definition of "breaking" matches the Rust API guidelines and the
   `SandboxManifest` schema and its capability vocabulary, `SandboxHost` /
   `SandboxOutcome` / `SandboxFailure`, and the `autumn plugin package` /
   `autumn plugin inspect` output — is experimental and may change in any
-  release. The capability vocabulary is deliberately one word long in the first
-  slice and is expected to grow; both the wire and the container carry version
-  fields so a host refuses an artifact it cannot fully understand rather than
-  guessing at it.
+  release. That now includes the grown capability vocabulary (issue #1632): the
+  `kv` / `http-outbound` / `db` / `jobs` / `render` words, the `[grants]` and
+  `[quotas]` manifest tables, the `call` / `call_result` / `render` / `fragment`
+  wire frames, and the `CapabilityServices`, `KvStore`, `OutboundHttp`,
+  `PluginStore`, `JobSink`, `FragmentNode`, `RenderSlots` and
+  `PluginActivityLog` types. Both the wire and the container carry version
+  fields, and a capability name this build does not understand is a refusal
+  rather than a silently dropped grant — so a host refuses an artifact it cannot
+  fully enforce instead of guessing at it.
 
 When in doubt: if `cargo doc --no-deps` doesn't list it, it is not part of
 the public API.

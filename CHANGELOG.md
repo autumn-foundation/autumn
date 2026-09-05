@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **plugin-sandbox:** the capability vocabulary grows past request handling
+  (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
+  `http-outbound`, `db`, `jobs` and `render` beside `http-request`, and a new
+  `[grants]` table says what each is scoped to — hostnames, plugin-owned tables,
+  job types, render slots — with per-request `[quotas]` an operator can tune.
+  The guest asks over the NDJSON channel it already answers on
+  (`{"op":"call","call":"kv-get",…}` → `{"op":"call_result",…}`), so **a plugin
+  granted every capability imports exactly what a plugin granted none imports**
+  and the #1609 escape corpus keeps proving what it proved. Scoping is by
+  derivation rather than by check: the guest names a logical key, table, host or
+  job type and the host derives the physical one from the manifest and the
+  active tenant, so cross-tenant and host-table access are unspellable rather
+  than refused. Render hooks return a fragment *tree* the host renders, not HTML
+  it sanitises — no parser, so no parser differential — and a hook that traps,
+  overruns its fuel or emits a tag the renderer will not produce omits the
+  fragment instead of breaking the page. Every call, allowed or refused, lands
+  in a bounded per-plugin activity log that answers "what did this plugin do in
+  the last hour" from one surface: hosts called, KV/DB usage, jobs enqueued,
+  denials and quota hits, recorded as shapes and never as values.
+  `autumn plugin inspect --against <installed-artifact>` reviews an upgrade as
+  an upgrade, printing exactly what the new manifest asks for that the approved
+  one did not and exiting non-zero when anything grew. `autumn plugin inspect`
+  (text and JSON) now carries the grant lists and quotas, and stops printing
+  "no database access" over a manifest that was just granted `db`. Fifteen-plus
+  cross-capability escape attempts run end-to-end through the real interpreter
+  in `tests/integration/plugin_sandbox_capabilities.rs`. See
+  `docs/guide/sandboxed-plugins.md`.
+
 - **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
   update validation left after #1719/#1742/#1778/#1801 (issue #1751).
   `must_match` — like `custom`, `ip` on `Option<_>` fields, and

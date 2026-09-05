@@ -140,6 +140,7 @@ REQUEST_PATH_MODULES=(
   autumn/src/plugin_sandbox/host.rs:plugin-sandbox
   autumn/src/plugin_sandbox/wire.rs:plugin-sandbox
   autumn/src/plugin_sandbox/plugin.rs:plugin-sandbox
+  autumn/src/plugin_sandbox/capability/mod.rs:plugin-sandbox
   autumn-search/src/lib.rs:default
   autumn/src/replication/wal.rs:db
   autumn/src/replication/segment.rs:db

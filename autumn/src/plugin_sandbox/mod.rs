@@ -41,9 +41,12 @@
 //! actually withholds, and `docs/guide/sandboxed-plugins.md` for the narrative.
 
 pub mod artifact;
+pub mod capability;
+pub mod grants;
 pub mod host;
 pub mod manifest;
 pub mod plugin;
+pub mod slots;
 pub mod wire;
 
 /// Hand-written WAT guests the escape corpus is built from.
@@ -58,9 +61,21 @@ pub use artifact::{
     ArtifactError, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES, MAX_MODULE_BYTES, SandboxArtifact,
     read_bounded,
 };
+pub use capability::{
+    ActivitySummary, CacheKvStore, CallResult, CallValue, CapabilityCall, CapabilityRateLimiter,
+    CapabilityRuntime, CapabilityServices, DenialReason, FragmentNode, JobSink, KvStore,
+    MemoryJobSink, MemoryKvStore, MemoryPluginStore, OutboundHttp, OutboundRequest,
+    OutboundResponse, PluginActivityLog, PluginJob, PluginRow, PluginStore, PluginValue,
+    RecordingHttp, RenderError, Scope, StoreError,
+};
+pub use grants::{
+    CapabilityGrants, CapabilityQuotas, ConsentDelta, MAX_GRANT_ENTRIES, MAX_GRANT_IDENT_LEN,
+    MAX_HOST_LEN, MAX_QUOTA, is_grantable_host, is_grantable_ident, is_grantable_name,
+};
 pub use host::{
     CapabilityDenial, DeniedCapability, MAX_INIT_SECTION_BYTES, MAX_INIT_SEGMENTS,
-    MAX_TABLE_ELEMENTS, SandboxFailure, SandboxHost, SandboxLoadError, SandboxOutcome,
+    MAX_QUEUED_REPLY_BYTES, MAX_TABLE_ELEMENTS, SandboxFailure, SandboxHost, SandboxLoadError,
+    SandboxOutcome, SandboxRenderOutcome,
 };
 pub use manifest::{
     DeclaredRoute, MAX_CONCURRENCY, MAX_FOOTPRINT_BYTES, MAX_FUEL, MAX_MEMORY_BYTES,
@@ -68,6 +83,7 @@ pub use manifest::{
     ResourceLimits, SandboxCapability, SandboxManifest, WIRE_VERSION,
 };
 pub use plugin::{SANDBOX_ATTRIBUTION_HEADER, SandboxPluginError, SandboxedPlugin};
+pub use slots::{RenderSlots, SlotError};
 pub use wire::{
     ALLOWED_REQUEST_HEADERS, ALLOWED_RESPONSE_CONTENT_TYPES, ALLOWED_RESPONSE_HEADERS, OwnedRoutes,
     SandboxRequest, SandboxResponse, WireError, request_header_allowed, response_header_allowed,
@@ -99,6 +115,24 @@ pub fn __fuzz_parse_guest_frame(line: &str) -> bool {
 #[must_use]
 pub fn __fuzz_parse_manifest(src: &str) -> bool {
     SandboxManifest::parse(src).is_ok()
+}
+
+/// Parse a fragment tree and render it to HTML, as a render hook's answer is
+/// (issue #1632). Fuzzing seam; not a public API.
+///
+/// The one place in this subsystem where guest-supplied structure becomes markup
+/// that a *browser* then parses, so it is the one whose failure mode is stored
+/// XSS rather than a refused request. The rendering ceilings — depth, node
+/// count, bytes — are what the fuzzer is being pointed at: a tree inside every
+/// structural bound can still be built to blow one of them, and the difference
+/// between refusing and recursing is a stack.
+#[doc(hidden)]
+#[must_use]
+pub fn __fuzz_render_fragment(line: &str) -> bool {
+    let Ok(nodes) = serde_json::from_str::<Vec<capability::FragmentNode>>(line) else {
+        return false;
+    };
+    capability::render::render(&nodes, 64 * 1024).is_ok()
 }
 
 /// The single-binary promise is a *manifest* property, not a source property.

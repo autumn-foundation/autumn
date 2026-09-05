@@ -458,11 +458,199 @@ ANSI escape reads as text that tried to forge a record rather than as one.
 
 ---
 
+## The capability vocabulary
+
+A plugin that can only answer HTTP is a demo. Real ones need to read data, call
+an API, queue work and put something on a page — so `capabilities` names five
+more words, and `[grants]` says what each is scoped to:
+
+```toml
+capabilities = ["http-request", "kv", "http-outbound", "db", "jobs", "render"]
+
+[grants]
+hosts     = ["api.example.com"]   # http-outbound may call exactly these
+tables    = ["orders"]            # db owns exactly these, tenant-scoped
+job_types = ["reindex"]           # jobs may enqueue exactly these
+slots     = ["order-summary"]     # render may fill exactly these
+
+[quotas]
+kv_reads       = 64               # per request; every quota is operator-set
+outbound_calls = 4
+```
+
+| Capability | What it grants | What it can never reach |
+| --- | --- | --- |
+| `kv` | a key/value namespace private to (this plugin, this tenant) | another plugin's or tenant's keys |
+| `http-outbound` | the hostnames in `[grants].hosts`, through the framework client | any other host; redirects are not followed for it |
+| `db` | the plugin-owned tables in `[grants].tables`, scoped to the active tenant | host-application tables, another tenant's rows, raw SQL |
+| `jobs` | the job types in `[grants].job_types` | any other type; the job runs under this plugin's own grants |
+| `render` | the host-declared slots in `[grants].slots` | script, style, event handlers, off-origin links |
+
+The grant table and the capability list must agree in **both** directions. A
+`hosts` list without `http-outbound` is refused, because the operator read "no
+outbound network" in one place and `api.example.com` three lines below it. A
+`db` grant naming no table is refused too, because it is authority the consent
+screen shows and the runtime can never honour.
+
+### How a plugin asks
+
+Over the channel it already has. A guest writes a call frame to stdout and reads
+the answer from stdin — the same NDJSON dialogue it answers requests on:
+
+```text
+guest → host  {"op":"call","call":"kv-get","id":1,"key":"cart"}
+host  → guest {"op":"call_result","status":"ok","id":1,
+               "value":{"kind":"value","value":"one item","found":true}}
+guest → host  {"op":"call","call":"http-fetch","id":2,"method":"GET",
+               "url":"https://api.example.com/v1/orders"}
+host  → guest {"op":"call_result","status":"denied","id":2,
+               "reason":"quota-exceeded","detail":"…"}
+guest → host  {"op":"response","status":200,…}
+```
+
+**Capabilities are data, not code.** A plugin granted `db` imports exactly what
+a plugin granted nothing imports — `fd_read` and `fd_write`. Growing the
+vocabulary never widened the module's import surface, which is why the consent
+screen's import list still means what it meant.
+
+A refusal comes back as a `call_result` the guest can read, not as a trap. A
+plugin that hits a ceiling should degrade — render the panel without the live
+number — and its author needs to see *which* rule refused:
+`capability-not-granted`, `not-in-grant`, `quota-exceeded`, `malformed`,
+`unavailable` or `backend-error`.
+
+### Why cross-tenant access is unspellable
+
+The guest names a **logical** thing; the host derives the physical one:
+
+| The guest says | The host uses |
+| --- | --- |
+| `key: "cart"` | `plugin-kv:<plugin>:<tenant>:cart`, every segment escaped |
+| `table: "orders"` | `plugin_<plugin>_orders`, filtered by the active tenant |
+| `job_type: "reindex"` | a job stamped with this plugin and this tenant |
+
+There is no field in the protocol where a tenant, another plugin, or a physical
+table name would go. Cross-tenant access is not denied — it cannot be written
+down. That is also why a row may not carry a `tenant_id` or `row_id` column: a
+row that could set those would be a row that chooses its own tenant.
+
+### Render hooks are trees, not HTML
+
+A granted plugin fills a slot by returning a fragment *tree*, which the host
+renders:
+
+```text
+guest → {"op":"fragment","nodes":[
+           {"node":"element","tag":"p","attributes":[["class","panel"]],
+            "children":[{"node":"text","text":"3 orders"}]}]}
+host  → <p class="panel">3 orders</p>
+```
+
+Not "the guest sends HTML and the host sanitises it". Sanitising is a filter in
+front of a parser, and the notable sanitiser bypasses of the last decade have
+been *parser differentials* — the filter's HTML parser and the browser's
+disagreeing about one input. There is no parser here, so there is nothing to
+disagree with: the tag list, the attribute list and the escaping are a function
+this framework writes. Nothing rendered needs `unsafe-inline`, so a host page
+with a nonce-based CSP keeps it.
+
+A hook that traps, runs out of fuel, answers with a tag the renderer will not
+emit, or overruns `render_bytes` produces **no fragment and no error** — the host
+omits it and serves the page. A plugin's failure is never the page's.
+
+Both halves have to agree on a slot. The *manifest* names the slots the plugin
+will fill, which is what an operator approves; the *application* declares the
+slots that exist, which is what stops a plugin appearing somewhere the app never
+offered:
+
+```rust,ignore
+use autumn_web::plugin_sandbox::RenderSlots;
+
+let slots = RenderSlots::declaring(["order-summary"]).with(plugin.clone())?;
+
+// ...in the order-page handler:
+let extra = slots.render("order-summary", &[("order".into(), id)]).await;
+```
+
+`with` refuses at boot when a manifest names a slot this app does not declare,
+rather than leaving an operator to wonder later why nothing appears. `render`
+returns a `String` and never a `Result` — every failure contributes nothing and
+is logged.
+
+### Quotas, consent and audit
+
+Every capability carries a per-request ceiling, plus a `calls` budget that bounds
+their sum and a `calls_per_second` ceiling shared across a plugin's requests.
+Exceeding one denies that call and records it; it does not fail the request, and
+it does not touch another plugin or any host route.
+
+An upgrade is the moment a plugin's authority can grow without anyone looking,
+so review it as an upgrade:
+
+```bash
+autumn plugin inspect shop-0.2.autumn-plugin --against shop-0.1.autumn-plugin
+```
+
+It prints exactly what the new manifest asks for that the approved one did not —
+new capabilities, hosts, tables, job types, slots, raised quotas — and **exits
+non-zero** when there is anything, so an unattended install stops rather than
+consenting on your behalf. Asking for *less* is not a prompt.
+
+For "what did this plugin do in the last hour", every capability call — allowed,
+denied or over quota — is recorded once, at the point it happens:
+
+```rust,ignore
+let summary = plugin.activity().summary("shop", Duration::from_secs(3600));
+println!("{}", summary.render("shop", Duration::from_secs(3600)));
+```
+
+```text
+sandboxed plugin `shop` — last 3600s
+  performed:
+    db-insert × 12
+    http-fetch × 3
+  denied:
+    job-enqueue × 1
+  hosts called:
+    api.example.com × 3
+  targets refused:
+    drain-accounts × 1
+```
+
+Records carry the *shape* — the key, the table, the host, the job type — and
+never a value. An audit surface that logged what a plugin stored would be a
+second copy of the tenant data this whole subsystem exists to contain.
+
+### Wiring the backends
+
+Capabilities are honoured against backends you supply, so a host that wires none
+still runs a granted plugin — its calls are answered `unavailable` and recorded,
+which is a refusal like any other rather than a silent success:
+
+```rust,ignore
+use autumn_web::plugin_sandbox::{CapabilityServices, MemoryKvStore, SandboxedPlugin};
+
+let plugin = SandboxedPlugin::from_file(path)?.with_services(CapabilityServices {
+    kv: Some(MemoryKvStore::new()),
+    ..CapabilityServices::none()
+});
+```
+
+The tenant is not one of them: it is resolved per request from the tenancy
+middleware, because one compiled plugin serves every tenant.
+
+---
+
 ## Limits of this slice
 
-- The only capability is `http-request`. Database, sessions, mail, storage and
-  outbound HTTP are not "not granted" — they do not exist as grantable
-  capabilities, so no manifest can ask for them.
+- Sessions, mail and file storage are not "not granted" — they do not exist as
+  grantable capabilities, so no manifest can ask for them.
+- A plugin's DB and KV backends are whatever the host wires. The framework ships
+  in-process reference implementations that enforce the scoping exactly as a
+  scoped statement would; a durable Postgres-backed store is the operator's to
+  supply through `PluginStore`.
+- Outbound calls do not follow redirects on a plugin's behalf, and the allow-list
+  is a *name* list — IP-range (SSRF) guarding for the app-level client is #1627's.
 - Upgrading a sandboxed plugin needs an app restart.
 - There is no registry; you get artifacts the same way you get any other file.
 - An interpreter is slower than native code. For a hello-world route the
