@@ -37,18 +37,10 @@ pub fn route_macro(
     };
     let path = route_args.path.clone();
 
-    let (guard_prelude, mut input_fn) = match parse::parse_multi_item_handler(item) {
-        Ok(v) => v,
+    let mut input_fn = match parse::parse_async_handler(item) {
+        Ok(f) => f,
         Err(err) => return err,
     };
-
-    if input_fn.sig.asyncness.is_none() {
-        return syn::Error::new_spanned(
-            input_fn.sig.fn_token,
-            "Autumn route handlers must be async functions",
-        )
-        .to_compile_error();
-    }
 
     // Extract #[intercept(LayerType)] attributes from the handler.
     let interceptors = parse::extract_interceptors(&mut input_fn.attrs);
@@ -264,12 +256,6 @@ pub fn route_macro(
     };
 
     quote! {
-        // A guard macro (#[throttle]/#[secured]/#[step_up]) that expanded
-        // before this route attribute leaves its `FromRequestParts` gate
-        // struct/impl here — re-emitted verbatim so the gate type #input_fn's
-        // signature references still exists in the final expansion.
-        #guard_prelude
-
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
         // to import axum manually. However, the path resolution in Axum macros makes this impossible
         // natively. Custom compile errors handle the type checks.
@@ -1024,13 +1010,25 @@ mod tests {
 
     #[test]
     fn route_macro_infers_response_schema_when_throttle_expands_first() {
+        // The compiler invokes the route macro with only the ONE item
+        // `#[throttle]` remains attached to — never the sibling gate
+        // struct/impl it also emits (see `param_helpers::extract_fn_item`'s
+        // doc comment) — so a hand-simulated stack must extract that same
+        // single item before feeding it onward.
         let throttled = crate::throttle::throttle_macro(
             quote! { limit = 5, per = "1m", key = "ip" },
             quote! {
                 async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
             },
         );
-        let generated = route_macro("POST", "post", quote! { "/users" }, throttled).to_string();
+        let throttled_fn = crate::param_helpers::extract_fn_item(throttled, "create");
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/users" },
+            quote! { #throttled_fn },
+        )
+        .to_string();
 
         assert!(
             generated.contains("response : :: core :: option :: Option :: Some")
@@ -1048,7 +1046,9 @@ mod tests {
                 async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
             },
         );
-        let generated = route_macro("POST", "post", quote! { "/users" }, secured).to_string();
+        let secured_fn = crate::param_helpers::extract_fn_item(secured, "create");
+        let generated =
+            route_macro("POST", "post", quote! { "/users" }, quote! { #secured_fn }).to_string();
 
         assert!(
             generated.contains("response : :: core :: option :: Option :: Some")
@@ -1066,7 +1066,14 @@ mod tests {
                 async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
             },
         );
-        let generated = route_macro("POST", "post", quote! { "/users" }, stepped_up).to_string();
+        let stepped_up_fn = crate::param_helpers::extract_fn_item(stepped_up, "create");
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/users" },
+            quote! { #stepped_up_fn },
+        )
+        .to_string();
 
         assert!(
             generated.contains("response : :: core :: option :: Option :: Some")
@@ -1103,15 +1110,22 @@ mod tests {
         // first and captures the real type, then secured wraps throttle's
         // whole generated body one level deeper. Only the innermost
         // `__autumn_inner` binding carries `Json<Created>` — the outer one
-        // reads `Response`.
+        // reads `Response`. Each step extracts just the handler fn before
+        // handing it to the next macro call — the compiler invokes an
+        // attribute macro with only the ONE item it remains attached to,
+        // never the sibling gate struct/impl an earlier guard also emitted
+        // (see `param_helpers::extract_fn_item`'s doc comment).
         let throttled = crate::throttle::throttle_macro(
             quote! { limit = 5, per = "1m", key = "ip" },
             quote! {
                 async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
             },
         );
-        let secured = crate::secured::secured_macro(quote! { "admin" }, throttled);
-        let generated = route_macro("POST", "post", quote! { "/users" }, secured).to_string();
+        let throttled_fn = crate::param_helpers::extract_fn_item(throttled, "create");
+        let secured = crate::secured::secured_macro(quote! { "admin" }, quote! { #throttled_fn });
+        let secured_fn = crate::param_helpers::extract_fn_item(secured, "create");
+        let generated =
+            route_macro("POST", "post", quote! { "/users" }, quote! { #secured_fn }).to_string();
 
         assert!(
             generated.contains("response : :: core :: option :: Option :: Some")
