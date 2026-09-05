@@ -3209,9 +3209,115 @@ def _module_spans(masked):
 
 
 def _scope_at(spans, offset):
-    """The inline-module path an offset sits in."""
+    """The scope path an offset sits in."""
     starts, mods = spans
     return mods[bisect.bisect_right(starts, offset) - 1]
+
+
+# A MODULE is not a binding scope either. Two functions in one module may both
+# call a parameter `source`, one an `OsEnv` and one an unrelated type — and
+# unioning receivers per module let the second bless a name nothing reads. This
+# is the third scope this rung has had (file, then inline module, now the
+# binding's own), each one the reviewer's finding after the last was landed.
+#
+# The label is the HEADER TEXT, normalised, from the keyword to its opening
+# brace: `fn probe(source: OsEnv)`, `mod inner`, `impl Foo`. That is what lets
+# both sides derive the same path over their own copy of the file, since what
+# crosses between them stays a name. Two spans with identical headers in one
+# module share a scope; so does an inner `{ … }` block, which is not pushed at
+# all. Both are over-admission bounded to a single item, where the rule this
+# replaces was bounded to a whole module.
+SCOPE_HEAD = re.compile(r'\b(mod|fn|impl)\b')
+
+
+# A function whose declared RETURN TYPE is an environment returns one, and
+# `let env = dotenv_env_for_profile(&profile)` binds it. Before receivers were
+# scoped lexically that name resolved by ACCIDENT — two other functions in the
+# same file take `env: &dyn Env`, and the module-wide union handed their name
+# to this one. Scoping it correctly removed the accident and the name with it,
+# which the truth set caught: 430 -> 429. So the signature is read instead,
+# the same way the env parameter type already is.
+FN_RETURN = re.compile(r'\bfn\s+(\w+)\s*(?:<(?:[^<>]|<[^<>]*>)*>)?\s*\(')
+
+
+def _fn_returns(masked):
+    """`[(name, return type, offset)]` for every function that declares one."""
+    out = []
+    for m in FN_RETURN.finditer(masked):
+        i, depth = m.end() - 1, 0
+        while i < len(masked):                 # balance the parameter list
+            if masked[i] == '(':
+                depth += 1
+            elif masked[i] == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        j = i
+        while j < len(masked) and masked[j] not in '{;':
+            j += 1
+        tail = masked[i + 1:j]
+        arrow = tail.find('->')
+        if arrow == -1:
+            continue
+        ret = ' '.join(tail[arrow + 2:].split('where')[0].split())
+        if ret:
+            out.append((m.group(1), ret, m.start()))
+    return out
+
+
+def _scope_opens(masked):
+    """`{brace offset: (header offset, label)}` for every scope opened.
+
+    The HEADER offset matters as much as the brace: a parameter is written
+    before the `{`, and a scope that began after it filed `source: OsEnv` in
+    the enclosing module rather than in the function it binds. The declaration
+    and its uses have to land in the same scope or the whole rule is inert.
+    """
+    out = {}
+    for m in SCOPE_HEAD.finditer(masked):
+        i, depth = m.end(), 0
+        while i < len(masked):
+            c = masked[i]
+            if c in '([':
+                depth += 1
+            elif c in ')]':
+                depth -= 1
+            elif depth <= 0 and c in ';{':
+                break
+            i += 1
+        # `mod x;` and `fn f();` declare no block, and `-> impl Trait {` is a
+        # TYPE whose brace belongs to the `fn` that was matched before it —
+        # first label wins, so the function keeps its own body.
+        if i < len(masked) and masked[i] == '{':
+            out.setdefault(i, (m.start(), ' '.join(masked[m.start():i].split())))
+    return out
+
+
+def _lexical_spans(masked):
+    """`([start], [scope path])` — the binding scope each offset sits in."""
+    opens = _scope_opens(masked)
+    starts, scopes, stack, here, depth = [0], [()], [], (), 0
+    for i, c in enumerate(masked):
+        if c == '{':
+            if i in opens:
+                head, label = opens[i]
+                stack.append(depth)
+                here = here + (label,)
+                # …starting at the HEADER, so the parameters it declares are
+                # inside the scope they bind. `max` keeps the list sorted for
+                # the bisect, which a pathological header could otherwise break.
+                starts.append(max(head, starts[-1]))
+                scopes.append(here)
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if stack and stack[-1] == depth:
+                stack.pop()
+                here = here[:-1]
+                starts.append(i)
+                scopes.append(here)
+    return starts, scopes
 
 
 def _split_tree(text):
@@ -3351,9 +3457,15 @@ def _declared_receivers(patterns):
     — which is this script's most repeated mistake. The trailing lookahead is
     what keeps a bare type name from matching a longer one: `RootedEnv` is not
     `RootedEnvironment`.
+
+    A type may be written QUALIFIED — `source: crate::config::OsEnv` needs no
+    import — and requiring a bare local name made that declaration invisible.
+    The path is captured rather than merely allowed, so the caller can hold it
+    to the same identity test an `impl` path gets: a name is not an address.
     """
     return re.compile(
-        r"\b([a-z_]\w*)\s*:\s*&?\s*(?:'\w+\s+)?(?:mut\s+)?(?:dyn\s+)?(?:"
+        r"\b([a-z_]\w*)\s*:\s*&?\s*(?:'\w+\s+)?(?:mut\s+)?(?:dyn\s+)?"
+        r"(?P<path>(?:\w+\s*::\s*)*)(?:"
         + '|'.join(sorted(patterns)) + r')(?!\w)')
 
 
@@ -3385,8 +3497,16 @@ class _Accessor:
         found = self._receiver.match(match.group(0))
         return found.group(1) if found else None
 
-    def allows(self, name, mods):
-        return name in self.by_scope.get(mods, ())
+    def allows(self, name, scope):
+        """Whether `name` is an environment at a call site in `scope`.
+
+        By PREFIX, because that is what a Rust binding does: an inner block
+        sees the function's parameters and the module's items, and a sibling
+        sees neither. Exact matching would have dropped `self.inner.var(…)`,
+        whose `inner` is a struct field declared outside every function.
+        """
+        return any(name in self.by_scope.get(scope[:n], ())
+                   for n in range(len(scope) + 1))
 
 
 def _absolute_path(rel, path, crates, inner=()):
@@ -3438,7 +3558,7 @@ def accessor(root, test_files=frozenset()):
     index, types, per_file, masked_all = {}, set(), {}, {}
     helpers, declared, imports, modules = {}, {}, {}, {}
     env_type, impls, trait_at, scopes = {}, {}, set(), {}
-    shadowed = {}
+    shadowed, returns = {}, {}
     crates = _crates(root)
     for rel in out.split('\0'):
         # Test code is skipped outright, as the scan that consumes this index
@@ -3465,6 +3585,10 @@ def accessor(root, test_files=frozenset()):
         # written in, not under the file. Two sibling `mod` blocks are two
         # scopes, and a bare name in one does not reach the other.
         spans = _module_spans(masked)
+        # …and a BINDING has a narrower scope than its module. Items, imports
+        # and types stay modular; a receiver name is filed under the function
+        # or block it is declared in.
+        lex = _lexical_spans(masked)
         crate, filemods = _module_of(rel, crates)
         seen = scopes.setdefault(rel, set())
         for m in ENV_HELPER.finditer(masked):
@@ -3478,7 +3602,7 @@ def accessor(root, test_files=frozenset()):
             declares = _env_param_type(m.group(2))
             if declares:
                 env_type[m.group(1)] = declares
-        masked_all[rel] = (masked, data, spans)
+        masked_all[rel] = (masked, data, spans, lex)
         # A locally declared macro takes the name over; an imported one does
         # the same. Either way this file's `env!` is not the std one.
         shadowed[rel] = bool(
@@ -3502,6 +3626,7 @@ def accessor(root, test_files=frozenset()):
         for at in list(seen):
             declared.setdefault((rel, at), set()).update(
                 helpers.get((rel, at), ()))
+        returns[rel] = _fn_returns(masked)
         for local, path, offset in _use_items(masked):
             at = _scope_at(spans, offset)
             seen.add(at)
@@ -3509,9 +3634,9 @@ def accessor(root, test_files=frozenset()):
         for m in ENV_BOUND.finditer(masked):
             if data[m.start()]:
                 continue
-            at = _scope_at(spans, m.start())
-            seen.add(at)
-            per_file.setdefault((rel, at), set()).add(m.group(1))
+            seen.add(_scope_at(spans, m.start()))
+            per_file.setdefault((rel, _scope_at(lex, m.start())),
+                                set()).add(m.group(1))
         params = {g for m in ENV_GENERIC.finditer(masked) if not data[m.start()]
                   for g in m.groups() if g}
         if params:
@@ -3519,9 +3644,9 @@ def accessor(root, test_files=frozenset()):
                 r'\b([a-z_]\w*)\s*:\s*&?\s*(?:'
                 + '|'.join(sorted(map(re.escape, params))) + r')\s*[,;})]')
             for m in bounded.finditer(masked):
-                at = _scope_at(spans, m.start())
-                seen.add(at)
-                per_file.setdefault((rel, at), set()).add(m.group(1))
+                seen.add(_scope_at(spans, m.start()))
+                per_file.setdefault((rel, _scope_at(lex, m.start())),
+                                    set()).add(m.group(1))
         seen.add(())
     # A QUALIFIED `impl a::b::Env for T` is resolved once every `trait Env`
     # declaration in the tree is known, which is why it waits for the walk to
@@ -3576,15 +3701,48 @@ def accessor(root, test_files=frozenset()):
                 here.add(local)
         return here
 
-    for (rel, at), (masked, data, spans) in (
+    for (rel, at), (masked, data, spans, lex) in (
             ((r, a), masked_all[r]) for r in masked_all
             for a in scopes.get(r, ((),))):
-        here = visible(rel, at, types)
-        if not here:
+        # …and a FUNCTION that returns an environment binds one when it is
+        # called. The return type is read from the signature and held to the
+        # same identity test: qualified, it must resolve to the type this tree
+        # derived; bare, it must be a type this module can see; `impl Env` is
+        # the trait itself and needs neither.
+        factories = set()
+        for name, ret, offset in returns.get(rel, ()):
+            if _scope_at(spans, offset) != at:
+                continue
+            bare = re.sub(r'^(?:impl|dyn)\s+', '', ret).strip()
+            kind = bare.split('::')[-1].split('<')[0].strip()
+            path = bare[:len(bare) - len(bare.split('::')[-1])]
+            if kind == 'Env':
+                factories.add(name)
+            elif kind in types and (
+                    resolves(rel, at, path + kind, kind) if path.strip()
+                    else kind in visible(rel, at, types)):
+                factories.add(name)
+        if factories:
+            call = re.compile(
+                r'\blet\s+(?:mut\s+)?([a-z_]\w*)\s*(?::[^=;]*)?=\s*&?\s*(?:'
+                + '|'.join(sorted(map(re.escape, factories))) + r')\s*\(')
+            for m in call.finditer(masked):
+                if data[m.start()]:
+                    continue
+                per_file.setdefault((rel, _scope_at(lex, m.start())),
+                                    set()).add(m.group(1))
+        # The pattern is built from EVERY derived environment type, not only
+        # the ones this module imports by a bare name — gating the whole rung
+        # on a bare-name import is what made the qualified spelling invisible,
+        # since `source: crate::config::OsEnv` needs no import at all. Which
+        # of them counts is then decided per match, below.
+        if not types:
             continue
+        here = visible(rel, at, types)
         bound = re.compile(
-            r'\blet\s+(?:mut\s+)?([a-z_]\w*)\s*(?::[^=;]*)?=\s*&?\s*(?:'
-            + '|'.join(sorted(map(re.escape, here))) + r')\b')
+            r'\blet\s+(?:mut\s+)?([a-z_]\w*)\s*(?::[^=;]*)?=\s*&?\s*'
+            r'(?P<path>(?:\w+\s*::\s*)*)(?:'
+            + '|'.join(sorted(map(re.escape, types))) + r')\b')
         # …and a parameter or field DECLARED with one. `ENV_BOUND` asks for the
         # literal word `Env` in the annotation, which is a rule about the
         # trait's spelling rather than about the type: `fn load(source:
@@ -3592,13 +3750,27 @@ def accessor(root, test_files=frozenset()):
         # `source.var(…)` is a real read that nothing here could see — and it
         # used to fall through to the `env`-prefixed floor, which is exactly
         # the wrong reason to be covered.
-        typed = _declared_receivers(_type_pattern(t) for t in here)
-        per_file.setdefault((rel, at), set()).update(
-            m.group(1) for m in bound.finditer(masked)
-            if not data[m.start()] and _scope_at(spans, m.start()) == at)
-        per_file[(rel, at)].update(
-            m.group(1) for m in typed.finditer(masked)
-            if not data[m.start()] and _scope_at(spans, m.start()) == at)
+        typed = _declared_receivers(_type_pattern(t) for t in types)
+        for pattern in (bound, typed):
+            for m in pattern.finditer(masked):
+                if data[m.start()] or _scope_at(spans, m.start()) != at:
+                    continue
+                named = re.search(r'[A-Za-z_]\w*$',
+                                  m.group(0).split('::')[-1].strip())
+                if not named:
+                    continue
+                kind = named.group(0)
+                path = (m.groupdict().get('path') or '').strip()
+                # A BARE name must be one this module can see; a QUALIFIED one
+                # has to name the type this tree derived, not a same-named one
+                # somewhere else — the same test `impl a::b::Env` gets.
+                if path:
+                    if not resolves(rel, at, path + kind, kind):
+                        continue
+                elif kind not in here:
+                    continue
+                per_file.setdefault((rel, _scope_at(lex, m.start())),
+                                    set()).add(m.group(1))
     # …and a receiver whose type is the one a derived HELPER calls an
     # environment. `env: &HashMap<String, String>` mentions no `Env` at all, so
     # `ENV_BOUND` cannot see it and the name prefix was doing the work: six real
@@ -3608,7 +3780,7 @@ def accessor(root, test_files=frozenset()):
     # receiver rule only where the tree, in that module, has declared or
     # imported a helper that says this type is its environment. An `envelope:
     # Envelope` is not one anywhere, which is the whole point.
-    for (rel, at), (masked, data, spans) in (
+    for (rel, at), (masked, data, spans, lex) in (
             ((r, a), masked_all[r]) for r in masked_all
             for a in scopes.get(r, ((),))):
         declares = {env_type[h] for h in
@@ -3621,9 +3793,11 @@ def accessor(root, test_files=frozenset()):
         if not declares:
             continue
         typed = _declared_receivers(_type_pattern(d) for d in declares)
-        per_file.setdefault((rel, at), set()).update(
-            m.group(1) for m in typed.finditer(masked)
-            if not data[m.start()] and _scope_at(spans, m.start()) == at)
+        for m in typed.finditer(masked):
+            if data[m.start()] or _scope_at(spans, m.start()) != at:
+                continue
+            per_file.setdefault((rel, _scope_at(lex, m.start())),
+                                set()).add(m.group(1))
     # A RECEIVER NAME is file-local, and the pattern was global: `base` is
     # derived from `let base = OsEnv` in one module, and an unrelated module's
     # `base.var(…)` on something else then read as an environment call. A type
@@ -3667,8 +3841,15 @@ def accessor(root, test_files=frozenset()):
         by_scope = {}
         for at in scopes.get(rel, ((),)):
             here |= visible(rel, at, set(index)) | set(helpers.get((rel, at), ()))
-            mine = set(per_file.get((rel, at), ())) | visible(rel, at, types)
-            by_scope[at] = frozenset(mine)
+            # A TYPE used as its own receiver (`OsEnv.var(…)`) is an item, so it
+            # is visible wherever its module is; a BINDING is not, so it is
+            # filed under the scope that declares it and read back by prefix.
+            by_scope[()] = by_scope.get((), frozenset()) | visible(rel, at, types)
+            recv |= visible(rel, at, types)
+        for (r, at), mine in per_file.items():
+            if r != rel:
+                continue
+            by_scope[at] = by_scope.get(at, frozenset()) | frozenset(mine)
             recv |= mine
         here, recv = frozenset(here), frozenset(recv)
         # `use std::env as process_env` renames the MODULE, and the base
@@ -4242,7 +4423,7 @@ def source_tokens(root):
         # accessor is about to be run on. That is what makes call-site scoping
         # cost nothing: no offset ever crosses between this body and the one
         # the derivation read, only a module name.
-        spans = (_module_spans(body)
+        spans = (_lexical_spans(body)
                  if effective_suffix(rel) == '.rs' else None)
         offsets, at = [], 0
         for l in lines:
@@ -5816,9 +5997,22 @@ def self_test():
     # what crosses between derivation and scan is a module NAME, never an
     # offset.
     _scoped = _acc_for('autumn/src/config.rs')
-    case('a receiver is an environment only in its own module',
-         (_scoped.allows('env', ()), _scoped.allows('env', ('zzz_other',))),
-         (True, False))
+    # Visibility is by PREFIX, which is what a Rust binding does: an inner
+    # block sees the function's parameters and the module's items, a sibling
+    # sees neither. Asserted on a constructed scope table rather than on the
+    # tree, so the rule is what is under test and not one file's shape.
+    _probe = _Accessor(re.compile('x'), {
+        (): frozenset({'field'}),
+        ('mod a', 'fn one(source: OsEnv)'): frozenset({'source'}),
+    })
+    case('a receiver is visible in its own scope and inward only',
+         [_probe.allows(n, at) for n, at in
+          (('source', ('mod a', 'fn one(source: OsEnv)')),
+           ('source', ('mod a', 'fn one(source: OsEnv)', 'fn inner()')),
+           ('source', ('mod a', 'fn two(source: Other)')),
+           ('source', ('mod a',)),
+           ('field', ('mod a', 'fn two(source: Other)')))],
+         [True, True, False, False, True])
     # …and the whole-file union still finds the candidate, so the SCOPE is
     # doing the deciding rather than the regex quietly missing it.
     case('the union still matches what the scope rejects',
@@ -5830,16 +6024,63 @@ def self_test():
          ('AUTUMN_MEDIA__STORAGE__BACKEND' in swept,
           'AUTUMN_MEDIA__ROOM_STORE_BACKEND' in swept),
          (True, True))
+    _recv = _declared_receivers(
+        _type_pattern(t) for t in ('RootedEnv', '&HashMap<String, String>'))
     case('a receiver declared with an environment type is derived',
-         [_declared_receivers(
-             _type_pattern(t) for t in ('RootedEnv', '&HashMap<String, String>')
-          ).findall(s) for s in
+         [[(m.group(1), m.group('path')) for m in _recv.finditer(s)] for s in
           ('fn load(source: RootedEnv) { source.var("AUTUMN_X"); }',
            'fn other(y: &RootedEnvironment) {}',
            'fn f(env: &HashMap<String, String>, key: &str) {}',
            'fn g(d: &dyn RootedEnv) {}',
            'fn h(css: CssBuilder) {}')],
-         [['source'], [], ['env'], ['d'], []])
+         [[('source', '')], [], [('env', '')], [('d', '')], []])
+    # …and the type may be QUALIFIED, which needs no import. The path is
+    # captured rather than merely allowed, so the caller holds it to the same
+    # identity test an `impl` path gets.
+    case('a qualified type annotation is captured with its path',
+         [(lambda m: (m.group(1), m.group('path')) if m else None)(
+             _recv.search(t)) for t in
+          ('fn f(source: crate::config::RootedEnv)',
+           'fn f(source: RootedEnv)',
+           'fn f(x: other::RootedEnv)')],
+         [('source', 'crate::config::'), ('source', ''),
+          ('x', 'other::')])
+    # A binding scope is the function, not the module: the header text is the
+    # label, so both sides derive the same path over their own copy.
+    # A parameter is written in the HEADER, before the brace — a scope that
+    # began at the brace filed it in the enclosing module instead of in the
+    # function it binds, and a declaration that lands outside the scope it
+    # binds makes the whole rule inert.
+    case('a parameter is inside the scope it binds',
+         (lambda src: [_scope_at(_lexical_spans(src), src.index(t)) for t in
+                       ('source: OsEnv', 'source.var("X")', 'struct S')])(
+             'mod a {\n  fn one(source: OsEnv) { source.var("X"); }\n'
+             '}\nstruct S;\n'),
+         [('mod a', 'fn one(source: OsEnv)'),
+          ('mod a', 'fn one(source: OsEnv)'), ()])
+    # A function whose declared RETURN type is an environment binds one when
+    # it is called. `AUTUMN_OFFSITE_MULTIPART_PART_SIZE_BYTES` resolved by
+    # ACCIDENT before receivers were scoped: two other functions in that file
+    # take `env: &dyn Env`, and the module-wide union lent their name to
+    # `let env = dotenv_env_for_profile(…)`. Scoping removed the accident and
+    # the name with it — truth set 430 -> 429 — so the signature is read now.
+    case('a function that returns an environment is read from its signature',
+         [(n, r) for n, r, _ in _fn_returns(
+             'fn a(p: &str) -> autumn_web::dotenv::DotenvOsEnv { x }\n'
+             'fn b() -> impl Env { y }\n'
+             'fn c() { }\n'
+             'fn d() -> u64 { 0 }\n')],
+         [('a', 'autumn_web::dotenv::DotenvOsEnv'), ('b', 'impl Env'),
+          ('d', 'u64')])
+    case('that read survives the lexical scoping',
+         'AUTUMN_OFFSITE_MULTIPART_PART_SIZE_BYTES' in swept, True)
+    case('a binding scope is the function it is written in',
+         (lambda src: [_scope_at(_lexical_spans(src), src.index(p)) for p in
+                       ('source.var("X")', 'source.var("Y")', 'struct S')])(
+             'mod a {\n  fn one(source: OsEnv) { source.var("X"); }\n'
+             '  fn two(source: Other) { source.var("Y"); }\n}\nstruct S;\n'),
+         [('mod a', 'fn one(source: OsEnv)'),
+          ('mod a', 'fn two(source: Other)'), ()])
     case('a helper key behind other arguments reads',
          args_of('override_string(&mut self.ffmpeg.bin, env, '
                  '"AUTUMN_MEDIA__FFMPEG__BIN")', _media_acc, real_index),
