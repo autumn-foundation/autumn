@@ -239,7 +239,7 @@ not claimed here ahead of it landing.
 | Advisories (workspace / sqlite / scaffold graphs) | ok / ok / ok | ok / ok / ok |
 | Licenses / sources (workspace / sqlite graphs) | ok+ok / ok+ok | ok+ok / ok+ok |
 | Lockfile entries behind their own semver range (correct command) | 32 | 1 (`generic-array`, excluded by rehearsal) |
-| Cargo.lock line count | 10111 | see commit |
+| Cargo.lock line count | 10111 | 9972 |
 | Packages removed entirely (dead transitive weight) | — | 14 |
 
 The reqwest ask-before analysis is unaffected by this batch (none of the 31
@@ -289,6 +289,7 @@ cargo update -p generic-array --precise 0.14.7
 cargo deny check licenses sources
 cargo deny --config deny-sqlite.toml check licenses sources
 ./scripts/pre-push-check.sh
+wc -l Cargo.lock   # line-count measurement in the table above
 
 # Duplicate-version census
 cargo metadata --format-version 1 > /tmp/meta.json
