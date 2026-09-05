@@ -151,10 +151,15 @@
 #   - **Cargo profiles**. `[profile.dev] debug = "line-tables-only"` in
 #     `platform-support.md` is a Cargo profile, and `[profile.<name>]` is ALSO
 #     Autumn's overlay syntax — the same four characters mean two different files.
-#     Disambiguated on the leaf keys, not the header: a `[profile.X]` table whose
-#     keys are all Cargo profile knobs (`debug`, `opt-level`, `lto`, `panic`,
-#     `strip`, …) is Cargo's, and Autumn's overlay carries config SECTIONS, never
-#     those names. Header-based skipping would have cost the real overlay fences,
+#     Disambiguated on the entries, not the header: a `[profile.X]` table is
+#     Cargo's only when EVERY entry is a Cargo knob — scalars against
+#     (`debug`, `opt-level`, `lto`, `panic`, `strip`, …) and tables against
+#     Cargo's own table knobs, `package` (`[profile.dev.package."*"]`, which
+#     `platform-support.md` names) and `build-override`. Judging the scalars
+#     alone let one Cargo-looking knob carry a whole mixed table out of scope:
+#     `[profile.prod] debug = 1` plus `[profile.prod.server] prot = 9000` read as
+#     a Cargo profile on the strength of `debug`, and neither invalid key was
+#     reported even though `[profile.prod.server]` is unmistakably Autumn. Header-based skipping would have cost the real overlay fences,
 #     which are the production-tuning ones most worth gating.
 #   - **`fly.toml`** (4 of the 37 `other-file` fences). Fly's `[deploy]` table takes `release_command`
 #     and `kill_timeout`; Autumn's `[deploy]` takes `host`, `app_name`, `app_dir`.
@@ -506,6 +511,12 @@ CARGO_PROFILE_KEYS = {
     "strip",
 }
 
+# Cargo's TABLE-valued profile knobs: `[profile.dev.package."*"]` and
+# `[profile.dev.build-override]`. Recognized so a real Cargo profile carrying one
+# is still exempt, while any OTHER table-valued entry marks the profile as
+# Autumn's.
+CARGO_PROFILE_TABLES = {"package", "build-override"}
+
 # A marker naming a TOML file, inside the fence or in the prose just above it.
 # `autumn.toml` and its profile siblings (`autumn-prod.toml`) identify the fence
 # as one this gate reads; any other name identifies it as one it must not.
@@ -701,9 +712,26 @@ def near_known_root(root, known_roots):
 
 
 def is_cargo_profile(name, table):
-    """`[profile.<name>]` whose keys are all Cargo profile knobs."""
-    scalars = {k for k, v in table.items() if not isinstance(v, dict)}
-    return bool(scalars) and scalars <= CARGO_PROFILE_KEYS
+    """`[profile.<name>]` whose entries are ALL Cargo profile knobs.
+
+    Every entry counts, tables included. Looking only at the scalars let one
+    Cargo-looking knob carry an entire mixed table out of scope:
+    `[profile.prod] debug = 1` plus `[profile.prod.server] prot = 9000` read as a
+    Cargo profile on the strength of `debug`, and neither invalid key was
+    reported — even though `[profile.prod.server]` is unmistakably Autumn.
+
+    Cargo profiles do have table-valued knobs of their own — `package` (as in
+    `[profile.dev.package."*"]`, which `platform-support.md` names) and
+    `build-override` — so those are recognized rather than treated as evidence
+    against; anything else table-valued means this is not a Cargo profile.
+    """
+    if not table:
+        return False
+    for key, value in table.items():
+        allowed = CARGO_PROFILE_TABLES if isinstance(value, dict) else CARGO_PROFILE_KEYS
+        if key not in allowed:
+            return False
+    return True
 
 
 # ── The walk (mirrors AutumnConfig::validate_toml_table) ──────────────────────
@@ -1080,6 +1108,18 @@ def self_test():
         ("cargo profile multi", "release", {"lto": True, "strip": "symbols"}, True),
         ("autumn overlay", "prod", {"server": {"port": 1}}, False),
         ("autumn overlay scalar-free", "prod", {}, False),
+        # Cargo's own table-valued knobs stay exempt...
+        ("cargo profile with package table", "dev", {"package": {"*": {"debug": 0}}}, True),
+        ("cargo profile with build-override", "dev", {"build-override": {"opt-level": 3}}, True),
+        # ...but a MIXED table is Autumn's: one Cargo-looking scalar must not
+        # carry an Autumn subsection out of scope.
+        (
+            "mixed cargo scalar + autumn section",
+            "prod",
+            {"debug": 1, "server": {"prot": 9000}},
+            False,
+        ),
+        ("unknown table-valued entry", "dev", {"debug": 1, "widget": {"x": 1}}, False),
     ]
 
     passed = failed = 0
