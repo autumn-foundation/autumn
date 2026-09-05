@@ -247,6 +247,39 @@
 #     widens a scope to the end of it — worse than the defect being fixed. When
 #     a bug has two halves, land both or neither, and prefer neither over a
 #     half that regresses something (see the note above `MOD_BLOCK`).
+#   * A PREMISE not carried to every walk that rests on it. `masked` keeps
+#     string contents deliberately, so every walk over it that reads
+#     punctuation as structure needs the literal mask. Four of five had it; the
+#     closure walk did not, and a `"{"` in a closure body ran that scope to the
+#     end of its file. The same shape one function over: the mask was passed to
+#     the BLOCK form of that walk and not to the expression form beside it,
+#     where a literal `";"` ends a body exactly as wrongly. Find every place
+#     that asks the question, not the one the report names.
+#   * A LANGUAGE mistaken for a SHAPE. A Rust fence says an occurrence is
+#     Rust; it does not say the occurrence is an identifier. One snippet holds
+#     `pub const AUTUMN_X` and `env::var("AUTUMN_X")` — a declaration and a key
+#     claim — and an exemption asked of the line exempted both. The converse
+#     bounded the fix: a name in a `//` comment inside that fence IS the
+#     identifier the code beside it names, and validating comments too reported
+#     a correct page. Ask the language which characters are which.
+#   * A CONVENTION read as a grammar, for the eleventh scope in eleven rounds.
+#     "A macro import is written at file scope" is true of this tree and is not
+#     Rust: a `use` inside a function shadows for that function, and a
+#     file-wide flag withheld the std macro from every sibling. Every other
+#     import here was already read back by prefix from its own binding scope;
+#     this one had been left whole-file on the strength of where such imports
+#     usually sit.
+#   * A LINE standing in for an expression, again. `NEGATED` was searched
+#     anywhere on the physical line holding a call, which asks whether the line
+#     contains a negation rather than whether this call is what is negated —
+#     so `if !items.contains(&x) { env::var("X"); }` threw away a real read.
+#     A negation reaches the expression it heads and no further.
+#   * A CONDITION written for the files that happen to have a SUFFIX. Both
+#     shell preprocessing passes were selected by file extension, and
+#     `Dockerfile` has none — so a Dockerfile took neither, and single quotes
+#     that sh honours were read as an expansion. The property being asked
+#     about was never the suffix; it was whether a Bourne shell runs these
+#     lines, which every name in `SHELL_SHAPED_NAMED` does.
 #
 # EVERY RUNG HAS NOW BEEN AUDITED against the list above, rather than tightened
 # one at a time as a reviewer found it — which is how five of these survived
@@ -272,6 +305,9 @@
 #     `AUTUMN_SOURCE`, none a near-miss of a framework variable. The residual
 #     exposure is that a page could mask a typo by declaring it, which is
 #     narrower than a blanket exemption and is what the `*_env` key signals.
+#     Narrowed again since: the exemption reaches the page's Rust fences, and
+#     within them only occurrences that are not string literals — a name in a
+#     literal is the key claim under test, however the page also uses it.
 #
 # The self-tests assert on each STEP — detect, scan, classify, resolve — because
 # a test that checks only the final verdict cannot tell "handled correctly" from
@@ -4067,18 +4103,26 @@ class _Accessor:
         return any(name in (self.rebound or {}).get(scope[:n], ())
                    for n in range(len(scope) + 1))
 
-    def imports_shadow(self, name):
-        """Whether the shadow came from a `use`, not a local `macro_rules!`.
+    def imports_shadow(self, name, scope=()):
+        """Whether a `use` in scope of `scope` shadows the macro `name`.
 
         An IMPORTED shadow has no declaration in this file to sit after, so a
         region test looking for one finds nothing and trusts the call — which
         is how `use crate::macros::env; env!(…)` went on being read as the std
-        macro. The import's region is the scope of the `use`, and this file's
-        offsets cannot narrow it further without crossing one, so it suppresses
-        the whole file: the fail-closed direction, and correct wherever the
-        import is at file scope, which is where a macro import is written.
+        macro.
+
+        The first fix suppressed the whole FILE, on the reasoning that a macro
+        import is written at file scope anyway. That is a convention, not a
+        grammar: a `use` inside a function renames for that function, and a
+        block-local `use crate::defs::option_env;` withheld the std macro from
+        every sibling function in the file. Every other import here is already
+        read back by prefix from its own binding scope — the module alias, the
+        direct accessor — and this one now is too, from the same structure. A
+        derivation that reaches nothing still suppresses nothing, so the
+        fail-closed reading is unchanged where the import really is file-wide.
         """
-        return name in self.imported
+        return any(name in self.imported.get(scope[:n], ())
+                   for n in range(len(scope) + 1))
 
     def shadows(self, name):
         """Whether this file takes the macro `name` over anywhere."""
@@ -4219,8 +4263,10 @@ def accessor(root, test_files=frozenset()):
                           if not data[m.start()]]
         for m in declares_macro:
             macro_at.setdefault(m.group(1), set()).add((crate, filemods))
-        macro_imports[rel] = [(local, path) for local, path, _
-                              in _use_items(masked)
+        # …carrying the BINDING scope of the `use`, not just its name: a macro
+        # import inside a function shadows for that function only.
+        macro_imports[rel] = [(local, path, _scope_at(lex, offset))
+                              for local, path, offset in _use_items(masked)
                               if local in ('env', 'option_env')]
         shadowed[rel] = {m.group(1) for m in declares_macro}
         if TRAIT_DECL.search(masked):
@@ -4374,7 +4420,17 @@ def accessor(root, test_files=frozenset()):
                 # is filed by binding scope and read back by prefix — exactly
                 # as a receiver is. Only a module-level one becomes a name the
                 # module has.
-                if any('fn ' in seg for seg in lex_at):
+                #
+                # And "inside a function" was the wrong way to ask that. A
+                # function is not the only item that is not a module: an
+                # associated type — `impl Trait for Foo { type E = OsEnv; }` —
+                # sits in a scope holding an `impl` and no `fn` at all, so it
+                # took the module branch and published `E` as a name the whole
+                # module could name and import. The question is whether the
+                # alias is at MODULE level, and the only scope segments a
+                # module path holds are modules; a `fn`, an `impl` and a
+                # closure alike put it somewhere narrower.
+                if not all(seg.startswith('mod ') for seg in lex_at):
                     local_types.setdefault((rel, lex_at), set()).add(name)
                 else:
                     scopes.setdefault(rel, set()).add(at)
@@ -4520,10 +4576,14 @@ def accessor(root, test_files=frozenset()):
     # qualified `impl` path is: an import shadows when it reaches a macro this
     # tree declares, and `use std::env;` reaches a module in another crate.
     for rel, items in macro_imports.items():
-        for local, path in items:
+        for local, path, lex_at in items:
             if _absolute_path(rel, path, crates) in macro_at.get(local, ()):
+                # `shadowed` stays file-wide: it is the outer filter that says
+                # this file has SOME reason to doubt the std macro, and the
+                # region tests below decide where. The region is what moved.
                 shadowed.setdefault(rel, set()).add(local)
-                imported_shadow.setdefault(rel, set()).add(local)
+                imported_shadow.setdefault(rel, {}).setdefault(
+                    lex_at, set()).add(local)
 
     def imports_of(rel):
         return [(local, path, at) for (r, at), items in imports.items()
@@ -4675,7 +4735,8 @@ def accessor(root, test_files=frozenset()):
             cache[key] = re.compile(pattern)
         return _Accessor(cache[key], by_scope,
                          frozenset(shadowed.get(rel, ())),
-                         frozenset(imported_shadow.get(rel, ())),
+                         {at: frozenset(names) for at, names
+                          in imported_shadow.get(rel, {}).items()},
                          {at: frozenset(names)
                           for (r, at), names in rebound.items() if r == rel},
                          alias_scopes, direct_scopes)
@@ -4694,6 +4755,46 @@ NEGATED = re.compile(
     r'assert(?:_ne)?!\s*\(\s*!'
     r'|!\s*[\w.]*\bcontains\b'
     r'|\bassert_ne!\s*\([^;]*\bcontains\b')
+
+
+def _negation_covers(line, at):
+    """Whether a negative assertion on this line covers the call at `at`.
+
+    The negation used to be looked for anywhere on the LINE, which asks a
+    different question: whether the line holds a negation, not whether THIS
+    call is the thing negated. So `if !items.contains(&x) { env::var("X"); }`
+    — where the negation is about an unrelated collection and the read is in
+    the block it guards — lost a genuine read. A line is a layout, not an
+    expression; this is the same substitution the header records twice over.
+
+    So the negation has to REACH the call. Walk from the negation to the end
+    of the expression it heads and ask whether the call is inside it. A `{`
+    at depth zero ends that expression rather than extending it — unlike a
+    closure body, where `|x| Foo { a: 1 }` makes the brace part of the value.
+    Here a depth-zero brace after a condition opens the block the condition
+    guards, which is exactly the text that must stop being covered.
+    """
+    for m in NEGATED.finditer(line):
+        if m.start() > at:
+            break                      # matches are ordered; none can reach back
+        depth, j = 0, m.end()
+        while j < len(line):
+            c = line[j]
+            if c in '([':
+                depth += 1
+            elif c in ')]':
+                if depth == 0:
+                    break
+                depth -= 1
+            elif depth == 0 and c in ';,{':
+                break
+            j += 1
+        # `assert_ne!(…contains…)` matches with its own call to the LEFT of
+        # the negation's end, so a call before `m.end()` is covered too — it
+        # is inside the assertion this matched the head of.
+        if at < j:
+            return True
+    return False
 
 # Test code is not the runtime. A test names a variable to prove the runtime
 # IGNORES it — `temp_env::with_var_unset("AUTUMN_TEST_DOTENV_OVERLAY_UNSET", …)`
@@ -5193,8 +5294,8 @@ def source_tokens(root):
         # A Dockerfile's exec-form lines expand nothing — see `_docker_literal`,
         # and so does a `run:` block in a shell this script does not read.
         literal = set(unreadable)
-        if pathlib.PurePath(rel).name.split('.')[0] in ('Dockerfile',
-                                                        'Containerfile'):
+        named_shell = pathlib.PurePath(rel).name.split('.')[0]
+        if named_shell in ('Dockerfile', 'Containerfile'):
             body, docker_literal, docker_ps = _docker_commands(body)
             literal |= docker_literal
             powershell |= docker_ps
@@ -5216,9 +5317,21 @@ def source_tokens(root):
         # `.yml` never did: `echo '${AUTUMN_X}'` in a `run:` step is a literal.
         # A compose file does not take them, because compose interpolates every
         # value BEFORE any shell sees it, so the quotes there are YAML's.
-        shell = (effective_suffix(rel) in HAS_HEREDOC
+        #
+        # A file matched by NAME reaches here having taken NEITHER pass, because
+        # both were asked by SUFFIX and `Dockerfile` has none to match — so
+        # `RUN printf '%s' '$AUTUMN_X'` reported an expansion of a name sh never
+        # expands. The condition was written for the files that happen to carry
+        # a suffix, and the property it is really asking about is whether a
+        # Bourne shell executes these lines. Every name in `SHELL_SHAPED_NAMED`
+        # hands its command lines to one: a Dockerfile's shell form, a Justfile
+        # or Makefile recipe. Make expands its own `$` first, which can only
+        # remove a name before sh ever sees it — never turn a quoted one into a
+        # read — so the quoting answer is the same there too.
+        named_sh = named_shell in SHELL_SHAPED_NAMED
+        shell = (effective_suffix(rel) in HAS_HEREDOC or named_sh
                  or (yaml_file and not interpolated))
-        quoted = (effective_suffix(rel) in SHELL_QUOTED
+        quoted = (effective_suffix(rel) in SHELL_QUOTED or named_sh
                   or (yaml_file and not interpolated))
         # TWO views, because the rungs mean different things inside double
         # quotes: `"${AUTUMN_X}"` is an expansion, while
@@ -5449,11 +5562,12 @@ def source_tokens(root):
             macro = MACRO_CALL.match(m.group(0))
             if (macro and not macro.group('path')
                     and acc_for(rel).shadows(macro.group('name'))):
+                mine = _scope_at(spans, m.start())
                 # An IMPORTED shadow has no local declaration to sit after, so
                 # the region test below finds nothing and would trust the call.
-                if acc_for(rel).imports_shadow(macro.group('name')):
+                # Its region is the `use`'s own binding scope, read by prefix.
+                if acc_for(rel).imports_shadow(macro.group('name'), mine):
                     continue
-                mine = _scope_at(spans, m.start())
                 if any(d.start() < m.start()
                        and m.start() < _block_end(body, d.start(), literals)
                        and mine[:len(_scope_at(spans, d.start()))]
@@ -5513,7 +5627,8 @@ def source_tokens(root):
                     continue
             head = body.rfind('\n', 0, m.start()) + 1
             tail = body.find('\n', m.start())
-            if NEGATED.search(body[head:tail if tail >= 0 else len(body)]):
+            if _negation_covers(body[head:tail if tail >= 0 else len(body)],
+                                m.start() - head):
                 continue
             args, _ = _balanced(body, m.end() - 1, ARG_SPAN_LIMIT)
             if args:
@@ -5657,6 +5772,44 @@ def fence_langs(lines):
 RUST_FENCES = ('rust', 'rs', 'no_run', 'ignore', 'should_panic', 'compile_fail')
 
 
+def _rust_fence_classes(lines, langs):
+    """`{line index: class string}` for every line inside a Rust fence.
+
+    The fence says which LANGUAGE an occurrence is in; it does not say the
+    occurrence is an identifier. A snippet that declares `pub const AUTUMN_X`
+    and then calls `env::var("AUTUMN_X")` holds both an identifier use and a
+    key claim, and exempting the whole fenced line excused the claim along
+    with the declaration — a name inside a string literal is exactly the thing
+    this gate exists to check.
+
+    So the same classification the Rust scan runs is run over the fence body:
+    `'c'`ode, `'m'`omment, `'s'`tring, per character. The body is classified
+    whole rather than line by line, because a raw string opened on one line is
+    still open on the next, and joining with `\\n` keeps every line's own
+    offsets — which is what lets a match position in the line index straight
+    into its class.
+    """
+    out, i, n = {}, 0, len(lines)
+    while i < n:
+        if langs[i] not in RUST_FENCES:
+            i += 1
+            continue
+        j = i
+        while j < n and langs[j] in RUST_FENCES:
+            j += 1
+        # Cut back into lines by LENGTH, not by splitting on a newline: the
+        # classification is a string of `c`/`m`/`s`, one per input character,
+        # and the newlines it classifies are `c` like any other code character
+        # — so there is nothing in it to split on. Slicing by the lines' own
+        # lengths is what keeps each line's offsets its own.
+        cls, pos = ''.join(_rust_classes('\n'.join(lines[i:j]))), 0
+        for k in range(i, j):
+            out[k] = cls[pos:pos + len(lines[k])]
+            pos += len(lines[k]) + 1
+        i = j
+    return out
+
+
 # ------------------------------------------------------------- corpus scan
 
 def scan(files, read, leaves, built, tokens):
@@ -5670,12 +5823,21 @@ def scan(files, read, leaves, built, tokens):
         consts = set(DECLARED_CONST.findall(text))
         at, waived = blocks(lines), waivers(lines)
         langs = fence_langs(lines)
-        for i, line in enumerate(lines, 1):
-            # A waiver marker names the variable in order to waive it. That
-            # mention is metadata addressed to this script, not a key claim
-            # addressed to a reader, so it is not an occurrence — counting it
-            # made an unreasoned waiver report its own subject twice.
-            line = WAIVER.sub('', line)
+        # A waiver marker names the variable in order to waive it. That
+        # mention is metadata addressed to this script, not a key claim
+        # addressed to a reader, so it is not an occurrence — counting it
+        # made an unreasoned waiver report its own subject twice.
+        #
+        # Stripped ONCE, up front, rather than inside the loop: the Rust
+        # classification below indexes by offset into the same line the
+        # matches are found in, and a line normalised in one place and
+        # classified in another puts every offset past the marker on a
+        # different character. `blocks`, `waivers` and `fence_langs` keep
+        # reading the raw lines, since a marker is a comment and the fence
+        # structure is the file's, not the scan's.
+        scan_lines = [WAIVER.sub('', l) for l in lines]
+        rust_cls = _rust_fence_classes(scan_lines, langs)
+        for i, line in enumerate(scan_lines, 1):
             # Before the well-formed names, the misspelt namespace — checked
             # first because it is invisible to every pattern that follows.
             for m in NEAR.finditer(line):
@@ -5715,7 +5877,8 @@ def scan(files, read, leaves, built, tokens):
                     stats['waived'] += 1
                 else:
                     defects.append((rel, i, token, line.strip()))
-            for var in VAR.findall(line):
+            for var_m in VAR.finditer(line):
+                var = var_m.group(0)
                 if var in chosen:
                     stats['reader-chosen name'] += 1
                     continue
@@ -5733,7 +5896,27 @@ def scan(files, read, leaves, built, tokens):
                 # still let it excuse `Set \`AUTUMN_X\` in your deployment
                 # environment`, which is prose, not code. The fence is the
                 # thing that says which language an occurrence is in.
-                if var in consts and langs[i - 1] in RUST_FENCES:
+                #
+                # …and which language it is in is not yet which SHAPE it is.
+                # One snippet may hold both: `pub const AUTUMN_X: &str = …`
+                # declares an identifier, and `env::var("AUTUMN_X")` two lines
+                # down makes a key claim about the very name this gate exists
+                # to check. Asking only whether the line is Rust exempted them
+                # together, so Rust's own classification decides.
+                #
+                # A STRING LITERAL, and only that. A literal is a VALUE: the
+                # name inside it is the key the code claims the runtime reads,
+                # which is the claim under test. A COMMENT is not — inside a
+                # Rust fence it is prose about the code beside it, naming the
+                # identifier that code names. Extending this to comments as
+                # well reported `docs/guide/wasm-islands.md:186`, where a
+                # comment says `World::new(AUTUMN_SOURCE, count)` about the
+                # const declared six lines above it: a correct page, reported.
+                # Waiving that page would have been normalising the evidence
+                # to fit the rule.
+                if (var in consts and langs[i - 1] in RUST_FENCES
+                        and 's' not in rust_cls.get(i - 1, '')[var_m.start():
+                                                               var_m.end()]):
                     stats['example-code identifier'] += 1
                     continue
                 if family(var, line):
@@ -6222,6 +6405,22 @@ def self_test():
           EXPANDED.findall(_shell_literals(
               "Write-Output '${AUTUMN_LOG__LEVL}'"))),
          (True, False, []))
+    # …and the file that gets the pass is decided by SHAPE, not by whether it
+    # happens to carry a suffix. `Dockerfile` matched neither shell tuple nor
+    # the YAML branch, so a Dockerfile took no quoting pass at all and
+    # `RUN printf '%s' '$AUTUMN_X'` reported an expansion sh never performs.
+    # Every name in `SHELL_SHAPED_NAMED` hands its command lines to a Bourne
+    # shell, so every one of them takes the same passes.
+    case('a named shell-shaped file has no suffix to be recognised by',
+         [(effective_suffix(p) in SHELL_QUOTED,
+           pathlib.PurePath(p).name.split('.')[0] in SHELL_SHAPED_NAMED)
+          for p in ('deploy/Dockerfile', 'Dockerfile.api.tmpl',
+                    'Justfile', 'scripts/x.sh')],
+         [(False, True), (False, True), (False, True), (True, False)])
+    case('a single-quoted Docker expansion names no variable',
+         EXPANDED.findall(_shell_literals(
+             "RUN printf '%s' '$AUTUMN_LOG__LEVL'")),
+         [])
     # A value is ONE shell word, and a shell word can hold spaces without being
     # two. A command substitution is the case a regex cannot reach.
     case('a substituted value is not a following command',
@@ -6477,6 +6676,34 @@ def self_test():
     s6, d6 = scan(['d.md'], lambda _: doc6, leaves, built, tokens)
     case('a page const does not excuse prose outside the fence',
          (s6['example-code identifier'], len(d6)), (1, 1))
+    # …and a fence says which LANGUAGE an occurrence is in, not which SHAPE.
+    # One snippet holds both: the `pub const` is an identifier, and the
+    # `env::var("…")` beneath it is a key claim about the name this gate
+    # exists to check. Exempting the whole fenced line excused them together.
+    doc7 = ('```rust\npub const AUTUMN_SOURCE: &str = "x";\n'
+            'let v = std::env::var("AUTUMN_SOURCE");\n```\n')
+    s7, d7 = scan(['d.md'], lambda _: doc7, leaves, built, tokens)
+    case('a fenced string literal is not an identifier occurrence',
+         (s7['example-code identifier'], len(d7)), (1, 1))
+    # …but a COMMENT inside the fence still is one. It is prose about the code
+    # beside it, naming the identifier that code names — and `wasm-islands.md`
+    # writes exactly that, so validating comments reported a correct page.
+    doc8 = ('```rust\npub const AUTUMN_SOURCE: &str = "x";\n'
+            '// World::new(AUTUMN_SOURCE, count)\n```\n')
+    s8, d8 = scan(['d.md'], lambda _: doc8, leaves, built, tokens)
+    case('a fenced comment names the identifier beside it',
+         (s8['example-code identifier'], len(d8)), (2, 0))
+    # The classification is cut back into lines by LENGTH. Splitting it on a
+    # newline finds none — every character of it is `c`, `m` or `s` — which
+    # silently gave every line after the first an empty class and cost the
+    # exemption its second occurrence.
+    case('fence classes line up with their own lines',
+         (lambda cls: [len(cls[1]), len(cls[2]), cls[2][11:24]])(
+             _rust_fence_classes(
+                 ['```rust', 'pub const AUTUMN_SOURCE: &str = "x";',
+                  'let v = q("AUTUMN_SOURCE");', '```'],
+                 [None, 'rust', 'rust', None])),
+         [36, 27, 'sssssssssssss'])
     case('a fence language is read from its info string',
          fence_langs(['```rust', 'x', '```', 'y', '~~~bash', 'z', '~~~']),
          [None, 'rust', None, None, None, 'bash', None])
@@ -6552,6 +6779,16 @@ def self_test():
          'AUTUMN_TEST_SESSION_COOKIE' in swept, False)
     case('a fixture environment name is not swept in',
          'AUTUMN_SERVER__TLS__ENABLED' in swept, False)
+    # …but the negation has to be about THIS call. Asked of the whole physical
+    # line it was asked about the line's layout instead, and a read written in
+    # the block an unrelated negated condition guards was thrown away with it.
+    case('a negation reaches only the expression it heads',
+         [(lambda s: _negation_covers(s, s.index('env::var')))(t) for t in
+          ('assert!(!std::env::var("X").is_ok());',
+           'assert_ne!(std::env::var("X"), out.contains("y"));',
+           'if !items.contains(&x) { std::env::var("X"); }',
+           'let v = std::env::var("X"); if !items.contains(&y) { }')],
+         [True, True, False, False])
     # `.get` belongs to every collection, so it is an accessor only on an
     # environment map. A test asserting `map.get("AUTUMN_LOG__LEVL") == None`
     # names a variable precisely to prove nothing reads it.
@@ -7120,6 +7357,22 @@ def self_test():
                       'type Top = OsEnv;\n'
                       'fn one() { type Local = OsEnv; }\n'))],
          [('Top', []), ('Local', ['fn one()'])])
+    # …and a function is not the only thing that is not a module. An
+    # ASSOCIATED type sits in a scope holding an `impl` and no `fn`, so a rule
+    # written as "is any segment a fn" filed it modularly and published the
+    # name to the whole module. Only a path made entirely of modules is a
+    # module path; `mod`, and nothing else, keeps the alias module-level.
+    case('an associated type stays inside its impl',
+         [(n, [s[:20] for s in lex],
+           all(s.startswith('mod ') for s in lex))
+          for n, lex in (lambda text, lits: [
+              (m.group(1), _scope_at(_lexical_spans(text, lits), m.start()))
+              for m in TYPE_ALIAS.finditer(text)])(
+                  *masked_with_literals(
+                      'mod m { type Top = OsEnv;\n'
+                      'impl Trait for Foo { type Assoc = OsEnv; } }\n'))],
+         [('Top', ['mod m'], True),
+          ('Assoc', ['mod m', 'impl Trait for Foo'], False)])
     case('a type alias is read with its right-hand side',
          [TYPE_ALIAS.findall(t) for t in
           ('type AppEnv = OsEnv;',
@@ -7383,11 +7636,25 @@ def self_test():
     # test looking for one finds nothing and trusts the call — the fix that
     # made the shadow a region left the imported half with no region at all.
     case('an imported shadow suppresses without a local declaration',
-         (lambda a: [a.shadows('env'), a.imports_shadow('env'),
-                     a.shadows('option_env'), a.imports_shadow('option_env')])(
+         (lambda a: [a.shadows('env'), a.imports_shadow('env', ()),
+                     a.shadows('option_env'),
+                     a.imports_shadow('option_env', ())])(
              _Accessor(re.compile('x'), {}, frozenset({'env', 'option_env'}),
-                       frozenset({'env'}))),
+                       {(): frozenset({'env'})})),
          [True, True, True, False])
+    # …and that region is the `use`'s own binding scope. Suppressing the whole
+    # file read a CONVENTION — a macro import is normally written at file scope
+    # — as the grammar, so a `use` inside one function withheld the std macro
+    # from every sibling. Read by prefix, exactly like the module alias and the
+    # direct accessor imported alongside it.
+    case('an imported shadow reaches only the scope that imported it',
+         (lambda a: [a.imports_shadow('env', ()),
+                     a.imports_shadow('env', ('fn one()',)),
+                     a.imports_shadow('env', ('fn one()', '|x|')),
+                     a.imports_shadow('env', ('fn two()',))])(
+             _Accessor(re.compile('x'), {}, frozenset({'env'}),
+                       {('fn one()',): frozenset({'env'})})),
+         [False, True, True, False])
     case('a qualified macro call is not shadowable',
          [(lambda m: bool(m.group('path')))(MACRO_CALL.match(t)) for t in
           ('env!("X")', 'option_env!("X")', 'std::env!("X")',

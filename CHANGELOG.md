@@ -90,7 +90,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`AUTUMN_SECTION__FIELD`), reader-chosen names
   (`access_key_id_env = "AUTUMN_OFFSITE_ACCESS_KEY_ID"`) and identifiers a page
   declares in its own example code (`pub const AUTUMN_SOURCE: &str = …` in
-  `docs/guide/wasm-islands.md`) are recognised as such rather than waived. A
+  `docs/guide/wasm-islands.md`) are recognised as such rather than waived —
+  the last of those only inside that page's Rust fences, and only where the
+  occurrence is not a string literal, so a snippet that both declares a const
+  and calls `env::var("…")` on the same spelling still has the call checked. A
   malformed name — lower case outside a placeholder, or a dangling separator —
   is reported rather than skipped, since a spelling that matches nothing is a
   claim the reader cannot be warned about.
