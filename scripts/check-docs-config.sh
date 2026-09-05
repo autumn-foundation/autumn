@@ -172,10 +172,24 @@
 # `check-docs-cli.sh` applies to fenced commands: a fence is copyable, so the
 # remedy is to make it parse — split mutually exclusive options into one fence
 # each, or quote an elided placeholder (`"<YOUR_URL>"`) so it is valid TOML.
-#   - **Fences with no `[section]` header AND no marker** (12). A bare
-#     `key = value` fragment has no root to resolve against, and inferring one
-#     from the surrounding prose would invent defects; a marked one IS read (see
-#     above). All 12 were resolved by hand: 8 carry no keys at all (empty or
+#   - **Fences with no `[section]` header, no marker, and no dotted key** (12).
+#     A bare `key = value` fragment has no root to resolve against, and inferring
+#     one from the surrounding prose would invent defects; a marked one IS read
+#     (see above), and so is one carrying a DOTTED key whose first segment is a
+#     known root — `server.prot = 9000` declares `[server]` without a header, and
+#     TOML treats the two spellings as the same document.
+#
+#     Only the dotted form, though, and that line is drawn on a measurement.
+#     `skills/autumn-web/references/api-reference.md` carries a headerless Cargo
+#     DEPENDENCY list in which `http` is both a crate everyone depends on and an
+#     Autumn schema root, so a "known root among top-level keys" rule admits that
+#     fence and then reports its other ~22 crate names as unknown config roots —
+#     22 correct lines on a correct page. Inline tables are the same hazard once
+#     removed: dependency lists are written `diesel = { version = "2", … }`, and
+#     nine schema roots (`cache`, `deploy`, `http`, `jobs`, `log`, `mail`, `role`,
+#     `session`, `storage`) are plausible crate names, so that fence's clean
+#     result today is luck rather than design. A dotted key carries no such
+#     collision: it is a table declaration, not a name. All 12 were resolved by hand: 8 carry no keys at all (empty or
 #     comment-only), one is a daemon state file (`pid`, `started_at`), one is a
 #     dependency version list, and one — `operator-alerts.md`'s `pagerduty_url`
 #     fragment — was a real `[alerts]` key that the fence simply did not name.
@@ -393,6 +407,11 @@ def corpus():
 TOML_FENCE = re.compile(r"^([ \t]*)```toml[ \t]*\n(.*?)^\1```", re.S | re.M)
 SECTION_HEADER = re.compile(r'^\s*\[\[?([A-Za-z0-9_.\-"]+)', re.M)
 
+# A top-level DOTTED assignment: `server.prot = 9000` declares `[server]` without
+# a header, and TOML treats the two spellings as the same document. Captures only
+# the first segment, which is the root being declared.
+DOTTED_ROOT = re.compile(r'^[ \t]*([A-Za-z0-9_-]+)[ \t]*\.[ \t]*[A-Za-z0-9_."\']+[ \t]*=', re.M)
+
 # Root tables that make a fence a Cargo manifest.
 CARGO_ROOTS = {
     "package",
@@ -520,6 +539,25 @@ def classify(body, lead_in, known_roots):
         return None
     if roots & CARGO_ROOTS:
         return "cargo-manifest"
+    # A DOTTED key declares its table without a header: `server.prot = 9000` is
+    # `[server] prot`, and TOML treats the two as identical. Admitting on that
+    # signal costs nothing and closes a hole a bare-key rule cannot.
+    #
+    # Only the dotted form, deliberately — NOT a bare key or an inline table
+    # whose name merely collides with a root. That distinction is measured, not
+    # cautious-by-default: `skills/autumn-web/references/api-reference.md` carries
+    # a headerless Cargo DEPENDENCY list, and `http` is both a crate everyone
+    # depends on and an Autumn schema root. A "known root among top-level keys"
+    # rule admits that fence and then reports its other ~22 crate names as unknown
+    # config roots — 22 correct lines on a correct page. Inline tables are the
+    # same hazard one step removed: dependency lists are written as
+    # `diesel = { version = "2", features = [...] }`, and nine schema roots
+    # (`cache`, `deploy`, `http`, `jobs`, `log`, `mail`, `role`, `session`,
+    # `storage`) are plausible crate names, so today's clean result there is luck
+    # rather than design. A dotted key has no such collision: it is a table
+    # declaration, not a name.
+    if any(seg in known_roots for seg in DOTTED_ROOT.findall(body)):
+        return None
     if not headers:
         return "no-section-header"
     # `profile` counts as a recognized root even though it is `#[serde(skip)]`
@@ -986,6 +1024,20 @@ def self_test():
     for label, body, expected in (
         ("marked headerless, valid root scalar", '# autumn.toml\nrole = "worker"\n', None),
         ("headerless without a marker", 'role = "worker"\n', "no-section-header"),
+        # A DOTTED key declares its table, so it identifies the fence.
+        ("dotted root is read", "server.port = 9000\n", None),
+        ("dotted root, indented", "  database.pool_size = 10\n", None),
+        ("dotted non-root is not read", "widget.colour = 1\n", "no-section-header"),
+        # ...but a bare key or an inline table whose NAME collides with a root is
+        # not enough: a headerless Cargo dependency list carries `http` and could
+        # carry `cache`/`mail`/`storage`, and admitting it would report every
+        # other crate name as an unknown config root.
+        ("bare colliding key is not read", 'http = "1.0"\n', "no-section-header"),
+        (
+            "inline table colliding with a root is not read",
+            'http = { version = "1.0" }\ndiesel = { version = "2" }\n',
+            "no-section-header",
+        ),
     ):
         got = classify(body, "", known_roots)
         if got == expected:
