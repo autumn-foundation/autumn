@@ -113,13 +113,24 @@ async fn db_client(mail_dir: &std::path::Path) -> TestClient {
             // prepared statement") — discovered when CI ran this for the
             // first time (against a real Postgres testcontainer) rather than
             // never at all. The migration file is one `;`-separated command
-            // per statement with no semicolons inside any string literal or
-            // comment, so splitting on `;` and executing each piece on its
-            // own reproduces exactly what `diesel migration run` applies,
-            // one statement at a time.
+            // per statement, so splitting on `;` and executing each piece on
+            // its own reproduces exactly what `diesel migration run`
+            // applies, one statement at a time — but two of its explanatory
+            // comments contain a mid-sentence `;` of their own ("a typed FK;
+            // application code…", "`pending`; accepting sets it…", both
+            // full-line `--` comments — Codex review finding: naively
+            // splitting the raw file breaks those apart into invalid
+            // fragments), so every full-line `--` comment is dropped first.
+            // The file has no block (`/* */`) comments and no semicolon
+            // inside any string literal, so this leaves pure SQL to split.
             const MIGRATION_SQL: &str =
                 include_str!("../migrations/00000000000000_create_teams/up.sql");
-            for statement in MIGRATION_SQL.split(';') {
+            let sql_without_comments = MIGRATION_SQL
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for statement in sql_without_comments.split(';') {
                 let statement = statement.trim();
                 if !statement.is_empty() {
                     db.execute_sql(statement).await;
