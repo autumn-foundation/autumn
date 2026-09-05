@@ -1517,6 +1517,47 @@ def _shell_named(value):
     return name[:-4] if name.endswith('.exe') else name
 
 
+FLOW_KEY_CHARS = "'\" "
+
+
+def _flow_pairs(text):
+    """`[(path, scalar)]` for every scalar inside a YAML FLOW mapping.
+
+    A section may be written block or flow, and this reader knew only the block
+    form — so `defaults: { run: { shell: pwsh } }`, which GitHub accepts at both
+    workflow and job level, declared a shell this pass never saw and every
+    `run:` under it was parsed as Bourne. That is the same property of YAML,
+    corrected for the fifth time in a different place: the `env:` mapping, the
+    quoted key, the workflow root, the consumer test, and now the shell.
+
+    Shallow on purpose — it answers "which scalars, under which keys" and
+    nothing else, which is all any caller here asks of a flow mapping.
+    """
+    out, stack, token, key = [], [], '', None
+    for c in text:
+        if c == '{':
+            if key is not None:
+                stack.append(key)
+            key, token = None, ''
+        elif c == '}':
+            if key is not None and token.strip():
+                out.append((tuple(stack) + (key,), token.strip(FLOW_KEY_CHARS)))
+            key, token = None, ''
+            if stack:
+                stack.pop()
+        elif c == ':':
+            key, token = token.strip(FLOW_KEY_CHARS), ''
+        elif c == ',':
+            if key is not None and token.strip():
+                out.append((tuple(stack) + (key,), token.strip(FLOW_KEY_CHARS)))
+            key, token = None, ''
+        else:
+            token += c
+    if key is not None and token.strip():
+        out.append((tuple(stack) + (key,), token.strip(FLOW_KEY_CHARS)))
+    return out
+
+
 def _yaml_shells(body):
     """`(PowerShell lines, lines in a shell this script cannot read)`.
 
@@ -1555,15 +1596,28 @@ def _yaml_shells(body):
         if path[:1] == ['jobs'] and len(path) == 2:
             job = path[1]
         value = YAML_VALUE.match(l)
-        if key == 'shell' and value:
-            shell = _shell_named(value.group(1))
-            if path[-2:] == ['defaults', 'run']:
-                if path[:1] == ['jobs']:
+
+        def declare(where, shell):
+            """File a shell under the path that declares it."""
+            nonlocal default
+            if where[-2:] == ['defaults', 'run']:
+                if where[:1] == ['jobs']:
                     jobs[job] = shell
                 else:
                     default = shell
-            elif 'steps' in path:
+            elif 'steps' in where:
                 steps[step] = shell
+
+        if key == 'shell' and value:
+            declare(path, _shell_named(value.group(1)))
+        elif value and value.group(1).lstrip().startswith('{'):
+            # …and the same declaration written FLOW, which this reader could
+            # not see at all: `defaults: { run: { shell: pwsh } }` reached it as
+            # one `defaults` key with an opaque value.
+            for sub, scalar in _flow_pairs(value.group(1)):
+                if sub[-1:] == ('shell',):
+                    declare(path + [key] + list(sub[:-1]),
+                            _shell_named(scalar))
         stack.append((column, key))
     # Pass two: the lines each `run:` block owns, under its effective shell.
     out, unknown = set(), set()
@@ -3405,6 +3459,13 @@ def _in_literal(literals):
     return lambda i: i < len(literals) and literals[i] == 's'
 
 
+# Every `let` binding of a name, environment or not. A name can be REBOUND:
+# `fn probe(source: OsEnv) { let source = Other; source.var(…) }` resolves the
+# call on `Other`, and prefix lookup — which knows a scope but not an offset —
+# cannot tell the two apart. `if let Some(x)` and `while let Ok(v)` are not
+# matched, because a pattern is not a plain binding name.
+LET_BIND = re.compile(r'\blet\s+(?:mut\s+)?([a-z_]\w*)\s*[:=]')
+
 MOD_BLOCK = re.compile(r'\bmod\s+([a-z_]\w*)\s*\{')
 
 
@@ -3916,6 +3977,7 @@ def accessor(root, test_files=frozenset()):
     helpers, declared, imports, modules = {}, {}, {}, {}
     env_type, impls, trait_at, scopes = {}, {}, set(), {}
     shadowed, returns, aliases, local_types = {}, {}, {}, {}
+    blessed_at = {}
     macro_at, macro_imports, factory_at = {}, {}, {}
     crates = _crates(root)
     for rel in out.split('\0'):
@@ -4020,6 +4082,7 @@ def accessor(root, test_files=frozenset()):
             seen.add(_scope_at(spans, m.start()))
             per_file.setdefault((rel, _scope_at(lex, m.start())),
                                 set()).add(m.group(1))
+            blessed_at.setdefault((rel, m.group(1)), set()).add(m.start())
         params = {g for m in ENV_GENERIC.finditer(masked) if not data[m.start()]
                   for g in m.groups() if g}
         if params:
@@ -4030,6 +4093,7 @@ def accessor(root, test_files=frozenset()):
                 seen.add(_scope_at(spans, m.start()))
                 per_file.setdefault((rel, _scope_at(lex, m.start())),
                                     set()).add(m.group(1))
+                blessed_at.setdefault((rel, m.group(1)), set()).add(m.start())
         seen.add(())
     # A QUALIFIED `impl a::b::Env for T` is resolved once every `trait Env`
     # declaration in the tree is known, which is why it waits for the walk to
@@ -4175,6 +4239,7 @@ def accessor(root, test_files=frozenset()):
                     continue
                 per_file.setdefault((rel, _scope_at(lex, m.start())),
                                     set()).add(m.group(1))
+                blessed_at.setdefault((rel, m.group(1)), set()).add(m.start())
         # The pattern is built from EVERY derived environment type, not only
         # the ones this module imports by a bare name — gating the whole rung
         # on a bare-name import is what made the qualified spelling invisible,
@@ -4216,6 +4281,7 @@ def accessor(root, test_files=frozenset()):
                     continue
                 per_file.setdefault((rel, _scope_at(lex, m.start())),
                                     set()).add(m.group(1))
+                blessed_at.setdefault((rel, m.group(1)), set()).add(m.start())
     # …and a receiver whose type is the one a derived HELPER calls an
     # environment. `env: &HashMap<String, String>` mentions no `Env` at all, so
     # `ENV_BOUND` cannot see it and the name prefix was doing the work: six real
@@ -4243,6 +4309,7 @@ def accessor(root, test_files=frozenset()):
                 continue
             per_file.setdefault((rel, _scope_at(lex, m.start())),
                                 set()).add(m.group(1))
+            blessed_at.setdefault((rel, m.group(1)), set()).add(m.start())
     # A RECEIVER NAME is file-local, and the pattern was global: `base` is
     # derived from `let base = OsEnv` in one module, and an unrelated module's
     # `base.var(…)` on something else then read as an environment call. A type
@@ -4275,6 +4342,40 @@ def accessor(root, test_files=frozenset()):
             orig = path.rsplit('::', 1)[-1].strip()
             if orig in index and resolves(rel, at, path, orig):
                 index.setdefault(local, index[orig])
+    # A binding SHADOWS. `fn probe(source: OsEnv) { let source = Other;
+    # source.var(…) }` rebinds the name, and Rust resolves the call on `Other`
+    # — but a receiver is filed by SCOPE, and a scope has no before and after,
+    # so prefix lookup accepted the parameter for a call on the inner value.
+    #
+    # Which of the two a call site means is a question about an OFFSET, and no
+    # offset crosses from here to the scan by design. So this fails closed
+    # instead: a name whose scope also holds a `let` binding this derivation did
+    # not recognise as an environment is ambiguous, and is dropped from that
+    # scope. A page documenting a key read only through such a name is reported
+    # rather than blessed, which is the direction this file prefers everywhere
+    # else. A name bound once, as an environment, is untouched — which is every
+    # `let env = …` in the tree today, measured: truth set unchanged.
+    for (rel, at), mine in per_file.items():
+        masked, data, _, lex = masked_all[rel]
+        for m in LET_BIND.finditer(masked):
+            name = m.group(1)
+            if (name not in mine or data[m.start()]
+                    or _scope_at(lex, m.start()) != at):
+                continue
+            stop = masked.find(';', m.end())
+            stop = len(masked) if stop < 0 else stop
+            # Every rung that blesses a receiver records the offset it matched
+            # at, so "is THIS binding an environment" is answered by asking
+            # whether any of them landed in this statement. Counting instead of
+            # locating is what I tried first, and it dropped nine real
+            # receivers: `let denv: Box<dyn Env>` comes from `ENV_BOUND` and
+            # `let env: HashMap<String, String>` from the helper's declared
+            # parameter type, neither of which is the `let x = OsEnv` rung I
+            # had instrumented. Five rungs ask this question; two were counted.
+            if not any(m.start() <= off < stop
+                       for off in blessed_at.get((rel, name), ())):
+                mine.discard(name)
+
     cache = {}
 
     def compiled(rel):
@@ -6712,6 +6813,38 @@ def self_test():
     # over from its definition onward, so a real `option_env!(…)` written
     # above one is still the std macro. A file-wide flag withheld the
     # alternative from the whole file, the lines before it included.
+    # A section may be written BLOCK or FLOW, and this reader knew one of them
+    # — so `defaults: { run: { shell: pwsh } }` declared a shell it never saw
+    # and every `run:` under it was parsed as Bourne, reading a PowerShell
+    # local as an environment read.
+    case('a flow mapping yields its nested scalars',
+         _flow_pairs('{ run: { shell: pwsh }, other: x }'),
+         [(('run', 'shell'), 'pwsh'), (('other',), 'x')])
+    case('flow defaults choose the shell, at either level',
+         [sorted(_yaml_shells(y)[0]) for y in
+          ('on: push\njobs:\n  a:\n    defaults: { run: { shell: pwsh } }\n'
+           '    steps:\n      - run: Write-Output "$AUTUMN_X"\n',
+           'on: push\ndefaults: { run: { shell: pwsh } }\njobs:\n  a:\n'
+           '    steps:\n      - run: Write-Output "$AUTUMN_X"\n',
+           'on: push\njobs:\n  a:\n    defaults:\n      run: { shell: pwsh }\n'
+           '    steps:\n      - run: Write-Output "$AUTUMN_X"\n')],
+         [[5], [5], [6]])
+    # …and the block form it already read, plus a workflow declaring none,
+    # are the controls: this must add a spelling, not change the answer.
+    case('the block spelling and no-defaults are unchanged',
+         [sorted(_yaml_shells(y)[0]) for y in
+          ('on: push\njobs:\n  a:\n    defaults:\n      run:\n'
+           '        shell: pwsh\n    steps:\n      - run: Write-Output "$X"\n',
+           'on: push\njobs:\n  a:\n    steps:\n      - run: echo "$X"\n')],
+         [[7], []])
+    # A `let` REBINDS: a receiver name is filed by scope, and a scope has no
+    # before and after, so an outer environment parameter blessed a call on an
+    # inner unrelated value. A pattern binding is not a plain name.
+    case('a plain let binding is distinguished from a pattern',
+         [LET_BIND.findall(t) for t in
+          ('let source = Other;', 'let mut env = x;', 'let denv: Box<dyn Env> =',
+           'if let Some(x) = y {', 'while let Ok(v) = r {')],
+         [['source'], ['env'], ['denv'], [], []])
     case('a macro call is recognised for the shadow test',
          [(lambda m: m.group('name') if m else None)(MACRO_CALL.match(t))
           for t in ('option_env!("X")', 'env!("X")', 'std::env!("X")',
