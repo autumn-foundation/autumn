@@ -4993,6 +4993,21 @@ def source_tokens(root):
     test_files = test_module_files(root)
     acc_for, key_index = accessor(root, test_files)
     tokens = set()
+    # A DECLARATION is not a read. A compose `environment:` entry, an Actions
+    # `env:` mapping, a dotenv line, a Dockerfile `ARG`/`ENV` and an exported
+    # shell assignment all SET a name; none of them is evidence that anything
+    # reads it, and treating them as evidence let a typo duplicated between a
+    # deployment file and a page defeat the gate — the one thing it exists to
+    # catch. They are collected apart and admitted only alongside a read.
+    #
+    # Measured before changing it: of 430 names, exactly ONE is carried by a
+    # declaration alone — `AUTUMN_CLI_VERSION`, which `Dockerfile.tmpl`
+    # declares with `ARG` and then reads with `cargo install --version
+    # "${AUTUMN_CLI_VERSION}"`. Its expansion is suppressed by the rule that a
+    # file assigning a name owns its own expansions of it, so `self_read`
+    # keeps that pairing: a file that both declares and expands a name is
+    # reading it, and a declaration nothing ever expands is not.
+    declares, self_read = set(), set()
     for rel in out.split('\0'):
         # Markdown is prose, and `README.md.tmpl` is prose too — the same
         # effective-suffix reading `comment_leader` already does, applied here
@@ -5209,19 +5224,19 @@ def source_tokens(root):
             if effective_suffix(rel) in HAS_HERE_STRING or n in powershell:
                 tokens.update(PS_ENV.findall(line))
             elif shell_shapes(rel):
-                tokens.update(ASSIGNED.findall(code_lines[n]))
-                tokens.update(ASSIGNED_PREFIX.findall(code_lines[n]))
+                declares.update(ASSIGNED.findall(code_lines[n]))
+                declares.update(ASSIGNED_PREFIX.findall(code_lines[n]))
                 if DECLARED.match(code_lines[n]) or declaring:
                     # BOTH: `ARG AUTUMN_X` has no `=` at all, and the legacy
                     # `ENV AUTUMN_X value` form has none either, so
                     # `DECLARED_CONT` alone dropped them. Adding the
                     # continuation reader must not replace the reader it
                     # extends.
-                    tokens.update(DECLARED.findall(code_lines[n]))
-                    tokens.update(DECLARED_CONT.findall(code_lines[n]))
+                    declares.update(DECLARED.findall(code_lines[n]))
+                    declares.update(DECLARED_CONT.findall(code_lines[n]))
                     declaring = code_lines[n].rstrip().endswith('\\')
                 elif effective_suffix(rel) in DOTENV:
-                    tokens.update(DECLARED_CONT.findall(code_lines[n]))
+                    declares.update(DECLARED_CONT.findall(code_lines[n]))
                 # Compose declares a variable in three spellings, and only one
                 # of them has an `=`: `- NAME=value`, `- NAME` (inherit from
                 # the host) and `NAME: value` as a mapping key. The assignment
@@ -5231,14 +5246,26 @@ def source_tokens(root):
                 # `environment:` section, so the shape is all that is left to
                 # read.
                 if n in declared_lines:
-                    tokens.update(COMPOSE_DECLARED.findall(code_lines[n]))
+                    declares.update(COMPOSE_DECLARED.findall(code_lines[n]))
                 if n not in literal:
-                    here = set(local)
+                    here, shadowing = set(local), set()
                     for start, end, names in scoped:
                         if start <= offsets[n] < end:
-                            here |= names
-                    tokens.update(v for v in EXPANDED.findall(line)
-                                  if v not in here)
+                            shadowing |= names
+                    here |= shadowing
+                    for v in EXPANDED.findall(line):
+                        if v not in here:
+                            tokens.add(v)
+                        elif v not in shadowing:
+                            # Suppressed because THIS file assigns the name —
+                            # but the expansion is still the file reading it,
+                            # which is what makes its own declaration mean
+                            # something. `ARG AUTUMN_CLI_VERSION=…` plus
+                            # `cargo install --version "${AUTUMN_CLI_VERSION}"`
+                            # in one Dockerfile is a build argument the file
+                            # reads; a compose `environment:` entry nothing
+                            # ever expands is not.
+                            self_read.add(v)
             # The generated-data mask applies to BINDINGS as well as
             # accessors: `r#"const FAKE_ENV: &str = "AUTUMN_X";"#` inside an
             # ordinary Rust string is sample text, not a binding. Same rule,
@@ -5333,6 +5360,9 @@ def source_tokens(root):
                 called = next((g for g in m.groups() if g), '')
                 tokens.update(QUOTED.findall(
                     key_argument(args, key_index.get(called, 0))))
+    # …and a declaration counts only where something reads the same name.
+    tokens |= declares & (tokens | self_read)
+
     return tokens
 
 
