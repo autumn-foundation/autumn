@@ -205,6 +205,35 @@ pub struct Scope {
 ///
 /// Synchronous for the same reason [`OutboundHttp`](super::OutboundHttp) is: the
 /// interpreter is, and it already runs on a blocking worker.
+/// One page of a `db-query`.
+///
+/// A bare `Vec` could not carry the one thing the guest needs and cannot infer:
+/// whether the host's byte ceiling stopped the answer short. A short page and a
+/// small table look identical from the guest, and a plugin paging through its
+/// own table would read the first as the second.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct QueryPage {
+    /// The rows, each carrying its [`ID_COLUMN`].
+    pub rows: Vec<PluginRow>,
+    /// Whether a matching row was left out because `max_bytes` was reached.
+    ///
+    /// Not set for rows left out by `limit`: the guest chose that number and
+    /// gets a full page back, so it already knows to ask again.
+    pub truncated: bool,
+}
+
+impl QueryPage {
+    /// A page that carries every row that matched.
+    #[must_use]
+    pub const fn complete(rows: Vec<PluginRow>) -> Self {
+        Self {
+            rows,
+            truncated: false,
+        }
+    }
+}
+
 pub trait PluginStore: Send + Sync + 'static {
     /// Insert `row`, returning the id assigned to it.
     ///
@@ -261,7 +290,8 @@ pub trait PluginStore: Send + Sync + 'static {
     /// quota, and row size from what the plugin previously stored — so an
     /// implementation that materialises first has already spent the memory the
     /// ceiling exists to deny. Returning fewer rows than `limit` is always
-    /// allowed; the caller re-checks and tells the guest its answer was cut.
+    /// allowed — say so in [`QueryPage::truncated`], which is what the guest
+    /// reads to tell "that is all of them" from "that is all that fits".
     ///
     /// # Errors
     ///
@@ -272,7 +302,7 @@ pub trait PluginStore: Send + Sync + 'static {
         filter: &PluginRow,
         limit: usize,
         max_bytes: usize,
-    ) -> Result<Vec<PluginRow>, StoreError>;
+    ) -> Result<QueryPage, StoreError>;
 
     /// Replace the row with this id.
     ///
@@ -364,12 +394,21 @@ pub(super) fn perform(
                     (*limit as usize).min(row_limit)
                 };
                 match store.query(&scope, &filter, want, super::MAX_RESULT_BYTES) {
-                    Ok(mut rows) => {
+                    Ok(page) => {
+                        let mut rows = page.rows;
                         rows.truncate(want);
-                        let (rows, truncated) = super::bounded_rows(rows);
+                        // The store's own report, OR'd with a re-check of what
+                        // it handed back: the trait is an embedder's to
+                        // implement, so "the host does not hold more than this"
+                        // cannot rest on someone else's loop honouring the
+                        // budget it was given.
+                        let (rows, cut) = super::bounded_rows(rows);
                         CallResult::Ok {
                             id,
-                            value: CallValue::Rows { rows, truncated },
+                            value: CallValue::Rows {
+                                rows,
+                                truncated: page.truncated || cut,
+                            },
                         }
                     }
                     Err(err) => CallResult::denied(id, DenialReason::BackendError, err.to_string()),
@@ -587,7 +626,7 @@ impl PluginStore for MemoryPluginStore {
         filter: &PluginRow,
         limit: usize,
         max_bytes: usize,
-    ) -> Result<Vec<PluginRow>, StoreError> {
+    ) -> Result<QueryPage, StoreError> {
         let rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
         // Ids first, values second. Sorting borrowed ids rather than cloned
         // rows is what lets the byte budget be honoured *before* a row is
@@ -609,16 +648,25 @@ impl PluginStore for MemoryPluginStore {
         matched.sort_by(|left, right| left.2.cmp(&right.2));
         let mut out = Vec::new();
         let mut total = 0_usize;
+        let mut truncated = false;
         for key in matched.into_iter().take(limit) {
             let Some(row) = rows.get(key) else { continue };
             let weight = super::row_weight(row);
             if !out.is_empty() && total.saturating_add(weight) > max_bytes {
+                // A row that matched and was left out. Reported rather than
+                // merely omitted: the caller cannot see the difference between
+                // this and a table with nothing more in it, and neither can the
+                // guest it answers.
+                truncated = true;
                 break;
             }
             total = total.saturating_add(weight);
             out.push(with_id(row.clone(), &key.2));
         }
-        Ok(out)
+        Ok(QueryPage {
+            rows: out,
+            truncated,
+        })
     }
 
     #[allow(

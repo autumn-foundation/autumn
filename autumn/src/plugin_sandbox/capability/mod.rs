@@ -92,7 +92,7 @@ pub use audit::{
 // Aliased for use *inside* this module only, so the `pub use` above can carry
 // the real names without shadowing itself.
 use audit::{CapabilityEvent as Event, CapabilityOutcome as Outcome};
-pub use db::{MemoryPluginStore, PluginStore, Scope, StoreError};
+pub use db::{MemoryPluginStore, PluginStore, QueryPage, Scope, StoreError};
 pub use jobs::MemoryJobSink;
 pub use jobs::{JobSink, PluginJob};
 pub use kv::{CacheKvStore, KvStore, MemoryKvStore};

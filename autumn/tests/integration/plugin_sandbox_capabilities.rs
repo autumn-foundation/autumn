@@ -26,6 +26,7 @@
 //!   one call can never demonstrate a per-request ceiling, so the quota test
 //!   that drove it asserted three successes and no denial at all.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,10 +62,10 @@ const ROUTES: &[&str] = &[
 ];
 
 fn manifest_toml(capabilities: &[&str], grants: &str) -> String {
-    let routes: String = ROUTES
-        .iter()
-        .map(|path| format!("\n[[routes]]\nmethod = \"GET\"\npath = \"{path}\"\n"))
-        .collect();
+    let routes = ROUTES.iter().fold(String::new(), |mut out, path| {
+        let _ = write!(out, "\n[[routes]]\nmethod = \"GET\"\npath = \"{path}\"\n");
+        out
+    });
     let caps = capabilities
         .iter()
         .map(|name| format!("\"{name}\""))
@@ -277,21 +278,12 @@ fn growing_the_vocabulary_added_not_one_import_to_a_module() {
 /// three things at once: the call was refused, nothing reached a backend, and
 /// the refusal is visible to an operator.
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "a table of escape attempts, one literal per attempt; the length is the corpus's \
+              and splitting it would put attempts where a reader counting them would miss some"
+)]
 fn the_escape_corpus_is_contained_end_to_end() {
-    let full = full_manifest();
-    // Manifests that grant less, so "not granted at all" is covered beside
-    // "granted but out of scope".
-    let no_kv = manifest_toml(
-        &["http-request", "http-outbound", "db", "jobs"],
-        r#"
-[grants]
-hosts = ["api.example.com"]
-tables = ["orders"]
-job_types = ["reindex"]
-"#,
-    );
-    let request_only = manifest_toml(&["http-request"], "");
-
     struct Attempt {
         what: &'static str,
         manifest: String,
@@ -307,6 +299,21 @@ job_types = ["reindex"]
         /// demanding the host deny a call it is right to serve.
         expect_denial: bool,
     }
+
+    let full = full_manifest();
+    // Manifests that grant less, so "not granted at all" is covered beside
+    // "granted but out of scope".
+    let no_kv = manifest_toml(
+        &["http-request", "http-outbound", "db", "jobs"],
+        r#"
+[grants]
+hosts = ["api.example.com"]
+tables = ["orders"]
+job_types = ["reindex"]
+"#,
+    );
+    let request_only = manifest_toml(&["http-request"], "");
+
     let attempts = vec![
         // Cross-tenant KV, by spelling the separator a naive
         // `format!("{plugin}:{tenant}:{key}")` would have made meaningful.
@@ -322,7 +329,7 @@ job_types = ["reindex"]
         // Capabilities that were never granted at all.
         Attempt {
             what: "using kv without the kv capability",
-            manifest: no_kv.clone(),
+            manifest: no_kv,
             path: "/shop/kv-read",
             expect_denial: true,
         },
@@ -346,7 +353,7 @@ job_types = ["reindex"]
         },
         Attempt {
             what: "enqueueing a job with only http-request",
-            manifest: request_only.clone(),
+            manifest: request_only,
             path: "/shop/job-granted",
             expect_denial: true,
         },
@@ -372,7 +379,7 @@ job_types = ["reindex"]
         // Choosing its own tenant through a row column.
         Attempt {
             what: "writing the tenant_id column",
-            manifest: full.clone(),
+            manifest: full,
             path: "/shop/db-tenant-column",
             expect_denial: true,
         },
@@ -559,7 +566,7 @@ fn a_quota_bust_denies_the_call_without_touching_another_plugin_or_a_host_route(
         "name = \"other-plugin\"",
     );
     let other_host = load(&other_src, guests::CAPABILITY_CLIENT);
-    let (status, events) = verdict(&other_host, wired.services.clone(), "/shop/fetch-twice");
+    let (status, events) = verdict(&other_host, wired.services, "/shop/fetch-twice");
     assert_eq!(status, 200, "{events:?}");
 }
 
@@ -659,7 +666,7 @@ fn an_operator_can_answer_what_this_plugin_did() {
 
     // Two plugins in one log, each seeing only its own.
     let outcome = load(&full_manifest(), guests::CAPABILITY_CLIENT)
-        .run_with(&request("/shop/job-granted"), wired.services.clone());
+        .run_with(&request("/shop/job-granted"), wired.services);
     log.ingest("other-plugin", outcome.activity);
     assert_eq!(
         log.summary(PLUGIN_NAME, Duration::from_secs(3600))
@@ -749,7 +756,7 @@ fn two_plugins_sharing_a_store_cannot_be_named_onto_one_table() {
 
     let victim = load(&victim_src, guests::CAPABILITY_CLIENT);
     assert_eq!(
-        verdict(&victim, services.clone(), "/shop/db-insert").0,
+        verdict(&victim, services, "/shop/db-insert").0,
         200,
         "the victim writes its own row"
     );

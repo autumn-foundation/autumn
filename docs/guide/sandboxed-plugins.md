@@ -548,6 +548,9 @@ result whose size the guest chooses, so the byte budget travels into the store
 rather than being applied once the whole answer has been built. When it stops an
 answer short, `rows` comes back with `"truncated": true` — read it, or a plugin
 paging through its own table will read a short page as the end of the table. A
+`PluginStore` you implement yourself reports the same thing in `QueryPage`, and
+is expected to stop reading at `max_bytes` rather than gather and let the host
+discard. A
 single row is bounded at 256 KiB across its columns when it is *written*, so a
 row that was stored can always be read back.
 
