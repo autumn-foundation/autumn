@@ -80,7 +80,12 @@
 #![allow(
     clippy::cast_possible_wrap,
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss
+    clippy::cast_precision_loss,
+    // `AllStatusHandler` mirrors `InMemoryOutboundWebhookHandler`'s own
+    // `get_subscriptions`/`get_subscription` shape (`webhook_outbound.rs`),
+    // which allows this same nursery lint at the module level for the same
+    // read-guard-then-build-list pattern.
+    clippy::significant_drop_tightening
 )]
 
 use autumn_web::config::JobConfig;
