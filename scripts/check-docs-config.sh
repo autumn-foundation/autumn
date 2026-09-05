@@ -1042,15 +1042,24 @@ YAML_SCALARS = ('.yml', '.yaml')
 # guessed: `run` (GitHub Actions, GitLab), `command` and `entrypoint` (compose,
 # Kubernetes), `script` (GitLab). Measured before narrowing: every name a block
 # scalar carries in this tree — all 31 occurrences, 10 names — is under `run`.
-YAML_BLOCK = re.compile(r'^(\s*)(?:-\s+)?([A-Za-z0-9_.-]+):\s*[|>][-+0-9]*\s*$')
+# A KEY MAY BE QUOTED. `"shell": pwsh` is the same mapping key as `shell: pwsh`
+# — YAML's quotes, removed before any consumer sees the document — and every key
+# pattern here accepted only the bare spelling, so a quoted `shell:` selected no
+# grammar at all and its block fell back to Bourne. One fragment now, used by
+# all of them, because this is a property of YAML keys and not of any one rung.
+# ONE capture group on purpose: every caller reads its key by position, and a
+# three-way alternation would have renumbered them all silently.
+YAML_KEY_NAME = r'["\']?([A-Za-z0-9_.-]+)["\']?'
+YAML_BLOCK = re.compile(r'^(\s*)(?:-\s+)?' + YAML_KEY_NAME + r':\s*[|>][-+0-9]*\s*$')
 # An executed key does not need a block scalar: `- run: echo "${AUTUMN_X}"` is
 # one line and just as real. Blanking every non-block line discarded it.
-YAML_INLINE = re.compile(r'^\s*(?:-\s+)?([A-Za-z0-9_.-]+):[^\S\n]+(?![|>]\s*$)\S')
+YAML_INLINE = re.compile(r'^\s*(?:-\s+)?' + YAML_KEY_NAME
+                         + r':[^\S\n]+(?![|>]\s*$)\S')
 YAML_EXECUTED = ('run', 'command', 'entrypoint', 'script')
 # Every key line, value or not, so the nesting can be tracked. `steps:` opens a
 # mapping and carries no value, so neither pattern above sees it — and it is
 # exactly the ancestor that decides whether a `run` below it is a command.
-YAML_KEY = re.compile(r'^(\s*)(-\s+)?([A-Za-z0-9_.-]+):(?=\s|$)')
+YAML_KEY = re.compile(r'^(\s*)(-\s+)?' + YAML_KEY_NAME + r':(?=\s|$)')
 
 # …and the key NAME alone does not make a value executable. `run` was accepted
 # wherever it appeared in any non-compose YAML, so a `run:` field in a plain
@@ -1131,7 +1140,7 @@ COMPOSE_DECLARED = re.compile(
 # A flow collection opened on the same line as the section key: the key never
 # reaches the nesting stack, so `declares` was false for the only line the
 # declarations are on.
-YAML_FLOW_SECTION = re.compile(r'^\s*(?:-\s+)?([A-Za-z0-9_.-]+):\s*[\{\[]')
+YAML_FLOW_SECTION = re.compile(r'^\s*(?:-\s+)?' + YAML_KEY_NAME + r':\s*[\{\[]')
 
 # A workflow chooses the SHELL its `run:` blocks are written in, and the two
 # grammars share almost nothing: in PowerShell `$NAME` is an ordinary local and
@@ -1163,9 +1172,15 @@ YAML_FLOW_SECTION = re.compile(r'^\s*(?:-\s+)?([A-Za-z0-9_.-]+):\s*[\{\[]')
 # local as a read and misses the real one, both at once. This is the same
 # mistake as the file suffix deciding a `run:` block's grammar, one layer in:
 # the default is a statement about what nobody overrode.
-DOCKER_EXEC = re.compile(r'^\s*(?:RUN|CMD|ENTRYPOINT)\s*\[')
-DOCKER_RUN = re.compile(r'^\s*(?:RUN|CMD|ENTRYPOINT)\s+')
-DOCKER_SHELL = re.compile(r'^\s*SHELL\s*\[')
+# Docker's format reference says an instruction keyword "is not
+# case-sensitive"; upper case is only a convention, and reading the convention
+# as the grammar meant a lowercase `cmd ["echo", "$AUTUMN_X"]` missed the exec
+# form entirely and read its literal dollar as an expansion. The same guess as
+# every other spelling-for-identity in this file, in a format that says so in
+# one sentence.
+DOCKER_EXEC = re.compile(r'^\s*(?:RUN|CMD|ENTRYPOINT)\s*\[', re.I)
+DOCKER_RUN = re.compile(r'^\s*(?:RUN|CMD|ENTRYPOINT)\s+', re.I)
+DOCKER_SHELL = re.compile(r'^\s*SHELL\s*\[', re.I)
 # `FROM` starts a NEW BUILD STAGE with a new base image, and `SHELL` does not
 # cross into it — the effective shell goes back to the image's default. A
 # `SHELL ["pwsh", …]` in an earlier stage was still selecting PowerShell for a
@@ -1284,7 +1299,7 @@ BOURNE_SHELLS = tuple(s for s in DOCKER_SHELLS if s not in POWERSHELL)
 # `shell: pwsh -NoProfile -Command ". '{0}'"` — and a single-token pattern
 # rejected it, so the block silently fell back to Bourne. What names the
 # grammar is the EXECUTABLE, so the value is read and its first word taken.
-YAML_VALUE = re.compile(r'^\s*(?:-\s+)?[A-Za-z0-9_.-]+:\s*(\S.*?)\s*$')
+YAML_VALUE = re.compile(r'^\s*(?:-\s+)?[\'"]?[A-Za-z0-9_.-]+[\'"]?:\s*(\S.*?)\s*$')
 
 
 def _command_option(word):
@@ -2940,7 +2955,13 @@ ASSIGNED_ANY = re.compile(r'(?:^|[;&|(\s])(?:export\s+)?(AUTUMN_[A-Z0-9_]+)=')
 # line saw only the first. `DECLARED_CONT` reads the rest, and the caller
 # supplies the continuation state, because whether a line is a continuation is
 # a property of the line ABOVE it.
-DECLARED = re.compile(r'^\s*(?:ARG|ENV)\s+(AUTUMN_[A-Z0-9_]+)')
+# …and `ARG` / `ENV` are instructions too, so they take the same rule — but the
+# flag is SCOPED to the keyword. `re.I` on the whole pattern made the variable
+# case-insensitive as well, so `arg autumn_z=` declared `autumn_z`, and a casing
+# typo the gate exists to report would have become a declaration that resolves
+# it. Caught by the self-test written for the fix, one line after a comment
+# claiming exactly this had been avoided.
+DECLARED = re.compile(r'^\s*(?i:ARG|ENV)\s+(AUTUMN_[A-Z0-9_]+)')
 DECLARED_CONT = re.compile(r'(?:^|\s)(AUTUMN_[A-Z0-9_]+)=')
 
 # A dotenv file's ENTIRE grammar is `NAME=value`: there is no command for a
@@ -3618,6 +3639,10 @@ def accessor(root, test_files=frozenset()):
     # An aliased helper keeps the ORIGINAL's key position: `use … as f` renames
     # the call, not the signature — and only when the path really reaches the
     # helper this tree derived.
+    def imports_of(rel):
+        return [(local, path, at) for (r, at), items in imports.items()
+                if r == rel for local, path in items]
+
     for (rel, at), items in imports.items():
         for local, path in items:
             orig = path.rsplit('::', 1)[-1].strip()
@@ -3646,9 +3671,22 @@ def accessor(root, test_files=frozenset()):
             by_scope[at] = frozenset(mine)
             recv |= mine
         here, recv = frozenset(here), frozenset(recv)
-        key = (here, recv, bool(shadowed.get(rel)))
+        # `use std::env as process_env` renames the MODULE, and the base
+        # pattern spells `env::` literally — so `process_env::var(…)` was a
+        # real read the gate could not see. The import machinery already
+        # resolves types and helpers; the module was the one import it did not
+        # follow. Only an alias of the std module counts, so an unrelated
+        # `use foo::bar as process_env` adds nothing.
+        aliases = frozenset(
+            local for local, path, _ in imports_of(rel)
+            if local != 'env'
+            and re.fullmatch(r'(?:std|core)\s*::\s*env', path.strip()))
+        key = (here, recv, aliases, bool(shadowed.get(rel)))
         if key not in cache:
             pattern = ACCESSOR.pattern
+            if aliases:
+                pattern += (r'|\b(?:' + '|'.join(sorted(map(re.escape, aliases)))
+                            + r')::(var|var_os|set_var)\s*\(')
             if not shadowed.get(rel):
                 pattern += ENV_MACRO
             if here:
@@ -5958,6 +5996,22 @@ def self_test():
              'CMD ["sh", "-c", "echo $AUTUMN_C"]\n'
              'CMD ["/app/x", \\\n  "$AUTUMN_D"]\nENV AUTUMN_E=1\n')),
          [0, 3, 4])
+    # Docker's format reference says an instruction keyword "is not
+    # case-sensitive". Upper case is a convention, and reading the convention
+    # as the grammar missed the exec form entirely on a lowercase line — so a
+    # literal dollar handed to `echo` read as an expansion.
+    case('a Docker instruction is not case-sensitive',
+         (lambda r: (sorted(r[1]), sorted(r[2])))(_docker_commands(
+             'from a\n'
+             'cmd ["echo", "$AUTUMN_A"]\n'
+             'run echo $AUTUMN_B\n'
+             'shell ["pwsh", "-Command"]\n'
+             'run Write-Output "$env:AUTUMN_C"\n')),
+         ([1], [4]))
+    case('a lowercase ARG/ENV still declares',
+         (DECLARED.findall('arg AUTUMN_X='), DECLARED.findall('ENV AUTUMN_Y=1'),
+          DECLARED.findall('arg autumn_z=')),
+         (['AUTUMN_X'], ['AUTUMN_Y'], []))
     # `FROM` starts a new stage with a new base image, and `SHELL` does not
     # cross into it. State that outlives what set it read a later Bourne
     # stage as PowerShell.
@@ -6473,6 +6527,23 @@ def self_test():
     # `_yaml_shells` answers with two sets now — PowerShell lines, and lines
     # in a shell this script cannot read. These cases ask about the first.
     _yaml_shells0 = lambda b: _yaml_shells(b)[0]
+    # A YAML key MAY BE QUOTED — the quotes are YAML's own and gone before any
+    # consumer sees the document — and every key pattern took only the bare
+    # spelling, so a quoted `shell:` selected no grammar and fell back to
+    # Bourne. One fragment, all the key patterns, one capture group so no
+    # caller's positions moved.
+    case('a quoted YAML key is the same key',
+         [(lambda m: m.groups() if m else None)(pat.match(t)) for pat, t in
+          ((YAML_KEY, '  "shell": pwsh'), (YAML_KEY, '  shell: pwsh'),
+           (YAML_BLOCK, '  \'run\': |'), (YAML_INLINE, '  "run": echo hi'),
+           (YAML_FLOW_SECTION, '  "env": { A: 1 }'))],
+         [('  ', None, 'shell'), ('  ', None, 'shell'), ('  ', 'run'),
+          ('run',), ('env',)])
+    case('a quoted shell key still selects PowerShell',
+         sorted(_yaml_shells0('on: push\njobs:\n  a:\n    steps:\n'
+                              '      - "shell": pwsh\n'
+                              '        run: echo $AUTUMN_X\n')),
+         [5])
     # …and the PowerShell shortcut normalises, or it answers differently from
     # the rule it is a shortcut for.
     case('an uppercase PowerShell shell still selects PowerShell',
