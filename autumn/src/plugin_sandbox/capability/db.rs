@@ -483,6 +483,16 @@ pub(super) fn perform(
 type Denial = Box<dyn FnOnce(u64) -> CallResult>;
 
 fn validated_row(row: &PluginRow) -> Result<PluginRow, Denial> {
+    // The host's own column comes off *before* the guest's ceilings are applied
+    // to what is left. `db-get` hands back the row plus its `row_id`, and the
+    // documented read-modify-write is to change a field and send that map to
+    // `db-update` — so a row stored at exactly `MAX_ROW_COLUMNS`, or near
+    // `MAX_ROW_BYTES`, would be refused on the way back in for carrying a column
+    // the host added itself. Counting it would make the ceilings a function of
+    // where the row had been rather than of what the plugin wrote.
+    let mut row = row.clone();
+    row.remove(ID_COLUMN);
+    let row = &row;
     if let Err(detail) = check_row(row) {
         return Err(Box::new(move |id| {
             CallResult::denied(id, DenialReason::Malformed, detail)
@@ -503,10 +513,9 @@ fn validated_row(row: &PluginRow) -> Result<PluginRow, Denial> {
             }));
         }
     }
-    let mut row = row.clone();
-    // Stripped rather than refused; see `RESERVED_COLUMNS`.
-    row.remove(ID_COLUMN);
-    Ok(row)
+    // Already stripped above, before the ceilings ran; see `RESERVED_COLUMNS`
+    // for why it is stripped rather than refused.
+    Ok(row.clone())
 }
 
 /// The same checks for a `db-query` *filter*, where stripping is not an option.
@@ -701,9 +710,15 @@ impl PluginStore for MemoryPluginStore {
             .map(|(key, _)| key)
             .collect();
         matched.sort_by(|left, right| left.2.cmp(&right.2));
+        // A match beyond `limit` is a cut as much as a match beyond
+        // `max_bytes`, and the guest cannot tell it happened: with `limit: 0`
+        // the row cap is the *quota*, which the guest is never sent, so a full
+        // page and a finished table look identical to it. One extra look is what
+        // makes `truncated` mean "there is more" rather than "the bytes ran
+        // out".
+        let mut truncated = matched.len() > limit;
         let mut out = Vec::new();
         let mut total = 0_usize;
-        let mut truncated = false;
         for key in matched.into_iter().take(limit) {
             let Some(row) = rows.get(key) else { continue };
             let weight = super::row_weight(row);

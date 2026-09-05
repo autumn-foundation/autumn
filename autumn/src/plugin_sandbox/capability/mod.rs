@@ -1613,6 +1613,117 @@ path = "/shop/panel"
         }
     }
 
+    #[test]
+    fn a_row_at_the_column_ceiling_survives_a_read_modify_write() {
+        // The documented pattern: read a row, change a field, send it back. The
+        // row comes back carrying the `row_id` the host added, so a row stored
+        // at exactly `MAX_ROW_COLUMNS` arrived at `db-update` with one column
+        // too many — refused for a column the guest never wrote. The ceilings
+        // must be a function of what the plugin stored, not of where the row
+        // had been.
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        let full: PluginRow = (0..MAX_ROW_COLUMNS)
+            .map(|index| {
+                (
+                    format!("c{index}"),
+                    PluginValue::Int(i64::try_from(index).unwrap_or(0)),
+                )
+            })
+            .collect();
+        assert_eq!(full.len(), MAX_ROW_COLUMNS);
+
+        let inserted = fixture.runtime.dispatch(&CapabilityCall::DbInsert {
+            id: 1,
+            table: "orders".to_owned(),
+            row: full,
+        });
+        let CallResult::Ok {
+            value: CallValue::RowId { row_id },
+            ..
+        } = inserted
+        else {
+            panic!("a row at the ceiling should store: {inserted:?}")
+        };
+
+        let read = fixture.runtime.dispatch(&CapabilityCall::DbGet {
+            id: 2,
+            table: "orders".to_owned(),
+            row_id: row_id.clone(),
+        });
+        let CallResult::Ok {
+            value: CallValue::Rows { rows, .. },
+            ..
+        } = read
+        else {
+            panic!("the read should have succeeded: {read:?}")
+        };
+        let mut echoed = rows.first().cloned().unwrap_or_default();
+        assert_eq!(
+            echoed.len(),
+            MAX_ROW_COLUMNS + 1,
+            "the row comes back with the host's id, which is the whole problem"
+        );
+        echoed.insert("c0".to_owned(), PluginValue::Int(99));
+
+        let updated = fixture.runtime.dispatch(&CapabilityCall::DbUpdate {
+            id: 3,
+            table: "orders".to_owned(),
+            row_id,
+            row: echoed,
+        });
+        assert!(
+            updated.denial().is_none(),
+            "writing back what was read must not be refused: {updated:?}"
+        );
+    }
+
+    #[test]
+    fn a_page_cut_by_the_row_quota_says_so_too() {
+        // `truncated` is the guest's only signal that more rows exist. A page
+        // cut by `db_rows` looked complete, and with `limit: 0` the guest is
+        // never told the quota — so a full page and a finished table were
+        // indistinguishable, and the cursor documented for continuing was never
+        // reached.
+        let base = manifest(&everything());
+        let mut quotas = base.quotas;
+        quotas.db_rows = 2;
+        let manifest = SandboxManifest { quotas, ..base };
+        let store = db::MemoryPluginStore::new();
+        let mut runtime = CapabilityRuntime::new(
+            &manifest,
+            CapabilityServices {
+                db: Some(Arc::clone(&store) as Arc<dyn PluginStore>),
+                ..CapabilityServices::none()
+            }
+            .for_tenant("alpha"),
+        );
+        for sku in ["A-1", "A-2", "A-3", "A-4"] {
+            let inserted = runtime.dispatch(&CapabilityCall::DbInsert {
+                id: 1,
+                table: "orders".to_owned(),
+                row: row(&[("sku", sku)]),
+            });
+            assert!(inserted.denial().is_none(), "{inserted:?}");
+        }
+
+        let result = runtime.dispatch(&CapabilityCall::DbQuery {
+            id: 2,
+            table: "orders".to_owned(),
+            filter: PluginRow::new(),
+            limit: 0,
+            after: None,
+        });
+        let CallResult::Ok {
+            value: CallValue::Rows { rows, truncated },
+            ..
+        } = result
+        else {
+            panic!("the query should have succeeded: {result:?}")
+        };
+        assert_eq!(rows.len(), 2, "the quota caps the page");
+        assert!(truncated, "and the guest is told there is more");
+    }
+
     // ── Outbound containment ─────────────────────────────────────────
 
     #[test]
