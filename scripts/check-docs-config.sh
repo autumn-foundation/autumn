@@ -149,9 +149,13 @@
 # profile-merge order — and got `[logging]` wrong. Borrowing the sibling gate's
 # exclusion past its justification hid a live defect for four review rounds.
 #
-# MARKERS BEAT HEURISTICS — all of them. The rules below are guesses about what a
-# fence IS; a marker is the page SAYING so, and a guess must never overrule a
-# statement. Getting that order wrong opened three holes at once: a
+# POSITIVE EVIDENCE BEATS HEURISTICS — all of it. The Cargo-root and
+# Cargo-profile rules are guesses about what a fence IS; a marker naming
+# `autumn.toml`, or a section the config surface actually has, is evidence it IS
+# Autumn config, and a guess must never overrule evidence. `[server] port` next
+# to `[features] enabled` is an invalid Autumn section sitting in Autumn config,
+# not a Cargo manifest — judged the other way round the whole fence was skipped
+# and the invalid root never reported. Getting that order wrong opened three holes at once: a
 # `# autumn.toml` fence whose section happened to be `[package]` was written off
 # as a Cargo manifest, one with no section at all as a fragment, and a
 # `[profile.prod] debug = 1` under the marker as a Cargo profile — each invalid
@@ -648,6 +652,15 @@ def classify(body, lead_in, known_roots, schema=None):
         return f"other-file:{theirs[0]}"
     if ours:
         return None
+    # A POSITIVE Autumn root outranks the Cargo-root heuristic, for the same
+    # reason a marker does: `[package]` in a fence that also carries `[server]`
+    # is an invalid Autumn section sitting in Autumn config, not evidence the
+    # whole fence is a manifest. Judged the other way round, `[server] port` plus
+    # `[features] enabled` was written off as `cargo-manifest` and the invalid
+    # root never reported. Safe by construction as well as by measurement: no
+    # Cargo root is also an Autumn root, and no corpus fence mixes the two.
+    if roots & (known_roots | {"profile"}):
+        return None
     if roots & CARGO_ROOTS:
         return "cargo-manifest"
     # A DOTTED key declares its table without a header: `server.prot = 9000` is
@@ -671,6 +684,7 @@ def classify(body, lead_in, known_roots, schema=None):
         return None
     if not headers:
         return "no-section-header"
+    # (The positive-root test ran above, before the Cargo heuristic.)
     # `profile` counts as a recognized root even though it is `#[serde(skip)]`
     # and so absent from the schema: a fence that is ONLY overlays
     # (`[profile.prod.server]`, and nothing else) would otherwise go unread, and
@@ -874,26 +888,30 @@ def check_fence(body, schema, plugin_roots=frozenset(), marked=False):
         if key == "profile" and isinstance(value, dict):
             # `[profile.prod.server] port = …` resolves as `server.port`.
             for name, overlay in value.items():
-                # `[[profile.x]]` reaches here as a list, which the framework
-                # also walks item by item.
-                entries = overlay if isinstance(overlay, list) else [overlay]
-                for entry in entries:
-                    if not isinstance(entry, dict):
-                        # `[profile] prod = "x"` — a profile name whose value is
-                        # not a table. It parses, and a non-strict app ignores it
-                        # silently, so it is the gate's to report;
-                        # `validate_toml_table` reports `profile.prod` too.
-                        findings.append(f"profile.{name}")
-                        continue
-                    # The Cargo-profile exemption is a HEURISTIC about which file
-                    # a `[profile.x]` belongs to, so it may only override an
-                    # unmarked fence. Under an explicit `# autumn.toml` marker the
-                    # page has already said which file this is, and `debug = 1`
-                    # there is an unknown Autumn root after profile resolution,
-                    # not a Cargo knob.
-                    if not marked and is_cargo_profile(name, entry):
-                        continue
-                    walk(entry, "", schema, findings, plugin_roots)
+                if not isinstance(overlay, dict):
+                    # A profile name whose value is not a TABLE: `[profile] prod
+                    # = "x"`, and equally `[[profile.prod]]`, which `tomllib`
+                    # gives as a list. Both parse, both are ineffective, and a
+                    # non-strict app ignores them as silently as an unknown key.
+                    #
+                    # The runtime is unambiguous here — at `path == ["profile"]`
+                    # it descends ONLY `Value::Table` and pushes everything else
+                    # as an error `profile.<name>` (`config.rs`). An earlier
+                    # version of this loop walked the list's items as if they were
+                    # overlays, on a mistaken read of the branch one level up
+                    # (which handles `profile` ITSELF being an array). So
+                    # `[[profile.prod]] server = { port = 9000 }` was validated as
+                    # a real overlay and passed, while profile merging ignores it.
+                    findings.append(f"profile.{name}")
+                    continue
+                # The Cargo-profile exemption is a HEURISTIC about which file a
+                # `[profile.x]` belongs to, so it may only override an unmarked
+                # fence. Under an explicit `# autumn.toml` marker the page has
+                # already said which file this is, and `debug = 1` there is an
+                # unknown Autumn root after profile resolution, not a Cargo knob.
+                if not marked and is_cargo_profile(name, overlay):
+                    continue
+                walk(overlay, "", schema, findings, plugin_roots)
         else:
             walk({key: value}, "", schema, findings, plugin_roots)
     return findings
@@ -1290,6 +1308,14 @@ def self_test():
         ("marker beats cargo-root heuristic", '# autumn.toml\n[package]\nname = "x"\n', "", None),
         # ...but an unmarked one is still a Cargo manifest.
         ("unmarked cargo root still skipped", '[package]\nname = "x"\n', "", "cargo-manifest"),
+        # ...but a Cargo root ALONGSIDE an Autumn root is an invalid section in
+        # Autumn config, not evidence the fence is a manifest.
+        (
+            "autumn root outranks cargo heuristic",
+            "[server]\nport = 3000\n\n[features]\nenabled = true\n",
+            "",
+            None,
+        ),
         # A lead-in naming BOTH files resolves to the other file — the safe way.
         (
             "other-file wins when both are named",
@@ -1327,6 +1353,13 @@ def self_test():
     for label, body, expected in (
         ("scalar profile entry", '[profile]\nprod = "x"\n', ["profile.prod"]),
         ("array-of-scalars profile entry", '[profile]\nprod = ["x"]\n', ["profile.prod"]),
+        # `[[profile.prod]]` is a LIST, which the runtime reports rather than
+        # walks: at path ["profile"] it descends only Value::Table.
+        (
+            "array-of-tables profile entry is malformed",
+            '[[profile.prod]]\nserver = { port = 9000 }\n',
+            ["profile.prod"],
+        ),
         ("table profile entry stays clean", "[profile.prod.server]\nport = 1\n", []),
     ):
         got = check_fence(body, schema)
