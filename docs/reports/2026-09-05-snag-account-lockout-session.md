@@ -39,7 +39,7 @@ service, same workaround the prior Snag session used).
 - Driven via `curl` with cookie jars; confirmation links pulled from the
   `log` mail transport's captured output
 
-## 🐛 Bug: concurrent threshold-crossing requests each stamp their own `locked_at` and each log `account_locked`, instead of once at the transition
+## 🐛 Bug: concurrent threshold-crossing requests each stamp their own `locked_at` and each log `account_locked` instead of once at the transition — plus a plausible, unverified stale-write bypass
 
 ### Charter
 
@@ -85,11 +85,25 @@ against 5 independent fresh accounts.
 
 Scaled shape — realistic burst size, default-shaped threshold: `threshold =
 3`, 10 concurrent wrong-password requests against one fresh account produced
-**5 duplicate `account_locked` lines** (`failed_attempts: 6, 7, 8, 9, 10` —
-i.e. every request from the 4th through the 10th, not just the 3rd, fired its
-own transition log). 1/1 run at this shape; not independently repeated, but
-the mechanism (below) is deterministic given the interleaving, and the 5/5
-minimal-shape reruns confirm it isn't a fluke.
+**8 duplicate `account_locked` lines** (`failed_attempts: 3, 4, 5, 6, 7, 8,
+9, 10`, filtered to this account's own `account_id_digest` — the two
+requests whose atomic increment landed at 1 or 2 correctly stayed silent,
+and every one of the other eight logged its own transition). 1/1 run at
+this shape; not independently repeated, but the mechanism (below) is
+deterministic given the interleaving, and the 5/5 minimal-shape reruns
+confirm it isn't a fluke.
+
+**Correction**: this figure originally read "5 duplicate lines
+(`failed_attempts: 6, 7, 8, 9, 10`)" — an artifact of having grepped the
+server log with `tail -5` while writing the session up and never going back
+to look at the full output. A reviewer (`chatgpt-codex-connector`) flagged
+that "6 through 10" (five values) didn't match the accompanying "4th through
+10th" claim (seven requests) and asked which was right; re-deriving the
+count from the complete log, filtered to this test's specific
+`account_id_digest` (a second, unrelated account's single-lock event from
+earlier in the same server session shared the log file and was polluting an
+unfiltered count), showed the true number is worse than either figure: all
+eight requests at or past the threshold logged, not five.
 
 The account's `failed_attempts` counter itself is **not** corrupted by the
 race — Postgres's `SET failed_attempts = failed_attempts + 1 RETURNING
@@ -165,11 +179,38 @@ threshold first, so the account's real recorded lock time — and therefore
 its cool-off expiry — carries the same non-determinism, bounded by the width
 of the concurrent race window (tens of milliseconds in this session's
 tests, potentially more under heavier contention or slower storage). No
-auth bypass, no data loss, no duplicate database rows, and the account is
-still genuinely locked either way (confirmed separately below) — the defect
-is that *when* it unlocks, and how many transition events describe it, are
-both non-deterministic under concurrent load rather than tied to the actual
-first-crossing request.
+duplicate database rows, and in every race this session actually drove
+(races on the order of tens to ~100ms wide) the account was still genuinely
+locked afterward — the defect *observed* is that *when* it unlocks, and how
+many transition events describe it, are non-deterministic under concurrent
+load rather than tied to the actual first-crossing request.
+
+**Correction — walking back "no auth bypass" (raised by
+`chatgpt-codex-connector` review, mechanism confirmed by re-reading the
+code, not independently driven live)**: an unqualified "no auth bypass" is
+an overclaim this session didn't earn. The same per-request, unconditionally
+written `now` has a sharper failure mode than anchor drift: if any one
+racing request stalls (slow scheduling, a slow DB round trip, GC-style
+pause — anything longer than `cooloff_secs`) between capturing its `now`
+and executing its `locked_at` UPDATE, and that stale write lands *after* a
+more recent lock, it overwrites the real lock with an already-expired
+timestamp. The very next login then takes the expired-lock branch
+(`autumn-cli/src/generate/auth.rs:3964-3972`) and the guarded reset
+(`4079-4097`) clears the lock outright — reachable by an ordinary correct
+password, no special privilege needed. This session's own scaled-shape
+config (`cooloff_secs = 6`, later widened to `60` for the other tests)
+demonstrates the window is realistic: this session's own bcrypt calls alone
+ran 750ms-1s per attempt, and real production request-latency tail
+(slow client, contended pool, GC-class pause) can plausibly exceed a
+single-digit-second cool-off. **Not reproduced live this session** — doing
+so needs a way to hold one request's timeline open between its `now` read
+and its `UPDATE` (e.g. an instrumented build, or pool/connection starvation
+tuned precisely enough to stall one request past `cooloff_secs` while
+others complete) that this black-box HTTP-only session didn't build. Severity
+is corrected upward accordingly: moderate-to-high rather than "moderate,
+non-security-critical" — the log duplication is cosmetic, but this specific
+stale-write path is a plausible, unverified lockout-bypass mechanism, not
+just a telemetry one. See follow-up charters for driving it for real.
 
 ### Dedup search
 
@@ -225,18 +266,35 @@ when it needs a design decision" rule, not a fix PR.
   threshold and stamped `locked_at`; the DB row and the `account_locked` log
   line both agreed. 1/1, plus implicit in every other test below that first
   drives an account into a lock.
-- **Non-enumerating identical response while locked** (oracle: same doc
-  section, point 3). Re-tested carefully after an initial false start (see
-  below): with `cooloff_secs` long enough that the lock was still active,
-  a **correct**-password `POST /login` and a **wrong**-password one against
-  the same locked account returned byte-identical bodies and status
-  (`422`), except for the dev-only debug error overlay's embedded stack
-  trace (different source line per branch taken) — that overlay is
-  explicitly gated on `is_dev` and has its own dedicated framework tests
-  ("must NOT show error details in prod", `error_page_filter.rs`), so its
-  presence in a dev-profile response is expected and doesn't undermine the
-  production claim. Stripping the dev overlay, the two response bodies
-  `diff`ed to nothing.
+- **Non-enumerating identical response while locked, within one locked
+  account** (oracle: same doc section, point 3). Re-tested carefully after
+  an initial false start (see below): with `cooloff_secs` long enough that
+  the lock was still active, a **correct**-password `POST /login` and a
+  **wrong**-password one against the same locked account returned
+  byte-identical bodies and status (`422`), except for two per-request
+  fields inside the dev-only debug error overlay (a freshly-minted `Request
+  ID` UUID and the session cookie id — neither account- or
+  password-dependent). That overlay is explicitly gated on `is_dev` and has
+  its own dedicated framework tests ("must NOT show error details in prod",
+  `error_page_filter.rs`), so its presence in a dev-profile response is
+  expected and doesn't undermine the production claim. Stripping the dev
+  overlay, the two response bodies `diff`ed to nothing.
+  - **Correction (caught by `chatgpt-codex-connector` review, verified
+    directly against the saved response files)**: this report originally
+    attributed the overlay diff to "different source line per branch
+    taken," implying the two requests took different code paths. Checked
+    directly: both responses' embedded stack traces highlight the *same*
+    source line (`auth.rs:1179`, the active-lock check) — they took the
+    identical branch, as the claim requires. The actual byte diff is the
+    two per-request fields named above, not a branch difference; corrected.
+  - **Scope note (also from that review)**: this test shows only that,
+    *given* a locked account, a correct and a wrong password are
+    indistinguishable — it does not compare that response against an
+    ordinary wrong-password response on a **not**-locked account or against
+    an unknown-email response, so it doesn't by itself establish the doc's
+    fuller claim that "the response does not reveal which accounts exist or
+    are locked" to an outside prober. Not driven this session; carried into
+    the follow-up charters below rather than assumed to also hold.
   - **False-start correction, left in for honesty**: the first attempt at
     this test used `cooloff_secs = 6` and enough wall-clock time elapsed
     between locking the account and issuing the "correct password" request
@@ -301,8 +359,12 @@ when it needs a design decision" rule, not a fix PR.
 
 - **Bugs filed: 1** — duplicate `account_locked` telemetry, and a
   non-deterministic `locked_at` write, under concurrent threshold-crossing
-  requests (moderate severity, repro 5/5 minimal + 1/1 scaled, oracle:
-  docs/guide/authentication.md §"Account lockout" point 2).
+  requests (moderate-to-high severity — the telemetry duplication is
+  confirmed live at 8/10 and 2/2 requests respectively across two repro
+  shapes; the same non-idempotent write also has a plausible, code-confirmed
+  but not live-driven, lockout-bypass mechanism via a stalled request's
+  stale timestamp, see Impact — oracle: docs/guide/authentication.md
+  §"Account lockout" point 2).
 - **Digest: 1** — stale rustdoc claim on `unlock_account`'s unknown-email
   behavior (cosmetic; the actual behavior is fine).
 - **Solid areas**: threshold lockout transition, non-enumerating
@@ -319,6 +381,22 @@ when it needs a design decision" rule, not a fix PR.
    (it is, per this session's read of the current `auth.rs` template) —
    both live in the same handful of lines and a single guarded-atomic-UPDATE
    redesign plausibly fixes both at once.
+1a. **Drive the stale-write lockout-bypass mechanism for real** (raised by
+   review on this PR, not yet live-tested): construct a way to stall one
+   `POST /login` request between its `now` read and its `locked_at` write —
+   e.g. an instrumented debug build with an injectable delay, or tuning
+   pool/connection contention to stall exactly one request past
+   `cooloff_secs` — and confirm whether a subsequent correct-password login
+   actually clears an active lock early. This is the highest-priority
+   follow-up: if it reproduces, it upgrades from "plausible mechanism" to a
+   confirmed lockout bypass.
+1b. **Locked-vs-not-locked / locked-vs-unknown-email response comparison**:
+   this session only compared correct-vs-wrong password *within* one locked
+   account. Compare that locked-account response against an ordinary
+   wrong-password response on an unlocked account and against an
+   unknown-email response, at both the body and timing level, to actually
+   validate the doc's broader "does not reveal which accounts exist or are
+   locked" claim rather than the narrower one this session confirmed.
 2. **`reauth`, `login_verify` (`--totp`), and `passkey_login_finish`
    (`--passkeys`)** — the audit report already flags `reauth` as duplicating
    the L15 counter-collapse block (confirmed by this session's static read:
