@@ -280,6 +280,8 @@ impl SandboxedPlugin {
             ..self.services.clone()
         };
         let host = Arc::clone(&self.host);
+        let ingest_log = Arc::clone(&self.activity);
+        let ingest_plugin = plugin.clone();
         let slot_owned = slot.to_owned();
         // Bounded before it is cloned onto the worker. The context is the
         // *host's* — a handler builds it — but "the host built it" is not the
@@ -294,6 +296,12 @@ impl SandboxedPlugin {
         let context = super::host::bounded_context(context);
         let outcome = tokio::task::spawn_blocking(move || {
             let outcome = host.render(&slot_owned, &context, services);
+            // Inside the closure for the same reason as `serve`: a reader who
+            // navigates away drops this future and its join handle while the
+            // blocking task runs on, and recording after the `.await` lost the
+            // whole record of what the hook did.
+            ingest_log.ingest(&ingest_plugin, outcome.activity.clone());
+            ingest_log.ingest_dropped(&ingest_plugin, outcome.dropped_events);
             drop(permit);
             outcome
         })
@@ -311,9 +319,7 @@ impl SandboxedPlugin {
                 return None;
             }
         };
-        self.activity.ingest(&plugin, outcome.activity);
-        self.activity
-            .ingest_dropped(&plugin, outcome.dropped_events);
+        // Already ingested inside the blocking task above.
         match outcome.fragment {
             Ok(fragment) => Some(fragment),
             Err(failure) => {
@@ -564,8 +570,20 @@ async fn serve(
     // The permit still moves INTO the closure — a detached `spawn_blocking`
     // task must not outlive it — but it comes back out so the response body can
     // keep holding it while hyper delivers the bytes.
+    //
+    // The activity is ingested in *here*, before the closure returns, and not
+    // after the `.await`. A client that disconnects drops this future and its
+    // join handle, and the blocking closure keeps running to completion — it
+    // has already been admitted and holds a permit. Recording afterwards meant
+    // the outcome of an abandoned request was dropped with the handle, so every
+    // capability call it made became invisible to the operator. The one request
+    // whose record is most worth having is the one nobody waited for.
+    let ingest_log = Arc::clone(&activity);
+    let ingest_plugin = plugin.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let outcome = host.run_with(&request, services);
+        ingest_log.ingest(&ingest_plugin, outcome.activity.clone());
+        ingest_log.ingest_dropped(&ingest_plugin, outcome.dropped_activity);
         (outcome, permit)
     })
     .await;
@@ -582,11 +600,10 @@ async fn serve(
         }
     };
 
-    // Before the response is built, so a request that fails on the way out
-    // still leaves the record of what it did — a plugin whose denials are the
-    // reason it failed is exactly the one an operator will ask about.
-    activity.ingest(&plugin, outcome.activity);
-    activity.ingest_dropped(&plugin, outcome.dropped_activity);
+    // Already ingested inside the blocking task above, so that a request whose
+    // client walked away still leaves the record of what it did — a plugin
+    // whose denials are the reason it failed is exactly the one an operator
+    // will ask about.
 
     match outcome.result {
         Ok(response) => {
