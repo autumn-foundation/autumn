@@ -574,10 +574,19 @@ fn check_row_id(row_id: &str) -> Result<(), Denial> {
 /// the host's memory the real ceiling.
 #[derive(Debug)]
 pub struct MemoryPluginStore {
-    rows: Mutex<HashMap<(String, String, String), PluginRow>>,
+    /// The rows and the bytes they hold, under one lock — see `MemoryJobSink`
+    /// for why the total lives beside the data it describes.
+    rows: Mutex<StoredRows>,
     next: Mutex<u64>,
     capacity: usize,
     byte_capacity: usize,
+}
+
+/// The stored rows and their running weight.
+#[derive(Debug, Default)]
+struct StoredRows {
+    map: HashMap<(String, String, String), PluginRow>,
+    bytes: usize,
 }
 
 /// Rows a [`MemoryPluginStore::new`] store will hold, across every table and
@@ -596,7 +605,7 @@ pub const DEFAULT_STORE_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 impl Default for MemoryPluginStore {
     fn default() -> Self {
         Self {
-            rows: Mutex::new(HashMap::new()),
+            rows: Mutex::new(StoredRows::default()),
             next: Mutex::new(0),
             capacity: DEFAULT_STORE_CAPACITY,
             byte_capacity: DEFAULT_STORE_BYTE_CAPACITY,
@@ -632,7 +641,7 @@ impl MemoryPluginStore {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Arc<Self> {
         Arc::new(Self {
-            rows: Mutex::new(HashMap::new()),
+            rows: Mutex::new(StoredRows::default()),
             next: Mutex::new(0),
             capacity,
             byte_capacity: DEFAULT_STORE_BYTE_CAPACITY,
@@ -643,7 +652,7 @@ impl MemoryPluginStore {
     #[must_use]
     pub fn with_capacities(capacity: usize, byte_capacity: usize) -> Arc<Self> {
         Arc::new(Self {
-            rows: Mutex::new(HashMap::new()),
+            rows: Mutex::new(StoredRows::default()),
             next: Mutex::new(0),
             capacity,
             byte_capacity,
@@ -658,6 +667,7 @@ impl MemoryPluginStore {
         self.rows
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .map
             .insert(
                 (table.to_owned(), tenant.to_owned(), row_id.to_owned()),
                 row,
@@ -674,7 +684,7 @@ impl MemoryPluginStore {
     )]
     pub fn keys(&self) -> Vec<(String, String, String)> {
         let rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut keys: Vec<_> = rows.keys().cloned().collect();
+        let mut keys: Vec<_> = rows.map.keys().cloned().collect();
         keys.sort();
         keys
     }
@@ -689,7 +699,7 @@ impl PluginStore for MemoryPluginStore {
     )]
     fn insert(&self, scope: &Scope, row: PluginRow) -> Result<String, StoreError> {
         let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
-        if rows.len() >= self.capacity {
+        if rows.map.len() >= self.capacity {
             return Err(StoreError::Backend(format!(
                 "this host's in-memory plugin store is full at {} rows",
                 self.capacity
@@ -697,16 +707,16 @@ impl PluginStore for MemoryPluginStore {
         }
         // And by size, which is the ceiling that actually bounds memory: a row
         // count times `MAX_ROW_BYTES` is gigabytes.
-        let held: usize = rows
-            .iter()
-            .map(|(stored_key, stored)| Self::entry_weight(stored_key, stored))
-            .fold(0, usize::saturating_add);
+        // Against the running total rather than a fresh scan: re-weighing every
+        // row on each insert made a full store the expensive case, and the scan
+        // ran while holding this lock.
         let incoming_key = (
             scope.table.clone(),
             scope.tenant.clone(),
             String::from("r0000000000"),
         );
-        if held.saturating_add(Self::entry_weight(&incoming_key, &row)) > self.byte_capacity {
+        let incoming = Self::entry_weight(&incoming_key, &row);
+        if rows.bytes.saturating_add(incoming) > self.byte_capacity {
             return Err(StoreError::Backend(format!(
                 "this host's in-memory plugin store is full at {} bytes",
                 self.byte_capacity
@@ -716,7 +726,8 @@ impl PluginStore for MemoryPluginStore {
         *next = next.saturating_add(1);
         let row_id = format!("r{next}");
         drop(next);
-        rows.insert(
+        rows.bytes = rows.bytes.saturating_add(incoming);
+        rows.map.insert(
             (scope.table.clone(), scope.tenant.clone(), row_id.clone()),
             row,
         );
@@ -728,6 +739,7 @@ impl PluginStore for MemoryPluginStore {
             .rows
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .map
             .get(&(scope.table.clone(), scope.tenant.clone(), row_id.to_owned()))
             .cloned()
             .map(|row| with_id(row, row_id)))
@@ -756,6 +768,7 @@ impl PluginStore for MemoryPluginStore {
         // Sorted so a query is a deterministic function of the store, which is
         // what lets a test assert on the rows rather than on their set.
         let mut matched: Vec<&(String, String, String)> = rows
+            .map
             .iter()
             .filter(|((table, tenant, _), _)| *table == scope.table && *tenant == scope.tenant)
             .filter(|(_, row)| {
@@ -777,7 +790,9 @@ impl PluginStore for MemoryPluginStore {
         let mut out = Vec::new();
         let mut total = 0_usize;
         for key in matched.into_iter().take(limit) {
-            let Some(row) = rows.get(key) else { continue };
+            let Some(row) = rows.map.get(key) else {
+                continue;
+            };
             let weight = super::row_weight(row);
             if !out.is_empty() && total.saturating_add(weight) > max_bytes {
                 // A row that matched and was left out. Reported rather than
@@ -805,7 +820,7 @@ impl PluginStore for MemoryPluginStore {
     fn update(&self, scope: &Scope, row_id: &str, row: PluginRow) -> Result<(), StoreError> {
         let key = (scope.table.clone(), scope.tenant.clone(), row_id.to_owned());
         let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(existing) = rows.get(&key) else {
+        let Some(existing) = rows.map.get(&key) else {
             return Err(StoreError::NotFound);
         };
         // The byte ceiling applies to a *replacement* as much as to an insert.
@@ -816,32 +831,33 @@ impl PluginStore for MemoryPluginStore {
         // rewriting a row in place is never refused for the size it already
         // was.
         let outgoing = Self::entry_weight(&key, existing);
-        let held: usize = rows
-            .iter()
-            .map(|(stored_key, stored)| Self::entry_weight(stored_key, stored))
-            .fold(0, usize::saturating_add);
-        if held
-            .saturating_sub(outgoing)
-            .saturating_add(Self::entry_weight(&key, &row))
-            > self.byte_capacity
-        {
+        let incoming = Self::entry_weight(&key, &row);
+        if rows.bytes.saturating_sub(outgoing).saturating_add(incoming) > self.byte_capacity {
             return Err(StoreError::Backend(format!(
                 "this host's in-memory plugin store is full at {} bytes",
                 self.byte_capacity
             )));
         }
-        rows.insert(key, row);
+        rows.bytes = rows.bytes.saturating_sub(outgoing).saturating_add(incoming);
+        rows.map.insert(key, row);
         Ok(())
     }
 
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the removal and the total it changes are one critical section; releasing \
+                  between them would let a reader see a row gone and its bytes still charged"
+    )]
     fn delete(&self, scope: &Scope, row_id: &str) -> Result<(), StoreError> {
         let key = (scope.table.clone(), scope.tenant.clone(), row_id.to_owned());
-        self.rows
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&key)
-            .map(|_| ())
-            .ok_or(StoreError::NotFound)
+        let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(removed) = rows.map.remove(&key) else {
+            return Err(StoreError::NotFound);
+        };
+        // The total follows the map, or a long-running store ratchets shut.
+        let freed = Self::entry_weight(&key, &removed);
+        rows.bytes = rows.bytes.saturating_sub(freed);
+        Ok(())
     }
 }
 

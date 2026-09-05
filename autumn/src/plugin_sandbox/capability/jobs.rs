@@ -103,7 +103,12 @@ pub(super) fn perform(
 /// that needs somewhere to read it back from rather than a live queue.
 #[derive(Debug)]
 pub struct MemoryJobSink {
-    queued: Mutex<Vec<PluginJob>>,
+    /// The queue and the bytes it holds, under one lock.
+    ///
+    /// Together, not beside each other: a total kept in a second mutex can be
+    /// read between the two writes that should have changed it, and a running
+    /// total that can be observed stale is worse than no total at all.
+    queued: Mutex<QueuedJobs>,
     /// How many jobs the queue will hold before refusing — the "queue depth"
     /// ceiling.
     depth: usize,
@@ -111,6 +116,13 @@ pub struct MemoryJobSink {
     /// actually bounds memory: depth times the largest legal payload is
     /// hundreds of megabytes, and nothing in this slice drains the queue.
     byte_capacity: usize,
+}
+
+/// A queue and its running weight.
+#[derive(Debug, Default)]
+struct QueuedJobs {
+    jobs: Vec<PluginJob>,
+    bytes: usize,
 }
 
 /// How many jobs the zero-configuration queue holds before refusing.
@@ -137,7 +149,7 @@ pub const DEFAULT_JOB_BYTE_CAPACITY: usize = 16 * 1024 * 1024;
 impl Default for MemoryJobSink {
     fn default() -> Self {
         Self {
-            queued: Mutex::new(Vec::new()),
+            queued: Mutex::new(QueuedJobs::default()),
             depth: DEFAULT_JOB_DEPTH,
             byte_capacity: DEFAULT_JOB_BYTE_CAPACITY,
         }
@@ -155,7 +167,7 @@ impl MemoryJobSink {
     #[must_use]
     pub fn bounded(depth: usize) -> Arc<Self> {
         Arc::new(Self {
-            queued: Mutex::new(Vec::new()),
+            queued: Mutex::new(QueuedJobs::default()),
             depth,
             byte_capacity: DEFAULT_JOB_BYTE_CAPACITY,
         })
@@ -177,7 +189,7 @@ impl MemoryJobSink {
     #[must_use]
     pub fn with_capacities(depth: usize, byte_capacity: usize) -> Arc<Self> {
         Arc::new(Self {
-            queued: Mutex::new(Vec::new()),
+            queued: Mutex::new(QueuedJobs::default()),
             depth,
             byte_capacity,
         })
@@ -189,7 +201,17 @@ impl MemoryJobSink {
         self.queued
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .jobs
             .clone()
+    }
+
+    /// Bytes the queue is currently holding, for assertions.
+    #[must_use]
+    pub fn queued_bytes(&self) -> usize {
+        self.queued
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .bytes
     }
 }
 
@@ -202,7 +224,7 @@ impl JobSink for MemoryJobSink {
     )]
     fn enqueue(&self, job: PluginJob) -> Result<String, String> {
         let mut queued = self.queued.lock().unwrap_or_else(PoisonError::into_inner);
-        if queued.len() >= self.depth {
+        if queued.jobs.len() >= self.depth {
             return Err(format!(
                 "the plugin job queue is at its depth ceiling of {}",
                 self.depth
@@ -213,17 +235,20 @@ impl JobSink for MemoryJobSink {
         // and a job retains a tenant id, a plugin name and a job type beside
         // its arguments — a tenant arrives in a header with no length bound of
         // its own, so an empty-payload job charged nothing while holding one.
-        let held: usize = queued
-            .iter()
-            .map(Self::job_weight)
-            .fold(0, usize::saturating_add);
-        if held.saturating_add(Self::job_weight(&job)) > self.byte_capacity {
+        // The running total, not a fresh scan. Re-weighing the whole queue on
+        // every enqueue made a *full* queue the expensive case: each refusal
+        // walked every payload while holding this lock, so a plugin that had
+        // filled the queue could spend the host's CPU indefinitely at no cost
+        // to its own quota. A refusal now costs the same as an acceptance.
+        let incoming = Self::job_weight(&job);
+        if queued.bytes.saturating_add(incoming) > self.byte_capacity {
             return Err(format!(
                 "the plugin job queue is at its {}-byte ceiling",
                 self.byte_capacity
             ));
         }
-        queued.push(job);
-        Ok(format!("j{}", queued.len()))
+        queued.bytes = queued.bytes.saturating_add(incoming);
+        queued.jobs.push(job);
+        Ok(format!("j{}", queued.jobs.len()))
     }
 }

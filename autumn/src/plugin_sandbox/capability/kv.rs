@@ -182,9 +182,18 @@ pub(super) fn perform(runtime: &CapabilityRuntime, call: &CapabilityCall, key: &
 /// or Redis's eviction.
 #[derive(Debug)]
 pub struct MemoryKvStore {
-    entries: Mutex<HashMap<String, PluginValue>>,
+    /// The entries and the bytes they hold, under one lock — see
+    /// `MemoryJobSink` for why the total lives beside the data it describes.
+    entries: Mutex<KvEntries>,
     capacity: usize,
     byte_capacity: usize,
+}
+
+/// The stored entries and their running weight.
+#[derive(Debug, Default)]
+struct KvEntries {
+    map: HashMap<String, PluginValue>,
+    bytes: usize,
 }
 
 /// Keys a [`MemoryKvStore::new`] store will hold.
@@ -205,7 +214,7 @@ pub const DEFAULT_KV_BYTE_CAPACITY: usize = 32 * 1024 * 1024;
 impl Default for MemoryKvStore {
     fn default() -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(KvEntries::default()),
             capacity: DEFAULT_KV_CAPACITY,
             byte_capacity: DEFAULT_KV_BYTE_CAPACITY,
         }
@@ -224,7 +233,7 @@ impl MemoryKvStore {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Arc<Self> {
         Arc::new(Self {
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(KvEntries::default()),
             capacity,
             byte_capacity: DEFAULT_KV_BYTE_CAPACITY,
         })
@@ -234,7 +243,7 @@ impl MemoryKvStore {
     #[must_use]
     pub fn with_capacities(capacity: usize, byte_capacity: usize) -> Arc<Self> {
         Arc::new(Self {
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(KvEntries::default()),
             capacity,
             byte_capacity,
         })
@@ -272,7 +281,7 @@ impl MemoryKvStore {
     )]
     pub fn keys(&self) -> Vec<String> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut keys: Vec<String> = entries.keys().cloned().collect();
+        let mut keys: Vec<String> = entries.map.keys().cloned().collect();
         keys.sort();
         keys
     }
@@ -283,6 +292,7 @@ impl KvStore for MemoryKvStore {
         self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .map
             .get(key)
             .cloned()
     }
@@ -298,7 +308,7 @@ impl KvStore for MemoryKvStore {
         // Overwriting an existing key adds no *entry*, so the key ceiling
         // applies to new keys only — a plugin that keeps one counter updated is
         // never refused however long it runs.
-        if entries.len() >= self.capacity && !entries.contains_key(key) {
+        if entries.map.len() >= self.capacity && !entries.map.contains_key(key) {
             return Err(format!(
                 "this host's plugin key/value store is full at {} keys",
                 self.capacity
@@ -307,29 +317,43 @@ impl KvStore for MemoryKvStore {
         // The byte ceiling is the one that actually bounds memory, and it has to
         // account for a *replacement* too: overwriting a small value with a huge
         // one adds no key and can still take the store past its size.
+        // Against the running total, not a fresh scan of the map. Re-weighing
+        // everything on each `set` made a *full* store the expensive case —
+        // and `weight` now walks each value's characters to find its encoded
+        // length, so a plugin that filled the store and then overwrote one key
+        // repeatedly could spend the host's CPU without spending its own quota.
         let incoming = Self::entry_weight(key, &value);
         let outgoing = entries
+            .map
             .get(key)
             .map_or(0, |existing| Self::entry_weight(key, existing));
-        let held: usize = entries
-            .iter()
-            .map(|(stored_key, stored)| Self::entry_weight(stored_key, stored))
-            .fold(0, usize::saturating_add);
-        if held.saturating_sub(outgoing).saturating_add(incoming) > self.byte_capacity {
+        if entries
+            .bytes
+            .saturating_sub(outgoing)
+            .saturating_add(incoming)
+            > self.byte_capacity
+        {
             return Err(format!(
                 "this host's plugin key/value store is full at {} bytes",
                 self.byte_capacity
             ));
         }
-        entries.insert(key.to_owned(), value);
+        entries.bytes = entries
+            .bytes
+            .saturating_sub(outgoing)
+            .saturating_add(incoming);
+        entries.map.insert(key.to_owned(), value);
         Ok(())
     }
 
     fn delete(&self, key: &str) {
-        self.entries
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(key);
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(removed) = entries.map.remove(key) {
+            // The total follows the map. A delete that freed bytes without
+            // saying so would ratchet the store shut over a long run.
+            let freed = Self::entry_weight(key, &removed);
+            entries.bytes = entries.bytes.saturating_sub(freed);
+        }
     }
 }
 
