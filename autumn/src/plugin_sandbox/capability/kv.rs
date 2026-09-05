@@ -322,3 +322,77 @@ impl KvStore for CacheKvStore {
         self.0.invalidate(key);
     }
 }
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// A `Cache` that keeps only *bytes*, the way a cross-replica backend does.
+    ///
+    /// The shape that made the bug invisible: an in-process backend answers
+    /// `get_value` with the value itself, so a downcast works and a test written
+    /// against Moka passes while Redis silently stores nothing. This one drops
+    /// the erased value and keeps only what was serialized — exactly what
+    /// `cache/layer.rs` does — so an adapter relying on the downcast fails here.
+    #[derive(Debug, Default)]
+    struct SerializingCache {
+        bytes: Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    }
+
+    impl crate::cache::Cache for SerializingCache {
+        fn get_value(&self, key: &str) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+            let bytes = self
+                .bytes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(key)
+                .cloned()?;
+            Some(Arc::new(crate::cache::RawCacheBytes(bytes)))
+        }
+
+        /// Dropped, not stored. This is the line that made `kv-set` a no-op.
+        fn insert_value(&self, _key: &str, _value: Arc<dyn std::any::Any + Send + Sync>) {}
+
+        fn insert_raw_bytes(&self, key: &str, bytes: Vec<u8>, _ttl: Option<Duration>) {
+            self.bytes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(key.to_owned(), bytes);
+        }
+
+        fn invalidate(&self, key: &str) {
+            self.bytes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(key);
+        }
+
+        fn clear(&self) {
+            self.bytes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
+        }
+    }
+
+    #[test]
+    fn the_cache_backed_store_round_trips_through_a_serializing_backend() {
+        let cache = Arc::new(SerializingCache::default());
+        let store = CacheKvStore(Arc::clone(&cache) as Arc<dyn crate::cache::Cache>);
+        let key = namespaced_key("shop", Some("alpha"), "cart");
+
+        assert!(store.get(&key).is_none(), "nothing stored yet");
+        let _ = store.set(&key, PluginValue::Text("A-1".to_owned()));
+        assert_eq!(
+            store.get(&key),
+            Some(PluginValue::Text("A-1".to_owned())),
+            "a value written through a serializing backend must read back"
+        );
+        store.delete(&key);
+        assert!(store.get(&key).is_none(), "and delete must remove it");
+    }
+}

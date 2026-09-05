@@ -1574,4 +1574,40 @@ sha256 = "{digest}"
         );
         assert!(report.passed(), "{}", report.to_text_report());
     }
+
+    #[test]
+    fn a_render_context_is_bounded_before_it_is_cloned_onto_a_worker() {
+        // The context is the host's, but "the host built it" is not "the host
+        // chose its size": it is routinely assembled from a row or a query
+        // string, and none of it is in the per-request footprint
+        // `max_concurrency` is validated against.
+        let many: Vec<(String, String)> = (0..MAX_RENDER_CONTEXT_ENTRIES * 4)
+            .map(|index| (format!("k{index}"), String::new()))
+            .collect();
+        assert_eq!(
+            bounded_context(&many).len(),
+            MAX_RENDER_CONTEXT_ENTRIES,
+            "empty pairs still cost allocation, so the count alone has to bound them"
+        );
+
+        let heavy: Vec<(String, String)> = (0..MAX_RENDER_CONTEXT_ENTRIES)
+            .map(|index| (format!("k{index}"), "x".repeat(MAX_RENDER_CONTEXT_BYTES)))
+            .collect();
+        let kept = bounded_context(&heavy);
+        let carried: usize = kept
+            .iter()
+            .map(|(name, value)| name.len().saturating_add(value.len()))
+            .sum();
+        assert!(
+            carried <= MAX_RENDER_CONTEXT_BYTES,
+            "the worker was handed {carried} bytes"
+        );
+
+        // What fits is passed through unchanged, which is every real caller.
+        let ordinary = vec![
+            ("id".to_owned(), "42".to_owned()),
+            ("locale".to_owned(), "en".to_owned()),
+        ];
+        assert_eq!(bounded_context(&ordinary), ordinary);
+    }
 }
