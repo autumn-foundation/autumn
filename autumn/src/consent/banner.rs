@@ -716,20 +716,18 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
             // particular route.
 
             // An already-empty HTML body is not a page to prompt in, and
-            // appending a bare banner to one produces a document that is
-            // nothing but a banner. The case that makes this reachable is a
-            // `HEAD` hit on a pre-rendered page: with a `dist` manifest the
-            // static-first middleware answers it directly with `Body::empty()`
-            // and `Content-Type: text/html`, and user layers — this one
-            // included — are reapplied *outside* that middleware, so no Axum
-            // per-route wrapper will fix up what we return. Splicing there
-            // would give a `HEAD` response a body and a `Content-Length` of the
-            // banner rather than of the equivalent `GET`.
+            // appending a bare banner to one produces a document that is nothing
+            // but a banner. The reachable case is a `HEAD` hit on a pre-rendered
+            // page: with a `dist` manifest the static-first middleware answers it
+            // directly with `Body::empty()` and `Content-Type: text/html`, and
+            // user layers — this one included — are reapplied outside that
+            // middleware, so no Axum per-route wrapper will fix up what we
+            // return. Splicing there would give a `HEAD` response a body, and a
+            // `Content-Length` of the banner rather than of the equivalent `GET`.
             //
-            // Deliberately keyed on the empty body rather than on the method:
-            // on a route Axum *does* wrap, a `HEAD` still carries the full body
-            // here and must be spliced, so that its `Content-Length` matches
-            // the `GET`.
+            // Keyed on the empty body rather than on the method: on a route Axum
+            // does wrap, a `HEAD` still carries the full body here and must be
+            // spliced, so its `Content-Length` matches the `GET`.
             if bytes.is_empty() {
                 parts
                     .headers
@@ -788,33 +786,29 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
                 .append(VARY, HeaderValue::from_static("Cookie"));
             Response::from_parts(parts, Body::from(updated))
         }
-        // Too large to safely buffer and splice into (MAX_SPLICE_BODY_BYTES).
-        // Serve the page unmodified — no banner this one time — rather than
-        // dropping it: a large report/streamed page without the banner is far
-        // better than an empty page. The bytes are unchanged, so any existing
-        // Content-Length stays correct and no Cache-Control change is needed
-        // (nothing per-visitor was embedded). This path is only reached for a
-        // visitor who still needs prompting, and the app's own handler can
-        // still gate markup on the same Consent cookie regardless of whether
-        // the banner itself got spliced in, so — exactly like the
-        // decided-but-not-injected case above — a shared cache must still
-        // vary on it rather than conflate this undecided visitor's oversized
-        // representation with a decided visitor's.
+        // Too large to buffer and splice into safely (`MAX_SPLICE_BODY_BYTES`). Serve
+        // the page unmodified — no banner this once — rather than dropping it: a large
+        // report or streamed page without the banner is far better than an empty page.
+        // The bytes are unchanged, so any existing `Content-Length` stays correct and no
+        // `Cache-Control` change is needed, since nothing per-visitor was embedded. This
+        // path is reached only for a visitor who still needs prompting, and the app's
+        // handler can still gate markup on the same Consent cookie whether or not the
+        // banner was spliced in — so, exactly like the decided-but-not-injected case
+        // above, a shared cache must still vary on it rather than conflate this
+        // undecided visitor's oversized representation with a decided visitor's.
         CollectedBody::Oversized(body) => {
             parts
                 .headers
                 .append(VARY, HeaderValue::from_static("Cookie"));
             Response::from_parts(parts, body)
         }
-        // The body stream errored before EOF. Rather than silently discarding
-        // everything and returning a well-formed, misleadingly-complete
-        // empty `200` — the page did not actually load successfully —
-        // replay whatever bytes were already read and then end the
-        // reconstructed stream with the same error, mirroring
-        // `crate::etag::apply_etag`'s identical handling of a body read
-        // failure: the connection aborts abnormally, an honest signal (to
-        // the client and any caching proxy) that the transfer failed rather
-        // than completed.
+        // The body stream errored before EOF. Rather than silently discarding everything
+        // and returning a well-formed, misleadingly complete empty `200` — the page did
+        // not load successfully — replay whatever bytes were already read and end the
+        // reconstructed stream with the same error, mirroring `crate::etag::apply_etag`'s
+        // handling of a body read failure. The connection aborts abnormally, an honest
+        // signal to the client and any caching proxy that the transfer failed rather than
+        // completed.
         CollectedBody::Errored { prefix, error } => {
             parts.headers.remove(CONTENT_LENGTH);
             let frames: Vec<Result<Bytes, axum::Error>> = if prefix.is_empty() {
@@ -847,18 +841,18 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
 /// `snippet` is always plain ASCII-safe markup, so splicing it in at an
 /// ASCII tag's byte offset can never straddle a multi-byte UTF-8 sequence.
 fn splice_before_body_close(body: &[u8], snippet: &str) -> Option<Vec<u8>> {
-    // The opening is checked FIRST, and it gates both branches.
+    // The opening is checked first, and it gates both branches.
     //
-    // Searching for `</body>` alone is not a document test: a fragment can
-    // contain those bytes without being one — inside a `<script>` string, or an
-    // HTML comment — and splicing at that offset would drop the banner inside
-    // the script or the comment, corrupting the fragment and rendering no
-    // usable controls. A real document both opens like one and (usually) closes
-    // its body; a fragment that merely mentions the tag does neither.
+    // Searching for `</body>` alone is not a document test: a fragment can contain those
+    // bytes without being one — inside a `<script>` string, or an HTML comment — and
+    // splicing at that offset would drop the banner inside the script or the comment,
+    // corrupting the fragment and rendering no usable controls. A real document both
+    // opens like one and usually closes its body; a fragment that merely mentions the tag
+    // does neither.
     //
-    // This is a shape test, not a parser. It is deliberately fail-safe: an
-    // input it cannot recognise is left alone rather than spliced blind, so the
-    // failure mode is a missing banner, never mangled markup.
+    // This is a shape test, not a parser, and deliberately fail-safe: an input it cannot
+    // recognise is left alone rather than spliced blind, so the failure mode is a missing
+    // banner, never mangled markup.
     if !starts_like_a_document(body) {
         return None;
     }
