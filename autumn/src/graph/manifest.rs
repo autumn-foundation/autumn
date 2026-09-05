@@ -1432,12 +1432,12 @@ mod tests {
             )],
             &[],
         );
-        let generated: Vec<&GraphNode> = graph
+        let generated = graph
             .nodes
             .iter()
             .filter(|n| n.route.as_ref().is_some_and(|r| r.generated_by.is_some()))
-            .collect();
-        assert_eq!(generated.len(), 2, "{:?}", graph.nodes);
+            .count();
+        assert_eq!(generated, 2, "{:?}", graph.nodes);
         assert!(
             graph.completeness.unmodelled_mounted_routes.is_empty(),
             "an attributed auto-API route is no longer unaccounted for: {:?}",
