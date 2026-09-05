@@ -80,8 +80,15 @@
 #      schema and stay green, so reading it here is equivalent to compiling the
 #      config, at zero toolchain cost.
 #
-#   2. `config_section("<root>")` calls across the workspace — the roots a plugin
-#      registers as known-and-opaque (`AppBuilder::config_section`, `app.rs`).
+#   2. `config_section("<root>")` calls across the workspace, with Rust comments
+#      stripped first — the roots a plugin registers as known-and-opaque
+#      (`AppBuilder::config_section`, `app.rs`). Scanning raw text let a call
+#      written in PROSE register a root: `config.rs` explains the seam in four
+#      comments naming `config_section("my.plugin")`, and that illustrative name
+#      became authoritative. Worse in the other direction — delete a real
+#      registration, leave its old call in a nearby comment, and the gate keeps
+#      exempting a root nothing registers any more, inheriting the drift it is
+#      meant to catch.
 #      `autumn-search` registers `search` and the media plugin registers `media`,
 #      so `[search] enabled = false` is a correct line in a correct page even
 #      though `search` is not an `AutumnConfig` root. Their children are not
@@ -106,6 +113,22 @@
 # fence is read only on POSITIVE identification — it names `autumn.toml` (or a
 # profile overlay / the `.example` template), or it carries a section the config
 # surface recognizes.
+#
+# NEAR MISSES ARE STILL IDENTIFIED. Identification-by-section-name and the thing
+# being validated are the same names, so a fence whose ONLY header is misspelled
+# would stop looking like `autumn.toml` and be skipped — the gate going quiet
+# exactly when the defect it exists for is present. (Typo `[telemetry]` to
+# `[telemettry]` in `cloud-native.md` and the run went 168 checked -> 167,
+# exit 0.) A root within edit distance 1 of a real one — insertion, deletion,
+# substitution, or adjacent transposition — therefore identifies the fence, and
+# the walk reports the misspelling as the unknown root it is.
+#
+# Distance 1 is where the measurement put the line. Every root in the 10
+# legitimately-skipped other-file fences sits 3 or more from any Autumn root
+# except `version` (a capacity-contract root, 2 from `session`), so distance 2
+# admits that whole fence and reports its five correct sections as drift, while
+# distance 1 admits none of them and still catches `telemettry`, `sesion`,
+# `databse`, `serverr` and their transposed forms.
 #
 # MARKERS BEAT HEURISTICS — all of them. The rules below are guesses about what a
 # fence IS; a marker is the page SAYING so, and a guess must never overrule a
@@ -308,6 +331,17 @@ def load_schema():
 # only ever EXEMPT a root, and no page writes them as a real section.
 CONFIG_SECTION_CALL = re.compile(r'(?<!has_)config_section\(\s*"([A-Za-z0-9_.]+)"')
 
+# Rust line and block comments, removed before the scan above runs.
+#
+# Without this the regex reads raw text, so a call written in PROSE registers a
+# plugin root: `config.rs` explains the seam in four comments naming
+# `config_section("my.plugin")`, and that illustrative name became an
+# authoritative root the gate would accept as opaque. The same mechanism is worse
+# in the other direction — delete a real registration and leave its old call in a
+# nearby comment, and the gate keeps exempting a root nothing registers any more,
+# which is drift the gate is supposed to catch rather than inherit.
+RUST_COMMENT = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
+
 
 def plugin_roots():
     files = subprocess.run(
@@ -320,7 +354,7 @@ def plugin_roots():
     roots = set()
     for rel in filter(None, files):
         with open(os.path.join(ROOT, rel), encoding="utf-8", errors="ignore") as fh:
-            roots.update(CONFIG_SECTION_CALL.findall(fh.read()))
+            roots.update(CONFIG_SECTION_CALL.findall(RUST_COMMENT.sub("", fh.read())))
     return roots
 
 
@@ -545,7 +579,23 @@ def classify(body, lead_in, known_roots):
     headers = SECTION_HEADER.findall(body)
     roots = {h.split(".")[0].strip('"') for h in headers}
 
-    # MARKERS BEAT HEURISTICS — all of them. The Cargo-root and headerless rules
+    # NEAR MISSES ARE STILL IDENTIFIED. Identification-by-section-name and the thing
+# being validated are the same names, so a fence whose ONLY header is misspelled
+# would stop looking like `autumn.toml` and be skipped — the gate going quiet
+# exactly when the defect it exists for is present. (Typo `[telemetry]` to
+# `[telemettry]` in `cloud-native.md` and the run went 168 checked -> 167,
+# exit 0.) A root within edit distance 1 of a real one — insertion, deletion,
+# substitution, or adjacent transposition — therefore identifies the fence, and
+# the walk reports the misspelling as the unknown root it is.
+#
+# Distance 1 is where the measurement put the line. Every root in the 10
+# legitimately-skipped other-file fences sits 3 or more from any Autumn root
+# except `version` (a capacity-contract root, 2 from `session`), so distance 2
+# admits that whole fence and reports its five correct sections as drift, while
+# distance 1 admits none of them and still catches `telemettry`, `sesion`,
+# `databse`, `serverr` and their transposed forms.
+#
+# MARKERS BEAT HEURISTICS — all of them. The Cargo-root and headerless rules
     # below are guesses about what a fence IS; a marker is the page SAYING so, and
     # a guess must never overrule a statement. Ordering this the other way round
     # made three separate holes, each found the same way: a `# autumn.toml` fence
@@ -594,7 +644,60 @@ def classify(body, lead_in, known_roots):
     # from the header.
     if roots & (known_roots | {"profile"}):
         return None
+    # THE CIRCULARITY. Identification-by-section-name and the thing being
+    # validated are the same names, so a fence whose ONLY section header is
+    # misspelled stops looking like `autumn.toml` and is skipped — the gate goes
+    # quiet exactly when the defect it exists for is present. Typo `[telemetry]`
+    # to `[telemettry]` in `cloud-native.md` and the run went from 168 checked
+    # fences to 167 and exited 0.
+    #
+    # A NEAR MISS breaks the circle: a root within edit distance 1 of a real one
+    # (insertion, deletion, substitution, or adjacent transposition) identifies
+    # the fence, and the walk then reports the misspelling as the unknown root it
+    # is. Distance 1 is where the measurement put the line, not a guess: every
+    # root in the 10 legitimately-skipped other-file fences is at distance 3 or
+    # more from any Autumn root except `version` (a capacity-contract root, 2
+    # from `session`), so distance 2 would admit that whole fence and report its
+    # five correct sections as drift, while distance 1 admits none of them and
+    # still catches `telemettry`, `sesion`, `databse`, `serverr` and their
+    # transposed forms.
+    if any(near_known_root(r, known_roots) for r in roots):
+        return None
     return "no-autumn-section"
+
+
+def edit_distance(a, b, limit=1):
+    """Optimal string alignment distance, capped at `limit + 1`.
+
+    Levenshtein plus adjacent transposition, because a transposed pair
+    (`telemtery`) is one slip of the fingers and plain Levenshtein scores it 2 —
+    which at a threshold of 1 would miss the commonest typo shape there is.
+    """
+    if a == b:
+        return 0
+    if abs(len(a) - len(b)) > limit:
+        return limit + 1
+    prev2, prev = None, list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            best = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if i > 1 and j > 1 and ca == b[j - 2] and a[i - 2] == cb:
+                best = min(best, prev2[j - 2] + 1)
+            cur.append(best)
+        if min(cur) > limit:
+            return limit + 1
+        prev2, prev = prev, cur
+    return prev[-1]
+
+
+def near_known_root(root, known_roots):
+    """The real root `root` was probably meant to be, or None."""
+    for known in known_roots:
+        if edit_distance(root, known) <= 1:
+            return known
+    return None
 
 
 def is_cargo_profile(name, table):
@@ -1175,6 +1278,70 @@ def self_test():
                 )
             ),
         ),
+    ):
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+            print(f"  FAIL [{label}]")
+
+    # THE CIRCULARITY: a fence whose only section header is misspelled must still
+    # be identified, or the gate goes quiet on the defect it exists for.
+    for label, body, expected in (
+        ("typo'd sole header is read", "[telemettry]\nenabled = true\n", None),
+        ("transposed sole header is read", "[teleemtry]\nenabled = true\n", None),
+        ("truncated sole header is read", "[telemetr]\nenabled = true\n", None),
+        # ...while genuinely other-file roots stay skipped. `version` is the
+        # closest of them (distance 2 from `session`) and is the reason the
+        # threshold is 1: at 2 this fence is admitted and its five correct
+        # sections reported as drift.
+        ("capacity-contract root stays skipped", "[provenance]\nhost = 1\n", "no-autumn-section"),
+        ("version root stays skipped", "[version]\nx = 1\n", "no-autumn-section"),
+        ("credentials root stays skipped", '[acme_dns]\napi_token = "x"\n', "no-autumn-section"),
+        ("plugin-manifest root stays skipped", "[capabilities]\nnet = false\n", "no-autumn-section"),
+    ):
+        got = classify(body, "", known_roots)
+        if got == expected:
+            passed += 1
+        else:
+            failed += 1
+            print(f"  FAIL [{label}]: expected {expected!r}, got {got!r}")
+
+    if check_fence("[telemettry]\nenabled = true\n", schema) == ["telemettry"]:
+        passed += 1
+    else:
+        failed += 1
+        print("  FAIL [typo'd header is reported as an unknown root]")
+
+    # The distance function itself, including the margin the threshold rests on.
+    for label, a, b, expected in (
+        ("substitution", "telemettry", "telemetry", 1),
+        ("transposition", "telemtery", "telemetry", 1),
+        ("deletion", "telemetr", "telemetry", 1),
+        ("identical", "server", "server", 0),
+        # The measured margin: the nearest other-file root is 2 away, not 1.
+        ("version vs session is 2", "version", "session", 2),
+    ):
+        got = edit_distance(a, b, limit=3)
+        if got == expected:
+            passed += 1
+        else:
+            failed += 1
+            print(f"  FAIL [distance {label}]: expected {expected}, got {got}")
+
+    # A `config_section` call written in a COMMENT must not register a root.
+    commented = '// see config_section("my.plugin") for the seam\n'
+    real = 'app.config_section("media")\n'
+    for label, ok in (
+        (
+            "commented call is not a registration",
+            CONFIG_SECTION_CALL.findall(RUST_COMMENT.sub("", commented)) == [],
+        ),
+        (
+            "real call still registers",
+            CONFIG_SECTION_CALL.findall(RUST_COMMENT.sub("", real)) == ["media"],
+        ),
+        ("block comment is stripped too", RUST_COMMENT.sub("", "/* a\nb */x") == "x"),
     ):
         if ok:
             passed += 1
