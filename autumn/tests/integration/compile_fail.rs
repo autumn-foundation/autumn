@@ -396,6 +396,10 @@ fn cache_coherence_compile_fail_tests() {
 }
 
 #[test]
+// Same shape as `compile_fail_tests` above, and allowed for the same reason: a
+// flat registry of trybuild fixtures, one `t.pass(...)` per guarantee, with no
+// structure worth extracting.
+#[allow(clippy::too_many_lines)]
 fn compile_pass_tests() {
     let t = trybuild::TestCases::new();
 
