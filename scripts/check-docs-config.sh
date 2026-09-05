@@ -165,7 +165,18 @@
 #     And the FILE SUFFIX is the same guess one level up: `.yml` said Bourne,
 #     while `defaults.run.shell: pwsh` says the block is PowerShell, where
 #     `$NAME` is a local and only `$env:NAME` reads the environment. The suffix
-#     does not know what the consumer was told to run.
+#     does not know what the consumer was told to run. Docker says it a third
+#     time: `/bin/sh -c` is the shell form's interpreter only until a `SHELL`
+#     instruction replaces it, and reading a `pwsh` shell form as Bourne blesses
+#     the local AND misses the real read, in one line.
+#   * A path RESOLVED against nothing. `self::i18n::X` was read as evidence that
+#     the crate matched, with the declaring module then allowed to appear
+#     anywhere in what was left — so a nested module's own unrelated type
+#     resolved to a crate-root one it merely shares a name with. `self` and
+#     `super` mean something exact, relative to the file doing the importing.
+#     Its neighbour is the same failure in the parse: a use tree NESTS, and
+#     splitting once on the first `{` recorded `crate::{i18n::{X as A}}` under a
+#     path to nothing, dropping a real read. A name is not an address.
 #   * A rule believed because it sounds like how the language works, when the
 #     language is right there to ask. "An unfinished pipeline keeps bash
 #     parsing, so it collects the next line's heredoc delimiters first" is a
@@ -1036,8 +1047,17 @@ COMPOSE_DECLARED = re.compile(
 # The exception matters and is in this tree: `CMD ["sh", "-c", "…"]` names a
 # shell as the executable, so its arguments ARE expanded. The first array
 # element decides, which is exactly what Docker does with it.
+#
+# …and the shell form's interpreter is not a constant either. `SHELL ["pwsh",
+# "-Command"]` REPLACES `/bin/sh -c` for every shell-form instruction after it,
+# so `RUN Write-Output "$AUTUMN_X"` is PowerShell — where that is a local and
+# only `$env:AUTUMN_X` reads the environment. Reading it as Bourne counts the
+# local as a read and misses the real one, both at once. This is the same
+# mistake as the file suffix deciding a `run:` block's grammar, one layer in:
+# the default is a statement about what nobody overrode.
 DOCKER_EXEC = re.compile(r'^\s*(?:RUN|CMD|ENTRYPOINT)\s*\[')
 DOCKER_RUN = re.compile(r'^\s*(?:RUN|CMD|ENTRYPOINT)\s+')
+DOCKER_SHELL = re.compile(r'^\s*SHELL\s*\[')
 DOCKER_FIRST = re.compile(r'\[\s*"([^"]*)"')
 DOCKER_SHELLS = ('sh', 'bash', 'zsh', 'ash', 'dash', 'busybox',
                  'pwsh', 'powershell')
@@ -1056,12 +1076,22 @@ def _docker_commands(body):
     other four turned it up, not because anything reported it.
     """
     out, literal, powershell, active = [], set(), set(), False
+    # What the shell form runs through. `None` is Docker's own default,
+    # `/bin/sh -c`; a `SHELL` instruction replaces it for everything after.
+    shell_form = None
     for index, l in enumerate(body.splitlines()):
         if active:
             out.append(l)
             for carry in (literal, powershell):
                 if index - 1 in carry:
                     carry.add(index)
+            active = l.rstrip().endswith('\\')
+            continue
+        if DOCKER_SHELL.match(l):
+            tokens = _command_tokens(l[l.index('['):])
+            shell_form = (_shell_named(l[l.index('['):][slice(*tokens[0])])
+                          if tokens else '')
+            out.append(l)
             active = l.rstrip().endswith('\\')
             continue
         m = DOCKER_RUN.match(l)
@@ -1071,10 +1101,17 @@ def _docker_commands(body):
         head, rest = m.group(0), l[m.end():]
         active = l.rstrip().endswith('\\')
         if not rest.lstrip().startswith('['):
-            # Shell form: the keyword is not a word of the command, and Docker
-            # runs it through `/bin/sh`, so it is Bourne whatever else is
-            # installed in the image.
+            # Shell form: the keyword is not a word of the command, and it runs
+            # through whatever `SHELL` last named — Bourne by default.
             out.append(' ' * len(head) + rest)
+            if shell_form in POWERSHELL:
+                powershell.add(index)
+            elif shell_form is not None and shell_form not in DOCKER_SHELLS:
+                # An interpreter whose grammar this script does not know reads
+                # nothing it can recognise, so the line expands nothing. That
+                # drops names rather than admitting them, which is the same
+                # direction as an exec form whose first element is unreadable.
+                literal.add(index)
             continue
         span = _payload_span(rest)
         if span is None:
@@ -2902,6 +2939,67 @@ def _module_of(rel, crates):
     return '', ()
 
 
+def _split_tree(text):
+    """Top-level commas of a use-tree list, which may hold nested lists."""
+    parts, depth, start = [], 0, 0
+    for i, c in enumerate(text):
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return parts
+
+
+def _expand_use(tree, prefix, out):
+    """Every `(local name, full path)` one use tree names.
+
+    A use tree NESTS: `use crate::{i18n::{Env, RootedEnv as Alias}};` is three
+    levels, and splitting once on the first `{` recorded the alias as
+    `crate:: RootedEnv` — a path to nothing, so a real read through `Alias` was
+    dropped and the page documenting its key failed. Each list carries the
+    prefix it is written under, which is what makes it a tree rather than a
+    flat list that happens to have braces in it.
+    """
+    tree = tree.strip()
+    if not tree:
+        return
+    opens = tree.find('{')
+    if opens == -1:
+        path = (prefix + tree).strip()
+        # A glob imports no NAME, so it resolves nothing here; `self` in a list
+        # imports the module the list is written under.
+        if path.endswith('*'):
+            return
+        if re.search(r'(^|::)\s*self\s*$', path):
+            path = re.sub(r'(^|::)\s*self\s*$', '', path).strip()
+            if not path:
+                return
+            out.append((path.rsplit('::', 1)[-1].strip(), path))
+            return
+        alias = USE_AS.search(path)
+        if alias:
+            out.append((alias.group(1), path[:alias.start()].strip()))
+        else:
+            out.append((path.rsplit('::', 1)[-1].strip(), path))
+        return
+    depth, closes = 0, len(tree)
+    for i in range(opens, len(tree)):
+        if tree[i] == '{':
+            depth += 1
+        elif tree[i] == '}':
+            depth -= 1
+            if depth == 0:
+                closes = i
+                break
+    head = prefix + tree[:opens]
+    for part in _split_tree(tree[opens + 1:closes]):
+        _expand_use(part, head, out)
+
+
 def _use_items(text):
     """`(local name, full path)` for every item a file imports.
 
@@ -2911,18 +3009,7 @@ def _use_items(text):
     """
     out = []
     for stmt in USE_TREE.findall(text):
-        prefix, _, rest = stmt.strip().partition('{')
-        items = ([prefix + part for part in rest.rstrip('}').split(',')]
-                 if rest else [prefix])
-        for item in items:
-            path = item.strip()
-            if not path:
-                continue
-            alias = USE_AS.search(path)
-            if alias:
-                out.append((alias.group(1), path[:alias.start()].strip()))
-            else:
-                out.append((path.rsplit('::', 1)[-1].strip(), path))
+        _expand_use(stmt, '', out)
     return out
 ENV_GENERIC = re.compile(r'[<,]\s*([A-Z]\w*)\s*:\s*[^,>]*\bEnv\b'
                          r'|\bwhere\s+([A-Z]\w*)\s*:\s*[^,;{]*\bEnv\b')
@@ -2976,6 +3063,53 @@ def _type_pattern(declared):
     return r'\s*'.join(r'(?:,\s*)?>' if tok == '>' else re.escape(tok)
                        for tok in re.findall(r'\w+|\S', declared)
                        if tok != '&')
+
+
+def _declared_receivers(patterns):
+    """Names DECLARED with one of these environment types.
+
+    ONE spelling of one rule. A concrete type the tree proved implements `Env`
+    and the map type a helper calls its environment are the same claim about a
+    declaration, and writing that claim twice is how a fix lands in one of them
+    — which is this script's most repeated mistake. The trailing lookahead is
+    what keeps a bare type name from matching a longer one: `RootedEnv` is not
+    `RootedEnvironment`.
+    """
+    return re.compile(
+        r"\b([a-z_]\w*)\s*:\s*&?\s*(?:'\w+\s+)?(?:mut\s+)?(?:dyn\s+)?(?:"
+        + '|'.join(sorted(patterns)) + r')(?!\w)')
+
+
+def _absolute_path(rel, path, crates):
+    """The `(crate, module)` a use path names, from the file that writes it.
+
+    A RELATIVE path is only relative to somewhere. `self` and `super` were
+    read as proof the crate matched and nothing more, so `self::i18n::X`
+    written in a nested module resolved against the crate-root `i18n::X`
+    that a different module declares — and an unrelated local type imported
+    under an alias became an environment. `self` means the module doing the
+    importing and `super` means one step out of it; both are answerable
+    exactly, so neither should have been treated as a hint.
+    """
+    segments = [seg for seg in re.split(r'\s*::\s*', path.strip()) if seg]
+    if len(segments) < 2:
+        return None
+    crate, here = _module_of(rel, crates)
+    walk = segments[:-1]        # everything but the item's own name
+    if walk[0] == 'crate':
+        return crate, tuple(walk[1:])
+    if walk[0] in ('self', 'super'):
+        mods = list(here)
+        while walk and walk[0] in ('self', 'super'):
+            if walk[0] == 'super':
+                if not mods:
+                    return None
+                mods.pop()
+            walk.pop(0)
+        return crate, tuple(mods) + tuple(walk)
+    # Anything else heads a crate: a use path in this edition starts at a
+    # crate root, `crate`, `self` or `super`.
+    return walk[0], tuple(walk[1:])
 
 
 def accessor(root, test_files=frozenset()):
@@ -3066,27 +3200,13 @@ def accessor(root, test_files=frozenset()):
 
         A set of segments was not identity: `OsEnv` lives in
         `autumn/src/config.rs`, whose segments are `config` and `src`, and
-        every crate in this workspace has both. The crate has to match, and
-        the declaring module has to appear IN ORDER.
+        every crate in this workspace has both. Nor was "the declaring module
+        appears somewhere in order", which let a longer path that merely
+        CONTAINS the right module resolve. The path is normalised to an
+        absolute module and compared exactly.
         """
-        segments = [seg for seg in re.split(r'\s*::\s*', path.strip()) if seg]
-        if not segments:
-            return False
-        here = _module_of(rel, crates)[0]
-        for crate, mods in modules.get(name, ()):
-            head, rest = segments[0], segments[1:-1]
-            if head in ('crate', 'self', 'super'):
-                if here != crate:
-                    continue
-            elif head == crate:
-                pass
-            else:
-                continue
-            # The declaring module path, in order, somewhere in what is left.
-            if not mods or any(tuple(rest[i:i + len(mods)]) == mods
-                               for i in range(len(rest) - len(mods) + 1)):
-                return True
-        return False
+        at = _absolute_path(rel, path, crates)
+        return at is not None and at in modules.get(name, ())
 
     def visible(rel, names):
         here = {n for n in names if n in declared.get(rel, ())}
@@ -3103,9 +3223,19 @@ def accessor(root, test_files=frozenset()):
         bound = re.compile(
             r'\blet\s+(?:mut\s+)?([a-z_]\w*)\s*(?::[^=;]*)?=\s*&?\s*(?:'
             + '|'.join(sorted(map(re.escape, here))) + r')\b')
+        # …and a parameter or field DECLARED with one. `ENV_BOUND` asks for the
+        # literal word `Env` in the annotation, which is a rule about the
+        # trait's spelling rather than about the type: `fn load(source:
+        # RootedEnv)` declares an environment implementation by name, so
+        # `source.var(…)` is a real read that nothing here could see — and it
+        # used to fall through to the `env`-prefixed floor, which is exactly
+        # the wrong reason to be covered.
+        typed = _declared_receivers(_type_pattern(t) for t in here)
         per_file.setdefault(rel, set()).update(
             m.group(1) for m in bound.finditer(masked)
             if not data[m.start()])
+        per_file[rel].update(m.group(1) for m in typed.finditer(masked)
+                             if not data[m.start()])
     # …and a receiver whose type is the one a derived HELPER calls an
     # environment. `env: &HashMap<String, String>` mentions no `Env` at all, so
     # `ENV_BOUND` cannot see it and the name prefix was doing the work: six real
@@ -3124,9 +3254,7 @@ def accessor(root, test_files=frozenset()):
         declares = {d for d in declares if not re.search(r'\bEnv\b', d)}
         if not declares:
             continue
-        typed = re.compile(
-            r'\b([a-z_]\w*)\s*:\s*&?\s*(?:\'\w+\s+)?(?:mut\s+)?(?:'
-            + '|'.join(sorted(_type_pattern(d) for d in declares)) + r')')
+        typed = _declared_receivers(_type_pattern(d) for d in declares)
         per_file.setdefault(rel, set()).update(
             m.group(1) for m in typed.finditer(masked)
             if not data[m.start()])
@@ -5085,6 +5213,55 @@ def self_test():
                     '&HashMap<\n    String,\n    String,\n>',
                     '&HashMap<String, usize>')],
          [True, True, True, False])
+    # A use tree NESTS, and splitting once on the first `{` recorded an alias
+    # under a path to nothing — so a real read through it was dropped and the
+    # page documenting its key failed. Each list carries the prefix it is
+    # written under; a glob names nothing, and `self` in a list names the
+    # module the list is under.
+    case('a nested use tree carries its prefixes',
+         _use_items('use crate::{i18n::{Env, RootedEnv as Alias}, '
+                    'config::OsEnv};\nuse std::collections::*;\n'
+                    'use crate::config::{self, OsEnv as Cfg};'),
+         [('Env', 'crate::i18n::Env'), ('Alias', 'crate::i18n::RootedEnv'),
+          ('OsEnv', 'crate::config::OsEnv'),
+          ('config', 'crate::config'), ('Cfg', 'crate::config::OsEnv')])
+    # A RELATIVE path is relative to somewhere. `self` and `super` were read as
+    # proof the crate matched and nothing more, so `self::i18n::X` in a nested
+    # module resolved against a crate-root `i18n::X` that a different module
+    # declares. Both are answerable exactly.
+    _cr = {'autumn': 'autumn_web'}
+    case('a relative import is normalised against the importing module',
+         [_absolute_path('autumn/src/i18n/locale.rs', p, _cr) for p in
+          ('self::i18n::RootedEnv', 'super::RootedEnv', 'crate::i18n::RootedEnv',
+           'autumn_web::i18n::RootedEnv', 'super::super::RootedEnv')],
+         [('autumn_web', ('i18n', 'locale', 'i18n')),
+          ('autumn_web', ('i18n',)),
+          ('autumn_web', ('i18n',)),
+          ('autumn_web', ('i18n',)),
+          ('autumn_web', ())])
+    # …and identity is EXACT. "The declaring module appears somewhere in order"
+    # let a longer path that merely contains the right module resolve.
+    case('a containing path is not the declaring one',
+         (_absolute_path('autumn/src/lib.rs', 'crate::i18n::sub::RootedEnv',
+                         _cr),
+          _absolute_path('autumn/src/lib.rs', 'crate::i18n::RootedEnv', _cr)),
+         (('autumn_web', ('i18n', 'sub')), ('autumn_web', ('i18n',))))
+    # A parameter DECLARED with a concrete environment type is a receiver:
+    # `ENV_BOUND` asks for the literal word `Env` in the annotation, which is a
+    # rule about the trait's spelling rather than about the type. `RootedEnv`
+    # is not `RootedEnvironment`, which is what the lookahead is for — and the
+    # concrete type and the helper's map type go through ONE rule, since two
+    # spellings of one claim is how a fix lands in only one of them.
+    case('a receiver declared with an environment type is derived',
+         [_declared_receivers(
+             _type_pattern(t) for t in ('RootedEnv', '&HashMap<String, String>')
+          ).findall(s) for s in
+          ('fn load(source: RootedEnv) { source.var("AUTUMN_X"); }',
+           'fn other(y: &RootedEnvironment) {}',
+           'fn f(env: &HashMap<String, String>, key: &str) {}',
+           'fn g(d: &dyn RootedEnv) {}',
+           'fn h(css: CssBuilder) {}')],
+         [['source'], [], ['env'], ['d'], []])
     case('a helper key behind other arguments reads',
          args_of('override_string(&mut self.ffmpeg.bin, env, '
                  '"AUTUMN_MEDIA__FFMPEG__BIN")', _media_acc, real_index),
@@ -5222,6 +5399,20 @@ def self_test():
              'CMD ["sh", "-c", "echo $AUTUMN_C"]\n'
              'CMD ["/app/x", \\\n  "$AUTUMN_D"]\nENV AUTUMN_E=1\n')),
          [0, 3, 4])
+    # …and the shell form runs through whatever `SHELL` last named, which is
+    # `/bin/sh -c` only until an instruction says otherwise. Reading a pwsh
+    # shell form as Bourne counts `$AUTUMN_X` — a PowerShell LOCAL — as a read
+    # and misses the `$env:AUTUMN_X` that is one.
+    case('a Dockerfile SHELL instruction chooses the shell form grammar',
+         (lambda r: (sorted(r[2]), sorted(r[1])))(_docker_commands(
+             'RUN echo $AUTUMN_A\n'
+             'SHELL ["pwsh", "-Command"]\n'
+             'RUN Write-Output "$env:AUTUMN_B"\n'
+             'SHELL ["/bin/bash", "-c"]\n'
+             'RUN echo $AUTUMN_C\n'
+             'SHELL ["cmd", "/S", "/C"]\n'
+             'RUN echo %AUTUMN_D%\n')),
+         ([2], [6]))
     # A bare `var(` is any function named `var`; the environment API has a
     # receiver or a path. This tree's own `Env` trait is called as a method.
     # …and the receiver must be an ENVIRONMENT one, derived from the tree.
