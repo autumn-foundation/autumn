@@ -1119,8 +1119,19 @@ SEQ_ITEM = re.compile(r'^(\s*)-\s+(.*)$')
 # …and YAML may quote either spelling: `"AUTUMN_X": v` and `- "AUTUMN_X=v"` are
 # both valid and both were invisible, because the name was required to sit
 # immediately after the indent or the dash.
+# …and a FLOW collection puts the key and its declarations on one line:
+# `env: { AUTUMN_X: "1", AUTUMN_Y: "2" }` is valid YAML and valid Actions, and
+# `environment: [AUTUMN_X=v]` is valid compose. The block form was the one in
+# front of me. The second alternative anchors on the collection's own
+# punctuation rather than on the line start, which keeps it from reading a name
+# mentioned inside a VALUE — that is why the anchor is not simply dropped.
 COMPOSE_DECLARED = re.compile(
-    r'^\s*(?:-\s+)?[\'"]?(AUTUMN_[A-Z0-9_]+)[\'"]?\s*(?:[:=]|$)', re.M)
+    r'(?:^\s*(?:-\s+)?|[\{\[,]\s*)[\'"]?(AUTUMN_[A-Z0-9_]+)[\'"]?\s*(?:[:=]|$)',
+    re.M)
+# A flow collection opened on the same line as the section key: the key never
+# reaches the nesting stack, so `declares` was false for the only line the
+# declarations are on.
+YAML_FLOW_SECTION = re.compile(r'^\s*(?:-\s+)?([A-Za-z0-9_.-]+):\s*[\{\[]')
 
 # A workflow chooses the SHELL its `run:` blocks are written in, and the two
 # grammars share almost nothing: in PowerShell `$NAME` is an ordinary local and
@@ -1740,7 +1751,10 @@ def _yaml_blocks(body, interpolated=False, consumer='actions',
         # The ASSIGNMENT view of a compose file keeps only what can name a
         # variable to a process; the expansion view keeps everything.
         section = YAML_ASSIGNS.get(consumer)
-        declares = section is not None and any(k == section for _, k in stack)
+        flow = YAML_FLOW_SECTION.match(l)
+        declares = section is not None and (
+            any(k == section for _, k in stack)
+            or (flow is not None and flow.group(1) == section))
         keep = ((executed or declares) if assignments
                 else (interpolated or executed))
         # `COMPOSE_DECLARED` reads a SHAPE, so it has to be told where that
@@ -3054,8 +3068,16 @@ BOUND = re.compile(
 # documenting one of them rested on an unrelated Dockerfile `ARG` happening to
 # carry the same name. `env!` and `option_env!` take the key first, like the
 # std accessors they are macro forms of.
-ACCESSOR = re.compile(r'\b(?:std::)?env::(var|var_os|set_var)\s*\('
-                      r'|\b(?:(?:core|std)::)?((?:option_)?env)!\s*\(')
+ACCESSOR = re.compile(r'\b(?:std::)?env::(var|var_os|set_var)\s*\(')
+# The macro forms are SHADOWABLE, which the path form is not. Rust lets a
+# `macro_rules! env` take the name over for the rest of its textual scope, so
+# `env!("AUTUMN_…")` there is whatever that macro does — and a spelling was
+# again standing in for an identity, one round after the `env`-prefixed floor
+# came out for the same reason. A file that declares or imports either name
+# does not get this alternative; nothing in this tree does, so it costs
+# nothing and closes the hole.
+ENV_MACRO = r'|\b(?:(?:core|std)::)?((?:option_)?env)!\s*\('
+MACRO_SHADOW = re.compile(r'\bmacro_rules!\s*(option_env|env)\b')
 
 # `impl Env for OsEnv` — the types that ARE an environment.
 #
@@ -3395,6 +3417,7 @@ def accessor(root, test_files=frozenset()):
     index, types, per_file, masked_all = {}, set(), {}, {}
     helpers, declared, imports, modules = {}, {}, {}, {}
     env_type, impls, trait_at, scopes = {}, {}, set(), {}
+    shadowed = {}
     crates = _crates(root)
     for rel in out.split('\0'):
         # Test code is skipped outright, as the scan that consumes this index
@@ -3435,6 +3458,12 @@ def accessor(root, test_files=frozenset()):
             if declares:
                 env_type[m.group(1)] = declares
         masked_all[rel] = (masked, data, spans)
+        # A locally declared macro takes the name over; an imported one does
+        # the same. Either way this file's `env!` is not the std one.
+        shadowed[rel] = bool(
+            [m for m in MACRO_SHADOW.finditer(masked) if not data[m.start()]]
+            or [1 for local, _, _ in _use_items(masked)
+                if local in ('env', 'option_env')])
         if TRAIT_DECL.search(masked):
             trait_at.add((crate, filemods))
         impls[rel] = [(m.group(1), m.group(2), _scope_at(spans, m.start()))
@@ -3617,8 +3646,11 @@ def accessor(root, test_files=frozenset()):
             by_scope[at] = frozenset(mine)
             recv |= mine
         here, recv = frozenset(here), frozenset(recv)
-        if (here, recv) not in cache:
+        key = (here, recv, bool(shadowed.get(rel)))
+        if key not in cache:
             pattern = ACCESSOR.pattern
+            if not shadowed.get(rel):
+                pattern += ENV_MACRO
             if here:
                 pattern += (r'|\b(' + '|'.join(sorted(map(re.escape, here)))
                             + r')\s*\(')
@@ -3630,8 +3662,8 @@ def accessor(root, test_files=frozenset()):
                 # still means nothing.
                 pattern += (r'|\b(?:' + '|'.join(sorted(map(re.escape, recv)))
                             + r')\s*\.\s*(var|var_os|set_var|get)\s*\(')
-            cache[(here, recv)] = re.compile(pattern)
-        return _Accessor(cache[(here, recv)], by_scope)
+            cache[key] = re.compile(pattern)
+        return _Accessor(cache[key], by_scope)
 
     return compiled, index
 
@@ -5543,12 +5575,21 @@ def self_test():
     # Setting a variable publishes it, as `export` does; removing one does not.
     # A COMPILE-TIME read is a read: `option_env!("AUTUMN_BUILD_GIT_SHA")` is
     # how five build-stamp variables reach the binary.
-    case('a compile-time env macro is an accessor',
-         [bool(ACCESSOR.search(t)) for t in
-          ('option_env!("AUTUMN_BUILD_GIT_SHA")', 'env!("AUTUMN_X")',
-           'std::env!("AUTUMN_X")', 'envelope!("AUTUMN_X")',
-           'some_env!("AUTUMN_X")')],
-         [True, True, True, False, False])
+    # …and the macro forms are SHADOWABLE, which the path form is not. Rust
+    # lets `macro_rules! env` take the name over, so its `env!(…)` is whatever
+    # that macro does — a spelling standing in for an identity, one round after
+    # the `env`-prefixed floor came out for the same reason.
+    case('a shadowed macro name is not the std macro',
+         [bool(MACRO_SHADOW.search(t)) for t in
+          ('macro_rules! env {', 'macro_rules! option_env {',
+           'macro_rules! envelope {', 'macro_rules! my_env {')],
+         [True, True, False, False])
+    # The path form carries no macro alternative on its own, so a file that
+    # shadows simply does not get one appended.
+    case('the macro alternative is appended, not built in',
+         (bool(ACCESSOR.search('env!("AUTUMN_X")')),
+          bool(ACCESSOR.search('std::env::var("AUTUMN_X")'))),
+         (False, True))
     case('a write that publishes is an accessor',
          bool(ACCESSOR.search('std::env::set_var("AUTUMN_SYNC__DB_PATH", p)')),
          True)
@@ -5606,6 +5647,12 @@ def self_test():
     # …read through the accessor of the module that DEFINES the helper, since
     # `override_string` is the media plugin's function and means nothing in
     # `config.rs`. That scoping is the point, so the test asks the right file.
+    case('a compile-time env macro is an accessor',
+         [bool(_acc_for('autumn-macros/src/main_macro.rs').search(t)) for t in
+          ('option_env!("AUTUMN_BUILD_GIT_SHA")', 'env!("AUTUMN_X")',
+           'std::env!("AUTUMN_X")', 'envelope!("AUTUMN_X")',
+           'some_env!("AUTUMN_X")')],
+         [True, True, True, False, False])
     _media_acc = _acc_for('autumn-media-plugin/src/config.rs')
     # A NAME PREFIX is not an interface. `env`-prefixed receivers and
     # `env`-prefixed helper names stood here as a static floor, and an
@@ -6445,6 +6492,25 @@ def self_test():
          ['AUTUMN_ACTIONS__DECLARED'])
     # …and only under `env:`. A name sitting in some other field is a value
     # the workflow never publishes.
+    # A FLOW collection puts the key and its declarations on one line, in
+    # both formats — and the second anchor is the collection's own
+    # punctuation, so a name mentioned inside a VALUE is still not a
+    # declaration.
+    case('a flow-style section declares too',
+         [COMPOSE_DECLARED.findall(t) for t in
+          ('env: { AUTUMN_A: "1", AUTUMN_B: "2" }',
+           'environment: [AUTUMN_C=v, "AUTUMN_D=v"]',
+           '      AUTUMN_G: "see AUTUMN_H: for more"')],
+         [['AUTUMN_A', 'AUTUMN_B'], ['AUTUMN_C', 'AUTUMN_D'],
+          ['AUTUMN_G']])
+    # …and the line survives the assignment view, which is the half the
+    # nesting stack could not answer: the key never enters it.
+    case('a flow-style section line is kept',
+         bool(COMPOSE_DECLARED.findall(_yaml_blocks(
+             'on: push\njobs:\n  a:\n    steps:\n'
+             '      - env: { AUTUMN_FLOW__X: "1" }\n'
+             '        run: echo hi\n', False, 'actions', True))),
+         True)
     # Compose may quote either declaration spelling.
     case('a quoted compose declaration is still a declaration',
          COMPOSE_DECLARED.findall('      - AUTUMN_A=1\n      "AUTUMN_B": v\n'
