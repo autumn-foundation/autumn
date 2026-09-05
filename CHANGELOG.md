@@ -2879,16 +2879,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frames to also catch `#[throttle]`'s generated `FromRequestParts` gate
   cloning `parts.headers` *before* ever calling into the `rate_limit` module
   (`autumn-macros/src/throttle.rs`), which the first attribution pass missed
-  entirely. Full, corrected `#[throttle]` overhead against the
+  entirely; and base-subtracting the callgrind instruction counts (an
+  `--iterations 0` run per route, matching the DHAT methodology) rather than
+  dividing raw process totals by request count, which had been diluting both
+  routes' per-request figures with shared process-startup/router-construction
+  cost. Full, corrected `#[throttle]` overhead against the
   ~140-151-block/~27.3-28.7KB per-request baseline `config_alloc_gate`
   already gates (#2232): ~10 blocks / ~885 bytes per request (~6.6%/~3.1%,
-  under the 10%-of-allocations floor) and ~6-7% more instructions than an
-  unthrottled route (callgrind, `--route throttled` vs. `--route plain`;
-  the range reflects run-to-run measurement noise on this hardware, not a
-  precisely pinned figure) — which, read as "would a fix removing this
-  entire overhead clear the 5%-of-instructions floor," technically says yes.
-  But no *safe, autonomous, smallest-fix* candidate
-  gets there: the only narrowly-scoped, mechanistically-clear piece —
+  under the 10%-of-allocations floor) and ~5.3% more instructions than an
+  unthrottled route on the marginal, base-subtracted count (callgrind,
+  `--route throttled` vs. `--route plain`) — which, read as "would a fix
+  removing this entire overhead clear the 5%-of-instructions floor,"
+  technically says yes, though only just. But no *safe, autonomous,
+  smallest-fix* candidate gets there: the only narrowly-scoped,
+  mechanistically-clear piece —
   two redundant `format!` calls building an almost-always-cache-hit
   `HashMap` key (`resolve_throttle_params`'s `registry_key`,
   `__check_throttle`'s `cache_key`) — accounts for only ~6 of those ~10
