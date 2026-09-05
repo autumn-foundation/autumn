@@ -389,6 +389,14 @@ jobs:
           # they share one cache entry instead of five near-identical copies.
           # This job is the only writer (the shards set `save-if: false`).
           shared-key: workspace-test
+          # Save the target dir even when the test STEP fails. rust-cache skips
+          # its save on a failed job by default, and because this job is the
+          # sole writer of the shared key, a red `test` means no shard ever
+          # gets a warm cache — exactly when a warm cache matters most, since
+          # a red suite is what you iterate against. What is being cached is
+          # compiled artifacts; their validity does not depend on whether the
+          # tests that ran afterwards passed.
+          cache-on-failure: true
       - name: Run tests
         # `--skip compile_fail::` hands the trybuild module to the `trybuild`
         # job below. It is a substring skip and `compile_fail::` is the module
