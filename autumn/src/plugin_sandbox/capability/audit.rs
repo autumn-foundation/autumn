@@ -331,10 +331,12 @@ impl ActivitySummary {
             (SandboxCapability::HttpOutbound, true) => Some(&mut self.hosts),
             (SandboxCapability::Db, true) => Some(&mut self.tables),
             (SandboxCapability::Jobs, true) if enqueued => Some(&mut self.job_types),
-            (SandboxCapability::Jobs, true) => Some(&mut self.refused_targets),
+            // Every remaining scoped call — refused outright, or a `jobs` call
+            // that reached a sink which would not take it — is a target the
+            // plugin *named* and did not get.
             (
                 SandboxCapability::HttpOutbound | SandboxCapability::Db | SandboxCapability::Jobs,
-                false,
+                _,
             ) => Some(&mut self.refused_targets),
             _ => None,
         };
