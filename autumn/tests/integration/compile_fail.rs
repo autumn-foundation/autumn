@@ -351,8 +351,8 @@ fn agent_authority_compile_fail_tests() {
 
 /// The `#[agent_operable]` compile-*pass* half (#1691), for the reason its
 /// compile-fail sibling has its own test: a self-contained feature worth
-/// running on its own, and two fewer lines in a `compile_pass_tests` that is
-/// already over the line limit.
+/// running on its own, and two fewer lines in the `compile_pass_tests_*` halves,
+/// which are already over the line limit.
 #[test]
 fn agent_authority_compile_pass_tests() {
     let t = trybuild::TestCases::new();
@@ -388,8 +388,16 @@ fn cache_coherence_compile_fail_tests() {
     t.compile_fail("tests/compile-fail/repository_acknowledge_stale_blank_reason.rs");
 }
 
+// Split into `_a` / `_b` halves so CI can run them as two parallel trybuild
+// shards (see the `trybuild` job in .github/workflows/ci.yml). Each half owns a
+// disjoint slice of the SAME fixture list — nothing is gated on the split, so a
+// new fixture may be appended to either half. `compile_pass` cases are the
+// expensive ones: unlike a `compile_fail` case, which stops at the first
+// diagnostic, each one compiles AND links a whole crate against autumn-web —
+// which is why they were 25 of the 37 minutes trybuild spent on Windows in the
+// run that motivated the split.
 #[test]
-fn compile_pass_tests() {
+fn compile_pass_tests_a() {
     let t = trybuild::TestCases::new();
 
     // Build-time cache coherence (#1716): a declared dependency set, an
@@ -494,6 +502,12 @@ fn compile_pass_tests() {
     // uses `serialize_as`, as every `#[encrypted]` field does (#1340).
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_encrypted_hooks.rs");
+}
+
+// The second half of the `compile_pass` fixture list; see `compile_pass_tests_a`.
+#[test]
+fn compile_pass_tests_b() {
+    let t = trybuild::TestCases::new();
 
     // Sharding extractors + repository with_pool over a shard (requires db feature)
     #[cfg(feature = "db")]
