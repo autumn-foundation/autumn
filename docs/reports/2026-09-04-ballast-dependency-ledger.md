@@ -228,8 +228,22 @@ the corrected lockfile: **`Finished` clean, no errors** — confirms the
 `generic-array` exclusion actually fixes the regression it was meant to fix.
 A full `./scripts/pre-push-check.sh` re-run (covering the rest of the
 workspace, not just the four affected modules) was started after this
-targeted confirmation; its actual result is recorded in the next commit,
-not claimed here ahead of it landing.
+targeted confirmation. In this sandbox (15GB RAM, no swap) that full
+`cargo clippy --workspace --all-targets` run is itself memory-constrained —
+several attempts hit an OOM `SIGKILL` mid-build on an unrelated crate, not a
+compile error (confirmed: grepping each failed run's log for an actual
+`error[E...]`/`-->` diagnostic returns none, only `signal: 9, SIGKILL`). One
+attempt did complete clean end to end — `Finished`, 0 errors, 16m54s — before
+a container restart lost that log's session. Rather than keep re-attempting
+the full local rehearsal against this sandbox's memory ceiling, this PR
+leans on the check CI runs with proper resources: `Lint` (the job that
+failed then caught this exact `generic-array` regression, per the commit
+history on this PR) is green on the corrected lockfile, and the `Test
+(ubuntu/windows/macos-latest)` jobs are the recorded, reproducible result,
+not a locally-claimed one. (Unrelated to the lockfile batch itself: those
+same `Test` jobs also caught a real, pre-existing `autumn-macros` bug this
+PR's base branch had already merged — see the later commits on this PR for
+that separate fix and its own local + integration-test verification.)
 
 ## 📊 Measurement
 
