@@ -6,7 +6,7 @@
 # off a page. `scripts/check-docs-links.sh` gates its *links*, so nobody is sent
 # to a page that does not exist; `scripts/check-docs-cli.sh` gates its
 # *commands*, so nobody is handed an `autumn …` line clap will reject. Nothing
-# checked the third: the **config key**. The reader-facing corpus carries 165
+# checked the third: the **config key**. The reader-facing corpus carries 166
 # `autumn.toml` fences judged against 484 schema leaves, and a renamed or
 # never-shipped key leaves behind a line that looks exactly like a working one.
 #
@@ -102,7 +102,7 @@
 #      nothing and the gate fails loudly on README.md rather than silently
 #      widening.
 #
-# WHICH FENCES ARE READ. Of the corpus's 246 ```toml fences, 165 are read. A
+# WHICH FENCES ARE READ. Of the corpus's 246 ```toml fences, 166 are read. A
 # fence is read only on POSITIVE identification — it names `autumn.toml` (or a
 # profile overlay / the `.example` template), or it carries a section the config
 # surface recognizes. The marker is checked BEFORE the "no section header" bail,
@@ -161,12 +161,40 @@
 # `check-docs-cli.sh` applies to fenced commands: a fence is copyable, so the
 # remedy is to make it parse — split mutually exclusive options into one fence
 # each, or quote an elided placeholder (`"<YOUR_URL>"`) so it is valid TOML.
-#   - **Fences with no `[section]` header AND no marker** (13). A bare
-#     `key = value` fragment has no root to resolve against; guessing one would
-#     invent defects. A marked one IS read — see above.
+#   - **Fences with no `[section]` header AND no marker** (12). A bare
+#     `key = value` fragment has no root to resolve against, and inferring one
+#     from the surrounding prose would invent defects; a marked one IS read (see
+#     above). All 12 were resolved by hand: 8 carry no keys at all (empty or
+#     comment-only), one is a daemon state file (`pid`, `started_at`), one is a
+#     dependency version list, and one — `operator-alerts.md`'s `pagerduty_url`
+#     fragment — was a real `[alerts]` key that the fence simply did not name.
+#     That was fixed in the DOCS rather than here: the fence now repeats its
+#     `[alerts]` header, like its sibling six lines below, which is what a reader
+#     arriving mid-page by ctrl-F needs in order to know where the key goes.
 #   - **`examples/<app>/content/`.** Seed content for an example app, rendered by
 #     that app's own routes — the same exclusion, for the same reason,
 #     `check-docs-links.sh` makes.
+#   - **The CHILDREN of a plugin root** (`[media] …`, `[search] …`). Opacity
+#     mirrors the runtime, whose contract is that the plugin owns validation of
+#     its own subtree, and `SearchConfig` holds up that end —
+#     `#[serde(deny_unknown_fields)]`, so a typo'd `queu` is a boot error, loudly.
+#     `MediaConfig` does NOT: it is `#[serde(default)]` without
+#     `deny_unknown_fields`, so a typo'd `[media]` key is silently dropped and the
+#     default stands — the very class this gate exists for, in the one subtree it
+#     cannot see. That gap is REAL and is deliberately not closed here.
+#
+#     All 35 `[media]` keys across the corpus's three `[media]` fences were
+#     resolved by hand and every one is correct, so nothing is broken today.
+#     Extracting a schema for them is also not the cheap fix it looks like: the
+#     `[media]` subtree is owned by TWO structs in two crates — the runtime
+#     `autumn-media-plugin::MediaConfig` and the deploy-side host config in
+#     `autumn-cli/src/deploy/media.rs` — and a naive single-file extraction
+#     reported 13 correct lines in `deployment.md` (`api_port`, `unit_name`,
+#     `binary_path`, …) as drift, because they live in the other struct. The
+#     real fix is one line in the plugin (`deny_unknown_fields` on `MediaConfig`,
+#     as `SearchConfig` already has), which makes the runtime enforce the
+#     contract the opacity rule already assumes — a plugin change, not a docs
+#     one.
 #   - **The archive trees** — `docs/plans/`, `docs/adr/`, `docs/design/`,
 #     `docs/stories/`, `docs/reports/`, `docs/releases/`, `docs/migrations/`,
 #     `CHANGELOG.md`, `RELEASE_NOTES.md`, `benchmarks/`, `bmad/`, `agents/`, and

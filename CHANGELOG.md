@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anywhere says so. A bad link 404s and a bad command exits 2; both are dead
   ends the reader can see and route around.
   `scripts/check-docs-config.sh` resolves every key in every `autumn.toml`
-  fence in the reader-facing corpus (165 of the corpus's 246 TOML fences)
+  fence in the reader-facing corpus (166 of the corpus's 246 TOML fences)
   against the 484-leaf config schema, using the same walk semantics as the
   framework's own `AutumnConfig::validate_toml` — including the rule that a
   section with no schema entry (`jobs.queues`, `auth.oauth2`,
@@ -52,7 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per option, which is what a reader picking between them needed anyway; an
   identified `autumn.toml` fence that does not parse is now itself a gate
   failure, with no waiver, on the same principle `check-docs-cli.sh` applies to
-  fenced commands.
+  fenced commands. One further fence — `operator-alerts.md`'s `pagerduty_url`
+  fragment — went unread because it named no section; it now repeats its
+  `[alerts]` header like its sibling six lines below, which is also what a
+  reader arriving mid-page by ctrl-F needs in order to know where the key goes.
+  The children of a plugin root (`[media]`, `[search]`) stay unchecked, matching
+  the runtime's opacity contract; the header records why, and why the real fix
+  for `[media]` is `deny_unknown_fields` on `MediaConfig` rather than a docs-side
+  schema.
 - **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
   update validation left after #1719/#1742/#1778/#1801 (issue #1751).
   `must_match` — like `custom`, `ip` on `Option<_>` fields, and
