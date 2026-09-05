@@ -317,15 +317,74 @@ fn validate_path(path: &LitStr) -> Result<(), TokenStream> {
     Ok(())
 }
 
+/// Split macro input into any leading top-level items plus a trailing
+/// function item.
+///
+/// A body guard (`#[throttle]`, `#[secured]`, `#[step_up]`, `#[authorize]`)
+/// that already expanded on this handler (guard written ABOVE the outer
+/// attribute, so it runs first) leaves a companion extractor-gate `struct` +
+/// `impl FromRequestParts` pair immediately before the function — see
+/// `crate::throttle::throttle_macro` and its siblings. Those leading items
+/// must ride through to the outer macro's own output unmodified (including
+/// when a SECOND guard is stacked above the first and receives that gate as
+/// part of its own input), so this parses `item` as a sequence of top-level
+/// items and requires the function to be the last one, returning every
+/// earlier item as `leading_items` (empty when there's nothing to preserve —
+/// the common case with no guard, or a guard still present as an unexpanded
+/// attribute).
+///
+/// Returns `Ok((leading_items, func))` if the input ends in a function item,
+/// or a compile error `TokenStream` if not. Does not itself check asyncness —
+/// callers with their own specific "must be async" wording (`#[throttle]`,
+/// `#[secured]`, …) check `func.sig.asyncness` themselves.
+pub fn split_leading_items_and_fn(item: TokenStream) -> Result<(TokenStream, ItemFn), TokenStream> {
+    fn parse_items(input: ParseStream) -> syn::Result<Vec<syn::Item>> {
+        let mut items = Vec::new();
+        while !input.is_empty() {
+            items.push(input.parse()?);
+        }
+        Ok(items)
+    }
+
+    let items: Vec<syn::Item> = match syn::parse::Parser::parse2(parse_items, item.clone()) {
+        Ok(items) => items,
+        Err(_) => {
+            return Err(syn::Error::new_spanned(
+                item,
+                "route macros can only be applied to functions",
+            )
+            .to_compile_error());
+        }
+    };
+
+    let Some((last, leading)) = items.split_last() else {
+        return Err(syn::Error::new_spanned(
+            item,
+            "route macros can only be applied to functions",
+        )
+        .to_compile_error());
+    };
+    let syn::Item::Fn(input_fn) = last.clone() else {
+        return Err(syn::Error::new_spanned(
+            item,
+            "route macros can only be applied to functions",
+        )
+        .to_compile_error());
+    };
+
+    let leading_items = quote! { #(#leading)* };
+    Ok((leading_items, input_fn))
+}
+
 /// Parse and validate an async handler function from macro input.
 ///
-/// Returns `Ok(func)` if valid, or a compile error `TokenStream` if not.
-/// Validates: is a function, is async.
-pub fn parse_async_handler(item: TokenStream) -> Result<ItemFn, TokenStream> {
-    let input_fn: ItemFn = syn::parse2(item.clone()).map_err(|_| {
-        syn::Error::new_spanned(item, "route macros can only be applied to functions")
-            .to_compile_error()
-    })?;
+/// See [`split_leading_items_and_fn`] for the leading-items behavior this
+/// builds on.
+///
+/// Returns `Ok((leading_items, func))` if valid, or a compile error
+/// `TokenStream` if not. Validates: is a function, is async.
+pub fn parse_async_handler(item: TokenStream) -> Result<(TokenStream, ItemFn), TokenStream> {
+    let (leading_items, input_fn) = split_leading_items_and_fn(item)?;
 
     if input_fn.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
@@ -335,7 +394,7 @@ pub fn parse_async_handler(item: TokenStream) -> Result<ItemFn, TokenStream> {
         .to_compile_error());
     }
 
-    Ok(input_fn)
+    Ok((leading_items, input_fn))
 }
 
 /// Extract `#[intercept(LayerType)]` attributes from a function's attribute
