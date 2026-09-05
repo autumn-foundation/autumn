@@ -391,6 +391,11 @@ pub fn split_leading_items_and_fn(
 ///
 /// Returns `Ok((leading_items, func))` if valid, or a compile error
 /// `TokenStream` if not.
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps an owned `TokenStream` parameter so callers (route macros with
+// many call sites of their own, at both the proc-macro boundary and in
+// tests) don't need to thread a reference through.
+#[allow(clippy::needless_pass_by_value)]
 pub fn parse_async_handler_with_leading_items(
     item: TokenStream,
 ) -> Result<(TokenStream, ItemFn), TokenStream> {

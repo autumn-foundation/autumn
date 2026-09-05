@@ -245,6 +245,10 @@ fn build_spec_tokens(attrs: &ThrottleAttrs) -> TokenStream {
 
 /// Expand the `#[throttle(...)]` attribute.
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_throttle_args(attr) {
         Ok(a) => a,

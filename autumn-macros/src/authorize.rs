@@ -146,6 +146,10 @@ fn snake_case(name: &str) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse the args first; the parser may surface a leading `"action"`
     // string literal as the bare-Path action via the `Meta::Path` branch

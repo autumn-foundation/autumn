@@ -191,6 +191,10 @@ fn type_contains_impl_trait(ty: &syn::Type) -> bool {
 
 /// Expand the `#[step_up]` / `#[step_up(max_age = "Nm")]` attribute.
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let max_age_opt = match parse_step_up_args(attr) {
         Ok(v) => v,
