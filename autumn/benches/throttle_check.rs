@@ -44,15 +44,25 @@
 //! cargo build --release -p autumn-web --bench throttle_check
 //! BIN=$(find target/release/deps -maxdepth 1 -name "throttle_check-*" -type f ! -name "*.d")
 //!
-//! # Instruction profile
-//! valgrind --tool=callgrind --callgrind-out-file=callgrind.out "$BIN" --iterations 1000
-//! callgrind_annotate --threshold=80 callgrind.out | head -40
+//! # Instruction profile — separate `--route` invocations, not the `both`
+//! # default, so the two output files are the isolated per-route workloads
+//! # the "own added cost" comparison below actually needs (a combined `both`
+//! # run profiles one throttled + one plain request per iteration together
+//! # and cannot be split back apart after the fact — caught in review).
+//! valgrind --tool=callgrind --callgrind-out-file=throttled.out "$BIN" --iterations 1000 --route throttled
+//! valgrind --tool=callgrind --callgrind-out-file=plain.out     "$BIN" --iterations 1000 --route plain
+//! callgrind_annotate --threshold=80 throttled.out | head -40
+//! callgrind_annotate --threshold=80 plain.out     | head -40
 //!
 //! # Allocation profile (valgrind's built-in dhat tool — no crate dependency).
-//! # Two runs, subtracted, isolate the marginal per-request cost from
-//! # process-startup/router-construction/warm-up (see `request_pipeline.rs`).
-//! valgrind --tool=dhat --dhat-out-file=dhat-base.json "$BIN" --iterations 0
-//! valgrind --tool=dhat --dhat-out-file=dhat-run.json  "$BIN" --iterations 200
+//! # Two runs per route, subtracted, isolate the marginal per-request cost
+//! # from process-startup/router-construction/warm-up (see
+//! # `request_pipeline.rs`), then diff the two routes' marginals for
+//! # `#[throttle]`'s own added cost.
+//! valgrind --tool=dhat --dhat-out-file=dhat-throttled-base.json "$BIN" --iterations 0   --route throttled
+//! valgrind --tool=dhat --dhat-out-file=dhat-throttled-run.json  "$BIN" --iterations 200 --route throttled
+//! valgrind --tool=dhat --dhat-out-file=dhat-plain-base.json     "$BIN" --iterations 0   --route plain
+//! valgrind --tool=dhat --dhat-out-file=dhat-plain-run.json      "$BIN" --iterations 200 --route plain
 //! ```
 //!
 //! `--iterations N` issues one `/route-a` + one `/route-b` GET per round
