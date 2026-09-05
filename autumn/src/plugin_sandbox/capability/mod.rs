@@ -1842,7 +1842,7 @@ path = "/shop/panel"
         let orders = db::physical_table("shop", "orders").expect("derivable");
         assert_eq!(
             fixture.db.keys(),
-            vec![(orders, "alpha".to_owned(), row_id.clone())]
+            vec![(orders, tenant_segment(Some("alpha")), row_id.clone())]
         );
 
         let read = fixture.runtime.dispatch(&CapabilityCall::DbGet {
@@ -1892,12 +1892,22 @@ path = "/shop/panel"
         let store = db::MemoryPluginStore::new();
         // Seeded directly: a host-application table, and another tenant's row
         // in the plugin's own table.
-        store.seed("users", "alpha", "u1", row(&[("email", "ceo@example.com")]));
+        store.seed(
+            "users",
+            &tenant_segment(Some("alpha")),
+            "u1",
+            row(&[("email", "ceo@example.com")]),
+        );
         // Derived, not hard-coded: a literal here turns the whole test vacuous
         // the moment the derivation changes, because beta's row would land in a
         // table alpha was never going to reach anyway.
         let orders = db::physical_table("shop", "orders").expect("derivable");
-        store.seed(&orders, "beta", "r99", row(&[("sku", "beta's")]));
+        store.seed(
+            &orders,
+            &tenant_segment(Some("beta")),
+            "r99",
+            row(&[("sku", "beta's")]),
+        );
 
         let manifest = manifest(&everything());
         let mut alpha = CapabilityRuntime::new(
@@ -1975,8 +1985,12 @@ path = "/shop/panel"
         assert_eq!(
             store.keys(),
             vec![
-                (orders, "beta".to_owned(), "r99".to_owned()),
-                ("users".to_owned(), "alpha".to_owned(), "u1".to_owned()),
+                (orders, tenant_segment(Some("beta")), "r99".to_owned()),
+                (
+                    "users".to_owned(),
+                    tenant_segment(Some("alpha")),
+                    "u1".to_owned()
+                ),
             ]
         );
     }
