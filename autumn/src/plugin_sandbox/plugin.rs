@@ -125,44 +125,6 @@ impl From<SandboxLoadError> for SandboxPluginError {
     }
 }
 
-/// The most context entries one render hook is handed.
-///
-/// A slot's context is a handful of values a panel needs — an id, a locale, a
-/// count. Far above that, and far below anything that could matter.
-pub const MAX_RENDER_CONTEXT_ENTRIES: usize = 32;
-
-/// The most bytes one render hook's context may carry across all its entries.
-pub const MAX_RENDER_CONTEXT_BYTES: usize = 16 * 1024;
-
-/// Take as much of `context` as the ceilings above allow.
-///
-/// Per-entry overhead is counted, not just the strings: a thousand empty pairs
-/// cost real allocation and real serialization, and a budget measured only in
-/// string length prices them at nothing.
-fn bounded_context(context: &[(String, String)]) -> Vec<(String, String)> {
-    /// What one entry costs beyond its bytes: two `String` headers, a tuple, and
-    /// the JSON punctuation it becomes on the wire.
-    const PER_ENTRY: usize = 64;
-
-    let mut out = Vec::with_capacity(context.len().min(MAX_RENDER_CONTEXT_ENTRIES));
-    let mut total = 0_usize;
-    for (name, value) in context {
-        if out.len() >= MAX_RENDER_CONTEXT_ENTRIES {
-            break;
-        }
-        let weight = name
-            .len()
-            .saturating_add(value.len())
-            .saturating_add(PER_ENTRY);
-        if total.saturating_add(weight) > MAX_RENDER_CONTEXT_BYTES {
-            break;
-        }
-        total = total.saturating_add(weight);
-        out.push((name.clone(), value.clone()));
-    }
-    out
-}
-
 /// A sandboxed plugin, ready to mount.
 ///
 /// `Clone` shares the compiled host, the concurrency permits, the capability
@@ -329,7 +291,7 @@ impl SandboxedPlugin {
         // rendered with fewer context entries is a panel missing a value, and a
         // page losing its panel over a caller's mistake is the outcome this
         // whole path exists to avoid.
-        let context = bounded_context(context);
+        let context = super::host::bounded_context(context);
         let outcome = tokio::task::spawn_blocking(move || {
             let outcome = host.render(&slot_owned, &context, services);
             drop(permit);
@@ -1591,25 +1553,32 @@ sha256 = "{digest}"
         // chose its size": it is routinely assembled from a row or a query
         // string, and none of it is in the per-request footprint
         // `max_concurrency` is validated against.
-        let many: Vec<(String, String)> = (0..MAX_RENDER_CONTEXT_ENTRIES * 4)
+        let many: Vec<(String, String)> = (0
+            ..crate::plugin_sandbox::host::MAX_RENDER_CONTEXT_ENTRIES * 4)
             .map(|index| (format!("k{index}"), String::new()))
             .collect();
         assert_eq!(
-            bounded_context(&many).len(),
-            MAX_RENDER_CONTEXT_ENTRIES,
+            crate::plugin_sandbox::host::bounded_context(&many).len(),
+            crate::plugin_sandbox::host::MAX_RENDER_CONTEXT_ENTRIES,
             "empty pairs still cost allocation, so the count alone has to bound them"
         );
 
-        let heavy: Vec<(String, String)> = (0..MAX_RENDER_CONTEXT_ENTRIES)
-            .map(|index| (format!("k{index}"), "x".repeat(MAX_RENDER_CONTEXT_BYTES)))
+        let heavy: Vec<(String, String)> = (0
+            ..crate::plugin_sandbox::host::MAX_RENDER_CONTEXT_ENTRIES)
+            .map(|index| {
+                (
+                    format!("k{index}"),
+                    "x".repeat(crate::plugin_sandbox::host::MAX_RENDER_CONTEXT_BYTES),
+                )
+            })
             .collect();
-        let kept = bounded_context(&heavy);
+        let kept = crate::plugin_sandbox::host::bounded_context(&heavy);
         let carried: usize = kept
             .iter()
             .map(|(name, value)| name.len().saturating_add(value.len()))
             .sum();
         assert!(
-            carried <= MAX_RENDER_CONTEXT_BYTES,
+            carried <= crate::plugin_sandbox::host::MAX_RENDER_CONTEXT_BYTES,
             "the worker was handed {carried} bytes"
         );
 
@@ -1618,6 +1587,9 @@ sha256 = "{digest}"
             ("id".to_owned(), "42".to_owned()),
             ("locale".to_owned(), "en".to_owned()),
         ];
-        assert_eq!(bounded_context(&ordinary), ordinary);
+        assert_eq!(
+            crate::plugin_sandbox::host::bounded_context(&ordinary),
+            ordinary
+        );
     }
 }

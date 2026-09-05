@@ -591,13 +591,42 @@ pub enum CallResult {
     },
 }
 
+/// Characters of a denial detail that reach the guest and the log.
+///
+/// The host's own sentences are all far shorter. What this bounds is the half
+/// it does not write: a `StoreError::Backend`, a `JobSink` error or an
+/// `OutboundHttp` failure is a string from someone else's driver, and a driver
+/// that echoes the query, the row or the upstream's body makes it as long as
+/// whoever influenced that input cared to. Generous next to any real message
+/// and far under the reply queue, so a denial can never be the thing that fails
+/// the request it was explaining.
+pub const MAX_DETAIL_CHARS: usize = 512;
+
 impl CallResult {
     /// Build a denial.
+    ///
+    /// Bounds and neutralises `detail` here rather than at each call site,
+    /// because the field's contract says it is bounded and escaped and the
+    /// interesting inputs are the ones the host did not write: a backend's
+    /// error string is an embedder's driver talking, and it may carry as much
+    /// attacker-influenced text as that driver chose to include. Serialized in
+    /// full before the reply-queue ceiling is checked, an unbounded one would
+    /// turn an explanation into the failure it was explaining.
     pub fn denied(id: u64, reason: DenialReason, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        let mut chars = detail.chars();
+        let kept: String = chars.by_ref().take(MAX_DETAIL_CHARS).collect();
+        let kept = if chars.next().is_some() {
+            format!("{kept}…")
+        } else {
+            kept
+        };
         Self::Denied {
             id,
             reason,
-            detail: detail.into(),
+            // Escaped as well as bounded: this reaches a `tracing` line and the
+            // rendered operator summary, which a terminal interprets.
+            detail: super::manifest::rejected(&kept),
         }
     }
 

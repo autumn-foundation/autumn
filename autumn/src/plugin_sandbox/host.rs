@@ -1192,6 +1192,53 @@ impl fmt::Debug for SandboxHost {
     }
 }
 
+/// What one context entry costs beyond its bytes: two `String` headers, a
+/// tuple, and the JSON punctuation it becomes on the wire.
+///
+/// Counted in both the ceiling and the fuel charge, so a thousand empty pairs
+/// are neither free to hold nor free to encode.
+pub const RENDER_CONTEXT_ENTRY_OVERHEAD: usize = 64;
+
+/// The most context entries one render hook is handed.
+///
+/// A slot's context is a handful of values a panel needs — an id, a locale, a
+/// count. Far above that, and far below anything that could matter.
+pub const MAX_RENDER_CONTEXT_ENTRIES: usize = 32;
+
+/// The most bytes one render hook's context may carry across all its entries.
+pub const MAX_RENDER_CONTEXT_BYTES: usize = 16 * 1024;
+
+/// Take as much of `context` as the ceilings above allow.
+///
+/// Applied by [`SandboxHost::render`] itself, not only by the wrapper: the
+/// entry point is public, an embedder may call it with context built from a
+/// row or a query string, and a ceiling that only one of two callers reaches is
+/// a ceiling the other does not have.
+///
+/// Per-entry overhead is counted, not just the strings: a thousand empty pairs
+/// cost real allocation and real serialization, and a budget measured only in
+/// string length prices them at nothing.
+#[must_use]
+pub fn bounded_context(context: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(context.len().min(MAX_RENDER_CONTEXT_ENTRIES));
+    let mut total = 0_usize;
+    for (name, value) in context {
+        if out.len() >= MAX_RENDER_CONTEXT_ENTRIES {
+            break;
+        }
+        let weight = name
+            .len()
+            .saturating_add(value.len())
+            .saturating_add(RENDER_CONTEXT_ENTRY_OVERHEAD);
+        if total.saturating_add(weight) > MAX_RENDER_CONTEXT_BYTES {
+            break;
+        }
+        total = total.saturating_add(weight);
+        out.push((name.clone(), value.clone()));
+    }
+    out
+}
+
 impl SandboxHost {
     /// Compile a verified artifact into a runnable host.
     ///
@@ -1501,14 +1548,27 @@ impl SandboxHost {
             );
         }
 
+        // Bounded here, at the public entry point, rather than only in
+        // `SandboxedPlugin::render_slot`. An embedder may call this directly
+        // with context built from a row or a query string, and a ceiling only
+        // one of two callers reaches is a ceiling the other does not have.
+        let context = &bounded_context(context);
+
         // The context is the host's own text rather than a client's body, so it
         // is priced by its length the same way an encoded request is. Measured
         // from the parts rather than from the encoded frame, because encoding
-        // it is the work being priced.
+        // it is the work being priced. Per-entry overhead is included, so a
+        // context of many empty pairs is not charged nothing for allocation and
+        // serialization it really costs.
         let encoding = context
             .iter()
             .map(|(name, value)| {
-                u64::try_from(name.len().saturating_add(value.len())).unwrap_or(u64::MAX)
+                u64::try_from(
+                    name.len()
+                        .saturating_add(value.len())
+                        .saturating_add(RENDER_CONTEXT_ENTRY_OVERHEAD),
+                )
+                .unwrap_or(u64::MAX)
             })
             .fold(
                 u64::try_from(slot.len()).unwrap_or(u64::MAX),
