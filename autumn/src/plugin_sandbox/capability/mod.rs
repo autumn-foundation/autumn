@@ -1049,7 +1049,7 @@ impl CapabilityRuntime {
     }
 
     /// Run the call against its backend, everything already checked.
-    fn perform(&mut self, call: &CapabilityCall, target: &str) -> CallResult {
+    fn perform(&self, call: &CapabilityCall, target: &str) -> CallResult {
         match call {
             CapabilityCall::KvGet { .. }
             | CapabilityCall::KvSet { .. }
@@ -1683,7 +1683,10 @@ path = "/shop/panel"
         let wide = "x".repeat(MAX_VALUE_TEXT_BYTES);
         for index in 0..16 {
             let mut row = row(&[("kind", "wide")]);
-            for column in 0..4 {
+            // Three, not four: four maxed-out columns plus the names is over
+            // `MAX_ROW_BYTES`, and a row that cannot be stored cannot
+            // demonstrate an answer that is too big to return.
+            for column in 0..3 {
                 row.insert(format!("c{column}"), PluginValue::Text(wide.clone()));
             }
             row.insert("n".to_owned(), PluginValue::Int(index));

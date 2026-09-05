@@ -137,10 +137,10 @@ impl PluginActivityLog {
         {
             let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
             for event in events {
-                if entries.len() >= MAX_LOG_EVENTS {
-                    if let Some((at, who, _)) = entries.pop_front() {
-                        evicted.push((at, who));
-                    }
+                if entries.len() >= MAX_LOG_EVENTS
+                    && let Some((at, who, _)) = entries.pop_front()
+                {
+                    evicted.push((at, who));
                 }
                 entries.push_back((now, plugin.to_owned(), event));
             }
