@@ -432,12 +432,50 @@ jobs:
           # tests that ran afterwards passed.
           cache-on-failure: true
       - name: Run tests
-        # `--skip compile_fail::` hands the trybuild module to the `trybuild`
-        # job below. It is a substring skip and `compile_fail::` is the module
-        # path of every test in it, so the two are exhaustive by construction:
-        # what this job skips is exactly what that job's four shards run.
+        # Two skips, each handed to a lane of its own:
+        #
+        # `compile_fail::` goes to the `trybuild` job below. `sim_` goes to the
+        # step right after this one. Both are substring skips over module paths
+        # that nothing else shares, so the three lanes partition the suite
+        # exactly — measured on the consolidated binary: 1840 + 10 + 37 = 1887,
+        # with no test matching two filters.
         run: |
-          cargo test --workspace -- --skip compile_fail::
+          cargo test --workspace -- --skip compile_fail:: --skip sim_
+      - name: Run the simulation suite single-threaded
+        # WHY A SEPARATE, SINGLE-THREADED LANE.
+        #
+        # The `sim_*` modules are determinism tests: each builds a
+        # `tokio::runtime::Builder::new_current_thread().start_paused(true)`
+        # runtime and asserts a seed replays byte-identically. They are
+        # sensitive to CPU oversubscription, and sharding made that worse, not
+        # better. Pulling trybuild out of this binary freed the whole libtest
+        # thread pool: the same ~1880 tests that used to trickle through the
+        # gaps between trybuild's long-running cases (863s on ubuntu) now run at
+        # full parallelism in ~61s. On the 4-vCPU `ubuntu-latest` runner that
+        # 14x compression is enough to flip these tests — `Test (ubuntu-latest)`
+        # failed both attempts of run 8482, on `sim_retry_storm` and then
+        # `sim_fault_plan`, while macOS and Windows passed on re-run.
+        # Reproduced locally on a 4-core box: the same binary WITH trybuild
+        # (888s) shows no `sim_*` failure, WITHOUT it (27s) does.
+        #
+        # So they get the environment they were written for. This is the same
+        # principle as the trybuild shard — a lane per execution requirement —
+        # not a quarantine: every one of these 37 tests still runs, still
+        # blocks merge, and is not skipped anywhere.
+        #
+        # It runs as a STEP of this job rather than a job of its own so it
+        # reuses the target dir just compiled above: no extra runner, no second
+        # workspace build, and the tests themselves take seconds.
+        #
+        # The root cause is the tests' sensitivity to contention, which this
+        # only sidesteps; making them robust under an oversubscribed pool is
+        # worth its own issue.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --workspace -- sim_ --test-threads=1 | tee "${RUNNER_TEMP}/sim.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/sim.log" \
+            || { echo "::error::the sim_ lane ran no tests — the filter no longer matches the sim_* modules"; exit 1; }
 
   trybuild:
     name: Trybuild ${{ matrix.shard }} (${{ matrix.os }})

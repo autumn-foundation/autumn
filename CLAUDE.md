@@ -35,7 +35,7 @@ so it is usually automatic:
 
 | Job | What it runs |
 | --- | --- |
-| `test` | `cargo test --workspace -- --skip compile_fail::` — the default lane |
+| `test` | `cargo test --workspace -- --skip compile_fail:: --skip sim_` — the default lane, plus a second step running `sim_` at `--test-threads=1` |
 | `trybuild` | `compile_fail::*` only, split into four shards |
 | `test-features` | one job per non-default feature set (markdown, i18n, tls, …) |
 | `test-docker` | the Linux `#[ignore]`d Docker/testcontainer sweep |
@@ -50,6 +50,16 @@ Two rules matter when editing tests:
 - **Branch protection should require `Test suite`** (the `test-gate` job), not
   the individual shards — it is the one check name that survives adding or
   removing a shard.
+- **A new `sim_*` module is single-threaded automatically.** The `test` job
+  skips `sim_` and a second step re-runs exactly that set with
+  `--test-threads=1`. These are determinism tests — each builds a
+  `start_paused(true)` current-thread runtime and asserts a seed replays
+  byte-identically — and they fail under CPU oversubscription. Sharding made
+  that *worse*: pulling trybuild out of the binary freed the libtest thread
+  pool, so the remaining ~1880 tests went from trickling through trybuild's
+  gaps (863s) to full parallelism (61s), and on the 4-vCPU `ubuntu-latest`
+  runner that flipped them. Name a new simulation module `sim_*` and it lands
+  in the quiet lane; name it something else and it will not.
 
 The split is not cosmetic: on the 2026-08-26 trunk run, `compile_fail::` alone
 was 37 of the 47 minutes the consolidated `integration_tests` binary spent

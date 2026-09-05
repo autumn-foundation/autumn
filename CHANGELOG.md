@@ -1417,7 +1417,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixture list is `#[cfg(feature = ...)]`-gated, so narrowing a shard to `-p
   autumn-web --test integration_tests` would silently compile fewer fixtures
   and still report green. Each shard asserts a non-zero pass count, because
-  `cargo test` exits 0 when a filter matches nothing. **Branch protection must
+  `cargo test` exits 0 when a filter matches nothing. The `sim_*` determinism
+  modules get a third lane, single-threaded, as a second step of the same job:
+  they build `start_paused(true)` runtimes and assert byte-identical replay, and
+  sharding made them *less* stable, not more — removing trybuild freed the
+  libtest thread pool, so the remaining ~1880 tests went from trickling through
+  trybuild's gaps (863s) to full parallelism (61s), which on the 4-vCPU
+  `ubuntu-latest` runner was enough to flip them (`Test (ubuntu-latest)` failed
+  both attempts of run 8482, on `sim_retry_storm` then `sim_fault_plan`, while
+  macOS and Windows passed on re-run; reproduced locally on a 4-core box, where
+  the same binary with trybuild present shows no such failure). All 37 still run
+  and still block merge — the lane costs 4 seconds and no extra runner.
+  **Branch protection must
   be repointed** from the per-OS `Test (…)` checks to the new `Test suite`
   (`test-gate`) check, which aggregates every shard and is the one name that
   stays stable as shards are added or removed.
