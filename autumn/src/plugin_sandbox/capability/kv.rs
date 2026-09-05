@@ -184,6 +184,7 @@ pub(super) fn perform(runtime: &CapabilityRuntime, call: &CapabilityCall, key: &
 pub struct MemoryKvStore {
     entries: Mutex<HashMap<String, PluginValue>>,
     capacity: usize,
+    byte_capacity: usize,
 }
 
 /// Keys a [`MemoryKvStore::new`] store will hold.
@@ -192,11 +193,21 @@ pub struct MemoryKvStore {
 /// enough that reaching it is a bug report rather than an outage.
 pub const DEFAULT_KV_CAPACITY: usize = 10_000;
 
+/// Bytes of keys and values a [`MemoryKvStore::new`] store will hold.
+///
+/// A key count is not a memory bound. `DEFAULT_KV_CAPACITY` entries at the
+/// default 64 KiB `kv_value_bytes` is about 625 MiB, and at the largest legal
+/// quota it is gigabytes — a granted plugin reaches that in under a minute at
+/// the default call rate. What an operator can reason about is *how much
+/// memory this store may take*, so that is what it is given.
+pub const DEFAULT_KV_BYTE_CAPACITY: usize = 32 * 1024 * 1024;
+
 impl Default for MemoryKvStore {
     fn default() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
             capacity: DEFAULT_KV_CAPACITY,
+            byte_capacity: DEFAULT_KV_BYTE_CAPACITY,
         }
     }
 }
@@ -208,12 +219,24 @@ impl MemoryKvStore {
         Arc::new(Self::default())
     }
 
-    /// An empty store holding at most `capacity` keys.
+    /// An empty store holding at most `capacity` keys, with the default byte
+    /// ceiling.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Arc<Self> {
         Arc::new(Self {
             entries: Mutex::new(HashMap::new()),
             capacity,
+            byte_capacity: DEFAULT_KV_BYTE_CAPACITY,
+        })
+    }
+
+    /// An empty store bounded by both a key count and a total size.
+    #[must_use]
+    pub fn with_capacities(capacity: usize, byte_capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            entries: Mutex::new(HashMap::new()),
+            capacity,
+            byte_capacity,
         })
     }
 
@@ -221,6 +244,22 @@ impl MemoryKvStore {
     #[must_use]
     pub const fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// How many bytes of keys and values this store will hold.
+    #[must_use]
+    pub const fn byte_capacity(&self) -> usize {
+        self.byte_capacity
+    }
+
+    /// What one entry costs: its key, its value, and the map's own per-entry
+    /// overhead, which a store measuring only payloads would charge at nothing.
+    const fn entry_weight(key: &str, value: &PluginValue) -> usize {
+        /// A `HashMap` bucket plus two `String` headers, near enough.
+        const PER_ENTRY: usize = 96;
+        key.len()
+            .saturating_add(value.weight())
+            .saturating_add(PER_ENTRY)
     }
 
     /// Every key currently stored, for assertions.
@@ -256,13 +295,30 @@ impl KvStore for MemoryKvStore {
     )]
     fn set(&self, key: &str, value: PluginValue) -> Result<(), String> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        // Overwriting an existing key adds nothing, so the ceiling applies to
-        // *new* keys only — a plugin that keeps one counter updated is never
-        // refused however long it runs.
+        // Overwriting an existing key adds no *entry*, so the key ceiling
+        // applies to new keys only — a plugin that keeps one counter updated is
+        // never refused however long it runs.
         if entries.len() >= self.capacity && !entries.contains_key(key) {
             return Err(format!(
                 "this host's plugin key/value store is full at {} keys",
                 self.capacity
+            ));
+        }
+        // The byte ceiling is the one that actually bounds memory, and it has to
+        // account for a *replacement* too: overwriting a small value with a huge
+        // one adds no key and can still take the store past its size.
+        let incoming = Self::entry_weight(key, &value);
+        let outgoing = entries
+            .get(key)
+            .map_or(0, |existing| Self::entry_weight(key, existing));
+        let held: usize = entries
+            .iter()
+            .map(|(stored_key, stored)| Self::entry_weight(stored_key, stored))
+            .fold(0, usize::saturating_add);
+        if held.saturating_sub(outgoing).saturating_add(incoming) > self.byte_capacity {
+            return Err(format!(
+                "this host's plugin key/value store is full at {} bytes",
+                self.byte_capacity
             ));
         }
         entries.insert(key.to_owned(), value);

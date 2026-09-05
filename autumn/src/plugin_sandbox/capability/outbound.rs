@@ -375,17 +375,26 @@ pub(super) fn perform(
     }
 
     // Refused before the request is built, not after the backend has copied it:
-    // the body is the guest's, and an unbounded one is host memory and egress
-    // an operator never agreed to when they granted a hostname.
+    // everything here is the guest's, and an unbounded request is host memory
+    // and egress an operator never agreed to when they granted a hostname.
+    //
+    // Headers count against the same budget as the body. Bounding only the body
+    // left the quota trivially sidesteppable: the allow-list caps how *many*
+    // headers may be set and says nothing about their size, so one `user-agent`
+    // could carry what the body was just refused for.
     let request_ceiling = runtime.quotas().outbound_request_bytes as usize;
-    if body.len() > request_ceiling {
+    let header_weight: usize = allowed
+        .iter()
+        .map(|(name, value)| name.len().saturating_add(value.len()))
+        .fold(0, usize::saturating_add);
+    let request_weight = header_weight.saturating_add(body.len());
+    if request_weight > request_ceiling {
         return CallResult::denied(
             id,
             DenialReason::QuotaExceeded,
             format!(
-                "the request body is {} bytes, over this plugin's {request_ceiling}-byte \
-                 `outbound_request_bytes` quota",
-                body.len()
+                "the request is {request_weight} bytes of headers and body, over this plugin's \
+                 {request_ceiling}-byte `outbound_request_bytes` quota"
             ),
         );
     }

@@ -2121,6 +2121,68 @@ path = "/shop/panel"
         );
     }
 
+    #[test]
+    fn an_outbound_requests_headers_count_against_its_byte_quota() {
+        // Bounding the body alone left the quota sidesteppable: the allow-list
+        // caps how *many* headers may be set and says nothing about their size,
+        // so one `user-agent` could carry what a body was just refused for.
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        let ceiling = fixture.runtime.quotas().outbound_request_bytes as usize;
+        fixture.http.answer(
+            "https://api.example.com/",
+            OutboundResponse::from_url("https://api.example.com/", 200, "ok"),
+        );
+
+        let result = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
+            id: 1,
+            method: "POST".to_owned(),
+            url: "https://api.example.com/".to_owned(),
+            headers: vec![("user-agent".to_owned(), "x".repeat(ceiling + 1))],
+            body: String::new(),
+        });
+        assert_eq!(
+            result.denial(),
+            Some(DenialReason::QuotaExceeded),
+            "an empty body does not make an oversized request small: {result:?}"
+        );
+        assert!(
+            fixture.http.seen().is_empty(),
+            "the call still left the host"
+        );
+    }
+
+    #[test]
+    fn the_in_memory_kv_store_is_bounded_by_bytes_not_only_by_keys() {
+        // A key count is not a memory bound: the default capacity at the
+        // default `kv_value_bytes` is hundreds of megabytes, and gigabytes at
+        // the largest legal quota.
+        let store = MemoryKvStore::with_capacities(10_000, 4096);
+        // Well inside the key ceiling, well past the byte one.
+        let mut refused = false;
+        for index in 0..64 {
+            if store
+                .set(&format!("k{index}"), PluginValue::Text("x".repeat(512)))
+                .is_err()
+            {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "the store grew past its byte ceiling");
+        assert!(
+            store.keys().len() < 10_000,
+            "and it refused long before the key ceiling"
+        );
+
+        // A replacement is checked too: no new key, but more bytes.
+        let small = MemoryKvStore::with_capacities(10_000, 4096);
+        assert!(small.set("k", PluginValue::Text("x".repeat(64))).is_ok());
+        assert!(
+            small.set("k", PluginValue::Text("x".repeat(8192))).is_err(),
+            "overwriting one key with an oversized value adds no entry and still grows the store"
+        );
+    }
+
     // ── DB containment ───────────────────────────────────────────────
 
     #[test]
