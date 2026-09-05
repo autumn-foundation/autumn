@@ -1,9 +1,9 @@
 //! Shared parsing and validation helpers for route macros.
 
 use proc_macro2::TokenStream;
-use quote::{ToTokens, format_ident, quote};
+use quote::{format_ident, quote};
 use syn::parse::ParseStream;
-use syn::{Attribute, Ident, Item, ItemFn, LitStr, Token};
+use syn::{Attribute, Ident, ItemFn, LitStr, Token};
 
 /// Keys accepted inside a route attribute's `seo(...)` argument, in the order
 /// they are documented. Each one maps 1:1 onto a
@@ -317,16 +317,68 @@ fn validate_path(path: &LitStr) -> Result<(), TokenStream> {
     Ok(())
 }
 
-/// Parse and validate an async handler function from macro input.
+/// Split macro input into any leading non-function items plus a trailing
+/// function item, tolerating (but not requiring) leading items ahead of the
+/// handler.
+///
+/// A body-guard macro that has already expanded (`#[secured]`, `#[step_up]`,
+/// `#[throttle]`) emits a hidden `FromRequestParts` gate type — a struct plus
+/// its impl — ahead of the handler function itself, rather than rewriting a
+/// single function in place (#1668). When such a guard is written *above*
+/// another guard or route attribute, that outer macro receives the inner
+/// guard's gate items followed by the handler function as its own input, not
+/// a lone function item. The common case (no guard has expanded yet) is
+/// tried first, so parse-error messages for genuinely invalid input are
+/// unchanged; only on that failure is the input re-parsed as a sequence of
+/// items (as `syn::File` does), taking the *last* one as the handler.
+///
+/// Returns `Ok((leading_items, func))` if a trailing function item was
+/// found — `leading_items` is empty in the common case — or a compile error
+/// `TokenStream` if not. Does not validate asyncness; callers that require
+/// it (all current ones do) check `func.sig.asyncness` themselves so each
+/// can keep its own diagnostic wording.
+pub fn split_leading_items_and_fn(
+    item: &TokenStream,
+) -> Result<(TokenStream, ItemFn), TokenStream> {
+    if let Ok(input_fn) = syn::parse2::<ItemFn>(item.clone()) {
+        return Ok((TokenStream::new(), input_fn));
+    }
+
+    let not_a_function = || {
+        syn::Error::new_spanned(
+            item.clone(),
+            "route macros can only be applied to functions",
+        )
+        .to_compile_error()
+    };
+
+    let mut file: syn::File = syn::parse2(item.clone()).map_err(|_| not_a_function())?;
+    let Some(syn::Item::Fn(input_fn)) = file.items.pop() else {
+        return Err(not_a_function());
+    };
+
+    let leading_items = file.items;
+    Ok((quote! { #(#leading_items)* }, input_fn))
+}
+
+/// Parse an async handler function from macro input, tolerating leading
+/// non-function items ahead of it (see [`split_leading_items_and_fn`]).
+///
+/// Validates exactly what a bare handler parse would (must be a function,
+/// must be async); every earlier item is returned as an opaque token stream
+/// the caller is responsible for re-emitting verbatim.
 ///
 /// Returns `Ok((leading_items, func))` if valid, or a compile error
-/// `TokenStream` if not. Validates: is a function, is async. `leading_items`
-/// is the (usually empty) sequence of sibling items a body-guard macro left
-/// ahead of the function — see [`parse_leading_items_and_fn`] — and the
-/// caller must re-emit it verbatim alongside whatever it generates from the
-/// function.
-pub fn parse_async_handler(item: TokenStream) -> Result<(TokenStream, ItemFn), TokenStream> {
-    let (leading, input_fn) = parse_leading_items_and_fn(item)?;
+/// `TokenStream` if not.
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps an owned `TokenStream` parameter so callers (route macros with
+// many call sites of their own, at both the proc-macro boundary and in
+// tests) don't need to thread a reference through.
+#[allow(clippy::needless_pass_by_value)]
+pub fn parse_async_handler_with_leading_items(
+    item: TokenStream,
+) -> Result<(TokenStream, ItemFn), TokenStream> {
+    let (leading_items, input_fn) = split_leading_items_and_fn(&item)?;
 
     if input_fn.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
@@ -336,75 +388,7 @@ pub fn parse_async_handler(item: TokenStream) -> Result<(TokenStream, ItemFn), T
         .to_compile_error());
     }
 
-    Ok((leading, input_fn))
-}
-
-/// Parse macro `item` input as a target handler function, recovering it even
-/// when it is not the ONLY item in the stream.
-///
-/// The common case is `item` being exactly one function, and this is then
-/// equivalent to (and byte-identical in cost to) `syn::parse2::<ItemFn>`.
-///
-/// `#[secured]`/`#[step_up]`/`#[throttle]` each move their check into a
-/// `FromRequestParts` gate — a hidden struct + trait impl emitted as sibling
-/// items ahead of the (rewritten) handler function, rather than a statement
-/// inside it (issue #1668). So when one of those guards is written ABOVE
-/// another guard or the route attribute, it expands first and hands the
-/// macro below it a stream of MULTIPLE items — the gate's struct and impl,
-/// then the function — not a single function. A macro at any of those
-/// call sites that still assumed "the input is exactly one function" (as
-/// every one of them did before issue #1668's gate redesign) would reject
-/// that shape outright with a confusing "can only be applied to functions"
-/// error, silently discarding the earlier guard's gate items in the process
-/// (issue #2516).
-///
-/// Recovers the LAST item as the target function (every guard here appends
-/// its own gate ahead of, never after, the function it rewrites) and returns
-/// every item before it as `leading_items`, unparsed and untouched, for the
-/// caller to splice back into its own output — the gate type the function's
-/// own inserted parameter names must still be defined somewhere.
-pub fn parse_leading_items_and_fn(item: TokenStream) -> Result<(TokenStream, ItemFn), TokenStream> {
-    // Fast path: try the whole stream as one function first, so the
-    // overwhelmingly common (single-function, no earlier guard) case never
-    // pays for a second, item-sequence parse.
-    if let Ok(input_fn) = syn::parse2::<ItemFn>(item.clone()) {
-        return Ok((TokenStream::new(), input_fn));
-    }
-
-    let items =
-        parse_item_sequence(item.clone()).map_err(|_| not_a_function_error(item.clone()))?;
-    let Some((last, leading)) = items.split_last() else {
-        return Err(not_a_function_error(item));
-    };
-    let Item::Fn(input_fn) = last.clone() else {
-        return Err(not_a_function_error(item));
-    };
-    let leading_items = leading.iter().map(ToTokens::to_token_stream).collect();
     Ok((leading_items, input_fn))
-}
-
-fn not_a_function_error(item: TokenStream) -> TokenStream {
-    syn::Error::new_spanned(item, "route macros can only be applied to functions")
-        .to_compile_error()
-}
-
-/// Parse a `TokenStream` as a bare sequence of items (no enclosing braces) —
-/// what a module or file body holds. `syn` has no single parser for this
-/// shape; the couple of lines here are the standard way to walk it.
-fn parse_item_sequence(item: TokenStream) -> syn::Result<Vec<Item>> {
-    struct ItemSequence(Vec<Item>);
-
-    impl syn::parse::Parse for ItemSequence {
-        fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
-            let mut items = Vec::new();
-            while !input.is_empty() {
-                items.push(input.parse()?);
-            }
-            Ok(Self(items))
-        }
-    }
-
-    syn::parse2::<ItemSequence>(item).map(|ItemSequence(items)| items)
 }
 
 /// Extract `#[intercept(LayerType)]` attributes from a function's attribute

@@ -160,10 +160,11 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // Parse the async handler function
-    let (leading_guard_items, input_fn) = match crate::parse::parse_async_handler(item) {
-        Ok(v) => v,
-        Err(err) => return err,
-    };
+    let (leading_guard_items, input_fn) =
+        match crate::parse::parse_async_handler_with_leading_items(item) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
 
     let fn_name = &input_fn.sig.ident;
     let route_info_name = format_ident!("__autumn_route_info_{}", fn_name);

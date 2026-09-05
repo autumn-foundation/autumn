@@ -112,13 +112,17 @@ fn parse_scope_array(expr: &Expr) -> syn::Result<Vec<String>> {
 }
 
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let SecuredArgs { roles, scopes } = match parse_secured_args(attr) {
         Ok(r) => r,
         Err(err) => return err.to_compile_error(),
     };
 
-    let (leading_guard_items, mut input_fn) = match crate::parse::parse_leading_items_and_fn(item) {
+    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
         Ok(v) => v,
         Err(err) => return err,
     };
@@ -312,7 +316,7 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     quote! {
-        #leading_guard_items
+        #leading_items
         #gate_item
         #input_fn
     }

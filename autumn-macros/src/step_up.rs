@@ -191,12 +191,16 @@ fn type_contains_impl_trait(ty: &syn::Type) -> bool {
 
 /// Expand the `#[step_up]` / `#[step_up(max_age = "Nm")]` attribute.
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let max_age_opt = match parse_step_up_args(attr) {
         Ok(v) => v,
         Err(err) => return err.to_compile_error(),
     };
-    let (leading_guard_items, mut input_fn) = match crate::parse::parse_leading_items_and_fn(item) {
+    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
         Ok(v) => v,
         Err(err) => return err,
     };
@@ -224,7 +228,10 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // `api_doc::infer_response_body`'s guard recovery
     // (`RESPONSE_REWRITING_GUARD_MARKERS`) requires exactly this const IN the
     // body to tell a real guard's `__autumn_inner` wrapper apart from
-    // unrelated code with the same shape (issue #2516).
+    // unrelated code with the same shape (issue #2516), so
+    // `api_doc::recover_guarded_return_type` can still recover the
+    // pre-rewrite return type for OpenAPI when #[step_up] expands before the
+    // route macro (#1677).
     let max_age_marker = quote! {
         #[allow(dead_code)]
         const __AUTUMN_STEP_UP_MAX_AGE: ::core::option::Option<u64> = #max_age_tokens;
@@ -350,7 +357,7 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     quote! {
-        #leading_guard_items
+        #leading_items
         #gate_item
         #input_fn
     }

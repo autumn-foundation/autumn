@@ -90,7 +90,8 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err,
     };
 
-    let (leading_guard_items, input_fn) = match parse::parse_async_handler(item) {
+    let (leading_guard_items, input_fn) = match parse::parse_async_handler_with_leading_items(item)
+    {
         Ok(v) => v,
         Err(err) => return err,
     };
