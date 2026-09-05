@@ -24,7 +24,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ExprLit, ItemFn, Lit, LitStr, Meta, Token, parse_quote};
+use syn::{Expr, ExprLit, Lit, LitStr, Meta, Token, parse_quote};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -112,15 +112,19 @@ fn parse_scope_array(expr: &Expr) -> syn::Result<Vec<String>> {
 }
 
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let SecuredArgs { roles, scopes } = match parse_secured_args(attr) {
         Ok(r) => r,
         Err(err) => return err.to_compile_error(),
     };
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
 
     if input_fn.sig.asyncness.is_none() {
@@ -312,6 +316,7 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     quote! {
+        #leading_items
         #gate_item
         #input_fn
     }
