@@ -97,11 +97,21 @@ const BEARER_TOKEN: &str = "bolt-throttle-bench-client";
 const THROTTLE_LIMIT: u32 = 1_000_000;
 
 fn main() {
+    // `.parse().ok()` alone would collapse a present-but-malformed value
+    // (a typo like `--iterations 20O0`, or a missing value that swallows the
+    // next flag) into `None`, and `unwrap_or` would then silently run the
+    // 2,000-iteration default for a workload the caller didn't ask for
+    // (caught in review). Reserve the default for an ABSENT flag only; an
+    // unparseable supplied value panics naming it.
     let iterations: u32 = std::env::args()
         .position(|a| a == "--iterations")
-        .and_then(|i| std::env::args().nth(i + 1))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2_000);
+        .map_or(2_000, |i| {
+            let raw = std::env::args()
+                .nth(i + 1)
+                .expect("--iterations requires a value");
+            raw.parse()
+                .unwrap_or_else(|e| panic!("--iterations value {raw:?} is not a valid u32: {e}"))
+        });
     // Compared as `iterations < THROTTLE_LIMIT - 50` (a compile-time-constant
     // subtraction), not `iterations + 50 < THROTTLE_LIMIT`: the addition form
     // wraps silently in a release build for an `iterations` near `u32::MAX`
@@ -123,10 +133,17 @@ fn main() {
     // rejected rather than silently falling back to `both` (caught in
     // review): a typo'd `--route` would otherwise record a mixed, doubled
     // workload and produce an invalid A/B with no indication why.
-    let route: String = std::env::args()
-        .position(|a| a == "--route")
-        .and_then(|i| std::env::args().nth(i + 1))
-        .unwrap_or_else(|| "both".to_owned());
+    // Same "absent flag vs. present-but-missing-value" distinction as
+    // `--iterations` above: a `--route` with nothing after it must not
+    // silently default to `both`.
+    let route: String = std::env::args().position(|a| a == "--route").map_or_else(
+        || "both".to_owned(),
+        |i| {
+            std::env::args()
+                .nth(i + 1)
+                .expect("--route requires a value")
+        },
+    );
     let (hit_throttled, hit_plain) = match route.as_str() {
         "throttled" => (true, false),
         "plain" => (false, true),
