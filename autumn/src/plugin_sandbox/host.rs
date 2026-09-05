@@ -3691,6 +3691,29 @@ fn charge_units(caller: &mut Caller<'_, HostState>, units: u64) -> Result<(), wa
     caller.set_fuel(remaining)
 }
 
+/// Charge `units`, taking the budget to zero rather than trapping when it does
+/// not cover them.
+///
+/// For the one charge that necessarily *follows* a committed side effect: a
+/// reply can only be measured once the call has been answered, and by then a KV
+/// write, a job enqueue or an outbound POST has happened. Trapping there ends
+/// the request over work already done — and a retry does that work again, which
+/// for a POST is the difference between one order and two.
+///
+/// Taking the budget to zero instead is bounded and terminal in the same
+/// breath: the overshoot is one reply's worth, the next dispatch cannot start
+/// because [`CAPABILITY_CALL_FUEL`] is charged before it with [`charge_units`],
+/// which does trap, and the guest's own instructions run out on the next one.
+/// The request still ends here — it ends after the effect is accounted for
+/// rather than after it is disowned.
+fn charge_units_saturating(
+    caller: &mut Caller<'_, HostState>,
+    units: u64,
+) -> Result<(), wasmi::Error> {
+    let left = caller.get_fuel()?;
+    caller.set_fuel(left.saturating_sub(units))
+}
+
 /// Register the guest-visible WASI surface.
 ///
 /// One registration per import, all in one place, because this list **is** the
@@ -3891,8 +3914,13 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                             {
                                 charge_units(&mut caller, CAPABILITY_CALL_FUEL)?;
                                 let _ = caller.data_mut().service_next();
+                                // Saturating, because this charge follows a call
+                                // that has already run: see
+                                // `charge_units_saturating`. The pre-charge above
+                                // is the trapping one, and it is what stops the
+                                // next call.
                                 let owed = caller.data_mut().take_pending_charge();
-                                charge_units(&mut caller, owed)?;
+                                charge_units_saturating(&mut caller, owed)?;
                             }
                             // Charged whether the write was accepted or not, and
                             // drained before the branch below, so no exit from
