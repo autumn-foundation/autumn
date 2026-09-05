@@ -137,13 +137,36 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             INCOMPATIBLE_GUARD_ATTRS.contains(&segment.ident.to_string().as_str())
         })
     });
-    if !leading_guard_items.is_empty() || unexpanded_guard_attr.is_some() {
-        return unexpanded_guard_attr
-            .map_or_else(
-                || syn::Error::new_spanned(leading_guard_items, INCOMPATIBLE_GUARD_MSG),
-                |attr| syn::Error::new_spanned(attr, INCOMPATIBLE_GUARD_MSG),
-            )
-            .to_compile_error();
+    // `#[authorize]` above `#[ws]` (already expanded) slips past both checks
+    // above: unlike the other three guards it emits no separate gate sibling
+    // item (so `leading_guard_items` is typically empty) and it *removes*
+    // its own attribute once consumed (so `input_fn.attrs` no longer carries
+    // it either) — see `authorize_macro`'s `#leading_items #input_fn`
+    // emission vs. the other three guards' `#leading_items #gate_item
+    // #input_fn` (third Codex review pass on #2513). Rather than keep
+    // enumerating every guard's particular expansion shape, check the
+    // actual invariant directly: all four guards rewrite the return type to
+    // the exact same `-> ::autumn_web::reexports::axum::response::Response`
+    // (confirmed identical across secured.rs/step_up.rs/throttle.rs/
+    // authorize.rs), which a legitimate `#[ws]` handler — required to
+    // return `impl WsHandler` — never would.
+    let already_returns_response = matches!(
+        &input_fn.sig.output,
+        syn::ReturnType::Type(_, ty)
+            if matches!(ty.as_ref(), syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "Response"))
+    );
+    if !leading_guard_items.is_empty()
+        || unexpanded_guard_attr.is_some()
+        || already_returns_response
+    {
+        let err = if let Some(attr) = unexpanded_guard_attr {
+            syn::Error::new_spanned(attr, INCOMPATIBLE_GUARD_MSG)
+        } else if !leading_guard_items.is_empty() {
+            syn::Error::new_spanned(leading_guard_items, INCOMPATIBLE_GUARD_MSG)
+        } else {
+            syn::Error::new_spanned(&input_fn.sig.output, INCOMPATIBLE_GUARD_MSG)
+        };
+        return err.to_compile_error();
     }
 
     let fn_name = &input_fn.sig.ident;
@@ -423,6 +446,33 @@ mod tests {
         assert!(
             generated.contains("compile_error"),
             "a #[throttle] guard stacked above #[ws] must be a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_rejects_an_authorize_guard_expanded_above_it() {
+        // `#[authorize]` above `#[ws]`: unlike `#[secured]`/`#[step_up]`/
+        // `#[throttle]`, `authorize_macro` emits no separate gate sibling
+        // item (just `#leading_items #input_fn`) and removes its own
+        // attribute once consumed, so neither `leading_guard_items` nor a
+        // live attribute on `input_fn` catches this ordering — only the
+        // rewritten `-> Response` return type does (third Codex finding on
+        // #2513, deeper than the first two).
+        let authorized = crate::authorize::authorize_macro(
+            quote! { "view", resource = Room },
+            quote! {
+                async fn echo() -> impl WsHandler { |socket| async move {} }
+            },
+        );
+        let generated = ws_macro(quote! { "/echo" }, authorized).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "an #[authorize] guard stacked above #[ws] must be a compile error: {generated}"
+        );
+        assert!(
+            generated.contains("cannot be combined with"),
+            "the error must explain why the combination is rejected: {generated}"
         );
     }
 

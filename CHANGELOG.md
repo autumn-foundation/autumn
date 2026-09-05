@@ -1681,9 +1681,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[ws]` outermost, the guard still a live, unexpanded attribute below it —
   slips past that check entirely (nothing has expanded yet, so there are no
   leading items) and generates the same silently-broken code, just one macro
-  expansion later. The rejection now also scans the handler's still-live
-  attributes for `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]`, so
-  both stacking orders are caught. Separately, `#[ws]`'s `ApiDoc` had the
+  expansion later. The rejection then also scanned the handler's still-live
+  attributes for `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` — but
+  a fourth Codex pass caught that `#[authorize]` above `#[ws]` (already
+  expanded) slips past *both* checks: unlike the other three guards,
+  `authorize_macro` emits no separate `FromRequestParts` gate sibling item
+  (so leading items stay empty) and it removes its own attribute once
+  consumed (so the live-attribute scan finds nothing either). Rather than
+  keep chasing each guard's particular expansion shape, the rejection now
+  checks the actual invariant directly: all four guards rewrite the return
+  type to the exact same `-> Response` (confirmed identical across all four
+  guards' source), which a legitimate `#[ws]` handler — required to return
+  `impl WsHandler` — never would. Separately, `#[ws]`'s `ApiDoc` had the
   same hardcoded `secured: false, required_roles: &[]` gap `#[static_get]`
   had for the (still-supported) case of a live `#[authorize]` attribute or
   policy check — fixed the same way, via `api_doc::extract_secured_info`
