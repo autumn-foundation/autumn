@@ -37,8 +37,8 @@ pub fn route_macro(
     };
     let path = route_args.path.clone();
 
-    let mut input_fn = match parse::parse_async_handler(item) {
-        Ok(f) => f,
+    let (preamble, mut input_fn) = match parse::parse_async_handler_with_preamble(item) {
+        Ok(v) => v,
         Err(err) => return err,
     };
 
@@ -256,6 +256,13 @@ pub fn route_macro(
     };
 
     quote! {
+        // A guard macro that already expanded above this route macro (#1668:
+        // #[throttle]/#[secured]/#[step_up]) leaves its handler-unique gate
+        // `struct` + `impl FromRequestParts` here, ahead of the function —
+        // the function's new first parameter names that gate type, so it
+        // must be re-emitted verbatim for the gate type to exist.
+        #preamble
+
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
         // to import axum manually. However, the path resolution in Axum macros makes this impossible
         // natively. Custom compile errors handle the type checks.

@@ -24,7 +24,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ExprLit, ItemFn, Lit, LitStr, Meta, Token, parse_quote};
+use syn::{Expr, ExprLit, Lit, LitStr, Meta, Token, parse_quote};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -118,18 +118,15 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    // `parse_async_handler_with_preamble` also tolerates zero or more item
+    // definitions ahead of the function — the gate `struct` + `impl
+    // FromRequestParts` a guard macro that already expanded above this one
+    // (e.g. `#[secured]` above `#[throttle]`) leaves behind — and already
+    // validates the trailing function is async.
+    let (preamble, mut input_fn) = match crate::parse::parse_async_handler_with_preamble(item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
-
-    if input_fn.sig.asyncness.is_none() {
-        return syn::Error::new_spanned(
-            input_fn.sig.fn_token,
-            "#[secured] can only be applied to async functions",
-        )
-        .to_compile_error();
-    }
 
     // The session/role check is emitted for the classic forms (`#[secured]`,
     // `#[secured("admin")]`) and whenever a role is required. It is OMITTED for
@@ -312,6 +309,7 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     quote! {
+        #preamble
         #gate_item
         #input_fn
     }
