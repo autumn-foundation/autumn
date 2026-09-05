@@ -190,7 +190,7 @@ pub fn emit_symbol_slice(symbols: &[String]) -> TokenStream {
     if symbols.is_empty() {
         quote! { &[] }
     } else {
-        let items = symbols.iter().map(|s| s.as_str());
+        let items = symbols.iter().map(String::as_str);
         quote! { &[#(#items),*] }
     }
 }
