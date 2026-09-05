@@ -226,6 +226,32 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-cli.sh --self-test && ./scripts/check-docs-cli.sh
+      - name: Config-key drift gate
+        # The third thing a reader copies off a page, after the link and the
+        # command: the `autumn.toml` key. It is the only one of the three that
+        # fails SILENTLY. `server.strict_config` is off by default, so serde
+        # drops an unknown key without a warning — the app boots, the setting
+        # the reader believed they changed keeps its default, and nothing
+        # anywhere says so. A bad link 404s and a bad command exits 2; both are
+        # dead ends the reader can see and route around.
+        #
+        # The baseline run found two, in the guide: `[session] ttl_seconds` in
+        # wizards.md (the key is `max_age_secs`, and the documented "increase"
+        # to 3600 was a 24x decrease against the 86400 default), and an
+        # impossible `[app] profile` in dev-error-overlay.md — `AutumnConfig`
+        # has no `[app]` section and `profile` is `#[serde(skip)]`, resolved
+        # from `AUTUMN_ENV`/`--profile`/build mode and settable from no config
+        # file at all.
+        #
+        # The truth set is the CI-guarded `schema_keys.snapshot` plus the
+        # workspace's `config_section()` calls and the CLI's own `[dev]`
+        # struct, so there is nothing here to regenerate:
+        # `schema_keys_snapshot_guard` already fails if that snapshot drifts
+        # from the compiled schema in either direction.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-config.sh --self-test && ./scripts/check-docs-config.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`

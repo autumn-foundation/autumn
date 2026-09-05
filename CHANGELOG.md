@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A config-key drift gate for the docs corpus [no-plugin]:** the link gate
+  stops a reader being sent to a page that does not exist and the CLI gate
+  stops them being handed a command that does not exist; nothing checked the
+  third thing they copy off a page — the `autumn.toml` **key** — and it is the
+  only one of the three that fails **silently**. `server.strict_config` is off
+  by default, so serde drops an unknown key without a warning: the app boots,
+  the setting the reader believed they changed keeps its default, and nothing
+  anywhere says so. A bad link 404s and a bad command exits 2; both are dead
+  ends the reader can see and route around.
+  `scripts/check-docs-config.sh` resolves every key in every `autumn.toml`
+  fence in the reader-facing corpus (161 of the corpus's 246 TOML fences)
+  against the 484-leaf config schema, using the same walk semantics as the
+  framework's own `AutumnConfig::validate_toml` — including the rule that a
+  section with no schema entry (`jobs.queues`, `auth.oauth2`,
+  `http.client.base_urls`, `resilience.circuit_breaker.hosts`) is opaque,
+  since those take arbitrary valid children. It now runs in CI's docs-only
+  job. Its baseline found **2 defects across 2 guide pages**, both fixed here:
+  `[session] ttl_seconds = 3600` in `wizards.md`, under "consider increasing
+  the session TTL" — there is no `ttl_seconds` in the source, the key is
+  `session.max_age_secs`, and its default is `86400`, so the documented
+  "increase" was also a 24x *decrease* if the reader hand-corrected the name;
+  and an impossible `[app] profile = "production"` in `dev-error-overlay.md`,
+  where `AutumnConfig` has no `[app]` section and `profile` is
+  `#[serde(skip)]`, resolved from `AUTUMN_ENV`/`--profile`/build mode and
+  settable from no config file at all (it traces to ADR 0006, which proposed
+  that "one-line opt-out in `autumn.toml`"; the implementation went another
+  way and the guide shipped the proposal). The truth set needs no
+  regeneration: it is `autumn/tests/fixtures/schema_keys.snapshot`, which
+  `schema_keys_snapshot_guard` already asserts both ways against the compiled
+  schema on every CI run, plus the workspace's `config_section()` calls
+  (plugin-owned roots such as `[search]` and `[media]`) and the `[dev]` fields
+  parsed from `autumn-cli`'s own `DevConfig`. Values are deliberately out of
+  scope — only whether the key exists — as are the archive trees
+  (`docs/plans/`, `docs/adr/`, `docs/design/`, `CHANGELOG.md`, …), whose 13
+  out-of-schema keys are accurate records of superseded proposals rather than
+  instructions a reader follows today.
 - **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
   update validation left after #1719/#1742/#1778/#1801 (issue #1751).
   `must_match` — like `custom`, `ip` on `Option<_>` fields, and
