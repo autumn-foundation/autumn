@@ -90,8 +90,10 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err,
     };
 
-    let input_fn = match parse::parse_async_handler(item) {
-        Ok(f) => f,
+    // See the note in `route_macro`: a guard stacked above this attribute emits
+    // its gate type alongside the handler, and that prelude is re-emitted below.
+    let (prelude, input_fn) = match parse::parse_async_handler_with_prelude(item) {
+        Ok(parsed) => parsed,
         Err(err) => return err,
     };
 
@@ -162,6 +164,7 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let path_params_tokens = crate::api_doc::emit_path_param_slice(&path_params);
 
     quote! {
+        #prelude
         #input_fn
 
         #upgrade_handler
@@ -238,6 +241,29 @@ mod tests {
     use quote::quote;
 
     use super::ws_macro;
+
+    #[test]
+    fn ws_keeps_a_stacked_guards_gate_type_in_scope() {
+        // `#[secured]` above `#[ws]`: secured expands first and emits its
+        // `FromRequestParts` gate type ALONGSIDE the handler (#1668), so
+        // `ws_macro` receives `[items…] fn`. It must keep that prelude — the
+        // handler carries a `_: __AutumnSecuredGate_echo` parameter that only
+        // resolves if the gate type is still emitted.
+        let secured = crate::secured::secured_macro(
+            quote! { "admin" },
+            quote! { async fn echo() -> impl WsHandler { |socket| async move {} } },
+        );
+        let generated = ws_macro(quote! { "/echo" }, secured).to_string();
+
+        assert!(
+            generated.contains("struct __AutumnSecuredGate_echo"),
+            "the inner guard's gate type must survive into the ws output: {generated}"
+        );
+        assert!(
+            generated.contains("__autumn_route_info_echo"),
+            "the ws route info must still be generated: {generated}"
+        );
+    }
 
     #[test]
     fn ws_defaults_public_false() {

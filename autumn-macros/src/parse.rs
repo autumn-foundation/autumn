@@ -317,15 +317,71 @@ fn validate_path(path: &LitStr) -> Result<(), TokenStream> {
     Ok(())
 }
 
-/// Parse and validate an async handler function from macro input.
+/// Split a macro input into any leading items plus the trailing function.
 ///
-/// Returns `Ok(func)` if valid, or a compile error `TokenStream` if not.
-/// Validates: is a function, is async.
-pub fn parse_async_handler(item: TokenStream) -> Result<ItemFn, TokenStream> {
-    let input_fn: ItemFn = syn::parse2(item.clone()).map_err(|_| {
-        syn::Error::new_spanned(item, "route macros can only be applied to functions")
-            .to_compile_error()
-    })?;
+/// Returns `None` when the stream is not a sequence of items ending in a
+/// function, so callers can fall back to their own diagnostic.
+///
+/// The body guards (`#[secured]`, `#[step_up]`, `#[throttle]`, `#[authorize]`)
+/// stack on one another, and since #1668 each emits a `FromRequestParts` gate
+/// type ALONGSIDE the handler. So whenever an inner guard has already expanded,
+/// an outer guard's input is `[items…] fn` rather than a bare `fn`, and parsing
+/// it as a single `ItemFn` fails. Each guard re-emits the prelude ahead of its
+/// own output so the inner gate types stay in scope.
+pub fn split_handler_prelude(item: TokenStream) -> Option<(TokenStream, ItemFn)> {
+    let file: syn::File = syn::parse2(item).ok()?;
+    let (last, prelude) = file.items.split_last()?;
+    let syn::Item::Fn(input_fn) = last else {
+        return None;
+    };
+    Some((quote! { #(#prelude)* }, input_fn.clone()))
+}
+
+/// Parse and validate an async handler function from macro input, together
+/// with any items that precede it.
+///
+/// Returns `Ok((prelude, func))` if valid, or a compile error `TokenStream` if
+/// not. Validates: the trailing item is a function, and it is async.
+///
+/// WHY A PRELUDE: a guard attribute written ABOVE a route attribute —
+/// `#[secured]` / `#[step_up]` / `#[throttle]` over `#[get]` — expands FIRST
+/// and hands its output to the route macro. Since #1668 each of those guards
+/// emits a handler-unique `FromRequestParts` gate type ALONGSIDE the handler
+/// and inserts a `_: Gate` parameter referring to it, so what arrives here is
+/// `[items…] fn`, not a bare `fn`. Parsing the whole stream as a single
+/// `ItemFn` rejected that with "route macros can only be applied to
+/// functions", which is how #2488 broke the four
+/// `route_macro_infers_response_schema_*` tests #2484 had just added.
+///
+/// The leading items are handed back untouched for the caller to re-emit ahead
+/// of its own output, which is what keeps the gate type in scope for the
+/// parameter the guard inserted. A bare `fn` yields an empty prelude, so the
+/// single-item path is unchanged.
+pub fn parse_async_handler_with_prelude(
+    item: TokenStream,
+) -> Result<(TokenStream, ItemFn), TokenStream> {
+    // Cloned once up front purely to span the diagnostic; `item` itself is then
+    // consumed by the parse below.
+    let item_for_err = item.clone();
+    let not_a_fn = move || {
+        syn::Error::new_spanned(
+            &item_for_err,
+            "route macros can only be applied to functions",
+        )
+        .to_compile_error()
+    };
+
+    // `syn::File` rather than `ItemFn`: it accepts a sequence of items, and the
+    // handler is the last of them. Anything that is not a sequence of items, or
+    // whose final item is not a function, still fails with the original
+    // diagnostic.
+    let file: syn::File = syn::parse2(item).map_err(|_| not_a_fn())?;
+    // One arm covers both rejections: an empty stream (no last item) and a
+    // stream whose final item is not a function.
+    let Some((syn::Item::Fn(input_fn), prelude)) = file.items.split_last() else {
+        return Err(not_a_fn());
+    };
+    let input_fn = input_fn.clone();
 
     if input_fn.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
@@ -335,7 +391,7 @@ pub fn parse_async_handler(item: TokenStream) -> Result<ItemFn, TokenStream> {
         .to_compile_error());
     }
 
-    Ok(input_fn)
+    Ok((quote! { #(#prelude)* }, input_fn))
 }
 
 /// Extract `#[intercept(LayerType)]` attributes from a function's attribute

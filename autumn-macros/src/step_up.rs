@@ -196,9 +196,17 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(v) => v,
         Err(err) => return err.to_compile_error(),
     };
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    // A guard stacked BELOW this one has already expanded and emitted its
+    // `FromRequestParts` gate type alongside the handler, so `item` may be
+    // `[items…] fn`. Keep that prelude and re-emit it below; the fallback
+    // re-parses as a bare `ItemFn` purely to surface syn's original diagnostic
+    // unchanged for input that is genuinely not a function.
+    let (prelude, mut input_fn) = match crate::parse::split_handler_prelude(item.clone()) {
+        Some(parsed) => parsed,
+        None => match syn::parse2::<ItemFn>(item) {
+            Ok(f) => (quote! {}, f),
+            Err(err) => return err.to_compile_error(),
+        },
     };
     if input_fn.sig.asyncness.is_none() {
         return syn::Error::new_spanned(
@@ -331,11 +339,25 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     input_fn.block = syn::parse_quote! {
         {
+            // Marker const, re-declared here in the handler body and not only
+            // inside the gate above. `api_doc::infer_response_body` recovers a
+            // guarded handler's pre-rewrite return type from the
+            // `__autumn_inner` binding below, and
+            // `idempotency_guard::generated_inner_response_binding` only trusts
+            // that binding when one of `RESPONSE_REWRITING_GUARD_MARKERS` sits
+            // earlier in the SAME block — the marker is what tells a real
+            // guard's wrapper apart from user code that coincidentally has the
+            // same shape. Moving this const into the gate (#1668) silently took
+            // the OpenAPI response schema away from every `#[step_up]`-above-route
+            // handler (#1677). `#[secured]` keeps its markers here for exactly
+            // this reason.
+            const __AUTUMN_STEP_UP_MAX_AGE: ::core::option::Option<u64> = #max_age_tokens;
             #original_response
         }
     };
 
     quote! {
+        #prelude
         #gate_item
         #input_fn
     }

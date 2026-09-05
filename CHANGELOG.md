@@ -1633,6 +1633,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **macros:** `#[secured]` / `#[step_up]` / `#[throttle]` / `#[authorize]`
+  written **above** a route attribute compile again, and keep their OpenAPI
+  response schema (issue #1677, regressed by #1668/#2488). Two independent
+  breakages, both surfaced by the four
+  `route_macro_infers_response_schema_*` tests #2484 had added one commit
+  earlier. First, #2488 changed each guard to emit a handler-unique
+  `FromRequestParts` gate type **alongside** the handler rather than a
+  statement inside its body; a guard written above a route attribute expands
+  first, so the route macro began receiving `[items…] fn` and rejected it with
+  `route macros can only be applied to functions` — that ordering stopped
+  compiling at all. `parse_async_handler_with_prelude` now splits the trailing
+  handler off any leading items and hands those back for the caller to re-emit,
+  which keeps the gate type in scope for the `_: Gate` parameter the guard
+  inserted; `#[get]`/`#[post]`/…, `#[ws]` and `#[static_get]` all use it, and
+  the guards use the same split so they can stack on one another. A bare `fn`
+  yields an empty prelude, so unguarded handlers expand byte-identically.
+  Second, `api_doc::infer_response_body` recovers a guarded handler's
+  pre-rewrite return type from the `__autumn_inner` binding, and
+  `idempotency_guard` only trusts that binding when one of
+  `RESPONSE_REWRITING_GUARD_MARKERS` sits earlier in the **same block** —
+  #2488 moved `step_up`'s and `throttle`'s marker consts into the gate, so
+  every `#[step_up]`/`#[throttle]`-above-route handler silently lost its
+  `Json<T>` response schema from the generated spec. Both now re-declare their
+  marker in the handler body, as `#[secured]` always has. `#[ws]` and
+  `#[static_get]` gained regression tests for the stacked ordering, which had
+  the same latent defect and no coverage. [no-plugin] — a macro-expansion fix
+  with no new agent-facing surface.
 - **🧭 Wayfinder: keyboard bypass-blocks link added to 6 supported example
   apps (a11y `bypass` Serious 7/8 → 0/8; `landmark-one-main` Moderate 1/8 → 0/8):**
   `autumn check --a11y` — the framework's own WCAG audit, run against each

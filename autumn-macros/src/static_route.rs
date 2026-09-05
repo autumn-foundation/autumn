@@ -159,9 +159,10 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
-    // Parse the async handler function
-    let input_fn = match crate::parse::parse_async_handler(item) {
-        Ok(f) => f,
+    // Parse the async handler function, plus any items a guard attribute
+    // stacked above this one emitted alongside it (see `route_macro`).
+    let (prelude, input_fn) = match crate::parse::parse_async_handler_with_prelude(item) {
+        Ok(parsed) => parsed,
         Err(err) => return err,
     };
 
@@ -206,6 +207,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let seo_defaults = attrs.seo.emit();
 
     quote! {
+        #prelude
         #input_fn
 
         #[doc(hidden)]
@@ -273,6 +275,29 @@ mod tests {
     use quote::quote;
 
     use super::static_get_macro;
+
+    #[test]
+    fn static_get_keeps_a_stacked_guards_gate_type_in_scope() {
+        // `#[secured]` above `#[static_get]`: secured expands first and emits
+        // its `FromRequestParts` gate type ALONGSIDE the handler (#1668), so
+        // `static_get_macro` receives `[items…] fn`. It must keep that
+        // prelude — the handler carries a `_: __AutumnSecuredGate_about`
+        // parameter that only resolves if the gate type is still emitted.
+        let secured = crate::secured::secured_macro(
+            quote! { "admin" },
+            quote! { async fn about() -> &'static str { "about" } },
+        );
+        let generated = static_get_macro(quote! { "/about" }, secured).to_string();
+
+        assert!(
+            generated.contains("struct __AutumnSecuredGate_about"),
+            "the inner guard's gate type must survive into the static route output: {generated}"
+        );
+        assert!(
+            generated.contains("__autumn_route_info_about"),
+            "the static route info must still be generated: {generated}"
+        );
+    }
 
     #[test]
     fn static_get_defaults_public_false() {

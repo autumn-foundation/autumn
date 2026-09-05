@@ -118,9 +118,17 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    // A guard stacked BELOW this one has already expanded and emitted its
+    // `FromRequestParts` gate type alongside the handler, so `item` may be
+    // `[items…] fn`. Keep that prelude and re-emit it below; the fallback
+    // re-parses as a bare `ItemFn` purely to surface syn's original diagnostic
+    // unchanged for input that is genuinely not a function.
+    let (prelude, mut input_fn) = match crate::parse::split_handler_prelude(item.clone()) {
+        Some(parsed) => parsed,
+        None => match syn::parse2::<ItemFn>(item) {
+            Ok(f) => (quote! {}, f),
+            Err(err) => return err.to_compile_error(),
+        },
     };
 
     if input_fn.sig.asyncness.is_none() {
@@ -312,6 +320,7 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     quote! {
+        #prelude
         #gate_item
         #input_fn
     }
