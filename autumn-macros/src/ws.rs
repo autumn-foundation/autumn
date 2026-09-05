@@ -108,21 +108,37 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // wired.
     let is_public = crate::api_doc::is_public(&input_fn);
 
+    // Derive `secured`/`required_roles`/`required_scopes` from any
+    // `#[secured]` markers on the handler, the same way `crate::route` and
+    // `crate::static_route` do (#2513 Codex review): otherwise a
+    // `#[secured(...)]`-guarded WebSocket route is protected at runtime but
+    // reported as `unclassified`/roleless to `routes audit`.
+    let (secured, required_roles, required_scopes) =
+        crate::api_doc::extract_secured_info(&input_fn);
+
     // Separate user params into AppState params (supplied from extracted state)
     // and extractor params (become Axum extractors on the upgrade handler).
     let mut extractor_params = Vec::new();
     let mut call_args = Vec::new();
 
-    for arg in &input_fn.sig.inputs {
+    for (idx, arg) in input_fn.sig.inputs.iter().enumerate() {
         if let syn::FnArg::Typed(pat_type) = arg {
             if is_app_state_type(&pat_type.ty) {
                 // AppState param — supply from our extracted state
                 call_args.push(quote! { __autumn_state.clone() });
             } else {
-                // Regular extractor — add to upgrade handler params
-                let pat = &pat_type.pat;
-                extractor_params.push(arg.clone());
-                call_args.push(quote! { #pat });
+                // Regular extractor — add to upgrade handler params, bound to
+                // a freshly generated identifier rather than echoing the
+                // original parameter's pattern back as a call argument: a
+                // guard (`#[secured]`/`#[step_up]`/`#[throttle]`) expanded
+                // above `#[ws]` inserts a leading `_: __AutumnXGate` parameter
+                // (#2513 Codex review), and `_` is a pattern, not a valid
+                // call-argument expression — `#fn_name(_)` does not compile.
+                let attrs = &pat_type.attrs;
+                let ty = &pat_type.ty;
+                let local_ident = format_ident!("__autumn_ws_extractor_{idx}");
+                extractor_params.push(quote! { #(#attrs)* #local_ident: #ty });
+                call_args.push(quote! { #local_ident });
             }
         }
     }
@@ -193,8 +209,9 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     success_status: 101,
                     hidden: true,
                     query_schema: ::core::option::Option::None,
-                    secured: false,
-                    required_roles: &[],
+                    secured: #secured,
+                    required_roles: #required_roles,
+                    required_scopes: #required_scopes,
                     register_schemas: ::core::option::Option::None,
                     api_version: ::core::option::Option::None,
                     public: #is_public,
@@ -254,6 +271,50 @@ mod tests {
         );
         // The handler's module path is captured for audit diagnostics.
         assert!(generated.contains("module_path"));
+        assert!(
+            generated.contains("secured : false"),
+            "an unguarded ws route must record secured = false: {generated}"
+        );
+        assert!(
+            generated.contains("required_roles : & []"),
+            "an unguarded ws route must have no required roles: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_compiles_when_secured_guard_expands_first() {
+        // `#[secured("admin")]` above `#[ws]`: the guard expands first and
+        // inserts a leading `_: __AutumnSecuredGate_echo` gate parameter.
+        // Before the fix, `ws_macro` echoed that parameter's wildcard
+        // pattern (`_`) straight back as a call argument, producing
+        // `echo (_)` — invalid Rust, since `_` is a pattern, not an
+        // expression (#2513 Codex review). It must instead bind the
+        // parameter to a generated identifier and forward that.
+        let secured = crate::secured::secured_macro(
+            quote! { "admin" },
+            quote! {
+                async fn echo() -> impl WsHandler { |socket| async move {} }
+            },
+        );
+        let generated = ws_macro(quote! { "/echo" }, secured).to_string();
+
+        assert!(
+            !generated.contains("echo (_ )") && !generated.contains("echo (_)"),
+            "the gate's wildcard pattern must never be forwarded as a call argument: {generated}"
+        );
+        assert!(
+            generated.contains("__autumn_ws_extractor_0"),
+            "the gate parameter must be bound to a generated identifier and forwarded by \
+             name: {generated}"
+        );
+        assert!(
+            generated.contains("secured : true"),
+            "a #[secured]-above-#[ws] route must record secured = true: {generated}"
+        );
+        assert!(
+            generated.contains(r#"required_roles : & ["admin"]"#),
+            "roles from a #[secured] guard must survive into the ws route's ApiDoc: {generated}"
+        );
     }
 
     #[test]

@@ -1655,6 +1655,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `api_doc::extract_secured_info(&input_fn)`, mirroring `crate::route`
   exactly (found by Codex review on #2513).
 
+- **macros: `#[secured]`/`#[step_up]`/`#[throttle]` above `#[ws]` failed to
+  compile, and once fixed would have had the same `routes audit` gap as
+  `#[static_get]` above:** `ws_macro` builds a two-function wrapper that
+  calls the user's handler by hand, and for each non-`AppState` parameter it
+  echoed that parameter's *pattern* straight back as the call argument. A
+  guard expanded above `#[ws]` inserts a leading `_: __AutumnXGate`
+  parameter (same `parse_async_handler_with_leading_items` leading-item
+  support the fix above added), and `_` is a pattern, not a valid
+  expression — `#fn_name(_)` does not compile (Codex review on #2513,
+  P1). Fixed by binding every forwarded extractor to a freshly generated
+  identifier instead of reusing its original pattern. Separately, `#[ws]`'s
+  `ApiDoc` had the identical hardcoded `secured: false, required_roles: &[]`
+  gap `#[static_get]` had — fixed the same way, via
+  `api_doc::extract_secured_info` (Codex review on #2513, P2).
+
 - **🔒 `autumn generate auth`: a concurrent successful login could be silently
   re-locked by a racing failed attempt (issue #2500):** the generated
   `login` handler (and the duplicated `reauth` step-up block) counted a
