@@ -37,7 +37,7 @@ use autumn_web::plugin_sandbox::test_guests as guests;
 use autumn_web::plugin_sandbox::{
     CapabilityServices, JobSink, KvStore, OutboundHttp, OutboundResponse, PluginActivityLog,
     PluginStore, PluginValue, SandboxArtifact, SandboxHost, SandboxManifest, SandboxRequest,
-    SandboxedPlugin,
+    SandboxedPlugin, tenant_segment,
 };
 use http::StatusCode;
 
@@ -452,7 +452,7 @@ fn one_tenants_writes_are_unreadable_from_another_tenants_request() {
         store
             .keys()
             .first()
-            .is_some_and(|key| key.contains(":alpha:")),
+            .is_some_and(|key| key.contains(&format!(":{}:", tenant_segment(Some("alpha"))))),
         "{:?}",
         store.keys()
     );
@@ -726,8 +726,16 @@ async fn the_tenant_a_mounted_plugin_binds_to_is_the_requests_own() {
         2,
         "one key per tenant, not one shared: {keys:?}"
     );
-    assert!(keys.iter().any(|key| key.contains(":alpha:")), "{keys:?}");
-    assert!(keys.iter().any(|key| key.contains(":beta:")), "{keys:?}");
+    // Derived, not spelled: the tenant reaches a key as a *segment* that says
+    // whether there was a tenant at all, so a literal `:alpha:` here would stop
+    // testing anything the moment that derivation changed.
+    for tenant in ["alpha", "beta"] {
+        let segment = format!(":{}:", tenant_segment(Some(tenant)));
+        assert!(
+            keys.iter().any(|key| key.contains(&segment)),
+            "{tenant}: {keys:?}"
+        );
+    }
 }
 
 #[test]

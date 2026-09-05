@@ -78,7 +78,7 @@ pub use capability::{
     MAX_TARGET_CHARS, MAX_VALUE_TEXT_BYTES, MemoryJobSink, MemoryKvStore, MemoryPluginStore,
     NO_TENANT, OutboundHttp, OutboundRequest, OutboundResponse, PluginActivityLog, PluginJob,
     PluginRow, PluginStore, PluginValue, QueryPage, RecordingHttp, RenderError, Scope, StoreError,
-    bounded_rows, row_weight,
+    bounded_rows, row_weight, tenant_segment,
 };
 pub use grants::{
     CapabilityGrants, CapabilityQuotas, ConsentDelta, MAX_GRANT_ENTRIES, MAX_GRANT_IDENT_LEN,
