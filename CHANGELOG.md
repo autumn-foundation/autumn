@@ -454,9 +454,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   back, for that run alone, when the pinned CLI lacks `routes posture`: it
   probes forward through the next few releases and installs the first one
   that has it, landing on a specific, bounded release rather than a moving
-  "latest" that keeps drifting from the app's own pin. The fallback stops
-  firing at all once a release in the app's own compatible series adds the
-  command. `ci.yml`'s `a11y verify` and `routes audit` steps (like
+  "latest" that keeps drifting from the app's own pin. The fallback does
+  not resolve itself — the workflow still installs the app's pinned
+  `autumn-web` version first on every run — so it keeps firing until the
+  app raises that pin (and reruns `autumn upgrade --apply`) to a release
+  that already has the command. `ci.yml`'s `a11y verify` and `routes audit`
+  steps (like
   `posture-gate.yml`'s own `manifest` job) compile and introspect the pull
   request's own code, so they never fall back — they now probe for their
   subcommand the same way `posture-gate.yml`'s verdict job already did, and

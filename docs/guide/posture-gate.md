@@ -111,14 +111,17 @@ another is not decidable from the strings, and a gate that blocks on
 > releases and installs the first one that has it — for that run only —
 > instead of staying stuck. That's a specific, bounded release, not a moving
 > "latest": it doesn't drift further from your `autumn-web` version with
-> every later, unrelated release, and it stops firing at all once a release
-> in your app's own compatible series adds the command. Until then, the
-> gate still runs (rather than staying red until you raise `autumn-web`
-> yourself), just under a CLI that may not exactly match your `autumn-web`
-> version. If nothing in range has the command, the first run fails, naming
-> it. It fails rather than skipping on purpose: a gate that waves a pull
-> request through because its own tooling is too old is worse than a red
-> one.
+> every later, unrelated release. But it also doesn't resolve itself —
+> the workflow still installs your pinned `autumn-web` version first, on
+> every run, so publishing a newer compatible release upstream changes
+> nothing here on its own. The fallback keeps firing until you raise your
+> app's `autumn-web` version and rerun `autumn upgrade --apply` to pick up
+> a pin that already has the command. Until then, the gate still runs
+> (rather than staying red until you raise `autumn-web` yourself), just
+> under a CLI that may not exactly match your `autumn-web` version. If
+> nothing in range has the command, the first run fails, naming it. It
+> fails rather than skipping on purpose: a gate that waves a pull request
+> through because its own tooling is too old is worse than a red one.
 
 
 **New apps** get it by default: `autumn new` scaffolds
