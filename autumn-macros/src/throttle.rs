@@ -273,16 +273,6 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let spec_tokens = build_spec_tokens(&attrs);
     let gate_ident = format_ident!("__AutumnThrottleGate_{}", fn_name);
 
-    // The marker const also stays in the handler body (not just inside the
-    // gate below) so `api_doc::recover_guarded_return_type` can still
-    // recover the pre-rewrite return type for OpenAPI when #[throttle]
-    // expands before the route macro (#1677).
-    let route_id_marker = quote! {
-        #[allow(dead_code)]
-        const __AUTUMN_THROTTLE_ROUTE_ID: &str =
-            ::core::concat!(::core::module_path!(), "::", #fn_name_str);
-    };
-
     // Whether THIS gate should also serve a cached idempotency replay: see
     // `should_own_replay` for the full ordering rationale (issue #1668's
     // pre-body gates and `#[authorize]`'s in-body check must never both skip
@@ -319,6 +309,27 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // `FromRequest` body extractor (`Json` / `Form` / `Multipart`) and
     // short-circuits on the first rejection, so an over-limit or replayed
     // request never causes the body to be parsed or buffered.
+    // Stable per-handler bucket namespace. Two routes pointing at the same
+    // named limiter share their bucket via the runtime registry — the
+    // route_id here is only used for inline limiters and for uniqueness when
+    // a named entry is missing from config.
+    //
+    // Emitted from one shared `TokenStream` (cheaply `Clone`) so it can be
+    // declared TWICE — once inside the gate below for the actual runtime
+    // check, and once (inert) into the handler body via `route_id_marker`
+    // near the bottom of this function — mirroring `secured_macro`'s
+    // `role_scope_consts`/`markers` split. `api_doc::infer_response_body`'s
+    // guard recovery (`RESPONSE_REWRITING_GUARD_MARKERS`) requires this const
+    // in the handler's OWN body to tell a real guard's `__autumn_inner`
+    // wrapper apart from unrelated code with the same shape; since #1668
+    // moved the throttle check itself into this gate, this is the only
+    // reason a copy still needs to live in the body at all (issue #2516).
+    let route_id_marker = quote! {
+        #[allow(dead_code)]
+        const __AUTUMN_THROTTLE_ROUTE_ID: &str =
+            ::core::concat!(::core::module_path!(), "::", #fn_name_str);
+    };
+
     let gate_item = quote! {
         #[doc(hidden)]
         #[allow(non_camel_case_types)]
@@ -336,13 +347,7 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> impl ::core::future::Future<Output = ::core::result::Result<Self, Self::Rejection>>
                 + Send {
                 async move {
-                    // Stable per-handler bucket namespace. Two routes pointing
-                    // at the same named limiter share their bucket via the
-                    // runtime registry — the route_id here is only used for
-                    // inline limiters and for uniqueness when a named entry is
-                    // missing from config.
-                    const __AUTUMN_THROTTLE_ROUTE_ID: &str =
-                        ::core::concat!(::core::module_path!(), "::", #fn_name_str);
+                    #route_id_marker
                     let __autumn_throttle_headers = parts.headers.clone();
                     // Optional because `MatchedPath` is absent for some routes
                     // (fallbacks, unnested handlers). When present, the

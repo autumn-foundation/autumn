@@ -220,17 +220,24 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
     let check_call = build_check_call(&max_age_tokens);
-    let fn_name = input_fn.sig.ident.clone();
-    let gate_ident = format_ident!("__AutumnStepUpGate_{}", fn_name);
-
-    // The marker const also stays in the handler body (not just inside the
-    // gate below) so `api_doc::recover_guarded_return_type` can still
-    // recover the pre-rewrite return type for OpenAPI when #[step_up]
-    // expands before the route macro (#1677).
+    // Inert copy of `check_call`'s own `__AUTUMN_STEP_UP_MAX_AGE` const,
+    // spliced into the handler body below (mirroring `secured_macro`'s
+    // `role_scope_consts`/`markers` split): #1668 moved the step-up check
+    // itself into the gate below, so `check_call`'s copy of this const never
+    // reaches the handler's own body any more, but
+    // `api_doc::infer_response_body`'s guard recovery
+    // (`RESPONSE_REWRITING_GUARD_MARKERS`) requires exactly this const IN the
+    // body to tell a real guard's `__autumn_inner` wrapper apart from
+    // unrelated code with the same shape (issue #2516), so
+    // `api_doc::recover_guarded_return_type` can still recover the
+    // pre-rewrite return type for OpenAPI when #[step_up] expands before the
+    // route macro (#1677).
     let max_age_marker = quote! {
         #[allow(dead_code)]
         const __AUTUMN_STEP_UP_MAX_AGE: ::core::option::Option<u64> = #max_age_tokens;
     };
+    let fn_name = input_fn.sig.ident.clone();
+    let gate_ident = format_ident!("__AutumnStepUpGate_{}", fn_name);
 
     // Whether THIS gate should also serve a cached idempotency replay: see
     // `should_own_replay` for the full ordering rationale (issue #1668's

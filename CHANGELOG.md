@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **deploy:** `autumn deploy check` now prints the same config-manifest signal
+  `autumn deploy up` already prints (#1952 check/up parity) — a confirming
+  line naming the `autumn.toml` (and, when present, `autumn-<profile>.toml`)
+  that will be uploaded, or the loud "no autumn.toml found" warning when the
+  project has none. Before this, an operator relying on `deploy check` as the
+  documented way to catch a broken deploy before touching the server had no
+  signal at all that the deployed app would silently run built-in defaults —
+  they only found out once they actually ran `up`. Purely informational: it
+  is not a graded preflight check and never affects `check`'s exit code. See
+  `docs/guide/deployment.md`'s "Your `autumn.toml` is deployed alongside the
+  binary" section for the full behavior this closes out. [no-plugin]
+
 - **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
   update validation left after #1719/#1742/#1778/#1801 (issue #1751).
   `must_match` — like `custom`, `ip` on `Option<_>` fields, and
@@ -1673,6 +1685,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/security/2026-09-03-webhook-ssrf/`.
 
 ### Fixed
+
+- **macros: stacked `#[secured]`/`#[step_up]`/`#[throttle]` above a route
+  attribute broke instead of composing (issue #2516):** #1668 moved each of
+  these three body guards' checks out of the handler body and into a
+  `FromRequestParts` gate — a hidden struct + trait impl now emitted as
+  sibling items ahead of the (rewritten) handler function, rather than
+  wrapping the body in place. Every macro downstream of one of these guards
+  — the route macro (`#[get]`/`#[post]`/etc.), and the three guards
+  themselves when stacked on each other — still assumed its `item` input was
+  exactly one function, so a guard written above another guard or the route
+  attribute handed the next macro a multi-item stream it rejected outright
+  with a confusing "route macros can only be applied to functions" error,
+  silently on every PR touching route macros regardless of whether the
+  guards were involved (the failure is in the default, always-compiled
+  `autumn-macros` unit suite). Fixed by teaching every one of those call
+  sites (`parse::split_leading_items_and_fn`, shared by the route/static/ws
+  macros and reused directly by the three guards) to recover the trailing
+  function from a longer item sequence and re-emit everything before it
+  verbatim, so an earlier guard's gate type is never dropped. Separately,
+  `#[step_up]`/`#[throttle]`'s move to a gate had also stopped emitting
+  their `__AUTUMN_STEP_UP_MAX_AGE`/`__AUTUMN_THROTTLE_ROUTE_ID` marker
+  consts into the handler body, which is what lets the route macro tell a
+  real guard's `__autumn_inner` return-type wrapper apart from unrelated
+  code (#1677) — restored by emitting an inert copy of each into the body
+  alongside the real one in the gate, mirroring `#[secured]`'s existing
+  `role_scope_consts`/`markers` split.
+
+- **macros: `#[secured]` above `#[static_get]` was protected at runtime but
+  reported unsecured to `routes audit`:** the fix above taught
+  `#[static_get]` to accept a guard's leading gate items via
+  `parse::parse_async_handler_with_leading_items`, but its generated
+  `ApiDoc` still hardcoded `secured: false, required_roles: &[]` instead of
+  reading the `#[secured]` marker back off the handler the way the
+  `#[get]`/`#[post]` route macro does — a `#[secured("admin")]`-guarded
+  static route was correctly gated on every request, yet `routes audit`
+  classified it `unclassified` and its declared roles were missing from
+  posture output. Fixed by deriving all three fields from
+  `api_doc::extract_secured_info(&input_fn)`, mirroring `crate::route`
+  exactly (found by Codex review on #2513).
+
+- **macros: `#[secured]`/`#[step_up]`/`#[throttle]` above `#[ws]` failed to
+  compile, and once fixed would have had the same `routes audit` gap as
+  `#[static_get]` above:** `ws_macro` builds a two-function wrapper that
+  calls the user's handler by hand, and for each non-`AppState` parameter it
+  echoed that parameter's *pattern* straight back as the call argument. A
+  guard expanded above `#[ws]` inserts a leading `_: __AutumnXGate`
+  parameter (same `parse_async_handler_with_leading_items` leading-item
+  support the fix above added), and `_` is a pattern, not a valid
+  expression — `#fn_name(_)` does not compile (Codex review on #2513,
+  P1). Fixed by binding every forwarded extractor to a freshly generated
+  identifier instead of reusing its original pattern. Separately, `#[ws]`'s
+  `ApiDoc` had the identical hardcoded `secured: false, required_roles: &[]`
+  gap `#[static_get]` had — fixed the same way, via
+  `api_doc::extract_secured_info` (Codex review on #2513, P2).
 
 - **🔒 `autumn generate auth`: a concurrent successful login could be silently
   re-locked by a racing failed attempt (issue #2500):** the generated
