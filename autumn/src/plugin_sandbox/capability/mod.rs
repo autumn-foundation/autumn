@@ -2208,6 +2208,27 @@ path = "/shop/panel"
             "and refused far below its row ceiling"
         );
 
+        // Replacement is the path that adds no entry and still grows the store,
+        // so every backend that has one is asserted here rather than left to be
+        // found a round later: `db-update` was bounded only on insert, while
+        // `kv-set` already accounted for it.
+        let roomy = db::MemoryPluginStore::with_capacities(10_000, 8192);
+        let small = roomy
+            .insert(&scope, row(&[("blob", "x")]))
+            .expect("a small row fits");
+        assert!(
+            roomy
+                .update(&scope, &small, row(&[("blob", "x".repeat(65536).as_str())]))
+                .is_err(),
+            "replacing a small row with an oversized one adds no row and still grows the store"
+        );
+        let kv = MemoryKvStore::with_capacities(10_000, 4096);
+        assert!(kv.set("k", PluginValue::Text("x".repeat(64))).is_ok());
+        assert!(
+            kv.set("k", PluginValue::Text("x".repeat(8192))).is_err(),
+            "the same must hold for the key/value store"
+        );
+
         let sink = MemoryJobSink::with_capacities(1024, 8192);
         let mut refused = false;
         for _ in 0..64 {

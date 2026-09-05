@@ -783,8 +783,30 @@ impl PluginStore for MemoryPluginStore {
     fn update(&self, scope: &Scope, row_id: &str, row: PluginRow) -> Result<(), StoreError> {
         let key = (scope.table.clone(), scope.tenant.clone(), row_id.to_owned());
         let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
-        if !rows.contains_key(&key) {
+        let Some(existing) = rows.get(&key) else {
             return Err(StoreError::NotFound);
+        };
+        // The byte ceiling applies to a *replacement* as much as to an insert.
+        // An update adds no row, so a check that only ran on `insert` left the
+        // store growable without bound: replacing each of many small rows with
+        // one near `MAX_ROW_BYTES` is the same memory, arrived at by the path
+        // that was not looking. The outgoing row's weight comes off first, so
+        // rewriting a row in place is never refused for the size it already
+        // was.
+        let outgoing = super::row_weight(existing);
+        let held: usize = rows
+            .values()
+            .map(super::row_weight)
+            .fold(0, usize::saturating_add);
+        if held
+            .saturating_sub(outgoing)
+            .saturating_add(super::row_weight(&row))
+            > self.byte_capacity
+        {
+            return Err(StoreError::Backend(format!(
+                "this host's in-memory plugin store is full at {} bytes",
+                self.byte_capacity
+            )));
         }
         rows.insert(key, row);
         Ok(())
