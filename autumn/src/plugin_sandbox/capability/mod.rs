@@ -255,18 +255,33 @@ where
         type Value = PluginRow;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(formatter, "at most {MAX_ROW_COLUMNS} columns")
+            write!(formatter, "at most {} columns", MAX_ROW_COLUMNS + 1)
         }
 
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            // One over the column ceiling, deliberately. `db-get` hands the row
+            // back with the host's `row_id` on it, and the documented
+            // read-modify-write is to change a field and send that map to
+            // `db-update` — so a row stored at exactly `MAX_ROW_COLUMNS`
+            // arrives here with 33 entries. Refusing it *here* would fail the
+            // whole frame as malformed before `validated_row` could strip the
+            // column the host itself added, which is the bug this subsystem
+            // already fixed once at the dispatch layer and this parse bound
+            // reintroduced one layer earlier.
+            //
+            // The real limit is still enforced, after stripping, by
+            // `validated_row`. This is only a bound on what is *allocated*, and
+            // thirty-three entries bounds it exactly as well as thirty-two.
+            const PARSE_CEILING: usize = MAX_ROW_COLUMNS + 1;
+
             let mut out = PluginRow::new();
             while let Some((column, value)) = map.next_entry::<String, PluginValue>()? {
                 // Counted on the map, not on entries read: a frame repeating one
                 // column name collapses to a single entry, and refusing it for
                 // its *reads* would reject a legal row written wastefully.
-                if out.len() >= MAX_ROW_COLUMNS && !out.contains_key(&column) {
+                if out.len() >= PARSE_CEILING && !out.contains_key(&column) {
                     return Err(A::Error::custom(format!(
-                        "more than {MAX_ROW_COLUMNS} columns"
+                        "more than {PARSE_CEILING} columns"
                     )));
                 }
                 out.insert(column, value);
@@ -1893,6 +1908,45 @@ path = "/shop/panel"
         };
         assert_eq!(rows.len(), 2, "the quota caps the page");
         assert!(truncated, "and the guest is told there is more");
+    }
+
+    #[test]
+    fn a_read_modify_write_echo_still_parses_at_the_column_ceiling() {
+        // The round-trip this asserts was already fixed once, at the dispatch
+        // layer, and the parse-time column bound reintroduced it one layer
+        // earlier — where the existing test could not see it, because that one
+        // builds a `CapabilityCall` directly instead of parsing a frame.
+        //
+        // `db-get` returns the row plus the host's `row_id`, so a row stored at
+        // exactly `MAX_ROW_COLUMNS` comes back with one more entry than a row
+        // may have, and sending it to `db-update` is the documented workflow.
+        let columns = (0..MAX_ROW_COLUMNS)
+            .map(|index| format!(r#""c{index}":"v""#))
+            .chain(std::iter::once(r#""row_id":"r1""#.to_owned()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let line = format!(
+            r#"{{"call":"db-update","id":1,"table":"orders","row_id":"r1","row":{{{columns}}}}}"#
+        );
+        let parsed = serde_json::from_str::<CapabilityCall>(&line);
+        assert!(
+            parsed.is_ok(),
+            "the echo of a full row must survive parsing: {parsed:?}"
+        );
+
+        // And one genuine column past the ceiling is still refused while read.
+        let columns = (0..=MAX_ROW_COLUMNS)
+            .map(|index| format!(r#""c{index}":"v""#))
+            .chain(std::iter::once(r#""row_id":"r1""#.to_owned()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let line = format!(
+            r#"{{"call":"db-update","id":1,"table":"orders","row_id":"r1","row":{{{columns}}}}}"#
+        );
+        assert!(
+            serde_json::from_str::<CapabilityCall>(&line).is_err(),
+            "a row genuinely over the ceiling is still refused"
+        );
     }
 
     #[test]
