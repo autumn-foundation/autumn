@@ -865,9 +865,17 @@ jobs:
 
   test-gate:
     name: Test suite
-    # The stable, shard-count-independent name for branch protection and for
-    # downstream `needs:`. It fails if ANY shard failed or was cancelled; a
-    # `needs:` alone would let a skipped shard pass silently.
+    # The stable, shard-count-independent name for BRANCH PROTECTION. It fails
+    # if any shard failed or was cancelled; a `needs:` alone would let a skipped
+    # shard pass silently.
+    #
+    # Nothing else should hang off this job. Anything with `needs: [test-gate]`
+    # inherits two properties it almost certainly does not want: it cannot start
+    # until the SLOWEST shard finishes (the Windows trybuild shard, ~57m), and
+    # it is SKIPPED whenever any one of the ~34 shard jobs is red — and a
+    # skipped required check can never be satisfied, so the PR stops being
+    # mergeable even once the real failure is understood. `coverage` and `loom`
+    # were briefly wired here and hit exactly that; they depend on `test`.
     needs: [test, trybuild, test-features, test-docker]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
@@ -882,7 +890,12 @@ jobs:
 
   coverage:
     name: Coverage
-    needs: [test-gate, meta]
+    # `test`, NOT `test-gate`: coverage instruments the workspace suite, so the
+    # `test` job is the only thing it actually depends on. Hanging it off the
+    # aggregate would make an unrelated red shard (a feature lane, a trybuild
+    # shard) skip coverage entirely, and would delay its start until the
+    # slowest shard finished. See the note on `test-gate`.
+    needs: [test, meta]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
       - uses: actions/checkout@v7
@@ -1140,7 +1153,8 @@ jobs:
   # the preemption budget + job timeout bound the state-space search.
   loom:
     name: Loom
-    needs: [test-gate, meta]
+    # `test`, NOT `test-gate` — same reasoning as `coverage` above.
+    needs: [test, meta]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     timeout-minutes: 30
     steps:
