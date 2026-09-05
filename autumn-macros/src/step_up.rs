@@ -17,7 +17,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{ItemFn, LitStr, parse_quote};
+use syn::{LitStr, parse_quote};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -196,9 +196,9 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(v) => v,
         Err(err) => return err.to_compile_error(),
     };
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    let (leading_guard_items, mut input_fn) = match crate::parse::parse_leading_items_and_fn(item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
     if input_fn.sig.asyncness.is_none() {
         return syn::Error::new_spanned(
@@ -216,6 +216,19 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
     let check_call = build_check_call(&max_age_tokens);
+    // Inert copy of `check_call`'s own `__AUTUMN_STEP_UP_MAX_AGE` const,
+    // spliced into the handler body below (mirroring `secured_macro`'s
+    // `role_scope_consts`/`markers` split): #1668 moved the step-up check
+    // itself into the gate below, so `check_call`'s copy of this const never
+    // reaches the handler's own body any more, but
+    // `api_doc::infer_response_body`'s guard recovery
+    // (`RESPONSE_REWRITING_GUARD_MARKERS`) requires exactly this const IN the
+    // body to tell a real guard's `__autumn_inner` wrapper apart from
+    // unrelated code with the same shape (issue #2516).
+    let max_age_marker = quote! {
+        #[allow(dead_code)]
+        const __AUTUMN_STEP_UP_MAX_AGE: ::core::option::Option<u64> = #max_age_tokens;
+    };
     let fn_name = input_fn.sig.ident.clone();
     let gate_ident = format_ident!("__AutumnStepUpGate_{}", fn_name);
 
@@ -331,11 +344,13 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     input_fn.block = syn::parse_quote! {
         {
+            #max_age_marker
             #original_response
         }
     };
 
     quote! {
+        #leading_guard_items
         #gate_item
         #input_fn
     }

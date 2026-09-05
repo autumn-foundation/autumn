@@ -21,7 +21,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ItemFn, Lit, LitInt, LitStr, parse_quote};
+use syn::{Expr, Lit, LitInt, LitStr, parse_quote};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -251,9 +251,9 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    let (leading_guard_items, mut input_fn) = match crate::parse::parse_leading_items_and_fn(item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
 
     if input_fn.sig.asyncness.is_none() {
@@ -305,6 +305,27 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // `FromRequest` body extractor (`Json` / `Form` / `Multipart`) and
     // short-circuits on the first rejection, so an over-limit or replayed
     // request never causes the body to be parsed or buffered.
+    // Stable per-handler bucket namespace. Two routes pointing at the same
+    // named limiter share their bucket via the runtime registry — the
+    // route_id here is only used for inline limiters and for uniqueness when
+    // a named entry is missing from config.
+    //
+    // Emitted from one shared `TokenStream` (cheaply `Clone`) so it can be
+    // declared TWICE — once inside the gate below for the actual runtime
+    // check, and once (inert) into the handler body via `route_id_marker`
+    // near the bottom of this function — mirroring `secured_macro`'s
+    // `role_scope_consts`/`markers` split. `api_doc::infer_response_body`'s
+    // guard recovery (`RESPONSE_REWRITING_GUARD_MARKERS`) requires this const
+    // in the handler's OWN body to tell a real guard's `__autumn_inner`
+    // wrapper apart from unrelated code with the same shape; since #1668
+    // moved the throttle check itself into this gate, this is the only
+    // reason a copy still needs to live in the body at all (issue #2516).
+    let route_id_marker = quote! {
+        #[allow(dead_code)]
+        const __AUTUMN_THROTTLE_ROUTE_ID: &str =
+            ::core::concat!(::core::module_path!(), "::", #fn_name_str);
+    };
+
     let gate_item = quote! {
         #[doc(hidden)]
         #[allow(non_camel_case_types)]
@@ -322,13 +343,7 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> impl ::core::future::Future<Output = ::core::result::Result<Self, Self::Rejection>>
                 + Send {
                 async move {
-                    // Stable per-handler bucket namespace. Two routes pointing
-                    // at the same named limiter share their bucket via the
-                    // runtime registry — the route_id here is only used for
-                    // inline limiters and for uniqueness when a named entry is
-                    // missing from config.
-                    const __AUTUMN_THROTTLE_ROUTE_ID: &str =
-                        ::core::concat!(::core::module_path!(), "::", #fn_name_str);
+                    #route_id_marker
                     let __autumn_throttle_headers = parts.headers.clone();
                     // Optional because `MatchedPath` is absent for some routes
                     // (fallbacks, unnested handlers). When present, the
@@ -439,11 +454,13 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     input_fn.block = syn::parse_quote! {
         {
+            #route_id_marker
             #original_response
         }
     };
 
     quote! {
+        #leading_guard_items
         #gate_item
         #input_fn
     }

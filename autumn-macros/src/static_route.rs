@@ -160,8 +160,8 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // Parse the async handler function
-    let input_fn = match crate::parse::parse_async_handler(item) {
-        Ok(f) => f,
+    let (leading_guard_items, input_fn) = match crate::parse::parse_async_handler(item) {
+        Ok(v) => v,
         Err(err) => return err,
     };
 
@@ -206,6 +206,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let seo_defaults = attrs.seo.emit();
 
     quote! {
+        #leading_guard_items
         #input_fn
 
         #[doc(hidden)]

@@ -1616,6 +1616,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **macros: stacked `#[secured]`/`#[step_up]`/`#[throttle]` above a route
+  attribute broke instead of composing (issue #2516):** #1668 moved each of
+  these three body guards' checks out of the handler body and into a
+  `FromRequestParts` gate — a hidden struct + trait impl now emitted as
+  sibling items ahead of the (rewritten) handler function, rather than
+  wrapping the body in place. Every macro downstream of one of these guards
+  — the route macro (`#[get]`/`#[post]`/etc.), and the three guards
+  themselves when stacked on each other — still assumed its `item` input was
+  exactly one function, so a guard written above another guard or the route
+  attribute handed the next macro a multi-item stream it rejected outright
+  with a confusing "route macros can only be applied to functions" error,
+  silently on every PR touching route macros regardless of whether the
+  guards were involved (the failure is in the default, always-compiled
+  `autumn-macros` unit suite). Fixed by teaching every one of those call
+  sites (`parse::parse_leading_items_and_fn`, shared by the route/static/ws
+  macros and reused directly by the three guards) to recover the trailing
+  function from a longer item sequence and re-emit everything before it
+  verbatim, so an earlier guard's gate type is never dropped. Separately,
+  `#[step_up]`/`#[throttle]`'s move to a gate had also stopped emitting
+  their `__AUTUMN_STEP_UP_MAX_AGE`/`__AUTUMN_THROTTLE_ROUTE_ID` marker
+  consts into the handler body, which is what lets the route macro tell a
+  real guard's `__autumn_inner` return-type wrapper apart from unrelated
+  code (#1677) — restored by emitting an inert copy of each into the body
+  alongside the real one in the gate, mirroring `#[secured]`'s existing
+  `role_scope_consts`/`markers` split.
+
 - **🧭 Wayfinder: keyboard bypass-blocks link added to 6 supported example
   apps (a11y `bypass` Serious 7/8 → 0/8; `landmark-one-main` Moderate 1/8 → 0/8):**
   `autumn check --a11y` — the framework's own WCAG audit, run against each
