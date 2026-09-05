@@ -891,6 +891,15 @@ pub(crate) enum GuestFrame {
     Fragment {
         /// The fragment tree. See [`render`](super::capability::render) for why
         /// it is a tree and not a string of HTML.
+        ///
+        /// Bounded while it is read, like the `attributes` and `children`
+        /// vectors inside it: `render` applies `MAX_NODES` to a tree serde has
+        /// already built, and `SandboxHost::execute` then clones it. This is
+        /// the root of that tree, so leaving it unbounded left the whole point
+        /// of bounding the branches unfinished.
+        #[serde(
+            deserialize_with = "super::capability::bounded_vec::<_, _, { super::capability::render::MAX_NODES }>"
+        )]
         nodes: Vec<super::capability::FragmentNode>,
     },
 }

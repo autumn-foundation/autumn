@@ -1896,6 +1896,32 @@ path = "/shop/panel"
     }
 
     #[test]
+    fn the_root_of_a_fragment_is_bounded_like_its_branches() {
+        // The branches were bounded first and the root was left open, which
+        // made bounding the branches pointless: `render` applies `MAX_NODES` to
+        // a tree serde has already built, and the host then clones it.
+        let nodes = (0..=render::MAX_NODES)
+            .map(|_| r#"{"node":"text","text":""}"#)
+            .collect::<Vec<_>>()
+            .join(",");
+        let line = format!(r#"{{"op":"fragment","nodes":[{nodes}]}}"#);
+        let err = serde_json::from_str::<crate::plugin_sandbox::wire::GuestFrame>(&line)
+            .expect_err("a fragment over the node ceiling must not parse");
+        assert!(err.to_string().contains("more than"), "{err}");
+
+        // Exactly at the ceiling still parses.
+        let nodes = (0..render::MAX_NODES)
+            .map(|_| r#"{"node":"text","text":""}"#)
+            .collect::<Vec<_>>()
+            .join(",");
+        let line = format!(r#"{{"op":"fragment","nodes":[{nodes}]}}"#);
+        assert!(
+            serde_json::from_str::<crate::plugin_sandbox::wire::GuestFrame>(&line).is_ok(),
+            "a fragment at the ceiling is legal"
+        );
+    }
+
+    #[test]
     fn a_guest_collection_is_refused_while_it_is_read_not_after() {
         // The distinction this asserts is invisible from the outside if you
         // only check that an oversized frame is refused: the *old* code also
