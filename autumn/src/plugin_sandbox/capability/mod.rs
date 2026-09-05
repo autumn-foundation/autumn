@@ -2225,7 +2225,7 @@ path = "/shop/panel"
             vec![jobs::PluginJob {
                 plugin: "shop".to_owned(),
                 job_type: "reindex".to_owned(),
-                tenant: "alpha".to_owned(),
+                tenant: Some("alpha".to_owned()),
                 payload: row(&[("since", "2026-01-01")]),
             }]
         );
@@ -2664,7 +2664,7 @@ path = "/shop/panel"
         let job = || PluginJob {
             plugin: "shop".to_owned(),
             job_type: "reindex".to_owned(),
-            tenant: "alpha".to_owned(),
+            tenant: Some("alpha".to_owned()),
             payload: PluginRow::new(),
         };
         for index in 0..jobs::DEFAULT_JOB_DEPTH {

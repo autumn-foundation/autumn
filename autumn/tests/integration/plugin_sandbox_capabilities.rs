@@ -937,7 +937,7 @@ fn a_value_a_plugin_stores_round_trips_through_the_wire() {
             .kv
             .get(&autumn_web::plugin_sandbox::capability::kv::namespaced_key(
                 PLUGIN_NAME,
-                "alpha",
+                Some("alpha"),
                 "cart",
             )),
         Some(PluginValue::Text("one item".to_owned())),
