@@ -102,8 +102,14 @@ fn main() {
         .and_then(|i| std::env::args().nth(i + 1))
         .and_then(|v| v.parse().ok())
         .unwrap_or(2_000);
+    // Compared as `iterations < THROTTLE_LIMIT - 50` (a compile-time-constant
+    // subtraction), not `iterations + 50 < THROTTLE_LIMIT`: the addition form
+    // wraps silently in a release build for an `iterations` near `u32::MAX`
+    // (e.g. `--iterations 4294967295` wraps to 49, passing the guard and
+    // starting an enormous run that reaches the denial path anyway) — caught
+    // in review.
     assert!(
-        iterations + 50 < THROTTLE_LIMIT,
+        iterations < THROTTLE_LIMIT - 50,
         "--iterations {iterations} plus the 50-round warm-up would exhaust the \
          #[throttle] bucket (limit = {THROTTLE_LIMIT}), profiling denials instead \
          of the intended warm Decision::Allowed path"
@@ -113,7 +119,10 @@ fn main() {
     // marginal DHAT cost from the other's — an A/B knob for the profiler,
     // like `repository_crud.rs`'s `--fast-recycle`. No framework code changes
     // with this flag; it only decides which of the two already-mounted
-    // routes this run's loop sends traffic to.
+    // routes this run's loop sends traffic to. An unrecognized value is
+    // rejected rather than silently falling back to `both` (caught in
+    // review): a typo'd `--route` would otherwise record a mixed, doubled
+    // workload and produce an invalid A/B with no indication why.
     let route: String = std::env::args()
         .position(|a| a == "--route")
         .and_then(|i| std::env::args().nth(i + 1))
@@ -121,7 +130,8 @@ fn main() {
     let (hit_throttled, hit_plain) = match route.as_str() {
         "throttled" => (true, false),
         "plain" => (false, true),
-        _ => (true, true),
+        "both" => (true, true),
+        other => panic!("--route must be one of throttled|plain|both, got {other:?}"),
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
