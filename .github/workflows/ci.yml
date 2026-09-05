@@ -664,13 +664,22 @@ jobs:
           # which isn't available where this line was authored, so they're
           # skipped here (not fixed blind) pending that investigation; every
           # other saas test, including every one #2530 added, passes.
-          # `teams` has ~20 of its own pre-existing ignored tests that have
-          # likewise never run together before and, going by saas's
-          # experience above, may have similar undiscovered ordering
-          # sensitivity -- scoped to just the test #2530 added rather than
-          # risking the same kind of surprise for tests this change has no
-          # connection to. Widening both back out to their full suites is a
-          # follow-up, once someone can actually run them against Docker.
+          # `teams` also turned up a second, more fundamental pre-existing
+          # bug on this same first-ever real run: `db_client`'s schema setup
+          # passed the whole (multi-statement) migration file to
+          # `TestDb::execute_sql` in one call, which Postgres refuses
+          # ("cannot insert multiple commands into a prepared statement") --
+          # meaning EVERY ignored test in this file was always unable to run
+          # against real Postgres, full stop, regardless of ordering. Fixed
+          # by splitting the migration into individual statements before
+          # this line was written. That fix likely unblocks teams's other
+          # ~20 pre-existing ignored tests too, but they've still never run
+          # together before and, going by saas's experience above, may have
+          # their own undiscovered ordering sensitivity -- scoped to just the
+          # test #2530 added rather than risking that same kind of surprise
+          # for tests this change has no connection to. Widening both back
+          # out to their full suites is a follow-up, once someone can
+          # actually run them against Docker.
           cargo test -p saas -- --ignored --test-threads=1 \
             --skip tenants_are_isolated \
             --skip remember_me_accepts_previous_token_within_grace \

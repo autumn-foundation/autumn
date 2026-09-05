@@ -107,10 +107,24 @@ async fn db_client(mail_dir: &std::path::Path) -> TestClient {
     static SCHEMA_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     SCHEMA_READY
         .get_or_init(|| async {
-            db.execute_sql(include_str!(
-                "../migrations/00000000000000_create_teams/up.sql"
-            ))
-            .await;
+            // `TestDb::execute_sql` runs each call through Diesel's prepared-
+            // statement path, which Postgres refuses for a string containing
+            // more than one command ("cannot insert multiple commands into a
+            // prepared statement") — discovered when CI ran this for the
+            // first time (against a real Postgres testcontainer) rather than
+            // never at all. The migration file is one `;`-separated command
+            // per statement with no semicolons inside any string literal or
+            // comment, so splitting on `;` and executing each piece on its
+            // own reproduces exactly what `diesel migration run` applies,
+            // one statement at a time.
+            const MIGRATION_SQL: &str =
+                include_str!("../migrations/00000000000000_create_teams/up.sql");
+            for statement in MIGRATION_SQL.split(';') {
+                let statement = statement.trim();
+                if !statement.is_empty() {
+                    db.execute_sql(statement).await;
+                }
+            }
         })
         .await;
     db.execute_sql("TRUNCATE invitations, memberships, organizations, users RESTART IDENTITY")
