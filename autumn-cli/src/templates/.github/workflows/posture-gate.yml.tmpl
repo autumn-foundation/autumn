@@ -191,10 +191,11 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           if ! "$HOME/.local/bin/autumn" routes posture --help >/dev/null 2>&1; then
             echo "::warning::the autumn CLI pinned to this app's autumn-web version (v{{autumn_version}}) has no \`routes posture\` command yet. Probing the next few releases for it, for this run only, rather than tracking whatever is newest — raise autumn-web and this workflow's pin together once one has it, to remove the mismatch for good."
+            pinned_major="$(printf '%s' "{{autumn_version}}" | cut -d. -f1)"
             pinned_minor="$(printf '%s' "{{autumn_version}}" | cut -d. -f2)"
             resolved=""
             for bump in 1 2 3 4 5; do
-              candidate="0.$((pinned_minor + bump)).0"
+              candidate="${pinned_major}.$((pinned_minor + bump)).0"
               if curl -fsSL "https://raw.githubusercontent.com/autumn-foundation/autumn/v${candidate}/scripts/install.sh" 2>/dev/null \
                    | sh -s -- --version "v${candidate}" >/dev/null 2>&1 \
                  && "$HOME/.local/bin/autumn" routes posture --help >/dev/null 2>&1; then
