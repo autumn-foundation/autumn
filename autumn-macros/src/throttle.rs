@@ -245,26 +245,43 @@ fn build_spec_tokens(attrs: &ThrottleAttrs) -> TokenStream {
 
 /// Expand the `#[throttle(...)]` attribute.
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_throttle_args(attr) {
         Ok(a) => a,
         Err(err) => return err.to_compile_error(),
     };
 
-    // `parse_async_handler_with_preamble` also tolerates zero or more item
-    // definitions ahead of the function — the gate `struct` + `impl
-    // FromRequestParts` a guard macro that already expanded above this one
-    // (e.g. `#[secured]` above `#[throttle]`) leaves behind — and already
-    // validates the trailing function is async.
-    let (preamble, mut input_fn) = match crate::parse::parse_async_handler_with_preamble(item) {
+    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
         Ok(v) => v,
         Err(err) => return err,
     };
+
+    if input_fn.sig.asyncness.is_none() {
+        return syn::Error::new_spanned(
+            input_fn.sig.fn_token,
+            "#[throttle] can only be applied to async functions",
+        )
+        .to_compile_error();
+    }
 
     let fn_name = input_fn.sig.ident.clone();
     let fn_name_str = fn_name.to_string();
     let spec_tokens = build_spec_tokens(&attrs);
     let gate_ident = format_ident!("__AutumnThrottleGate_{}", fn_name);
+
+    // The marker const also stays in the handler body (not just inside the
+    // gate below) so `api_doc::recover_guarded_return_type` can still
+    // recover the pre-rewrite return type for OpenAPI when #[throttle]
+    // expands before the route macro (#1677).
+    let route_id_marker = quote! {
+        #[allow(dead_code)]
+        const __AUTUMN_THROTTLE_ROUTE_ID: &str =
+            ::core::concat!(::core::module_path!(), "::", #fn_name_str);
+    };
 
     // Whether THIS gate should also serve a cached idempotency replay: see
     // `should_own_replay` for the full ordering rationale (issue #1668's
@@ -434,29 +451,15 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     input_fn.sig.output = parse_quote! {
         -> ::autumn_web::reexports::axum::response::Response
     };
-    // A dead-code marker mirroring the real `__AUTUMN_THROTTLE_ROUTE_ID` const
-    // the gate carries (#1668 moved the runtime check itself into the gate's
-    // own `impl` block, out of the handler body). `api_doc::infer_response_body`
-    // recovers a guard-rewritten handler's real return type from the
-    // `__autumn_inner` binding below, but only accepts that binding when one
-    // of `RESPONSE_REWRITING_GUARD_MARKERS` is present earlier in the *same*
-    // block — so `#[throttle]` needs its own marker in-body too, exactly like
-    // `#[secured]`'s `role_scope_consts`, or a route stacking `#[throttle]`
-    // above `#[route]` silently loses its OpenAPI response schema (#1677).
-    let body_marker = quote! {
-        #[allow(dead_code)]
-        const __AUTUMN_THROTTLE_ROUTE_ID: &str = #fn_name_str;
-    };
-
     input_fn.block = syn::parse_quote! {
         {
-            #body_marker
+            #route_id_marker
             #original_response
         }
     };
 
     quote! {
-        #preamble
+        #leading_items
         #gate_item
         #input_fn
     }

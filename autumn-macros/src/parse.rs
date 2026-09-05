@@ -322,51 +322,10 @@ fn validate_path(path: &LitStr) -> Result<(), TokenStream> {
 /// Returns `Ok(func)` if valid, or a compile error `TokenStream` if not.
 /// Validates: is a function, is async.
 pub fn parse_async_handler(item: TokenStream) -> Result<ItemFn, TokenStream> {
-    let (preamble, input_fn) = parse_async_handler_with_preamble(item)?;
-    if !preamble.is_empty() {
-        return Err(syn::Error::new_spanned(
-            preamble,
-            "route macros can only be applied to functions",
-        )
-        .to_compile_error());
-    }
-    Ok(input_fn)
-}
-
-/// Parse and validate an async handler function from macro input, tolerating
-/// zero or more item definitions ahead of it.
-///
-/// A guard macro that expands before the route macro (e.g.
-/// `#[throttle]`/`#[secured]`/`#[step_up]`, since #1668's pre-body
-/// `FromRequestParts` gate refactor) emits its handler-unique gate `struct`
-/// and its `impl FromRequestParts` block ahead of the modified handler
-/// function, rather than a single function. Route macros need those leading
-/// items re-emitted verbatim (the handler's new first parameter names the
-/// gate type they define), so this returns them separately from the trailing
-/// function instead of failing to parse.
-///
-/// Returns `Ok((preamble, func))` if the input ends in a function — `preamble`
-/// is the empty `TokenStream` when there is no guard gate ahead of it — or a
-/// compile error `TokenStream` if not. Validates: ends in a function, that
-/// function is async.
-pub fn parse_async_handler_with_preamble(
-    item: TokenStream,
-) -> Result<(TokenStream, ItemFn), TokenStream> {
-    let file: syn::File = syn::parse2(item.clone()).map_err(|_| {
+    let input_fn: ItemFn = syn::parse2(item.clone()).map_err(|_| {
         syn::Error::new_spanned(item, "route macros can only be applied to functions")
             .to_compile_error()
     })?;
-
-    let mut items = file.items;
-    let last = items.pop();
-    let Some(syn::Item::Fn(input_fn)) = last else {
-        let trailing = items.into_iter().chain(last);
-        return Err(syn::Error::new_spanned(
-            quote! { #(#trailing)* },
-            "route macros can only be applied to functions",
-        )
-        .to_compile_error());
-    };
 
     if input_fn.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
@@ -376,8 +335,81 @@ pub fn parse_async_handler_with_preamble(
         .to_compile_error());
     }
 
-    let preamble = quote! { #(#items)* };
-    Ok((preamble, input_fn))
+    Ok(input_fn)
+}
+
+/// Split macro input into any leading non-function items plus a trailing
+/// function item, tolerating (but not requiring) leading items ahead of the
+/// handler.
+///
+/// A body-guard macro that has already expanded (`#[secured]`, `#[step_up]`,
+/// `#[throttle]`) emits a hidden `FromRequestParts` gate type — a struct plus
+/// its impl — ahead of the handler function itself, rather than rewriting a
+/// single function in place (#1668). When such a guard is written *above*
+/// another guard or route attribute, that outer macro receives the inner
+/// guard's gate items followed by the handler function as its own input, not
+/// a lone function item. The common case (no guard has expanded yet) is
+/// tried first, so parse-error messages for genuinely invalid input are
+/// unchanged; only on that failure is the input re-parsed as a sequence of
+/// items (as `syn::File` does), taking the *last* one as the handler.
+///
+/// Returns `Ok((leading_items, func))` if a trailing function item was
+/// found — `leading_items` is empty in the common case — or a compile error
+/// `TokenStream` if not. Does not validate asyncness; callers that require
+/// it (all current ones do) check `func.sig.asyncness` themselves so each
+/// can keep its own diagnostic wording.
+pub fn split_leading_items_and_fn(
+    item: &TokenStream,
+) -> Result<(TokenStream, ItemFn), TokenStream> {
+    if let Ok(input_fn) = syn::parse2::<ItemFn>(item.clone()) {
+        return Ok((TokenStream::new(), input_fn));
+    }
+
+    let not_a_function = || {
+        syn::Error::new_spanned(
+            item.clone(),
+            "route macros can only be applied to functions",
+        )
+        .to_compile_error()
+    };
+
+    let mut file: syn::File = syn::parse2(item.clone()).map_err(|_| not_a_function())?;
+    let Some(syn::Item::Fn(input_fn)) = file.items.pop() else {
+        return Err(not_a_function());
+    };
+
+    let leading_items = file.items;
+    Ok((quote! { #(#leading_items)* }, input_fn))
+}
+
+/// Parse an async handler function from macro input, tolerating leading
+/// non-function items ahead of it (see [`split_leading_items_and_fn`]).
+///
+/// Validated exactly as [`parse_async_handler`] does (must be a function,
+/// must be async); every earlier item is returned as an opaque token stream
+/// the caller is responsible for re-emitting verbatim.
+///
+/// Returns `Ok((leading_items, func))` if valid, or a compile error
+/// `TokenStream` if not.
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps an owned `TokenStream` parameter so callers (route macros with
+// many call sites of their own, at both the proc-macro boundary and in
+// tests) don't need to thread a reference through.
+#[allow(clippy::needless_pass_by_value)]
+pub fn parse_async_handler_with_leading_items(
+    item: TokenStream,
+) -> Result<(TokenStream, ItemFn), TokenStream> {
+    let (leading_items, input_fn) = split_leading_items_and_fn(&item)?;
+
+    if input_fn.sig.asyncness.is_none() {
+        return Err(syn::Error::new_spanned(
+            input_fn.sig.fn_token,
+            "Autumn route handlers must be async functions",
+        )
+        .to_compile_error());
+    }
+
+    Ok((leading_items, input_fn))
 }
 
 /// Extract `#[intercept(LayerType)]` attributes from a function's attribute

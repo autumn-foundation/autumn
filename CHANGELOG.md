@@ -1640,6 +1640,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fake attempt closures, independent of the real network/signal machinery the
   rest of the test drives.
 
+- **🔒 `autumn generate auth`: a concurrent successful login could be silently
+  re-locked by a racing failed attempt (issue #2500):** the generated
+  `login` handler (and the duplicated `reauth` step-up block) counted a
+  wrong-password attempt with an atomic `failed_attempts + 1` `UPDATE` and
+  then, once the new count crossed `[auth.lockout].threshold`, stamped
+  `locked_at` with a *second*, unconditional `UPDATE ... SET locked_at =
+  now() WHERE id = ?` — gated only by a stale in-memory `current_locked_at`
+  value read at the top of the request, never re-checked against the
+  database. If a concurrent request with the *correct* password committed
+  its own "successful login resets the counter" `UPDATE`
+  (`failed_attempts = 0, locked_at = NULL`) in the gap between the failed
+  request's two statements, the unconditional lock stamp reapplied on top
+  of that reset — silently re-locking an account for the full `cooloff_secs`
+  window (default 15 minutes) even though it had *already* logged in
+  successfully (303 redirect and session cookie already issued). Reproduced
+  12/100 (and 7/60, 3/100 on reruns) with a genuinely concurrent
+  wrong-password/correct-password pair against a fresh `autumn generate
+  auth` scaffold.
+  Fix: the lock-stamp `UPDATE` in both handlers now filters on the row's
+  *current* `failed_attempts` (`>= threshold`) and `locked_at`
+  (`IS NULL`) at write time instead of trusting the in-memory read, so a
+  concurrent successful reset makes the stamp a no-op rather than
+  clobbering it; the `account_locked` telemetry event is now gated on the
+  stamp actually having affected a row, so a losing race is never logged
+  as a lock. New generator meta-tests (`autumn-cli/src/generate/auth.rs`)
+  assert both guards are present in the generated source, and
+  `autumn/tests/integration/auth_lockout_race.rs` (Postgres testcontainer)
+  reproduces the exact bad interleaving deterministically against a real
+  database — showing the pre-fix pattern re-locks the account and the fixed
+  pattern doesn't, plus the mirror-image ordering where a lock that
+  genuinely wins the race correctly rejects the concurrent login instead of
+  silently granting a session.
+
 - **🧭 Wayfinder: keyboard bypass-blocks link added to 6 supported example
   apps (a11y `bypass` Serious 7/8 → 0/8; `landmark-one-main` Moderate 1/8 → 0/8):**
   `autumn check --a11y` — the framework's own WCAG audit, run against each
@@ -3221,48 +3254,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity between the input buffers and the emitted ones, so an `_owned`
   function that quietly delegated to its borrowed twin would fail even though
   its output is correct.
-
-### Fixed
-
-- **macros: `#[throttle]`/`#[secured]`/`#[step_up]` above the route macro no
-  longer fail to compile, or silently drop the OpenAPI response schema, once
-  stacked (#1668 regression):** #1668 moved these three guards' runtime
-  checks out of the handler body into each guard's own handler-unique
-  `FromRequestParts` gate — `struct` + `impl`, emitted as a sibling item
-  ahead of the (still single) handler function. Every route macro's own
-  `item` parser (`parse::parse_async_handler`, plus the three guard macros'
-  own parsers, needed when one guard expands above another) only ever
-  accepted a lone `ItemFn`, so a guard macro receiving that two-item output
-  as `item` — any of `#[throttle]`/`#[secured]`/`#[step_up]`/`#[route]`
-  written *above* another guard already using the #1668 gate shape — hit a
-  spurious `route macros can only be applied to functions` compile error.
-  `parse::parse_async_handler_with_preamble` now accepts zero or more
-  leading item definitions ahead of the trailing function, returning them
-  separately so the route/guard macro re-emits that preamble (the gate type
-  the function's new first parameter names) verbatim instead of choking on
-  it.
-
-  Fixing the parse gap surfaced a second, previously-masked bug: with
-  parsing no longer failing first, `#[throttle]`/`#[step_up]` above
-  `#[route]` still resolved to no OpenAPI response schema, because
-  `api_doc::infer_response_body`'s `__autumn_inner`-binding recovery (#1677)
-  only trusts that binding when one of `RESPONSE_REWRITING_GUARD_MARKERS`'s
-  marker consts sits earlier in the *same* handler-body block — and #1668
-  moved `#[throttle]`'s/`#[step_up]`'s marker consts into their gate's
-  `impl` block, out of the body, while `#[secured]`'s marker consts stayed
-  in-body for exactly this reason. Both guards now also leave a dead-code
-  copy of their marker const in the handler body (mirroring `#[secured]`'s
-  existing `role_scope_consts` pattern), restoring the invariant
-  `infer_response_body` relies on — including through stacked guards, where
-  only the innermost binding carries the handler's real return type.
-
-  Regression-proven at both the macro-expansion level (`route.rs`'s
-  existing `route_macro_infers_response_schema_when_throttle_expands_first`
-  / `..._when_step_up_expands_first` / `..._under_stacked_guards_above_route`
-  tests, which predate this fix but never previously reached the code path
-  they exercise) and end to end: `cargo test -p autumn-macros --lib` (1073
-  passed), `cargo fmt --all -- --check`, `cargo clippy -p autumn-macros
-  --all-targets -- -D warnings` all clean.
 
 ## [0.7.0] - 2026-08-23
 
