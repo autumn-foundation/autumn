@@ -21,7 +21,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ItemFn, Lit, LitInt, LitStr, parse_quote};
+use syn::{Expr, Lit, LitInt, LitStr, parse_quote};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -251,18 +251,15 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    // `parse_async_handler_with_preamble` also tolerates zero or more item
+    // definitions ahead of the function — the gate `struct` + `impl
+    // FromRequestParts` a guard macro that already expanded above this one
+    // (e.g. `#[secured]` above `#[throttle]`) leaves behind — and already
+    // validates the trailing function is async.
+    let (preamble, mut input_fn) = match crate::parse::parse_async_handler_with_preamble(item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
-
-    if input_fn.sig.asyncness.is_none() {
-        return syn::Error::new_spanned(
-            input_fn.sig.fn_token,
-            "#[throttle] can only be applied to async functions",
-        )
-        .to_compile_error();
-    }
 
     let fn_name = input_fn.sig.ident.clone();
     let fn_name_str = fn_name.to_string();
@@ -437,13 +434,29 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     input_fn.sig.output = parse_quote! {
         -> ::autumn_web::reexports::axum::response::Response
     };
+    // A dead-code marker mirroring the real `__AUTUMN_THROTTLE_ROUTE_ID` const
+    // the gate carries (#1668 moved the runtime check itself into the gate's
+    // own `impl` block, out of the handler body). `api_doc::infer_response_body`
+    // recovers a guard-rewritten handler's real return type from the
+    // `__autumn_inner` binding below, but only accepts that binding when one
+    // of `RESPONSE_REWRITING_GUARD_MARKERS` is present earlier in the *same*
+    // block — so `#[throttle]` needs its own marker in-body too, exactly like
+    // `#[secured]`'s `role_scope_consts`, or a route stacking `#[throttle]`
+    // above `#[route]` silently loses its OpenAPI response schema (#1677).
+    let body_marker = quote! {
+        #[allow(dead_code)]
+        const __AUTUMN_THROTTLE_ROUTE_ID: &str = #fn_name_str;
+    };
+
     input_fn.block = syn::parse_quote! {
         {
+            #body_marker
             #original_response
         }
     };
 
     quote! {
+        #preamble
         #gate_item
         #input_fn
     }
