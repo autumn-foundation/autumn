@@ -3160,6 +3160,9 @@ ACCESSOR = re.compile(r'\b(?:std::)?env::(var|var_os|set_var)\s*\(')
 # nothing and closes the hole.
 ENV_MACRO = r'|\b(?:(?:core|std)::)?((?:option_)?env)!\s*\('
 MACRO_SHADOW = re.compile(r'\bmacro_rules!\s*(option_env|env)\b')
+# …and what a MATCH of the macro alternative looks like, so the scan can ask
+# which macro it is without re-deriving the pattern.
+MACRO_CALL = re.compile(r'(?:(?:core|std)::)?((?:option_)?env)!')
 
 # `impl Env for OsEnv` — the types that ARE an environment.
 #
@@ -3543,9 +3546,16 @@ class _Accessor:
     # Only the receiver alternative has this shape: a name, a dot, a method.
     _receiver = re.compile(r'([A-Za-z_]\w*)\s*\.')
 
-    def __init__(self, pattern, by_scope):
+    def __init__(self, pattern, by_scope, shadowed=frozenset()):
         self.pattern = pattern
         self.by_scope = by_scope
+        # The macro names this file takes over. WHERE it takes them over is the
+        # scan's to work out on its own text: a `macro_rules!` shadows from its
+        # definition to the end of the enclosing scope, so a real `env!(…)`
+        # written ABOVE one is still the std macro — and a file-wide flag
+        # withheld the alternative from the whole file including the lines
+        # before the declaration.
+        self.shadowed = shadowed
 
     def finditer(self, body):
         return self.pattern.finditer(body)
@@ -3553,21 +3563,35 @@ class _Accessor:
     def search(self, text):
         return self.pattern.search(text)
 
+    def shadows(self, name):
+        """Whether this file takes the macro `name` over anywhere."""
+        return name in self.shadowed
+
     def receiver(self, match):
         """The receiver a match reads through, or `None` for the other forms."""
         found = self._receiver.match(match.group(0))
         return found.group(1) if found else None
 
-    def allows(self, name, scope):
+    def allows(self, name, scope, dotted=True):
         """Whether `name` is an environment at a call site in `scope`.
 
         By PREFIX, because that is what a Rust binding does: an inner block
         sees the function's parameters and the module's items, and a sibling
         sees neither. Exact matching would have dropped `self.inner.var(…)`,
         whose `inner` is a struct field declared outside every function.
+
+        …and a FIELD is reached THROUGH something. Prefix visibility is right
+        for `self.inner`, and it also handed every same-named local in the
+        module to `struct Wrapper { inner: OsEnv }` — so a name derived outside
+        any function is accepted only where the call site spells the access:
+        `self.inner.var(…)`, not a bare `inner.var(…)` on an unrelated value.
         """
-        return any(name in self.by_scope.get(scope[:n], ())
-                   for n in range(len(scope) + 1))
+        for n in range(len(scope) + 1):
+            if name not in self.by_scope.get(scope[:n], ()):
+                continue
+            if dotted or any('fn ' in seg for seg in scope[:n]):
+                return True
+        return False
 
 
 def _absolute_path(rel, path, crates, inner=()):
@@ -3620,7 +3644,7 @@ def accessor(root, test_files=frozenset()):
     helpers, declared, imports, modules = {}, {}, {}, {}
     env_type, impls, trait_at, scopes = {}, {}, set(), {}
     shadowed, returns = {}, {}
-    macro_at, macro_imports = {}, {}
+    macro_at, macro_imports, factory_at = {}, {}, {}
     crates = _crates(root)
     for rel in out.split('\0'):
         # Test code is skipped outright, as the scan that consumes this index
@@ -3679,7 +3703,7 @@ def accessor(root, test_files=frozenset()):
         macro_imports[rel] = [(local, path) for local, path, _
                               in _use_items(masked)
                               if local in ('env', 'option_env')]
-        shadowed[rel] = bool(declares_macro)
+        shadowed[rel] = {m.group(1) for m in declares_macro}
         if TRAIT_DECL.search(masked):
             trait_at.add((crate, filemods))
         impls[rel] = [(m.group(1), m.group(2), _scope_at(spans, m.start()))
@@ -3698,6 +3722,13 @@ def accessor(root, test_files=frozenset()):
             declared.setdefault((rel, at), set()).update(
                 helpers.get((rel, at), ()))
         returns[rel] = _fn_returns(masked)
+        # A module that declares nothing but a factory is still a module the
+        # derivation has to visit. `scopes` is the set of paths where something
+        # was found, and a `mod x { fn make_env() -> OsEnv }` adds nothing else
+        # — so the factory pass never reached it and the import resolved to a
+        # name nobody had registered.
+        for _, _, offset in returns[rel]:
+            seen.add(_scope_at(spans, offset))
         for local, path, offset in _use_items(masked):
             at = _scope_at(spans, offset)
             seen.add(at)
@@ -3772,27 +3803,43 @@ def accessor(root, test_files=frozenset()):
                 here.add(local)
         return here
 
+    # Every environment FACTORY in the tree, before anything consumes one: a
+    # function whose declared return type is an environment. Qualified, the
+    # type must resolve to one this tree derived; bare, it must be a type the
+    # module can see; `impl Env` is the trait itself and needs neither.
+    declared_factories = {}
     for (rel, at), (masked, data, spans, lex) in (
             ((r, a), masked_all[r]) for r in masked_all
             for a in scopes.get(r, ((),))):
-        # …and a FUNCTION that returns an environment binds one when it is
-        # called. The return type is read from the signature and held to the
-        # same identity test: qualified, it must resolve to the type this tree
-        # derived; bare, it must be a type this module can see; `impl Env` is
-        # the trait itself and needs neither.
-        factories = set()
         for name, ret, offset in returns.get(rel, ()):
             if _scope_at(spans, offset) != at:
                 continue
             bare = re.sub(r'^(?:impl|dyn)\s+', '', ret).strip()
             kind = bare.split('::')[-1].split('<')[0].strip()
             path = bare[:len(bare) - len(bare.split('::')[-1])]
-            if kind == 'Env':
-                factories.add(name)
-            elif kind in types and (
+            if kind == 'Env' or (kind in types and (
                     resolves(rel, at, path + kind, kind) if path.strip()
-                    else kind in visible(rel, at, types)):
-                factories.add(name)
+                    else kind in visible(rel, at, types))):
+                declared_factories.setdefault((rel, at), set()).add(name)
+                factory_at.setdefault(name, set()).add(
+                    (_module_of(rel, crates)[0],
+                     _module_of(rel, crates)[1] + at))
+
+    for (rel, at), (masked, data, spans, lex) in (
+            ((r, a), masked_all[r]) for r in masked_all
+            for a in scopes.get(r, ((),))):
+        # …and a FUNCTION that returns an environment binds one when it is
+        # called. Which functions those are was derived in the pass above, so
+        # an IMPORTED one resolves like any other import — deriving and
+        # consuming in a single pass meant a factory declared in a `mod` below
+        # its use, or in another file, was not yet known when the use was read.
+        factories = set(declared_factories.get((rel, at), ()))
+        for local, path in imports.get((rel, at), ()):
+            orig = path.rsplit('::', 1)[-1].strip()
+            if (orig in factory_at
+                    and _absolute_path(rel, path, crates, at)
+                    in factory_at[orig]):
+                factories.add(local)
         if factories:
             call = re.compile(
                 r'\blet\s+(?:mut\s+)?([a-z_]\w*)\s*(?::[^=;]*)?=\s*&?\s*(?:'
@@ -3890,7 +3937,7 @@ def accessor(root, test_files=frozenset()):
     for rel, items in macro_imports.items():
         for local, path in items:
             if _absolute_path(rel, path, crates) in macro_at.get(local, ()):
-                shadowed[rel] = True
+                shadowed.setdefault(rel, set()).add(local)
 
     def imports_of(rel):
         return [(local, path, at) for (r, at), items in imports.items()
@@ -3941,14 +3988,15 @@ def accessor(root, test_files=frozenset()):
             local for local, path, _ in imports_of(rel)
             if local != 'env'
             and re.fullmatch(r'(?:std|core)\s*::\s*env', path.strip()))
-        key = (here, recv, aliases, bool(shadowed.get(rel)))
+        key = (here, recv, aliases)
         if key not in cache:
             pattern = ACCESSOR.pattern
             if aliases:
                 pattern += (r'|\b(?:' + '|'.join(sorted(map(re.escape, aliases)))
                             + r')::(var|var_os|set_var)\s*\(')
-            if not shadowed.get(rel):
-                pattern += ENV_MACRO
+            # The macro alternative is always in the pattern now; a shadow is a
+            # REGION, and the scan decides where it applies over its own text.
+            pattern += ENV_MACRO
             if here:
                 pattern += (r'|\b(' + '|'.join(sorted(map(re.escape, here)))
                             + r')\s*\(')
@@ -3961,7 +4009,8 @@ def accessor(root, test_files=frozenset()):
                 pattern += (r'|\b(?:' + '|'.join(sorted(map(re.escape, recv)))
                             + r')\s*\.\s*(var|var_os|set_var|get)\s*\(')
             cache[key] = re.compile(pattern)
-        return _Accessor(cache[key], by_scope)
+        return _Accessor(cache[key], by_scope,
+                         frozenset(shadowed.get(rel, ())))
 
     return compiled, index
 
@@ -4619,9 +4668,23 @@ def source_tokens(root):
                 continue
             # A receiver is an environment in the module that DECLARED it, and
             # a sibling `mod` that binds the same name is a different variable.
+            # A macro this file takes over is the std one until the
+            # `macro_rules!` that takes it, and inside that declaration's scope
+            # thereafter. Found on the SCAN's own text, so no offset crosses
+            # from the derivation.
+            macro = MACRO_CALL.match(m.group(0))
+            if macro and acc_for(rel).shadows(macro.group(1)):
+                mine = _scope_at(spans, m.start())
+                if any(d.start() < m.start()
+                       and mine[:len(_scope_at(spans, d.start()))]
+                       == _scope_at(spans, d.start())
+                       for d in MACRO_SHADOW.finditer(body)
+                       if d.group(1) == macro.group(1)):
+                    continue
             through = acc_for(rel).receiver(m)
             if through is not None and not acc_for(rel).allows(
-                    through, _scope_at(spans, m.start())):
+                    through, _scope_at(spans, m.start()),
+                    body[:m.start()].rstrip().endswith('.')):
                 continue
             head = body.rfind('\n', 0, m.start()) + 1
             tail = body.find('\n', m.start())
@@ -6128,6 +6191,22 @@ def self_test():
         (): frozenset({'field'}),
         ('mod a', 'fn one(source: OsEnv)'): frozenset({'source'}),
     })
+    # …and a FIELD is reached THROUGH something. Prefix visibility is right
+    # for `self.inner.var(…)`, whose `inner` is declared outside every
+    # function — and it also handed every same-named local in the module to a
+    # `struct Wrapper { inner: OsEnv }`. A name derived outside any function
+    # is accepted only where the call site spells the access.
+    _fields = _Accessor(re.compile('x'), {
+        (): frozenset({'inner'}),
+        ('fn f(env: OsEnv)',): frozenset({'env'}),
+    })
+    case('a field is an environment only through a dot',
+         [_fields.allows(n, at, dot) for n, at, dot in
+          (('inner', ('fn g()',), True),      # self.inner.var(…)
+           ('inner', ('fn g()',), False),     # a bare local named `inner`
+           ('env', ('fn f(env: OsEnv)',), False),   # a parameter, bare
+           ('env', ('fn f(env: OsEnv)',), True))],
+         [True, False, True, True])
     case('a receiver is visible in its own scope and inward only',
          [_probe.allows(n, at) for n, at in
           (('source', ('mod a', 'fn one(source: OsEnv)')),
@@ -6187,6 +6266,15 @@ def self_test():
     # take `env: &dyn Env`, and the module-wide union lent their name to
     # `let env = dotenv_env_for_profile(…)`. Scoping removed the accident and
     # the name with it — truth set 430 -> 429 — so the signature is read now.
+    # A macro shadow is a REGION: `macro_rules! option_env` takes the name
+    # over from its definition onward, so a real `option_env!(…)` written
+    # above one is still the std macro. A file-wide flag withheld the
+    # alternative from the whole file, the lines before it included.
+    case('a macro call is recognised for the shadow test',
+         [(lambda m: m.group(1) if m else None)(MACRO_CALL.match(t)) for t in
+          ('option_env!("X")', 'env!("X")', 'std::env!("X")',
+           'envelope!("X")')],
+         ['option_env', 'env', 'env', None])
     case('a function that returns an environment is read from its signature',
          [(n, r) for n, r, _ in _fn_returns(
              'fn a(p: &str) -> autumn_web::dotenv::DotenvOsEnv { x }\n'
