@@ -1133,6 +1133,13 @@ COMPOSE_DECLARED = re.compile(
 DOCKER_EXEC = re.compile(r'^\s*(?:RUN|CMD|ENTRYPOINT)\s*\[')
 DOCKER_RUN = re.compile(r'^\s*(?:RUN|CMD|ENTRYPOINT)\s+')
 DOCKER_SHELL = re.compile(r'^\s*SHELL\s*\[')
+# `FROM` starts a NEW BUILD STAGE with a new base image, and `SHELL` does not
+# cross into it — the effective shell goes back to the image's default. A
+# `SHELL ["pwsh", …]` in an earlier stage was still selecting PowerShell for a
+# later Bourne stage, so `$env:AUTUMN_X` there read as a real environment
+# access. State that outlives the thing that set it is the same shape as a
+# default standing in for a language, one scope smaller.
+DOCKER_STAGE = re.compile(r'^\s*FROM\s', re.I)
 DOCKER_FIRST = re.compile(r'\[\s*"([^"]*)"')
 DOCKER_SHELLS = ('sh', 'bash', 'zsh', 'ash', 'dash', 'busybox',
                  'pwsh', 'powershell')
@@ -1160,6 +1167,11 @@ def _docker_commands(body):
             for carry in (literal, powershell):
                 if index - 1 in carry:
                     carry.add(index)
+            active = l.rstrip().endswith('\\')
+            continue
+        if DOCKER_STAGE.match(l):
+            shell_form = None
+            out.append(l)
             active = l.rstrip().endswith('\\')
             continue
         if DOCKER_SHELL.match(l):
@@ -3280,6 +3292,38 @@ def _declared_receivers(patterns):
         + '|'.join(sorted(patterns)) + r')(?!\w)')
 
 
+class _Accessor:
+    """A file's accessor pattern, plus which receivers each of its scopes has.
+
+    The regex finds candidates across the whole file; `allows` decides whether
+    the receiver at a given call site is an environment IN THE MODULE THAT CALL
+    SITE SITS IN. Splitting it this way is what lets the caller compute module
+    spans over its own text — the two sides share a module name, never an
+    offset.
+    """
+
+    # Only the receiver alternative has this shape: a name, a dot, a method.
+    _receiver = re.compile(r'([A-Za-z_]\w*)\s*\.')
+
+    def __init__(self, pattern, by_scope):
+        self.pattern = pattern
+        self.by_scope = by_scope
+
+    def finditer(self, body):
+        return self.pattern.finditer(body)
+
+    def search(self, text):
+        return self.pattern.search(text)
+
+    def receiver(self, match):
+        """The receiver a match reads through, or `None` for the other forms."""
+        found = self._receiver.match(match.group(0))
+        return found.group(1) if found else None
+
+    def allows(self, name, mods):
+        return name in self.by_scope.get(mods, ())
+
+
 def _absolute_path(rel, path, crates, inner=()):
     """The `(crate, module)` a use path names, from the file that writes it.
 
@@ -3531,17 +3575,25 @@ def accessor(root, test_files=frozenset()):
     cache = {}
 
     def compiled(rel):
-        # The accessor stays per FILE: the scan reads a differently-processed
-        # body, so an offset here is not an offset there, and matching them up
-        # would be a silent failure waiting to happen. What the scoping buys is
-        # that a receiver only reaches this union if its own module derived it
-        # — a sibling `mod`'s unrelated `Shared` never becomes one. The
-        # residual, stated rather than hidden: two inline modules that bind the
-        # SAME receiver name, one an environment, still share the pattern.
+        # ONE regex per file to FIND candidates, and a per-scope set to accept
+        # them. I shipped the union alone one round ago and wrote the residual
+        # into this comment — two inline modules binding the same receiver name,
+        # one an environment — - and the reviewer promptly reproduced it. The
+        # reason I gave for stopping was wrong, which is the part worth
+        # recording: I said matching offsets between the derivation's masked
+        # copy and the scan's processed body would be a silent failure waiting
+        # to happen. It would be, and nothing needs it. The scan computes its
+        # OWN spans over the body it is scanning, exactly as it already does for
+        # `_generated_data`; what crosses between the two is a module NAME, not
+        # an offset. A residual I could describe precisely was a residual I
+        # could have closed.
         here, recv = set(), set()
+        by_scope = {}
         for at in scopes.get(rel, ((),)):
             here |= visible(rel, at, set(index)) | set(helpers.get((rel, at), ()))
-            recv |= set(per_file.get((rel, at), ())) | visible(rel, at, types)
+            mine = set(per_file.get((rel, at), ())) | visible(rel, at, types)
+            by_scope[at] = frozenset(mine)
+            recv |= mine
         here, recv = frozenset(here), frozenset(recv)
         if (here, recv) not in cache:
             pattern = ACCESSOR.pattern
@@ -3557,7 +3609,7 @@ def accessor(root, test_files=frozenset()):
                 pattern += (r'|\b(?:' + '|'.join(sorted(map(re.escape, recv)))
                             + r')\s*\.\s*(var|var_os|set_var|get)\s*\(')
             cache[(here, recv)] = re.compile(pattern)
-        return cache[(here, recv)]
+        return _Accessor(cache[(here, recv)], by_scope)
 
     return compiled, index
 
@@ -4094,6 +4146,12 @@ def source_tokens(root):
         # the whole-body mask.
         nested = (_generated_data(body)
                   if effective_suffix(rel) == '.rs' else None)
+        # …and the module each offset sits in, computed over the SAME body the
+        # accessor is about to be run on. That is what makes call-site scoping
+        # cost nothing: no offset ever crosses between this body and the one
+        # the derivation read, only a module name.
+        spans = (_module_spans(body)
+                 if effective_suffix(rel) == '.rs' else None)
         offsets, at = [], 0
         for l in lines:
             offsets.append(at)
@@ -4195,6 +4253,12 @@ def source_tokens(root):
         for m in (acc_for(rel).finditer(body)
                   if effective_suffix(rel) == '.rs' else ()):
             if nested is not None and nested[m.start()]:
+                continue
+            # A receiver is an environment in the module that DECLARED it, and
+            # a sibling `mod` that binds the same name is a different variable.
+            through = acc_for(rel).receiver(m)
+            if through is not None and not acc_for(rel).allows(
+                    through, _scope_at(spans, m.start())):
                 continue
             head = body.rfind('\n', 0, m.start()) + 1
             tail = body.find('\n', m.start())
@@ -5626,6 +5690,26 @@ def self_test():
     # is not `RootedEnvironment`, which is what the lookahead is for — and the
     # concrete type and the helper's map type go through ONE rule, since two
     # spellings of one claim is how a fix lands in only one of them.
+    # A receiver is an environment in the module that DECLARED it. The union
+    # regex finds candidates across the file; the scope decides which are real,
+    # and the scan computes its own spans over the body it is scanning — so
+    # what crosses between derivation and scan is a module NAME, never an
+    # offset.
+    _scoped = _acc_for('autumn/src/config.rs')
+    case('a receiver is an environment only in its own module',
+         (_scoped.allows('env', ()), _scoped.allows('env', ('zzz_other',))),
+         (True, False))
+    # …and the whole-file union still finds the candidate, so the SCOPE is
+    # doing the deciding rather than the regex quietly missing it.
+    case('the union still matches what the scope rejects',
+         bool(_scoped.search('env.var("AUTUMN_MASTER_KEY")')), True)
+    # The guard on the assumption underneath: real reads through real
+    # receivers survive call-site scoping. A tightening that dropped them
+    # would look exactly like a fix from inside.
+    case('real receiver reads survive the scoping',
+         ('AUTUMN_MEDIA__STORAGE__BACKEND' in swept,
+          'AUTUMN_MEDIA__ROOM_STORE_BACKEND' in swept),
+         (True, True))
     case('a receiver declared with an environment type is derived',
          [_declared_receivers(
              _type_pattern(t) for t in ('RootedEnv', '&HashMap<String, String>')
@@ -5792,6 +5876,17 @@ def self_test():
              'CMD ["sh", "-c", "echo $AUTUMN_C"]\n'
              'CMD ["/app/x", \\\n  "$AUTUMN_D"]\nENV AUTUMN_E=1\n')),
          [0, 3, 4])
+    # `FROM` starts a new stage with a new base image, and `SHELL` does not
+    # cross into it. State that outlives what set it read a later Bourne
+    # stage as PowerShell.
+    case('a Dockerfile FROM resets the effective shell',
+         (lambda r: (sorted(r[2]), sorted(r[1])))(_docker_commands(
+             'FROM a AS one\n'
+             'SHELL ["pwsh", "-Command"]\n'
+             'RUN Write-Output "$env:AUTUMN_A"\n'
+             'FROM debian:bookworm-slim\n'
+             'RUN echo $AUTUMN_B\n')),
+         ([2], []))
     # …and the shell form runs through whatever `SHELL` last named, which is
     # `/bin/sh -c` only until an instruction says otherwise. Reading a pwsh
     # shell form as Bourne counts `$AUTUMN_X` — a PowerShell LOCAL — as a read
