@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anywhere says so. A bad link 404s and a bad command exits 2; both are dead
   ends the reader can see and route around.
   `scripts/check-docs-config.sh` resolves every key in every `autumn.toml`
-  fence in the reader-facing corpus (161 of the corpus's 246 TOML fences)
+  fence in the reader-facing corpus (165 of the corpus's 246 TOML fences)
   against the 484-leaf config schema, using the same walk semantics as the
   framework's own `AutumnConfig::validate_toml` — including the rule that a
   section with no schema entry (`jobs.queues`, `auth.oauth2`,
@@ -44,7 +44,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scope — only whether the key exists — as are the archive trees
   (`docs/plans/`, `docs/adr/`, `docs/design/`, `CHANGELOG.md`, …), whose 13
   out-of-schema keys are accurate records of superseded proposals rather than
-  instructions a reader follows today.
+  instructions a reader follows today. A third defect surfaced when review
+  widened the gate's coverage: `cloud-native.md`'s read-your-writes block set
+  `read_your_writes` twice in one `[database]` table — a TOML duplicate-key
+  error, under prose telling the reader to add the key — so the whole fence
+  failed to parse and every key in it went unchecked. It is now two fences, one
+  per option, which is what a reader picking between them needed anyway; an
+  identified `autumn.toml` fence that does not parse is now itself a gate
+  failure, with no waiver, on the same principle `check-docs-cli.sh` applies to
+  fenced commands.
 - **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
   update validation left after #1719/#1742/#1778/#1801 (issue #1751).
   `must_match` — like `custom`, `ip` on `Option<_>` fields, and

@@ -6,7 +6,7 @@
 # off a page. `scripts/check-docs-links.sh` gates its *links*, so nobody is sent
 # to a page that does not exist; `scripts/check-docs-cli.sh` gates its
 # *commands*, so nobody is handed an `autumn …` line clap will reject. Nothing
-# checked the third: the **config key**. The reader-facing corpus carries 162
+# checked the third: the **config key**. The reader-facing corpus carries 165
 # `autumn.toml` fences judged against 484 schema leaves, and a renamed or
 # never-shipped key leaves behind a line that looks exactly like a working one.
 #
@@ -86,7 +86,12 @@
 #      so `[search] enabled = false` is a correct line in a correct page even
 #      though `search` is not an `AutumnConfig` root. Their children are not
 #      validated, matching the app-boot exemption, which treats a declared plugin
-#      root as an opaque table.
+#      root as an opaque table — and, like that exemption, the root counts only
+#      as a TABLE. `config_section` declares a config *table*, so a registered
+#      root written as a scalar or array (`media = "enabled"`) is a malformed
+#      section that nothing deserializes, and the app boots on default plugin
+#      config; the runtime carries the same `val.is_table()` guard for exactly
+#      that reason.
 #
 #   3. `autumn-cli/src/dev.rs`'s `DevConfig` struct — the `[dev]` keys the CLI
 #      reads from `autumn.toml` itself, outside `AutumnConfig`. `watch_dirs` is
@@ -97,12 +102,15 @@
 #      nothing and the gate fails loudly on README.md rather than silently
 #      widening.
 #
-# WHICH FENCES ARE READ. Of the corpus's 246 ```toml fences, 162 are read. A
+# WHICH FENCES ARE READ. Of the corpus's 246 ```toml fences, 165 are read. A
 # fence is read only on POSITIVE identification — it names `autumn.toml` (or a
 # profile overlay / the `.example` template), or it carries a section the config
-# surface recognizes. This corpus is a Rust framework's, so most of its TOML is
-# some other file, and several families of it collide with real Autumn section
-# names:
+# surface recognizes. The marker is checked BEFORE the "no section header" bail,
+# because part of the config surface is top-level scalars with no section to sit
+# under: `jobs.md` documents `role = "worker"` under an `# autumn.toml` marker,
+# and `role` is a real schema root. This corpus is a Rust framework's, so most of
+# its TOML is some other file, and several families of it collide with real
+# Autumn section names:
 #
 #   - **Cargo manifests** (41 fences). Skipped on their root sections
 #     (`[package]`, `[dependencies]`, `[features]`, …).
@@ -136,14 +144,26 @@
 #     correct pages is one people learn to switch off.
 #
 # WHAT IT DELIBERATELY DOES NOT CHECK:
-#   - **VALUES.** Only key existence. A key's type, range, and whether the value
-#     is sensible are the app's to reject; this gate answers the one question the
-#     reader cannot answer for themselves, because nothing tells them: does this
-#     key exist at all?
-#   - **Fences that do not parse as TOML.** Elided snippets (`…`, `<host>`) are
-#     illustrations, not files. 1 fence in the corpus is in this state.
-#   - **Fences with no `[section]` header** (16). A bare `key = value` fragment
-#     has no root to resolve against; guessing one would invent defects.
+#   - **VALUES.** Only key existence — with one exception, below. A key's type,
+#     range, and whether the value is sensible are the app's to reject; this gate
+#     answers the one question the reader cannot answer for themselves, because
+#     nothing tells them: does this key exist at all?
+#
+# THE ONE EXCEPTION — an identified `autumn.toml` fence that does NOT PARSE is a
+# defect, not a skip. It is presented as a file to copy, and TOML that does not
+# parse fails at boot for whoever copies it; skipping it also leaves every key in
+# it unchecked, so the silent-key class this gate exists for can hide behind a
+# parse error. The baseline found one: `cloud-native.md`'s read-your-writes block
+# set `read_your_writes` twice in one `[database]` table — a duplicate-key error
+# — under prose telling the reader to "Add `read_your_writes` in `[database]`".
+# It is now two fences, one per option, which is what a reader picking between
+# them needed anyway. There is no waiver for this, on the same principle
+# `check-docs-cli.sh` applies to fenced commands: a fence is copyable, so the
+# remedy is to make it parse — split mutually exclusive options into one fence
+# each, or quote an elided placeholder (`"<YOUR_URL>"`) so it is valid TOML.
+#   - **Fences with no `[section]` header AND no marker** (13). A bare
+#     `key = value` fragment has no root to resolve against; guessing one would
+#     invent defects. A marked one IS read — see above.
 #   - **`examples/<app>/content/`.** Seed content for an example app, rendered by
 #     that app's own routes — the same exclusion, for the same reason,
 #     `check-docs-links.sh` makes.
@@ -429,9 +449,6 @@ def classify(body, lead_in, known_roots):
     the baseline caught it.
     """
     headers = SECTION_HEADER.findall(body)
-    if not headers:
-        return "no-section-header"
-
     roots = {h.split(".")[0].strip('"') for h in headers}
     if roots & CARGO_ROOTS:
         return "cargo-manifest"
@@ -447,8 +464,15 @@ def classify(body, lead_in, known_roots):
     # `fly.toml`'s `[deploy]` is spelled exactly like Autumn's.
     if theirs:
         return f"other-file:{theirs[0]}"
+    # A marker is checked BEFORE the headerless bail below, because some of the
+    # config surface is top-level scalars with no section to sit under:
+    # `docs/guide/jobs.md` documents `role = "worker"` under a `# autumn.toml`
+    # marker, and `role` is a real schema root. Bailing on "no section header"
+    # first left that fence — and a `rol` typo in it — unread.
     if ours:
         return None
+    if not headers:
+        return "no-section-header"
     # `profile` counts as a recognized root even though it is `#[serde(skip)]`
     # and so absent from the schema: a fence that is ONLY overlays
     # (`[profile.prod.server]`, and nothing else) would otherwise go unread, and
@@ -470,20 +494,31 @@ def is_cargo_profile(name, table):
 # ── The walk (mirrors AutumnConfig::validate_toml_table) ──────────────────────
 
 
-def walk(table, path, schema, out):
+def walk(table, path, schema, out, plugin_roots=frozenset()):
     for key, value in table.items():
         full = f"{path}.{key}" if path else key
         if path not in schema:
             # No schema entry: a dynamic-key or plugin-owned section. Its children
             # are arbitrary and valid, exactly as the framework treats them.
             continue
+        if not path and key in plugin_roots:
+            # A plugin-declared root is known and OPAQUE — but only as a TABLE.
+            # The runtime's exemption carries the same `val.is_table()` guard
+            # (`config.rs`), because `config_section` declares a config *table*:
+            # `media = "enabled"` or `media = ["a"]` is a malformed section that
+            # nothing deserializes, so the app boots on default plugin config.
+            # Accepting a scalar here would document exactly that.
+            if isinstance(value, dict):
+                continue
+            out.append(full)
+            continue
         if key not in schema[path]:
             out.append(full)
             continue
-        descend(value, full, schema, out)
+        descend(value, full, schema, out, plugin_roots)
 
 
-def descend(value, path, schema, out):
+def descend(value, path, schema, out, plugin_roots=frozenset()):
     """Recurse into a value, following ARRAYS OF TABLES as the framework does.
 
     `[[database.shards]]` and `[[security.webhooks.endpoints]]` reach `tomllib`
@@ -495,19 +530,39 @@ def descend(value, path, schema, out):
     rejects it. Both arrays are live in the corpus this gate reads.
     """
     if isinstance(value, dict):
-        walk(value, path, schema, out)
+        walk(value, path, schema, out, plugin_roots)
     elif isinstance(value, list):
         for item in value:
             if isinstance(item, dict):
-                walk(item, path, schema, out)
+                walk(item, path, schema, out, plugin_roots)
 
 
-def check_fence(body, schema):
-    """Out-of-schema key paths in one fence, or None if it is not read."""
+# Marks a finding as a parse defect rather than an unknown key, so the report
+# can phrase it correctly — the two have different remedies.
+PARSE_DEFECT = "<parse> "
+
+
+def check_fence(body, schema, plugin_roots=frozenset()):
+    """Out-of-schema key paths in one fence.
+
+    A fence that has already been IDENTIFIED as `autumn.toml` and does not parse
+    is itself a defect, not something to skip: it is presented as a file to copy,
+    and TOML that does not parse fails at boot for whoever copies it. The
+    baseline found one — `cloud-native.md`'s read-your-writes block set
+    `read_your_writes` twice in one `[database]` table (a duplicate-key error) —
+    and skipping it also left every other key in that fence unchecked, so the
+    silent-key class this gate exists for could hide behind a parse error.
+
+    There is no waiver for this, deliberately, on the same principle
+    `check-docs-cli.sh` applies to fenced commands: a fence is copyable, so the
+    remedy is to make it parse — split mutually exclusive options into one fence
+    each (which is what a reader needs anyway), or quote an elided placeholder
+    (`"<YOUR_URL>"`) so it is valid TOML.
+    """
     try:
         table = tomllib.loads(body)
-    except (tomllib.TOMLDecodeError, ValueError):
-        return None
+    except (tomllib.TOMLDecodeError, ValueError) as exc:
+        return [f"{PARSE_DEFECT}does not parse as TOML: {exc}"]
     findings = []
     for key, value in table.items():
         if key == "profile" and isinstance(value, dict):
@@ -520,9 +575,9 @@ def check_fence(body, schema):
                         continue
                     if is_cargo_profile(name, table):
                         continue
-                    walk(table, "", schema, findings)
+                    walk(table, "", schema, findings, plugin_roots)
         else:
-            walk({key: value}, "", schema, findings)
+            walk({key: value}, "", schema, findings, plugin_roots)
     return findings
 
 
@@ -533,6 +588,8 @@ def build_schema():
     schema, leaf_count = load_schema()
     # Plugin roots and CLI-owned `[dev]` keys join the root entry; plugin roots
     # get no entry of their own, which makes them opaque — children unchecked.
+    # They are ALSO returned separately, so `walk` can enforce the runtime's
+    # table-only guard on them rather than accepting any value.
     extra_roots = plugin_roots()
     schema[""].update(extra_roots)
     dev_keys = cli_dev_keys()
@@ -542,7 +599,7 @@ def build_schema():
     return schema, leaf_count, extra_roots, dev_keys
 
 
-def scan(schema):
+def scan(schema, plugin_root_set=frozenset()):
     findings = []
     fences = []
     known_roots = schema[""]
@@ -557,10 +614,7 @@ def scan(schema):
             if skip:
                 fences.append((rel, line, skip, []))
                 continue
-            bad = check_fence(body, schema)
-            if bad is None:
-                fences.append((rel, line, "unparseable", []))
-                continue
+            bad = check_fence(body, schema, plugin_root_set)
             fences.append((rel, line, "checked", bad))
             for path in bad:
                 findings.append((rel, line, path))
@@ -581,7 +635,7 @@ def suggest(path, schema):
 
 def main():
     schema, leaf_count, extra_roots, dev_keys = build_schema()
-    findings, fences = scan(schema)
+    findings, fences = scan(schema, extra_roots)
 
     if MODE == "--list":
         by_verdict = collections.Counter(v.split(":")[0] for _, _, v, _ in fences)
@@ -596,6 +650,12 @@ def main():
         return 0
 
     for rel, line, path in findings:
+        if path.startswith(PARSE_DEFECT):
+            # A parse defect is not an unknown key and must not be phrased as
+            # one: the remedy is different (make the fence parse), so it gets
+            # its own message rather than being wrapped in "unknown config key".
+            print(f"{rel}:{line}: this autumn.toml fence {path[len(PARSE_DEFECT):]}")
+            continue
         hint = suggest(path, schema)
         tail = f" (did you mean `{hint}`?)" if hint else ""
         print(f"{rel}:{line}: unknown config key `{path}`{tail}")
@@ -820,12 +880,62 @@ def self_test():
             failed += 1
             print(f"  FAIL [{name}]: expected {expected}, got {got}")
 
-    # An unparseable fence is skipped, not reported.
-    if check_fence("[server]\nport = <PORT>\n", schema) is None:
+    # An identified fence that does not parse is a defect, not a skip: it is
+    # presented as a file to copy and would fail at boot for whoever copies it.
+    for label, fence in (
+        ("unparseable: bare placeholder", "[server]\nport = <PORT>\n"),
+        # The exact shape the baseline found in cloud-native.md.
+        (
+            "unparseable: duplicate key",
+            '[database]\nread_your_writes = "request"\nread_your_writes = "session"\n',
+        ),
+    ):
+        got = check_fence(fence, schema)
+        if len(got) == 1 and got[0].startswith(PARSE_DEFECT):
+            passed += 1
+        else:
+            failed += 1
+            print(f"  FAIL [{label}]: expected a parse defect, got {got}")
+
+    # A quoted placeholder IS valid TOML — the documented remedy must work.
+    if check_fence('[server]\nport = "<PORT>"\n', schema) == []:
         passed += 1
     else:
         failed += 1
-        print("  FAIL [unparseable fence]: expected None")
+        print("  FAIL [quoted placeholder parses clean]")
+
+    # Plugin roots are known-and-opaque only as TABLES, matching the runtime's
+    # `val.is_table()` guard; a scalar or array is a malformed section.
+    plugins = frozenset({"search", "media"})
+    for label, fence, expected in (
+        ("plugin root as table", "[media]\nanything = 1\n", []),
+        ("plugin root as scalar", 'media = "enabled"\n', ["media"]),
+        ("plugin root as array", 'media = ["a", "b"]\n', ["media"]),
+    ):
+        got = check_fence(fence, schema, plugins)
+        if got == expected:
+            passed += 1
+        else:
+            failed += 1
+            print(f"  FAIL [{label}]: expected {expected}, got {got}")
+
+    # A headerless fence carrying an `# autumn.toml` marker is read, so a
+    # top-level scalar key (`role`) is checked rather than skipped.
+    for label, body, expected in (
+        ("marked headerless, valid root scalar", '# autumn.toml\nrole = "worker"\n', None),
+        ("headerless without a marker", 'role = "worker"\n', "no-section-header"),
+    ):
+        got = classify(body, "", known_roots)
+        if got == expected:
+            passed += 1
+        else:
+            failed += 1
+            print(f"  FAIL [{label}]: expected {expected!r}, got {got!r}")
+    if check_fence('# autumn.toml\nrol = "worker"\n', schema) == ["rol"]:
+        passed += 1
+    else:
+        failed += 1
+        print("  FAIL [marked headerless typo is caught]")
 
     # The truth sets must be non-empty against the real tree, or the gate would
     # pass by knowing nothing.
