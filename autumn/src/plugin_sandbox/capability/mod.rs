@@ -177,12 +177,45 @@ pub enum PluginValue {
     Text(String),
 }
 
+/// The bytes `text` occupies once JSON-escaped, excluding its framing quotes.
+///
+/// Not `text.len()`. JSON escaping is not a constant factor: a NUL becomes the
+/// six bytes `\u0000`, so 256 KiB of them serialize past 1.5 MiB. Every ceiling
+/// in this module exists to stop the host building a reply it cannot send, and
+/// a ceiling measured in *stored* bytes does not do that — it passes a value
+/// that then overruns the reply queue and fails the request, after whatever
+/// side effect produced it has already happened.
+///
+/// The two framing quotes are deliberately *not* counted. They are per-value
+/// encoding overhead, already covered by the per-entry constants the stores
+/// add, and counting them here would quietly redefine `kv_value_bytes` and
+/// every sibling ceiling as two bytes less than the number the operator wrote —
+/// a value of exactly the declared size would be refused for carrying its own
+/// punctuation.
+///
+/// Counted rather than serialized, so asking the size costs no allocation.
+#[must_use]
+pub fn encoded_text_len(text: &str) -> usize {
+    text.chars()
+        .map(|ch| match ch {
+            // The two-byte escapes JSON names.
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            // Every other control character takes the `\u00XX` long form.
+            other if other.is_control() => 6,
+            other => other.len_utf8(),
+        })
+        .fold(0, usize::saturating_add)
+}
+
 impl PluginValue {
-    /// The bytes this value costs in host memory, for the quota.
+    /// The bytes this value costs, measured as it will be *encoded*.
+    ///
+    /// See [`encoded_text_len`]: the quotas this feeds bound a reply the host
+    /// has to serialize, so the stored length is the wrong number.
     #[must_use]
-    pub const fn weight(&self) -> usize {
+    pub fn weight(&self) -> usize {
         match self {
-            Self::Text(text) => text.len(),
+            Self::Text(text) => encoded_text_len(text),
             _ => 8,
         }
     }

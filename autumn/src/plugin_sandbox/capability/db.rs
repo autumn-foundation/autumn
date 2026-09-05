@@ -605,6 +605,23 @@ impl Default for MemoryPluginStore {
 }
 
 impl MemoryPluginStore {
+    /// What one stored row costs: its value *and* its key.
+    ///
+    /// The key is three owned strings — physical table, tenant, row id — cloned
+    /// once per row. A ceiling that summed only values therefore charged an
+    /// empty row nothing while it retained a tenant id per row, and a tenant id
+    /// arrives in a header with no length validation of its own.
+    fn entry_weight(key: &(String, String, String), row: &PluginRow) -> usize {
+        /// A `HashMap` bucket plus three `String` headers, near enough.
+        const PER_ENTRY: usize = 128;
+        key.0
+            .len()
+            .saturating_add(key.1.len())
+            .saturating_add(key.2.len())
+            .saturating_add(super::row_weight(row))
+            .saturating_add(PER_ENTRY)
+    }
+
     /// An empty store holding at most [`DEFAULT_STORE_CAPACITY`] rows.
     #[must_use]
     pub fn new() -> Arc<Self> {
@@ -681,10 +698,15 @@ impl PluginStore for MemoryPluginStore {
         // And by size, which is the ceiling that actually bounds memory: a row
         // count times `MAX_ROW_BYTES` is gigabytes.
         let held: usize = rows
-            .values()
-            .map(super::row_weight)
+            .iter()
+            .map(|(stored_key, stored)| Self::entry_weight(stored_key, stored))
             .fold(0, usize::saturating_add);
-        if held.saturating_add(super::row_weight(&row)) > self.byte_capacity {
+        let incoming_key = (
+            scope.table.clone(),
+            scope.tenant.clone(),
+            String::from("r0000000000"),
+        );
+        if held.saturating_add(Self::entry_weight(&incoming_key, &row)) > self.byte_capacity {
             return Err(StoreError::Backend(format!(
                 "this host's in-memory plugin store is full at {} bytes",
                 self.byte_capacity
@@ -793,14 +815,14 @@ impl PluginStore for MemoryPluginStore {
         // that was not looking. The outgoing row's weight comes off first, so
         // rewriting a row in place is never refused for the size it already
         // was.
-        let outgoing = super::row_weight(existing);
+        let outgoing = Self::entry_weight(&key, existing);
         let held: usize = rows
-            .values()
-            .map(super::row_weight)
+            .iter()
+            .map(|(stored_key, stored)| Self::entry_weight(stored_key, stored))
             .fold(0, usize::saturating_add);
         if held
             .saturating_sub(outgoing)
-            .saturating_add(super::row_weight(&row))
+            .saturating_add(Self::entry_weight(&key, &row))
             > self.byte_capacity
         {
             return Err(StoreError::Backend(format!(

@@ -387,14 +387,20 @@ pub(super) fn perform(
         .iter()
         .map(|(name, value)| name.len().saturating_add(value.len()))
         .fold(0, usize::saturating_add);
-    let request_weight = header_weight.saturating_add(body.len());
+    // The URL counts too. It is cloned into the request and handed to the
+    // backend like everything else, and a budget that omitted it left a guest
+    // free to send multi-megabyte request targets with an empty body — the
+    // quota reading zero for a call that is anything but.
+    let request_weight = header_weight
+        .saturating_add(body.len())
+        .saturating_add(url.len());
     if request_weight > request_ceiling {
         return CallResult::denied(
             id,
             DenialReason::QuotaExceeded,
             format!(
-                "the request is {request_weight} bytes of headers and body, over this plugin's \
-                 {request_ceiling}-byte `outbound_request_bytes` quota"
+                "the request is {request_weight} bytes of url, headers and body, over this \
+                 plugin's {request_ceiling}-byte `outbound_request_bytes` quota"
             ),
         );
     }
@@ -436,6 +442,26 @@ pub(super) fn perform(
                         landed = super::super::manifest::rejected(
                             landed.as_deref().unwrap_or(&response.final_url)
                         )
+                    ),
+                );
+            }
+            // Checked as it will be *encoded*, not as it was received. An
+            // upstream body of NULs is six bytes each once escaped, so a
+            // response inside a 256 KiB quota serializes past 1.5 MiB and
+            // overruns the reply queue — failing the whole request after the
+            // call has already been made, which for a POST a retry then
+            // repeats. The raw ceiling stays too, because that is the number
+            // the operator set and the one the message should quote.
+            let encoded = super::encoded_text_len(&response.body);
+            if encoded > super::MAX_RESULT_BYTES {
+                return CallResult::denied(
+                    id,
+                    DenialReason::ResponseTooLarge,
+                    format!(
+                        "{host} answered {found} bytes that encode to {encoded}, over the \
+                         {max}-byte ceiling one reply may carry",
+                        found = response.body.len(),
+                        max = super::MAX_RESULT_BYTES
                     ),
                 );
             }

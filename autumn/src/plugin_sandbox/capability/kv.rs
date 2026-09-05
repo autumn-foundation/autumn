@@ -254,7 +254,7 @@ impl MemoryKvStore {
 
     /// What one entry costs: its key, its value, and the map's own per-entry
     /// overhead, which a store measuring only payloads would charge at nothing.
-    const fn entry_weight(key: &str, value: &PluginValue) -> usize {
+    fn entry_weight(key: &str, value: &PluginValue) -> usize {
         /// A `HashMap` bucket plus two `String` headers, near enough.
         const PER_ENTRY: usize = 96;
         key.len()
