@@ -577,11 +577,21 @@ pub struct MemoryPluginStore {
     rows: Mutex<HashMap<(String, String, String), PluginRow>>,
     next: Mutex<u64>,
     capacity: usize,
+    byte_capacity: usize,
 }
 
 /// Rows a [`MemoryPluginStore::new`] store will hold, across every table and
 /// tenant.
 pub const DEFAULT_STORE_CAPACITY: usize = 10_000;
+
+/// Bytes of rows a [`MemoryPluginStore::new`] store will hold.
+///
+/// A row count is not a memory bound: every accepted row may carry
+/// [`MAX_ROW_BYTES`](super::MAX_ROW_BYTES), so `DEFAULT_STORE_CAPACITY` rows is
+/// gigabytes, reachable in under a minute at the default call rate. The unit an
+/// operator budgets in is bytes, so that is the ceiling this store enforces
+/// alongside its row count.
+pub const DEFAULT_STORE_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 
 impl Default for MemoryPluginStore {
     fn default() -> Self {
@@ -589,6 +599,7 @@ impl Default for MemoryPluginStore {
             rows: Mutex::new(HashMap::new()),
             next: Mutex::new(0),
             capacity: DEFAULT_STORE_CAPACITY,
+            byte_capacity: DEFAULT_STORE_BYTE_CAPACITY,
         }
     }
 }
@@ -607,6 +618,18 @@ impl MemoryPluginStore {
             rows: Mutex::new(HashMap::new()),
             next: Mutex::new(0),
             capacity,
+            byte_capacity: DEFAULT_STORE_BYTE_CAPACITY,
+        })
+    }
+
+    /// An empty store bounded by both a row count and a total size.
+    #[must_use]
+    pub fn with_capacities(capacity: usize, byte_capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            rows: Mutex::new(HashMap::new()),
+            next: Mutex::new(0),
+            capacity,
+            byte_capacity,
         })
     }
 
@@ -653,6 +676,18 @@ impl PluginStore for MemoryPluginStore {
             return Err(StoreError::Backend(format!(
                 "this host's in-memory plugin store is full at {} rows",
                 self.capacity
+            )));
+        }
+        // And by size, which is the ceiling that actually bounds memory: a row
+        // count times `MAX_ROW_BYTES` is gigabytes.
+        let held: usize = rows
+            .values()
+            .map(super::row_weight)
+            .fold(0, usize::saturating_add);
+        if held.saturating_add(super::row_weight(&row)) > self.byte_capacity {
+            return Err(StoreError::Backend(format!(
+                "this host's in-memory plugin store is full at {} bytes",
+                self.byte_capacity
             )));
         }
         let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);

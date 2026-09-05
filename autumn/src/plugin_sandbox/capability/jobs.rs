@@ -107,6 +107,10 @@ pub struct MemoryJobSink {
     /// How many jobs the queue will hold before refusing — the "queue depth"
     /// ceiling.
     depth: usize,
+    /// How many bytes of payload the queue will hold, which is the ceiling that
+    /// actually bounds memory: depth times the largest legal payload is
+    /// hundreds of megabytes, and nothing in this slice drains the queue.
+    byte_capacity: usize,
 }
 
 /// How many jobs the zero-configuration queue holds before refusing.
@@ -121,11 +125,21 @@ pub struct MemoryJobSink {
 /// [`MAX_ROW_COLUMNS`]: super::MAX_ROW_COLUMNS
 pub const DEFAULT_JOB_DEPTH: usize = 1024;
 
+/// Bytes of queued payload the zero-configuration queue holds before refusing.
+///
+/// The depth ceiling above bounds the queue in jobs; this bounds it in the unit
+/// that actually runs out. A payload may approach `MAX_ROW_BYTES`, so
+/// `DEFAULT_JOB_DEPTH` of them is hundreds of megabytes — reached in seconds at
+/// the default call rate, and never released, because this slice ships no
+/// consumer.
+pub const DEFAULT_JOB_BYTE_CAPACITY: usize = 16 * 1024 * 1024;
+
 impl Default for MemoryJobSink {
     fn default() -> Self {
         Self {
             queued: Mutex::new(Vec::new()),
             depth: DEFAULT_JOB_DEPTH,
+            byte_capacity: DEFAULT_JOB_BYTE_CAPACITY,
         }
     }
 }
@@ -143,6 +157,17 @@ impl MemoryJobSink {
         Arc::new(Self {
             queued: Mutex::new(Vec::new()),
             depth,
+            byte_capacity: DEFAULT_JOB_BYTE_CAPACITY,
+        })
+    }
+
+    /// A queue bounded by both a depth and a total payload size.
+    #[must_use]
+    pub fn with_capacities(depth: usize, byte_capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            queued: Mutex::new(Vec::new()),
+            depth,
+            byte_capacity,
         })
     }
 
@@ -169,6 +194,18 @@ impl JobSink for MemoryJobSink {
             return Err(format!(
                 "the plugin job queue is at its depth ceiling of {}",
                 self.depth
+            ));
+        }
+        // And by payload size. Depth alone bounds the queue in jobs, not in the
+        // memory they hold, and nothing here drains it.
+        let held: usize = queued
+            .iter()
+            .map(|queued_job| super::row_weight(&queued_job.payload))
+            .fold(0, usize::saturating_add);
+        if held.saturating_add(super::row_weight(&job.payload)) > self.byte_capacity {
+            return Err(format!(
+                "the plugin job queue is at its {}-byte ceiling",
+                self.byte_capacity
             ));
         }
         queued.push(job);

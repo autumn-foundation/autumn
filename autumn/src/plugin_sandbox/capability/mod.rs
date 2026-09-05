@@ -2183,6 +2183,52 @@ path = "/shop/panel"
         );
     }
 
+    #[test]
+    fn every_in_memory_backend_is_bounded_by_bytes_not_only_by_count() {
+        // The same defect in three places, so it is asserted in one test: a
+        // count ceiling times the largest legal entry is gigabytes for the row
+        // store, hundreds of megabytes for the job queue. Whatever the count
+        // allows, the byte ceiling has to stop first when entries are large.
+        let scope = db::Scope {
+            table: "plugin_shop__orders".to_owned(),
+            tenant: tenant_segment(Some("alpha")),
+        };
+        let store = db::MemoryPluginStore::with_capacities(10_000, 8192);
+        let fat = row(&[("blob", "x".repeat(2048).as_str())]);
+        let mut refused = false;
+        for _ in 0..64 {
+            if store.insert(&scope, fat.clone()).is_err() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "the row store grew past its byte ceiling");
+        assert!(
+            store.keys().len() < 10_000,
+            "and refused far below its row ceiling"
+        );
+
+        let sink = MemoryJobSink::with_capacities(1024, 8192);
+        let mut refused = false;
+        for _ in 0..64 {
+            let job = PluginJob {
+                plugin: "shop".to_owned(),
+                tenant: Some("alpha".to_owned()),
+                job_type: "reindex".to_owned(),
+                payload: row(&[("blob", "x".repeat(2048).as_str())]),
+            };
+            if sink.enqueue(job).is_err() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "the job queue grew past its byte ceiling");
+        assert!(
+            sink.queued().len() < 1024,
+            "and refused far below its depth ceiling"
+        );
+    }
+
     // ── DB containment ───────────────────────────────────────────────
 
     #[test]
