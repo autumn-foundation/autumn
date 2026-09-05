@@ -1202,6 +1202,21 @@ enum Annotation {
 }
 
 // ── Free helpers ─────────────────────────────────────────────────────
+//
+// `agent_authority.rs` forked this module's handle tracking (see its module
+// doc comment) and most of its similarly-named helpers have since diverged on
+// purpose — it carries a richer `Handle` enum where this module only needs a
+// flat set of names, and its `INERT_MACROS` deliberately excludes `vec!`/
+// `format!` for a reason specific to that analyser (see its `mac()`).
+//
+// `expr_attrs`, `expr_attrs_mut`, `item_attrs_mut`, `immediately_invoked_closure`,
+// `call_path_name`, `tokens_contain_await`, `collect_pat_idents`, the
+// `StripAnnotations`/`VisitMut` impl, and `EXECUTORS` (above) *are* still
+// byte-for-byte copies — they just enumerate `syn`'s own `Expr`/`Item`
+// variants or do generic token-tree plumbing, owing nothing to either
+// analyser's rules. Fix a bug in one of those and fix it in the other;
+// `shared_helpers_match_query_budget` in `agent_authority.rs`'s test module
+// fails the build if they drift.
 
 fn expr_attrs(expr: &Expr) -> &[Attribute] {
     match expr {
