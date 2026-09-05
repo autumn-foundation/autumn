@@ -36,14 +36,26 @@
 //!  plugin ───────────────────────► the manifest's routes ARE the mount
 //! ```
 //!
+//! # What the root re-exports
+//!
+//! Everything a caller needs to *use* the sandbox: the plugin and host types,
+//! the manifest vocabulary, the capability backends and their reference
+//! implementations, and every `MAX_*` ceiling — because a ceiling nobody can
+//! name is a ceiling nobody can plan against. What stays behind
+//! `capability::render::` and `capability::audit::` is the machinery those
+//! types are built from.
+//!
 //! Each module's own header explains its half in full; start with
 //! [`manifest`] for what an operator reviews, [`host`] for what the sandbox
 //! actually withholds, and `docs/guide/sandboxed-plugins.md` for the narrative.
 
 pub mod artifact;
+pub mod capability;
+pub mod grants;
 pub mod host;
 pub mod manifest;
 pub mod plugin;
+pub mod slots;
 pub mod wire;
 
 /// Hand-written WAT guests the escape corpus is built from.
@@ -58,9 +70,25 @@ pub use artifact::{
     ArtifactError, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES, MAX_MODULE_BYTES, SandboxArtifact,
     read_bounded,
 };
+pub use capability::{
+    ActivitySummary, CacheKvStore, CallResult, CallValue, CapabilityCall, CapabilityEvent,
+    CapabilityOutcome, CapabilityRateLimiter, CapabilityRuntime, CapabilityServices, DenialReason,
+    FragmentNode, JobSink, KvStore, MAX_DETAIL_CHARS, MAX_EVENTS, MAX_KV_KEY_BYTES, MAX_LOG_EVENTS,
+    MAX_OUTBOUND_HEADERS, MAX_RESPONSE_HEADER_BYTES, MAX_RESULT_BYTES, MAX_ROW_BYTES,
+    MAX_ROW_COLUMNS, MAX_ROW_ID_BYTES, MAX_TARGET_CHARS, MAX_VALUE_TEXT_BYTES, MemoryJobSink,
+    MemoryKvStore, MemoryPluginStore, NO_TENANT, OutboundHttp, OutboundRequest, OutboundResponse,
+    PluginActivityLog, PluginJob, PluginRow, PluginStore, PluginValue, QueryPage, RecordingHttp,
+    RenderError, Scope, StoreError, bounded_rows, row_weight, tenant_segment,
+};
+pub use grants::{
+    CapabilityGrants, CapabilityQuotas, ConsentDelta, MAX_GRANT_ENTRIES, MAX_GRANT_IDENT_LEN,
+    MAX_HOST_LEN, MAX_QUOTA, is_grantable_host, is_grantable_ident, is_grantable_name,
+};
 pub use host::{
     CapabilityDenial, DeniedCapability, MAX_INIT_SECTION_BYTES, MAX_INIT_SEGMENTS,
-    MAX_TABLE_ELEMENTS, SandboxFailure, SandboxHost, SandboxLoadError, SandboxOutcome,
+    MAX_QUEUED_REPLY_BYTES, MAX_RENDER_CONTEXT_BYTES, MAX_RENDER_CONTEXT_ENTRIES,
+    MAX_TABLE_ELEMENTS, RENDER_CONTEXT_ENTRY_OVERHEAD, SandboxFailure, SandboxHost,
+    SandboxLoadError, SandboxOutcome, SandboxRenderOutcome, bounded_context,
 };
 pub use manifest::{
     DeclaredRoute, MAX_CONCURRENCY, MAX_FOOTPRINT_BYTES, MAX_FUEL, MAX_MEMORY_BYTES,
@@ -68,6 +96,7 @@ pub use manifest::{
     ResourceLimits, SandboxCapability, SandboxManifest, WIRE_VERSION,
 };
 pub use plugin::{SANDBOX_ATTRIBUTION_HEADER, SandboxPluginError, SandboxedPlugin};
+pub use slots::{RenderSlots, SlotError};
 pub use wire::{
     ALLOWED_REQUEST_HEADERS, ALLOWED_RESPONSE_CONTENT_TYPES, ALLOWED_RESPONSE_HEADERS, OwnedRoutes,
     SandboxRequest, SandboxResponse, WireError, request_header_allowed, response_header_allowed,
@@ -99,6 +128,24 @@ pub fn __fuzz_parse_guest_frame(line: &str) -> bool {
 #[must_use]
 pub fn __fuzz_parse_manifest(src: &str) -> bool {
     SandboxManifest::parse(src).is_ok()
+}
+
+/// Parse a fragment tree and render it to HTML, as a render hook's answer is
+/// (issue #1632). Fuzzing seam; not a public API.
+///
+/// The one place in this subsystem where guest-supplied structure becomes markup
+/// that a *browser* then parses, so it is the one whose failure mode is stored
+/// XSS rather than a refused request. The rendering ceilings — depth, node
+/// count, bytes — are what the fuzzer is being pointed at: a tree inside every
+/// structural bound can still be built to blow one of them, and the difference
+/// between refusing and recursing is a stack.
+#[doc(hidden)]
+#[must_use]
+pub fn __fuzz_render_fragment(line: &str) -> bool {
+    let Ok(nodes) = serde_json::from_str::<Vec<capability::FragmentNode>>(line) else {
+        return false;
+    };
+    capability::render::render(&nodes, 64 * 1024).is_ok()
 }
 
 /// The single-binary promise is a *manifest* property, not a source property.

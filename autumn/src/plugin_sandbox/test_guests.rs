@@ -3360,3 +3360,271 @@ pub fn empty_iovecs(iovecs: u32, calls: u32) -> String {
 "#
     )
 }
+
+// ── Capability-channel guests (issue #1632) ──────────────────────────────
+
+/// A plugin that uses the capability channel: it reads the request frame,
+/// picks a call from the path, writes the call frame, reads the answer, and
+/// reports whether the host allowed it.
+///
+/// The answer is deliberately coarse — 200 for `"status":"ok"`, 403 otherwise —
+/// because the point of these tests is *which calls the host allows*, and a
+/// guest that had to base64 the reply back out would be a hundred lines of WAT
+/// whose bugs would look like containment failures.
+///
+/// One guest with a dispatch table rather than one per call: the escape corpus
+/// above is one module per misbehaviour because each *module* is the thing
+/// under test, and here it is each *call*.
+pub const CAPABILITY_CLIENT: &str = r#"(module
+  (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 2 4)
+
+  ;; Answers.
+  (data (i32.const 128) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"YWxsb3dlZA==\"}\0a\00")
+  (data (i32.const 384) "{\"op\":\"response\",\"status\":403,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"cmVmdXNlZA==\"}\0a\00")
+
+  ;; Needles matched against the request frame, and the call each selects.
+  (data (i32.const 640) "/kv-write\00")
+  (data (i32.const 660) "/kv-read\00")
+  (data (i32.const 680) "/kv-other-tenant\00")
+  (data (i32.const 704) "/fetch-granted\00")
+  (data (i32.const 724) "/fetch-undeclared\00")
+  (data (i32.const 748) "/db-insert\00")
+  (data (i32.const 768) "/db-host-table\00")
+  (data (i32.const 788) "/db-tenant-column\00")
+  (data (i32.const 812) "/job-granted\00")
+  (data (i32.const 832) "/job-undeclared\00")
+  (data (i32.const 856) "/kv-flood\00")
+  (data (i32.const 876) "\"status\":\"ok\"\00")
+  (data (i32.const 896) "\"op\":\"render\"\00")
+
+
+  ;; Call frames.
+  (data (i32.const 1024) "{\"op\":\"call\",\"call\":\"kv-set\",\"id\":1,\"key\":\"cart\",\"value\":\"one item\"}\0a\00")
+  (data (i32.const 1280) "{\"op\":\"call\",\"call\":\"kv-get\",\"id\":2,\"key\":\"cart\"}\0a\00")
+  (data (i32.const 1536) "{\"op\":\"call\",\"call\":\"kv-get\",\"id\":3,\"key\":\"beta:cart\"}\0a\00")
+  (data (i32.const 1792) "{\"op\":\"call\",\"call\":\"http-fetch\",\"id\":4,\"method\":\"GET\",\"url\":\"https://api.example.com/v1\"}\0a\00")
+  (data (i32.const 2048) "{\"op\":\"call\",\"call\":\"http-fetch\",\"id\":5,\"method\":\"GET\",\"url\":\"https://api.example.com.attacker.test/v1\"}\0a\00")
+  (data (i32.const 2304) "{\"op\":\"call\",\"call\":\"db-insert\",\"id\":6,\"table\":\"orders\",\"row\":{\"sku\":\"A-1\"}}\0a\00")
+  (data (i32.const 2560) "{\"op\":\"call\",\"call\":\"db-query\",\"id\":7,\"table\":\"users\"}\0a\00")
+  (data (i32.const 2816) "{\"op\":\"call\",\"call\":\"db-insert\",\"id\":8,\"table\":\"orders\",\"row\":{\"tenant_id\":\"beta\"}}\0a\00")
+  (data (i32.const 3072) "{\"op\":\"call\",\"call\":\"job-enqueue\",\"id\":9,\"job_type\":\"reindex\"}\0a\00")
+  (data (i32.const 3328) "{\"op\":\"call\",\"call\":\"job-enqueue\",\"id\":10,\"job_type\":\"drain-accounts\"}\0a\00")
+  ;; Two `http-fetch`es to the granted host, so a per-request `outbound_calls`
+  ;; quota of one can actually be exceeded — a guest that makes a single call
+  ;; can never demonstrate a ceiling.
+  (data (i32.const 3584) "{\"op\":\"call\",\"call\":\"http-fetch\",\"id\":11,\"method\":\"GET\",\"url\":\"https://api.example.com/v1\"}\0a\00")
+  ;; The render answer, kept clear of every call frame above: data segments
+  ;; apply in order, so a block that overruns the next one's offset silently
+  ;; truncates itself.
+  (data (i32.const 4096) "{\"op\":\"fragment\",\"nodes\":[{\"node\":\"element\",\"tag\":\"p\",\"attributes\":[[\"class\",\"panel\"]],\"children\":[{\"node\":\"text\",\"text\":\"3 orders\"}]}]}\0a\00")
+  ;; Needles for the two routes that need a *hit* rather than a call.
+  (data (i32.const 4608) "\"found\":true\00")
+  (data (i32.const 4640) "/kv-read-hit\00")
+  (data (i32.const 4672) "/fetch-twice\00")
+
+  (func $strlen (param $p i32) (result i32)
+    (local $n i32)
+    (block $done
+      (loop $l
+        (br_if $done (i32.eqz (i32.load8_u (i32.add (local.get $p) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $l)))
+    (local.get $n))
+
+  (func $emit (param $p i32)
+    (i32.store (i32.const 0) (local.get $p))
+    (i32.store (i32.const 4) (call $strlen (local.get $p)))
+    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 16))))
+
+  ;; Read one newline-terminated frame into the buffer at 65536.
+  (func $read_line (result i32)
+    (local $n i32)
+    (block $done
+      (loop $l
+        (i32.store (i32.const 0) (i32.add (i32.const 65536) (local.get $n)))
+        (i32.store (i32.const 4) (i32.const 1))
+        (i32.store (i32.const 16) (i32.const 0))
+        (br_if $done (i32.ne (call $fd_read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 16)) (i32.const 0)))
+        (br_if $done (i32.eqz (i32.load (i32.const 16))))
+        (br_if $done (i32.eq (i32.load8_u (i32.add (i32.const 65536) (local.get $n))) (i32.const 10)))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br_if $done (i32.ge_u (local.get $n) (i32.const 40000)))
+        (br $l)))
+    (local.get $n))
+
+  (func $contains (param $len i32) (param $needle i32) (result i32)
+    (local $i i32) (local $j i32) (local $nl i32)
+    (local.set $nl (call $strlen (local.get $needle)))
+    (if (i32.gt_u (local.get $nl) (local.get $len)) (then (return (i32.const 0))))
+    (block $no
+      (loop $outer
+        (br_if $no (i32.gt_u (i32.add (local.get $i) (local.get $nl)) (local.get $len)))
+        (local.set $j (i32.const 0))
+        (block $mismatch
+          (loop $inner
+            (br_if $mismatch (i32.ne
+              (i32.load8_u (i32.add (i32.const 65536) (i32.add (local.get $i) (local.get $j))))
+              (i32.load8_u (i32.add (local.get $needle) (local.get $j)))))
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br_if $inner (i32.lt_u (local.get $j) (local.get $nl))))
+          (return (i32.const 1)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $outer)))
+    (i32.const 0))
+
+  ;; Which call frame this request selects, or 0 for none.
+  (func $select (param $len i32) (result i32)
+    (if (call $contains (local.get $len) (i32.const 640)) (then (return (i32.const 1024))))
+    (if (call $contains (local.get $len) (i32.const 660)) (then (return (i32.const 1280))))
+    (if (call $contains (local.get $len) (i32.const 724)) (then (return (i32.const 2048))))
+    (if (call $contains (local.get $len) (i32.const 704)) (then (return (i32.const 1792))))
+    (if (call $contains (local.get $len) (i32.const 768)) (then (return (i32.const 2560))))
+    (if (call $contains (local.get $len) (i32.const 788)) (then (return (i32.const 2816))))
+    (if (call $contains (local.get $len) (i32.const 748)) (then (return (i32.const 2304))))
+    (if (call $contains (local.get $len) (i32.const 832)) (then (return (i32.const 3328))))
+    (if (call $contains (local.get $len) (i32.const 812)) (then (return (i32.const 3072))))
+    (i32.const 0))
+
+  (func (export "_start")
+    (local $len i32) (local $call i32) (local $i i32)
+    (local.set $len (call $read_line))
+    ;; A render frame is answered with a fragment. One plugin, one manifest,
+    ;; every capability — which is the reference plugin the issue's success
+    ;; metric asks for rather than five plugins that each do one thing.
+    (if (call $contains (local.get $len) (i32.const 896))
+      (then (call $emit (i32.const 4096)) (return)))
+    ;; The flood case never reads a reply, which is how the host's ceiling on
+    ;; unread replies gets exercised at all.
+    (if (call $contains (local.get $len) (i32.const 856))
+      (then
+        (block $stop
+          (loop $l
+            (call $emit (i32.const 1024))
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br_if $stop (i32.ge_u (local.get $i) (i32.const 100000)))
+            (br $l)))
+        (call $emit (i32.const 128))
+        (return)))
+    ;; Two `http-fetch`es in one request, so a per-request quota of one is
+    ;; exceeded on the second. Answers 200 only if the second was refused.
+    (if (call $contains (local.get $len) (i32.const 4672))
+      (then
+        (call $emit (i32.const 3584))
+        (drop (call $read_line))
+        (call $emit (i32.const 3584))
+        (local.set $len (call $read_line))
+        (if (call $contains (local.get $len) (i32.const 876))
+          (then (call $emit (i32.const 384)))
+          (else (call $emit (i32.const 128))))
+        (return)))
+    ;; A *hit*, not merely a call that was allowed. `kv-get` for a key another
+    ;; tenant owns is correctly ALLOWED and correctly MISSES — the escaping is
+    ;; what makes it miss — so a test that read the status alone could not tell
+    ;; containment from success.
+    ;; `/kv-read-hit` asks for its own key; `/kv-other-tenant` asks for
+    ;; `beta:cart`, which is what a naive `format!("{plugin}:{tenant}:{key}")`
+    ;; would have made reachable. Both answer 200 only on a hit.
+    (local.set $call (i32.const 0))
+    (if (call $contains (local.get $len) (i32.const 4640))
+      (then (local.set $call (i32.const 1280))))
+    (if (call $contains (local.get $len) (i32.const 680))
+      (then (local.set $call (i32.const 1536))))
+    (if (local.get $call)
+      (then
+        (call $emit (local.get $call))
+        (local.set $len (call $read_line))
+        (if (call $contains (local.get $len) (i32.const 4608))
+          (then (call $emit (i32.const 128)))
+          (else (call $emit (i32.const 384))))
+        (return)))
+    (local.set $call (call $select (local.get $len)))
+    (if (i32.eqz (local.get $call)) (then (call $emit (i32.const 384)) (return)))
+    (call $emit (local.get $call))
+    (local.set $len (call $read_line))
+    (if (call $contains (local.get $len) (i32.const 876))
+      (then (call $emit (i32.const 128)))
+      (else (call $emit (i32.const 384)))))
+)
+"#;
+
+/// A plugin that answers a render frame with a fragment tree.
+///
+/// The fragment carries one legal element and, on the `/unsafe` path, a tag and
+/// an attribute the renderer will not emit — so the same guest proves both that
+/// a hook works and that a hostile one produces no page.
+pub const RENDER_CLIENT: &str = r#"(module
+  (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 2 4)
+
+  (data (i32.const 128) "{\"op\":\"fragment\",\"nodes\":[{\"node\":\"element\",\"tag\":\"p\",\"attributes\":[[\"class\",\"panel\"]],\"children\":[{\"node\":\"text\",\"text\":\"3 orders <b>& counting</b>\"}]}]}\0a\00")
+  (data (i32.const 640) "{\"op\":\"fragment\",\"nodes\":[{\"node\":\"element\",\"tag\":\"script\",\"children\":[{\"node\":\"text\",\"text\":\"alert(1)\"}]}]}\0a\00")
+  (data (i32.const 1024) "{\"op\":\"fragment\",\"nodes\":[{\"node\":\"element\",\"tag\":\"a\",\"attributes\":[[\"href\",\"javascript:alert(1)\"]],\"children\":[]}]}\0a\00")
+  (data (i32.const 1536) "{\"op\":\"response\",\"status\":200,\"headers\":[],\"body_b64\":\"\"}\0a\00")
+  (data (i32.const 1792) "\"slot\":\"unsafe-tag\"\00")
+  (data (i32.const 1824) "\"slot\":\"unsafe-href\"\00")
+  (data (i32.const 1856) "\"slot\":\"wrong-frame\"\00")
+
+  (func $strlen (param $p i32) (result i32)
+    (local $n i32)
+    (block $done
+      (loop $l
+        (br_if $done (i32.eqz (i32.load8_u (i32.add (local.get $p) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $l)))
+    (local.get $n))
+
+  (func $emit (param $p i32)
+    (i32.store (i32.const 0) (local.get $p))
+    (i32.store (i32.const 4) (call $strlen (local.get $p)))
+    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 16))))
+
+  (func $read_line (result i32)
+    (local $n i32)
+    (block $done
+      (loop $l
+        (i32.store (i32.const 0) (i32.add (i32.const 65536) (local.get $n)))
+        (i32.store (i32.const 4) (i32.const 1))
+        (i32.store (i32.const 16) (i32.const 0))
+        (br_if $done (i32.ne (call $fd_read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 16)) (i32.const 0)))
+        (br_if $done (i32.eqz (i32.load (i32.const 16))))
+        (br_if $done (i32.eq (i32.load8_u (i32.add (i32.const 65536) (local.get $n))) (i32.const 10)))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br_if $done (i32.ge_u (local.get $n) (i32.const 40000)))
+        (br $l)))
+    (local.get $n))
+
+  (func $contains (param $len i32) (param $needle i32) (result i32)
+    (local $i i32) (local $j i32) (local $nl i32)
+    (local.set $nl (call $strlen (local.get $needle)))
+    (if (i32.gt_u (local.get $nl) (local.get $len)) (then (return (i32.const 0))))
+    (block $no
+      (loop $outer
+        (br_if $no (i32.gt_u (i32.add (local.get $i) (local.get $nl)) (local.get $len)))
+        (local.set $j (i32.const 0))
+        (block $mismatch
+          (loop $inner
+            (br_if $mismatch (i32.ne
+              (i32.load8_u (i32.add (i32.const 65536) (i32.add (local.get $i) (local.get $j))))
+              (i32.load8_u (i32.add (local.get $needle) (local.get $j)))))
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br_if $inner (i32.lt_u (local.get $j) (local.get $nl))))
+          (return (i32.const 1)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $outer)))
+    (i32.const 0))
+
+  (func (export "_start")
+    (local $len i32)
+    (local.set $len (call $read_line))
+    (if (call $contains (local.get $len) (i32.const 1792))
+      (then (call $emit (i32.const 640)) (return)))
+    (if (call $contains (local.get $len) (i32.const 1824))
+      (then (call $emit (i32.const 1024)) (return)))
+    (if (call $contains (local.get $len) (i32.const 1856))
+      (then (call $emit (i32.const 1536)) (return)))
+    (call $emit (i32.const 128)))
+)
+"#;

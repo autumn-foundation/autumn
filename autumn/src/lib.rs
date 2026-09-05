@@ -469,6 +469,11 @@ pub mod __fuzz {
     pub use crate::plugin_sandbox::__fuzz_parse_manifest as parse_sandbox_manifest;
     #[cfg(feature = "plugin-sandbox")]
     pub use crate::plugin_sandbox::__fuzz_read_artifact as read_sandbox_artifact;
+    // The render-hook fragment tree (#1632): the one guest-supplied structure
+    // that becomes markup a browser parses, so its failure mode is stored XSS
+    // rather than a refused request.
+    #[cfg(feature = "plugin-sandbox")]
+    pub use crate::plugin_sandbox::__fuzz_render_fragment as render_sandbox_fragment;
 
     // Body handling: form-urlencoded (always) + inbound-mail MIME (feature-gated).
     pub use crate::form::__fuzz_decode_urlencoded as decode_urlencoded_form;

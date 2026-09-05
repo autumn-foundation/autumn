@@ -7,7 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **plugin-sandbox:** three consequences of #1632 that an existing sandbox
+  embedder will notice. `SandboxManifest` gains `grants` and `quotas` fields, so
+  a struct literal over it needs two more lines — prefer `SandboxManifest::parse`
+  and edit the public fields of what comes back, which is unaffected;
+  `SandboxManifest::grants(cap)` is renamed `is_granted(cap)`, because `grants`
+  is now the field holding what each capability is scoped to. The per-request
+  host footprint gained the capability reply queue and the audit ledger, so a
+  manifest tuned to the previous ceiling may now be refused at load with
+  `LimitOutOfRange` on "the per-request host footprint × max_concurrency" —
+  lower `max_concurrency` or `max_response_bytes` (an otherwise-default manifest
+  still admits `max_concurrency = 16`). And the `autumn plugin-check` gating
+  line for a sandboxed plugin now reads "no session, auth, filesystem or
+  environment capability" and names the grant scopes, rather than claiming no
+  database or network capability over a manifest that holds one — and it is
+  carried by a `capability-grants` check present on every sandboxed report,
+  rather than only by the sensitive-surfaces check, which a plugin whose prefix
+  is not named like `/admin` never reaches. Non-breaking
+  for the stable surface: all of it is behind the non-default `plugin-sandbox`
+  feature, which `STABILITY.md` places outside SemVer.
+
 ### Added
+
+- **plugin-sandbox:** the capability vocabulary grows past request handling
+  (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
+  `http-outbound`, `db`, `jobs` and `render` beside `http-request`, and a new
+  `[grants]` table says what each is scoped to — hostnames, plugin-owned tables,
+  job types, render slots — with per-request `[quotas]` an operator can tune.
+  The guest asks over the NDJSON channel it already answers on
+  (`{"op":"call","call":"kv-get",…}` → `{"op":"call_result",…}`), so **a plugin
+  granted every capability imports exactly what a plugin granted none imports**
+  and the #1609 escape corpus keeps proving what it proved. Scoping is by
+  derivation rather than by check: the guest names a logical key, table, host or
+  job type and the host derives the physical one from the manifest and the
+  active tenant, so cross-tenant and host-table access are unspellable rather
+  than refused. Render hooks return a fragment *tree* the host renders, not HTML
+  it sanitises — no parser, so no parser differential — and a hook that traps,
+  overruns its fuel or emits a tag the renderer will not produce omits the
+  fragment rather than taking the page down with it. Every call, allowed or
+  refused, lands
+  in a bounded per-plugin activity log that answers "what did this plugin do in
+  the last hour" from one surface: hosts called, KV/DB usage, jobs enqueued,
+  denials and quota hits, recorded as shapes and never as values — and, when a
+  plugin outruns its own ledger, a line saying every count below it is a floor.
+  The `jobs` capability **enqueues**; running the result is the host's, and this
+  wire version has no frame for delivering a job back into a guest.
+  `autumn plugin inspect --against <installed-artifact>` reviews an upgrade as
+  an upgrade — capabilities, grant lists, quotas, **routes and resource
+  ceilings**, since a new route is an endpoint nobody approved and a raised
+  `fuel` is authority that touches no capability name — printing exactly what
+  grew and exiting non-zero when anything did. `autumn plugin inspect`
+  (text and JSON) now carries the grant lists and quotas, and stops printing
+  "no database access" over a manifest that was just granted `db`. Fifteen-plus
+  adversarial corpus of cross-capability escape attempts runs end-to-end through
+  the real interpreter in `tests/integration/plugin_sandbox_capabilities.rs`.
+  Every result the guest can size is bounded before it is built rather than
+  after: a row carries at most 256 KiB across its columns (checked on the way
+  *in*, so a stored row can always be read back), one `db-get`/`db-query` answer
+  carries at most 512 KiB and says `"truncated": true` when that cut it short,
+  and the budget travels into `PluginStore::query` so a store never materialises
+  what the reply would discard — with an `after` cursor so a page that was cut
+  can actually be continued, and a query filter refusing `row_id` because
+  stripping it would turn "the row with this id" into "every row this tenant
+  has". The outbound response-header ceilings travel into `OutboundRequest`
+  beside `max_response_bytes`, the render context is bounded before it is cloned
+  onto a worker, and `CacheKvStore` uses the serde-aware cache API so a plugin's
+  KV survives on a cross-replica backend rather than silently storing nothing. The shipped `MemoryJobSink` has a finite default
+  depth and no unbounded spelling — this slice ships no consumer that drains it.
+  The activity log counts what it evicts as well as what a per-request ledger
+  overflowed, and both are timestamped and windowed like ordinary events, so a
+  "last hour" neither presents the last twenty seconds as the hour nor carries a
+  lifetime total into a window the calls were not in. See
+  `docs/guide/sandboxed-plugins.md`. **Non-breaking**: everything here is behind
+  the non-default `plugin-sandbox` feature, which `STABILITY.md` already places
+  outside SemVer, and a first-slice manifest parses and runs unchanged —
+  `[grants]` and `[quotas]` both default, and an unknown capability name is
+  still a refusal rather than a silently dropped grant. The only source-level
+  change for an embedder is that `SandboxManifest` gains `grants`/`quotas` and
+  `SandboxOutcome` gains `activity`, so a struct literal over either must name
+  the new fields.
 
 - **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
   update validation left after #1719/#1742/#1778/#1801 (issue #1751).

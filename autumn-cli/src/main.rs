@@ -638,6 +638,17 @@ pub enum PluginSubcommands {
         /// Output format: `text` (default) or `json`.
         #[arg(long, default_value = "text", value_name = "FORMAT")]
         format: String,
+        /// The artifact currently installed, to review this one as an *upgrade*
+        /// (issue #1632).
+        ///
+        /// An upgrade is the moment a plugin's authority can grow without
+        /// anybody looking. With this, `inspect` prints exactly what the new
+        /// manifest asks for that the approved one did not — new capabilities,
+        /// new hosts, tables, job types, render slots, raised quotas — and
+        /// exits non-zero when there is anything, so an unattended install
+        /// stops rather than consenting on the operator's behalf.
+        #[arg(long, value_name = "ARTIFACT")]
+        against: Option<String>,
     },
 }
 
@@ -5094,12 +5105,20 @@ fn run_command(command: Commands) {
                     });
                     0
                 }
-                PluginSubcommands::Inspect { artifact, format } => {
+                PluginSubcommands::Inspect {
+                    artifact,
+                    format,
+                    against,
+                } => {
                     let format = format.parse().unwrap_or_else(|e| {
                         eprintln!("autumn plugin inspect: {e}");
                         std::process::exit(1);
                     });
-                    plugin_sandbox::run_inspect(std::path::Path::new(&artifact), &format);
+                    plugin_sandbox::run_inspect(
+                        std::path::Path::new(&artifact),
+                        &format,
+                        against.as_deref().map(std::path::Path::new),
+                    );
                     0
                 }
             };
@@ -8968,10 +8987,40 @@ mod tests {
             .expect("parses");
         match cli.command {
             Commands::Plugin {
-                action: PluginSubcommands::Inspect { artifact, format },
+                action:
+                    PluginSubcommands::Inspect {
+                        artifact,
+                        format,
+                        against,
+                    },
             } => {
                 assert_eq!(artifact, "hello.autumn-plugin");
                 assert_eq!(format, "text");
+                // No `--against`: reviewing an artifact on its own, not as an
+                // upgrade. The upgrade gate must not fire when nobody asked
+                // for it (issue #1632).
+                assert_eq!(against, None);
+            }
+            _ => panic!("expected plugin inspect"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_inspect_accepts_an_upgrade_baseline() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "inspect",
+            "shop-0.2.autumn-plugin",
+            "--against",
+            "shop-0.1.autumn-plugin",
+        ])
+        .expect("parses");
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::Inspect { against, .. },
+            } => {
+                assert_eq!(against.as_deref(), Some("shop-0.1.autumn-plugin"));
             }
             _ => panic!("expected plugin inspect"),
         }
