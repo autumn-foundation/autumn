@@ -315,16 +315,19 @@ fn write_attribute(
                 });
             }
         }
-        "colspan" | "rowspan" => {
+        // The condition is a guard rather than an `if` inside the arm: an arm
+        // whose whole body is one `if` is an arm clippy asks to be written this
+        // way, and the `_ => {}` below already accepts everything that falls
+        // through, so the guard failing lands there rather than anywhere new.
+        "colspan" | "rowspan"
             if value.is_empty()
                 || value.len() > 3
-                || !value.bytes().all(|byte| byte.is_ascii_digit())
-            {
-                return Err(RenderError::InvalidAttributeValue {
-                    name: name.clone(),
-                    reason: "expected one to three digits",
-                });
-            }
+                || !value.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            return Err(RenderError::InvalidAttributeValue {
+                name: name.clone(),
+                reason: "expected one to three digits",
+            });
         }
         // `title` is the only free-form value, and it is escaped like text.
         _ => {}
