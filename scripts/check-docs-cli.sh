@@ -2129,7 +2129,14 @@ def _redirect(tok):
 WAIVER = re.compile(r'<!--\s*cli-surface-allow:\s*autumn\s+([a-z0-9 -]+?)\s*(?:—|--|:)\s*(\S.*?)-->')
 
 INCLUDE_DIRS = ('docs/guide/', 'docs/migrations/', 'skills/', 'agents/')
-INCLUDE_FILES = ('README.md', 'EXAMPLES.md', 'CONTRIBUTING.md', 'STABILITY.md')
+# `docs/plugins.md` is a live product guide sitting at the `docs/` root rather
+# than under `docs/guide/`, linked from seven corpus pages as *the* plugin
+# guide. It joined the sibling `check-docs-config.sh` list in the same commit:
+# the two definitions of "reader-facing" are kept identical on purpose, since
+# a page covered by one gate and not the other is how a page ends up with no
+# owner. Corpus 175 -> 176 here, and this gate stays green over it.
+INCLUDE_FILES = ('README.md', 'EXAMPLES.md', 'CONTRIBUTING.md', 'STABILITY.md',
+                 'docs/plugins.md')
 
 
 def in_scope(path):

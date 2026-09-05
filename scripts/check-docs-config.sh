@@ -326,9 +326,35 @@ SELF = 'scripts/check-docs-config.sh'
 
 # The corpus a reader lands in, matching check-docs-cli.sh exactly. Kept
 # identical on purpose: three gates disagreeing about what "reader-facing"
-# means is how a page ends up covered by one and not the others.
+# means is how a page ends up covered by one and not the others — so
+# `docs/plugins.md` was added to BOTH lists in the same commit.
+#
+# `docs/plugins.md` is a live product guide that happens to sit at the `docs/`
+# root rather than under `docs/guide/`, and seven corpus pages — `STABILITY.md`
+# among them — link to it as *the* plugin guide. It tells operators to set
+# `AUTUMN_PLUGIN_CONTRACT=warn` to boot a deployment whose plugins fail the
+# contract, and a typo there was never scanned. The directory was standing in
+# for the audience.
+#
+# It is one file and not a rule, which is deliberate and was measured. "A page
+# the corpus links to is corpus" sounds like the general form and is wrong
+# here: the corpus links to `CHANGELOG.md` (109 names), to seven ADRs and to
+# `docs/design/`, every one of which this gate deliberately excludes because
+# their job includes naming keys that were renamed away or never built. The
+# link graph is evidence about a page, not a definition of the corpus.
+#
+# Audited rather than assumed, since fixing the reported page alone is this
+# script's most repeated mistake: every markdown file outside the corpus that
+# names an `AUTUMN_*` was run through the gate. 43 files, 311 occurrences, and
+# the only one to report was `.github/self-hosted-ci-runners.md`, six times
+# for `AUTUMN_SELF_HOSTED_HEAVY` — which is correct prose about a GitHub
+# Actions REPOSITORY VARIABLE read as `${{ vars.AUTUMN_SELF_HOSTED_HEAVY }}`,
+# a namespace this gate does not model and no runtime ever reads. That page
+# stays out; the rest of the population is the archival material already named
+# below under WHAT IT DELIBERATELY DOES NOT CHECK.
 INCLUDE_DIRS = ('docs/guide/', 'docs/migrations/', 'skills/', 'agents/')
-INCLUDE_FILES = ('README.md', 'EXAMPLES.md', 'CONTRIBUTING.md', 'STABILITY.md')
+INCLUDE_FILES = ('README.md', 'EXAMPLES.md', 'CONTRIBUTING.md', 'STABILITY.md',
+                 'docs/plugins.md')
 
 # `AUTUMN_` followed by at least one more character, ending on an
 # alphanumeric so a trailing underscore in prose (`AUTUMN_UPGRADE_*`) is not
@@ -410,6 +436,48 @@ def malformed(var):
     """A name the runtime cannot read: wrong case, or a dangling separator."""
     bare = re.sub(r'\{[a-z]+\}', '', var)
     return any(c.islower() for c in bare) or bool(TRAILING_WILDCARD.match(var))
+
+
+# A name is extracted correctly and can still validate less than the page
+# CLAIMS. `AUTUMN_LOG__LEVEL-TYPO` in backticks yields the token
+# `AUTUMN_LOG__LEVEL` — a real name — so the invalid key passed, the count
+# moved, and nothing was reported. The prefix resolved; the claim did not.
+#
+# What decides it is the SPAN, not the character. `-` really does end a
+# variable name in every language here, and outside backticks the text around a
+# name belongs to prose or to code: `AUTUMN_DATABASE__PRIMARY_URL/AUTUMN_…` is
+# a sentence saying "either of these" and `$AUTUMN_I18N_DEFAULT_LOCALE.ftl` is a
+# path, both correct. A name written BARE inside an inline code span is a
+# different act: the span is offered as the thing to type, so the whole span has
+# to be the name.
+#
+# "Bare" is what keeps this from reporting code. A span holding `=`, `$`, `:`,
+# `/`, a quote or whitespace is being shown as code, where the surrounding
+# characters have meaning of their own — `AUTUMN_UPGRADE_BINARY=target/…`,
+# `${AUTUMN_MEDIA__FFMPEG__BIN}`, `i18n/$AUTUMN_I18N_DEFAULT_LOCALE.ftl`. What
+# is left is a token, and a token's remainder is a family stand-in (`*`,
+# `<TABLE>`) or it is a typo.
+#
+# Measured on the whole corpus before landing: zero new defects, so this
+# reports nothing that is written today.
+CODE_SPAN = re.compile(r'`([^`\n]+)`')
+BARE_TOKEN = re.compile(r'^[A-Za-z0-9_{}<>*.\-]+$')
+FAMILY_TAIL = re.compile(r'^[A-Za-z0-9_<>*]*$')
+
+
+def span_defects(line):
+    """Bare code spans on this line whose token is more than the name in it."""
+    out = []
+    for content in CODE_SPAN.findall(line):
+        if not BARE_TOKEN.match(content):
+            continue
+        found = VAR.match(content)
+        if not found:
+            continue
+        rest = content[found.end():]
+        if rest and not FAMILY_TAIL.match(rest):
+            out.append(content)
+    return out
 
 # A path segment that is a sequence index rather than a field name: a literal
 # index as written in a shell line, or the `{i}` / `{N}` placeholder the
@@ -4084,6 +4152,16 @@ def scan(files, read, leaves, built, tokens):
                     defects.append((rel, i, m.group(0), line.strip()))
             if 'AUTUMN_' not in line:
                 continue
+            # …then the claim the token UNDER-states: a bare backticked span
+            # whose token runs past the name inside it. Checked before the
+            # names, for the same reason the misspelt namespace is: the
+            # extracted name resolves, so nothing after this point can report
+            # it.
+            for token in span_defects(line):
+                if at[i] in waived.get(token, ()):
+                    stats['waived'] += 1
+                else:
+                    defects.append((rel, i, token, line.strip()))
             for var in VAR.findall(line):
                 if var in chosen:
                     stats['reader-chosen name'] += 1
@@ -4364,7 +4442,15 @@ def main():
     for rel, line, var, text in defects:
         print(f'\n{rel}:{line}: `{var}` does not name a config key')
         print(f'    {text}')
-        if is_config_form(var):
+        # A token that is not a name at all gets told so. Saying "nothing reads
+        # it" of `AUTUMN_LOG__LEVEL-TYPO` is true and useless: the reader has to
+        # be told the `-TYPO` is why, since the part before it IS a real name.
+        outside = [c for c in re.sub(r'\{[a-z]+\}', '', var)
+                   if not (c.isalnum() or c == '_')]
+        if outside:
+            print(f'    `{"".join(sorted(set(outside)))}` cannot appear in a '
+                  f'variable name, so this is not the name `{VAR.match(var)[0]}`')
+        elif is_config_form(var):
             print(f'    derives the path `{to_path(var)}`, '
                   f'which is not in {SNAPSHOT.relative_to(ROOT)}')
         else:
@@ -4634,6 +4720,36 @@ def self_test():
          VAR.findall('export AUTUMN_LOG__LEVEL_=debug'), ['AUTUMN_LOG__LEVEL_'])
     case('a dangling separator is malformed',
          malformed('AUTUMN_LOG__LEVEL_'), True)
+    # A name can be extracted CORRECTLY and still validate less than the page
+    # claims: `AUTUMN_LOG__LEVEL-TYPO` yields the real name in front of it, so
+    # the prefix resolved and the invalid key passed. What decides it is the
+    # SPAN — a bare backticked token is offered as the thing to type, while a
+    # span holding `=`, `$`, `/` or a quote is code, where the characters
+    # around the name have meaning of their own.
+    case('a bare code span must be exactly the name',
+         [span_defects('set `%s` to warn' % c) for c in
+          ('AUTUMN_LOG__LEVEL-TYPO', 'AUTUMN_LOG__LEVEL.TYPO',
+           'AUTUMN_LOG__LEVEL', 'AUTUMN_SESSION__*',
+           'AUTUMN_MEDIA__<TABLE>__<FIELD>',
+           'AUTUMN_DATABASE__SHARDS__{i}__NAME')],
+         [['AUTUMN_LOG__LEVEL-TYPO'], ['AUTUMN_LOG__LEVEL.TYPO'],
+          [], [], [], []])
+    # …and a span that is CODE is left alone, because the characters after the
+    # name are the language's and not the reader's typo.
+    case('a code span is not a bare token',
+         [span_defects('`%s`' % c) for c in
+          ('AUTUMN_UPGRADE_BINARY=target/debug/hot-upgrade',
+           '${AUTUMN_MEDIA__FFMPEG__BIN}',
+           'i18n/$AUTUMN_I18N_DEFAULT_LOCALE.ftl',
+           'AUTUMN_ROLE: web')],
+         [[], [], [], []])
+    # The whole corpus is the control: this rung must report nothing that is
+    # written today, or it is a narrowing that costs correct pages.
+    case('the bare-span rung reports nothing in the corpus',
+         [(rel, d) for rel in corpus(ROOT)
+          for l in (ROOT / rel).read_text(encoding='utf-8',
+                                          errors='replace').splitlines()
+          for d in span_defects(l)], [])
     # A wildcard is a claim about a family, checked like any other claim: the
     # prefix must actually begin a real name, or `*` becomes a blanket excuse.
     case('a real family prefix exists',
@@ -5101,6 +5217,22 @@ def self_test():
     # skipped as source.
     case('a markdown template is a checked page',
          'autumn-cli/src/templates/README.md.tmpl' in corpus(ROOT), True)
+    # A live guide sitting outside `docs/guide/` is still a page a reader
+    # lands on — seven corpus pages link to `docs/plugins.md` as *the* plugin
+    # guide, and its `AUTUMN_PLUGIN_CONTRACT=warn` instruction went unscanned
+    # because the DIRECTORY was standing in for the audience.
+    case('the linked plugin guide is a checked page',
+         'docs/plugins.md' in corpus(ROOT), True)
+    # …and the two gates' idea of "reader-facing" is asserted identical, not
+    # merely intended to be: adding a page to one and not the other is exactly
+    # how a page ends up with no owner.
+    case('the sibling gate agrees on the corpus',
+         sorted(re.search(r'^INCLUDE_FILES = \(([^)]*)\)',
+                          (ROOT / 'scripts' / 'check-docs-cli.sh')
+                          .read_text(encoding='utf-8'), re.M).group(1).split()),
+         sorted(re.search(r'^INCLUDE_FILES = \(([^)]*)\)',
+                          (ROOT / SELF).read_text(encoding='utf-8'), re.M)
+                .group(1).split()))
     # HCL takes all three comment forms; a `//` in shell or YAML is a path.
     case('Terraform strips its slash forms too',
          uncommented('// export AUTUMN_LOG__LEVL=x\nreal = 1 # note', '#',
