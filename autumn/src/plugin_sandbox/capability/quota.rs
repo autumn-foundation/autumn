@@ -92,7 +92,7 @@ impl QuotaLedger {
     /// # Errors
     ///
     /// Names the quota field that is spent.
-    pub fn charge_capability(&mut self, call: &CapabilityCall) -> Result<(), &'static str> {
+    pub const fn charge_capability(&mut self, call: &CapabilityCall) -> Result<(), &'static str> {
         let (counter, ceiling, field) = match call {
             CapabilityCall::KvGet { .. } => {
                 (&mut self.kv_reads, self.declared.kv_reads, "kv_reads")

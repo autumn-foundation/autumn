@@ -625,6 +625,11 @@ pub enum ManifestError {
 }
 
 impl fmt::Display for ManifestError {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per refusal, each writing the sentence an operator reads; the length \
+                  is the vocabulary's, and splitting it would separate a variant from its words"
+    )]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Toml(detail) => write!(f, "malformed sandbox plugin manifest: {detail}"),

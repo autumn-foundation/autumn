@@ -89,11 +89,7 @@ pub fn namespaced_key(plugin: &str, tenant: &str, key: &str) -> String {
 }
 
 /// Answer one `kv-*` call. Capability, scope and quota are already checked.
-pub(super) fn perform(
-    runtime: &mut CapabilityRuntime,
-    call: &CapabilityCall,
-    key: &str,
-) -> CallResult {
+pub(super) fn perform(runtime: &CapabilityRuntime, call: &CapabilityCall, key: &str) -> CallResult {
     let id = call.id();
     let Some(store) = runtime.services.kv.clone() else {
         return CallResult::denied(
@@ -104,18 +100,15 @@ pub(super) fn perform(
     };
     let physical = namespaced_key(&runtime.plugin, runtime.tenant(), key);
     match call {
-        CapabilityCall::KvGet { .. } => match store.get(&physical) {
-            Some(value) => CallResult::Ok {
-                id,
-                value: CallValue::Value { value, found: true },
-            },
-            None => CallResult::Ok {
-                id,
-                value: CallValue::Value {
+        CapabilityCall::KvGet { .. } => CallResult::Ok {
+            id,
+            value: store.get(&physical).map_or(
+                CallValue::Value {
                     value: PluginValue::Null,
                     found: false,
                 },
-            },
+                |value| CallValue::Value { value, found: true },
+            ),
         },
         CapabilityCall::KvSet { value, .. } => {
             let ceiling = runtime.quotas().kv_value_bytes as usize;
@@ -206,6 +199,12 @@ impl MemoryKvStore {
 
     /// Every key currently stored, for assertions.
     #[must_use]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the body is one critical section over the shared map; releasing early would \
+                  either split a ceiling check from the write it guards or let the snapshot \
+                  this returns be torn"
+    )]
     pub fn keys(&self) -> Vec<String> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let mut keys: Vec<String> = entries.keys().cloned().collect();
@@ -223,6 +222,12 @@ impl KvStore for MemoryKvStore {
             .cloned()
     }
 
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the body is one critical section over the shared map; releasing early would \
+                  either split a ceiling check from the write it guards or let the snapshot \
+                  this returns be torn"
+    )]
     fn set(&self, key: &str, value: PluginValue) -> Result<(), String> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         // Overwriting an existing key adds nothing, so the ceiling applies to

@@ -121,6 +121,29 @@ pub const MAX_VALUE_TEXT_BYTES: usize = 64 * 1024;
 /// needs a length of its own rather than inheriting a grant's.
 pub const MAX_KV_KEY_BYTES: usize = 512;
 
+/// Most bytes one row may carry across all of its columns.
+///
+/// [`MAX_VALUE_TEXT_BYTES`] bounds one column, and 32 of them bounds a row at
+/// 2 MiB — twice what a whole reply may be. A row that cannot be handed back is
+/// a row that must not be accepted, so the ceiling that lets a `db-get` answer
+/// is applied where the row goes *in*.
+pub const MAX_ROW_BYTES: usize = 256 * 1024;
+
+/// Most bytes the rows in one `db-get` or `db-query` answer may carry.
+///
+/// Rows are the one result whose size the *guest* chooses: a `db_rows` quota of
+/// 500 against [`MAX_ROW_BYTES`] is 125 MiB the host would materialise, encode
+/// and hold, per request, on a quota the plugin's own manifest sets. So the
+/// budget travels into the store (see [`PluginStore::query`]) rather than being
+/// checked once the whole answer exists — by which point the allocation has
+/// already happened.
+///
+/// Comfortably under the host's queued-reply ceiling, so a reply that fits this
+/// always fits the queue and a legal read never fails a later call.
+///
+/// [`PluginStore::query`]: db::PluginStore::query
+pub const MAX_RESULT_BYTES: usize = 512 * 1024;
+
 /// Longest accepted plugin row id, in bytes.
 pub const MAX_ROW_ID_BYTES: usize = 128;
 
@@ -157,7 +180,7 @@ pub enum PluginValue {
 impl PluginValue {
     /// The bytes this value costs in host memory, for the quota.
     #[must_use]
-    pub fn weight(&self) -> usize {
+    pub const fn weight(&self) -> usize {
         match self {
             Self::Text(text) => text.len(),
             _ => 8,
@@ -195,6 +218,13 @@ pub fn check_row(row: &PluginRow) -> Result<(), String> {
             row.len()
         ));
     }
+    let weight = row_weight(row);
+    if weight > MAX_ROW_BYTES {
+        return Err(format!(
+            "a row may carry at most {MAX_ROW_BYTES} bytes across its columns; this one carries \
+             {weight}"
+        ));
+    }
     for (column, value) in row {
         if !super::grants::is_grantable_ident(column) {
             return Err(format!(
@@ -211,6 +241,49 @@ pub fn check_row(row: &PluginRow) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// What one row costs in host memory: its values, plus its column names.
+///
+/// Column names count because they are repeated in every row of an answer and
+/// in the JSON of every reply, so a row of 32 long names is not free.
+#[must_use]
+pub fn row_weight(row: &PluginRow) -> usize {
+    row.iter().fold(0, |sum, (column, value)| {
+        sum.saturating_add(column.len())
+            .saturating_add(value.weight())
+    })
+}
+
+/// Keep rows while they fit [`MAX_RESULT_BYTES`], reporting whether any were
+/// left behind.
+///
+/// The second line of defence, not the first: [`PluginStore::query`] is given
+/// the same budget so a well-behaved store never builds the rows this would
+/// discard. It runs anyway, because the store is an embedder's trait
+/// implementation and "the host does not hold more than this" cannot rest on
+/// someone else's loop.
+///
+/// At least one row always survives: a row is bounded by [`MAX_ROW_BYTES`],
+/// which is under this ceiling, so a `db-get` of a legally-stored row is never
+/// answered with nothing.
+///
+/// [`PluginStore::query`]: db::PluginStore::query
+#[must_use]
+pub fn bounded_rows(rows: Vec<PluginRow>) -> (Vec<PluginRow>, bool) {
+    let mut kept = Vec::with_capacity(rows.len());
+    let mut total = 0_usize;
+    let mut truncated = false;
+    for row in rows {
+        let weight = row_weight(&row);
+        if !kept.is_empty() && total.saturating_add(weight) > MAX_RESULT_BYTES {
+            truncated = true;
+            break;
+        }
+        total = total.saturating_add(weight);
+        kept.push(row);
+    }
+    (kept, truncated)
 }
 
 // ── The calls ────────────────────────────────────────────────────────────
@@ -502,7 +575,6 @@ pub enum CallResult {
 
 impl CallResult {
     /// Build a denial.
-    #[must_use]
     pub fn denied(id: u64, reason: DenialReason, detail: impl Into<String>) -> Self {
         Self::Denied {
             id,
@@ -553,6 +625,13 @@ pub enum CallValue {
     Rows {
         /// The rows, each carrying its `row_id` alongside its columns.
         rows: Vec<PluginRow>,
+        /// Whether [`MAX_RESULT_BYTES`] stopped the answer short.
+        ///
+        /// On the wire so a guest can tell "that is all of them" from "that is
+        /// all that fits". Without it a plugin paging through its own table
+        /// would read a short answer as the end of the table and stop, which is
+        /// silent data loss in the plugin rather than in the host.
+        truncated: bool,
     },
     /// An HTTP response, from `http-fetch`.
     Http {
@@ -822,7 +901,7 @@ impl CapabilityRuntime {
         if let Err(field) = self.quotas.charge_call() {
             return self.record(
                 call,
-                named,
+                &named,
                 CallResult::denied(
                     id,
                     DenialReason::QuotaExceeded,
@@ -837,7 +916,7 @@ impl CapabilityRuntime {
         if !self.is_granted(capability) {
             return self.record(
                 call,
-                named,
+                &named,
                 CallResult::denied(
                     id,
                     DenialReason::CapabilityNotGranted,
@@ -852,13 +931,13 @@ impl CapabilityRuntime {
         // entitled to make.
         let target = match self.target_of(call) {
             Ok(target) => target,
-            Err(result) => return self.record(call, named, result),
+            Err(result) => return self.record(call, &named, result),
         };
 
         if let Err(field) = self.quotas.charge_capability(call) {
             return self.record(
                 call,
-                target.clone(),
+                &target,
                 CallResult::denied(
                     id,
                     DenialReason::QuotaExceeded,
@@ -878,7 +957,7 @@ impl CapabilityRuntime {
         {
             return self.record(
                 call,
-                target.clone(),
+                &target,
                 CallResult::denied(
                     id,
                     DenialReason::QuotaExceeded,
@@ -888,7 +967,7 @@ impl CapabilityRuntime {
         }
 
         let result = self.perform(call, &target);
-        self.record(call, target, result)
+        self.record(call, &target, result)
     }
 
     /// The thing this call names, checked against the grant list.
@@ -989,7 +1068,7 @@ impl CapabilityRuntime {
     ///
     /// Every exit from `dispatch` goes through here, so there is no path that
     /// answers the guest without also telling the operator.
-    fn record(&mut self, call: &CapabilityCall, target: String, result: CallResult) -> CallResult {
+    fn record(&mut self, call: &CapabilityCall, target: &str, result: CallResult) -> CallResult {
         // Bounded and neutralised once, here, rather than at each of the six
         // exits. A KV key is the one identifier a guest chooses freely, a table
         // or job type is bounded only by the wire, and from here both go into a
@@ -997,7 +1076,7 @@ impl CapabilityRuntime {
         // renders. `MAX_TARGET_CHARS` is far below what `rejected` would allow,
         // because a ledger this deep with 512-character entries is megabytes the
         // footprint never budgeted.
-        let target = super::manifest::rejected(&bounded_target(&target));
+        let target = super::manifest::rejected(&bounded_target(target));
         let outcome = match result.denial() {
             None => Outcome::Allowed,
             Some(DenialReason::QuotaExceeded) => Outcome::QuotaExceeded,
@@ -1564,6 +1643,80 @@ path = "/shop/panel"
         assert!(fixture.http.seen().is_empty());
     }
 
+    #[test]
+    fn a_row_no_reply_could_carry_is_refused_where_it_goes_in() {
+        // `MAX_VALUE_TEXT_BYTES` bounds one column and 32 of them bounds a row
+        // at 2 MiB — twice what one reply may be. Accepting such a row would
+        // store something `db-get` could never hand back, so the ceiling that
+        // makes a read answerable belongs on the write.
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        let fat: PluginRow = (0..8)
+            .map(|index| {
+                (
+                    format!("c{index}"),
+                    PluginValue::Text("x".repeat(MAX_VALUE_TEXT_BYTES)),
+                )
+            })
+            .collect();
+        assert!(
+            row_weight(&fat) > MAX_ROW_BYTES,
+            "the fixture is fat enough"
+        );
+        let result = fixture.runtime.dispatch(&CapabilityCall::DbInsert {
+            id: 1,
+            table: "orders".to_owned(),
+            row: fat,
+        });
+        assert_eq!(result.denial(), Some(DenialReason::Malformed), "{result:?}");
+        assert!(fixture.db.keys().is_empty(), "{:?}", fixture.db.keys());
+    }
+
+    #[test]
+    fn a_query_is_bounded_by_bytes_and_says_when_it_was_cut() {
+        // The finding: `db_rows` defaults to 500 and a row may be
+        // `MAX_ROW_BYTES`, so a granted plugin could make the host materialise,
+        // encode and hold a hundred megabytes per request against a quota its
+        // own manifest sets. The budget now reaches the store, and the guest is
+        // told its answer was cut rather than reading a short page as the end
+        // of the table.
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        let wide = "x".repeat(MAX_VALUE_TEXT_BYTES);
+        for index in 0..16 {
+            let mut row = row(&[("kind", "wide")]);
+            for column in 0..4 {
+                row.insert(format!("c{column}"), PluginValue::Text(wide.clone()));
+            }
+            row.insert("n".to_owned(), PluginValue::Int(index));
+            let inserted = fixture.runtime.dispatch(&CapabilityCall::DbInsert {
+                id: 1,
+                table: "orders".to_owned(),
+                row,
+            });
+            assert!(inserted.denial().is_none(), "row {index}: {inserted:?}");
+        }
+
+        let result = fixture.runtime.dispatch(&CapabilityCall::DbQuery {
+            id: 2,
+            table: "orders".to_owned(),
+            filter: row(&[("kind", "wide")]),
+            limit: 0,
+        });
+        let CallResult::Ok {
+            value: CallValue::Rows { rows, truncated },
+            ..
+        } = result
+        else {
+            panic!("the query should have succeeded: {result:?}")
+        };
+        assert!(truncated, "16 wide rows do not fit one reply");
+        assert!(!rows.is_empty(), "and the answer is not empty either");
+        let carried: usize = rows.iter().map(row_weight).sum();
+        assert!(
+            carried <= MAX_RESULT_BYTES.saturating_add(MAX_ROW_BYTES),
+            "the answer carried {carried} bytes"
+        );
+    }
+
     // ── DB containment ───────────────────────────────────────────────
 
     #[test]
@@ -1598,7 +1751,7 @@ path = "/shop/panel"
             row_id,
         });
         let CallResult::Ok {
-            value: CallValue::Rows { rows },
+            value: CallValue::Rows { rows, .. },
             ..
         } = read
         else {
@@ -1666,7 +1819,10 @@ path = "/shop/panel"
             listed,
             CallResult::Ok {
                 id: 1,
-                value: CallValue::Rows { rows: Vec::new() }
+                value: CallValue::Rows {
+                    rows: Vec::new(),
+                    truncated: false
+                }
             },
             "an unfiltered query returns this tenant's rows, which are none"
         );
@@ -1700,7 +1856,10 @@ path = "/shop/panel"
                     result,
                     CallResult::Ok {
                         id: result.id(),
-                        value: CallValue::Rows { rows: Vec::new() }
+                        value: CallValue::Rows {
+                            rows: Vec::new(),
+                            truncated: false
+                        }
                     },
                     "a read of another tenant's id must miss, not error"
                 );
@@ -1716,7 +1875,7 @@ path = "/shop/panel"
         assert_eq!(
             store.keys(),
             vec![
-                (orders.clone(), "beta".to_owned(), "r99".to_owned()),
+                (orders, "beta".to_owned(), "r99".to_owned()),
                 ("users".to_owned(), "alpha".to_owned(), "u1".to_owned()),
             ]
         );
@@ -1762,7 +1921,7 @@ path = "/shop/panel"
             row_id: row_id.clone(),
         });
         let CallResult::Ok {
-            value: CallValue::Rows { rows },
+            value: CallValue::Rows { rows, .. },
             ..
         } = read
         else {
@@ -2318,7 +2477,7 @@ path = "/shop/panel"
                 limit,
             });
             let CallResult::Ok {
-                value: CallValue::Rows { rows },
+                value: CallValue::Rows { rows, .. },
                 ..
             } = result
             else {
@@ -2387,6 +2546,33 @@ path = "/shop/panel"
             Some(DenialReason::BackendError)
         );
         assert_eq!(sink.queued().len(), 1);
+    }
+
+    #[test]
+    fn the_zero_configuration_job_queue_is_finite() {
+        // `MemoryJobSink::new()` used to be unbounded, and this slice ships no
+        // consumer that removes a queued job — so an application that wired the
+        // exported default gave a granted plugin a way to grow the host without
+        // limit. The quotas slow that and never stop it. There is no unbounded
+        // spelling any more; a default that must be tightened to be safe is a
+        // default that will be shipped as it is.
+        //
+        // Driven against the sink rather than through `dispatch`: the per-request
+        // quotas would refuse long before the queue filled, and it is the queue
+        // that outlives the request.
+        let sink = jobs::MemoryJobSink::new();
+        let job = || PluginJob {
+            plugin: "shop".to_owned(),
+            job_type: "reindex".to_owned(),
+            tenant: "alpha".to_owned(),
+            payload: PluginRow::new(),
+        };
+        for index in 0..jobs::DEFAULT_JOB_DEPTH {
+            assert!(sink.enqueue(job()).is_ok(), "job {index}");
+        }
+        let over = sink.enqueue(job());
+        assert!(over.is_err(), "{over:?}");
+        assert_eq!(sink.queued().len(), jobs::DEFAULT_JOB_DEPTH);
     }
 
     // ── Audit ────────────────────────────────────────────────────────

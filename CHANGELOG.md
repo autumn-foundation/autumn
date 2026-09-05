@@ -62,7 +62,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (text and JSON) now carries the grant lists and quotas, and stops printing
   "no database access" over a manifest that was just granted `db`. Fifteen-plus
   adversarial corpus of cross-capability escape attempts runs end-to-end through
-  the real interpreter in `tests/integration/plugin_sandbox_capabilities.rs`. See
+  the real interpreter in `tests/integration/plugin_sandbox_capabilities.rs`.
+  Every result the guest can size is bounded before it is built rather than
+  after: a row carries at most 256 KiB across its columns (checked on the way
+  *in*, so a stored row can always be read back), one `db-get`/`db-query` answer
+  carries at most 512 KiB and says `"truncated": true` when that cut it short,
+  and the budget travels into `PluginStore::query` so a store never materialises
+  what the reply would discard. The shipped `MemoryJobSink` has a finite default
+  depth and no unbounded spelling — this slice ships no consumer that drains it.
+  The activity log counts what it evicts as well as what a per-request ledger
+  overflowed, and both are timestamped and windowed like ordinary events, so a
+  "last hour" neither presents the last twenty seconds as the hour nor carries a
+  lifetime total into a window the calls were not in. See
   `docs/guide/sandboxed-plugins.md`. **Non-breaking**: everything here is behind
   the non-default `plugin-sandbox` feature, which `STABILITY.md` already places
   outside SemVer, and a first-slice manifest parses and runs unchanged —

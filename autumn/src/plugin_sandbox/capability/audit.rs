@@ -96,10 +96,28 @@ pub struct PluginActivityLog {
     /// by every plugin and every concurrent request. `VecDeque::pop_front` is
     /// the same eviction in constant time.
     entries: Mutex<VecDeque<(Instant, String, CapabilityEvent)>>,
-    /// Events the per-request ledgers could not hold, so a summary can say it
-    /// is a floor rather than a count.
-    dropped: Mutex<BTreeMap<String, u64>>,
+    /// Calls this log knows happened but cannot show: the ones a per-request
+    /// ledger could not hold, and the ones this ring itself evicted.
+    ///
+    /// Timestamped like `entries`, and windowed by the same cutoff. A lifetime
+    /// total would attach itself to every later summary — including one whose
+    /// window ended before any of those calls — and tell an operator that a
+    /// quiet hour was incomplete forever after one noisy second.
+    ///
+    /// Coalesced into [`DROPPED_BUCKET`] buckets per plugin so the ring cannot
+    /// grow one entry per evicted event, which is the growth it exists to
+    /// report.
+    dropped: Mutex<VecDeque<(Instant, String, u64)>>,
 }
+
+/// How coarsely dropped-call records are timestamped.
+///
+/// One eviction is one dropped call, and evictions arrive at the plugin's whole
+/// call rate — so recording each separately would cost as much memory as
+/// keeping the events did. Consecutive drops for one plugin inside this span
+/// become one record. It is three orders of magnitude below the "last hour" the
+/// acceptance criterion asks about, so the windowing stays honest.
+const DROPPED_BUCKET: Duration = Duration::from_secs(1);
 
 impl PluginActivityLog {
     /// An empty log.
@@ -111,12 +129,32 @@ impl PluginActivityLog {
     /// Record everything one request's runtime gathered.
     pub fn ingest(&self, plugin: &str, events: impl IntoIterator<Item = CapabilityEvent>) {
         let now = Instant::now();
-        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        for event in events {
-            if entries.len() >= MAX_LOG_EVENTS {
-                entries.pop_front();
+        // What this ring evicts to make room, carried out of the critical
+        // section rather than recorded inside it: the two locks are never held
+        // at once, so neither orders the other and no future reader can
+        // deadlock the log an operator reads during an incident.
+        let mut evicted: Vec<(Instant, String)> = Vec::new();
+        {
+            let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            for event in events {
+                if entries.len() >= MAX_LOG_EVENTS {
+                    if let Some((at, who, _)) = entries.pop_front() {
+                        evicted.push((at, who));
+                    }
+                }
+                entries.push_back((now, plugin.to_owned(), event));
             }
-            entries.push_back((now, plugin.to_owned(), event));
+        }
+        if !evicted.is_empty() {
+            // An evicted event is a call the summary can no longer show. Left
+            // uncounted, a busy plugin's "last hour" would present the last few
+            // seconds as the whole hour, with no sign that the rest existed.
+            // Recorded under the *evicted* event's own timestamp, so a drop that
+            // has aged out of the window stops being reported with it.
+            let mut dropped = self.dropped.lock().unwrap_or_else(PoisonError::into_inner);
+            for (at, who) in evicted {
+                note_dropped(&mut dropped, at, &who, 1);
+            }
         }
     }
 
@@ -130,11 +168,8 @@ impl PluginActivityLog {
         if dropped == 0 {
             return;
         }
-        {
-            let mut counts = self.dropped.lock().unwrap_or_else(PoisonError::into_inner);
-            let counter = counts.entry(plugin.to_owned()).or_insert(0);
-            *counter = counter.saturating_add(dropped);
-        }
+        let mut ring = self.dropped.lock().unwrap_or_else(PoisonError::into_inner);
+        note_dropped(&mut ring, Instant::now(), plugin, dropped);
     }
 
     /// What `plugin` did within `window`.
@@ -160,13 +195,15 @@ impl PluginActivityLog {
                 summary.record(event);
             }
         }
-        summary.dropped = self
-            .dropped
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(plugin)
-            .copied()
-            .unwrap_or(0);
+        summary.dropped = {
+            let dropped = self.dropped.lock().unwrap_or_else(PoisonError::into_inner);
+            dropped
+                .iter()
+                .filter(|(at, who, _)| {
+                    who == plugin && cutoff.saturating_duration_since(*at) <= window
+                })
+                .fold(0_u64, |sum, (_, _, count)| sum.saturating_add(*count))
+        };
         summary
     }
 
@@ -181,6 +218,43 @@ impl PluginActivityLog {
         names.dedup();
         names
     }
+}
+
+/// Add `count` dropped calls for `plugin` at `at`, coalescing into the newest
+/// record when it is the same plugin within one [`DROPPED_BUCKET`].
+///
+/// Bounded by the same ceiling as the event ring, and evicting oldest-first for
+/// the same reason: a report of unbounded growth must not itself grow without
+/// bound.
+fn note_dropped(
+    ring: &mut VecDeque<(Instant, String, u64)>,
+    at: Instant,
+    plugin: &str,
+    count: u64,
+) {
+    if let Some((last, who, total)) = ring.back_mut() {
+        // Distance either way: an eviction record carries the *evicted* event's
+        // timestamp, which runs behind the wall clock a per-request overflow is
+        // stamped with, so the two interleave out of order.
+        let span = if at >= *last {
+            at.saturating_duration_since(*last)
+        } else {
+            last.saturating_duration_since(at)
+        };
+        if who == plugin && span < DROPPED_BUCKET {
+            // The newer of the two, so a bucket is reported for as long as any
+            // call in it belongs to the window. A bucket is one second against a
+            // window of an hour, so the edge it rounds is not one an operator
+            // can act on differently.
+            *last = (*last).max(at);
+            *total = total.saturating_add(count);
+            return;
+        }
+    }
+    if ring.len() >= MAX_LOG_EVENTS {
+        ring.pop_front();
+    }
+    ring.push_back((at, plugin.to_owned(), count));
 }
 
 /// The answer to "what did this plugin do".
@@ -375,7 +449,7 @@ mod tests {
 
         let shop = log.summary("shop", Duration::from_secs(3600));
         assert_eq!(shop.allowed.get("kv-get").copied(), Some(1));
-        assert!(shop.allowed.get("kv-set").is_none(), "{shop:?}");
+        assert!(!shop.allowed.contains_key("kv-set"), "{shop:?}");
 
         // A zero-length window covers nothing, which is the same filter the
         // "last hour" in the acceptance criterion rests on.
@@ -411,5 +485,70 @@ mod tests {
         let rendered = log.summary("shop", Duration::from_secs(60)).to_string();
         assert!(rendered.contains("last 60s"), "{rendered}");
         assert!(rendered.contains("`shop`"), "{rendered}");
+    }
+
+    #[test]
+    fn an_event_the_ring_evicted_is_reported_as_dropped_rather_than_forgotten() {
+        // The ring holds the recent end, which is right. What was wrong was
+        // saying nothing about the rest: a plugin busy enough to fill 4,096
+        // entries in twenty seconds got a "last hour" summary showing twenty
+        // seconds, with counts presented as the hour's.
+        let log = PluginActivityLog::new();
+        for _ in 0..MAX_LOG_EVENTS + 100 {
+            log.ingest("shop", [event("kv-get", CapabilityOutcome::Allowed)]);
+        }
+        let summary = log.summary("shop", Duration::from_secs(3600));
+        assert_eq!(
+            summary.allowed.get("kv-get").copied(),
+            Some(MAX_LOG_EVENTS as u64),
+            "the ring still holds its ceiling"
+        );
+        assert_eq!(summary.dropped, 100, "and says what it could not hold");
+        assert!(
+            summary.to_string().contains("NOT counted below"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn a_dropped_count_leaves_the_window_with_the_calls_it_describes() {
+        // A lifetime total attached itself to every later summary. An operator
+        // asking about a window that ended before the overflow was told the
+        // window was incomplete — permanently, and about calls that were not in
+        // it.
+        let log = PluginActivityLog::new();
+        log.ingest_dropped("shop", 9);
+        assert_eq!(log.summary("shop", Duration::from_secs(3600)).dropped, 9);
+        assert_eq!(
+            log.summary("shop", Duration::ZERO).dropped,
+            0,
+            "a window covering nothing covers no drops either"
+        );
+        assert_eq!(
+            log.summary("other", Duration::from_secs(3600)).dropped,
+            0,
+            "and a drop belongs to the plugin that made it"
+        );
+    }
+
+    #[test]
+    fn the_dropped_ledger_is_itself_bounded() {
+        // It reports unbounded growth, so it must not be the growth. Coalescing
+        // is what keeps one record per plugin per bucket rather than one per
+        // evicted event.
+        let log = PluginActivityLog::new();
+        for _ in 0..MAX_LOG_EVENTS * 3 {
+            log.ingest("shop", [event("kv-get", CapabilityOutcome::Allowed)]);
+        }
+        let held = log
+            .dropped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        assert!(held <= MAX_LOG_EVENTS, "the dropped ring grew to {held}");
+        assert!(
+            log.summary("shop", Duration::from_secs(3600)).dropped >= 1,
+            "and still reports the drops"
+        );
     }
 }

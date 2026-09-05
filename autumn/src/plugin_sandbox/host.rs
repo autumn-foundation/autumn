@@ -1512,7 +1512,7 @@ impl SandboxHost {
             })
             .fold(
                 u64::try_from(slot.len()).unwrap_or(u64::MAX),
-                |sum, pair| sum.saturating_add(pair),
+                u64::saturating_add,
             )
             / BYTES_PER_FUEL;
 
@@ -1724,6 +1724,12 @@ impl SandboxHost {
 /// or a budget that could not cover its own fixed charges — and carries no
 /// store, because there is none. `Ran` carries the store so the caller can drain
 /// the evidence: fuel, memory peak, denials, stderr and the capability ledger.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "`Ran` carries the wasmi `Store` itself, which is large by construction and is the \
+              common path; boxing it would add an allocation per request without shrinking the \
+              store, and this value is a return value moved once, never held in a collection"
+)]
 enum Execution<'a> {
     /// Turned away before a store existed.
     Refused(SandboxFailure, u64),

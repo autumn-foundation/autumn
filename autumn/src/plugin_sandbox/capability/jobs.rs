@@ -56,7 +56,7 @@ pub trait JobSink: Send + Sync + 'static {
 
 /// Answer one `job-enqueue`. Capability, scope and quota are already checked.
 pub(super) fn perform(
-    runtime: &mut CapabilityRuntime,
+    runtime: &CapabilityRuntime,
     call: &CapabilityCall,
     job_type: &str,
 ) -> CallResult {
@@ -95,16 +95,37 @@ pub(super) fn perform(
 ///
 /// The property worth testing about job enqueue is *what the record says*, and
 /// that needs somewhere to read it back from rather than a live queue.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemoryJobSink {
     queued: Mutex<Vec<PluginJob>>,
     /// How many jobs the queue will hold before refusing — the "queue depth"
-    /// ceiling. `None` is unbounded.
-    depth: Option<usize>,
+    /// ceiling.
+    depth: usize,
+}
+
+/// How many jobs the zero-configuration queue holds before refusing.
+///
+/// There is no unbounded spelling, deliberately. This slice ships no consumer
+/// that removes a queued job, so an unbounded queue is a granted plugin's
+/// memory-exhaustion channel: the per-request and per-second quotas slow the
+/// growth and never stop it, and a job payload may be [`MAX_ROW_COLUMNS`]
+/// columns of text. A default that has to be *tightened* to be safe is a default
+/// that will be shipped as it is.
+///
+/// [`MAX_ROW_COLUMNS`]: super::MAX_ROW_COLUMNS
+pub const DEFAULT_JOB_DEPTH: usize = 1024;
+
+impl Default for MemoryJobSink {
+    fn default() -> Self {
+        Self {
+            queued: Mutex::new(Vec::new()),
+            depth: DEFAULT_JOB_DEPTH,
+        }
+    }
 }
 
 impl MemoryJobSink {
-    /// An unbounded queue.
+    /// A queue holding [`DEFAULT_JOB_DEPTH`] jobs.
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -115,7 +136,7 @@ impl MemoryJobSink {
     pub fn bounded(depth: usize) -> Arc<Self> {
         Arc::new(Self {
             queued: Mutex::new(Vec::new()),
-            depth: Some(depth),
+            depth,
         })
     }
 
@@ -130,11 +151,18 @@ impl MemoryJobSink {
 }
 
 impl JobSink for MemoryJobSink {
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the body is one critical section over the shared map; releasing early would \
+                  either split a ceiling check from the write it guards or let the snapshot \
+                  this returns be torn"
+    )]
     fn enqueue(&self, job: PluginJob) -> Result<String, String> {
         let mut queued = self.queued.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(depth) = self.depth.filter(|depth| queued.len() >= *depth) {
+        if queued.len() >= self.depth {
             return Err(format!(
-                "the plugin job queue is at its depth ceiling of {depth}"
+                "the plugin job queue is at its depth ceiling of {}",
+                self.depth
             ));
         }
         queued.push(job);

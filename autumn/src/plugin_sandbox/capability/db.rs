@@ -246,10 +246,22 @@ pub trait PluginStore: Send + Sync + 'static {
     /// `Ok(None)`, not an error: "no such row" is an answer.
     fn get(&self, scope: &Scope, row_id: &str) -> Result<Option<PluginRow>, StoreError>;
 
-    /// Rows matching every column in `filter`, capped at `limit`.
+    /// Rows matching every column in `filter`, capped at `limit` rows and
+    /// `max_bytes` of row weight.
     ///
     /// Each returned row must carry its [`ID_COLUMN`]; see the contract on
     /// [`insert`](Self::insert).
+    ///
+    /// # Implementor contract
+    ///
+    /// **Stop reading once the rows gathered so far would exceed `max_bytes`**
+    /// ([`row_weight`](super::row_weight) is the measure), rather than
+    /// gathering `limit` rows and letting the caller discard the excess. Both
+    /// numbers are guest-influenced — `limit` comes from the frame and the
+    /// quota, and row size from what the plugin previously stored — so an
+    /// implementation that materialises first has already spent the memory the
+    /// ceiling exists to deny. Returning fewer rows than `limit` is always
+    /// allowed; the caller re-checks and tells the guest its answer was cut.
     ///
     /// # Errors
     ///
@@ -259,6 +271,7 @@ pub trait PluginStore: Send + Sync + 'static {
         scope: &Scope,
         filter: &PluginRow,
         limit: usize,
+        max_bytes: usize,
     ) -> Result<Vec<PluginRow>, StoreError>;
 
     /// Replace the row with this id.
@@ -282,7 +295,7 @@ pub trait PluginStore: Send + Sync + 'static {
     reason = "one match arm per operation; splitting it would hide the shared scope derivation"
 )]
 pub(super) fn perform(
-    runtime: &mut CapabilityRuntime,
+    runtime: &CapabilityRuntime,
     call: &CapabilityCall,
     table: &str,
 ) -> CallResult {
@@ -323,12 +336,18 @@ pub(super) fn perform(
                 return result(id);
             }
             match store.get(&scope, row_id) {
-                Ok(found) => CallResult::Ok {
-                    id,
-                    value: CallValue::Rows {
-                        rows: found.into_iter().collect(),
-                    },
-                },
+                Ok(found) => {
+                    // Through the same bound as a query, though a single row is
+                    // under `MAX_ROW_BYTES` and therefore always survives it: a
+                    // store is an embedder's implementation, and a row it
+                    // returns larger than one it would have accepted is exactly
+                    // the case that must not reach the reply queue.
+                    let (rows, truncated) = super::bounded_rows(found.into_iter().collect());
+                    CallResult::Ok {
+                        id,
+                        value: CallValue::Rows { rows, truncated },
+                    }
+                }
                 Err(err) => CallResult::denied(id, DenialReason::BackendError, err.to_string()),
             }
         }
@@ -344,12 +363,13 @@ pub(super) fn perform(
                 } else {
                     (*limit as usize).min(row_limit)
                 };
-                match store.query(&scope, &filter, want) {
+                match store.query(&scope, &filter, want, super::MAX_RESULT_BYTES) {
                     Ok(mut rows) => {
                         rows.truncate(want);
+                        let (rows, truncated) = super::bounded_rows(rows);
                         CallResult::Ok {
                             id,
-                            value: CallValue::Rows { rows },
+                            value: CallValue::Rows { rows, truncated },
                         }
                     }
                     Err(err) => CallResult::denied(id, DenialReason::BackendError, err.to_string()),
@@ -505,6 +525,12 @@ impl MemoryPluginStore {
 
     /// Every `(table, tenant, row_id)` currently stored, sorted.
     #[must_use]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the body is one critical section over the shared map; releasing early would \
+                  either split a ceiling check from the write it guards or let the snapshot \
+                  this returns be torn"
+    )]
     pub fn keys(&self) -> Vec<(String, String, String)> {
         let rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
         let mut keys: Vec<_> = rows.keys().cloned().collect();
@@ -514,6 +540,12 @@ impl MemoryPluginStore {
 }
 
 impl PluginStore for MemoryPluginStore {
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the body is one critical section over the shared map; releasing early would \
+                  either split a ceiling check from the write it guards or let the snapshot \
+                  this returns be torn"
+    )]
     fn insert(&self, scope: &Scope, row: PluginRow) -> Result<String, StoreError> {
         let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
         if rows.len() >= self.capacity {
@@ -543,16 +575,28 @@ impl PluginStore for MemoryPluginStore {
             .map(|row| with_id(row, row_id)))
     }
 
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the body is one critical section over the shared map; releasing early would \
+                  either split a ceiling check from the write it guards or let the snapshot \
+                  this returns be torn"
+    )]
     fn query(
         &self,
         scope: &Scope,
         filter: &PluginRow,
         limit: usize,
+        max_bytes: usize,
     ) -> Result<Vec<PluginRow>, StoreError> {
         let rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
-        // Sorted by row id so a query is a deterministic function of the store,
-        // which is what lets a test assert on the rows rather than on their set.
-        let mut matched: Vec<(String, PluginRow)> = rows
+        // Ids first, values second. Sorting borrowed ids rather than cloned
+        // rows is what lets the byte budget be honoured *before* a row is
+        // cloned: gathering every match and truncating afterwards would
+        // materialise the megabytes this argument exists to refuse.
+        //
+        // Sorted so a query is a deterministic function of the store, which is
+        // what lets a test assert on the rows rather than on their set.
+        let mut matched: Vec<&(String, String, String)> = rows
             .iter()
             .filter(|((table, tenant, _), _)| *table == scope.table && *tenant == scope.tenant)
             .filter(|(_, row)| {
@@ -560,16 +604,29 @@ impl PluginStore for MemoryPluginStore {
                     .iter()
                     .all(|(column, want)| row.get(column) == Some(want))
             })
-            .map(|((_, _, row_id), row)| (row_id.clone(), row.clone()))
+            .map(|(key, _)| key)
             .collect();
-        matched.sort_by(|(left, _), (right, _)| left.cmp(right));
-        matched.truncate(limit);
-        Ok(matched
-            .into_iter()
-            .map(|(row_id, row)| with_id(row, &row_id))
-            .collect())
+        matched.sort_by(|left, right| left.2.cmp(&right.2));
+        let mut out = Vec::new();
+        let mut total = 0_usize;
+        for key in matched.into_iter().take(limit) {
+            let Some(row) = rows.get(key) else { continue };
+            let weight = super::row_weight(row);
+            if !out.is_empty() && total.saturating_add(weight) > max_bytes {
+                break;
+            }
+            total = total.saturating_add(weight);
+            out.push(with_id(row.clone(), &key.2));
+        }
+        Ok(out)
     }
 
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the body is one critical section over the shared map; releasing early would \
+                  either split a ceiling check from the write it guards or let the snapshot \
+                  this returns be torn"
+    )]
     fn update(&self, scope: &Scope, row_id: &str, row: PluginRow) -> Result<(), StoreError> {
         let key = (scope.table.clone(), scope.tenant.clone(), row_id.to_owned());
         let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);

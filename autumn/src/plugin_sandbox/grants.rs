@@ -82,7 +82,7 @@ pub const MAX_GRANT_ENTRIES: usize = 64;
 
 /// Longest accepted grant identifier (table, job type, render slot), in bytes.
 ///
-/// 63 is PostgreSQL's identifier ceiling, and the derived physical table name
+/// 63 is `PostgreSQL`'s identifier ceiling, and the derived physical table name
 /// is longer than the granted one — so this is the input bound that keeps the
 /// *derived* name inside the bound that actually matters. See
 /// [`CapabilityGrants::validate`].
@@ -153,7 +153,7 @@ enum EntryKind {
 impl CapabilityGrants {
     /// Whether every list is empty — the shape a first-slice manifest has.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.hosts.is_empty()
             && self.tables.is_empty()
             && self.job_types.is_empty()
@@ -161,7 +161,7 @@ impl CapabilityGrants {
     }
 
     /// The rows, in the order the consent screen prints them.
-    fn rows(&self) -> [GrantRow<'_>; 4] {
+    const fn rows(&self) -> [GrantRow<'_>; 4] {
         [
             (
                 "hosts",
@@ -518,7 +518,7 @@ pub struct ConsentDelta {
 impl ConsentDelta {
     /// Whether the operator must be asked again before this manifest runs.
     #[must_use]
-    pub fn requires_consent(&self) -> bool {
+    pub const fn requires_consent(&self) -> bool {
         !self.added_capabilities.is_empty()
             || !self.added_hosts.is_empty()
             || !self.added_tables.is_empty()

@@ -543,7 +543,13 @@ A `call_result` carries one of six value kinds: `done` (a write or delete),
 `value` (from `kv-get`, with a `found` flag so a stored `null` is not a miss),
 `row-id` (from `db-insert`), `rows` (from `db-get` and `db-query`), `http`, and
 `job-id`. A `db-query` with `limit: 0` — or no `limit` — returns as many rows as
-the `db_rows` quota allows.
+the `db_rows` quota allows, **and as many as fit 512 KiB**: rows are the one
+result whose size the guest chooses, so the byte budget travels into the store
+rather than being applied once the whole answer has been built. When it stops an
+answer short, `rows` comes back with `"truncated": true` — read it, or a plugin
+paging through its own table will read a short page as the end of the table. A
+single row is bounded at 256 KiB across its columns when it is *written*, so a
+row that was stored can always be read back.
 
 A refusal comes back as a `call_result` the guest can read, not as a trap. A
 plugin that hits a ceiling should degrade — render the panel without the live
@@ -709,7 +715,9 @@ middleware, because one compiled plugin serves every tenant.
   widen the grant — but there is no wire frame for delivering a job back into a
   guest, and adding one is a later slice.
 - The shipped `PluginStore`, `JobSink` and `OutboundHttp` implementations are
-  in-process: `MemoryPluginStore` and `MemoryJobSink` are bounded maps, and
+  in-process: `MemoryPluginStore` and `MemoryJobSink` are bounded — the job
+  queue holds `DEFAULT_JOB_DEPTH` and there is no unbounded spelling, because
+  this slice ships no consumer that drains it — and
   `RecordingHttp` answers from a fixed table and is a test double. Wiring a real
   upstream means implementing `OutboundHttp` against the framework client and
   honouring the contract on the trait.

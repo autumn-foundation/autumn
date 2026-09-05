@@ -275,8 +275,13 @@ pub fn attempted_authority(url: &str) -> String {
 }
 
 /// Answer one `http-fetch`. Capability, scope and quota are already checked.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the request is assembled, sent and re-checked in one pass; splitting it would put \
+              the redirect re-check somewhere the assembly could be changed without it"
+)]
 pub(super) fn perform(
-    runtime: &mut CapabilityRuntime,
+    runtime: &CapabilityRuntime,
     call: &CapabilityCall,
     host: &str,
 ) -> CallResult {

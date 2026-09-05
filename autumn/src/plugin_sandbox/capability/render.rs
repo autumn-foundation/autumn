@@ -121,7 +121,7 @@ pub enum FragmentNode {
         attributes: Vec<(String, String)>,
         /// Children.
         #[serde(default)]
-        children: Vec<FragmentNode>,
+        children: Vec<Self>,
     },
 }
 
