@@ -5548,6 +5548,41 @@ def waivers(lines):
     return out
 
 
+# Which fenced block each line of a page sits in, by language. The sibling
+# `check-docs-cli.sh` has read fences since it shipped, and this gate did not —
+# so the example-code exemption, which is about a page USING a name as a Rust
+# identifier, had no way to ask whether the occurrence was in Rust at all. It
+# was scoped to the page, then to "not an assignment word", and prose outside
+# any fence was exempt both times: `Set \`AUTUMN_X\` in your deployment
+# environment` is a reader instruction, not example code, and a `pub const`
+# further up the page excused it.
+#
+# `~~~` opens a fence as `\`\`\`` does, a longer run closes a shorter one, and an
+# info string's FIRST word is the language.
+FENCE = re.compile(r'^(\s*)(`{3,}|~{3,})\s*([^\s`]*)')
+
+
+def fence_langs(lines):
+    """`[language or None]`, one per line — None outside any fence."""
+    out, marker, lang = [], None, None
+    for line in lines:
+        found = FENCE.match(line)
+        if marker is None and found:
+            marker, lang = found.group(2), (found.group(3) or '').lower()
+            out.append(None)                 # the opener is not content
+            continue
+        if marker is not None and found and found.group(2)[0] == marker[0] \
+                and len(found.group(2)) >= len(marker) and not found.group(3):
+            marker, lang = None, None
+            out.append(None)                 # …nor is the closer
+            continue
+        out.append(lang)
+    return out
+
+
+RUST_FENCES = ('rust', 'rs', 'no_run', 'ignore', 'should_panic', 'compile_fail')
+
+
 # ------------------------------------------------------------- corpus scan
 
 def scan(files, read, leaves, built, tokens):
@@ -5560,6 +5595,7 @@ def scan(files, read, leaves, built, tokens):
         # code, scoped to this page only.
         consts = set(DECLARED_CONST.findall(text))
         at, waived = blocks(lines), waivers(lines)
+        langs = fence_langs(lines)
         for i, line in enumerate(lines, 1):
             # A waiver marker names the variable in order to waive it. That
             # mention is metadata addressed to this script, not a key claim
@@ -5616,8 +5652,14 @@ def scan(files, read, leaves, built, tokens):
                 # copies, exempted by a Rust constant that has nothing to do
                 # with it. An assignment word is the one shape that cannot be
                 # an identifier use: Rust writes `NAME: T = …`, never `NAME=`.
-                if var in consts and not re.search(
-                        r'(?<![\w$/{-])' + re.escape(var) + r'=', line):
+                # …and only where the page is USING it as a Rust identifier,
+                # which means inside a Rust fence. Scoping the exemption to the
+                # page let a `pub const` in a snippet excuse a shell `export`
+                # of the same spelling; scoping it to "not an assignment word"
+                # still let it excuse `Set \`AUTUMN_X\` in your deployment
+                # environment`, which is prose, not code. The fence is the
+                # thing that says which language an occurrence is in.
+                if var in consts and langs[i - 1] in RUST_FENCES:
                     stats['example-code identifier'] += 1
                     continue
                 if family(var, line):
@@ -6341,14 +6383,29 @@ def self_test():
     s3, d3 = scan(['d.md'], lambda _: doc3, leaves, built, tokens)
     case('reader-chosen name resolves', (s3['reader-chosen name'], len(d3)), (2, 0))
 
-    # A const the page declares is an identifier in example code, on that page.
-    doc4 = 'pub const AUTUMN_SOURCE: &str = "x";\nWorld::new(AUTUMN_SOURCE)\n'
+    # A const the page declares is an identifier in example code, on that page
+    # — and "in example code" means inside a RUST FENCE. Page-wide, the
+    # exemption excused a shell `export` of the same spelling; narrowed to
+    # "not an assignment word", it still excused the prose instruction
+    # `Set \`AUTUMN_SOURCE\` in your environment`. The fence says which
+    # language an occurrence is in, which is the question being asked.
+    doc4 = ('```rust\npub const AUTUMN_SOURCE: &str = "x";\n'
+            'World::new(AUTUMN_SOURCE)\n```\n')
     s4, d4 = scan(['d.md'], lambda _: doc4, leaves, built, tokens)
     case('declared const is example code',
          (s4['example-code identifier'], len(d4)), (2, 0))
     _, d5 = scan(['d.md'], lambda _: 'World::new(AUTUMN_SOURCE)\n',
                  leaves, built, tokens)
     case('an undeclared name is not excused by another page', len(d5), 1)
+    # …and prose outside the fence is not excused by a declaration inside it.
+    doc6 = ('```rust\npub const AUTUMN_SOURCE: &str = "x";\n```\n'
+            'Set `AUTUMN_SOURCE` in your deployment environment.\n')
+    s6, d6 = scan(['d.md'], lambda _: doc6, leaves, built, tokens)
+    case('a page const does not excuse prose outside the fence',
+         (s6['example-code identifier'], len(d6)), (1, 1))
+    case('a fence language is read from its info string',
+         fence_langs(['```rust', 'x', '```', 'y', '~~~bash', 'z', '~~~']),
+         [None, 'rust', None, None, None, 'bash', None])
 
     # The gate's own header names variables in order to explain itself. If the
     # sweep reads this file, every one of them resolves for free — including the
