@@ -358,18 +358,16 @@ pub fn split_leading_items_and_fn(item: TokenStream) -> Result<(TokenStream, Ite
     };
 
     let Some((last, leading)) = items.split_last() else {
-        return Err(syn::Error::new_spanned(
-            item,
-            "route macros can only be applied to functions",
-        )
-        .to_compile_error());
+        return Err(
+            syn::Error::new_spanned(item, "route macros can only be applied to functions")
+                .to_compile_error(),
+        );
     };
     let syn::Item::Fn(input_fn) = last.clone() else {
-        return Err(syn::Error::new_spanned(
-            item,
-            "route macros can only be applied to functions",
-        )
-        .to_compile_error());
+        return Err(
+            syn::Error::new_spanned(item, "route macros can only be applied to functions")
+                .to_compile_error(),
+        );
     };
 
     let leading_items = quote! { #(#leading)* };
