@@ -17,7 +17,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{ItemFn, LitStr, parse_quote};
+use syn::{LitStr, parse_quote};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -191,22 +191,18 @@ fn type_contains_impl_trait(ty: &syn::Type) -> bool {
 
 /// Expand the `#[step_up]` / `#[step_up(max_age = "Nm")]` attribute.
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let max_age_opt = match parse_step_up_args(attr) {
         Ok(v) => v,
         Err(err) => return err.to_compile_error(),
     };
-    // A guard stacked BELOW this one has already expanded and emitted its
-    // `FromRequestParts` gate type alongside the handler, so `item` may be
-    // `[items…] fn`. Keep that prelude and re-emit it below; the fallback
-    // re-parses as a bare `ItemFn` purely to surface syn's original diagnostic
-    // unchanged for input that is genuinely not a function.
-    let (prelude, mut input_fn) = match crate::parse::split_handler_prelude(item.clone()) {
-        Some(parsed) => parsed,
-        None => match syn::parse2::<ItemFn>(item) {
-            Ok(f) => (quote! {}, f),
-            Err(err) => return err.to_compile_error(),
-        },
+    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
     if input_fn.sig.asyncness.is_none() {
         return syn::Error::new_spanned(
@@ -226,6 +222,15 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let check_call = build_check_call(&max_age_tokens);
     let fn_name = input_fn.sig.ident.clone();
     let gate_ident = format_ident!("__AutumnStepUpGate_{}", fn_name);
+
+    // The marker const also stays in the handler body (not just inside the
+    // gate below) so `api_doc::recover_guarded_return_type` can still
+    // recover the pre-rewrite return type for OpenAPI when #[step_up]
+    // expands before the route macro (#1677).
+    let max_age_marker = quote! {
+        #[allow(dead_code)]
+        const __AUTUMN_STEP_UP_MAX_AGE: ::core::option::Option<u64> = #max_age_tokens;
+    };
 
     // Whether THIS gate should also serve a cached idempotency replay: see
     // `should_own_replay` for the full ordering rationale (issue #1668's
@@ -339,25 +344,13 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     input_fn.block = syn::parse_quote! {
         {
-            // Marker const, re-declared here in the handler body and not only
-            // inside the gate above. `api_doc::infer_response_body` recovers a
-            // guarded handler's pre-rewrite return type from the
-            // `__autumn_inner` binding below, and
-            // `idempotency_guard::generated_inner_response_binding` only trusts
-            // that binding when one of `RESPONSE_REWRITING_GUARD_MARKERS` sits
-            // earlier in the SAME block — the marker is what tells a real
-            // guard's wrapper apart from user code that coincidentally has the
-            // same shape. Moving this const into the gate (#1668) silently took
-            // the OpenAPI response schema away from every `#[step_up]`-above-route
-            // handler (#1677). `#[secured]` keeps its markers here for exactly
-            // this reason.
-            const __AUTUMN_STEP_UP_MAX_AGE: ::core::option::Option<u64> = #max_age_tokens;
+            #max_age_marker
             #original_response
         }
     };
 
     quote! {
-        #prelude
+        #leading_items
         #gate_item
         #input_fn
     }

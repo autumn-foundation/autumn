@@ -90,9 +90,15 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err,
     };
 
-    // See the note in `route_macro`: a guard stacked above this attribute emits
-    // its gate type alongside the handler, and that prelude is re-emitted below.
-    let (prelude, input_fn) = match parse::parse_async_handler_with_prelude(item) {
+    // A guard stacked ABOVE `#[ws]` (`#[secured]` / `#[step_up]` /
+    // `#[throttle]` / `#[authorize]`) expands first and emits its
+    // `FromRequestParts` gate type alongside the handler (#1668), so `item`
+    // may be `[items…] fn`. `#[get]`/`#[post]` were taught this in #1677;
+    // `#[ws]` has the same exposure and was left on the single-item parse,
+    // where that ordering fails with "route macros can only be applied to
+    // functions". The leading items are re-emitted below so the gate type
+    // stays in scope for the `_: Gate` parameter the guard inserted.
+    let (leading_items, input_fn) = match parse::parse_async_handler_with_leading_items(item) {
         Ok(parsed) => parsed,
         Err(err) => return err,
     };
@@ -164,7 +170,7 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let path_params_tokens = crate::api_doc::emit_path_param_slice(&path_params);
 
     quote! {
-        #prelude
+        #leading_items
         #input_fn
 
         #upgrade_handler
@@ -246,9 +252,9 @@ mod tests {
     fn ws_keeps_a_stacked_guards_gate_type_in_scope() {
         // `#[secured]` above `#[ws]`: secured expands first and emits its
         // `FromRequestParts` gate type ALONGSIDE the handler (#1668), so
-        // `ws_macro` receives `[items…] fn`. It must keep that prelude — the
-        // handler carries a `_: __AutumnSecuredGate_echo` parameter that only
-        // resolves if the gate type is still emitted.
+        // `ws_macro` receives `[items…] fn`. It must keep those leading items —
+        // the handler carries a `_: __AutumnSecuredGate_echo` parameter that
+        // only resolves if the gate type is still emitted.
         let secured = crate::secured::secured_macro(
             quote! { "admin" },
             quote! { async fn echo() -> impl WsHandler { |socket| async move {} } },

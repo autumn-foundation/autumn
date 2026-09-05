@@ -41,6 +41,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature set (only `derive`, not `card`/`unic`), so no model can use them
   today regardless of the update path.
 
+- **A CI gate for `AUTUMN_*` config keys named in the docs [no-plugin]:**
+  nothing here is agent-facing — it's a CI/docs-harness addition, not new
+  framework surface (`scripts/check-docs-config.sh`, wired into the docs-only
+  job in `.github/workflows/ci.yml`). The corpus already gates the link a
+  reader clicks (`check-docs-links.sh`) and the command they run
+  (`check-docs-cli.sh`); this gates the third thing they copy off a page, and
+  the only one of the three that fails **silently**. A wrong link 404s and a
+  wrong command exits 2, but a wrong environment variable is simply not read:
+  the process starts, the default stands, and nothing anywhere reports that
+  the override was ignored. `autumn check --config` and `server.strict_config`
+  reject an unknown key in `autumn.toml`, but neither sees the env layer — an
+  override is applied by name at load time or not at all — so
+  `AUTUMN_DATABASE_URL` (one underscore, the pre-0.2 spelling) beside a
+  production Postgres URL reads exactly like a working line, and the app comes
+  up on the default database.
+
+  The gate asks whether the runtime **reads** a name, not whether a config key
+  is spelled like it. Those are different sets: the env layer is written field
+  by field (`parse_env(env, "AUTUMN_LOG__LEVEL", …)`), so a TOML key with no
+  override of its own has no environment spelling at all — `openapi.enabled`
+  is a real schema leaf and `AUTUMN_OPENAPI__ENABLED` is read by nothing, as
+  are 90 of the 397 leaves. So a name resolves when something in the tracked
+  non-markdown tree **binds** it (`const CANARY_ENV: &str = "AUTUMN_CANARY"`)
+  or **reads** it through an env accessor, or when it matches one the runtime
+  **builds** (`format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_ID")` — the
+  filled-in segment open, the rest exact, which is the runtime's own
+  behaviour). That covers the four subsystems outside `AutumnConfig`:
+  `autumn-search` and `autumn-media-plugin` layer their own overrides in their
+  own crates, `autumn-cli` owns `[dev] watch_dirs`, and `AUTUMN_SYNC__*` is
+  read by the Tauri shell the CLI generates.
+  `autumn/tests/fixtures/schema_keys.snapshot` — the same schema walk that
+  backs strict unknown-key validation, already kept honest by
+  `schema_keys_snapshot_guard`, so nothing needs regenerating and no Rust
+  toolchain is required — bounds the one open-ended template
+  (`…SHARDS__{i}__{field}`) and checks declared config *paths*.
+
+  It also gates the hand-maintained 142-row `AUTUMN_* -> config path` table in
+  `config.rs`'s module docs, the mapping readers meet on docs.rs. Each row
+  makes two claims, checked against their own truth: the path must exist in
+  the schema, the variable must be one the runtime reads, and the two must
+  agree — so neither a row edited on one side nor a row publishing an override
+  that sets nothing gets through. Any row shaped like a mapping that the
+  checker cannot parse is reported rather than skipped.
+
+  Prose that names a family (`AUTUMN_ALERTS__*`,
+  `AUTUMN_MEDIA__<TABLE>__<FIELD>`), pages teaching the naming rule
+  (`AUTUMN_SECTION__FIELD`), reader-chosen names
+  (`access_key_id_env = "AUTUMN_OFFSITE_ACCESS_KEY_ID"`) and identifiers a page
+  declares in its own example code (`pub const AUTUMN_SOURCE: &str = …` in
+  `docs/guide/wasm-islands.md`) are recognised as such rather than waived —
+  the last of those only inside that page's Rust fences, and only where the
+  occurrence is not a string literal, so a snippet that both declares a const
+  and calls `env::var("…")` on the same spelling still has the call checked. A
+  malformed name — lower case outside a placeholder, or a dangling separator —
+  is reported rather than skipped, since a spelling that matches nothing is a
+  claim the reader cannot be warned about.
+
+  The corpus is the pages a reader lands on, defined identically here and in
+  `check-docs-cli.sh`: the guides, the migration notes, the root `README.md`
+  and its siblings, `docs/plugins.md`, the markdown templates written into
+  every scaffolded project, and each example's `README.md` — the page GitHub
+  renders when a reader follows one of the example links in the README table,
+  and where `export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"`
+  and friends are copied from.
+
+  The baseline run found **0 defects** across 681 occurrences on 193 pages:
+  the reader-facing corpus was already accurate, and the gate is here to keep
+  it that way. One occurrence is waived in place beside the passage that needs
+  it — a migration guide's `rg` pattern for a key that release removed.
+
 - **A CI gate for the "local development" install path [no-plugin]:** nothing
   here is agent-facing — it's a CI/test-harness addition, not new framework
   surface (`local-dev-quickstart` job in
@@ -1633,33 +1703,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **macros:** `#[secured]` / `#[step_up]` / `#[throttle]` / `#[authorize]`
-  written **above** a route attribute compile again, and keep their OpenAPI
-  response schema (issue #1677, regressed by #1668/#2488). Two independent
-  breakages, both surfaced by the four
-  `route_macro_infers_response_schema_*` tests #2484 had added one commit
-  earlier. First, #2488 changed each guard to emit a handler-unique
-  `FromRequestParts` gate type **alongside** the handler rather than a
-  statement inside its body; a guard written above a route attribute expands
-  first, so the route macro began receiving `[items…] fn` and rejected it with
-  `route macros can only be applied to functions` — that ordering stopped
-  compiling at all. `parse_async_handler_with_prelude` now splits the trailing
-  handler off any leading items and hands those back for the caller to re-emit,
-  which keeps the gate type in scope for the `_: Gate` parameter the guard
-  inserted; `#[get]`/`#[post]`/…, `#[ws]` and `#[static_get]` all use it, and
-  the guards use the same split so they can stack on one another. A bare `fn`
-  yields an empty prelude, so unguarded handlers expand byte-identically.
-  Second, `api_doc::infer_response_body` recovers a guarded handler's
-  pre-rewrite return type from the `__autumn_inner` binding, and
-  `idempotency_guard` only trusts that binding when one of
-  `RESPONSE_REWRITING_GUARD_MARKERS` sits earlier in the **same block** —
-  #2488 moved `step_up`'s and `throttle`'s marker consts into the gate, so
-  every `#[step_up]`/`#[throttle]`-above-route handler silently lost its
-  `Json<T>` response schema from the generated spec. Both now re-declare their
-  marker in the handler body, as `#[secured]` always has. `#[ws]` and
-  `#[static_get]` gained regression tests for the stacked ordering, which had
-  the same latent defect and no coverage. [no-plugin] — a macro-expansion fix
+- **macros:** `#[ws]` and `#[static_get]` accept a guard attribute stacked
+  **above** them (`#[secured]` / `#[step_up]` / `#[throttle]` / `#[authorize]`).
+  Since #1668 each guard emits a handler-unique `FromRequestParts` gate type
+  *alongside* the handler, so a guard written above a route attribute expands
+  first and hands the route macro `[items…] fn` rather than a lone function.
+  #1677 taught `#[get]`/`#[post]`/… to tolerate that via
+  `parse_async_handler_with_leading_items`, but left `#[ws]` and
+  `#[static_get]` on the single-item parse, where the same ordering still fails
+  with `route macros can only be applied to functions`. Both now use the same
+  helper and re-emit the leading items, so the gate type stays in scope for the
+  `_: Gate` parameter the guard inserted, and both gained a regression test for
+  the stacked ordering — neither had any. [no-plugin] — a macro-expansion fix
   with no new agent-facing surface.
+- **🔒 `autumn generate auth`: a concurrent successful login could be silently
+  re-locked by a racing failed attempt (issue #2500):** the generated
+  `login` handler (and the duplicated `reauth` step-up block) counted a
+  wrong-password attempt with an atomic `failed_attempts + 1` `UPDATE` and
+  then, once the new count crossed `[auth.lockout].threshold`, stamped
+  `locked_at` with a *second*, unconditional `UPDATE ... SET locked_at =
+  now() WHERE id = ?` — gated only by a stale in-memory `current_locked_at`
+  value read at the top of the request, never re-checked against the
+  database. If a concurrent request with the *correct* password committed
+  its own "successful login resets the counter" `UPDATE`
+  (`failed_attempts = 0, locked_at = NULL`) in the gap between the failed
+  request's two statements, the unconditional lock stamp reapplied on top
+  of that reset — silently re-locking an account for the full `cooloff_secs`
+  window (default 15 minutes) even though it had *already* logged in
+  successfully (303 redirect and session cookie already issued). Reproduced
+  12/100 (and 7/60, 3/100 on reruns) with a genuinely concurrent
+  wrong-password/correct-password pair against a fresh `autumn generate
+  auth` scaffold.
+  Fix: the lock-stamp `UPDATE` in both handlers now filters on the row's
+  *current* `failed_attempts` (`>= threshold`) and `locked_at`
+  (`IS NULL`) at write time instead of trusting the in-memory read, so a
+  concurrent successful reset makes the stamp a no-op rather than
+  clobbering it; the `account_locked` telemetry event is now gated on the
+  stamp actually having affected a row, so a losing race is never logged
+  as a lock. New generator meta-tests (`autumn-cli/src/generate/auth.rs`)
+  assert both guards are present in the generated source, and
+  `autumn/tests/integration/auth_lockout_race.rs` (Postgres testcontainer)
+  reproduces the exact bad interleaving deterministically against a real
+  database — showing the pre-fix pattern re-locks the account and the fixed
+  pattern doesn't, plus the mirror-image ordering where a lock that
+  genuinely wins the race correctly rejects the concurrent login instead of
+  silently granting a session.
+
 - **🧭 Wayfinder: keyboard bypass-blocks link added to 6 supported example
   apps (a11y `bypass` Serious 7/8 → 0/8; `landmark-one-main` Moderate 1/8 → 0/8):**
   `autumn check --a11y` — the framework's own WCAG audit, run against each
