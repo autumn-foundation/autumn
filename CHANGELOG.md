@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anywhere says so. A bad link 404s and a bad command exits 2; both are dead
   ends the reader can see and route around.
   `scripts/check-docs-config.sh` resolves every key in every `autumn.toml`
-  fence in the reader-facing corpus (166 of the corpus's 246 TOML fences)
+  fence in the reader-facing corpus (168 of the corpus's 248 TOML fences)
   against the 484-leaf config schema, using the same walk semantics as the
   framework's own `AutumnConfig::validate_toml` — including the rule that a
   section with no schema entry (`jobs.queues`, `auth.oauth2`,

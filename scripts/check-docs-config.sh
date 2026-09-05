@@ -6,7 +6,7 @@
 # off a page. `scripts/check-docs-links.sh` gates its *links*, so nobody is sent
 # to a page that does not exist; `scripts/check-docs-cli.sh` gates its
 # *commands*, so nobody is handed an `autumn …` line clap will reject. Nothing
-# checked the third: the **config key**. The reader-facing corpus carries 166
+# checked the third: the **config key**. The reader-facing corpus carries 168
 # `autumn.toml` fences judged against 484 schema leaves, and a renamed or
 # never-shipped key leaves behind a line that looks exactly like a working one.
 #
@@ -102,7 +102,7 @@
 #      nothing and the gate fails loudly on README.md rather than silently
 #      widening.
 #
-# WHICH FENCES ARE READ. Of the corpus's 246 ```toml fences, 166 are read. A
+# WHICH FENCES ARE READ. Of the corpus's 248 ```toml fences, 168 are read. A
 # fence is read only on POSITIVE identification — it names `autumn.toml` (or a
 # profile overlay / the `.example` template), or it carries a section the config
 # surface recognizes.
@@ -196,6 +196,16 @@
 #     That was fixed in the DOCS rather than here: the fence now repeats its
 #     `[alerts]` header, like its sibling six lines below, which is what a reader
 #     arriving mid-page by ctrl-F needs in order to know where the key goes.
+#   - Fences nested in a Markdown BLOCKQUOTE are read like any other: the quote
+#     prefix is stripped from every line first. `docs/guide/tls.md` documents the
+#     ACME `directory` and `ca_root_path` keys in two `[server.tls.acme]` fences
+#     inside an aside, and a `^`-anchored fence regex never saw them — 2 live
+#     reader-facing fences, silently uncovered. Stripping cannot move a reported
+#     line number (removing a prefix removes no newline, asserted in --self-test)
+#     and cannot invent a fence (no TOML line starts with `>`).
+#     `check-docs-cli.sh` learned this the same way: a live `autumn migrate run`
+#     hid behind a `\n> ` break in migrations.md.
+#
 #   - **`examples/<app>/content/`.** Seed content for an example app, rendered by
 #     that app's own routes — the same exclusion, for the same reason,
 #     `check-docs-links.sh` makes.
@@ -405,6 +415,21 @@ def corpus():
 # ── Fence extraction and classification ───────────────────────────────────────
 
 TOML_FENCE = re.compile(r"^([ \t]*)```toml[ \t]*\n(.*?)^\1```", re.S | re.M)
+
+# A Markdown blockquote prefix (`> `, or nested `> > `), at the start of a line.
+#
+# Config fences live inside blockquotes in this corpus — `docs/guide/tls.md`
+# documents the ACME `directory` and `ca_root_path` keys in two `[server.tls.acme]`
+# fences nested in an aside — and every line of those begins with `> `, so a fence
+# regex anchored at `^` never sees them. Stripping the prefix from every line
+# before extracting makes them ordinary fences. It cannot shift a reported line
+# number, because removing a prefix never removes a newline (asserted in
+# --self-test), and it cannot invent a fence, because TOML has no line that
+# starts with `>`.
+#
+# `check-docs-cli.sh` learned the same lesson the same way: a live
+# `autumn migrate run` hid behind a `\n> ` break in migrations.md.
+BLOCKQUOTE_PREFIX = re.compile(r"^[ \t]*(?:>[ \t]?)+", re.M)
 SECTION_HEADER = re.compile(r'^\s*\[\[?([A-Za-z0-9_.\-"]+)', re.M)
 
 # A top-level DOTTED assignment: `server.prot = 9000` declares `[server]` without
@@ -704,7 +729,7 @@ def scan(schema, plugin_root_set=frozenset()):
     known_roots = schema[""]
     for rel in corpus():
         with open(os.path.join(ROOT, rel), encoding="utf-8", errors="ignore") as fh:
-            text = fh.read()
+            text = BLOCKQUOTE_PREFIX.sub("", fh.read())
         for match in TOML_FENCE.finditer(text):
             body = match.group(2)
             line = text[: match.start()].count("\n") + 1
@@ -1104,6 +1129,58 @@ def self_test():
         else:
             failed += 1
             print(f"  FAIL [{label}]: expected {expected}, got {got}")
+
+    # Blockquoted fences are extracted, and stripping the quote prefix must not
+    # move a line number — that is what keeps a reported location clickable.
+    quoted = (
+        "> Some aside:\n>\n> ```toml\n> [server.tls.acme]\n"
+        '> ca_root_path = "x"\n> ```\n'
+    )
+    stripped = BLOCKQUOTE_PREFIX.sub("", quoted)
+    for label, ok in (
+        ("blockquote strip preserves line count", stripped.count("\n") == quoted.count("\n")),
+        ("blockquoted fence becomes extractable", bool(TOML_FENCE.search(stripped))),
+        (
+            "blockquoted fence body is clean TOML",
+            check_fence(TOML_FENCE.search(stripped).group(2), schema) == [],
+        ),
+        (
+            "typo inside a blockquoted fence is caught",
+            check_fence(
+                TOML_FENCE.search(
+                    BLOCKQUOTE_PREFIX.sub(
+                        "", quoted.replace("ca_root_path", "ca_root_pathh")
+                    )
+                ).group(2),
+                schema,
+            )
+            == ["server.tls.acme.ca_root_pathh"],
+        ),
+        # Nested quotes and an unquoted fence must both still work.
+        (
+            "nested blockquote strips too",
+            bool(
+                TOML_FENCE.search(
+                    BLOCKQUOTE_PREFIX.sub(
+                        "", "> > ```toml\n> > [server]\n> > port = 1\n> > ```\n"
+                    )
+                )
+            ),
+        ),
+        (
+            "unquoted fence is unaffected",
+            bool(
+                TOML_FENCE.search(
+                    BLOCKQUOTE_PREFIX.sub("", "```toml\n[server]\nport = 1\n```\n")
+                )
+            ),
+        ),
+    ):
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+            print(f"  FAIL [{label}]")
 
     # The truth sets must be non-empty against the real tree, or the gate would
     # pass by knowing nothing.
