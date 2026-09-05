@@ -451,19 +451,7 @@ fn symbol_index(
             .entry(model.model.to_owned())
             .or_default()
             .insert(id.clone());
-        index
-            .entry(model.table.to_owned())
-            .or_default()
-            .insert(id.clone());
-        // A table name is also registered lowercased, because an unquoted SQL
-        // identifier is case-insensitive: `sql_query("SELECT * FROM POSTS")`
-        // names the same table as `posts`, and dropping that edge would be a
-        // false negative in an impact answer. Type names are *not* folded —
-        // `Post` and `post` are different Rust items.
-        index
-            .entry(model.table.to_ascii_lowercase())
-            .or_default()
-            .insert(id);
+        index.entry(model.table.to_owned()).or_default().insert(id);
     }
     for repo in repositories {
         let id = repository_id(repo.module_path, repo.repository);
@@ -479,13 +467,33 @@ fn symbol_index(
     index
 }
 
+/// Table names, lowercased, for matching an unquoted SQL identifier.
+///
+/// A separate map from [`symbol_index`] on purpose. An unquoted SQL identifier
+/// is case-insensitive, so `sql_query("SELECT * FROM POSTS")` names the `posts`
+/// table — but a Rust type name is not, and folding everything made a DTO
+/// called `Posts` resolve to that table (Codex round 5). Only candidates that
+/// came from a SQL literal are looked up here.
+fn sql_table_index(models: &[ModelGraphDescriptor]) -> BTreeMap<String, BTreeSet<String>> {
+    let mut index: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for model in models {
+        index
+            .entry(model.table.to_ascii_lowercase())
+            .or_default()
+            .insert(model_id(model.model_path));
+    }
+    index
+}
+
 /// Resolve one item's symbols into edges, strongest provenance winning.
 fn resolve_edges(
     from: &str,
     signature_symbols: &[&str],
     body_symbols: &[&str],
+    sql_symbols: &[&str],
     access: Access,
     index: &BTreeMap<String, BTreeSet<String>>,
+    sql_tables: &BTreeMap<String, BTreeSet<String>>,
     edges: &mut BTreeMap<(String, String), GraphEdge>,
 ) {
     for (symbols, provenance) in [
@@ -493,12 +501,15 @@ fn resolve_edges(
         (body_symbols, Provenance::Body),
     ] {
         for symbol in symbols {
-            // The lowercase fallback is what makes an unquoted SQL identifier
-            // (`FROM POSTS`) resolve to the `posts` table; it can only ever
-            // match a table entry, since type names are indexed verbatim.
-            let targets = index
-                .get(*symbol)
-                .or_else(|| index.get(&symbol.to_ascii_lowercase()));
+            // A SQL-derived candidate also matches a table name case-folded,
+            // because an unquoted SQL identifier is case-insensitive. Every
+            // other candidate is matched verbatim: `Post` and `post` are
+            // different Rust items.
+            let folded = sql_symbols
+                .contains(symbol)
+                .then(|| sql_tables.get(&symbol.to_ascii_lowercase()))
+                .flatten();
+            let targets = index.get(*symbol).or(folded);
             let Some(targets) = targets else {
                 continue;
             };
@@ -540,13 +551,21 @@ pub fn build(
     jobs: &[JobGraphDescriptor],
 ) -> ArchitectureGraph {
     let index = symbol_index(models, repositories);
+    let sql_tables = sql_table_index(models);
     let mut nodes: BTreeMap<String, GraphNode> = BTreeMap::new();
     let mut edges: BTreeMap<(String, String), GraphEdge> = BTreeMap::new();
 
     add_model_nodes(models, &mut nodes);
     add_repository_nodes(repositories, models, &index, &mut nodes, &mut edges);
-    let route_totals = add_route_nodes(routes, mounted, &index, &mut nodes, &mut edges);
-    add_job_nodes(jobs, &index, &mut nodes, &mut edges);
+    let route_totals = add_route_nodes(
+        routes,
+        mounted,
+        &index,
+        &sql_tables,
+        &mut nodes,
+        &mut edges,
+    );
+    add_job_nodes(jobs, &index, &sql_tables, &mut nodes, &mut edges);
     let surface = add_auto_api_nodes(
         mounted,
         repositories,
@@ -682,6 +701,7 @@ fn add_route_nodes(
     routes: &[RouteGraphDescriptor],
     mounted: &[MountedRoute],
     index: &BTreeMap<String, BTreeSet<String>>,
+    sql_tables: &BTreeMap<String, BTreeSet<String>>,
     nodes: &mut BTreeMap<String, GraphNode>,
     edges: &mut BTreeMap<(String, String), GraphEdge>,
 ) -> RouteTotals {
@@ -754,8 +774,10 @@ fn add_route_nodes(
             &id,
             route.signature_symbols,
             route.body_symbols,
+            route.sql_symbols,
             access,
             index,
+            sql_tables,
             edges,
         );
     }
@@ -770,6 +792,7 @@ fn add_route_nodes(
 fn add_job_nodes(
     jobs: &[JobGraphDescriptor],
     index: &BTreeMap<String, BTreeSet<String>>,
+    sql_tables: &BTreeMap<String, BTreeSet<String>>,
     nodes: &mut BTreeMap<String, GraphNode>,
     edges: &mut BTreeMap<(String, String), GraphEdge>,
 ) {
@@ -805,8 +828,10 @@ fn add_job_nodes(
             &id,
             job.signature_symbols,
             job.body_symbols,
+            job.sql_symbols,
             access,
             index,
+            sql_tables,
             edges,
         );
     }
@@ -838,22 +863,21 @@ fn add_auto_api_nodes(
         if matched_mounted.contains(&(route.method.clone(), route.path.clone())) {
             continue;
         }
-        // The *longest* matching prefix owns the route, and ties break on the
-        // repository's node id. Taking the first match would make attribution
-        // depend on link order when one auto-API is mounted under another's
-        // prefix, which `--check` would then report as phantom drift.
-        let owner = repositories
-            .iter()
-            .filter(|repo| {
-                AUTO_API_METHODS.contains(&route.method.to_ascii_uppercase().as_str())
-                    && is_under_api_prefix(&route.path, repo.api)
-            })
-            .max_by_key(|repo| {
-                (
-                    repo.api.len(),
-                    std::cmp::Reverse(repository_id(repo.module_path, repo.repository)),
-                )
-            });
+        // Ownership is *declared*, not inferred: the route carries the
+        // `api = "..."` prefix of the repository that generated it. Matching on
+        // the served path instead got two cases wrong — a CRUD surface mounted
+        // inside `.scoped("/v1", …)` no longer starts with the declared prefix
+        // and was dropped, and a hand-written route under an API prefix was
+        // claimed as generated (Codex round 5).
+        let owner = route.repository_api.as_ref().and_then(|api| {
+            repositories
+                .iter()
+                .filter(|repo| repo.api == api)
+                // Two repositories cannot declare the same prefix (the router
+                // would refuse the mount), but ties break on node id anyway so
+                // the answer never depends on link order.
+                .min_by_key(|repo| repository_id(repo.module_path, repo.repository))
+        });
         let Some(repo) = owner else {
             unmodelled.insert(format!("{} {}", route.method, route.path));
             continue;
@@ -1027,6 +1051,7 @@ mod tests {
             line: 30,
             signature_symbols,
             body_symbols,
+            sql_symbols: &[],
         }
     }
 
@@ -1046,6 +1071,7 @@ mod tests {
             line: 40,
             signature_symbols: &[],
             body_symbols,
+            sql_symbols: &[],
         }
     }
 
@@ -1060,6 +1086,7 @@ mod tests {
                 roles: vec!["admin".to_owned()],
                 ..RouteAuth::default()
             },
+            repository_api: None,
         }
     }
 

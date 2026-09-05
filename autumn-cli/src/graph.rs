@@ -541,6 +541,7 @@ mod tests {
         line: 1,
         signature_symbols: &["PgPostRepository"],
         body_symbols: &[],
+        sql_symbols: &[],
     }];
 
     const JOBS: &[JobGraphDescriptor] = &[JobGraphDescriptor {
@@ -554,6 +555,7 @@ mod tests {
         line: 1,
         signature_symbols: &[],
         body_symbols: &["posts"],
+        sql_symbols: &[],
     }];
 
     /// `ROUTES[0]` with its extractor gone: the route no longer reaches the
@@ -669,6 +671,7 @@ mod tests {
             handler: "feed".to_owned(),
             module_path: "app::live".to_owned(),
             auth: autumn_web::graph::RouteAuth::default(),
+            repository_api: None,
         };
         let after = build(&[mounted], 0, ROUTES, MODELS, REPOSITORIES, JOBS);
         let drift = format_drift(&before, &after).expect("a new opaque mount is drift");
@@ -703,6 +706,7 @@ mod tests {
                 secured,
                 ..autumn_web::graph::RouteAuth::default()
             },
+            repository_api: None,
         };
         let before = build(&[mounted(true)], 0, ROUTES, MODELS, REPOSITORIES, JOBS);
         let after = build(&[mounted(false)], 0, ROUTES, MODELS, REPOSITORIES, JOBS);

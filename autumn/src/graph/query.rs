@@ -275,6 +275,7 @@ mod tests {
             line: 1,
             signature_symbols: &["PgPostRepository"],
             body_symbols: &[],
+            sql_symbols: &[],
         },
         // Reaches `Post` directly, by naming the diesel table module.
         RouteGraphDescriptor {
@@ -287,6 +288,7 @@ mod tests {
             line: 2,
             signature_symbols: &[],
             body_symbols: &["posts"],
+            sql_symbols: &[],
         },
         // Reaches nothing.
         RouteGraphDescriptor {
@@ -299,6 +301,7 @@ mod tests {
             line: 1,
             signature_symbols: &[],
             body_symbols: &[],
+            sql_symbols: &[],
         },
     ];
 
@@ -313,6 +316,7 @@ mod tests {
         line: 1,
         signature_symbols: &[],
         body_symbols: &["posts"],
+        sql_symbols: &[],
     }];
 
     fn graph() -> ArchitectureGraph {

@@ -4394,7 +4394,7 @@ impl AppBuilder {
         // does this process serve".
         let (graph_mounted, graph_opaque) = if role.serves_http() {
             (
-                graph_mounted_routes(&all_routes, &scoped_groups, &declared_routes),
+                graph_mounted_routes(&all_routes, &scoped_groups, &declared_routes, &config),
                 omitted_router_count(
                     merge_routers.len(),
                     nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
@@ -5982,7 +5982,7 @@ impl AppBuilder {
         // router is built, so `/actuator/graph` can answer from the first
         // request rather than after some later warm-up.
         crate::graph::install(crate::graph::manifest::audit(
-            &graph_mounted_routes(&all_routes, &scoped_groups, &[]),
+            &graph_mounted_routes(&all_routes, &scoped_groups, &[], &config),
             // The static-build path builds its router with no nest mounts and
             // no declared plugin routes (see the `RouterContext` below), so the
             // merge count is the whole opaque surface here.
@@ -6125,8 +6125,21 @@ impl AppBuilder {
     /// Triggered when `AUTUMN_DUMP_GRAPH=1` is set (by `autumn graph`).
     /// Does not connect to a database or bind a TCP port.
     fn run_dump_graph_mode(&self) {
-        let mounted =
-            graph_mounted_routes(&self.routes, &self.scoped_groups, &self.declared_routes);
+        // The framework's mounts depend on configuration — the health probe
+        // paths and the actuator prefix are both configurable — so the census
+        // needs the app's own config, not defaults. `AutumnConfig::load()` is
+        // the plain five-layer TOML + env read with no telemetry or database
+        // work, which keeps this dump's promise of touching neither. A config
+        // that fails to load is not this command's error to report: fall back
+        // to defaults so the graph still dumps, exactly as the routes listing
+        // would still list.
+        let config = crate::config::AutumnConfig::load().unwrap_or_default();
+        let mounted = graph_mounted_routes(
+            &self.routes,
+            &self.scoped_groups,
+            &self.declared_routes,
+            &config,
+        );
         crate::graph::manifest::print_manifest_dump(&crate::graph::manifest::audit(
             &mounted,
             self.graph_opaque_router_count(),
@@ -7507,7 +7520,7 @@ impl AppBuilder {
         // See the matching call in `run()`: the graph is published before the
         // router is built so `/actuator/graph` answers from the first request.
         crate::graph::install(crate::graph::manifest::audit(
-            &graph_mounted_routes(&routes, &scoped_groups, &declared_routes),
+            &graph_mounted_routes(&routes, &scoped_groups, &declared_routes, &config),
             omitted_router_count(
                 merge_routers.len(),
                 nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
@@ -7635,7 +7648,18 @@ fn graph_mounted_routes(
     routes: &[Route],
     scoped_groups: &[ScopedGroup],
     declared_routes: &[crate::route_listing::RouteInfo],
+    config: &crate::config::AutumnConfig,
 ) -> Vec<crate::graph::MountedRoute> {
+    // The framework's own mounts — probes, the actuator, htmx assets, the docs
+    // UI — are served by `router.rs` and belong in the census: the manifest and
+    // the guide both promise a framework endpoint is *named* in
+    // `unmodelled_mounted_routes`, and without them the completeness report
+    // systematically understated the served surface (Codex round 5). Built with
+    // the same helper `autumn routes` uses, so the two cannot disagree about
+    // what the framework mounts.
+    let mut framework: Vec<crate::route_listing::RouteInfo> = Vec::new();
+    crate::route_listing::append_framework_routes(&mut framework, config);
+
     routes
         .iter()
         .map(|route| graph_route_summary(route, None))
@@ -7646,6 +7670,7 @@ fn graph_mounted_routes(
                 .map(move |route| graph_route_summary(route, Some(&group.prefix)))
         }))
         .chain(declared_routes.iter().map(graph_declared_route_summary))
+        .chain(framework.iter().map(graph_declared_route_summary))
         .collect()
 }
 
@@ -7680,6 +7705,9 @@ fn graph_declared_route_summary(
             policy: route.policy,
             public: route.classification == crate::route_listing::RouteClassification::Public,
         },
+        // A `RouteInfo` carries no repository metadata: these are plugin and
+        // framework mounts, which no `#[repository]` generated.
+        repository_api: None,
     }
 }
 
@@ -7727,6 +7755,12 @@ fn graph_route_summary(route: &Route, scope_prefix: Option<&str>) -> crate::grap
             policy: route.api_doc.has_policy,
             public: route.api_doc.public,
         },
+        // Declared ownership, straight off the route the `#[repository(api =
+        // "...")]` macro generated. Never re-derived from the served path.
+        repository_api: route
+            .repository
+            .as_ref()
+            .map(|meta| meta.api_path.to_owned()),
     }
 }
 

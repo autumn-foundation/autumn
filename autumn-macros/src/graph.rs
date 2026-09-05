@@ -37,12 +37,20 @@ use quote::quote;
 /// the example app does, and every real statement does.
 const SQL_SHAPES: &[(&str, &str, bool)] = &[
     ("SELECT", "FROM", false),
+    // A `WITH` statement is read-only only if nothing in it mutates: the
+    // statement after the CTEs, or a CTE body, can be an `INSERT`/`UPDATE`/
+    // `DELETE`. `sql_shape` re-checks those verbs for this shape rather than
+    // trusting the `false` here.
     ("WITH", "SELECT", false),
     ("INSERT", "INTO", true),
     ("UPDATE", "SET", true),
     ("DELETE", "FROM", true),
     ("TRUNCATE", "TABLE", true),
 ];
+
+/// Verbs that make any statement containing them a mutation, wherever they
+/// appear — used for `WITH`, whose leading verb says nothing about its effect.
+const SQL_MUTATION_VERBS: &[&str] = &["DELETE", "INSERT", "TRUNCATE", "UPDATE"];
 
 /// Identifiers that are evidence the item mutates something.
 ///
@@ -150,15 +158,48 @@ fn sql_shape(literal: &str) -> Option<bool> {
         .filter(|w| !w.is_empty());
     let first = words.next()?;
     let rest: Vec<&str> = words.collect();
-    SQL_SHAPES
+    let (_, _, mutating) = SQL_SHAPES
         .iter()
-        .find(|(verb, companion, _)| first == *verb && rest.contains(companion))
-        .map(|(_, _, mutating)| *mutating)
+        .find(|(verb, companion, _)| first == *verb && rest.contains(companion))?;
+    // `WITH old AS (SELECT …) DELETE FROM posts …` is a write. Its leading verb
+    // is `WITH`, so the table alone cannot say; the mutation verbs can.
+    let mutating = *mutating
+        || (first == "WITH" && rest.iter().any(|w| SQL_MUTATION_VERBS.contains(w)));
+    Some(mutating)
 }
 
 /// Whether a string literal reads as a SQL statement.
 fn looks_like_sql(literal: &str) -> bool {
     sql_shape(literal).is_some()
+}
+
+/// Candidate names read off a token stream that came from *SQL literals*.
+///
+/// Kept apart from the rest because only these may be matched against a table
+/// name case-insensitively: an unquoted SQL identifier folds, a Rust type name
+/// does not. Without the split, a DTO named `Posts` would resolve to the
+/// `posts` table (Codex round 5).
+#[must_use]
+pub fn sql_candidate_symbols(stream: &TokenStream) -> Vec<String> {
+    let mut tokens = Vec::new();
+    flatten(stream, &mut tokens);
+    sql_symbols_of(&tokens)
+}
+
+/// [`sql_candidate_symbols`] over an already-flattened stream.
+fn sql_symbols_of(tokens: &[TokenTree]) -> Vec<String> {
+    let mut symbols: Vec<String> = Vec::new();
+    for tree in tokens {
+        if let TokenTree::Literal(literal) = tree {
+            let source = literal.to_string();
+            if looks_like_sql(&source) {
+                symbols.extend(sql_words(&literal_text(&source)));
+            }
+        }
+    }
+    symbols.sort();
+    symbols.dedup();
+    symbols
 }
 
 /// Candidate names read off a token stream.
@@ -257,6 +298,7 @@ pub fn emit_route_descriptor(
     let block = &input_fn.block;
     let body_tokens = quote! { #block };
     let body = emit_symbol_slice(&candidate_symbols(&body_tokens));
+    let sql = emit_symbol_slice(&sql_candidate_symbols(&body_tokens));
     let handler = input_fn.sig.ident.to_string();
     quote! {
         ::autumn_web::reexports::inventory::submit! {
@@ -270,6 +312,7 @@ pub fn emit_route_descriptor(
                 line: ::core::line!(),
                 signature_symbols: #signature,
                 body_symbols: #body,
+                sql_symbols: #sql,
             }
         }
     }
@@ -291,6 +334,7 @@ pub fn emit_job_descriptor(
     let mut flat = Vec::new();
     flatten(&body_tokens, &mut flat);
     let body = emit_symbol_slice(&symbols_of(&flat));
+    let sql = emit_symbol_slice(&sql_symbols_of(&flat));
     let mutating = mutates(&flat);
     let handler = input_fn.sig.ident.to_string();
     let kind_ident = syn::Ident::new(kind, proc_macro2::Span::call_site());
@@ -307,6 +351,7 @@ pub fn emit_job_descriptor(
                 line: ::core::line!(),
                 signature_symbols: #signature,
                 body_symbols: #body,
+                sql_symbols: #sql,
             }
         }
     }
