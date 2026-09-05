@@ -177,6 +177,58 @@ pub enum PluginValue {
     Text(String),
 }
 
+/// Deserialize a `Vec` that refuses to grow past `LIMIT` while it is being read.
+///
+/// A structural ceiling checked *after* `serde_json` has built the collection
+/// bounds what is rendered or dispatched, never what is allocated. One frame of
+/// a few hundred kilobytes can carry hundreds of thousands of `["",""]` pairs,
+/// each of which becomes two `String`s — tens of megabytes of host memory,
+/// outside the guest's own limiter and multiplied by every concurrent request,
+/// spent to produce a value that is then refused for having too many elements.
+///
+/// The limit is applied by the visitor, so the refusal happens at element
+/// `LIMIT + 1` and nothing larger is ever held.
+///
+/// # Errors
+///
+/// The deserializer's own error when an element cannot be read, and a custom
+/// one naming `LIMIT` when the sequence carries more than that many.
+pub fn bounded_vec<'de, D, T, const LIMIT: usize>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    use serde::de::{Error as _, SeqAccess, Visitor};
+
+    struct Bounded<T, const LIMIT: usize>(std::marker::PhantomData<T>);
+
+    impl<'de, T, const LIMIT: usize> Visitor<'de> for Bounded<T, LIMIT>
+    where
+        T: serde::Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "at most {LIMIT} elements")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            // `size_hint` is a hint from the input and not to be trusted with an
+            // allocation, so it is clamped to what will be accepted anyway.
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(LIMIT));
+            while let Some(item) = seq.next_element()? {
+                if out.len() >= LIMIT {
+                    return Err(A::Error::custom(format!("more than {LIMIT} elements")));
+                }
+                out.push(item);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(Bounded::<T, LIMIT>(std::marker::PhantomData))
+}
+
 /// The bytes `text` occupies once JSON-escaped, excluding its framing quotes.
 ///
 /// Not `text.len()`. JSON escaping is not a constant factor: a NUL becomes the
@@ -374,7 +426,13 @@ pub enum CapabilityCall {
         /// Absolute URL. Its host must appear in `[grants].hosts`.
         url: String,
         /// Request headers.
-        #[serde(default)]
+        ///
+        /// Bounded while it is read, not after the allow-list check; see
+        /// [`bounded_vec`].
+        #[serde(
+            default,
+            deserialize_with = "bounded_vec::<_, _, MAX_OUTBOUND_HEADERS>"
+        )]
         headers: Vec<(String, String)>,
         /// Request body, as text.
         #[serde(default)]
@@ -1784,6 +1842,42 @@ path = "/shop/panel"
         };
         assert_eq!(rows.len(), 2, "the quota caps the page");
         assert!(truncated, "and the guest is told there is more");
+    }
+
+    #[test]
+    fn a_guest_collection_is_refused_while_it_is_read_not_after() {
+        // The distinction this asserts is invisible from the outside if you
+        // only check that an oversized frame is refused: the *old* code also
+        // refused it, having first allocated the whole thing. What is being
+        // tested is that the refusal comes from the parser, so nothing larger
+        // than the ceiling is ever held.
+        let pairs = (0..=MAX_OUTBOUND_HEADERS)
+            .map(|_| r#"["",""]"#)
+            .collect::<Vec<_>>()
+            .join(",");
+        let line = format!(
+            r#"{{"call":"http-fetch","id":1,"method":"GET","url":"https://api.example.com/","headers":[{pairs}],"body":""}}"#
+        );
+        let parsed = serde_json::from_str::<CapabilityCall>(&line);
+        let err = parsed.expect_err("a frame over the header ceiling must not parse");
+        assert!(
+            err.to_string().contains("more than"),
+            "the parser should say why: {err}"
+        );
+
+        // And exactly at the ceiling still parses, so the bound is not off by
+        // one in the direction that breaks a legal call.
+        let pairs = (0..MAX_OUTBOUND_HEADERS)
+            .map(|_| r#"["a","b"]"#)
+            .collect::<Vec<_>>()
+            .join(",");
+        let line = format!(
+            r#"{{"call":"http-fetch","id":1,"method":"GET","url":"https://api.example.com/","headers":[{pairs}],"body":""}}"#
+        );
+        assert!(
+            serde_json::from_str::<CapabilityCall>(&line).is_ok(),
+            "a frame at the ceiling is legal"
+        );
     }
 
     // ── Outbound containment ─────────────────────────────────────────

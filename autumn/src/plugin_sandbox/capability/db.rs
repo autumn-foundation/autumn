@@ -664,14 +664,21 @@ impl MemoryPluginStore {
     /// For a test that needs a host-application row, or another tenant's row, to
     /// exist before it proves a plugin cannot reach it.
     pub fn seed(&self, table: &str, tenant: &str, row_id: &str, row: PluginRow) {
-        self.rows
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        let key = (table.to_owned(), tenant.to_owned(), row_id.to_owned());
+        let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
+        // Accounted like any other write. Bypassing the ceilings is the point
+        // of this helper - it exists to place a row the plugin path would
+        // refuse - but bypassing the *total* is not: a seeded row that weighed
+        // nothing let the store hold its whole byte capacity again on top of
+        // everything seeded, and left later updates and deletes adjusting a
+        // number that never included those rows.
+        let outgoing = rows
             .map
-            .insert(
-                (table.to_owned(), tenant.to_owned(), row_id.to_owned()),
-                row,
-            );
+            .get(&key)
+            .map_or(0, |existing| Self::entry_weight(&key, existing));
+        let incoming = Self::entry_weight(&key, &row);
+        rows.bytes = rows.bytes.saturating_sub(outgoing).saturating_add(incoming);
+        rows.map.insert(key, row);
     }
 
     /// Every `(table, tenant, row_id)` currently stored, sorted.

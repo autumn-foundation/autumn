@@ -125,10 +125,16 @@ pub enum FragmentNode {
         /// The tag name.
         tag: String,
         /// Attributes, each of which must appear in [`ALLOWED_ATTRIBUTES`].
-        #[serde(default)]
+        ///
+        /// Bounded while it is *read*, not after: see
+        /// [`bounded_vec`](super::bounded_vec).
+        #[serde(
+            default,
+            deserialize_with = "super::bounded_vec::<_, _, MAX_ATTRIBUTES>"
+        )]
         attributes: Vec<(String, String)>,
         /// Children.
-        #[serde(default)]
+        #[serde(default, deserialize_with = "super::bounded_vec::<_, _, MAX_NODES>")]
         children: Vec<Self>,
     },
 }
