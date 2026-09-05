@@ -1700,6 +1700,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **hot-upgrade example: `live_upgrade` test no longer conflates a mid-flight
+  reset with a refused connection, and no longer lets an unbounded number of
+  resets pass silently (issue #2462):**
+  `upgrades_in_place_under_load_without_dropping_a_connection_or_the_state`
+  counted every request failure — `ECONNREFUSED` (nothing listening, the
+  actual zero-downtime violation) and `ECONNRESET`/`ECONNABORTED` (a
+  connection torn down mid-flight) — into one `connect_errors` counter, then
+  asserted zero on it with a message claiming *"no connection may be
+  refused"*. That failed once, intermittently, on `Test (macos-latest)` with
+  two `ECONNRESET`s, and the message actively misled: it named refusal when
+  the actual cause was a reset. Refused and reset are now classified
+  separately (`is_connection_refused`/`is_mid_flight_reset`); a mid-flight
+  reset gets one retry (`with_reset_retry`, after a short 20ms backoff so it
+  lands after the handover settles rather than in the same window that reset
+  the first attempt), while a refused connection is a hard, zero-tolerance
+  failure on the first attempt — never retried, since there is nothing to
+  wait out. A retried success's `latency` is overwritten to span the whole
+  attempt (failed try + backoff + retry), not just the retry's own timing, so
+  a genuine cutover latency spike can't hide behind a cheap retry.
+  Autumn's in-place upgrade hands the successor the *same* listening socket
+  by duplicating its fd across the `exec` (`HandoffSocket::from_listener`),
+  not by binding a second `SO_REUSEPORT` socket, so — unlike this issue's own
+  initial theory — there is no accept-queue race between two listeners to
+  blame a reset on; the root cause of the one observed instance remains
+  unconfirmed. Retrying past a reset is therefore now bounded
+  (`MAX_TOLERATED_RESETS`, asserted): an isolated anomaly doesn't fail the
+  run, but a systemic source of resets — real evidence of a defect in the
+  handoff or drain path — still does, rather than being silently retried
+  away every time. The failure message and a `println!` summary say which of
+  refused/hard-failed/retried happened.
+  `with_reset_retry`'s branching (retry-then-succeed, a second reset still
+  fails, a refusal is never retried, an unrelated error kind is never
+  retried, and the spanning-latency behavior) is unit-tested directly against
+  fake attempt closures, independent of the real network/signal machinery the
+  rest of the test drives.
+
 - **🔒 `autumn generate auth`: a concurrent successful login could be silently
   re-locked by a racing failed attempt (issue #2500):** the generated
   `login` handler (and the duplicated `reauth` step-up block) counted a
