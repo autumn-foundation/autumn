@@ -274,6 +274,21 @@
 #     contains a negation rather than whether this call is what is negated —
 #     so `if !items.contains(&x) { env::var("X"); }` threw away a real read.
 #     A negation reaches the expression it heads and no further.
+#   * A NAME matching a PREFIX rather than an identity, in its most literal
+#     form: `\b(?:std::)?env::var\(` begins matching at the `env::` inside any
+#     path, because `\b` sits happily between a `:` and a letter — so
+#     `crate::env::var(…)`, an ordinary module somebody named `env` holding a
+#     function somebody named `var`, read as the std accessor. The comment
+#     above the pattern already said the form it keeps is the one "where `env::`
+#     is the module and not a variable somebody named"; the pattern was one
+#     lookbehind short of saying it, and three more bare-name alternatives
+#     built beside it had the same `\b` in front.
+#   * A CHECK written inside the branch that happened to motivate it. The
+#     value-namespace shadow test — does a `let` of this name take it back —
+#     sat under `if name in direct_names()`, so it asked the question only of
+#     imported std accessors and never of the derived helpers that reach the
+#     same bare-name match. Whether a `let` shadows a name is a fact about the
+#     name in that scope; which rung put it in the pattern does not change it.
 #   * A CONDITION written for the files that happen to have a SUFFIX. Both
 #     shell preprocessing passes were selected by file extension, and
 #     `Dockerfile` has none — so a Dockerfile took neither, and single quotes
@@ -3382,7 +3397,23 @@ BOUND = re.compile(
 # documenting one of them rested on an unrelated Dockerfile `ARG` happening to
 # carry the same name. `env!` and `option_env!` take the key first, like the
 # std accessors they are macro forms of.
-ACCESSOR = re.compile(r'\b(?:std::)?env::(var|var_os|set_var)\s*\(')
+#
+# …and QUALIFIED means qualified. `\b(?:std::)?env::` let the match BEGIN at
+# the `env::` inside any path, so `crate::env::var(…)` and `my_lib::env::var(…)`
+# — an ordinary module somebody named `env`, with a function somebody named
+# `var` — were read as the std accessor. The comment above already said the
+# form that needs no derivation is the one "where `env::` is the module and not
+# a variable somebody named"; the pattern was one lookbehind short of saying it.
+# A name matching a PREFIX rather than a whole identity is the shape this file's
+# header records, and it had it in its most literal form.
+#
+# The bare `env::var(…)` spelling did not disappear with it — it moved to the
+# rung that can answer it. Bare `env::` is the std module only because the file
+# wrote `use std::env;`, which is an IMPORT, scoped like every other; the alias
+# rung below collects it now (it used to exclude the local name `env` precisely
+# because this pattern covered it) and accepts the call only in the scope that
+# imported it.
+ACCESSOR = re.compile(r'(?<![:\w])(?:std|core)::env::(var|var_os|set_var)\s*\(')
 # The macro forms are SHADOWABLE, which the path form is not. Rust lets a
 # `macro_rules! env` take the name over for the rest of its textual scope, so
 # `env!("AUTUMN_…")` there is whatever that macro does — and a spelling was
@@ -4664,9 +4695,14 @@ def accessor(root, test_files=frozenset()):
         # resolves types and helpers; the module was the one import it did not
         # follow. Only an alias of the std module counts, so an unrelated
         # `use foo::bar as process_env` adds nothing.
+        # The local name `env` is no longer excluded. It used to be, because
+        # `ACCESSOR` spelled bare `env::var(` itself — and that spelling was
+        # exactly what let any module named `env` be read as std. `use
+        # std::env;` is an import like any other, so it is scoped like any
+        # other, and a bare `env::var(` is the std accessor precisely where
+        # that import reaches.
         def std_env_alias(local, path):
-            return (local != 'env'
-                    and re.fullmatch(r'(?:std|core)\s*::\s*env', path.strip()))
+            return bool(re.fullmatch(r'(?:std|core)\s*::\s*env', path.strip()))
 
         aliases = frozenset(
             local for local, path, _ in imports_of(rel)
@@ -4712,17 +4748,26 @@ def accessor(root, test_files=frozenset()):
         direct_scopes = {k: frozenset(v) for k, v in direct_scopes.items()}
         if key not in cache:
             pattern = ACCESSOR.pattern
+            # `\b` is not enough in FRONT of a bare name: it matches between
+            # the `:` and the `e` of `crate::env::var`, so every one of these
+            # alternatives could begin matching inside a longer path and read
+            # somebody else's module or function as this one. That is the same
+            # defect the qualified pattern above had, in three more places —
+            # the fix belongs everywhere the question is asked. `.` is excluded
+            # too, since `obj.getenv(…)` is a method, not the imported free
+            # function these alternatives are about.
+            head = r'|(?<![:\w.])(?:'
             if aliases:
-                pattern += (r'|\b(?:' + '|'.join(sorted(map(re.escape, aliases)))
+                pattern += (head + '|'.join(sorted(map(re.escape, aliases)))
                             + r')::(var|var_os|set_var)\s*\(')
             if direct:
-                pattern += (r'|\b(?:' + '|'.join(sorted(map(re.escape, direct)))
+                pattern += (head + '|'.join(sorted(map(re.escape, direct)))
                             + r')\s*\(')
             # The macro alternative is always in the pattern now; a shadow is a
             # REGION, and the scan decides where it applies over its own text.
             pattern += ENV_MACRO
             if here:
-                pattern += (r'|\b(' + '|'.join(sorted(map(re.escape, here)))
+                pattern += (r'|(?<![:\w.])(' + '|'.join(sorted(map(re.escape, here)))
                             + r')\s*\(')
             if recv:
                 # `get` belongs here and not in a floor: a map-typed
@@ -5589,14 +5634,25 @@ def source_tokens(root):
             # env helper's call, so only names this file imports that way are
             # asked the question.
             bare = re.match(r'([A-Za-z_]\w*)\s*\(', m.group(0))
-            if bare and spans and bare.group(1) in acc_for(rel).direct_names():
-                if not acc_for(rel).direct_here(bare.group(1), here):
+            if bare and spans:
+                if bare.group(1) in acc_for(rel).direct_names() \
+                        and not acc_for(rel).direct_here(bare.group(1), here):
                     continue
                 # …and Rust's VALUE namespace can take the name back: `let
                 # getenv = |_| String::new()` after the import shadows it, and
                 # the import being in scope says nothing about that. Same
                 # question as a rebound receiver, same answer — found here, on
                 # the scan's own text, from the binding onward.
+                #
+                # Asked of EVERY bare candidate, not only the imported ones.
+                # This test sat inside the direct-import branch, so a derived
+                # helper — `parse_env`, which is the other thing a bare `name(`
+                # match can be — kept its meaning through a `let parse_env =
+                # |…| …;` that Rust says takes the name. The shadow is a fact
+                # about the name in this scope; which rung put the name in the
+                # pattern does not change it. `env::var(`, `env.var(` and
+                # `option_env!(` do not reach here — none of them is a bare
+                # name followed by `(`.
                 start = _scope_start(spans, m.start())
                 if any(_bound_name(d) == bare.group(1)
                        and (_binder_is_let(d)
@@ -5604,8 +5660,12 @@ def source_tokens(root):
                                 body, start + d.start(), literals))
                        for d in LET_BIND.finditer(body[start:m.start()])):
                     continue
+            # An alias of `std::env` renames the module only where it was
+            # imported — `env` included now. It used to be exempted here
+            # because the base pattern spelled bare `env::var(` itself, which
+            # is what let any module named `env` read as std.
             alias = ALIAS_CALL.match(m.group(0))
-            if (alias and spans and alias.group(1) != 'env'
+            if (alias and spans
                     and not acc_for(rel).alias_here(alias.group(1), here)):
                 continue
             # …and a name its scope REBINDS is the environment only until the
@@ -7980,7 +8040,31 @@ def self_test():
           bool(_acc_for('autumn-cli/src/deploy.rs')
                .search('self.inner.var("AUTUMN_X")')),
           bool(real_acc.search('self.inner.var("AUTUMN_X")'))),
-         (False, False, False, False, True, True, True, True, True, False))
+         (False, False, False, False, True, False, True, True, True, False))
+    # …and BARE `env::var(` is the std accessor only where the file imported
+    # `std::env`. It used to be spelled into the base pattern, which is what
+    # let `crate::env::var(…)` — an ordinary module somebody named `env` — read
+    # as std. `config.rs` does not import it and `system_info.rs` does, so the
+    # same call text is an accessor in one file and not in the other; the
+    # qualified path needs no import in either.
+    case('a bare env:: path is the std module only where it is imported',
+         (bool(real_acc.search('env::var("AUTUMN_X")')),
+          bool(_acc_for('autumn/src/system_info.rs')
+               .search('env::var("AUTUMN_X")')),
+          bool(real_acc.search('crate::env::var("AUTUMN_X")')),
+          bool(_acc_for('autumn/src/system_info.rs')
+               .search('crate::env::var("AUTUMN_X")'))),
+         (False, True, False, False))
+    # The qualified form needs no import and takes no path in front of it.
+    # `my_lib::env::var(…)` used to match at its `env::`, because `\b` sits
+    # happily between a `:` and a letter — a name matching a PREFIX rather than
+    # an identity, which is the shape the header records.
+    case('a qualified accessor is not matched out of a longer path',
+         [bool(ACCESSOR.search(t)) for t in
+          ('std::env::var("X")', 'core::env::var_os("X")',
+           '    std::env::var("X")', 'crate::env::var("X")',
+           'my_lib::env::var("X")', 'crate::std::env::var("X")')],
+         [True, True, True, False, False, False])
     # A redirection is not a command — `AUTUMN_X=1 > out` is a null command
     # that starts no process — but it may PRECEDE one, so it is consumed and
     # the question asked again rather than added to the terminator set.
@@ -8696,10 +8780,10 @@ def self_test():
            '"std::env::var(\\"AUTUMN_X\\")";"# }',
            'const HELP: &str = r#"std::env::var("AUTUMN_X")"#;',
            'fn p() -> &\'static str { "fn m() {\\n'
-           'std::env::var(\\"AUTUMN_X\\");\\n}" }',
+           '    std::env::var(\\"AUTUMN_X\\");\\n}" }',
            'fn p() -> &\'static str { r#"fn m() {\n'
            'std::env::var("AUTUMN_X");\n}"# }')],
-         [[], [], ['env::var('], ['std::env::var(']])
+         [[], [], ['std::env::var('], ['std::env::var(']])
     case('a stray quote outside YAML still costs one line',
          _hash_uncommented("x = 'a\n# AUTUMN_LOG__LEVL=y cmd\nz = 1\n",
                            True).splitlines(),
