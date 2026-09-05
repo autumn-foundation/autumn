@@ -305,6 +305,17 @@ pub fn is_grantable_host(host: &str) -> bool {
     if host.parse::<std::net::Ipv4Addr>().is_ok() {
         return false;
     }
+    // …and every other spelling that a URL parser reads as an address. Rust's
+    // `Ipv4Addr` accepts only dotted-quad, but WHATWG and POSIX resolvers also
+    // accept short and non-decimal forms — `127.1`, `127.0.1`, `0177.0.0.1`,
+    // `0x7f.1` — each of which reached loopback while passing the label rules
+    // below as though it were a name. The rule those parsers actually use is
+    // that a host is an address when its *last* label is a number, so that is
+    // the rule here: it catches every short form, and it still admits
+    // `1.example.com`, whose last label is not.
+    if host.rsplit('.').next().is_some_and(looks_like_number) {
+        return false;
+    }
     host.split('.').all(|label| {
         !label.is_empty()
             && label.len() <= 63
@@ -314,6 +325,22 @@ pub fn is_grantable_host(host: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
     })
+}
+
+/// Whether `label` is something a URL parser would read as a number.
+///
+/// Decimal or hexadecimal; octal needs no separate arm because it is written
+/// with digits and reads as decimal here, which refuses it either way. The
+/// charset check in [`is_grantable_host`] has already ruled out upper case, so
+/// only the lower-case `0x` prefix has to be recognised.
+fn looks_like_number(label: &str) -> bool {
+    if label.is_empty() {
+        return false;
+    }
+    if let Some(hex) = label.strip_prefix("0x") {
+        return !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
+    label.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Whether `ident` is a name a physical SQL identifier may be derived from.
@@ -775,5 +802,37 @@ mod tests {
                 max: MAX_GRANT_ENTRIES,
             })
         );
+    }
+
+    #[test]
+    fn no_spelling_of_an_address_is_grantable_as_a_host() {
+        // `Ipv4Addr::parse` accepts only dotted-quad, but a URL parser accepts
+        // short and non-decimal forms and resolves every one of these to
+        // loopback or to the cloud metadata endpoint. Each passed the label
+        // rules as though it were a name.
+        for spelling in [
+            "127.0.0.1",
+            "127.1",
+            "127.0.1",
+            "0177.0.0.1",
+            "0x7f.1",
+            "169.254.169.254",
+            "10.0.0.1",
+            "1.2.3.4",
+        ] {
+            assert!(
+                !is_grantable_host(spelling),
+                "{spelling} is an address, not a name"
+            );
+        }
+        // And a name whose last label is not a number is still a name.
+        for name in [
+            "api.example.com",
+            "1.example.com",
+            "10.internal.example",
+            "a-b.example.co.uk",
+        ] {
+            assert!(is_grantable_host(name), "{name} is a name");
+        }
     }
 }

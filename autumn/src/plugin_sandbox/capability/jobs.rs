@@ -161,6 +161,18 @@ impl MemoryJobSink {
         })
     }
 
+    /// What one queued job costs: everything the record retains.
+    fn job_weight(job: &PluginJob) -> usize {
+        /// A `Vec` slot plus the three `String` headers a job carries.
+        const PER_ENTRY: usize = 96;
+        job.plugin
+            .len()
+            .saturating_add(job.job_type.len())
+            .saturating_add(job.tenant.as_ref().map_or(0, String::len))
+            .saturating_add(super::row_weight(&job.payload))
+            .saturating_add(PER_ENTRY)
+    }
+
     /// A queue bounded by both a depth and a total payload size.
     #[must_use]
     pub fn with_capacities(depth: usize, byte_capacity: usize) -> Arc<Self> {
@@ -196,13 +208,16 @@ impl JobSink for MemoryJobSink {
                 self.depth
             ));
         }
-        // And by payload size. Depth alone bounds the queue in jobs, not in the
-        // memory they hold, and nothing here drains it.
+        // And by the size of the whole record, not just its payload. Depth
+        // alone bounds the queue in jobs rather than in the memory they hold,
+        // and a job retains a tenant id, a plugin name and a job type beside
+        // its arguments — a tenant arrives in a header with no length bound of
+        // its own, so an empty-payload job charged nothing while holding one.
         let held: usize = queued
             .iter()
-            .map(|queued_job| super::row_weight(&queued_job.payload))
+            .map(Self::job_weight)
             .fold(0, usize::saturating_add);
-        if held.saturating_add(super::row_weight(&job.payload)) > self.byte_capacity {
+        if held.saturating_add(Self::job_weight(&job)) > self.byte_capacity {
             return Err(format!(
                 "the plugin job queue is at its {}-byte ceiling",
                 self.byte_capacity
