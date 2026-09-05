@@ -163,8 +163,8 @@ fn sql_shape(literal: &str) -> Option<bool> {
         .find(|(verb, companion, _)| first == *verb && rest.contains(companion))?;
     // `WITH old AS (SELECT …) DELETE FROM posts …` is a write. Its leading verb
     // is `WITH`, so the table alone cannot say; the mutation verbs can.
-    let mutating = *mutating
-        || (first == "WITH" && rest.iter().any(|w| SQL_MUTATION_VERBS.contains(w)));
+    let mutating =
+        *mutating || (first == "WITH" && rest.iter().any(|w| SQL_MUTATION_VERBS.contains(w)));
     Some(mutating)
 }
 

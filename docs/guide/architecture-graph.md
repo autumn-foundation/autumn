@@ -77,11 +77,20 @@ $ curl -s localhost:3000/actuator/graph | jq '.completeness'
   "generated_routes": 4,
   "opaque_mounted_routers": 1,
   "unmodelled_mounted_routes": [
+    "GET /_autumn/inspect",
+    "GET /actuator/graph",
+    "…",
     "WS /ws/feed",
     "WS /ws/r/{slug}"
   ]
 }
 ```
+
+`unmodelled_mounted_routes` is long on purpose: it names every served endpoint
+the graph has no macro declaration for — the framework's own probes, actuator
+and dev endpoints as well as the app's `#[ws]` handlers. Naming them is what
+stops the completeness section reading as a complete account of the served
+surface when it is not.
 
 It is **sensitive-gated**, like `/actuator/env`: the document names every route,
 its auth requirement, and the table each one touches — a map of exactly where an

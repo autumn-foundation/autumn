@@ -557,14 +557,8 @@ pub fn build(
 
     add_model_nodes(models, &mut nodes);
     add_repository_nodes(repositories, models, &index, &mut nodes, &mut edges);
-    let route_totals = add_route_nodes(
-        routes,
-        mounted,
-        &index,
-        &sql_tables,
-        &mut nodes,
-        &mut edges,
-    );
+    let route_totals =
+        add_route_nodes(routes, mounted, &index, &sql_tables, &mut nodes, &mut edges);
     add_job_nodes(jobs, &index, &sql_tables, &mut nodes, &mut edges);
     let surface = add_auto_api_nodes(
         mounted,
@@ -1090,6 +1084,15 @@ mod tests {
         }
     }
 
+    /// A mounted route a `#[repository(api = ...)]` generated, carrying the
+    /// declared ownership the real `Route` does.
+    fn mounted_by_repository(method: &str, path: &str, api: &str) -> MountedRoute {
+        MountedRoute {
+            repository_api: Some(api.to_owned()),
+            ..mounted(method, path, "auto")
+        }
+    }
+
     #[test]
     fn every_declared_element_becomes_a_node() {
         let graph = build(
@@ -1444,8 +1447,8 @@ mod tests {
         // touches posts` missed the entire REST surface of the table.
         let graph = build(
             &[
-                mounted("GET", "/api/posts", "list"),
-                mounted("POST", "/api/posts", "create"),
+                mounted_by_repository("GET", "/api/posts", "/api/posts"),
+                mounted_by_repository("POST", "/api/posts", "/api/posts"),
             ],
             0,
             &[],
@@ -1487,7 +1490,11 @@ mod tests {
     #[test]
     fn an_auto_api_route_reaches_the_model_through_its_repository() {
         let graph = build(
-            &[mounted("GET", "/api/posts/{id}", "show")],
+            &[mounted_by_repository(
+                "GET",
+                "/api/posts/{id}",
+                "/api/posts",
+            )],
             0,
             &[],
             &[model("Post", "app::models::Post", "posts")],
@@ -1537,46 +1544,52 @@ mod tests {
     }
 
     #[test]
-    fn nested_api_prefixes_attribute_to_the_longest_match() {
-        // Two repositories, one mounted under the other's prefix. Taking the
-        // first match would make the answer depend on link order, which
-        // `--check` would then report as phantom drift.
-        let outer = RepositoryGraphDescriptor {
-            api: "/api",
-            module_path: "app::repositories::outer",
-            ..repository("RootRepository", "PgRootRepository", "Root", "roots")
-        };
-        let inner = repository_with_api(
-            "PostRepository",
-            "PgPostRepository",
-            "Post",
-            "posts",
-            "/api/posts",
-        );
-        let forward = build(
-            &[mounted("GET", "/api/posts/{id}", "show")],
+    fn a_scoped_auto_api_route_is_still_attributed_to_its_repository() {
+        // Mounted inside `.scoped("/v1", …)` the CRUD surface is served at
+        // `/v1/api/posts`, which does not start with the declared prefix.
+        // Inferring ownership from the path dropped these routes entirely
+        // (Codex round 5); the route carries its own repository, so nothing
+        // has to be guessed.
+        let graph = build(
+            &[mounted_by_repository("GET", "/v1/api/posts", "/api/posts")],
             0,
             &[],
-            &[],
-            &[outer, inner],
+            &[model("Post", "app::models::Post", "posts")],
+            &[repository_with_api(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+                "/api/posts",
+            )],
             &[],
         );
-        let reversed = build(
-            &[mounted("GET", "/api/posts/{id}", "show")],
+        assert_eq!(graph.completeness.generated_routes, 1, "{:?}", graph.nodes);
+        assert!(graph.completeness.unmodelled_mounted_routes.is_empty());
+    }
+
+    #[test]
+    fn a_hand_written_route_under_an_api_prefix_is_not_claimed_as_generated() {
+        // The inverse: a plugin GET beneath `/api/posts` that no repository
+        // generated must not be attributed to one.
+        let graph = build(
+            &[mounted("GET", "/api/posts/search", "search")],
             0,
             &[],
-            &[],
-            &[inner, outer],
+            &[model("Post", "app::models::Post", "posts")],
+            &[repository_with_api(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+                "/api/posts",
+            )],
             &[],
         );
+        assert_eq!(graph.completeness.generated_routes, 0);
         assert_eq!(
-            forward, reversed,
-            "attribution must not depend on link order"
-        );
-        let edge = &forward.edges[0];
-        assert!(
-            edge.to.ends_with("PostRepository"),
-            "the longest matching prefix owns the route: {edge:?}"
+            graph.completeness.unmodelled_mounted_routes,
+            vec!["GET /api/posts/search"]
         );
     }
 
@@ -1618,7 +1631,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mounted_route_outside_every_api_prefix_stays_unmodelled() {
+    fn a_mounted_route_no_repository_generated_stays_unmodelled() {
         let graph = build(
             &[mounted("GET", "/api/postscript", "other")],
             0,
@@ -1660,13 +1673,16 @@ mod tests {
         let graph = build(
             &[],
             0,
-            &[route(
-                "report",
-                "GET",
-                "/report",
-                &[],
-                &["POSTS", "SELECT", "FROM"],
-            )],
+            &[RouteGraphDescriptor {
+                sql_symbols: &["FROM", "POSTS", "SELECT"],
+                ..route(
+                    "report",
+                    "GET",
+                    "/report",
+                    &[],
+                    &["POSTS", "SELECT", "FROM"],
+                )
+            }],
             &[model("Post", "app::models::Post", "posts")],
             &[],
             &[],
@@ -1678,6 +1694,22 @@ mod tests {
             graph.edges
         );
         assert_eq!(graph.edges[0].to, "model:app::models::Post");
+    }
+
+    #[test]
+    fn a_rust_type_named_like_a_table_does_not_resolve_to_it() {
+        // A DTO called `Posts` is a type-shaped candidate, not a SQL word.
+        // Folding every candidate made it resolve to the `posts` table — a
+        // false dependency the graph would then report forever.
+        let graph = build(
+            &[],
+            0,
+            &[route("show", "GET", "/show", &[], &["Posts"])],
+            &[model("Post", "app::models::Post", "posts")],
+            &[],
+            &[],
+        );
+        assert!(graph.edges.is_empty(), "{:?}", graph.edges);
     }
 
     #[test]
