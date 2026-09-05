@@ -185,6 +185,64 @@ async fn signup_creates_organization_with_owner_membership() {
         .assert_body_contains("owner");
 }
 
+/// Every recoverable signup/login failure mode redisplays the form inline
+/// (HTTP 200, same page, error adjacent to the fields) with the entered email
+/// preserved, instead of navigating the user to a generic error page and
+/// losing what they typed (Wayfinder: error-path inventory).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn signup_and_login_failures_redisplay_the_form_with_email_preserved() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+
+    // Malformed email at signup.
+    let resp = client
+        .post("/signup")
+        .form("email=not-an-email&password=Tr0ubad0ur-Xy7-correct-horse")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("Enter a valid email address"));
+    assert!(
+        resp.text().contains(r#"value="not-an-email""#),
+        "expected the entered email to be preserved in the re-rendered form, got: {}",
+        resp.text()
+    );
+
+    // Over-long password at signup.
+    let long_password = "x".repeat(129);
+    let resp = client
+        .post("/signup")
+        .form(&format!("email=long@acme.test&password={long_password}"))
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("at most 128 characters"));
+    assert!(resp.text().contains(r#"value="long@acme.test""#));
+
+    // Duplicate email at signup: the first signup succeeds, the second is
+    // redisplayed inline rather than dropped onto a generic error page.
+    let _ = signup(&client, "dupe@acme.test").await;
+    let resp = client
+        .post("/signup")
+        .form("email=dupe@acme.test&password=Tr0ubad0ur-Xy7-correct-horse-2")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("Could not create account"));
+    assert!(resp.text().contains(r#"value="dupe@acme.test""#));
+
+    // Invalid credentials at login preserve the entered (nonexistent) email.
+    let resp = client
+        .post("/login")
+        .form("email=nobody@acme.test&password=wrong-password-entirely")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("Invalid email or password"));
+    assert!(resp.text().contains(r#"value="nobody@acme.test""#));
+}
+
 /// AC4 + AC5(a) + success metric: inviting sends a real email (captured as an
 /// `.eml`), and accepting via the tokened link as a brand-new user creates
 /// the account and the membership in one step.
