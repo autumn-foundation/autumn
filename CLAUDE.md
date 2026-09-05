@@ -68,6 +68,16 @@ Two rules matter when editing tests:
   budget and fails on the slow runners only. Start the clock immediately
   before the `advance`/`run_to_idle` under test, as
   `sim_strict_wall_clock`, `sim_advance_to` and `sim_clock_drain` all do.
+- **Process-global state needs its own binary, and sharding enforces that.**
+  The `test` lane now runs its ~1880 tests at full parallelism instead of
+  trickling through trybuild's gaps, so a test that mutates a process-wide
+  singleton and depends on it across several `await`s no longer survives on
+  luck. `TestApp::build` clears the global cache unconditionally, so
+  `capsule_cache_effect` — which installs one and reads it back over two
+  requests — had to move to its own `[[test]]` binary, joining
+  `cache_global_integration` and `cached_global_backend`. If a test only passes
+  because nothing else happened to run at that moment, it belongs in the
+  isolated list below, not the consolidated one.
 
 The split is not cosmetic: on the 2026-08-26 trunk run, `compile_fail::` alone
 was 37 of the 47 minutes the consolidated `integration_tests` binary spent

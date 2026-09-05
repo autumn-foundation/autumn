@@ -1091,6 +1091,12 @@ path = "tests/cache_global_integration.rs"
 name = "cached_global_backend"
 path = "tests/cached_global_backend.rs"
 
+# Isolated: installs a process-global cache backend and depends on it surviving
+# across two requests, which any concurrent `TestApp::build` would clear.
+[[test]]
+name = "capsule_cache_effect"
+path = "tests/capsule_cache_effect.rs"
+
 # Isolated: loom model-checking binary. Empty under a normal build
 # (`#![cfg(loom_models)]`); only compiles/runs under
 # `RUSTFLAGS="--cfg loom_models"`, and is exercised in its own dedicated CI job
