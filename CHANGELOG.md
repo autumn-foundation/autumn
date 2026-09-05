@@ -1604,6 +1604,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **4 `autumn-macros` unit tests hand-simulating `#[throttle]`/`#[secured]`/
+  `#[step_up]` expanding above a route attribute fed a macro's raw
+  multi-item output (its `FromRequestParts` gate `struct` + `impl` +
+  handler fn, emitted as one stream since #1668/#2488) directly into the
+  next macro call, a shape the real compiler never produces** — an
+  attribute macro is always invoked with the tokens of the ONE item it
+  remains attached to, never the sibling gate items an earlier guard also
+  emitted alongside it (`param_helpers::extract_fn_item`, added by #1668's
+  own tests, exists precisely to strip those siblings before chaining a
+  simulated stack). These 4 tests skipped that extraction, so they broke
+  the moment #1668 introduced the gate pattern, exercising a bundle shape
+  no real `#[throttle] #[post]` stacking can hit. Fixed by extracting the
+  handler fn with `extract_fn_item` at each simulated expansion step,
+  matching the pattern the codebase's other stacked-guard tests already
+  use. Fixing the parse separately surfaced a real bug in the same code
+  path (#1677's OpenAPI-schema recovery): `throttle_macro`/`step_up_macro`
+  never restated their marker const (`__AUTUMN_THROTTLE_ROUTE_ID`/
+  `__AUTUMN_STEP_UP_MAX_AGE`) inside the handler body the way
+  `secured_macro` already does for `__AUTUMN_SECURED_ROLES` — without it,
+  the response-schema recovery that scans for that marker never fires, so
+  a throttled or step-up-gated route's real `Json<T>` return type silently
+  vanished from its OpenAPI doc whenever the guard expanded before the
+  route attribute. Both now match `secured_macro`'s existing pattern.
+  Verified beyond the 5 corrected unit tests: the real `secured_route`/
+  `step_up_route`/`throttle_route`/`authorization_integration` integration
+  suites (47 tests covering 401/429 gating, idempotent replay, and stacked
+  guards) and a full `cargo test --workspace --no-run` across every crate
+  and example app (all of which use these macros) both stay green.
+- **🧭 Wayfinder: restored the focus outline on admin-plugin form/search
+  inputs (keyboard focus visible: 0/2 fields → 2/2, forced-colors mode):**
+  the core admin CRUD loop — list → create → edit, the flow every registered
+  model routes through — set `.form-input:focus` and `.search-bar
+  input:focus` to `outline: none`, replacing it with `border-color` +
+  `box-shadow` only. `box-shadow` (and often `border-color`) is suppressed
+  under forced-colors mode (Windows High Contrast and equivalent OS/browser
+  settings), so a keyboard user in that mode tabbing through the create/edit
+  form, or the list page's search box, got no focus indicator on any field —
+  a WCAG 2.4.7 (Focus Visible) failure, and the exact "style away focus
+  outlines without an equal-or-better replacement" anti-pattern this
+  audit is built to catch. Both rules now keep `outline: 2px solid
+  var(--primary); outline-offset: 2px;`, the same convention already used on
+  8 other focus states in `autumn/src/ui/widgets.css` and on this file's own
+  skip-link — forced-colors mode renders a non-`none` outline with the
+  system's focus color regardless of author styling, so it can't be silently
+  stripped the way `box-shadow` is. Audited with the repo's own `autumn a11y
+  verify` (static Maud scan, 77 `html!` blocks, 0 findings before and after —
+  this class of defect is outside its raw-markup rule set) and `autumn check
+  --a11y` against rendered fixtures of the create form, the edit form (with
+  a validation-error state), and the delete-confirmation dialog (0 DOM-level
+  violations before and after); the keyboard walkthrough that surfaced the
+  defect and the regression test pinning it
+  (`form_and_search_input_focus_keeps_a_visible_outline`) are in
+  `autumn-admin-plugin/src/templates.rs`.
 - **🧭 Wayfinder: keyboard bypass-blocks link added to 6 supported example
   apps (a11y `bypass` Serious 7/8 → 0/8; `landmark-one-main` Moderate 1/8 → 0/8):**
   `autumn check --a11y` — the framework's own WCAG audit, run against each
@@ -1664,7 +1717,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   involved. No public API changed — `fetch_bytes`'s signature and error type
   are unchanged, `fetch_text` is a new addition. No plugin-facing surface;
   this is a CLI robustness fix, not new framework surface.
-
 - **`--counter-cache` scaffolds compiled clean now (#2431):** `autumn generate
   scaffold Comment ... --belongs-to Post --counter-cache` — the documented,
   only way to use the flag — generated a child model that failed `cargo check`
