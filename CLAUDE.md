@@ -53,7 +53,9 @@ The default approach for new tests is to add them to the consolidated binary so 
 
 ##### Docker / testcontainer DB tests run automatically in CI
 
-The CI "Run Docker-dependent tests" step (Linux) sweeps every `#[ignore]`d
+The CI "Run Docker-dependent tests" step — since #1747 a step of the Linux-only
+`Test (Docker)` job rather than the last step of `Test (ubuntu-latest)`, so it
+gets a runner whose disk it is the only claimant of — sweeps every `#[ignore]`d
 test that compiles into the `autumn` consolidated `integration_tests` binary with
 `--features "test-support,offline-sync"` (a bare `--ignored` run), so a new
 house-pattern testcontainer DB test — `#[ignore = "requires Docker (testcontainers)"]` in a `db`-gated (or ungated) module — executes in CI with

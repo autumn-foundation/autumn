@@ -514,6 +514,49 @@ jobs:
         run: |
           cargo test -p autumn-web --features system-tests --lib system_test::
           cargo test -p autumn-web --features system-tests --test integration_tests system_test_api
+
+  # The Docker/testcontainer sweep runs as its own job rather than as the last
+  # step of `test` (#1747). As step 16 of that job it inherited a disk already
+  # filled by the whole workspace build plus eight feature-flipped rebuilds,
+  # and then died compiling its own dependencies — `bollard`, `bollard-stubs`
+  # and a re-linked `autumn-web` — with "No space left on device" and 23-41 MB
+  # free, before a single test body ran. Steps 1-15 of that job were green, as
+  # were the macOS and Windows legs, so the sweep was not failing on anything
+  # it tested; it was failing on being last in line for the disk.
+  #
+  # Nothing here is skipped, reordered or weakened: the two steps below are the
+  # ones that were inline, verbatim, on a runner whose disk they are the only
+  # claimant of. They keep their `runner.os == 'Linux'` guards, which stay true
+  # on this runner, so the commands are byte-for-byte the ones that ran before.
+  #
+  # NOTE: this is a NEW check name, so branch protection — which requires the
+  # per-OS `Test (…)` checks — does not require it yet. Until an admin adds it,
+  # a failure here is visible on the PR but does not itself block merge. #2519
+  # restructures these jobs more broadly and carries the same follow-up; expect
+  # to reconcile with it (it names the equivalent job `test-docker` too).
+  test-docker:
+    name: Test (Docker)
+    needs: [lint, meta]
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space
+        run: |
+          # The same reclaim the `test` job does: drop the preinstalled
+          # toolchains a Rust build never uses, before the cache is restored.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
       - name: Install Postgres client tools (Linux)
         if: runner.os == 'Linux'
         run: |

@@ -1351,6 +1351,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **ci: the Docker/testcontainer sweep runs as its own `Test (Docker)` job
+  instead of the last step of `Test (ubuntu-latest)`:** as step 16 of that job
+  it inherited a disk already filled by the whole workspace build plus eight
+  feature-flipped rebuilds, and died compiling its own dependencies
+  (`bollard`, `bollard-stubs`, a re-linked `autumn-web`) with `No space left on
+  device` and 23–41 MB free — before a single test body ran, with steps 1–15
+  and both the macOS and Windows legs green. The two steps move verbatim (the
+  diff is purely additive: a job boundary inserted in front of them), so the
+  same commands run the same sweep, on a runner whose disk they are the only
+  claimant of. Branch protection still names only the per-OS `Test (…)` checks,
+  so `Test (Docker)` needs adding there to block merge again. [no-plugin] —
+  CI-only; no API, behaviour or feature change. (#1747)
 - **plugin-conformance:** **Breaking:** `plugin_conformance::ConformanceConfig`
   gains a `contract` field and is now `#[non_exhaustive]`, so it can no longer
   be built with a struct literal — use `ConformanceConfig::new(name)` and the
