@@ -3596,9 +3596,25 @@ def _block_end(text, offset, literals=None):
 
 
 def _scope_start(spans, offset):
-    """Where the innermost scope containing `offset` begins."""
-    starts, _ = spans
-    return starts[bisect.bisect_right(starts, offset) - 1]
+    """Where the innermost scope containing `offset` BEGINS.
+
+    Not the most recent boundary — that is what this returned at first, and a
+    boundary is as often a scope CLOSING as one opening. A closure that ends
+    just before a call put the window's start after the closure, so a `let`
+    written above it was outside the search and the shadow was never found.
+    Four probes routed around their rung this session before that showed up;
+    this was at least one of them. Walk back to the first boundary at which
+    this scope path became current.
+    """
+    starts, scopes = spans
+    i = bisect.bisect_right(starts, offset) - 1
+    here = scopes[i]
+    # Walk back over this scope's own boundaries AND over anything nested
+    # inside it — a closure that opened and closed above the call is still
+    # within the scope the call is in, so its boundaries are not the start.
+    while i > 0 and scopes[i - 1][:len(here)] == here:
+        i -= 1
+    return starts[i]
 
 
 def _scope_at(spans, offset):
@@ -7315,6 +7331,16 @@ def self_test():
     # over its own body only. Treating them alike suppressed the receiver after
     # the loop as well as inside it — the reaching-backwards mistake mirrored,
     # one round later and one binder over.
+    # A scope BOUNDARY is as often a close as an open, and the window a shadow
+    # is searched in starts where the scope began — not at the last boundary
+    # before the call. A closure ending just above a call put the window after
+    # the `let` that shadows its receiver, so the shadow was never found.
+    case('a scope start is where the scope began',
+         (lambda src: (lambda sp: [_scope_start(sp, src.index(p)) for p in
+                                   ('AFTER', 'INSIDE')])(_lexical_spans(src)))(
+             'fn f(source: OsEnv) {\n  let g = |x: u8| x;\n'
+             '  let _ = "INSIDE";\n  let _ = "AFTER";\n}\n'),
+         [0, 0])
     case('a let runs on and a pattern binder does not',
          [_binder_is_let(m) for m in LET_BIND.finditer(
              'let a = 1; for b in xs { } if let Some(c) = d { }')],
