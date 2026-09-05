@@ -3727,7 +3727,7 @@ def _scope_opens(masked, literals=None):
 CLOSURE_HEAD = re.compile(r'(?<!\|)\|(?!\|)[^|;{}()\[\]\n]+\|')
 
 
-def _closure_end(masked, i):
+def _closure_end(masked, i, literals=None):
     """One past the end of a closure body beginning at `i`.
 
     A closure body is a BLOCK or an EXPRESSION, and the expression form is the
@@ -3736,13 +3736,30 @@ def _closure_end(masked, i):
     around it — `map(|s: OsEnv| s.var(k))` ends at the `)` it did not open.
     Stopping on an unopened closer is also what keeps the span nested inside
     whatever block holds it, which the sweep below relies on.
+
+    `masked` KEEPS string and character contents, on purpose — a name is read
+    out of a literal — so every walk over it that reads punctuation as
+    structure has to be told which characters are inside one. Every other walk
+    here already is: `_block_end`, `_scope_opens`, the sweep in
+    `_lexical_spans`. This one was not, so `|s: OsEnv| { let _ = "{"; s }`
+    counted a brace that Rust does not, and the closure's scope ran to the end
+    of the file — trusting every later receiver of that name.
+
+    BOTH walks take the mask, not just the brace one that the report named.
+    They answer the same question about the same text, and a `";"` or `","` in
+    a literal ends the expression form exactly as wrongly as a `"{"` extends
+    the block form.
     """
+    lit = _in_literal(literals)
     j = i
     while j < len(masked) and masked[j].isspace():
         j += 1
-    if j < len(masked) and masked[j] == '{':
+    if j < len(masked) and masked[j] == '{' and not lit(j):
         depth = 0
         while j < len(masked):
+            if lit(j):
+                j += 1
+                continue
             if masked[j] == '{':
                 depth += 1
             elif masked[j] == '}':
@@ -3753,6 +3770,9 @@ def _closure_end(masked, i):
         return len(masked)
     depth = 0
     while j < len(masked):
+        if lit(j):
+            j += 1
+            continue
         c = masked[j]
         if c in '([{':
             depth += 1
@@ -3807,7 +3827,7 @@ def _lexical_spans(masked, literals=None):
         # The header text is the label, exactly as it is for an item: two
         # sibling closures with identical parameter lists share a scope, which
         # is the same bounded over-admission two identically-headed items get.
-        spans.append((m.start(), _closure_end(masked, m.end()),
+        spans.append((m.start(), _closure_end(masked, m.end(), literals),
                       ' '.join(m.group(0).split())))
     # Outermost first at a shared start, so an item and a closure that begin
     # together nest rather than alternate.
@@ -7435,6 +7455,29 @@ def self_test():
     # …and the mask has to be cut the way `untested` cuts the body, or every
     # offset past the first test item names a different character. Missing that
     # on the scan side cost a real read its resolution.
+    # …and the CLOSURE walk asks the same question of the same text, so it
+    # takes the same mask. It did not, and a `"{"` written in a closure body
+    # ran that closure's scope to the end of the file — trusting every later
+    # receiver that happened to share the parameter's name.
+    case('a brace in a closure literal does not extend its scope',
+         (lambda src: (lambda text, lits:
+                       [_scope_at(_lexical_spans(text, lits), text.index(p))
+                        for p in ('source }', 'other.source.var')])(
+             *masked_with_literals(src)))(
+             'fn f() { let _ = |source: OsEnv| { let _ = "{"; source };\n'
+             '  other.source.var("X"); }\n'),
+         [('fn f()', '|source: OsEnv|'), ('fn f()',)])
+    # The expression form is the same bug from the other side: a `;` or `,` in
+    # a literal ends the body exactly as wrongly as a `{` extends it. One walk
+    # was named in the report; both answer the question.
+    case('a semicolon in a closure literal does not end its scope',
+         (lambda src: (lambda text, lits:
+                       [_scope_at(_lexical_spans(text, lits), text.index(p))
+                        for p in ('s.var("A")', 's.var("B")')])(
+             *masked_with_literals(src)))(
+             'fn f() { xs.map(|s: OsEnv| s.var(";" ) ); let s = Other; '
+             's.var("B"); }\nfn g(s: OsEnv) { s.var("A"); }\n'),
+         [('fn g(s: OsEnv)',), ('fn f()',)])
     case('the literal mask is cut with the body',
          (lambda text, lits: len(text) == len(lits))(
              *masked_with_literals(
