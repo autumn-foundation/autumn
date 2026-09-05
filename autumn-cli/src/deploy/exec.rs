@@ -861,19 +861,17 @@ pub fn first_deploy_ops(
             "systemctl daemon-reload",
         )),
     ]);
-    // Pending migrations run BEFORE the initial release is even started (issue
-    // #1607, AC-3). `systemd-run --wait` returns the child's exit status, so a
-    // failed migration surfaces a non-zero error that stops `run_ops` here — the
-    // slot never starts, the proxy is never routed at it, and the caller's
-    // first-deploy teardown removes the half-written release.
+    // Pending migrations run before the initial release is even started (#1607, AC-3).
+    // `systemd-run --wait` returns the child's exit status, so a failed migration
+    // surfaces a non-zero error that stops `run_ops` here: the slot never starts, the
+    // proxy is never routed at it, and the caller's first-deploy teardown removes the
+    // half-written release.
     //
-    // It sits AFTER `daemon-reload` (which only reloads unit files and starts
-    // nothing) rather than before it, so `daemon-reload` is unambiguously a
-    // PRE-migrate step on BOTH builders — see [`PRE_MIGRATE_LABELS`], which the
-    // fleet summary uses to tell "died before migrating" from "the schema moved".
-    //
-    // `MigrateStep::Skip` omits ONLY this op (a fleet migrates exactly once); see
-    // [`MigrateStep`].
+    // It sits after `daemon-reload`, which only reloads unit files and starts nothing,
+    // rather than before it, so `daemon-reload` is unambiguously a pre-migrate step on
+    // both builders — see [`PRE_MIGRATE_LABELS`], which the fleet summary uses to tell
+    // "died before migrating" from "the schema moved". `MigrateStep::Skip` omits only
+    // this op, since a fleet migrates exactly once; see [`MigrateStep`].
     if matches!(migrate, MigrateStep::Run) {
         ops.push(DeployOp::Run(release_migrate_command(cfg, &release_dir)));
     }
@@ -979,30 +977,29 @@ pub fn cutover_ops(
     let candidate_unit_path = format!("/etc/systemd/system/{candidate_unit}.service");
     let live_unit = slot_unit_name(&cfg.service_name, plan.live_slot);
 
-    // Refresh the SHARED proxy unit on the redeploy path too (issue #2070).
-    // Previously only `first_deploy_ops` wrote the proxy unit, so a fix landed in
-    // the unit (e.g. the reboot-durable `StateDirectory`/`HOME` of #2069) never
-    // reached an already-provisioned host on upgrade. Prepending the idempotent
-    // install (mirroring how `first_deploy_ops` starts) rewrites it on every
-    // redeploy, and — kamal-proxy only — restarts + re-registers the live upstream
-    // ONLY when the unit actually changed, so an existing host adopts the new unit
-    // with a routeless window bounded to ~the restart (see
-    // `ProxyController::refresh_installed_ops`). Writing the unit is deterministic,
-    // lands at the final path, and causes no restart on its own, so it is safe to do
-    // at the very start of the cutover; the live upstream re-registered on a change
-    // is the release serving RIGHT NOW, targeted at the DERIVED live-slot port
-    // (`plan.live_port`). That derived port is CORRECT here because the redeploy path
-    // refuses a concurrent `server.port` change at pre-flight (#2073,
-    // `refuse_concurrent_public_port_change`), so the public port is unchanged and the
-    // derived live port necessarily equals the port the live release actually binds —
-    // a live-safe port change is future work (Option C). The candidate/flip below use
-    // the new derived candidate port, which the new release genuinely binds.
+    // Refresh the shared proxy unit on the redeploy path too (#2070). Previously only
+    // `first_deploy_ops` wrote the proxy unit, so a fix landed in the unit — the
+    // reboot-durable `StateDirectory`/`HOME` of #2069, say — never reached an
+    // already-provisioned host on upgrade. Prepending the idempotent install, mirroring
+    // how `first_deploy_ops` starts, rewrites it on every redeploy and, for kamal-proxy
+    // only, restarts and re-registers the live upstream when the unit actually changed,
+    // so an existing host adopts the new unit with a routeless window bounded to about
+    // the restart (see `ProxyController::refresh_installed_ops`). Writing the unit is
+    // deterministic, lands at the final path, and causes no restart on its own, so it is
+    // safe at the very start of the cutover.
     //
-    // The re-register carries `reregister_options` — the OLD release's own TLS/host
-    // recovered from the `shared/proxy-options` marker (issue #2074) — NOT the new
-    // config's, so a later-op failure + rollback leaves the still-live old release on
-    // its OWN host/TLS instead of the new/removed one. The candidate flip below still
-    // uses the controller's NEW `tls_host`.
+    // The live upstream re-registered on a change is the release serving right now,
+    // targeted at the derived live-slot port (`plan.live_port`). That derived port is
+    // correct here because the redeploy path refuses a concurrent `server.port` change at
+    // pre-flight (#2073, `refuse_concurrent_public_port_change`), so the public port is
+    // unchanged and the derived live port necessarily equals the port the live release
+    // binds; a live-safe port change is future work. The candidate and flip below use the
+    // new derived candidate port, which the new release genuinely binds.
+    //
+    // The re-register carries `reregister_options` — the old release's own TLS and host,
+    // recovered from the `shared/proxy-options` marker (#2074) — not the new config's, so
+    // a later-op failure and rollback leaves the still-live old release on its own host
+    // and TLS. The candidate flip below still uses the controller's new `tls_host`.
     let mut ops = proxy.refresh_installed_ops(
         plan.public_port,
         &cfg.service_name,
@@ -1060,15 +1057,14 @@ pub fn cutover_ops(
             ),
         )),
     ]);
-    // Migrations run BEFORE the flip. `systemd-run --wait` returns the child's
-    // exit status, so a failed migration surfaces a non-zero error that stops
-    // run_ops before the flip — old release still serving (AC-3).
-    //
-    // #1621: this is the ONE op a fleet parameterises. The position is unchanged
-    // (between `start-candidate` and `readiness-gate`, i.e. PRE-boundary, so the
-    // existing candidate-teardown path still covers a failed migration), and
-    // `MigrateStep::Skip` omits ONLY this op — hosts 2..N of a fleet, whose shared
-    // schema the first redeploying host already migrated. See [`MigrateStep`].
+    // Migrations run before the flip. `systemd-run --wait` returns the child's exit
+    // status, so a failed migration surfaces a non-zero error that stops `run_ops` before
+    // the flip, leaving the old release serving (AC-3). #1621: this is the one op a fleet
+    // parameterises. Its position is unchanged — between `start-candidate` and
+    // `readiness-gate`, so pre-boundary, and the existing candidate-teardown path still
+    // covers a failed migration — and `MigrateStep::Skip` omits only this op, for hosts
+    // 2..N of a fleet whose shared schema the first redeploying host already migrated.
+    // See [`MigrateStep`].
     if matches!(migrate, MigrateStep::Run) {
         ops.push(DeployOp::Run(release_migrate_command(cfg, &release_dir)));
     }
@@ -1081,15 +1077,14 @@ pub fn cutover_ops(
         // live traffic to it and drains the old target. Only reached after a
         // passing readiness gate (AC-2).
         proxy.flip_op(&cfg.service_name, &loopback_upstream(plan.candidate_port)),
-        // Commit the on-disk state markers as ONE remote transaction after the flip
-        // (#1938): a single SSH round-trip that either lands as a unit or fails as a
-        // unit, so a failure between the flip and completing the markers can no
-        // longer leave the proxy on the new release while the markers still describe
-        // the old one. Internally it (1) records the release being replaced (its dir
-        // + live slot) as the new "previous release" — read from `current` +
-        // live-slot BEFORE they change — then (2) repoints `current` to the new
-        // release, then (3) records the new live slot. Each marker file is written
-        // via temp-file + `mv` (atomic rename), not a truncating redirect.
+        // Commit the on-disk state markers as one remote transaction after the flip
+        // (#1938): a single SSH round-trip that lands as a unit or fails as a unit, so a
+        // failure between the flip and completing the markers can no longer leave the
+        // proxy on the new release while the markers describe the old one. It records the
+        // release being replaced — its dir and live slot — as the new "previous release",
+        // read from `current` and the live slot before they change; then repoints
+        // `current` to the new release; then records the new live slot. Each marker file
+        // is written via temp file plus `mv`, an atomic rename, not a truncating redirect.
         DeployOp::Run(commit_markers_command(
             cfg,
             &release_dir,
@@ -1351,15 +1346,14 @@ pub fn rollback_ops(
 ) -> Vec<DeployOp> {
     let previous_unit = slot_unit_name(&cfg.service_name, target.slot);
     let previous_unit_path = format!("/etc/systemd/system/{previous_unit}.service");
-    // Re-render the TARGET release's slot unit from the persisted marker (dir +
-    // port), so rollback never depends on the slot's on-disk unit being intact. A
-    // redeploy reusing this slot overwrites its unit to point at the new candidate
-    // BEFORE the flip; if that redeploy fails pre-flip its teardown removes the
-    // candidate dir but leaves the slot unit pointing at the now-removed dir. Left
-    // as-is, `restart-previous` below would relaunch that clobbered unit
-    // (ExecStart -> removed dir) instead of the retained previous release. Rendering
-    // from `target.release_dir`/`target.port` (NOT the current live config) restores
-    // the correct unit for the release we roll back to.
+    // Re-render the target release's slot unit from the persisted marker — dir and port
+    // — so rollback never depends on the slot's on-disk unit being intact. A redeploy
+    // reusing this slot overwrites its unit to point at the new candidate before the
+    // flip; if that redeploy fails pre-flip, its teardown removes the candidate dir but
+    // leaves the slot unit pointing at the now-removed dir. Left as-is, `restart-previous`
+    // below would relaunch that clobbered unit, whose ExecStart names a removed dir,
+    // instead of the retained previous release. Rendering from `target.release_dir` and
+    // `target.port`, not the current live config, restores the correct unit.
     let target_unit = super::render_app_unit(cfg, &target.release_dir, target.port, target.slot);
     // The slot that was live before this rollback — traffic just moved away from
     // it. `target.slot` is the slot we roll back TO, so the former-live slot is the
@@ -1409,17 +1403,15 @@ pub fn rollback_ops(
         // Health-gated flip back: the previous unit (brought up above) must pass
         // /ready before the proxy swaps traffic to it.
         proxy.flip_op(&cfg.service_name, &loopback_upstream(target.port)),
-        // Commit the on-disk state markers as ONE remote transaction after the flip
-        // (#1938), symmetric with cutover: a single SSH round-trip that lands or
-        // fails as a unit, so a failure between the flip and completing the markers
-        // cannot leave the proxy on the rolled-back release while the markers still
-        // describe the release we rolled back FROM. Internally it (1) records the
-        // release we are rolling back FROM (its dir + the former-live slot,
-        // `other_slot(target.slot)`) as the new "previous release" — read from
-        // `current` + live-slot BEFORE they change — then (2) repoints `current` to
-        // the target release, then (3) records the target's live slot. Each marker
-        // file is written via temp-file + `mv` (atomic rename), not a truncating
-        // redirect.
+        // Commit the on-disk state markers as one remote transaction after the flip
+        // (#1938), symmetric with cutover: a single SSH round-trip that lands or fails as
+        // a unit, so a failure between the flip and completing the markers cannot leave
+        // the proxy on the rolled-back release while the markers still describe the
+        // release we rolled back from. It records the release being rolled back from —
+        // its dir and the former-live slot, `other_slot(target.slot)` — as the new
+        // "previous release", read from `current` and the live slot before they change;
+        // then repoints `current` to the target release; then records the target's live
+        // slot. Each marker file is written via temp file plus `mv`, an atomic rename.
         DeployOp::Run(commit_markers_command(
             cfg,
             &target.release_dir,
@@ -4035,16 +4027,14 @@ mod tests {
 
     #[test]
     fn cutover_ops_skip_omits_only_the_migrate_op() {
-        // #1621 (AC-4): a fleet's schema is fleet-wide, so it migrates EXACTLY
-        // ONCE — hosts 2..N build their cutover with `MigrateStep::Skip`. Skipping
-        // must remove the `migrate` op and NOTHING else: the boundary label
-        // (`proxy-flip`) keeps its identity and every other step keeps its relative
-        // position, or `execute_with_teardown`'s boundary lookup (and with it the
-        // per-host auto-rollback the fleet driver depends on) would silently change
-        // meaning on every host after the first.
-        //
-        // The assertion is differential — `Skip`'s vector is derived from `Run`'s —
-        // so it can never drift from the exact vector pinned by
+        // #1621 (AC-4): a fleet's schema is fleet-wide, so it migrates exactly once, and
+        // hosts 2..N build their cutover with `MigrateStep::Skip`. Skipping must remove
+        // the `migrate` op and nothing else: the boundary label (`proxy-flip`) keeps its
+        // identity and every other step keeps its relative position, or
+        // `execute_with_teardown`'s boundary lookup — and with it the per-host
+        // auto-rollback the fleet driver depends on — would silently change meaning on
+        // every host after the first. The assertion is differential, deriving `Skip`'s
+        // vector from `Run`'s, so it can never drift from the exact vector pinned by
         // `redeploy_produces_exact_zero_downtime_sequence`.
         let labels = |ops: &[DeployOp]| ops.iter().map(DeployOp::label).collect::<Vec<_>>();
         let run = labels(&sample_cutover_ops_with(
@@ -5147,17 +5137,15 @@ mod tests {
 
     #[test]
     fn first_deploy_teardown_records_the_torn_down_result() {
-        // #1621 (AC-6, audit gap G3). A first-deploy teardown returns the host to
-        // NOTHING INSTALLED — that is what `CompensatedTeardown` means. Leaving
-        // `shared/last-deploy` untouched made `deploy status` report
-        // `last deploy: deployed <ts>` for a host carrying no release at all: a
-        // wrong value in the column an operator reads FIRST when inspecting a
-        // halted rollout.
-        //
-        // The teardown RECORDS `torn down` rather than deleting the marker. An
-        // absent marker renders `last deploy: ?`, which is also what a host that
-        // was never deployed shows, so clearing it would erase exactly the fact
-        // triage needs: this host WAS taken back down, on purpose, at this time.
+        // #1621 (AC-6, audit gap G3). A first-deploy teardown returns the host to nothing
+        // installed — that is what `CompensatedTeardown` means. Leaving
+        // `shared/last-deploy` untouched made `deploy status` report `last deploy:
+        // deployed <ts>` for a host carrying no release at all: a wrong value in the
+        // column an operator reads first when inspecting a halted rollout. The teardown
+        // records `torn down` rather than deleting the marker, because an absent marker
+        // renders `last deploy: ?`, the same as a host that was never deployed, so
+        // clearing it would erase exactly the fact triage needs — this host was taken back
+        // down, on purpose, at this time.
         let cfg = resolved();
         let plan = SlotPlan::first(3000);
         let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
@@ -6199,19 +6187,17 @@ mod tests {
 
     #[test]
     fn probe_host_status_consults_the_live_slot_unit_for_the_maintenance_flag_path() {
-        // #1621 review round 1 (Codex 2). The status probe used to read ONLY the
-        // shared flag path. A host still running a slot unit rendered BEFORE #1621
-        // has no `Environment=AUTUMN_MAINTENANCE_FLAG_FILE=` line, so the app it is
-        // running polls the cwd-relative (release-local) `tmp/autumn-maintenance
-        // .json` instead — and `deploy status` reported the SHARED path's state for
-        // it anyway. So it could print `maintenance off` for a host that is
-        // actually maintained, and `maintenance ON` for one whose legacy write
-        // failed and which is therefore still taking traffic.
-        //
-        // The probe must instead ask the LIVE SLOT UNIT which file the running app
-        // polls, resolving it exactly as `maintenance::flag_file_path_from` does
-        // (the override when set, else `WorkingDirectory` + the legacy relative
-        // path), and report THAT file's presence.
+        // #1621 review round 1 (Codex 2). The status probe used to read only the shared
+        // flag path. A host still running a slot unit rendered before #1621 has no
+        // `Environment=AUTUMN_MAINTENANCE_FLAG_FILE=` line, so the app it runs polls the
+        // cwd-relative, release-local `tmp/autumn-maintenance.json` instead — and `deploy
+        // status` reported the shared path's state for it anyway. It could print
+        // `maintenance off` for a host that is actually maintained, and `maintenance ON`
+        // for one whose legacy write failed and which is therefore still taking traffic.
+        // The probe must instead ask the live slot unit which file the running app polls,
+        // resolving it exactly as `maintenance::flag_file_path_from` does — the override
+        // when set, else `WorkingDirectory` plus the legacy relative path — and report
+        // that file's presence.
         let cfg = resolved();
         let exec = RecordingExecutor::new()
             .with_stdout("detect-current", status_probe_stdout(RELEASE_ID, 3001))
