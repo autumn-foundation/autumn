@@ -1322,6 +1322,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **ci:** the test suite is now **sharded across runners** instead of running as
+  one job per OS. On the 2026-08-26 trunk run the `Test (windows-latest)` job
+  alone was 128 minutes and *was* the critical path of a 2h27m CI run. Measured
+  from that run's logs, two things dominated. First, `compile_fail::` — the
+  trybuild module — accounted for 37.1 of the 46.8 minutes the consolidated
+  `integration_tests` binary spent running on Windows (10.3/14.4 on Linux,
+  12.0/17.4 on macOS), and it was the *tail*: the binary finished 0.2s after
+  trybuild did, on every OS. Each case shells out a nested `cargo` build and
+  trybuild serialises them behind its project-dir lock, so it cannot be sped up
+  with more threads — only with more runners. Second, the eight non-default
+  feature lanes (markdown, inbound-mail, i18n, plugin-sandbox, system-tests,
+  redis-tls, tls, acme) ran in sequence in that same job, ~44 minutes of pure
+  recompilation on Windows, despite being independent builds that share
+  nothing. The `test` job is now four job families that run side by side:
+  `test` (the workspace suite, with `compile_fail::` skipped), `trybuild` (four
+  shards), `test-features` (one job per feature set) and `test-docker` (the
+  Linux testcontainer sweep). `compile_pass_tests` was split into
+  `compile_pass_tests_a` / `_b` — a disjoint split of the same fixture list, no
+  fixture added or removed — so the expensive half can occupy two runners.
+  Every shard still runs `cargo test --workspace`, deliberately: the trybuild
+  fixture list is `#[cfg(feature = ...)]`-gated, so narrowing a shard to `-p
+  autumn-web --test integration_tests` would silently compile fewer fixtures
+  and still report green. Each shard asserts a non-zero pass count, because
+  `cargo test` exits 0 when a filter matches nothing. **Branch protection must
+  be repointed** from the per-OS `Test (…)` checks to the new `Test suite`
+  (`test-gate`) check, which aggregates every shard and is the one name that
+  stays stable as shards are added or removed.
 - **plugin-conformance:** **Breaking:** `plugin_conformance::ConformanceConfig`
   gains a `contract` field and is now `#[non_exhaustive]`, so it can no longer
   be built with a struct literal — use `ConformanceConfig::new(name)` and the

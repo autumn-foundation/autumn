@@ -27,6 +27,38 @@ separate, deliberate step the user asks for by name.
 
 ---
 
+## CI test sharding
+
+`.github/workflows/ci.yml` runs the suite as four sibling job families rather
+than one job per OS. Which one a test lands in follows from how it is written,
+so it is usually automatic:
+
+| Job | What it runs |
+| --- | --- |
+| `test` | `cargo test --workspace -- --skip compile_fail::` — the default lane |
+| `trybuild` | `compile_fail::*` only, split into four shards |
+| `test-features` | one job per non-default feature set (markdown, i18n, tls, …) |
+| `test-docker` | the Linux `#[ignore]`d Docker/testcontainer sweep |
+
+Two rules matter when editing tests:
+
+- **`compile_fail.rs` is partitioned by test-function name.** A new `#[test]`
+  in that module runs in the `rest` shard automatically. A **renamed** one does
+  not: `fail`, `pass_a` and `pass_b` name their functions explicitly and assert
+  a non-zero pass count, so a rename fails that shard loudly rather than
+  silently skipping it. Rename the shard filter in `ci.yml` alongside.
+- **Branch protection should require `Test suite`** (the `test-gate` job), not
+  the individual shards — it is the one check name that survives adding or
+  removing a shard.
+
+The split is not cosmetic: on the 2026-08-26 trunk run, `compile_fail::` alone
+was 37 of the 47 minutes the consolidated `integration_tests` binary spent
+running on Windows, and it was the tail everything else waited on. Its cases
+each shell out a nested `cargo` build and trybuild serialises them behind a
+project-dir lock, so the only thing that makes it faster is more runners.
+
+---
+
 ## Integration Test Layout Guidelines
 
 To minimize Cargo compilation and linking overhead (avoiding 100+ separate binaries), the workspace uses a consolidated test binary structure for both the `autumn` and `autumn-cli` packages.
@@ -53,7 +85,7 @@ The default approach for new tests is to add them to the consolidated binary so 
 
 ##### Docker / testcontainer DB tests run automatically in CI
 
-The CI "Run Docker-dependent tests" step (Linux) sweeps every `#[ignore]`d
+The CI `test-docker` job (Linux) sweeps every `#[ignore]`d
 test that compiles into the `autumn` consolidated `integration_tests` binary with
 `--features "test-support,offline-sync"` (a bare `--ignored` run), so a new
 house-pattern testcontainer DB test — `#[ignore = "requires Docker (testcontainers)"]` in a `db`-gated (or ungated) module — executes in CI with

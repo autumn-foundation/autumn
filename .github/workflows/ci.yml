@@ -313,6 +313,45 @@ jobs:
       - name: cargo-deny check (licenses, sources; sqlite backend graph)
         run: cargo deny --config deny-sqlite.toml check licenses sources
 
+  # ---------------------------------------------------------------------------
+  # THE TEST SUITE IS SHARDED ACROSS RUNNERS.
+  #
+  # It used to be one `Test (<os>)` job per OS that ran, in sequence: the whole
+  # workspace suite, then eight feature-flipped re-builds, then the Docker sweep.
+  # On the 2026-08-26 trunk run that job was 128 minutes on Windows and 92 on
+  # macOS, and it WAS the critical path of CI (2h27m end to end). Measured from
+  # that run's logs, the time went:
+  #
+  #                             ubuntu    macos   windows
+  #   compile (cargo test -W)    11.6m    29.1m     27.0m
+  #   run: integration_tests     14.4m    17.4m     46.8m
+  #     ...of which trybuild     10.3m    12.0m     37.1m   <-- ONE #[test]
+  #   run: 142 other binaries     1.9m     5.0m      4.7m
+  #   gated feature re-builds    25.0m    38.3m     44.0m
+  #
+  # Two facts drive the split below:
+  #
+  #   1. `compile_fail::*` (trybuild) was 71-79% of the consolidated
+  #      `integration_tests` binary's run time, and it is the TAIL -- the binary
+  #      finished 0.2s after trybuild did, on every OS. Each case shells out a
+  #      nested `cargo` build, trybuild serialises them behind its project-dir
+  #      lock, and libtest cannot split a single `#[test]`. So it does not get
+  #      faster by adding threads; it gets faster by moving to its own runners.
+  #   2. The eight gated feature lanes are INDEPENDENT re-builds of autumn-web
+  #      under disjoint feature sets. Run in sequence they are ~44 minutes of
+  #      pure recompilation on Windows; run side by side they are ~11.
+  #
+  # What is NOT sharded, deliberately: everything still runs `cargo test
+  # --workspace`, so every shard sees the same globally-unified feature set that
+  # decides which `#[cfg]`-gated trybuild fixtures exist. Narrowing a shard to
+  # `-p autumn-web --test integration_tests` would silently drop fixtures.
+  # The duplicated compile that costs is the price of that guarantee.
+  #
+  # Adding a shard: add it to the matrix AND to `test-gate`'s `needs`. Branch
+  # protection should require ONLY `Test suite` (the `test-gate` job) -- it is
+  # the one check name that stays stable as shards are added and removed.
+  # ---------------------------------------------------------------------------
+
   test:
     name: Test (${{ matrix.os }})
     needs: [lint, meta]
@@ -326,8 +365,8 @@ jobs:
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
-          # The full workspace build (especially the wide-feature +
-          # Postgres-container step below) sits near the runner's disk
+          # The full workspace build (and, in `test-docker`, the wide-feature
+          # Postgres-container sweep on top of it) sits near the runner's disk
           # ceiling; a cold-cache PR build tips it over ("No space left on
           # device"). Reclaim the preinstalled toolchains a Rust build never
           # uses before the cache is restored.
@@ -345,10 +384,130 @@ jobs:
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
       - name: Run tests
-        run: cargo test --workspace
+        # `--skip compile_fail::` hands the trybuild module to the `trybuild`
+        # job below. It is a substring skip and `compile_fail::` is the module
+        # path of every test in it, so the two are exhaustive by construction:
+        # what this job skips is exactly what that job's four shards run.
+        run: |
+          cargo test --workspace -- --skip compile_fail::
+
+  trybuild:
+    name: Trybuild ${{ matrix.shard }} (${{ matrix.os }})
+    needs: [lint, meta]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # The four shards partition `compile_fail::` exactly. `pass_a`/`pass_b`
+        # are two halves of one fixture list (see the comment on
+        # `compile_pass_tests_a`); `rest` is everything else in the module --
+        # the feature-gated registries and the two guide-consistency tests,
+        # which together measured under a second.
+        shard: [fail, pass_a, pass_b, rest]
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && fromJSON(needs.meta.outputs.heavy_runs_on) || matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # The full workspace build (and, in `test-docker`, the wide-feature
+          # Postgres-container sweep on top of it) sits near the runner's disk
+          # ceiling; a cold-cache PR build tips it over ("No space left on
+          # device"). Reclaim the preinstalled toolchains a Rust build never
+          # uses before the cache is restored.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+        # Deliberately NO per-shard cache key: every shard of this job runs the
+        # identical `cargo test --workspace` build and differs only in which
+        # tests it then runs, so they should share one warm target dir. (The
+        # default key already varies by job name and by runner OS/arch.)
+      - name: Run the trybuild shard
+        # `cargo test --workspace` (not `-p autumn-web --test integration_tests`)
+        # on purpose: the fixtures registered by `compile_fail.rs` are
+        # `#[cfg(feature = ...)]`-gated, so the set that exists depends on the
+        # GLOBALLY unified feature resolution of a workspace build. Narrowing
+        # the package selection here would quietly compile fewer of them out and
+        # still report green. Every other test in the workspace is filtered out
+        # by the shard's own filter, so the extra targets only cost their link.
+        #
+        # `assert_ran` for the reason the TLS/ACME lanes give: `cargo test` exits
+        # 0 when a filter matches NOTHING, so a rename in `compile_fail.rs` would
+        # otherwise leave a shard green having compiled nothing at all.
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.shard }}" in
+            fail)   filter=(compile_fail::compile_fail_tests) ;;
+            pass_a) filter=(compile_fail::compile_pass_tests_a) ;;
+            pass_b) filter=(compile_fail::compile_pass_tests_b) ;;
+            rest)   filter=(compile_fail::
+                      --skip compile_fail::compile_fail_tests
+                      --skip compile_fail::compile_pass_tests_a
+                      --skip compile_fail::compile_pass_tests_b) ;;
+          esac
+          cargo test --workspace -- "${filter[@]}" | tee "${RUNNER_TEMP}/trybuild.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/trybuild.log" \
+            || { echo "::error::trybuild shard ${{ matrix.shard }} ran no tests — the filter no longer matches anything in compile_fail.rs"; exit 1; }
+
+  test-features:
+    name: Test ${{ matrix.lane }} (${{ matrix.os }})
+    needs: [lint, meta]
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each lane is a feature set that `cargo test --workspace` does not
+        # compile, so each is its own re-build of autumn-web. They share nothing
+        # but the source tree, which is why they belong on separate runners.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        lane: [markdown, inbound-mail, i18n, plugin-sandbox, system-tests]
+        include:
+          # Linux-only lanes, unchanged from the `if: runner.os == 'Linux'`
+          # guards they used to carry inline. Each step's own comment says why.
+          - { os: ubuntu-latest, lane: redis-tls }
+          - { os: ubuntu-latest, lane: tls }
+          - { os: ubuntu-latest, lane: acme }
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && fromJSON(needs.meta.outputs.heavy_runs_on) || matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # The full workspace build (and, in `test-docker`, the wide-feature
+          # Postgres-container sweep on top of it) sits near the runner's disk
+          # ceiling; a cold-cache PR build tips it over ("No space left on
+          # device"). Reclaim the preinstalled toolchains a Rust build never
+          # uses before the cache is restored.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+        with:
+          # One target dir per feature set; see the note on the trybuild job.
+          key: ${{ matrix.lane }}
       - name: Run markdown-gated tests (user-content sanitizer)
-        # `markdown` is not a default feature, so the `cargo test --workspace`
-        # above compiles neither the stored-XSS regression corpus
+        if: matrix.lane == 'markdown'
+        # `markdown` is not a default feature, so the `test` job's `cargo test
+        # --workspace` compiles neither the stored-XSS regression corpus
         # (`autumn/tests/integration/rich_text.rs`, gated on
         # `markdown` + `maud`) nor the `markdown::user_content` doctests. That
         # corpus IS the safety guarantee for user-submitted rich text
@@ -358,6 +517,7 @@ jobs:
           cargo test -p autumn-web --features markdown --lib markdown::
           cargo test -p autumn-web --features markdown --doc markdown::
       - name: Run inbound-mail-gated tests (untrusted MIME parsing)
+        if: matrix.lane == 'inbound-mail'
         # `inbound-mail` and its provider aliases are not default features, so
         # `cargo test --workspace` compiles neither `inbound_mail`'s in-module
         # suite nor `autumn/tests/integration/inbound_mail_integration.rs`
@@ -368,19 +528,21 @@ jobs:
           cargo test -p autumn-web --features "inbound-mail,inbound-mailgun,inbound-ses,mail" --lib inbound_mail
           cargo test -p autumn-web --features "inbound-mail,inbound-mailgun,inbound-ses,mail,test-support" --test integration_tests inbound_mail
       - name: Run i18n-gated tests (translatable model fields)
-        # `i18n` is not a default feature, so the `cargo test --workspace` above
-        # compiles neither `i18n::translatable`'s in-module suite nor the two
+        if: matrix.lane == 'i18n'
+        # `i18n` is not a default feature, so the `test` job's `cargo test
+        # --workspace` compiles neither `i18n::translatable`'s in-module suite nor the two
         # `#![cfg(feature = "i18n")]` integration modules. Those are the whole
         # behavioural proof for #1384 — per-locale persistence, the fallback
         # walk, the documented sentinel, and the ambient-locale request path —
         # so they have to run in a lane that blocks merge rather than only in
         # the (non-blocking, Codecov-driven) coverage job. The Docker-gated
         # round-trip tests in `translatable_model` are swept separately by the
-        # "Run Docker-dependent tests" step below.
+        # `test-docker` job.
         run: |
           cargo test -p autumn-web --features i18n --lib i18n::
           cargo test -p autumn-web --features "i18n,test-support" --test integration_tests translatable
       - name: Run plugin-sandbox tests (untrusted-plugin containment)
+        if: matrix.lane == 'plugin-sandbox'
         # `plugin-sandbox` is not a default feature, so `cargo test --workspace`
         # compiles neither the sandbox's in-module suites nor
         # `autumn/tests/integration/plugin_sandbox.rs`. That integration module IS
@@ -397,9 +559,24 @@ jobs:
           cargo test -p autumn-web --features "plugin-sandbox,test-support" --test integration_tests plugin_sandbox
           cargo test -p autumn-web --features plugin-sandbox --doc plugin_sandbox
 
+      - name: Run system-test harness (non-browser) tests
+        if: matrix.lane == 'system-tests'
+        # `system-tests` is not a default feature. The `test` job's `cargo test
+        # --workspace` happens to compile it today only because `example-e2e` depends
+        # on `autumn-web` with that feature and workspace feature unification
+        # turns it on — accidental coverage that would vanish silently if that
+        # one dependency were ever dev-scoped or dropped. Name it explicitly so
+        # the harness's own tests (browser resolution, transient-CDP retry
+        # loop, `SystemTest::layer`) stay covered on purpose. The `#[ignore]`d
+        # browser tests need Chromium and run in publish-gate.yml's
+        # browser-provisioned job.
+        run: |
+          cargo test -p autumn-web --features system-tests --lib system_test::
+          cargo test -p autumn-web --features system-tests --test integration_tests system_test_api
       - name: Run redis-TLS-gated tests (rediss:// CryptoProvider guard)
-        # `redis` and `ws` are not `autumn-web` default features. The
-        # workspace `cargo test` above happens to compile this suite anyway,
+        if: matrix.lane == 'redis-tls'
+        # `redis` and `ws` are not `autumn-web` default features. The `test`
+        # job's workspace `cargo test` happens to compile this suite anyway,
         # because resolver-3 feature unification pulls `redis` in from
         # `autumn-cache-redis`/`autumn-cli` and `ws` from the `reddit-clone`
         # example — a coincidence of what other members want, not anything
@@ -417,7 +594,6 @@ jobs:
         # Linux only: the assertions are about process-global state and fork
         # isolation, neither of which is platform-specific, and `rusty_fork`
         # re-execs the test binary — cheapest on the fast runner.
-        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           assert_ran() {
@@ -431,8 +607,9 @@ jobs:
             | tee "${RUNNER_TEMP}/cache-redis.log"
           assert_ran "${RUNNER_TEMP}/cache-redis.log" "autumn-cache-redis unit tests"
       - name: Run direct-TLS (HTTPS) tests
-        # `tls` is not a default feature, so the workspace `cargo test` above
-        # compiles neither `tls`'s in-module suite nor the `[server.tls]`
+        if: matrix.lane == 'tls'
+        # `tls` is not a default feature, so the `test` job's workspace `cargo
+        # test` compiles neither `tls`'s in-module suite nor the `[server.tls]`
         # integration modules. Those are the behavioural proof for #1603 — the
         # listener itself (`tls_serving`) plus the app-surface parity the ACs
         # name: the framework probes, the inbound request timeout, SSE, `wss://`
@@ -452,7 +629,6 @@ jobs:
         # checked for a non-zero pass count: `cargo test` exits 0 when a filter
         # matches NOTHING, so a cfg drift that stopped compiling these modules
         # in would otherwise leave this step green with zero HTTPS coverage.
-        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           assert_ran() {
@@ -469,26 +645,26 @@ jobs:
             --test integration_tests tls_app_surface:: | tee "${RUNNER_TEMP}/tls-surface.log"
           assert_ran "${RUNNER_TEMP}/tls-surface.log" "tls_app_surface"
       - name: Run ACME-gated tests (certificate provisioning + renewal)
-        # `acme` is not a default feature either, so the workspace `cargo test`
-        # above compiles neither `acme`'s in-module suite nor `acme_end_to_end`.
+        if: matrix.lane == 'acme'
+        # `acme` is not a default feature either, so the `test` job's workspace
+        # `cargo test` compiles neither `acme`'s in-module suite nor `acme_end_to_end`.
         # That suite is the behavioural proof for #1608 — first-boot issuance and
         # the HTTP→HTTPS redirect, a forced near-expiry rotation with no restart,
         # a restart reusing the stored account and certificate, and a failed order
         # reaching health plus the error-reporting seam — driven through a real
         # `instant-acme` client against an in-process fake CA (`acme_fake_ca`).
-        # No Docker and no network, so it belongs in this fast lane rather than
-        # the Docker sweep below.
+        # No Docker and no network, so it belongs in this lane rather than the
+        # `test-docker` job.
         #
-        # The `tls` half of this path is covered by the direct-TLS step above;
+        # The `tls` half of this path is covered by the `tls` lane;
         # `acme` implies `tls`, so this step deliberately runs only the ACME
         # suites rather than rebuilding and re-running those.
         #
-        # Linux only, and `assert_ran` for the same two reasons the step above
+        # Linux only, and `assert_ran` for the same two reasons the `tls` lane
         # gives: the renewal tests wait on real elapsed time, and `cargo test`
         # exits 0 when a filter matches NOTHING — so a cfg drift that stopped
         # compiling these modules in would otherwise leave this step green with
         # zero ACME coverage.
-        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           assert_ran() {
@@ -501,21 +677,35 @@ jobs:
           cargo test -p autumn-web --features acme \
             --test integration_tests acme_end_to_end:: | tee "${RUNNER_TEMP}/acme-e2e.log"
           assert_ran "${RUNNER_TEMP}/acme-e2e.log" "acme_end_to_end"
-      - name: Run system-test harness (non-browser) tests
-        # `system-tests` is not a default feature. The `cargo test --workspace`
-        # above happens to compile it today only because `example-e2e` depends
-        # on `autumn-web` with that feature and workspace feature unification
-        # turns it on — accidental coverage that would vanish silently if that
-        # one dependency were ever dev-scoped or dropped. Name it explicitly so
-        # the harness's own tests (browser resolution, transient-CDP retry
-        # loop, `SystemTest::layer`) stay covered on purpose. The `#[ignore]`d
-        # browser tests need Chromium and run in publish-gate.yml's
-        # browser-provisioned job.
-        run: |
-          cargo test -p autumn-web --features system-tests --lib system_test::
-          cargo test -p autumn-web --features system-tests --test integration_tests system_test_api
-      - name: Install Postgres client tools (Linux)
+
+  test-docker:
+    name: Docker-dependent tests
+    needs: [lint, meta]
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space (Linux)
         if: runner.os == 'Linux'
+        run: |
+          # The full workspace build (and, in `test-docker`, the wide-feature
+          # Postgres-container sweep on top of it) sits near the runner's disk
+          # ceiling; a cold-cache PR build tips it over ("No space left on
+          # device"). Reclaim the preinstalled toolchains a Rust build never
+          # uses before the cache is restored.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+      - name: Install Postgres client tools (Linux)
         run: |
           # The offsite-backup round-trip below drives `autumn db backup`, which
           # shells out to the HOST `pg_dump`/`pg_restore`. ubuntu-latest does not
@@ -532,7 +722,6 @@ jobs:
           pg_restore --version
           ssh -V
       - name: Run Docker-dependent tests
-        if: runner.os == 'Linux'
         timeout-minutes: 45
         run: |
           cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
@@ -642,9 +831,27 @@ jobs:
           # installed above.
           cargo test -p autumn-cli --test deploy_e2e -- --ignored
 
+
+  test-gate:
+    name: Test suite
+    # The stable, shard-count-independent name for branch protection and for
+    # downstream `needs:`. It fails if ANY shard failed or was cancelled; a
+    # `needs:` alone would let a skipped shard pass silently.
+    needs: [test, trybuild, test-features, test-docker]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check shard results
+        run: |
+          results='${{ join(needs.*.result, " ") }}'
+          echo "shard results: $results"
+          for r in $results; do
+            [ "$r" = "success" ] || { echo "::error::a test shard did not succeed ($results)"; exit 1; }
+          done
+
   coverage:
     name: Coverage
-    needs: [test, meta]
+    needs: [test-gate, meta]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
       - uses: actions/checkout@v7
@@ -902,7 +1109,7 @@ jobs:
   # the preemption budget + job timeout bound the state-space search.
   loom:
     name: Loom
-    needs: [test, meta]
+    needs: [test-gate, meta]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     timeout-minutes: 30
     steps:
