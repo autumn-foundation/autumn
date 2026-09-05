@@ -868,9 +868,15 @@ fn add_auto_api_nodes(
             repositories
                 .iter()
                 .filter(|repo| repo.api == api)
-                // Two repositories cannot declare the same prefix (the router
-                // would refuse the mount), but ties break on node id anyway so
-                // the answer never depends on link order.
+                // Ties break on node id, so the answer never depends on link
+                // order. They are not impossible, though: two repositories CAN
+                // declare the same raw `api = "..."` prefix as long as their
+                // generated routes are mounted under different `.scoped(...)`
+                // prefixes, because then the effective paths do not collide and
+                // the router has nothing to refuse. In that case this picks the
+                // lexicographically first and can attribute a CRUD route to the
+                // wrong model. Carrying a repository-specific identity rather
+                // than the prefix alone is the fix — see #2520.
                 .min_by_key(|repo| repository_id(repo.module_path, repo.repository))
         });
         let Some(repo) = owner else {

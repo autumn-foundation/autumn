@@ -124,7 +124,113 @@ fn literal_text(literal: &str) -> String {
         .and_then(|rest| rest.strip_suffix(&closing))
         .unwrap_or(trimmed);
     // Escapes are neutralised rather than decoded, so `\n` cannot contribute `n`.
-    inner.replace('\\', " ")
+    //
+    // `\n` and `\r` are the exception: they become the newline they stand for
+    // rather than a space, because `strip_sql_comments` needs line structure to
+    // know where a `--` comment ends. Without this, SQL written as
+    // `"-- why\nDELETE FROM posts"` has no line break at all by the time the
+    // comment stripper sees it, and the stripper would swallow the statement.
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('n' | 'r') => out.push('\n'),
+                // Any other escape is neutralised, and its letter dropped with
+                // it, so `\t` cannot contribute the candidate symbol `t`.
+                Some(_) | None => out.push(' '),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// A SQL statement with its comments removed.
+///
+/// Needed because the statement's *verb* decides its shape, and a statement is
+/// perfectly ordinarily written with a comment above it:
+///
+/// ```sql
+/// -- prune rows nobody can reach any more
+/// DELETE FROM posts WHERE ...
+/// ```
+///
+/// Left in, the first word is `PRUNE`, no [`SQL_SHAPES`] entry matches, and the
+/// literal contributes neither table symbols nor mutation evidence — the `posts`
+/// edge is simply lost. A dropped edge is the false negative this whole module
+/// is built to avoid, so the comment has to go before the verb is read.
+///
+/// Quote-aware, and that is the point rather than a detail: `SELECT '--' FROM
+/// posts` contains a `--` that starts no comment. Treating it as one would eat
+/// the rest of the statement and lose the very edge this function exists to
+/// keep. Single-quoted strings (with `''` escapes) and double-quoted
+/// identifiers are therefore tracked, and block comments nest, as they do in
+/// Postgres.
+fn strip_sql_comments(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut block_depth = 0_u32;
+    while i < chars.len() {
+        let ch = chars[i];
+        let next = chars.get(i + 1).copied();
+        if block_depth > 0 {
+            match (ch, next) {
+                ('/', Some('*')) => {
+                    block_depth += 1;
+                    i += 2;
+                }
+                ('*', Some('/')) => {
+                    block_depth -= 1;
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        match (ch, next) {
+            ('-', Some('-')) => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                // Keep the newline: it separates the words either side.
+                out.push('\n');
+            }
+            ('/', Some('*')) => {
+                block_depth = 1;
+                i += 2;
+                // A block comment separates whatever surrounds it.
+                out.push(' ');
+            }
+            ('\'' | '"', _) => {
+                // Copy the quoted run verbatim; nothing inside it is a comment.
+                let quote = ch;
+                out.push(quote);
+                i += 1;
+                while i < chars.len() {
+                    out.push(chars[i]);
+                    if chars[i] == quote {
+                        // `''` / `""` is an escaped quote, not the end.
+                        if chars.get(i + 1) == Some(&quote) {
+                            out.push(quote);
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push(ch);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Identifier-shaped words inside a string literal.
@@ -152,7 +258,7 @@ fn sql_words(literal: &str) -> Vec<String> {
 /// Word-boundary aware in both directions, so `"selection"` is not a `SELECT`
 /// and `"Delete this post?"` is not a `DELETE` — it carries no `FROM`.
 fn sql_shape(literal: &str) -> Option<bool> {
-    let text = literal_text(literal).to_ascii_uppercase();
+    let text = strip_sql_comments(&literal_text(literal)).to_ascii_uppercase();
     let mut words = text
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .filter(|w| !w.is_empty());
@@ -193,7 +299,7 @@ fn sql_symbols_of(tokens: &[TokenTree]) -> Vec<String> {
         if let TokenTree::Literal(literal) = tree {
             let source = literal.to_string();
             if looks_like_sql(&source) {
-                symbols.extend(sql_words(&literal_text(&source)));
+                symbols.extend(sql_words(&strip_sql_comments(&literal_text(&source))));
             }
         }
     }
@@ -230,7 +336,7 @@ fn symbols_of(tokens: &[TokenTree]) -> Vec<String> {
             TokenTree::Literal(literal) => {
                 let source = literal.to_string();
                 if looks_like_sql(&source) {
-                    symbols.extend(sql_words(&literal_text(&source)));
+                    symbols.extend(sql_words(&strip_sql_comments(&literal_text(&source))));
                 }
             }
             TokenTree::Punct(_) | TokenTree::Group(_) => {}
@@ -553,6 +659,57 @@ mod tests {
     fn a_statement_verb_without_its_companion_is_not_sql() {
         assert!(!looks_like_sql("\"Delete this post?\""));
         assert!(looks_like_sql("\"DELETE FROM posts WHERE id = $1\""));
+    }
+
+    /// The SQL-derived candidate symbols of a single literal, written as it
+    /// would appear in source (sigils and all).
+    fn sql_symbols(source: &str) -> Vec<String> {
+        let stream: TokenStream = source.parse().expect("a parseable literal");
+        sql_candidate_symbols(&stream)
+    }
+
+    /// A comment above the statement is ordinary SQL style. Reading the verb off
+    /// the comment's first word loses the shape, and with it every table symbol
+    /// and the mutation evidence — a dropped edge, which is the one failure this
+    /// module exists to prevent.
+    #[test]
+    fn a_leading_comment_does_not_hide_the_statement() {
+        let escaped = "\"-- prune rows nobody can reach\\nDELETE FROM posts WHERE id = $1\"";
+        assert_eq!(sql_shape(escaped), Some(true), "escaped newline");
+        assert!(
+            sql_symbols(escaped).contains(&"posts".to_owned()),
+            "the table behind a comment must still be a candidate"
+        );
+
+        let raw = "r#\"-- prune rows nobody can reach\nDELETE FROM posts WHERE id = $1\"#";
+        assert_eq!(sql_shape(raw), Some(true), "real newline");
+        assert!(sql_symbols(raw).contains(&"posts".to_owned()));
+
+        let block = "\"/* housekeeping */ SELECT id FROM posts\"";
+        assert_eq!(sql_shape(block), Some(false), "block comment");
+        assert!(sql_symbols(block).contains(&"posts".to_owned()));
+    }
+
+    /// The hazard the fix introduces if it is written naively: a `--` inside a
+    /// quoted string starts no comment, and treating it as one would swallow the
+    /// rest of the statement — losing exactly the edge the fix is meant to keep.
+    #[test]
+    fn a_quoted_double_dash_is_not_a_comment() {
+        let literal = "\"SELECT id FROM posts WHERE slug = '--'\"";
+        assert_eq!(sql_shape(literal), Some(false));
+        assert!(
+            sql_symbols(literal).contains(&"posts".to_owned()),
+            "a quoted -- must not eat the FROM clause"
+        );
+    }
+
+    /// Comments are not evidence. A `WITH` statement's mutation check scans the
+    /// whole statement, so prose in a comment could otherwise report a read-only
+    /// query as a write.
+    #[test]
+    fn a_mutation_verb_in_a_comment_is_not_mutation_evidence() {
+        let literal = "\"WITH recent AS (SELECT id FROM posts) SELECT * FROM recent -- never DELETE\"";
+        assert_eq!(sql_shape(literal), Some(false));
     }
 
     #[test]
