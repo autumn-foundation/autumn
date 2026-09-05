@@ -21,7 +21,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ItemFn, Lit, LitInt, LitStr, parse_quote};
+use syn::{Expr, Lit, LitInt, LitStr, parse_quote};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -245,15 +245,19 @@ fn build_spec_tokens(attrs: &ThrottleAttrs) -> TokenStream {
 
 /// Expand the `#[throttle(...)]` attribute.
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_throttle_args(attr) {
         Ok(a) => a,
         Err(err) => return err.to_compile_error(),
     };
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
 
     if input_fn.sig.asyncness.is_none() {
@@ -268,17 +272,12 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let spec_tokens = build_spec_tokens(&attrs);
     let gate_ident = format_ident!("__AutumnThrottleGate_{}", fn_name);
-    // Emitted a second time into the handler body below (issue #2516): the
-    // gate redesign (#2488) moved the rate-limit check into the gate's own
-    // `from_request_parts`, but `api_doc::infer_response_body`'s recovery of
-    // the pre-rewrite return type (#1677/#2484) still requires one of
-    // `RESPONSE_REWRITING_GUARD_MARKERS` to be present in the *handler's own*
-    // block, structurally distinguishing a real guard-generated
-    // `__autumn_inner` binding from a handler that coincidentally ends the
-    // same way. Nothing in the body reads this copy, hence `allow(dead_code)`
-    // — see `secured_macro`'s identically-shaped `role_scope_consts` for the
-    // established pattern.
-    let markers = quote! {
+
+    // The marker const also stays in the handler body (not just inside the
+    // gate below) so `api_doc::recover_guarded_return_type` can still
+    // recover the pre-rewrite return type for OpenAPI when #[throttle]
+    // expands before the route macro (#1677).
+    let route_id_marker = quote! {
         #[allow(dead_code)]
         const __AUTUMN_THROTTLE_ROUTE_ID: &str =
             ::core::concat!(::core::module_path!(), "::", #fn_name_str);
@@ -454,12 +453,13 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     input_fn.block = syn::parse_quote! {
         {
-            #markers
+            #route_id_marker
             #original_response
         }
     };
 
     quote! {
+        #leading_items
         #gate_item
         #input_fn
     }
