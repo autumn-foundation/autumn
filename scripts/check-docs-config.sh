@@ -3366,6 +3366,9 @@ MACRO_SHADOW = re.compile(r'\bmacro_rules!\s*(option_env|env)\b')
 # reported a page documenting a key the runtime really does read. The shadow is
 # a rule about a NAME, and a path is not that name.
 MACRO_CALL = re.compile(r'(?P<path>(?:core|std)::)?(?P<name>(?:option_)?env)!')
+# …and what an ALIAS-form accessor match looks like, so the scan can ask which
+# scope imported it. `env::var(…)` is the std path and never an alias.
+ALIAS_CALL = re.compile(r'([A-Za-z_]\w*)\s*::\s*(?:var|var_os|set_var)\s*\(')
 
 # `impl Env for OsEnv` — the types that ARE an environment.
 #
@@ -3922,7 +3925,7 @@ class _Accessor:
     _receiver = re.compile(r'([A-Za-z_]\w*)\s*\.')
 
     def __init__(self, pattern, by_scope, shadowed=frozenset(),
-                 imported=frozenset(), rebound=None):
+                 imported=frozenset(), rebound=None, alias_scopes=None):
         self.pattern = pattern
         self.by_scope = by_scope
         # The macro names this file takes over. WHERE it takes them over is the
@@ -3934,12 +3937,23 @@ class _Accessor:
         self.shadowed = shadowed
         self.imported = imported
         self.rebound = rebound
+        self.alias_scopes = alias_scopes or {}
 
     def finditer(self, body):
         return self.pattern.finditer(body)
 
     def search(self, text):
         return self.pattern.search(text)
+
+    def alias_here(self, name, scope):
+        """Whether `name` is an alias of `std::env` imported in scope of `scope`.
+
+        A `use` inside a function renames the module for that function, not for
+        the file — so an unrelated `process_env` module elsewhere is not the
+        std one. Read back by prefix, like every other scoped derivation here.
+        """
+        return any(name in self.alias_scopes.get(scope[:n], ())
+                   for n in range(len(scope) + 1))
 
     def rebinds(self, name, scope):
         """Whether some scope enclosing `scope` rebinds `name` to a non-environment.
@@ -4044,7 +4058,7 @@ def accessor(root, test_files=frozenset()):
     helpers, declared, imports, modules = {}, {}, {}, {}
     env_type, impls, trait_at, scopes = {}, {}, set(), {}
     shadowed, returns, aliases, local_types = {}, {}, {}, {}
-    imported_shadow, rebound = {}, {}
+    imported_shadow, rebound, import_lex = {}, {}, {}
     blessed_at = {}
     macro_at, macro_imports, factory_at = {}, {}, {}
     crates = _crates(root)
@@ -4144,6 +4158,12 @@ def accessor(root, test_files=frozenset()):
             at = _scope_at(spans, offset)
             seen.add(at)
             imports.setdefault((rel, at), []).append((local, path))
+            # …and its BINDING scope beside its module, because a `use` written
+            # inside a function is that function's. Filing an alias of
+            # `std::env` by module made it file-wide, so an ordinary module of
+            # the same name elsewhere in the file read as the std one.
+            import_lex.setdefault((rel, _scope_at(lex, offset)),
+                                  []).append((local, path))
         for m in ENV_BOUND.finditer(masked):
             if data[m.start()]:
                 continue
@@ -4481,10 +4501,24 @@ def accessor(root, test_files=frozenset()):
         # resolves types and helpers; the module was the one import it did not
         # follow. Only an alias of the std module counts, so an unrelated
         # `use foo::bar as process_env` adds nothing.
+        def std_env_alias(local, path):
+            return (local != 'env'
+                    and re.fullmatch(r'(?:std|core)\s*::\s*env', path.strip()))
+
         aliases = frozenset(
             local for local, path, _ in imports_of(rel)
-            if local != 'env'
-            and re.fullmatch(r'(?:std|core)\s*::\s*env', path.strip()))
+            if std_env_alias(local, path))
+        # …and WHERE each was imported, so a `use` inside one function does not
+        # rename `env::` for the rest of the file. The pattern stays file-wide
+        # to FIND candidates; which scope may accept one is decided at the call
+        # site, exactly as it is for a receiver.
+        alias_scopes = {}
+        for (r, at), items in import_lex.items():
+            if r != rel:
+                continue
+            for local, path in items:
+                if std_env_alias(local, path):
+                    alias_scopes.setdefault(at, set()).add(local)
         # …and the FUNCTION may be imported directly, aliased or not: `use
         # std::env::var as getenv;` makes `getenv("AUTUMN_X")` a real read that
         # a pattern spelling `env::var` cannot see. The module alias rung was
@@ -4496,6 +4530,7 @@ def accessor(root, test_files=frozenset()):
             if re.fullmatch(r'(?:std|core)\s*::\s*env\s*::\s*'
                             r'(?:var|var_os|set_var)', path.strip()))
         key = (here, recv, aliases, direct)
+        alias_scopes = {k: frozenset(v) for k, v in alias_scopes.items()}
         if key not in cache:
             pattern = ACCESSOR.pattern
             if aliases:
@@ -4523,7 +4558,8 @@ def accessor(root, test_files=frozenset()):
                          frozenset(shadowed.get(rel, ())),
                          frozenset(imported_shadow.get(rel, ())),
                          {at: frozenset(names)
-                          for (r, at), names in rebound.items() if r == rel})
+                          for (r, at), names in rebound.items() if r == rel},
+                         alias_scopes)
 
     return compiled, index
 
@@ -5270,6 +5306,13 @@ def source_tokens(root):
             if through is not None and not acc_for(rel).allows(
                     through, here,
                     body[:m.start()].rstrip().endswith('.')):
+                continue
+            # An alias of `std::env` renames the module only where it was
+            # imported: a `use` inside one function does not make an unrelated
+            # `process_env` elsewhere in the file the std module.
+            alias = ALIAS_CALL.match(m.group(0))
+            if (alias and spans and alias.group(1) != 'env'
+                    and not acc_for(rel).alias_here(alias.group(1), here)):
                 continue
             # …and a name its scope REBINDS is the environment only until the
             # rebinding. The derivation names it; where the `let` sits is found
@@ -7021,6 +7064,21 @@ def self_test():
           ('let source = Other;', 'let mut env = x;', 'let denv: Box<dyn Env> =',
            'if let Some(x) = y {', 'while let Ok(v) = r {')],
          [['source'], ['env'], ['denv'], [], []])
+    # An ALIAS of `std::env` renames the module where it is imported, and a
+    # `use` inside a function is that function's. Unioned across the file, an
+    # unrelated `process_env` module elsewhere read as the std one.
+    case('an alias call is recognised, and the std path is not one',
+         [(lambda m: m.group(1) if m else None)(ALIAS_CALL.match(t)) for t in
+          ('process_env::var("X")', 'env::var("X")', 'other::get("X")')],
+         ['process_env', 'env', None])
+    case('an alias reaches the scope that imported it',
+         (lambda a: [a.alias_here('process_env', ('fn one()',)),
+                     a.alias_here('process_env', ('fn one()', '|c|')),
+                     a.alias_here('process_env', ('fn two()',)),
+                     a.alias_here('process_env', ())])(
+             _Accessor(re.compile('x'), {}, frozenset(), frozenset(), None,
+                       {('fn one()',): frozenset({'process_env'})})),
+         [True, True, False, False])
     case('a macro call is recognised for the shadow test',
          [(lambda m: m.group('name') if m else None)(MACRO_CALL.match(t))
           for t in ('option_env!("X")', 'env!("X")', 'std::env!("X")',
