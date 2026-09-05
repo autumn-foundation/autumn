@@ -39,7 +39,7 @@ service, same workaround the prior Snag session used).
 - Driven via `curl` with cookie jars; confirmation links pulled from the
   `log` mail transport's captured output
 
-## 🐛 Bug: `account_locked` telemetry fires once per concurrent request that crosses the threshold, not once at the transition
+## 🐛 Bug: concurrent threshold-crossing requests each stamp their own `locked_at` and each log `account_locked`, instead of once at the transition
 
 ### Charter
 
@@ -94,20 +94,37 @@ minimal-shape reruns confirm it isn't a fluke.
 The account's `failed_attempts` counter itself is **not** corrupted by the
 race — Postgres's `SET failed_attempts = failed_attempts + 1 RETURNING
 failed_attempts` is a real atomic per-row increment, so 10 concurrent
-failures still land on exactly 10. Only the *log event* (and the harmless,
-idempotent re-write of `locked_at` to the same timestamp) duplicates.
+failures still land on exactly 10. The *log event* duplicates, and — see
+correction below — so, non-idempotently, does the `locked_at` write.
+
+**Correction (caught by `chatgpt-codex-connector` review on this PR,
+verified against the code)**: this report originally described the
+duplicate `locked_at` writes as "harmless" and "idempotent... to the same
+timestamp." That's wrong. `now` (`chrono::Utc::now().naive_utc()`) is
+captured once per *request*, not once per race, and each racing request
+that satisfies the threshold guard writes **its own** `now` to `locked_at`
+unconditionally — the writes are to the same column, but not to the same
+value. Whichever racing `UPDATE` commits last wins, and that request's own
+call-time timestamp becomes the account's real cool-off anchor, regardless
+of which request actually crossed the threshold first. In this session's
+observed runs the racing requests' timestamps were tens to ~100ms apart, so
+the practical drift in unlock time is small — but it is a real drift in
+actual lockout *behavior* (the true, database-recorded lock/unlock time),
+not merely duplicate telemetry describing an otherwise-correct state. See
+Impact below.
 
 ### Root cause
 
-`autumn-cli/src/generate/auth.rs`, generated `login` handler (identically
-`reauth`, per the existing audit report — see Dedup below):
+`autumn-cli/src/generate/auth.rs`, generated `login` handler:
 
 ```rust
+let now = chrono::Utc::now().naive_utc();          // line 3953, per-request
 let mut current_attempts = user.failed_attempts;   // line 3958
 let mut current_locked_at = user.locked_at;        // line 3959
 // ... atomic increment of failed_attempts in the DB ...
 if new_attempts >= lockout_cfg.threshold && current_locked_at.is_none() {  // line 4006
-    // stamp locked_at, tracing::warn!(event = "account_locked", ...)
+    // unconditionally writes locked_at = Some(now) using THIS request's `now`,
+    // then tracing::warn!(event = "account_locked", ...)
 }
 ```
 
@@ -117,9 +134,17 @@ concurrent requests against a never-locked account all read `locked_at =
 NULL` before any of them writes anything, so **every** request whose own
 increment happens to land at-or-past the threshold satisfies
 `current_locked_at.is_none()` — there is nothing that re-checks `locked_at`
-against the database immediately before deciding to log the transition.
-Only the *first* request to cross the threshold should log; the guard
-compares against a snapshot that predates the whole race.
+against the database immediately before deciding to log the transition (and
+write the account's own `now` into it). Only the *first* request to cross
+the threshold should log and stamp the lock; the guard compares against a
+snapshot that predates the whole race.
+
+The generated `reauth` handler has the identical `current_locked_at`
+snapshot-then-write structure (`autumn-cli/src/generate/auth.rs:5010-5054`)
+and so shares the same non-deterministic `locked_at`-anchor drift — but,
+per the second correction below, it does **not** duplicate the
+`account_locked` **log event**, because its threshold branch never calls
+`tracing::warn!` at all.
 
 ### Impact
 
@@ -131,9 +156,20 @@ rule counting or deduplicating on it will over-count an attack by up to
 tooling is, which is precisely the traffic shape credential-stuffing tools
 use. An operator paging off "N `account_locked` events" gets a number that
 depends on request interleaving, not on the number of accounts actually
-locked. No auth bypass, no data loss, no duplicate database rows — this is a
-telemetry-fidelity bug, not a lockout-effectiveness bug (confirmed
-separately below: the account is genuinely locked afterward either way).
+locked.
+
+This is not *purely* a telemetry-fidelity bug, per the correction above: the
+`locked_at` value itself is also decided by whichever racing request's
+`UPDATE` commits last, not by whichever request actually crossed the
+threshold first, so the account's real recorded lock time — and therefore
+its cool-off expiry — carries the same non-determinism, bounded by the width
+of the concurrent race window (tens of milliseconds in this session's
+tests, potentially more under heavier contention or slower storage). No
+auth bypass, no data loss, no duplicate database rows, and the account is
+still genuinely locked either way (confirmed separately below) — the defect
+is that *when* it unlocks, and how many transition events describe it, are
+both non-deterministic under concurrent load rather than tied to the actual
+first-crossing request.
 
 ### Dedup search
 
@@ -154,22 +190,31 @@ sketch (a single guarded atomic UPDATE for the reset branch) does not
 by itself fix this one, since this bug lives in the unconditional read of
 `current_locked_at` at line 3959, used by *both* branches at line 4006.
 
-Not independently re-driven against `reauth`, which the audit report
-already identifies as sharing this exact code shape (search this report for
-"duplicates the lockout block") — flagged as a likely-identical bug there,
-not re-confirmed live this session; see follow-up charters.
+Not independently re-driven against `reauth` this session (static read
+only, corrected above after review): it shares the snapshot-then-write
+structure and so the `locked_at`-anchor drift, but it does **not** share the
+`account_locked` log duplication specifically, since its threshold branch
+never emits that event. The audit report's "duplicates the lockout block"
+language about `reauth` is about **L15** (the cool-off-reset counter
+collapse), which `reauth` does genuinely duplicate byte-for-byte — that is
+a correct cross-reference for L15, just not for this session's telemetry
+finding. See follow-up charters.
 
 ### Fix
 
 Out of scope for a same-PR fix under Snag's charter: correct behavior here
-is unambiguous (log once, at the actual transition), but a minimal fix needs
-a design call this session didn't make — whether to guard the lock-stamping
-`UPDATE` on `locked_at IS NULL` and only log when a row is actually affected
+is unambiguous (log once, and stamp `locked_at` once, at the actual
+transition, using the timestamp of whichever request actually wins it), but
+a minimal fix needs a design call this session didn't make — whether to
+guard the lock-stamping `UPDATE` on `locked_at IS NULL` and only log (using
+the DB's own `now()`, not the request's) when a row is actually affected
 (mirroring the pattern the audit report's L15 fix sketch already proposes
 for the neighboring branch), and whether to fix `login` and `reauth`
 independently or extract the shared lockout-transition logic they both
-duplicate. Filed as a report per the "ships as a report when it needs a
-design decision" rule, not a fix PR.
+duplicate — `reauth` needs the `locked_at`-write fix but not a new
+`tracing::warn!` call, since it has none today and this report takes no
+position on whether it should. Filed as a report per the "ships as a report
+when it needs a design decision" rule, not a fix PR.
 
 ## 🔬 Coverage record
 
@@ -254,9 +299,10 @@ design decision" rule, not a fix PR.
 
 ## Findings summary
 
-- **Bugs filed: 1** — duplicate `account_locked` telemetry under concurrent
-  threshold-crossing requests (moderate severity, repro 5/5 minimal + 1/1
-  scaled, oracle: docs/guide/authentication.md §"Account lockout" point 2).
+- **Bugs filed: 1** — duplicate `account_locked` telemetry, and a
+  non-deterministic `locked_at` write, under concurrent threshold-crossing
+  requests (moderate severity, repro 5/5 minimal + 1/1 scaled, oracle:
+  docs/guide/authentication.md §"Account lockout" point 2).
 - **Digest: 1** — stale rustdoc claim on `unlock_account`'s unknown-email
   behavior (cosmetic; the actual behavior is fine).
 - **Solid areas**: threshold lockout transition, non-enumerating
@@ -275,12 +321,14 @@ design decision" rule, not a fix PR.
    redesign plausibly fixes both at once.
 2. **`reauth`, `login_verify` (`--totp`), and `passkey_login_finish`
    (`--passkeys`)** — the audit report already flags `reauth` as duplicating
-   the vulnerable block and `passkey_login_finish` as skipping the
-   `locked_at` check entirely; this session only drove the plain password
-   `/login` path live. A follow-up charter should scaffold `--totp
-   --passkeys` and actually drive concurrent/cool-off-boundary traffic
-   against those paths rather than trusting the static-template
-   cross-reference.
+   the L15 counter-collapse block (confirmed by this session's static read:
+   `reauth` shares this session's `locked_at`-anchor-drift bug too, but not
+   the `account_locked` log duplication, since it never emits that event)
+   and `passkey_login_finish` as skipping the `locked_at` check entirely;
+   this session only drove the plain password `/login` path live. A
+   follow-up charter should scaffold `--totp --passkeys` and actually drive
+   concurrent/cool-off-boundary traffic against those paths rather than
+   trusting the static-template cross-reference.
 3. **`threshold = 0` / `enabled = false`** — config-driven opt-out, listed
    above as untested rather than assumed-fine; a five-minute live check
    would close this gap.
