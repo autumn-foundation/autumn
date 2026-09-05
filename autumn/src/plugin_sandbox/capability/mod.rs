@@ -737,7 +737,7 @@ const TENANT_PRESENT: char = 't';
 
 /// The namespace segment for `tenant`, injective in `Option<&str>`.
 ///
-/// A present tenant is [`TENANT_PRESENT`] followed by its id; absence is
+/// A present tenant is `TENANT_PRESENT` followed by its id; absence is
 /// [`NO_TENANT`], which no present tenant can produce because every one of them
 /// starts with that prefix. This is the whole of "an absent tenant is not a
 /// tenant named `_`", and it is a derivation rather than a check for the same
@@ -1497,12 +1497,9 @@ path = "/shop/panel"
         let key = kv::namespaced_key(&manifest.name, Some("alpha"), "cart");
         let _ = kv.set(&key, PluginValue::Text("x".repeat(4096)));
 
-        let mut quotas = manifest.quotas.clone();
+        let mut quotas = manifest.quotas;
         quotas.kv_value_bytes = 64;
-        let tightened = SandboxManifest {
-            quotas,
-            ..manifest.clone()
-        };
+        let tightened = SandboxManifest { quotas, ..manifest };
         let mut runtime = CapabilityRuntime::new(
             &tightened,
             CapabilityServices {
