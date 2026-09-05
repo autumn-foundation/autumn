@@ -57,6 +57,14 @@
 #   `[profile.prod.server] port = 9000` is judged as `server.port`, exactly as the
 #   loader resolves it.
 #
+#   ARRAYS OF TABLES are walked item by item against the SAME schema path, as
+#   `validate_toml_table` does (there is no `shards.0` in the schema). This is
+#   load-bearing, not a corner case: `[[database.shards]]` (`sharding.md`) and
+#   `[[security.webhooks.endpoints]]` (`signed-webhooks.md`) are both live in the
+#   corpus, and descending only into `dict` values left every key inside them
+#   unchecked — a `primary_urll` there read as clean while the framework's own
+#   strict validator rejects it.
+#
 # TRUTH SET — three mechanical sources, no hand-written key list:
 #
 #   1. `autumn/tests/fixtures/schema_keys.snapshot` (484 leaves) — the compiled
@@ -472,8 +480,26 @@ def walk(table, path, schema, out):
         if key not in schema[path]:
             out.append(full)
             continue
-        if isinstance(value, dict):
-            walk(value, full, schema, out)
+        descend(value, full, schema, out)
+
+
+def descend(value, path, schema, out):
+    """Recurse into a value, following ARRAYS OF TABLES as the framework does.
+
+    `[[database.shards]]` and `[[security.webhooks.endpoints]]` reach `tomllib`
+    as a list of dicts, and `validate_toml_table` walks each table item against
+    the SAME schema path (not an indexed one — there is no `shards.0` in the
+    schema). Treating only `dict` as descendable left every key inside an array
+    entry unchecked: `[[database.shards]] primary_urll = …` in `sharding.md`
+    would have passed this gate while the framework's own strict validator
+    rejects it. Both arrays are live in the corpus this gate reads.
+    """
+    if isinstance(value, dict):
+        walk(value, path, schema, out)
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                walk(item, path, schema, out)
 
 
 def check_fence(body, schema):
@@ -487,11 +513,14 @@ def check_fence(body, schema):
         if key == "profile" and isinstance(value, dict):
             # `[profile.prod.server] port = …` resolves as `server.port`.
             for name, overlay in value.items():
-                if not isinstance(overlay, dict):
-                    continue
-                if is_cargo_profile(name, overlay):
-                    continue
-                walk(overlay, "", schema, findings)
+                # `[[profile.x]]` reaches here as a list, which the framework
+                # also walks item by item.
+                for table in overlay if isinstance(overlay, list) else [overlay]:
+                    if not isinstance(table, dict):
+                        continue
+                    if is_cargo_profile(name, table):
+                        continue
+                    walk(table, "", schema, findings)
         else:
             walk({key: value}, "", schema, findings)
     return findings
@@ -609,6 +638,31 @@ def self_test():
             [],
         ),
         ("dynamic base_urls map", '[http.client.base_urls]\nstripe = "https://x"\n', []),
+        # Arrays of tables are walked item by item against the SAME schema path,
+        # as `validate_toml_table` does. Both of these are live in the corpus.
+        (
+            "array of tables, valid",
+            '[[database.shards]]\nname = "s0"\nprimary_url = "postgres://x"\n',
+            [],
+        ),
+        (
+            "array of tables, typo",
+            '[[database.shards]]\nname = "s0"\nprimary_urll = "postgres://x"\n',
+            ["database.shards.primary_urll"],
+        ),
+        (
+            "array of tables, second entry typo",
+            '[[security.webhooks.endpoints]]\nsecret_env = "A"\n'
+            '\n[[security.webhooks.endpoints]]\nsecret_enb = "B"\n',
+            ["security.webhooks.endpoints.secret_enb"],
+        ),
+        (
+            "array of tables under a profile overlay",
+            '[[profile.prod.database.shards]]\nprimary_urll = "postgres://x"\n',
+            ["database.shards.primary_urll"],
+        ),
+        # A scalar array is not a table array and must not be descended into.
+        ("scalar array", '[dev]\nwatch_dirs = ["views", "locales"]\n', []),
         # Profile overlays resolve to the base path.
         ("profile overlay ok", "[profile.prod.server]\nport = 9000\n", []),
         ("profile overlay bad", "[profile.prod.server]\nprot = 9000\n", ["server.prot"]),
