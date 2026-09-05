@@ -92,6 +92,18 @@ A process that never built an application router answers `503` with an
 explanation rather than `404`, so "this process published no graph" reads
 differently from "this build has no such endpoint".
 
+A **worker** (`AUTUMN_ROLE=worker`) serves the probe-only router and mounts no
+application route, so its graph reports every declared route as
+`mounted: false` and names them under `unmounted_routes`. That is the honest
+answer to "what does *this process* serve" — the elements are still compiled
+in, they are just not being served here.
+
+One number can legitimately differ between `autumn graph show` and
+`/actuator/graph`: `opaque_mounted_routers`. The dump exits before startup
+adds any configuration-driven router (a blob store, the SEO endpoints, an
+inbound-mail webhook), so a running binary can count more of them than the
+committed document does.
+
 ## What is in the graph
 
 **Nodes** — one per macro-declared element:

@@ -44,7 +44,11 @@ pub const LIMITS: &[&str] = &[
     "Raw SQL is matched by identifier, and only inside string literals that contain a SQL \
      keyword; SQL assembled at runtime from fragments is invisible.",
     "A router mounted with `merge`/`nest` is opaque: its endpoints cannot be enumerated at all, \
-     so `completeness.opaque_mounted_routers` counts them rather than naming them.",
+     so `completeness.opaque_mounted_routers` counts them rather than naming them. The \
+     `AUTUMN_DUMP_GRAPH` count covers the routers the *builder* declares; a router the \
+     configuration adds during startup (a blob store, the SEO endpoints, an inbound-mail \
+     webhook) is mounted after that dump exits, so the running binary's `/actuator/graph` can \
+     report a higher count than the committed document.",
     "A model's declared relations (`#[votable]`, `#[commentable]`) are attributed to its \
      repository as a whole, because that is where the generated methods live — so a route \
      holding the repository is reported as reaching the edge table whether or not it calls \

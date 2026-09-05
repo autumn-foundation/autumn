@@ -4383,14 +4383,28 @@ impl AppBuilder {
         // `graph_installed_before_every_router_build` pins all three, because a
         // graph installed on only some of them is an endpoint that answers 503
         // in production while every unit test passes.
-        crate::graph::install(crate::graph::manifest::audit(
-            &graph_mounted_routes(&all_routes, &scoped_groups, &declared_routes),
-            omitted_router_count(
-                merge_routers.len(),
-                nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
-                &declared_routes,
-            ),
-        ));
+        //
+        // A worker serves the probe-only router: it mounts no application route
+        // at all, and drops every raw router the builder collected. Publishing
+        // the full route table there would have `/actuator/graph` — which a
+        // worker can expose — describe endpoints this process does not serve
+        // (Codex round 4). The declared elements are still nodes, because they
+        // are still compiled in; they simply report `mounted: false`, and the
+        // completeness section names them, which is the honest answer to "what
+        // does this process serve".
+        let (graph_mounted, graph_opaque) = if role.serves_http() {
+            (
+                graph_mounted_routes(&all_routes, &scoped_groups, &declared_routes),
+                omitted_router_count(
+                    merge_routers.len(),
+                    nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
+                    &declared_routes,
+                ),
+            )
+        } else {
+            (Vec::new(), 0)
+        };
+        crate::graph::install(crate::graph::manifest::audit(&graph_mounted, graph_opaque));
 
         let router_build = if role.serves_http() {
             crate::router::try_build_router_with_static_inner(

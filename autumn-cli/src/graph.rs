@@ -29,7 +29,7 @@
 
 use std::process::Command;
 
-use autumn_web::graph::manifest::{ArchitectureGraph, parse_manifest_dump};
+use autumn_web::graph::manifest::{ArchitectureGraph, Completeness, parse_manifest_dump};
 use autumn_web::graph::query;
 
 use crate::routes;
@@ -105,6 +105,67 @@ fn without_locations(graph: &ArchitectureGraph) -> ArchitectureGraph {
         node.location = String::new();
     }
     copy
+}
+
+/// Name each completeness field that moved.
+///
+/// Per-field, because a new opaque or unmodelled served surface is *exactly*
+/// how this section changes, and reporting only the declared/mounted counts
+/// printed an apparently no-op transition (`39 / 39 -> 39 / 39`) for the one
+/// case a reviewer most needs to see (Codex round 4).
+fn completeness_changes(committed: &Completeness, current: &Completeness) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut count = |label: &str, before: usize, after: usize| {
+        if before != after {
+            lines.push(format!("  completeness {label} {before} -> {after}"));
+        }
+    };
+    count(
+        "declared routes",
+        committed.declared_routes,
+        current.declared_routes,
+    );
+    count(
+        "mounted routes",
+        committed.mounted_routes,
+        current.mounted_routes,
+    );
+    count("models", committed.models, current.models);
+    count("repositories", committed.repositories, current.repositories);
+    count("jobs", committed.jobs, current.jobs);
+    count(
+        "repository auto-API routes",
+        committed.generated_routes,
+        current.generated_routes,
+    );
+    count(
+        "unenumerable mounted routers",
+        committed.opaque_mounted_routers,
+        current.opaque_mounted_routers,
+    );
+    let mut list = |label: &str, before: &[String], after: &[String]| {
+        for entry in after {
+            if !before.contains(entry) {
+                lines.push(format!("  + {label} {entry}"));
+            }
+        }
+        for entry in before {
+            if !after.contains(entry) {
+                lines.push(format!("  - {label} {entry}"));
+            }
+        }
+    };
+    list(
+        "route declared but not mounted",
+        &committed.unmounted_routes,
+        &current.unmounted_routes,
+    );
+    list(
+        "mounted with no macro declaration",
+        &committed.unmodelled_mounted_routes,
+        &current.unmodelled_mounted_routes,
+    );
+    lines
 }
 
 /// The symbol that resolved an edge, or `declared` for a declaration edge.
@@ -215,15 +276,10 @@ pub fn format_drift(committed: &ArchitectureGraph, current: &ArchitectureGraph) 
         }
     }
 
-    if committed.completeness != current.completeness {
-        lines.push(format!(
-            "  completeness {} declared / {} mounted routes -> {} / {}",
-            committed.completeness.declared_routes,
-            committed.completeness.mounted_routes,
-            current.completeness.declared_routes,
-            current.completeness.mounted_routes,
-        ));
-    }
+    lines.extend(completeness_changes(
+        &committed.completeness,
+        &current.completeness,
+    ));
 
     if lines.is_empty() {
         lines.push("  (the documents differ in a field this report does not name)".to_string());
@@ -576,6 +632,38 @@ mod tests {
         let drift = format_drift(&before, &after).expect("weakened evidence is drift");
         assert!(drift.contains("evidence signature"), "{drift}");
         assert!(drift.contains("-> body"), "{drift}");
+    }
+
+    #[test]
+    fn a_new_unenumerable_router_is_named_in_the_drift_report() {
+        // The route and model counts are identical; only the opaque-router
+        // count moved. Printing "39 / 39 -> 39 / 39" for that would withhold
+        // exactly what a reviewer needs to approve.
+        let before = graph();
+        let after = build(&[], 2, ROUTES, MODELS, REPOSITORIES, JOBS);
+        let drift = format_drift(&before, &after).expect("a new opaque router is drift");
+        assert!(
+            drift.contains("unenumerable mounted routers 0 -> 2"),
+            "{drift}"
+        );
+    }
+
+    #[test]
+    fn a_new_unmodelled_mount_is_named_in_the_drift_report() {
+        let before = graph();
+        let mounted = autumn_web::graph::MountedRoute {
+            method: "WS".to_owned(),
+            path: "/ws/feed".to_owned(),
+            handler: "feed".to_owned(),
+            module_path: "app::live".to_owned(),
+            auth: autumn_web::graph::RouteAuth::default(),
+        };
+        let after = build(&[mounted], 0, ROUTES, MODELS, REPOSITORIES, JOBS);
+        let drift = format_drift(&before, &after).expect("a new opaque mount is drift");
+        assert!(
+            drift.contains("+ mounted with no macro declaration WS /ws/feed"),
+            "{drift}"
+        );
     }
 
     #[test]
