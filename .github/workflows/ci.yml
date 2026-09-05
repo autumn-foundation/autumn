@@ -843,7 +843,7 @@ jobs:
     steps:
       - name: Check shard results
         run: |
-          results='${{ join(needs.*.result, " ") }}'
+          results='${{ join(needs.*.result, ' ') }}'
           echo "shard results: $results"
           for r in $results; do
             [ "$r" = "success" ] || { echo "::error::a test shard did not succeed ($results)"; exit 1; }
