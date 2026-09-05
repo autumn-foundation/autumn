@@ -3181,7 +3181,14 @@ SELF_DEFAULT = _SelfDefault()
 # "$AUTUMN_ZZ"` prints `x`, and the same with `local` prints nothing. Treating
 # a function-local name as local to the whole FILE suppressed genuine reads of
 # the incoming environment after the binding had gone out of scope.
-SHELL_FN = re.compile(r'(?:^|[;&|\s])(?:function\s+)?([A-Za-z_]\w*)\s*\(\s*\)\s*\{')
+# Bash has TWO function grammars, and `help function` gives both: `name () {
+# …; }` and `function name { …; }`, where the parentheses are optional after
+# the keyword. Requiring them missed the second form entirely, so a `local` in
+# such a function stayed in the FILE-wide local set and suppressed a genuine
+# top-level read after the function returned — a correct page reported.
+SHELL_FN = re.compile(
+    r'(?:^|[;&|\s])(?:function\s+([A-Za-z_]\w*)\s*(?:\(\s*\))?'
+    r'|([A-Za-z_]\w*)\s*\(\s*\))\s*\{')
 # `local NAME` needs no `=`. Bash declares the local either way, and an
 # undefined local still SHADOWS the inherited environment — `f() { local
 # AUTUMN_X; echo "$AUTUMN_X"; }` prints nothing whatever the environment holds.
@@ -3527,6 +3534,12 @@ def _module_spans(masked, literals=None):
                 starts.append(i)
                 mods.append(here)
     return starts, mods
+
+
+def _scope_start(spans, offset):
+    """Where the innermost scope containing `offset` begins."""
+    starts, _ = spans
+    return starts[bisect.bisect_right(starts, offset) - 1]
 
 
 def _scope_at(spans, offset):
@@ -3909,7 +3922,7 @@ class _Accessor:
     _receiver = re.compile(r'([A-Za-z_]\w*)\s*\.')
 
     def __init__(self, pattern, by_scope, shadowed=frozenset(),
-                 imported=frozenset()):
+                 imported=frozenset(), rebound=None):
         self.pattern = pattern
         self.by_scope = by_scope
         # The macro names this file takes over. WHERE it takes them over is the
@@ -3920,12 +3933,22 @@ class _Accessor:
         # before the declaration.
         self.shadowed = shadowed
         self.imported = imported
+        self.rebound = rebound
 
     def finditer(self, body):
         return self.pattern.finditer(body)
 
     def search(self, text):
         return self.pattern.search(text)
+
+    def rebinds(self, name, scope):
+        """Whether some scope enclosing `scope` rebinds `name` to a non-environment.
+
+        Reported as a NAME and a scope, never an offset — the scan finds the
+        rebinding on its own text and suppresses only what comes after it.
+        """
+        return any(name in (self.rebound or {}).get(scope[:n], ())
+                   for n in range(len(scope) + 1))
 
     def imports_shadow(self, name):
         """Whether the shadow came from a `use`, not a local `macro_rules!`.
@@ -4021,7 +4044,7 @@ def accessor(root, test_files=frozenset()):
     helpers, declared, imports, modules = {}, {}, {}, {}
     env_type, impls, trait_at, scopes = {}, {}, set(), {}
     shadowed, returns, aliases, local_types = {}, {}, {}, {}
-    imported_shadow = {}
+    imported_shadow, rebound = {}, {}
     blessed_at = {}
     macro_at, macro_imports, factory_at = {}, {}, {}
     crates = _crates(root)
@@ -4394,13 +4417,13 @@ def accessor(root, test_files=frozenset()):
     # so prefix lookup accepted the parameter for a call on the inner value.
     #
     # Which of the two a call site means is a question about an OFFSET, and no
-    # offset crosses from here to the scan by design. So this fails closed
-    # instead: a name whose scope also holds a `let` binding this derivation did
-    # not recognise as an environment is ambiguous, and is dropped from that
-    # scope. A page documenting a key read only through such a name is reported
-    # rather than blessed, which is the direction this file prefers everywhere
-    # else. A name bound once, as an environment, is untouched — which is every
-    # `let env = …` in the tree today, measured: truth set unchanged.
+    # offset crosses from here to the scan by design — so this reports only the
+    # NAME, exactly as the macro shadow does, and the scan works out WHERE on
+    # its own text. Dropping the name from the whole scope was the first
+    # attempt and it reached backwards: `source.var(…); let source = Other;`
+    # has a call that Rust resolves on the environment, and suppressing the
+    # whole scope reported the page documenting it. A rebound name is marked,
+    # not deleted, and the suppression starts at the rebinding.
     for (rel, at), mine in per_file.items():
         masked, data, _, lex = masked_all[rel]
         for m in LET_BIND.finditer(masked):
@@ -4420,7 +4443,7 @@ def accessor(root, test_files=frozenset()):
             # had instrumented. Five rungs ask this question; two were counted.
             if not any(m.start() <= off < stop
                        for off in blessed_at.get((rel, name), ())):
-                mine.discard(name)
+                rebound.setdefault((rel, at), set()).add(name)
 
     cache = {}
 
@@ -4462,12 +4485,25 @@ def accessor(root, test_files=frozenset()):
             local for local, path, _ in imports_of(rel)
             if local != 'env'
             and re.fullmatch(r'(?:std|core)\s*::\s*env', path.strip()))
-        key = (here, recv, aliases)
+        # …and the FUNCTION may be imported directly, aliased or not: `use
+        # std::env::var as getenv;` makes `getenv("AUTUMN_X")` a real read that
+        # a pattern spelling `env::var` cannot see. The module alias rung was
+        # written for one of the two spellings Rust offers and I taught it that
+        # one; this is the other, and it needs no receiver because the accessor
+        # IS the name.
+        direct = frozenset(
+            local for local, path, _ in imports_of(rel)
+            if re.fullmatch(r'(?:std|core)\s*::\s*env\s*::\s*'
+                            r'(?:var|var_os|set_var)', path.strip()))
+        key = (here, recv, aliases, direct)
         if key not in cache:
             pattern = ACCESSOR.pattern
             if aliases:
                 pattern += (r'|\b(?:' + '|'.join(sorted(map(re.escape, aliases)))
                             + r')::(var|var_os|set_var)\s*\(')
+            if direct:
+                pattern += (r'|\b(?:' + '|'.join(sorted(map(re.escape, direct)))
+                            + r')\s*\(')
             # The macro alternative is always in the pattern now; a shadow is a
             # REGION, and the scan decides where it applies over its own text.
             pattern += ENV_MACRO
@@ -4485,13 +4521,24 @@ def accessor(root, test_files=frozenset()):
             cache[key] = re.compile(pattern)
         return _Accessor(cache[key], by_scope,
                          frozenset(shadowed.get(rel, ())),
-                         frozenset(imported_shadow.get(rel, ())))
+                         frozenset(imported_shadow.get(rel, ())),
+                         {at: frozenset(names)
+                          for (r, at), names in rebound.items() if r == rel})
 
     return compiled, index
 
 
 # …and never where the line asserts the name is absent.
-NEGATED = re.compile(r'assert(?:_ne)?!\s*\(\s*!|!\s*[\w.]*\bcontains\b|\bassert_ne!')
+# A NEGATIVE assertion — the code saying this name is *not* read, or *not*
+# present — is not evidence that the runtime reads it. `assert_ne!` alone is
+# not that shape, though: it compares two values, and
+# `assert_ne!(std::env::var("AUTUMN_X"), Ok(String::new()))` is an ordinary
+# read whose page was reported. What makes it negative is the containment
+# test — `assert_ne!(…, …contains(…))` — or an explicit `!`.
+NEGATED = re.compile(
+    r'assert(?:_ne)?!\s*\(\s*!'
+    r'|!\s*[\w.]*\bcontains\b'
+    r'|\bassert_ne!\s*\([^;]*\bcontains\b')
 
 # Test code is not the runtime. A test names a variable to prove the runtime
 # IGNORES it — `temp_env::with_var_unset("AUTUMN_TEST_DOTENV_OVERLAY_UNSET", …)`
@@ -4537,7 +4584,16 @@ TEST_PATH = re.compile(r'(^|/)(?:tests|benches)/|_test\.rs$')
 # production. The declarations are read out of the tree rather than matched by
 # filename, so a module named anything is covered and a `tests.rs` that is NOT
 # declared test-only keeps being read.
-TEST_MOD = re.compile(r'#\[cfg\(([^\]]*)\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;')
+# A test-only `mod` declaration may carry OTHER attributes between the `cfg`
+# and the `mod`, and `#[path = "…"]` among them redirects the file it names.
+# Matching only the adjacent form meant `#[cfg(test)] #[path = "fixture.rs"]
+# mod x;` was neither recognised as test-only NOR resolved to its real file, so
+# the fixture was scanned as production code and its accessors blessed names
+# the runtime never reads.
+TEST_MOD = re.compile(
+    r'#\[cfg\(([^\]]*)\)\]\s*((?:#\[[^\]]*\]\s*)*)'
+    r'(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;')
+MOD_PATH_ATTR = re.compile(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]')
 
 
 _TEST_MODULE_FILES = {}
@@ -4566,11 +4622,18 @@ def test_module_files(root):
             continue
         skel = _rust_skeleton(body)
         parent = pathlib.PurePath(rel).parent
-        for pred, name in TEST_MOD.findall(skel):
+        for pred, attrs, name in TEST_MOD.findall(skel):
             if _cfg_truth(pred)[0]:
                 continue
-            files.add(str(parent / f'{name}.rs'))
-            files.add(str(parent / name / 'mod.rs'))
+            # `#[path = "…"]` names the file outright, relative to the
+            # declaring module's directory; without one the two conventional
+            # spellings apply.
+            explicit = MOD_PATH_ATTR.search(attrs)
+            if explicit:
+                files.add(str(parent / explicit.group(1)))
+            else:
+                files.add(str(parent / f'{name}.rs'))
+                files.add(str(parent / name / 'mod.rs'))
     _TEST_MODULE_FILES[key] = files
     return files
 
@@ -5203,9 +5266,20 @@ def source_tokens(root):
                        if d.group(1) == macro.group('name')):
                     continue
             through = acc_for(rel).receiver(m)
+            here = _scope_at(spans, m.start()) if spans else ()
             if through is not None and not acc_for(rel).allows(
-                    through, _scope_at(spans, m.start()),
+                    through, here,
                     body[:m.start()].rstrip().endswith('.')):
+                continue
+            # …and a name its scope REBINDS is the environment only until the
+            # rebinding. The derivation names it; where the `let` sits is found
+            # here, on the scan's own text, so a call written before it still
+            # resolves and one after it does not.
+            if (through is not None and spans
+                    and acc_for(rel).rebinds(through, here)
+                    and any(d.group(1) == through
+                            for d in LET_BIND.finditer(
+                                body[_scope_start(spans, m.start()):m.start()]))):
                 continue
             head = body.rfind('\n', 0, m.start()) + 1
             tail = body.find('\n', m.start())
@@ -5376,7 +5450,15 @@ def scan(files, read, leaves, built, tokens):
                 if var in chosen:
                     stats['reader-chosen name'] += 1
                     continue
-                if var in consts:
+                # …and only where the page is USING it as an identifier. The
+                # exemption was page-wide, so a page declaring `pub const
+                # AUTUMN_X: &str = …` in a snippet also excused `export
+                # AUTUMN_X=1` further down — a shell instruction a reader
+                # copies, exempted by a Rust constant that has nothing to do
+                # with it. An assignment word is the one shape that cannot be
+                # an identifier use: Rust writes `NAME: T = …`, never `NAME=`.
+                if var in consts and not re.search(
+                        r'(?<![\w$/{-])' + re.escape(var) + r'=', line):
                     stats['example-code identifier'] += 1
                     continue
                 if family(var, line):
@@ -6428,7 +6510,18 @@ def self_test():
     case('the declaration is matched by cfg, not by name',
          (TEST_MOD.findall('#[cfg(test)]\nmod tests;'),
           TEST_MOD.findall('#[cfg(feature = "db")]\nmod tests;')),
-         ([('test', 'tests')], [('feature = "db"', 'tests')]))
+         ([('test', '', 'tests')], [('feature = "db"', '', 'tests')]))
+    # …and the attributes BETWEEN the cfg and the `mod` come with it, because
+    # `#[path = "…"]` among them names the file the declaration refers to. A
+    # declaration this could not match was neither excluded as test-only nor
+    # resolved, so its fixture was scanned as production code.
+    case('an intervening attribute does not hide the declaration',
+         TEST_MOD.findall('#[cfg(test)]\n#[path = "fixture.rs"]\nmod x;'),
+         [('test', '#[path = "fixture.rs"]\n', 'x')])
+    case('a path attribute names the file outright',
+         (lambda m: m.group(1) if m else None)(
+             MOD_PATH_ATTR.search('#[path = "fixture.rs"]')),
+         'fixture.rs')
     case('…and only a test-only cfg excludes the file',
          (_cfg_truth('test')[0], _cfg_truth('feature = "db"')[0]),
          (False, True))
@@ -6871,6 +6964,19 @@ def self_test():
     # `local NAME` needs no `=` — bash declares the local either way, and an
     # undefined local still shadows the inherited environment. A declaration
     # also takes a LIST, and `-g` makes it global instead.
+    # Bash has two function grammars and `help function` gives both. Requiring
+    # the parentheses missed `function f { … }`, so a `local` inside it stayed
+    # in the FILE-wide local set and suppressed a genuine top-level read.
+    case('both bash function grammars declare a function',
+         [[g for g in m.groups() if g] for t in
+          ('f() { local AUTUMN_X=1; }', 'function f { local AUTUMN_X=1; }',
+           'function f() { local AUTUMN_X=1; }')
+          for m in [SHELL_FN.search(t)] if m],
+         [['f'], ['f'], ['f']])
+    case('…and the local is scoped to either form',
+         [sorted(n) for _, _, n in
+          _shell_function_locals('function f { local AUTUMN_X=1; }')],
+         [['AUTUMN_X']])
     case('a bare local declaration still declares',
          [sorted(_shell_local_names(t)) for t in
           ('local AUTUMN_X; echo "$AUTUMN_X"', 'local AUTUMN_X=1',
