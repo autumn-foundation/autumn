@@ -39,7 +39,13 @@ pub struct PluginJob {
     /// One of the plugin's declared job types.
     pub job_type: String,
     /// The tenant that was active at enqueue, and that the run binds to.
-    pub tenant: String,
+    ///
+    /// `None` in a single-tenant application, which is not the same as a tenant
+    /// named `-`: a runner passes this straight back to
+    /// [`CapabilityServices::for_tenant`](super::CapabilityServices::for_tenant)
+    /// or leaves it unset, so the raw id is what belongs here and the
+    /// namespacing stays the host's to derive.
+    pub tenant: Option<String>,
     /// The job's arguments.
     pub payload: PluginRow,
 }
@@ -77,7 +83,7 @@ pub(super) fn perform(
     let job = PluginJob {
         plugin: runtime.plugin.clone(),
         job_type: job_type.to_owned(),
-        tenant: runtime.tenant().to_owned(),
+        tenant: runtime.tenant().map(str::to_owned),
         payload: payload.clone(),
     };
     match sink.enqueue(job) {

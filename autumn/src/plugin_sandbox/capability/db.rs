@@ -198,6 +198,12 @@ pub struct Scope {
     /// The derived physical table name.
     pub table: String,
     /// The tenant every row is filtered by and stamped with.
+    ///
+    /// The *derived* tenant segment, not the raw id — see
+    /// [`tenant_segment`](super::tenant_segment). A raw id cannot say whether
+    /// there was one, so a deployment with a tenant named `-` would share a
+    /// namespace with its single-tenant requests. Store it as it arrives; do
+    /// not decode it.
     pub tenant: String,
 }
 
@@ -346,7 +352,7 @@ pub(super) fn perform(
     };
     let scope = Scope {
         table: physical,
-        tenant: runtime.tenant().to_owned(),
+        tenant: runtime.tenant_key(),
     };
     let row_limit = runtime.quotas().db_rows as usize;
 

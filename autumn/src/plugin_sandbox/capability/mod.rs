@@ -723,7 +723,33 @@ impl CapabilityServices {
 /// A literal rather than an empty string, so a single-tenant deployment's keys
 /// are as unambiguously namespaced as a multi-tenant one's — and so that a
 /// tenant later appearing does not collide with the keys written before it.
-pub const NO_TENANT: &str = "_";
+///
+/// **Never spellable by a real tenant.** A tenant id has no charset
+/// restriction, so a literal any tenant could also be named would put a
+/// deployment's tenant `_` in the same namespace as its single-tenant
+/// requests — reachable in a tenancy migration, or with the plugin router
+/// mounted outside the tenancy middleware. Presence is therefore encoded in the
+/// segment itself: see [`tenant_segment`].
+pub const NO_TENANT: &str = "-";
+
+/// Prefix marking a namespace segment that names a real tenant.
+const TENANT_PRESENT: char = 't';
+
+/// The namespace segment for `tenant`, injective in `Option<&str>`.
+///
+/// A present tenant is [`TENANT_PRESENT`] followed by its id; absence is
+/// [`NO_TENANT`], which no present tenant can produce because every one of them
+/// starts with that prefix. This is the whole of "an absent tenant is not a
+/// tenant named `_`", and it is a derivation rather than a check for the same
+/// reason the physical table name is: the colliding spelling stops existing
+/// instead of being refused.
+#[must_use]
+pub fn tenant_segment(tenant: Option<&str>) -> String {
+    tenant.map_or_else(
+        || NO_TENANT.to_owned(),
+        |id| format!("{TENANT_PRESENT}{id}"),
+    )
+}
 
 /// Enforcement, once, for every capability.
 ///
@@ -823,20 +849,30 @@ impl CapabilityRuntime {
         self.quotas.declared()
     }
 
-    /// The tenant every scoped call binds to, as a namespace segment.
+    /// The tenant every scoped call binds to, as the caller supplied it.
     ///
-    /// [`NO_TENANT`] when the caller supplied none. That is right for a
-    /// single-tenant application and **wrong** for a multi-tenant one whose
-    /// plugin router was mounted outside the tenancy middleware: every tenant's
-    /// keys and rows would pool into one namespace. Nothing inside the sandbox
-    /// can tell those two apart — `CURRENT_TENANT` is simply absent in both —
-    /// so the caller is the one that has to know, which is why
+    /// `None` when the caller supplied none. That is right for a single-tenant
+    /// application and **wrong** for a multi-tenant one whose plugin router was
+    /// mounted outside the tenancy middleware: every tenant's keys and rows
+    /// would pool into one namespace. Nothing inside the sandbox can tell those
+    /// two apart — `CURRENT_TENANT` is simply absent in both — so the caller is
+    /// the one that has to know, which is why
     /// [`CapabilityServices::for_tenant`] exists and why
     /// `SandboxedPlugin::serve` reads the task-local on the async task rather
     /// than inside `spawn_blocking`, where it is absent for a third reason.
     #[must_use]
-    pub fn tenant(&self) -> &str {
-        self.services.tenant.as_deref().unwrap_or(NO_TENANT)
+    pub fn tenant(&self) -> Option<&str> {
+        self.services.tenant.as_deref()
+    }
+
+    /// The namespace segment every scoped derivation uses.
+    ///
+    /// [`tenant_segment`] of [`tenant`](Self::tenant): the *physical* tenant,
+    /// the way [`physical_table`](db::physical_table) is the physical table.
+    /// Never the raw id, because the raw id cannot say whether there was one.
+    #[must_use]
+    pub fn tenant_key(&self) -> String {
+        tenant_segment(self.tenant())
     }
 
     /// Everything this request did, in order.
@@ -1408,20 +1444,81 @@ path = "/shop/panel"
         // Tenant ids are the application's, not the manifest's: they come from
         // a header or a subdomain, and nothing validates their charset.
         assert_ne!(
-            kv::namespaced_key("shop", "b%3Ax", "k"),
-            kv::namespaced_key("shop", "b", "%3Ax:k")
+            kv::namespaced_key("shop", Some("b%3Ax"), "k"),
+            kv::namespaced_key("shop", Some("b"), "%3Ax:k")
         );
         assert_ne!(
-            kv::namespaced_key("shop", "a", "b:c"),
-            kv::namespaced_key("shop", "a:b", "c")
+            kv::namespaced_key("shop", Some("a"), "b:c"),
+            kv::namespaced_key("shop", Some("a:b"), "c")
         );
     }
 
     #[test]
     fn two_plugins_never_share_a_key() {
         assert_ne!(
-            kv::namespaced_key("shop", "t", "cart"),
-            kv::namespaced_key("other", "t", "cart")
+            kv::namespaced_key("shop", Some("t"), "cart"),
+            kv::namespaced_key("other", Some("t"), "cart")
+        );
+    }
+
+    #[test]
+    fn no_tenant_is_not_a_tenant_that_could_be_named() {
+        // A tenant id has no charset restriction, so the single-tenant sentinel
+        // must be a segment no tenant could also be. It used to be `_`, which a
+        // deployment can name a tenant — and then that tenant shared a
+        // namespace with every request that arrived without one, reachable in a
+        // tenancy migration or with the router mounted outside the tenancy
+        // middleware.
+        for spelling in [NO_TENANT, "_", "", "-", "t", "t-"] {
+            assert_ne!(
+                tenant_segment(Some(spelling)),
+                tenant_segment(None),
+                "a tenant named {spelling:?} reached the single-tenant namespace"
+            );
+            assert_ne!(
+                kv::namespaced_key("shop", Some(spelling), "cart"),
+                kv::namespaced_key("shop", None, "cart"),
+                "{spelling:?}"
+            );
+        }
+        // And distinct tenants stay distinct, which is the property the marker
+        // must not have broken.
+        assert_ne!(tenant_segment(Some("a")), tenant_segment(Some("b")));
+    }
+
+    #[test]
+    fn a_stored_value_over_the_current_ceiling_is_refused_on_the_way_out() {
+        // Lowering `kv_value_bytes` is meant to reduce authority, but the store
+        // keeps what the old ceiling allowed. Serving it anyway would make the
+        // tightened quota cosmetic, and a large enough value would overrun the
+        // reply queue and fail the request rather than being refused.
+        let kv = MemoryKvStore::new();
+        let manifest = manifest(&everything());
+        let key = kv::namespaced_key(&manifest.name, Some("alpha"), "cart");
+        let _ = kv.set(&key, PluginValue::Text("x".repeat(4096)));
+
+        let mut quotas = manifest.quotas.clone();
+        quotas.kv_value_bytes = 64;
+        let tightened = SandboxManifest {
+            quotas,
+            ..manifest.clone()
+        };
+        let mut runtime = CapabilityRuntime::new(
+            &tightened,
+            CapabilityServices {
+                kv: Some(Arc::clone(&kv) as Arc<dyn KvStore>),
+                ..CapabilityServices::none()
+            }
+            .for_tenant("alpha"),
+        );
+        let result = runtime.dispatch(&CapabilityCall::KvGet {
+            id: 1,
+            key: "cart".to_owned(),
+        });
+        assert_eq!(
+            result.denial(),
+            Some(DenialReason::QuotaExceeded),
+            "{result:?}"
         );
     }
 

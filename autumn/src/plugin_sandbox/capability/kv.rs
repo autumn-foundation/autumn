@@ -78,12 +78,16 @@ pub fn escape_segment(segment: &str) -> String {
 /// Every segment but the last is the host's; the last is the guest's, and it is
 /// escaped exactly like the others so a key of `a:b` cannot masquerade as a
 /// namespace boundary.
+///
+/// The tenant arrives as an `Option` rather than a string because "no tenant"
+/// has to be a segment no tenant could be named: see
+/// [`tenant_segment`](super::tenant_segment).
 #[must_use]
-pub fn namespaced_key(plugin: &str, tenant: &str, key: &str) -> String {
+pub fn namespaced_key(plugin: &str, tenant: Option<&str>, key: &str) -> String {
     format!(
         "{KV_PREFIX}:{plugin}:{tenant}:{key}",
         plugin = escape_segment(plugin),
-        tenant = escape_segment(tenant),
+        tenant = escape_segment(&super::tenant_segment(tenant)),
         key = escape_segment(key)
     )
 }
@@ -100,16 +104,38 @@ pub(super) fn perform(runtime: &CapabilityRuntime, call: &CapabilityCall, key: &
     };
     let physical = namespaced_key(&runtime.plugin, runtime.tenant(), key);
     match call {
-        CapabilityCall::KvGet { .. } => CallResult::Ok {
-            id,
-            value: store.get(&physical).map_or(
-                CallValue::Value {
-                    value: PluginValue::Null,
-                    found: false,
+        CapabilityCall::KvGet { .. } => {
+            let ceiling = runtime.quotas().kv_value_bytes as usize;
+            match store.get(&physical) {
+                // Checked on the way *out* as well as in. A quota is the
+                // operator's current answer, and lowering one is meant to
+                // *reduce* authority — but the store keeps what was written
+                // under the old ceiling, so without this an upgrade that
+                // tightened `kv_value_bytes` would go on serving values over
+                // it, and a value large enough could overrun the reply queue
+                // and fail the request outright rather than being refused.
+                Some(value) if value.weight() > ceiling => CallResult::denied(
+                    id,
+                    DenialReason::QuotaExceeded,
+                    format!(
+                        "the stored value is {} bytes, over this plugin's current {ceiling}-byte \
+                         `kv_value_bytes` ceiling",
+                        value.weight()
+                    ),
+                ),
+                Some(value) => CallResult::Ok {
+                    id,
+                    value: CallValue::Value { value, found: true },
                 },
-                |value| CallValue::Value { value, found: true },
-            ),
-        },
+                None => CallResult::Ok {
+                    id,
+                    value: CallValue::Value {
+                        value: PluginValue::Null,
+                        found: false,
+                    },
+                },
+            }
+        }
         CapabilityCall::KvSet { value, .. } => {
             let ceiling = runtime.quotas().kv_value_bytes as usize;
             if value.weight() > ceiling {

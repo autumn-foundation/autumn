@@ -559,6 +559,20 @@ pub fn run_inspect(path: &Path, format: &ReportFormat, against: Option<&Path>) {
             eprintln!("\u{2717} {err}");
             std::process::exit(1);
         });
+        // A delta against a *different* plugin is not an upgrade, and reading
+        // it as one is worse than not reading it at all: the candidate would
+        // inherit the unrelated baseline's capabilities, grants, routes and
+        // limits and come back "asks for no authority", which is exactly the
+        // verdict an unattended install is gated on. Refused rather than
+        // compared, because there is no answer to give.
+        let (name, baseline) = (&artifact.manifest().name, &previous.manifest().name);
+        if name != baseline {
+            eprintln!(
+                "\u{2717} --against names `{baseline}`, but this artifact is `{name}`; an upgrade \
+                 is compared against an earlier build of the same plugin"
+            );
+            std::process::exit(1);
+        }
         report.upgrade = Some(artifact.manifest().consent_delta_from(previous.manifest()));
     }
     match format {
@@ -750,6 +764,31 @@ job_types = ["reindex"]
             assert!(text.contains(expected), "{expected} missing from:\n{text}");
         }
         assert!(!text.contains("or database capability"), "{text}");
+    }
+
+    #[test]
+    fn an_upgrade_baseline_naming_another_plugin_is_refused_rather_than_compared() {
+        // `--against` pointed at the wrong installed artifact is a typo an
+        // operator makes once. Comparing anyway would let a new plugin inherit
+        // the unrelated baseline's capabilities, grants, routes and limits and
+        // come back "asks for no authority" — the exact verdict an unattended
+        // install is gated on.
+        let next = pack(&granted_fixture());
+        let other = pack(&fixture(
+            &granted_manifest_toml().replace(
+                &format!("name = \"{}\"", next.manifest().name),
+                "name = \"autumn-plugin-other\"",
+            ),
+            wat::parse_str(MODULE).expect("valid WAT"),
+        ));
+        assert_ne!(next.manifest().name, other.manifest().name);
+
+        let delta = next.manifest().consent_delta_from(other.manifest());
+        assert!(
+            !delta.requires_consent(),
+            "the delta itself sees no new authority, which is exactly why the *names* have to \
+             be checked before one is taken: {delta:?}"
+        );
     }
 
     #[test]
