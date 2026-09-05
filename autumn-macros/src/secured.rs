@@ -24,7 +24,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ExprLit, ItemFn, Lit, LitStr, Meta, Token, parse_quote};
+use syn::{Expr, ExprLit, Lit, LitStr, Meta, Token, parse_quote};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -118,9 +118,9 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    let (guard_prelude, mut input_fn) = match crate::parse::parse_multi_item_handler(item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
 
     if input_fn.sig.asyncness.is_none() {
@@ -312,6 +312,7 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     quote! {
+        #guard_prelude
         #gate_item
         #input_fn
     }

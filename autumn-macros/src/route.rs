@@ -37,10 +37,18 @@ pub fn route_macro(
     };
     let path = route_args.path.clone();
 
-    let mut input_fn = match parse::parse_async_handler(item) {
-        Ok(f) => f,
+    let (guard_prelude, mut input_fn) = match parse::parse_multi_item_handler(item) {
+        Ok(v) => v,
         Err(err) => return err,
     };
+
+    if input_fn.sig.asyncness.is_none() {
+        return syn::Error::new_spanned(
+            input_fn.sig.fn_token,
+            "Autumn route handlers must be async functions",
+        )
+        .to_compile_error();
+    }
 
     // Extract #[intercept(LayerType)] attributes from the handler.
     let interceptors = parse::extract_interceptors(&mut input_fn.attrs);
@@ -256,6 +264,12 @@ pub fn route_macro(
     };
 
     quote! {
+        // A guard macro (#[throttle]/#[secured]/#[step_up]) that expanded
+        // before this route attribute leaves its `FromRequestParts` gate
+        // struct/impl here — re-emitted verbatim so the gate type #input_fn's
+        // signature references still exists in the final expansion.
+        #guard_prelude
+
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
         // to import axum manually. However, the path resolution in Axum macros makes this impossible
         // natively. Custom compile errors handle the type checks.

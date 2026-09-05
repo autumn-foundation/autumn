@@ -18,7 +18,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ExprLit, Ident, ItemFn, Lit, LitStr, Meta, Token, parse_quote};
+use syn::{Expr, ExprLit, Ident, Lit, LitStr, Meta, Token, parse_quote};
 
 /// Parsed `#[authorize(...)]` arguments.
 ///
@@ -176,9 +176,9 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         format_ident!("{}", name)
     });
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    let (guard_prelude, mut input_fn) = match crate::parse::parse_multi_item_handler(item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
 
     if input_fn.sig.asyncness.is_none() {
@@ -325,7 +325,10 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    quote! { #input_fn }
+    quote! {
+        #guard_prelude
+        #input_fn
+    }
 }
 
 /// Variant of [`parse_authorize_args`] that allows a leading bare

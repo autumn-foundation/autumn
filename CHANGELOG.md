@@ -1604,6 +1604,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`#[throttle]`/`#[secured]`/`#[step_up]`/`#[authorize]` above a route
+  attribute (or above each other) compile again, with the OpenAPI response
+  schema they document intact:** #1668/#2488 moved each guard's session/
+  step-up/rate-limit check into a hidden `FromRequestParts` gate — emitting
+  `quote! { #gate_struct #gate_impl #handler_fn }`, a 3-item stream, instead
+  of a single rewritten function — but every macro that might receive that
+  expansion (the route attributes, and each guard macro itself when guards
+  stack) still called `syn::parse2::<ItemFn>` expecting one item, so any
+  guard written *above* a route attribute, or above another guard, failed
+  every affected route with `route macros can only be applied to functions`.
+  `autumn-macros::parse::parse_multi_item_handler` now finds the handler fn
+  inside a multi-item stream and hands back the leading gate items so callers
+  re-emit them verbatim — dropping them would leave a gate parameter
+  referencing a type absent from the final expansion. Fixing the parse also
+  exposed a second gap in the same code path (#1677's OpenAPI-schema
+  recovery): `throttle_macro`/`step_up_macro` never restated their marker
+  const (`__AUTUMN_THROTTLE_ROUTE_ID`/`__AUTUMN_STEP_UP_MAX_AGE`) inside the
+  handler body the way `secured_macro` already does for
+  `__AUTUMN_SECURED_ROLES` — without it, the response-schema recovery that
+  scans for that marker never fires, so a throttled or step-up-gated route's
+  real `Json<T>` return type silently vanished from its OpenAPI doc whenever
+  the guard expanded first. Both are now consistent. Verified beyond the
+  four unit tests that first caught this: the real `secured_route`/
+  `step_up_route`/`throttle_route`/`authorization_integration` integration
+  suites (47 tests covering 401/429 gating, idempotent replay, and stacked
+  guards) and a full `cargo test --workspace --no-run` across every crate and
+  example app (all of which use these macros) both stay green.
 - **🧭 Wayfinder: restored the focus outline on admin-plugin form/search
   inputs (keyboard focus visible: 0/2 fields → 2/2, forced-colors mode):**
   the core admin CRUD loop — list → create → edit, the flow every registered
