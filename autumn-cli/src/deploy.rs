@@ -1558,15 +1558,14 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
     if let Some(refusal) = windows_deploy_refusal(std::env::consts::OS, action) {
         return Err(DeployError::UnsupportedPlatform(refusal));
     }
-    // Ambient load (the operator's shell profile, `dev` by default): used ONLY to
-    // read `[deploy]` and compute `resolved` — in particular `resolved.profile`,
-    // the profile the deployed service will actually boot under (default `prod`).
-    // Lenient-unknown-roots load (#2063): the deploy CLI structurally cannot
-    // know an app's plugin set (no AppBuilder, no plugin-crate dep), so it must
-    // NOT fail-close on a plugin-owned top-level config table (e.g. `[media]`)
-    // under `strict_config`. It keeps strict validation of every core section
-    // it DOES own; app boot — which knows the plugin set via the `config_section`
-    // seam — remains the strict gate for plugin roots.
+    // Ambient load (the operator's shell profile, `dev` by default), used only to read
+    // `[deploy]` and compute `resolved` — in particular `resolved.profile`, the profile
+    // the deployed service boots under (default `prod`). It is a lenient-unknown-roots
+    // load (#2063): the deploy CLI structurally cannot know an app's plugin set, with no
+    // AppBuilder and no plugin-crate dependency, so it must not fail closed on a
+    // plugin-owned top-level table such as `[media]` under `strict_config`. Every core
+    // section it does own stays strictly validated, and app boot — which knows the
+    // plugin set through the `config_section` seam — remains the strict gate.
     let ambient_config = AutumnConfig::load_lenient_unknown_roots()
         .map_err(|e| DeployError::Config(e.to_string()))?;
     let deploy_cfg = ambient_config.deploy.unwrap_or_default();
@@ -1881,23 +1880,20 @@ impl<E: Env> Env for ForcedProfileEnv<E> {
         if key == "AUTUMN_ENV" {
             return Ok(self.profile.clone());
         }
-        // Report `AUTUMN_DOTENV=1` so `should_load` opts the (non-dev) deploy
-        // profile into `.env.<profile>` loading. The operator explicitly ran
-        // `autumn deploy` to gather + upload the target profile's config, and
-        // `.env.<profile>` is a documented place for profile-only values, so
-        // the deploy-time reload reads it without requiring the operator to
-        // export `AUTUMN_DOTENV` by hand. This does not mutate the global env
-        // and does not touch the deployed service's runtime. The
-        // profile-selector-key exclusion in the dotenv overlay still strips
-        // `AUTUMN_ENV`/`AUTUMN_PROFILE`/`AUTUMN_IS_DEBUG` from any `.env` file.
+        // Report `AUTUMN_DOTENV=1` so `should_load` opts the non-dev deploy profile into
+        // `.env.<profile>` loading. The operator explicitly ran `autumn deploy` to gather
+        // and upload the target profile's config, and `.env.<profile>` is a documented
+        // place for profile-only values, so the deploy-time reload reads it without the
+        // operator exporting `AUTUMN_DOTENV` by hand. This mutates neither the global env
+        // nor the deployed service's runtime, and the profile-selector-key exclusion in
+        // the overlay still strips `AUTUMN_ENV`/`AUTUMN_PROFILE`/`AUTUMN_IS_DEBUG` from
+        // any `.env` file.
         //
-        // But only SYNTHESIZE `1` when the inner env has no explicit value: an
-        // operator who runs `AUTUMN_DOTENV=0 autumn deploy ...` (or `false`) is
-        // deliberately opting OUT of `.env.<profile>` loading, and `should_load`
-        // honors `0`/`false` as the documented off switch (see dotenv.rs). So
-        // delegate to the inner env when it provides `AUTUMN_DOTENV`, preserving
-        // an explicit `0`/`false`/`1`/`true`, and fall back to `1` only when it
-        // is unset.
+        // Synthesize `1` only when the inner env has no explicit value: an operator
+        // running `AUTUMN_DOTENV=0 autumn deploy ...` is deliberately opting out, and
+        // `should_load` honors `0`/`false` as the documented off switch (see dotenv.rs).
+        // So delegate to the inner env when it provides `AUTUMN_DOTENV`, preserving an
+        // explicit value, and fall back to `1` only when it is unset.
         if key == "AUTUMN_DOTENV" {
             return self
                 .inner
@@ -2231,16 +2227,16 @@ fn collect_fleet_preflight(
     configured_host_count: usize,
 ) -> Vec<PreflightCheck> {
     let Some(shared) = fleet.hosts.first() else {
-        // A fleet with no entries at all (issue #2274). `ResolvedFleet::from_targets`
-        // keeps a `None`-host entry rather than dropping it, so an unconfigured
-        // `[deploy]` reaches the arm below and reports `ssh_reachability` normally —
-        // this arm is unreachable today. It still must not return NO checks: this
-        // function IS the fail-fast boundary (`run_up`, `run_check` and
-        // `run_rollback` all abort on the count it produces), and zero checks reads
-        // as "0 failed", walks the run past that boundary, and leaves the
-        // `fleet.hosts[0]` sites downstream to panic on the empty vec. `hosts` is a
-        // `pub` field, so the non-empty promise in its doc comment is not a type —
-        // the gate fails CLOSED, in the same words the single-host path uses.
+        // A fleet with no entries at all (#2274). `ResolvedFleet::from_targets` keeps a
+        // `None`-host entry rather than dropping it, so an unconfigured `[deploy]`
+        // reaches the arm below and reports `ssh_reachability` normally, leaving this
+        // arm unreachable today. It still must not return no checks: this function is
+        // the fail-fast boundary — `run_up`, `run_check`, and `run_rollback` all abort
+        // on the count it produces — and zero checks reads as "0 failed", walks the run
+        // past that boundary, and leaves the `fleet.hosts[0]` sites downstream to panic
+        // on an empty vec. `hosts` is a `pub` field, so the non-empty promise in its doc
+        // comment is not a type: the gate fails closed, in the same words the
+        // single-host path uses.
         return vec![grade_ssh_reachability(None, 0, SSH_PROBE_TIMEOUT)];
     };
     if is_single_host_deploy(fleet, configured_host_count) {
@@ -3389,15 +3385,15 @@ where
         exec::DeployMode::Redeploy { live_slot } => {
             // Pre-flight refuse (#2073): the reboot-durability restart-refresh (#2070)
             // re-execs `kamal-proxy run` on the public port and re-registers the
-            // still-live upstream at its DERIVED loopback port — both correct ONLY
-            // when the public port is unchanged. If the operator changed `server.port`
-            // since the live release was deployed, that restart would rebind a
-            // different public port and the re-register would aim at a dead loopback
-            // port, stranding `:80` mid-cutover with no auto-recovery. Refuse here —
-            // BEFORE any op runs, sourced from the INSTALLED proxy unit's `--http-port`
-            // (captured in the deploy-start probe) — so the live release keeps serving.
-            // A live-safe port change is future work (Option C, #2073). No installed
-            // unit → first-deploy shape (allowed); an unreadable unit → fail closed.
+            // still-live upstream at its derived loopback port — both correct only while
+            // the public port is unchanged. If the operator changed `server.port` since
+            // the live release was deployed, that restart would rebind a different public
+            // port and the re-register would aim at a dead loopback port, stranding `:80`
+            // mid-cutover with no auto-recovery. Refuse here, before any op runs, sourced
+            // from the installed proxy unit's `--http-port` captured in the deploy-start
+            // probe, so the live release keeps serving. A live-safe port change is future
+            // work. No installed unit means a first deploy and is allowed; an unreadable
+            // unit fails closed.
             refuse_concurrent_public_port_change(&probe.installed_proxy_port, input.public_port)
                 .map_err(|message| DeployError::Config(scoped(message)))?;
             // Pre-flight refuse (#2074): if the `shared/proxy-options` marker is present
@@ -3547,17 +3543,17 @@ where
         .map(&make_executor)
         .collect::<Result<Vec<E>, DeployError>>()?;
 
-    // MediaMTX host preflight (#1974 Slice 7) — non-mutating doctor checks run
-    // BEFORE the app deploy so a bad media host fails fast without anything being
-    // written. The MUTATING provisioning (write config/unit + restart) is deferred
-    // until after the app cutover succeeds (below) so a rolled-back app deploy
-    // never touches the host MediaMTX unit. No-op unless enabled (see fn).
+    // MediaMTX host preflight (#1974 Slice 7): non-mutating doctor checks run before the
+    // app deploy, so a bad media host fails fast with nothing written. The mutating
+    // provisioning — write config and unit, restart — is deferred until after the app
+    // cutover succeeds, so a rolled-back app deploy never touches the host MediaMTX unit.
+    // No-op unless enabled (see fn).
     //
-    // Single-host by construction, not by branch: `provision_media_host` has no
-    // teardown/rollback path, so a media-enabled FLEET is refused outright above
-    // (§4.8). Reaching here with media enabled therefore proves the config declares
-    // exactly one host, and `executors[0]` is it. With media disabled both this and
-    // the provisioning call below are no-ops, so no host-count branch is needed.
+    // Single-host by construction rather than by branch: `provision_media_host` has no
+    // teardown or rollback path, so a media-enabled fleet is refused outright above
+    // (§4.8). Reaching here with media enabled proves the config declares exactly one
+    // host, and `executors[0]` is it. With media disabled this and the provisioning call
+    // below are both no-ops, so no host-count branch is needed.
     check_media_host_preflight(input.media_cfg, input.ffmpeg_bin, &executors[0])?;
 
     // ── ALL-HOSTS PROBE (read-only, serial, rollout order) ───────────────────
@@ -3615,17 +3611,16 @@ where
                 reregister_options: &state.reregister_options,
             },
         );
-        // HOST PREPARATION (#1607, AC-1): this host has no usable reverse-proxy
-        // binary, so install one as the very FIRST op of its turn — ahead of the
-        // proxy unit that supervises it, and ahead of everything else. Running it
-        // here rather than during the read-only probe phase is what keeps "no host
-        // is touched until every host is graded" true, and it means a failed
-        // install is an ordinary PRE-cutover failure: the rollout halts, this host
-        // is compensated like any other, and no host that already cut over is left
-        // behind.
+        // Host preparation (#1607, AC-1): this host has no usable reverse-proxy binary,
+        // so install one as the first op of its turn, ahead of the proxy unit that
+        // supervises it and ahead of everything else. Running it here rather than during
+        // the read-only probe phase is what keeps "no host is touched until every host is
+        // graded" true, and it makes a failed install an ordinary pre-cutover failure:
+        // the rollout halts, this host is compensated like any other, and no host that
+        // already cut over is left behind.
         // Repair the drifted marker as an early op — before the cutover's
-        // record-previous-release reads it — so the on-disk marker matches the
-        // proxy truth even if the rest of the deploy is later interrupted.
+        // record-previous-release reads it — so the on-disk marker matches the proxy
+        // truth even if the rest of the deploy is interrupted.
         if state.repair {
             ops.insert(
                 0,
@@ -4857,19 +4852,19 @@ fn remote_parent_dir(path: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    // ── Tier 2 fail-fast on Windows (issue #1616) ──────────────────────────
+    // ── Tier 2 fail-fast on Windows (#1616) ────────────────────────────────
     //
-    // The remote actions shell out to `ssh`/`sh`, and `up`/`rollback`/
-    // `maintenance` stage secrets with Unix file modes (`exec::stage_temp_file`
-    // skips its `chmod 0600` off Unix), so a native Windows deploy would write
-    // the environment file carrying the signing secret and database password
-    // without an owner-only mode. That is exactly the silent degradation the
-    // platform policy forbids, so those actions refuse up front.
+    // The remote actions shell out to `ssh`/`sh`, and `up`, `rollback`, and
+    // `maintenance` stage secrets with Unix file modes — `exec::stage_temp_file` skips
+    // its `chmod 0600` off Unix — so a native Windows deploy would write the environment
+    // file carrying the signing secret and database password without an owner-only mode.
+    // That is exactly the silent degradation the platform policy forbids, so those
+    // actions refuse up front.
     //
-    // `check` and `plan` are the other half, and the half that first shipped
-    // wrong: they are local-only, so refusing them claimed something untrue
-    // about the command AND took away the only way a Windows developer can
-    // validate a deploy config before switching to WSL2.
+    // `check` and `plan` are the other half, and the half that first shipped wrong: they
+    // are local-only, so refusing them claimed something untrue about the command and
+    // took away the only way a Windows developer can validate a deploy config before
+    // switching to WSL2.
 
     /// Every [`DeployAction`], for the completeness check below. The real gate
     /// is the wildcard-free match in `reaches_a_remote_host` — a new variant
@@ -5486,15 +5481,13 @@ mod tests {
     #[test]
     fn an_empty_fleet_still_fails_the_preflight_gate() {
         // #2274: `collect_fleet_preflight` is the fail-fast boundary — `run_up`,
-        // `run_check` and `run_rollback` all abort on the count it produces. Handing
-        // back ZERO checks for a hostless fleet would report "0 failed", let the run
-        // walk past that boundary, and leave the three `fleet.hosts[0]` sites
-        // downstream to panic on the empty vec.
-        //
-        // `ResolvedFleet::from_targets` keeps a `None` host rather than dropping the
-        // entry, so today every real fleet has at least one element and this arm is
-        // unreachable — but `hosts` is a `pub` field on a `pub` struct, so the
-        // invariant is a promise, not a type. The gate fails CLOSED instead of
+        // `run_check`, and `run_rollback` all abort on the count it produces. Handing
+        // back zero checks for a hostless fleet would report "0 failed", let the run walk
+        // past that boundary, and leave the three `fleet.hosts[0]` sites downstream to
+        // panic on an empty vec. `ResolvedFleet::from_targets` keeps a `None` host rather
+        // than dropping the entry, so every real fleet has at least one element and this
+        // arm is unreachable today — but `hosts` is a `pub` field on a `pub` struct, so
+        // the invariant is a promise, not a type. The gate fails closed instead of
         // trusting it.
         let empty = ResolvedFleet { hosts: vec![] };
         let checks = collect_fleet_preflight(&preflight_config(), &empty, 0);
@@ -5721,17 +5714,14 @@ mod tests {
 
     #[test]
     fn deploy_status_reads_its_probe_port_under_the_deploy_profile_without_validating() {
-        // #1621 review round 1 (Codex 3). `deploy status` is the read-only command
-        // an operator reaches for mid-incident, and it needs exactly ONE value from
-        // the application config: `server.port`. Routing that through
-        // `load_runtime_config` validated the WHOLE config under the deploy profile,
-        // so an unrelated invalid production setting aborted the command before a
-        // single host was probed.
-        //
-        // The port must still come from the SAME profile resolution the deploy
-        // itself uses, or status reports against the wrong port — so the fallback
-        // layers base ← `[profile.prod]` ← `autumn-prod.toml` ← env, exactly like
-        // the loader.
+        // #1621 review round 1 (Codex 3). `deploy status` is the read-only command an
+        // operator reaches for mid-incident, and it needs exactly one value from the
+        // application config: `server.port`. Routing that through `load_runtime_config`
+        // validated the whole config under the deploy profile, so an unrelated invalid
+        // production setting aborted the command before a single host was probed. The
+        // port must still come from the same profile resolution the deploy itself uses,
+        // or status reports against the wrong port, so the fallback layers base ←
+        // `[profile.prod]` ← `autumn-prod.toml` ← env, exactly like the loader.
         use autumn_web::config::MockEnv;
 
         let dir = tempfile::TempDir::new().expect("temp project dir");
@@ -5866,16 +5856,14 @@ mod tests {
 
     #[test]
     fn runtime_config_loads_profile_scoped_prod_values_for_env_file_and_grading() {
-        // Regression (P1 follow-up to #1956): `autumn deploy` must reload its
-        // config under the TARGET deploy profile (default `prod`), so a signing
-        // secret and DB URL that live ONLY under `[profile.prod]` are loaded,
-        // graded, and uploaded — instead of the operator's ambient/dev values.
-        //
-        // This exercises the exact seam `run` → `load_runtime_config` uses: a
-        // `ForcedProfileEnv` (which reports `AUTUMN_ENV=<deploy profile>`) fed to
-        // `AutumnConfig::load_with_env`, so the loader layers `[profile.prod]` on
-        // top. `AUTUMN_MANIFEST_DIR` points config loading at the temp project
-        // WITHOUT mutating the process env or CWD (a `MockEnv` inner supplies it).
+        // Regression (P1 follow-up to #1956): `autumn deploy` must reload its config
+        // under the target deploy profile (default `prod`), so a signing secret and DB
+        // URL that live only under `[profile.prod]` are loaded, graded, and uploaded
+        // rather than the operator's ambient dev values. This exercises the exact seam
+        // `run` → `load_runtime_config` uses: a `ForcedProfileEnv`, which reports
+        // `AUTUMN_ENV=<deploy profile>`, fed to `AutumnConfig::load_with_env`, so the
+        // loader layers `[profile.prod]` on top. `AUTUMN_MANIFEST_DIR` points config
+        // loading at the temp project without mutating the process env or CWD.
         use autumn_web::config::MockEnv;
 
         let dir = tempfile::TempDir::new().expect("temp project dir");
@@ -6079,17 +6067,16 @@ mod tests {
     #[test]
     fn resolve_preserves_raw_profile_alias_while_grading_normalized() {
         // Regression: the app's runtime resolver
-        // (`autumn_web::config::normalize_profile_name`) trims and case-folds
-        // profile aliases, so `PROD`, `Production`, and ` production ` all boot
-        // under the canonical `prod`. But the host's override-file lookup
-        // (`profile_override_file_lookup_names`) keys off the RAW selector
-        // spelling — it prefers `autumn-production.toml` over `autumn-prod.toml`
-        // when the raw input was `production`. So `resolved.profile` (and the
-        // `AUTUMN_ENV` value written from it) must preserve the operator's trimmed
-        // raw spelling, NOT the alias-folded form, or override-file precedence
-        // flips on hosts that have both files. Grading is normalized separately
-        // (canonicalize at the grade site) so a weak secret under `PROD`/
-        // `Production`/` production ` still FAILS preflight locally.
+        // (`autumn_web::config::normalize_profile_name`) trims and case-folds profile
+        // aliases, so `PROD`, `Production`, and ` production ` all boot under the
+        // canonical `prod`. But the host's override-file lookup
+        // (`profile_override_file_lookup_names`) keys off the raw selector spelling: it
+        // prefers `autumn-production.toml` over `autumn-prod.toml` when the raw input
+        // was `production`. So `resolved.profile`, and the `AUTUMN_ENV` value written
+        // from it, must preserve the operator's trimmed raw spelling rather than the
+        // alias-folded form, or override-file precedence flips on hosts carrying both
+        // files. Grading is normalized separately, at the grade site, so a weak secret
+        // under any alias still fails preflight locally.
         let find_signing = |checks: &[PreflightCheck]| {
             checks
                 .iter()
@@ -6229,17 +6216,15 @@ mod tests {
 
     #[test]
     fn app_unit_points_the_maintenance_flag_at_the_shared_dir() {
-        // #1621 R1 (the deliberate cross-cutting register entry): the runtime's
-        // maintenance flag path is cwd-relative and the slot unit's WorkingDirectory
-        // is the RELEASE dir, so before this line a cutover ORPHANED the flag and
-        // silently un-maintained the host. Pointing the override at the per-app
-        // `shared/` dir — which `prepare-dirs` already creates, which survives
-        // cutovers/rollbacks/pruning, and which BOTH slots see — is what makes
-        // `autumn deploy maintenance on` mean anything.
-        //
-        // This line is added to BOTH host spellings equally (it comes from
-        // `render_app_unit`, which the fleet driver and the single-host path share),
-        // so the AC-1 differential invariant is untouched.
+        // #1621 R1, the deliberate cross-cutting register entry: the runtime's
+        // maintenance flag path is cwd-relative and the slot unit's WorkingDirectory is
+        // the release dir, so before this line a cutover orphaned the flag and silently
+        // un-maintained the host. Pointing the override at the per-app `shared/` dir —
+        // which `prepare-dirs` already creates, which survives cutovers, rollbacks, and
+        // pruning, and which both slots see — is what makes `autumn deploy maintenance
+        // on` mean anything. The line is added to both host spellings equally, since it
+        // comes from `render_app_unit`, which the fleet driver and the single-host path
+        // share, so the AC-1 differential invariant is untouched.
         let cfg = ResolvedDeployConfig::resolve(
             &DeployConfig {
                 app_name: Some("shop".to_owned()),
@@ -6997,15 +6982,14 @@ mod tests {
              migrate at {migrate}, boundary at {boundary}, labels: {flat:?}"
         );
 
-        // (3) STEP-LABEL SUBSET. Every printed step label either names a real
-        // executed op or is one of the five deliberately MECHANISM-NEUTRAL labels
-        // (`build` is local, `upload` executes as `upload-binary`, `cutover` as
-        // `proxy-flip`, `drain` as `drain-old`, and `prepare-host` executes as the
-        // probe-gated `install-proxy` — which runs ONLY on a host that has no proxy
-        // binary, so it is legitimately absent from this already-equipped fleet's
-        // ops). Partitioning — rather than a bare `contains` — means a NEW plan step
-        // forces a deliberate decision here instead of silently drifting away from
-        // the ops.
+        // (3) Step-label subset. Every printed step label either names a real executed
+        // op or is one of the five deliberately mechanism-neutral labels: `build` is
+        // local, `upload` executes as `upload-binary`, `cutover` as `proxy-flip`,
+        // `drain` as `drain-old`, and `prepare-host` as the probe-gated `install-proxy`,
+        // which runs only on a host with no proxy binary and so is legitimately absent
+        // from this already-equipped fleet's ops. Partitioning, rather than a bare
+        // `contains`, means a new plan step forces a deliberate decision here instead of
+        // drifting away from the ops.
         let step_labels: Vec<&str> = build_deploy_plan(&fleet.hosts[0])
             .iter()
             .map(|s| s.label)
@@ -7446,21 +7430,20 @@ mod tests {
 
     #[test]
     fn media_provisioning_is_deferred_past_app_cutover_in_up() {
-        // Finding K: the MUTATING MediaMTX provisioning must run only AFTER the app
-        // deploy/cutover commits. The app deploy rolls back on failure (readiness
-        // gate, migrations) and leaves the OLD release serving, and there is
-        // deliberately no media teardown — so writing/restarting the host MediaMTX
-        // unit BEFORE the app is committed would strand a rolled-back release
-        // against a moved media daemon. We assert the source order of the `up`
-        // path: the non-mutating preflight precedes the rollout loop, and
-        // `provision_media_host` is invoked only after that loop has run every
-        // host to completion.
+        // Finding K: the mutating MediaMTX provisioning must run only after the app
+        // deploy and cutover commit. The app deploy rolls back on failure — readiness
+        // gate, migrations — and leaves the old release serving, and there is
+        // deliberately no media teardown, so writing and restarting the host MediaMTX
+        // unit before the app is committed would strand a rolled-back release against a
+        // moved media daemon. This asserts the source order of the `up` path: the
+        // non-mutating preflight precedes the rollout loop, and `provision_media_host`
+        // is invoked only after that loop has run every host to completion.
         //
-        // #1621 re-anchored the middle marker. `run_up` is now a fleet-shaped
-        // driver (`run_up` prologue + `run_up_with` loop), so the commit point is
-        // no longer a single `result.map_err(...)?` line but the per-host execution
-        // LOOP — a strictly stronger statement: provisioning must follow the last
-        // host's cutover, not merely one host's.
+        // #1621 re-anchored the middle marker. `run_up` is now a fleet-shaped driver
+        // (`run_up` prologue plus `run_up_with` loop), so the commit point is the
+        // per-host execution loop rather than a single `result.map_err(...)?` line — a
+        // strictly stronger statement: provisioning must follow the last host's cutover,
+        // not merely one host's.
         let src = include_str!("deploy.rs");
         let up_body = src
             .split("fn run_up(")
@@ -8308,17 +8291,15 @@ mod tests {
 
     #[test]
     fn a_failed_host_halts_the_rollout_and_leaves_later_hosts_untouched() {
-        // #1621 (AC-3). Host 2's readiness gate fails — a PRE-boundary failure, so
-        // its candidate is torn down by the existing per-host auto-rollback and its
-        // old release keeps serving. The rollout then HALTS: host 3 is never
-        // touched. Host 1 is left on the new release and NAMED, so the operator can
-        // reverse it.
+        // #1621 (AC-3). Host 2's readiness gate fails, a pre-boundary failure, so its
+        // candidate is torn down by the per-host auto-rollback and its old release keeps
+        // serving. The rollout then halts: host 3 is never touched. Host 1 is left on
+        // the new release and named, so the operator can reverse it.
         //
-        // #1621 slice 4 pins this against the HALT-AND-FREEZE seam (`auto_rollback:
-        // false`, the internal form of `--no-rollback`): freezing is exactly the
-        // "stop and let me look" behaviour, so it must keep reporting partial state
-        // truthfully. The default path — which compensates web-a instead of leaving
-        // it forward — is
+        // Slice 4 pins this against the halt-and-freeze seam (`auto_rollback: false`,
+        // the internal form of `--no-rollback`): freezing is exactly the "stop and let
+        // me look" behaviour, so it must keep reporting partial state truthfully. The
+        // default path, which compensates web-a instead of leaving it forward, is
         // `a_pre_boundary_failure_rolls_the_already_cut_over_hosts_back`.
         let hosts = ["web-a", "web-b", "web-c"];
         let fleet = fleet_of(&hosts);
@@ -8560,15 +8541,13 @@ mod tests {
     #[test]
     fn a_compensated_first_deploy_stops_reporting_a_successful_last_deploy() {
         // #1621 (AC-6, audit gap G3). `CompensatedTeardown` returns web-a to
-        // nothing-installed — but its first deploy had already written
-        // `shared/last-deploy = deployed <ts>` via `record-proxy-options`. Left
-        // alone, `deploy status` would show `last deploy: deployed <ts>` for a host
-        // carrying no release at all, which is the worst possible moment for a
-        // wrong value: the operator is inspecting the fleet precisely BECAUSE the
-        // rollout halted.
-        //
-        // The teardown's last op rewrites the marker to `torn down`, so the column
-        // reports what actually happened instead of a deploy that was undone.
+        // nothing-installed, but its first deploy had already written
+        // `shared/last-deploy = deployed <ts>` via `record-proxy-options`. Left alone,
+        // `deploy status` would show `last deploy: deployed <ts>` for a host carrying no
+        // release at all — the worst possible moment for a wrong value, since the
+        // operator is inspecting the fleet precisely because the rollout halted. The
+        // teardown's last op rewrites the marker to `torn down`, so the column reports
+        // what actually happened.
         let fleet = fleet_of(&["web-a", "web-b"]);
         let mut recorder = fleet::test_support::FleetRecorder::new();
         recorder = script_first_deploy(recorder, "web-a");
@@ -9211,15 +9190,15 @@ mod tests {
 
     #[test]
     fn per_host_job_and_scheduler_backends_warn_for_a_fleet_and_stay_silent_for_one_host() {
-        // #1621. `[jobs] backend` defaults to `local` (an in-process queue) and
-        // `[scheduler] backend` to `in_process` (a per-process timer). On ONE host
-        // that is correct and is what every un-configured app runs; on N hosts it
-        // silently means N independent queues and N schedulers — enqueued work is
-        // only ever run by the host that took the request, pending work dies with
-        // every `drain-old`, `unique`/`concurrency` stop being enforced fleet-wide,
-        // and every cron fires N times. A WARNING, never a refusal: these are the
-        // DEFAULTS, so refusing would break every existing single-host user's
-        // scale-up (same rule as `FLEET_AUTO_MIGRATE_WARNING`).
+        // #1621. `[jobs] backend` defaults to `local`, an in-process queue, and
+        // `[scheduler] backend` to `in_process`, a per-process timer. On one host that
+        // is correct and is what every unconfigured app runs; on N hosts it silently
+        // means N independent queues and N schedulers — enqueued work runs only on the
+        // host that took the request, pending work dies with every `drain-old`,
+        // `unique`/`concurrency` stop being enforced fleet-wide, and every cron fires N
+        // times. A warning, never a refusal: these are the defaults, so refusing would
+        // break every existing single-host user's scale-up (same rule as
+        // `FLEET_AUTO_MIGRATE_WARNING`).
         let warning = fleet_shared_backend_warning(3, "local", true)
             .expect("a fleet on the in-process defaults must be warned");
         assert!(
@@ -9306,16 +9285,14 @@ mod tests {
 
     #[test]
     fn only_restricts_the_rollout_and_moves_the_migration_with_it() {
-        // #1621 (§3.2). `--only web-b` on a three-host fleet touches web-b and
-        // nothing else — not even the read-only probes run against the hosts it
-        // skips, which is deliberate: an excluded host's drifted marker must not
-        // refuse the repair deploy aimed at a different host.
-        //
-        // Migrate placement is computed over the SELECTED hosts: web-b is the first
-        // redeploy in this rollout, so web-b migrates. (Over the full fleet web-a
-        // would have.) That is the honest reading of "exactly once" for a narrowed
-        // rollout — the schema is fleet-wide, and the hosts left out are not being
-        // deployed at all.
+        // #1621 (§3.2). `--only web-b` on a three-host fleet touches web-b and nothing
+        // else — not even the read-only probes run against the skipped hosts, which is
+        // deliberate: an excluded host's drifted marker must not refuse a repair deploy
+        // aimed at a different host. Migrate placement is computed over the selected
+        // hosts, so web-b, the first redeploy in this rollout, migrates; over the full
+        // fleet web-a would have. That is the honest reading of "exactly once" for a
+        // narrowed rollout — the schema is fleet-wide, and the hosts left out are not
+        // being deployed at all.
         let selected = select_hosts(
             &["web-a", "web-b", "web-c"]
                 .iter()
@@ -10471,16 +10448,14 @@ mod tests {
 
     #[test]
     fn fleet_rollback_skips_a_host_with_no_previous_release_and_rolls_the_rest_back() {
-        // #1621 (§3.2). A host that has never been redeployed — a first deploy
-        // clears the marker, and a host just added to the fleet never had one — has
-        // nothing to roll back TO. That is a reported SKIP rather than a failed
-        // rollback, and it must NOT stop the other hosts: halting there would leave
-        // them on the release the operator is trying to leave.
-        //
-        // It does still make the COMMAND exit non-zero. The contract of a fleet
-        // rollback is that the FLEET returns to its previous release, and a fleet
-        // where one host cannot follow the others is mixed — reporting that as
-        // success is how a mixed fleet survives an incident unnoticed.
+        // #1621 (§3.2). A host that has never been redeployed — a first deploy clears
+        // the marker, and a host just added to the fleet never had one — has nothing to
+        // roll back to. That is a reported skip rather than a failed rollback, and it
+        // must not stop the other hosts: halting there would leave them on the release
+        // the operator is trying to leave. It does still make the command exit non-zero.
+        // The contract of a fleet rollback is that the fleet returns to its previous
+        // release, and a fleet where one host cannot follow the others is mixed —
+        // reporting that as success is how a mixed fleet survives an incident unnoticed.
         let hosts = ["web-a", "web-b", "web-c"];
         let fleet = fleet_of(&hosts);
         let mut recorder = fleet::test_support::FleetRecorder::new();
