@@ -53,6 +53,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature set (only `derive`, not `card`/`unic`), so no model can use them
   today regardless of the update path.
 
+- **A CI gate for `AUTUMN_*` config keys named in the docs [no-plugin]:**
+  nothing here is agent-facing — it's a CI/docs-harness addition, not new
+  framework surface (`scripts/check-docs-config.sh`, wired into the docs-only
+  job in `.github/workflows/ci.yml`). The corpus already gates the link a
+  reader clicks (`check-docs-links.sh`) and the command they run
+  (`check-docs-cli.sh`); this gates the third thing they copy off a page, and
+  the only one of the three that fails **silently**. A wrong link 404s and a
+  wrong command exits 2, but a wrong environment variable is simply not read:
+  the process starts, the default stands, and nothing anywhere reports that
+  the override was ignored. `autumn check --config` and `server.strict_config`
+  reject an unknown key in `autumn.toml`, but neither sees the env layer — an
+  override is applied by name at load time or not at all — so
+  `AUTUMN_DATABASE_URL` (one underscore, the pre-0.2 spelling) beside a
+  production Postgres URL reads exactly like a working line, and the app comes
+  up on the default database.
+
+  The gate asks whether the runtime **reads** a name, not whether a config key
+  is spelled like it. Those are different sets: the env layer is written field
+  by field (`parse_env(env, "AUTUMN_LOG__LEVEL", …)`), so a TOML key with no
+  override of its own has no environment spelling at all — `openapi.enabled`
+  is a real schema leaf and `AUTUMN_OPENAPI__ENABLED` is read by nothing, as
+  are 90 of the 397 leaves. So a name resolves when something in the tracked
+  non-markdown tree **binds** it (`const CANARY_ENV: &str = "AUTUMN_CANARY"`)
+  or **reads** it through an env accessor, or when it matches one the runtime
+  **builds** (`format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_ID")` — the
+  filled-in segment open, the rest exact, which is the runtime's own
+  behaviour). That covers the four subsystems outside `AutumnConfig`:
+  `autumn-search` and `autumn-media-plugin` layer their own overrides in their
+  own crates, `autumn-cli` owns `[dev] watch_dirs`, and `AUTUMN_SYNC__*` is
+  read by the Tauri shell the CLI generates.
+  `autumn/tests/fixtures/schema_keys.snapshot` — the same schema walk that
+  backs strict unknown-key validation, already kept honest by
+  `schema_keys_snapshot_guard`, so nothing needs regenerating and no Rust
+  toolchain is required — bounds the one open-ended template
+  (`…SHARDS__{i}__{field}`) and checks declared config *paths*.
+
+  It also gates the hand-maintained 142-row `AUTUMN_* -> config path` table in
+  `config.rs`'s module docs, the mapping readers meet on docs.rs. Each row
+  makes two claims, checked against their own truth: the path must exist in
+  the schema, the variable must be one the runtime reads, and the two must
+  agree — so neither a row edited on one side nor a row publishing an override
+  that sets nothing gets through. Any row shaped like a mapping that the
+  checker cannot parse is reported rather than skipped.
+
+  Prose that names a family (`AUTUMN_ALERTS__*`,
+  `AUTUMN_MEDIA__<TABLE>__<FIELD>`), pages teaching the naming rule
+  (`AUTUMN_SECTION__FIELD`), reader-chosen names
+  (`access_key_id_env = "AUTUMN_OFFSITE_ACCESS_KEY_ID"`) and identifiers a page
+  declares in its own example code (`pub const AUTUMN_SOURCE: &str = …` in
+  `docs/guide/wasm-islands.md`) are recognised as such rather than waived —
+  the last of those only inside that page's Rust fences, and only where the
+  occurrence is not a string literal, so a snippet that both declares a const
+  and calls `env::var("…")` on the same spelling still has the call checked. A
+  malformed name — lower case outside a placeholder, or a dangling separator —
+  is reported rather than skipped, since a spelling that matches nothing is a
+  claim the reader cannot be warned about.
+
+  The corpus is the pages a reader lands on, defined identically here and in
+  `check-docs-cli.sh`: the guides, the migration notes, the root `README.md`
+  and its siblings, `docs/plugins.md`, the markdown templates written into
+  every scaffolded project, and each example's `README.md` — the page GitHub
+  renders when a reader follows one of the example links in the README table,
+  and where `export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"`
+  and friends are copied from.
+
+  The baseline run found **0 defects** across 681 occurrences on 193 pages:
+  the reader-facing corpus was already accurate, and the gate is here to keep
+  it that way. One occurrence is waived in place beside the passage that needs
+  it — a migration guide's `rg` pattern for a key that release removed.
+
 - **A CI gate for the "local development" install path [no-plugin]:** nothing
   here is agent-facing — it's a CI/test-harness addition, not new framework
   surface (`local-dev-quickstart` job in
@@ -1697,6 +1767,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   had for the (still-supported) case of a live `#[authorize]` attribute or
   policy check — fixed the same way, via `api_doc::extract_secured_info`
   (Codex review on #2513, P2).
+
+- **hot-upgrade example: `live_upgrade` test no longer conflates a mid-flight
+  reset with a refused connection, and no longer lets an unbounded number of
+  resets pass silently (issue #2462):**
+  `upgrades_in_place_under_load_without_dropping_a_connection_or_the_state`
+  counted every request failure — `ECONNREFUSED` (nothing listening, the
+  actual zero-downtime violation) and `ECONNRESET`/`ECONNABORTED` (a
+  connection torn down mid-flight) — into one `connect_errors` counter, then
+  asserted zero on it with a message claiming *"no connection may be
+  refused"*. That failed once, intermittently, on `Test (macos-latest)` with
+  two `ECONNRESET`s, and the message actively misled: it named refusal when
+  the actual cause was a reset. Refused and reset are now classified
+  separately (`is_connection_refused`/`is_mid_flight_reset`); a mid-flight
+  reset gets one retry (`with_reset_retry`, after a short 20ms backoff so it
+  lands after the handover settles rather than in the same window that reset
+  the first attempt), while a refused connection is a hard, zero-tolerance
+  failure on the first attempt — never retried, since there is nothing to
+  wait out. A retried success's `latency` is overwritten to span the whole
+  attempt (failed try + backoff + retry), not just the retry's own timing, so
+  a genuine cutover latency spike can't hide behind a cheap retry.
+  Autumn's in-place upgrade hands the successor the *same* listening socket
+  by duplicating its fd across the `exec` (`HandoffSocket::from_listener`),
+  not by binding a second `SO_REUSEPORT` socket, so — unlike this issue's own
+  initial theory — there is no accept-queue race between two listeners to
+  blame a reset on; the root cause of the one observed instance remains
+  unconfirmed. Retrying past a reset is therefore now bounded
+  (`MAX_TOLERATED_RESETS`, asserted): an isolated anomaly doesn't fail the
+  run, but a systemic source of resets — real evidence of a defect in the
+  handoff or drain path — still does, rather than being silently retried
+  away every time. The failure message and a `println!` summary say which of
+  refused/hard-failed/retried happened.
+  `with_reset_retry`'s branching (retry-then-succeed, a second reset still
+  fails, a refusal is never retried, an unrelated error kind is never
+  retried, and the spanning-latency behavior) is unit-tested directly against
+  fake attempt closures, independent of the real network/signal machinery the
+  rest of the test drives.
 
 - **🔒 `autumn generate auth`: a concurrent successful login could be silently
   re-locked by a racing failed attempt (issue #2500):** the generated
