@@ -49,10 +49,19 @@
 //! # the "own added cost" comparison below actually needs (a combined `both`
 //! # run profiles one throttled + one plain request per iteration together
 //! # and cannot be split back apart after the fact — caught in review).
-//! valgrind --tool=callgrind --callgrind-out-file=throttled.out "$BIN" --iterations 1000 --route throttled
-//! valgrind --tool=callgrind --callgrind-out-file=plain.out     "$BIN" --iterations 1000 --route plain
-//! callgrind_annotate --threshold=80 throttled.out | head -40
-//! callgrind_annotate --threshold=80 plain.out     | head -40
+//! # Callgrind collects from process startup by default, so each nonzero-
+//! # iteration total still includes router construction and the 50-round
+//! # warm-up; a zero-iteration run per route isolates that fixed cost so it
+//! # can be subtracted before dividing by the iteration count, the same way
+//! # the dhat runs below already are (also caught in review — an earlier
+//! # version of this doc example divided the raw nonzero totals directly).
+//! valgrind --tool=callgrind --callgrind-out-file=throttled-0.out    "$BIN" --iterations 0    --route throttled
+//! valgrind --tool=callgrind --callgrind-out-file=plain-0.out        "$BIN" --iterations 0    --route plain
+//! valgrind --tool=callgrind --callgrind-out-file=throttled-1000.out "$BIN" --iterations 1000 --route throttled
+//! valgrind --tool=callgrind --callgrind-out-file=plain-1000.out     "$BIN" --iterations 1000 --route plain
+//! callgrind_annotate --threshold=80 throttled-1000.out | head -40
+//! callgrind_annotate --threshold=80 plain-1000.out     | head -40
+//! # marginal Ir/request = (1000-iteration total - 0-iteration total) / 1000
 //!
 //! # Allocation profile (valgrind's built-in dhat tool — no crate dependency).
 //! # Two runs per route, subtracted, isolate the marginal per-request cost
