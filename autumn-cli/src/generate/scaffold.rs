@@ -6876,29 +6876,27 @@ pub async fn move_down(
     } else {
         index_columns_labeled
     };
-    // Issue #1312: the CSRF pair and the one-time submit-token pair (#1360) the
-    // index/search handlers thread into `bulk_actions_form`'s hidden fields.
-    // Injected after `flash: Flash,` in the signatures that render the bulk
-    // form; empty (so byte-identical) otherwise. The submit token matters here
-    // for the same reason it does on create/update: `SubmitTokenLayer` waves a
-    // tokenless request straight through, so without it a double-clicked
-    // "Delete selected" runs the whole destructive path — hooks and dependent
-    // deletes included — twice instead of replaying the first response.
-    // Issue #1349: under `--i18n` the four token extractors collapse into ONE
-    // tuple parameter. axum implements `FromRequestParts` for tuples, and its
-    // `Handler` impls stop at 16 arguments — the owner-scoped `search` handler
-    // already declares 13, and `#[secured]`/`#[get]` inject three more, so
-    // adding `locale: Locale` on top would push it to 17 and fail to compile
-    // with an unreadable elided-tuple trait error. Destructuring in the pattern
-    // keeps every use site in the body spelled exactly as before. Only under
-    // the flag: the plain scaffold's signature stays byte-identical.
-    // Issue #1358: the Move up/down buttons need the same CSRF + one-time
-    // submit-token pair as the bulk-delete form (a double-clicked move is
-    // exactly the double-submit `SubmitTokenLayer` guards against), so this
-    // gate — and the params it emits — are shared between the two features
-    // rather than duplicated. Reusing the identical 4-tuple (rather than a
-    // 2-tuple for reorder-only) means every emitted param is always actually
-    // used by at least one of the two forms, whichever combination is on.
+    // #1312: the CSRF pair and the one-time submit-token pair (#1360) the index and search
+    // handlers thread into `bulk_actions_form`'s hidden fields, injected after `flash:
+    // Flash,` in the signatures that render the bulk form and empty otherwise. The submit
+    // token matters here for the same reason it does on create and update:
+    // `SubmitTokenLayer` waves a tokenless request straight through, so without it a
+    // double-clicked "Delete selected" runs the whole destructive path — hooks and
+    // dependent deletes included — twice instead of replaying the first response.
+    //
+    // #1349: under `--i18n` the four token extractors collapse into one tuple parameter.
+    // axum implements `FromRequestParts` for tuples, and its `Handler` impls stop at 16
+    // arguments: the owner-scoped `search` handler already declares 13, and
+    // `#[secured]`/`#[get]` inject three more, so adding `locale: Locale` would push it to
+    // 17 and fail with an unreadable elided-tuple trait error. Destructuring in the
+    // pattern keeps every use site in the body spelled as before, and only under the flag
+    // — the plain scaffold's signature stays byte-identical.
+    //
+    // #1358: the Move up/down buttons need the same CSRF and submit-token pair as the
+    // bulk-delete form, since a double-clicked move is exactly the double-submit
+    // `SubmitTokenLayer` guards against, so this gate and the params it emits are shared
+    // between the two features. Reusing the identical 4-tuple, rather than a 2-tuple for
+    // reorder-only, means every emitted param is always used by at least one of the forms.
     let bulk_csrf_params = if !bulk_delete_enabled && !reorder_enabled {
         String::new()
     } else if labels.enabled() {
@@ -6938,23 +6936,22 @@ pub async fn move_down(
     };
 
     let list_render = if live { &live_ul_render } else { &table_render };
-    // The list + pager block the index handler renders. When searchable (AC3),
-    // this becomes an `active_search_input` box wired to `GET /{plural}/search`
-    // sitting above the single `#{plural}-search-results` container that htmx
-    // swaps into. We use the input-only `active_search_input` (not the composite
-    // `active_search`, which would render its OWN empty `#{plural}-search-results`
-    // container and produce a duplicate id) and render one container ourselves,
-    // seeded with the initial `{list_render}` + pager server-side — so the first
-    // paint needs no extra AJAX round-trip (no `.initial_load()`) and
-    // non-JavaScript visitors still see the full list. The shared `crate::layout`
-    // does not load htmx, so an htmx `<script>` is inlined here. When not
-    // searchable (or a live variant), it is exactly the previous `{list_render}`
-    // + `pagination_nav` pair — byte-for-byte identical (AC4).
-    // #1126: the non-live (sort/filter) index handlers preserve the active
-    // sort+filter query string on the pager links via `PagerOptions::query`, so
-    // paging never drops the current sort/filter (`pager_query` is bound in each
-    // handler from the raw query string). The `--live` variants call `repo.page`
-    // and extract no `RawQuery`, so they keep the plain pager.
+    // The list and pager block the index handler renders. When searchable (AC3) this
+    // becomes an `active_search_input` box wired to `GET /{plural}/search`, sitting above
+    // the single `#{plural}-search-results` container htmx swaps into. It uses the
+    // input-only `active_search_input`, not the composite `active_search`, which would
+    // render its own empty `#{plural}-search-results` container and duplicate the id, and
+    // renders one container here seeded with the initial `{list_render}` and pager
+    // server-side — so the first paint needs no extra AJAX round-trip, no
+    // `.initial_load()`, and non-JavaScript visitors still see the full list. The shared
+    // `crate::layout` does not load htmx, so an htmx `<script>` is inlined here. When not
+    // searchable, or on a live variant, it is exactly the previous `{list_render}` and
+    // `pagination_nav` pair, byte for byte (AC4).
+    //
+    // #1126: the non-live index handlers preserve the active sort and filter query string
+    // on the pager links via `PagerOptions::query`, so paging never drops them
+    // (`pager_query` is bound in each handler from the raw query string). The `--live`
+    // variants call `repo.page` and extract no `RawQuery`, so they keep the plain pager.
     let pager_line = if live {
         format!("(pagination_nav(&page_data, &PagerOptions::new(&paths::index()){pager_labels}))")
     } else {
@@ -6962,35 +6959,32 @@ pub async fn move_down(
             "(pagination_nav(&page_data, &PagerOptions::new(&paths::index()).query(pager_query){pager_labels}))"
         )
     };
-    // Issue #1315: the index's "Export CSV" link, and the `let` that builds its
-    // href. The link carries the index's CURRENT query string, so "filter →
-    // sort → export" downloads exactly the rows on screen rather than the whole
-    // table; `pager_query` is the same raw query the pager links already
-    // preserve. Paging params ride along harmlessly — the export handler
-    // extracts no `PageRequest`. Both are empty for a gated-off variant, so its
-    // index stays byte-identical to its pre-#1315 output.
+    // #1315: the index's "Export CSV" link, and the `let` that builds its href. The link
+    // carries the index's current query string, so "filter → sort → export" downloads
+    // exactly the rows on screen rather than the whole table; `pager_query` is the same
+    // raw query the pager links already preserve. Paging params ride along harmlessly,
+    // since the export handler extracts no `PageRequest`. Both are empty for a gated-off
+    // variant, so its index stays byte-identical to its pre-#1315 output. Rendered
+    // deliberately outside the #1312 bulk-actions `<form>`: a nested `<form>` is invalid
+    // HTML, and an export is not a selection action.
     //
-    // Rendered deliberately OUTSIDE the #1312 bulk-actions `<form>`: a nested
-    // `<form>` is invalid HTML, and an export is not a selection action.
+    // Where it sits depends on `--searchable`, because the link must never outlive the row
+    // set it describes:
     //
-    // WHERE it sits depends on `--searchable`, because the link must never
-    // outlive the row set it describes:
+    //   * Not searchable — page furniture next to "New {pascal_name}". The only things
+    //     that narrow the list are `?sort=` and `?filter[col]=`, both in the URL that
+    //     `pager_query` copies into the href, so a link rendered once with the page stays
+    //     accurate as long as the page does.
     //
-    //   * Not searchable — page furniture next to "New {pascal_name}". The only
-    //     things that narrow the list are `?sort=`/`?filter[col]=`, both of which
-    //     live in the URL that `pager_query` copies into the href, so a link
-    //     rendered once with the page stays accurate for as long as the page does.
-    //
-    //   * Searchable — INSIDE the `#{plural}-search-results` container instead.
-    //     `active_search_input` swaps that container and pushes no URL, so the
-    //     search term never reaches `pager_query` and `ListQuery` has no field to
-    //     put it in. A link left outside the container would survive the swap
-    //     pointing at the UNSEARCHED set: the user narrows the list, clicks
-    //     "Export CSV" next to the rows they filtered down to, and silently
-    //     downloads the rows they just excluded. Rendering it inside means the
-    //     swap replaces it — the search fragment emits no link, so searched
-    //     results simply offer no export, which is what the generators guide
-    //     already documents. Clearing the search restores the list and its link.
+    //   * Searchable — inside the `#{plural}-search-results` container instead.
+    //     `active_search_input` swaps that container and pushes no URL, so the search term
+    //     never reaches `pager_query` and `ListQuery` has no field for it. A link left
+    //     outside the container would survive the swap pointing at the unsearched set: the
+    //     user narrows the list, clicks "Export CSV" next to the rows they filtered down
+    //     to, and silently downloads the rows they just excluded. Rendering it inside means
+    //     the swap replaces it — the search fragment emits no link, so searched results
+    //     offer no export, which the generators guide already documents. Clearing the
+    //     search restores the list and its link.
     let (export_href_let, export_link) = if export_enabled {
         (
             "    let export_href = if pager_query.is_empty() {\n        \
@@ -7020,20 +7014,19 @@ pub async fn move_down(
     } else {
         export_link.as_str()
     };
-    // Issue #1332 AC2: the index's "Trash" link. Page furniture next to "New
-    // {pascal_name}" — unlike "Export CSV" it describes no row set, so a search
-    // that swaps the results container cannot leave it pointing at stale rows,
-    // and it stays outside the #1312 bulk-actions `<form>` (a trash page is not
-    // a selection action). The explicit `" "` separator is the same one the
-    // export link and the show view use: Maud drops template whitespace between
-    // nodes, so without it the anchors render as one glued run.
-    // Issue #1393: the index's "Import CSV" link. Page furniture like "Trash",
-    // NOT like "Export CSV": it opens an upload form rather than describing the
-    // row set on screen, so a search that swaps the results container cannot
-    // leave it pointing at rows the user has since filtered away — which is why
-    // it stays in the furniture slot even on a searchable scaffold. Outside the
-    // #1312 bulk-actions `<form>` for the same reason the export is: an import
-    // is not a selection action, and a nested `<form>` is invalid HTML.
+    // #1332 AC2: the index's "Trash" link. Page furniture next to "New {pascal_name}":
+    // unlike "Export CSV" it describes no row set, so a search that swaps the results
+    // container cannot leave it pointing at stale rows, and it stays outside the #1312
+    // bulk-actions `<form>`, since a trash page is not a selection action. The explicit
+    // `" "` separator is the same one the export link and the show view use, because Maud
+    // drops template whitespace between nodes and the anchors would otherwise render as
+    // one glued run.
+    //
+    // #1393: the index's "Import CSV" link. Page furniture like "Trash", not like "Export
+    // CSV": it opens an upload form rather than describing the row set on screen, so a
+    // search that swaps the results container cannot leave it pointing at rows the user has
+    // filtered away, which is why it stays in the furniture slot even on a searchable
+    // scaffold. Outside the bulk-actions `<form>` for the same reason the export is.
     let import_link_furniture = if import_enabled {
         format!(
             "\n        \" \"\n        \
@@ -7060,18 +7053,17 @@ pub async fn move_down(
     } else {
         String::new()
     };
-    // Issue #1312: the list itself (data_table + pager) is wrapped in the
-    // bulk-actions `<form>` so each row's checkbox submits with the
-    // delete-selected button. The "New {pascal_name}" link, the htmx `<script>`,
-    // and the search box deliberately stay OUTSIDE: they are page furniture, not
-    // part of the selection.
+    // #1312: the list itself — data_table plus pager — is wrapped in the bulk-actions
+    // `<form>`, so each row's checkbox submits with the delete-selected button. The "New
+    // {pascal_name}" link, the htmx `<script>`, and the search box deliberately stay
+    // outside: they are page furniture, not part of the selection.
     //
-    // When searchable, the form sits INSIDE the `#{plural}-search-results`
-    // container htmx swaps — not around it. The `/search` fragment is itself a
-    // whole `bulk_actions_form`, so swapping it into a container that already
-    // lived inside a form would nest one `<form>` in another (invalid HTML the
-    // parser silently drops). Form-inside-container means every swap replaces
-    // the form wholesale and the checkboxes always have their submit button.
+    // When searchable, the form sits inside the `#{plural}-search-results` container htmx
+    // swaps, not around it. The `/search` fragment is itself a whole `bulk_actions_form`,
+    // so swapping it into a container that already lived inside a form would nest one
+    // `<form>` in another, which the parser silently drops. Form-inside-container means
+    // every swap replaces the form wholesale and the checkboxes always have their submit
+    // button.
     let index_list_block = if search_enabled {
         // `export_link_in_results` is the "Export CSV" anchor (empty unless this
         // variant emits an export). It goes inside the swapped container but
@@ -7370,20 +7362,18 @@ pub async fn index(
         }
     };
 
-    // When `--live-validation`, emit one inline-validation handler per validated
-    // field. Each handler decodes the *whole* submitted form (htmx's
-    // `hx-include="closest form"` posts every field, not just the one that
-    // changed) via the same `decode_form` used by `create`/`update`, builds a
-    // `Changeset<{pascal_name}Form>` through the struct's derived
-    // `#[validate(...)]` rules, and returns `text_input_htmx`'s full field
-    // wrapper (label + input + inline error) for that one field. Sharing the
-    // changeset/validator machinery with `create`/`update` means there is only
-    // one place the validation rules live, and the returned markup matches
-    // `text_input_htmx`'s `hx-swap="outerHTML"` contract — swapping in a bare
-    // `<span>` would delete the input it's supposed to replace.
-    // Issue #1255: rich-text columns are excluded — see the matching filter on
-    // `validated_field_names` in `plan_scaffold`. Both sides must agree or the
-    // mounted route set and the emitted handler set drift apart.
+    // When `--live-validation`, emit one inline-validation handler per validated field.
+    // Each decodes the whole submitted form — htmx's `hx-include="closest form"` posts
+    // every field, not just the one that changed — via the same `decode_form` that
+    // `create` and `update` use, builds a `Changeset<{pascal_name}Form>` through the
+    // struct's derived `#[validate(...)]` rules, and returns `text_input_htmx`'s full
+    // field wrapper (label, input, inline error) for that one field. Sharing the changeset
+    // and validator machinery with `create`/`update` keeps the validation rules in one
+    // place, and the returned markup matches `text_input_htmx`'s `hx-swap="outerHTML"`
+    // contract — swapping in a bare `<span>` would delete the input it is meant to
+    // replace. Rich-text columns are excluded (#1255); see the matching filter on
+    // `validated_field_names` in `plan_scaffold`. Both sides must agree or the mounted
+    // route set and the emitted handler set drift apart.
     let htmx_validated: Vec<(&String, &Vec<String>)> = validations
         .iter()
         .filter(|(name, _)| {
@@ -7605,21 +7595,20 @@ pub async fn index(
         out
     };
 
-    // Issue #1319: the FTS results handler backing the index `active_search`
-    // box. For htmx requests it returns just the results fragment (swapped into
-    // `#{plural}-search-results`); for a plain navigation — a bookmarked search
-    // URL, or a shared pager link — it returns the full page so search degrades
-    // gracefully without JavaScript. An empty `q` falls back to the standard
-    // `page(&page_req)` listing (AC3). Reuses the same `columns` and
-    // reference-label loads the index builds so search rows render identically.
-    // The pager preserves the request's raw query string (stripping `page`/
-    // `size`) via `PagerOptions::query`, so `q` survives pagination without any
-    // hand-rolled percent-encoding.
+    // #1319: the FTS results handler backing the index `active_search` box. For htmx
+    // requests it returns just the results fragment, swapped into
+    // `#{plural}-search-results`; for a plain navigation — a bookmarked search URL, or a
+    // shared pager link — it returns the full page, so search degrades gracefully without
+    // JavaScript. An empty `q` falls back to the standard `page(&page_req)` listing (AC3).
+    // It reuses the same `columns` and reference-label loads the index builds, so search
+    // rows render identically, and the pager preserves the request's raw query string,
+    // stripping `page` and `size`, via `PagerOptions::query`, so `q` survives pagination
+    // with no hand-rolled percent-encoding.
     //
-    // Issue #1312: the fragment htmx swaps into `#{plural}-search-results` is the
-    // WHOLE bulk form, not just the table — otherwise the first search would
-    // replace the form's innards with checkboxes that have no `<form>` (and no
-    // submit button) around them, silently breaking bulk delete after a search.
+    // #1312: the fragment htmx swaps into `#{plural}-search-results` is the whole bulk
+    // form, not just the table. Otherwise the first search would replace the form's
+    // innards with checkboxes that have no `<form>`, and no submit button, around them,
+    // silently breaking bulk delete after a search.
     let search_results_table = format!(
         r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({search_empty}).base_path("/{plural}/search")))"#
     );
@@ -7970,22 +7959,21 @@ pub async fn show(
 {show_authz_call}    show_view({show_view_locale_arg}db, &row, {flash_arg}, csrf.as_ref(), csrf_field.as_ref(){show_view_state_arg_call}).await
 }}"#
             );
-            // Issue #1326 security fix (IDOR): a transition mutates an existing
-            // row, so when record-policy wiring is on (the default for non-`--api`
-            // scaffolds) the transition handler must record-authorize the actor
-            // against the loaded row *before* writing — using the SAME `"update"`
-            // action the `update` handler uses. Without this, any authenticated
-            // user who knows another row's id could POST a transition and change
-            // its state, bypassing the record policy. Mirrors the `update`/`destroy`
-            // authorize preamble: the full `State(state)` + `session: Session`
-            // extractor pair (a transition handler never carries a multipart
-            // `state`, so there is no attachment-reuse concern) and `&state` as the
-            // `AppState` receiver. When policy wiring is off it emits nothing, so
-            // the handler is exactly `id/db/flash/csrf/body` as before.
-            // Issue #1236: with attachments the shared `show_view` needs the app
-            // state to sign the stored file's URL. The authorize wiring already
-            // injects one; without it (`--no-policy`) the transition handler adds
-            // its own, and either binding shape coerces to `&AppState`.
+            // #1326 security fix (IDOR): a transition mutates an existing row,
+            // so with record-policy wiring on — the default for non-`--api`
+            // scaffolds — the handler must record-authorize the actor against
+            // the loaded row before writing, using the same `"update"` action
+            // `update` uses. Without this, any authenticated user who knows
+            // another row's id could POST a transition and change its state,
+            // bypassing the record policy. It mirrors the `update`/`destroy`
+            // authorize preamble: the `State(state)` plus `session: Session`
+            // pair — a transition handler never carries a multipart `state`, so
+            // there is no attachment-reuse concern — and `&state` as the
+            // `AppState` receiver. With policy wiring off it emits nothing.
+            // #1236: with attachments the shared `show_view` needs the app state
+            // to sign the stored file's URL. The authorize wiring already injects
+            // one; under `--no-policy` the transition handler adds its own, and
+            // either binding shape coerces to `&AppState`.
             let transition_authz_params = if authorize {
                 "    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    session: autumn_web::session::Session,\n"
             } else if has_attachments {
@@ -8000,26 +7988,25 @@ pub async fn show(
             } else {
                 String::new()
             };
-            // Issue #1318: a state transition is a read-modify-write — it loads
-            // the row, asks `transition_{field}_to` whether the edge is legal
-            // from the state it just read, then writes. With a lock column in
-            // play that whole sequence becomes a compare-and-swap against the
-            // version it read, for two reasons:
+            // #1318: a state transition is a read-modify-write — it loads the row,
+            // asks `transition_{field}_to` whether the edge is legal from the state
+            // it just read, then writes. With a lock column in play that sequence
+            // becomes a compare-and-swap against the version it read, for two
+            // reasons:
             //
-            //   * the GUARD stops two concurrent transitions out of the same
-            //     source state from both committing. Both would pass the
-            //     legality check against the stale row they each loaded, and an
-            //     `id`-only `WHERE` would let the second silently overwrite the
-            //     first's transition;
-            //   * the BUMP makes the transition visible to everyone else
-            //     guarding on the version — without it, an author holding an
-            //     edit form opened before the transition saves successfully and
-            //     is never told the record moved on, which is exactly the
-            //     "changed by someone else" case the 409 banner promises.
+            //   * the guard stops two concurrent transitions out of the same source
+            //     state from both committing. Both would pass the legality check
+            //     against the stale row they each loaded, and an `id`-only `WHERE`
+            //     would let the second silently overwrite the first;
+            //   * the bump makes the transition visible to everyone else guarding on
+            //     the version. Without it, an author holding an edit form opened
+            //     before the transition saves successfully and is never told the
+            //     record moved on — exactly the "changed by someone else" case the
+            //     409 banner promises.
             //
             // Every fragment is empty without a lock column, including the tuple
-            // parentheses: the emitted `.set(...)` must stay the
-            // single-expression pre-#1318 form byte for byte.
+            // parentheses: the emitted `.set(...)` must stay the single-expression
+            // pre-#1318 form byte for byte.
             let (transition_set_open, transition_lock_bump, transition_set_close) =
                 if lock_version.is_some() {
                     (
@@ -8038,23 +8025,23 @@ pub async fn show(
             let transition_lock_filter = lock_version.map_or_else(String::new, |_| {
                 format!(".filter({plural}::lock_version.eq(row.lock_version))")
             });
-            // Zero rows is ambiguous: the version moved between the load and
-            // the write, or the row was deleted outright. The block re-reads to
-            // tell them apart — 409 with the detail page re-rendered for a
-            // record someone else changed, 404 for one that is gone — rather
-            // than redirecting with a success flash for a transition that never
-            // happened, or offering a conflict page whose suggested reload
-            // cannot succeed. It renders the RE-READ row, not this request's
-            // snapshot: the reader is deciding again, and the legal edges may
-            // no longer be the ones they were shown.
+            // Zero rows is ambiguous: the version moved between the load and the
+            // write, or the row was deleted outright. The block re-reads to tell
+            // them apart — 409 with the detail page re-rendered for a record
+            // someone else changed, 404 for one that is gone — rather than
+            // redirecting with a success flash for a transition that never
+            // happened, or offering a conflict page whose suggested reload cannot
+            // succeed. It renders the re-read row, not this request's snapshot: the
+            // reader is deciding again, and the legal edges may no longer be the
+            // ones they were shown.
+            //
             // The re-read row must be re-authorized before it is rendered. The
-            // policy check earlier in this handler ran against `row`, the
-            // snapshot this request loaded; a record policy can depend on
-            // mutable row data (the generated owner policy does), so the very
-            // concurrent write that moved the version may also have moved the
-            // row out of this actor's reach. Rendering `current` unchecked would
-            // hand them its current properties and transition controls. Empty
-            // without a policy, where there is nothing to re-check.
+            // policy check earlier in this handler ran against `row`, the snapshot
+            // this request loaded, and a record policy can depend on mutable row
+            // data — the generated owner policy does — so the concurrent write that
+            // moved the version may also have moved the row out of this actor's
+            // reach. Rendering `current` unchecked would hand them its properties
+            // and transition controls. Empty without a policy.
             let transition_conflict_reauthz = if authorize {
                 format!(
                     "                autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"update\", &current).await?;\n"
@@ -8488,17 +8475,15 @@ fn render_nested_section(
         String::new()
     };
 
-    // SECURITY (issue #1125/#1830 posture parity): when the flat `GET /{plural}`
-    // index is owner-scoped, the nested list must be too. Otherwise
-    // `--belongs-to` would quietly open a SECOND, unscoped door onto the same
-    // rows — a child list scoped only by parent would disclose every user's
-    // children of that parent, including through the parent's public show page.
-    // The scoping lives in `children_section_with`, so BOTH entry points (the
-    // nested page and the parent's show view) inherit it.
-    //
-    // The `AppState`/`Session` pair is always in the helper's signature — the
-    // parent-side injection emits one fixed call shape — but is `_`-prefixed
-    // (and so warning-free) for a scaffold with no owner column.
+    // Security (#1125/#1830 posture parity): when the flat `GET /{plural}` index is
+    // owner-scoped, the nested list must be too. Otherwise `--belongs-to` would quietly
+    // open a second, unscoped door onto the same rows — a child list scoped only by parent
+    // would disclose every user's children of that parent, including through the parent's
+    // public show page. The scoping lives in `children_section_with`, so both entry points,
+    // the nested page and the parent's show view, inherit it. The `AppState`/`Session` pair
+    // is always in the helper's signature, since the parent-side injection emits one fixed
+    // call shape, but is `_`-prefixed, and so warning-free, for a scaffold with no owner
+    // column.
     let (state_param, session_param, owner_prelude, owner_filter) = owner_scoped.map_or_else(
         || (
             "_state: &autumn_web::AppState",
@@ -8981,22 +8966,20 @@ fn render_form_for_helper(
                 );
             }
             FieldKind::RichText => {
-                // Issue #1255: the derive sees a plain `String` column and
-                // emits a single-line text input. A rich-text column instead
-                // renders `form::rich_text_area_htmx` — a Markdown editor with
-                // a syntax hint and an htmx live-preview pane wired to the
-                // generated `POST /{plural}/preview/{field}` endpoint. That is
-                // a whole labeled control, not a `FieldControl` variant, so it
-                // takes the same `.exclude()` + `.append()` escape hatch the
-                // constrained-field arm below uses.
-                //
-                // The token-field-aware variant is used so the preview POST's
-                // `hx-params` filter names the app's ACTUAL configured
-                // `[security.submit_token].field_name` (issue #1843), not just
-                // the default — the helper already has the `SubmitFormField`
-                // extractor in scope for `submit_token_input`.
-                // `rich_text_area_*` takes `&str` (unlike the `a11y` builders'
-                // `impl Into<String>`), so this label site borrows.
+                // #1255: the derive sees a plain `String` column and emits a
+                // single-line text input. A rich-text column instead renders
+                // `form::rich_text_area_htmx` — a Markdown editor with a syntax
+                // hint and an htmx live-preview pane wired to the generated `POST
+                // /{plural}/preview/{field}` endpoint. That is a whole labeled
+                // control, not a `FieldControl` variant, so it takes the same
+                // `.exclude()` plus `.append()` escape hatch the constrained-field
+                // arm below uses. The token-field-aware variant is used so the
+                // preview POST's `hx-params` filter names the app's actual
+                // configured `[security.submit_token].field_name` (#1843), not just
+                // the default; the helper already has the `SubmitFormField`
+                // extractor in scope for `submit_token_input`. `rich_text_area_*`
+                // takes `&str`, unlike the `a11y` builders' `impl Into<String>`, so
+                // this label site borrows.
                 let label =
                     labels.lit_ref(&format!("{snake_name}.field.{name}"), &humanize_label(name));
                 // A non-nullable column takes the `required_*` variant, exactly
@@ -9093,19 +9076,17 @@ fn render_form_for_helper(
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Select {{ options: {name}_select }})"
                 );
             }
-            // A nullable `bool` renders as a tri-state `<select>` so `NULL`
-            // stays reachable, and the derive fills it with hardcoded
-            // `— Unset —` / `Yes` / `No` (`autumn-macros/src/model.rs`'s
-            // `form_control_tokens`). Those are user-facing strings this flag
-            // is supposed to have claimed: without the override they survive
-            // untranslated in every create and edit form, next to a field
-            // label that IS translated. The same `override_field` escape hatch
-            // the enum arm uses replaces them, keeping the derive's `""` /
-            // `"true"` / `"false"` values so form parsing is unaffected.
-            //
-            // Only under `--i18n`: with the flag off the derived control is
-            // already right, and emitting an override would change output the
-            // rest of this module keeps byte-identical.
+            // A nullable `bool` renders as a tri-state `<select>` so `NULL` stays
+            // reachable, and the derive fills it with hardcoded `— Unset —`, `Yes`,
+            // and `No` (`autumn-macros/src/model.rs`'s `form_control_tokens`).
+            // Those are user-facing strings this flag is supposed to have claimed:
+            // without the override they survive untranslated in every create and
+            // edit form, next to a field label that is translated. The same
+            // `override_field` escape hatch the enum arm uses replaces them, keeping
+            // the derive's `""`, `"true"`, and `"false"` values so form parsing is
+            // unaffected. Only under `--i18n`: with the flag off the derived control
+            // is already right, and an override would change output the rest of this
+            // module keeps byte-identical.
             FieldKind::Bool if f.nullable && labels.enabled() => {
                 let mut options = format!(
                     "(\"\".into(), {}.into())",
@@ -9140,28 +9121,26 @@ fn render_form_for_helper(
                         labels.lit(&format!("{snake_name}.field.{name}"), &humanize_label(name));
                     let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
                     if matches!(f.kind, FieldKind::Text) && input_type == "text" {
-                        // A `text` DSL column with a length/plain constraint is a
-                        // long-form field (Postgres `TEXT`), so its control is a
-                        // `<textarea>`, not a single-line `<input>` — the same
-                        // element the derived `FieldControl::Textarea` would pick.
-                        // (A `text{email}`/`text{url}` field has `input_type` ==
-                        // `email`/`url`, which a textarea can't carry — those
-                        // inherently single-line, type-dependent controls take the
-                        // `<input type="…">` branch below instead.)
+                        // A `text` DSL column with a length or plain constraint is
+                        // a long-form field (Postgres `TEXT`), so its control is a
+                        // `<textarea>`, the element the derived
+                        // `FieldControl::Textarea` would pick. A
+                        // `text{email}`/`text{url}` field has `input_type` `email`
+                        // or `url`, which a textarea cannot carry, so those
+                        // single-line controls take the `<input type="…">` branch
+                        // below.
                         //
-                        // Route the constrained multi-line `<textarea>` through the
-                        // typed accessible `a11y::TextArea` primitive (#1933): the
-                        // rendered element/attributes/values carry over unchanged
-                        // (the label now carries `autumn-field__label`), only
-                        // TextArea's attribute order differs. Only the attributes a
-                        // textarea honours apply — the length rules from
-                        // `html5_constraint_builder_calls` (`minlength`/`maxlength`)
-                        // and `required`; the input-only `type`/`min`/`max` are
-                        // dropped. The 422 re-render value is the element's text
-                        // content (not a `value=` attribute) so entered input
-                        // survives, matching `form::textarea_input`. The wrapper
-                        // `<div>` and inline-error `<div>` skeleton stay raw and
-                        // identical to the single-line `<input>` branch below.
+                        // The constrained multi-line `<textarea>` routes through the
+                        // typed accessible `a11y::TextArea` primitive (#1933):
+                        // rendered element, attributes, and values carry over
+                        // unchanged — the label now carries `autumn-field__label` —
+                        // and only TextArea's attribute order differs. Only the
+                        // attributes a textarea honours apply: the length rules from
+                        // `html5_constraint_builder_calls` and `required`, while the
+                        // input-only `type`, `min`, and `max` are dropped. The 422
+                        // re-render value is the element's text content, not a
+                        // `value=` attribute, so entered input survives, matching
+                        // `form::textarea_input`.
                         let constraint_builders = html5_constraint_builder_calls(f)
                             .map(|(_, calls)| calls)
                             .unwrap_or_default();
@@ -9278,17 +9257,14 @@ fn render_form_for_helper(
          }\n    "
             .to_owned()
     });
-    // Issue #1323: the nested inline create form must not offer the parent
-    // foreign key as an editable control — the parent is the URL, and the nested
-    // create handler sets the column from the path either way. The helper is
-    // shared by the flat create/edit forms (which keep the belongs_to select from
-    // #1146) and the nested form, so it takes a flag: the nested call passes
-    // `true`, every other call `false`. A scaffold with no `--belongs-to` emits
-    // neither the parameter nor the block.
-    //
-    // Placed AFTER the state-machine exclusion and BEFORE the submit-token
-    // prepend, so both exclusions read together and neither disturbs the
-    // token's position at the front of the form (issue #1360).
+    // #1323: the nested inline create form must not offer the parent foreign key as an
+    // editable control — the parent is the URL, and the nested create handler sets the
+    // column from the path either way. The helper is shared by the flat create and edit
+    // forms, which keep the belongs_to select from #1146, and the nested form, so it takes
+    // a flag: the nested call passes `true`, every other call `false`. A scaffold with no
+    // `--belongs-to` emits neither the parameter nor the block. Placed after the
+    // state-machine exclusion and before the submit-token prepend, so both exclusions read
+    // together and neither disturbs the token's position at the front of the form (#1360).
     let parent_fk_block = parent_fk.map_or_else(String::new, |name| {
         let _ = write!(extra_params, ",\n    exclude_parent_fk: bool");
         format!("    if exclude_parent_fk {{\n        form = form.exclude(\"{name}\");\n    }}\n")
@@ -9612,18 +9588,16 @@ fn render_changeset_form_inputs(
             // htmx inline-validation path, so no `validate_url`.
             render_live_constrained_field(f, cv, input_type, None)
         } else if f.kind.is_attachment() {
-            // Issue #1236: a plain file input, no hidden key. The enclosing
-            // `<form>` carries `enctype="multipart/form-data"` so the browser
-            // uploads the file with zero JavaScript; an edit that doesn't
-            // re-upload preserves the current attachment server-side (the
-            // handler binds `streamed.or(current)`). A file input itself can't be
-            // repopulated — browser security.
-            //
-            // Issue #1951: route it through the typed accessible `a11y::FileField`
-            // primitive so the file input carries a programmatically-associated
-            // `<label for>` (the previous raw `label { … } input;` had an
-            // unassociated label). No htmx wiring — attachments never take the
-            // inline-validation path.
+            // #1236: a plain file input, no hidden key. The enclosing `<form>`
+            // carries `enctype="multipart/form-data"` so the browser uploads the
+            // file with no JavaScript, and an edit that does not re-upload
+            // preserves the current attachment server-side, since the handler
+            // binds `streamed.or(current)`. A file input cannot be repopulated —
+            // browser security. #1951 routes it through the typed accessible
+            // `a11y::FileField` primitive, so the input carries a
+            // programmatically-associated `<label for>`; the previous raw `label
+            // { … } input;` had an unassociated label. No htmx wiring —
+            // attachments never take the inline-validation path.
             format!("(autumn_web::a11y::FileField::new(\"{name}\").label(\"{label}\"))")
         } else {
             // A required (non-nullable) field uses the framework's
@@ -9713,18 +9687,18 @@ fn render_changeset_form_inputs(
                     // no client-side guard at all.
                     let validated_htmx = live_validation && validated.contains(&name.as_str());
                     if let Some((input_type, _attrs)) = &constraint {
-                        // Issue #1750: a DSL-constrained `String`/`Text` field
-                        // carries the #1388 client-side HTML5 attributes
-                        // (`minlength`/`maxlength`, `type="email"`/`url`, and a
-                        // `<textarea>` for long-form `Text`) the shipped helpers
-                        // can't express. Route it through the typed a11y
+                        // #1750: a DSL-constrained `String`/`Text` field carries
+                        // the #1388 client-side HTML5 attributes —
+                        // `minlength`/`maxlength`, `type="email"`/`url`, and a
+                        // `<textarea>` for long-form `Text` — that the shipped
+                        // helpers cannot express. Route it through the typed a11y
                         // primitives mirroring the standard `form_for` path
-                        // (issue #1951), threading the htmx inline-validation
-                        // wiring on via `.hx()` when the field is validated so
-                        // real-time validation keeps working alongside the static
-                        // constraints. (A constrained field always has a validator
+                        // (#1951), threading the htmx inline-validation wiring on
+                        // via `.hx()` when the field is validated, so real-time
+                        // validation keeps working alongside the static
+                        // constraints. A constrained field always has a validator
                         // rule, so this is the validated path; the `validate_url`
-                        // is threaded only when `live_validation`.)
+                        // is threaded only when `live_validation`.
                         let validate_url =
                             validated_htmx.then(|| format!("paths::validate_{name}()"));
                         render_live_constrained_field(f, cv, input_type, validate_url.as_deref())
@@ -11054,42 +11028,40 @@ fn render_csv_import_section(
     // handler binds has one type either way.
     let not_csv_english = "That file is not a .csv - choose a CSV file and try again.";
     let no_file_english = "Choose a CSV file to import.";
-    // The two per-column cell rules, each emitted only when some column needs
-    // it: an unused `fn` is a `dead_code` warning in the user's app.
+    // The two per-column cell rules, each emitted only when some column needs it: an
+    // unused `fn` is a `dead_code` warning in the user's app. `cell_call` composes
+    // whichever apply, innermost first, so a text column that is also boolean — there is
+    // no such column today, but the composition costs nothing — would go through both.
+    // With neither, the value passes through exactly as before either helper existed.
     //
-    // `cell_call` composes whichever apply, innermost first, so a text column
-    // that is also boolean (there is no such column today, but the composition
-    // costs nothing) would go through both. With neither, the value is passed
-    // through exactly as it was before either helper existed.
-    // Named on the page, not just in a doc comment. These columns ARE in the
-    // header the export writes and in the list printed above it, but the form
-    // does not carry them — so without this line an operator could edit one in a
-    // spreadsheet, re-upload, and watch nothing happen, with no error and no row
-    // in the report to explain it.
-    // The subset of the ignored columns whose presence in a file is genuinely
-    // surprising: `id` and `created_at` are assigned by the database and every
-    // exported file carries them, so flagging those would fire on every ordinary
-    // round trip. A `--default`ed column, a `position` column or an
-    // `Attachment`, though, is a column an operator can edit in a spreadsheet
-    // and watch silently do nothing — that is what the report warns about.
+    // The ignored columns are named on the page, not just in a doc comment. They are in
+    // the header the export writes and in the list printed above it, but the form does not
+    // carry them, so without this line an operator could edit one in a spreadsheet,
+    // re-upload, and watch nothing happen with no error and no row in the report.
+    //
+    // `discarded_columns` is the subset whose presence in a file is genuinely surprising.
+    // `id` and `created_at` are assigned by the database and appear in every exported
+    // file, so flagging those would fire on every ordinary round trip. A `--default`ed
+    // column, a `position` column, or an `Attachment` is a column an operator can edit in a
+    // spreadsheet and watch silently do nothing — that is what the report warns about.
     let discarded_columns: Vec<&str> = ignored_columns
         .iter()
         .copied()
         .filter(|name| *name != "id" && *name != "created_at")
         .collect();
-    // A model with no droppable column emits none of this: no const, no probe,
-    // no markup — and the local and the view's parameter lose their `mut` and
-    // gain a leading underscore, because an unused binding is a warning in the
-    // user's app and the scaffold's contract is that generated code compiles
-    // clean.
-    // The columns an uploaded file MUST carry: every exported column the form can
-    // actually set. Without this check a file that shares no column names with
-    // the model still imports — `decode_form` ignores headers it does not know,
-    // and a form whose every field can be defaulted (an unchecked checkbox's
-    // `bool`, an optional column) then decodes an unrelated row into a blank
-    // record. `junk\nx` would preview as "1 row would insert" and commit a row of
-    // defaults. Comparing the header up front makes that one file-level refusal,
-    // which is what it is — the operator picked the wrong file.
+    // A model with no droppable column emits none of this: no const, no probe, no markup —
+    // and the local and the view's parameter lose their `mut` and gain a leading
+    // underscore, because an unused binding is a warning in the user's app and the
+    // scaffold's contract is that generated code compiles clean.
+    //
+    // `required_columns` are the columns an uploaded file must carry: every exported
+    // column the form can set. Without this check a file that shares no column names with
+    // the model still imports — `decode_form` ignores headers it does not know, and a form
+    // whose every field can be defaulted (an unchecked checkbox's `bool`, an optional
+    // column) then decodes an unrelated row into a blank record. `junk\nx` would preview as
+    // "1 row would insert" and commit a row of defaults. Comparing the header up front
+    // makes that one file-level refusal, which is what it is: the operator picked the wrong
+    // file.
     let (required_columns_const, header_check) = if required_columns.is_empty() {
         // Every exported column is one the form cannot set (a model whose columns
         // are all `--default`ed). There is nothing a file could be missing, so
@@ -12206,20 +12178,19 @@ fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String
                 out,
                 "CREATE TABLE IF NOT EXISTS {target} (id BIGSERIAL PRIMARY KEY);"
             );
-            // Seed two rows (ids 1 and 2, since BIGSERIAL starts there) so a
-            // NOT NULL `references` column pointing at this stub has a real
-            // id to reference. Without at least one row, any raw INSERT the
-            // smoke test issues against the table under test — e.g. the enum
-            // out-of-set rejection test's deliberately-invalid INSERT, see
-            // `enum_rejection_insert_sql` — would fail on this FK constraint
-            // regardless of the column it's actually trying to exercise,
-            // masking the real assertion behind an unrelated failure. The
-            // second row exists for `unique_sample_literal_variant`: a
-            // *non-target* `unique references` column in
-            // `unique_violation_insert_sql`'s duplicate insert needs a
-            // second real id, distinct from the target's own value, or it
-            // would collide with itself across the two inserts the same way
-            // the target column is meant to.
+            // Seed two rows — ids 1 and 2, since BIGSERIAL starts there — so a NOT
+            // NULL `references` column pointing at this stub has a real id to
+            // reference. Without at least one row, any raw INSERT the smoke test
+            // issues against the table under test, such as the enum out-of-set
+            // rejection test's deliberately invalid INSERT (see
+            // `enum_rejection_insert_sql`), would fail on this FK constraint
+            // whatever column it was exercising, masking the real assertion behind
+            // an unrelated failure. The second row exists for
+            // `unique_sample_literal_variant`: a non-target `unique references`
+            // column in `unique_violation_insert_sql`'s duplicate insert needs a
+            // second real id, distinct from the target's own value, or it would
+            // collide with itself across the two inserts the way the target column
+            // is meant to.
             let _ = writeln!(
                 out,
                 "INSERT INTO {target} DEFAULT VALUES;\nINSERT INTO {target} DEFAULT VALUES;"
@@ -14376,20 +14347,16 @@ fn render_enum_rejection_smoke_test(
     setup_calls: &str,
     api: bool,
 ) -> String {
-    // `setup_calls` is shared with (and identical to) the base index/api
-    // smoke test's own setup, which issues a plain, non-idempotent
-    // `CREATE TABLE {plural} (...)` and, for any `--index`/`references`
-    // field, a plain `CREATE INDEX idx_{plural}_{field} ...` (matching the
-    // real migration). Both tests run against the same `TestDb::shared()`
-    // Postgres container in the same test binary, so whichever one runs
-    // second would hit "relation already exists" — make *this* test's own
-    // copies of both statement kinds idempotent so it works whether it runs
-    // alongside the base test or standalone (e.g. `cargo test
-    // posts_rejects_out_of_set_status -- --ignored`). The reference-stub-table
-    // `CREATE TABLE`s are already `IF NOT EXISTS` (see
-    // `render_reference_stub_tables_sql`), so only the main table's statement
-    // needs the same treatment; `CREATE INDEX` has no per-index counterpart
-    // to worry about, so every occurrence is rewritten.
+    // `setup_calls` is shared with, and identical to, the base index/api smoke test's own
+    // setup, which issues a plain, non-idempotent `CREATE TABLE {plural} (...)` and, for
+    // any `--index`/`references` field, a plain `CREATE INDEX idx_{plural}_{field} ...`
+    // matching the real migration. Both tests run against the same `TestDb::shared()`
+    // Postgres container in the same test binary, so whichever ran second would hit
+    // "relation already exists". Make this test's own copies of both statement kinds
+    // idempotent, so it works alongside the base test or standalone. The reference-stub
+    // `CREATE TABLE`s are already `IF NOT EXISTS` (see `render_reference_stub_tables_sql`),
+    // so only the main table's statement needs the same treatment; `CREATE INDEX` has no
+    // per-index counterpart, so every occurrence is rewritten.
     let setup_calls = setup_calls.replacen(
         &format!("CREATE TABLE {plural} ("),
         &format!("CREATE TABLE IF NOT EXISTS {plural} ("),
