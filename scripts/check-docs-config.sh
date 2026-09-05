@@ -1180,7 +1180,12 @@ YAML_KEY = re.compile(r'^(\s*)(-\s+)?' + YAML_KEY_NAME + r':(?=\s|$)')
 # a workflow written `"jobs":` was no workflow at all and every `run:` body
 # and `env:` mapping in it was discarded. Same fix, missed neighbour — the
 # entry in this file's header with the most recurrences, again.
-YAML_WORKFLOW = re.compile(r'^[\'"]?(?:jobs|runs)[\'"]?:\s*$', re.M)
+# …and a root key may carry a trailing COMMENT. `jobs: # runtime jobs` is a
+# valid workflow root, and requiring nothing but whitespace after the colon
+# made `_yaml_consumer` return None for the whole file — every executed `run:`
+# body and `env:` declaration in it discarded, which is this file's failing-open
+# shape at its purest: a scope test that turns a whole file off.
+YAML_WORKFLOW = re.compile(r'^[\'"]?(?:jobs|runs)[\'"]?:\s*(?:#.*)?$', re.M)
 
 
 def _yaml_consumer(rel, body):
@@ -3177,9 +3182,33 @@ SELF_DEFAULT = _SelfDefault()
 # a function-local name as local to the whole FILE suppressed genuine reads of
 # the incoming environment after the binding had gone out of scope.
 SHELL_FN = re.compile(r'(?:^|[;&|\s])(?:function\s+)?([A-Za-z_]\w*)\s*\(\s*\)\s*\{')
-SHELL_LOCAL = re.compile(
-    r'(?:^|[;&|\s])(?:local|declare|typeset)\s+(?!-g\b)(?:-\w+\s+)*'
-    r'(AUTUMN_[A-Z0-9_]+)=')
+# `local NAME` needs no `=`. Bash declares the local either way, and an
+# undefined local still SHADOWS the inherited environment — `f() { local
+# AUTUMN_X; echo "$AUTUMN_X"; }` prints nothing whatever the environment holds.
+# Requiring the assignment read that as an ordinary expansion and blessed the
+# name. A declaration also takes a LIST, so the head is matched here and the
+# names are read out of its words below: `local AUTUMN_A AUTUMN_B` declares two.
+SHELL_LOCAL_HEAD = re.compile(
+    r'(?:^|[;&|\s])(?:local|declare|typeset)\s+(?!-g\b)(?:-\w+\s+)*')
+SHELL_LOCAL_NAME = re.compile(r'^(AUTUMN_[A-Z0-9_]+)(?==|$)')
+
+
+def _shell_local_names(code):
+    """Every name a `local`/`declare`/`typeset` declaration makes local."""
+    names = set()
+    for m in SHELL_LOCAL_HEAD.finditer(code):
+        rest = code[m.end():]
+        stop = re.search(r'[;&|\n)]', rest)
+        for word in _words(rest[:stop.start()] if stop else rest):
+            found = SHELL_LOCAL_NAME.match(word)
+            if found:
+                names.add(found.group(1))
+    return names
+
+
+def _words(text):
+    """The whitespace-separated words of a shell fragment."""
+    return [w for w in re.split(r'\s+', text.strip()) if w]
 
 
 def _shell_function_locals(code):
@@ -3195,7 +3224,7 @@ def _shell_function_locals(code):
                 if depth == 0:
                     break
             i += 1
-        names = set(SHELL_LOCAL.findall(code[m.end():i]))
+        names = _shell_local_names(code[m.end():i])
         if names:
             out.append((m.end(), i, names))
     return out
@@ -3879,7 +3908,8 @@ class _Accessor:
     # Only the receiver alternative has this shape: a name, a dot, a method.
     _receiver = re.compile(r'([A-Za-z_]\w*)\s*\.')
 
-    def __init__(self, pattern, by_scope, shadowed=frozenset()):
+    def __init__(self, pattern, by_scope, shadowed=frozenset(),
+                 imported=frozenset()):
         self.pattern = pattern
         self.by_scope = by_scope
         # The macro names this file takes over. WHERE it takes them over is the
@@ -3889,12 +3919,26 @@ class _Accessor:
         # withheld the alternative from the whole file including the lines
         # before the declaration.
         self.shadowed = shadowed
+        self.imported = imported
 
     def finditer(self, body):
         return self.pattern.finditer(body)
 
     def search(self, text):
         return self.pattern.search(text)
+
+    def imports_shadow(self, name):
+        """Whether the shadow came from a `use`, not a local `macro_rules!`.
+
+        An IMPORTED shadow has no declaration in this file to sit after, so a
+        region test looking for one finds nothing and trusts the call — which
+        is how `use crate::macros::env; env!(…)` went on being read as the std
+        macro. The import's region is the scope of the `use`, and this file's
+        offsets cannot narrow it further without crossing one, so it suppresses
+        the whole file: the fail-closed direction, and correct wherever the
+        import is at file scope, which is where a macro import is written.
+        """
+        return name in self.imported
 
     def shadows(self, name):
         """Whether this file takes the macro `name` over anywhere."""
@@ -3977,6 +4021,7 @@ def accessor(root, test_files=frozenset()):
     helpers, declared, imports, modules = {}, {}, {}, {}
     env_type, impls, trait_at, scopes = {}, {}, set(), {}
     shadowed, returns, aliases, local_types = {}, {}, {}, {}
+    imported_shadow = {}
     blessed_at = {}
     macro_at, macro_imports, factory_at = {}, {}, {}
     crates = _crates(root)
@@ -4332,6 +4377,7 @@ def accessor(root, test_files=frozenset()):
         for local, path in items:
             if _absolute_path(rel, path, crates) in macro_at.get(local, ()):
                 shadowed.setdefault(rel, set()).add(local)
+                imported_shadow.setdefault(rel, set()).add(local)
 
     def imports_of(rel):
         return [(local, path, at) for (r, at), items in imports.items()
@@ -4438,7 +4484,8 @@ def accessor(root, test_files=frozenset()):
                             + r')\s*\.\s*(var|var_os|set_var|get)\s*\(')
             cache[key] = re.compile(pattern)
         return _Accessor(cache[key], by_scope,
-                         frozenset(shadowed.get(rel, ())))
+                         frozenset(shadowed.get(rel, ())),
+                         frozenset(imported_shadow.get(rel, ())))
 
     return compiled, index
 
@@ -5144,6 +5191,10 @@ def source_tokens(root):
             macro = MACRO_CALL.match(m.group(0))
             if (macro and not macro.group('path')
                     and acc_for(rel).shadows(macro.group('name'))):
+                # An IMPORTED shadow has no local declaration to sit after, so
+                # the region test below finds nothing and would trust the call.
+                if acc_for(rel).imports_shadow(macro.group('name')):
+                    continue
                 mine = _scope_at(spans, m.start())
                 if any(d.start() < m.start()
                        and mine[:len(_scope_at(spans, d.start()))]
@@ -6817,6 +6868,25 @@ def self_test():
     # — so `defaults: { run: { shell: pwsh } }` declared a shell it never saw
     # and every `run:` under it was parsed as Bourne, reading a PowerShell
     # local as an environment read.
+    # `local NAME` needs no `=` — bash declares the local either way, and an
+    # undefined local still shadows the inherited environment. A declaration
+    # also takes a LIST, and `-g` makes it global instead.
+    case('a bare local declaration still declares',
+         [sorted(_shell_local_names(t)) for t in
+          ('local AUTUMN_X; echo "$AUTUMN_X"', 'local AUTUMN_X=1',
+           'local AUTUMN_A AUTUMN_B=2', 'declare -g AUTUMN_G=1',
+           'typeset -i AUTUMN_N', 'echo AUTUMN_X')],
+         [['AUTUMN_X'], ['AUTUMN_X'], ['AUTUMN_A', 'AUTUMN_B'], [],
+          ['AUTUMN_N'], []])
+    # A workflow ROOT key may carry a trailing comment. Requiring nothing but
+    # whitespace after the colon made the file no workflow at all — every
+    # executed `run:` body and `env:` declaration in it discarded, which is the
+    # failing-open shape at its purest.
+    case('a workflow root survives a trailing comment',
+         [bool(YAML_WORKFLOW.search(t)) for t in
+          ('jobs:\n', 'jobs: # runtime jobs\n', '"jobs":  # x\n',
+           'jobs: value\n')],
+         [True, True, True, False])
     case('a flow mapping yields its nested scalars',
          _flow_pairs('{ run: { shell: pwsh }, other: x }'),
          [(('run', 'shell'), 'pwsh'), (('other',), 'x')])
@@ -6854,6 +6924,15 @@ def self_test():
     # over the bare name in its textual scope; `std::env!` resolves through the
     # path to the std macro regardless, so suppressing it too reported a page
     # whose key the runtime really does read. A path is not the name.
+    # An IMPORTED shadow has no local `macro_rules!` to sit after, so a region
+    # test looking for one finds nothing and trusts the call — the fix that
+    # made the shadow a region left the imported half with no region at all.
+    case('an imported shadow suppresses without a local declaration',
+         (lambda a: [a.shadows('env'), a.imports_shadow('env'),
+                     a.shadows('option_env'), a.imports_shadow('option_env')])(
+             _Accessor(re.compile('x'), {}, frozenset({'env', 'option_env'}),
+                       frozenset({'env'}))),
+         [True, True, True, False])
     case('a qualified macro call is not shadowable',
          [(lambda m: bool(m.group('path')))(MACRO_CALL.match(t)) for t in
           ('env!("X")', 'option_env!("X")', 'std::env!("X")',
