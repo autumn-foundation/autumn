@@ -225,6 +225,8 @@ fn subscription(id: &str, topic: &str, status: WebhookSubscriptionStatus) -> Web
 #[ignore = "requires Docker (testcontainers)"]
 #[allow(clippy::too_many_lines)]
 async fn webhook_outbound_dispatch_fanout_profile() {
+    const TOPIC: &str = "order.created";
+
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
 
@@ -292,8 +294,6 @@ async fn webhook_outbound_dispatch_fanout_profile() {
     // contaminates the `autumn_jobs` statement profile below.
     job::start_runtime(vec![job_info], &state, &shutdown, &job_config, false)
         .expect("start postgres-backed job runtime");
-
-    const TOPIC: &str = "order.created";
 
     // Three subscriber-fan-out sizes: a handful of integration partners, a
     // mid-size platform, and a large multi-tenant integrator. Each tier mixes
