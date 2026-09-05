@@ -327,6 +327,19 @@ async fn signup_and_login_failures_redisplay_the_form_with_email_preserved() {
     assert!(resp.text().contains("at most 128 characters"));
     assert!(resp.text().contains(r#"value="long@acme.test""#));
 
+    // Weak password at signup (the one branch that already redisplayed
+    // before this PR, but — per Codex review — was never itself asserted to
+    // preserve the entered email; `signup_rejects_weak_password` above only
+    // checks the policy message).
+    let resp = client
+        .post("/signup")
+        .form("email=weak2@acme.test&password=password")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("too common"));
+    assert!(resp.text().contains(r#"value="weak2@acme.test""#));
+
     // Duplicate email at signup: the first signup succeeds, the second is
     // redisplayed inline rather than dropped onto a generic error page.
     let _ = signup(&client, "dupe@acme.test").await;
@@ -348,6 +361,19 @@ async fn signup_and_login_failures_redisplay_the_form_with_email_preserved() {
     resp.assert_ok();
     assert!(resp.text().contains("Invalid email or password"));
     assert!(resp.text().contains(r#"value="nobody@acme.test""#));
+
+    // Over-long input at login (Codex review finding: the pre-existing
+    // "invalid credentials" case above exercises the same `login_page` call
+    // but not this distinct length-guard branch). Reuses the over-long
+    // password minted for the signup case above.
+    let resp = client
+        .post("/login")
+        .form(&format!("email=toolong@acme.test&password={long_password}"))
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("Invalid email or password"));
+    assert!(resp.text().contains(r#"value="toolong@acme.test""#));
 }
 
 /// A "Remember me" opt-in must survive a rejected login (Codex review

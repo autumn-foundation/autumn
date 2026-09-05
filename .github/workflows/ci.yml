@@ -641,6 +641,17 @@ jobs:
           # basecamp/kamal-proxy Docker Hub image) and needs the ssh client
           # installed above.
           cargo test -p autumn-cli --test deploy_e2e -- --ignored
+          # Example apps are NOT auto-swept the way autumn-web's consolidated
+          # `integration_tests` binary is (Codex review finding on #2530):
+          # `saas` and `teams` each have their own Docker-gated
+          # `tests/integration_test.rs` (signup -> login -> tenant-scoped
+          # flows, invite/accept, role gating, …) that otherwise never runs
+          # anywhere in CI. `--test-threads=1` because both suites share one
+          # process-global `TestDb::shared()` Postgres container and each
+          # test's setup does a `TRUNCATE` — concurrent tests would race each
+          # other's data, exactly as each file's own doc comment says.
+          cargo test -p saas -- --ignored --test-threads=1
+          cargo test -p teams -- --ignored --test-threads=1
 
   coverage:
     name: Coverage

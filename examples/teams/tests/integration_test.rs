@@ -220,6 +220,20 @@ async fn signup_and_login_failures_redisplay_the_form_with_email_preserved() {
     assert!(resp.text().contains("at most 128 characters"));
     assert!(resp.text().contains(r#"value="long@acme.test""#));
 
+    // Weak password at signup (Codex review finding: teams had no
+    // weak-password redisplay coverage at all, unlike saas's pre-existing
+    // `signup_rejects_weak_password`; asserted here alongside email
+    // preservation, which no prior test checked for either app's
+    // weak-password branch).
+    let resp = client
+        .post("/signup")
+        .form("email=weak@acme.test&password=password")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("too common"));
+    assert!(resp.text().contains(r#"value="weak@acme.test""#));
+
     // Duplicate email at signup: the first signup succeeds, the second is
     // redisplayed inline rather than dropped onto a generic error page.
     let _ = signup(&client, "dupe@acme.test").await;
@@ -241,6 +255,18 @@ async fn signup_and_login_failures_redisplay_the_form_with_email_preserved() {
     resp.assert_ok();
     assert!(resp.text().contains("Invalid email or password"));
     assert!(resp.text().contains(r#"value="nobody@acme.test""#));
+
+    // Over-long input at login (Codex review finding: the "invalid
+    // credentials" case above exercises the same `login_page` call but not
+    // this distinct length-guard branch).
+    let resp = client
+        .post("/login")
+        .form(&format!("email=toolong@acme.test&password={long_password}"))
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("Invalid email or password"));
+    assert!(resp.text().contains(r#"value="toolong@acme.test""#));
 }
 
 /// AC4 + AC5(a) + success metric: inviting sends a real email (captured as an

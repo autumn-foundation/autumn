@@ -1633,9 +1633,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lose that opt-in. Zero-membership and corrupt-role login failures in
   `teams` (real server-side conditions no resubmit can fix) are left as
   real error responses. Two new `#[ignore = "requires Docker
-  (testcontainers)"]` integration tests (one per app) prove all 6 cases
-  end-to-end; a third proves the remember-me checkbox survives a rejected
-  login both ticked and unticked.
+  (testcontainers)"]` integration tests (one per app) exercise all 6 cases
+  end-to-end, including the weak-password branch's email preservation (never
+  previously asserted for either app) and the over-long-input login case; a
+  third proves the remember-me checkbox survives a rejected login both ticked
+  and unticked. `saas` and `teams` were not previously part of CI's
+  Docker-dependent test sweep at all — unlike `autumn-web`'s consolidated
+  binary, example apps are not auto-swept — so `.github/workflows/ci.yml`
+  now runs both crates' `--ignored` suites explicitly (`--test-threads=1`:
+  both share one process-global `TestDb::shared()` container, and each
+  test's setup does a `TRUNCATE`).
 
 - **🔒 `autumn generate auth`: a concurrent successful login could be silently
   re-locked by a racing failed attempt (issue #2500):** the generated
