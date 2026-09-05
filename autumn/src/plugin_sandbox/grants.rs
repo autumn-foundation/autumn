@@ -373,6 +373,15 @@ pub struct CapabilityQuotas {
     pub outbound_calls: u32,
     /// Bytes one outbound response may return to the guest.
     pub outbound_response_bytes: u32,
+    /// Bytes one outbound *request* body may carry.
+    ///
+    /// The counterpart to `outbound_response_bytes`, and it was missing: a
+    /// plugin's own body is guest-chosen, and without this its only bound was
+    /// the stdout frame the call arrives in — megabytes by default, and far
+    /// more once an operator raises `max_response_bytes`. An operator granting
+    /// `http-outbound` is agreeing to calls to named hosts, not to whatever
+    /// volume of egress the plugin decides to push through them.
+    pub outbound_request_bytes: u32,
     /// Row-returning DB operations per request.
     pub db_reads: u32,
     /// Row-writing DB operations per request.
@@ -415,6 +424,7 @@ impl Default for CapabilityQuotas {
             kv_value_bytes: 64 * 1024,
             outbound_calls: 4,
             outbound_response_bytes: 256 * 1024,
+            outbound_request_bytes: 256 * 1024,
             db_reads: 64,
             db_writes: 32,
             db_rows: 500,
@@ -434,13 +444,14 @@ impl CapabilityQuotas {
     /// disagree about which quotas exist — the failure mode of writing them out
     /// three times is a quota that is enforced but never displayed.
     #[must_use]
-    pub const fn fields(&self) -> [(&'static str, u32); 13] {
+    pub const fn fields(&self) -> [(&'static str, u32); 14] {
         [
             ("kv_reads", self.kv_reads),
             ("kv_writes", self.kv_writes),
             ("kv_value_bytes", self.kv_value_bytes),
             ("outbound_calls", self.outbound_calls),
             ("outbound_response_bytes", self.outbound_response_bytes),
+            ("outbound_request_bytes", self.outbound_request_bytes),
             ("db_reads", self.db_reads),
             ("db_writes", self.db_writes),
             ("db_rows", self.db_rows),
@@ -725,14 +736,15 @@ mod tests {
                 2 => broken.kv_value_bytes = 0,
                 3 => broken.outbound_calls = 0,
                 4 => broken.outbound_response_bytes = 0,
-                5 => broken.db_reads = 0,
-                6 => broken.db_writes = 0,
-                7 => broken.db_rows = 0,
-                8 => broken.job_enqueues = 0,
-                9 => broken.render_bytes = 0,
-                10 => broken.calls = 0,
-                11 => broken.outbound_timeout_ms = 0,
-                12 => broken.calls_per_second = 0,
+                5 => broken.outbound_request_bytes = 0,
+                6 => broken.db_reads = 0,
+                7 => broken.db_writes = 0,
+                8 => broken.db_rows = 0,
+                9 => broken.job_enqueues = 0,
+                10 => broken.render_bytes = 0,
+                11 => broken.calls = 0,
+                12 => broken.outbound_timeout_ms = 0,
+                13 => broken.calls_per_second = 0,
                 other => panic!("quota field {other} ({field}) has no case here"),
             }
             assert_eq!(

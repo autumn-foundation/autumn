@@ -2088,6 +2088,39 @@ path = "/shop/panel"
         );
     }
 
+    #[test]
+    fn an_outbound_request_body_is_bounded_like_the_response_is() {
+        // The quota table bounded what an upstream may *return* and said nothing
+        // about what the plugin may *send*. A body is guest-chosen, so its only
+        // bound was the stdout frame it arrived in — megabytes by default. An
+        // operator granting a hostname agreed to calls, not to unbounded egress
+        // through them.
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        let ceiling = fixture.runtime.quotas().outbound_request_bytes as usize;
+        fixture.http.answer(
+            "https://api.example.com/",
+            OutboundResponse::from_url("https://api.example.com/", 200, "ok"),
+        );
+
+        let result = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
+            id: 1,
+            method: "POST".to_owned(),
+            url: "https://api.example.com/".to_owned(),
+            headers: Vec::new(),
+            body: "x".repeat(ceiling + 1),
+        });
+        assert_eq!(
+            result.denial(),
+            Some(DenialReason::QuotaExceeded),
+            "{result:?}"
+        );
+        // Refused before dispatch: nothing reached the backend.
+        assert!(
+            fixture.http.seen().is_empty(),
+            "the call still left the host"
+        );
+    }
+
     // ── DB containment ───────────────────────────────────────────────
 
     #[test]

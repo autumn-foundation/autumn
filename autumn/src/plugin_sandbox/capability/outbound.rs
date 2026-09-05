@@ -374,6 +374,22 @@ pub(super) fn perform(
         allowed.push((name.to_ascii_lowercase(), value.clone()));
     }
 
+    // Refused before the request is built, not after the backend has copied it:
+    // the body is the guest's, and an unbounded one is host memory and egress
+    // an operator never agreed to when they granted a hostname.
+    let request_ceiling = runtime.quotas().outbound_request_bytes as usize;
+    if body.len() > request_ceiling {
+        return CallResult::denied(
+            id,
+            DenialReason::QuotaExceeded,
+            format!(
+                "the request body is {} bytes, over this plugin's {request_ceiling}-byte \
+                 `outbound_request_bytes` quota",
+                body.len()
+            ),
+        );
+    }
+
     let ceiling = runtime.quotas().outbound_response_bytes as usize;
     let request = OutboundRequest {
         plugin: runtime.plugin.clone(),
