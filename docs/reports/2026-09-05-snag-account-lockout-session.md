@@ -165,12 +165,22 @@ per the second correction below, it does **not** duplicate the
 Moderate, non-security-critical but a real violation of a stated,
 incident-response-facing claim: `account_locked` is documented and templated
 specifically as a correlatable signal for responders, and any SIEM/alert
-rule counting or deduplicating on it will over-count an attack by up to
-(burst size − threshold + 1) events — worse the more concurrent an attacker's
-tooling is, which is precisely the traffic shape credential-stuffing tools
-use. An operator paging off "N `account_locked` events" gets a number that
-depends on request interleaving, not on the number of accounts actually
-locked.
+rule counting or deduplicating on it will see up to (burst size − threshold
++ 1) total events fired for one lock transition — an over-count of up to
+(burst size − threshold) *excess* events beyond the one the docs describe
+(that distinction corrected below) — worse the more concurrent an
+attacker's tooling is, which is precisely the traffic shape
+credential-stuffing tools use. An operator paging off "N `account_locked`
+events" gets a number that depends on request interleaving, not on the
+number of accounts actually locked.
+
+**Correction (`chatgpt-codex-connector` review, verified by re-deriving the
+arithmetic)**: the paragraph above originally called `(burst size −
+threshold + 1)` the *over-count*. That value is the **total** number of
+events fired (for the 10-request/threshold-3 test: 8 total, at counters 3
+through 10); the *excess* over the one legitimate transition event is one
+less than that, `(burst size − threshold)` — 7 in that same example, not 8.
+Reworded above to state both numbers without conflating them.
 
 This is not *purely* a telemetry-fidelity bug, per the correction above: the
 `locked_at` value itself is also decided by whichever racing request's
@@ -197,20 +207,34 @@ more recent lock, it overwrites the real lock with an already-expired
 timestamp. The very next login then takes the expired-lock branch
 (`autumn-cli/src/generate/auth.rs:3964-3972`) and the guarded reset
 (`4079-4097`) clears the lock outright — reachable by an ordinary correct
-password, no special privilege needed. This session's own scaled-shape
-config (`cooloff_secs = 6`, later widened to `60` for the other tests)
-demonstrates the window is realistic: this session's own bcrypt calls alone
-ran 750ms-1s per attempt, and real production request-latency tail
-(slow client, contended pool, GC-class pause) can plausibly exceed a
-single-digit-second cool-off. **Not reproduced live this session** — doing
-so needs a way to hold one request's timeline open between its `now` read
-and its `UPDATE` (e.g. an instrumented build, or pool/connection starvation
-tuned precisely enough to stall one request past `cooloff_secs` while
-others complete) that this black-box HTTP-only session didn't build. Severity
-is corrected upward accordingly: moderate-to-high rather than "moderate,
-non-security-critical" — the log duplication is cosmetic, but this specific
-stale-write path is a plausible, unverified lockout-bypass mechanism, not
-just a telemetry one. See follow-up charters for driving it for real.
+password, no special privilege needed. **Not reproduced live this
+session** — doing so needs a way to hold one request's timeline open
+between its `now` read and its `UPDATE` (e.g. an instrumented build, or
+pool/connection starvation tuned precisely enough to stall one request past
+`cooloff_secs` while others complete) that this black-box HTTP-only session
+didn't build. Severity is corrected upward accordingly: moderate-to-high
+rather than "moderate, non-security-critical" — the log duplication is
+cosmetic, but this specific stale-write path is a plausible, unverified
+lockout-bypass mechanism, not just a telemetry one. See follow-up charters
+for driving it for real.
+
+**Correction (`chatgpt-codex-connector` review, verified by re-reading the
+line order)**: this report previously cited this session's own observed
+750ms-1s bcrypt latency as evidence the vulnerable window is realistically
+exceeded. Checked directly: `verify_password(...).await` (the bcrypt call,
+`auth.rs:3941`) completes *before* `now` is captured (`auth.rs:3953`), so
+that latency happens before the clock the bypass depends on even starts —
+it cannot age the eventual `locked_at` write, and is not evidence for this
+specific mechanism. The only interval that matters is between line 3953 and
+the `UPDATE` at line 4012, which this session never measured directly (its
+own DB round trips there were on the order of single-digit milliseconds).
+The mechanism itself is unaffected by this correction — it needs only a
+stall of any origin (scheduler contention, a slow DB round trip, a GC-class
+pause) exceeding `cooloff_secs` between those two lines — but this session
+has not established that such a stall is realistic under normal load, only
+that the code permits it if one occurs. Weakens the "plausible... window is
+realistic" framing to "mechanism confirmed, real-world likelihood
+unmeasured"; the follow-up charter to drive it for real stands unchanged.
 
 ### Dedup search
 
