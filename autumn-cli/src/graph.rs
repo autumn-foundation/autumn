@@ -169,7 +169,7 @@ fn completeness_changes(committed: &Completeness, current: &Completeness) -> Vec
 }
 
 /// The symbol that resolved an edge, or `declared` for a declaration edge.
-fn symbol_or_declared(symbol: &str) -> &str {
+const fn symbol_or_declared(symbol: &str) -> &str {
     if symbol.is_empty() {
         "declared"
     } else {
@@ -216,8 +216,14 @@ pub fn format_drift(committed: &ArchitectureGraph, current: &ArchitectureGraph) 
                 if before_auth != after_auth {
                     lines.push(format!(
                         "      auth {} -> {}",
-                        before_auth.map_or_else(|| "unmounted".to_owned(), |a| a.label()),
-                        after_auth.map_or_else(|| "unmounted".to_owned(), |a| a.label()),
+                        before_auth.map_or_else(
+                            || "unmounted".to_owned(),
+                            autumn_web::graph::RouteAuth::label,
+                        ),
+                        after_auth.map_or_else(
+                            || "unmounted".to_owned(),
+                            autumn_web::graph::RouteAuth::label,
+                        ),
                     ));
                 }
             }
@@ -550,6 +556,21 @@ mod tests {
         body_symbols: &["posts"],
     }];
 
+    /// `ROUTES[0]` with its extractor gone: the route no longer reaches the
+    /// repository at all.
+    const STRIPPED: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+        signature_symbols: &[],
+        ..ROUTES[0]
+    }];
+
+    /// `ROUTES[0]` reaching the repository by name in the body rather than by
+    /// declaring it as an extractor: same edge, weaker evidence.
+    const BODY_ONLY: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+        signature_symbols: &[],
+        body_symbols: &["PgPostRepository"],
+        ..ROUTES[0]
+    }];
+
     fn graph() -> ArchitectureGraph {
         build(&[], 0, ROUTES, MODELS, REPOSITORIES, JOBS)
     }
@@ -604,10 +625,6 @@ mod tests {
     #[test]
     fn a_lost_edge_is_named_in_the_drift_report() {
         let before = graph();
-        const STRIPPED: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
-            signature_symbols: &[],
-            ..ROUTES[0]
-        }];
         let after = build(&[], 0, STRIPPED, MODELS, REPOSITORIES, JOBS);
         let drift = format_drift(&before, &after).expect("losing an edge is drift");
         assert!(
@@ -623,11 +640,6 @@ mod tests {
         // evidence changed, and "the documents differ in a field this report
         // does not name" is not something a reviewer can approve.
         let before = graph();
-        const BODY_ONLY: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
-            signature_symbols: &[],
-            body_symbols: &["PgPostRepository"],
-            ..ROUTES[0]
-        }];
         let after = build(&[], 0, BODY_ONLY, MODELS, REPOSITORIES, JOBS);
         let drift = format_drift(&before, &after).expect("weakened evidence is drift");
         assert!(drift.contains("evidence signature"), "{drift}");
