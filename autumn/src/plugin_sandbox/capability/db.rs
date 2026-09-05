@@ -95,7 +95,13 @@ pub fn physical_table(plugin: &str, table: &str) -> Option<String> {
     }
     let plugin: String = plugin
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_lowercase() } else { '_' })
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
         .collect();
     let name = format!("{TABLE_PREFIX}{plugin}_{table}");
     (name.len() <= MAX_IDENTIFIER_LEN).then_some(name)
@@ -412,11 +418,7 @@ impl PluginStore for MemoryPluginStore {
             .rows
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&(
-                scope.table.clone(),
-                scope.tenant.clone(),
-                row_id.to_owned(),
-            ))
+            .get(&(scope.table.clone(), scope.tenant.clone(), row_id.to_owned()))
             .cloned()
             .map(|row| with_id(row, row_id)))
     }
@@ -449,11 +451,7 @@ impl PluginStore for MemoryPluginStore {
     }
 
     fn update(&self, scope: &Scope, row_id: &str, row: PluginRow) -> Result<(), StoreError> {
-        let key = (
-            scope.table.clone(),
-            scope.tenant.clone(),
-            row_id.to_owned(),
-        );
+        let key = (scope.table.clone(), scope.tenant.clone(), row_id.to_owned());
         let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
         if !rows.contains_key(&key) {
             return Err(StoreError::NotFound);
@@ -463,11 +461,7 @@ impl PluginStore for MemoryPluginStore {
     }
 
     fn delete(&self, scope: &Scope, row_id: &str) -> Result<(), StoreError> {
-        let key = (
-            scope.table.clone(),
-            scope.tenant.clone(),
-            row_id.to_owned(),
-        );
+        let key = (scope.table.clone(), scope.tenant.clone(), row_id.to_owned());
         self.rows
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

@@ -24,9 +24,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use super::{
-    CallResult, CallValue, CapabilityCall, CapabilityRuntime, DenialReason, PluginValue,
-};
+use super::{CallResult, CallValue, CapabilityCall, CapabilityRuntime, DenialReason, PluginValue};
 
 /// The prefix every sandboxed plugin's cache key carries.
 ///
@@ -162,10 +160,7 @@ impl MemoryKvStore {
     /// Every key currently stored, for assertions.
     #[must_use]
     pub fn keys(&self) -> Vec<String> {
-        let entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let mut keys: Vec<String> = entries.keys().cloned().collect();
         keys.sort();
         keys

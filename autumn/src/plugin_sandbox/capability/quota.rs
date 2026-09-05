@@ -77,7 +77,9 @@ impl QuotaLedger {
     /// Names the quota field that is spent.
     pub fn charge(&mut self, call: &CapabilityCall) -> Result<(), &'static str> {
         let (counter, ceiling, field) = match call {
-            CapabilityCall::KvGet { .. } => (&mut self.kv_reads, self.declared.kv_reads, "kv_reads"),
+            CapabilityCall::KvGet { .. } => {
+                (&mut self.kv_reads, self.declared.kv_reads, "kv_reads")
+            }
             CapabilityCall::KvSet { .. } | CapabilityCall::KvDelete { .. } => {
                 (&mut self.kv_writes, self.declared.kv_writes, "kv_writes")
             }
@@ -192,7 +194,9 @@ impl CapabilityRateLimiter {
         // break, so the count is taken rather than the request being failed —
         // and `PoisonError::into_inner` is how that is spelled without
         // `unwrap`, which this module's panic gate forbids.
-        let mut bucket = bucket.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut bucket = bucket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let full = u64::from(self.per_second).saturating_mul(SCALE);
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(bucket.last);

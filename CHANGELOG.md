@@ -24,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than refused. Render hooks return a fragment *tree* the host renders, not HTML
   it sanitises — no parser, so no parser differential — and a hook that traps,
   overruns its fuel or emits a tag the renderer will not produce omits the
-  fragment instead of breaking the page. Every call, allowed or refused, lands
+  fragment rather than taking the page down with it. Every call, allowed or
+  refused, lands
   in a bounded per-plugin activity log that answers "what did this plugin do in
   the last hour" from one surface: hosts called, KV/DB usage, jobs enqueued,
   denials and quota hits, recorded as shapes and never as values.
@@ -35,7 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "no database access" over a manifest that was just granted `db`. Fifteen-plus
   cross-capability escape attempts run end-to-end through the real interpreter
   in `tests/integration/plugin_sandbox_capabilities.rs`. See
-  `docs/guide/sandboxed-plugins.md`.
+  `docs/guide/sandboxed-plugins.md`. **Non-breaking**: everything here is behind
+  the non-default `plugin-sandbox` feature, which `STABILITY.md` already places
+  outside SemVer, and a first-slice manifest parses and runs unchanged —
+  `[grants]` and `[quotas]` both default, and an unknown capability name is
+  still a refusal rather than a silently dropped grant. The only source-level
+  change for an embedder is that `SandboxManifest` gains `grants`/`quotas` and
+  `SandboxOutcome` gains `activity`, so a struct literal over either must name
+  the new fields.
 
 - **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
   update validation left after #1719/#1742/#1778/#1801 (issue #1751).

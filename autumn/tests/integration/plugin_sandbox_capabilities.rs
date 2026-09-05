@@ -14,10 +14,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use autumn_web::plugin_sandbox::test_guests as guests;
 use autumn_web::plugin_sandbox::capability::{
     MemoryJobSink, MemoryKvStore, MemoryPluginStore, RecordingHttp,
 };
+use autumn_web::plugin_sandbox::test_guests as guests;
 use autumn_web::plugin_sandbox::{
     CapabilityServices, JobSink, KvStore, OutboundHttp, OutboundResponse, PluginActivityLog,
     PluginStore, PluginValue, SandboxArtifact, SandboxHost, SandboxManifest, SandboxRequest,
@@ -70,7 +70,14 @@ sha256 = "{digest}"
 
 fn full_manifest() -> String {
     manifest_toml(
-        &["http-request", "kv", "http-outbound", "db", "jobs", "render"],
+        &[
+            "http-request",
+            "kv",
+            "http-outbound",
+            "db",
+            "jobs",
+            "render",
+        ],
         r#"
 [grants]
 hosts = ["api.example.com"]
@@ -88,7 +95,7 @@ fn pack(manifest_src: &str, wat: &str) -> SandboxArtifact {
     SandboxArtifact::seal(manifest, module).expect("seals")
 }
 
-fn host(manifest_src: &str, wat: &str) -> SandboxHost {
+fn load(manifest_src: &str, wat: &str) -> SandboxHost {
     SandboxHost::load(&pack(manifest_src, wat)).expect("loads")
 }
 
@@ -164,7 +171,7 @@ fn verdict(host: &SandboxHost, services: CapabilityServices, path: &str) -> (u16
 /// capability in the vocabulary, exercised through the real interpreter.
 #[test]
 fn one_reference_plugin_reaches_every_subsystem_over_the_wire() {
-    let host = host(&full_manifest(), guests::CAPABILITY_CLIENT);
+    let host = load(&full_manifest(), guests::CAPABILITY_CLIENT);
     let wired = wired("alpha");
 
     for path in [
@@ -226,7 +233,7 @@ fn growing_the_vocabulary_added_not_one_import_to_a_module() {
     // The capability channel is data on a channel the guest already had, so a
     // plugin that uses every capability imports what a plugin that uses none
     // imports. That is why the #1609 escape corpus still proves what it proved.
-    let host = host(&full_manifest(), guests::CAPABILITY_CLIENT);
+    let host = load(&full_manifest(), guests::CAPABILITY_CLIENT);
     let mut imports = host.imports();
     imports.sort();
     assert_eq!(
@@ -322,11 +329,12 @@ job_types = ["reindex"]
     ];
 
     for attempt in attempts {
-        let host = host(&attempt.manifest, guests::CAPABILITY_CLIENT);
+        let host = load(&attempt.manifest, guests::CAPABILITY_CLIENT);
         let wired = wired("alpha");
         let (status, events) = verdict(&host, wired.services.clone(), attempt.path);
         assert_eq!(
-            status, 403,
+            status,
+            403,
             "escape attempt succeeded: {what} ({events:?})",
             what = attempt.what
         );
@@ -346,13 +354,15 @@ job_types = ["reindex"]
 #[test]
 fn one_tenants_writes_are_unreadable_from_another_tenants_request() {
     // 11: the containment the whole subsystem exists for, through the real wire.
-    let host = host(&full_manifest(), guests::CAPABILITY_CLIENT);
+    let host = load(&full_manifest(), guests::CAPABILITY_CLIENT);
     let store = MemoryKvStore::new();
-    let services = |tenant: &str| CapabilityServices {
-        kv: Some(Arc::clone(&store) as Arc<dyn KvStore>),
-        ..CapabilityServices::none()
-    }
-    .for_tenant(tenant);
+    let services = |tenant: &str| {
+        CapabilityServices {
+            kv: Some(Arc::clone(&store) as Arc<dyn KvStore>),
+            ..CapabilityServices::none()
+        }
+        .for_tenant(tenant)
+    };
 
     assert_eq!(
         verdict(&host, services("alpha"), "/shop/kv-write").0,
@@ -377,7 +387,7 @@ fn one_tenants_writes_are_unreadable_from_another_tenants_request() {
 #[test]
 fn a_guest_that_never_reads_its_replies_is_stopped_rather_than_growing_the_host() {
     // 12: the capability channel's own denial-of-service shape.
-    let host = host(&full_manifest(), guests::CAPABILITY_CLIENT);
+    let host = load(&full_manifest(), guests::CAPABILITY_CLIENT);
     let wired = wired("alpha");
     let outcome = host.run_with(&request("/shop/kv-flood"), wired.services.clone());
     // Either the quota, the fuel budget or the unread-reply ceiling stops it —
@@ -389,7 +399,8 @@ fn a_guest_that_never_reads_its_replies_is_stopped_rather_than_growing_the_host(
         "the request completed"
     );
     assert!(
-        outcome.activity.len() <= usize::try_from(host.manifest().quotas.calls).unwrap_or(usize::MAX),
+        outcome.activity.len()
+            <= usize::try_from(host.manifest().quotas.calls).unwrap_or(usize::MAX),
         "the ledger stayed inside the call quota: {}",
         outcome.activity.len()
     );
@@ -399,7 +410,7 @@ fn a_guest_that_never_reads_its_replies_is_stopped_rather_than_growing_the_host(
 fn a_capability_with_no_backend_is_denied_rather_than_quietly_succeeding() {
     // 13: an operator who granted `db` but wired no store must not be told the
     // write happened.
-    let host = host(&full_manifest(), guests::CAPABILITY_CLIENT);
+    let host = load(&full_manifest(), guests::CAPABILITY_CLIENT);
     let (status, events) = verdict(&host, CapabilityServices::none(), "/shop/db-insert");
     assert_eq!(status, 403, "{events:?}");
     assert!(
@@ -413,7 +424,7 @@ fn a_quota_bust_denies_the_call_without_touching_another_plugin_or_a_host_route(
     // 14: quotas are per plugin, and a spent one is an answer rather than an
     // outage.
     let manifest_src = format!("{}\n[quotas]\noutbound_calls = 1\n", full_manifest());
-    let host = host(&manifest_src, guests::CAPABILITY_CLIENT);
+    let host = load(&manifest_src, guests::CAPABILITY_CLIENT);
     let wired = wired("alpha");
     assert_eq!(
         verdict(&host, wired.services.clone(), "/shop/fetch-granted").0,
@@ -432,7 +443,7 @@ fn a_quota_bust_denies_the_call_without_touching_another_plugin_or_a_host_route(
         &format!("name = \"{PLUGIN_NAME}\""),
         "name = \"other-plugin\"",
     );
-    let other_host = host(&other_src, guests::CAPABILITY_CLIENT);
+    let other_host = load(&other_src, guests::CAPABILITY_CLIENT);
     assert_eq!(
         verdict(&other_host, wired.services.clone(), "/shop/fetch-granted").0,
         200
@@ -442,7 +453,7 @@ fn a_quota_bust_denies_the_call_without_touching_another_plugin_or_a_host_route(
 #[test]
 fn an_operator_can_answer_what_this_plugin_did() {
     // 15: the audit criterion, from one surface.
-    let host = host(&full_manifest(), guests::CAPABILITY_CLIENT);
+    let host = load(&full_manifest(), guests::CAPABILITY_CLIENT);
     let wired = wired("alpha");
     let log = PluginActivityLog::new();
     for path in [
@@ -475,7 +486,10 @@ fn an_operator_can_answer_what_this_plugin_did() {
         "users",
         "drain-accounts",
     ] {
-        assert!(rendered.contains(expected), "{expected} missing:\n{rendered}");
+        assert!(
+            rendered.contains(expected),
+            "{expected} missing:\n{rendered}"
+        );
     }
     assert_eq!(log.plugins(), vec![PLUGIN_NAME.to_owned()]);
 }
@@ -494,11 +508,8 @@ slots = ["order-summary", "unsafe-tag", "unsafe-href", "wrong-frame"]
 
 #[tokio::test]
 async fn a_granted_slot_yields_a_sanitized_fragment() {
-    let plugin = SandboxedPlugin::from_artifact(&pack(
-        &render_manifest(),
-        guests::RENDER_CLIENT,
-    ))
-    .expect("loads");
+    let plugin = SandboxedPlugin::from_artifact(&pack(&render_manifest(), guests::RENDER_CLIENT))
+        .expect("loads");
     let fragment = plugin
         .render_slot("order-summary", &[("order".to_owned(), "7".to_owned())])
         .await;
@@ -510,11 +521,8 @@ async fn a_granted_slot_yields_a_sanitized_fragment() {
 
 #[tokio::test]
 async fn a_hostile_or_broken_hook_omits_the_fragment_rather_than_breaking_the_page() {
-    let plugin = SandboxedPlugin::from_artifact(&pack(
-        &render_manifest(),
-        guests::RENDER_CLIENT,
-    ))
-    .expect("loads");
+    let plugin = SandboxedPlugin::from_artifact(&pack(&render_manifest(), guests::RENDER_CLIENT))
+        .expect("loads");
     for slot in ["unsafe-tag", "unsafe-href", "wrong-frame"] {
         assert_eq!(plugin.render_slot(slot, &[]).await, None, "{slot}");
     }

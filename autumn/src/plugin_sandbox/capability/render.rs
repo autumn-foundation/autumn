@@ -303,7 +303,8 @@ fn write_attribute(
             // that needs escaping to be safe here is a value that was never
             // going to work anyway.
             if !value.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'_' | b':' | b'.' | b'+')
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b' ' | b'-' | b'_' | b':' | b'.' | b'+')
             }) {
                 return Err(RenderError::InvalidAttributeValue {
                     name: name.clone(),
@@ -390,7 +391,11 @@ mod tests {
         }
     }
 
-    fn element(tag: &str, attributes: &[(&str, &str)], children: Vec<FragmentNode>) -> FragmentNode {
+    fn element(
+        tag: &str,
+        attributes: &[(&str, &str)],
+        children: Vec<FragmentNode>,
+    ) -> FragmentNode {
         FragmentNode::Element {
             tag: tag.to_owned(),
             attributes: attributes
@@ -461,7 +466,10 @@ mod tests {
     #[test]
     fn an_href_may_only_point_back_at_the_host() {
         for href in ["/orders/7", "?page=2", "#top"] {
-            assert!(render(&[element("a", &[("href", href)], Vec::new())], 4096).is_ok(), "{href}");
+            assert!(
+                render(&[element("a", &[("href", href)], Vec::new())], 4096).is_ok(),
+                "{href}"
+            );
         }
         for href in [
             "javascript:alert(1)",
@@ -486,7 +494,11 @@ mod tests {
     #[test]
     fn an_attribute_value_cannot_break_out_of_its_quotes() {
         let rendered = render(
-            &[element("a", &[("title", "\" onmouseover=\"alert(1)")], Vec::new())],
+            &[element(
+                "a",
+                &[("title", "\" onmouseover=\"alert(1)")],
+                Vec::new(),
+            )],
             4096,
         )
         .expect("title is free-form and escaped");
@@ -497,12 +509,10 @@ mod tests {
     #[test]
     fn a_class_value_is_a_closed_charset_rather_than_an_escaped_one() {
         assert!(render(&[element("div", &[("class", "a b-c_d")], Vec::new())], 4096).is_ok());
-        assert!(
-            matches!(
-                render(&[element("div", &[("class", "a\"b")], Vec::new())], 4096),
-                Err(RenderError::InvalidAttributeValue { .. })
-            )
-        );
+        assert!(matches!(
+            render(&[element("div", &[("class", "a\"b")], Vec::new())], 4096),
+            Err(RenderError::InvalidAttributeValue { .. })
+        ));
     }
 
     #[test]

@@ -89,12 +89,12 @@ use quota::QuotaLedger;
 
 pub use audit::{ActivitySummary, CapabilityEvent as AuditEvent, PluginActivityLog};
 pub use db::{MemoryPluginStore, PluginStore, Scope, StoreError};
-pub use quota::CapabilityRateLimiter;
-pub use render::{FragmentNode, RenderError};
-pub use jobs::{JobSink, PluginJob};
 pub use jobs::MemoryJobSink;
+pub use jobs::{JobSink, PluginJob};
 pub use kv::{CacheKvStore, KvStore, MemoryKvStore};
 pub use outbound::{OutboundHttp, OutboundRequest, OutboundResponse, RecordingHttp};
+pub use quota::CapabilityRateLimiter;
+pub use render::{FragmentNode, RenderError};
 
 /// The most columns one plugin row may carry.
 ///
@@ -856,9 +856,9 @@ impl CapabilityRuntime {
     /// Run the call against its backend, everything already checked.
     fn perform(&mut self, call: &CapabilityCall, target: &str) -> CallResult {
         match call {
-            CapabilityCall::KvGet { .. } | CapabilityCall::KvSet { .. } | CapabilityCall::KvDelete { .. } => {
-                kv::perform(self, call, target)
-            }
+            CapabilityCall::KvGet { .. }
+            | CapabilityCall::KvSet { .. }
+            | CapabilityCall::KvDelete { .. } => kv::perform(self, call, target),
             CapabilityCall::HttpFetch { .. } => outbound::perform(self, call, target),
             CapabilityCall::DbInsert { .. }
             | CapabilityCall::DbGet { .. }
@@ -921,8 +921,8 @@ impl CapabilityRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::grants::MAX_QUOTA;
+    use super::*;
     use jobs::MemoryJobSink;
     use kv::MemoryKvStore;
     use outbound::{OutboundResponse, RecordingHttp};
@@ -1110,11 +1110,13 @@ path = "/shop/panel"
     #[test]
     fn one_tenants_key_is_unreadable_when_another_is_active() {
         let store = MemoryKvStore::new();
-        let services = |tenant: &str| CapabilityServices {
-            kv: Some(Arc::clone(&store) as Arc<dyn KvStore>),
-            ..CapabilityServices::none()
-        }
-        .for_tenant(tenant);
+        let services = |tenant: &str| {
+            CapabilityServices {
+                kv: Some(Arc::clone(&store) as Arc<dyn KvStore>),
+                ..CapabilityServices::none()
+            }
+            .for_tenant(tenant)
+        };
 
         let manifest = manifest(&everything());
         let mut alpha = CapabilityRuntime::new(&manifest, services("alpha"));
@@ -1149,11 +1151,13 @@ path = "/shop/panel"
         // `cart`. Both segments are escaped, so the two keys stay distinct.
         let store = MemoryKvStore::new();
         let manifest = manifest(&everything());
-        let services = |tenant: &str| CapabilityServices {
-            kv: Some(Arc::clone(&store) as Arc<dyn KvStore>),
-            ..CapabilityServices::none()
-        }
-        .for_tenant(tenant);
+        let services = |tenant: &str| {
+            CapabilityServices {
+                kv: Some(Arc::clone(&store) as Arc<dyn KvStore>),
+                ..CapabilityServices::none()
+            }
+            .for_tenant(tenant)
+        };
 
         let mut beta = CapabilityRuntime::new(&manifest, services("b"));
         beta.dispatch(&CapabilityCall::KvSet {
@@ -1281,7 +1285,10 @@ path = "/shop/panel"
             outbound::host_of("https://api.example.com:8443/v1"),
             Some("api.example.com".to_owned())
         );
-        assert_eq!(outbound::host_of("https://api.example.com:not-a-port/"), None);
+        assert_eq!(
+            outbound::host_of("https://api.example.com:not-a-port/"),
+            None
+        );
     }
 
     #[test]
@@ -1653,7 +1660,11 @@ path = "/shop/panel"
                 job_type: job_type.to_owned(),
                 payload: PluginRow::new(),
             });
-            assert_eq!(result.denial(), Some(DenialReason::NotInGrant), "{job_type}");
+            assert_eq!(
+                result.denial(),
+                Some(DenialReason::NotInGrant),
+                "{job_type}"
+            );
         }
         assert!(fixture.jobs.queued().is_empty());
     }
@@ -1917,11 +1928,13 @@ path = "/shop/panel"
             table: "orders".to_owned(),
             row: row(&[("note", "the customer's home address")]),
         });
-        let serialized =
-            serde_json::to_string(fixture.runtime.events()).expect("events serialize");
+        let serialized = serde_json::to_string(fixture.runtime.events()).expect("events serialize");
         assert!(!serialized.contains("card number"), "{serialized}");
         assert!(!serialized.contains("home address"), "{serialized}");
-        assert!(serialized.contains("cart"), "the key is a shape, not a value");
+        assert!(
+            serialized.contains("cart"),
+            "the key is a shape, not a value"
+        );
     }
 
     #[test]

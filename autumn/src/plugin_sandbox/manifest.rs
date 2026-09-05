@@ -886,12 +886,18 @@ impl SandboxManifest {
         // what?". An operator reading `http-outbound` alone has approved the
         // open internet.
         for (label, capability) in [
-            ("outbound hosts it may call", SandboxCapability::HttpOutbound),
+            (
+                "outbound hosts it may call",
+                SandboxCapability::HttpOutbound,
+            ),
             ("tenant-scoped tables it owns", SandboxCapability::Db),
             ("job types it may enqueue", SandboxCapability::Jobs),
             ("render slots it may fill", SandboxCapability::Render),
         ] {
-            let Some(entries) = self.grants.list_for(capability).filter(|list| !list.is_empty())
+            let Some(entries) = self
+                .grants
+                .list_for(capability)
+                .filter(|list| !list.is_empty())
             else {
                 continue;
             };
@@ -2345,10 +2351,8 @@ slots = ["order-summary"]
 
     #[test]
     fn a_repeated_grant_entry_is_refused() {
-        let src = vocabulary_toml().replace(
-            r#"tables = ["orders"]"#,
-            r#"tables = ["orders", "orders"]"#,
-        );
+        let src =
+            vocabulary_toml().replace(r#"tables = ["orders"]"#, r#"tables = ["orders", "orders"]"#);
         assert!(matches!(
             SandboxManifest::parse(&src),
             Err(ManifestError::DuplicateGrantEntry { .. })
@@ -2391,7 +2395,12 @@ slots = ["order-summary"]
         let delta = next.consent_delta_from(&previous);
         assert!(delta.requires_consent());
         assert!(delta.added_capabilities.contains(&SandboxCapability::Kv));
-        assert!(delta.added_hosts.iter().any(|host| host == "api.example.com"));
+        assert!(
+            delta
+                .added_hosts
+                .iter()
+                .any(|host| host == "api.example.com")
+        );
         assert!(delta.added_tables.iter().any(|table| table == "orders"));
         assert!(delta.added_job_types.iter().any(|job| job == "reindex"));
         assert!(delta.added_slots.iter().any(|slot| slot == "order-summary"));
@@ -2413,7 +2422,11 @@ slots = ["order-summary"]
 
         let up = raised.consent_delta_from(&base);
         assert!(up.requires_consent());
-        assert!(up.raised_quotas.iter().any(|(field, ..)| *field == "kv_writes"));
+        assert!(
+            up.raised_quotas
+                .iter()
+                .any(|(field, ..)| *field == "kv_writes")
+        );
         assert!(!base.consent_delta_from(&raised).requires_consent());
     }
 
@@ -2428,7 +2441,10 @@ slots = ["order-summary"]
             "order-summary",
             "kv_reads",
         ] {
-            assert!(summary.contains(expected), "{expected} missing from {summary}");
+            assert!(
+                summary.contains(expected),
+                "{expected} missing from {summary}"
+            );
         }
         // The blanket "no database, no network" line must not survive next to a
         // manifest that was just granted both.

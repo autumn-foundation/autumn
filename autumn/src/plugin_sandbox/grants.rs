@@ -147,7 +147,12 @@ impl CapabilityGrants {
                 &self.hosts,
                 EntryKind::Host,
             ),
-            ("tables", SandboxCapability::Db, &self.tables, EntryKind::Ident),
+            (
+                "tables",
+                SandboxCapability::Db,
+                &self.tables,
+                EntryKind::Ident,
+            ),
             (
                 "job_types",
                 SandboxCapability::Jobs,
@@ -469,7 +474,8 @@ impl ConsentDelta {
         if !self.requires_consent() {
             return String::new();
         }
-        let mut out = String::from("This upgrade asks for authority the installed version did not:\n");
+        let mut out =
+            String::from("This upgrade asks for authority the installed version did not:\n");
         // `write!` to a `String` is infallible; results are dropped rather than
         // unwrapped so this stays panic-free by construction.
         for capability in &self.added_capabilities {

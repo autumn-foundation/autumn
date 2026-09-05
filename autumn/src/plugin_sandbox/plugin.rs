@@ -199,10 +199,7 @@ impl SandboxedPlugin {
     /// manifest, for an embedder that wants one shared across a fleet.
     #[must_use]
     pub fn with_services(mut self, services: CapabilityServices) -> Self {
-        let rate = services
-            .rate
-            .clone()
-            .or_else(|| self.services.rate.clone());
+        let rate = services.rate.clone().or_else(|| self.services.rate.clone());
         self.services = CapabilityServices {
             tenant: None,
             rate,

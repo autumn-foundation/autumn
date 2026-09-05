@@ -539,11 +539,7 @@ pub fn run_inspect(path: &Path, format: &ReportFormat, against: Option<&Path>) {
             eprintln!("\u{2717} {err}");
             std::process::exit(1);
         });
-        report.upgrade = Some(
-            artifact
-                .manifest()
-                .consent_delta_from(previous.manifest()),
-        );
+        report.upgrade = Some(artifact.manifest().consent_delta_from(previous.manifest()));
     }
     match format {
         ReportFormat::Text => print!("{}", report.to_text()),

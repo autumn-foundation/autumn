@@ -1413,9 +1413,7 @@ impl SandboxHost {
         };
 
         match self.execute(line, encoding_fuel(request), Exchange::Request, services) {
-            Execution::Refused(failure, fuel_used) => {
-                SandboxOutcome::refused(failure, fuel_used)
-            }
+            Execution::Refused(failure, fuel_used) => SandboxOutcome::refused(failure, fuel_used),
             Execution::Ran(store, result) => finish(store, limits, &rules, result),
         }
     }
@@ -1450,7 +1448,9 @@ impl SandboxHost {
         // Checked here rather than left to the guest: a plugin that was not
         // granted the slot must not run at all for it, because running is what
         // costs the page its latency.
-        if !self.manifest.grants(super::manifest::SandboxCapability::Render)
+        if !self
+            .manifest
+            .grants(super::manifest::SandboxCapability::Render)
             || !self
                 .manifest
                 .grants
@@ -2755,7 +2755,6 @@ enum GuestAnswer {
     /// The answer to a render slot.
     Fragment(Vec<super::capability::FragmentNode>),
 }
-
 
 /// The guest's memory ceiling, and the evidence that it was applied.
 #[derive(Debug)]
