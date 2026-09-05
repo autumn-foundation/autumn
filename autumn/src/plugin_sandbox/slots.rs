@@ -30,6 +30,24 @@
 //! logged. A page that renders one plugin's fragment and omits another's is the
 //! designed outcome, not a degraded one.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
 use std::sync::Arc;
 
 use super::manifest::SandboxCapability;
@@ -116,7 +134,7 @@ impl RenderSlots {
     /// application does not offer.
     pub fn with(mut self, plugin: Arc<SandboxedPlugin>) -> Result<Self, SlotError> {
         let manifest = plugin.manifest();
-        if manifest.grants(SandboxCapability::Render) {
+        if manifest.is_granted(SandboxCapability::Render) {
             for slot in &manifest.grants.slots {
                 if !self.declared.iter().any(|declared| declared == slot) {
                     return Err(SlotError::UndeclaredSlot {
@@ -156,7 +174,7 @@ impl RenderSlots {
         let mut out = String::new();
         for plugin in &self.plugins {
             let manifest = plugin.manifest();
-            if !manifest.grants(SandboxCapability::Render)
+            if !manifest.is_granted(SandboxCapability::Render)
                 || !manifest.grants.allows(SandboxCapability::Render, slot)
             {
                 continue;

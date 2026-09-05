@@ -17,7 +17,7 @@
 //! slots = ["order-summary"]        # render may fill exactly these
 //!
 //! [quotas]
-//! kv_reads = 64                    # per request, operator-configurable
+//! kv_reads = 64                    # per request; declared here, approved on install
 //! ```
 //!
 //! # The two-way rule
@@ -46,6 +46,24 @@
 //! outbound allow-list compared with anything looser than equality is not an
 //! allow-list. `api.example.com.attacker.test` ends with the granted name, and
 //! `https://api.example.com@attacker.test/` starts with it.
+
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
 
 use std::fmt;
 
@@ -84,6 +102,10 @@ pub const MAX_QUOTA: u32 = 1_000_000;
 // ── Grants ───────────────────────────────────────────────────────────────
 
 /// The named things each granted capability is scoped to.
+///
+/// Not `#[non_exhaustive]`: an embedder building a manifest in memory fills this
+/// in, usually as `CapabilityGrants { hosts: …, ..Default::default() }`, and
+/// that spelling only works from outside the crate while the type stays open.
 ///
 /// Every list is empty by default, which is what makes the vocabulary
 /// fail-closed: a manifest that forgets a list does not get a permissive one.
@@ -274,6 +296,15 @@ pub fn is_grantable_host(host: &str) -> bool {
     if !host.contains('.') {
         return false;
     }
+    // An IPv4 literal is refused for the same reason `host_of` refuses an IPv6
+    // one: a literal address is not a name, so a *name* allow-list can neither
+    // grant nor deny one honestly. Enforcing it for one family and not the
+    // other was the gap — `169.254.169.254` is all digits and dots, so it
+    // passed the label rules below and put the cloud metadata endpoint on a
+    // consent screen as though it were a hostname.
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return false;
+    }
     host.split('.').all(|label| {
         !label.is_empty()
             && label.len() <= 63
@@ -311,7 +342,14 @@ pub fn is_grantable_name(name: &str) -> bool {
 
 // ── Quotas ───────────────────────────────────────────────────────────────
 
-/// Per-request ceilings on each capability, operator-configurable.
+/// Per-request ceilings on each capability.
+///
+/// **Declared by the plugin's author and approved by the operator**, not set by
+/// the operator: they live in the manifest, which the artifact digest covers, so
+/// there is no mount-time override. That is why every one of them is on the
+/// consent screen and why [`ConsentDelta`] treats a raised quota as new
+/// authority — an upgrade that doubles `db_writes` is asking for something, and
+/// approving it is the operator's only lever.
 ///
 /// Fuel bounds the *guest's* work. It does not bound the host's: a KV write
 /// costs a guest one call frame and costs the host a cache round-trip, and a
@@ -351,6 +389,14 @@ pub struct CapabilityQuotas {
     /// a plugin cannot spend every ceiling at once and call that staying within
     /// its quota.
     pub calls: u32,
+    /// How long one outbound call may take, in milliseconds.
+    ///
+    /// Fuel bounds the guest's instructions and cannot bound a socket that
+    /// never answers. An outbound call runs on a blocking worker holding the
+    /// plugin's concurrency permit, so without a deadline a granted host that
+    /// black-holes the connection shuts the plugin's prefix and eats the shared
+    /// blocking pool.
+    pub outbound_timeout_ms: u32,
     /// Calls per second per capability, across every request this plugin
     /// serves.
     ///
@@ -375,6 +421,7 @@ impl Default for CapabilityQuotas {
             job_enqueues: 8,
             render_bytes: 64 * 1024,
             calls: 128,
+            outbound_timeout_ms: 5_000,
             calls_per_second: 200,
         }
     }
@@ -387,7 +434,7 @@ impl CapabilityQuotas {
     /// disagree about which quotas exist — the failure mode of writing them out
     /// three times is a quota that is enforced but never displayed.
     #[must_use]
-    pub const fn fields(&self) -> [(&'static str, u32); 12] {
+    pub const fn fields(&self) -> [(&'static str, u32); 13] {
         [
             ("kv_reads", self.kv_reads),
             ("kv_writes", self.kv_writes),
@@ -400,6 +447,7 @@ impl CapabilityQuotas {
             ("job_enqueues", self.job_enqueues),
             ("render_bytes", self.render_bytes),
             ("calls", self.calls),
+            ("outbound_timeout_ms", self.outbound_timeout_ms),
             ("calls_per_second", self.calls_per_second),
         ]
     }
@@ -437,6 +485,7 @@ impl CapabilityQuotas {
 /// re-prompting for that trains operators to click through the prompt that
 /// matters.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct ConsentDelta {
     /// Capabilities the new manifest asks for and the old one did not.
     pub added_capabilities: Vec<SandboxCapability>,
@@ -450,6 +499,20 @@ pub struct ConsentDelta {
     pub added_slots: Vec<String>,
     /// Quotas raised, as `(field, approved, requested)`.
     pub raised_quotas: Vec<(&'static str, u32, u32)>,
+    /// Routes newly mounted, as `"METHOD /path"`.
+    ///
+    /// A route is *enforced* authority, not documentation: the host builds its
+    /// router from exactly this list, and the consent screen promises the plugin
+    /// serves "these and only these". An upgrade that adds one exposes an
+    /// endpoint nobody approved, so it belongs here beside a new capability.
+    pub added_routes: Vec<String>,
+    /// Resource ceilings raised, as `(field, approved, requested)`.
+    ///
+    /// Also authority, and the kind an upgrade can grow enormously without
+    /// touching a capability name: `fuel` and `memory_bytes` and
+    /// `max_concurrency` are what one plugin may cost the host, and their
+    /// product is what `request_footprint_bytes` bounds.
+    pub raised_limits: Vec<(&'static str, u128, u128)>,
 }
 
 impl ConsentDelta {
@@ -462,6 +525,8 @@ impl ConsentDelta {
             || !self.added_job_types.is_empty()
             || !self.added_slots.is_empty()
             || !self.raised_quotas.is_empty()
+            || !self.added_routes.is_empty()
+            || !self.raised_limits.is_empty()
     }
 
     /// The lines to print above a re-consent prompt.
@@ -496,8 +561,14 @@ impl ConsentDelta {
                 let _ = writeln!(out, "  + {label} {entry}");
             }
         }
+        for route in &self.added_routes {
+            let _ = writeln!(out, "  + route {route}");
+        }
         for (field, approved, requested) in &self.raised_quotas {
             let _ = writeln!(out, "  + quota {field} {approved} -> {requested}");
+        }
+        for (field, approved, requested) in &self.raised_limits {
+            let _ = writeln!(out, "  + limit {field} {approved} -> {requested}");
         }
         out
     }
@@ -535,6 +606,16 @@ mod tests {
         for host in [
             "",
             "localhost",
+            // A literal address is not a name, so a *name* allow-list can
+            // neither grant nor deny one honestly. Enforcing that for IPv6 and
+            // not IPv4 was the gap: `169.254.169.254` is all digits and dots,
+            // so it passed every label rule and put the cloud metadata endpoint
+            // on a consent screen as though it were a hostname.
+            "169.254.169.254",
+            "127.0.0.1",
+            "10.0.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
             "API.example.com",
             "api.example.com.",
             ".example.com",
@@ -650,7 +731,8 @@ mod tests {
                 8 => broken.job_enqueues = 0,
                 9 => broken.render_bytes = 0,
                 10 => broken.calls = 0,
-                11 => broken.calls_per_second = 0,
+                11 => broken.outbound_timeout_ms = 0,
+                12 => broken.calls_per_second = 0,
                 other => panic!("quota field {other} ({field}) has no case here"),
             }
             assert_eq!(

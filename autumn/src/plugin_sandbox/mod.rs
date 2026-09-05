@@ -36,6 +36,15 @@
 //!  plugin ───────────────────────► the manifest's routes ARE the mount
 //! ```
 //!
+//! # What the root re-exports
+//!
+//! Everything a caller needs to *use* the sandbox: the plugin and host types,
+//! the manifest vocabulary, the capability backends and their reference
+//! implementations, and every `MAX_*` ceiling — because a ceiling nobody can
+//! name is a ceiling nobody can plan against. What stays behind
+//! `capability::render::` and `capability::audit::` is the machinery those
+//! types are built from.
+//!
 //! Each module's own header explains its half in full; start with
 //! [`manifest`] for what an operator reviews, [`host`] for what the sandbox
 //! actually withholds, and `docs/guide/sandboxed-plugins.md` for the narrative.
@@ -62,11 +71,13 @@ pub use artifact::{
     read_bounded,
 };
 pub use capability::{
-    ActivitySummary, CacheKvStore, CallResult, CallValue, CapabilityCall, CapabilityRateLimiter,
-    CapabilityRuntime, CapabilityServices, DenialReason, FragmentNode, JobSink, KvStore,
-    MemoryJobSink, MemoryKvStore, MemoryPluginStore, OutboundHttp, OutboundRequest,
-    OutboundResponse, PluginActivityLog, PluginJob, PluginRow, PluginStore, PluginValue,
-    RecordingHttp, RenderError, Scope, StoreError,
+    ActivitySummary, CacheKvStore, CallResult, CallValue, CapabilityCall, CapabilityEvent,
+    CapabilityOutcome, CapabilityRateLimiter, CapabilityRuntime, CapabilityServices, DenialReason,
+    FragmentNode, JobSink, KvStore, MAX_EVENTS, MAX_KV_KEY_BYTES, MAX_LOG_EVENTS,
+    MAX_OUTBOUND_HEADERS, MAX_ROW_COLUMNS, MAX_ROW_ID_BYTES, MAX_TARGET_CHARS,
+    MAX_VALUE_TEXT_BYTES, MemoryJobSink, MemoryKvStore, MemoryPluginStore, NO_TENANT, OutboundHttp,
+    OutboundRequest, OutboundResponse, PluginActivityLog, PluginJob, PluginRow, PluginStore,
+    PluginValue, RecordingHttp, RenderError, Scope, StoreError,
 };
 pub use grants::{
     CapabilityGrants, CapabilityQuotas, ConsentDelta, MAX_GRANT_ENTRIES, MAX_GRANT_IDENT_LEN,

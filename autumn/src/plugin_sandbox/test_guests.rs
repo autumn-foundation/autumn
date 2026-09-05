@@ -3398,7 +3398,7 @@ pub const CAPABILITY_CLIENT: &str = r#"(module
   (data (i32.const 856) "/kv-flood\00")
   (data (i32.const 876) "\"status\":\"ok\"\00")
   (data (i32.const 896) "\"op\":\"render\"\00")
-  (data (i32.const 928) "{\"op\":\"fragment\",\"nodes\":[{\"node\":\"element\",\"tag\":\"p\",\"attributes\":[[\"class\",\"panel\"]],\"children\":[{\"node\":\"text\",\"text\":\"3 orders\"}]}]}\0a\00")
+
 
   ;; Call frames.
   (data (i32.const 1024) "{\"op\":\"call\",\"call\":\"kv-set\",\"id\":1,\"key\":\"cart\",\"value\":\"one item\"}\0a\00")
@@ -3411,6 +3411,18 @@ pub const CAPABILITY_CLIENT: &str = r#"(module
   (data (i32.const 2816) "{\"op\":\"call\",\"call\":\"db-insert\",\"id\":8,\"table\":\"orders\",\"row\":{\"tenant_id\":\"beta\"}}\0a\00")
   (data (i32.const 3072) "{\"op\":\"call\",\"call\":\"job-enqueue\",\"id\":9,\"job_type\":\"reindex\"}\0a\00")
   (data (i32.const 3328) "{\"op\":\"call\",\"call\":\"job-enqueue\",\"id\":10,\"job_type\":\"drain-accounts\"}\0a\00")
+  ;; Two `http-fetch`es to the granted host, so a per-request `outbound_calls`
+  ;; quota of one can actually be exceeded — a guest that makes a single call
+  ;; can never demonstrate a ceiling.
+  (data (i32.const 3584) "{\"op\":\"call\",\"call\":\"http-fetch\",\"id\":11,\"method\":\"GET\",\"url\":\"https://api.example.com/v1\"}\0a\00")
+  ;; The render answer, kept clear of every call frame above: data segments
+  ;; apply in order, so a block that overruns the next one's offset silently
+  ;; truncates itself.
+  (data (i32.const 4096) "{\"op\":\"fragment\",\"nodes\":[{\"node\":\"element\",\"tag\":\"p\",\"attributes\":[[\"class\",\"panel\"]],\"children\":[{\"node\":\"text\",\"text\":\"3 orders\"}]}]}\0a\00")
+  ;; Needles for the two routes that need a *hit* rather than a call.
+  (data (i32.const 4608) "\"found\":true\00")
+  (data (i32.const 4640) "/kv-read-hit\00")
+  (data (i32.const 4672) "/fetch-twice\00")
 
   (func $strlen (param $p i32) (result i32)
     (local $n i32)
@@ -3465,7 +3477,6 @@ pub const CAPABILITY_CLIENT: &str = r#"(module
   ;; Which call frame this request selects, or 0 for none.
   (func $select (param $len i32) (result i32)
     (if (call $contains (local.get $len) (i32.const 640)) (then (return (i32.const 1024))))
-    (if (call $contains (local.get $len) (i32.const 680)) (then (return (i32.const 1536))))
     (if (call $contains (local.get $len) (i32.const 660)) (then (return (i32.const 1280))))
     (if (call $contains (local.get $len) (i32.const 724)) (then (return (i32.const 2048))))
     (if (call $contains (local.get $len) (i32.const 704)) (then (return (i32.const 1792))))
@@ -3483,7 +3494,7 @@ pub const CAPABILITY_CLIENT: &str = r#"(module
     ;; every capability — which is the reference plugin the issue's success
     ;; metric asks for rather than five plugins that each do one thing.
     (if (call $contains (local.get $len) (i32.const 896))
-      (then (call $emit (i32.const 928)) (return)))
+      (then (call $emit (i32.const 4096)) (return)))
     ;; The flood case never reads a reply, which is how the host's ceiling on
     ;; unread replies gets exercised at all.
     (if (call $contains (local.get $len) (i32.const 856))
@@ -3495,6 +3506,38 @@ pub const CAPABILITY_CLIENT: &str = r#"(module
             (br_if $stop (i32.ge_u (local.get $i) (i32.const 100000)))
             (br $l)))
         (call $emit (i32.const 128))
+        (return)))
+    ;; Two `http-fetch`es in one request, so a per-request quota of one is
+    ;; exceeded on the second. Answers 200 only if the second was refused.
+    (if (call $contains (local.get $len) (i32.const 4672))
+      (then
+        (call $emit (i32.const 3584))
+        (drop (call $read_line))
+        (call $emit (i32.const 3584))
+        (local.set $len (call $read_line))
+        (if (call $contains (local.get $len) (i32.const 876))
+          (then (call $emit (i32.const 384)))
+          (else (call $emit (i32.const 128))))
+        (return)))
+    ;; A *hit*, not merely a call that was allowed. `kv-get` for a key another
+    ;; tenant owns is correctly ALLOWED and correctly MISSES — the escaping is
+    ;; what makes it miss — so a test that read the status alone could not tell
+    ;; containment from success.
+    ;; `/kv-read-hit` asks for its own key; `/kv-other-tenant` asks for
+    ;; `beta:cart`, which is what a naive `format!("{plugin}:{tenant}:{key}")`
+    ;; would have made reachable. Both answer 200 only on a hit.
+    (local.set $call (i32.const 0))
+    (if (call $contains (local.get $len) (i32.const 4640))
+      (then (local.set $call (i32.const 1280))))
+    (if (call $contains (local.get $len) (i32.const 680))
+      (then (local.set $call (i32.const 1536))))
+    (if (local.get $call)
+      (then
+        (call $emit (local.get $call))
+        (local.set $len (call $read_line))
+        (if (call $contains (local.get $len) (i32.const 4608))
+          (then (call $emit (i32.const 128)))
+          (else (call $emit (i32.const 384))))
         (return)))
     (local.set $call (call $select (local.get $len)))
     (if (i32.eqz (local.get $call)) (then (call $emit (i32.const 384)) (return)))

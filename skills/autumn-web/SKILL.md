@@ -2497,24 +2497,31 @@ autumn plugin inspect new.autumn-plugin --against installed.autumn-plugin
 ```
 
 ```rust
-use autumn_web::plugin_sandbox::{CapabilityServices, MemoryKvStore, RenderSlots, SandboxedPlugin};
+use std::sync::Arc;
+use autumn_web::plugin_sandbox::{
+    CapabilityServices, KvStore, MemoryKvStore, RenderSlots, SandboxedPlugin,
+};
 
 let hello = SandboxedPlugin::from_file(std::path::Path::new("plugins/hello.autumn-plugin"))?
     // Capabilities are honoured against backends YOU wire. Anything unwired is
     // answered `unavailable` and recorded — a refusal, never a silent success.
+    // The `as Arc<dyn KvStore>` is load-bearing: unsizing does not pass through
+    // `Option`, so `Some(MemoryKvStore::new())` will not coerce on its own.
     .with_services(CapabilityServices {
-        kv: Some(MemoryKvStore::new()),
+        kv: Some(MemoryKvStore::new() as Arc<dyn KvStore>),
         ..CapabilityServices::none()
     });
 
 // Render slots need both halves: the manifest names the slots the plugin will
 // fill, the app declares the slots that exist. `with` fails at boot on a
 // mismatch; `render` returns a String and never breaks the page.
-let slots = RenderSlots::declaring(["order-summary"]).with(std::sync::Arc::new(hello.clone()))?;
-let fragment = slots.render("order-summary", &[]).await;
+let slots = RenderSlots::declaring(["order-summary"]).with(Arc::new(hello.clone()))?;
+let fragment: String = slots.render("order-summary", &[]).await;
 
 // "What did this plugin do in the last hour" — one surface, shapes not values.
+// `Display`: the summary already knows its plugin and its window.
 let summary = hello.activity().summary("autumn-plugin-hello", std::time::Duration::from_secs(3600));
+println!("{summary}");
 
 autumn_web::app().plugin(hello).run().await;
 ```
@@ -2530,7 +2537,9 @@ ceiling degrades instead of 502ing.
 
 Scoping is **derivation, not checking**: the guest names a logical key, table,
 host or job type and the host derives `plugin-kv:<plugin>:<tenant>:<key>` /
-`plugin_<plugin>_<table>` from the manifest and the active tenant. There is no
+`plugin_<hex-escaped plugin>__<table>` from the manifest and the active tenant
+(the escape is injective, so a plugin *named* `shop_orders` owning `v2` cannot
+land on the table `shop` owning `orders_v2` already has). There is no
 field in the protocol where another tenant, another plugin, a host-app table or
 SQL would go, so cross-tenant access is unspellable rather than refused. Render
 hooks return a fragment **tree** the host renders (no HTML parser, so no parser

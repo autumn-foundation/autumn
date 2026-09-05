@@ -32,6 +32,7 @@ use super::{
 
 /// One job a sandboxed plugin asked for.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct PluginJob {
     /// The plugin whose grants and quotas the run executes under.
     pub plugin: String,

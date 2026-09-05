@@ -188,9 +188,9 @@ const DENIED_CLASSES: &[&str] = &[
 fn granted_class(manifest: &SandboxManifest, class: &str) -> bool {
     use autumn_web::plugin_sandbox::SandboxCapability;
     match class {
-        "network" => manifest.grants(SandboxCapability::HttpOutbound),
+        "network" => manifest.is_granted(SandboxCapability::HttpOutbound),
         "database" => {
-            manifest.grants(SandboxCapability::Db) || manifest.grants(SandboxCapability::Kv)
+            manifest.is_granted(SandboxCapability::Db) || manifest.is_granted(SandboxCapability::Kv)
         }
         // Filesystem, environment and process control have no capability that
         // grants them and are not on the roadmap to; they stay in the list
@@ -471,16 +471,15 @@ fn conformance(manifest: &SandboxManifest) -> ConformanceReport {
             granted.push(format!("{label}={}", entries.join("|")));
         }
     }
-    let gating = format!(
-        "sandboxed: no session, auth, filesystem or environment capability ({granted})",
-        granted = granted.join(", ")
-    );
+    let granted = granted.join(", ");
+    let gating =
+        format!("sandboxed: no session, auth, filesystem or environment capability ({granted})");
     let sensitive = vec![plugin_check::SensitiveRouteDecl {
         path_pattern: manifest.prefix.clone(),
-        auth_mechanism: gating,
+        auth_mechanism: gating.clone(),
     }];
 
-    plugin_check::build_report(
+    let mut report = plugin_check::build_report(
         &plugin_check::PluginCheckOptions {
             package: None,
             bin: None,
@@ -504,7 +503,28 @@ fn conformance(manifest: &SandboxManifest) -> ConformanceReport {
             deny_experimental: false,
         },
         &routes,
-    )
+    );
+
+    // The gating string above reaches the report only through the
+    // sensitive-surfaces check, and that check only looks at routes whose path
+    // is *named* like a sensitive one (`/admin`, `/debug`, …). A plugin that
+    // holds `db` and `http-outbound` under the prefix `/shop` is exactly as
+    // authoritative and would have been reported with the grant nowhere in
+    // sight. So the grant gets a check of its own, present on every sandboxed
+    // artifact: an automated reader gating an install on this report needs to
+    // see the authority whether or not the path happens to say "admin".
+    //
+    // `Pass`, because a declared grant is conformant — `SandboxManifest::parse`
+    // has already refused an ungrantable host, table, job type or slot by the
+    // time this runs. The check reports authority; it does not adjudicate it.
+    // Consent is `autumn plugin inspect`'s job, and it fails the verdict there.
+    report.checks.push(plugin_check::CheckResult {
+        name: "capability-grants".to_owned(),
+        status: plugin_check::CheckStatus::Pass,
+        message: gating,
+        diagnostics: Vec::new(),
+    });
+    report
 }
 
 /// Run `autumn plugin package`, printing the consent summary and exiting

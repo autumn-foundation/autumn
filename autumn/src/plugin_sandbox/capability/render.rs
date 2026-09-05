@@ -68,8 +68,11 @@ pub const VOID_TAGS: &[&str] = &["br", "hr"];
 /// and CSS alone can exfiltrate — `background: url(https://…)` keyed off an
 /// attribute selector is a well-known read of the surrounding page. `id` is
 /// absent because a duplicate id changes what the *host's* own scripts and
-/// labels resolve to. `target` and `rel` are absent because the renderer sets
-/// them itself, below.
+/// labels resolve to. `target` and `rel` are absent because a fragment's links
+/// are same-origin by construction (see `check_href`), so neither has
+/// anything to say: `target="_blank"` without `rel="noopener"` is a
+/// window-opener hazard, and there is no cross-origin link for `rel` to
+/// annotate.
 pub const ALLOWED_ATTRIBUTES: &[(&str, &str)] = &[
     ("a", "href"),
     ("a", "title"),
@@ -339,10 +342,28 @@ fn write_attribute(
 /// An allow-list of *shapes* rather than a deny-list of schemes. `javascript:`
 /// is the famous one, but `data:text/html`, `vbscript:`, and every scheme a
 /// browser or an OS handler adds next are the same hole, and a deny-list is
-/// never finished. A protocol-relative `//host` is refused for the same reason
-/// an absolute URL is: the fragment is decoration on the host's page, and a
-/// plugin that wants to send a reader elsewhere can say so in text.
+/// never finished.
+///
+/// # Backslashes are refused outright
+///
+/// `//host` is the obvious protocol-relative escape and is refused. `/\host` is
+/// the same escape spelled the way the WHATWG URL parser reads it: for a
+/// *special* scheme (`http`, `https`) a backslash is a path separator, so
+/// `/\attacker.test/login` parses as `//attacker.test/login` and every major
+/// browser navigates off-origin. `\/`, `\\` and a backslash anywhere later in
+/// the value are the same class of bug one variation along, so the character is
+/// refused wherever it appears rather than pattern-matched at the front.
 fn check_href(value: &str) -> Result<(), RenderError> {
+    // Before the shape test, and unconditionally: `/\evil` passes every
+    // prefix check a reader would write, because the byte that makes it an
+    // authority is the *second* one.
+    if value.contains('\\') {
+        return Err(RenderError::InvalidAttributeValue {
+            name: "href".to_owned(),
+            reason: "may not carry a backslash: a browser reads it as a path \
+                     separator, so `/\\host` is `//host` by another spelling",
+        });
+    }
     let shaped = (value.starts_with('/') && !value.starts_with("//"))
         || value.starts_with('#')
         || value.starts_with('?');
@@ -479,7 +500,13 @@ mod tests {
             "vbscript:msgbox",
             "https://attacker.test/",
             "//attacker.test/",
+            // A browser reads `\` as a path separator for http(s), so each of
+            // these is `//attacker.test` by another spelling and navigates
+            // off-origin. `/\` is the one a `!starts_with("//")` guard misses.
+            "/\\attacker.test/login",
+            "\\/attacker.test/login",
             "\\\\attacker.test\\share",
+            "/path\\..\\..\\etc",
         ] {
             assert!(
                 matches!(

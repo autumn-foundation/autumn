@@ -8987,10 +8987,40 @@ mod tests {
             .expect("parses");
         match cli.command {
             Commands::Plugin {
-                action: PluginSubcommands::Inspect { artifact, format },
+                action:
+                    PluginSubcommands::Inspect {
+                        artifact,
+                        format,
+                        against,
+                    },
             } => {
                 assert_eq!(artifact, "hello.autumn-plugin");
                 assert_eq!(format, "text");
+                // No `--against`: reviewing an artifact on its own, not as an
+                // upgrade. The upgrade gate must not fire when nobody asked
+                // for it (issue #1632).
+                assert_eq!(against, None);
+            }
+            _ => panic!("expected plugin inspect"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_inspect_accepts_an_upgrade_baseline() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "inspect",
+            "shop-0.2.autumn-plugin",
+            "--against",
+            "shop-0.1.autumn-plugin",
+        ])
+        .expect("parses");
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::Inspect { against, .. },
+            } => {
+                assert_eq!(against.as_deref(), Some("shop-0.1.autumn-plugin"));
             }
             _ => panic!("expected plugin inspect"),
         }

@@ -63,19 +63,36 @@ impl QuotaLedger {
         &self.declared
     }
 
-    /// Charge one call against both its per-capability counter and the shared
-    /// `calls` budget.
+    /// Charge one dispatch against the shared `calls` budget.
     ///
-    /// Both are checked before either is committed. Charging one and then
-    /// failing the other would spend a per-capability unit on a call that was
-    /// refused, so a plugin's second surface would run short because its first
-    /// one hit the shared ceiling — a quota that punishes the wrong capability
-    /// is one an author cannot act on.
+    /// Charged for *every* call, including one about to be refused: a refusal
+    /// costs a grant scan, an encoded reply, a ledger entry and a log line, and
+    /// leaving refusals unmetered made the cheapest way to spend the host's time
+    /// the one nothing counted. See `CapabilityRuntime::dispatch`.
     ///
     /// # Errors
     ///
     /// Names the quota field that is spent.
-    pub fn charge(&mut self, call: &CapabilityCall) -> Result<(), &'static str> {
+    pub const fn charge_call(&mut self) -> Result<(), &'static str> {
+        if self.calls >= self.declared.calls {
+            return Err("calls");
+        }
+        self.calls = self.calls.saturating_add(1);
+        Ok(())
+    }
+
+    /// Charge one call against its per-capability counter.
+    ///
+    /// Split from [`charge_call`](Self::charge_call) so the two ceilings bound
+    /// different things: the shared one bounds *dispatches*, and these bound
+    /// *backend work*. A call refused for naming an ungranted host never
+    /// reaches a backend, so spending its `outbound_calls` unit would let one
+    /// manifest mistake starve the calls the plugin is entitled to make.
+    ///
+    /// # Errors
+    ///
+    /// Names the quota field that is spent.
+    pub fn charge_capability(&mut self, call: &CapabilityCall) -> Result<(), &'static str> {
         let (counter, ceiling, field) = match call {
             CapabilityCall::KvGet { .. } => {
                 (&mut self.kv_reads, self.declared.kv_reads, "kv_reads")
@@ -105,11 +122,7 @@ impl QuotaLedger {
         if *counter >= ceiling {
             return Err(field);
         }
-        if self.calls >= self.declared.calls {
-            return Err("calls");
-        }
         *counter = counter.saturating_add(1);
-        self.calls = self.calls.saturating_add(1);
         Ok(())
     }
 }
@@ -199,17 +212,30 @@ impl CapabilityRateLimiter {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let full = u64::from(self.per_second).saturating_mul(SCALE);
         let now = Instant::now();
-        let elapsed = now.saturating_duration_since(bucket.last);
+        let micros = u64::try_from(now.saturating_duration_since(bucket.last).as_micros())
+            .unwrap_or(u64::MAX);
         // `as_micros` rather than `as_secs_f64`: the refill has to be monotone
         // in elapsed time and identical on every platform, and a float divide
         // is neither.
-        let refill = u64::try_from(elapsed.as_micros())
-            .unwrap_or(u64::MAX)
-            .saturating_mul(u64::from(self.per_second))
-            .saturating_mul(SCALE)
-            / 1_000_000;
+        let rate = u64::from(self.per_second).saturating_mul(SCALE);
+        let refill = micros.saturating_mul(rate) / 1_000_000;
         bucket.tokens = bucket.tokens.saturating_add(refill).min(full);
-        bucket.last = now;
+        // Advance the clock only by the time that actually became tokens, and
+        // carry the remainder. Assigning `now` unconditionally *discards* every
+        // interval shorter than one token's worth — 5 µs at the default 200/s —
+        // so a plugin whose calls arrive faster than that quantum refills
+        // strictly slower than its declared rate, and under contention could sit
+        // at zero tokens while time passed. Clamped at `micros` so the clock can
+        // only ever move forward to `now` at most.
+        let converted = refill
+            .saturating_mul(1_000_000)
+            .checked_div(rate)
+            .unwrap_or(micros)
+            .min(micros);
+        bucket.last = bucket
+            .last
+            .checked_add(std::time::Duration::from_micros(converted))
+            .unwrap_or(now);
         if bucket.tokens < SCALE {
             return false;
         }

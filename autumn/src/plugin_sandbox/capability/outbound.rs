@@ -20,14 +20,32 @@
 //! round. So [`host_of`] refuses userinfo outright rather than parsing past it —
 //! a plugin has no use for it, and refusing is a rule with no edge cases.
 //!
-//! # What the host still owns
+//! # Redirects are the allow-list's real escape hatch
 //!
-//! Redirects are not followed on the guest's behalf: a 3xx comes back as a 3xx,
-//! because a redirect to a host the manifest never named is exactly the escape
-//! the allow-list exists to stop, and "check the new host too" is a rule that
-//! has to hold for every hop. IP-range (SSRF) guarding for the app-level client
-//! is #1627's, not this module's; the allow-list here is a *name* allow-list and
-//! says so.
+//! Checking the URL the guest wrote bounds *the first hop*. A granted
+//! `api.example.com` that answers `302 Location: https://attacker.test/collect`
+//! sends the request — body and all — somewhere the manifest never named, and a
+//! host that only inspected the outgoing URL would record one allowed call to
+//! the granted host and nothing else. Most HTTP clients follow redirects by
+//! default, so the natural wiring is the vulnerable one.
+//!
+//! Two things close it, and it needs both:
+//!
+//! * every [`OutboundRequest`] carries [`allowed_hosts`](OutboundRequest::allowed_hosts)
+//!   and [`follow_redirects: false`](OutboundRequest::follow_redirects), so an
+//!   implementation has what it needs to be correct without re-deriving the
+//!   grant; and
+//! * every [`OutboundResponse`] must report the
+//!   [`final_url`](OutboundResponse::final_url) it actually fetched, and the
+//!   host **re-checks that against the grant** before a byte reaches the guest.
+//!
+//! The second is what makes the first more than a comment: an implementation
+//! that follows a redirect anyway must either report where it ended up — and be
+//! denied — or lie, and a backend that lies is host-side code the operator
+//! wrote, which is the same trust boundary as the database driver.
+//!
+//! IP-range (SSRF) guarding for the app-level client is #1627's, not this
+//! module's; the allow-list here is a *name* allow-list and says so.
 
 use std::sync::Arc;
 
@@ -68,6 +86,7 @@ const ALLOWED_OUTBOUND_METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH
 
 /// One outbound call, already checked against the grant list.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OutboundRequest {
     /// The plugin making the call, for the upstream's logs and for ours.
     pub plugin: String,
@@ -88,6 +107,27 @@ pub struct OutboundRequest {
     /// the answer against it either way — a backend an embedder wrote is not
     /// where this bound may be missing.
     pub max_response_bytes: usize,
+    /// Every hostname this plugin was granted.
+    ///
+    /// The host has already checked `url` against it. It is carried anyway so an
+    /// implementation that must make a per-hop decision — a redirect policy, a
+    /// connection-level check — can do so without being handed the manifest.
+    pub allowed_hosts: Vec<String>,
+    /// Always `false`, and the field exists to say so where an implementation
+    /// will see it.
+    ///
+    /// Following a redirect is how the allow-list is escaped; see the module
+    /// header. A client that defaults to following must be configured off for
+    /// this call.
+    pub follow_redirects: bool,
+    /// How long this call may take before the implementation must give up.
+    ///
+    /// Fuel bounds the guest's instructions and cannot bound a socket that
+    /// never answers. The call runs on a blocking worker holding the plugin's
+    /// concurrency permit, so an implementation that waits forever shuts the
+    /// plugin's prefix and degrades the shared blocking pool — this is the
+    /// ceiling that stops it, from the `outbound_timeout_ms` quota.
+    pub timeout: std::time::Duration,
 }
 
 /// What an upstream said.
@@ -99,6 +139,31 @@ pub struct OutboundResponse {
     pub headers: Vec<(String, String)>,
     /// Response body.
     pub body: String,
+    /// The URL the bytes actually came from.
+    ///
+    /// Required, not optional, and re-checked by the host against the grant
+    /// before the guest sees anything. For an implementation that honours
+    /// [`follow_redirects: false`](OutboundRequest::follow_redirects) this is
+    /// always the request's own URL and reporting it costs a clone; for one that
+    /// followed a redirect it is the only thing standing between a granted host
+    /// and an ungranted one.
+    pub final_url: String,
+}
+
+impl OutboundResponse {
+    /// A response that came from the URL it was asked for.
+    ///
+    /// The shape an implementation that does not follow redirects always wants,
+    /// so honouring the contract is the shorter thing to write.
+    #[must_use]
+    pub fn from_url(url: impl Into<String>, status: u16, body: impl Into<String>) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body: body.into(),
+            final_url: url.into(),
+        }
+    }
 }
 
 /// Something that can make an outbound call on a plugin's behalf.
@@ -109,6 +174,26 @@ pub struct OutboundResponse {
 /// of this trait async.
 pub trait OutboundHttp: Send + Sync + 'static {
     /// Perform the call.
+    ///
+    /// An implementation carries two obligations the sandbox cannot enforce from
+    /// the outside, and both are load-bearing:
+    ///
+    /// 1. **Do not follow redirects.** [`OutboundRequest::follow_redirects`] is
+    ///    always `false`; a 3xx must come back as a 3xx. Following one sends the
+    ///    request to a host the manifest never granted. Most clients follow by
+    ///    default — `reqwest` follows up to ten hops unless told otherwise — so
+    ///    this is a thing to configure, not a thing to assume.
+    /// 2. **Report [`final_url`](OutboundResponse::final_url) honestly.** The
+    ///    host re-checks it against the grant and denies the call if it is not a
+    ///    granted host, which is what turns obligation 1 from a comment into a
+    ///    check.
+    ///
+    /// It must also respect [`OutboundRequest::timeout`] — this runs on a
+    /// blocking worker holding the plugin's concurrency permit, and fuel cannot
+    /// bound a socket that never answers — and must not read past
+    /// [`OutboundRequest::max_response_bytes`], which the host checks on the way
+    /// out but which an implementation should bound on the way in rather than
+    /// buffering a hostile upstream's gigabyte first.
     ///
     /// # Errors
     ///
@@ -163,6 +248,30 @@ pub fn host_of(url: &str) -> Option<String> {
     // name something no grant could have named — including a trailing dot,
     // which resolves identically and would compare unequal.
     super::super::grants::is_grantable_host(&host).then_some(host)
+}
+
+/// The authority a URL reached for, however malformed, for the audit ledger.
+///
+/// [`host_of`] answers "may this be called", and its `None` is the whole point
+/// of the allow-list. This answers the different question the operator surface
+/// asks — "what did it reach for" — so it parses as far as it can and hands back
+/// what it found rather than a placeholder. It is never used for a grant
+/// decision, and the caller bounds and escapes it like any other guest string.
+#[must_use]
+pub fn attempted_authority(url: &str) -> String {
+    let rest = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .trim_start_matches('/');
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Userinfo is the case that matters: `api.example.com@attacker.test` must
+    // record `attacker.test`, which is where a browser or a client would go.
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if authority.is_empty() {
+        url.to_owned()
+    } else {
+        authority.to_ascii_lowercase()
+    }
 }
 
 /// Answer one `http-fetch`. Capability, scope and quota are already checked.
@@ -244,13 +353,44 @@ pub(super) fn perform(
         headers: allowed,
         body: body.clone(),
         max_response_bytes: ceiling,
+        allowed_hosts: runtime
+            .grants
+            .list_for(super::super::manifest::SandboxCapability::HttpOutbound)
+            .unwrap_or_default()
+            .to_vec(),
+        follow_redirects: false,
+        timeout: std::time::Duration::from_millis(u64::from(runtime.quotas().outbound_timeout_ms)),
     };
     match client.fetch(request) {
         Ok(response) => {
-            if response.body.len() > ceiling {
+            // Where the bytes actually came from, re-checked against the grant.
+            // An implementation that followed a redirect must say so here, and
+            // this is where saying so is refused — see the module header on why
+            // checking only the outgoing URL bounds the first hop and nothing
+            // else.
+            let landed = host_of(&response.final_url);
+            if landed.as_deref() != Some(host) {
                 return CallResult::denied(
                     id,
-                    DenialReason::QuotaExceeded,
+                    DenialReason::NotInGrant,
+                    format!(
+                        "the call to {host} returned bytes from {landed}, which \
+                         `[grants].hosts` does not name; a redirect is not followed on a \
+                         plugin's behalf",
+                        landed = super::super::manifest::rejected(
+                            landed.as_deref().unwrap_or(&response.final_url)
+                        )
+                    ),
+                );
+            }
+            if response.body.len() > ceiling {
+                // `ResponseTooLarge` rather than `QuotaExceeded`: the request
+                // *left* and the upstream answered, so the audit surface must
+                // count this as a host that was called. A quota denial means
+                // nothing reached the network.
+                return CallResult::denied(
+                    id,
+                    DenialReason::ResponseTooLarge,
                     format!(
                         "{host} answered {found} bytes, over the {ceiling}-byte \
                          `outbound_response_bytes` quota",
@@ -301,6 +441,9 @@ impl RecordingHttp {
     }
 
     /// Answer `url` with `response`.
+    ///
+    /// The caller sets `final_url`; [`OutboundResponse::from_url`] is the
+    /// honest shape, and [`answer_from`](Self::answer_from) the dishonest one.
     pub fn answer(&self, url: impl Into<String>, response: OutboundResponse) {
         self.answers
             .lock()
@@ -315,6 +458,28 @@ impl RecordingHttp {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+}
+
+impl RecordingHttp {
+    /// Answer `url` as though the upstream had redirected to `elsewhere`.
+    ///
+    /// The one thing a test double must be able to do that a well-behaved
+    /// client will not: prove that the host re-checks where the bytes came
+    /// from rather than trusting the URL it sent.
+    pub fn answer_from(&self, url: impl Into<String>, elsewhere: impl Into<String>) {
+        self.answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((
+                url.into(),
+                OutboundResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: "redirected".to_owned(),
+                    final_url: elsewhere.into(),
+                },
+            ));
     }
 }
 

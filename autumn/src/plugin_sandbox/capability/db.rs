@@ -16,22 +16,28 @@
 //!   an empty filter returns this tenant's rows because that is the only kind of
 //!   row the statement can select.
 //!
-//! # Why the identifiers are safe to concatenate
+//! # What a store implementation is handed, and what it must do
 //!
-//! [`physical_table`] builds a name by concatenation, which is normally how SQL
-//! injection happens. It is safe here because *both* halves have already been
-//! refused unless they match `[a-z][a-z0-9_]*` — the plugin name at manifest
-//! validation ([`validate_name`](super::super::manifest)) and the table name at
-//! grant validation ([`is_grantable_ident`](super::super::grants::is_grantable_ident)).
-//! A name that cannot contain a quote, a space, a semicolon or a hyphen cannot
-//! close an identifier or open a statement. [`physical_table`] re-checks anyway
-//! and returns `None` rather than trusting that, because it is public and
-//! `from_module` takes a manifest an embedder built by hand.
+//! A [`PluginStore`] receives a [`Scope`] — a physical table name and a tenant —
+//! plus a [`PluginRow`] of scalars. The framework ships
+//! [`MemoryPluginStore`], a faithful model of the scoping; a durable
+//! implementation over SQL is the operator's to supply, and this module owes it
+//! two guarantees and one obligation.
 //!
-//! Values are never concatenated at all: they are bound parameters, and the
-//! statement builder emits placeholders.
+//! The guarantees: [`Scope::table`] is a bare `[a-z][a-z0-9_]*` identifier that
+//! cannot close a quote or open a statement, because [`physical_table`] derives
+//! it from two names that were each refused unless they matched that shape and
+//! re-checks the result rather than trusting that they were (it is public, and
+//! `SandboxHost::from_module` takes a manifest an embedder built by hand). And
+//! every column name in a row has passed the same check, in
+//! [`check_row`](super::check_row).
+//!
+//! The obligation: **row values are never identifiers and must never be
+//! concatenated into a statement.** They are guest-chosen strings and numbers,
+//! and nothing here constrains their content — bind them.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use super::{
@@ -64,7 +70,7 @@ pub const ID_COLUMN: &str = "row_id";
 /// nothing and can override nothing.
 pub const RESERVED_COLUMNS: &[&str] = &[TENANT_COLUMN];
 
-/// PostgreSQL's identifier ceiling. A derived name past it would be silently
+/// `PostgreSQL`'s identifier ceiling. A derived name past it would be silently
 /// truncated by the server, and two logical tables could then collide.
 const MAX_IDENTIFIER_LEN: usize = 63;
 
@@ -75,36 +81,88 @@ const MAX_IDENTIFIER_LEN: usize = 63;
 /// is public and takes a manifest an embedder filled in by hand, so "validation
 /// already ran" is an invariant a caller can step around — and this is the
 /// function whose output goes into a statement.
+///
+/// # Why the plugin name is escaped rather than folded
+///
+/// The obvious derivation — lower-case the plugin name and map its punctuation
+/// to `_` — is **not injective**, and two different plugins landing on one table
+/// is a cross-plugin read and write. It fails in two ways at once:
+///
+/// | Plugin | Table | Folded name |
+/// | --- | --- | --- |
+/// | `shop` | `orders_v2` | `plugin_shop_orders_v2` |
+/// | `shop_orders` | `v2` | `plugin_shop_orders_v2` |
+/// | `my-shop` / `my.shop` / `my_shop` / `My_Shop` | `orders` | `plugin_my_shop_orders` |
+///
+/// The first row is the one that matters: it has nothing to do with punctuation
+/// and everything to do with the separator, so no amount of tidying the plugin
+/// name fixes it. A hostile author picks a *name* — which nothing constrains
+/// beyond `[A-Za-z0-9._-]` — that shifts the boundary onto a victim plugin's
+/// table. Both manifests validate, both consent screens are truthful, and
+/// `AppBuilder` sees two distinct plugin names so it mounts both.
+///
+/// So each half is escaped into a disjoint alphabet and joined by a separator
+/// that neither half can contain. `_` and every character outside `[a-z0-9]`
+/// become `_<two hex digits>`, which makes the escape injective; `__` is then
+/// the one two-character sequence no escaped name can produce, so the split
+/// point is unambiguous. `plugin_shop__orders_5fv2` and
+/// `plugin_shop_5forders__v2` are different tables, as they must be.
 #[must_use]
 pub fn physical_table(plugin: &str, table: &str) -> Option<String> {
-    // The plugin name's manifest charset allows `.` and `-`, which are legal in
-    // a plugin name and illegal in an unquoted SQL identifier. Mapping them to
-    // `_` keeps the derived name a bare identifier; it is injective enough for
-    // this purpose because a single application does not mount two plugins whose
-    // names differ only by punctuation — and if it did, `AppBuilder` refuses the
-    // duplicate registration before either is mounted.
-    if plugin.is_empty()
-        || !plugin
+    if !super::super::grants::is_grantable_ident(table) {
+        return None;
+    }
+    let plugin = escape_identifier_segment(plugin)?;
+    // `__` is the separator precisely because `escape_identifier_segment` can
+    // never emit it: it emits `_` only as the first character of a three-byte
+    // `_xx` escape, and `x` is a hex digit rather than `_`.
+    let name = format!("{TABLE_PREFIX}{plugin}__{table}");
+    (name.len() <= MAX_IDENTIFIER_LEN).then_some(name)
+}
+
+/// Escape one name into `[a-z0-9_]` injectively, or `None` if it is not a name
+/// this build derives from at all.
+///
+/// Injective because the escape is total on everything outside `[a-z0-9]`,
+/// including `_` itself: without escaping `_`, the plugin `a_b` and the plugin
+/// `a-b` would both come out `a_b`.
+fn escape_identifier_segment(name: &str) -> Option<String> {
+    // The manifest's own name charset. Checked rather than assumed, for the
+    // same reason the table name is.
+    if name.is_empty()
+        || !name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
         return None;
     }
-    if !super::super::grants::is_grantable_ident(table) {
-        return None;
+    let mut out = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
+            out.push(char::from(byte));
+        } else {
+            // Upper case included: `Shop` and `shop` are different plugin names
+            // and must be different tables, but SQL folds unquoted identifiers.
+            out.push('_');
+            let _ = write!(out, "{byte:02x}");
+        }
     }
-    let plugin: String = plugin
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let name = format!("{TABLE_PREFIX}{plugin}_{table}");
-    (name.len() <= MAX_IDENTIFIER_LEN).then_some(name)
+    // A derived name must still start with a letter: a plugin named `1shop`
+    // would otherwise produce a table beginning with a digit. `TABLE_PREFIX`
+    // supplies that, so only the total length is left to check, in the caller.
+    Some(out)
+}
+
+/// Whether `plugin` can own `table` at all — i.e. whether a physical name for
+/// the pair fits inside this build's identifier ceiling.
+///
+/// Exposed so [`SandboxManifest`](crate::plugin_sandbox::SandboxManifest)
+/// validation can refuse at *load* a manifest whose `db` grant could only ever be denied at
+/// the first call. A capability an operator approved on the consent screen and
+/// the runtime can never honour is worse than one that was never offered.
+#[must_use]
+pub fn is_derivable(plugin: &str, table: &str) -> bool {
+    physical_table(plugin, table).is_some()
 }
 
 /// Why a store could not do what it was asked.
@@ -135,6 +193,7 @@ impl std::error::Error for StoreError {}
 /// argument through which a caller could ask it for another tenant's rows
 /// without saying so in this struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Scope {
     /// The derived physical table name.
     pub table: String,
@@ -149,12 +208,37 @@ pub struct Scope {
 pub trait PluginStore: Send + Sync + 'static {
     /// Insert `row`, returning the id assigned to it.
     ///
+    /// # Implementor contract
+    ///
+    /// Three obligations, and the sandbox cannot enforce any of them from the
+    /// outside — they are why this trait is a trust boundary the operator
+    /// crosses deliberately, like a database driver:
+    ///
+    /// 1. **Every read and every write MUST be filtered and stamped by
+    ///    [`Scope::tenant`].** This is the whole of the tenant containment: the
+    ///    wire has no tenant field precisely so that this argument is the only
+    ///    place a tenant can come from, and an implementation that ignores it
+    ///    leaks every row to every tenant with nothing else to catch it.
+    /// 2. **Only [`Scope::table`] may be touched.** It is a bare
+    ///    `[a-z][a-z0-9_]*` identifier derived by [`physical_table`]; do not
+    ///    derive another name from it.
+    /// 3. **Row *values* are guest-chosen and MUST be bound, never
+    ///    concatenated.** Column *names* have been checked
+    ///    ([`check_row`](super::check_row)); values have not, and nothing here
+    ///    constrains their content.
+    ///
+    /// [`get`](Self::get) and [`query`](Self::query) must also return each row
+    /// carrying its [`ID_COLUMN`], which is how the guest addresses it again.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Backend`] if the write did not happen.
     fn insert(&self, scope: &Scope, row: PluginRow) -> Result<String, StoreError>;
 
     /// The row with this id, if this scope owns one.
+    ///
+    /// The returned row must carry its [`ID_COLUMN`]; see the contract on
+    /// [`insert`](Self::insert).
     ///
     /// # Errors
     ///
@@ -163,6 +247,9 @@ pub trait PluginStore: Send + Sync + 'static {
     fn get(&self, scope: &Scope, row_id: &str) -> Result<Option<PluginRow>, StoreError>;
 
     /// Rows matching every column in `filter`, capped at `limit`.
+    ///
+    /// Each returned row must carry its [`ID_COLUMN`]; see the contract on
+    /// [`insert`](Self::insert).
     ///
     /// # Errors
     ///
@@ -356,21 +443,50 @@ fn check_row_id(row_id: &str) -> Result<(), Denial> {
 /// runs on somebody else's schedule — and so a single-process deployment has
 /// something to wire.
 ///
-/// It is a faithful model of the scoping, not of the durability: rows are keyed
-/// by `(table, tenant, row_id)` exactly as a scoped statement would filter them,
-/// so a query that would return another tenant's rows here would return them
-/// there too.
-#[derive(Debug, Default)]
+/// It is a faithful model of the **scoping**, not of the durability or of the
+/// performance: rows are keyed by `(table, tenant, row_id)` exactly as a scoped
+/// statement would filter them, so a query that would return another tenant's
+/// rows here would return them there too — but `query` is a linear scan of every
+/// row in the map rather than an index seek, and nothing here is written to
+/// disk. It is **bounded**, for the reason [`MemoryKvStore`](super::kv::MemoryKvStore)
+/// is: a plugin declares its own `db_writes` quota, so an unbounded store makes
+/// the host's memory the real ceiling.
+#[derive(Debug)]
 pub struct MemoryPluginStore {
     rows: Mutex<HashMap<(String, String, String), PluginRow>>,
     next: Mutex<u64>,
+    capacity: usize,
+}
+
+/// Rows a [`MemoryPluginStore::new`] store will hold, across every table and
+/// tenant.
+pub const DEFAULT_STORE_CAPACITY: usize = 10_000;
+
+impl Default for MemoryPluginStore {
+    fn default() -> Self {
+        Self {
+            rows: Mutex::new(HashMap::new()),
+            next: Mutex::new(0),
+            capacity: DEFAULT_STORE_CAPACITY,
+        }
+    }
 }
 
 impl MemoryPluginStore {
-    /// An empty store.
+    /// An empty store holding at most [`DEFAULT_STORE_CAPACITY`] rows.
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// An empty store holding at most `capacity` rows.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            rows: Mutex::new(HashMap::new()),
+            next: Mutex::new(0),
+            capacity,
+        })
     }
 
     /// Put a row in directly, bypassing the plugin path.
@@ -399,17 +515,21 @@ impl MemoryPluginStore {
 
 impl PluginStore for MemoryPluginStore {
     fn insert(&self, scope: &Scope, row: PluginRow) -> Result<String, StoreError> {
+        let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
+        if rows.len() >= self.capacity {
+            return Err(StoreError::Backend(format!(
+                "this host's in-memory plugin store is full at {} rows",
+                self.capacity
+            )));
+        }
         let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
         *next = next.saturating_add(1);
         let row_id = format!("r{next}");
         drop(next);
-        self.rows
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                (scope.table.clone(), scope.tenant.clone(), row_id.clone()),
-                row,
-            );
+        rows.insert(
+            (scope.table.clone(), scope.tenant.clone(), row_id.clone()),
+            row,
+        );
         Ok(row_id)
     }
 

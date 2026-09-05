@@ -302,6 +302,8 @@ impl SandboxedPlugin {
             }
         };
         self.activity.ingest(&plugin, outcome.activity);
+        self.activity
+            .ingest_dropped(&plugin, outcome.dropped_events);
         match outcome.fragment {
             Ok(fragment) => Some(fragment),
             Err(failure) => {
@@ -574,6 +576,7 @@ async fn serve(
     // still leaves the record of what it did — a plugin whose denials are the
     // reason it failed is exactly the one an operator will ask about.
     activity.ingest(&plugin, outcome.activity);
+    activity.ingest_dropped(&plugin, outcome.dropped_activity);
 
     match outcome.result {
         Ok(response) => {

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **plugin-sandbox:** three consequences of #1632 that an existing sandbox
+  embedder will notice. `SandboxManifest` gains `grants` and `quotas` fields, so
+  a struct literal over it needs two more lines — prefer `SandboxManifest::parse`
+  and edit the public fields of what comes back, which is unaffected;
+  `SandboxManifest::grants(cap)` is renamed `is_granted(cap)`, because `grants`
+  is now the field holding what each capability is scoped to. The per-request
+  host footprint gained the capability reply queue and the audit ledger, so a
+  manifest tuned to the previous ceiling may now be refused at load with
+  `LimitOutOfRange` on "the per-request host footprint × max_concurrency" —
+  lower `max_concurrency` or `max_response_bytes` (an otherwise-default manifest
+  still admits `max_concurrency = 16`). And the `autumn plugin-check` gating
+  line for a sandboxed plugin now reads "no session, auth, filesystem or
+  environment capability" and names the grant scopes, rather than claiming no
+  database or network capability over a manifest that holds one — and it is
+  carried by a `capability-grants` check present on every sandboxed report,
+  rather than only by the sensitive-surfaces check, which a plugin whose prefix
+  is not named like `/admin` never reaches. Non-breaking
+  for the stable surface: all of it is behind the non-default `plugin-sandbox`
+  feature, which `STABILITY.md` places outside SemVer.
+
 ### Added
 
 - **plugin-sandbox:** the capability vocabulary grows past request handling
@@ -28,14 +50,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused, lands
   in a bounded per-plugin activity log that answers "what did this plugin do in
   the last hour" from one surface: hosts called, KV/DB usage, jobs enqueued,
-  denials and quota hits, recorded as shapes and never as values.
+  denials and quota hits, recorded as shapes and never as values — and, when a
+  plugin outruns its own ledger, a line saying every count below it is a floor.
+  The `jobs` capability **enqueues**; running the result is the host's, and this
+  wire version has no frame for delivering a job back into a guest.
   `autumn plugin inspect --against <installed-artifact>` reviews an upgrade as
-  an upgrade, printing exactly what the new manifest asks for that the approved
-  one did not and exiting non-zero when anything grew. `autumn plugin inspect`
+  an upgrade — capabilities, grant lists, quotas, **routes and resource
+  ceilings**, since a new route is an endpoint nobody approved and a raised
+  `fuel` is authority that touches no capability name — printing exactly what
+  grew and exiting non-zero when anything did. `autumn plugin inspect`
   (text and JSON) now carries the grant lists and quotas, and stops printing
   "no database access" over a manifest that was just granted `db`. Fifteen-plus
-  cross-capability escape attempts run end-to-end through the real interpreter
-  in `tests/integration/plugin_sandbox_capabilities.rs`. See
+  adversarial corpus of cross-capability escape attempts runs end-to-end through
+  the real interpreter in `tests/integration/plugin_sandbox_capabilities.rs`. See
   `docs/guide/sandboxed-plugins.md`. **Non-breaking**: everything here is behind
   the non-default `plugin-sandbox` feature, which `STABILITY.md` already places
   outside SemVer, and a first-slice manifest parses and runs unchanged —

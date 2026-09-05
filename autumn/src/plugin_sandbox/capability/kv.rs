@@ -42,7 +42,13 @@ pub trait KvStore: Send + Sync + 'static {
     /// Read one already-namespaced key.
     fn get(&self, key: &str) -> Option<PluginValue>;
     /// Write one already-namespaced key.
-    fn set(&self, key: &str, value: PluginValue);
+    ///
+    /// # Errors
+    ///
+    /// One line for the guest and the audit ledger when the write did not
+    /// happen — a full store, an unreachable backend. A store that cannot say
+    /// no is one whose ceiling is the host's memory.
+    fn set(&self, key: &str, value: PluginValue) -> Result<(), String>;
     /// Delete one already-namespaced key.
     fn delete(&self, key: &str);
 }
@@ -120,10 +126,12 @@ pub(super) fn perform(
                     format!("a kv value may hold at most {ceiling} bytes"),
                 );
             }
-            store.set(&physical, value.clone());
-            CallResult::Ok {
-                id,
-                value: CallValue::Done,
+            match store.set(&physical, value.clone()) {
+                Ok(()) => CallResult::Ok {
+                    id,
+                    value: CallValue::Done,
+                },
+                Err(detail) => CallResult::denied(id, DenialReason::BackendError, detail),
             }
         }
         CapabilityCall::KvDelete { .. } => {
@@ -142,19 +150,58 @@ pub(super) fn perform(
 
 /// A `KvStore` held in a map, for tests and single-process deployments.
 ///
-/// Not a cache: nothing expires, and it is the caller's to bound. It exists so
-/// the containment properties this module claims can be proven without standing
-/// up Redis, and so a small deployment has something to wire.
-#[derive(Debug, Default)]
+/// Not a cache — nothing expires — but it is **bounded**, because an unbounded
+/// one is not something to hand a plugin. A plugin declares its own
+/// `kv_writes` and `kv_value_bytes` quotas in a manifest an operator approves,
+/// and both may legally be `MAX_QUOTA`; a store with no ceiling of its own
+/// turns that into the host's memory. Past [`capacity`](Self::with_capacity) a
+/// write is refused and the guest is told, rather than the process dying.
+///
+/// It exists so the containment properties this module claims can be proven
+/// without standing up Redis, and so a small deployment has something to wire.
+/// A deployment that outgrows it wants [`CacheKvStore`], which inherits Moka's
+/// or Redis's eviction.
+#[derive(Debug)]
 pub struct MemoryKvStore {
     entries: Mutex<HashMap<String, PluginValue>>,
+    capacity: usize,
+}
+
+/// Keys a [`MemoryKvStore::new`] store will hold.
+///
+/// Generous for the panel-rendering plugin this store is meant for, and small
+/// enough that reaching it is a bug report rather than an outage.
+pub const DEFAULT_KV_CAPACITY: usize = 10_000;
+
+impl Default for MemoryKvStore {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            capacity: DEFAULT_KV_CAPACITY,
+        }
+    }
 }
 
 impl MemoryKvStore {
-    /// An empty store.
+    /// An empty store holding at most [`DEFAULT_KV_CAPACITY`] keys.
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// An empty store holding at most `capacity` keys.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            entries: Mutex::new(HashMap::new()),
+            capacity,
+        })
+    }
+
+    /// How many keys this store will hold.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Every key currently stored, for assertions.
@@ -176,11 +223,19 @@ impl KvStore for MemoryKvStore {
             .cloned()
     }
 
-    fn set(&self, key: &str, value: PluginValue) {
-        self.entries
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(key.to_owned(), value);
+    fn set(&self, key: &str, value: PluginValue) -> Result<(), String> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        // Overwriting an existing key adds nothing, so the ceiling applies to
+        // *new* keys only — a plugin that keeps one counter updated is never
+        // refused however long it runs.
+        if entries.len() >= self.capacity && !entries.contains_key(key) {
+            return Err(format!(
+                "this host's plugin key/value store is full at {} keys",
+                self.capacity
+            ));
+        }
+        entries.insert(key.to_owned(), value);
+        Ok(())
     }
 
     fn delete(&self, key: &str) {
@@ -215,8 +270,9 @@ impl KvStore for CacheKvStore {
             .and_then(|value| value.downcast_ref::<PluginValue>().cloned())
     }
 
-    fn set(&self, key: &str, value: PluginValue) {
+    fn set(&self, key: &str, value: PluginValue) -> Result<(), String> {
         self.0.insert_value(key, std::sync::Arc::new(value));
+        Ok(())
     }
 
     fn delete(&self, key: &str) {

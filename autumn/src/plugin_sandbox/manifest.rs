@@ -410,6 +410,29 @@ impl ResourceLimits {
             .saturating_add(crate::plugin_sandbox::host::FIXED_HOST_BUFFER_BYTES as u128)
     }
 
+    /// Every limit, as `(field, value)`, in declaration order.
+    ///
+    /// One list, read by validation and by the upgrade diff alike — the failure
+    /// mode of writing them out twice is a ceiling that is enforced but that an
+    /// upgrade can raise without anyone being asked.
+    #[must_use]
+    pub const fn fields(&self) -> [(&'static str, u128); 6] {
+        [
+            ("fuel", self.fuel as u128),
+            ("memory_bytes", self.memory_bytes as u128),
+            (
+                "max_request_body_bytes",
+                self.max_request_body_bytes as u128,
+            ),
+            ("max_response_bytes", self.max_response_bytes as u128),
+            ("max_concurrency", self.max_concurrency as u128),
+            (
+                "request_body_timeout_ms",
+                self.request_body_timeout_ms as u128,
+            ),
+        ]
+    }
+
     fn validate(&self) -> Result<(), ManifestError> {
         let checks: [(&str, u128, u128); 6] = [
             ("fuel", u128::from(self.fuel), u128::from(MAX_FUEL)),
@@ -733,6 +756,19 @@ impl std::error::Error for ManifestError {}
 /// Construct one with [`SandboxManifest::parse`]; the constructor validates, so
 /// a `SandboxManifest` value in hand is always one this build is willing to
 /// enforce.
+///
+/// Deliberately **not** `#[non_exhaustive]`, unlike most of this subsystem's
+/// types: building one by hand is a supported path and one this repository
+/// depends on — `tests/sandbox_manifest_seal_alloc_gate.rs` hands `seal` a
+/// manifest with 20,000 routes precisely because `parse` would refuse it, and
+/// there is no other way to reach the code under test. That is also why
+/// [`SandboxHost::from_module`](crate::plugin_sandbox::SandboxHost::from_module)
+/// re-validates rather than trusting that parsing ran.
+///
+/// The cost is that adding a field to this struct is a source break for anyone
+/// writing such a literal, and the vocabulary is expected to grow. Prefer
+/// `parse` and edit the public fields of what comes back; the slice that adds
+/// the next capability will say so in the changelog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxManifest {
@@ -797,8 +833,13 @@ impl SandboxManifest {
     }
 
     /// Whether this manifest grants `capability`.
+    ///
+    /// Named `is_granted` rather than `grants` because `grants` is now the
+    /// *field* holding what each capability is scoped to, and
+    /// `manifest.grants(Render)` two lines above `manifest.grants.slots` is a
+    /// thing a reader has to stop and parse.
     #[must_use]
-    pub fn grants(&self, capability: SandboxCapability) -> bool {
+    pub fn is_granted(&self, capability: SandboxCapability) -> bool {
         self.capabilities.contains(&capability)
     }
 
@@ -918,16 +959,16 @@ impl SandboxManifest {
             "mail and file storage",
             "raw SQL and host-application tables",
         ];
-        if !self.grants(SandboxCapability::HttpOutbound) {
+        if !self.is_granted(SandboxCapability::HttpOutbound) {
             ungranted.insert(1, "outbound network access");
         }
-        if !self.grants(SandboxCapability::Db) {
+        if !self.is_granted(SandboxCapability::Db) {
             ungranted.insert(1, "database access");
         }
-        if !self.grants(SandboxCapability::Kv) {
+        if !self.is_granted(SandboxCapability::Kv) {
             ungranted.insert(1, "key/value storage");
         }
-        if !self.grants(SandboxCapability::Jobs) {
+        if !self.is_granted(SandboxCapability::Jobs) {
             ungranted.insert(1, "background jobs");
         }
         out.push_str(&ungranted.join(", "));
@@ -979,7 +1020,35 @@ impl SandboxManifest {
                     (requested > approved).then_some((field, approved, requested))
                 })
                 .collect(),
+            // Routes are the router, not a description of it — an added one is
+            // an endpoint the approved manifest did not serve. Compared as the
+            // consent screen prints them, including the HEAD a declared GET
+            // implies, so a GET added to an existing path is caught with it.
+            added_routes: added(&previous.consent_routes(), &self.consent_routes()),
+            raised_limits: previous
+                .limits
+                .fields()
+                .into_iter()
+                .zip(self.limits.fields())
+                .filter_map(|((field, approved), (_, requested))| {
+                    (requested > approved).then_some((field, approved, requested))
+                })
+                .collect(),
         }
+    }
+
+    /// The routes the consent screen names, as `"METHOD /path"`.
+    ///
+    /// Built from [`route_infos`](Self::route_infos) rather than from
+    /// `self.routes`, so the HEAD that HTTP serves wherever it serves GET is in
+    /// the list an upgrade is diffed against. A manifest that adds a bare GET
+    /// adds two mounted routes, and both are authority.
+    #[must_use]
+    fn consent_routes(&self) -> Vec<String> {
+        self.route_infos()
+            .into_iter()
+            .map(|route| format!("{} {}", route.method, route.path))
+            .collect()
     }
 
     pub(crate) fn validate(&self) -> Result<(), ManifestError> {
@@ -1002,7 +1071,7 @@ impl SandboxManifest {
             return Err(ManifestError::InvalidVersion(rejected(&self.version)));
         }
         validate_prefix(&self.prefix)?;
-        if !self.grants(SandboxCapability::HttpRequest) {
+        if !self.is_granted(SandboxCapability::HttpRequest) {
             return Err(ManifestError::MissingCapability(
                 SandboxCapability::HttpRequest,
             ));
@@ -1050,6 +1119,23 @@ impl SandboxManifest {
         // whichever route happens to be malformed too.
         self.grants.validate(&granted)?;
         self.quotas.validate()?;
+        // A granted table whose physical name cannot be derived — because the
+        // plugin's name and the table's together overrun the identifier ceiling
+        // — is authority the consent screen displays and every call then denies
+        // as `malformed`. Refusing at load is the difference between an
+        // operator learning at install and an author learning at 3am: the same
+        // argument `FuelBelowFixedCharges` rests on.
+        for table in &self.grants.tables {
+            if !crate::plugin_sandbox::capability::db::is_derivable(&self.name, table) {
+                return Err(ManifestError::InvalidGrantEntry {
+                    field: "tables",
+                    entry: rejected(table),
+                    reason: "no physical table name can be derived for this plugin name and \
+                             table together; both are escaped into one identifier, and the \
+                             result must fit in 63 bytes",
+                });
+            }
+        }
         validate_digest(&self.sha256)?;
         if self.routes.is_empty() {
             return Err(ManifestError::NoRoutes);
@@ -1507,7 +1593,7 @@ max_concurrency = 8
         assert_eq!(manifest.capabilities, vec![SandboxCapability::HttpRequest]);
         assert_eq!(manifest.routes.len(), 1);
         assert_eq!(manifest.limits.fuel, 200_000_000);
-        assert!(manifest.grants(SandboxCapability::HttpRequest));
+        assert!(manifest.is_granted(SandboxCapability::HttpRequest));
     }
 
     #[test]
@@ -2252,7 +2338,7 @@ slots = ["order-summary"]
             SandboxCapability::Jobs,
             SandboxCapability::Render,
         ] {
-            assert!(manifest.grants(capability), "{capability}");
+            assert!(manifest.is_granted(capability), "{capability}");
             assert!(SandboxCapability::ALL.contains(&capability), "{capability}");
         }
     }
@@ -2389,7 +2475,22 @@ slots = ["order-summary"]
 
     #[test]
     fn an_upgrade_that_asks_for_more_needs_fresh_consent() {
-        let previous = SandboxManifest::parse(&valid_toml()).expect("valid");
+        // Same plugin, same routes, same ceilings — only the grant grows, so
+        // the delta isolates the thing under test. Diffing two *different*
+        // plugins would report every route as new and prove nothing about
+        // capabilities.
+        let previous = SandboxManifest::parse(
+            &vocabulary_toml()
+                .replace(
+                    r#"capabilities = ["http-request", "kv", "http-outbound", "db", "jobs", "render"]"#,
+                    r#"capabilities = ["http-request"]"#,
+                )
+                .replace(r#"hosts = ["api.example.com"]"#, "")
+                .replace(r#"tables = ["orders"]"#, "")
+                .replace(r#"job_types = ["reindex"]"#, "")
+                .replace(r#"slots = ["order-summary"]"#, ""),
+        )
+        .expect("valid");
         let next = SandboxManifest::parse(&vocabulary_toml()).expect("valid");
 
         let delta = next.consent_delta_from(&previous);
@@ -2404,6 +2505,10 @@ slots = ["order-summary"]
         assert!(delta.added_tables.iter().any(|table| table == "orders"));
         assert!(delta.added_job_types.iter().any(|job| job == "reindex"));
         assert!(delta.added_slots.iter().any(|slot| slot == "order-summary"));
+        assert!(
+            delta.added_routes.is_empty() && delta.raised_limits.is_empty(),
+            "only the grant moved: {delta:?}"
+        );
         let summary = delta.summary();
         assert!(summary.contains("api.example.com"), "{summary}");
 
@@ -2428,6 +2533,108 @@ slots = ["order-summary"]
                 .any(|(field, ..)| *field == "kv_writes")
         );
         assert!(!base.consent_delta_from(&raised).requires_consent());
+    }
+
+    #[test]
+    fn an_upgrade_that_mounts_a_new_route_needs_fresh_consent() {
+        // A route is the router, not a description of it: the host builds its
+        // mount from exactly this list, and the consent screen promises the
+        // plugin serves "these and only these". An upgrade adding one exposes
+        // an endpoint nobody approved.
+        let previous = SandboxManifest::parse(&vocabulary_toml()).expect("valid");
+        let next = SandboxManifest::parse(&format!(
+            "{}\n[[routes]]\nmethod = \"POST\"\npath = \"/shop/checkout\"\n",
+            vocabulary_toml()
+        ))
+        .expect("valid");
+
+        let delta = next.consent_delta_from(&previous);
+        assert!(delta.requires_consent());
+        assert!(
+            delta
+                .added_routes
+                .iter()
+                .any(|route| route == "POST /shop/checkout"),
+            "{:?}",
+            delta.added_routes
+        );
+        assert!(delta.summary().contains("/shop/checkout"));
+        // Dropping a route asks for less.
+        assert!(!previous.consent_delta_from(&next).requires_consent());
+    }
+
+    #[test]
+    fn the_head_a_new_get_implies_is_part_of_the_upgrade_too() {
+        // HTTP serves HEAD wherever it serves GET and the runtime mounts it, so
+        // a manifest adding one bare GET adds two mounted routes. Both are
+        // authority, and the diff is taken over the list the consent screen
+        // prints rather than the literal `[[routes]]`.
+        let previous = SandboxManifest::parse(&vocabulary_toml()).expect("valid");
+        let next = SandboxManifest::parse(&format!(
+            "{}\n[[routes]]\nmethod = \"GET\"\npath = \"/shop/orders\"\n",
+            vocabulary_toml()
+        ))
+        .expect("valid");
+        let delta = next.consent_delta_from(&previous);
+        assert!(
+            delta.added_routes.contains(&"GET /shop/orders".to_owned())
+                && delta.added_routes.contains(&"HEAD /shop/orders".to_owned()),
+            "{:?}",
+            delta.added_routes
+        );
+    }
+
+    #[test]
+    fn an_upgrade_that_raises_a_resource_ceiling_needs_fresh_consent() {
+        // The kind of growth that touches no capability name: `fuel`,
+        // `memory_bytes` and `max_concurrency` are what one plugin may cost the
+        // host, and an upgrade can multiply them by thousands while every word
+        // on the consent screen stays the same.
+        let modest = SandboxManifest::parse(&format!(
+            "{}\n[limits]\nfuel = 5000000\nmemory_bytes = 16777216\nmax_concurrency = 4\n",
+            vocabulary_toml()
+        ))
+        .expect("valid");
+        let greedy = SandboxManifest::parse(&format!(
+            "{}\n[limits]\nfuel = 100000000000\nmemory_bytes = 16777216\nmax_concurrency = 4\n",
+            vocabulary_toml()
+        ))
+        .expect("valid");
+
+        let delta = greedy.consent_delta_from(&modest);
+        assert!(delta.requires_consent());
+        assert!(
+            delta
+                .raised_limits
+                .iter()
+                .any(|(field, ..)| *field == "fuel"),
+            "{:?}",
+            delta.raised_limits
+        );
+        assert!(delta.summary().contains("fuel"));
+        // Lowering a ceiling asks for less.
+        assert!(!modest.consent_delta_from(&greedy).requires_consent());
+    }
+
+    #[test]
+    fn a_db_grant_whose_physical_name_cannot_be_derived_is_refused_at_load() {
+        // The alternative is a capability the consent screen displays and every
+        // call then denies as `malformed` — an operator approving authority the
+        // runtime can never honour.
+        let src = vocabulary_toml()
+            .replace("autumn-plugin-shop", &"p".repeat(40))
+            .replace("\"orders\"", &format!("\"{}\"", "t".repeat(30)));
+        assert!(
+            matches!(
+                SandboxManifest::parse(&src),
+                Err(ManifestError::InvalidGrantEntry {
+                    field: "tables",
+                    ..
+                })
+            ),
+            "{:?}",
+            SandboxManifest::parse(&src)
+        );
     }
 
     #[test]
