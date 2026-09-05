@@ -306,7 +306,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 # check-docs-cli.sh and check-plugin-freshness.sh.
 run_py() {
   python3 - "$@" <<'PYEOF'
-import os, re, subprocess, sys, pathlib, collections
+import os, re, subprocess, sys, pathlib, collections, bisect
 
 MODE = sys.argv[1]
 ROOT = pathlib.Path(sys.argv[2])
@@ -1223,6 +1223,11 @@ def _docker_literal(body):
 
 
 POWERSHELL = ('pwsh', 'powershell')
+# The shells whose `$NAME` this script reads as an environment expansion.
+# Everything else — Actions' built-in `python` and `cmd`, and any custom
+# `perl {0}` template — is a language this gate does not speak, and a block
+# written in one expands nothing it can recognise.
+BOURNE_SHELLS = tuple(s for s in DOCKER_SHELLS if s not in POWERSHELL)
 # The whole scalar, not one token: Actions takes a CUSTOM shell line —
 # `shell: pwsh -NoProfile -Command ". '{0}'"` — and a single-token pattern
 # rejected it, so the block silently fell back to Bourne. What names the
@@ -1340,18 +1345,25 @@ def _shell_named(value):
 
 
 def _yaml_shells(body):
-    """Line indices whose `run:` block is written in PowerShell.
+    """`(PowerShell lines, lines in a shell this script cannot read)`.
 
     Only the `run` blocks are considered, since nothing else is executed; a
-    file that names no PowerShell anywhere returns an empty set, which is the
-    common case and costs one scan.
+    file that declares no shell at all is entirely Bourne, which is the common
+    case and costs one scan.
+
+    THE DEFAULT WAS AGAIN A GUESS ABOUT WHAT NOBODY OVERRODE. This returned
+    PowerShell lines and let everything else fall through to Bourne, so a step
+    that says `shell: perl {0}` — a custom shell GitHub documents by that very
+    example — had `print $AUTUMN_ZZZ__TYPO;` read as a Bourne expansion, and an
+    ordinary Perl scalar blessed a name the runtime never reads. `python` and
+    `cmd` are built-in Actions shells in the same position.
+
+    A block whose shell this script does not read expands nothing. That drops
+    names rather than admitting them, and it is the same answer the Dockerfile
+    `SHELL` rule gives to the same question one format over.
     """
-    # Lowercased, because this shortcut runs BEFORE `_shell_named` gets to
-    # normalise anything — so `shell: PWSH.EXE` returned no PowerShell lines at
-    # all and the whole block fell back to Bourne. A fast path that answers a
-    # question the slow path answers differently is not a fast path.
-    if not any(s in body.lower() for s in POWERSHELL):
-        return set()
+    if 'shell' not in body.lower():
+        return set(), set()
     src, stack = body.splitlines(), []
     default, jobs, steps = None, {}, {}
     job, step = None, None
@@ -1381,14 +1393,15 @@ def _yaml_shells(body):
                 steps[step] = shell
         stack.append((column, key))
     # Pass two: the lines each `run:` block owns, under its effective shell.
-    out, stack, job, step = set(), [], None, None
+    out, unknown = set(), set()
+    stack, job, step = [], None, None
     key, indent, block = None, 0, False
     for index, l in enumerate(src):
         if key is not None:
             if l.strip() and (len(l) - len(l.lstrip())) <= indent:
                 key = None
-            elif block:
-                out.add(index)
+            elif block is not None:
+                block.add(index)
                 continue
             else:
                 continue
@@ -1406,14 +1419,17 @@ def _yaml_shells(body):
         stack.append((column, at.group(3)))
         if at.group(3) == 'run' and path[-1:] == ['steps']:
             shell = steps.get(step, jobs.get(job, default))
-            if shell in POWERSHELL:
-                out.add(index)
-                block = True
-            else:
-                block = False
+            # Three answers, not two: a shell this script reads as PowerShell,
+            # one it reads as Bourne, and one it does not read. `None` is the
+            # Actions default, which really is Bourne.
+            block = (out if shell in POWERSHELL
+                     else None if shell is None or shell in BOURNE_SHELLS
+                     else unknown)
+            if block is not None:
+                block.add(index)
             if YAML_BLOCK.match(l):
                 key, indent = 'run', len(at.group(1))
-    return out
+    return out, unknown
 
 # Blanking only the non-executed BLOCK scalars was half the rule. An ordinary
 # scalar is just as inert: `name: "${AUTUMN_LOG__LEVL}"` in a workflow is text
@@ -2951,7 +2967,21 @@ BOUND = re.compile(
 ACCESSOR = re.compile(r'\b(?:std::)?env::(var|var_os|set_var)\s*\(')
 
 # `impl Env for OsEnv` — the types that ARE an environment.
-ENV_IMPL = re.compile(r'\bimpl\s*(?:<[^<>]*>)?\s*Env\b[^{]*?\bfor\s+([A-Za-z_]\w*)')
+#
+# The trait may be written QUALIFIED. `impl<F> autumn_web::config::Env for
+# FnEnv<F>` is a real one in `autumn-cli/src/generate/mod.rs`, and requiring
+# the bare token straight after `impl` meant `FnEnv` never became an
+# environment type — so `let base = FnEnv(&env_var)` was not a receiver and a
+# key implemented only through it would have been reported. A rule about how a
+# name is SPELLED at the use site, once more.
+#
+# The path is admitted, the identity is not weakened: the last segment must be
+# exactly `Env`, so `impl foo::MyEnv for T` still matches nothing, and a
+# qualified path is resolved against where the tree declares `trait Env`
+# (`TRAIT_DECL` below) rather than believed.
+ENV_IMPL = re.compile(r'\bimpl\s*(?:<[^<>]*>)?\s*((?:\w+\s*::\s*)*)Env\b'
+                      r'[^{]*?\bfor\s+([A-Za-z_]\w*)')
+TRAIT_DECL = re.compile(r'\b(?:pub(?:\s*\([^)]*\))?\s+)?trait\s+Env\b')
 # …and any binding, parameter or field whose type mentions one.
 ENV_BOUND = re.compile(r'\b([a-z_]\w*)\s*:\s*[^,;{}()=]*\bEnv\b')
 # A GENERIC parameter bounded by `Env` is an environment too, and a field
@@ -3005,6 +3035,49 @@ def _module_of(rel, crates):
                 mods.append(stem)
             return crates[parent], tuple(mods)
     return '', ()
+
+
+# A file is NOT one module. `mod a { … }` and `mod b { … }` are siblings, and a
+# bare `Shared` in one does not name the `Shared` in the other — Rust does not
+# even hand a child module its parent's items by bare name; only a `use` does.
+# Filing every declaration in a file under the file's own module let a sibling's
+# unrelated type be an environment, and a `.var(…)` on its value read as a real
+# accessor. `_module_of` answers where the FILE sits; this answers where an
+# OFFSET sits, which is the question a declaration and a `use` both ask.
+MOD_BLOCK = re.compile(r'\bmod\s+([a-z_]\w*)\s*\{')
+
+
+def _module_spans(masked):
+    """`([start], [module path])` for a masked Rust body, in offset order.
+
+    Reads the masked text, so a `mod x {` inside a string, a comment or
+    generated data opens nothing — the same rule the derivations that consume
+    this run under, and the difference between a scope and a lookalike.
+    """
+    opens = {m.end() - 1: m.group(1) for m in MOD_BLOCK.finditer(masked)}
+    starts, mods, stack, here, depth = [0], [()], [], (), 0
+    for i, c in enumerate(masked):
+        if c == '{':
+            if i in opens:
+                stack.append(depth)
+                here = here + (opens[i],)
+                starts.append(i + 1)
+                mods.append(here)
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if stack and stack[-1] == depth:
+                stack.pop()
+                here = here[:-1]
+                starts.append(i)
+                mods.append(here)
+    return starts, mods
+
+
+def _scope_at(spans, offset):
+    """The inline-module path an offset sits in."""
+    starts, mods = spans
+    return mods[bisect.bisect_right(starts, offset) - 1]
 
 
 def _split_tree(text):
@@ -3076,8 +3149,10 @@ def _use_items(text):
     environment type declared somewhere else entirely.
     """
     out = []
-    for stmt in USE_TREE.findall(text):
-        _expand_use(stmt, '', out)
+    for stmt in USE_TREE.finditer(text):
+        found = []
+        _expand_use(stmt.group(1), '', found)
+        out.extend((local, path, stmt.start()) for local, path in found)
     return out
 ENV_GENERIC = re.compile(r'[<,]\s*([A-Z]\w*)\s*:\s*[^,>]*\bEnv\b'
                          r'|\bwhere\s+([A-Z]\w*)\s*:\s*[^,;{]*\bEnv\b')
@@ -3148,7 +3223,7 @@ def _declared_receivers(patterns):
         + '|'.join(sorted(patterns)) + r')(?!\w)')
 
 
-def _absolute_path(rel, path, crates):
+def _absolute_path(rel, path, crates, inner=()):
     """The `(crate, module)` a use path names, from the file that writes it.
 
     A RELATIVE path is only relative to somewhere. `self` and `super` were
@@ -3163,6 +3238,7 @@ def _absolute_path(rel, path, crates):
     if len(segments) < 2:
         return None
     crate, here = _module_of(rel, crates)
+    here = here + inner         # …plus the inline modules around the `use`
     walk = segments[:-1]        # everything but the item's own name
     if walk[0] == 'crate':
         return crate, tuple(walk[1:])
@@ -3195,7 +3271,7 @@ def accessor(root, test_files=frozenset()):
                          capture_output=True, text=True).stdout
     index, types, per_file, masked_all = {}, set(), {}, {}
     helpers, declared, imports, modules = {}, {}, {}, {}
-    env_type = {}
+    env_type, impls, trait_at, scopes = {}, {}, set(), {}
     crates = _crates(root)
     for rel in out.split('\0'):
         # Test code is skipped outright, as the scan that consumes this index
@@ -3218,35 +3294,78 @@ def accessor(root, test_files=frozenset()):
         # mask, and the first where the leak was global rather than local.
         masked = untested(_rust_uncommented(body))
         data = _generated_data(masked)
+        # Every derivation below is filed under the INLINE MODULE it was
+        # written in, not under the file. Two sibling `mod` blocks are two
+        # scopes, and a bare name in one does not reach the other.
+        spans = _module_spans(masked)
+        crate, filemods = _module_of(rel, crates)
+        seen = scopes.setdefault(rel, set())
         for m in ENV_HELPER.finditer(masked):
             if data[m.start()]:
                 continue
+            at = _scope_at(spans, m.start())
+            seen.add(at)
             index[m.group(1)] = len(_split_args(m.group(2))) - 1
-            helpers.setdefault(rel, set()).add(m.group(1))
+            helpers.setdefault((rel, at), set()).add(m.group(1))
+            modules.setdefault(m.group(1), set()).add((crate, filemods + at))
             declares = _env_param_type(m.group(2))
             if declares:
                 env_type[m.group(1)] = declares
-        masked_all[rel] = (masked, data)
-        own = {m.group(1) for m in ENV_IMPL.finditer(masked)
-               if not data[m.start()]}
-        types.update(own)
-        declared[rel] = own | set(helpers.get(rel, ()))
+        masked_all[rel] = (masked, data, spans)
+        if TRAIT_DECL.search(masked):
+            trait_at.add((crate, filemods))
+        impls[rel] = [(m.group(1), m.group(2), _scope_at(spans, m.start()))
+                      for m in ENV_IMPL.finditer(masked)
+                      if not data[m.start()]]
         # Where each derived name LIVES — crate and module path, not a bare
         # stem, so an import can be checked against its identity.
-        at = _module_of(rel, crates)
-        for name in own | set(helpers.get(rel, ())):
-            modules.setdefault(name, set()).add(at)
-        imports[rel] = _use_items(masked)
-        names = per_file.setdefault(rel, set())
-        names.update(m.group(1) for m in ENV_BOUND.finditer(masked)
-                     if not data[m.start()])
+        for path, name, at in impls[rel]:
+            if path.strip():
+                continue          # qualified: resolved after the walk
+            seen.add(at)
+            types.add(name)
+            declared.setdefault((rel, at), set()).add(name)
+            modules.setdefault(name, set()).add((crate, filemods + at))
+        for at in list(seen):
+            declared.setdefault((rel, at), set()).update(
+                helpers.get((rel, at), ()))
+        for local, path, offset in _use_items(masked):
+            at = _scope_at(spans, offset)
+            seen.add(at)
+            imports.setdefault((rel, at), []).append((local, path))
+        for m in ENV_BOUND.finditer(masked):
+            if data[m.start()]:
+                continue
+            at = _scope_at(spans, m.start())
+            seen.add(at)
+            per_file.setdefault((rel, at), set()).add(m.group(1))
         params = {g for m in ENV_GENERIC.finditer(masked) if not data[m.start()]
                   for g in m.groups() if g}
         if params:
-            names.update(re.findall(
+            bounded = re.compile(
                 r'\b([a-z_]\w*)\s*:\s*&?\s*(?:'
-                + '|'.join(sorted(map(re.escape, params))) + r')\s*[,;})]',
-                masked))
+                + '|'.join(sorted(map(re.escape, params))) + r')\s*[,;})]')
+            for m in bounded.finditer(masked):
+                at = _scope_at(spans, m.start())
+                seen.add(at)
+                per_file.setdefault((rel, at), set()).add(m.group(1))
+        seen.add(())
+    # A QUALIFIED `impl a::b::Env for T` is resolved once every `trait Env`
+    # declaration in the tree is known, which is why it waits for the walk to
+    # finish. The path must name the trait this tree declares — accepting any
+    # path ending in `Env` would be the same mistake one level over, since the
+    # last segment is a name and not an identity.
+    for rel, found in impls.items():
+        crate, filemods = _module_of(rel, crates)
+        for path, name, at in found:
+            if not path.strip():
+                continue
+            if _absolute_path(rel, path + 'Env', crates, at) not in trait_at:
+                continue
+            types.add(name)
+            scopes.setdefault(rel, set()).add(at)
+            declared.setdefault((rel, at), set()).add(name)
+            modules.setdefault(name, set()).add((crate, filemods + at))
     # A type that IS an environment can be the receiver itself (`OsEnv.var(…)`),
     # and a binding of one is too — `let denv = DotenvEnv::new(…)` has no
     # annotation to read, so the types are matched on the right of a `let` as
@@ -3262,7 +3381,7 @@ def accessor(root, test_files=frozenset()):
     # round ago: two modules may each define a `RootedEnv`, and only one of
     # them is an environment. A file may use a type it declares, or one it
     # imports by name — nothing else.
-    def resolves(rel, path, name):
+    def resolves(rel, at, path, name):
         """Whether `path`, written in `rel`, names the `name` this tree
         derived — rather than a same-named item somewhere else.
 
@@ -3273,19 +3392,21 @@ def accessor(root, test_files=frozenset()):
         CONTAINS the right module resolve. The path is normalised to an
         absolute module and compared exactly.
         """
-        at = _absolute_path(rel, path, crates)
-        return at is not None and at in modules.get(name, ())
+        where = _absolute_path(rel, path, crates, at)
+        return where is not None and where in modules.get(name, ())
 
-    def visible(rel, names):
-        here = {n for n in names if n in declared.get(rel, ())}
-        for local, path in imports.get(rel, ()):
+    def visible(rel, at, names):
+        here = {n for n in names if n in declared.get((rel, at), ())}
+        for local, path in imports.get((rel, at), ()):
             orig = path.rsplit('::', 1)[-1].strip()
-            if orig in names and resolves(rel, path, orig):
+            if orig in names and resolves(rel, at, path, orig):
                 here.add(local)
         return here
 
-    for rel, (masked, data) in masked_all.items():
-        here = visible(rel, types)
+    for (rel, at), (masked, data, spans) in (
+            ((r, a), masked_all[r]) for r in masked_all
+            for a in scopes.get(r, ((),))):
+        here = visible(rel, at, types)
         if not here:
             continue
         bound = re.compile(
@@ -3299,11 +3420,12 @@ def accessor(root, test_files=frozenset()):
         # used to fall through to the `env`-prefixed floor, which is exactly
         # the wrong reason to be covered.
         typed = _declared_receivers(_type_pattern(t) for t in here)
-        per_file.setdefault(rel, set()).update(
+        per_file.setdefault((rel, at), set()).update(
             m.group(1) for m in bound.finditer(masked)
-            if not data[m.start()])
-        per_file[rel].update(m.group(1) for m in typed.finditer(masked)
-                             if not data[m.start()])
+            if not data[m.start()] and _scope_at(spans, m.start()) == at)
+        per_file[(rel, at)].update(
+            m.group(1) for m in typed.finditer(masked)
+            if not data[m.start()] and _scope_at(spans, m.start()) == at)
     # …and a receiver whose type is the one a derived HELPER calls an
     # environment. `env: &HashMap<String, String>` mentions no `Env` at all, so
     # `ENV_BOUND` cannot see it and the name prefix was doing the work: six real
@@ -3313,9 +3435,12 @@ def accessor(root, test_files=frozenset()):
     # receiver rule only where the tree, in that module, has declared or
     # imported a helper that says this type is its environment. An `envelope:
     # Envelope` is not one anywhere, which is the whole point.
-    for rel, (masked, data) in masked_all.items():
+    for (rel, at), (masked, data, spans) in (
+            ((r, a), masked_all[r]) for r in masked_all
+            for a in scopes.get(r, ((),))):
         declares = {env_type[h] for h in
-                    visible(rel, set(env_type)) | set(helpers.get(rel, ()))
+                    visible(rel, at, set(env_type))
+                    | set(helpers.get((rel, at), ()))
                     if h in env_type}
         # A type that already mentions `Env` is `ENV_BOUND`'s to find, and
         # matching `&dyn Env` here too would only re-derive what it derives.
@@ -3323,9 +3448,9 @@ def accessor(root, test_files=frozenset()):
         if not declares:
             continue
         typed = _declared_receivers(_type_pattern(d) for d in declares)
-        per_file.setdefault(rel, set()).update(
+        per_file.setdefault((rel, at), set()).update(
             m.group(1) for m in typed.finditer(masked)
-            if not data[m.start()])
+            if not data[m.start()] and _scope_at(spans, m.start()) == at)
     # A RECEIVER NAME is file-local, and the pattern was global: `base` is
     # derived from `let base = OsEnv` in one module, and an unrelated module's
     # `base.var(…)` on something else then read as an environment call. A type
@@ -3341,16 +3466,26 @@ def accessor(root, test_files=frozenset()):
     # An aliased helper keeps the ORIGINAL's key position: `use … as f` renames
     # the call, not the signature — and only when the path really reaches the
     # helper this tree derived.
-    for rel, items in imports.items():
+    for (rel, at), items in imports.items():
         for local, path in items:
             orig = path.rsplit('::', 1)[-1].strip()
-            if orig in index and resolves(rel, path, orig):
+            if orig in index and resolves(rel, at, path, orig):
                 index.setdefault(local, index[orig])
     cache = {}
 
     def compiled(rel):
-        here = frozenset(visible(rel, set(index)) | set(helpers.get(rel, ())))
-        recv = frozenset(set(per_file.get(rel, ())) | visible(rel, types))
+        # The accessor stays per FILE: the scan reads a differently-processed
+        # body, so an offset here is not an offset there, and matching them up
+        # would be a silent failure waiting to happen. What the scoping buys is
+        # that a receiver only reaches this union if its own module derived it
+        # — a sibling `mod`'s unrelated `Shared` never becomes one. The
+        # residual, stated rather than hidden: two inline modules that bind the
+        # SAME receiver name, one an environment, still share the pattern.
+        here, recv = set(), set()
+        for at in scopes.get(rel, ((),)):
+            here |= visible(rel, at, set(index)) | set(helpers.get((rel, at), ()))
+            recv |= set(per_file.get((rel, at), ())) | visible(rel, at, types)
+        here, recv = frozenset(here), frozenset(recv)
         if (here, recv) not in cache:
             pattern = ACCESSOR.pattern
             if here:
@@ -3774,8 +3909,9 @@ def source_tokens(root):
         # on the RAW text, before anything is stripped.
         yaml_file = effective_suffix(rel) in YAML_SCALARS
         powershell = set()
+        unreadable = set()
         if yaml_file and _yaml_consumer(rel, body) == 'actions':
-            powershell = _yaml_shells(body)
+            powershell, unreadable = _yaml_shells(body)
         raw = body
         body = uncommented(body, comment_leader(rel),
                           hash_needs_space(rel),
@@ -3799,11 +3935,13 @@ def source_tokens(root):
             body = untested(body)
         interpolated = yaml_file and _yaml_interpolated(rel)
         yaml_code, declared_lines = None, set()
-        # A Dockerfile's exec-form lines expand nothing — see `_docker_literal`.
-        literal = set()
+        # A Dockerfile's exec-form lines expand nothing — see `_docker_literal`,
+        # and so does a `run:` block in a shell this script does not read.
+        literal = set(unreadable)
         if pathlib.PurePath(rel).name.split('.')[0] in ('Dockerfile',
                                                         'Containerfile'):
-            body, literal, docker_ps = _docker_commands(body)
+            body, docker_literal, docker_ps = _docker_commands(body)
+            literal |= docker_literal
             powershell |= docker_ps
         if yaml_file:
             consumer = _yaml_consumer(rel, body)
@@ -5351,17 +5489,51 @@ def self_test():
     # written under; a glob names nothing, and `self` in a list names the
     # module the list is under.
     case('a nested use tree carries its prefixes',
-         _use_items('use crate::{i18n::{Env, RootedEnv as Alias}, '
-                    'config::OsEnv};\nuse std::collections::*;\n'
-                    'use crate::config::{self, OsEnv as Cfg};'),
+         [(local, path) for local, path, _ in
+          _use_items('use crate::{i18n::{Env, RootedEnv as Alias}, '
+                     'config::OsEnv};\nuse std::collections::*;\n'
+                     'use crate::config::{self, OsEnv as Cfg};')],
          [('Env', 'crate::i18n::Env'), ('Alias', 'crate::i18n::RootedEnv'),
           ('OsEnv', 'crate::config::OsEnv'),
           ('config', 'crate::config'), ('Cfg', 'crate::config::OsEnv')])
+    _cr = {'autumn': 'autumn_web'}
+    # A file is not one module, and a `use` is scoped like everything else.
+    # Sibling `mod` blocks are two scopes: filing every declaration under the
+    # FILE let one module's unrelated type be the other's environment.
+    case('inline modules are separate scopes',
+         (lambda sp: [_scope_at(sp, o) for o in (0, 22, 36, 52, 65)])(
+             _module_spans('struct A;\nmod a { struct S; fn f() { } }\n'
+                           'mod b { struct S; }\nstruct C;')),
+         [(), ('a',), ('a',), ('b',), ()])
+    # …and a `mod x {` written inside a string or a comment opens nothing,
+    # because the spans are read off the MASKED text the derivations use.
+    case('a mod in generated data is not a scope',
+         (lambda sp: [_scope_at(sp, o) for o in (0, 40)])(
+             _module_spans(_rust_uncommented(
+                 'struct A;\n// mod a { struct S;\nstruct C;\n'))),
+         [(), ()])
+    # A relative path inside an inline module is relative to THAT module.
+    case('a relative import resolves from its inline module',
+         (_absolute_path('autumn/src/i18n.rs', 'self::sub::RootedEnv', _cr,
+                         ('inner',)),
+          _absolute_path('autumn/src/i18n.rs', 'super::RootedEnv', _cr,
+                         ('inner',))),
+         (('autumn_web', ('i18n', 'inner', 'sub')),
+          ('autumn_web', ('i18n',))))
+    # The trait may be written QUALIFIED — `impl<F> autumn_web::config::Env
+    # for FnEnv<F>` is a real one — and the last segment must still be exactly
+    # `Env`, so a different trait whose name merely ends in it matches nothing.
+    case('a qualified Env impl is an Env impl',
+         [ENV_IMPL.findall(t) for t in
+          ('impl<F> autumn_web::config::Env for FnEnv<F>',
+           'impl Env for OsEnv {',
+           'impl foo::MyEnv for Other {',
+           'impl Environment for Other {')],
+         [[('autumn_web::config::', 'FnEnv')], [('', 'OsEnv')], [], []])
     # A RELATIVE path is relative to somewhere. `self` and `super` were read as
     # proof the crate matched and nothing more, so `self::i18n::X` in a nested
     # module resolved against a crate-root `i18n::X` that a different module
     # declares. Both are answerable exactly.
-    _cr = {'autumn': 'autumn_web'}
     case('a relative import is normalised against the importing module',
          [_absolute_path('autumn/src/i18n/locale.rs', p, _cr) for p in
           ('self::i18n::RootedEnv', 'super::RootedEnv', 'crate::i18n::RootedEnv',
@@ -6032,10 +6204,13 @@ def self_test():
               'services:\n  a:\n    command:\n      - bash\n      - -c\n'
               '      - |\n        AUTUMN_OK=1 cmd\n', True, 'compose', True))),
          ([], ['AUTUMN_OK']))
+    # `_yaml_shells` answers with two sets now — PowerShell lines, and lines
+    # in a shell this script cannot read. These cases ask about the first.
+    _yaml_shells0 = lambda b: _yaml_shells(b)[0]
     # …and the PowerShell shortcut normalises, or it answers differently from
     # the rule it is a shortcut for.
     case('an uppercase PowerShell shell still selects PowerShell',
-         sorted(_yaml_shells('on: push\njobs:\n  a:\n    defaults:\n'
+         sorted(_yaml_shells0('on: push\njobs:\n  a:\n    defaults:\n'
                              '      run:\n        shell: PWSH.EXE\n'
                              '    steps:\n      - run: echo $AUTUMN_X\n')),
          [7])
@@ -6072,7 +6247,7 @@ def self_test():
                     '/app/x -c "y"', 'sh "no dash c"')],
          ['AUTUMN_X=1 exec app', 'AUTUMN_Y=1 app', None, None])
     case('a custom pwsh shell line still selects PowerShell',
-         sorted(_yaml_shells('on: push\njobs:\n  a:\n    defaults:\n'
+         sorted(_yaml_shells0('on: push\njobs:\n  a:\n    defaults:\n'
                              '      run:\n'
                              '        shell: pwsh -NoProfile -Command ". \'{0}\'"\n'
                              '    steps:\n      - run: echo $AUTUMN_X\n')),
@@ -6085,14 +6260,14 @@ def self_test():
            '        shell: pwsh\n    steps:\n      - run: |\n'
            '          echo $env:AUTUMN_X\n')
     case('a pwsh run block is read as PowerShell',
-         (sorted(_yaml_shells(_ps)),
-          sorted(_yaml_shells('on: push\ndefaults:\n  run:\n    shell: pwsh\n'
+         (sorted(_yaml_shells0(_ps)),
+          sorted(_yaml_shells0('on: push\ndefaults:\n  run:\n    shell: pwsh\n'
                               'jobs:\n  a:\n    steps:\n'
                               '      - run: echo $AUTUMN_X\n')),
-          sorted(_yaml_shells('on: push\njobs:\n  a:\n    steps:\n'
+          sorted(_yaml_shells0('on: push\njobs:\n  a:\n    steps:\n'
                               '      - run: echo $AUTUMN_X\n'
                               '        shell: pwsh\n')),
-          sorted(_yaml_shells('on: push\njobs:\n  a:\n    steps:\n'
+          sorted(_yaml_shells0('on: push\njobs:\n  a:\n    steps:\n'
                               '      - run: echo $AUTUMN_X\n')),
           PS_ENV.findall('echo $env:AUTUMN_X'),
           EXPANDED.findall('echo $env:AUTUMN_X')),
