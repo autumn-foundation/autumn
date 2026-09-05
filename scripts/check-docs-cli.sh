@@ -2137,10 +2137,19 @@ INCLUDE_DIRS = ('docs/guide/', 'docs/migrations/', 'skills/', 'agents/')
 # owner. Corpus 175 -> 176 here, and this gate stays green over it.
 INCLUDE_FILES = ('README.md', 'EXAMPLES.md', 'CONTRIBUTING.md', 'STABILITY.md',
                  'docs/plugins.md')
+# A `README.md` under `examples/` is the page a reader LANDS on: the root
+# `README.md` table links thirteen examples by directory and `EXAMPLES.md`
+# eleven more, and a directory link renders that directory's `README.md`. They
+# carry copyable `autumn …` commands and `AUTUMN_*` exports alike, so they join
+# both gates in the same commit, for the reason `docs/plugins.md` did. Corpus
+# 176 -> 192 here, and this gate stays green over it.
+INCLUDE_README_DIRS = ('examples/',)
 
 
 def in_scope(path):
-    return path.startswith(INCLUDE_DIRS) or path in INCLUDE_FILES
+    return (path.startswith(INCLUDE_DIRS) or path in INCLUDE_FILES
+            or (path.startswith(INCLUDE_README_DIRS)
+                and pathlib.PurePath(path).name == 'README.md'))
 
 
 def corpus(root):

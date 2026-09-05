@@ -95,7 +95,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is reported rather than skipped, since a spelling that matches nothing is a
   claim the reader cannot be warned about.
 
-  The baseline run found **0 defects** across 659 occurrences on 176 pages:
+  The corpus is the pages a reader lands on, defined identically here and in
+  `check-docs-cli.sh`: the guides, the migration notes, the root `README.md`
+  and its siblings, `docs/plugins.md`, the markdown templates written into
+  every scaffolded project, and each example's `README.md` — the page GitHub
+  renders when a reader follows one of the example links in the README table,
+  and where `export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"`
+  and friends are copied from.
+
+  The baseline run found **0 defects** across 681 occurrences on 193 pages:
   the reader-facing corpus was already accurate, and the gate is here to keep
   it that way. One occurrence is waived in place beside the passage that needs
   it — a migration guide's `rg` pattern for a key that release removed.

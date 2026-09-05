@@ -229,6 +229,24 @@
 #     [NAME=VALUE]...`, so `env -i AUTUMN_X=v cmd` really exports — and the
 #     option read as the command name, dropping the variable. Running the
 #     language answered half the question; its usage line answers the rest.
+#   * A MEASUREMENT that answers a different question than the one being
+#     decided. The example READMEs were audited before being left out of the
+#     corpus, and the audit asked whether they REPORT anything today; they do
+#     not, and they were left out on that. The question a corpus decision turns
+#     on is whether a page is a reader's, because the typo a gate exists for
+#     has not been written yet — "clean today" and "gated" are different
+#     properties, and twenty copyable `AUTUMN_*` lines sat outside the gate on
+#     the strength of the wrong one. The same slip in miniature, one round
+#     later: a paired proof that put two probe names on ONE documentation line,
+#     so the report for the control also showed the name under test, and three
+#     working fixes read as inert until the probe was corrected.
+#   * HALF A FIX to a symmetric bug is a new bug. Two wrong counts can cancel:
+#     `strip_prefix("${")?.strip_suffix('}')?` puts a brace in a string and a
+#     brace in a char literal, and the brace walk was wrong about both in
+#     opposite directions. Correcting either one alone unbalances the file and
+#     widens a scope to the end of it — worse than the defect being fixed. When
+#     a bug has two halves, land both or neither, and prefer neither over a
+#     half that regresses something (see the note above `MOD_BLOCK`).
 #
 # EVERY RUNG HAS NOW BEEN AUDITED against the list above, rather than tightened
 # one at a time as a reviewer found it — which is how five of these survived
@@ -352,9 +370,42 @@ SELF = 'scripts/check-docs-config.sh'
 # a namespace this gate does not model and no runtime ever reads. That page
 # stays out; the rest of the population is the archival material already named
 # below under WHAT IT DELIBERATELY DOES NOT CHECK.
+#
+# That audit is also where an EXAMPLE README slipped out, and the way it did is
+# worth keeping: I ran the population, saw the example READMEs report nothing,
+# and read that as a reason to leave them out. "Reports nothing today" is not
+# "gated" — it is the answer to a different question, and the whole point of a
+# gate is the typo that has not been written yet. They are the page a reader
+# LANDS ON: the root `README.md` table links thirteen of them by directory,
+# `EXAMPLES.md` another eleven, and a directory link renders its `README.md`.
+# Between them they hold twenty copyable `AUTUMN_*` lines — `export
+# AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"` in two deployment
+# walkthroughs, `AUTUMN_MASTER_KEY`, `AUTUMN_PROFILE`, `AUTUMN_UPGRADE_BINARY`
+# — every one of them an instruction a reader pastes into a shell.
+#
+# This does not reopen the link-graph rule above. It is a DIRECTORY rule, the
+# same kind as `docs/guide/`: a `README.md` anywhere under `examples/` is a
+# live example's front page. `examples/wiki/content/*.md` are seed data for the
+# example app rather than pages about it, and stay out because they are not
+# READMEs. Both gates take it, in this commit, for the reason `docs/plugins.md`
+# went into both.
 INCLUDE_DIRS = ('docs/guide/', 'docs/migrations/', 'skills/', 'agents/')
 INCLUDE_FILES = ('README.md', 'EXAMPLES.md', 'CONTRIBUTING.md', 'STABILITY.md',
                  'docs/plugins.md')
+# A `README.md` under one of these is corpus wherever it sits in the tree.
+INCLUDE_README_DIRS = ('examples/',)
+
+
+def reader_facing(path):
+    """Whether a markdown path is a page this corpus is responsible for.
+
+    Spelled once, and spelled the same in `check-docs-cli.sh`: a page covered
+    by one gate and not the other is how a page ends up with no owner, and the
+    self-test compares all three constants rather than trusting this comment.
+    """
+    return (path.startswith(INCLUDE_DIRS) or path in INCLUDE_FILES
+            or (path.startswith(INCLUDE_README_DIRS)
+                and pathlib.PurePath(path).name == 'README.md'))
 
 # `AUTUMN_` followed by at least one more character, ending on an
 # alphanumeric so a trailing underscore in prose (`AUTUMN_UPGRADE_*`) is not
@@ -1029,6 +1080,23 @@ def _rust_skeleton(body):
 # `x = 1# std::env::var("AUTUMN_LOG__LEVL")` in a Python file was surviving a
 # rule written for shell and reading as a real accessor.
 HASH_NEEDS_SPACE = ('.sh', '.bash', '.zsh', '.yml', '.yaml', '.env', '.example')
+# A Dockerfile has no suffix to look this up by, and fell to the default —
+# so a `#` ANYWHERE cut the line, including one inside a shell word. Docker's
+# own rule is stricter than the Bourne one, not looser: a comment must be a
+# whole line, and everything after the instruction keyword is handed to the
+# shell (shell form) or read as JSON (exec form). In `RUN printf '%s' word#tag
+# "$AUTUMN_X"` the hash is word content, the shell really does expand
+# `AUTUMN_X`, and cutting at the hash removed the read and reported the page
+# documenting it. The Bourne start-of-word rule is right for the payload and
+# still strips the whole-line form, whose `#` starts a line.
+#
+# `Makefile` and `Justfile` are left alone deliberately rather than swept in
+# with it. Their grammar is genuinely mixed — make strips a `#` anywhere on a
+# variable line but hands a recipe line to the shell — so which rule applies
+# depends on the line, not the file, and that is a different question from this
+# one. Measured before leaving it: no `Makefile` or `Justfile` in this tree
+# writes a hash inside a word at all, so nothing here rests on the choice.
+HASH_NEEDS_SPACE_NAMED = ('Dockerfile',)
 
 # Where a quoted scalar may legitimately continue onto the next line, so the
 # closing quote is not read as a new opener. YAML only, and gated further on the
@@ -2496,6 +2564,11 @@ def _hash_uncommented(body, shell_like=False, carry_quotes=False,
 
 def hash_needs_space(rel):
     """Whether this file type needs whitespace before a `#` to open a comment."""
+    p = pathlib.PurePath(rel)
+    if p.suffix == '.tmpl':
+        p = pathlib.PurePath(p.stem)
+    if p.name.split('.')[0] in HASH_NEEDS_SPACE_NAMED:
+        return True
     return effective_suffix(rel) in HASH_NEEDS_SPACE
 
 
@@ -3180,6 +3253,20 @@ MACRO_CALL = re.compile(r'(?:(?:core|std)::)?((?:option_)?env)!')
 ENV_IMPL = re.compile(r'\bimpl\s*(?:<[^<>]*>)?\s*((?:\w+\s*::\s*)*)Env\b'
                       r'[^{]*?\bfor\s+([A-Za-z_]\w*)')
 TRAIT_DECL = re.compile(r'\b(?:pub(?:\s*\([^)]*\))?\s+)?trait\s+Env\b')
+# An ALIAS is the same type under a second name. `type AppEnv = OsEnv;` makes
+# `fn load(source: AppEnv)` a receiver declaration that nothing here could see,
+# because the receiver pattern is built from the concrete names `types` holds
+# and an alias is not one of them. Rust says the two spellings are the same
+# type; this rung was reading the spelling again.
+#
+# Resolved after the walk and to a FIXPOINT, because an alias may name an alias
+# and because a qualified right-hand side needs every `impl Env` in the tree
+# known first. The right-hand side gets exactly the test a qualified `impl`
+# path gets — bare, a type the module can see; qualified, one that resolves to
+# the type this tree derived — so `type AppEnv = other::OsEnv;` reaching some
+# unrelated `OsEnv` adds nothing.
+TYPE_ALIAS = re.compile(r'\btype\s+([A-Za-z_]\w*)\s*(?:<[^=;{}]*>)?\s*='
+                        r'\s*([^;{}]+);')
 # …and any binding, parameter or field whose type mentions one.
 ENV_BOUND = re.compile(r'\b([a-z_]\w*)\s*:\s*[^,;{}()=]*\bEnv\b')
 # A GENERIC parameter bounded by `Env` is an environment too, and a field
@@ -3242,6 +3329,35 @@ def _module_of(rel, crates):
 # unrelated type be an environment, and a `.var(…)` on its value read as a real
 # accessor. `_module_of` answers where the FILE sits; this answers where an
 # OFFSET sits, which is the question a declaration and a `use` both ask.
+# KNOWN AND NOT FIXED HERE: the brace walks below count braces over the masked
+# text, and the mask keeps LITERALS — so a `'{'` or a `"${"` counts as a brace.
+# `autumn-cli/src/i18n.rs` matches on brace characters to decode escaped braces
+# and opens three scopes that never close; `autumn/src/router.rs` opens one. A
+# scope whose brace never balances runs to the end of the file, so
+# `build_router_pre_state`'s `env` is visible to every function written after
+# it — the over-admission this rung exists to remove, one level under it.
+#
+# Found by MEASURING, not reported: the per-file derivation diff showed two
+# files changing scope paths under a closure fix that had no business touching
+# them, which is why that comparison is taken.
+#
+# It is not fixed here because the two obvious repairs each regress a different
+# file, and the reason is worth recording. Blanking CHARACTER literals alone
+# unbalances `autumn-media-plugin/src/config.rs`, which writes
+# `strip_prefix("${")?.strip_suffix('}')?` — a `{` in a string and a `}` in a
+# char literal, two wrong counts that cancel — and nests five sibling functions
+# inside `resolve_placeholder`. Blanking BOTH, by re-running `_rust_classes`
+# over the masked text, unbalances `autumn-cli/src/migrate.rs` instead and lets
+# `fn run` swallow the four functions after it: re-classifying text that has
+# already had its comments DROPPED is not the same as classifying the file.
+# Half a fix to a symmetric bug is a new bug, and a fix that widens a scope is
+# worse than the bug it closes.
+#
+# The repair is to carry the classification taken from the RAW body through to
+# both walks rather than recompute it from their input, which is a change to
+# what `_lexical_spans` is given and belongs in its own commit with its own
+# proof — not bolted onto a round that is measured clean without it.
+
 MOD_BLOCK = re.compile(r'\bmod\s+([a-z_]\w*)\s*\{')
 
 
@@ -3358,29 +3474,123 @@ def _scope_opens(masked):
     return out
 
 
+# A CLOSURE binds too, and its parameter list is written between two bars with
+# no keyword and — half the time — no brace after it. `SCOPE_HEAD` therefore
+# could not see one, so `let _ = |source: OsEnv| …;` filed `source` in the
+# enclosing FUNCTION, and an unrelated `let source = Other;` later in that
+# function inherited it. This is the fourth scope this rung has had: file,
+# inline module, item, and now the one binding form that opens a scope without
+# opening a block.
+#
+# The empty list `||` is excluded on purpose, and not to save work: it binds
+# nothing, so it needs no scope — and `a || b` is spelled identically. Requiring
+# at least one character between the bars is what keeps logical-or out without
+# needing to know which one this is. A list holding `(`, `;` or a newline is
+# left alone for the same reason, from the other side: `Some(a) | Some(b)` is a
+# pattern alternative, not a binding, and a destructuring `|(a, b)|` declares no
+# annotated name for anything here to read.
+CLOSURE_HEAD = re.compile(r'(?<!\|)\|(?!\|)[^|;{}()\[\]\n]+\|')
+
+
+def _closure_end(masked, i):
+    """One past the end of a closure body beginning at `i`.
+
+    A closure body is a BLOCK or an EXPRESSION, and the expression form is the
+    reason this cannot be a brace walk: `|s: OsEnv| s.var(k)` ends at the `,`
+    or `;` that ends the expression it sits in, or at the bracket that closes
+    around it — `map(|s: OsEnv| s.var(k))` ends at the `)` it did not open.
+    Stopping on an unopened closer is also what keeps the span nested inside
+    whatever block holds it, which the sweep below relies on.
+    """
+    j = i
+    while j < len(masked) and masked[j].isspace():
+        j += 1
+    if j < len(masked) and masked[j] == '{':
+        depth = 0
+        while j < len(masked):
+            if masked[j] == '{':
+                depth += 1
+            elif masked[j] == '}':
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+            j += 1
+        return len(masked)
+    depth = 0
+    while j < len(masked):
+        c = masked[j]
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            if depth == 0:
+                return j
+            depth -= 1
+        elif depth == 0 and c in ';,':
+            return j
+        j += 1
+    return len(masked)
+
+
 def _lexical_spans(masked):
-    """`([start], [scope path])` — the binding scope each offset sits in."""
+    """`([start], [scope path])` — the binding scope each offset sits in.
+
+    Two kinds of scope, one sweep. An item scope runs from its HEADER to its
+    closing brace, so the parameters it declares are inside the scope they
+    bind; a closure runs from its opening bar to the end of its body, which may
+    be a block or a bare expression. Both are properly nested — `_closure_end`
+    stops at a closer it did not open — so a single stack orders them, and the
+    walk that used to key everything on a `{` no longer has to.
+    """
     opens = _scope_opens(masked)
-    starts, scopes, stack, here, depth = [0], [()], [], (), 0
+    spans, stack, depth = [], [], 0
     for i, c in enumerate(masked):
         if c == '{':
             if i in opens:
                 head, label = opens[i]
-                stack.append(depth)
-                here = here + (label,)
-                # …starting at the HEADER, so the parameters it declares are
-                # inside the scope they bind. `max` keeps the list sorted for
-                # the bisect, which a pathological header could otherwise break.
-                starts.append(max(head, starts[-1]))
-                scopes.append(here)
+                stack.append((depth, head, label))
             depth += 1
         elif c == '}':
             depth -= 1
-            if stack and stack[-1] == depth:
-                stack.pop()
-                here = here[:-1]
-                starts.append(i)
-                scopes.append(here)
+            if stack and stack[-1][0] == depth:
+                _, head, label = stack.pop()
+                spans.append((head, i, label))
+    # A scope whose brace never balances runs to the end of the file, which is
+    # what the walk this replaces did by leaving the path extended. Recording
+    # spans only when they CLOSE quietly dropped those, and `autumn/src/router.rs`
+    # — where a `'{'` char literal counts as a brace — lost the `env` parameter
+    # of `build_router_pre_state` to module scope, widening exactly what the
+    # scoping rung exists to narrow. The second-order measurement caught it;
+    # the truth set did not move.
+    for _, head, label in stack:
+        spans.append((head, len(masked), label))
+    for m in CLOSURE_HEAD.finditer(masked):
+        # The header text is the label, exactly as it is for an item: two
+        # sibling closures with identical parameter lists share a scope, which
+        # is the same bounded over-admission two identically-headed items get.
+        spans.append((m.start(), _closure_end(masked, m.end()),
+                      ' '.join(m.group(0).split())))
+    # Outermost first at a shared start, so an item and a closure that begin
+    # together nest rather than alternate.
+    spans.sort(key=lambda s: (s[0], -s[1]))
+    starts, scopes, open_spans, here = [0], [()], [], ()
+
+    def close_through(pos):
+        nonlocal here
+        while open_spans and open_spans[-1][0] <= pos:
+            end, _ = open_spans.pop()
+            here = open_spans[-1][1] if open_spans else ()
+            # `max` keeps the list sorted for the bisect; a zero-width span
+            # would otherwise put an end before the start that opened it.
+            starts.append(max(end, starts[-1]))
+            scopes.append(here)
+
+    for start, end, label in spans:
+        close_through(start)
+        here = here + (label,)
+        open_spans.append((end, here))
+        starts.append(max(start, starts[-1]))
+        scopes.append(here)
+    close_through(len(masked) + 1)
     return starts, scopes
 
 
@@ -3643,7 +3853,7 @@ def accessor(root, test_files=frozenset()):
     index, types, per_file, masked_all = {}, set(), {}, {}
     helpers, declared, imports, modules = {}, {}, {}, {}
     env_type, impls, trait_at, scopes = {}, {}, set(), {}
-    shadowed, returns = {}, {}
+    shadowed, returns, aliases = {}, {}, {}
     macro_at, macro_imports, factory_at = {}, {}, {}
     crates = _crates(root)
     for rel in out.split('\0'):
@@ -3709,6 +3919,10 @@ def accessor(root, test_files=frozenset()):
         impls[rel] = [(m.group(1), m.group(2), _scope_at(spans, m.start()))
                       for m in ENV_IMPL.finditer(masked)
                       if not data[m.start()]]
+        aliases[rel] = [(m.group(1), ' '.join(m.group(2).split()),
+                         _scope_at(spans, m.start()))
+                        for m in TYPE_ALIAS.finditer(masked)
+                        if not data[m.start()]]
         # Where each derived name LIVES — crate and module path, not a bare
         # stem, so an import can be checked against its identity.
         for path, name, at in impls[rel]:
@@ -3802,6 +4016,33 @@ def accessor(root, test_files=frozenset()):
             if orig in names and resolves(rel, at, path, orig):
                 here.add(local)
         return here
+
+    # An ALIAS names a type that already is one. Run to a fixpoint so an alias
+    # of an alias resolves, and after the qualified `impl` walk above so the
+    # right-hand side has every derived type to resolve against; a round that
+    # adds nothing ends it, which also ends `type A = B; type B = A;`.
+    while True:
+        grew = False
+        for rel, found in aliases.items():
+            crate, filemods = _module_of(rel, crates)
+            for name, rhs, at in found:
+                if name in types:
+                    continue
+                bare = re.sub(r'^(?:impl|dyn)\s+', '', rhs).strip()
+                kind = bare.split('::')[-1].split('<')[0].strip()
+                path = bare[:len(bare) - len(bare.split('::')[-1])]
+                if kind not in types:
+                    continue
+                if not (resolves(rel, at, path + kind, kind) if path.strip()
+                        else kind in visible(rel, at, types)):
+                    continue
+                types.add(name)
+                scopes.setdefault(rel, set()).add(at)
+                declared.setdefault((rel, at), set()).add(name)
+                modules.setdefault(name, set()).add((crate, filemods + at))
+                grew = True
+        if not grew:
+            break
 
     # Every environment FACTORY in the tree, before anything consumes one: a
     # function whose declared return type is an environment. Qualified, the
@@ -4712,8 +4953,7 @@ def corpus(root):
     out = subprocess.run(['git', 'ls-files', '-z', '*.md', '*.md.tmpl'],
                          cwd=root, capture_output=True, text=True).stdout
     return [f for f in out.split('\0')
-            if f and (f.startswith(INCLUDE_DIRS) or f in INCLUDE_FILES
-                      or f.endswith('.md.tmpl'))]
+            if f and (reader_facing(f) or f.endswith('.md.tmpl'))]
 
 
 # -------------------------------------------------------------- resolution
@@ -5747,6 +5987,21 @@ def self_test():
          (hash_needs_space('x.sh'), hash_needs_space('x.yml'),
           hash_needs_space('x.py'), hash_needs_space('main.tf.tmpl')),
          (True, True, False, False))
+    # A Dockerfile has no suffix to look up, and the default cut at every `#`.
+    # Everything after the keyword is the shell's, so the Bourne word rule
+    # applies to it — and a whole-line comment still starts a line.
+    case('a Dockerfile takes the shell boundary',
+         (hash_needs_space('a/Dockerfile'), hash_needs_space('Dockerfile.tmpl'),
+          hash_needs_space('x/Dockerfile.api.tmpl')),
+         (True, True, True))
+    case('a hash inside a Docker shell word is not a comment',
+         uncommented('RUN printf \'%s\' word#tag "$AUTUMN_X"', '#',
+                     hash_needs_space('Dockerfile')),
+         'RUN printf \'%s\' word#tag "$AUTUMN_X"')
+    case('…and a Dockerfile comment line still goes',
+         uncommented('# syntax=docker/dockerfile:1\nRUN x  # note', '#',
+                     hash_needs_space('Dockerfile')),
+         '\nRUN x  ')
     case('a `#` inside a string is not a comment either',
          uncommented('url = "http://x/#frag"', '#'), 'url = "http://x/#frag"')
     # An escaped quote does not end a string. Without this, `"a\"b"` reads as a
@@ -5948,16 +6203,31 @@ def self_test():
     # because the DIRECTORY was standing in for the audience.
     case('the linked plugin guide is a checked page',
          'docs/plugins.md' in corpus(ROOT), True)
+    # An example's README is the page a reader LANDS on — the root `README.md`
+    # links thirteen examples by directory, and a directory link renders its
+    # `README.md`. Twenty copyable `AUTUMN_*` lines lived there ungated because
+    # an earlier audit asked whether those pages REPORTED anything rather than
+    # whether they were covered, and "clean today" is not "gated".
+    case('an example README is a checked page',
+         'examples/bookmarks-sharded/README.md' in corpus(ROOT), True)
+    # …but only its README: `examples/wiki/content/*.md` is seed data for the
+    # example app, not a page about it.
+    case('example app content is not a page',
+         'examples/wiki/content/configuration.md' in corpus(ROOT), False)
     # …and the two gates' idea of "reader-facing" is asserted identical, not
     # merely intended to be: adding a page to one and not the other is exactly
-    # how a page ends up with no owner.
+    # how a page ends up with no owner. ALL THREE constants, because the last
+    # addition was a directory rule and a test that compared only the file list
+    # would have watched the two gates diverge without a word.
     case('the sibling gate agrees on the corpus',
-         sorted(re.search(r'^INCLUDE_FILES = \(([^)]*)\)',
-                          (ROOT / 'scripts' / 'check-docs-cli.sh')
-                          .read_text(encoding='utf-8'), re.M).group(1).split()),
-         sorted(re.search(r'^INCLUDE_FILES = \(([^)]*)\)',
-                          (ROOT / SELF).read_text(encoding='utf-8'), re.M)
-                .group(1).split()))
+         [sorted(re.search(r'^%s = \(([^)]*)\)' % const,
+                           (ROOT / 'scripts' / 'check-docs-cli.sh')
+                           .read_text(encoding='utf-8'), re.M).group(1).split())
+          for const in ('INCLUDE_DIRS', 'INCLUDE_FILES', 'INCLUDE_README_DIRS')],
+         [sorted(re.search(r'^%s = \(([^)]*)\)' % const,
+                           (ROOT / SELF).read_text(encoding='utf-8'), re.M)
+                 .group(1).split())
+          for const in ('INCLUDE_DIRS', 'INCLUDE_FILES', 'INCLUDE_README_DIRS')])
     # HCL takes all three comment forms; a `//` in shell or YAML is a path.
     case('Terraform strips its slash forms too',
          uncommented('// export AUTUMN_LOG__LEVL=x\nreal = 1 # note', '#',
@@ -6151,6 +6421,17 @@ def self_test():
            'impl foo::MyEnv for Other {',
            'impl Environment for Other {')],
          [[('autumn_web::config::', 'FnEnv')], [('', 'OsEnv')], [], []])
+    # An ALIAS is a second name for a type that already is one, and the
+    # receiver pattern was built from the concrete names alone — so `fn
+    # load(source: AppEnv)` declared an environment nothing here could see.
+    case('a type alias is read with its right-hand side',
+         [TYPE_ALIAS.findall(t) for t in
+          ('type AppEnv = OsEnv;',
+           'type Boxed<T> = crate::config::OsEnv;',
+           'type Res = Result<u8, E>;',
+           'let x = 1;')],
+         [[('AppEnv', 'OsEnv')], [('Boxed', 'crate::config::OsEnv')],
+          [('Res', 'Result<u8, E>')], []])
     # A RELATIVE path is relative to somewhere. `self` and `super` were read as
     # proof the crate matched and nothing more, so `self::i18n::X` in a nested
     # module resolved against a crate-root `i18n::X` that a different module
@@ -6292,6 +6573,42 @@ def self_test():
              '  fn two(source: Other) { source.var("Y"); }\n}\nstruct S;\n'),
          [('mod a', 'fn one(source: OsEnv)'),
           ('mod a', 'fn two(source: Other)'), ()])
+    # …and a CLOSURE is a binding scope with no keyword and no brace. Its
+    # parameter used to be filed in the enclosing function, where an unrelated
+    # `let source` later in that function inherited it.
+    case('a closure parameter does not leak to its function',
+         (lambda src: [_scope_at(_lexical_spans(src), src.index(p)) for p in
+                       ('c.var("X")', 'let source', 'source.var("Y")')])(
+             'fn one() { let _ = |c: OsEnv| { c.var("X"); };\n'
+             '  let source = Other; source.var("Y"); }\n'),
+         [('fn one()', '|c: OsEnv|'), ('fn one()',), ('fn one()',)])
+    # An EXPRESSION-bodied closure has no block to walk to, so its scope ends
+    # at whatever ends the expression — here the `)` it did not open.
+    case('an expression-bodied closure ends with its expression',
+         (lambda src: [_scope_at(_lexical_spans(src), src.index(p)) for p in
+                       ('s.var("A")', 'let s', 's.var("B")')])(
+             'fn f() { xs.map(|s: OsEnv| s.var("A")); let s = Other; '
+             's.var("B"); }'),
+         [('fn f()', '|s: OsEnv|'), ('fn f()',), ('fn f()',)])
+    # `a || b` is spelled exactly like a zero-parameter closure, and a closure
+    # that binds nothing needs no scope — so requiring a character between the
+    # bars settles both at once. A pattern alternative holds a `(`.
+    # A scope whose brace never balances — which a `'{'` in the masked text can
+    # cause, see the note above `MOD_BLOCK` — runs to the end of the file
+    # rather than vanishing. Vanishing is what dropping unclosed spans did, and
+    # it cost `build_router_pre_state` its `env` to module scope: strictly
+    # wider than the bug it was standing next to.
+    case('an unbalanced scope runs on rather than disappearing',
+         (lambda src: [_scope_at(_lexical_spans(src), src.index(p)) for p in
+                       ('e.var("X")', 'q.var("Y")')])(
+             "fn one(e: OsEnv) { let c = '{'; e.var(\"X\"); }\n"
+             'fn two(q: Other) { q.var("Y"); }\n'),
+         [('fn one(e: OsEnv)',), ('fn one(e: OsEnv)', 'fn two(q: Other)')])
+    case('logical or and pattern alternatives open no scope',
+         [CLOSURE_HEAD.search(t) is not None for t in
+          ('if a || b { }', 'match x { Some(a) | Some(b) => 1 }',
+           'let f = |s: OsEnv| s;')],
+         [False, False, True])
     case('a helper key behind other arguments reads',
          args_of('override_string(&mut self.ffmpeg.bin, env, '
                  '"AUTUMN_MEDIA__FFMPEG__BIN")', _media_acc, real_index),
