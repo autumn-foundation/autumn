@@ -229,6 +229,55 @@ where
     deserializer.deserialize_seq(Bounded::<T, LIMIT>(std::marker::PhantomData))
 }
 
+/// Deserialize a [`PluginRow`] that refuses to grow past [`MAX_ROW_COLUMNS`]
+/// while it is being read.
+///
+/// [`bounded_vec`] for maps, and needed for the same reason: `check_row` applies
+/// the column ceiling to a map `serde_json` has already built, so a frame of
+/// hundreds of thousands of one-character columns is materialised in full and
+/// then refused for having too many. Worse than the sequence case, because
+/// `dispatch` deserializes before it checks the capability — so an *ungranted*
+/// call can spend that memory.
+///
+/// # Errors
+///
+/// The deserializer's own error when an entry cannot be read, and a custom one
+/// naming the ceiling when the map carries more entries than that.
+pub fn bounded_row<'de, D>(deserializer: D) -> Result<PluginRow, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error as _, MapAccess, Visitor};
+
+    struct Bounded;
+
+    impl<'de> Visitor<'de> for Bounded {
+        type Value = PluginRow;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "at most {MAX_ROW_COLUMNS} columns")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut out = PluginRow::new();
+            while let Some((column, value)) = map.next_entry::<String, PluginValue>()? {
+                // Counted on the map, not on entries read: a frame repeating one
+                // column name collapses to a single entry, and refusing it for
+                // its *reads* would reject a legal row written wastefully.
+                if out.len() >= MAX_ROW_COLUMNS && !out.contains_key(&column) {
+                    return Err(A::Error::custom(format!(
+                        "more than {MAX_ROW_COLUMNS} columns"
+                    )));
+                }
+                out.insert(column, value);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_map(Bounded)
+}
+
 /// The bytes `text` occupies once JSON-escaped, excluding its framing quotes.
 ///
 /// Not `text.len()`. JSON escaping is not a constant factor: a NUL becomes the
@@ -445,6 +494,7 @@ pub enum CapabilityCall {
         /// Logical table name, which must appear in `[grants].tables`.
         table: String,
         /// The row.
+        #[serde(deserialize_with = "bounded_row")]
         row: PluginRow,
     },
     /// Read one row by id.
@@ -464,7 +514,7 @@ pub enum CapabilityCall {
         table: String,
         /// Column equality filter; an empty map matches every row the plugin
         /// and tenant own.
-        #[serde(default)]
+        #[serde(default, deserialize_with = "bounded_row")]
         filter: PluginRow,
         /// Largest number of rows to return, capped by the `db_rows` quota.
         #[serde(default)]
@@ -490,6 +540,7 @@ pub enum CapabilityCall {
         /// The row id.
         row_id: String,
         /// The replacement row.
+        #[serde(deserialize_with = "bounded_row")]
         row: PluginRow,
     },
     /// Delete one row by id.
@@ -508,7 +559,7 @@ pub enum CapabilityCall {
         /// The job type, which must appear in `[grants].job_types`.
         job_type: String,
         /// The job's arguments.
-        #[serde(default)]
+        #[serde(default, deserialize_with = "bounded_row")]
         payload: PluginRow,
     },
 }
