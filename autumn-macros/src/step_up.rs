@@ -17,7 +17,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{ItemFn, LitStr, parse_quote};
+use syn::{LitStr, parse_quote};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -196,17 +196,15 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(v) => v,
         Err(err) => return err.to_compile_error(),
     };
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    // `parse_async_handler_with_preamble` also tolerates zero or more item
+    // definitions ahead of the function — the gate `struct` + `impl
+    // FromRequestParts` a guard macro that already expanded above this one
+    // (e.g. `#[secured]` above `#[step_up]`) leaves behind — and already
+    // validates the trailing function is async.
+    let (preamble, mut input_fn) = match crate::parse::parse_async_handler_with_preamble(item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
-    if input_fn.sig.asyncness.is_none() {
-        return syn::Error::new_spanned(
-            input_fn.sig.fn_token,
-            "#[step_up] can only be applied to async functions",
-        )
-        .to_compile_error();
-    }
 
     let max_age_tokens = max_age_opt.map_or_else(
         || quote! { ::core::option::Option::None },
@@ -329,13 +327,29 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     input_fn.sig.output = parse_quote! {
         -> ::autumn_web::reexports::axum::response::Response
     };
+    // A dead-code marker mirroring the real `__AUTUMN_STEP_UP_MAX_AGE` const
+    // the gate carries (#1668 moved the runtime check itself into the gate's
+    // own `impl` block, out of the handler body). `api_doc::infer_response_body`
+    // recovers a guard-rewritten handler's real return type from the
+    // `__autumn_inner` binding below, but only accepts that binding when one
+    // of `RESPONSE_REWRITING_GUARD_MARKERS` is present earlier in the *same*
+    // block — so `#[step_up]` needs its own marker in-body too, exactly like
+    // `#[secured]`'s role/scope consts, or a route stacking `#[step_up]`
+    // above `#[route]` silently loses its OpenAPI response schema (#1677).
+    let body_marker = quote! {
+        #[allow(dead_code)]
+        const __AUTUMN_STEP_UP_MAX_AGE: ::core::option::Option<u64> = #max_age_tokens;
+    };
+
     input_fn.block = syn::parse_quote! {
         {
+            #body_marker
             #original_response
         }
     };
 
     quote! {
+        #preamble
         #gate_item
         #input_fn
     }
