@@ -68,7 +68,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *in*, so a stored row can always be read back), one `db-get`/`db-query` answer
   carries at most 512 KiB and says `"truncated": true` when that cut it short,
   and the budget travels into `PluginStore::query` so a store never materialises
-  what the reply would discard. The shipped `MemoryJobSink` has a finite default
+  what the reply would discard — with an `after` cursor so a page that was cut
+  can actually be continued, and a query filter refusing `row_id` because
+  stripping it would turn "the row with this id" into "every row this tenant
+  has". The outbound response-header ceilings travel into `OutboundRequest`
+  beside `max_response_bytes`, the render context is bounded before it is cloned
+  onto a worker, and `CacheKvStore` uses the serde-aware cache API so a plugin's
+  KV survives on a cross-replica backend rather than silently storing nothing. The shipped `MemoryJobSink` has a finite default
   depth and no unbounded spelling — this slice ships no consumer that drains it.
   The activity log counts what it evicts as well as what a per-request ledger
   overflowed, and both are timestamped and windowed like ordinary events, so a

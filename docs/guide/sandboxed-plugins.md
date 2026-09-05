@@ -546,13 +546,28 @@ A `call_result` carries one of six value kinds: `done` (a write or delete),
 the `db_rows` quota allows, **and as many as fit 512 KiB**: rows are the one
 result whose size the guest chooses, so the byte budget travels into the store
 rather than being applied once the whole answer has been built. When it stops an
-answer short, `rows` comes back with `"truncated": true` — read it, or a plugin
-paging through its own table will read a short page as the end of the table. A
-`PluginStore` you implement yourself reports the same thing in `QueryPage`, and
-is expected to stop reading at `max_bytes` rather than gather and let the host
-discard. A
-single row is bounded at 256 KiB across its columns when it is *written*, so a
-row that was stored can always be read back.
+answer short, `rows` comes back with `"truncated": true`.
+
+Continue with `after`: rows arrive in ascending `row_id` order, so the last
+`row_id` of one page is the `after` of the next.
+
+```json
+{"op":"call","call":"db-query","id":1,"table":"orders","filter":{"kind":"open"}}
+→ {"op":"call_result","id":1,"rows":[…,{"row_id":"r40",…}],"truncated":true}
+
+{"op":"call","call":"db-query","id":2,"table":"orders","filter":{"kind":"open"},
+ "after":"r40"}
+```
+
+Read `truncated`, or a plugin paging through its own table will take a short
+page for the end of the table. A `PluginStore` you implement yourself reports
+the same flag in `QueryPage`, must return rows in ascending `row_id` order for
+`after` to mean anything, and is expected to stop reading at `max_bytes` rather
+than gather and let the host discard. A filter may not carry `row_id` — use
+`db-get` for a single row, because stripping it would turn "the row with this
+id" into "every row this tenant has". A single row is bounded at 256 KiB across
+its columns when it is *written*, so a row that was stored can always be read
+back.
 
 A refusal comes back as a `call_result` the guest can read, not as a trap. A
 plugin that hits a ceiling should degrade — render the panel without the live
