@@ -3876,7 +3876,19 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                             // as `FuelExhausted`. A trap here leaves the rest of
                             // the queue undispatched, which is the same
                             // property one level up.
-                            while caller.data().has_pending_call() {
+                            //
+                            // The loop stops on a terminal answer as well as on
+                            // an empty queue. One chunk may carry several call
+                            // frames, and servicing an early one can end the
+                            // request — a reply the guest never read pushing the
+                            // queue over `MAX_QUEUED_REPLY_BYTES`, or the host
+                            // failing to encode its own answer. Draining the
+                            // rest afterwards would perform a job enqueue, a DB
+                            // write or an outbound POST on a request that is
+                            // already going to fail, which is the property the
+                            // charge-before-dispatch order exists to establish.
+                            while caller.data().has_pending_call() && caller.data().answer.is_none()
+                            {
                                 charge_units(&mut caller, CAPABILITY_CALL_FUEL)?;
                                 let _ = caller.data_mut().service_next();
                                 let owed = caller.data_mut().take_pending_charge();
