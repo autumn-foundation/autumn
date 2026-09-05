@@ -105,14 +105,25 @@
 # WHICH FENCES ARE READ. Of the corpus's 246 ```toml fences, 166 are read. A
 # fence is read only on POSITIVE identification — it names `autumn.toml` (or a
 # profile overlay / the `.example` template), or it carries a section the config
-# surface recognizes. The marker is checked BEFORE the "no section header" bail,
-# because part of the config surface is top-level scalars with no section to sit
-# under: `jobs.md` documents `role = "worker"` under an `# autumn.toml` marker,
-# and `role` is a real schema root. This corpus is a Rust framework's, so most of
-# its TOML is some other file, and several families of it collide with real
-# Autumn section names:
+# surface recognizes.
 #
-#   - **Cargo manifests** (41 fences). Skipped on their root sections
+# MARKERS BEAT HEURISTICS — all of them. The rules below are guesses about what a
+# fence IS; a marker is the page SAYING so, and a guess must never overrule a
+# statement. Getting that order wrong opened three holes at once: a
+# `# autumn.toml` fence whose section happened to be `[package]` was written off
+# as a Cargo manifest, one with no section at all as a fragment, and a
+# `[profile.prod] debug = 1` under the marker as a Cargo profile — each invalid
+# Autumn config, each reported clean. So the marker is read first, and only an
+# unmarked fence reaches the heuristics. (A marker naming ANOTHER file is read
+# before either, so a lead-in naming both — "add this to Cargo.toml next to your
+# autumn.toml" — resolves to the other file, the safe direction.)
+#
+# This corpus is a Rust framework's, so most of its TOML is some other file, and
+# several families of it collide with real Autumn section names:
+#
+#   - **Cargo manifests** (21 unmarked fences, plus 20 more that name
+#     `Cargo.toml` outright and are skipped as `other-file` before the
+#     root-name heuristic is consulted). Skipped on their root sections
 #     (`[package]`, `[dependencies]`, `[features]`, …).
 #   - **Cargo profiles**. `[profile.dev] debug = "line-tables-only"` in
 #     `platform-support.md` is a Cargo profile, and `[profile.<name>]` is ALSO
@@ -122,7 +133,7 @@
 #     `strip`, …) is Cargo's, and Autumn's overlay carries config SECTIONS, never
 #     those names. Header-based skipping would have cost the real overlay fences,
 #     which are the production-tuning ones most worth gating.
-#   - **`fly.toml`** (4 fences). Fly's `[deploy]` table takes `release_command`
+#   - **`fly.toml`** (4 of the 37 `other-file` fences). Fly's `[deploy]` table takes `release_command`
 #     and `kill_timeout`; Autumn's `[deploy]` takes `host`, `app_name`, `app_dir`.
 #     Zero key overlap, but the section name is identical, so the fence is read as
 #     Fly's only when it SAYS so — a `# fly.toml` marker comment in the fence, or
@@ -444,6 +455,17 @@ AUTUMN_TOML_NAME = re.compile(r"^autumn([-.][A-Za-z0-9_.\-]+?)?\.toml(\.example)
 LEAD_IN_LINES = 3
 
 
+def marker_files(body, lead_in):
+    """(autumn-ish names, other names) marking this fence, fence first then prose."""
+    leading_comments = "\n".join(
+        line for line in body.split("\n")[:3] if line.strip().startswith("#")
+    )
+    ours, theirs = named_toml_files(leading_comments)
+    if not (ours or theirs):
+        ours, theirs = named_toml_files(lead_in)
+    return ours, theirs
+
+
 def named_toml_files(text):
     """(names of autumn.toml-ish files, names of other .toml files) in `text`."""
     ours, theirs = [], []
@@ -478,27 +500,26 @@ def classify(body, lead_in, known_roots):
     """
     headers = SECTION_HEADER.findall(body)
     roots = {h.split(".")[0].strip('"') for h in headers}
-    if roots & CARGO_ROOTS:
-        return "cargo-manifest"
 
-    # The fence's own first comment lines, then the prose that introduces it.
-    leading_comments = "\n".join(
-        line for line in body.split("\n")[:3] if line.strip().startswith("#")
-    )
-    ours, theirs = named_toml_files(leading_comments)
-    if not (ours or theirs):
-        ours, theirs = named_toml_files(lead_in)
+    # MARKERS BEAT HEURISTICS — all of them. The Cargo-root and headerless rules
+    # below are guesses about what a fence IS; a marker is the page SAYING so, and
+    # a guess must never overrule a statement. Ordering this the other way round
+    # made three separate holes, each found the same way: a `# autumn.toml` fence
+    # whose section happened to be `[package]` was written off as a Cargo
+    # manifest, one with no section at all was written off as a fragment, and a
+    # `[profile.prod] debug = 1` under the marker was written off as a Cargo
+    # profile — all three invalid Autumn config, reported as clean.
+    ours, theirs = marker_files(body, lead_in)
     # A marker naming another file settles it, even alongside a recognized root:
-    # `fly.toml`'s `[deploy]` is spelled exactly like Autumn's.
+    # `fly.toml`'s `[deploy]` is spelled exactly like Autumn's. Checked before
+    # `ours` so a lead-in naming BOTH files ("add this to Cargo.toml next to your
+    # autumn.toml") is read as the other file, which is the safe direction.
     if theirs:
         return f"other-file:{theirs[0]}"
-    # A marker is checked BEFORE the headerless bail below, because some of the
-    # config surface is top-level scalars with no section to sit under:
-    # `docs/guide/jobs.md` documents `role = "worker"` under a `# autumn.toml`
-    # marker, and `role` is a real schema root. Bailing on "no section header"
-    # first left that fence — and a `rol` typo in it — unread.
     if ours:
         return None
+    if roots & CARGO_ROOTS:
+        return "cargo-manifest"
     if not headers:
         return "no-section-header"
     # `profile` counts as a recognized root even though it is `#[serde(skip)]`
@@ -570,7 +591,7 @@ def descend(value, path, schema, out, plugin_roots=frozenset()):
 PARSE_DEFECT = "<parse> "
 
 
-def check_fence(body, schema, plugin_roots=frozenset()):
+def check_fence(body, schema, plugin_roots=frozenset(), marked=False):
     """Out-of-schema key paths in one fence.
 
     A fence that has already been IDENTIFIED as `autumn.toml` and does not parse
@@ -598,12 +619,24 @@ def check_fence(body, schema, plugin_roots=frozenset()):
             for name, overlay in value.items():
                 # `[[profile.x]]` reaches here as a list, which the framework
                 # also walks item by item.
-                for table in overlay if isinstance(overlay, list) else [overlay]:
-                    if not isinstance(table, dict):
+                entries = overlay if isinstance(overlay, list) else [overlay]
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        # `[profile] prod = "x"` — a profile name whose value is
+                        # not a table. It parses, and a non-strict app ignores it
+                        # silently, so it is the gate's to report;
+                        # `validate_toml_table` reports `profile.prod` too.
+                        findings.append(f"profile.{name}")
                         continue
-                    if is_cargo_profile(name, table):
+                    # The Cargo-profile exemption is a HEURISTIC about which file
+                    # a `[profile.x]` belongs to, so it may only override an
+                    # unmarked fence. Under an explicit `# autumn.toml` marker the
+                    # page has already said which file this is, and `debug = 1`
+                    # there is an unknown Autumn root after profile resolution,
+                    # not a Cargo knob.
+                    if not marked and is_cargo_profile(name, entry):
                         continue
-                    walk(table, "", schema, findings, plugin_roots)
+                    walk(entry, "", schema, findings, plugin_roots)
         else:
             walk({key: value}, "", schema, findings, plugin_roots)
     return findings
@@ -642,7 +675,8 @@ def scan(schema, plugin_root_set=frozenset()):
             if skip:
                 fences.append((rel, line, skip, []))
                 continue
-            bad = check_fence(body, schema, plugin_root_set)
+            marked = bool(marker_files(body, lead_in)[0])
+            bad = check_fence(body, schema, plugin_root_set, marked)
             fences.append((rel, line, "checked", bad))
             for path in bad:
                 findings.append((rel, line, path))
@@ -964,6 +998,60 @@ def self_test():
     else:
         failed += 1
         print("  FAIL [marked headerless typo is caught]")
+
+    # MARKERS BEAT HEURISTICS. Each of these was a hole where a guess about the
+    # fence's identity overruled the page saying what it is.
+    for label, body, lead_in, expected in (
+        # A Cargo-shaped root under an explicit autumn marker is invalid Autumn
+        # config, not a Cargo manifest.
+        ("marker beats cargo-root heuristic", '# autumn.toml\n[package]\nname = "x"\n', "", None),
+        # ...but an unmarked one is still a Cargo manifest.
+        ("unmarked cargo root still skipped", '[package]\nname = "x"\n', "", "cargo-manifest"),
+        # A lead-in naming BOTH files resolves to the other file — the safe way.
+        (
+            "other-file wins when both are named",
+            '[dependencies]\nautumn-web = "0.1"\n',
+            "add this to Cargo.toml next to your autumn.toml:",
+            "other-file:Cargo.toml",
+        ),
+    ):
+        got = classify(body, lead_in, known_roots)
+        if got == expected:
+            passed += 1
+        else:
+            failed += 1
+            print(f"  FAIL [{label}]: expected {expected!r}, got {got!r}")
+
+    if check_fence('# autumn.toml\n[package]\nname = "x"\n', schema, marked=True) == ["package"]:
+        passed += 1
+    else:
+        failed += 1
+        print("  FAIL [marked cargo-root fence reports its keys]")
+
+    # The Cargo-profile exemption is a heuristic too: it may not overrule a marker.
+    for label, body, marked, expected in (
+        ("unmarked cargo profile stays exempt", "[profile.dev]\ndebug = 1\n", False, []),
+        ("marked cargo profile is judged", "# autumn.toml\n[profile.dev]\ndebug = 1\n", True, ["debug"]),
+    ):
+        got = check_fence(body, schema, marked=marked)
+        if got == expected:
+            passed += 1
+        else:
+            failed += 1
+            print(f"  FAIL [{label}]: expected {expected}, got {got}")
+
+    # A profile name whose value is not a table is reported, as the runtime does.
+    for label, body, expected in (
+        ("scalar profile entry", '[profile]\nprod = "x"\n', ["profile.prod"]),
+        ("array-of-scalars profile entry", '[profile]\nprod = ["x"]\n', ["profile.prod"]),
+        ("table profile entry stays clean", "[profile.prod.server]\nport = 1\n", []),
+    ):
+        got = check_fence(body, schema)
+        if got == expected:
+            passed += 1
+        else:
+            failed += 1
+            print(f"  FAIL [{label}]: expected {expected}, got {got}")
 
     # The truth sets must be non-empty against the real tree, or the gate would
     # pass by knowing nothing.
