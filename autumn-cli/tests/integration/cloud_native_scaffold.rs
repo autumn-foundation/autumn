@@ -400,10 +400,11 @@ fn ci_workflow_runs_a11y_verify() {
 /// Issue #2495: `ci.yml`'s `a11y verify` and `routes audit` steps compile
 /// and introspect the pull request's own code, the same as
 /// posture-gate.yml's `manifest` job — so unlike that job's `posture`
-/// sibling (which only ever reads JSON, and does get a "latest release"
-/// fallback), `ci.yml` must keep installing the CLI pinned to this app's
-/// `autumn-web` version and never silently reach for a CLI this project's
-/// own compatibility check (`autumn doctor`) would call incompatible.
+/// sibling (which only ever reads JSON, and does probe forward for a
+/// compatible release), `ci.yml` must keep installing the CLI pinned to
+/// this app's `autumn-web` version and never silently reach for a CLI this
+/// project's own compatibility check (`autumn doctor`) would call
+/// incompatible.
 #[test]
 fn ci_workflow_always_installs_the_cli_pinned_to_app_version() {
     let temp_dir = scaffold("ci-pinned-cli-app");
@@ -415,7 +416,7 @@ fn ci_workflow_always_installs_the_cli_pinned_to_app_version() {
         "ci.yml must install the CLI pinned to this app's autumn version: {ci}"
     );
     assert!(
-        !ci.contains("trunk-dev"),
+        !ci.contains("trunk-dev") && !ci.contains("for bump in"),
         "ci.yml must never fall back to a CLI this project's own \
          compatibility check would call incompatible: {ci}"
     );

@@ -174,28 +174,44 @@ jobs:
       # ever reads JSON, so it carries none of that job's macro-compilation
       # risk, and `routes posture` postdating the pinned release is exactly
       # the gap #2495 exists to close. So: try the pinned, compatible CLI
-      # first; only if it lacks the command, fall back to the latest
-      # published release for THIS RUN ALONE, rather than pinning every app
-      # to "latest" permanently (which this project's own `autumn doctor`
-      # compatibility check would call incompatible the moment a minor
-      # release ships). The fallback stops firing on its own once a release
-      # in this app's own compatible series adds the command.
+      # first; only if it lacks the command, probe forward through the next
+      # few minor releases and install the FIRST one that has it — never
+      # "whatever is newest today". A new subcommand ships in a minor bump,
+      # not a patch, so guessing forward by minor is enough to find it, and
+      # unlike tracking "latest" (which drifts further from this app's own
+      # pin with every later, unrelated release, forever, until someone
+      # bumps autumn-web), this converges on the SAME minimal release every
+      # run from here on — it does not keep moving. Capped at 5 releases
+      # ahead: past that, this app's own pin is stale enough that guessing
+      # further stops being a reasonable stand-in for actually raising it.
       - name: Install the autumn CLI
         run: |
           curl -fsSL "https://raw.githubusercontent.com/autumn-foundation/autumn/v{{autumn_version}}/scripts/install.sh" \
             | sh -s -- --version "v{{autumn_version}}"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           if ! "$HOME/.local/bin/autumn" routes posture --help >/dev/null 2>&1; then
-            echo "::warning::the autumn CLI pinned to this app's autumn-web version (v{{autumn_version}}) has no \`routes posture\` command yet. Falling back to the latest published release for this run only — it may not exactly match this app's autumn-web version. Raise autumn-web and this workflow's pin together once a compatible release ships the command, to remove the mismatch."
-            curl -fsSL "https://raw.githubusercontent.com/autumn-foundation/autumn/trunk-dev/scripts/install.sh" \
-              | sh
+            echo "::warning::the autumn CLI pinned to this app's autumn-web version (v{{autumn_version}}) has no \`routes posture\` command yet. Probing the next few releases for it, for this run only, rather than tracking whatever is newest — raise autumn-web and this workflow's pin together once one has it, to remove the mismatch for good."
+            pinned_minor="$(printf '%s' "{{autumn_version}}" | cut -d. -f2)"
+            resolved=""
+            for bump in 1 2 3 4 5; do
+              candidate="0.$((pinned_minor + bump)).0"
+              if curl -fsSL "https://raw.githubusercontent.com/autumn-foundation/autumn/v${candidate}/scripts/install.sh" 2>/dev/null \
+                   | sh -s -- --version "v${candidate}" >/dev/null 2>&1 \
+                 && "$HOME/.local/bin/autumn" routes posture --help >/dev/null 2>&1; then
+                resolved="v${candidate}"
+                break
+              fi
+            done
+            if [ -n "$resolved" ]; then
+              echo "::notice::installed ${resolved}, the closest published release with \`routes posture\`"
+            fi
           fi
-          # Fail, never skip, if even the latest release lacks it: a gate
-          # that waves a pull request through because its own tooling is too
-          # old is worse than one that is red.
+          # Fail, never skip, if nothing in range has it: a gate that waves a
+          # pull request through because its own tooling is too old is worse
+          # than one that is red.
           installed_version="$("$HOME/.local/bin/autumn" --version 2>/dev/null || echo unknown)"
           if ! "$HOME/.local/bin/autumn" routes posture --help >/dev/null 2>&1; then
-            echo "::error::even the latest published autumn CLI (${installed_version}) has no \`routes posture\` command yet, so this gate cannot run. It starts running on its own once a release ships the command."
+            echo "::error::neither the pinned autumn CLI (v{{autumn_version}}) nor the next 5 releases after it have a \`routes posture\` command (latest tried: ${installed_version}), so this gate cannot run. Raise this app's autumn-web version and this workflow's pin to a release that has it."
             exit 1
           fi
 

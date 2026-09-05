@@ -556,11 +556,11 @@ fn a_workspace_member_is_not_seeded_with_files_the_workspace_root_owns() {
     assert!(root.join("Dockerfile").is_file());
 }
 
-/// Issue #2495: `posture-gate.yml`'s verdict job now falls back to the
-/// latest published CLI release, for one run, only when the release pinned
-/// to this app's own `autumn-web` version is missing a command it needs;
-/// `ci.yml` (which compiles and introspects the pull request's own code)
-/// never does. `autumn upgrade --apply` renders both through its own,
+/// Issue #2495: `posture-gate.yml`'s verdict job now probes forward through
+/// a bounded run of candidate releases, for one run, only when the release
+/// pinned to this app's own `autumn-web` version is missing a command it
+/// needs; `ci.yml` (which compiles and introspects the pull request's own
+/// code) never does. `autumn upgrade --apply` renders both through its own,
 /// independently constructed `TemplateVars`
 /// (`upgrade/scaffold.rs::current_files`), a different call site than
 /// `autumn new`'s (`new.rs::generate_inner`). Prove the fix reaches the
@@ -592,10 +592,15 @@ fn apply_writes_posture_gate_with_fallback_and_ci_without_it() {
          autumn version as the default: {posture_gate}"
     );
     assert!(
-        posture_gate.contains("trunk-dev") && posture_gate.contains("::warning::"),
-        "posture-gate.yml's verdict job must fall back to the latest \
-         published release, visibly, when the pinned CLI is missing \
+        posture_gate.contains("for bump in") && posture_gate.contains("::warning::"),
+        "posture-gate.yml's verdict job must probe forward for the closest \
+         compatible release, visibly, when the pinned CLI is missing \
          `routes posture`: {posture_gate}"
+    );
+    assert!(
+        !posture_gate.contains("trunk-dev"),
+        "the fallback must land on a specific, bounded candidate release, \
+         not an unbounded, ever-drifting \"latest\": {posture_gate}"
     );
 
     assert!(
@@ -603,7 +608,7 @@ fn apply_writes_posture_gate_with_fallback_and_ci_without_it() {
         "ci.yml must install the CLI pinned to this app's autumn version: {ci}"
     );
     assert!(
-        !ci.contains("trunk-dev"),
+        !ci.contains("for bump in") && !ci.contains("trunk-dev"),
         "ci.yml must never fall back to a CLI this project's own \
          compatibility check would call incompatible: {ci}"
     );

@@ -2955,12 +2955,14 @@ mod tests {
     /// app's own autumn-web version — but always installing "latest" instead
     /// would run this security gate under a CLI this project's own
     /// compatibility check (`doctor.rs::check_version_compat`) calls
-    /// incompatible the moment a minor release ships. So the verdict job
-    /// tries the pinned, compatible CLI first and only falls back to the
-    /// latest published release, for that run alone, when the pinned one
-    /// lacks the command. The `manifest` job — which compiles the pull
-    /// request's own code — gets no such fallback at all: nothing in it may
-    /// run under a CLI this project calls incompatible.
+    /// incompatible the moment a minor release ships, and the gap would only
+    /// ever grow as later, unrelated releases ship. So the verdict job tries
+    /// the pinned, compatible CLI first and, only when it lacks the command,
+    /// probes forward through a bounded run of candidate releases — landing
+    /// on the closest one that has it, not a moving "latest" — for that run
+    /// alone. The `manifest` job — which compiles the pull request's own
+    /// code — gets no such fallback at all: nothing in it may run under a
+    /// CLI this project calls incompatible.
     #[test]
     fn the_posture_gate_prefers_the_pinned_compatible_cli_and_falls_back_only_when_needed() {
         let files = owned(GenerateOptions::default());
@@ -2979,15 +2981,21 @@ mod tests {
             .split_once("  posture:")
             .expect("two jobs: the build and the verdict");
         assert!(
-            !build_job.contains("trunk-dev"),
+            !build_job.contains("for bump in"),
             "the manifest job compiles the pull request's own code and must \
              never fall back to a CLI this project's own compatibility \
              check would call incompatible: {build_job}"
         );
         assert!(
-            verdict_job.contains("trunk-dev") && verdict_job.contains("::warning::"),
-            "the verdict job must fall back to the latest published \
+            verdict_job.contains("for bump in") && verdict_job.contains("::warning::"),
+            "the verdict job must probe forward for the closest compatible \
              release, visibly, when the pinned CLI lacks routes posture: \
+             {verdict_job}"
+        );
+        assert!(
+            !verdict_job.contains("trunk-dev"),
+            "the fallback must land on a specific, bounded candidate \
+             release, not an unbounded, ever-drifting \"latest\": \
              {verdict_job}"
         );
     }
