@@ -1083,7 +1083,14 @@ def _yaml_runs(key, stack, consumer, value=''):
 # What DOES assign in a compose file is `environment:`, in either spelling
 # (`- AUTUMN_X=v` as a list, `AUTUMN_X: v` as a map), plus the fields that
 # invoke a shell. Nothing else in the file names a variable to a process.
-COMPOSE_ASSIGNS = 'environment'
+# …and every consumer spells it. GitHub Actions publishes an `env:` mapping to
+# the steps under it, at workflow, job or step level — `runtime-latency.yml`
+# does exactly that with seven `AUTUMN_*` names — and the assignment view knew
+# only compose's word, so those declarations were blanked with the rest of the
+# non-executed file. Compose's own section was recognised the round it was
+# reported and the neighbouring format was left alone, which is the entry in
+# this file's header with the most recurrences.
+YAML_ASSIGNS = {'compose': 'environment', 'actions': 'env'}
 # The three spellings a compose `environment:` entry takes. Only the first has
 # an `=`, which is why the assignment rungs could not see the other two.
 SEQ_ITEM = re.compile(r'^(\s*)-\s+(.*)$')
@@ -1698,8 +1705,9 @@ def _yaml_blocks(body, interpolated=False, consumer='actions',
                                    l.partition(':')[2]))
         # The ASSIGNMENT view of a compose file keeps only what can name a
         # variable to a process; the expansion view keeps everything.
-        declares = any(k == COMPOSE_ASSIGNS for _, k in stack)
-        keep = ((executed or declares) if (interpolated and assignments)
+        section = YAML_ASSIGNS.get(consumer)
+        declares = section is not None and any(k == section for _, k in stack)
+        keep = ((executed or declares) if assignments
                 else (interpolated or executed))
         # `COMPOSE_DECLARED` reads a SHAPE, so it has to be told where that
         # shape means a declaration. The assignment view also keeps shell
@@ -2549,14 +2557,56 @@ QUOTED = re.compile(r'\\?["\'](AUTUMN_[A-Z0-9_]+)\\?["\']')
 # not carried to the neighbour asking the same question, which is this script's
 # most repeated mistake and now has a second entry in its own header.
 class _ExportAssignment:
-    """`export NAME=…`, where `export` is the command being run."""
+    """`export NAME[=…]`, where `export` is the command being run.
 
-    _start = re.compile(r'(?:^|[;&|(\s])(export)\s+(AUTUMN_[A-Z0-9_]+)=')
+    THE VALUE IS OPTIONAL, and requiring it lost the two-statement form.
+    `help export` in bash gives the grammar as `export [-fn] [name[=value] …]`,
+    and `AUTUMN_X=value; export AUTUMN_X; app` really does publish — verified by
+    running it. The bare assignment is deliberately classified as a local, so
+    with the export unread the name reached nothing and a page documenting it
+    was reported. `export` takes a LIST, too, so `export AUTUMN_A AUTUMN_B=1`
+    publishes both.
+
+    Two of its options are not this: `-n` UNexports, and `-f` exports a shell
+    FUNCTION of that name rather than a variable. Neither publishes a variable,
+    so a line carrying either yields nothing.
+    """
+
+    _start = re.compile(r'(?:^|[;&|(\s])(export)(?=[\s])')
+    _word = re.compile(r'[^\s;&|()]+')
+    _name = re.compile(r'[A-Za-z_][A-Za-z0-9_]*$')
 
     def findall(self, body):
-        return [m.group(2) for m in self._start.finditer(body)
-                if _at_command_word(body, m.start(1),
-                                    _PrefixAssignment._word_end)]
+        out = []
+        for m in self._start.finditer(body):
+            if not _at_command_word(body, m.start(1),
+                                    _PrefixAssignment._word_end):
+                continue
+            i, names, publishes = m.end(1), [], True
+            while i < len(body):
+                while i < len(body) and body[i] in ' \t':
+                    i += 1
+                word = self._word.match(body, i)
+                if not word:
+                    break
+                text = word.group(0)
+                if text.startswith('-') and len(text) > 1:
+                    if set('nf') & set(text[1:]):
+                        publishes = False
+                    i = word.end()
+                    continue
+                assigned = ASSIGN_WORD.match(text)
+                if assigned:
+                    names.append(text[:assigned.end() - 1])
+                    i = _PrefixAssignment._word_end(body, i + assigned.end())
+                    continue
+                if not self._name.match(text):
+                    break
+                names.append(text)
+                i = word.end()
+            if publishes:
+                out.extend(n for n in names if n.startswith('AUTUMN_'))
+        return out
 
 
 ASSIGNED = _ExportAssignment()
@@ -2964,7 +3014,14 @@ BOUND = re.compile(
 # below derives back. What is left in this pattern is the one form that needs
 # no derivation: a QUALIFIED std path, where `env::` is the module and not a
 # variable somebody named.
-ACCESSOR = re.compile(r'\b(?:std::)?env::(var|var_os|set_var)\s*\(')
+# …and a COMPILE-TIME read is a read. `option_env!("AUTUMN_BUILD_GIT_SHA")` in
+# `autumn-macros/src/main_macro.rs` is how five of the build-stamp variables
+# reach the binary, and the pattern knew only the runtime call — so a page
+# documenting one of them rested on an unrelated Dockerfile `ARG` happening to
+# carry the same name. `env!` and `option_env!` take the key first, like the
+# std accessors they are macro forms of.
+ACCESSOR = re.compile(r'\b(?:std::)?env::(var|var_os|set_var)\s*\('
+                      r'|\b(?:(?:core|std)::)?((?:option_)?env)!\s*\(')
 
 # `impl Env for OsEnv` — the types that ARE an environment.
 #
@@ -3948,7 +4005,7 @@ def source_tokens(root):
             # Compose needs its own ASSIGNMENT view — see `COMPOSE_ASSIGNS`.
             # Everywhere else the two views coincide, because a non-compose
             # file keeps only what its consumer executes to begin with.
-            if interpolated:
+            if interpolated or consumer in YAML_ASSIGNS:
                 yaml_code = _yaml_blocks(body, interpolated, consumer, True,
                                          declared_lines)
             body = _yaml_blocks(body, interpolated, consumer)
@@ -3972,7 +4029,12 @@ def source_tokens(root):
         # quote kinds and every unquoted heredoc body.
         code = body if yaml_code is None else yaml_code
         if shell:
-            body, code = _shell_heredocs(body), _shell_heredocs(body, True)
+            # Each view takes the pass over ITSELF. Recomputing `code` from
+            # `body` here discarded the assignment view a moment after building
+            # it — harmless while only compose had one, since compose does not
+            # take the shell passes, and a silent no-op for Actions the moment
+            # it did.
+            body, code = _shell_heredocs(body), _shell_heredocs(code, True)
         if quoted:
             esc = QUOTE_ESCAPE.get(effective_suffix(rel), '\\')
             here = effective_suffix(rel) in HAS_HERE_STRING
@@ -4091,7 +4153,7 @@ def source_tokens(root):
                 # The assignment view has already narrowed these lines to the
                 # `environment:` section, so the shape is all that is left to
                 # read.
-                if interpolated and n in declared_lines:
+                if n in declared_lines:
                     tokens.update(COMPOSE_DECLARED.findall(code_lines[n]))
                 if n not in literal:
                     tokens.update(v for v in EXPANDED.findall(line)
@@ -5380,6 +5442,14 @@ def self_test():
          uncommented('cp //server/share /tmp # note', '#', needs_space=True),
          'cp //server/share /tmp ')
     # Setting a variable publishes it, as `export` does; removing one does not.
+    # A COMPILE-TIME read is a read: `option_env!("AUTUMN_BUILD_GIT_SHA")` is
+    # how five build-stamp variables reach the binary.
+    case('a compile-time env macro is an accessor',
+         [bool(ACCESSOR.search(t)) for t in
+          ('option_env!("AUTUMN_BUILD_GIT_SHA")', 'env!("AUTUMN_X")',
+           'std::env!("AUTUMN_X")', 'envelope!("AUTUMN_X")',
+           'some_env!("AUTUMN_X")')],
+         [True, True, True, False, False])
     case('a write that publishes is an accessor',
          bool(ACCESSOR.search('std::env::set_var("AUTUMN_SYNC__DB_PATH", p)')),
          True)
@@ -5655,6 +5725,25 @@ def self_test():
           ['AUTUMN_X']))
     # `export` must BE the command word, exactly as an assignment must sit
     # before one — the same question, asked of the neighbouring rung.
+    # The VALUE is optional. `help export` gives `export [-fn] [name[=value] …]`,
+    # and each of these was RUN under bash: the two-statement form really
+    # publishes, `-n` unexports and `-f` names a function, so neither of those
+    # publishes a variable.
+    case('an export without a value still publishes',
+         [ASSIGNED.findall(t) for t in
+          ('export AUTUMN_X', 'AUTUMN_X=1; export AUTUMN_X',
+           'export AUTUMN_A AUTUMN_B=1', 'export AUTUMN_X="two words" AUTUMN_Y',
+           'export -n AUTUMN_X', 'export -f AUTUMN_X',
+           'printf %s export AUTUMN_X', 'export')],
+         [['AUTUMN_X'], ['AUTUMN_X'], ['AUTUMN_A', 'AUTUMN_B'],
+          ['AUTUMN_X', 'AUTUMN_Y'], [], [], [], []])
+    # …and an exported name is no longer this file's own local, which is the
+    # whole point of the two-statement form.
+    case('a name exported on a later line is not a local',
+         (lambda b: set(ASSIGNED_ANY.findall(b)) - set(ASSIGNED.findall(b))
+          - set(ASSIGNED_PREFIX.findall(b)))(
+             'AUTUMN_X=1\nexport AUTUMN_X\nAUTUMN_Y=2\n'),
+         {'AUTUMN_Y'})
     case('export counts only as the command word',
          (ASSIGNED.findall('export AUTUMN_X=1'),
           ASSIGNED.findall('printf %s export AUTUMN_X=x'),
@@ -6214,6 +6303,18 @@ def self_test():
                              '      run:\n        shell: PWSH.EXE\n'
                              '    steps:\n      - run: echo $AUTUMN_X\n')),
          [7])
+    # An Actions `env:` mapping publishes to the steps under it, exactly as
+    # compose's `environment:` does — recognising one word and not the other
+    # blanked seven real declarations in `runtime-latency.yml`.
+    case('an Actions env mapping is a declaration',
+         COMPOSE_DECLARED.findall(_yaml_blocks(
+             'on: push\njobs:\n  a:\n    steps:\n      - env:\n'
+             '          AUTUMN_ACTIONS__DECLARED: "1"\n'
+             '        run: echo hi\n    name: AUTUMN_NOT__DECLARED\n',
+             False, 'actions', True)),
+         ['AUTUMN_ACTIONS__DECLARED'])
+    # …and only under `env:`. A name sitting in some other field is a value
+    # the workflow never publishes.
     # Compose may quote either declaration spelling.
     case('a quoted compose declaration is still a declaration',
          COMPOSE_DECLARED.findall('      - AUTUMN_A=1\n      "AUTUMN_B": v\n'
