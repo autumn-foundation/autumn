@@ -507,20 +507,41 @@ pub type PluginRow = BTreeMap<String, PluginValue>;
 ///
 /// Names the first rule the row broke.
 pub fn check_row(row: &PluginRow) -> Result<(), String> {
-    if row.len() > MAX_ROW_COLUMNS {
+    check_row_without(row, None)
+}
+
+/// As [`check_row`], ignoring `skip` if the row carries it.
+///
+/// Exists so a caller that is going to strip a column can check the row it will
+/// *build* without building it first. Stripping by cloning and removing meant a
+/// row over the ceiling was copied in full before the ceiling refused it, and a
+/// legal one was copied twice — once to strip, once to return.
+///
+/// # Errors
+///
+/// One line naming the ceiling the row missed.
+pub fn check_row_without(row: &PluginRow, skip: Option<&str>) -> Result<(), String> {
+    let kept = || {
+        row.iter()
+            .filter(move |(column, _)| Some(column.as_str()) != skip)
+    };
+    let columns = kept().count();
+    if columns > MAX_ROW_COLUMNS {
         return Err(format!(
-            "a row may carry at most {MAX_ROW_COLUMNS} columns; this one carries {}",
-            row.len()
+            "a row may carry at most {MAX_ROW_COLUMNS} columns; this one carries {columns}"
         ));
     }
-    let weight = row_weight(row);
+    let weight = kept().fold(0, |sum: usize, (column, value)| {
+        sum.saturating_add(column.len())
+            .saturating_add(value.weight())
+    });
     if weight > MAX_ROW_BYTES {
         return Err(format!(
             "a row may carry at most {MAX_ROW_BYTES} bytes across its columns; this one carries \
              {weight}"
         ));
     }
-    for (column, value) in row {
+    for (column, value) in kept() {
         if !super::grants::is_grantable_ident(column) {
             return Err(format!(
                 "column name {:?} is not a lower-case `[a-z][a-z0-9_]*` identifier; the host \

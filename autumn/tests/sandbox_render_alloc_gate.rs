@@ -1,5 +1,5 @@
-//! Isolated integration test: a render tag or attribute name the allow-list is
-//! going to refuse must not be copied on its way to being refused.
+//! Isolated integration test: guest strings the host is going to refuse must
+//! not be copied on their way to being refused — render names, and DB rows.
 //!
 //! `write_node` and `write_attribute` used to `to_ascii_lowercase()` the
 //! guest's string and *then* look it up, so a tag or attribute name the size of
@@ -89,5 +89,88 @@ fn refusing_an_unknown_attribute_does_not_copy_its_name() {
         extra < NAME_BYTES as u64,
         "refusing a {NAME_BYTES}-byte attribute name allocated {extra} bytes more than \
          refusing a short one — the name was copied on its way to being refused",
+    );
+}
+
+// ── DB rows ─────────────────────────────────────────────────────────────
+
+/// Drive the real dispatch path, which is where the copy happened.
+///
+/// `validated_row` is private, and measuring `check_row_without` instead would
+/// prove nothing: that function never cloned. The clone was in the caller.
+fn insert_cost(bytes: usize) -> u64 {
+    use autumn_web::plugin_sandbox::capability::{
+        CapabilityCall, CapabilityRuntime, CapabilityServices, MemoryPluginStore, PluginRow,
+        PluginStore, PluginValue,
+    };
+    use std::sync::Arc;
+
+    let manifest = autumn_web::plugin_sandbox::SandboxManifest::parse(&format!(
+        r#"
+name = "autumn-plugin-shop"
+version = "0.1.0"
+wire_version = 1
+prefix = "/shop"
+capabilities = ["http-request", "db"]
+sha256 = "{digest}"
+
+[[routes]]
+method = "GET"
+path = "/shop/panel"
+
+[grants]
+tables = ["orders"]
+"#,
+        digest = "b".repeat(64)
+    ))
+    .expect("valid manifest");
+
+    let store = MemoryPluginStore::new();
+    let mut runtime = CapabilityRuntime::new(
+        &manifest,
+        CapabilityServices {
+            db: Some(Arc::clone(&store) as Arc<dyn PluginStore>),
+            ..CapabilityServices::none()
+        }
+        .for_tenant("alpha"),
+    );
+
+    // Built outside the measured window, deliberately: what is measured is what
+    // dispatch does with a row it is handed, not the cost of handing it one.
+    let mut row = PluginRow::new();
+    row.insert("blob".to_owned(), PluginValue::Text("x".repeat(bytes)));
+    let call = CapabilityCall::DbInsert {
+        id: 1,
+        table: "orders".to_owned(),
+        row,
+    };
+
+    allocation_counter::measure(|| {
+        let out = runtime.dispatch(&call);
+        std::hint::black_box(&out);
+    })
+    .bytes_total
+}
+
+#[test]
+fn refusing_an_oversized_row_does_not_copy_it() {
+    // `validated_row` used to clone the row and strip the host's column from
+    // the copy, so a row past `MAX_ROW_BYTES` was duplicated in full before the
+    // ceiling refused it. Measured rather than asserted for the usual reason:
+    // the denial is identical either way, and only the allocation differs.
+    let small = insert_cost(16);
+    let big = insert_cost(NAME_BYTES);
+
+    // A quarter of the row, not the whole of it. Measured: with the copy the
+    // difference is ~523 KiB, without it the big row allocates *less* than the
+    // small one (a shorter denial string), so the gap is zero. A threshold at
+    // `NAME_BYTES` itself would have sat inside the noise of the small row's
+    // own allocations and passed against the defect — it did, before this was
+    // measured rather than assumed.
+    let extra = big.saturating_sub(small);
+    assert!(
+        extra < (NAME_BYTES / 4) as u64,
+        "refusing a {NAME_BYTES}-byte row allocated {extra} bytes more than refusing a \
+         small one — the row was copied on its way to being refused",
     );
 }

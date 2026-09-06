@@ -40,9 +40,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use super::{
-    CallResult, CallValue, CapabilityCall, CapabilityRuntime, DenialReason, PluginRow, check_row,
-};
+use super::{CallResult, CallValue, CapabilityCall, CapabilityRuntime, DenialReason, PluginRow};
 
 /// The prefix every sandboxed plugin's physical table carries.
 ///
@@ -497,15 +495,19 @@ fn validated_row(row: &PluginRow) -> Result<PluginRow, Denial> {
     // `MAX_ROW_BYTES`, would be refused on the way back in for carrying a column
     // the host added itself. Counting it would make the ceilings a function of
     // where the row had been rather than of what the plugin wrote.
-    let mut row = row.clone();
-    row.remove(ID_COLUMN);
-    let row = &row;
-    if let Err(detail) = check_row(row) {
+    //
+    // Checked on the borrowed row, excluding that column, rather than on a
+    // stripped copy: cloning first meant a row over `MAX_ROW_BYTES` was
+    // duplicated in full before the ceiling refused it — guest-controlled, up
+    // to the frame — and a legal one was duplicated twice, once to strip and
+    // once to return. One owned copy is built at the end, after every check has
+    // passed.
+    if let Err(detail) = super::check_row_without(row, Some(ID_COLUMN)) {
         return Err(Box::new(move |id| {
             CallResult::denied(id, DenialReason::Malformed, detail)
         }));
     }
-    for column in row.keys() {
+    for column in row.keys().filter(|column| column.as_str() != ID_COLUMN) {
         if RESERVED_COLUMNS.contains(&column.as_str()) {
             let column = column.clone();
             return Err(Box::new(move |id| {
@@ -520,9 +522,13 @@ fn validated_row(row: &PluginRow) -> Result<PluginRow, Denial> {
             }));
         }
     }
-    // Already stripped above, before the ceilings ran; see `RESERVED_COLUMNS`
-    // for why it is stripped rather than refused.
-    Ok(row.clone())
+    // The one copy, built now that the row is known to be legal. `ID_COLUMN` is
+    // dropped rather than refused; see `RESERVED_COLUMNS` for why.
+    Ok(row
+        .iter()
+        .filter(|(column, _)| column.as_str() != ID_COLUMN)
+        .map(|(column, value)| (column.clone(), value.clone()))
+        .collect())
 }
 
 /// The same checks for a `db-query` *filter*, where stripping is not an option.
