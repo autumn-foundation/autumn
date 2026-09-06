@@ -28,11 +28,17 @@ Reproduce every claim below with the commands in 🔬 Reproduce.
 ## 📈 Evidence (Tier 2 — repository record)
 
 1. **Core WASI memory-access plumbing is duplicated verbatim.** `memory_of`,
-   `read_u32`, `write_u32`, `iovec`, and `write_two_zeroes` — the functions
-   every guest-facing WASI call goes through to touch guest linear memory —
-   are byte-identical between the two files modulo one lifetime parameter
-   (`HostState<'kv>` vs `HostState`). Confirmed by direct diff, not
-   name-matching.
+   `read_u32`, `write_u32`, and `iovec` — the functions every guest-facing
+   WASI call goes through to touch guest linear memory — are byte-identical
+   between the two files modulo one lifetime parameter (`HostState<'kv>` vs
+   `HostState`). Confirmed by direct diff, not name-matching. `write_two_zeroes`
+   (`autumn-edge/src/host.rs:801`, `autumn/src/plugin_sandbox/host.rs:3622`) is
+   the same logic reached through the same two calls, but not textually
+   identical: `autumn-edge` takes `Caller` by value and reborrows it as
+   `&mut caller` at each call site, while `plugin_sandbox` takes `&mut Caller`
+   directly and passes it straight through — a real difference in the two
+   files' calling convention for this helper, not just a lifetime
+   parameter, even though the two bodies decide the same thing the same way.
 
 2. **The guest-visible WASI surface has already diverged.** `plugin_sandbox`
    serves `clock_res_get` and `fd_tell` as real, answered capabilities
@@ -174,9 +180,15 @@ git log origin/trunk-dev --follow --diff-filter=A --format='%ad %s' --date=short
 # No commits to the edge host since the plugin sandbox landed
 git log origin/trunk-dev --oneline --since=2026-09-03 -- autumn-edge/src/host.rs
 
-# Duplicated plumbing (byte-identical modulo one lifetime parameter)
+# Duplicated plumbing (byte-identical modulo one lifetime parameter):
+# memory_of / read_u32 / write_u32 / iovec
 diff <(sed -n '453,500p' autumn-edge/src/host.rs) \
      <(sed -n '2843,2890p' autumn/src/plugin_sandbox/host.rs)
+
+# write_two_zeroes: same two calls, same branching, but a real calling-
+# convention difference (by-value + reborrow vs. by-ref), not just a lifetime
+diff <(sed -n '801,814p' autumn-edge/src/host.rs) \
+     <(sed -n '3622,3635p' autumn/src/plugin_sandbox/host.rs)
 
 # Diverged WASI surface: present in plugin_sandbox, absent from autumn-edge
 grep -n '"clock_res_get"\|"fd_tell"' autumn/src/plugin_sandbox/host.rs
@@ -185,6 +197,8 @@ grep -n 'clock_res_get\|fd_tell' autumn-edge/src/host.rs   # no output
 # The design doc's own self-flagged, unresolved risk
 grep -n "could drift" docs/plans/2026-08-27-sandboxed-plugins-first-slice.md
 
-# No prior ADR or report names this pairing
-grep -rln "plugin_sandbox" docs/adr/ docs/reports/   # no output before this file
+# No prior ADR or report names this pairing. Query the tree *before* this
+# file was added (HEAD^) — after this change lands, the same grep against the
+# working tree will also match this report itself and prove nothing.
+git grep -rln "plugin_sandbox" HEAD^ -- docs/adr/ docs/reports/   # no output
 ```
