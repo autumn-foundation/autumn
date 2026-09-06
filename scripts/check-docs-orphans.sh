@@ -548,6 +548,10 @@ ATTR_ASSIGNED = (r'[A-Za-z_:][-\w:.]*' + _TWS + r'*=' + _TWS +
                  r'*(?:' + _Q + r'|' + _Q1 + r'|[^\s"\'=<>`]+)')
 ATTR = (r'[A-Za-z_:][-\w:.]*(?:' + _TWS + r'*=' + _TWS +
         r'*(?:' + _Q + r'|' + _Q1 + r'|[^\s"\'=<>`]+))?')
+# The same, confined to a single line — for the block start conditions,
+# which require the whole tag on the opening line.
+ATTR_1LINE = (r'[A-Za-z_:][-\w:.]*(?:[ \t]*=[ \t]*'
+              r'(?:"[^"\n]*"|\'[^\'\n]*\'|[^\s"\'=<>`]+))?')
 
 # The CommonMark type-1 tags. Declared here rather than beside the block
 # pattern that used to own them, because the line scan below needs them
@@ -977,9 +981,14 @@ RAW_BLOCK_TYPE7 = re.compile(
     # only its name, optional whitespace and `>`. Sharing one expression let
     # `</span a=x>` count as a tag, so a type-7 block opened on a line that
     # is ordinary paragraph text and swallowed the link below it.
-    r'^ {0,3}(?:<[A-Za-z][A-Za-z0-9-]*(?:' + _TWS + r'+' + ATTR + r')*'
-    + _TWS + r'*/?>'
-    r'|</[A-Za-z][A-Za-z0-9-]*' + _TWS + r'*>)[ \t]*$'
+    # ONE line. Type 7 wants a complete tag followed by nothing but
+    # whitespace to the end of the line, so `<span` / ` title=x>` opens no
+    # block at all and the markdown under it renders. `_TWS` permits a
+    # newline — right for an INLINE tag, which may wrap — and using it here
+    # let a split tag swallow the link below it.
+    r'^ {0,3}(?:<[A-Za-z][A-Za-z0-9-]*(?:[ \t]+' + ATTR_1LINE + r')*'
+    r'[ \t]*/?>'
+    r'|</[A-Za-z][A-Za-z0-9-]*[ \t]*>)[ \t]*$'
     r'(?:\n(?![ \t]*$)[^\n]*)*',
     re.M)
 # A raw anchor IS navigation, so its destination is resolved like any other —
@@ -1415,6 +1424,11 @@ def definition_labels(txt):
 
 # An image, in either spelling, inside a link's rendered content.
 ANY_IMAGE = re.compile(r'!\[|<img\b', re.I)
+# Any HTML tag, open or close, quote-aware so a `>` inside an attribute
+# does not end it early.
+ANY_TAG = re.compile(
+    r'<[A-Za-z][A-Za-z0-9-]*(?:' + _TWS + r'+' + ATTR + r')*' + _TWS + r'*/?>'
+    r'|</[A-Za-z][A-Za-z0-9-]*' + _TWS + r'*>', re.I)
 
 
 def has_content(image_span, masked_span):
@@ -1427,7 +1441,12 @@ def has_content(image_span, masked_span):
     source instead counted the `![fake](x.png)` inside
     `<a href=…><!-- ![fake](x.png) --></a>`, an anchor that renders nothing.
     """
-    return bool(masked_span.strip() or ANY_IMAGE.search(image_span))
+    # Tags are stripped before asking whether there is text: an empty element
+    # is markup, not content. `<a href=…><span></span></a>` has no text and no
+    # clickable area, and counting its tag SOURCE as content made it a route —
+    # the same nothing as `<a href=…></a>`, spelled with more bytes.
+    return bool(ANY_TAG.sub('', masked_span).strip()
+                or ANY_IMAGE.search(image_span))
 
 
 def _image_resolves(m, defined):
@@ -3643,6 +3662,31 @@ self_test() {
   printf '# Jobs\n\nSee [mail][x!].\n\n[x\\!]: mail.md\n' > "$c9hu/docs/guide/jobs.md"
   git -C "$c9hu" add -A && git -C "$c9hu" commit -qm label-escape-def-only
   check "a label escaped only in the definition does not resolve" fail "$c9hu"
+
+  # An empty element is markup, not content: nothing to see, nothing to click.
+  local c9hv="$tmp/c9hv"; make_corpus "$c9hv"
+  printf '# Jobs\n\n<a href="mail.md"><span></span></a>\n' > "$c9hv/docs/guide/jobs.md"
+  git -C "$c9hv" add -A && git -C "$c9hv" commit -qm anchor-empty-markup
+  check "an anchor holding empty markup is not an edge" fail "$c9hv"
+
+  # ...but the same element with TEXT in it is a route.
+  local c9hw="$tmp/c9hw"; make_corpus "$c9hw"
+  printf '# Jobs\n\n<a href="mail.md"><span>go</span></a>\n' > "$c9hw/docs/guide/jobs.md"
+  git -C "$c9hw" add -A && git -C "$c9hw" commit -qm anchor-markup-with-text
+  check "an anchor holding text inside markup is a route" pass "$c9hw"
+
+  # A type-7 block needs its whole tag on ONE line, so a split tag opens
+  # nothing and the link under it renders.
+  local c9hx="$tmp/c9hx"; make_corpus "$c9hx"
+  printf '# Jobs\n\n<span\n title=x>\nSee [mail](mail.md).\n' > "$c9hx/docs/guide/jobs.md"
+  git -C "$c9hx" add -A && git -C "$c9hx" commit -qm type7-split-tag
+  check "a tag split across lines opens no type-7 block" pass "$c9hx"
+
+  # ...while the same tag on one line still opens one.
+  local c9hy="$tmp/c9hy"; make_corpus "$c9hy"
+  printf '# Jobs\n\n<span title=x>\nSee [mail](mail.md).\n' > "$c9hy/docs/guide/jobs.md"
+  git -C "$c9hy" add -A && git -C "$c9hy" commit -qm type7-one-line-tag
+  check "the same tag on one line opens a type-7 block" fail "$c9hy"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
