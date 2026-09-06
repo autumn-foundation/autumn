@@ -317,27 +317,6 @@ fn validate_path(path: &LitStr) -> Result<(), TokenStream> {
     Ok(())
 }
 
-/// Parse and validate an async handler function from macro input.
-///
-/// Returns `Ok(func)` if valid, or a compile error `TokenStream` if not.
-/// Validates: is a function, is async.
-pub fn parse_async_handler(item: TokenStream) -> Result<ItemFn, TokenStream> {
-    let input_fn: ItemFn = syn::parse2(item.clone()).map_err(|_| {
-        syn::Error::new_spanned(item, "route macros can only be applied to functions")
-            .to_compile_error()
-    })?;
-
-    if input_fn.sig.asyncness.is_none() {
-        return Err(syn::Error::new_spanned(
-            input_fn.sig.fn_token,
-            "Autumn route handlers must be async functions",
-        )
-        .to_compile_error());
-    }
-
-    Ok(input_fn)
-}
-
 /// Split macro input into any leading non-function items plus a trailing
 /// function item, tolerating (but not requiring) leading items ahead of the
 /// handler.
@@ -385,7 +364,7 @@ pub fn split_leading_items_and_fn(
 /// Parse an async handler function from macro input, tolerating leading
 /// non-function items ahead of it (see [`split_leading_items_and_fn`]).
 ///
-/// Validated exactly as [`parse_async_handler`] does (must be a function,
+/// Validates exactly what a bare handler parse would (must be a function,
 /// must be async); every earlier item is returned as an opaque token stream
 /// the caller is responsible for re-emitting verbatim.
 ///

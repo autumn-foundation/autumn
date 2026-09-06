@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **deploy:** `autumn deploy check` now prints the same config-manifest signal
+  `autumn deploy up` already prints (#1952 check/up parity) — a confirming
+  line naming the `autumn.toml` (and, when present, `autumn-<profile>.toml`)
+  that will be uploaded, or the loud "no autumn.toml found" warning when the
+  project has none. Before this, an operator relying on `deploy check` as the
+  documented way to catch a broken deploy before touching the server had no
+  signal at all that the deployed app would silently run built-in defaults —
+  they only found out once they actually ran `up`. Purely informational: it
+  is not a graded preflight check and never affects `check`'s exit code. See
+  `docs/guide/deployment.md`'s "Your `autumn.toml` is deployed alongside the
+  binary" section for the full behavior this closes out. [no-plugin]
+
 - **testing:** a real-ACME end-to-end test drives the ACME order state
   machine (order → HTTP-01 → finalize → issue) against a real, independently-
   implemented ACME server — [Pebble](https://github.com/letsencrypt/pebble),
@@ -1829,6 +1841,190 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **macros: stacked `#[secured]`/`#[step_up]`/`#[throttle]` above a route
+  attribute broke instead of composing (issue #2516):** #1668 moved each of
+  these three body guards' checks out of the handler body and into a
+  `FromRequestParts` gate — a hidden struct + trait impl now emitted as
+  sibling items ahead of the (rewritten) handler function, rather than
+  wrapping the body in place. Every macro downstream of one of these guards
+  — the route macro (`#[get]`/`#[post]`/etc.), and the three guards
+  themselves when stacked on each other — still assumed its `item` input was
+  exactly one function, so a guard written above another guard or the route
+  attribute handed the next macro a multi-item stream it rejected outright
+  with a confusing "route macros can only be applied to functions" error,
+  silently on every PR touching route macros regardless of whether the
+  guards were involved (the failure is in the default, always-compiled
+  `autumn-macros` unit suite). Fixed by teaching every one of those call
+  sites (`parse::split_leading_items_and_fn`, shared by the route/static/ws
+  macros and reused directly by the three guards) to recover the trailing
+  function from a longer item sequence and re-emit everything before it
+  verbatim, so an earlier guard's gate type is never dropped. Separately,
+  `#[step_up]`/`#[throttle]`'s move to a gate had also stopped emitting
+  their `__AUTUMN_STEP_UP_MAX_AGE`/`__AUTUMN_THROTTLE_ROUTE_ID` marker
+  consts into the handler body, which is what lets the route macro tell a
+  real guard's `__autumn_inner` return-type wrapper apart from unrelated
+  code (#1677) — restored by emitting an inert copy of each into the body
+  alongside the real one in the gate, mirroring `#[secured]`'s existing
+  `role_scope_consts`/`markers` split.
+
+- **macros: `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` stacked
+  with `#[static_get]` is now a compile error, not a false "protected"
+  certification:** the fix above taught `#[static_get]` to accept a guard's
+  leading gate items via `parse::parse_async_handler_with_leading_items`,
+  and an initial pass had it read the guard's role/scope marker back off the
+  handler via `api_doc::extract_secured_info(&input_fn)` — mirroring
+  `crate::route` — so a `#[secured("admin")]`-guarded static route would
+  report `secured: true` to `routes audit` instead of the previous hardcoded
+  `secured: false`. A follow-up Codex pass caught that this was actively
+  wrong, not just incomplete: cached SSG/ISR responses are served by the
+  static-first middleware *before* the inner router (session, auth) is ever
+  reached (`AppBuilder::static_gate`'s doc comment spells this out), so the
+  guard only ever runs on the rare synchronous render/revalidate call, never
+  on a cache hit — the overwhelming majority of live traffic to a cached
+  page. Certifying `secured: true` there made `routes audit` wrongly attest
+  the page as protected when an anonymous request against a warm cache entry
+  gets the cached HTML unauthenticated either way. `#[static_get]` now
+  rejects the combination outright, in both attribute orders, and the error
+  points authors at `AppBuilder::static_gate` — the gate actually built to
+  protect pre-rendered pages (Codex review on #2513, P1). That rejection's
+  first version detected a guard expanded *above* `#[static_get]` by
+  checking for a leading sibling gate item — a shape only a test that
+  hand-concatenates one macro's raw multi-item output into another's input
+  can produce; the real compiler never bundles a sibling item alongside the
+  one it hands to the next attribute macro in a stack (confirmed by
+  `param_helpers::extract_fn_item`'s own doc comment, added for exactly this
+  reason elsewhere in this crate). So in genuine compiled code that leading-
+  item check could never fire, and the rejection for this — the more
+  natural — attribute order silently never worked, an eighth Codex finding
+  on #2513 caught. Fixed by checking what actually does survive onto the
+  single function the real compiler hands `static_get_macro`: the guard's
+  own pre-body gate parameter for `#[secured]`/`#[step_up]`/`#[throttle]`
+  (`param_helpers::has_any_guard_gate_param`), and the role/policy-check
+  body marker for `#[authorize]`, which inserts no such parameter
+  (`api_doc::extract_secured_info`, the same recovery the `#[get]`/`#[post]`
+  route macro already relies on for this scenario). The accompanying unit
+  tests were corrected the same way — sliced through
+  `param_helpers::extract_fn_item` rather than fed a raw multi-item macro
+  output — so they exercise the shape the compiler actually produces instead
+  of a synthetic one, and would have caught this gap themselves.
+
+- **macros: `#[secured]`/`#[step_up]`/`#[throttle]` above `#[ws]` never
+  actually worked, and generated silently-broken code rather than a clear
+  error:** `ws_macro` builds a two-function wrapper that calls the user's
+  handler by hand, and for each non-`AppState` parameter it echoed that
+  parameter's *pattern* straight back as the call argument. A guard expanded
+  above `#[ws]` inserts a leading `_: __AutumnXGate` parameter, and `_` is a
+  pattern, not a valid expression — `#fn_name(_)` does not compile (Codex
+  review on #2513, P1). Fixing that forwarding surfaced a deeper,
+  pre-existing incompatibility Codex caught on the very next review pass:
+  every one of those three guards unconditionally rewrites the wrapped
+  function's return type to `Response` and threads its original return value
+  through `IntoResponse::into_response`, which cannot hold for a `#[ws]`
+  handler — it returns `impl WsHandler` (a plain closure), not something
+  `IntoResponse`. Properly supporting the combination would mean teaching
+  all three guard macros to special-case a WebSocket handler's return type,
+  a cross-cutting redesign out of scope here. `#[ws]` now rejects the
+  combination outright with a purpose-written compile error (mirroring the
+  existing `#[edge]`-on-`#[ws]` rejection) instead of ever emitting code that
+  fails to compile deep inside guard-generated internals; the error explains
+  the incompatibility and suggests checking authorization via an extractor
+  inside the upgrade handler instead. That rejection initially only checked
+  for an already-*expanded* guard above `#[ws]` (a non-empty leading-items
+  stream); a third Codex pass caught that the *other* attribute order —
+  `#[ws]` outermost, the guard still a live, unexpanded attribute below it —
+  slips past that check entirely (nothing has expanded yet, so there are no
+  leading items) and generates the same silently-broken code, just one macro
+  expansion later. The rejection then also scanned the handler's still-live
+  attributes for `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` — but
+  a fourth Codex pass caught that `#[authorize]` above `#[ws]` (already
+  expanded) slips past *both* checks: unlike the other three guards,
+  `authorize_macro` emits no separate `FromRequestParts` gate sibling item
+  (so leading items stay empty) and it removes its own attribute once
+  consumed (so the live-attribute scan finds nothing either). Rather than
+  keep chasing each guard's particular expansion shape, the rejection now
+  checks the actual invariant directly: all four guards rewrite the return
+  type to the exact same `-> Response` (confirmed identical across all four
+  guards' source), which a legitimate `#[ws]` handler — required to return
+  `impl WsHandler` — never would. Separately, `#[ws]`'s `ApiDoc` had the
+  same hardcoded `secured: false, required_roles: &[]` gap `#[static_get]`
+  had for the (still-supported) case of a live `#[authorize]` attribute or
+  policy check — fixed the same way, via `api_doc::extract_secured_info`
+  (Codex review on #2513, P2). That return-type check itself had a false-
+  positive gap a fifth Codex pass caught: it matched a `Response` return
+  type by its *last path segment only*, so a `#[ws]` handler legitimately
+  returning some unrelated user type merely *named* `Response` (e.g.
+  `my_crate::Response`, implementing the public `WsHandler` trait) would be
+  misclassified as guard-incompatible and rejected outright. Fixed by
+  matching the guard's exact fully qualified return path segment-by-segment
+  (`::autumn_web::reexports::axum::response::Response`) instead of just the
+  final identifier.
+
+- **macros: `#[static_get]`/`#[ws]` missed a `#[secured]`/`#[step_up]`/
+  `#[throttle]`/`#[authorize]` guard hidden behind
+  `#[cfg_attr(predicate, ...)]`:** both rejections' "guard still a live,
+  unexpanded attribute below the route macro" check compared each
+  attribute's own path against the guard names directly, so it correctly
+  caught a bare `#[secured("admin")]` written below `#[static_get]`/`#[ws]`
+  but missed the identical case written as
+  `#[cfg_attr(feature = "auth", secured("admin"))]` — `cfg_attr` is a
+  built-in attribute the compiler does not resolve until after every
+  attribute macro has finished expanding, so the outer route macro sees a
+  live `cfg_attr` attribute, not `secured`, and let the combination through
+  uncaught (ninth Codex finding on #2513). Fixed by teaching the shared scan
+  (`param_helpers::attr_or_cfg_attr_matches_any`, now used by both
+  `static_route.rs` and `ws.rs`) to also look inside a `cfg_attr`'s own
+  argument list for a wrapped guard attribute.
+
+- **macros: `#[static_get]`/`#[ws]` also missed a guard attribute imported
+  under an alias (e.g. `use ::autumn_web::secured as auth;` then
+  `#[auth("admin")]`):** a proc-macro attribute is invoked on raw syntax
+  before the compiler resolves imports, so there is no API for a proc macro
+  to ask "does this path actually name `autumn_web::secured`" — an aliased
+  guard's spelling is fundamentally invisible to the name-based scan the
+  ninth finding's fix still relied on, however thorough (tenth Codex finding
+  on #2513, and a materially different problem from the ninth: no name-based
+  check, however exhaustive, can close this one). Fixed the only way a
+  syntactic scan can be made sound against a rename it cannot see through:
+  `#[static_get]`/`#[ws]` now unconditionally leave a marker const in the
+  body of every handler they accept
+  (`param_helpers::STATIC_ROUTE_HANDLER_MARKER`/`WS_HANDLER_MARKER`,
+  mirroring the `__AUTUMN_STEP_UP_MAX_AGE`/`__AUTUMN_THROTTLE_ROUTE_ID`
+  body-marker-const technique already used to communicate across a macro
+  expansion boundary elsewhere in this crate), and each of
+  `secured_macro`/`step_up_macro`/`throttle_macro`/`authorize_macro` now
+  checks for it (`param_helpers::reject_if_incompatible_route_marker`)
+  immediately after parsing its own input — before doing any of its own
+  work — regardless of what name or alias the compiler invoked it under.
+  Covered by five new tests (one per guard, plus `#[ws]`) that construct the
+  exact scenario an alias produces: accept a still-unrecognized attribute
+  through `#[static_get]`/`#[ws]` first, then invoke the guard's macro
+  function directly on the result, proving the rejection fires without
+  ever relying on the guard's surface name.
+
+- **macros: the tenth finding's marker could still be missed when another
+  attribute macro sat between `#[static_get]`/`#[ws]` and the aliased
+  guard:** `has_body_const_marker` only scanned a handler's top-level body
+  statements, but `#[cached]` — a real, already-shipped macro in this crate
+  — re-homes a handler's entire original body one level deeper, inside a
+  `(|| async move { … })().await` closure IIFE (`cached_macro`'s
+  `compute`). `#[static_get] #[cached] #[auth("admin")]` (`auth` an alias
+  for `secured`) would leave the marker buried inside that IIFE, invisible
+  to the flat scan, silently reopening the exact cache-bypass hole this
+  whole rejection exists to close (eleventh Codex finding on #2513).
+  `edge::stmts_have_marker` already solves this same "wrapper shape buries
+  a marker" problem for `#[edge]` — by recursing into any expression an
+  earlier guard's rewrite (or `#[cached]`'s IIFE, once taught the shape)
+  might hide a marker inside — via the shared
+  `idempotency_guard::expr_nested_async_body` helper, so `#[static_get]`'s
+  new marker check needed the same descent, not a special case of its own.
+  Taught `expr_nested_async_body` to also unwrap a zero-argument closure
+  call (`(|| async move { … })()`, `#[cached]`'s exact shape), and switched
+  `param_helpers::has_body_const_marker` to delegate to
+  `edge::stmts_have_marker` instead of its own flat scan, so every consumer
+  of the marker-const technique benefits uniformly. Covered by a new test
+  that runs a handler through `#[static_get]` then `#[cached]` before the
+  aliased guard, confirmed red (the marker present but buried, no compile
+  error) before the fix and green after.
 - **Database pool refusals echoed credentials into the boot log (issue
   #1905):** the pool's boot-time refusals name the offending target so the
   message is actionable, and did so verbatim. `setup_database` surfaces

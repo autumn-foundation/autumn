@@ -16,6 +16,19 @@ use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, LitInt, LitStr, Token};
 
+/// Attribute names of the body-guard macros that cannot meaningfully gate a
+/// `#[static_get]` route. See `static_get_macro`'s rejection of the
+/// combination in either attribute order.
+const INCOMPATIBLE_GUARD_ATTRS: [&str; 4] = ["secured", "step_up", "throttle", "authorize"];
+
+/// Error message for `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]`
+/// combined with `#[static_get]`, in either attribute order.
+pub const INCOMPATIBLE_GUARD_MSG: &str = "`#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` \
+     cannot be combined with `#[static_get]`: cached SSG/ISR responses are served by the \
+     static-first middleware before the inner router (session, auth) is ever reached, so this \
+     guard would not protect a cache hit. Use `AppBuilder::static_gate` to gate pre-rendered \
+     pages instead.";
+
 /// Parsed attributes for `#[static_get("/path", params = fn, revalidate = N)]`.
 struct StaticGetAttrs {
     path: LitStr,
@@ -160,15 +173,19 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // Parse the async handler function
-    let input_fn = match crate::parse::parse_async_handler(item) {
-        Ok(f) => f,
-        Err(err) => return err,
-    };
+    let (leading_guard_items, mut input_fn) =
+        match crate::parse::parse_async_handler_with_leading_items(item) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
 
-    let fn_name = &input_fn.sig.ident;
+    // Owned rather than borrowed: `input_fn` is mutated below (a marker gets
+    // spliced into its body) once the guard checks pass, and these need to
+    // outlive that mutable borrow to reach the final `quote!` at the bottom.
+    let fn_name = input_fn.sig.ident.clone();
     let route_info_name = format_ident!("__autumn_route_info_{}", fn_name);
     let static_meta_name = format_ident!("__autumn_static_meta_{}", fn_name);
-    let vis = &input_fn.vis;
+    let vis = input_fn.vis.clone();
 
     // Honor a `#[public]` marker on the handler so the route audit gate can
     // classify this static route as `public` rather than `unclassified`.
@@ -176,6 +193,86 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // `crate::route`), which is the only place `is_public` was previously
     // wired.
     let is_public = crate::api_doc::is_public(&input_fn);
+
+    // `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` cannot
+    // meaningfully gate a `#[static_get]` route: cached SSG/ISR responses
+    // are served by the static-first middleware *before* the inner router
+    // (session, auth) is ever reached (see `AppBuilder::static_gate`'s doc
+    // comment in `autumn/src/app.rs`), so a route-level guard here only
+    // ever runs on the rare synchronous render/revalidate call, never on a
+    // cache hit — the overwhelming majority of live traffic to a cached
+    // page. An earlier version of this macro derived `secured: true` from
+    // such a guard, which made `routes audit` wrongly certify the page as
+    // protected (P1, #2513 Codex review). Reject the combination outright,
+    // in both stacking orders, pointing authors at the gate actually built
+    // for this: `AppBuilder::static_gate`.
+    //
+    // `unexpanded_guard_attr` catches `#[static_get]` outermost, the guard
+    // still a live attribute below it — confirmed reachable in real
+    // compiled code by the identical, already-shipped `#[edge]`-vs-guard
+    // rejection's own trybuild fixture (`edge_with_secured.rs`). This scan
+    // must also see a guard hidden behind `#[cfg_attr(predicate, secured(..))]`:
+    // `cfg_attr` itself is not resolved until after every attribute macro
+    // has finished expanding, so a plain `attr.path()` name check sees only
+    // `cfg_attr`, never the guard it wraps, letting a feature-gated guard
+    // slip past this rejection entirely (Codex review on #2513, ninth
+    // finding) — `param_helpers::attr_or_cfg_attr_matches_any` looks inside
+    // `cfg_attr`'s own argument list for this reason. But a guard written
+    // *above* `#[static_get]` (the more natural order) is a
+    // materially different case: by the time the real compiler invokes
+    // `static_get_macro`, the guard has already fully expanded and consumed
+    // itself, so there is no live attribute left to find, and — contrary to
+    // an earlier version of this check — no leading sibling gate item
+    // either. Attribute macros are only ever invoked with the tokens of the
+    // single item they still decorate, never bundled with a sibling item
+    // another macro emitted alongside it (see
+    // `param_helpers::extract_fn_item`'s doc comment); `leading_guard_items`
+    // being non-empty here is a shape only a test that hand-concatenates
+    // macro outputs can produce, never the real compiler (Codex review on
+    // #2513, eighth finding — the fix below to the P1 finding on this same
+    // line still only checked that unreachable shape). What DOES survive
+    // onto the surviving single function is the guard's own signature/body
+    // rewrite: `#[secured]`/`#[step_up]`/`#[throttle]` each insert a
+    // handler-unique pre-body gate parameter
+    // (`param_helpers::has_any_guard_gate_param`), and `#[authorize]` —
+    // which inserts no such parameter — leaves its role/policy-check marker
+    // directly in the body (`api_doc::extract_secured_info`, the same
+    // recovery the `#[get]`/`#[post]` route macro already relies on for
+    // this exact scenario).
+    let unexpanded_guard_attr = input_fn.attrs.iter().find(|attr| {
+        crate::param_helpers::attr_or_cfg_attr_matches_any(attr, &INCOMPATIBLE_GUARD_ATTRS)
+    });
+    let already_expanded_guard = crate::param_helpers::has_any_guard_gate_param(&input_fn)
+        || crate::api_doc::extract_secured_info(&input_fn).0;
+    if !leading_guard_items.is_empty() || unexpanded_guard_attr.is_some() || already_expanded_guard
+    {
+        let err = unexpanded_guard_attr.map_or_else(
+            || syn::Error::new_spanned(&input_fn.sig, INCOMPATIBLE_GUARD_MSG),
+            |attr| syn::Error::new_spanned(attr, INCOMPATIBLE_GUARD_MSG),
+        );
+        return err.to_compile_error();
+    }
+
+    // No guard is visible by name or by expansion artifact at this point,
+    // but a still-pending guard attribute imported under an alias (e.g.
+    // `use ::autumn_web::secured as auth;` then `#[auth("admin")]`) is
+    // exactly as live and unexpanded as a plainly-spelled one, and
+    // completely invisible to `attr_or_cfg_attr_matches_any`'s name-based
+    // scan: a proc-macro attribute runs before the compiler resolves
+    // imports, so there is no way to ask "does this path actually name
+    // `autumn_web::secured`" from here (Codex review on #2513, tenth
+    // finding). Leave a marker for that guard's OWN macro to find once IT
+    // expands, regardless of what name it was invoked under — see
+    // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
+    crate::param_helpers::prepend_body_const_marker(
+        &mut input_fn,
+        crate::param_helpers::STATIC_ROUTE_HANDLER_MARKER,
+    );
+
+    // No guard is present at this point, so the route is always unsecured.
+    let secured = false;
+    let required_roles = quote! { &[] };
+    let required_scopes = quote! { &[] };
 
     // Build the revalidate expression
     let revalidate_expr = attrs.revalidate.map_or_else(
@@ -213,6 +310,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         crate::graph::emit_route_descriptor(&input_fn, "GET", &quote! { #path }, true);
 
     quote! {
+        #leading_guard_items
         #input_fn
 
         #graph_descriptor
@@ -237,8 +335,9 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     success_status: 200,
                     hidden: false,
                     query_schema: ::core::option::Option::None,
-                    secured: false,
-                    required_roles: &[],
+                    secured: #secured,
+                    required_roles: #required_roles,
+                    required_scopes: #required_scopes,
                     register_schemas: ::core::option::Option::None,
                     api_version: ::core::option::Option::None,
                     public: #is_public,
@@ -296,6 +395,171 @@ mod tests {
         );
         // The handler's module path is captured for audit diagnostics.
         assert!(generated.contains("module_path"));
+    }
+
+    #[test]
+    fn static_get_rejects_a_secured_guard_expanded_above_it() {
+        // `#[secured("admin")]` above `#[static_get]`: the guard expands
+        // first and, critically, the real compiler then invokes
+        // `static_get_macro` with ONLY the resulting single function's
+        // tokens — never bundled with the gate sibling item the guard also
+        // emitted (attribute macros are only ever invoked with the one item
+        // they still decorate; see `param_helpers::extract_fn_item`'s doc
+        // comment). `extract_fn_item` slices out that single function here
+        // to reproduce exactly that shape, rather than feeding the whole
+        // multi-item `secured_macro` output directly, which is a shape the
+        // real compiler never produces (a gap in this test caught by a
+        // later Codex pass: the P1 fix this test originally accompanied
+        // only checked that unreachable shape via `leading_guard_items` and
+        // so never actually closed the false `secured: true` certification
+        // it claimed to — eighth finding on #2513). An earlier version of
+        // this macro read the guard's role marker via `extract_secured_info`
+        // and recorded `secured: true` — but cached SSG/ISR responses are
+        // served by the static-first middleware *before* the guard (or the
+        // inner router at all) ever runs, so that certification was false
+        // for the overwhelming majority of live traffic to the cached page
+        // (a cache hit). Reject the combination outright instead.
+        let secured = crate::secured::secured_macro(
+            quote! { "admin" },
+            quote! {
+                async fn about() -> &'static str { "about" }
+            },
+        );
+        let secured_fn = crate::param_helpers::extract_fn_item(secured, "about");
+        let generated = static_get_macro(quote! { "/about" }, quote! { #secured_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a #[secured] guard stacked above #[static_get] must be a compile error, not a \
+             false `secured: true` certification: {generated}"
+        );
+        assert!(
+            generated.contains("cannot be combined with"),
+            "the error must explain why the combination is rejected: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_rejects_a_live_unexpanded_secured_attribute() {
+        // The *other* stacking order: `#[static_get]` outermost, `#[secured]`
+        // still a live, unexpanded attribute below it.
+        let generated = static_get_macro(
+            quote! { "/about" },
+            quote! {
+                #[secured("admin")]
+                async fn about() -> &'static str { "about" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a live, unexpanded #[secured] attribute below #[static_get] must also be a \
+             compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_rejects_a_secured_attribute_wrapped_in_cfg_attr() {
+        // A guard hidden behind `#[cfg_attr(predicate, secured(..))]` below
+        // `#[static_get]` is just as live and unexpanded as a bare
+        // `#[secured]` attribute in the same position — `cfg_attr` is not
+        // resolved until after every attribute macro has finished expanding.
+        // Ninth Codex finding on #2513: a scan that only compared
+        // `attr.path()` against the guard's own name saw `cfg_attr`, not
+        // `secured`, and let this slip through uncaught.
+        let generated = static_get_macro(
+            quote! { "/private" },
+            quote! {
+                #[cfg_attr(feature = "auth", secured("admin"))]
+                async fn private() -> &'static str { "private" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a #[secured] guard wrapped in #[cfg_attr] below #[static_get] must also be a \
+             compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_rejects_a_step_up_guard_expanded_above_it() {
+        // See `static_get_rejects_a_secured_guard_expanded_above_it`: sliced
+        // via `extract_fn_item` to match what the real compiler actually
+        // hands `static_get_macro`, not the unreachable bundled shape.
+        let stepped_up = crate::step_up::step_up_macro(
+            quote! {},
+            quote! {
+                async fn about() -> &'static str { "about" }
+            },
+        );
+        let stepped_up_fn = crate::param_helpers::extract_fn_item(stepped_up, "about");
+        let generated =
+            static_get_macro(quote! { "/about" }, quote! { #stepped_up_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a #[step_up] guard stacked above #[static_get] must be a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_rejects_a_throttle_guard_expanded_above_it() {
+        let throttled = crate::throttle::throttle_macro(
+            quote! { limit = 10, per = "1m" },
+            quote! {
+                async fn about() -> &'static str { "about" }
+            },
+        );
+        let throttled_fn = crate::param_helpers::extract_fn_item(throttled, "about");
+        let generated = static_get_macro(quote! { "/about" }, quote! { #throttled_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a #[throttle] guard stacked above #[static_get] must be a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_rejects_an_authorize_guard_expanded_above_it() {
+        // `#[authorize]` is the one guard with no pre-body gate parameter —
+        // it leaves only a body marker/policy-check statement — so this
+        // exercises the `api_doc::extract_secured_info` half of the
+        // already-expanded-guard detection, not
+        // `param_helpers::has_any_guard_gate_param`.
+        let authorized = crate::authorize::authorize_macro(
+            quote! { "view", resource = Room },
+            quote! {
+                async fn about() -> &'static str { "about" }
+            },
+        );
+        let authorized_fn = crate::param_helpers::extract_fn_item(authorized, "about");
+        let generated =
+            static_get_macro(quote! { "/about" }, quote! { #authorized_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "an #[authorize] guard stacked above #[static_get] must be a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_defaults_unsecured_when_no_guard_present() {
+        let generated = static_get_macro(
+            quote! { "/about" },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("secured : false"),
+            "an unguarded static route must record secured = false: {generated}"
+        );
+        assert!(
+            generated.contains("required_roles : & []"),
+            "an unguarded static route must have no required roles: {generated}"
+        );
     }
 
     #[test]
