@@ -2073,9 +2073,9 @@ Two cases need `--force`:
 
 - The project has no manifest entry for the file — it was generated before
   Autumn wrote the manifest — **and** the template has changed since. Prefer
-  re-running `autumn generate <the same arguments> --force` first: that
-  rewrites the file and records its digest, and the destroy then works
-  without `--force`.
+  re-running the original generator command with `--force` first (for example
+  `autumn generate model Post title:String --force`): that rewrites the file
+  and records its digest, and the destroy then works without `--force`.
 - You edited the file, and you want it deleted anyway.
 
 `--force` skips the content check. It does not skip the applied-migration
