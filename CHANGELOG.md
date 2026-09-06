@@ -1740,6 +1740,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failing after upgrade — this is the intended effect of closing the gap. See
   `docs/security/2026-09-03-webhook-ssrf/`.
 
+### Performance
+
+- **`MemorySearchBackend::keyword_search` no longer re-tokenizes every
+  document's fields on every query:** `score` (in `autumn-search/src/memory.rs`)
+  called `tokenize` — which allocates a `String` per token via
+  `str::to_lowercase` — on every indexed field of every document, on every
+  single `keyword_search` call. Profiling a realistic 5,000-document,
+  two-field (~206 words/document) corpus with `valgrind --tool=callgrind`
+  found this re-tokenization (the scan loop itself plus `str::to_lowercase`)
+  accounted for ~66% of the call's instructions. A document's tokens don't
+  change between searches, only between writes, so `MemorySearchBackend` now
+  tokenizes each document's fields once, when it is written (`StoredDocument`
+  in `memory.rs`), and every later `keyword_search`/`score` call reuses the
+  cached tokens instead of recomputing them. Purely an internal
+  representation change to the in-memory reference/dev backend — no public
+  API moved and ranking behavior is unchanged (same 128 `autumn-search` tests
+  pass unmodified in assertions). New harness:
+  `autumn-search/benches/keyword_search.rs`. Measured on the same machine, one
+  session: instructions (callgrind, 5 queries over the corpus) 12,029,984,210
+  → 1,820,921,069 (**-84.9%**); marginal allocation blocks/query (dhat)
+  1,038,586 → 8,586 (**-99.2%**); marginal allocation bytes/query (dhat)
+  6,563,220 → 530,398 (**-91.9%**).
+
 ### Fixed
 
 - **`route_macro` lost a guarded handler's OpenAPI response schema under
