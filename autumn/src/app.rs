@@ -6390,7 +6390,7 @@ impl AppBuilder {
 
         let mut openapi_config = openapi_config;
         openapi_config.api_versions = api_versions;
-        let openapi_config = openapi_config.session_cookie_name(config.session.cookie_name.clone());
+        let openapi_config = openapi_config.session_cookie_name(config.session.cookie_name);
 
         let docs = crate::router::collect_openapi_docs(&routes, &scoped_groups);
         let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
