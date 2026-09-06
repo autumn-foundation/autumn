@@ -1526,6 +1526,13 @@ def definition_labels(txt):
 # Painting-without-attributes and non-interactive is the line that actually
 # separates them.
 #
+# `picture` was on this list and is not now. An EMPTY one paints nothing and
+# gives its anchor a 0x0 box, so it made `<a href=…><picture></picture></a>` a
+# route — the same nothing as the empty container already rejected. Removing it
+# loses no real case: the spec requires a `<picture>` to contain an `img`, and
+# that `img` is what paints and is matched here anyway (measured: a picture
+# wrapping one gives the anchor 20x17 and navigates).
+#
 # `iframe` was in this list for one round and is deliberately not now, for ONE
 # reason rather than the two given here before: its CONTENTS are hidden (see
 # `HIDDEN_TAGS`), so the whole element is blanked before this test ever runs
@@ -1536,7 +1543,7 @@ def definition_labels(txt):
 # elements that are listed. The conclusion held up; that half of the argument
 # for it never should have been written down unchecked.
 ANY_IMAGE = re.compile(
-    r'!\[|<(?:img|svg|video|canvas|picture|object|embed|progress|meter)\b',
+    r'!\[|<(?:img|svg|video|canvas|object|embed|progress|meter)\b',
     re.I)
 # An element carrying `hidden`, and its OPENING tag only — the matching close
 # is found by a scan, because same-name nesting cannot be balanced by a regular
@@ -1719,6 +1726,91 @@ def _raw_text_end(txt, name, at):
     return m.end() if m else len(txt)
 
 
+# `inert` does not hide, it DEACTIVATES. An inert anchor still paints — 30x17
+# in Chromium, same as any other — but focus and activation are suppressed, so
+# clicking it does nothing and the reader cannot follow it. A link nobody can
+# follow is not a route, so it cannot make a page reachable.
+#
+# The attribute applies to the whole SUBTREE, which is why this is a span scan
+# rather than a test on the anchor alone: an `<a>` inside `<div inert>` is just
+# as dead, and that was measured too.
+INERT_OPEN = re.compile(
+    r'<([A-Za-z][A-Za-z0-9-]*)(?:' + _TWS + r'+' + ATTR + r')*?'
+    + _TWS + r'+inert(?:' + _TWS + r'*=' + _TWS + r'*(?:' + _Q + r'|'
+    + _Q1 + r'|[^\s"\'=<>`]+))?(?:' + _TWS + r'+' + ATTR + r')*'
+    + _TWS + r'*/?>', re.I)
+
+
+def inert_spans(view, src):
+    """Spans of the document that `inert` has deactivated.
+
+    Read off `src`, where attribute values are intact, but a hit counts only
+    where the masked `view` still has a `<` — so an inert element written
+    inside a comment or a script deactivates nothing. Same guard, and same
+    reason, as the inline-CSS path in `hidden_open`.
+
+    Bare PATHS inside an inert subtree still count elsewhere: the text is on
+    screen and a reader can retype it. Only the links are dead.
+    """
+    spans, at = [], 0
+    while True:
+        m = INERT_OPEN.search(src, at)
+        if not m:
+            return spans
+        if not (m.start() < len(view) and view[m.start()] == '<'):
+            at = m.start() + 1
+            continue
+        end = element_end(src, m, m.group(1))
+        spans.append((m.start(), end))
+        at = max(end, m.end())
+
+
+def element_end(txt, m, name):
+    """Where the element opened by match `m` ends, contents and all.
+
+    Three shapes, each with a case behind it (see `VOID_ELEMENTS`,
+    `RAW_TEXT_NAMES` and `FOREIGN_ROOTS`): a void element is the whole of
+    itself; a raw-text element ends at its first close, because a same-name
+    spelling inside it is text; anything else has to be BALANCED, since the
+    close that ends it is not necessarily the first one with its name.
+
+    Running out of closes is not a bug: an unclosed element is closed
+    implicitly by its parent, so ending at the end of the span is what the
+    browser shows — `<a …><span hidden>Mail</a>` is an empty link.
+    """
+    lname = name.lower()
+    if lname in VOID_ELEMENTS:
+        return m.end()
+    if lname in RAW_TEXT_NAMES:
+        return _raw_text_end(txt, name, m.end())
+    depth, pos, end = 1, m.end(), len(txt)
+    tag = re.compile(r'<(/?)' + re.escape(name) + r'(?=[\s/>]|$)', re.I)
+    while depth:
+        t = tag.search(txt, pos)
+        # A raw-text element opening BEFORE the next same-name tag means that
+        # tag is inside it, and so is text rather than structure: skip its
+        # contents before counting anything.
+        r = RAW_TEXT_OPEN.search(txt, pos)
+        if r and (not t or r.start() < t.start()):
+            pos = _raw_text_end(txt, r.group(1), r.end())
+            continue
+        if not t:
+            break
+        gt = txt.find('>', t.end())
+        # In foreign content `/>` genuinely closes, so a nested `<svg/>` opens
+        # no level. Counting it as one left the outer close unable to reach
+        # depth zero and swallowed the label after it.
+        if (not t.group(1) and lname in FOREIGN_ROOTS
+                and gt != -1 and txt[gt - 1] == '/'):
+            pos = gt + 1
+            continue
+        depth += -1 if t.group(1) else 1
+        pos = t.end()
+        if not depth:
+            end = len(txt) if gt == -1 else gt + 1
+    return end
+
+
 def mask_hidden_subtrees(txt, src=None):
     """Blank every `hidden` element, contents and all, space for space.
 
@@ -1747,50 +1839,7 @@ def mask_hidden_subtrees(txt, src=None):
             # content: step over the tag without masking anything.
             at = m.end()
             continue
-        if lname in VOID_ELEMENTS:
-            # No subtree to balance: the element is the whole of itself.
-            end = m.end()
-            out = out[:m.start()] + ' ' * (end - m.start()) + out[end:]
-            ref = ref[:m.start()] + ' ' * (end - m.start()) + ref[end:]
-            at = end
-            continue
-        if lname in RAW_TEXT_NAMES:
-            # Its own contents are text, so there is no nesting to balance:
-            # the first close ends it, and a same-name spelling inside is
-            # just more text.
-            end = _raw_text_end(out, name, m.end())
-            out = out[:m.start()] + ' ' * (end - m.start()) + out[end:]
-            ref = ref[:m.start()] + ' ' * (end - m.start()) + ref[end:]
-            at = end
-            continue
-        # Running out of closes is not a bug here: an unclosed element is
-        # closed implicitly by its parent, so masking to the end of the span
-        # is what the browser shows — `<a …><span hidden>Mail</a>` is empty.
-        depth, pos, end = 1, m.end(), len(out)
-        tag = re.compile(r'<(/?)' + re.escape(name) + r'(?=[\s/>]|$)', re.I)
-        while depth:
-            t = tag.search(out, pos)
-            # A raw-text element opening BEFORE the next same-name tag means
-            # that tag is inside it, and so is text rather than structure:
-            # skip its contents before counting anything.
-            r = RAW_TEXT_OPEN.search(out, pos)
-            if r and (not t or r.start() < t.start()):
-                pos = _raw_text_end(out, r.group(1), r.end())
-                continue
-            if not t:
-                break
-            gt = out.find('>', t.end())
-            # In foreign content `/>` genuinely closes, so a nested `<svg/>`
-            # opens no level. Counting it as one left the outer close unable
-            # to reach depth zero and swallowed the label after it.
-            if (not t.group(1) and lname in FOREIGN_ROOTS
-                    and gt != -1 and out[gt - 1] == '/'):
-                pos = gt + 1
-                continue
-            depth += -1 if t.group(1) else 1
-            pos = t.end()
-            if not depth:
-                end = len(out) if gt == -1 else gt + 1
+        end = element_end(out, m, name)
         out = out[:m.start()] + ' ' * (end - m.start()) + out[end:]
         ref = ref[:m.start()] + ' ' * (end - m.start()) + ref[end:]
         at = end
@@ -2089,9 +2138,18 @@ def edges_from(f):
     # what follows, so `<a href="mail.md" =>` — malformed, and rendered as
     # literal text rather than a link — recorded an edge. One grammar decides
     # what an anchor is; the other only says where its destination sits.
+    dead = inert_spans(txt, raw)
+
+    def is_inert(at):
+        return any(a <= at < b for a, b in dead)
+
     for tag in ANCHOR_TAG.finditer(txt):
         m = ANCHOR_HREF.search(tag.group(0))
         if not m:
+            continue
+        # An inert anchor paints but cannot be activated, so it is not a route
+        # — nor is one anywhere inside an inert subtree.
+        if is_inert(tag.start()):
             continue
         # An anchor with no content is nothing to click, the same as `[](x.md)`
         # — the href is metadata and the reader is left with an empty element.
@@ -2107,7 +2165,8 @@ def edges_from(f):
         # is read off `raw` at the same offsets. A tag cannot contain a comment,
         # so taking the raw slice here needs no further guard.
         if (HIDDEN_OPEN.fullmatch(tag.group(0))
-                or style_hidden_fullmatch(raw[tag.start():tag.end()])):
+                or style_hidden_fullmatch(raw[tag.start():tag.end()])
+                or INERT_OPEN.fullmatch(raw[tag.start():tag.end()])):
             continue
         # The close is looked for in the MASKED view, not `raw`: an apparent
         # `</a>` inside a script or a comment is content, not a boundary, and
@@ -4369,6 +4428,56 @@ self_test() {
     > "$c9jn/docs/guide/jobs.md"
   git -C "$c9jn" add -A && git -C "$c9jn" commit -qm svg-display-none
   check "inline CSS does hide an svg" fail "$c9jn"
+
+  # `inert` does not hide, it DEACTIVATES: the anchor still paints at 30x17
+  # but cannot be activated, so the reader cannot follow it.
+  local c9ke="$tmp/c9ke"; make_corpus "$c9ke"
+  printf '# Jobs\n\n<a inert href="mail.md">Mail</a>\n' > "$c9ke/docs/guide/jobs.md"
+  git -C "$c9ke" add -A && git -C "$c9ke" commit -qm inert-anchor
+  check "an inert anchor is not a route" fail "$c9ke"
+
+  # ...and it applies to the whole subtree, not just the tag carrying it.
+  local c9kf="$tmp/c9kf"; make_corpus "$c9kf"
+  printf '# Jobs\n\n<div inert><a href="mail.md">Mail</a></div>\n' \
+    > "$c9kf/docs/guide/jobs.md"
+  git -C "$c9kf" add -A && git -C "$c9kf" commit -qm inert-subtree
+  check "an anchor inside an inert subtree is not a route" fail "$c9kf"
+
+  # ...but the subtree ENDS, so a link after it is live.
+  local c9kg="$tmp/c9kg"; make_corpus "$c9kg"
+  printf '# Jobs\n\n<div inert>x</div><a href="mail.md">Mail</a>\n' \
+    > "$c9kg/docs/guide/jobs.md"
+  git -C "$c9kg" add -A && git -C "$c9kg" commit -qm inert-ends
+  check "a link after an inert subtree is a route" pass "$c9kg"
+
+  # ...and an `inert` written inside a comment deactivates nothing.
+  local c9kh="$tmp/c9kh"; make_corpus "$c9kh"
+  printf '# Jobs\n\nx <!-- <div inert> --> <a href="mail.md">Mail</a>\n' \
+    > "$c9kh/docs/guide/jobs.md"
+  git -C "$c9kh" add -A && git -C "$c9kh" commit -qm commented-inert
+  check "a commented-out inert deactivates nothing" pass "$c9kh"
+
+  # A bare PATH inside an inert subtree is still on screen and still counts:
+  # inert kills the link, not the text.
+  local c9ki="$tmp/c9ki"; make_corpus "$c9ki"
+  printf '# Jobs\n\n<div inert>see docs/guide/mail.md</div>\n' \
+    > "$c9ki/docs/guide/jobs.md"
+  git -C "$c9ki" add -A && git -C "$c9ki" commit -qm inert-bare-path
+  check "a bare path inside an inert subtree still counts" pass "$c9ki"
+
+  # An EMPTY picture paints nothing — the same nothing as an empty container.
+  local c9kj="$tmp/c9kj"; make_corpus "$c9kj"
+  printf '# Jobs\n\n<a href="mail.md"><picture></picture></a>\n' \
+    > "$c9kj/docs/guide/jobs.md"
+  git -C "$c9kj" add -A && git -C "$c9kj" commit -qm empty-picture
+  check "an empty picture is not link content" fail "$c9kj"
+
+  # ...while a real one contains the `img` that paints, and that is what counts.
+  local c9kk="$tmp/c9kk"; make_corpus "$c9kk"
+  printf '# Jobs\n\n<a href="mail.md"><picture><img src="x.png"></picture></a>\n' \
+    > "$c9kk/docs/guide/jobs.md"
+  git -C "$c9kk" add -A && git -C "$c9kk" commit -qm picture-with-img
+  check "a picture wrapping an img is link content" pass "$c9kk"
 
   # `progress` paints with no attributes at all, so an anchor around one is a
   # link the reader can see and click (160x17, hit-testing inside the anchor).
