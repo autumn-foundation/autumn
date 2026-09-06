@@ -270,15 +270,30 @@ pub fn redact_targets_in_message(msg: &str) -> String {
             target_start(trimmed).map_or_else(
                 || chunk.to_owned(),
                 |at| {
+                    // A closing delimiter is not part of the target. libpq
+                    // quotes the URI it rejects, so leaving the `"` attached
+                    // fed it to `Url::parse`, which re-emitted it as `%22`
+                    // inside the path — a mangled message for no gain. Split
+                    // it off and put it back after.
+                    let (target, closer) = split_closing_delimiters(&trimmed[at..]);
                     format!(
-                        "{}{}{trailing}",
+                        "{}{}{closer}{trailing}",
                         &trimmed[..at],
-                        redact_target(&trimmed[at..])
+                        redact_target(target)
                     )
                 },
             )
         })
         .collect()
+}
+
+/// Split a trailing run of closing delimiters off a target.
+///
+/// Only the three a target is actually wrapped in — `"` (libpq's own quoting),
+/// `'` and `)`. Not `]`, which ends an IPv6 host.
+fn split_closing_delimiters(token: &str) -> (&str, &str) {
+    let end = token.trim_end_matches(['"', '\'', ')']).len();
+    (&token[..end], &token[end..])
 }
 
 /// Byte offset where a database target starts inside `token`, if any.
@@ -508,15 +523,37 @@ mod tests {
         // libpq QUOTES the URI it rejects, and an operator writes `url=…`.
         // Requiring the token to START with a scheme handed all of these back
         // whole — the coverage the substring-matching predecessor had.
-        for message in [
-            r#"end of string reached when looking for matching "]" in URI: "postgres://app:hunter2@[::1/db""#,
-            r#"invalid connection string: "postgres://user:hunter2@host/db""#,
-            "connect failed (postgres://user:hunter2@host/db)",
-            "url=postgres://user:hunter2@host/db",
-            "'postgres://user:hunter2@host/db'",
-        ] {
-            let redacted = redact_targets_in_message(message);
-            assert!(!redacted.contains("hunter2"), "leaked in: {redacted}");
-        }
+        //
+        // Asserted by EXACT equality, not just "the password is gone": these
+        // are the inputs where the scanner has to guess a token boundary
+        // inside a delimiter, so over-redacting them is the likelier failure,
+        // and a redactor that returned a bare `****` for all five would pass a
+        // leak-only check.
+        assert_eq!(
+            redact_targets_in_message(
+                r#"invalid connection string: "postgres://user:hunter2@host/db""#
+            ),
+            r#"invalid connection string: "postgres://user:****@host/db""#
+        );
+        assert_eq!(
+            redact_targets_in_message("connect failed (postgres://user:hunter2@host/db)"),
+            "connect failed (postgres://user:****@host/db)"
+        );
+        assert_eq!(
+            redact_targets_in_message("url=postgres://user:hunter2@host/db"),
+            "url=postgres://user:****@host/db"
+        );
+        assert_eq!(
+            redact_targets_in_message("'postgres://user:hunter2@host/db'"),
+            "'postgres://user:****@host/db'"
+        );
+        // Unparseable (libpq's own diagnostic): the target goes wholesale, but
+        // the prose and its delimiters still frame it.
+        assert_eq!(
+            redact_targets_in_message(
+                r#"end of string reached when looking for matching "]" in URI: "postgres://app:hunter2@[::1/db""#
+            ),
+            r#"end of string reached when looking for matching "]" in URI: "****""#
+        );
     }
 }

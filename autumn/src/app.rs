@@ -13281,10 +13281,13 @@ mod tests {
         );
     }
 
-    // Postgres-only fixture: it configures a distinct `replica_url` (and/or
-    // native shards), which SQLite refuses at both layers —
-    // `database_backend_consistency` at config time and
-    // `reject_unusable_sqlite_replica` at topology build. Gated rather than
+    // Postgres-only fixture: it configures a distinct `replica_url`, which
+    // SQLite refuses at both layers — `database_backend_consistency` at config
+    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
+    // only a replica naming the same file as its primary. That replica is the
+    // blocker; the shards some of these fixtures also declare are refused at
+    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
+    // builder, so they would not fail here on their own. Gated rather than
     // swapped, so the test never asserts a configuration production refuses;
     // same treatment `db::`'s replica tests got.
     #[cfg(not(feature = "sqlite"))]
@@ -13352,10 +13355,13 @@ mod tests {
         assert!(!state.role().serves_http());
     }
 
-    // Postgres-only fixture: it configures a distinct `replica_url` (and/or
-    // native shards), which SQLite refuses at both layers —
-    // `database_backend_consistency` at config time and
-    // `reject_unusable_sqlite_replica` at topology build. Gated rather than
+    // Postgres-only fixture: it configures a distinct `replica_url`, which
+    // SQLite refuses at both layers — `database_backend_consistency` at config
+    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
+    // only a replica naming the same file as its primary. That replica is the
+    // blocker; the shards some of these fixtures also declare are refused at
+    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
+    // builder, so they would not fail here on their own. Gated rather than
     // swapped, so the test never asserts a configuration production refuses;
     // same treatment `db::`'s replica tests got.
     #[cfg(not(feature = "sqlite"))]
@@ -13586,10 +13592,13 @@ mod tests {
         config
     }
 
-    // Postgres-only fixture: it configures a distinct `replica_url` (and/or
-    // native shards), which SQLite refuses at both layers —
-    // `database_backend_consistency` at config time and
-    // `reject_unusable_sqlite_replica` at topology build. Gated rather than
+    // Postgres-only fixture: it configures a distinct `replica_url`, which
+    // SQLite refuses at both layers — `database_backend_consistency` at config
+    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
+    // only a replica naming the same file as its primary. That replica is the
+    // blocker; the shards some of these fixtures also declare are refused at
+    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
+    // builder, so they would not fail here on their own. Gated rather than
     // swapped, so the test never asserts a configuration production refuses;
     // same treatment `db::`'s replica tests got.
     #[cfg(not(feature = "sqlite"))]
@@ -13647,10 +13656,13 @@ mod tests {
         assert!(["shard0", "shard1"].contains(&routed.name()));
     }
 
-    // Postgres-only fixture: it configures a distinct `replica_url` (and/or
-    // native shards), which SQLite refuses at both layers —
-    // `database_backend_consistency` at config time and
-    // `reject_unusable_sqlite_replica` at topology build. Gated rather than
+    // Postgres-only fixture: it configures a distinct `replica_url`, which
+    // SQLite refuses at both layers — `database_backend_consistency` at config
+    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
+    // only a replica naming the same file as its primary. That replica is the
+    // blocker; the shards some of these fixtures also declare are refused at
+    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
+    // builder, so they would not fail here on their own. Gated rather than
     // swapped, so the test never asserts a configuration production refuses;
     // same treatment `db::`'s replica tests got.
     #[cfg(not(feature = "sqlite"))]
@@ -14752,10 +14764,13 @@ mod tests {
             .plugin_migrations("plugin-b", PLUGIN_MIGRATIONS);
     }
 
-    // Postgres-only fixture: it configures a distinct `replica_url` (and/or
-    // native shards), which SQLite refuses at both layers —
-    // `database_backend_consistency` at config time and
-    // `reject_unusable_sqlite_replica` at topology build. Gated rather than
+    // Postgres-only fixture: it configures a distinct `replica_url`, which
+    // SQLite refuses at both layers — `database_backend_consistency` at config
+    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
+    // only a replica naming the same file as its primary. That replica is the
+    // blocker; the shards some of these fixtures also declare are refused at
+    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
+    // builder, so they would not fail here on their own. Gated rather than
     // swapped, so the test never asserts a configuration production refuses;
     // same treatment `db::`'s replica tests got.
     #[cfg(not(feature = "sqlite"))]
@@ -14799,10 +14814,13 @@ mod tests {
         assert_eq!(check.replica_url, "postgres://localhost/replica");
     }
 
-    // Postgres-only fixture: it configures a distinct `replica_url` (and/or
-    // native shards), which SQLite refuses at both layers —
-    // `database_backend_consistency` at config time and
-    // `reject_unusable_sqlite_replica` at topology build. Gated rather than
+    // Postgres-only fixture: it configures a distinct `replica_url`, which
+    // SQLite refuses at both layers — `database_backend_consistency` at config
+    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
+    // only a replica naming the same file as its primary. That replica is the
+    // blocker; the shards some of these fixtures also declare are refused at
+    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
+    // builder, so they would not fail here on their own. Gated rather than
     // swapped, so the test never asserts a configuration production refuses;
     // same treatment `db::`'s replica tests got.
     #[cfg(not(feature = "sqlite"))]

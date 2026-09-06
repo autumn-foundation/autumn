@@ -1030,11 +1030,16 @@ jobs:
         #
         # A BARE `--lib`, no filter list (#1905): fixtures now spell their
         # target through `crate::test_urls`, which picks a Postgres or SQLite
-        # target per backend, and the handful of tests whose SUBJECT is
-        # Postgres-only (a distinct `replica_url`, native sharding) are
-        # `#[cfg(not(feature = "sqlite"))]` rather than parametrised. A filter
-        # list would let a newly-added module rot the same way the pool tests
-        # did — silently, because nothing runs it.
+        # target per backend. The tests `#[cfg(not(feature = "sqlite"))]`
+        # excludes from this lane are the ones whose SUBJECT this build refuses
+        # — a fixture carrying a distinct `replica_url`, and the Postgres job
+        # backend — not everything Postgres-only: the `sharding::` suite IS
+        # parametrised and runs here, because `create_shard_set` applies no
+        # backend screen and its routing/slot/seed machinery is
+        # backend-independent (see the fixture comment in `sharding.rs` for
+        # what that does and does not claim). A filter list would let a
+        # newly-added module rot the same way the pool tests did — silently,
+        # because nothing runs it.
         run: cargo test -p autumn-web --features sqlite --lib
       - name: Run the sqlite integration suite
         # Named sqlite `[[test]]` targets only. `test-support` is required by the

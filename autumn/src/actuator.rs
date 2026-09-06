@@ -5731,10 +5731,11 @@ mod tests {
 
     // Postgres-only: the fixture gives one shard a DISTINCT replica_url, and
     // both layers refuse that on SQLite — `database_backend_consistency` at
-    // config time, `reject_unusable_sqlite_replica` at topology build. Native
-    // sharding is itself Postgres-only. Same treatment `db::`'s replica tests
-    // got, rather than a fixture swap that would assert a configuration
-    // production refuses.
+    // config time, `reject_unusable_sqlite_replica` at topology build. The
+    // replica is the blocker: native sharding is Postgres-only too, but it is
+    // refused at BOOT rather than by the topology builder, so the shards alone
+    // would not fail here. Same treatment `db::`'s replica tests got, rather
+    // than a fixture swap that would assert a configuration production refuses.
     #[cfg(not(feature = "sqlite"))]
     #[tokio::test]
     #[cfg(feature = "db")]

@@ -21,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `crate::test_urls` helper that picks one per backend, and the tests whose
   SUBJECT is refused on SQLite (a distinct `replica_url`, the Postgres job
   backend) are `#[cfg(not(feature = "sqlite"))]` with a SQLite counterpart
-  where one exists. The lane runs a bare `--lib`: 5601 tests under `sqlite`,
-  5642 under the default.
+  where one exists. The lane runs a bare `--lib`: 5606 tests under `sqlite`,
+  5647 under the default.
 
   **Boot errors no longer echo credentials.** `DatabaseConfig::validate`
   printed the offending URL raw, and it is the refusal an ordinary
