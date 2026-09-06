@@ -22,9 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand-maintained `## Documentation` list and the skill indexes, and nothing
   noticed when a page was left off both. The baseline run found
   `time-zones.md`, `active-search-and-autocomplete.md` and
-  `outbound-webhooks.md` unreachable from every reader entry point, all three
-  accurate — every symbol they name resolves in the current source — which
-  makes them the expensive kind of defect rather than the cheap kind.
+  `outbound-webhooks.md` unreachable from every reader entry point. Making
+  `outbound-webhooks.md` reachable then surfaced six wrong claims about
+  delivery semantics in it, corrected here — every symbol it named resolved in
+  the current source the whole time, which is what a structural gate can check
+  and is not the same as being right.
   `outbound-webhooks.md` is the sharpest: the README indexed
   `signed-webhooks.md` (webhooks coming *in*), so a reader searching it for
   "webhook" concluded that was all there was and never found the page on

@@ -236,6 +236,17 @@ DEST = r'\(' + _WS + r'(?:' + ANGLE_DEST + r'|(' + DEST_BARE + r'))' + TITLE + _
 # recorded an edge and could conceal an orphan. The destination and the title
 # already carried this bound; the label is the third side of the same link.
 FLAT = r'(?:[^\[\]\\\n]|\\.|\n(?![ \t]*\n))'
+# CommonMark caps a reference label at 999 characters, so a longer one creates
+# no definition and renders as literal text. `FLAT+` was unbounded, and an
+# over-long label could mark its target reachable through a definition that
+# does not exist. The cap counts REPETITIONS rather than characters, so an
+# escaped character is counted once — the only direction that over-accepts, and
+# it takes a label of 999 escapes to reach. The repo pins the rule
+# (`migration_guide_gate_rejects_an_overlong_reference_label`).
+LABEL_MAX = '{1,999}'
+# The collapsed form `[label][]` has an EMPTY second label, so the two are
+# not interchangeable: `{1,999}?` is a lazy quantifier, not an optional one.
+LABEL_MAX_OPT = '{0,999}'
 # `!` joins the lookbehind because `![alt](x.md)` is an IMAGE: its destination
 # is a resource the page loads, not a page the reader can navigate to, and the
 # path is never visible on screen. By this gate's visible-or-clickable rule it
@@ -275,7 +286,14 @@ def decode_char_refs(s):
 # label contains a bracket — `[^\]]+` would stop at the escaped one and lose the
 # definition entirely. Same `FLAT` shape the sibling uses for exactly this.
 REF_DEF = re.compile(
-    r'^ {0,3}\[(' + FLAT + r'+)\]:(?:[ \t]*\n?[ \t]*)(?:' + ANGLE_DEST + r'|(\S+))'
+    r'^ {0,3}\[(' + FLAT + LABEL_MAX + r')\]:(?:[ \t]*\n?[ \t]*)'
+    # The bare form must have BALANCED parentheses, exactly as an inline
+    # destination does. `\\S+` took `mail.md#(unterminated`, which defines
+    # nothing, and `add_relative` then dropped the fragment and recorded
+    # `mail.md` — an orphan reachable through a definition that does not
+    # exist. Pinned by the repo's
+    # `migration_guide_gate_rejects_an_unbalanced_paren_in_a_definition`.
+    r'(?:' + ANGLE_DEST + r'|(' + DEST_BARE + r'))'
     # A title that OPENS and never closes makes the whole line a paragraph —
     # there is no definition at all. Truncating at the destination recorded a
     # target the reader never reaches. Pinned by the repo's
@@ -296,7 +314,8 @@ REF_DEF = re.compile(
 # reported as an orphan the reader can in fact click. A blank line ends the
 # paragraph and there is no title, which is what `TITLE` already encodes.
 REF_DEF_FULL = re.compile(
-    r'^ {0,3}\[(?:' + FLAT + r')+\]:(?:[ \t]*\n?[ \t]*)(?:<[^<>\r\n]*>|\S+)'
+    r'^ {0,3}\[(?:' + FLAT + r')' + LABEL_MAX + r'\]:(?:[ \t]*\n?[ \t]*)'
+    r'(?:<[^<>\r\n]*>|' + DEST_BARE + r')'
     # A definition ENDS at the end of its line: after the destination only
     # whitespace and an optional title may follow. `[m]: mail.md trailing
     # garbage` is a paragraph, not a definition, so blanking its span hid text
@@ -321,14 +340,17 @@ REF_DEF_FULL = re.compile(
 # Labels honour escapes on BOTH sides of the match, or `[mail][closing \]]`
 # would be read against a definition whose label the same escape kept whole,
 # and the two would never line up.
-_LBL = r'(?:[^\[\]\\]|\\.)'
-REF_USE_FULL = re.compile(r'(?<![\\!])\[' + _LBL + r'*\]\[(' + _LBL + r'*)\]')
-REF_USE_SHORTCUT = re.compile(r'(?<![\\!])\[(' + _LBL + r'+)\](?![\(\[:])')
+_LBL = FLAT  # see LABEL_MAX above: one label grammar, not two
+REF_USE_FULL = re.compile(
+    r'(?<![\\!])\[' + _LBL + r'*\]\[(' + _LBL + LABEL_MAX_OPT + r')\]')
+REF_USE_SHORTCUT = re.compile(
+    r'(?<![\\!])\[(' + _LBL + LABEL_MAX + r')\](?![\(\[:])')
 # Every full-reference span, image or not. Used to blank them before the
 # shortcut scan: in `![alt][mail]` the guard correctly stops REF_USE_FULL, but
 # the trailing `[mail]` then looks exactly like a standalone shortcut link, so
 # an image would resurrect the label the guard just rejected.
-REF_USE_ANY = re.compile(r'\[' + _LBL + r'*\]\[' + _LBL + r'*\]')
+REF_USE_ANY = re.compile(
+    r'\[' + _LBL + r'*\]\[' + _LBL + LABEL_MAX_OPT + r'\]')
 # An image and its destination, in both spellings. Blanked before the bare-path
 # scan for the same reason the inline pattern guards against `!`: the path in
 # `![alt](docs/guide/x.md)` is a resource the page loads, never text on screen,
@@ -1059,8 +1081,15 @@ def edges_from(f):
     # rendered, so `<a href="mail.md">` on its own line — which is itself such a
     # block — is a link the reader can click. Stripping it here broke two
     # anchor tests, which is what said the distinction is real.
-    for m in ANCHOR_HREF.finditer(txt):
-        add_relative(next(g for g in m.groups() if g is not None))
+    # The href is read only from a span `ANCHOR_TAG` already accepted as a
+    # COMPLETE tag. On its own `ANCHOR_HREF` stops at the value and never sees
+    # what follows, so `<a href="mail.md" =>` — malformed, and rendered as
+    # literal text rather than a link — recorded an edge. One grammar decides
+    # what an anchor is; the other only says where its destination sits.
+    for tag in ANCHOR_TAG.finditer(txt):
+        m = ANCHOR_HREF.search(tag.group(0))
+        if m:
+            add_relative(next(g for g in m.groups() if g is not None))
 
     # A reference USE inside code — `` `[mail][]` `` — is the one code case that
     # does not count, and it is not an exception to the visible/invisible rule
@@ -2378,6 +2407,42 @@ self_test() {
     > "$c9eu/docs/guide/jobs.md"
   git -C "$c9eu" add -A && git -C "$c9eu" commit -qm site-root-path
   check "a site-root path still counts as an edge" pass "$c9eu"
+
+  # A malformed anchor renders as literal text, so its href is not navigation.
+  local c9ev="$tmp/c9ev"; make_corpus "$c9ev"
+  printf '# Jobs\n\n<a href="mail.md" =>mail</a>\n' > "$c9ev/docs/guide/jobs.md"
+  git -C "$c9ev" add -A && git -C "$c9ev" commit -qm malformed-anchor
+  check "a malformed anchor confers no reachability" fail "$c9ev"
+
+  # A bare destination needs balanced parentheses, in a definition as inline.
+  local c9ew="$tmp/c9ew"; make_corpus "$c9ew"
+  printf '# Jobs\n\nSee [mail][m].\n\n[m]: mail.md#(unterminated\n' \
+    > "$c9ew/docs/guide/jobs.md"
+  git -C "$c9ew" add -A && git -C "$c9ew" commit -qm unbalanced-def-paren
+  check "an unbalanced paren in a definition defines nothing" fail "$c9ew"
+
+  # A label over CommonMark's 999-character cap defines nothing.
+  local c9ex="$tmp/c9ex"; make_corpus "$c9ex"
+  local long; long="$(printf 'a%.0s' $(seq 1000))"
+  printf '# Jobs\n\nSee [mail][%s].\n\n[%s]: mail.md\n' "$long" "$long" \
+    > "$c9ex/docs/guide/jobs.md"
+  git -C "$c9ex" add -A && git -C "$c9ex" commit -qm overlong-label
+  check "an overlong reference label defines nothing" fail "$c9ex"
+
+  # ...and one just inside the cap still resolves.
+  local c9ey="$tmp/c9ey"; make_corpus "$c9ey"
+  local ok999; ok999="$(printf 'a%.0s' $(seq 999))"
+  printf '# Jobs\n\nSee [mail][%s].\n\n[%s]: mail.md\n' "$ok999" "$ok999" \
+    > "$c9ey/docs/guide/jobs.md"
+  git -C "$c9ey" add -A && git -C "$c9ey" commit -qm label-at-cap
+  check "a reference label at the cap resolves" pass "$c9ey"
+
+  # A reference USE cannot cross a blank line either.
+  local c9ez="$tmp/c9ez"; make_corpus "$c9ez"
+  printf '# Jobs\n\nSee [mail][a\n\nb].\n\n[a b]: mail.md\n' \
+    > "$c9ez/docs/guide/jobs.md"
+  git -C "$c9ez" add -A && git -C "$c9ez" commit -qm use-across-blank
+  check "a reference use broken by a blank line is not a link" fail "$c9ez"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
