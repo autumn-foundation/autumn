@@ -216,7 +216,14 @@ TITLE = (r'(?:' + r'(?:[ \t]*\n?[ \t]*)' +
 # but never a blank line — a blank line ends the paragraph, so `[x](y.md\n\n)`
 # renders no link at all and must not record an edge.
 _WS = r'(?:[ \t]*\n?[ \t]*)'
-DEST = r'\(' + _WS + r'(?:<([^<>]*)>|(' + DEST_BARE + r'))' + TITLE + _WS + r'\)'
+# The angle form admits NO line ending at all — CommonMark allows the
+# whitespace AROUND a destination to span one newline, but not the destination
+# itself. `[Mail](<mail.md\n>)` renders no link, and `[^<>]*` matched it, then
+# `add_relative` stripped the newline and recorded the target: a malformed link
+# concealing an orphan. This is the same bound `_WS` and the title body already
+# carry, applied to the third place a newline could sneak through.
+ANGLE_DEST = r'<([^<>\r\n]*)>'
+DEST = r'\(' + _WS + r'(?:' + ANGLE_DEST + r'|(' + DEST_BARE + r'))' + TITLE + _WS + r'\)'
 # The label has to be matched too, not just the `](…)` tail: `\[Mail](mail.md)`
 # renders as literal text, so treating it as a route would let a link someone
 # deliberately disabled go on hiding an orphan. `\.` keeps an escaped bracket
@@ -263,7 +270,7 @@ def decode_char_refs(s):
 # label contains a bracket — `[^\]]+` would stop at the escaped one and lose the
 # definition entirely. Same `FLAT` shape the sibling uses for exactly this.
 REF_DEF = re.compile(
-    r'^ {0,3}\[((?:[^\[\]\\]|\\.)+)\]:(?:[ \t]*\n?[ \t]*)(?:<([^<>]*)>|(\S+))'
+    r'^ {0,3}\[((?:[^\[\]\\]|\\.)+)\]:(?:[ \t]*\n?[ \t]*)(?:' + ANGLE_DEST + r'|(\S+))'
     # A title that OPENS and never closes makes the whole line a paragraph —
     # there is no definition at all. Truncating at the destination recorded a
     # target the reader never reaches. Pinned by the repo's
@@ -272,7 +279,7 @@ REF_DEF = re.compile(
 # The same, extended to the optional title — on the destination's line or the
 # one after it, per CommonMark. Used only to blank the definition's full span.
 REF_DEF_FULL = re.compile(
-    r'^ {0,3}\[(?:[^\[\]\\]|\\.)+\]:(?:[ \t]*\n?[ \t]*)(?:<[^<>]*>|\S+)'
+    r'^ {0,3}\[(?:[^\[\]\\]|\\.)+\]:(?:[ \t]*\n?[ \t]*)(?:<[^<>\r\n]*>|\S+)'
     r'(?:[ \t]*\n?[ \t]*(?:"[^"]*"|\'[^\']*\'|\([^()]*\)))?', re.M)
 # ...but a definition only becomes a link the reader can click when some label
 # USES it. A leftover `[old]: mail.md` with no `[…][old]` anywhere renders as
@@ -521,9 +528,22 @@ HIDDEN_HTML = re.compile(
 # contents are SHOWN. A path in a `<pre>` block is on screen and still counts,
 # which is why they belong here and not in HIDDEN_HTML: this bounds Markdown
 # extraction only.
+# The end condition is the LINE, not the tag: CommonMark ends a type-1 block on
+# the line carrying a close tag, and that whole line is part of the block. So
+# `</pre> [Mail](mail.md)` leaves the link literal, and stopping at the `>` fed
+# the tail to the extractors as live Markdown. `check-migration-guides.sh`
+# records the same rule in as many words ("The end-condition line is part of the
+# block, so text sharing a line with `</script>` stays literal too").
+# The close tag need not match the opener — the spec says so explicitly — so
+# the alternation is deliberate rather than a backreference.
+# Anchored to the start of a line (up to three spaces) because that is the
+# START condition: a mid-line `see <pre> for details` opens no block, and the
+# Markdown under it still renders.
+TYPE1_TAGS = r'pre|textarea|script|style'
 PRE_BLOCK = re.compile(
-    r'<(pre|textarea)\b[^>]*>.*?</\1\s*>'
-    r'|<(?:pre|textarea)\b[^>]*>.*', re.S | re.I)
+    r'^ {0,3}<(?:' + TYPE1_TAGS + r')\b[^>]*>.*?</(?:' + TYPE1_TAGS + r')\s*>[^\n]*'
+    r'|^ {0,3}<(?:' + TYPE1_TAGS + r')\b[^>]*>.*',
+    re.S | re.I | re.M)
 # Every attribute value EXCEPT `href`. An attribute is not rendered text, so a
 # path, a reference label or a comment marker parked in one — `<span
 # data-note="[mail](mail.md)">` — is invisible and confers nothing. `href` is
@@ -579,10 +599,23 @@ BLOCK_TAGS = (
 # all three (`…_treats_a_cdata_block_as_literal` and its two siblings), and
 # omitting them let a link inside any of the three count as navigation.
 # Types 3-6 MAY interrupt a paragraph, so they need no context test.
+# Each of the three ends on the line carrying its terminator, and that whole
+# line belongs to the block — `<?demo ?> [Mail][m]` leaves the reference
+# literal, so a later `[m]: mail.md` cannot make it a route. Stopping at `?>`
+# handed the tail to the reference scanner and marked the orphan reachable.
+RAW_DELIM = (
+    r'^ {0,3}<\?.*?\?>[^\n]*'
+    r'|^ {0,3}<!\[CDATA\[.*?\]\]>[^\n]*'
+    r'|^ {0,3}<![A-Za-z][^>]*>[^\n]*')
+# The same three on their own, because `mask_invisible` needs them: nothing
+# inside one is Markdown, and `<![CDATA[x]]>` happens to READ as an image
+# reference — `![` … `]]` with one level of nesting. Blanking it there left a
+# bare `<` and `>` behind, RAW_BLOCK no longer matched the line, and a link
+# sharing it went back to counting as a route. Only these three are protected;
+# a type 6/7 block still needs `HIDDEN_HTML` to reach a `<script>` inside it.
+RAW_DELIM_BLOCK = re.compile(RAW_DELIM, re.M | re.S)
 RAW_BLOCK = re.compile(
-    r'^ {0,3}<\?.*?\?>'
-    r'|^ {0,3}<!\[CDATA\[.*?\]\]>'
-    r'|^ {0,3}<![A-Za-z][^>]*>'
+    RAW_DELIM +
     r'|^ {0,3}</?(?:' + BLOCK_TAGS + r')(?:[\s/>][^\n]*)?$'
     r'(?:\n(?![ \t]*$)[^\n]*)*',
     re.M | re.I | re.S)
@@ -684,6 +717,28 @@ def sub_in_prose(pat, txt, only_at_block_start=False):
     return ''.join(out)
 
 
+def fold_escapes(txt):
+    """Collapse the three backslash escapes that change what a construct IS.
+
+    An escaped backslash consumes the next one, so `\\\\\\\\[x](y.md)` renders a
+    literal backslash and a LIVE link while `\\\\[x](y.md)` renders literal text;
+    `\\!` stops an image from being one; and `\\<` stops raw HTML, so prose
+    showing literal tags around a live link keeps that link. Fixed-width
+    lookbehinds cannot count a run or see past the `!`, so each folds to a
+    same-LENGTH placeholder — same length because spans are blanked by offset
+    downstream and the positions must stay valid.
+
+    This is a function because two callers need it and only one had it: the
+    waiver scan read unfolded text, so a page DISPLAYING `\\<!-- orphan-allow:
+    … -->` — visible text, not a comment — exempted itself from the check. That
+    is the most expensive false negative this gate has, since it is how a page
+    opts out entirely.
+    """
+    return (txt.replace('\\\\', '\x00\x00')
+            .replace('\\!', '\x01\x01')
+            .replace('\\<', '\x02\x02'))
+
+
 def mask_invisible(txt):
     """Blank everything a reader cannot see — in PROSE, and not inside a code
     span. This is the ONE place that decides what is invisible, because scoping
@@ -707,6 +762,8 @@ def mask_invisible(txt):
             out.append(seg)
             continue
         protected = [(m.start(), m.end()) for m in CODE_SPAN.finditer(seg)]
+        protected += [(m.start(), m.end())
+                      for m in RAW_DELIM_BLOCK.finditer(seg)]
         tags = [(m.start(), m.end()) for m in HTML_TAG.finditer(seg)]
 
         def blank(pat, bound=None):
@@ -750,20 +807,10 @@ def edges_from(f):
     # THE ORDER OF THESE THREE STEPS IS LOAD-BEARING, and each was set by a
     # test that failed when it was wrong.
     #
-    # 1. Escapes fold FIRST. An escaped backslash consumes the next one, so
-    #    `\\\\[x](y.md)` renders a literal backslash and a LIVE link while
-    #    `\\[x](y.md)` renders literal text; and `\![x](y.md)` is a link, not an
-    #    image, because the backslash stops the `!`. Fixed-width lookbehinds
-    #    cannot count a run or see past the `!`, so both are folded to
-    #    same-LENGTH placeholders — same length because spans are blanked by
-    #    offset further down and the positions must stay valid. This has to
-    #    precede masking, or `mask_invisible` reads `\![x](y.md)` as an image
-    #    and blanks a live link.
-    #    `\<script>` is the same idea for a tag: the escape stops raw HTML, so
-    #    prose showing literal tags around a live link must keep that link.
-    txt = (read(f).replace('\\\\', '\x00\x00')
-           .replace('\\!', '\x01\x01')
-           .replace('\\<', '\x02\x02'))
+    # 1. Escapes fold FIRST — see `fold_escapes` for which three and why. It
+    #    has to precede masking, or `mask_invisible` reads `\![x](y.md)` as an
+    #    image and blanks a live link.
+    txt = fold_escapes(read(f))
     # 2. Raw HTML is identified BEFORE comments. A `<!--` inside a closed
     #    `<script>` is script data, not a Markdown comment, and parsing comments
     #    first truncated the document at it. This order also settles the
@@ -929,8 +976,12 @@ def waiver_view(txt):
     is the one place a false negative is most expensive, since it is how a page
     opts out of the check entirely, so it is matched only where an HTML comment
     would actually be an HTML comment.
+
+    Escapes fold first, for the same reason and in the same order as edge
+    extraction: `\\<!-- orphan-allow: … -->` is text the reader can see, not a
+    comment, and must not waive anything.
     """
-    txt = mask_invisible(txt)
+    txt = mask_invisible(fold_escapes(txt))
     kept = [seg for kind, seg in split_fences(txt) if kind == 'prose']
     return CODE_SPAN.sub(' ', ''.join(kept))
 
@@ -1899,6 +1950,58 @@ self_test() {
     > "$c9dm/docs/guide/jobs.md"
   git -C "$c9dm" add -A && git -C "$c9dm" commit -qm def-after-quote
   check "a definition after a closed block quote resolves" pass "$c9dm"
+
+  # A destination in angle brackets admits no line ending at all.
+  local c9dn="$tmp/c9dn"; make_corpus "$c9dn"
+  printf '# Jobs\n\nSee [mail](<mail.md\n>).\n' > "$c9dn/docs/guide/jobs.md"
+  git -C "$c9dn" add -A && git -C "$c9dn" commit -qm angle-dest-newline
+  check "an angle destination broken by a newline is not a link" fail "$c9dn"
+
+  # ...and the same bound holds in a definition, which shares the grammar.
+  local c9do="$tmp/c9do"; make_corpus "$c9do"
+  printf '# Jobs\n\nSee [mail][m].\n\n[m]: <mail.md\n>\n' > "$c9do/docs/guide/jobs.md"
+  git -C "$c9do" add -A && git -C "$c9do" commit -qm angle-def-newline
+  check "an angle destination broken by a newline defines nothing" fail "$c9do"
+
+  # A raw block ends on the line carrying its terminator, and that whole line
+  # is part of the block — so markdown sharing the line stays literal.
+  local c9dp="$tmp/c9dp"; make_corpus "$c9dp"
+  printf '# Jobs\n\n<?demo ?> [mail][m]\n\n[m]: mail.md\n' > "$c9dp/docs/guide/jobs.md"
+  git -C "$c9dp" add -A && git -C "$c9dp" commit -qm pi-terminator-line
+  check "text sharing a line with ?> stays inside the block" fail "$c9dp"
+
+  local c9dq="$tmp/c9dq"; make_corpus "$c9dq"
+  printf '# Jobs\n\n<![CDATA[x]]> [mail](mail.md)\n' > "$c9dq/docs/guide/jobs.md"
+  git -C "$c9dq" add -A && git -C "$c9dq" commit -qm cdata-terminator-line
+  check "text sharing a line with ]]> stays inside the block" fail "$c9dq"
+
+  local c9dr="$tmp/c9dr"; make_corpus "$c9dr"
+  printf '# Jobs\n\n<pre>x</pre> [mail](mail.md)\n' > "$c9dr/docs/guide/jobs.md"
+  git -C "$c9dr" add -A && git -C "$c9dr" commit -qm type1-terminator-line
+  check "text sharing a line with </pre> stays inside the block" fail "$c9dr"
+
+  # ...but a type-1 block needs its opener at the START of a line: mid-line
+  # there is no block, and the markdown under it still renders.
+  local c9ds="$tmp/c9ds"; make_corpus "$c9ds"
+  printf '# Jobs\n\nsee <pre> for details\n\nSee [mail](mail.md).\n' \
+    > "$c9ds/docs/guide/jobs.md"
+  git -C "$c9ds" add -A && git -C "$c9ds" commit -qm type1-midline
+  check "a mid-line <pre> opens no raw block" pass "$c9ds"
+
+  # An ESCAPED waiver marker is text the reader can see, not a comment, so it
+  # exempts nothing — the most expensive false negative this gate could have.
+  local c9dt="$tmp/c9dt"; make_corpus "$c9dt"
+  printf '# Mail\n\nWrite \\<!-- orphan-allow: why --> to waive a page.\n' \
+    > "$c9dt/docs/guide/mail.md"
+  git -C "$c9dt" add -A && git -C "$c9dt" commit -qm waiver-escaped
+  check "an escaped waiver marker exempts nothing" fail "$c9dt"
+
+  # ...while an escaped BACKSLASH before a real marker still waives.
+  local c9du="$tmp/c9du"; make_corpus "$c9du"
+  printf '# Mail\n\n\\\\<!-- orphan-allow: appendix, see the release notes -->\n' \
+    > "$c9du/docs/guide/mail.md"
+  git -C "$c9du" add -A && git -C "$c9du" commit -qm waiver-escaped-backslash
+  check "an escaped backslash before a waiver still waives" pass "$c9du"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
