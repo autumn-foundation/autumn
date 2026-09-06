@@ -97,10 +97,16 @@ pub async fn signup(
 ) -> AutumnResult<Response> {
     let email = form.email.trim().to_lowercase();
     if !email.contains('@') || email.len() > 254 {
+        // Bound the re-filled value: this branch is the only one that can be
+        // reached by an email BIGGER than the 254-char limit it's rejecting,
+        // so echoing `email` verbatim would let an attacker turn the bounded
+        // error page into an up-to-32MiB response (the default request-body
+        // limit) — Codex finding on this PR.
+        let echoed_email: String = email.chars().take(254).collect();
         return Ok(signup_page(
             state.config_arc().auth.password.min_length,
             csrf_value(&csrf),
-            &email,
+            &echoed_email,
             &["Enter a valid email address (max 254 characters)".to_owned()],
         )
         .into_response());
@@ -280,10 +286,27 @@ pub async fn login(
     Form(form): Form<LoginForm>,
 ) -> AutumnResult<Response> {
     let email = form.email.trim().to_lowercase();
-    let next = form.next.clone().unwrap_or_default();
+    // Bounded before use in any re-render below: unlike `email` (whose only
+    // unbounded reach is the guard branch immediately below — every other
+    // branch here runs after that length check), `next` is never otherwise
+    // validated for length, so an attacker could otherwise post a `next`
+    // field sized against the request-body limit (32MiB default) and have it
+    // echoed back into every failed-login re-render (Codex finding on this
+    // PR, originally raised against the analogous email echo).
+    let next: String = form
+        .next
+        .as_deref()
+        .unwrap_or_default()
+        .chars()
+        .take(254)
+        .collect();
     if email.len() > 254 || form.password.len() > 128 {
+        // Same bound as the equivalent signup guard: this branch is the only
+        // one reachable by an email BIGGER than the 254-char limit it's
+        // rejecting.
+        let echoed_email: String = email.chars().take(254).collect();
         return Ok(login_page(
-            &email,
+            &echoed_email,
             &next,
             csrf_value(&csrf),
             Some("Invalid email or password"),

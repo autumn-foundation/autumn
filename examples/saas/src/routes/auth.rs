@@ -120,10 +120,17 @@ pub async fn signup(
     // Cap input lengths so an attacker cannot drive bcrypt/DB work with huge
     // payloads (254 is the RFC-5321 email maximum; 128 is a generous password cap).
     if !email.contains('@') || email.len() > 254 {
+        // Bound the re-filled value: this branch is the only one that can be
+        // reached by an email BIGGER than the 254-char limit it's rejecting,
+        // so echoing `email` verbatim would let an attacker turn the bounded
+        // error page into an up-to-32MiB response (the default request-body
+        // limit) — and, for signup, one `SubmitTokenLayer` might cache for its
+        // replay TTL (Codex finding on this PR).
+        let echoed_email: String = email.chars().take(254).collect();
         return Ok(signup_page(
             state.config_arc().auth.password.min_length,
             submit_token.token(),
-            &email,
+            &echoed_email,
             &["Enter a valid email address (max 254 characters)".to_owned()],
         )
         .into_response());
@@ -251,7 +258,13 @@ pub async fn login(
     // Reject over-long inputs before any DB query or bcrypt work — they can never
     // match a stored account and only waste CPU.
     if email.len() > 254 || form.password.len() > 128 {
-        return Ok(login_page(&email, Some("Invalid email or password")).into_response());
+        // Bound the re-filled value: this is the only branch reachable by an
+        // email bigger than the 254-char limit, so echoing it verbatim would
+        // let an attacker turn a bounded error page into an up-to-32MiB
+        // response (the default request-body limit) — Codex finding on this
+        // PR, originally raised against the equivalent signup guard.
+        let echoed_email: String = email.chars().take(254).collect();
+        return Ok(login_page(&echoed_email, Some("Invalid email or password")).into_response());
     }
 
     let user: Option<User> = users::table
