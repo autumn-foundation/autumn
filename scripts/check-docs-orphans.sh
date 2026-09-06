@@ -263,7 +263,7 @@ def decode_char_refs(s):
 # label contains a bracket — `[^\]]+` would stop at the escaped one and lose the
 # definition entirely. Same `FLAT` shape the sibling uses for exactly this.
 REF_DEF = re.compile(
-    r'^ {0,3}\[((?:[^\[\]\\]|\\.)+)\]:\s*(?:<([^<>]*)>|(\S+))'
+    r'^ {0,3}\[((?:[^\[\]\\]|\\.)+)\]:(?:[ \t]*\n?[ \t]*)(?:<([^<>]*)>|(\S+))'
     # A title that OPENS and never closes makes the whole line a paragraph —
     # there is no definition at all. Truncating at the destination recorded a
     # target the reader never reaches. Pinned by the repo's
@@ -272,7 +272,7 @@ REF_DEF = re.compile(
 # The same, extended to the optional title — on the destination's line or the
 # one after it, per CommonMark. Used only to blank the definition's full span.
 REF_DEF_FULL = re.compile(
-    r'^ {0,3}\[(?:[^\[\]\\]|\\.)+\]:\s*(?:<[^<>]*>|\S+)'
+    r'^ {0,3}\[(?:[^\[\]\\]|\\.)+\]:(?:[ \t]*\n?[ \t]*)(?:<[^<>]*>|\S+)'
     r'(?:[ \t]*\n?[ \t]*(?:"[^"]*"|\'[^\']*\'|\([^()]*\)))?', re.M)
 # ...but a definition only becomes a link the reader can click when some label
 # USES it. A leftover `[old]: mail.md` with no `[…][old]` anywhere renders as
@@ -516,6 +516,14 @@ def strip_comments(txt):
 HIDDEN_HTML = re.compile(
     r'<(script|style|template)\b[^>]*>.*?</\1\s*>'
     r'|<(?:script|style|template)\b[^>]*>.*', re.S | re.I)
+# `<pre>` and `<textarea>` are CommonMark type-1 raw blocks alongside script and
+# style, so Markdown inside them is literal — but unlike script and style their
+# contents are SHOWN. A path in a `<pre>` block is on screen and still counts,
+# which is why they belong here and not in HIDDEN_HTML: this bounds Markdown
+# extraction only.
+PRE_BLOCK = re.compile(
+    r'<(pre|textarea)\b[^>]*>.*?</\1\s*>'
+    r'|<(?:pre|textarea)\b[^>]*>.*', re.S | re.I)
 # Every attribute value EXCEPT `href`. An attribute is not rendered text, so a
 # path, a reference label or a comment marker parked in one — `<span
 # data-note="[mail](mail.md)">` — is invisible and confers nothing. `href` is
@@ -581,7 +589,11 @@ RAW_BLOCK = re.compile(
 # Type 7 — any complete tag alone on its line — may NOT. Applied only where a
 # block can start, or `prose` / `<span>` / `[Mail](mail.md)` masks a live link.
 RAW_BLOCK_TYPE7 = re.compile(
-    r'^ {0,3}</?[A-Za-z][A-Za-z0-9-]*(?:\s[^\n]*?)?/?>[ \t]*$'
+    # A malformed `<x =>` is ordinary text, not a tag, so it opens nothing —
+    # the attribute grammar is HTML_TAG's rather than a permissive `[^\n]*?`.
+    r'^ {0,3}</?[A-Za-z][A-Za-z0-9-]*'
+    r'(?:\s+[A-Za-z_:][-\w:.]*(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+))?)*'
+    r'\s*/?>[ \t]*$'
     r'(?:\n(?![ \t]*$)[^\n]*)*',
     re.M)
 # A raw anchor IS navigation, so its destination is resolved like any other —
@@ -611,6 +623,15 @@ def block_starts(txt):
     `check-migration-guides.sh` tracks the same state as `md_paragraph_open`,
     and pins both cases (`…_keeps_a_type_seven_tag_inline_inside_a_paragraph`,
     `…_lets_a_type_six_tag_interrupt_a_paragraph`).
+
+    A block-quote line OPENS a paragraph rather than closing one, which is why
+    it is not in the list below. `> note` / `[m]: mail.md` is lazy continuation:
+    a definition cannot interrupt a paragraph, so the second line is ordinary
+    text inside the quote and defines nothing. Treating the quote as a
+    completed block admitted that non-definition as an edge, which is how an
+    orphan would slip past. The migration gate agrees — its `block_body()`
+    deliberately does not strip quote markers, so `> note` sets
+    `md_paragraph_open`.
     """
     starts, pos, para_open = set(), 0, False
     for line in txt.split('\n'):
@@ -703,12 +724,18 @@ def mask_invisible(txt):
             pieces.append(seg[last:])
             seg = ''.join(pieces)
 
-        blank(HIDDEN_HTML)
+        # Attributes are blanked BEFORE `HIDDEN_HTML`, because a tag boundary
+        # has to be known before script-shaped TEXT can be treated as a script.
+        # In `<span title="<script>">`, the quoted `<script>` is attribute text
+        # and every link below it is still live; running `HIDDEN_HTML` first
+        # made that span open a raw block and erased the rest of the page —
+        # or everything up to an unrelated later `</script>`.
         anchors = [(m.start(), m.end()) for m in ANCHOR_TAG.finditer(seg)]
         others = [t for t in tags
                   if not any(a <= t[0] < b for a, b in anchors)]
         blank(ATTR_VALUE, bound=anchors)
         blank(ATTR_VALUE_ANY, bound=others)
+        blank(HIDDEN_HTML)
         # Images last, and here rather than at the bare-path scan, so a
         # `![alt](x.md)` SAMPLE in a fence or code span keeps its visible
         # destination while a rendered image does not.
@@ -799,7 +826,12 @@ def edges_from(f):
     # The bare-path scan above deliberately still sees that region, because the
     # path itself is visible text there — the same visible/invisible split that
     # governs fences.
-    md_txt = sub_in_prose(RAW_BLOCK, txt)
+    # `<pre>` and `<textarea>` are type-1 raw blocks, so they suppress Markdown
+    # the same way — but they end at their own closing tag rather than at a
+    # blank line, and their contents are on screen, so they are stripped from
+    # this view only and the bare-path scan above still reads them.
+    md_txt = sub_in_prose(PRE_BLOCK, txt)
+    md_txt = sub_in_prose(RAW_BLOCK, md_txt)
     md_txt = sub_in_prose(RAW_BLOCK_TYPE7, md_txt, only_at_block_start=True)
 
     for pattern in (MD_LINK, MD_LINK_NESTED):
@@ -1788,6 +1820,85 @@ self_test() {
   printf '# Jobs\n\nSee [mail](mail.md "the mail\nguide").\n' > "$c9dd/docs/guide/jobs.md"
   git -C "$c9dd" add -A && git -C "$c9dd" commit -qm title-wrapped
   check "a title wrapped across one line resolves" pass "$c9dd"
+
+  # `<x =>` is not a tag at all — an attribute name cannot be empty — so it
+  # opens no type-7 block and the link under it still renders.
+  local c9de="$tmp/c9de"; make_corpus "$c9de"
+  printf '# Jobs\n\n<x =>\nSee [mail](mail.md).\n' > "$c9de/docs/guide/jobs.md"
+  git -C "$c9de" add -A && git -C "$c9de" commit -qm malformed-type7
+  check "a malformed tag opens no raw block" pass "$c9de"
+
+  # ...while a well-formed one alone on its line does, and suppresses it.
+  local c9df="$tmp/c9df"; make_corpus "$c9df"
+  printf '# Jobs\n\n<x a="1">\nSee [mail](mail.md).\n' > "$c9df/docs/guide/jobs.md"
+  git -C "$c9df" add -A && git -C "$c9df" commit -qm wellformed-type7
+  check "a well-formed tag alone on its line opens a raw block" fail "$c9df"
+
+  # `<pre>` is a type-1 raw block, and each of these three is a case type 7
+  # cannot reach — which is why the type-7 rule alone left the link live.
+  # It MAY interrupt a paragraph...
+  local c9dg="$tmp/c9dg"; make_corpus "$c9dg"
+  printf '# Jobs\n\ntext\n<pre>\nSee [mail](mail.md).\n</pre>\n' \
+    > "$c9dg/docs/guide/jobs.md"
+  git -C "$c9dg" add -A && git -C "$c9dg" commit -qm pre-interrupts
+  check "<pre> interrupting a paragraph makes the markdown literal" fail "$c9dg"
+
+  # ...its opener may carry trailing content...
+  local c9dg2="$tmp/c9dg2"; make_corpus "$c9dg2"
+  printf '# Jobs\n\n<pre>example\nSee [mail](mail.md).\n</pre>\n' \
+    > "$c9dg2/docs/guide/jobs.md"
+  git -C "$c9dg2" add -A && git -C "$c9dg2" commit -qm pre-trailing
+  check "<pre> with trailing content still opens a raw block" fail "$c9dg2"
+
+  # ...and it ends at its closing tag, not at the next blank line.
+  local c9dg3="$tmp/c9dg3"; make_corpus "$c9dg3"
+  printf '# Jobs\n\n<pre>\ncode\n\nSee [mail](mail.md).\n</pre>\n' \
+    > "$c9dg3/docs/guide/jobs.md"
+  git -C "$c9dg3" add -A && git -C "$c9dg3" commit -qm pre-past-blank
+  check "<pre> runs past a blank line to its closing tag" fail "$c9dg3"
+
+  # ...but unlike a script block its contents are SHOWN, so a path there is
+  # findable exactly as one in a fence is.
+  local c9dh="$tmp/c9dh"; make_corpus "$c9dh"
+  printf '# Jobs\n\n<pre>\ndocs/guide/mail.md\n</pre>\n' > "$c9dh/docs/guide/jobs.md"
+  git -C "$c9dh" add -A && git -C "$c9dh" commit -qm pre-visible
+  check "a bare path inside <pre> is still visible" pass "$c9dh"
+
+  # A definition's destination may not sit across a blank line from its label.
+  local c9di="$tmp/c9di"; make_corpus "$c9di"
+  printf '# Jobs\n\nSee [mail][m].\n\n[m]:\n\nmail.md\n' > "$c9di/docs/guide/jobs.md"
+  git -C "$c9di" add -A && git -C "$c9di" commit -qm def-across-blank
+  check "a destination after a blank line defines nothing" fail "$c9di"
+
+  # Script-SHAPED text inside an attribute value is text. Reading it as a raw
+  # block opener erased every link below it, to the next `</script>` or to EOF.
+  local c9dj="$tmp/c9dj"; make_corpus "$c9dj"
+  printf '# Jobs\n\n<span title="<script>">note</span>\n\nSee [mail](mail.md).\n' \
+    > "$c9dj/docs/guide/jobs.md"
+  git -C "$c9dj" add -A && git -C "$c9dj" commit -qm script-in-attribute
+  check "a script tag quoted in an attribute hides nothing" pass "$c9dj"
+
+  # ...and a real script block still hides what it wraps.
+  local c9dk="$tmp/c9dk"; make_corpus "$c9dk"
+  printf '# Jobs\n\n<script>\nSee [mail](mail.md).\n</script>\n' \
+    > "$c9dk/docs/guide/jobs.md"
+  git -C "$c9dk" add -A && git -C "$c9dk" commit -qm real-script-block
+  check "a real script block still hides its contents" fail "$c9dk"
+
+  # A definition cannot interrupt the paragraph a block quote opens: the second
+  # line lazily continues the quote and defines nothing.
+  local c9dl="$tmp/c9dl"; make_corpus "$c9dl"
+  printf '# Jobs\n\nSee [mail][m].\n\n> note\n[m]: mail.md\n' \
+    > "$c9dl/docs/guide/jobs.md"
+  git -C "$c9dl" add -A && git -C "$c9dl" commit -qm def-lazy-continuation
+  check "a definition lazily continuing a block quote defines nothing" fail "$c9dl"
+
+  # ...but one after the quote has closed still defines.
+  local c9dm="$tmp/c9dm"; make_corpus "$c9dm"
+  printf '# Jobs\n\nSee [mail][m].\n\n> note\n\n[m]: mail.md\n' \
+    > "$c9dm/docs/guide/jobs.md"
+  git -C "$c9dm" add -A && git -C "$c9dm" commit -qm def-after-quote
+  check "a definition after a closed block quote resolves" pass "$c9dm"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
