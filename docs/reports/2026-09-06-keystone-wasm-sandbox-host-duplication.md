@@ -181,9 +181,11 @@ git log origin/trunk-dev --follow --diff-filter=A --format='%ad %s' --date=short
 git log origin/trunk-dev --oneline --since=2026-09-03 -- autumn-edge/src/host.rs
 
 # Duplicated plumbing (byte-identical modulo one lifetime parameter):
-# memory_of / read_u32 / write_u32 / iovec
-diff <(sed -n '453,500p' autumn-edge/src/host.rs) \
-     <(sed -n '2843,2890p' autumn/src/plugin_sandbox/host.rs)
+# memory_of / read_u32 / write_u32 / iovec. Ranges end exactly at iovec's
+# closing brace -- past it the two files diverge into unrelated doc comments
+# and SERVED_IMPORTS/WASI-registration code, which is not part of this claim.
+diff <(sed -n '453,490p' autumn-edge/src/host.rs) \
+     <(sed -n '2843,2880p' autumn/src/plugin_sandbox/host.rs)
 
 # write_two_zeroes: same two calls, same branching, but a real calling-
 # convention difference (by-value + reborrow vs. by-ref), not just a lifetime
