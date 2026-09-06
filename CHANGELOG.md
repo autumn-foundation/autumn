@@ -3522,6 +3522,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **new `throttle_check` profiling harness; findings, no fix:** added
+  `autumn/benches/throttle_check.rs`, driving real traffic through a
+  `#[throttle]`-guarded route and an identical unthrottled route at
+  equal-length paths with an identical response body (issue #1350's
+  per-route rate limiter had no committed benchmark before this). Several
+  review rounds fixed real measurement bugs before these numbers were final:
+  `key = "token"` with an identical `Authorization: Bearer` header sent to
+  BOTH routes (not `key = "ip"` — `TestApp` requests carry no `ConnectInfo`,
+  which would make `extract_throttle_key` return `None` and profile
+  `__check_throttle`'s no-client bypass instead of the real
+  `limiter.decide()` path; and not an asymmetric header, which would fold
+  its own construction cost into the measurement); equal-length routes/body
+  (`/route-a`/`/route-b`, both `"ok"`), since differently-sized paths and
+  response bodies also leaked into the byte delta; a `THROTTLE_LIMIT` guard
+  plus an assertion on every measured response, so a large `--iterations`
+  can never silently drain the bucket and profile denials instead of the
+  documented warm `Decision::Allowed` path; asserting (not just
+  `black_box`ing) the measured status on BOTH routes, since an earlier
+  version asserted only the throttled side, putting that assertion's own
+  comparison/branch instructions asymmetrically into the callgrind delta;
+  and widening the frame-level DHAT attribution beyond `rate_limit::`-named
+  frames to also catch `#[throttle]`'s generated `FromRequestParts` gate
+  cloning `parts.headers` *before* ever calling into the `rate_limit` module
+  (`autumn-macros/src/throttle.rs`), which the first attribution pass missed
+  entirely; and base-subtracting the callgrind instruction counts (an
+  `--iterations 0` run per route, matching the DHAT methodology) rather than
+  dividing raw process totals by request count, which had been diluting both
+  routes' per-request figures with shared process-startup/router-construction
+  cost. Full, corrected `#[throttle]` overhead against the
+  ~140-151-block/~27.3-28.7KB per-request baseline `config_alloc_gate`
+  already gates (#2232): ~10 blocks / ~885 bytes per request (~6.6%/~3.1%,
+  under the 10%-of-allocations floor) and ~5.3% more instructions than an
+  unthrottled route on the marginal, base-subtracted count (callgrind,
+  `--route throttled` vs. `--route plain`) — which, read as "would a fix
+  removing this entire overhead clear the 5%-of-instructions floor,"
+  technically says yes, though only just. But no *safe, autonomous,
+  smallest-fix* candidate gets there: the only narrowly-scoped,
+  mechanistically-clear piece —
+  two redundant `format!` calls building an almost-always-cache-hit
+  `HashMap` key (`resolve_throttle_params`'s `registry_key`,
+  `__check_throttle`'s `cache_key`) — accounts for only ~6 of those ~10
+  blocks and isn't separately visible above a 1%-of-instructions self-cost
+  threshold on its own. The rest (two `HeaderMap` clones, one in the
+  generated gate and one in `extract_throttle_key`, plus the LRU-backed
+  `MemoryStore::decide` bucket lookup) is load-bearing rate-limiting state
+  tracking, not an obvious redundancy, and this bench's minimal 1-2-header
+  requests likely *understate* the gate's `parts.headers.clone()` cost for
+  a real multi-header production request. Fixing the aggregate would mean
+  restructuring the limiter's per-request key derivation and bucket-lookup
+  path together — a maintainer decision on a security-relevant surface, not
+  an unreviewed autonomous change. Recorded as a findings issue rather than
+  shipped; the harness itself is the lasting artifact, giving `#[throttle]`
+  its first profiling coverage.
 - **new `repository_crud` profiling harness; findings, no fix (#2486):** added
   `autumn/benches/repository_crud.rs`, driving real `save`/`find_by_id`/`page`
   calls through a `#[repository]`-generated repository against a live

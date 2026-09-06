@@ -540,6 +540,16 @@ required-features = ["db"]
 name = "csrf_verify"
 harness = false
 
+# Per-route `#[throttle]` rate-limiter workload for profilers (issue #1350):
+# drives real GET traffic through a `#[throttle]`-guarded handler and an
+# identical unthrottled handler, interleaved, so a profiler can attribute the
+# limiter's own per-request cost against the same ingress stack
+# `request_pipeline.rs` already measures. Asserts nothing beyond "not denied"
+# — see the file header for the exact commands.
+[[bench]]
+name = "throttle_check"
+harness = false
+
 # W6 PR3 seed-sweep runner (issue #1797): CI-facing driver for
 # `sim::sweep::sweep_proptest`. `required-features` (not a `#![cfg(...)]` file
 # guard, since a `[[bin]]` target — unlike a `[[test]]` — is simply skipped by
