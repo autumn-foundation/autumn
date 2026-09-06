@@ -1534,13 +1534,19 @@ HIDDEN_OPEN = re.compile(
 # `hidden` ATTRIBUTE this is a CSS declaration, so it reaches SVG and MathML
 # too — Chromium reports `<svg style="display:none" width=40 height=40>` as
 # `display: none` with a 0x0 box, where the same element carrying `hidden`
-# still paints. That is why `NOT_HIDDEN_BY_ATTR` is not consulted for this
-# pattern: the exclusion is a property of the attribute, not of hiding.
+# still paints. That is why `FOREIGN_ROOTS` is not consulted for this pattern:
+# the exclusion is a property of the attribute, not of hiding.
 # Deliberately narrow — only a literal `display:none` in an inline style. This
 # is not a CSS engine and does not pretend to be one: a stylesheet, a class, or
 # a computed rule is invisible to it, and a page hiding a link that way is a
 # gap this cannot see.
-_DISPLAY_NONE = r'display' + _TWS + r'*:' + _TWS + r'*none'
+#
+# BOTH ENDS ARE BOUNDED, and each end has a case behind it. `--display:none` is
+# a custom PROPERTY and changes nothing — Chromium leaves the anchor at 30x17 —
+# so an unbounded match rejected a live link; and `display:none-such` is not the
+# `none` value either, for the same reason. A substring test failed both.
+_DISPLAY_NONE = (r'(?<![-\w])display' + _TWS + r'*:' + _TWS
+                 + r'*none(?![-\w])')
 STYLE_HIDDEN_OPEN = re.compile(
     r'<([A-Za-z][A-Za-z0-9-]*)(?:' + _TWS + r'+' + ATTR + r')*?'
     + _TWS + r'+style' + _TWS + r'*=' + _TWS + r'*'
@@ -1587,23 +1593,29 @@ def hidden_open(view, src, at):
 VOID_ELEMENTS = frozenset((
     'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta',
     'source', 'track', 'wbr', 'param', 'keygen'))
-# `hidden` DOES NOT HIDE THESE. The attribute has no power of its own — it
-# works through the one UA-stylesheet rule `[hidden] { display: none }`, and
-# that stylesheet is namespaced to HTML, so it never matches an SVG or MathML
-# element. Chromium reports `<svg hidden width=40 height=40>` as
-# `display: inline` with a 40x40 box: it paints, and an anchor wrapping one is
-# an icon link the reader can click.
+# The two elements that enter FOREIGN CONTENT, where XML rules apply instead of
+# HTML ones. Two consequences here, and both are needed — an earlier round used
+# one of them alone and got the other wrong.
 #
-# This corrects a `SELF_CLOSING_ROOTS` set that stood here for one commit. It
-# gave `svg` and `math` a self-closing branch so `<svg hidden/>` would end at
-# its opening tag — right about HTML parsing (a trailing `/>` really does close
-# a foreign-content element, and is ignored on every HTML element) but wrong
-# about the premise, since neither is hidden in the first place. Treating them
-# as hidden also broke the balancing scan: in
-# `<svg hidden><svg/></svg>Mail`, the self-closing inner tag was counted as a
-# new open level, the outer close never returned depth to zero, and the visible
-# `Mail` was masked to the end of the anchor.
-NOT_HIDDEN_BY_ATTR = frozenset(('svg', 'math'))
+# 1. `hidden` DOES NOT HIDE THEM. The attribute has no power of its own: it
+#    works through the one UA-stylesheet rule `[hidden] { display: none }`, and
+#    that stylesheet is namespaced to HTML, so it never matches an SVG or
+#    MathML element. Chromium reports `<svg hidden width=40 height=40>` as
+#    `display: inline` with a 40x40 box — it paints, and an anchor wrapping one
+#    is an icon link the reader can click. Inline `display:none` is CSS rather
+#    than an attribute and DOES hide them, so this applies to `HIDDEN_OPEN`
+#    only.
+# 2. A trailing `/>` REALLY DOES CLOSE THEM, where on every HTML element the
+#    parser drops the slash and the element stays open. So a `<svg/>` nested
+#    inside a hidden one opens no new level, and counting it as one left the
+#    outer close unable to return depth to zero: in
+#    `<svg style="display:none"><svg/></svg>Mail`, the visible `Mail` was
+#    masked to the end of the anchor and its target reported as an orphan.
+#
+# These were briefly a single `SELF_CLOSING_ROOTS` set applying (2) to the
+# `hidden` path, which was the wrong pairing — (2) is real but only matters
+# once something has actually hidden the element, and `hidden` never does.
+FOREIGN_ROOTS = frozenset(('svg', 'math'))
 
 # Elements whose CONTENTS the tokenizer reads as text, so a tag spelled inside
 # one is not a tag. `<span hidden><textarea></span>Secret</textarea></span>`
@@ -1657,7 +1669,7 @@ def mask_hidden_subtrees(txt, src=None):
         # Only the ATTRIBUTE spares svg and math. `display:none` is CSS and
         # hides them like anything else, so the exclusion is scoped to the
         # pattern that matched rather than to the tag name alone.
-        if lname in NOT_HIDDEN_BY_ATTR and m.re is HIDDEN_OPEN:
+        if lname in FOREIGN_ROOTS and m.re is HIDDEN_OPEN:
             # The attribute does not apply, so this is ordinary visible
             # content: step over the tag without masking anything.
             at = m.end()
@@ -1694,11 +1706,18 @@ def mask_hidden_subtrees(txt, src=None):
                 continue
             if not t:
                 break
+            gt = out.find('>', t.end())
+            # In foreign content `/>` genuinely closes, so a nested `<svg/>`
+            # opens no level. Counting it as one left the outer close unable
+            # to reach depth zero and swallowed the label after it.
+            if (not t.group(1) and lname in FOREIGN_ROOTS
+                    and gt != -1 and out[gt - 1] == '/'):
+                pos = gt + 1
+                continue
             depth += -1 if t.group(1) else 1
             pos = t.end()
             if not depth:
-                close = out.find('>', pos)
-                end = len(out) if close == -1 else close + 1
+                end = len(out) if gt == -1 else gt + 1
         out = out[:m.start()] + ' ' * (end - m.start()) + out[end:]
         ref = ref[:m.start()] + ' ' * (end - m.start()) + ref[end:]
         at = end
@@ -4277,6 +4296,37 @@ self_test() {
     > "$c9jn/docs/guide/jobs.md"
   git -C "$c9jn" add -A && git -C "$c9jn" commit -qm svg-display-none
   check "inline CSS does hide an svg" fail "$c9jn"
+
+  # `--display` is a custom PROPERTY and changes nothing, so the match needs a
+  # property boundary — a substring test rejected this live link.
+  local c9js="$tmp/c9js"; make_corpus "$c9js"
+  printf '# Jobs\n\n<a style="--display:none" href="mail.md">Mail</a>\n' \
+    > "$c9js/docs/guide/jobs.md"
+  git -C "$c9js" add -A && git -C "$c9js" commit -qm custom-property
+  check "a custom property that ends in display is not it" pass "$c9js"
+
+  # ...and the value needs its own boundary: `none-such` is not `none`.
+  local c9jt="$tmp/c9jt"; make_corpus "$c9jt"
+  printf '# Jobs\n\n<a style="display:none-such" href="mail.md">Mail</a>\n' \
+    > "$c9jt/docs/guide/jobs.md"
+  git -C "$c9jt" add -A && git -C "$c9jt" commit -qm value-prefix
+  check "a value that merely starts with none is not none" pass "$c9jt"
+
+  # ...but a real declaration beside others still hides.
+  local c9ju="$tmp/c9ju"; make_corpus "$c9ju"
+  printf '# Jobs\n\n<a style="color:red;display:none" href="mail.md">Mail</a>\n' \
+    > "$c9ju/docs/guide/jobs.md"
+  git -C "$c9ju" add -A && git -C "$c9ju" commit -qm declaration-among-others
+  check "a real declaration among others still hides" fail "$c9ju"
+
+  # Inside a foreign-content root `/>` really closes, so a nested `<svg/>`
+  # opens no level. Counting it as one swallowed the label after the outer
+  # close — the same shape as the `hidden` case, reached by the CSS path.
+  local c9jv="$tmp/c9jv"; make_corpus "$c9jv"
+  printf '# Jobs\n\n<a href="mail.md"><svg style="display:none"><svg/></svg>Mail</a>\n' \
+    > "$c9jv/docs/guide/jobs.md"
+  git -C "$c9jv" add -A && git -C "$c9jv" commit -qm nested-selfclose-svg-css
+  check "a self-closing svg opens no nesting level" pass "$c9jv"
 
   # It is the declaration that hides, not the word: `display:block` is a route.
   local c9jo="$tmp/c9jo"; make_corpus "$c9jo"
