@@ -71,6 +71,7 @@ use http::{HeaderName, HeaderValue, StatusCode};
 use tokio::sync::Semaphore;
 
 use super::artifact::{ArtifactError, SandboxArtifact};
+use super::capability::{CapabilityRateLimiter, CapabilityServices, PluginActivityLog};
 use super::host::{SandboxHost, SandboxLoadError};
 use super::manifest::SandboxManifest;
 use super::wire::SandboxRequest;
@@ -125,6 +126,13 @@ impl From<SandboxLoadError> for SandboxPluginError {
 }
 
 /// A sandboxed plugin, ready to mount.
+///
+/// `Clone` shares the compiled host, the concurrency permits, the capability
+/// backends and the activity log rather than copying them — so registering a
+/// clone with [`RenderSlots`](super::slots::RenderSlots) and then installing the
+/// original as a [`Plugin`] gives one plugin with one ceiling and one ledger,
+/// not two of each.
+#[derive(Clone)]
 pub struct SandboxedPlugin {
     host: Arc<SandboxHost>,
     /// One permit per concurrently-executing request, so `max_concurrency ×
@@ -135,6 +143,14 @@ pub struct SandboxedPlugin {
     /// plugin was built from a bare host rather than an artifact — there is no
     /// container to have an identity, and saying so beats inventing one.
     artifact_sha256: Option<String>,
+    /// The capability backends, minus the tenant (issue #1632).
+    ///
+    /// Held without a tenant and bound to one per request, because one compiled
+    /// plugin serves every tenant: a `CapabilityServices` stored here with a
+    /// tenant in it would be one tenant's, for everybody.
+    services: CapabilityServices,
+    /// What this plugin has been doing, for the operator audit surface.
+    activity: Arc<PluginActivityLog>,
 }
 
 impl fmt::Debug for SandboxedPlugin {
@@ -151,11 +167,71 @@ impl SandboxedPlugin {
     #[must_use]
     pub fn new(host: SandboxHost) -> Self {
         let permits = Arc::new(Semaphore::new(host.manifest().limits.max_concurrency));
+        // The rate limiter is built here rather than by the caller, and from
+        // the manifest rather than from a parameter, so a plugin that names a
+        // `calls_per_second` on its consent screen is limited by it whether or
+        // not whoever mounted it remembered to say so.
+        let services = CapabilityServices {
+            rate: Some(Arc::new(CapabilityRateLimiter::new(
+                host.manifest().quotas.calls_per_second,
+            ))),
+            ..CapabilityServices::none()
+        };
         Self {
             host: Arc::new(host),
             permits,
             artifact_sha256: None,
+            services,
+            activity: Arc::new(PluginActivityLog::new()),
         }
+    }
+
+    /// Wire the backends this plugin's granted capabilities need (issue #1632).
+    ///
+    /// Anything left unwired stays unwired: a call to a capability with no
+    /// backend is answered
+    /// [`unavailable`](crate::plugin_sandbox::DenialReason::Unavailable) and
+    /// recorded, which is the same shape as every other refusal and not a
+    /// silent success.
+    ///
+    /// `services.tenant` is ignored — the tenant is the *request's*, resolved
+    /// per request — and `services.rate` may replace the limiter built from the
+    /// manifest, for an embedder that wants one shared across a fleet.
+    ///
+    /// *May*, not *does*: a replacement is taken only when it is no looser than
+    /// the manifest's. Sharing limiting state across instances is what this is
+    /// for; raising the ceiling is not, and silently allowing it would make the
+    /// `calls_per_second` on the consent screen a number the operator approved
+    /// and the plugin need not obey. A looser limiter is ignored and the
+    /// manifest's kept, so wiring one by mistake costs coordination rather than
+    /// containment.
+    #[must_use]
+    pub fn with_services(mut self, services: CapabilityServices) -> Self {
+        let approved = self
+            .services
+            .rate
+            .as_ref()
+            .map_or(u32::MAX, |rate| rate.per_second());
+        let rate = services
+            .rate
+            .clone()
+            .filter(|supplied| supplied.per_second() <= approved)
+            .or_else(|| self.services.rate.clone());
+        self.services = CapabilityServices {
+            tenant: None,
+            rate,
+            ..services
+        };
+        self
+    }
+
+    /// What this plugin has done, for the operator audit surface.
+    ///
+    /// Shared with every mounted route, so a caller that keeps this handle sees
+    /// activity as it happens rather than a copy taken at mount.
+    #[must_use]
+    pub fn activity(&self) -> Arc<PluginActivityLog> {
+        Arc::clone(&self.activity)
     }
 
     /// Load a verified artifact.
@@ -188,6 +264,93 @@ impl SandboxedPlugin {
     #[must_use]
     pub fn manifest(&self) -> &SandboxManifest {
         self.host.manifest()
+    }
+
+    /// Fill one render slot (issue #1632).
+    ///
+    /// Returns `None` — meaning *omit the fragment* — for every failure there
+    /// is: the slot was not granted, the guest trapped, it ran out of fuel, it
+    /// answered with something this build will not emit, or it overran the
+    /// `render_bytes` quota. A render hook is decoration on somebody else's
+    /// page, and there is no failure of a plugin's that should become a failure
+    /// of the page.
+    ///
+    /// Runs on a blocking worker for the same reason a request does, and holds
+    /// a concurrency permit for the same reason: a slot on a hot page is as
+    /// many concurrent interpreters as the page has readers.
+    pub async fn render_slot(&self, slot: &str, context: &[(String, String)]) -> Option<String> {
+        let plugin = self.manifest().name.clone();
+        let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
+            tracing::warn!(
+                plugin,
+                slot,
+                "sandboxed plugin is at its concurrency ceiling; omitting its render fragment"
+            );
+            return None;
+        };
+        let services = CapabilityServices {
+            // Read here rather than in the closure; see the note in `serve`.
+            tenant: crate::tenancy::CURRENT_TENANT
+                .try_with(Clone::clone)
+                .ok()
+                .flatten(),
+            ..self.services.clone()
+        };
+        let host = Arc::clone(&self.host);
+        let ingest_log = Arc::clone(&self.activity);
+        let ingest_plugin = plugin.clone();
+        let slot_owned = slot.to_owned();
+        // Bounded before it is cloned onto the worker. The context is the
+        // *host's* — a handler builds it — but "the host built it" is not the
+        // same as "the host chose its size": it is routinely assembled from a
+        // row, a query string or a form, and none of it appears in the
+        // per-request footprint `max_concurrency` is validated against. An
+        // unbounded `to_vec` duplicates every string of it per render, at every
+        // concurrent render at once. Truncated rather than refused: a fragment
+        // rendered with fewer context entries is a panel missing a value, and a
+        // page losing its panel over a caller's mistake is the outcome this
+        // whole path exists to avoid.
+        let context = super::host::bounded_context(context);
+        let outcome = tokio::task::spawn_blocking(move || {
+            let outcome = host.render(&slot_owned, &context, services);
+            // Inside the closure for the same reason as `serve`: a reader who
+            // navigates away drops this future and its join handle while the
+            // blocking task runs on, and recording after the `.await` lost the
+            // whole record of what the hook did.
+            ingest_log.ingest(&ingest_plugin, outcome.activity.clone());
+            ingest_log.ingest_dropped(&ingest_plugin, outcome.dropped_events);
+            drop(permit);
+            outcome
+        })
+        .await;
+
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::error!(
+                    plugin,
+                    slot,
+                    error = %err,
+                    "the sandbox render worker did not complete; omitting the fragment"
+                );
+                return None;
+            }
+        };
+        // Already ingested inside the blocking task above.
+        match outcome.fragment {
+            Ok(fragment) => Some(fragment),
+            Err(failure) => {
+                tracing::warn!(
+                    plugin,
+                    slot,
+                    failure = %failure,
+                    stderr = outcome.stderr,
+                    fuel_used = outcome.fuel_used,
+                    "sandboxed plugin did not produce a render fragment; omitting it"
+                );
+                None
+            }
+        }
     }
 
     /// This plugin, mounted at the prefix its own manifest declares.
@@ -243,16 +406,22 @@ impl SandboxedPlugin {
             };
             let host = Arc::clone(&self.host);
             let permits = Arc::clone(&self.permits);
+            let services = self.services.clone();
+            let activity = Arc::clone(&self.activity);
             let pattern = route.path.clone();
             router = router.route(
                 &nested,
                 axum::routing::on(
                     filter,
                     move |params: axum::extract::RawPathParams, request: axum::extract::Request| {
-                        let host = Arc::clone(&host);
-                        let permits = Arc::clone(&permits);
+                        let mounted = Mounted {
+                            host: Arc::clone(&host),
+                            permits: Arc::clone(&permits),
+                            services: services.clone(),
+                            activity: Arc::clone(&activity),
+                        };
                         let pattern = pattern.clone();
-                        async move { serve(host, permits, pattern, params, request).await }
+                        async move { serve(mounted, pattern, params, request).await }
                     },
                 ),
             );
@@ -337,13 +506,30 @@ fn method_filter(method: &str, implies_head: bool) -> Option<MethodFilter> {
 }
 
 /// Serve one request through the sandbox.
-async fn serve(
+/// Everything one mounted route needs to serve a request.
+///
+/// Gathered into a struct because the four move together into every route
+/// closure and then into `serve`, and a five-argument call whose first four are
+/// always the same four is a place for two of them to be swapped.
+struct Mounted {
     host: Arc<SandboxHost>,
     permits: Arc<Semaphore>,
+    services: CapabilityServices,
+    activity: Arc<PluginActivityLog>,
+}
+
+async fn serve(
+    mounted: Mounted,
     pattern: String,
     params: axum::extract::RawPathParams,
     request: axum::extract::Request,
 ) -> Response {
+    let Mounted {
+        host,
+        permits,
+        services,
+        activity,
+    } = mounted;
     let manifest = host.manifest();
     let limits = manifest.limits;
     let plugin = manifest.name.clone();
@@ -384,11 +570,37 @@ async fn serve(
     // path needs to know a HEAD was asked for, and `request` moves.
     let request_method_is_head = request.method.eq_ignore_ascii_case("HEAD");
 
+    // Read here, not inside the closure. `CURRENT_TENANT` is a task-local
+    // scoped by the tenancy middleware around *this* task; a `spawn_blocking`
+    // closure runs on a different thread with no task-local at all, so a
+    // capability resolved in there would silently be the single-tenant
+    // namespace for every tenant at once — the exact failure this whole
+    // subsystem exists to make impossible.
+    let services = CapabilityServices {
+        tenant: crate::tenancy::CURRENT_TENANT
+            .try_with(Clone::clone)
+            .ok()
+            .flatten(),
+        ..services
+    };
+
     // The permit still moves INTO the closure — a detached `spawn_blocking`
     // task must not outlive it — but it comes back out so the response body can
     // keep holding it while hyper delivers the bytes.
+    //
+    // The activity is ingested in *here*, before the closure returns, and not
+    // after the `.await`. A client that disconnects drops this future and its
+    // join handle, and the blocking closure keeps running to completion — it
+    // has already been admitted and holds a permit. Recording afterwards meant
+    // the outcome of an abandoned request was dropped with the handle, so every
+    // capability call it made became invisible to the operator. The one request
+    // whose record is most worth having is the one nobody waited for.
+    let ingest_log = Arc::clone(&activity);
+    let ingest_plugin = plugin.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        let outcome = host.run(&request);
+        let outcome = host.run_with(&request, services);
+        ingest_log.ingest(&ingest_plugin, outcome.activity.clone());
+        ingest_log.ingest_dropped(&ingest_plugin, outcome.dropped_activity);
         (outcome, permit)
     })
     .await;
@@ -404,6 +616,11 @@ async fn serve(
             return sandbox_error(&plugin, StatusCode::BAD_GATEWAY);
         }
     };
+
+    // Already ingested inside the blocking task above, so that a request whose
+    // client walked away still leaves the record of what it did — a plugin
+    // whose denials are the reason it failed is exactly the one an operator
+    // will ask about.
 
     match outcome.result {
         Ok(response) => {
@@ -830,6 +1047,50 @@ sha256 = "{digest}"
 
     fn hello_plugin() -> SandboxedPlugin {
         plugin_from(guests::HELLO, GREET_ROUTE, ResourceLimits::default())
+    }
+
+    #[test]
+    fn a_supplied_rate_limiter_cannot_raise_the_approved_ceiling() {
+        use crate::plugin_sandbox::capability::CapabilityRateLimiter;
+
+        let plugin = hello_plugin();
+        let approved = plugin
+            .services
+            .rate
+            .as_ref()
+            .expect("the manifest limiter is always built")
+            .per_second();
+
+        // Looser than the manifest: taken, this would let the plugin exceed the
+        // `calls_per_second` the operator approved on the consent screen.
+        let looser = plugin.clone().with_services(CapabilityServices {
+            rate: Some(Arc::new(CapabilityRateLimiter::new(
+                approved.saturating_mul(10).max(approved + 1),
+            ))),
+            ..CapabilityServices::none()
+        });
+        assert_eq!(
+            looser
+                .services
+                .rate
+                .as_ref()
+                .expect("a limiter is always present")
+                .per_second(),
+            approved,
+            "a looser limiter must be ignored and the manifest's kept"
+        );
+
+        // At or below it: taken, because sharing limiting state across
+        // instances is what the parameter is for.
+        let shared = Arc::new(CapabilityRateLimiter::new(approved));
+        let tighter = plugin.with_services(CapabilityServices {
+            rate: Some(Arc::clone(&shared)),
+            ..CapabilityServices::none()
+        });
+        assert!(
+            Arc::ptr_eq(tighter.services.rate.as_ref().expect("present"), &shared),
+            "an equal-or-tighter limiter must be the one actually used"
+        );
     }
 
     /// The app a test drives: a sandboxed plugin mounted beside an ordinary
@@ -1362,5 +1623,51 @@ sha256 = "{digest}"
             &routes,
         );
         assert!(report.passed(), "{}", report.to_text_report());
+    }
+
+    #[test]
+    fn a_render_context_is_bounded_before_it_is_cloned_onto_a_worker() {
+        // The context is the host's, but "the host built it" is not "the host
+        // chose its size": it is routinely assembled from a row or a query
+        // string, and none of it is in the per-request footprint
+        // `max_concurrency` is validated against.
+        let many: Vec<(String, String)> = (0
+            ..crate::plugin_sandbox::host::MAX_RENDER_CONTEXT_ENTRIES * 4)
+            .map(|index| (format!("k{index}"), String::new()))
+            .collect();
+        assert_eq!(
+            crate::plugin_sandbox::host::bounded_context(&many).len(),
+            crate::plugin_sandbox::host::MAX_RENDER_CONTEXT_ENTRIES,
+            "empty pairs still cost allocation, so the count alone has to bound them"
+        );
+
+        let heavy: Vec<(String, String)> = (0
+            ..crate::plugin_sandbox::host::MAX_RENDER_CONTEXT_ENTRIES)
+            .map(|index| {
+                (
+                    format!("k{index}"),
+                    "x".repeat(crate::plugin_sandbox::host::MAX_RENDER_CONTEXT_BYTES),
+                )
+            })
+            .collect();
+        let kept = crate::plugin_sandbox::host::bounded_context(&heavy);
+        let carried: usize = kept
+            .iter()
+            .map(|(name, value)| name.len().saturating_add(value.len()))
+            .sum();
+        assert!(
+            carried <= crate::plugin_sandbox::host::MAX_RENDER_CONTEXT_BYTES,
+            "the worker was handed {carried} bytes"
+        );
+
+        // What fits is passed through unchanged, which is every real caller.
+        let ordinary = vec![
+            ("id".to_owned(), "42".to_owned()),
+            ("locale".to_owned(), "en".to_owned()),
+        ];
+        assert_eq!(
+            crate::plugin_sandbox::host::bounded_context(&ordinary),
+            ordinary
+        );
     }
 }

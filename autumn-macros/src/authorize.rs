@@ -18,7 +18,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ExprLit, Ident, ItemFn, Lit, LitStr, Meta, Token, parse_quote};
+use syn::{Expr, ExprLit, Ident, Lit, LitStr, Meta, Token, parse_quote};
 
 /// Parsed `#[authorize(...)]` arguments.
 ///
@@ -146,6 +146,10 @@ fn snake_case(name: &str) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse the args first; the parser may surface a leading `"action"`
     // string literal as the bare-Path action via the `Meta::Path` branch
@@ -176,9 +180,9 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         format_ident!("{}", name)
     });
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
 
     if input_fn.sig.asyncness.is_none() {
@@ -187,6 +191,15 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             "#[authorize] can only be applied to async functions",
         )
         .to_compile_error();
+    }
+
+    // `#[authorize]` written below `#[static_get]`/`#[ws]` — including under
+    // an alias those macros' own by-name attribute scan cannot see — is
+    // caught here instead, once this guard's own macro is the one running
+    // (Codex review on #2513, tenth finding). See
+    // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
+    if let Some(err) = crate::param_helpers::reject_if_incompatible_route_marker(&input_fn) {
+        return err;
     }
 
     // Inject hidden `Session` and `State<AppState>` arguments so the
@@ -325,7 +338,10 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    quote! { #input_fn }
+    quote! {
+        #leading_items
+        #input_fn
+    }
 }
 
 /// Variant of [`parse_authorize_args`] that allows a leading bare
@@ -368,6 +384,36 @@ pub fn parse_with_leading_literal(attr: TokenStream) -> syn::Result<AuthorizeArg
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorize_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
+        // See `secured::tests::secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias`
+        // for the full rationale (Codex review on #2513, tenth finding).
+        let accepted = crate::static_route::static_get_macro(
+            quote::quote! { "/private" },
+            quote::quote! {
+                #[auth]
+                async fn update_post(post: Post) -> &'static str { "ok" }
+            },
+        );
+        assert!(
+            !accepted.to_string().contains("compile_error"),
+            "static_get_macro cannot recognize an aliased guard attribute by name: {accepted}"
+        );
+
+        let accepted_fn = crate::param_helpers::extract_fn_item(accepted, "update_post");
+        let generated = authorize_macro(
+            quote::quote! { "update", resource = Post },
+            quote::quote! { #accepted_fn },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "authorize_macro must reject a handler already marked as a #[static_get] route, \
+             regardless of what alias attribute name the source used to invoke it: {generated}"
+        );
+    }
 
     #[test]
     fn parses_action_and_resource() {

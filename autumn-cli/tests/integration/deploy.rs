@@ -784,8 +784,17 @@ fn preflight_grader_names(output: &str) -> Vec<String> {
             let name = rest.split(':').next()?.trim();
             // Drop the ` (host)` scope suffix a fleet row carries.
             let name = name.split(" (").next()?.trim();
-            (!name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
-                .then(|| name.to_owned())
+            // "warning" is never a real grader name — it's the lead word of the
+            // #1952 config-manifest notice (`manifest_preflight_notice`, printed
+            // by both `deploy up` and `deploy check`, outside the graded `checks`
+            // list) and of the nested capacity-contract warning inside it. Both
+            // share the SAME "⚠️  "-prefixed shape as a deferred grader row, so
+            // without this exclusion a no-manifest project would misparse into a
+            // spurious `"warning"` grader entry.
+            (name != "warning"
+                && !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+            .then(|| name.to_owned())
         })
         .collect()
 }
@@ -1140,4 +1149,93 @@ fn deploy_up_fails_fast_without_host() {
         combined.contains("[deploy] host") && combined.contains("hosts"),
         "the missing-host report must name both spellings\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+}
+
+#[test]
+fn deploy_check_confirms_config_manifest_upload() {
+    // #1952 check/up parity: `autumn deploy up` already prints a line naming the
+    // config manifest(s) it will upload (`manifest_preflight_notice`), but
+    // `autumn deploy check` — the documented way to catch a broken deploy BEFORE
+    // touching the server — said nothing about it, so an operator running only
+    // `check` had no signal either way until they actually ran `up`. With a
+    // project `autumn.toml` present, `check` must print the same confirming line
+    // `up` would.
+    let dir = project("host = \"deploy.example.test\"\n");
+    let (stdout, stderr, _code) = run_autumn(dir.path(), &["deploy", "check"], &[]);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("Uploading project config to the release dir: autumn.toml"),
+        "deploy check must confirm the config manifest it will upload, matching \
+         `deploy up`'s notice\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn deploy_check_warns_when_no_autumn_toml_present() {
+    // #1952 check/up parity, the other half: with NO `autumn.toml` anywhere in the
+    // project directory (the exact silent-defaults footgun this issue is about),
+    // `deploy check` must print the same loud warning `deploy up` already prints
+    // — not stay silent until the operator runs `up` for real. The deploy host is
+    // supplied only via `AUTUMN_DEPLOY__HOST` so the preflight can run without any
+    // `autumn.toml` on disk at all.
+    let dir = tempfile::tempdir().expect("create temp project dir");
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demoapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    let (stdout, stderr, _code) = run_autumn(
+        dir.path(),
+        &["deploy", "check"],
+        &[("AUTUMN_DEPLOY__HOST", "deploy.example.test")],
+    );
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("no autumn.toml found in the project directory"),
+        "deploy check must warn when there is no autumn.toml to upload, matching \
+         `deploy up`'s warning\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn deploy_check_grader_names_exclude_the_manifest_warning() {
+    // Regression found in review of the two tests above: `preflight_grader_names`
+    // (used by `deploy_check_and_doctor_grade_the_same_fleet_graders` and
+    // `deploy_check_reports_ssh_reachability_per_fleet_host`) detects grader rows
+    // by their "⚠️  name: ..." shape — and the no-manifest warning this diff now
+    // also routes through `deploy check` matches that EXACT shape
+    // ("⚠️  warning: no autumn.toml found..."), even though it is not one of the
+    // graded `checks` at all. Uncaught, a no-manifest project would misparse it
+    // into a spurious `"warning"` grader with no doctor-side counterpart. This
+    // pins that the helper excludes it while still finding the real graders.
+    let dir = tempfile::tempdir().expect("create temp project dir");
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demoapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    let (stdout, stderr, _code) = run_autumn(
+        dir.path(),
+        &["deploy", "check"],
+        &[("AUTUMN_DEPLOY__HOST", "deploy.example.test")],
+    );
+    let combined = format!("{stdout}{stderr}");
+    let names = preflight_grader_names(&combined);
+    assert!(
+        !names.iter().any(|name| name == "warning"),
+        "the config-manifest warning must never be counted as a grader\nnames: \
+         {names:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    for grader in [
+        "ssh_reachability",
+        "signing_secret",
+        "database_url",
+        "migrate_check",
+    ] {
+        assert!(
+            names.iter().any(|name| name == grader),
+            "the real graders must still be detected\nnames: {names:?}\nstdout:\n\
+             {stdout}\nstderr:\n{stderr}"
+        );
+    }
 }

@@ -586,9 +586,18 @@ fn pat_binds_inner_response(pat: &Pat) -> bool {
 /// including the `IntoResponse::into_response(…)` call, parens, and invisible
 /// groups they may sit behind — and yield the inner block.
 ///
-/// Shared with `api_doc`'s marker walks: each guard that expands *before*
-/// another buries the earlier guard's marker consts one wrapper level deeper,
-/// so a walk that does not descend through this shape silently loses them.
+/// Also unwraps the unrelated `(|| async move { … })().await` closure-IIFE
+/// wrapper `#[cached]` puts a handler's original body inside
+/// (`cached_macro`'s `compute`): a marker injected by an earlier-expanding
+/// attribute (e.g. `#[static_get]`'s `STATIC_ROUTE_HANDLER_MARKER`) ends up
+/// buried one level deeper than usual when `#[cached]` sits between it and
+/// the guard that needs to see it, same as the guard-generated wrapper above
+/// (Codex review on #2513, eleventh finding).
+///
+/// Shared with `api_doc`'s marker walks: each guard or wrapper that expands
+/// *before* another buries the earlier one's marker consts one wrapper level
+/// deeper, so a walk that does not descend through this shape silently loses
+/// them.
 pub fn expr_nested_async_body(expr: &Expr) -> Option<&Block> {
     match expr {
         Expr::Async(expr_async) => Some(&expr_async.block),
@@ -608,9 +617,30 @@ pub fn expr_nested_async_body(expr: &Expr) -> Option<&Block> {
         {
             call.args.first().and_then(expr_nested_async_body)
         }
+        // `(|| async move { … })()` / `(|| async move { … })().await` — a
+        // zero-argument call of an inline closure, the `#[cached]` IIFE
+        // shape. The closure itself is never `async`; its body is the async
+        // block being wrapped.
+        Expr::Call(call) if call.args.is_empty() => match unwrap_group_paren(&call.func) {
+            Expr::Closure(closure) => expr_nested_async_body(&closure.body),
+            _ => None,
+        },
         Expr::Group(group) => expr_nested_async_body(&group.expr),
         Expr::Paren(paren) => expr_nested_async_body(&paren.expr),
         _ => None,
+    }
+}
+
+/// Strip any invisible `Group`/`Paren` wrapper down to the expression they
+/// enclose, without following any other wrapper shape (unlike
+/// [`expr_nested_async_body`], which only unwraps a specific known set of
+/// *async* wrappers and returns the inner `Block` rather than the `Expr`
+/// itself).
+fn unwrap_group_paren(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Group(group) => unwrap_group_paren(&group.expr),
+        Expr::Paren(paren) => unwrap_group_paren(&paren.expr),
+        other => other,
     }
 }
 
@@ -648,8 +678,20 @@ fn stmts_have_response_rewriting_guard_marker(stmts: &[Stmt]) -> bool {
 /// type: a `let __autumn_inner: T = <init>;` binding sitting exactly one
 /// statement before the end of `block`, immediately followed by the
 /// generated `IntoResponse::into_response(__autumn_inner)` tail, with one of
-/// [`RESPONSE_REWRITING_GUARD_MARKERS`] present earlier in the same block
-/// (issue #1677's `api_doc::infer_response_body` recovery relies on this).
+/// [`RESPONSE_REWRITING_GUARD_MARKERS`] present earlier in the same block, or
+/// `markerless_gate_budget` above zero (issue #1677's
+/// `api_doc::infer_response_body` recovery relies on this).
+///
+/// `markerless_gate_budget` covers `#[step_up]`/`#[throttle]`: their marker
+/// consts moved out of the body and into their gate's own impl block
+/// (#1668), so they can never appear in `block` for this scan to find. The
+/// caller counts it once, from the enclosing function's signature — one unit
+/// per such gate parameter present — and this function returns the balance
+/// left after spending one unit to accept the *current* level, so a caller
+/// recursing into a deeper, nested block cannot spend the same real guard's
+/// unit a second time on an unrelated coincidental match there (a marker-const
+/// acceptance spends nothing, since a real marker is level-local proof on its
+/// own).
 ///
 /// Deliberately structural rather than a bare name-and-type scan. Matching
 /// the required *position* (second-to-last, with that exact tail following)
@@ -659,15 +701,21 @@ fn stmts_have_response_rewriting_guard_marker(stmts: &[Stmt]) -> bool {
 /// deeper (`(async move { #original_body }).await`) — so if that original
 /// body itself independently ends in the same two-statement shape, position
 /// and tail alone cannot tell a real guard's own binding apart from the
-/// user's body coincidentally mimicking it. Requiring one of the guard's own
-/// marker consts to also be present closes that gap: no guard ever emits the
-/// `__autumn_inner` binding without one, and a handler's own code has no
-/// reason to declare an identifier the framework treats as reserved.
+/// user's body coincidentally mimicking it. Requiring a marker const (or an
+/// unspent budget unit) to also be present closes that gap: no guard ever
+/// emits the `__autumn_inner` binding without one, a handler's own code has
+/// no reason to declare an identifier the framework treats as reserved, and
+/// the budget cap means a coincidence *beyond* the real guards' own levels
+/// still has nothing left to spend.
 ///
-/// Returns the local's declared type together with its initializer
-/// expression, so a caller can both read the type and recurse into a deeper
-/// nested guard via [`expr_nested_async_body`].
-pub fn generated_inner_response_binding(block: &Block) -> Option<(&Type, &Expr)> {
+/// Returns the local's declared type, its initializer expression, and the
+/// remaining budget, so a caller can read the type, recurse into a deeper
+/// nested guard via [`expr_nested_async_body`], and thread the correct
+/// balance through that recursion.
+pub fn generated_inner_response_binding(
+    block: &Block,
+    markerless_gate_budget: usize,
+) -> Option<(&Type, &Expr, usize)> {
     let len = block.stmts.len();
     if len < 2 {
         return None;
@@ -685,11 +733,15 @@ pub fn generated_inner_response_binding(block: &Block) -> Option<(&Type, &Expr)>
     if !stmt_is_inner_response_tail(&block.stmts[index + 1]) {
         return None;
     }
-    if !stmts_have_response_rewriting_guard_marker(&block.stmts[..index]) {
+    let remaining_budget = if stmts_have_response_rewriting_guard_marker(&block.stmts[..index]) {
+        markerless_gate_budget
+    } else if markerless_gate_budget > 0 {
+        markerless_gate_budget - 1
+    } else {
         return None;
-    }
+    };
     let init_expr = &local.init.as_ref()?.expr;
-    Some((&pat_type.ty, init_expr))
+    Some((&pat_type.ty, init_expr, remaining_budget))
 }
 
 fn stmt_is_inner_response_tail(stmt: &Stmt) -> bool {

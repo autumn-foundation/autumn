@@ -21,7 +21,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ItemFn, Lit, LitInt, LitStr, parse_quote};
+use syn::{Expr, Lit, LitInt, LitStr, parse_quote};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -245,15 +245,19 @@ fn build_spec_tokens(attrs: &ThrottleAttrs) -> TokenStream {
 
 /// Expand the `#[throttle(...)]` attribute.
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_throttle_args(attr) {
         Ok(a) => a,
         Err(err) => return err.to_compile_error(),
     };
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
 
     if input_fn.sig.asyncness.is_none() {
@@ -264,25 +268,19 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
+    // `#[throttle]` written below `#[static_get]`/`#[ws]` — including under
+    // an alias those macros' own by-name attribute scan cannot see — is
+    // caught here instead, once this guard's own macro is the one running
+    // (Codex review on #2513, tenth finding). See
+    // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
+    if let Some(err) = crate::param_helpers::reject_if_incompatible_route_marker(&input_fn) {
+        return err;
+    }
+
     let fn_name = input_fn.sig.ident.clone();
     let fn_name_str = fn_name.to_string();
     let spec_tokens = build_spec_tokens(&attrs);
     let gate_ident = format_ident!("__AutumnThrottleGate_{}", fn_name);
-    // Emitted a second time into the handler body below (issue #2516): the
-    // gate redesign (#2488) moved the rate-limit check into the gate's own
-    // `from_request_parts`, but `api_doc::infer_response_body`'s recovery of
-    // the pre-rewrite return type (#1677/#2484) still requires one of
-    // `RESPONSE_REWRITING_GUARD_MARKERS` to be present in the *handler's own*
-    // block, structurally distinguishing a real guard-generated
-    // `__autumn_inner` binding from a handler that coincidentally ends the
-    // same way. Nothing in the body reads this copy, hence `allow(dead_code)`
-    // — see `secured_macro`'s identically-shaped `role_scope_consts` for the
-    // established pattern.
-    let markers = quote! {
-        #[allow(dead_code)]
-        const __AUTUMN_THROTTLE_ROUTE_ID: &str =
-            ::core::concat!(::core::module_path!(), "::", #fn_name_str);
-    };
 
     // Whether THIS gate should also serve a cached idempotency replay: see
     // `should_own_replay` for the full ordering rationale (issue #1668's
@@ -320,6 +318,27 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // `FromRequest` body extractor (`Json` / `Form` / `Multipart`) and
     // short-circuits on the first rejection, so an over-limit or replayed
     // request never causes the body to be parsed or buffered.
+    // Stable per-handler bucket namespace. Two routes pointing at the same
+    // named limiter share their bucket via the runtime registry — the
+    // route_id here is only used for inline limiters and for uniqueness when
+    // a named entry is missing from config.
+    //
+    // Emitted from one shared `TokenStream` (cheaply `Clone`) so it can be
+    // declared TWICE — once inside the gate below for the actual runtime
+    // check, and once (inert) into the handler body via `route_id_marker`
+    // near the bottom of this function — mirroring `secured_macro`'s
+    // `role_scope_consts`/`markers` split. `api_doc::infer_response_body`'s
+    // guard recovery (`RESPONSE_REWRITING_GUARD_MARKERS`) requires this const
+    // in the handler's OWN body to tell a real guard's `__autumn_inner`
+    // wrapper apart from unrelated code with the same shape; since #1668
+    // moved the throttle check itself into this gate, this is the only
+    // reason a copy still needs to live in the body at all (issue #2516).
+    let route_id_marker = quote! {
+        #[allow(dead_code)]
+        const __AUTUMN_THROTTLE_ROUTE_ID: &str =
+            ::core::concat!(::core::module_path!(), "::", #fn_name_str);
+    };
+
     let gate_item = quote! {
         #[doc(hidden)]
         #[allow(non_camel_case_types)]
@@ -337,13 +356,7 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> impl ::core::future::Future<Output = ::core::result::Result<Self, Self::Rejection>>
                 + Send {
                 async move {
-                    // Stable per-handler bucket namespace. Two routes pointing
-                    // at the same named limiter share their bucket via the
-                    // runtime registry — the route_id here is only used for
-                    // inline limiters and for uniqueness when a named entry is
-                    // missing from config.
-                    const __AUTUMN_THROTTLE_ROUTE_ID: &str =
-                        ::core::concat!(::core::module_path!(), "::", #fn_name_str);
+                    #route_id_marker
                     let __autumn_throttle_headers = parts.headers.clone();
                     // Optional because `MatchedPath` is absent for some routes
                     // (fallbacks, unnested handlers). When present, the
@@ -454,12 +467,13 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     input_fn.block = syn::parse_quote! {
         {
-            #markers
+            #route_id_marker
             #original_response
         }
     };
 
     quote! {
+        #leading_items
         #gate_item
         #input_fn
     }
@@ -472,6 +486,34 @@ mod tests {
     use quote::quote;
 
     use super::throttle_macro;
+    use crate::static_route::static_get_macro;
+
+    #[test]
+    fn throttle_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
+        // See `secured::tests::secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias`
+        // for the full rationale (Codex review on #2513, tenth finding).
+        let accepted = static_get_macro(
+            quote! { "/private" },
+            quote! {
+                #[auth]
+                async fn private() -> &'static str { "private" }
+            },
+        );
+        assert!(
+            !accepted.to_string().contains("compile_error"),
+            "static_get_macro cannot recognize an aliased guard attribute by name: {accepted}"
+        );
+
+        let accepted_fn = crate::param_helpers::extract_fn_item(accepted, "private");
+        let generated =
+            throttle_macro(quote! { limit = 5, per = "1m" }, quote! { #accepted_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "throttle_macro must reject a handler already marked as a #[static_get] route, \
+             regardless of what alias attribute name the source used to invoke it: {generated}"
+        );
+    }
 
     #[test]
     fn inline_form_generates_check_call() {

@@ -37,8 +37,8 @@ pub fn route_macro(
     };
     let path = route_args.path.clone();
 
-    let mut input_fn = match parse::parse_async_handler(item) {
-        Ok(f) => f,
+    let (leading_items, mut input_fn) = match parse::parse_async_handler_with_leading_items(item) {
+        Ok(v) => v,
         Err(err) => return err,
     };
 
@@ -244,6 +244,14 @@ pub fn route_macro(
     };
     let seo_defaults = route_args.seo.emit();
 
+    // ── Architecture-graph node (#1747) ─────────────────────────
+    // Gated off wasm32 with `#native_cfg` for the same reason the route-info
+    // route companion does: a route the edge lane compiles out has nothing to
+    // say about the native binary's architecture, and the descriptor names
+    // `::autumn_web`, which never compiles for that target.
+    let graph_descriptor =
+        crate::graph::emit_route_descriptor(&input_fn, http_method, &quote! { #path }, false);
+
     // ── Path helper ─────────────────────────────────────────────
     let path_helper = emit_path_helper(&path_helper_name, &path, &path_params);
     // The alias re-exports the (possibly gated) helper, so it carries the same
@@ -256,6 +264,12 @@ pub fn route_macro(
     };
 
     quote! {
+        // A guard macro that already expanded above this route attribute
+        // (#[secured]/#[step_up]/#[throttle], #1668) leaves its hidden
+        // `FromRequestParts` gate type here, ahead of the handler — re-emit
+        // it verbatim; empty when no such guard expanded first.
+        #leading_items
+
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
         // to import axum manually. However, the path resolution in Axum macros makes this impossible
         // natively. Custom compile errors handle the type checks.
@@ -301,6 +315,9 @@ pub fn route_macro(
                 seo: #seo_defaults,
             }
         }
+
+        #native_cfg
+        #graph_descriptor
 
         #native_cfg
         #path_helper
@@ -1848,10 +1865,16 @@ mod tests {
             )),
             "the path helper must be gated too — it calls ::autumn_web::paths: {generated}"
         );
+        assert!(
+            generated.contains(&format!(
+                "{gate} :: autumn_web :: reexports :: inventory :: submit !"
+            )),
+            "the architecture-graph node references ::autumn_web too (#1747): {generated}"
+        );
         assert_eq!(
             generated.matches(gate).count(),
-            2,
-            "exactly the two native companions are gated: {generated}"
+            3,
+            "exactly the three native companions are gated: {generated}"
         );
         // The handler itself and the edge companion stay unconditional.
         assert!(
@@ -1884,8 +1907,8 @@ mod tests {
             generated
                 .matches("# [cfg (not (target_arch = \"wasm32\"))]")
                 .count(),
-            3,
-            "route info + path helper + alias are all native-only: {generated}"
+            4,
+            "route info + graph node + path helper + alias are all native-only: {generated}"
         );
     }
 
