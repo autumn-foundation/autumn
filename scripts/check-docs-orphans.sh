@@ -1243,12 +1243,21 @@ def decode_visible(txt):
         if kind != 'prose':
             out.append(seg)
             continue
+        def visible(t):
+            # Backslash escapes go too: `docs/guide/mail\.md` in prose is
+            # `docs/guide/mail.md` on screen, and the bare-path scan saw the
+            # backslash and missed it. Same scoping as the references for the
+            # same reason — inside a fence or backticks the escape is literal
+            # and the reader sees `mail\.md`, so unescaping there would invent
+            # a path nobody can read.
+            return UNESCAPE.sub(r'\1', decode_char_refs(t))
+
         pieces, last = [], 0
         for m in CODE_SPAN.finditer(seg):
-            pieces.append(decode_char_refs(seg[last:m.start()]))
+            pieces.append(visible(seg[last:m.start()]))
             pieces.append(m.group(0))
             last = m.end()
-        pieces.append(decode_char_refs(seg[last:]))
+        pieces.append(visible(seg[last:]))
         out.append(''.join(pieces))
     return ''.join(out)
 
@@ -1802,6 +1811,13 @@ def edges_from(f):
 
     shortcut_txt = INLINE_SPAN_ANY.sub(_blank_inline, shortcut_txt)
     for m in REF_USE_SHORTCUT.finditer(shortcut_txt):
+        # A shortcut's label IS its rendered content, so the same emptiness
+        # rule applies: `[<span></span>]` renders an anchor with nothing in it.
+        # The inline form, the raw anchor and the full reference all required
+        # content already; this was the fourth spelling and the one left out.
+        if not has_content(img_view[m.start(1):m.end(1)],
+                           shortcut_txt[m.start(1):m.end(1)]):
+            continue
         lbl = ref_label(m.group(1))
         if lbl is not None:
             used.add(lbl)
@@ -3792,6 +3808,28 @@ self_test() {
     > "$c9ig/README.md"
   git -C "$c9ig" add -A && git -C "$c9ig" commit -qm list-item-with-text
   check "a definition continuing a list item is visible text" pass "$c9ig"
+
+  # Markdown eats the punctuation escape, so the reader sees the real path.
+  local c9ih="$tmp/c9ih"; make_corpus "$c9ih"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\nSee docs/guide/mail\\.md\n' \
+    > "$c9ih/README.md"
+  git -C "$c9ih" add -A && git -C "$c9ih" commit -qm escaped-path-in-prose
+  check "an escaped path in prose still names the page" pass "$c9ih"
+
+  # ...but inside a fence the escape is literal, so the path is not on screen.
+  local c9ii="$tmp/c9ii"; make_corpus "$c9ii"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n```\ndocs/guide/mail\\.md\n```\n' \
+    > "$c9ii/README.md"
+  git -C "$c9ii" add -A && git -C "$c9ii" commit -qm escaped-path-in-fence
+  check "an escaped path in a fence stays literal" fail "$c9ii"
+
+  # A shortcut reference's label is its rendered content, so an empty one is
+  # an anchor with nothing in it.
+  local c9ij="$tmp/c9ij"; make_corpus "$c9ij"
+  printf '# Jobs\n\n[<span></span>]\n\n[<span></span>]: mail.md\n' \
+    > "$c9ij/docs/guide/jobs.md"
+  git -C "$c9ij" add -A && git -C "$c9ij" commit -qm empty-shortcut-reference
+  check "an empty shortcut reference is not an edge" fail "$c9ij"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
