@@ -121,14 +121,25 @@ where every other `#[query_budget]` fixture lives (no new test harness):
 
 **Stubs list** (what was faked, and why it doesn't undercut the verdict):
 
-- The real `#[job]`/`#[scheduled]` attribute macros are **not** applied in
-  the fixtures — applying them for real would require the actual
-  `autumn_web::AppState`, a `Serialize`/`Deserialize` args type, and the job
-  registry plumbing, none of which bears on the question. This stub is
-  covered, not papered over: the one thing the real macros could have
-  affected — wrapping the function body in a different shape — was ruled out
-  by reading `job.rs`/`scheduled.rs` source (both re-emit `ItemFn`
-  unchanged), not asserted without evidence.
+- **Update (same-day PR review, Codex bot):** the first pass of this assay
+  did not apply the real `#[job]`/`#[scheduled]` attribute macros — only
+  functions matching their enforced signature shape. A review comment on
+  PR #2546 correctly flagged that this could not prove the two macros
+  actually *compose* (only that the mechanism generalizes to the shape),
+  and that a break in either macro's expansion would go undetected. Two more
+  fixtures were added to close that gap:
+  `query_budget_real_job_accessor_n_plus_one.rs` (real `#[job(name = ...)]`,
+  real `autumn_web::AppState`, a real `#[derive(Serialize, Deserialize)]`
+  args struct) and `query_budget_real_scheduled_accessor_n_plus_one.rs`
+  (real `#[scheduled(every = ..., name = ...)]`, single-argument `AppState`
+  shape). Both compile-fail with the identical "classic N+1" diagnostic as
+  every other fixture in this family. `db()` is added to the real
+  `AppState` via a local extension trait rather than a real connection
+  pool — the walker's accessor check is a syntactic name match
+  (`autumn-macros/src/query_budget.rs`'s `expr_is_handle`), not a type
+  resolution, so this is a faithful stand-in without pulling the `db`
+  feature's runtime into a compile-time-only fixture. This was the one
+  remaining instrument gap named below; it is now closed.
 - Only 3 of the 5 named background-job defects were checked against the
   "conventionally-named accessor vs. app-specific method" distinction this
   assay turns on. `spawn_room_reaper_loop` (media plugin) and
@@ -146,14 +157,17 @@ autumn-web --test integration_tests`, default features `db,maud,htmx,...`):
 | `query_budget_accessor_handle_n_plus_one.rs` | compile-fail | **compile-fail** | `` `#[query_budget(1)]` cannot be proven: a database query (`find_author`) runs inside a loop `` — identical wording/shape to the existing `query_budget_n_plus_one.rs` route-handler fixture |
 | `query_budget_job_shaped_accessor_n_plus_one.rs` | compile-fail | **compile-fail** | same diagnostic, pointing at `for id in args.recipient_ids` |
 | `query_budget_job_shaped_accessor_batched.rs` | compile-pass | **compile-pass** | clean build |
+| `query_budget_real_job_accessor_n_plus_one.rs` (real `#[job]`) | compile-fail | **compile-fail** | same diagnostic, pointing at `for id in args.recipient_ids` |
+| `query_budget_real_scheduled_accessor_n_plus_one.rs` (real `#[scheduled]`) | compile-fail | **compile-fail** | same diagnostic, pointing at `for id in ids` |
 
 First run generated fresh `.stderr` snapshots via trybuild's standard
 `wip/`-then-promote flow (no snapshot existed yet, matching how every other
-compile-fail fixture in this suite was originally added); second run, after
-moving the generated snapshots into `tests/compile-fail/`, reproduced them
-byte-for-byte (`query_budget_compile_fail_tests ... ok`, 4.62s incremental).
-`compile_pass_tests` (60 fixtures including the new control) also passed
-clean in the same session.
+compile-fail fixture in this suite was originally added); every subsequent
+run, after moving the generated snapshots into `tests/compile-fail/`,
+reproduced them byte-for-byte (`query_budget_compile_fail_tests ... ok`,
+~5s incremental with the 7-fixture family). `compile_pass_tests` (60
+fixtures including the batched control) also passed clean in the same
+session.
 
 No worst-case/adversarial probing beyond this: the question is a binary
 mechanism-exists/doesn't, not a performance or scale claim, so the two
@@ -165,8 +179,10 @@ anything specific to the job/scheduled shape.
 
 ## 🏁 Verdict: **pursue**, with a correction to the premise
 
-**2/2 fixtures caught the N+1, 1/1 control built clean, zero changes to
-`autumn-macros`.** Against the pre-set line, this is an unambiguous pursue —
+**4/4 compile-fail fixtures caught the N+1 (2 signature-shaped, 2 with the
+real `#[job]`/`#[scheduled]` attributes), 1/1 control built clean, zero
+changes to `autumn-macros`.** Against the pre-set line, this is an
+unambiguous pursue —
 but the mechanism is not the one item 3 asked about. There is no such thing
 as "a `#[job]`/`#[scheduled]` function's own handle argument" to generalize
 to: `#[job]` structurally enforces `(AppState, Args[, JobContext])` and
@@ -222,8 +238,11 @@ cargo test -p autumn-web --test integration_tests compile_pass_tests -- --nocapt
 ```
 
 Fixtures: `autumn/tests/compile-fail/query_budget_accessor_handle_n_plus_one.rs`,
-`autumn/tests/compile-fail/query_budget_job_shaped_accessor_n_plus_one.rs`
-(+ pinned `.stderr` snapshots), `autumn/tests/compile-pass/query_budget_job_shaped_accessor_batched.rs`.
+`autumn/tests/compile-fail/query_budget_job_shaped_accessor_n_plus_one.rs`,
+`autumn/tests/compile-fail/query_budget_real_job_accessor_n_plus_one.rs`,
+`autumn/tests/compile-fail/query_budget_real_scheduled_accessor_n_plus_one.rs`
+(all four with pinned `.stderr` snapshots), and
+`autumn/tests/compile-pass/query_budget_job_shaped_accessor_batched.rs`.
 Wired into `autumn/tests/integration/compile_fail.rs`'s existing
 `query_budget_compile_fail_tests` / `compile_pass_tests` functions.
 

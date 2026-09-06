@@ -297,6 +297,12 @@ fn query_budget_compile_fail_tests() {
     // full assay.
     t.compile_fail("tests/compile-fail/query_budget_accessor_handle_n_plus_one.rs");
     t.compile_fail("tests/compile-fail/query_budget_job_shaped_accessor_n_plus_one.rs");
+    // The real `#[job]`/`#[scheduled]` attributes stacked with
+    // `#[query_budget]` (PR #2546 review): the fixtures above prove the
+    // accessor-tracking mechanism, but only the real attributes prove the
+    // two macros actually compose against each other.
+    t.compile_fail("tests/compile-fail/query_budget_real_job_accessor_n_plus_one.rs");
+    t.compile_fail("tests/compile-fail/query_budget_real_scheduled_accessor_n_plus_one.rs");
 }
 
 /// Every `#[agent_operable]` / `authority_grant!` compile-fail fixture, with
