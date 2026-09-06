@@ -45,10 +45,41 @@ pub struct MemorySearchBackend {
     store: RwLock<Store>,
 }
 
+/// An indexed document plus its field values, tokenized once.
+///
+/// `keyword_search` used to call [`tokenize`] on every field of every document
+/// on every query — profiling a 5,000-document/~200-word-body corpus found
+/// that re-tokenization (`score`'s own loop plus the `str::to_lowercase`
+/// allocation inside [`tokenize`]) accounted for ~66% of the call's
+/// instructions. A document's tokens don't change between searches, only
+/// between writes, so they are computed once here, in [`MemorySearchBackend::write`],
+/// and reused by every later `score` call until the document is rewritten.
+#[derive(Debug, Clone)]
+struct StoredDocument {
+    indexed: IndexedDocument,
+    /// Tokens of `indexed.document.fields[i].value`, aligned by index.
+    field_tokens: Vec<Vec<String>>,
+}
+
+impl StoredDocument {
+    fn new(indexed: IndexedDocument) -> Self {
+        let field_tokens = indexed
+            .document
+            .fields
+            .iter()
+            .map(|field| tokenize(&field.value).collect())
+            .collect();
+        Self {
+            indexed,
+            field_tokens,
+        }
+    }
+}
+
 /// Documents plus the write bookkeeping that decides which write wins.
 #[derive(Debug, Default)]
 struct Store {
-    documents: HashMap<String, HashMap<i64, IndexedDocument>>,
+    documents: HashMap<String, HashMap<i64, StoredDocument>>,
     /// Monotonic counter behind the write watermark. A counter rather than a
     /// clock: the watermark only ever answers "was this written after that",
     /// which a counter answers exactly, with no resolution floor and nothing
@@ -112,7 +143,7 @@ impl MemorySearchBackend {
     fn with_index<T>(
         &self,
         definition: &IndexDefinition,
-        f: impl FnOnce(&mut HashMap<i64, IndexedDocument>) -> T,
+        f: impl FnOnce(&mut HashMap<i64, StoredDocument>) -> T,
     ) -> T {
         self.with_store(|store| {
             f(store
@@ -165,6 +196,21 @@ impl MemorySearchBackend {
             .validate()
             .map_err(|e| SearchError::InvalidIndex(e.to_string()))?;
 
+        // Tokenize before taking the lock. `StoredDocument::new` is pure
+        // per-document work with no dependency on store state, and it is
+        // considerably heavier than the compare-and-set bookkeeping below —
+        // doing it inside `with_store` would hold the exclusive lock for the
+        // whole batch's tokenization time, blocking every concurrent
+        // keyword/vector/embedding read (all of which only need a read lock)
+        // for that whole span. A watermark-superseded document (rare: only
+        // when a concurrent write raced this batch) is tokenized and then
+        // discarded below rather than skipped — the price of not knowing
+        // which documents will be superseded until the lock is held.
+        let prepared: Vec<StoredDocument> = documents
+            .iter()
+            .map(|document| StoredDocument::new(document.clone()))
+            .collect();
+
         // ONE critical section for the whole compare-and-set. Checking the
         // sequence under one lock and replacing the document under another
         // would let a newer write slot in between the two, and the stale
@@ -200,13 +246,13 @@ impl MemorySearchBackend {
             let applied_ids: std::collections::HashSet<i64> =
                 applied.iter().map(|(id, _)| *id).collect();
             if let Some(map) = store.documents.get_mut(&index) {
-                for document in documents {
-                    if !applied_ids.contains(&document.id()) {
+                for stored in prepared {
+                    if !applied_ids.contains(&stored.indexed.id()) {
                         continue;
                     }
                     // Keyed upsert: re-indexing the same record replaces it, so
                     // at-least-once delivery can never duplicate a document.
-                    map.insert(document.id(), document.clone());
+                    map.insert(stored.indexed.id(), stored);
                 }
             }
         });
@@ -217,7 +263,7 @@ impl MemorySearchBackend {
     fn read_index<T>(
         &self,
         definition: &IndexDefinition,
-        f: impl FnOnce(Option<&HashMap<i64, IndexedDocument>>) -> T,
+        f: impl FnOnce(Option<&HashMap<i64, StoredDocument>>) -> T,
     ) -> T {
         let guard = self
             .store
@@ -245,12 +291,13 @@ impl MemorySearchBackend {
 fn score(
     definition: &IndexDefinition,
     document: &IndexedDocument,
+    field_tokens: &[Vec<String>],
     tokens: &[String],
 ) -> Option<f32> {
     let mut total = 0.0_f32;
     let mut matched = vec![false; tokens.len()];
 
-    for field in &document.document.fields {
+    for (field, field_tokens) in document.document.fields.iter().zip(field_tokens) {
         if field.value.is_empty() {
             continue;
         }
@@ -258,9 +305,9 @@ fn score(
             continue;
         };
         let factor = weight_factor(weight);
-        for field_token in tokenize(&field.value) {
+        for field_token in field_tokens {
             for (index, query_token) in tokens.iter().enumerate() {
-                if field_token == *query_token {
+                if field_token == query_token {
                     total += factor;
                     if let Some(slot) = matched.get_mut(index) {
                         *slot = true;
@@ -399,12 +446,14 @@ impl SearchBackend for MemorySearchBackend {
 
             let mut hits = self.read_index(definition, |index| {
                 let mut hits = Vec::new();
-                for document in index.into_iter().flat_map(HashMap::values) {
-                    if !query.filter.permits(&document.document) {
+                for stored in index.into_iter().flat_map(HashMap::values) {
+                    if !query.filter.permits(&stored.indexed.document) {
                         continue;
                     }
-                    if let Some(score) = score(definition, document, &tokens) {
-                        hits.push(SearchHit::new(definition.name, document.id(), score));
+                    if let Some(score) =
+                        score(definition, &stored.indexed, &stored.field_tokens, &tokens)
+                    {
+                        hits.push(SearchHit::new(definition.name, stored.indexed.id(), score));
                     }
                 }
                 hits
@@ -432,8 +481,8 @@ impl SearchBackend for MemorySearchBackend {
 
             let mut hits = Vec::new();
             let mismatch = self.read_index(definition, |index| {
-                for document in index.into_iter().flat_map(HashMap::values) {
-                    let Some(embedding) = &document.embedding else {
+                for stored in index.into_iter().flat_map(HashMap::values) {
+                    let Some(embedding) = &stored.indexed.embedding else {
                         continue;
                     };
                     // Filter FIRST: a document the caller cannot see must not
@@ -441,7 +490,7 @@ impl SearchBackend for MemorySearchBackend {
                     // the filter would let one tenant's differently-sized
                     // embedding abort every other tenant's vector search, and
                     // leak that document's width in the error.
-                    if !query.filter.permits(&document.document) {
+                    if !query.filter.permits(&stored.indexed.document) {
                         continue;
                     }
                     // A width disagreement means the index was built with a
@@ -457,7 +506,7 @@ impl SearchBackend for MemorySearchBackend {
                     if query.min_score.is_some_and(|min| score < min) {
                         continue;
                     }
-                    hits.push(SearchHit::new(definition.name, document.id(), score));
+                    hits.push(SearchHit::new(definition.name, stored.indexed.id(), score));
                 }
                 None
             });
@@ -484,8 +533,8 @@ impl SearchBackend for MemorySearchBackend {
                     // A record the filter excludes reads back as absent, so a
                     // "more like this" seed cannot be a record the caller
                     // cannot see.
-                    .filter(|document| filter.permits(&document.document))
-                    .and_then(|document| document.embedding.clone())
+                    .filter(|stored| filter.permits(&stored.indexed.document))
+                    .and_then(|stored| stored.indexed.embedding.clone())
             }))
         })
     }
@@ -514,12 +563,24 @@ mod tests {
         )
     }
 
+    /// `score` now takes the document's pre-tokenized fields alongside the
+    /// document itself (computed once at write time in real use); tests
+    /// derive them the same way `StoredDocument::new` does.
+    fn score_doc(
+        definition: &IndexDefinition,
+        document: &IndexedDocument,
+        tokens: &[String],
+    ) -> Option<f32> {
+        let stored = StoredDocument::new(document.clone());
+        score(definition, &stored.indexed, &stored.field_tokens, tokens)
+    }
+
     #[test]
     fn scoring_requires_every_query_token() {
         let document = doc(1, "Rust web", "frameworks");
-        assert!(score(&definition(), &document, &["rust".to_owned()]).is_some());
+        assert!(score_doc(&definition(), &document, &["rust".to_owned()]).is_some());
         assert!(
-            score(
+            score_doc(
                 &definition(),
                 &document,
                 &["rust".to_owned(), "web".to_owned()]
@@ -527,7 +588,7 @@ mod tests {
             .is_some()
         );
         assert!(
-            score(
+            score_doc(
                 &definition(),
                 &document,
                 &["rust".to_owned(), "gardening".to_owned()]
@@ -539,13 +600,13 @@ mod tests {
 
     #[test]
     fn scoring_weights_a_title_hit_above_a_body_hit() {
-        let title_hit = score(
+        let title_hit = score_doc(
             &definition(),
             &doc(1, "rust", "nothing"),
             &["rust".to_owned()],
         )
         .expect("match");
-        let body_hit = score(
+        let body_hit = score_doc(
             &definition(),
             &doc(2, "nothing", "rust"),
             &["rust".to_owned()],
@@ -556,8 +617,9 @@ mod tests {
 
     #[test]
     fn scoring_accumulates_repeated_occurrences() {
-        let once = score(&definition(), &doc(1, "rust", ""), &["rust".to_owned()]).expect("match");
-        let twice = score(
+        let once =
+            score_doc(&definition(), &doc(1, "rust", ""), &["rust".to_owned()]).expect("match");
+        let twice = score_doc(
             &definition(),
             &doc(1, "rust rust", ""),
             &["rust".to_owned()],
@@ -579,9 +641,9 @@ mod tests {
                 .with_field("body", 'A', "rust"),
         );
         let honest_score =
-            score(&definition(), &honest, &["rust".to_owned()]).expect("title match");
+            score_doc(&definition(), &honest, &["rust".to_owned()]).expect("title match");
         let inflated_score =
-            score(&definition(), &inflated, &["rust".to_owned()]).expect("body match");
+            score_doc(&definition(), &inflated, &["rust".to_owned()]).expect("body match");
         assert!(
             honest_score > inflated_score,
             "a document-declared weight must not promote a body hit: \
@@ -600,7 +662,7 @@ mod tests {
                 .with_field("internal_notes", 'A', "rust"),
         );
         assert!(
-            score(&definition(), &smuggled, &["rust".to_owned()]).is_none(),
+            score_doc(&definition(), &smuggled, &["rust".to_owned()]).is_none(),
             "a field outside the index definition must not be searchable"
         );
     }
