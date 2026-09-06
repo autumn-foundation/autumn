@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **`autumn migrate check` classifies against the app's own backend** (issue
-  #1906). The safety classifier was Postgres-only and handed a SQLite app wrong
+  #1906). The safety classifier was Postgres-only and gave SQLite apps incorrect
   advice: it recommended `CREATE INDEX CONCURRENTLY`, which SQLite has no syntax
   for; it flagged every `DROP INDEX` as blocking, though on SQLite it is a cheap
   catalog edit *and* a precondition of `DROP COLUMN`, so the generator's own
@@ -21,8 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ALTER COLUMN` in any spelling, `TRUNCATE`, `CONCURRENTLY`, inline
   `UNIQUE`/`PRIMARY KEY` on `ADD COLUMN`, a non-constant `ADD COLUMN` default, a
   `REFERENCES` column with a non-NULL default, sequences, types, extensions,
-  materialized views, `COMMENT ON`, `GRANT`/`REVOKE` — and fails the gate, since
-  they cannot apply. Postgres classification is unchanged.
+  materialized views, `COMMENT ON`, `GRANT`/`REVOKE`, `MERGE`, a writing CTE and
+  the Postgres-only `CREATE INDEX`/`CREATE TABLE` clauses — and fails the
+  `up.sql` gate, since they cannot apply. Postgres classification is unchanged.
 
 - **plugin-sandbox:** three consequences of #1632 that an existing sandbox
   embedder will notice. `SandboxManifest` gains `grants` and `quotas` fields, so

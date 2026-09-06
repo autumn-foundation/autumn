@@ -1183,9 +1183,11 @@ pub fn grade_database_url(
 #[must_use]
 pub fn grade_migrate_check(migrations_dir: &Path) -> PreflightCheck {
     // Grade against the app's own backend (issue #1906): a SQLite app's
-    // migrations must be judged by SQLite's dialect, not Postgres's.
+    // migrations must be judged by SQLite's dialect, not Postgres's. The
+    // offline detector never reads `.env` and never exits — `autumn doctor
+    // --json` calls this while assembling its report.
     grade_migrate_check_for(
-        crate::generate::detect_backend(Path::new(".")),
+        crate::generate::detect_backend_offline(Path::new("."), None),
         migrations_dir,
     )
 }

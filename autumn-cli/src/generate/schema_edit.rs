@@ -1456,7 +1456,7 @@ pub fn encrypt_columns_down_sql(table: &str, columns: &[String]) -> String {
 #[cfg(test)]
 #[must_use]
 pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
-    remove_columns_up_sql_for(DatabaseBackend::Postgres, table, fields, "")
+    remove_columns_up_sql_for(DatabaseBackend::Postgres, table, fields, "", &[])
 }
 
 /// `remove_columns_up_sql` for a specific database `backend` (issue #1614).
@@ -1482,39 +1482,19 @@ pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
 /// Postgres cascades index drops with the column, so its output stays
 /// byte-for-byte identical (no explicit `DROP INDEX`).
 ///
-/// Indexes the generator cannot name by convention — composite, partial,
-/// expression, or hand-named — are recovered from earlier migrations by
-/// [`remove_columns_up_sql_with_prior_indexes`] (issue #1906).
-///
 /// `existing_schema` mirrors [`add_columns_down_sql_for`] so a `unique` field's
 /// index name matches the one the up path generated.
-// Retained as a prior-index-unaware convenience wrapper for the test suite;
-// production calls `remove_columns_up_sql_with_prior_indexes`.
-#[cfg(test)]
+///
+/// `prior_indexes` (issue #1906) are the table's already-existing indexes, from
+/// [`crate::generate::prior_index::scan_prior_indexes`]. `SQLite` refuses
+/// `DROP COLUMN` while ANY index names the column, and the conventional
+/// `idx_<table>_<col>` guess above cannot reach a composite, partial,
+/// expression or hand-named index an earlier migration created. Each prior
+/// index that names a removed column gets its own `DROP INDEX IF EXISTS`.
+/// Postgres cascades index drops with the column, so it ignores `prior_indexes`
+/// and its output stays byte-for-byte identical.
 #[must_use]
 pub fn remove_columns_up_sql_for(
-    backend: DatabaseBackend,
-    table: &str,
-    fields: &[Field],
-    existing_schema: &str,
-) -> String {
-    remove_columns_up_sql_with_prior_indexes(backend, table, fields, existing_schema, &[])
-}
-
-/// [`remove_columns_up_sql_for`], plus the table's already-existing indexes
-/// (issue #1906).
-///
-/// `SQLite` refuses `DROP COLUMN` while ANY index names the column, including a
-/// composite, partial, expression or hand-named index an earlier migration
-/// created — which the conventional `idx_<table>_<col>` guess above cannot
-/// reach. `prior_indexes` comes from
-/// [`crate::generate::prior_index::scan_prior_indexes`]; each one that names a
-/// removed column gets a `DROP INDEX IF EXISTS` before the `DROP COLUMN`.
-///
-/// Postgres cascades index drops with the column, so `prior_indexes` is ignored
-/// there and the output stays byte-for-byte identical.
-#[must_use]
-pub fn remove_columns_up_sql_with_prior_indexes(
     backend: DatabaseBackend,
     table: &str,
     fields: &[Field],
@@ -1523,6 +1503,9 @@ pub fn remove_columns_up_sql_with_prior_indexes(
 ) -> String {
     let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
+    // Every index name already dropped, normalized. Two removed columns can
+    // share one composite index; drop it once.
+    let mut dropped: Vec<String> = Vec::new();
     for f in fields {
         let _ = writeln!(
             out,
@@ -1540,25 +1523,35 @@ pub fn remove_columns_up_sql_with_prior_indexes(
         // come from the same helpers the ADD and CREATE paths use, so the DROP matches
         // the existing CREATE INDEX.
         if backend == DatabaseBackend::Sqlite {
-            let mut dropped = vec![format!("idx_{table}_{}", f.name)];
+            let mut names = vec![format!("idx_{table}_{}", f.name)];
             if f.unique {
-                dropped.push(unique_index_name(table, &f.name, &collision_fields));
+                names.push(unique_index_name(table, &f.name, &collision_fields));
             }
-            // Indexes an earlier migration created that name this column. The
-            // conventional names above are already queued, so skip a scanned
-            // index that repeats one.
-            for index in prior_indexes.iter().filter(|i| i.covers(&f.name)) {
-                if !dropped.iter().any(|d| d.eq_ignore_ascii_case(&index.name)) {
-                    dropped.push(index.name.clone());
+            // Indexes an earlier migration created that name this column.
+            names.extend(
+                prior_indexes
+                    .iter()
+                    .filter(|i| i.covers(&f.name))
+                    .map(|i| i.name.clone()),
+            );
+            for name in names {
+                let key = index_name_key(&name);
+                if dropped.contains(&key) {
+                    continue;
                 }
-            }
-            for name in dropped {
+                dropped.push(key);
                 let _ = writeln!(out, "DROP INDEX IF EXISTS {name};");
             }
         }
         let _ = writeln!(out, "ALTER TABLE {table} DROP COLUMN {};", f.name);
     }
     out
+}
+
+/// Comparison key for an index name: unquoted and lowercased, so a scanned
+/// `"idx_posts_title"` matches the generator's own `idx_posts_title`.
+fn index_name_key(name: &str) -> String {
+    name.trim().trim_matches('"').to_lowercase()
 }
 
 /// `down.sql` companion to [`remove_columns_up_sql`]. Restores a `references`
@@ -1579,8 +1572,14 @@ pub fn remove_columns_up_sql_with_prior_indexes(
 #[cfg(test)]
 #[must_use]
 pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &str) -> String {
-    remove_columns_down_sql_for(DatabaseBackend::Postgres, table, fields, existing_schema)
-        .expect("Postgres ADD COLUMN generation never rejects")
+    remove_columns_down_sql_for(
+        DatabaseBackend::Postgres,
+        table,
+        fields,
+        existing_schema,
+        &[],
+    )
+    .expect("Postgres ADD COLUMN generation never rejects")
 }
 
 /// `remove_columns_down_sql` for a specific database `backend` (issue #1614).
@@ -1599,31 +1598,13 @@ pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &
 /// so every `NOT NULL` re-added column is rejected on `SQLite`; nullable
 /// re-added columns are unaffected. The Postgres path never rejects and stays
 /// byte-for-byte identical.
-// Retained as a prior-index-unaware convenience wrapper for the test suite;
-// production calls `remove_columns_down_sql_with_prior_indexes`.
-#[cfg(test)]
+///
+/// `prior_indexes` (issue #1906) are the indexes the up path dropped. This
+/// re-creates each one that named a removed column, after the columns are back:
+/// an index cannot reference a column that does not exist yet. Without it a
+/// `migrate down` would leave the table missing indexes it had before. Ignored
+/// on Postgres, whose output stays byte-for-byte identical.
 pub fn remove_columns_down_sql_for(
-    backend: DatabaseBackend,
-    table: &str,
-    fields: &[Field],
-    existing_schema: &str,
-) -> Result<String, GenerateError> {
-    remove_columns_down_sql_with_prior_indexes(backend, table, fields, existing_schema, &[])
-}
-
-/// [`remove_columns_down_sql_for`], plus the table's already-existing indexes
-/// (issue #1906).
-///
-/// The up path drops every prior index that named a removed column, so the
-/// rollback re-creates them verbatim — otherwise `migrate down` would silently
-/// leave the table without indexes it had before. Emitted after the columns are
-/// re-added, since an index cannot reference a column that does not exist yet.
-/// Ignored on Postgres, whose output stays byte-for-byte identical.
-///
-/// # Errors
-/// Same `SQLite` `NOT NULL`-without-default rejection as
-/// [`remove_columns_down_sql_for`].
-pub fn remove_columns_down_sql_with_prior_indexes(
     backend: DatabaseBackend,
     table: &str,
     fields: &[Field],
@@ -1632,6 +1613,10 @@ pub fn remove_columns_down_sql_with_prior_indexes(
 ) -> Result<String, GenerateError> {
     let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
+    // Index names this function re-creates itself, below. A prior index that
+    // repeats one must not be re-created twice: SQLite fails the whole rollback
+    // with "index <name> already exists".
+    let mut own_indexes: Vec<String> = Vec::new();
     for f in fields.iter().rev() {
         // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a DEFAULT
         // (#1614 AC #4). The rollback re-adds the dropped column with the same `ADD
@@ -1674,26 +1659,30 @@ pub fn remove_columns_down_sql_with_prior_indexes(
                 "CREATE INDEX idx_{table}_{} ON {table} ({});",
                 f.name, f.name
             );
+            own_indexes.push(index_name_key(&format!("idx_{table}_{}", f.name)));
         }
         if f.unique {
             out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
+            own_indexes.push(index_name_key(&unique_index_name(
+                table,
+                &f.name,
+                &collision_fields,
+            )));
         }
     }
     // Re-create the prior indexes the up path dropped, after every column is
-    // back. Deduped: two removed columns can share one composite index.
+    // back. Skips a name this function already emitted, and dedupes the scan
+    // itself: two removed columns can share one composite index.
     if backend == DatabaseBackend::Sqlite {
-        let mut recreated: Vec<&str> = Vec::new();
         for index in prior_indexes
             .iter()
             .filter(|i| fields.iter().any(|f| i.covers(&f.name)))
         {
-            if recreated
-                .iter()
-                .any(|n| n.eq_ignore_ascii_case(&index.name))
-            {
+            let key = index_name_key(&index.name);
+            if own_indexes.contains(&key) {
                 continue;
             }
-            recreated.push(&index.name);
+            own_indexes.push(key);
             let _ = writeln!(out, "{}", index.create_sql);
         }
     }
@@ -5579,6 +5568,7 @@ mod tests {
             "posts",
             &fields(&["title:String{translatable}"]),
             "",
+            &[],
         )
         .expect("SQLite rollback accepted for a defaulted column");
         assert!(sql.contains("title TEXT NOT NULL DEFAULT '{}'"), "{sql}");
@@ -6252,7 +6242,7 @@ mod tests {
             "CREATE INDEX idx_posts_author_title ON posts (author_id, title);",
             "posts",
         );
-        let up = remove_columns_up_sql_with_prior_indexes(
+        let up = remove_columns_up_sql_for(
             DatabaseBackend::Sqlite,
             "posts",
             &fields(&["title:String"]),
@@ -6277,7 +6267,7 @@ mod tests {
             "CREATE INDEX idx_posts_author_title ON posts (author_id, title);",
             "posts",
         );
-        let down = remove_columns_down_sql_with_prior_indexes(
+        let down = remove_columns_down_sql_for(
             DatabaseBackend::Sqlite,
             "posts",
             &fields(&["title:Option<String>"]),
@@ -6300,7 +6290,7 @@ mod tests {
     #[test]
     fn sqlite_remove_column_ignores_a_prior_index_on_other_columns() {
         let indexes = prior("CREATE INDEX idx_posts_body ON posts (body);", "posts");
-        let up = remove_columns_up_sql_with_prior_indexes(
+        let up = remove_columns_up_sql_for(
             DatabaseBackend::Sqlite,
             "posts",
             &fields(&["title:String"]),
@@ -6315,7 +6305,7 @@ mod tests {
         // The generator already emits `idx_<table>_<col>` unconditionally; a
         // scanned index of the same name must not produce a duplicate DROP.
         let indexes = prior("CREATE INDEX idx_posts_title ON posts (title);", "posts");
-        let up = remove_columns_up_sql_with_prior_indexes(
+        let up = remove_columns_up_sql_for(
             DatabaseBackend::Sqlite,
             "posts",
             &fields(&["title:String"]),
@@ -6337,7 +6327,7 @@ mod tests {
             "CREATE INDEX idx_posts_author_title ON posts (author_id, title);",
             "posts",
         );
-        let with = remove_columns_up_sql_with_prior_indexes(
+        let with = remove_columns_up_sql_for(
             DatabaseBackend::Postgres,
             "posts",
             &fields(&["title:String"]),
@@ -6349,27 +6339,81 @@ mod tests {
             "posts",
             &fields(&["title:String"]),
             "",
+            &[],
         );
         assert_eq!(with, without);
     }
 
     #[test]
-    fn remove_columns_for_delegates_to_the_prior_index_form() {
-        // The prior-index-unaware entry point must keep behaving as before.
-        let plain = remove_columns_up_sql_for(
+    fn sqlite_remove_column_never_recreates_one_index_twice() {
+        // The per-field loop already re-creates a `unique` field's index by the
+        // same name the scan recovers. Emitting both fails the whole rollback
+        // with "index idx_posts_slug_unique already exists".
+        let indexes = prior(
+            "CREATE UNIQUE INDEX idx_posts_slug_unique ON posts (slug);",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
             DatabaseBackend::Sqlite,
             "posts",
-            &fields(&["title:String"]),
+            &fields(&["slug:Option<String>:unique"]),
             "",
+            &indexes,
+        )
+        .unwrap();
+        assert_eq!(
+            down.matches("idx_posts_slug_unique ON posts (slug);")
+                .count(),
+            1,
+            "got:\n{down}"
         );
-        let empty = remove_columns_up_sql_with_prior_indexes(
+    }
+
+    #[test]
+    fn sqlite_remove_reference_column_never_recreates_its_auto_index_twice() {
+        let indexes = prior(
+            "CREATE INDEX idx_posts_author_id ON posts (author_id);",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
             DatabaseBackend::Sqlite,
             "posts",
-            &fields(&["title:String"]),
+            &fields(&["author:references?"]),
             "",
-            &[],
+            &indexes,
+        )
+        .unwrap();
+        assert_eq!(
+            down.matches("idx_posts_author_id ON posts (author_id);")
+                .count(),
+            1,
+            "got:\n{down}"
         );
-        assert_eq!(plain, empty);
+    }
+
+    #[test]
+    fn sqlite_remove_two_columns_sharing_one_composite_index_recreates_it_once() {
+        let indexes = prior(
+            "CREATE INDEX idx_posts_author_title ON posts (author_id, title);",
+            "posts",
+        );
+        let f = fields(&["title:Option<String>", "author_id:Option<i64>"]);
+        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "", &indexes);
+        let down = remove_columns_down_sql_for(DatabaseBackend::Sqlite, "posts", &f, "", &indexes)
+            .unwrap();
+        // The up path drops it once, ahead of the first DROP COLUMN.
+        assert_eq!(
+            up.matches("DROP INDEX IF EXISTS idx_posts_author_title;")
+                .count(),
+            1,
+            "got:\n{up}"
+        );
+        // And the rollback creates it exactly once.
+        assert_eq!(
+            down.matches("CREATE INDEX idx_posts_author_title").count(),
+            1,
+            "got:\n{down}"
+        );
     }
 
     #[test]
@@ -7148,7 +7192,7 @@ mod tests {
     #[test]
     fn sqlite_remove_columns_up_drops_reference_index_before_column() {
         let f = fields(&["author:references?"]);
-        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "");
+        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "", &[]);
         let drop_idx = up
             .find("DROP INDEX IF EXISTS idx_posts_author_id;")
             .expect("drop index");
@@ -7167,7 +7211,7 @@ mod tests {
     #[test]
     fn sqlite_remove_columns_up_drops_unique_index_before_column() {
         let f = fields(&["email:Option<String>:unique"]);
-        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "users", &f, "");
+        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "users", &f, "", &[]);
         let drop_idx = up
             .find("DROP INDEX IF EXISTS idx_users_email_unique;")
             .expect("drop index");
@@ -7190,7 +7234,7 @@ mod tests {
     fn sqlite_remove_columns_up_drops_plain_index_before_column() {
         // `RemoveTitleFromPosts`: `title` was created via scaffold `--index`.
         let f = fields(&["title:String"]);
-        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "");
+        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "", &[]);
         let drop_idx = up
             .find("DROP INDEX IF EXISTS idx_posts_title;")
             .expect("drop index");
@@ -7209,7 +7253,7 @@ mod tests {
     #[test]
     fn postgres_remove_columns_up_has_no_explicit_drop_index() {
         let f = fields(&["author:references?"]);
-        let up = remove_columns_up_sql_for(DatabaseBackend::Postgres, "posts", &f, "");
+        let up = remove_columns_up_sql_for(DatabaseBackend::Postgres, "posts", &f, "", &[]);
         assert!(!up.contains("DROP INDEX"), "up:\n{up}");
         assert!(up.contains("ALTER TABLE posts DROP COLUMN author_id;"));
         // And the Postgres-default test wrapper matches.

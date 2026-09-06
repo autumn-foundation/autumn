@@ -13,9 +13,8 @@ use super::naming::pascal_to_snake;
 use super::schema_edit::{
     MigrationShape, add_columns_down_sql_for, add_columns_up_sql_for, add_search_down_sql_for,
     add_search_up_sql_for, detect_migration_shape, encrypt_columns_down_sql,
-    encrypt_columns_up_sql, parse_model_search_config_for_table,
-    remove_columns_down_sql_with_prior_indexes, remove_columns_up_sql_with_prior_indexes,
-    singularize,
+    encrypt_columns_up_sql, parse_model_search_config_for_table, remove_columns_down_sql_for,
+    remove_columns_up_sql_for, singularize,
 };
 use super::{GenerateError, detect_backend, ensure_project_root};
 
@@ -197,27 +196,23 @@ pub fn plan_migration_with_options(
             }
             let existing_schema =
                 std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
-            // SQLite refuses `DROP COLUMN` while any index names the column, and
-            // the conventional `idx_<table>_<col>` guess cannot reach a
-            // composite, partial, expression or hand-named index from an earlier
-            // migration. Recover those from the migration history so the up path
-            // can drop them first and the rollback can restore them (#1906).
-            // Postgres cascades index drops with the column, so it needs none of
-            // this and its output stays byte-for-byte identical.
+            // SQLite refuses `DROP COLUMN` while an index names the column.
+            // Recover the table's prior indexes so the up path drops them first
+            // (#1906). Postgres cascades the drop and needs none of this.
             let prior_indexes = if backend == autumn_web::config::DatabaseBackend::Sqlite {
                 super::prior_index::scan_prior_indexes(&project_root.join("migrations"), table)
             } else {
                 Vec::new()
             };
             (
-                remove_columns_up_sql_with_prior_indexes(
+                remove_columns_up_sql_for(
                     backend,
                     table,
                     &fields,
                     &existing_schema,
                     &prior_indexes,
                 ),
-                remove_columns_down_sql_with_prior_indexes(
+                remove_columns_down_sql_for(
                     backend,
                     table,
                     &fields,

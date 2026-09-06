@@ -4,6 +4,13 @@
 //! into a risk tier. The result drives `autumn migrate check`'s exit code and
 //! human-readable safety report printed to stderr.
 //!
+//! Classification is per backend (issue #1906). Postgres asks how risky a
+//! statement is for a rolling deploy. `SQLite` asks that too, but first asks
+//! whether the statement runs at all: its `ALTER TABLE` accepts only four
+//! subcommands, and it has no `CONCURRENTLY`, `TRUNCATE`, sequences, types or
+//! grants. A statement the backend cannot parse is
+//! [`RiskLevel::Unsupported`].
+//!
 //! # Known limitations
 //!
 //! - Statement splitting uses `;` as the delimiter with awareness of
@@ -87,7 +94,8 @@ pub fn classify_sql(sql: &str) -> Vec<SafetyFinding> {
     classify_sql_for(DatabaseBackend::Postgres, sql)
 }
 
-/// [`classify_sql`] for a specific database `backend` (issue #1906).
+/// Classify the SQL content of an `up.sql` file against a specific database
+/// `backend` (issue #1906).
 ///
 /// The Postgres path is unchanged. The `SQLite` path applies `SQLite`'s own
 /// dialect rules: statements Postgres merely finds slow are often outright
@@ -118,7 +126,7 @@ pub fn classify_sql_for(backend: DatabaseBackend, sql: &str) -> Vec<SafetyFindin
         .filter(|stmt| !has_review_suppression(stmt))
         .flat_map(|stmt| {
             let normalized = normalize_statement(stmt);
-            let mut findings = classify_statement(backend, &normalized);
+            let mut findings = classify_statement(backend, &normalized, &newly_created);
             // Drop any index-build finding whose table was created earlier in
             // this same migration file (either backend's spelling of it).
             findings.retain(|f| {
@@ -189,6 +197,15 @@ fn extract_created_table_name(normalized: &str) -> Option<String> {
 fn extract_index_table_name(normalized: &str) -> Option<&str> {
     let after_on = normalized.find(" on ").map(|i| &normalized[i + 4..])?;
     let name = after_on.split([' ', '(']).next()?;
+    if name.is_empty() { None } else { Some(name) }
+}
+
+/// Extract the table name from a normalized `ALTER TABLE name …` statement.
+fn extract_altered_table_name(normalized: &str) -> Option<&str> {
+    let rest = normalized.strip_prefix("alter table ")?;
+    let rest = rest.strip_prefix("if exists ").unwrap_or(rest);
+    let rest = rest.strip_prefix("only ").unwrap_or(rest);
+    let name = rest.split([' ', '(']).next()?;
     if name.is_empty() { None } else { Some(name) }
 }
 
@@ -317,20 +334,36 @@ fn alter_table_subcommands(normalized: &str) -> Vec<&str> {
 /// A subcommand is "known" when a specific safety rule covers all risk scenarios
 /// for it (including the case where it is safe and produces no finding).
 fn is_known_alter_subcommand(backend: DatabaseBackend, subcommand: &str) -> bool {
-    let sqlite = backend == DatabaseBackend::Sqlite;
+    // On SQLite every subcommand is already classified: the four the grammar
+    // accepts by the rules below, and every other one as Unsupported. So none
+    // is left for the manual-review fallback.
+    if backend == DatabaseBackend::Sqlite {
+        return true;
+    }
     // `add column` is known unless it carries an inline PRIMARY KEY constraint,
     // which Autumn does not specifically classify.  UNIQUE and REFERENCES are handled
-    // by dedicated rules; NOT NULL is handled by the NOT NULL rule. On SQLite an
-    // inline PRIMARY KEY *is* classified (as Unsupported), so it counts as known.
+    // by dedicated rules; NOT NULL is handled by the NOT NULL rule.
     let add_col_known =
-        subcommand.starts_with("add column ") && (sqlite || !subcommand.contains(" primary key"));
+        subcommand.starts_with("add column ") && !subcommand.contains(" primary key");
     add_col_known
         || subcommand.starts_with("drop column ")
         || subcommand.starts_with("rename column ") // RENAME COLUMN
         || subcommand.starts_with("rename to ") // RENAME TABLE (ALTER TABLE … RENAME TO …)
-        // Postgres classifies only the TYPE form; SQLite classifies every
-        // `alter column` spelling as Unsupported, so none is left unknown there.
-        || (subcommand.starts_with("alter column ") && (sqlite || subcommand.contains(" type ")))
+        || (subcommand.starts_with("alter column ") && subcommand.contains(" type "))
+}
+
+/// Whether `subcommand` is one of the four `ALTER TABLE` forms `SQLite` parses:
+/// `RENAME TO`, `RENAME [COLUMN] … TO …`, `ADD COLUMN` and `DROP COLUMN`.
+/// `SQLite` also accepts `ADD`/`DROP` with the `COLUMN` keyword left out.
+fn is_sqlite_alter_subcommand(subcommand: &str) -> bool {
+    ["rename to ", "rename column ", "add column ", "drop column "]
+        .iter()
+        .any(|p| subcommand.starts_with(p))
+        // Bare `RENAME old TO new`, `ADD <col> …`, `DROP <col>` — but not
+        // `ADD CONSTRAINT`/`DROP CONSTRAINT`, which SQLite rejects.
+        || (subcommand.starts_with("rename ") && subcommand.contains(" to "))
+        || (subcommand.starts_with("add ") && !subcommand.starts_with("add constraint "))
+        || (subcommand.starts_with("drop ") && !subcommand.starts_with("drop constraint "))
 }
 
 /// Operation label for a non-concurrent Postgres index build.
@@ -339,18 +372,30 @@ const CREATE_INDEX_PG_OP: &str = "CREATE INDEX (non-concurrent)";
 /// so "non-concurrent" would be a meaningless qualifier there.
 const CREATE_INDEX_SQLITE_OP: &str = "CREATE INDEX";
 
-/// The first token of an `add column` subcommand's `DEFAULT` clause, lowercased,
-/// or `None` when the subcommand carries no default.
+/// The value of an `add column` subcommand's `DEFAULT` clause, lowercased, or
+/// `None` when the subcommand carries no default.
 ///
-/// A parenthesized expression is returned whole (balanced parentheses), so
-/// `default (lower(x))` yields `(lower(x))` rather than `(lower(x`.
+/// Three shapes are read whole rather than split on whitespace: a parenthesized
+/// expression (`(lower(x))`), a quoted literal including one with spaces
+/// (`'a b'`, with `''` as the escaped quote), and a signed number (`-1`).
+/// A `DEFAULT` inside a foreign-key action (`ON UPDATE SET DEFAULT`) is not a
+/// column default and is skipped.
 fn add_column_default_token(subcommand: &str) -> Option<String> {
-    let rest = subcommand.split_once(" default ")?.1.trim_start();
+    let mut from = 0;
+    let rest = loop {
+        let at = subcommand[from..].find(" default ")? + from;
+        // `SET DEFAULT` here is an FK action, not this column's default.
+        if !subcommand[..at].trim_end().ends_with(" set") {
+            break subcommand[at + " default ".len()..].trim_start();
+        }
+        from = at + " default ".len();
+    };
     if rest.starts_with('(') {
         let mut depth = 0usize;
         for (i, c) in rest.char_indices() {
             match c {
                 '(' => depth += 1,
+                // `depth` is at least 1 here: the first character is `(`.
                 ')' => {
                     depth -= 1;
                     if depth == 0 {
@@ -359,6 +404,21 @@ fn add_column_default_token(subcommand: &str) -> Option<String> {
                 }
                 _ => {}
             }
+        }
+        return Some(rest.to_owned());
+    }
+    if rest.starts_with('\'') {
+        let bytes = rest.as_bytes();
+        let mut i = 1;
+        while i < bytes.len() {
+            if bytes[i] == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2; // `''` is one escaped quote
+                    continue;
+                }
+                return Some(rest[..=i].to_owned());
+            }
+            i += 1;
         }
         return Some(rest.to_owned());
     }
@@ -371,16 +431,32 @@ fn add_column_default_token(subcommand: &str) -> Option<String> {
     )
 }
 
-/// `SQLite` constants for `DEFAULT` values acceptable to `ADD COLUMN`.
+/// Whether `default` is a constant `SQLite` accepts as an `ADD COLUMN` default.
 ///
-/// `SQLite` rejects `CURRENT_TIME`, `CURRENT_DATE`, `CURRENT_TIMESTAMP` and any
-/// parenthesized expression there; everything else is a literal it accepts.
+/// `SQLite`'s rule is that the default must reduce to a constant value. Its
+/// parser keeps no node for parentheses, so `DEFAULT ('draft')` is the same as
+/// `DEFAULT 'draft'` and is accepted; `DEFAULT (1+2)` and `DEFAULT (abs(-1))`
+/// are not. `CURRENT_TIME`, `CURRENT_DATE` and `CURRENT_TIMESTAMP` are rejected
+/// by name. An unparenthesized call such as `DEFAULT now()` is not even
+/// grammatical — only a literal or signed number may follow `DEFAULT` bare — so
+/// it counts as non-constant too.
 fn is_sqlite_constant_default(default: &str) -> bool {
-    !default.starts_with('(')
-        && !matches!(
-            default,
-            "current_time" | "current_date" | "current_timestamp"
-        )
+    let inner = default
+        .strip_prefix('(')
+        .and_then(|d| d.strip_suffix(')'))
+        .unwrap_or(default)
+        .trim();
+    if matches!(inner, "current_time" | "current_date" | "current_timestamp") {
+        return false;
+    }
+    // A quoted literal is constant whatever it contains.
+    if inner.starts_with('\'') || inner.starts_with("x'") {
+        return true;
+    }
+    // Otherwise: a bare literal or signed number. A call or an operator makes
+    // it an expression.
+    let unsigned = inner.trim_start_matches(['+', '-']).trim_start();
+    !unsigned.contains(['(', ')', '+', '-', '*', '/', '|', '<', '>', '=', '\''])
 }
 
 /// A statement `SQLite` has no syntax for at all (issue #1906).
@@ -394,19 +470,22 @@ fn sqlite_unsupported_statement(normalized: &str) -> Option<SafetyFinding> {
     let (operation, next_action) = if normalized.starts_with("truncate ") {
         (
             "TRUNCATE (unsupported on SQLite)",
-            "SQLite has no TRUNCATE statement. Use `DELETE FROM <table>;` (add              `DELETE FROM sqlite_sequence WHERE name = '<table>';` to reset AUTOINCREMENT).",
+            "SQLite has no TRUNCATE statement. Use `DELETE FROM <table>;` (add `DELETE FROM \
+             sqlite_sequence WHERE name = '<table>';` to reset AUTOINCREMENT).",
         )
-    } else if normalized.starts_with("create index concurrently")
-        || normalized.starts_with("create unique index concurrently")
+    } else if normalized.starts_with("create index concurrently ")
+        || normalized.starts_with("create unique index concurrently ")
     {
         (
             "CREATE INDEX CONCURRENTLY (unsupported on SQLite)",
-            "SQLite has no CONCURRENTLY option. Drop the keyword and build the index during a              low-traffic window.",
+            "SQLite has no CONCURRENTLY option. Drop the keyword and build the index during a \
+             low-traffic window.",
         )
-    } else if normalized.starts_with("drop index concurrently") {
+    } else if normalized.starts_with("drop index concurrently ") {
         (
             "DROP INDEX CONCURRENTLY (unsupported on SQLite)",
-            "SQLite has no CONCURRENTLY option. Drop the keyword — a plain DROP INDEX is a cheap              catalog edit on SQLite.",
+            "SQLite has no CONCURRENTLY option. Drop the keyword — a plain DROP INDEX is a cheap \
+             catalog edit on SQLite.",
         )
     } else if normalized.starts_with("create sequence")
         || normalized.starts_with("alter sequence")
@@ -422,13 +501,15 @@ fn sqlite_unsupported_statement(normalized: &str) -> Option<SafetyFinding> {
     {
         (
             "TYPE statement (unsupported on SQLite)",
-            "SQLite has no user-defined types. Model an enum as a TEXT column with a CHECK              constraint.",
+            "SQLite has no user-defined types. Model an enum as a TEXT column with a CHECK \
+             constraint.",
         )
     } else if normalized.starts_with("create extension") || normalized.starts_with("drop extension")
     {
         (
             "EXTENSION statement (unsupported on SQLite)",
-            "SQLite has no extensions in this sense. Remove the statement, or gate the migration              to the Postgres backend.",
+            "SQLite has no extensions in this sense. Remove the statement, or gate the migration to \
+             the Postgres backend.",
         )
     } else if normalized.starts_with("comment on") {
         (
@@ -441,12 +522,80 @@ fn sqlite_unsupported_statement(normalized: &str) -> Option<SafetyFinding> {
     {
         (
             "MATERIALIZED VIEW statement (unsupported on SQLite)",
-            "SQLite has no materialized views. Use a plain view, or a real table refreshed by a              background job.",
+            "SQLite has no materialized views. Use a plain view, or a real table refreshed by a \
+             background job.",
         )
     } else if normalized.starts_with("grant ") || normalized.starts_with("revoke ") {
         (
             "GRANT/REVOKE (unsupported on SQLite)",
-            "SQLite has no roles or grants — file permissions are the access control. Remove the              statement.",
+            "SQLite has no roles or grants — file permissions are the access control. Remove the \
+             statement.",
+        )
+    } else {
+        return sqlite_unsupported_clause(normalized);
+    };
+    Some(SafetyFinding {
+        operation: operation.to_owned(),
+        risk: RiskLevel::Unsupported,
+        why: "SQLite has no syntax for this statement, so the migration fails at apply time.",
+        next_action,
+    })
+}
+
+/// A statement whose *shape* `SQLite` accepts but which carries a Postgres-only
+/// clause, plus the DML forms `SQLite` has no grammar for (issue #1906).
+///
+/// Split out from [`sqlite_unsupported_statement`], which handles the
+/// Postgres-only object statements.
+fn sqlite_unsupported_clause(normalized: &str) -> Option<SafetyFinding> {
+    let (operation, next_action) = if normalized.starts_with("merge into ") {
+        (
+            "MERGE (unsupported on SQLite)",
+            "SQLite has no MERGE. Use INSERT … ON CONFLICT (upsert), naming the conflicting \
+             columns rather than a constraint.",
+        )
+    } else if normalized.starts_with("drop index ")
+        && normalized
+            .trim_start_matches("drop index ")
+            .trim_start_matches("if exists ")
+            .starts_with("sqlite_autoindex")
+    {
+        (
+            "DROP INDEX on an implicit index (unsupported on SQLite)",
+            "SQLite refuses to drop the index behind a UNIQUE or PRIMARY KEY constraint, even \
+             with IF EXISTS. Rebuild the table without the constraint instead.",
+        )
+    } else if is_create_index_statement(normalized) && has_postgres_index_clause(normalized) {
+        (
+            "CREATE INDEX with a Postgres-only clause (unsupported on SQLite)",
+            "SQLite's CREATE INDEX takes no USING, INCLUDE, WITH, TABLESPACE or NULLS NOT \
+             DISTINCT clause. Drop it — SQLite indexes are always B-trees. WHERE (partial), \
+             COLLATE and DESC are supported.",
+        )
+    } else if normalized.starts_with("create table") && has_postgres_table_clause(normalized) {
+        (
+            "CREATE TABLE with a Postgres-only clause (unsupported on SQLite)",
+            "SQLite has no declarative partitioning, identity columns, table inheritance or \
+             tablespaces. Use INTEGER PRIMARY KEY AUTOINCREMENT for an identity column; model \
+             partitioning in the application.",
+        )
+    } else if normalized.contains(" for update") || normalized.contains(" for share") {
+        (
+            "SELECT … FOR UPDATE (unsupported on SQLite)",
+            "SQLite has no row-level locking clause — a write transaction locks the whole \
+             database. Drop the clause.",
+        )
+    } else if normalized.contains("on conflict on constraint ") {
+        (
+            "ON CONFLICT ON CONSTRAINT (unsupported on SQLite)",
+            "SQLite's upsert target is a column list, not a constraint name. Write \
+             `ON CONFLICT (<columns>)`.",
+        )
+    } else if normalized.starts_with("with ") && contains_data_modifying_cte(normalized) {
+        (
+            "Data-modifying CTE (unsupported on SQLite)",
+            "SQLite allows only SELECT inside a CTE. Run the UPDATE/DELETE/INSERT as its own \
+             statement.",
         )
     } else {
         return None;
@@ -457,6 +606,61 @@ fn sqlite_unsupported_statement(normalized: &str) -> Option<SafetyFinding> {
         why: "SQLite has no syntax for this statement, so the migration fails at apply time.",
         next_action,
     })
+}
+
+/// Whether the statement is a `CREATE [UNIQUE] INDEX`.
+fn is_create_index_statement(normalized: &str) -> bool {
+    normalized.starts_with("create index") || normalized.starts_with("create unique index")
+}
+
+/// Whether a `CREATE INDEX` carries a clause `SQLite` has no grammar for.
+/// `WHERE` (partial), `COLLATE` and `DESC` are absent from the list: `SQLite`
+/// supports all three.
+fn has_postgres_index_clause(normalized: &str) -> bool {
+    let sql = without_string_literals(normalized);
+    sql.contains(" using ")
+        || sql.contains(" include (")
+        || sql.contains(" with (")
+        || sql.contains(" tablespace ")
+        || sql.contains(" nulls not distinct")
+}
+
+/// Whether a `CREATE TABLE` carries a clause `SQLite` has no grammar for.
+fn has_postgres_table_clause(normalized: &str) -> bool {
+    let sql = without_string_literals(normalized);
+    sql.contains(" partition by ")
+        || sql.contains(" partition of ")
+        || sql.contains(" as identity")
+        || sql.contains(" inherits (")
+        || sql.contains(" tablespace ")
+}
+
+/// Whether a `WITH` statement writes inside a CTE. `SQLite` allows only
+/// `SELECT` there.
+fn contains_data_modifying_cte(normalized: &str) -> bool {
+    let sql = without_string_literals(normalized);
+    ["(update ", "(delete ", "(insert into "]
+        .iter()
+        .any(|p| sql.contains(p))
+}
+
+/// Blank out the contents of single-quoted literals, keeping the quotes and the
+/// string's length. Lets a keyword search run over SQL without matching a word
+/// that only appears inside a value (`DEFAULT 'not unique yet'`).
+fn without_string_literals(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut in_literal = false;
+    for c in sql.chars() {
+        match c {
+            '\'' => {
+                in_literal = !in_literal;
+                out.push(c);
+            }
+            _ if in_literal => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Returns `true` when the normalized `add column` subcommand carries an inline
@@ -471,7 +675,7 @@ fn has_inline_unique_constraint(subcommand: &str) -> bool {
 /// Handles single-line and multi-line block comments. Unclosed block comments
 /// are consumed to end-of-input. Block comments inside string literals are an
 /// edge case not handled here (same limitation as `--` in strings).
-fn strip_block_comments(sql: &str) -> String {
+pub fn strip_block_comments(sql: &str) -> String {
     let mut result = String::with_capacity(sql.len());
     let mut chars = sql.chars().peekable();
     while let Some(c) = chars.next() {
@@ -511,7 +715,7 @@ pub fn normalize_statement(stmt: &str) -> String {
 /// (`CREATE [UNIQUE] INDEX CONCURRENTLY` or `DROP INDEX CONCURRENTLY`).
 ///
 /// Uses the same comment-stripping and whitespace-normalization pipeline as
-/// [`classify_sql`] so that concurrent index keywords mentioned only inside a
+/// [`classify_sql_for`] so that concurrent index keywords mentioned only inside a
 /// SQL comment (e.g. `-- CREATE INDEX CONCURRENTLY ...`) are not counted.
 pub fn contains_concurrent_index(sql: &str) -> bool {
     split_statements(sql).iter().any(|stmt| {
@@ -554,7 +758,11 @@ fn is_volatile_function_default(default_expr: &str) -> bool {
 
 /// Apply all pattern checks to a single normalized (lowercase, single-spaced) statement.
 #[allow(clippy::too_many_lines)]
-fn classify_statement(backend: DatabaseBackend, normalized: &str) -> Vec<SafetyFinding> {
+fn classify_statement(
+    backend: DatabaseBackend,
+    normalized: &str,
+    newly_created: &[String],
+) -> Vec<SafetyFinding> {
     if normalized.is_empty() {
         return vec![];
     }
@@ -567,6 +775,13 @@ fn classify_statement(backend: DatabaseBackend, normalized: &str) -> Vec<SafetyF
     }
 
     let mut findings = Vec::new();
+    // SQLite applies its ADD COLUMN restrictions only to a table that already
+    // has rows. A table this same migration creates has none, so the same
+    // statement applies cleanly — the suppression `classify_sql_for` already
+    // makes for index builds.
+    let fresh_table = sqlite
+        && extract_altered_table_name(normalized)
+            .is_some_and(|t| newly_created.iter().any(|c| *c == t));
 
     // DROP TABLE — check first; it subsumes DROP COLUMN detection
     if normalized.starts_with("drop table") {
@@ -627,10 +842,10 @@ fn classify_statement(backend: DatabaseBackend, normalized: &str) -> Vec<SafetyF
             operation: "DROP COLUMN".to_owned(),
             risk: RiskLevel::Destructive,
             why: if sqlite {
-                "Removes a column and its data. SQLite also refuses the statement outright when \
-                 the column is a primary key, is UNIQUE, is named by any index (including a \
-                 partial index's WHERE clause), or appears in a CHECK constraint, generated \
-                 column, view or trigger."
+                "Removes a column and its data. SQLite also refuses the statement outright in \
+                 several cases. The column must not be a primary key, UNIQUE, or named by any \
+                 index — a partial index's WHERE clause included. It must not appear in a CHECK \
+                 constraint, a generated column, a foreign key, a view or a trigger."
             } else {
                 "Removes a column and its data. Old replicas that SELECT or INSERT this column \
                  will error until they restart."
@@ -673,18 +888,32 @@ fn classify_statement(backend: DatabaseBackend, normalized: &str) -> Vec<SafetyF
         });
     }
 
-    // ALTER COLUMN — SQLite has no `ALTER TABLE … ALTER COLUMN` in any form, so
-    // every spelling (TYPE, SET/DROP NOT NULL, SET DEFAULT) fails at apply time.
-    if sqlite && normalized.contains("alter column") {
-        findings.push(SafetyFinding {
-            operation: "ALTER COLUMN (unsupported on SQLite)".to_owned(),
-            risk: RiskLevel::Unsupported,
-            why: "SQLite's ALTER TABLE supports only RENAME, ADD COLUMN and DROP COLUMN. It has \
-                  no ALTER COLUMN, so this statement fails at apply time.",
-            next_action: "Rebuild the table: create the new-shape table, copy the rows, drop the \
-                          old table, rename the new one. `autumn schema diff --write-migration` \
-                          emits that rebuild for you.",
-        });
+    // SQLite's ALTER TABLE grammar is exactly RENAME TO, RENAME [COLUMN],
+    // ADD COLUMN and DROP COLUMN. Every other subcommand — ALTER COLUMN in any
+    // spelling, ADD/DROP CONSTRAINT, SET SCHEMA, OWNER TO — is a parse error, so
+    // one rule covers them all rather than a list that can fall behind Postgres.
+    if sqlite && normalized.starts_with("alter table") {
+        for subcommand in alter_table_subcommands(normalized) {
+            if is_sqlite_alter_subcommand(subcommand) {
+                continue;
+            }
+            let is_alter_column = subcommand.starts_with("alter column ");
+            findings.push(SafetyFinding {
+                operation: if is_alter_column {
+                    "ALTER COLUMN (unsupported on SQLite)".to_owned()
+                } else {
+                    "ALTER TABLE subcommand (unsupported on SQLite)".to_owned()
+                },
+                risk: RiskLevel::Unsupported,
+                why: "SQLite's ALTER TABLE supports only RENAME, ADD COLUMN and DROP COLUMN. \
+                      Any other subcommand is a parse error, so this statement fails at apply \
+                      time.",
+                next_action: "Rebuild the table: create the new-shape table, copy the rows, drop \
+                              the old table, rename the new one. `autumn schema diff \
+                              --write-migration` emits that rebuild for you.",
+            });
+            break; // one finding per statement is enough
+        }
     }
 
     // ALTER COLUMN TYPE (Postgres)
@@ -713,7 +942,14 @@ fn classify_statement(backend: DatabaseBackend, normalized: &str) -> Vec<SafetyF
     if normalized.starts_with("alter table") {
         for subcommand in alter_table_subcommands(normalized) {
             if subcommand.starts_with("add column ") && subcommand.contains("not null") {
-                let has_default = subcommand.contains(" default ");
+                // SQLite drops a literal `DEFAULT NULL` before applying the
+                // NOT NULL check, so it is not a default there.
+                let default_token = add_column_default_token(subcommand);
+                let has_default = if sqlite {
+                    default_token.as_deref().is_some_and(|d| d != "null")
+                } else {
+                    subcommand.contains(" default ")
+                };
                 // A DEFAULT is "volatile" when it is a VOLATILE function call —
                 // i.e. one that Postgres must evaluate per-row, preventing the PG11+
                 // fast-constant-default path.  STABLE functions (e.g. `now()`) are
@@ -730,8 +966,13 @@ fn classify_statement(backend: DatabaseBackend, normalized: &str) -> Vec<SafetyF
                         // SQLite does not merely slow down here: it rejects the
                         // statement ("Cannot add a NOT NULL column with default
                         // value NULL"), so this can never apply.
-                        risk: if sqlite {
+                        risk: if sqlite && !fresh_table {
                             RiskLevel::Unsupported
+                        } else if sqlite {
+                            // A table created in this same migration has no rows,
+                            // so SQLite accepts the statement; Postgres still
+                            // validates nothing on an empty table either.
+                            RiskLevel::Safe
                         } else {
                             RiskLevel::PotentiallyBlocking
                         },
@@ -778,8 +1019,11 @@ fn classify_statement(backend: DatabaseBackend, normalized: &str) -> Vec<SafetyF
             if !subcommand.starts_with("add column ") {
                 continue;
             }
-            if has_inline_unique_constraint(subcommand) {
-                findings.push(if sqlite {
+            if has_inline_unique_constraint(&without_string_literals(subcommand)) {
+                findings.push(if sqlite && fresh_table {
+                    // No rows yet, so SQLite accepts the inline constraint.
+                    continue;
+                } else if sqlite {
                     // SQLite: "Cannot add a UNIQUE column".
                     SafetyFinding {
                         operation: "ADD COLUMN UNIQUE (unsupported on SQLite)".to_owned(),
@@ -802,7 +1046,7 @@ fn classify_statement(backend: DatabaseBackend, normalized: &str) -> Vec<SafetyF
                     }
                 });
             }
-            if sqlite && subcommand.contains(" primary key") {
+            if sqlite && !fresh_table && subcommand.contains(" primary key") {
                 findings.push(SafetyFinding {
                     operation: "ADD COLUMN PRIMARY KEY (unsupported on SQLite)".to_owned(),
                     risk: RiskLevel::Unsupported,
@@ -816,32 +1060,35 @@ fn classify_statement(backend: DatabaseBackend, normalized: &str) -> Vec<SafetyF
             // to be NULL, and never scans existing rows to validate the key — so
             // the Postgres row-validation finding does not apply there.
             if sqlite {
-                if subcommand.contains(" references ")
-                    && let Some(default) = add_column_default_token(subcommand)
-                    && default != "null"
-                {
+                // A generated column is the one ADD COLUMN form left; SQLite
+                // accepts VIRTUAL and rejects STORED.
+                if !fresh_table && subcommand.contains(" stored") && subcommand.contains(" as (") {
                     findings.push(SafetyFinding {
-                        operation: "ADD COLUMN REFERENCES (non-NULL default, unsupported on \
-                                    SQLite)"
+                        operation: "ADD COLUMN GENERATED … STORED (unsupported on SQLite)"
                             .to_owned(),
                         risk: RiskLevel::Unsupported,
-                        why: "SQLite requires an added REFERENCES column to default to NULL — a \
-                              non-NULL default makes the statement fail at apply time.",
-                        next_action: "Add the column nullable with no default, backfill it, then \
-                                      rebuild the table if the column must be NOT NULL.",
+                        why: "SQLite cannot add a STORED generated column to an existing table \
+                              — the statement fails at apply time. VIRTUAL is accepted.",
+                        next_action: "Use a VIRTUAL generated column, or rebuild the table with \
+                                      the STORED column in its CREATE TABLE.",
                     });
                 }
-                // SQLite only accepts a constant ADD COLUMN default: not
-                // CURRENT_TIME/DATE/TIMESTAMP, and not a parenthesized expression.
-                if let Some(default) = add_column_default_token(subcommand)
+                // SQLite's ADD COLUMN default must reduce to a constant.
+                // NOTE: no rule for `REFERENCES` with a non-NULL default. SQLite
+                // enforces that only when `PRAGMA foreign_keys` is ON, and
+                // Autumn's migration connection deliberately leaves it OFF (see
+                // `establish_sqlite_migration_connection`), so the statement does
+                // apply on the path this classifier grades.
+                if !fresh_table
+                    && let Some(default) = add_column_default_token(subcommand)
                     && !is_sqlite_constant_default(&default)
                 {
                     findings.push(SafetyFinding {
                         operation: "ADD COLUMN (non-constant default)".to_owned(),
                         risk: RiskLevel::Unsupported,
-                        why: "SQLite's ADD COLUMN default must be a constant: \
-                              CURRENT_TIME/CURRENT_DATE/CURRENT_TIMESTAMP and parenthesized \
-                              expressions are rejected at apply time.",
+                        why: "SQLite's ADD COLUMN default must reduce to a constant: \
+                              CURRENT_TIME/CURRENT_DATE/CURRENT_TIMESTAMP, a call, and any other \
+                              expression are rejected at apply time.",
                         next_action: "Use a literal DEFAULT, or add the column nullable and \
                                       backfill it with an UPDATE.",
                     });
@@ -888,8 +1135,10 @@ fn classify_statement(backend: DatabaseBackend, normalized: &str) -> Vec<SafetyF
     // CREATE INDEX / CREATE UNIQUE INDEX without CONCURRENTLY
     let is_create_index =
         normalized.starts_with("create index") || normalized.starts_with("create unique index");
-    let is_concurrent = normalized.starts_with("create index concurrently")
-        || normalized.starts_with("create unique index concurrently");
+    // The trailing space matters: `concurrently` must be the SQL option, not the
+    // start of the index's name (`CREATE INDEX concurrently_idx ON …`).
+    let is_concurrent = normalized.starts_with("create index concurrently ")
+        || normalized.starts_with("create unique index concurrently ");
     if is_create_index && !is_concurrent {
         findings.push(SafetyFinding {
             operation: if sqlite {
@@ -1089,8 +1338,7 @@ mod tests {
 
     #[test]
     fn create_table_is_safe() {
-        let sql =
-            "CREATE TABLE posts (\n    id BIGSERIAL PRIMARY KEY,\n    title TEXT NOT NULL\n);";
+        let sql = "CREATE TABLE posts (\n id BIGSERIAL PRIMARY KEY,\n title TEXT NOT NULL\n);";
         let findings = classify_sql(sql);
         assert!(
             findings.is_empty(),
@@ -2238,17 +2486,6 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_add_column_references_with_non_null_default_is_unsupported() {
-        // SQLite requires an added REFERENCES column to default to NULL.
-        let f = sqlite_finding(
-            "ALTER TABLE comments ADD COLUMN post_id INTEGER NOT NULL DEFAULT 0 REFERENCES posts(id);",
-            "ADD COLUMN REFERENCES (non-NULL default, unsupported on SQLite)",
-        )
-        .expect("finding expected");
-        assert_eq!(f.risk, RiskLevel::Unsupported);
-    }
-
-    #[test]
     fn sqlite_truncate_is_unsupported() {
         let f = sqlite_finding("TRUNCATE TABLE posts;", "TRUNCATE (unsupported on SQLite)")
             .expect("SQLite has no TRUNCATE statement");
@@ -2317,6 +2554,326 @@ mod tests {
             assert_eq!(a.risk, b.risk);
             assert_eq!(a.why, b.why);
             assert_eq!(a.next_action, b.next_action);
+        }
+    }
+
+    // ── review regressions: SQLite dialect (#1906) ────────────────────────
+
+    /// Every operation reported for `sql` on `SQLite`.
+    fn sqlite_ops(sql: &str) -> Vec<String> {
+        classify_sql_for(DatabaseBackend::Sqlite, sql)
+            .into_iter()
+            .map(|f| f.operation)
+            .collect()
+    }
+
+    #[test]
+    fn sqlite_add_column_not_null_default_null_is_unsupported() {
+        // SQLite drops a literal DEFAULT NULL before the NOT NULL check, so it
+        // is not a default there.
+        let f = sqlite_finding(
+            "ALTER TABLE posts ADD COLUMN title TEXT NOT NULL DEFAULT NULL;",
+            "ADD COLUMN NOT NULL (no default)",
+        )
+        .expect("finding expected");
+        assert_eq!(f.risk, RiskLevel::Unsupported);
+    }
+
+    #[test]
+    fn sqlite_add_column_bare_function_default_is_unsupported() {
+        // Only a literal or signed number may follow a bare DEFAULT.
+        for sql in [
+            "ALTER TABLE posts ADD COLUMN a TEXT NOT NULL DEFAULT now();",
+            "ALTER TABLE posts ADD COLUMN b TEXT NOT NULL DEFAULT gen_random_uuid();",
+        ] {
+            let f = sqlite_finding(sql, "ADD COLUMN (non-constant default)")
+                .unwrap_or_else(|| panic!("finding expected for {sql}"));
+            assert_eq!(f.risk, RiskLevel::Unsupported, "{sql}");
+        }
+    }
+
+    #[test]
+    fn sqlite_add_column_parenthesized_literal_default_is_accepted() {
+        // SQLite's parser keeps no node for parentheses, so `DEFAULT ('draft')`
+        // is the same constant as `DEFAULT 'draft'`.
+        for sql in [
+            "ALTER TABLE posts ADD COLUMN a TEXT NOT NULL DEFAULT ('draft');",
+            "ALTER TABLE posts ADD COLUMN b INTEGER NOT NULL DEFAULT (0);",
+            "ALTER TABLE posts ADD COLUMN c INTEGER NOT NULL DEFAULT -1;",
+            "ALTER TABLE posts ADD COLUMN d TEXT NOT NULL DEFAULT 'a b';",
+        ] {
+            assert!(
+                classify_sql_for(DatabaseBackend::Sqlite, sql).is_empty(),
+                "{sql} must be accepted, got {:?}",
+                sqlite_ops(sql)
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_add_column_parenthesized_expression_default_is_unsupported() {
+        for sql in [
+            "ALTER TABLE posts ADD COLUMN a TEXT NOT NULL DEFAULT (1+2);",
+            "ALTER TABLE posts ADD COLUMN b TEXT NOT NULL DEFAULT (abs(-1));",
+            "ALTER TABLE posts ADD COLUMN c TEXT NOT NULL DEFAULT (datetime('now'));",
+        ] {
+            let f = sqlite_finding(sql, "ADD COLUMN (non-constant default)")
+                .unwrap_or_else(|| panic!("finding expected for {sql}"));
+            assert_eq!(f.risk, RiskLevel::Unsupported, "{sql}");
+        }
+    }
+
+    #[test]
+    fn sqlite_add_column_references_applies_without_a_foreign_keys_pragma() {
+        // Autumn's migration connection leaves `PRAGMA foreign_keys` OFF, so
+        // SQLite accepts a non-NULL default on an added REFERENCES column.
+        let sql = "ALTER TABLE comments ADD COLUMN post_id INTEGER NOT NULL DEFAULT 0 \
+                   REFERENCES posts(id);";
+        assert!(
+            classify_sql_for(DatabaseBackend::Sqlite, sql).is_empty(),
+            "got {:?}",
+            sqlite_ops(sql)
+        );
+    }
+
+    #[test]
+    fn sqlite_fk_action_set_default_is_not_a_column_default() {
+        let sql = "ALTER TABLE t ADD COLUMN c INTEGER REFERENCES u(id) \
+                   ON UPDATE SET DEFAULT ON DELETE CASCADE;";
+        assert!(
+            classify_sql_for(DatabaseBackend::Sqlite, sql).is_empty(),
+            "got {:?}",
+            sqlite_ops(sql)
+        );
+    }
+
+    #[test]
+    fn sqlite_unique_inside_a_string_literal_is_not_a_constraint() {
+        let sql = "ALTER TABLE t ADD COLUMN d TEXT DEFAULT 'not unique yet';";
+        assert!(
+            classify_sql_for(DatabaseBackend::Sqlite, sql).is_empty(),
+            "got {:?}",
+            sqlite_ops(sql)
+        );
+    }
+
+    #[test]
+    fn sqlite_add_column_generated_stored_is_unsupported() {
+        let f = sqlite_finding(
+            "ALTER TABLE posts ADD COLUMN n INT GENERATED ALWAYS AS (id + 1) STORED;",
+            "ADD COLUMN GENERATED … STORED (unsupported on SQLite)",
+        )
+        .expect("finding expected");
+        assert_eq!(f.risk, RiskLevel::Unsupported);
+        // VIRTUAL is accepted.
+        assert!(
+            classify_sql_for(
+                DatabaseBackend::Sqlite,
+                "ALTER TABLE posts ADD COLUMN n INT GENERATED ALWAYS AS (id + 1) VIRTUAL;"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn sqlite_add_column_restrictions_do_not_apply_to_a_table_this_migration_creates() {
+        // A table with no rows accepts all of them.
+        let sql = "CREATE TABLE posts (id INTEGER PRIMARY KEY);\n\
+                   ALTER TABLE posts ADD COLUMN a INT NOT NULL;\n\
+                   ALTER TABLE posts ADD COLUMN b TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP;\n\
+                   ALTER TABLE posts ADD COLUMN c TEXT UNIQUE;";
+        assert!(
+            !classify_sql_for(DatabaseBackend::Sqlite, sql)
+                .iter()
+                .any(|f| f.risk == RiskLevel::Unsupported),
+            "got {:?}",
+            sqlite_ops(sql)
+        );
+    }
+
+    #[test]
+    fn sqlite_concurrently_must_be_the_keyword_not_a_name_prefix() {
+        for sql in [
+            "DROP INDEX concurrently_old_idx;",
+            "CREATE INDEX concurrently_idx ON posts (x);",
+        ] {
+            assert!(
+                !classify_sql_for(DatabaseBackend::Sqlite, sql)
+                    .iter()
+                    .any(|f| f.risk == RiskLevel::Unsupported),
+                "{sql} names an index, it does not use CONCURRENTLY: {:?}",
+                sqlite_ops(sql)
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_rejects_every_alter_table_subcommand_outside_its_grammar() {
+        for sql in [
+            "ALTER TABLE t ADD CONSTRAINT ck CHECK (id > 0);",
+            "ALTER TABLE t DROP CONSTRAINT ck;",
+            "ALTER TABLE t SET SCHEMA other;",
+            "ALTER TABLE t OWNER TO app;",
+        ] {
+            let findings = classify_sql_for(DatabaseBackend::Sqlite, sql);
+            assert!(
+                findings.iter().any(|f| f.risk == RiskLevel::Unsupported),
+                "{sql} -> {:?}",
+                sqlite_ops(sql)
+            );
+        }
+        // The four forms SQLite does parse stay classified as before.
+        for sql in [
+            "ALTER TABLE t ADD COLUMN c TEXT;",
+            "ALTER TABLE t DROP COLUMN c;",
+            "ALTER TABLE t RENAME COLUMN a TO b;",
+            "ALTER TABLE t RENAME TO u;",
+        ] {
+            assert!(
+                !classify_sql_for(DatabaseBackend::Sqlite, sql)
+                    .iter()
+                    .any(|f| f.risk == RiskLevel::Unsupported),
+                "{sql} -> {:?}",
+                sqlite_ops(sql)
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_alter_table_never_falls_through_to_manual_review() {
+        // Every subcommand is classified, so the Postgres catch-all must not fire.
+        for sql in [
+            "ALTER TABLE t ALTER COLUMN c SET NOT NULL;",
+            "ALTER TABLE t ADD COLUMN c INTEGER PRIMARY KEY;",
+            "ALTER TABLE t VALIDATE CONSTRAINT ck;",
+        ] {
+            assert!(
+                !sqlite_ops(sql).contains(&"Unclassified ALTER TABLE".to_owned()),
+                "{sql} -> {:?}",
+                sqlite_ops(sql)
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_rejects_postgres_only_index_and_table_clauses() {
+        for sql in [
+            "CREATE INDEX i ON posts USING btree (a);",
+            "CREATE UNIQUE INDEX i ON posts (a) INCLUDE (b);",
+            "CREATE INDEX i ON posts (a) WITH (fillfactor=70);",
+            "CREATE TABLE p (id int) PARTITION BY RANGE (id);",
+            "CREATE TABLE r (id int GENERATED BY DEFAULT AS IDENTITY);",
+        ] {
+            assert!(
+                classify_sql_for(DatabaseBackend::Sqlite, sql)
+                    .iter()
+                    .any(|f| f.risk == RiskLevel::Unsupported),
+                "{sql} -> {:?}",
+                sqlite_ops(sql)
+            );
+        }
+        // A partial / COLLATE / DESC index is valid SQLite.
+        let ok = "CREATE INDEX i ON posts (title COLLATE NOCASE DESC) WHERE deleted_at IS NULL;";
+        assert!(
+            !classify_sql_for(DatabaseBackend::Sqlite, ok)
+                .iter()
+                .any(|f| f.risk == RiskLevel::Unsupported),
+            "{ok} -> {:?}",
+            sqlite_ops(ok)
+        );
+    }
+
+    #[test]
+    fn sqlite_rejects_postgres_only_dml_forms() {
+        for sql in [
+            "MERGE INTO t USING u ON t.id = u.id WHEN MATCHED THEN UPDATE SET a = 1;",
+            "SELECT id FROM t FOR UPDATE;",
+            "INSERT INTO t (a) VALUES (1) ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING;",
+            "WITH d AS (DELETE FROM t RETURNING id) SELECT * FROM d;",
+        ] {
+            assert!(
+                classify_sql_for(DatabaseBackend::Sqlite, sql)
+                    .iter()
+                    .any(|f| f.risk == RiskLevel::Unsupported),
+                "{sql} -> {:?}",
+                sqlite_ops(sql)
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_cannot_drop_an_implicit_index() {
+        for sql in [
+            "DROP INDEX sqlite_autoindex_posts_1;",
+            "DROP INDEX IF EXISTS sqlite_autoindex_posts_1;",
+        ] {
+            let findings = classify_sql_for(DatabaseBackend::Sqlite, sql);
+            assert!(
+                findings.iter().any(|f| f.risk == RiskLevel::Unsupported),
+                "{sql} -> {:?}",
+                sqlite_ops(sql)
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_covers_every_postgres_only_object_statement() {
+        for sql in [
+            "GRANT SELECT ON posts TO app;",
+            "REVOKE SELECT ON posts FROM app;",
+            "DROP EXTENSION pgcrypto;",
+            "DROP MATERIALIZED VIEW mv;",
+            "REFRESH MATERIALIZED VIEW mv;",
+            "CREATE UNIQUE INDEX CONCURRENTLY i ON posts (a);",
+            "DROP INDEX CONCURRENTLY i;",
+            "ALTER SEQUENCE s RESTART;",
+        ] {
+            assert!(
+                classify_sql_for(DatabaseBackend::Sqlite, sql)
+                    .iter()
+                    .any(|f| f.risk == RiskLevel::Unsupported),
+                "{sql} -> {:?}",
+                sqlite_ops(sql)
+            );
+        }
+    }
+
+    #[test]
+    fn finding_prose_has_no_stray_whitespace_runs() {
+        // A Rust `\` string continuation eats the newline and the indentation;
+        // losing one leaves a space run in text printed straight to stderr.
+        let samples = [
+            "ALTER TABLE t ALTER COLUMN c TYPE TEXT;",
+            "ALTER TABLE t ADD COLUMN c TEXT NOT NULL;",
+            "ALTER TABLE t ADD COLUMN c TEXT UNIQUE;",
+            "ALTER TABLE t DROP COLUMN c;",
+            "TRUNCATE TABLE t;",
+            "CREATE INDEX i ON t (a);",
+            "CREATE SEQUENCE s;",
+            "CREATE TYPE m AS ENUM ('a');",
+            "CREATE EXTENSION pgcrypto;",
+            "COMMENT ON TABLE t IS 'x';",
+            "CREATE MATERIALIZED VIEW mv AS SELECT 1;",
+            "GRANT SELECT ON t TO app;",
+            "MERGE INTO t USING u ON t.id = u.id WHEN MATCHED THEN UPDATE SET a = 1;",
+            "CREATE INDEX i ON t USING btree (a);",
+            "CREATE TABLE p (id int) PARTITION BY RANGE (id);",
+            "SELECT id FROM t FOR UPDATE;",
+            "WITH d AS (DELETE FROM t RETURNING id) SELECT * FROM d;",
+            "DROP INDEX sqlite_autoindex_t_1;",
+            "ALTER TABLE t ADD COLUMN n INT GENERATED ALWAYS AS (id + 1) STORED;",
+        ];
+        for backend in [DatabaseBackend::Postgres, DatabaseBackend::Sqlite] {
+            for sql in samples {
+                for f in classify_sql_for(backend, sql) {
+                    assert!(!f.why.contains("  "), "{sql}: why = {:?}", f.why);
+                    assert!(
+                        !f.next_action.contains("  "),
+                        "{sql}: next_action = {:?}",
+                        f.next_action
+                    );
+                }
+            }
         }
     }
 }

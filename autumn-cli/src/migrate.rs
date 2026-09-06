@@ -177,7 +177,7 @@ pub enum MigrateAction {
     Baseline(BaselineArgs),
 }
 
-/// Per-migration safety report returned by [`check_migrations_in_dir`].
+/// Per-migration safety report returned by [`check_migrations_in_dir_for`].
 pub struct MigrationSafetyReport {
     /// Migration directory name (e.g. `"20260101000000_create_posts"`).
     pub name: String,
@@ -221,7 +221,7 @@ pub fn run(
             // offline / CI safety checks), so the `.env` overlay is built lazily
             // only in the database-backed paths below.
             let migrations_dir = resolve_migrations_dir();
-            run_safety_check(&migrations_dir);
+            run_safety_check(&migrations_dir, profile);
             return;
         }
         MigrateAction::Down(args) => {
@@ -839,12 +839,12 @@ fn print_findings(label: &str, name: &str, findings: &[safety::SafetyFinding]) {
 ///
 /// Prints a human-readable report to stderr and exits with code 1 if any
 /// unsafe or potentially-blocking operations are detected in either direction.
-fn run_safety_check(migrations_dir: &str) {
+fn run_safety_check(migrations_dir: &str, profile: Option<&str>) {
     // The app's own backend decides the dialect (issue #1906): a SQLite app must
-    // not be told to use `CREATE INDEX CONCURRENTLY`. `detect_backend` reads
-    // `autumn.toml`/`.env` best-effort and never aborts, so `check` stays the
-    // offline, URL-free preflight it is documented to be.
-    let backend = crate::generate::detect_backend(Path::new("."));
+    // not be told to use `CREATE INDEX CONCURRENTLY`. `detect_backend_offline`
+    // honors `--profile`, reads no `.env`, and never exits, so `check` stays the
+    // offline, URL-free preflight documented above.
+    let backend = crate::generate::detect_backend_offline(Path::new("."), profile);
     let reports = match check_migrations_in_dir_for(backend, Path::new(migrations_dir)) {
         Ok(r) => r,
         Err(e) => {
@@ -909,7 +909,8 @@ pub fn check_migrations_in_dir(dir: &Path) -> Result<Vec<MigrationSafetyReport>,
     check_migrations_in_dir_for(autumn_web::config::DatabaseBackend::Postgres, dir)
 }
 
-/// [`check_migrations_in_dir`] for a specific database `backend` (issue #1906).
+/// Read every migration directory in `dir` and classify both `up.sql` and
+/// `down.sql` against a specific database `backend` (issue #1906).
 ///
 /// The Postgres path is unchanged. On `SQLite` the SQL is classified against
 /// `SQLite`'s dialect ([`safety::classify_sql_for`]) and the
@@ -1205,7 +1206,7 @@ pub fn read_autumn_toml_table_with_profile_in(
     // EXISTS yet can't be read or parsed is a hard error — silently ignoring it
     // would resolve different URLs than the running app (which the runtime
     // loader rejects), risking migrations/row-moves against the wrong database.
-    let read_table = |path: &Path| -> Option<toml::Table> {
+    read_autumn_toml_table_with_profile_in_using(dir, profile, |path| {
         if !path.exists() {
             return None;
         }
@@ -1220,8 +1221,29 @@ pub fn read_autumn_toml_table_with_profile_in(
                 std::process::exit(1);
             }
         }
-    };
+    })
+}
 
+/// Reads an existing `autumn.toml`, tolerating a missing, unreadable or
+/// malformed file by returning `None` for it.
+///
+/// For the OFFLINE preflights only (issue #1906 review): they analyze SQL and
+/// must never abort on local config the running app is not being pointed at.
+/// Every path that resolves a real database URL uses the hard-error reader in
+/// [`read_autumn_toml_table_with_profile_in`] instead.
+pub fn read_optional_toml_table(path: &Path) -> Option<toml::Table> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+}
+
+/// [`read_autumn_toml_table_with_profile_in`] with a caller-supplied file
+/// reader, so the offline preflights can substitute a tolerant one.
+pub fn read_autumn_toml_table_with_profile_in_using(
+    dir: &Path,
+    profile: Option<&str>,
+    read_table: impl Fn(&Path) -> Option<toml::Table>,
+) -> Option<toml::Table> {
     let base = read_table(&dir.join("autumn.toml"));
     let Some(profile) = profile.filter(|p| !p.is_empty()) else {
         return base;
@@ -2337,6 +2359,60 @@ mod tests {
             ops,
             vec!["CREATE INDEX CONCURRENTLY (unsupported on SQLite)"],
             "got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn sqlite_dir_scan_classifies_down_sql_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("2026_01_01_000000_m");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("up.sql"), "CREATE INDEX i ON posts (title);\n").unwrap();
+        std::fs::write(
+            dir.join("down.sql"),
+            "DROP INDEX i;\nALTER TABLE posts ALTER COLUMN title TYPE TEXT;\n",
+        )
+        .unwrap();
+        let reports =
+            check_migrations_in_dir_for(autumn_web::config::DatabaseBackend::Sqlite, tmp.path())
+                .unwrap();
+        let down: Vec<&str> = reports[0]
+            .down
+            .iter()
+            .map(|f| f.operation.as_str())
+            .collect();
+        assert_eq!(
+            down,
+            vec!["ALTER COLUMN (unsupported on SQLite)"],
+            "the DROP INDEX must not be flagged, the ALTER COLUMN must be: {down:?}"
+        );
+    }
+
+    #[test]
+    fn grade_migrate_check_for_grades_against_the_given_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("2026_01_01_000000_m");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The generated SQLite remove-column shape: safe on SQLite, blocking on
+        // Postgres (which wants DROP INDEX CONCURRENTLY).
+        std::fs::write(
+            dir.join("up.sql"),
+            "DROP INDEX IF EXISTS idx_posts_title;\n",
+        )
+        .unwrap();
+        assert!(
+            crate::deploy::grade_migrate_check_for(
+                autumn_web::config::DatabaseBackend::Sqlite,
+                tmp.path()
+            )
+            .passed
+        );
+        assert!(
+            !crate::deploy::grade_migrate_check_for(
+                autumn_web::config::DatabaseBackend::Postgres,
+                tmp.path()
+            )
+            .passed
         );
     }
 

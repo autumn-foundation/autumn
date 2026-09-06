@@ -430,10 +430,16 @@ autumn migrate check
 
 `autumn migrate check` reads every `migrations/*/up.sql` file from disk (no
 database connection required) and classifies each SQL statement by its risk for
-a rolling deploy. It exits **0** when all statements are fully safe and **1**
-when any finding is `potentially-blocking`, `destructive`, `irreversible`,
-`data-backfill`, or `manual-review`. Each finding includes a one-line reason and
-a concrete next action.
+a rolling deploy. It exits **0** when all `up.sql` statements are fully safe and
+**1** when any is `potentially-blocking`, `destructive`, `irreversible`,
+`data-backfill`, `manual-review`, or `unsupported`. `down.sql` is classified and
+reported too, but does not decide the exit code: it runs on `autumn migrate
+down`, not on deploy. Each finding includes a one-line reason and a concrete
+next action.
+
+Classification follows the app's own backend (#1906). The example below is a
+Postgres app; on SQLite the same command applies SQLite's rules — see
+[SQLite in production](./sqlite-in-production.md#migration-mechanics-on-sqlite).
 
 Example output:
 
@@ -457,6 +463,7 @@ Example output:
 | `irreversible` | Cannot be undone without a multi-step expand/contract cycle. |
 | `data-backfill` | Schema change is safe but requires a separate backfill job. |
 | `manual-review` | Autumn cannot auto-classify this statement; operator review required. |
+| `unsupported` | The backend has no syntax for this statement; it fails at apply time. SQLite only (#1906). |
 
 ### Adding `autumn migrate check` to CI
 

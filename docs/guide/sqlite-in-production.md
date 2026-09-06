@@ -532,21 +532,47 @@ A few SQLite-specific mechanics apply when the generator emits migrations:
   generator emits `DROP INDEX` before `DROP COLUMN`, since SQLite will not drop a
   column that an index still references.
 - **Pre-existing indexes are dropped too (#1906).** A `Remove…From…` migration
-  reads the project's earlier migrations and emits a `DROP INDEX IF EXISTS` for
-  every index still live on the table that names the removed column — including
-  composite, partial, expression and hand-named indexes the generator did not
-  create. `down.sql` re-creates them after re-adding the column. Indexes created
-  outside `migrations/` (by hand against the database) remain invisible: drop
-  those in the same migration, or rebuild the table.
-- **`autumn migrate check` speaks SQLite (#1906).** The safety classifier reads
-  the app's backend and applies SQLite's own rules. It never recommends
-  `CREATE INDEX CONCURRENTLY` (no such syntax), does not flag a plain
-  `DROP INDEX` (a cheap catalog edit, and a precondition of `DROP COLUMN`), and
-  reports statements SQLite rejects outright — `ALTER COLUMN`, `TRUNCATE`,
-  `ADD COLUMN` with `NOT NULL` and no default, inline `UNIQUE`/`PRIMARY KEY`, a
-  non-constant `ADD COLUMN` default, a `REFERENCES` column with a non-NULL
-  default, sequences, types, extensions, materialized views, `COMMENT ON`,
-  `GRANT`/`REVOKE` — at a new **`unsupported`** risk level that fails the gate.
+  reads the project's earlier `migrations/*/up.sql` and emits a `DROP INDEX IF
+  EXISTS` for every index still live on the table that names the removed column.
+  Composite, partial, expression and hand-named indexes are all covered, as are
+  indexes carried through an `ALTER TABLE … RENAME TO`. `down.sql` re-creates
+  them after re-adding the column.
+
+  Three kinds stay invisible, and each still fails at apply time:
+  - an index created by hand against the database, outside `migrations/`;
+  - an index created in a migration's `down.sql` rather than its `up.sql`;
+  - the implicit index behind an inline `UNIQUE` or `PRIMARY KEY` column
+    constraint in a `CREATE TABLE`. SQLite refuses to drop such a column in any
+    case, and refuses to drop its `sqlite_autoindex_*` index too.
+
+  For all three, rebuild the table — `autumn schema diff --write-migration`
+  emits the rebuild.
+- **`autumn migrate check` applies SQLite rules (#1906).** The safety classifier
+  reads the app's backend. It never recommends `CREATE INDEX CONCURRENTLY` (no
+  such syntax), does not flag a plain `DROP INDEX` (a cheap catalog edit, and a
+  precondition of `DROP COLUMN`), and reports statements SQLite cannot run at a
+  new **`unsupported`** risk level, which fails the `up.sql` gate:
+
+  | Statement | Write instead |
+  | --- | --- |
+  | Any `ALTER TABLE` subcommand outside `RENAME`, `ADD COLUMN`, `DROP COLUMN` — `ALTER COLUMN`, `ADD`/`DROP CONSTRAINT`, `SET SCHEMA`, `OWNER TO` | Rebuild the table |
+  | `ADD COLUMN … NOT NULL` with no `DEFAULT`, or `DEFAULT NULL` | A constant `DEFAULT`, or a nullable column |
+  | `ADD COLUMN` with a non-constant `DEFAULT` — `CURRENT_TIMESTAMP`, `now()`, `(1+2)` | A literal, or backfill with `UPDATE` |
+  | `ADD COLUMN` with inline `UNIQUE` / `PRIMARY KEY`, or `GENERATED … STORED` | Add the column, then `CREATE UNIQUE INDEX`; or use `VIRTUAL` |
+  | `CREATE INDEX … USING` / `INCLUDE` / `WITH` / `TABLESPACE` | Drop the clause — SQLite indexes are always B-trees |
+  | `CREATE TABLE … PARTITION BY` / `AS IDENTITY` / `INHERITS` | `INTEGER PRIMARY KEY AUTOINCREMENT`; partition in the app |
+  | `TRUNCATE` | `DELETE FROM <table>;` |
+  | `MERGE`, `SELECT … FOR UPDATE`, `ON CONFLICT ON CONSTRAINT`, a writing CTE | `INSERT … ON CONFLICT (<columns>)`; separate statements |
+  | Sequences, types, extensions, materialized views, `COMMENT ON`, `GRANT`/`REVOKE` | Remove, or gate the migration to Postgres |
+  | `DROP INDEX sqlite_autoindex_*` | Rebuild the table without the constraint |
+
+  A table the same migration creates is exempt from the `ADD COLUMN` rules: it
+  has no rows, so SQLite accepts them. `down.sql` findings are reported but do
+  not decide the exit code — that migration runs on `autumn migrate down`.
+
+  One rule Autumn deliberately does **not** apply: SQLite rejects an added
+  `REFERENCES` column with a non-NULL default only when `PRAGMA foreign_keys` is
+  ON, and the migration connection leaves it OFF, so the statement applies.
 
 ---
 

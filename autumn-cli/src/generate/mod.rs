@@ -346,6 +346,39 @@ pub fn detect_backend_for_profile(
     detect_backend_with(project_root, Some(&effective), |k| std::env::var(k))
 }
 
+/// Backend detection for the OFFLINE preflights — `migrate check`, `deploy
+/// check`, `doctor` (issue #1906 review).
+///
+/// Differs from [`detect_backend`] in two ways that those commands require:
+///
+/// - It never reads `.env`. `migrate check` analyzes SQL files only; letting a
+///   developer's local `.env` decide the dialect would give the same checkout
+///   opposite CI verdicts.
+/// - It never exits. The hard-error `autumn.toml` reader is right for a command
+///   about to migrate a real database, but a malformed local config must not
+///   abort an offline SQL check, nor truncate `autumn doctor --json` to zero
+///   bytes mid-report.
+///
+/// Anything it cannot determine resolves to `Postgres`, the historical default.
+#[must_use]
+pub fn detect_backend_offline(
+    project_root: &Path,
+    profile: Option<&str>,
+) -> autumn_web::config::DatabaseBackend {
+    use autumn_web::config::DatabaseBackend;
+
+    let effective = crate::migrate::effective_profile(profile);
+    let table = crate::migrate::read_autumn_toml_table_with_profile_in_using(
+        project_root,
+        Some(&effective),
+        crate::migrate::read_optional_toml_table,
+    );
+    crate::migrate::resolve_primary_database_url_from_sources(|k| std::env::var(k), table.as_ref())
+        .as_deref()
+        .and_then(DatabaseBackend::detect)
+        .unwrap_or(DatabaseBackend::Postgres)
+}
+
 /// Directory-, profile-, and env-parameterized core of [`detect_backend`],
 /// separated so the profile-overlay and `.env` resolution is unit-testable
 /// without mutating the process-global environment.
