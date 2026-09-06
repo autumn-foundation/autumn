@@ -14,7 +14,7 @@
 
 /// A primary/write target named `name`.
 ///
-/// The SQLite spelling is a SHARED-CACHE in-memory target on purpose: it needs
+/// The `SQLite` spelling is a SHARED-CACHE in-memory target on purpose: it needs
 /// no files and no cleanup, and `sqlite_target_is_memory` exempts
 /// `cache=shared` from the single-slot rule, so a configured `max_size` still
 /// reaches the pool and the sizing assertions stay meaningful. deadpool is
@@ -32,8 +32,8 @@ pub fn primary(name: &str) -> String {
 
 /// A read-replica target to pair with the primary named `primary`.
 ///
-/// The SQLite spelling is the SAME target as the primary, and that is not a
-/// shortcut: `reject_unusable_sqlite_replica` refuses a SQLite replica that is
+/// The `SQLite` spelling is the SAME target as the primary, and that is not a
+/// shortcut: `reject_unusable_sqlite_replica` refuses a `SQLite` replica that is
 /// in-memory or names a different file, and its own message says the supported
 /// shape is "point the replica at the same database file as the primary". Two
 /// distinct in-memory databases would be a pair no supported configuration can
@@ -53,8 +53,8 @@ pub fn replica(primary: &str, _name: &str) -> String {
 /// A target that no connection attempt can reach, on either backend.
 ///
 /// Health-indicator tests need a pool whose checkout FAILS. "Unreachable" has
-/// to be spelled per backend: nothing listens on TCP port 1, while a SQLite
-/// in-memory target is always reachable — so the SQLite spelling is a file in a
+/// to be spelled per backend: nothing listens on TCP port 1, while a `SQLite`
+/// in-memory target is always reachable — so the `SQLite` spelling is a file in a
 /// directory that does not exist, spelled as a `file:` URI with `mode=ro` so it
 /// stays unreachable even if something creates that directory — a read-only
 /// open cannot create the file. `sqlite3_open` refuses it with
