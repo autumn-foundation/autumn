@@ -112,15 +112,31 @@ The concrete definition of "breaking" matches the Rust API guidelines and the
   `SandboxManifest` schema and its capability vocabulary, `SandboxHost` /
   `SandboxOutcome` / `SandboxFailure`, and the `autumn plugin package` /
   `autumn plugin inspect` output — is experimental and may change in any
-  release. The capability vocabulary is deliberately one word long in the first
-  slice and is expected to grow; both the wire and the container carry version
-  fields so a host refuses an artifact it cannot fully understand rather than
-  guessing at it.
+  release. "In full" is meant literally: **every item re-exported from
+  `autumn_web::plugin_sandbox`** is covered, including everything the grown
+  capability vocabulary added in #1632 — the `kv` / `http-outbound` / `db` /
+  `jobs` / `render` capability words, the `[grants]` and `[quotas]` manifest
+  tables, the `call` / `call_result` / `render` / `fragment` wire frames and the
+  `CapabilityCall` / `CallResult` / `CallValue` / `DenialReason` types a guest
+  author codes against, the `CapabilityServices` / `KvStore` / `OutboundHttp` /
+  `PluginStore` / `JobSink` backend traits and their reference implementations,
+  `SandboxRenderOutcome`, `FragmentNode`, `RenderSlots`, `PluginActivityLog`,
+  and every `MAX_*` ceiling. Both the wire and the container carry version
+  fields, and a capability name this build does not understand is a refusal
+  rather than a silently dropped grant — so a host refuses an artifact it cannot
+  fully enforce instead of guessing at it.
+
+  One shape to know: [`SandboxManifest`] is deliberately *not*
+  `#[non_exhaustive]` — building one by hand is a supported path — so every
+  slice that grows the vocabulary adds a field and breaks a struct literal over
+  it. Build one with `SandboxManifest::parse` and edit the public fields of what
+  comes back; that spelling survives.
 
 When in doubt: if `cargo doc --no-deps` doesn't list it, it is not part of
 the public API.
 
 [`AppBuilder::run`]: https://docs.rs/autumn-web/latest/autumn_web/app/struct.AppBuilder.html
+[`SandboxManifest`]: https://docs.rs/autumn-web/latest/autumn_web/plugin_sandbox/manifest/struct.SandboxManifest.html
 
 ### The plugin API surface (issue #1601)
 

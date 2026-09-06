@@ -2784,6 +2784,20 @@ impl SchedulerBackend {
             _ => None,
         }
     }
+
+    /// Whether this CONFIGURED backend coordinates across a fleet of
+    /// replicas, rather than a single process.
+    ///
+    /// Named so call sites (issue #1864) — like the ACME renewal spawn site,
+    /// which must ask this even when it had to fall back to an in-process
+    /// [`crate::scheduler::SchedulerCoordinator`] after a construction error —
+    /// read as intent rather than an inline enum match. See
+    /// [`crate::scheduler::SchedulerCoordinator::is_fleet_distributed`] for
+    /// the equivalent query on an actually-built coordinator instance.
+    #[must_use]
+    pub const fn is_fleet_distributed(self) -> bool {
+        matches!(self, Self::Postgres)
+    }
 }
 
 /// Process role: which slice of the framework runtime this replica runs.
@@ -18264,6 +18278,14 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         for role in [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker] {
             assert_eq!(ProcessRole::from_env_value(role.as_str()), Some(role));
         }
+    }
+
+    // Issue #1864: named so ACME's spawn site reads as intent rather than an
+    // inline `matches!` against the enum.
+    #[test]
+    fn scheduler_backend_is_fleet_distributed_only_for_postgres() {
+        assert!(!SchedulerBackend::InProcess.is_fleet_distributed());
+        assert!(SchedulerBackend::Postgres.is_fleet_distributed());
     }
 
     #[test]
