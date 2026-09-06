@@ -243,6 +243,7 @@ FLAT = r'(?:[^\[\]\\\n]|\\.|\n(?![ \t]*\n))'
 # escaped character is counted once — the only direction that over-accepts, and
 # it takes a label of 999 escapes to reach. The repo pins the rule
 # (`migration_guide_gate_rejects_an_overlong_reference_label`).
+LABEL_LIMIT = 999
 LABEL_MAX = '{1,999}'
 # The collapsed form `[label][]` has an EMPTY second label, so the two are
 # not interchangeable: `{1,999}?` is a lazy quantifier, not an optional one.
@@ -371,7 +372,17 @@ INLINE_SPAN_ANY = re.compile(
 
 
 def ref_label(s):
-    """CommonMark label matching: case-insensitive, internal whitespace collapsed."""
+    """CommonMark label matching: case-insensitive, internal whitespace collapsed.
+
+    Returns None for a label over the 999-character cap, which defines and uses
+    nothing. The cap is on SOURCE characters, so it cannot be a repetition
+    bound in the pattern: 500 `\\*` escapes are 500 repetitions and 1000
+    characters, and were accepted. `LABEL_MAX` stays as a cheap ceiling — a
+    valid label never needs more than 999 repetitions — and the exact count
+    happens here, where the captured text is in hand.
+    """
+    if len(s) > LABEL_LIMIT:
+        return None
     return ' '.join(s.split()).lower()
 # A bare repo path. The leading guard keeps `…/docs/guide/x.md` inside a longer
 # path from matching at the wrong offset.
@@ -563,7 +574,22 @@ def strip_comments(txt):
                 end = len(masked) if eol == -1 else eol
             seg = seg[:start] + ' ' * (end - start) + seg[end:]
             masked = masked[:start] + ' ' * (end - start) + masked[end:]
-        idx = masked.find(UNCLOSED)
+        # Only a LINE-INITIAL opener runs to EOF. That is the type-2 block
+        # start condition, and mid-line there is no block: `prose <!-- sample`
+        # is an incomplete INLINE comment, which is literal text, and the links
+        # below it stay live. Truncating at any `<!--` reported those pages as
+        # orphans and would block a valid docs change.
+        idx = -1
+        pos = 0
+        while True:
+            found = masked.find(UNCLOSED, pos)
+            if found == -1:
+                break
+            bol = masked.rfind('\n', 0, found) + 1
+            if masked[bol:found].strip() == '' and found - bol <= 3:
+                idx = found
+                break
+            pos = found + len(UNCLOSED)
         if idx != -1:
             # Everything from here to the end of the document is commented out.
             out.append(seg[:idx])
@@ -629,9 +655,17 @@ PRE_BLOCK = re.compile(
 # The distinction is why this belongs to type 7 and not to `RAW_BLOCK`.)
 # Every place that walks a tag shares this, since the four that had their own
 # copy of `[^\s>]+` are exactly the four this file has had to fix in lockstep.
-ATTR_ASSIGNED = (r'[A-Za-z_:][-\w:.]*'
-                 r'\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+)')
-ATTR = r'[A-Za-z_:][-\w:.]*(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+))?'
+# Whitespace INSIDE a tag may wrap a line but never cross a blank one: the
+# blank ends the paragraph, so `<a` / blank / ` href="b.md">` is not an anchor
+# at all. `\s+` spanned it and recorded the destination of a tag that never
+# renders — malformed prose concealing a real orphan. Same bound the
+# destination, the title and the label already carry, applied to the fourth
+# place a blank line could get through.
+_TWS = r'(?:[ \t]|\n(?![ \t]*\n))'
+ATTR_ASSIGNED = (r'[A-Za-z_:][-\w:.]*' + _TWS + r'*=' + _TWS +
+                 r'*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+)')
+ATTR = (r'[A-Za-z_:][-\w:.]*(?:' + _TWS + r'*=' + _TWS +
+        r'*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+))?')
 # Every attribute value EXCEPT `href`. An attribute is not rendered text, so a
 # path, a reference label or a comment marker parked in one — `<span
 # data-note="[mail](mail.md)">` — is invisible and confers nothing. `href` is
@@ -649,7 +683,8 @@ ATTR_VALUE_ANY = re.compile(r'\b' + ATTR_ASSIGNED, re.I)
 # fell outside the anchor bounds, was never masked, and its invisible path kept
 # an orphan alive. Fixing HTML_TAG and leaving this one is the same
 # rule-applied-to-one-sibling mistake this file keeps making.
-ANCHOR_TAG = re.compile(r'<a(?:\s+' + ATTR + r')*\s*/?>', re.I)
+ANCHOR_TAG = re.compile(
+    r'<a(?:' + _TWS + r'+' + ATTR + r')*' + _TWS + r'*/?>', re.I)
 # The `](…)` destination of a rendered link, blanked before the bare-path scan.
 LINK_DEST = re.compile(r'\]' + DEST)
 # A whole raw tag, used to bound where `src=` may be masked. Unscoped, that
@@ -659,7 +694,7 @@ LINK_DEST = re.compile(r'\]' + DEST)
 # `<span title="1 > 0" data-note="…">` is one tag, and stopping at the quoted
 # character would leave the later attributes outside the masking bounds.
 HTML_TAG = re.compile(
-    r'<[A-Za-z][A-Za-z0-9-]*(?:\s+' + ATTR + r')*\s*/?>')
+    r'<[A-Za-z][A-Za-z0-9-]*(?:' + _TWS + r'+' + ATTR + r')*' + _TWS + r'*/?>')
 # A raw HTML BLOCK of any tag — CommonMark type 6. Its contents are raw HTML,
 # so `[mail]` inside `<div>…</div>` stays literal and resolves no reference.
 # Unlike the hidden tags the text is still VISIBLE, so this bounds Markdown
@@ -723,7 +758,8 @@ RAW_BLOCK = re.compile(
 RAW_BLOCK_TYPE7 = re.compile(
     # A malformed `<x =>` is ordinary text, not a tag, so it opens nothing —
     # the attribute grammar is HTML_TAG's rather than a permissive `[^\n]*?`.
-    r'^ {0,3}</?[A-Za-z][A-Za-z0-9-]*(?:\s+' + ATTR + r')*\s*/?>[ \t]*$'
+    r'^ {0,3}</?[A-Za-z][A-Za-z0-9-]*(?:' + _TWS + r'+' + ATTR + r')*'
+    + _TWS + r'*/?>[ \t]*$'
     r'(?:\n(?![ \t]*$)[^\n]*)*',
     re.M)
 # A raw anchor IS navigation, so its destination is resolved like any other —
@@ -735,8 +771,9 @@ RAW_BLOCK_TYPE7 = re.compile(
 # quoted `>`, so a link the reader CAN click stopped counting — the direction
 # that reports a reachable page as an orphan.
 ANCHOR_HREF = re.compile(
-    r'<a(?:\s+' + ATTR + r')*?'
-    r'\s+href\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'=<>`]+))', re.I)
+    r'<a(?:' + _TWS + r'+' + ATTR + r')*?'
+    + _TWS + r'+href' + _TWS + r'*=' + _TWS +
+    r'*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'=<>`]+))', re.I)
 
 
 ATX_HEADING = re.compile(r'^ {0,3}#{1,6}(?:\s|$)')
@@ -1110,18 +1147,25 @@ def edges_from(f):
     uses_txt = REF_DEF_FULL.sub(lambda m: ' ' * len(m.group(0)), ref_txt)
 
     used = set()
+    # `None` from `ref_label` means the label is over the character cap and is
+    # no label at all; it must not join the used set, or an over-long
+    # definition below would find a match for it.
     for m in REF_USE_FULL.finditer(uses_txt):
         # `[label][]` (collapsed) leaves group 1 empty; the label is the text.
         inner = m.group(1)
-        used.add(ref_label(inner) if inner.strip()
-                 else ref_label(m.group(0)[1:m.group(0).index(']')]))
+        lbl = (ref_label(inner) if inner.strip()
+               else ref_label(m.group(0)[1:m.group(0).index(']')]))
+        if lbl is not None:
+            used.add(lbl)
     # Blank every full-reference span before looking for shortcuts, so the
     # `[mail]` tail of `![alt][mail]` is not re-read as a link of its own.
     shortcut_txt = REF_USE_ANY.sub(lambda m: ' ' * len(m.group(0)), uses_txt)
     shortcut_txt = INLINE_SPAN_ANY.sub(
         lambda m: ' ' * len(m.group(0)), shortcut_txt)
     for m in REF_USE_SHORTCUT.finditer(shortcut_txt):
-        used.add(ref_label(m.group(1)))
+        lbl = ref_label(m.group(1))
+        if lbl is not None:
+            used.add(lbl)
 
     # Markdown resolves a duplicated label to its FIRST definition, so a stale
     # `[mail]: mail.md` sitting below a live `[mail]: https://example.com` names
@@ -1141,6 +1185,8 @@ def edges_from(f):
         if m.start() not in ref_block_starts:
             continue
         label = ref_label(m.group(1))
+        if label is None:
+            continue
         if label in seen_labels:
             continue
         seen_labels.add(label)
@@ -2443,6 +2489,45 @@ self_test() {
     > "$c9ez/docs/guide/jobs.md"
   git -C "$c9ez" add -A && git -C "$c9ez" commit -qm use-across-blank
   check "a reference use broken by a blank line is not a link" fail "$c9ez"
+
+  # The cap is on SOURCE characters: 500 escapes are 500 repetitions and 1000
+  # characters, which a repetition bound alone lets through.
+  local c9fa="$tmp/c9fa"; make_corpus "$c9fa"
+  # 500 TWO-character escapes: 500 repetitions, 1000 source characters. Three
+  # characters each would be 1000 repetitions, which the repetition bound
+  # already rejects — that spelling passes without the source-length check and
+  # so proves nothing.
+  local esc; esc="$(printf '\\*%.0s' $(seq 500))"
+  printf '# Jobs\n\nSee [mail][%s].\n\n[%s]: mail.md\n' "$esc" "$esc" \
+    > "$c9fa/docs/guide/jobs.md"
+  git -C "$c9fa" add -A && git -C "$c9fa" commit -qm overlong-escaped-label
+  check "an overlong label of escapes defines nothing" fail "$c9fa"
+
+  # An unterminated comment runs to EOF only from the start of a line.
+  local c9fb="$tmp/c9fb"; make_corpus "$c9fb"
+  printf '# Jobs\n\nprose <!-- sample\n\nSee [mail](mail.md).\n' \
+    > "$c9fb/docs/guide/jobs.md"
+  git -C "$c9fb" add -A && git -C "$c9fb" commit -qm midline-unclosed-comment
+  check "a mid-line unclosed comment hides nothing" pass "$c9fb"
+
+  # ...but a line-initial one still comments out the rest of the file.
+  local c9fc="$tmp/c9fc"; make_corpus "$c9fc"
+  printf '# Jobs\n\n<!-- sample\n\nSee [mail](mail.md).\n' \
+    > "$c9fc/docs/guide/jobs.md"
+  git -C "$c9fc" add -A && git -C "$c9fc" commit -qm block-unclosed-comment
+  check "a line-initial unclosed comment still runs to EOF" fail "$c9fc"
+
+  # A tag's whitespace may wrap a line but not cross a blank one.
+  local c9fd="$tmp/c9fd"; make_corpus "$c9fd"
+  printf '# Jobs\n\n<a\n\n href="mail.md">mail</a>\n' > "$c9fd/docs/guide/jobs.md"
+  git -C "$c9fd" add -A && git -C "$c9fd" commit -qm anchor-across-blank
+  check "an anchor broken by a blank line is not an anchor" fail "$c9fd"
+
+  # ...but one wrapped across a single line is still an anchor.
+  local c9fe="$tmp/c9fe"; make_corpus "$c9fe"
+  printf '# Jobs\n\n<a\n href="mail.md">mail</a>\n' > "$c9fe/docs/guide/jobs.md"
+  git -C "$c9fe" add -A && git -C "$c9fe" commit -qm anchor-wrapped
+  check "an anchor wrapped across one line still counts" pass "$c9fe"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"

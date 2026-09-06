@@ -1263,9 +1263,12 @@ Two things to get right when generating this code:
       `jobs.backend = "local"` queue is in-process and non-durable, so a crash
       loses it; durable delivery needs `postgres`/`redis` jobs AND a durable
       `OutboundWebhookHandler`.
-    - No event or delivery ID is transmitted — only `Content-Type` and
-      `Autumn-Signature`, whose `t=` changes per attempt. Receiver-side
-      deduplication needs an ID the app mints into the payload itself.
+    - No stable event or delivery ID is transmitted: nothing Autumn sends
+      distinguishes a first attempt from a retry of the same event, and the
+      `Autumn-Signature` header's `t=` changes per attempt. (Do not enumerate
+      the headers — under `telemetry-otlp` the shared client also injects W3C
+      `traceparent`/`tracestate`.) Receiver-side deduplication needs an ID the
+      app mints into the payload itself.
     - Retries duplicate only after the job is enqueued, so `dispatch()` is
       neither at-least-once nor at-most-once. Idempotency buys protection from
       duplicates, not from loss.
