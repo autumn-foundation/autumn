@@ -6,7 +6,7 @@
 //! transactional statement copies the database. In WAL mode the copy does not
 //! block the writer, so a backup of a live app neither corrupts nor stalls it.
 //!
-//! [`verify`] calls `autumn_web::replication::sqlite::integrity_check`, the same
+//! `verify` calls `autumn_web::replication::sqlite::integrity_check`, the same
 //! check the in-process replication verifier uses.
 //!
 //! diesel's `SQLite` backend is in the CLI's dependency graph unconditionally
@@ -171,12 +171,7 @@ pub fn snapshot(target: &str, out_path: &Path) -> Result<(), SnapshotError> {
             op: "VACUUM INTO",
             detail: e.to_string(),
         })?;
-    let file = std::fs::File::open(out_path)
-        .map_err(SnapshotError::io(format!("opening {}", out_path.display())))?;
-    file.sync_all().map_err(SnapshotError::io(format!(
-        "flushing {}",
-        out_path.display()
-    )))
+    flush(out_path)
 }
 
 /// Grade a `SQLite` artifact: it must be a non-empty file that opens and passes
@@ -242,10 +237,21 @@ fn stage(artifact: &Path, staged: &Path, db: &Path) -> Result<(), SnapshotError>
     )))?;
     inherit_target_permissions(db, staged)?;
     verify(staged)?;
-    let file = std::fs::File::open(staged)
-        .map_err(SnapshotError::io(format!("opening {}", staged.display())))?;
+    flush(staged)
+}
+
+/// Flush a file to disk.
+///
+/// Opened for WRITING, not with `File::open`: Windows refuses `FlushFileBuffers`
+/// on a read-only handle with "Access is denied", where POSIX allows `fsync` on
+/// a read-only descriptor.
+fn flush(path: &Path) -> Result<(), SnapshotError> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(SnapshotError::io(format!("opening {}", path.display())))?;
     file.sync_all()
-        .map_err(SnapshotError::io(format!("flushing {}", staged.display())))
+        .map_err(SnapshotError::io(format!("flushing {}", path.display())))
 }
 
 /// Give `staged` the mode and owner of the database it replaces.

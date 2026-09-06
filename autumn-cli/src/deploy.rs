@@ -2248,14 +2248,13 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
     // Normalize BEFORE any containment check: a lexical prefix compare on
     // `/srv/app/shared/../releases/r1/app.db` would call it durable, while the
     // kernel resolves it into `releases/`, where retention deletes it.
-    let Some(text) = lexically_normalized(&path) else {
+    let raw = path.to_string_lossy().into_owned();
+    let Some(text) = lexically_normalized(&raw) else {
         return SqliteDataFile::Refused(format!(
-            "the configured SQLite database path {} climbs above the filesystem root.",
-            path.display()
+            "the configured SQLite database path {raw} climbs above the filesystem root."
         ));
     };
-    let path = std::path::Path::new(&text);
-    if path.is_absolute() {
+    if text.starts_with('/') {
         // Anything the deploy itself manages is transient — `releases/` is
         // replaced every deploy and pruned by retention, and `current` is just a
         // symlink into it. Only `shared/` survives, so only `shared/` is a
@@ -2291,33 +2290,38 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
 
 /// Collapse `.` and `..` lexically, and normalize separators.
 ///
-/// Lexical, not `canonicalize`: the path names a file on the DEPLOY TARGET, which
-/// this process cannot stat. That is enough for the containment rules — it closes
-/// the `shared/../releases` hole — and a symlink on the host that defeats it
-/// would defeat any check made from here.
+/// Deliberately a STRING walk, not `std::path`: the path names a file on the
+/// deploy TARGET, which is always a POSIX host, while `std::path` follows the
+/// host this CLI runs on. On Windows `Path::new("/var/lib/app.db").is_absolute()`
+/// is false, so every containment rule below would grade a Linux absolute path as
+/// a relative one — `autumn deploy check` from a Windows workstation would
+/// misjudge the target it is about to deploy to.
+///
+/// Lexical, not `canonicalize`: this process cannot stat the target. That is
+/// enough for the containment rules — it closes the `shared/../releases` hole —
+/// and a symlink on the host that defeats it would defeat any check made here.
 ///
 /// Returns `None` when the path climbs above the filesystem root.
-fn lexically_normalized(path: &std::path::Path) -> Option<String> {
-    use std::path::Component;
-
-    let absolute = path.is_absolute();
-    let mut names: Vec<String> = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
-            Component::ParentDir => {
+fn lexically_normalized(path: &str) -> Option<String> {
+    let absolute = path.starts_with('/');
+    let mut names: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            // An empty segment is a repeated or trailing `/`.
+            "" | "." => {}
+            ".." => {
                 // A leading `..` on a RELATIVE path has nothing to cancel and is
                 // kept, so the caller can refuse it; on an absolute path it would
                 // climb above the root.
-                if names.last().is_some_and(|name| name != "..") {
+                if names.last().is_some_and(|name| *name != "..") {
                     names.pop();
                 } else if absolute {
                     return None;
                 } else {
-                    names.push("..".to_owned());
+                    names.push("..");
                 }
             }
-            Component::Normal(name) => names.push(name.to_string_lossy().into_owned()),
+            name => names.push(name),
         }
     }
     let joined = names.join("/");
@@ -5765,6 +5769,34 @@ mod tests {
                 "{other:?}"
             );
         }
+    }
+
+    /// The deploy target is always a POSIX host, so path grading must not follow
+    /// the host this CLI runs on. `std::path` would: on Windows
+    /// `Path::new("/srv/app.db").is_absolute()` is false, so every absolute
+    /// target would be graded as a relative one and `autumn deploy check` from a
+    /// Windows workstation would misjudge the Linux host it deploys to.
+    #[test]
+    fn path_grading_uses_posix_rules_on_every_host() {
+        assert_eq!(
+            lexically_normalized("/srv/autumn/myapp/shared/../releases/r1/app.db"),
+            Some("/srv/autumn/myapp/releases/r1/app.db".to_owned())
+        );
+        assert_eq!(
+            lexically_normalized("./data//nested/../app.db"),
+            Some("data/app.db".to_owned())
+        );
+        assert_eq!(lexically_normalized("/a/../.."), None, "climbs above root");
+        assert_eq!(
+            lexically_normalized("../app.db"),
+            Some("../app.db".to_owned())
+        );
+        assert_eq!(lexically_normalized("."), Some(String::new()));
+        // A leading `/` means absolute here, whatever the host says.
+        assert!(
+            lexically_normalized("/var/lib/app.db").is_some_and(|text| text.starts_with('/')),
+            "a POSIX absolute path must stay absolute"
+        );
     }
 
     #[test]
