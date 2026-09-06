@@ -33,21 +33,31 @@ use super::layout::{csrf_value, layout};
 // login handler takes the same wall time whether or not the account exists.
 const DUMMY_HASH: &str = "$2b$12$Ro0CUfOqk6cXEKf3dyaM7OhSCvnwM9s1Aw6lfLP2.GvpAfNXwi.2K";
 
-fn signup_page(min_len: usize, csrf_token: &str, error: Option<&str>) -> Markup {
+/// `email` re-fills the address the user already typed so a rejected
+/// password doesn't also cost them re-typing an unrelated field. `messages`
+/// renders as a list rather than a single blob of text: joined into one
+/// `<p>` they used to collapse into a run-on sentence (HTML collapses the
+/// `\n` join to a single space), which defeated the point of reporting every
+/// failure at once.
+fn signup_page(min_len: usize, csrf_token: &str, email: &str, messages: &[String]) -> Markup {
     layout(
         "Sign up",
         false,
         csrf_token,
         html! {
             h1 class="text-2xl font-bold mb-6" { "Create your account" }
-            @if let Some(error) = error {
-                p class="mb-4 text-sm text-red-600" role="alert" { (error) }
+            @if !messages.is_empty() {
+                ul class="mb-4 text-sm text-red-600 list-disc pl-5" role="alert" {
+                    @for message in messages {
+                        li { (message) }
+                    }
+                }
             }
             form action="/signup" method="post" class="space-y-4 bg-white rounded-lg shadow p-6 max-w-md" {
                 input type="hidden" name="_csrf" value=(csrf_token);
                 div {
                     label for="email" class="block text-sm font-medium mb-1" { "Email" }
-                    input #email type="email" name="email" required autocomplete="email"
+                    input #email type="email" name="email" value=(email) required autocomplete="email"
                           class="w-full border rounded px-3 py-2";
                 }
                 div {
@@ -72,7 +82,8 @@ pub async fn signup_form(State(state): State<AppState>, csrf: Option<CsrfToken>)
     signup_page(
         state.config_arc().auth.password.min_length,
         csrf_value(&csrf),
-        None,
+        "",
+        &[],
     )
 }
 
@@ -86,14 +97,22 @@ pub async fn signup(
 ) -> AutumnResult<Response> {
     let email = form.email.trim().to_lowercase();
     if !email.contains('@') || email.len() > 254 {
-        return Err(AutumnError::unprocessable_msg(
-            "Enter a valid email address (max 254 characters)",
-        ));
+        return Ok(signup_page(
+            state.config_arc().auth.password.min_length,
+            csrf_value(&csrf),
+            &email,
+            &["Enter a valid email address (max 254 characters)".to_owned()],
+        )
+        .into_response());
     }
     if form.password.len() > 128 {
-        return Err(AutumnError::unprocessable_msg(
-            "Password must be at most 128 characters",
-        ));
+        return Ok(signup_page(
+            state.config_arc().auth.password.min_length,
+            csrf_value(&csrf),
+            &email,
+            &["Password must be at most 128 characters".to_owned()],
+        )
+        .into_response());
     }
     // `config_arc` shares the resolved config behind an `Arc`; `config()` would
     // deep-clone every section just to read `[auth.password]` on a request path.
@@ -103,15 +122,11 @@ pub async fn signup(
         autumn_web::auth::validate_password(&form.password, &policy, &[email.as_str()]).await;
     if !validation.is_valid() {
         let messages = validation.messages();
-        let message = if messages.is_empty() {
-            "Invalid password".to_owned()
-        } else {
-            messages.join("\n")
-        };
         return Ok(signup_page(
             config.auth.password.min_length,
             csrf_value(&csrf),
-            Some(&message),
+            &email,
+            &messages,
         )
         .into_response());
     }
@@ -202,26 +217,32 @@ fn safe_next(next: Option<&str>) -> &str {
     }
 }
 
-#[get("/login")]
-pub async fn login_form(
-    Query(query): Query<crate::models::NextQuery>,
-    csrf: Option<CsrfToken>,
-) -> Markup {
-    let next = query.next.unwrap_or_default();
+/// Render the login form, optionally re-filling `email` / `next` and showing
+/// an authentication `error` inline.
+///
+/// Mirrors `signup_page`: a failed login used to `Err(...)` straight to the
+/// framework's generic full-page error screen (`ErrorPageFilter`), which
+/// threw the user off the login page entirely — losing the email they'd
+/// typed and the post-login `next` destination — instead of keeping them on
+/// the form the way a rejected signup already does.
+fn login_page(email: &str, next: &str, csrf_token: &str, error: Option<&str>) -> Markup {
     layout(
         "Log in",
         false,
-        csrf_value(&csrf),
+        csrf_token,
         html! {
             h1 class="text-2xl font-bold mb-6" { "Log in" }
+            @if let Some(error) = error {
+                p class="mb-4 text-sm text-red-600" role="alert" { (error) }
+            }
             form action="/login" method="post" class="space-y-4 bg-white rounded-lg shadow p-6 max-w-md" {
-                input type="hidden" name="_csrf" value=(csrf_value(&csrf));
+                input type="hidden" name="_csrf" value=(csrf_token);
                 @if !next.is_empty() {
                     input type="hidden" name="next" value=(next);
                 }
                 div {
                     label for="email" class="block text-sm font-medium mb-1" { "Email" }
-                    input #email type="email" name="email" required autocomplete="email"
+                    input #email type="email" name="email" value=(email) required autocomplete="email"
                           class="w-full border rounded px-3 py-2";
                 }
                 div {
@@ -241,16 +262,33 @@ pub async fn login_form(
     )
 }
 
+#[get("/login")]
+pub async fn login_form(
+    Query(query): Query<crate::models::NextQuery>,
+    csrf: Option<CsrfToken>,
+) -> Markup {
+    let next = query.next.unwrap_or_default();
+    login_page("", &next, csrf_value(&csrf), None)
+}
+
 #[post("/login")]
 pub async fn login(
     session: Session,
     mut db: Db,
     membership_repo: PgMembershipRepository,
+    csrf: Option<CsrfToken>,
     Form(form): Form<LoginForm>,
 ) -> AutumnResult<Response> {
     let email = form.email.trim().to_lowercase();
+    let next = form.next.clone().unwrap_or_default();
     if email.len() > 254 || form.password.len() > 128 {
-        return Err(AutumnError::unauthorized_msg("Invalid email or password"));
+        return Ok(login_page(
+            &email,
+            &next,
+            csrf_value(&csrf),
+            Some("Invalid email or password"),
+        )
+        .into_response());
     }
 
     let user: Option<User> = users::table
@@ -260,16 +298,27 @@ pub async fn login(
         .await
         .optional()?;
 
-    let invalid = || AutumnError::unauthorized_msg("Invalid email or password");
     let user = match user {
         Some(u) => u,
         None => {
             let _ = verify_password(&form.password, DUMMY_HASH).await;
-            return Err(invalid());
+            return Ok(login_page(
+                &email,
+                &next,
+                csrf_value(&csrf),
+                Some("Invalid email or password"),
+            )
+            .into_response());
         }
     };
     if !verify_password(&form.password, &user.password_hash).await? {
-        return Err(invalid());
+        return Ok(login_page(
+            &email,
+            &next,
+            csrf_value(&csrf),
+            Some("Invalid email or password"),
+        )
+        .into_response());
     }
 
     let memberships: Vec<Membership> = membership_repo

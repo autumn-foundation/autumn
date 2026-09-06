@@ -256,7 +256,13 @@ async fn signup_login_dashboard_returns_200() {
 /// A weak password (present in the bundled common-password corpus) is rejected
 /// at signup: the form re-renders with the policy error at HTTP 200 — not a
 /// redirect and not a 5xx — and no account is created, so a follow-up login
-/// attempt with those credentials is unauthorized.
+/// attempt with those credentials is rejected too.
+///
+/// The login rejection is also a re-rendered form at HTTP 200, not a raw 401:
+/// a failed login used to `Err(...)` straight to the framework's generic
+/// full-page error screen, throwing the user off the login page entirely.
+/// It now stays on the login page with an inline, adjacent error message
+/// instead (Wayfinder finding, error-path inventory on the signup/login flow).
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn signup_rejects_weak_password() {
@@ -276,13 +282,65 @@ async fn signup_rejects_weak_password() {
         resp.text()
     );
 
-    // No account was created, so logging in with those credentials fails.
+    // No account was created, so logging in with those credentials fails —
+    // back on the login form, with the entered email re-filled rather than
+    // lost, and the credentials error shown inline.
     let login = client
         .post("/login")
         .form("email=weak@acme.test&password=password")
         .send()
         .await;
-    login.assert_status(401);
+    login.assert_ok();
+    assert!(
+        login.text().contains("Invalid email or password"),
+        "expected the login form re-rendered with the credentials error, got: {}",
+        login.text()
+    );
+    assert!(
+        login.text().contains(r#"value="weak@acme.test""#),
+        "expected the entered email to be re-filled on the failed login, got: {}",
+        login.text()
+    );
+}
+
+/// A password that fails the policy for more than one reason at once (here:
+/// both too short and too similar to the email) must show every failure as
+/// its own list item, and the typed email must survive the re-render.
+///
+/// Before this fix, every message was `join("\n")`-ed into a single `<p>`;
+/// HTML collapses that newline to a single space, so multiple failures ran
+/// together into one unpunctuated sentence a user could not parse into
+/// distinct, fixable problems — defeating the point of reporting every
+/// failure at once (issue #1345.6). The email field was also always blank on
+/// this re-render, regardless of what had been typed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn signup_lists_every_password_policy_failure_and_keeps_the_typed_email() {
+    let client = db_client().await;
+
+    // "combo" is short (< 8 chars) AND similar to the email's local part —
+    // two independent policy failures from one password, neither of them
+    // "too common" (not in the bundled corpus).
+    let resp = client
+        .post("/signup")
+        .form("email=combo@acme.test&password=combo")
+        .send()
+        .await;
+    resp.assert_ok();
+    let body = resp.text();
+
+    assert!(
+        body.contains("<li>Password must be at least 8 characters.</li>"),
+        "expected the length failure as its own list item, got: {body}"
+    );
+    assert!(
+        body.contains("<li>Password is too similar to your email or username.</li>"),
+        "expected the similarity failure as its own list item, got: {body}"
+    );
+    assert!(
+        body.contains(r#"value="combo@acme.test""#),
+        "expected the typed email to survive the failed re-render, got: {body}"
+    );
 }
 
 #[tokio::test]

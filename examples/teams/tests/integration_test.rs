@@ -185,6 +185,41 @@ async fn signup_creates_organization_with_owner_membership() {
         .assert_body_contains("owner");
 }
 
+/// A failed login used to `Err(...)` straight to the framework's generic
+/// full-page error screen (a raw 401), throwing the user off the login page
+/// entirely and losing both the typed email and the `?next=` destination.
+/// It now stays on the login page (HTTP 200) with the email re-filled, the
+/// `next` redirect preserved as a hidden field, and the error shown inline
+/// (Wayfinder finding, error-path inventory on the signup/login flow).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn login_with_wrong_password_stays_on_the_form() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    signup(&client, "owner@acme.test").await;
+    client.log_out();
+
+    let resp = client
+        .post("/login?next=%2Fmembers")
+        .form("email=owner@acme.test&password=wrong-password&next=/members")
+        .send()
+        .await;
+    resp.assert_ok();
+    let body = resp.text();
+    assert!(
+        body.contains("Invalid email or password"),
+        "expected the credentials error shown inline on the login form, got: {body}"
+    );
+    assert!(
+        body.contains(r#"value="owner@acme.test""#),
+        "expected the typed email to survive the failed login, got: {body}"
+    );
+    assert!(
+        body.contains(r#"name="next" value="/members""#),
+        "expected the next-redirect destination to survive the failed login, got: {body}"
+    );
+}
+
 /// AC4 + AC5(a) + success metric: inviting sends a real email (captured as an
 /// `.eml`), and accepting via the tokened link as a brand-new user creates
 /// the account and the membership in one step.
