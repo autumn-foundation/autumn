@@ -196,6 +196,21 @@ impl MemorySearchBackend {
             .validate()
             .map_err(|e| SearchError::InvalidIndex(e.to_string()))?;
 
+        // Tokenize before taking the lock. `StoredDocument::new` is pure
+        // per-document work with no dependency on store state, and it is
+        // considerably heavier than the compare-and-set bookkeeping below —
+        // doing it inside `with_store` would hold the exclusive lock for the
+        // whole batch's tokenization time, blocking every concurrent
+        // keyword/vector/embedding read (all of which only need a read lock)
+        // for that whole span. A watermark-superseded document (rare: only
+        // when a concurrent write raced this batch) is tokenized and then
+        // discarded below rather than skipped — the price of not knowing
+        // which documents will be superseded until the lock is held.
+        let prepared: Vec<StoredDocument> = documents
+            .iter()
+            .map(|document| StoredDocument::new(document.clone()))
+            .collect();
+
         // ONE critical section for the whole compare-and-set. Checking the
         // sequence under one lock and replacing the document under another
         // would let a newer write slot in between the two, and the stale
@@ -231,13 +246,13 @@ impl MemorySearchBackend {
             let applied_ids: std::collections::HashSet<i64> =
                 applied.iter().map(|(id, _)| *id).collect();
             if let Some(map) = store.documents.get_mut(&index) {
-                for document in documents {
-                    if !applied_ids.contains(&document.id()) {
+                for stored in prepared {
+                    if !applied_ids.contains(&stored.indexed.id()) {
                         continue;
                     }
                     // Keyed upsert: re-indexing the same record replaces it, so
                     // at-least-once delivery can never duplicate a document.
-                    map.insert(document.id(), StoredDocument::new(document.clone()));
+                    map.insert(stored.indexed.id(), stored);
                 }
             }
         });
