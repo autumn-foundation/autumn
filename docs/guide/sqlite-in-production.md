@@ -142,7 +142,7 @@ buckets on SQLite:
 | Sessions + auth (DB-backed) | ✅ | ✅ | Session/auth tables live in SQLite; no external store. | ⛔ **Planned — #1908** |
 | Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | `jobs.backend = "sqlite"`: a single-writer claim on the `autumn_jobs` table in the app's own file — durable and restart-safe, **no Redis required**. Retries, backoff, dead-lettering, uniqueness windows, concurrency limits, and the job dashboard match Postgres. | ✅ **Available now** (#1907) |
 | `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | `scheduler.backend = "in_process"` (the default) fires every tick locally, because one process is always the leader. `scheduler.backend = "sqlite"` leases each tick in a table, so several processes on the host elect exactly one leader per tick. | ✅ **Available now** (#1907) |
-| Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⚠️ / ⛔ | Single-host mutual exclusion within the process; a multi-replica configuration is refused at boot. | ⛔ **Planned — #1905** (multi-replica boot-refuse ships now) |
+| Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⚠️ | `autumn_web::lock::Lock` takes a lease row in `autumn_locks` instead of a session lock, so the processes on the host contend. A live holder renews; a dead one's lock frees at the lease expiry. | ⚠️ **Available now** (#1907) — single-host scope, lease not session, not re-entrant |
 | Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (single host has nothing to notify). | ⛔ **Planned — #1905** |
 | `autumn db backup` / `restore` | ✅ `pg_dump`/`pg_restore` | ✅ | Online-safe snapshot of the data file (safe against a live app). Backup tooling is still `pg_dump`/`pg_restore`-shaped today. | ⛔ **Planned — #1909** |
 | `autumn db scrub` | ✅ | ✅ | Runs against the SQLite file. | ⛔ **Planned — #1909** |
@@ -266,8 +266,23 @@ Design scheduled tasks to be idempotent regardless of tier.
 ### Distributed lock
 
 [`autumn_web::lock::Lock`](./distributed-locks.md) is a cluster-wide named lock
-built on Postgres advisory locks. On SQLite it provides **single-host** mutual
-exclusion (the whole point of the tier is that "the cluster" is one process).
+built on Postgres advisory locks. On SQLite the same API takes a lease row in an
+`autumn_locks` table in the app's own file, so it provides **single-host** mutual
+exclusion across the processes sharing that file. Three differences a caller can
+observe:
+
+- **The scope is one host.** Processes sharing the database file contend; two
+  hosts do not.
+- **It is a lease, not a session.** A holder that dies frees the lock at the
+  lease expiry rather than wedging it, and a live holder renews in the
+  background, so a long critical section is not preempted. Postgres releases on
+  connection loss instead.
+- **It is not re-entrant.** A Postgres session lock can be taken twice on one
+  connection; a second `try_lock` on the same name in the same process observes
+  `None`.
+
+`lock()` polls rather than waiting server-side, because SQLite has no
+`pg_advisory_lock` to block in. Tune the interval with `with_poll_interval`.
 Because a SQLite deployment is single-host by definition, a lock used for
 across-host coordination has no counterpart. Every Postgres-only primitive that
 would imply one — a `replica_url`, a shard directory, a Postgres job or

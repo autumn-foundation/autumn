@@ -270,15 +270,173 @@ async fn postgres_only_coordination_is_refused_under_sqlite() {
         "the refusal also names the in-process substitute; got: {msg}"
     );
 
-    // Advisory locks require the Postgres backend. (`Lock` is not `Debug`.)
-    let msg = match lock::Lock::from_state(&state, "sqlite_e2e_lock") {
-        Ok(_) => panic!("advisory locks must be refused under sqlite"),
-        Err(err) => err.to_string(),
-    };
+    // `start_runtime` installs a tracking store before it dispatches, so even a
+    // refused backend leaves one behind. Clear it, or the next test in this
+    // binary inherits it.
+    job::clear_global_job_client();
+}
+
+/// (19) `autumn_web::lock::Lock` works on `SQLite` too, over a lease row rather
+/// than a `pg_advisory_lock` session — the "file/table-based locking" #1907
+/// names. One holder at a time across the processes sharing the file, released
+/// on drop, and stealable once a dead holder's lease expires.
+#[tokio::test]
+async fn distributed_lock_grants_one_holder_at_a_time_on_sqlite() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+
+    // Two handles on the same name, as two processes would hold.
+    let a = lock::Lock::from_state(&state, "nightly-cleanup").expect("lock builds on sqlite");
+    let b = lock::Lock::from_state(&state, "nightly-cleanup").expect("lock builds on sqlite");
+    assert_eq!(a.key(), b.key(), "the same name derives the same key");
+    assert_eq!(a.name(), "nightly-cleanup");
+
+    let held = a.try_lock().await.expect("try_lock").expect("first wins");
     assert!(
-        msg.contains("advisory locks require the Postgres backend"),
-        "the advisory-lock refusal names the Postgres requirement; got: {msg}"
+        b.try_lock().await.expect("try_lock").is_none(),
+        "a second holder must observe the lock as taken"
     );
+
+    // A different name is a different lock.
+    let other = lock::Lock::from_state(&state, "daily-digest").expect("lock builds on sqlite");
+    let other_held = other
+        .try_lock()
+        .await
+        .expect("try_lock")
+        .expect("a different name does not contend");
+    other_held.release().await.expect("release");
+
+    // A bounded acquire on a held lock times out rather than hanging.
+    let err = b
+        .clone()
+        .with_poll_interval(Duration::from_millis(5))
+        .lock_timeout(Duration::from_millis(60))
+        .await
+        .expect_err("a held lock must time out");
+    assert!(
+        err.to_string().contains("nightly-cleanup"),
+        "the timeout names the lock: {err}"
+    );
+
+    held.release().await.expect("release");
+    let after = b
+        .try_lock()
+        .await
+        .expect("try_lock")
+        .expect("a released lock is free again");
+    after.release().await.expect("release");
+
+    // `try_with` runs the body only when it wins.
+    let taken = a.try_lock().await.expect("try_lock").expect("re-acquire");
+    let ran = b
+        .try_with(|| async { 1_u32 })
+        .await
+        .expect("try_with does not error");
+    assert!(
+        ran.is_none(),
+        "try_with must skip while another holder has it"
+    );
+    taken.release().await.expect("release");
+    assert_eq!(
+        b.try_with(|| async { 1_u32 })
+            .await
+            .expect("try_with does not error"),
+        Some(1),
+        "try_with runs the body once the lock is free"
+    );
+}
+
+/// (20) A holder that dies without releasing frees the lock when its lease
+/// expires, so a crash cannot wedge a named lock forever.
+#[tokio::test]
+async fn distributed_lock_lease_expires_on_sqlite() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+
+    let b = lock::Lock::from_state(&state, "wedged-lock").expect("lock builds");
+
+    // Take the lock once so the table exists, then release it.
+    b.try_lock()
+        .await
+        .expect("try_lock")
+        .expect("first acquire wins")
+        .release()
+        .await
+        .expect("release");
+
+    // Forge the row a dead holder would have left: taken, never released, and
+    // with nothing alive to renew it. A live holder's guard renews in the
+    // background, so this cannot be modelled with a real guard.
+    {
+        use diesel_async::RunQueryDsl as _;
+        let mut conn = pool.get().await.expect("sqlite connection");
+        diesel::sql_query(
+            "INSERT INTO autumn_locks (lock_key, lock_name, owner, acquired_at, expires_at) \
+             VALUES (?, 'wedged-lock', 'dead-process', 0, ?)",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(b.key())
+        .bind::<diesel::sql_types::BigInt, _>(far_future_ms())
+        .execute(&mut *conn)
+        .await
+        .expect("insert a held lease");
+    }
+    assert!(
+        b.try_lock().await.expect("try_lock").is_none(),
+        "the lock is held while the dead holder's lease is still live"
+    );
+
+    // Expire it.
+    {
+        use diesel_async::RunQueryDsl as _;
+        let mut conn = pool.get().await.expect("sqlite connection");
+        diesel::sql_query("UPDATE autumn_locks SET expires_at = 1")
+            .execute(&mut *conn)
+            .await
+            .expect("expire the lease");
+    }
+    let stolen = b
+        .try_lock()
+        .await
+        .expect("try_lock")
+        .expect("an expired lease is reclaimable");
+    stolen.release().await.expect("release");
+}
+
+/// An epoch-millis instant far enough ahead that no test outlives it.
+fn far_future_ms() -> i64 {
+    autumn_web::time::clock_unix_duration(&autumn_web::time::SystemClock)
+        .as_millis()
+        .try_into()
+        .map_or(i64::MAX, |now: i64| now.saturating_add(3_600_000))
+}
+
+/// (21) A live holder renews its lease, so a critical section longer than the
+/// TTL is never preempted.
+#[tokio::test]
+async fn distributed_lock_renews_while_held_on_sqlite() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test().with_profile("dev").with_pool(pool);
+
+    let a = lock::Lock::from_state(&state, "long-section")
+        .expect("lock builds")
+        .with_lease_ttl(Duration::from_millis(150));
+    let b = lock::Lock::from_state(&state, "long-section").expect("lock builds");
+
+    let held = a.try_lock().await.expect("try_lock").expect("first wins");
+    // Well past the TTL: without renewal the lease would have expired by now.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        b.try_lock().await.expect("try_lock").is_none(),
+        "a live holder renews its lease, so the lock stays held"
+    );
+    held.release().await.expect("release");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1110,16 +1268,16 @@ async fn sqlite_job_backend_tracks_job_status_durably() {
     .expect("tracked enqueue");
     assert!(!handle.token.is_empty());
 
+    // Read back through a different pooled connection than the store wrote on,
+    // which is what a second process would do.
     let key = autumn_web::auth::hash_api_token(&handle.token);
-    assert_eq!(
-        count(
-            &pool,
-            &format!("SELECT COUNT(*) AS value FROM autumn_job_tracking WHERE key = '{key}'"),
-        )
-        .await,
-        1,
-        "the tracked record is a row in the app's own file, not process memory"
-    );
+    let sql = format!("SELECT COUNT(*) AS value FROM autumn_job_tracking WHERE key = '{key}'");
+    eventually(
+        200,
+        "the tracked record to be a row in the app's own file",
+        async || count(&pool, &sql).await == 1,
+    )
+    .await;
 
     shutdown.cancel();
     job::clear_global_job_client();
