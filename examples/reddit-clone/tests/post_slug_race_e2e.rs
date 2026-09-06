@@ -64,7 +64,7 @@ async fn hidden_value_from(client: &reqwest::Client, url: &str, name: &str) -> S
     extract_hidden_value(&html, name)
 }
 
-#[derive(diesel::QueryableByName, Debug)]
+#[derive(diesel::QueryableByName)]
 struct SlugCount {
     #[diesel(sql_type = Text)]
     slug: String,
@@ -200,7 +200,12 @@ async fn concurrent_identical_submits_never_share_a_slug() {
     assert!(
         duplicates.is_empty(),
         "duplicate (subreddit_id, slug) pairs survived {CONCURRENT_SUBMITS} concurrent \
-         identical submits: {duplicates:?}"
+         identical submits: {}",
+        duplicates
+            .iter()
+            .map(|d| format!("{} (x{})", d.slug, d.count))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     #[derive(diesel::QueryableByName, Debug)]
