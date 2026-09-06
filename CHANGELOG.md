@@ -1983,6 +1983,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`#[query_budget]` silently missed queries issued through a handle bound
+  via an async/fallible accessor (e.g. `let mut conn = self.conn().await?;`),
+  a real shape in `PostgresSearchStore::write_documents`:** neither
+  `Analyzer::expr_is_handle` nor `chain_root_is_handle` peeled
+  `Expr::Await`/`Expr::Try` before checking whether a call was one of the
+  recognized handle accessors (`db`, `repo`, `repository`, `pool`, `conn`,
+  `connection`), so `conn` never entered the tracked-handle set and every
+  later query issued through it (e.g. a diesel-async
+  `query.execute(&mut conn)` inside a loop) went uncounted with **no
+  diagnostic at all** — worse than the analysis's own "never assume
+  query-free" contract, which is meant to *report* what it cannot prove, not
+  silently drop it. `expr_is_handle` now recognizes `self.conn().await?`
+  through a new, deliberately narrower `awaited_expr_is_fresh_handle` helper
+  that only fires on the `?`-unwrapped shape — a bare `self.conn().await`
+  (no `?`) still yields the `Result` itself, not the handle, and is not
+  promoted, so a later `result.is_err()`/`.unwrap()` is not miscounted as a
+  query. [no-plugin] — analysis-only fix inside `autumn-macros`; no API
+  change.
 - **macros: stacked `#[secured]`/`#[step_up]`/`#[throttle]` above a route
   attribute broke instead of composing (issue #2516):** #1668 moved each of
   these three body guards' checks out of the handler body and into a
