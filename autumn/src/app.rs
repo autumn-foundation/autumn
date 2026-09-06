@@ -12214,7 +12214,7 @@ fn format_middleware_list(config: &AutumnConfig) -> String {
 ///
 /// Delegates to the shared redactor ([`crate::db_url::redact_target`]), which
 /// also covers the shapes this function's own `Url::password()` check never saw
-/// — a `?password=` query parameter, a libpq keyword/value string, a SQLite
+/// — a `?password=` query parameter, a libpq keyword/value string, a `SQLite`
 /// target with userinfo.
 fn mask_database_url(url: &str, pool_size: usize) -> String {
     format!(
@@ -16922,6 +16922,25 @@ mod tests {
         assert!(!masked3.contains("secret"));
         assert!(masked3.contains("postgres://:****@localhost:5432/mydb"));
     }
+    // The point of routing this through the shared redactor: a SQLite operator
+    // reads their own path back out of the boot summary, and a Postgres
+    // operator keeps the connection policy they debug TLS with — while the
+    // shapes that carry a secret still go.
+    #[test]
+    fn mask_database_url_keeps_the_diagnostic_parts_of_a_target() {
+        let sqlite = mask_database_url("sqlite:///var/lib/app.db", 1);
+        assert!(sqlite.contains("sqlite:///var/lib/app.db"), "{sqlite}");
+
+        let read_only = mask_database_url("sqlite://file:app.db?mode=ro", 1);
+        assert!(read_only.contains("mode=ro"), "{read_only}");
+
+        let pg = mask_database_url("postgres://app@db/app?sslmode=verify-full", 10);
+        assert!(pg.contains("sslmode=verify-full"), "{pg}");
+
+        let secret = mask_database_url("postgres://app@db/app?sslpassword=hunter2", 10);
+        assert!(!secret.contains("hunter2"), "{secret}");
+    }
+
     #[test]
     fn mask_database_url_invalid_url_fallback() {
         let masked = mask_database_url("this is completely invalid as a URL with supersecret", 10);

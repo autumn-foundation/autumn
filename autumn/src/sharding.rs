@@ -2232,6 +2232,16 @@ mod tests {
     // construction under `--features sqlite`. The routing, slot-map, seed and
     // health-registration assertions below are backend-independent and now run
     // on both. Pools are lazy, so nothing connects unless a test checks out.
+    //
+    // WHICH LAYER THIS EXERCISES. `create_shard_set` is public API and applies
+    // no backend screen, which is what lets these tests run on either backend.
+    // A shard topology is nonetheless Postgres-only in PRODUCTION:
+    // `sqlite_sharding_unsupported_guard` (app.rs) refuses any SQLite shard
+    // primary at boot, and `database_backend_consistency` refuses `shards`
+    // beside a SQLite primary at config time. So these tests say "the routing
+    // and pool machinery is backend-independent", not "SQLite sharding is
+    // supported" — and if a screen is ever added to `create_shard_set` itself,
+    // they are meant to fail loudly and be gated then.
     fn shard_config(name: &str) -> ShardConfig {
         ShardConfig {
             name: name.to_owned(),
@@ -3015,6 +3025,21 @@ mod tests {
             .expect("configured");
         // a primary (7) + b primary (7) + b replica (3).
         assert_eq!(set.total_max_connections(), 17);
+    }
+
+    // The replica-free half of the sum, on both backends. The fixture above
+    // needs a replica to make the total interesting and so is Postgres-only;
+    // `cache=shared` is exempt from the single-slot clamp, so a configured
+    // `pool_size` reaches a SQLite pool too and the arithmetic still holds.
+    #[test]
+    fn total_max_connections_sums_every_primary_pool() {
+        let mut config = sharded_config(&["a", "b"]);
+        config.pool_size = 7;
+        let set = create_shard_set(&config, Arc::new(HashShardRouter))
+            .expect("build")
+            .expect("configured");
+        // a primary (7) + b primary (7).
+        assert_eq!(set.total_max_connections(), 14);
     }
 
     // ── ShardRepositorySeed (#1273) ─────────────────────────────────────

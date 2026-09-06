@@ -20,14 +20,34 @@
 /// reaches the pool and the sizing assertions stay meaningful. deadpool is
 /// lazy, so no connection is opened unless a test checks one out.
 #[cfg(not(feature = "sqlite"))]
-pub(crate) fn primary(name: &str) -> String {
+pub fn primary(name: &str) -> String {
     format!("postgres://localhost/{name}")
 }
 
-/// See [`primary`] (Postgres variant).
+/// See [`primary`] (the Postgres arm) for the contract.
 #[cfg(feature = "sqlite")]
-pub(crate) fn primary(name: &str) -> String {
+pub fn primary(name: &str) -> String {
     format!("sqlite:file:{name}?mode=memory&cache=shared")
+}
+
+/// A read-replica target to pair with the primary named `primary`.
+///
+/// The SQLite spelling is the SAME target as the primary, and that is not a
+/// shortcut: `reject_unusable_sqlite_replica` refuses a SQLite replica that is
+/// in-memory or names a different file, and its own message says the supported
+/// shape is "point the replica at the same database file as the primary". Two
+/// distinct in-memory databases would be a pair no supported configuration can
+/// produce. The pools stay distinct objects either way, so pool-identity and
+/// sizing assertions still mean what they say.
+#[cfg(not(feature = "sqlite"))]
+pub fn replica(_primary: &str, name: &str) -> String {
+    format!("postgres://localhost/{name}")
+}
+
+/// See [`replica`] (the Postgres arm) for the contract.
+#[cfg(feature = "sqlite")]
+pub fn replica(primary: &str, _name: &str) -> String {
+    self::primary(primary)
 }
 
 /// A target that no connection attempt can reach, on either backend.
@@ -35,15 +55,17 @@ pub(crate) fn primary(name: &str) -> String {
 /// Health-indicator tests need a pool whose checkout FAILS. "Unreachable" has
 /// to be spelled per backend: nothing listens on TCP port 1, while a SQLite
 /// in-memory target is always reachable — so the SQLite spelling is a file in a
-/// directory that does not exist, which `sqlite3_open` refuses with
+/// directory that does not exist, spelled as a `file:` URI with `mode=ro` so it
+/// stays unreachable even if something creates that directory — a read-only
+/// open cannot create the file. `sqlite3_open` refuses it with
 /// `SQLITE_CANTOPEN`.
 #[cfg(not(feature = "sqlite"))]
-pub(crate) fn unreachable(name: &str) -> String {
+pub fn unreachable(name: &str) -> String {
     format!("postgres://localhost:1/{name}")
 }
 
-/// See [`unreachable`] (Postgres variant).
+/// See [`unreachable`] (the Postgres arm) for the contract.
 #[cfg(feature = "sqlite")]
-pub(crate) fn unreachable(name: &str) -> String {
-    format!("sqlite:///autumn-no-such-directory/{name}.db")
+pub fn unreachable(name: &str) -> String {
+    format!("file:/autumn-no-such-directory/{name}.db?mode=ro")
 }

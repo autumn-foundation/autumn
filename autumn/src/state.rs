@@ -1371,7 +1371,7 @@ mod tests {
             ..Default::default()
         };
         let replica_config = config::DatabaseConfig {
-            url: Some(crate::test_urls::primary("replica")),
+            url: Some(crate::test_urls::replica("primary", "replica")),
             pool_size: 2,
             ..Default::default()
         };
@@ -1403,7 +1403,7 @@ mod tests {
             ..Default::default()
         };
         let replica_config = config::DatabaseConfig {
-            url: Some(crate::test_urls::primary("replica")),
+            url: Some(crate::test_urls::replica("primary", "replica")),
             pool_size: 2,
             ..Default::default()
         };
@@ -1439,7 +1439,7 @@ mod tests {
             ..Default::default()
         };
         let replica_config = config::DatabaseConfig {
-            url: Some(crate::test_urls::primary("replica")),
+            url: Some(crate::test_urls::replica("primary", "replica")),
             pool_size: 2,
             ..Default::default()
         };
@@ -1468,7 +1468,7 @@ mod tests {
             ..Default::default()
         };
         let replica_config = config::DatabaseConfig {
-            url: Some(crate::test_urls::primary("replica")),
+            url: Some(crate::test_urls::replica("primary", "replica")),
             pool_size: 2,
             ..Default::default()
         };

@@ -38,7 +38,12 @@
 # NOT run here (need Docker / a backend-flip feature / a browser — out of scope
 # for a fast, disk-cheap compile-only gate; CI runs them in dedicated jobs):
 #   - the Docker/testcontainer `#[ignore]`d sweep (ci.yml "Run Docker-dependent tests")
-#   - the `sqlite-runtime` lane (`--features sqlite`, a backend-flip feature)
+#   - the `sqlite-runtime` lane (`--features sqlite`, a backend-flip feature).
+#     Note what that costs since #1905: that lane now runs a BARE `--lib`, so a
+#     fixture that only panics under the flip (an inline `postgres://` target,
+#     say) is invisible here and surfaces on the PR. Reproduce it with
+#     `cargo test -p autumn-web --features sqlite --lib` when touching a test
+#     fixture that names a database target.
 #   - the `system-tests` (Chromium) browser suite
 #
 # Usage (runnable from anywhere in the tree):

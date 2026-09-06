@@ -15634,6 +15634,13 @@ mod tests {
             assert_eq!(state.job_registry().snapshot()["row_cancel"].queued, 0);
         }
 
+        // Postgres-only: under `--features sqlite` `start_postgres_runtime` is a
+        // stub that refuses BEFORE looking at the pool, so this fixture's
+        // subject — "backend=postgres with no pool configured" — cannot be
+        // reached there. The sqlite arm gets its own test below rather than a
+        // swapped expected string, which would have asserted a different
+        // contract under this test's name.
+        #[cfg(not(feature = "sqlite"))]
         #[tokio::test]
         async fn pg_start_runtime_without_pool_fails_with_actionable_error() {
             let _guard = global_job_runtime_test_lock().lock().await;
@@ -15664,17 +15671,40 @@ mod tests {
             )
             .expect_err("postgres backend must fail when no db pool is configured");
 
-            // Both builds refuse, for different reasons: the default build
-            // because no pool is configured, the sqlite build because there is
-            // no Postgres queue to configure one for. Assert whichever refusal
-            // this build owes the operator.
-            #[cfg(not(feature = "sqlite"))]
-            let expected = "jobs.backend=postgres requires a configured database";
-            #[cfg(feature = "sqlite")]
-            let expected = "jobs.backend=postgres is unsupported under the sqlite feature";
+            assert!(
+                error
+                    .to_string()
+                    .contains("jobs.backend=postgres requires a configured database"),
+                "unexpected error: {error}"
+            );
+            assert!(global_job_client().is_none());
+            clear_global_job_client();
+        }
+
+        // The sqlite arm of the same call. `start_postgres_runtime` is a stub
+        // under the backend flip — SQLite has no LISTEN/NOTIFY and no
+        // advisory-lock queue — so it refuses regardless of what is configured,
+        // and this is the only coverage of that refusal.
+        #[cfg(feature = "sqlite")]
+        #[tokio::test]
+        async fn sqlite_build_refuses_the_postgres_job_backend() {
+            let _guard = global_job_runtime_test_lock().lock().await;
+            clear_global_job_client();
+
+            let state = crate::AppState::for_test().with_profile("dev");
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let config = crate::config::JobConfig {
+                backend: "postgres".to_string(),
+                ..Default::default()
+            };
+
+            let error = start_runtime(Vec::new(), &state, &shutdown, &config, true)
+                .expect_err("the postgres job backend must refuse under the sqlite feature");
 
             assert!(
-                error.to_string().contains(expected),
+                error
+                    .to_string()
+                    .contains("jobs.backend=postgres is unsupported under the sqlite feature"),
                 "unexpected error: {error}"
             );
             assert!(global_job_client().is_none());

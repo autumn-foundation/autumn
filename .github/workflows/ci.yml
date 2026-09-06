@@ -931,9 +931,11 @@ jobs:
           # under the `sqlite` + `mail` union — which is exactly the
           # `DbSuppressionStore` backend-flip this PR fixes, so coverage must
           # keep compiling it. Restore it here, isolated to `-p autumn-web` so the
-          # sqlite flip can never leak onto the Pg-assuming workspace crates. A
-          # named sqlite `[[test]]` target keeps it off the pg-URL lib unit tests
-          # (which assume Postgres) — same rule the `sqlite-runtime` job follows.
+          # sqlite flip can never leak onto the Pg-assuming workspace crates.
+          # A named sqlite `[[test]]` target keeps this lane narrow; the lib
+          # unit tests are no longer Postgres-assuming (#1905 made them
+          # backend-parametric) and are RUN, though not measured for coverage,
+          # by the `sqlite-runtime` job's bare `--lib`.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --test sqlite_boot_serve
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \

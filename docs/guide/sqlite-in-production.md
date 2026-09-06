@@ -134,9 +134,9 @@ buckets on SQLite:
 | Sessions + auth (DB-backed) | ✅ | ✅ | Session/auth tables live in SQLite; no external store. | ⛔ **Planned — #1908** |
 | Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | Single-writer claim on the jobs table — durable and restart-safe, **no Redis required**. | ⛔ **Planned — #1907** |
 | `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | Single host is always the leader; every tick fires locally (no election needed). | ⛔ **Planned — #1907** |
-| Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⛔ | **Refused.** `Lock::from_state` returns `PoolUnavailable` under the `sqlite` feature — SQLite has no cross-connection advisory lock, and pretending to hold one is worse than refusing. Single-host mutual exclusion is what a `Mutex` is for. | ✅ **Available now — refuses** |
-| Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (a single host has nothing to notify). `PgFlagStore` / `PgExperimentStore` are Postgres-only (they open a `PgConnection` and use `pg_notify`), so `from_database_config` returns `None` on a SQLite target and the app falls back to the in-memory store rather than building a store that cannot connect. | ⚠️ **Available now — in-process only** |
-| Runtime config store (`runtime_config::pg`) | ✅ `pg_advisory_xact_lock` | ⚠️ | Same shape: `PgConfigStore::from_database_config` returns `None` on a SQLite target; use `InMemoryConfigStore` or a custom `ConfigStore`. | ⚠️ **Available now — no DB-backed store** |
+| Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⛔ | **Refused at construction**, not at boot: `Lock::from_state` returns `LockError::PoolUnavailable` under the `sqlite` feature, so the app boots and the first attempt to take a lock fails with a named reason. SQLite has no cross-connection advisory lock, and pretending to hold one is worse than refusing; single-host mutual exclusion is what a `Mutex` is for. | ✅ **Available now — refuses at construction** |
+| Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (a single host has nothing to notify). `PgFlagStore` / `PgExperimentStore` are Postgres-only (they open a `PgConnection` and use `pg_notify`), so `from_database_config` returns `None` on a SQLite target rather than building a store that cannot connect. Autumn never picks a store for you — the app passes one to `with_flag_store`, so on SQLite pass `InMemoryFlagStore` (an `.expect()` on the `None` now fails at boot instead of at the first flag read). | ⚠️ **Available now — in-process only** |
+| Runtime config store (`runtime_config::pg`) | ✅ `pg_advisory_xact_lock` | ⚠️ | Same shape: `PgConfigStore::from_database_config` returns `None` on a SQLite target; pass `InMemoryConfigStore` or a custom `ConfigStore` instead. | ⚠️ **Available now — no DB-backed store** |
 | ISR regeneration coordinator (`static_gen`) | ✅ `pg_try_advisory_lock` | ⚠️ | `PostgresIsrCoordinator` takes a `Pool<AsyncPgConnection>`, which a SQLite build's app state cannot produce — it is unreachable under the flip rather than refused. Single-host ISR uses the in-process coordinator, which is what one host needs. | ⚠️ **Available now — in-process coordinator** |
 | `autumn db backup` / `restore` | ✅ `pg_dump`/`pg_restore` | ✅ | Online-safe snapshot of the data file (safe against a live app). Backup tooling is still `pg_dump`/`pg_restore`-shaped today. | ⛔ **Planned — #1909** |
 | `autumn db scrub` | ✅ | ✅ | Runs against the SQLite file. | ⛔ **Planned — #1909** |
@@ -180,7 +180,7 @@ published support contract**. Available **today**:
 - **Generate-time rejections**, each naming its tracking issue:
   - `Uuid` / `Decimal` / `Attachment` / `DateTime<Utc>` / `Enum` field kinds —
     #1924.
-  - `--id uuid` primary keys — #1905.
+  - `--id uuid` primary keys — #2555.
   - `ADD COLUMN NOT NULL` without a default (on both the add and rollback re-add
     paths).
   - `DROP INDEX` emitted before `DROP COLUMN` on the forward **and** rollback
@@ -194,11 +194,10 @@ published support contract**. Available **today**:
   missing `pg_dump` or a non-`postgres://` URL.
 
 **Not in this slice — scaffold smoke tests on SQLite.** A scaffolded app still
-carries the **Postgres-shaped** (`#[ignore]`d) smoke test. A SQLite-native
-scaffold smoke harness needs the SQLite `TestDb` (a testcontainer) that lands
-with the runtime slice — until then there is no SQLite backend to run
-SQLite-dialect smoke SQL against, so the generated smoke test remains
-Postgres-shaped. Tracked under the runtime slice #1905.
+carries the **Postgres-shaped** (`#[ignore]`d) smoke test: it uses the
+Postgres-only `TestDb` testcontainer and `TRUNCATE … RESTART IDENTITY`. The
+runtime landed without a SQLite-native scaffold smoke harness; that is tracked
+in #2555.
 
 The support-matrix rows still marked **Planned** name follow-on subsystem slices
 whose SQLite support has not landed yet (sessions/auth #1908, durable jobs and
@@ -487,7 +486,7 @@ Additional generator shapes are refused on SQLite:
 
 - **`--id uuid` primary keys** are rejected at generate time — the SQLite primary
   key is `INTEGER PRIMARY KEY AUTOINCREMENT`, and a UUID primary key has no
-  working conversion yet. Tracked in #1905.
+  working conversion yet. Tracked in #2555.
 > **`generate auth` / `generate mailer` now generate on SQLite (#1927 / #1908).**
 > Historically refused at generate time, both now scaffold SQLite-dialect
 > migrations on a SQLite app (`INTEGER PRIMARY KEY AUTOINCREMENT`, `DEFAULT
@@ -509,10 +508,9 @@ Additional generator shapes are refused on SQLite:
 > test (including the duplicate-`unique` rejection) uses
 > `autumn_web::test::TestDb`, a **Postgres-only** testcontainer, and
 > `TRUNCATE … RESTART IDENTITY`, and runs only under `cargo test -- --ignored`
-> (it is `#[ignore]`d). There is no SQLite `TestDb` yet — it lands with the
-> runtime slice (#1905) — so a scaffolded SQLite app still carries the
-> Postgres-shaped smoke test rather than a SQLite-native one. A backend-aware
-> scaffold smoke harness is deferred to the runtime slice #1905.
+> (it is `#[ignore]`d). There is no SQLite `TestDb` yet, so a scaffolded SQLite
+> app still carries the Postgres-shaped smoke test rather than a SQLite-native
+> one. A backend-aware scaffold smoke harness is tracked in #2555.
 
 ### Migration mechanics on SQLite
 

@@ -8338,8 +8338,8 @@ impl DatabaseConfig {
     /// unsupported target yields "no store" at construction instead.
     ///
     /// Fails closed: a target [`DatabaseBackend::detect`] cannot classify is
-    /// refused too, the same rule
-    /// [`redact_pool_target`](crate::db) applies.
+    /// refused too, rather than handed to a Postgres driver on the chance that
+    /// it might work.
     #[must_use]
     pub fn effective_primary_postgres_url(&self) -> Option<&str> {
         self.effective_primary_url()
@@ -8525,9 +8525,11 @@ impl DatabaseConfig {
         ] {
             // A SQLite target (issue #1614) is now a recognized shape and
             // passes this per-field check; only strings that are neither a
-            // Postgres nor a SQLite target are rejected here. The message is
-            // unchanged for the Postgres-shaped forms so existing deployments
-            // and diagnostics see byte-for-byte identical errors.
+            // Postgres nor a SQLite target are rejected here. The message's
+            // GUIDANCE half is unchanged — everything up to "got" — so existing
+            // diagnostics that match on it still match; the target it quotes is
+            // now redacted (see below), because a rejected string is by
+            // definition one whose secrets this code cannot enumerate.
             if let Some(url) = url
                 && DatabaseBackend::detect(url).is_none()
             {

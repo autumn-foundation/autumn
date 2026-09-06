@@ -109,8 +109,16 @@ macro_rules! with_migration_connection {
             scope
                 .spawn(|| {
                     match crate::db::establish_migration_connection($url)
-                        .map_err(|e| MigrationError::Connection(e.to_string()))?
-                    {
+                        // Redacted: this is the RUNTIME's startup-migration
+                        // path (the `--wait` loop is the other one), and the
+                        // driver quotes the target it was handed straight back
+                        // into its message. It is logged with
+                        // `tracing::error!` at boot.
+                        .map_err(|e| {
+                            MigrationError::Connection(crate::db_url::redact_targets_in_message(
+                                &e.to_string(),
+                            ))
+                        })? {
                         crate::db::MigrationConnection::Native(mut native) => {
                             let $conn = &mut native;
                             $body
@@ -383,8 +391,9 @@ pub fn run_pending_sqlite(
     if let Some(err) = reject_in_memory_migrations(database_url, &migrations) {
         return Err(err);
     }
-    let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    let mut conn = crate::db::establish_sqlite_migration_connection(database_url).map_err(|e| {
+        MigrationError::Connection(crate::db_url::redact_targets_in_message(&e.to_string()))
+    })?;
     let applied = with_sqlite_migration_lock(&mut conn, |conn| {
         let mut harness = HarnessWithOutput::write_to_stdout(conn);
         harness
@@ -482,8 +491,9 @@ fn pending_migrations_sqlite(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
 ) -> Result<Vec<String>, MigrationError> {
-    let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    let mut conn = crate::db::establish_sqlite_migration_connection(database_url).map_err(|e| {
+        MigrationError::Connection(crate::db_url::redact_targets_in_message(&e.to_string()))
+    })?;
     let pending = conn
         .pending_migrations(migrations)
         .map_err(|e| MigrationError::Migration(e.to_string()))?;
@@ -2163,8 +2173,9 @@ pub fn applied_user_migrations_sqlite(
     database_url: &str,
     migrations_dir: &Path,
 ) -> Result<Vec<AppliedUserMigration>, MigrationError> {
-    let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    let mut conn = crate::db::establish_sqlite_migration_connection(database_url).map_err(|e| {
+        MigrationError::Connection(crate::db_url::redact_targets_in_message(&e.to_string()))
+    })?;
     let source = FileBasedMigrations::from_path(migrations_dir)
         .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
     let all_migrations: Vec<Box<dyn Migration<diesel::sqlite::Sqlite>>> = source
@@ -2209,8 +2220,9 @@ where
     P: FnOnce(&[AppliedUserMigration]) -> Result<Vec<String>, MigrationError> + Send,
     F: FnMut(&RevertedMigration) + Send,
 {
-    let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    let mut conn = crate::db::establish_sqlite_migration_connection(database_url).map_err(|e| {
+        MigrationError::Connection(crate::db_url::redact_targets_in_message(&e.to_string()))
+    })?;
     let source = FileBasedMigrations::from_path(migrations_dir)
         .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
     let all_migrations: Vec<Box<dyn Migration<diesel::sqlite::Sqlite>>> = source
@@ -2496,8 +2508,9 @@ pub fn hold_migration_lock(
     // (see `crate::db::establish_migration_connection`) — this lock is taken
     // before spawning the external diesel CLI, so it must reach TLS-only
     // servers too.
-    let mut conn = crate::db::establish_migration_connection(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    let mut conn = crate::db::establish_migration_connection(database_url).map_err(|e| {
+        MigrationError::Connection(crate::db_url::redact_targets_in_message(&e.to_string()))
+    })?;
 
     match &mut conn {
         crate::db::MigrationConnection::Native(conn) => {

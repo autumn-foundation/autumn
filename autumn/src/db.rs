@@ -1450,7 +1450,6 @@ fn normalize_sqlite_target(url: &str) -> String {
 /// A **shared-cache** in-memory database (`cache=shared`) is the deliberate
 /// exception: it IS shareable across the pool's connections within one process,
 /// so it must NOT be forced single-slot and returns `false` here.
-
 #[cfg(feature = "sqlite")]
 fn sqlite_target_is_memory(target: &str) -> bool {
     if target.contains("cache=shared") {
