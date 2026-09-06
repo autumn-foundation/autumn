@@ -211,13 +211,21 @@ def read(f):
 # either can parse. A shallower cap was the obvious shortcut and the wrong one:
 # it left this file naming 32 in a comment while implementing six, and a
 # destination between the two would have gone unrecognised and unblanked.
-# Depth N accepts nesting N exactly, measured. Atomic groups keep the nested
-# quantifiers from backtracking exponentially on a destination that does not
-# balance; at 32 the pattern is 684 characters and the corpus run is unchanged.
+# Depth N accepts nesting N exactly, measured. At 32 the pattern is 684
+# characters and the corpus run is unchanged.
+#
+# The two alternatives are disjoint on their first character — `(` or not — so
+# there is no ambiguity for the engine to backtrack through, and the nesting
+# costs nothing on input that does not balance (measured on unbalanced opens,
+# unbalanced closes, and a deep run that fails at the end). An earlier version
+# wrapped each level in an ATOMIC group to guard against a blowup that cannot
+# happen, and `(?>...)` is Python 3.11 syntax: on 3.10 the gate aborted while
+# compiling this pattern. A defence against a measured non-problem is not worth
+# a runtime requirement the script never declares.
 def _nested_parens(depth):
     body = r'[^()\s]'
     for _ in range(depth):
-        body = r'(?>[^()\s]|\((?:' + body + r')*\))'
+        body = r'(?:[^()\s]|\((?:' + body + r')*\))'
     return body
 
 
@@ -1325,6 +1333,23 @@ def definition_labels(txt):
     return out
 
 
+# An image, in either spelling, inside a link's rendered content.
+ANY_IMAGE = re.compile(r'!\[|<img\b', re.I)
+
+
+def has_content(raw_span, masked_span):
+    """Whether a link's content leaves the reader anything to click.
+
+    Two views, because neither alone is right. The MASKED one has comments and
+    hidden HTML already blanked, so `<a href=…><!-- hidden --></a>` reads as
+    the nothing it renders as — the raw text there looks like content but is a
+    comment. The RAW one is what says an IMAGE is content: masking blanks
+    images as invisible, and a linked image is the clearest clickable thing
+    there is.
+    """
+    return bool(masked_span.strip() or ANY_IMAGE.search(raw_span))
+
+
 def _image_resolves(m, defined):
     """Whether an image reference names a definition that exists."""
     first, second = m.group(1), m.group(2)
@@ -1518,12 +1543,10 @@ def edges_from(f):
 
     for pattern in (MD_LINK, MD_LINK_NESTED):
         for m in pattern.finditer(md_txt):
-            # Emptiness is judged on the text BEFORE masking. Every masker
-            # replaces space for space, so the offsets still line up — and a
-            # label holding an image has been blanked by then, which would
-            # otherwise read as empty and drop the one link the reader can
-            # actually click on `[![alt](img.png)](page.md)`.
-            if not raw[m.start(1):m.end(1)].strip():
+            # Offsets line up across both views because every masker replaces
+            # space for space.
+            if not has_content(raw[m.start(1):m.end(1)],
+                               md_txt[m.start(1):m.end(1)]):
                 continue
             add_relative(m.group(2) if m.group(2) is not None else m.group(3))
 
@@ -1546,8 +1569,8 @@ def edges_from(f):
         # An `<img>` inside IS content, which falls out of testing for
         # non-whitespace rather than for text.
         close = ANCHOR_CLOSE.search(raw, tag.end())
-        inner = raw[tag.end():close.start()] if close else raw[tag.end():]
-        if not inner.strip():
+        stop = close.start() if close else len(raw)
+        if not has_content(raw[tag.end():stop], txt[tag.end():stop]):
             continue
         add_relative(next(g for g in m.groups() if g is not None),
                      markdown=False)
@@ -1584,6 +1607,13 @@ def edges_from(f):
         # `[label][]` (collapsed) leaves the SECOND label empty; the label is
         # then the first one, which the pattern captures rather than this
         # having to find where it ends.
+        # `[][m]` renders an empty anchor exactly as `[](x.md)` does, so the
+        # rendered content — the FIRST label — has to carry something. The
+        # inline form and the raw anchor already required it; this was the
+        # third spelling of the same link and the one left out.
+        if not has_content(raw[m.start(1):m.end(1)],
+                           uses_txt[m.start(1):m.end(1)]):
+            continue
         inner = m.group(2)
         lbl = ref_label(inner) if inner.strip() else ref_label(m.group(1))
         if lbl is not None:
@@ -3389,6 +3419,27 @@ self_test() {
     > "$c9hd/docs/guide/jobs.md"
   git -C "$c9hd" add -A && git -C "$c9hd" commit -qm anchor-wrapping-image
   check "a raw anchor wrapping an image is a route" pass "$c9hd"
+
+  # `[][m]` renders an empty anchor, the same as `[](x.md)`.
+  local c9he="$tmp/c9he"; make_corpus "$c9he"
+  printf '# Jobs\n\n[][m]\n\n[m]: mail.md\n' > "$c9he/docs/guide/jobs.md"
+  git -C "$c9he" add -A && git -C "$c9he" commit -qm empty-full-reference
+  check "an empty full reference is not an edge" fail "$c9he"
+
+  # ...but one whose content is an image still is.
+  local c9hf="$tmp/c9hf"; make_corpus "$c9hf"
+  printf '# Jobs\n\n[![alt](img.png)][m]\n\n[m]: mail.md\n' \
+    > "$c9hf/docs/guide/jobs.md"
+  git -C "$c9hf" add -A && git -C "$c9hf" commit -qm image-full-reference
+  check "a full reference around an image is a route" pass "$c9hf"
+
+  # An anchor holding only a COMMENT renders nothing: the source looks like
+  # content, the page shows none.
+  local c9hg="$tmp/c9hg"; make_corpus "$c9hg"
+  printf '# Jobs\n\n<a href="mail.md"><!-- hidden --></a>\n' \
+    > "$c9hg/docs/guide/jobs.md"
+  git -C "$c9hg" add -A && git -C "$c9hg" commit -qm anchor-comment-only
+  check "an anchor holding only a comment is not an edge" fail "$c9hg"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
