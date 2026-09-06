@@ -32,19 +32,25 @@ use quote::quote;
 /// for a page that touches no database and, worse, reporting a read-only job as
 /// a writer, because mutation evidence is a *claim* rather than a superset.
 ///
-/// Each entry is `(leading verb, required companion, mutating)`. The literal
-/// must start with the verb and also carry the companion — which no prose in
+/// Each entry is `(leading verb, required companions, mutating)`. The literal
+/// must start with the verb and also carry every companion — which no prose in
 /// the example app does, and every real statement does.
-const SQL_SHAPES: &[(&str, &str, bool)] = &[
-    ("SELECT", "FROM", false),
+const SQL_SHAPES: &[(&str, &[&str], bool)] = &[
+    ("SELECT", &["FROM"], false),
     // A `WITH` statement is read-only only if nothing in it mutates: the
     // statement after the CTEs, or a CTE body, can be an `INSERT`/`UPDATE`/
-    // `DELETE`. `sql_shape` re-checks those verbs for this shape rather than
-    // trusting the `false` here.
-    ("WITH", "SELECT", false),
-    ("INSERT", "INTO", true),
-    ("UPDATE", "SET", true),
-    ("DELETE", "FROM", true),
+    // `DELETE`/`MERGE`. `sql_shape` re-checks those verbs for this shape rather
+    // than trusting the `false` here.
+    ("WITH", &["SELECT"], false),
+    ("INSERT", &["INTO"], true),
+    ("UPDATE", &["SET"], true),
+    ("DELETE", &["FROM"], true),
+    // Postgres 15's upsert. It is the one shape that names more than one
+    // companion, and it can afford to: `INTO`, `USING`, `ON` and a `WHEN`
+    // clause are all mandatory, so requiring the set costs no recall — while
+    // any one of them alone is a word an English sentence starting "Merge …"
+    // borrows freely ("merge into main", "merge using the newest revision").
+    ("MERGE", &["INTO", "USING", "ON", "WHEN"], true),
     // `TRUNCATE` is absent on purpose: Postgres makes its `TABLE` keyword
     // optional, so it has no companion every real statement carries. It is
     // matched on its whole grammar instead — see [`TRUNCATE_CLAUSE_WORDS`].
@@ -52,7 +58,7 @@ const SQL_SHAPES: &[(&str, &str, bool)] = &[
 
 /// Verbs that make any statement containing them a mutation, wherever they
 /// appear — used for `WITH`, whose leading verb says nothing about its effect.
-const SQL_MUTATION_VERBS: &[&str] = &["DELETE", "INSERT", "TRUNCATE", "UPDATE"];
+const SQL_MUTATION_VERBS: &[&str] = &["DELETE", "INSERT", "MERGE", "TRUNCATE", "UPDATE"];
 
 /// The optional keywords a `TRUNCATE` statement may carry.
 ///
@@ -383,9 +389,9 @@ fn sql_shape(literal: &str) -> Option<bool> {
     if first == "TRUNCATE" {
         return is_truncate_operands(&rest).then_some(true);
     }
-    let (_, _, mutating) = SQL_SHAPES
-        .iter()
-        .find(|(verb, companion, _)| first == *verb && rest.contains(companion))?;
+    let (_, _, mutating) = SQL_SHAPES.iter().find(|(verb, companions, _)| {
+        first == *verb && companions.iter().all(|c| rest.contains(c))
+    })?;
     // `WITH old AS (SELECT …) DELETE FROM posts …` is a write. Its leading verb
     // is `WITH`, so the table alone cannot say; the mutation verbs can.
     let mutating =
@@ -856,6 +862,48 @@ mod tests {
         let literal =
             "\"WITH recent AS (SELECT id FROM posts) SELECT * FROM recent -- never DELETE\"";
         assert_eq!(sql_shape(literal), Some(false));
+    }
+
+    /// Postgres 15 added `MERGE`, the upsert every other dialect spells
+    /// differently. Its verb was absent from the shape table, so a literal that
+    /// named its table only there matched nothing — no symbol, no mutation
+    /// evidence, no edge (Codex round 16).
+    #[test]
+    fn merge_is_a_statement_and_a_mutation() {
+        let literal = "\"MERGE INTO posts USING staged ON posts.id = staged.id \
+                       WHEN MATCHED THEN UPDATE SET title = staged.title \
+                       WHEN NOT MATCHED THEN INSERT VALUES (staged.id, staged.title)\"";
+        assert_eq!(sql_shape(literal), Some(true), "MERGE always writes");
+        let symbols = sql_symbols(literal);
+        assert!(symbols.contains(&"posts".to_owned()), "the merge target");
+        assert!(symbols.contains(&"staged".to_owned()), "the merge source");
+    }
+
+    /// `MERGE` leans on all four of its mandatory keywords rather than one
+    /// companion, because "merge" leads ordinary sentences that borrow `INTO`
+    /// and `USING` — a real statement always carries `ON` and a `WHEN` clause
+    /// too, so requiring the set costs no recall and keeps prose out.
+    #[test]
+    fn a_merge_sentence_is_not_a_statement() {
+        assert_eq!(
+            sql_shape("\"Merge into main using the newest revision\""),
+            None,
+            "prose must not be scanned, and must not claim mutation"
+        );
+        assert_eq!(
+            sql_shape("\"Merge the draft into the published post\""),
+            None
+        );
+    }
+
+    /// A `MERGE` behind CTEs is still a write. Its leading verb is `WITH`, so
+    /// the mutation-verb scan is what has to say so.
+    #[test]
+    fn a_merge_behind_ctes_is_still_a_mutation() {
+        let literal = "\"WITH staged AS (SELECT id, title FROM imports) \
+                       MERGE INTO posts USING staged ON posts.id = staged.id \
+                       WHEN MATCHED THEN DO NOTHING\"";
+        assert_eq!(sql_shape(literal), Some(true));
     }
 
     /// Postgres makes `TABLE` optional, so `TRUNCATE posts` is a complete
