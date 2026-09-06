@@ -23,7 +23,7 @@ const INCOMPATIBLE_GUARD_ATTRS: [&str; 4] = ["secured", "step_up", "throttle", "
 
 /// Error message for `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]`
 /// combined with `#[static_get]`, in either attribute order.
-const INCOMPATIBLE_GUARD_MSG: &str = "`#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` \
+pub const INCOMPATIBLE_GUARD_MSG: &str = "`#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` \
      cannot be combined with `#[static_get]`: cached SSG/ISR responses are served by the \
      static-first middleware before the inner router (session, auth) is ever reached, so this \
      guard would not protect a cache hit. Use `AppBuilder::static_gate` to gate pre-rendered \
@@ -173,16 +173,19 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // Parse the async handler function
-    let (leading_guard_items, input_fn) =
+    let (leading_guard_items, mut input_fn) =
         match crate::parse::parse_async_handler_with_leading_items(item) {
             Ok(v) => v,
             Err(err) => return err,
         };
 
-    let fn_name = &input_fn.sig.ident;
+    // Owned rather than borrowed: `input_fn` is mutated below (a marker gets
+    // spliced into its body) once the guard checks pass, and these need to
+    // outlive that mutable borrow to reach the final `quote!` at the bottom.
+    let fn_name = input_fn.sig.ident.clone();
     let route_info_name = format_ident!("__autumn_route_info_{}", fn_name);
     let static_meta_name = format_ident!("__autumn_static_meta_{}", fn_name);
-    let vis = &input_fn.vis;
+    let vis = input_fn.vis.clone();
 
     // Honor a `#[public]` marker on the handler so the route audit gate can
     // classify this static route as `public` rather than `unclassified`.
@@ -249,6 +252,22 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         );
         return err.to_compile_error();
     }
+
+    // No guard is visible by name or by expansion artifact at this point,
+    // but a still-pending guard attribute imported under an alias (e.g.
+    // `use ::autumn_web::secured as auth;` then `#[auth("admin")]`) is
+    // exactly as live and unexpanded as a plainly-spelled one, and
+    // completely invisible to `attr_or_cfg_attr_matches_any`'s name-based
+    // scan: a proc-macro attribute runs before the compiler resolves
+    // imports, so there is no way to ask "does this path actually name
+    // `autumn_web::secured`" from here (Codex review on #2513, tenth
+    // finding). Leave a marker for that guard's OWN macro to find once IT
+    // expands, regardless of what name it was invoked under — see
+    // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
+    crate::param_helpers::prepend_body_const_marker(
+        &mut input_fn,
+        crate::param_helpers::STATIC_ROUTE_HANDLER_MARKER,
+    );
 
     // No guard is present at this point, so the route is always unsecured.
     let secured = false;

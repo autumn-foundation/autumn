@@ -212,6 +212,15 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
+    // `#[step_up]` written below `#[static_get]`/`#[ws]` — including under an
+    // alias those macros' own by-name attribute scan cannot see — is caught
+    // here instead, once this guard's own macro is the one running (Codex
+    // review on #2513, tenth finding). See
+    // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
+    if let Some(err) = crate::param_helpers::reject_if_incompatible_route_marker(&input_fn) {
+        return err;
+    }
+
     let max_age_tokens = max_age_opt.map_or_else(
         || quote! { ::core::option::Option::None },
         |n| {
@@ -370,6 +379,33 @@ mod tests {
     use quote::quote;
 
     use super::step_up_macro;
+    use crate::static_route::static_get_macro;
+
+    #[test]
+    fn step_up_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
+        // See `secured::tests::secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias`
+        // for the full rationale (Codex review on #2513, tenth finding).
+        let accepted = static_get_macro(
+            quote! { "/private" },
+            quote! {
+                #[auth]
+                async fn private() -> &'static str { "private" }
+            },
+        );
+        assert!(
+            !accepted.to_string().contains("compile_error"),
+            "static_get_macro cannot recognize an aliased guard attribute by name: {accepted}"
+        );
+
+        let accepted_fn = crate::param_helpers::extract_fn_item(accepted, "private");
+        let generated = step_up_macro(quote! {}, quote! { #accepted_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "step_up_macro must reject a handler already marked as a #[static_get] route, \
+             regardless of what alias attribute name the source used to invoke it: {generated}"
+        );
+    }
 
     #[test]
     fn step_up_bare_generates_check_call() {

@@ -1888,6 +1888,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `static_route.rs` and `ws.rs`) to also look inside a `cfg_attr`'s own
   argument list for a wrapped guard attribute.
 
+- **macros: `#[static_get]`/`#[ws]` also missed a guard attribute imported
+  under an alias (e.g. `use ::autumn_web::secured as auth;` then
+  `#[auth("admin")]`):** a proc-macro attribute is invoked on raw syntax
+  before the compiler resolves imports, so there is no API for a proc macro
+  to ask "does this path actually name `autumn_web::secured`" — an aliased
+  guard's spelling is fundamentally invisible to the name-based scan the
+  ninth finding's fix still relied on, however thorough (tenth Codex finding
+  on #2513, and a materially different problem from the ninth: no name-based
+  check, however exhaustive, can close this one). Fixed the only way a
+  syntactic scan can be made sound against a rename it cannot see through:
+  `#[static_get]`/`#[ws]` now unconditionally leave a marker const in the
+  body of every handler they accept
+  (`param_helpers::STATIC_ROUTE_HANDLER_MARKER`/`WS_HANDLER_MARKER`,
+  mirroring the `__AUTUMN_STEP_UP_MAX_AGE`/`__AUTUMN_THROTTLE_ROUTE_ID`
+  body-marker-const technique already used to communicate across a macro
+  expansion boundary elsewhere in this crate), and each of
+  `secured_macro`/`step_up_macro`/`throttle_macro`/`authorize_macro` now
+  checks for it (`param_helpers::reject_if_incompatible_route_marker`)
+  immediately after parsing its own input — before doing any of its own
+  work — regardless of what name or alias the compiler invoked it under.
+  Covered by five new tests (one per guard, plus `#[ws]`) that construct the
+  exact scenario an alias produces: accept a still-unrecognized attribute
+  through `#[static_get]`/`#[ws]` first, then invoke the guard's macro
+  function directly on the result, proving the rejection fires without
+  ever relying on the guard's surface name.
+
 - **`route_macro` lost a guarded handler's OpenAPI response schema under
   `#[throttle]`/`#[step_up]` (issue #2516):** #2488 moved the
   `#[throttle]`/`#[step_up]` auth/rate-limit checks out of the handler body

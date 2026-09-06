@@ -38,7 +38,7 @@ const INCOMPATIBLE_GUARD_ATTRS: [&str; 4] = ["secured", "step_up", "throttle", "
 
 /// Error message for `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]`
 /// combined with `#[ws]`, in either attribute order.
-const INCOMPATIBLE_GUARD_MSG: &str = "`#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` cannot be combined with `#[ws]`, \
+pub const INCOMPATIBLE_GUARD_MSG: &str = "`#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` cannot be combined with `#[ws]`, \
      in either attribute order: those guards rewrite the handler to return an HTTP \
      `Response`, but a `#[ws]` handler must return `impl WsHandler`. Check authorization \
      inside the upgrade handler instead — add a `Session` (or other) extractor parameter and \
@@ -124,11 +124,11 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err,
     };
 
-    let (leading_guard_items, input_fn) = match parse::parse_async_handler_with_leading_items(item)
-    {
-        Ok(v) => v,
-        Err(err) => return err,
-    };
+    let (leading_guard_items, mut input_fn) =
+        match parse::parse_async_handler_with_leading_items(item) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
 
     // A body guard (`#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]`)
     // expanded above `#[ws]` leaves its `FromRequestParts` gate as a leading
@@ -198,6 +198,23 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         return err.to_compile_error();
     }
+
+    // No guard is visible by name or by expansion artifact at this point,
+    // but a still-pending guard attribute imported under an alias (e.g.
+    // `use ::autumn_web::secured as auth;` then `#[auth("admin")]`) is
+    // exactly as live and unexpanded as a plainly-spelled one, and
+    // completely invisible to `attr_or_cfg_attr_matches_any`'s name-based
+    // scan — a proc-macro attribute runs before the compiler resolves
+    // imports (Codex review on #2513, tenth finding). Leave a marker for
+    // that guard's OWN macro to find once IT expands, regardless of what
+    // name it was invoked under — see `param_helpers::WS_HANDLER_MARKER`'s
+    // doc comment. Must happen before `fn_name`/`vis` below borrow from
+    // `input_fn`, since those borrows need to outlive this mutation to
+    // reach the final `quote!` at the bottom.
+    crate::param_helpers::prepend_body_const_marker(
+        &mut input_fn,
+        crate::param_helpers::WS_HANDLER_MARKER,
+    );
 
     let fn_name = &input_fn.sig.ident;
     let vis = &input_fn.vis;
@@ -360,6 +377,34 @@ mod tests {
     use quote::quote;
 
     use super::ws_macro;
+
+    #[test]
+    fn secured_rejects_when_invoked_on_a_ws_handler_via_an_alias() {
+        // Same gap as `static_route.rs`'s marker, for `#[ws]`: see
+        // `secured::tests::secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias`
+        // for the full rationale (Codex review on #2513, tenth finding).
+        let accepted = ws_macro(
+            quote! { "/echo" },
+            quote! {
+                #[auth("admin")]
+                async fn echo() -> impl WsHandler { |socket| async move {} }
+            },
+        );
+        assert!(
+            !accepted.to_string().contains("compile_error"),
+            "ws_macro cannot recognize an aliased guard attribute by name: {accepted}"
+        );
+
+        let accepted_fn = crate::param_helpers::extract_fn_item(accepted, "echo");
+        let generated =
+            crate::secured::secured_macro(quote! { "admin" }, quote! { #accepted_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "secured_macro must reject a handler already marked as a #[ws] route, regardless \
+             of what alias attribute name the source used to invoke it: {generated}"
+        );
+    }
 
     #[test]
     fn ws_defaults_public_false() {

@@ -135,6 +135,15 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
+    // `#[secured]` written below `#[static_get]`/`#[ws]` — including under an
+    // alias those macros' own by-name attribute scan cannot see — is caught
+    // here instead, once this guard's own macro is the one running (Codex
+    // review on #2513, tenth finding). See
+    // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
+    if let Some(err) = crate::param_helpers::reject_if_incompatible_route_marker(&input_fn) {
+        return err;
+    }
+
     // The session/role check is emitted for the classic forms (`#[secured]`,
     // `#[secured("admin")]`) and whenever a role is required. It is OMITTED for
     // a scopes-ONLY gate so a pure service token with no session authorizes on
@@ -327,6 +336,45 @@ mod tests {
     use quote::quote;
 
     use super::{parse_secured_args, secured_macro};
+    use crate::static_route::static_get_macro;
+
+    #[test]
+    fn secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
+        // Simulates real source using `use ::autumn_web::secured as auth;`:
+        //   #[static_get("/private")]
+        //   #[auth("admin")]
+        //   async fn private() -> &'static str { "private" }
+        // `static_get_macro` cannot recognize `auth` by name (Codex review on
+        // #2513, tenth finding) and must accept the combination rather than
+        // reject it, leaving the incompatibility for the guard's own macro to
+        // catch via the marker it left behind. The compiler invokes the SAME
+        // `secured_macro` function regardless of what alias the source used
+        // to name it — aliasing changes only the surface spelling, never
+        // which function actually runs — so calling `secured_macro` directly
+        // here is exactly what real, aliased source code produces.
+        let accepted = static_get_macro(
+            quote! { "/private" },
+            quote! {
+                #[auth("admin")]
+                async fn private() -> &'static str { "private" }
+            },
+        );
+        assert!(
+            !accepted.to_string().contains("compile_error"),
+            "static_get_macro cannot recognize an aliased guard attribute by name, so it must \
+             accept (not reject) at this point, deferring to the guard's own marker check: \
+             {accepted}"
+        );
+
+        let accepted_fn = crate::param_helpers::extract_fn_item(accepted, "private");
+        let generated = secured_macro(quote! { "admin" }, quote! { #accepted_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "secured_macro must reject a handler already marked as a #[static_get] route, \
+             regardless of what alias attribute name the source used to invoke it: {generated}"
+        );
+    }
 
     #[test]
     fn secured_string_literal_replay_guard_still_injects_replay_stop() {
