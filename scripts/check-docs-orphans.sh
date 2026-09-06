@@ -1541,18 +1541,73 @@ HIDDEN_OPEN = re.compile(
 # a computed rule is invisible to it, and a page hiding a link that way is a
 # gap this cannot see.
 #
-# BOTH ENDS ARE BOUNDED, and each end has a case behind it. `--display:none` is
-# a custom PROPERTY and changes nothing — Chromium leaves the anchor at 30x17 —
-# so an unbounded match rejected a live link; and `display:none-such` is not the
-# `none` value either, for the same reason. A substring test failed both.
-_DISPLAY_NONE = (r'(?<![-\w])display' + _TWS + r'*:' + _TWS
-                 + r'*none(?![-\w])')
-STYLE_HIDDEN_OPEN = re.compile(
+# WHICH declaration wins is decided rather than pattern-matched, because a
+# style attribute is a cascade and the last valid declaration takes effect.
+# `display:none; display:block` renders a 1264px wide, clickable link, so a
+# pattern matching any occurrence of `display:none` rejected a live one. The
+# rules below were measured in Chromium, not read off a spec.
+STYLE_ATTR_OPEN = re.compile(
     r'<([A-Za-z][A-Za-z0-9-]*)(?:' + _TWS + r'+' + ATTR + r')*?'
     + _TWS + r'+style' + _TWS + r'*=' + _TWS + r'*'
-    r'(?:"[^"]*' + _DISPLAY_NONE + r'[^"]*"'
-    r"|'[^']*" + _DISPLAY_NONE + r"[^']*')"
+    r'(?:"([^"]*)"|\'([^\']*)\')'
     r'(?:' + _TWS + r'+' + ATTR + r')*' + _TWS + r'*/?>', re.I)
+# The property boundary matters on its own: `--display:none` is a custom
+# PROPERTY and changes nothing, so an unbounded match rejected a live link.
+_DISPLAY_DECL = re.compile(r'(?<![-\w])display' + _TWS + r'*:([^;]*)', re.I)
+_IMPORTANT = re.compile(r'!' + _TWS + r'*important' + _TWS + r'*$', re.I)
+
+
+def _display_none(style):
+    """Whether the EFFECTIVE `display` in an inline style is `none`.
+
+    Measured, all four in Chromium:
+      `display:none; display:block`             -> block  (later wins)
+      `display:block; display:none`             -> none
+      `display:none !important; display:block`  -> none   (important wins)
+      `display:none; display:block !important`  -> block
+
+    KNOWN LIMIT, and it is a false negative: a browser DROPS an invalid
+    declaration, so `display:none; display:bogus` stays hidden, while this
+    takes the later value at face value and calls the element visible. Telling
+    valid `display` values from invalid ones means carrying the keyword list
+    and its multi-keyword forms, which is a CSS engine — the thing this
+    deliberately is not. Inline CSS in this corpus is rare and invalid inline
+    CSS rarer still.
+    """
+    winner, winner_important = None, False
+    for m in _DISPLAY_DECL.finditer(style):
+        value = m.group(1).strip()
+        important = bool(_IMPORTANT.search(value))
+        if important:
+            value = _IMPORTANT.sub('', value).strip()
+        # A later declaration wins, unless an earlier one was `!important`
+        # and this one is not.
+        if important or not winner_important:
+            winner, winner_important = value, important
+    return winner is not None and winner.lower() == 'none'
+
+
+def _style_value(m):
+    """The style attribute's text from a `STYLE_ATTR_OPEN` match."""
+    return m.group(2) if m.group(2) is not None else m.group(3)
+
+
+def style_hidden_search(txt, at):
+    """Next opening tag whose inline style computes to `display:none`."""
+    pos = at
+    while True:
+        m = STYLE_ATTR_OPEN.search(txt, pos)
+        if not m:
+            return None
+        if _display_none(_style_value(m) or ''):
+            return m
+        pos = m.start() + 1
+
+
+def style_hidden_fullmatch(tag):
+    """Whether a complete opening tag hides itself with inline CSS."""
+    m = STYLE_ATTR_OPEN.fullmatch(tag)
+    return m if m and _display_none(_style_value(m) or '') else None
 
 
 def hidden_open(view, src, at):
@@ -1572,7 +1627,7 @@ def hidden_open(view, src, at):
     a = HIDDEN_OPEN.search(view, at)
     b, pos = None, at
     while True:
-        c = STYLE_HIDDEN_OPEN.search(src, pos)
+        c = style_hidden_search(src, pos)
         if not c:
             break
         if c.start() < len(view) and view[c.start()] == '<':
@@ -2034,7 +2089,7 @@ def edges_from(f):
         # is read off `raw` at the same offsets. A tag cannot contain a comment,
         # so taking the raw slice here needs no further guard.
         if (HIDDEN_OPEN.fullmatch(tag.group(0))
-                or STYLE_HIDDEN_OPEN.fullmatch(raw[tag.start():tag.end()])):
+                or style_hidden_fullmatch(raw[tag.start():tag.end()])):
             continue
         # The close is looked for in the MASKED view, not `raw`: an apparent
         # `</a>` inside a script or a comment is content, not a boundary, and
@@ -4296,6 +4351,42 @@ self_test() {
     > "$c9jn/docs/guide/jobs.md"
   git -C "$c9jn" add -A && git -C "$c9jn" commit -qm svg-display-none
   check "inline CSS does hide an svg" fail "$c9jn"
+
+  # A style attribute is a CASCADE: the later declaration wins, so this link
+  # is visible and matching any `display:none` occurrence rejected it.
+  local c9jw="$tmp/c9jw"; make_corpus "$c9jw"
+  printf '# Jobs\n\n<a style="display:none; display:block" href="mail.md">Mail</a>\n' \
+    > "$c9jw/docs/guide/jobs.md"
+  git -C "$c9jw" add -A && git -C "$c9jw" commit -qm cascade-later-wins
+  check "a later display declaration wins" pass "$c9jw"
+
+  # ...in the other order it really is hidden, so the rule is order, not
+  # "an override exists somewhere".
+  local c9jx="$tmp/c9jx"; make_corpus "$c9jx"
+  printf '# Jobs\n\n<a style="display:block; display:none" href="mail.md">Mail</a>\n' \
+    > "$c9jx/docs/guide/jobs.md"
+  git -C "$c9jx" add -A && git -C "$c9jx" commit -qm cascade-none-last
+  check "a later display:none still hides" fail "$c9jx"
+
+  # ...and `!important` beats declaration order, both ways round.
+  local c9jy="$tmp/c9jy"; make_corpus "$c9jy"
+  printf '# Jobs\n\n<a style="display:none !important; display:block" href="mail.md">Mail</a>\n' \
+    > "$c9jy/docs/guide/jobs.md"
+  git -C "$c9jy" add -A && git -C "$c9jy" commit -qm cascade-important-none
+  check "an important display:none beats a later block" fail "$c9jy"
+
+  local c9jz="$tmp/c9jz"; make_corpus "$c9jz"
+  printf '# Jobs\n\n<a style="display:none; display:block !important" href="mail.md">Mail</a>\n' \
+    > "$c9jz/docs/guide/jobs.md"
+  git -C "$c9jz" add -A && git -C "$c9jz" commit -qm cascade-important-block
+  check "an important display:block beats an earlier none" pass "$c9jz"
+
+  # ...and CSS is case-insensitive, so the cascade must be read that way too.
+  local c9ka="$tmp/c9ka"; make_corpus "$c9ka"
+  printf '# Jobs\n\n<a style="DISPLAY:NONE; Display: Block" href="mail.md">Mail</a>\n' \
+    > "$c9ka/docs/guide/jobs.md"
+  git -C "$c9ka" add -A && git -C "$c9ka" commit -qm cascade-case-insensitive
+  check "the cascade is read case-insensitively" pass "$c9ka"
 
   # `--display` is a custom PROPERTY and changes nothing, so the match needs a
   # property boundary — a substring test rejected this live link.
