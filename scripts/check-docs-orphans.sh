@@ -252,7 +252,12 @@ def decode_char_refs(s):
 # label contains a bracket — `[^\]]+` would stop at the escaped one and lose the
 # definition entirely. Same `FLAT` shape the sibling uses for exactly this.
 REF_DEF = re.compile(
-    r'^ {0,3}\[((?:[^\[\]\\]|\\.)+)\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
+    r'^ {0,3}\[((?:[^\[\]\\]|\\.)+)\]:\s*(?:<([^<>]*)>|(\S+))'
+    # A title that OPENS and never closes makes the whole line a paragraph —
+    # there is no definition at all. Truncating at the destination recorded a
+    # target the reader never reaches. Pinned by the repo's
+    # `…_rejects_a_definition_with_an_unterminated_title`.
+    r'(?![ \t]*(?:"[^"\n]*$|\'[^\'\n]*$|\([^)\n]*$))', re.M)
 # The same, extended to the optional title — on the destination's line or the
 # one after it, per CommonMark. Used only to blank the definition's full span.
 REF_DEF_FULL = re.compile(
@@ -347,11 +352,44 @@ FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})(.*)$', re.M)
 CODE_SPAN = re.compile(r'(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)', re.S)
 
 
+def comment_block_spans(txt):
+    """Line ranges covered by a line-initial HTML comment block.
+
+    Fences and comments are both leaf blocks, so whichever OPENS first wins —
+    and this file previously only enforced half of that. Putting fences first
+    stopped a fenced `<!--` sample from commenting out the file; the mirror
+    case then broke, and a ``` displayed INSIDE a comment opened a real fence
+    that swallowed everything after the comment closed. The repo's migration
+    gate hit the same pair in its own review rounds
+    (`…_treats_fences_inside_comments_as_comment_content`).
+    """
+    spans, pos, start = [], 0, None
+    for line in txt.split('\n'):
+        end = pos + len(line)
+        if start is None:
+            if line.lstrip().startswith('<!--'):
+                start = pos
+                if '-->' in line:
+                    spans.append((start, end))
+                    start = None
+        elif '-->' in line:
+            spans.append((start, end))
+            start = None
+        pos = end + 1
+    if start is not None:
+        spans.append((start, len(txt)))
+    return spans
+
+
 def split_fences(txt):
     """Split into ('prose'|'fence', text) segments, in order."""
+    commented = comment_block_spans(txt)
     parts, pos, in_fence, marker = [], 0, False, None
     for m in FENCE.finditer(txt):
         tok, rest = m.group(1), m.group(2)
+        # A fence delimiter inside a comment block is comment content.
+        if any(a <= m.start() < b for a, b in commented):
+            continue
         if not in_fence:
             # A backtick info string may not itself contain a backtick, so
             # ```` ```md`invalid ```` opens nothing — it is ordinary prose, and
@@ -1689,6 +1727,32 @@ self_test() {
   printf '# Jobs\n\nordinary prose\n<div>\n[mail](mail.md)\n' > "$c9cv/docs/guide/jobs.md"
   git -C "$c9cv" add -A && git -C "$c9cv" commit -qm type6-interrupts
   check "a type-6 tag interrupts a paragraph" fail "$c9cv"
+
+  # A fence delimiter inside a comment is comment content, not a fence.
+  local c9cw="$tmp/c9cw"; make_corpus "$c9cw"
+  printf '# Jobs\n\n<!--\n```\n-->\n\nSee [mail](mail.md).\n' > "$c9cw/docs/guide/jobs.md"
+  git -C "$c9cw" add -A && git -C "$c9cw" commit -qm fence-in-comment
+  check "a fence inside a comment does not open a fence" pass "$c9cw"
+
+  # ...and the mirror still holds: a comment sample in a fence opens nothing.
+  local c9cx="$tmp/c9cx"; make_corpus "$c9cx"
+  printf '# Jobs\n\n```\n<!--\n```\n\nSee [mail](mail.md).\n' > "$c9cx/docs/guide/jobs.md"
+  git -C "$c9cx" add -A && git -C "$c9cx" commit -qm comment-in-fence
+  check "a comment sample inside a fence opens no comment" pass "$c9cx"
+
+  # A definition whose title never closes defines nothing.
+  local c9cy="$tmp/c9cy"; make_corpus "$c9cy"
+  printf '# Jobs\n\nSee [mail][m].\n\n[m]: mail.md "unterminated\n' \
+    > "$c9cy/docs/guide/jobs.md"
+  git -C "$c9cy" add -A && git -C "$c9cy" commit -qm unterminated-title
+  check "a definition with an unterminated title defines nothing" fail "$c9cy"
+
+  # ...but a properly terminated one still resolves.
+  local c9cz="$tmp/c9cz"; make_corpus "$c9cz"
+  printf '# Jobs\n\nSee [mail][m].\n\n[m]: mail.md "the mail guide"\n' \
+    > "$c9cz/docs/guide/jobs.md"
+  git -C "$c9cz" add -A && git -C "$c9cz" commit -qm terminated-title
+  check "a definition with a closed title resolves" pass "$c9cz"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
