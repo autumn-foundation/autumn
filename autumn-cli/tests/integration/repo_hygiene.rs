@@ -983,6 +983,83 @@ fn cli_tests_cold_start_ignored_tests_are_ci_named() {
     }
 }
 
+/// Every `sqlite`-gated `[[test]]` target in `autumn/Cargo.toml` must be named
+/// in a CI workflow (issue #1908).
+///
+/// These targets are `#![cfg(feature = "sqlite")]`, so the default
+/// `cargo test --workspace` compiles each to an empty, passing binary. The
+/// backend flip makes a bare `cargo test --features sqlite` unsafe, so the
+/// sqlite job enumerates its targets BY NAME. A target added to `Cargo.toml` but
+/// not to that list therefore never runs anywhere and fails silently forever —
+/// which is how `sqlite_tracked_sessions` shipped dark. This closes the gap for
+/// every future target.
+///
+/// Membership is read from each target's own `#![cfg(...)]` gate rather than a
+/// name prefix, so a sqlite target named otherwise is still covered and a
+/// backend-independent `sim_*` target is not wrongly demanded.
+#[test]
+fn sqlite_test_targets_are_ci_named() {
+    let root = workspace_root();
+    let manifest_path = root.join("autumn/Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", manifest_path.display()));
+
+    // Match the `--test <name>` invocation flag across every workflow, not the
+    // bare name: a mention in a comment must not satisfy the check.
+    let workflows_dir = root.join(".github/workflows");
+    let mut invocations = String::new();
+    for entry in std::fs::read_dir(&workflows_dir)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflows_dir.display()))
+        .flatten()
+    {
+        if let Ok(body) = std::fs::read_to_string(entry.path()) {
+            invocations.push_str(&body.replace('\\', " "));
+            invocations.push(' ');
+        }
+    }
+    let invocations = invocations.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Pair each `[[test]]` name with its path, then keep only the sqlite-gated
+    // ones.
+    let mut name: Option<&str> = None;
+    let mut gated = Vec::new();
+    for line in manifest.lines().map(str::trim) {
+        if let Some(value) = line
+            .strip_prefix("name = \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+        {
+            name = Some(value);
+        } else if let Some(path) = line
+            .strip_prefix("path = \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            && let Some(target) = name.take()
+        {
+            let source = std::fs::read_to_string(root.join("autumn").join(path))
+                .unwrap_or_else(|err| panic!("failed to read {path}: {err}"));
+            if source
+                .lines()
+                .take_while(|l| !l.starts_with("use ") && !l.starts_with("mod "))
+                .any(|l| l.starts_with("#![cfg(") && l.contains(r#"feature = "sqlite""#))
+            {
+                gated.push(target.to_owned());
+            }
+        }
+    }
+    assert!(
+        gated.len() > 20,
+        "expected the sqlite-gated [[test]] targets to be discovered, found {gated:?}"
+    );
+
+    for target in gated {
+        assert!(
+            invocations.contains(&format!("--test {target}")),
+            "a CI workflow must run `--test {target}`; a sqlite-gated target missing from \
+             the sqlite job's named list compiles to an empty binary and never runs — \
+             see issue #1908",
+        );
+    }
+}
+
 #[test]
 fn contributing_documents_ignored_generator_tests() {
     let root = workspace_root();
