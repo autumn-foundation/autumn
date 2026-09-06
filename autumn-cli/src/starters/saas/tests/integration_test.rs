@@ -323,7 +323,8 @@ async fn login_with_wrong_password_preserves_the_remember_choice() {
         .await;
     resp.assert_ok();
     assert!(
-        resp.text().contains(r#"name="remember" value="on" checked"#),
+        resp.text()
+            .contains(r#"name="remember" value="on" checked"#),
         "expected the remember checkbox to stay checked on a failed login, got: {}",
         resp.text()
     );

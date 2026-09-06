@@ -273,8 +273,7 @@ pub async fn login(
         // PR, originally raised against the equivalent signup guard.
         let echoed_email: String = email.chars().take(254).collect();
         return Ok(
-            login_page(&echoed_email, remember, Some("Invalid email or password"))
-                .into_response(),
+            login_page(&echoed_email, remember, Some("Invalid email or password")).into_response(),
         );
     }
 
@@ -293,7 +292,7 @@ pub async fn login(
         None => {
             let _ = verify_password(&form.password, DUMMY_HASH).await;
             return Ok(
-                login_page(&email, remember, Some("Invalid email or password")).into_response()
+                login_page(&email, remember, Some("Invalid email or password")).into_response(),
             );
         }
     };
