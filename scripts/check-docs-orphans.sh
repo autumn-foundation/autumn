@@ -234,6 +234,11 @@ UNESCAPE = re.compile(r'\\([!-/:-@\[-`{-~])')
 # definition entirely. Same `FLAT` shape the sibling uses for exactly this.
 REF_DEF = re.compile(
     r'^ {0,3}\[((?:[^\[\]\\]|\\.)+)\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
+# The same, extended to the optional title — on the destination's line or the
+# one after it, per CommonMark. Used only to blank the definition's full span.
+REF_DEF_FULL = re.compile(
+    r'^ {0,3}\[(?:[^\[\]\\]|\\.)+\]:\s*(?:<[^<>]*>|\S+)'
+    r'(?:[ \t]*\n?[ \t]*(?:"[^"]*"|\'[^\']*\'|\([^()]*\)))?', re.M)
 # ...but a definition only becomes a link the reader can click when some label
 # USES it. A leftover `[old]: mail.md` with no `[…][old]` anywhere renders as
 # nothing at all, so counting it as an edge would let an obsolete line launder a
@@ -433,7 +438,14 @@ def strip_comments(txt):
 HIDDEN_HTML = re.compile(
     r'<(script|style|template)\b[^>]*>.*?</\1\s*>'
     r'|<(?:script|style|template)\b[^>]*>.*', re.S | re.I)
-SRC_ATTR = re.compile(r'\bsrc\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)', re.I)
+# Every attribute value EXCEPT `href`. An attribute is not rendered text, so a
+# path, a reference label or a comment marker parked in one — `<span
+# data-note="[mail](mail.md)">` — is invisible and confers nothing. `href` is
+# excluded because `<a href=…>` is real navigation the anchor extractor reads.
+# This subsumes the old `src`-only rule, which was the same idea applied to one
+# attribute name.
+ATTR_VALUE = re.compile(
+    r'\b(?!href\b)[A-Za-z_:][-\w:.]*\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)', re.I)
 # A whole raw tag, used to bound where `src=` may be masked. Unscoped, that
 # pattern also eats the query of `[Mail](mail.md?src=guide)`, which is an
 # ordinary Markdown link the sibling gate resolves.
@@ -487,7 +499,7 @@ def mask_invisible(txt):
             seg = ''.join(pieces)
 
         blank(HIDDEN_HTML)
-        blank(SRC_ATTR, bound=tags)
+        blank(ATTR_VALUE, bound=tags)
         # Images last, and here rather than at the bare-path scan, so a
         # `![alt](x.md)` SAMPLE in a fence or code span keeps its visible
         # destination while a rendered image does not.
@@ -549,7 +561,12 @@ def edges_from(f):
     # below, so blank their spans first: a bare scan over `[old]: docs/guide/x.md`
     # would re-admit an unused definition that renders as nothing, which is the
     # hole the usage check exists to close.
-    scan = REF_DEF.sub(lambda m: ' ' * len(m.group(0)), txt)
+    # Blanking uses the FULL definition, title included. `REF_DEF` stops at the
+    # destination because that is all resolution needs, but a definition may
+    # carry an optional title — `[old]: https://example.com "docs/guide/x.md"` —
+    # and a title left behind is scanned as a bare path even though the whole
+    # unused definition renders nothing.
+    scan = REF_DEF_FULL.sub(lambda m: ' ' * len(m.group(0)), txt)
     for m in BARE.finditer(scan):
         t = normalize(m.group(1))
         if t in traversable:
@@ -570,17 +587,6 @@ def edges_from(f):
     # all. Nothing a reader can see names the target, so it is not an edge.
     ref_txt = ''.join(seg for kind, seg in split_fences(txt) if kind == 'prose')
     ref_txt = CODE_SPAN.sub(' ', ref_txt)
-    # Raw tags go too. A `[mail]` sitting in an attribute value —
-    # `<span data-note="[mail]">` — is not parsed as a reference link by
-    # Markdown and shows nothing on screen, so it must not keep a definition
-    # alive. Only whole tags are removed, and only from this view: the anchor
-    # extractor reads `txt`, where `<a href=…>` is still intact and still
-    # navigation. Requiring a letter after `<` keeps prose like `a < b` alone.
-    # An HTML tag NAME is letters, digits and hyphens, and ends at whitespace,
-    # `/` or `>`. A looser `<[A-Za-z][^>]*>` also swallows `<mail.md>` — the
-    # angle-wrapped destination of a reference definition — which the self-test
-    # caught immediately.
-    ref_txt = re.sub(r'</?[A-Za-z][A-Za-z0-9-]*(?:\s[^>]*)?/?>', ' ', ref_txt)
 
     used = set()
     for m in REF_USE_FULL.finditer(ref_txt):
@@ -639,9 +645,9 @@ def waiver_view(txt):
     opts out of the check entirely, so it is matched only where an HTML comment
     would actually be an HTML comment.
     """
+    txt = mask_invisible(txt)
     kept = [seg for kind, seg in split_fences(txt) if kind == 'prose']
-    kept = HIDDEN_HTML.sub(lambda m: ' ' * len(m.group(0)), ''.join(kept))
-    return CODE_SPAN.sub(' ', kept)
+    return CODE_SPAN.sub(' ', ''.join(kept))
 
 
 defects, waived = [], 0
@@ -1291,6 +1297,27 @@ self_test() {
     > "$c9br/README.md"
   git -C "$c9br" add -A && git -C "$c9br" commit -qm unclosed-script
   check "an unclosed script block hides the links after it" fail "$c9br"
+
+  # An inline link parked in an attribute value is not navigation.
+  local c9bs="$tmp/c9bs"; make_corpus "$c9bs"
+  printf '# Jobs\n\n<span data-note="[mail](mail.md)">text</span>\n' \
+    > "$c9bs/docs/guide/jobs.md"
+  git -C "$c9bs" add -A && git -C "$c9bs" commit -qm link-in-attribute
+  check "an inline link inside an HTML attribute is not an edge" fail "$c9bs"
+
+  # Nor is a waiver parked in one.
+  local c9bt="$tmp/c9bt"; make_corpus "$c9bt"
+  printf '# Mail\n\n<span data-note="<!-- orphan-allow: fake -->">text</span>\n' \
+    > "$c9bt/docs/guide/mail.md"
+  git -C "$c9bt" add -A && git -C "$c9bt" commit -qm waiver-in-attribute
+  check "a waiver inside an HTML attribute does not exempt the page" fail "$c9bt"
+
+  # An unused definition's TITLE is part of the definition and renders nothing.
+  local c9bu="$tmp/c9bu"; make_corpus "$c9bu"
+  printf '# Jobs\n\ntext\n\n[old]: https://example.com "docs/guide/mail.md"\n' \
+    > "$c9bu/docs/guide/jobs.md"
+  git -C "$c9bu" add -A && git -C "$c9bu" commit -qm refdef-title
+  check "a path in an unused definition's title confers nothing" fail "$c9bu"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
