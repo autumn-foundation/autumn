@@ -86,12 +86,14 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 
 The `console.rs`, `scaffold_encrypted.rs`, `scaffold_validation.rs`, and the 15
 rows above compile into the consolidated `cli_tests` binary. `ci.yml`'s Docker
-sweep explicitly `--skip`s each of their modules (they scaffold and
-cargo-check/build/run a fresh project instead of touching Docker), so they
-are therefore named **explicitly** in
-`.github/workflows/generator-conformance.yml`; a new `#[ignore]`d test in that
-binary which is not added there — and, if it is not a Docker test, not
-skipped in `ci.yml`'s sweep either — will never run in CI (issue #1945).
+sweep explicitly `--skip`s each of their tests **by exact name** — never by
+module prefix, which would also silently swallow any Docker test later added
+to the same file — because they scaffold and cargo-check/build/run a fresh
+project instead of touching Docker. They are therefore named **explicitly**
+in `.github/workflows/generator-conformance.yml`; a new `#[ignore]`d,
+non-Docker test in that binary needs BOTH a `--skip <exact name>` line in
+`ci.yml`'s sweep AND its own step here, or it either runs in the wrong
+(Docker) step or never runs at all (issue #1945).
 
 ### Why `#[ignore]`?
 

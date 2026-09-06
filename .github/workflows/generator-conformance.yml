@@ -48,6 +48,12 @@ on:
       # listed anyway to match this file's per-test-file convention.
       - "autumn-cli/src/routes_audit.rs"
       - "autumn-cli/src/serve.rs"
+      # serve.rs's daemon lifecycle test also directly exercises these three
+      # (RuntimePaths, PID-file/process liveness checks, and the
+      # build/find-binary helpers `autumn serve` shells out to).
+      - "autumn-cli/src/paths.rs"
+      - "autumn-cli/src/process.rs"
+      - "autumn-cli/src/dev.rs"
       - "autumn-cli/tests/integration/api_scaffold.rs"
       - "autumn-cli/tests/integration/cloud_native_scaffold.rs"
       - "autumn-cli/tests/integration/generate_position_scaffold.rs"
@@ -106,6 +112,12 @@ on:
       # listed anyway to match this file's per-test-file convention.
       - "autumn-cli/src/routes_audit.rs"
       - "autumn-cli/src/serve.rs"
+      # serve.rs's daemon lifecycle test also directly exercises these three
+      # (RuntimePaths, PID-file/process liveness checks, and the
+      # build/find-binary helpers `autumn serve` shells out to).
+      - "autumn-cli/src/paths.rs"
+      - "autumn-cli/src/process.rs"
+      - "autumn-cli/src/dev.rs"
       - "autumn-cli/tests/integration/api_scaffold.rs"
       - "autumn-cli/tests/integration/cloud_native_scaffold.rs"
       - "autumn-cli/tests/integration/generate_position_scaffold.rs"
