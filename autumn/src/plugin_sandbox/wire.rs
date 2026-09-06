@@ -898,7 +898,7 @@ pub(crate) enum GuestFrame {
         /// the root of that tree, so leaving it unbounded left the whole point
         /// of bounding the branches unfinished.
         #[serde(
-            deserialize_with = "super::capability::bounded_vec::<_, _, { super::capability::render::MAX_NODES }>"
+            deserialize_with = "super::capability::bounded_tree::<_, { super::capability::render::MAX_NODES }>"
         )]
         nodes: Vec<super::capability::FragmentNode>,
     },

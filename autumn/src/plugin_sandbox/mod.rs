@@ -142,6 +142,9 @@ pub fn __fuzz_parse_manifest(src: &str) -> bool {
 #[doc(hidden)]
 #[must_use]
 pub fn __fuzz_render_fragment(line: &str) -> bool {
+    // The same reservation the wire path makes, so the fuzzer exercises the
+    // parse the host actually runs rather than an unbounded one.
+    let _budget = capability::FragmentNodeBudget::reserve(capability::render::MAX_NODES);
     let Ok(nodes) = serde_json::from_str::<Vec<capability::FragmentNode>>(line) else {
         return false;
     };

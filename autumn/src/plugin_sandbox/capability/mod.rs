@@ -177,6 +177,114 @@ pub enum PluginValue {
     Text(String),
 }
 
+thread_local! {
+    /// Nodes still allowed in the fragment tree currently being deserialized.
+    ///
+    /// A thread-local rather than a parameter because `deserialize_with` takes
+    /// only a `Deserializer`, and the budget has to be shared by a vector and
+    /// every vector nested inside it. Each request runs on its own blocking
+    /// thread, so there is no sharing between plugins, and the guard below
+    /// restores the previous value on the way out — including on the error
+    /// path, which is the common one here.
+    static FRAGMENT_NODE_BUDGET: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// Reserve a whole-tree node budget for as long as this value lives.
+pub struct FragmentNodeBudget(usize);
+
+impl FragmentNodeBudget {
+    /// Start a fragment parse with `limit` nodes for the entire tree.
+    #[must_use]
+    pub fn reserve(limit: usize) -> Self {
+        Self(FRAGMENT_NODE_BUDGET.with(|budget| budget.replace(limit)))
+    }
+}
+
+impl Drop for FragmentNodeBudget {
+    fn drop(&mut self) {
+        FRAGMENT_NODE_BUDGET.with(|budget| budget.set(self.0));
+    }
+}
+
+/// Deserialize the *root* of a fragment tree, reserving a budget for all of it.
+///
+/// # Errors
+///
+/// When the tree carries more than `LIMIT` nodes in total.
+pub fn bounded_tree<'de, D, const LIMIT: usize>(
+    deserializer: D,
+) -> Result<Vec<render::FragmentNode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _budget = FragmentNodeBudget::reserve(LIMIT);
+    bounded_subtree(deserializer)
+}
+
+/// Deserialize nodes against the budget the root reserved.
+///
+/// Per-vector ceilings were not enough, and this is the third pass over the
+/// same ground: bounding each `children` vector at `MAX_NODES` still admits
+/// `MAX_NODES` of them nested inside each other, so a frame within the stdout
+/// budget deserialized hundreds of thousands of nodes and was refused only
+/// afterwards, by `render`, on the aggregate. The count has to be shared by the
+/// whole tree or it is not a bound on the tree at all.
+///
+/// # Errors
+///
+/// When the tree's shared budget runs out.
+pub fn bounded_subtree<'de, D>(deserializer: D) -> Result<Vec<render::FragmentNode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error as _, SeqAccess, Visitor};
+
+    struct Bounded;
+
+    impl<'de> Visitor<'de> for Bounded {
+        type Value = Vec<render::FragmentNode>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {} nodes in the whole fragment",
+                render::MAX_NODES
+            )
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            // Read, then charge -- not the other way round. Charging first
+            // meant the probe that discovers the *end* of the sequence was
+            // itself charged, so a vector holding exactly the budget was
+            // refused for being one over it. An element's own children are
+            // charged as they are read, inside this same call, so the tree is
+            // still bounded while it is built rather than after.
+            while let Some(node) = seq.next_element()? {
+                let spent = FRAGMENT_NODE_BUDGET.with(|budget| {
+                    let left = budget.get();
+                    if left == 0 {
+                        return false;
+                    }
+                    budget.set(left.saturating_sub(1));
+                    true
+                });
+                if !spent {
+                    return Err(A::Error::custom(format!(
+                        "more than {} nodes in the fragment",
+                        render::MAX_NODES
+                    )));
+                }
+                out.push(node);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(Bounded)
+}
+
 /// Deserialize a `Vec` that refuses to grow past `LIMIT` while it is being read.
 ///
 /// A structural ceiling checked *after* `serde_json` has built the collection
@@ -2707,6 +2815,62 @@ path = "/shop/panel"
                 "{table} was allowed"
             );
         }
+    }
+
+    #[test]
+    fn the_node_ceiling_counts_the_whole_tree_not_each_vector() {
+        // Third pass over this ground, and the one that makes the count mean
+        // what it says. Bounding each `children` vector at `MAX_NODES`
+        // separately still admitted many such vectors, so a frame well inside
+        // the stdout budget deserialized far more than `MAX_NODES` nodes and
+        // was refused only afterwards, on the aggregate, by `render` — after
+        // `serde_json` had built the whole tree.
+        //
+        // Wide and shallow on purpose. Deep nesting is refused by
+        // `serde_json`'s own recursion limit long before any of this is
+        // reached, so a deep tree would pass whether or not the budget is
+        // shared — which is exactly what the first version of this test did.
+        let leaves = std::iter::repeat_n(r#"{"node":"text","text":"x"}"#, 8)
+            .collect::<Vec<_>>()
+            .join(",");
+        let branch = format!(r#"{{"node":"element","tag":"p","children":[{leaves}]}}"#);
+        // 128 branches of 9 nodes each: every vector is inside `MAX_NODES`, and
+        // the tree is over four times it.
+        let wide = std::iter::repeat_n(branch.as_str(), 128)
+            .collect::<Vec<_>>()
+            .join(",");
+        let line = format!(r#"{{"op":"fragment","nodes":[{wide}]}}"#);
+        let parsed = crate::plugin_sandbox::wire::from_line::<
+            crate::plugin_sandbox::wire::GuestFrame,
+        >(&line);
+        assert!(
+            parsed.is_err(),
+            "a tree past the node ceiling must be refused while it is read, not after"
+        );
+
+        // A tree inside the ceiling still parses, so the budget is not simply
+        // refusing anything with children.
+        let small = std::iter::repeat_n(branch.as_str(), 4)
+            .collect::<Vec<_>>()
+            .join(",");
+        let line = format!(r#"{{"op":"fragment","nodes":[{small}]}}"#);
+        assert!(
+            crate::plugin_sandbox::wire::from_line::<crate::plugin_sandbox::wire::GuestFrame>(
+                &line
+            )
+            .is_ok(),
+            "a fragment inside the ceiling must still parse"
+        );
+
+        // Twice on the same thread: the budget is thread-local, so the failed
+        // parse above must not have left this one poorer.
+        assert!(
+            crate::plugin_sandbox::wire::from_line::<crate::plugin_sandbox::wire::GuestFrame>(
+                &line
+            )
+            .is_ok(),
+            "the budget must be restored after each parse"
+        );
     }
 
     #[test]

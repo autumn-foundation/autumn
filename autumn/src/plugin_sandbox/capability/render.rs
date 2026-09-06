@@ -134,7 +134,10 @@ pub enum FragmentNode {
         )]
         attributes: Vec<(String, String)>,
         /// Children.
-        #[serde(default, deserialize_with = "super::bounded_vec::<_, _, MAX_NODES>")]
+        ///
+        /// Bounded against a budget shared by the *whole* tree, not per vector:
+        /// see [`bounded_subtree`](super::bounded_subtree).
+        #[serde(default, deserialize_with = "super::bounded_subtree")]
         children: Vec<Self>,
     },
 }
