@@ -1698,6 +1698,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spawn site queries fleet-distribution through a named
   `SchedulerCoordinator`/`SchedulerBackend` predicate instead of matching the
   scheduler config enum inline.
+- **ci:** the test suite is now **sharded across runners** instead of running as
+  one job per OS [no-plugin] — CI scheduling only; it adds no framework surface
+  an agent could reach for, and the notes for humans editing tests live in
+  CLAUDE.md rather than the plugin. On the 2026-08-26 trunk run
+  `Test (windows-latest)` alone was 128 minutes and *was* the critical path of a
+  2h27m run. Two things dominated, both measured from that run's logs. First,
+  `compile_fail::` (trybuild) was 37.1 of the 46.8 minutes the consolidated
+  `integration_tests` binary spent running on Windows, and it was the *tail* —
+  the binary finished 0.2s after trybuild did, on every OS. Each case shells out
+  a nested `cargo` build and trybuild serialises them behind a project-dir lock,
+  so only more runners make it faster. Second, the eight non-default feature
+  lanes ran in sequence in that same job, ~44 minutes of pure recompilation on
+  Windows despite being independent builds.
+
+  `test` is now four job families running side by side — `test` (the workspace
+  suite), `trybuild` (four shards), `test-features` (one job per feature set)
+  and `test-docker` — behind one aggregate `Test suite` gate. First fully-green
+  sharded run: **2h27m → 1h57m**. `trybuild`, `test-features` and `coverage`
+  were then narrowed further: the first two to Linux only (a trybuild golden is
+  pinned to the rustc version, not the OS; a feature lane asks about a feature,
+  not a platform), and `coverage` — by then a co-equal 55-minute tail — split
+  into four lanes by feature set, each uploading under its own Codecov flag.
+  That took the workflow from 47 expanded jobs to 32. Those three changes land
+  after the 1h57m measurement, so the new total is not yet measured.
+
+  Test-layout consequences, all of which keep every test running and
+  merge-blocking: `compile_pass_tests` split into `_a`/`_b` (a disjoint split of
+  the same fixture list, no fixture added or removed); the `sim_*` determinism
+  modules got a single-threaded second step, because removing trybuild freed the
+  libtest thread pool and the remaining ~1880 tests went from trickling through
+  trybuild's gaps (863s) to full parallelism (61s), enough to flip them on a
+  4-vCPU runner; and `capsule_cache_effect` moved to its own binary, because it
+  installs a process-global cache that any concurrent `TestApp::build` clears.
+  Every shard runs `cargo test --workspace` deliberately — the trybuild fixture
+  list is `#[cfg(feature = ...)]`-gated, so narrowing a shard would silently
+  compile fewer fixtures and still report green — and each asserts a non-zero
+  pass count, because `cargo test` exits 0 when a filter matches nothing.
+  **Branch protection must be repointed** from the per-OS `Test (…)` checks to
+  `Test suite` (`test-gate`), the one name that stays stable as shards come and
+  go.
 - **plugin-conformance:** **Breaking:** `plugin_conformance::ConformanceConfig`
   gains a `contract` field and is now `#[non_exhaustive]`, so it can no longer
   be built with a struct literal — use `ConformanceConfig::new(name)` and the
@@ -3582,6 +3622,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **new `throttle_check` profiling harness; findings, no fix:** added
+  `autumn/benches/throttle_check.rs`, driving real traffic through a
+  `#[throttle]`-guarded route and an identical unthrottled route at
+  equal-length paths with an identical response body (issue #1350's
+  per-route rate limiter had no committed benchmark before this). Several
+  review rounds fixed real measurement bugs before these numbers were final:
+  `key = "token"` with an identical `Authorization: Bearer` header sent to
+  BOTH routes (not `key = "ip"` — `TestApp` requests carry no `ConnectInfo`,
+  which would make `extract_throttle_key` return `None` and profile
+  `__check_throttle`'s no-client bypass instead of the real
+  `limiter.decide()` path; and not an asymmetric header, which would fold
+  its own construction cost into the measurement); equal-length routes/body
+  (`/route-a`/`/route-b`, both `"ok"`), since differently-sized paths and
+  response bodies also leaked into the byte delta; a `THROTTLE_LIMIT` guard
+  plus an assertion on every measured response, so a large `--iterations`
+  can never silently drain the bucket and profile denials instead of the
+  documented warm `Decision::Allowed` path; asserting (not just
+  `black_box`ing) the measured status on BOTH routes, since an earlier
+  version asserted only the throttled side, putting that assertion's own
+  comparison/branch instructions asymmetrically into the callgrind delta;
+  and widening the frame-level DHAT attribution beyond `rate_limit::`-named
+  frames to also catch `#[throttle]`'s generated `FromRequestParts` gate
+  cloning `parts.headers` *before* ever calling into the `rate_limit` module
+  (`autumn-macros/src/throttle.rs`), which the first attribution pass missed
+  entirely; and base-subtracting the callgrind instruction counts (an
+  `--iterations 0` run per route, matching the DHAT methodology) rather than
+  dividing raw process totals by request count, which had been diluting both
+  routes' per-request figures with shared process-startup/router-construction
+  cost. Full, corrected `#[throttle]` overhead against the
+  ~140-151-block/~27.3-28.7KB per-request baseline `config_alloc_gate`
+  already gates (#2232): ~10 blocks / ~885 bytes per request (~6.6%/~3.1%,
+  under the 10%-of-allocations floor) and ~5.3% more instructions than an
+  unthrottled route on the marginal, base-subtracted count (callgrind,
+  `--route throttled` vs. `--route plain`) — which, read as "would a fix
+  removing this entire overhead clear the 5%-of-instructions floor,"
+  technically says yes, though only just. But no *safe, autonomous,
+  smallest-fix* candidate gets there: the only narrowly-scoped,
+  mechanistically-clear piece —
+  two redundant `format!` calls building an almost-always-cache-hit
+  `HashMap` key (`resolve_throttle_params`'s `registry_key`,
+  `__check_throttle`'s `cache_key`) — accounts for only ~6 of those ~10
+  blocks and isn't separately visible above a 1%-of-instructions self-cost
+  threshold on its own. The rest (two `HeaderMap` clones, one in the
+  generated gate and one in `extract_throttle_key`, plus the LRU-backed
+  `MemoryStore::decide` bucket lookup) is load-bearing rate-limiting state
+  tracking, not an obvious redundancy, and this bench's minimal 1-2-header
+  requests likely *understate* the gate's `parts.headers.clone()` cost for
+  a real multi-header production request. Fixing the aggregate would mean
+  restructuring the limiter's per-request key derivation and bucket-lookup
+  path together — a maintainer decision on a security-relevant surface, not
+  an unreviewed autonomous change. Recorded as a findings issue rather than
+  shipped; the harness itself is the lasting artifact, giving `#[throttle]`
+  its first profiling coverage.
 - **new `repository_crud` profiling harness; findings, no fix (#2486):** added
   `autumn/benches/repository_crud.rs`, driving real `save`/`find_by_id`/`page`
   calls through a `#[repository]`-generated repository against a live
