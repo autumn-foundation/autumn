@@ -152,7 +152,23 @@ MD_LINK = re.compile(r'\]\(\s*<?([^)\s<>#]+\.md)')
 # check-docs-links.sh already parses and self-tests, so a page linked only that
 # way is genuinely reachable; without this the gate would report it as an
 # orphan and block a docs change written in a spelling the corpus supports.
-REF_DEF = re.compile(r'^ {0,3}\[[^\]]+\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
+REF_DEF = re.compile(r'^ {0,3}\[([^\]]+)\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
+# ...but a definition only becomes a link the reader can click when some label
+# USES it. A leftover `[old]: mail.md` with no `[…][old]` anywhere renders as
+# nothing at all, so counting it as an edge would let an obsolete line launder a
+# genuinely orphaned page past this gate — the failure direction that matters,
+# since it is the one the gate exists to catch. Collect the labels actually
+# used, in all three CommonMark spellings, and resolve only those definitions.
+#   full:      [text][label]
+#   collapsed: [label][]
+#   shortcut:  [label]        (not followed by `(`, `[` or `:`)
+REF_USE_FULL = re.compile(r'\[[^\]]*\]\[([^\]]*)\]')
+REF_USE_SHORTCUT = re.compile(r'\[([^\]]+)\](?![\(\[:])')
+
+
+def ref_label(s):
+    """CommonMark label matching: case-insensitive, internal whitespace collapsed."""
+    return ' '.join(s.split()).lower()
 # A bare repo path. The leading guard keeps `…/docs/guide/x.md` inside a longer
 # path from matching at the wrong offset.
 BARE = re.compile(r'(?<![\w/.-])(docs/guide/[A-Za-z0-9._/-]+\.md)')
@@ -196,8 +212,19 @@ def edges_from(f):
 
     for m in MD_LINK.finditer(txt):
         add_relative(m.group(1))
+
+    used = set()
+    for m in REF_USE_FULL.finditer(txt):
+        # `[label][]` (collapsed) leaves group 1 empty; the label is the text.
+        inner = m.group(1)
+        used.add(ref_label(inner) if inner.strip()
+                 else ref_label(m.group(0)[1:m.group(0).index(']')]))
+    for m in REF_USE_SHORTCUT.finditer(txt):
+        used.add(ref_label(m.group(1)))
     for m in REF_DEF.finditer(txt):
-        add_relative(m.group(1) if m.group(1) is not None else m.group(2))
+        if ref_label(m.group(1)) not in used:
+            continue
+        add_relative(m.group(2) if m.group(2) is not None else m.group(3))
     return out
 
 
@@ -341,6 +368,30 @@ self_test() {
     > "$c9c/README.md"
   git -C "$c9c" add -A && git -C "$c9c" commit -qm ref-style-indented-anchor
   check "an indented reference definition with an anchor counts as an edge" pass "$c9c"
+
+  # An unused definition renders as nothing, so it must NOT confer reachability
+  # — otherwise a leftover line launders a genuinely orphaned page past the gate.
+  local c9e="$tmp/c9e"; make_corpus "$c9e"
+  printf '# Jobs\n\ntext\n\n[old]: mail.md\n' > "$c9e/docs/guide/jobs.md"
+  git -C "$c9e" add -A && git -C "$c9e" commit -qm ref-style-unused
+  check "an unused reference definition does not make a page reachable" fail "$c9e"
+
+  local c9f="$tmp/c9f"; make_corpus "$c9f"
+  printf '# Jobs\n\nSee [mail][].\n\n[mail]: mail.md\n' > "$c9f/docs/guide/jobs.md"
+  git -C "$c9f" add -A && git -C "$c9f" commit -qm ref-style-collapsed
+  check "a collapsed reference link [label][] counts as an edge" pass "$c9f"
+
+  local c9g="$tmp/c9g"; make_corpus "$c9g"
+  printf '# Jobs\n\nSee [mail].\n\n[mail]: mail.md\n' > "$c9g/docs/guide/jobs.md"
+  git -C "$c9g" add -A && git -C "$c9g" commit -qm ref-style-shortcut
+  check "a shortcut reference link [label] counts as an edge" pass "$c9g"
+
+  # Label matching is case-insensitive and collapses internal whitespace.
+  local c9h="$tmp/c9h"; make_corpus "$c9h"
+  printf '# Jobs\n\nSee [the  Mail][Mail  Guide].\n\n[mail guide]: mail.md\n' \
+    > "$c9h/docs/guide/jobs.md"
+  git -C "$c9h" add -A && git -C "$c9h" commit -qm ref-style-label-normalized
+  check "reference labels match case- and whitespace-insensitively" pass "$c9h"
 
   # The definition must still name a real node — a reference to something else
   # does not launder an unreachable page into reachability.

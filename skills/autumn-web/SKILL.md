@@ -1249,8 +1249,14 @@ Two things to get right when generating this code:
 - **`dispatch()` is not transactional.** It writes a delivery-log row per
   subscription and *then* enqueues the job; no transaction spans the pluggable
   store and the queue, so a crash between the two leaves a logged event that was
-  never enqueued. Do not present it to a user as an outbox guarantee. An enqueue
-  that fails is marked `is_dlq` and is replayable.
+  never enqueued. Do not present it to a user as an outbox guarantee, and do not
+  write a reconciler over the log table to claim one: a successful enqueue
+  writes no marker, so an enqueued row is indistinguishable from one whose
+  process died first, and a sweeper can only duplicate or drop. For stronger
+  guarantees implement `OutboundWebhookHandler` over storage that commits the log
+  write and the enqueue together; make receivers idempotent on the event ID
+  either way, since retries make delivery at-least-once regardless. An enqueue
+  that fails is the one handled case — marked `is_dlq` and replayable.
 
 Do not
 hand-roll outbound delivery with a bare HTTP client — the user-supplied
