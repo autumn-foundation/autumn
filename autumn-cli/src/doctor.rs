@@ -3571,8 +3571,10 @@ fn check_database_topology_contract(
 ///
 /// A split web/worker role runs the HTTP tier and the job/scheduler tier in
 /// **separate processes**, so it needs a durable jobs backend the two processes
-/// can share. Only the recognized durable backends (`postgres`/`redis`) qualify;
-/// any other value — the in-process `local` queue, a typo like `postgresql`, or a
+/// can share. Only the recognized durable backends
+/// (`postgres`/`redis`/`sqlite`) qualify — `sqlite` because its queue is a table
+/// both processes on the host open (issue #1907). Any other value — the
+/// in-process `local` queue, a typo like `postgresql`, or a
 /// blank backend — falls through to the per-process local runtime, where a web
 /// replica's enqueue never reaches a worker replica's queue.
 /// [`autumn_web::config::split_role_requires_durable_backend`] flags that invalid
@@ -3585,13 +3587,13 @@ fn check_split_topology_on_local(role: ProcessRole, jobs_backend: &str) -> Check
             status: CheckStatus::Fail,
             detail: Some(format!(
                 "role={} with jobs.backend=\"{backend}\": a split web/worker role needs a durable \
-                 (postgres/redis) jobs backend; \"{backend}\" is not a recognized durable backend \
-                 and falls through to the in-process `local` runtime, which cannot share a job \
-                 queue across the separate web and worker processes",
+                 (postgres/redis/sqlite) jobs backend; \"{backend}\" is not a recognized durable \
+                 backend and falls through to the in-process `local` runtime, which cannot share a \
+                 job queue across the separate web and worker processes",
                 role.as_str(),
             )),
             hint: Some(
-                "Set jobs.backend = \"postgres\" (or redis) for split web/worker roles, or run the combined role",
+                "Set jobs.backend = \"postgres\" (or redis, or sqlite on the single-host SQLite tier) for split web/worker roles, or run the combined role",
             ),
         };
     }
@@ -5407,12 +5409,15 @@ fn resolve_deploy_previous_signing_secrets(merged: &toml::Table) -> Result<Vec<S
     Ok(out)
 }
 
-/// Whether any enabled runtime feature requires a configured Postgres pool at
+/// Whether any enabled runtime feature requires a configured database pool at
 /// startup, resolved from the merged active-profile runtime table (env first).
 /// Mirrors the exact backend conditions the runtime enforces:
 /// - `jobs.backend = "postgres"` → `job::start_postgres_runtime` requires a pool.
 /// - `scheduler.backend = "postgres"` → `scheduler::coordinator_from_config`
 ///   requires a pool.
+/// - `jobs.backend = "sqlite"` / `scheduler.backend = "sqlite"` → the durable
+///   `SQLite` queue and lease table live in the app's own database, so both
+///   require a pool too (issue #1907).
 ///
 /// Cache, channels, and idempotency have only in-memory/Redis backends (no
 /// Postgres variant), so they never require a DB pool.
@@ -5423,20 +5428,28 @@ fn resolve_deploy_db_backed_runtime(
     let env_var = |key: &str| env.var(key).ok().filter(|value| !value.is_empty());
 
     let jobs = merged.get("jobs").and_then(toml::Value::as_table);
-    let jobs_postgres = first_env(&env_var, &["AUTUMN_JOBS__BACKEND"])
-        .or_else(|| first_toml_string(jobs, &["backend"]))
-        .as_deref()
-        .map(str::trim)
-        == Some("postgres");
+    let jobs_db_backed = matches!(
+        first_env(&env_var, &["AUTUMN_JOBS__BACKEND"])
+            .or_else(|| first_toml_string(jobs, &["backend"]))
+            .as_deref()
+            .map(str::trim),
+        Some("postgres" | "sqlite")
+    );
 
     let scheduler = merged.get("scheduler").and_then(toml::Value::as_table);
-    let scheduler_postgres = first_env(&env_var, &["AUTUMN_SCHEDULER__BACKEND"])
+    let scheduler_db_backed = first_env(&env_var, &["AUTUMN_SCHEDULER__BACKEND"])
         .or_else(|| first_toml_string(scheduler, &["backend"]))
         .as_deref()
         .and_then(autumn_web::config::SchedulerBackend::from_env_value)
-        .is_some_and(|backend| backend == autumn_web::config::SchedulerBackend::Postgres);
+        .is_some_and(|backend| {
+            matches!(
+                backend,
+                autumn_web::config::SchedulerBackend::Postgres
+                    | autumn_web::config::SchedulerBackend::Sqlite
+            )
+        });
 
-    jobs_postgres || scheduler_postgres
+    jobs_db_backed || scheduler_db_backed
 }
 
 fn resolve_trusted_hosts() -> Vec<String> {
@@ -15378,6 +15391,17 @@ foo = "bar"
         let detail = result.detail.unwrap_or_default();
         assert!(detail.contains("role=worker"), "got: {detail}");
         assert!(detail.contains("redis"), "got: {detail}");
+    }
+
+    /// Issue #1907: the durable SQLite queue is a table both processes on the
+    /// host open, so it backs a split role.
+    #[test]
+    fn split_topology_passes_for_worker_role_on_sqlite_backend() {
+        let result = check_split_topology_on_local(ProcessRole::Worker, "sqlite");
+        assert_eq!(result.status, CheckStatus::Pass);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("role=worker"), "got: {detail}");
+        assert!(detail.contains("sqlite"), "got: {detail}");
     }
 
     #[test]

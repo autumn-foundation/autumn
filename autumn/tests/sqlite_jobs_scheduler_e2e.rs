@@ -1,44 +1,45 @@
 //! End-to-end proof that durable jobs and the single-host scheduler run on the
-//! `SQLite` backend via the in-process substitutes (issue #1907).
+//! `SQLite` backend (issue #1907).
 //!
 //! Issue #1907 asks for a single-host scheduling strategy — in-process
 //! coordination or file/table-based locking — to replace the Postgres
-//! advisory-lock approach so jobs and scheduled tasks run correctly on `SQLite`.
-//! That substrate already ships and is the documented `SQLite` default:
+//! advisory-lock approach, so jobs and scheduled tasks run correctly on
+//! `SQLite`. This suite covers both halves of that answer.
 //!
-//! - `jobs.backend = "local"` (the default) drives an in-process Tokio queue —
-//!   no Postgres `LISTEN/NOTIFY`, `FOR UPDATE SKIP LOCKED`, or advisory locks.
-//! - `scheduler.backend = "in_process"` (the default) coordinates ticks with
+//! **The in-process substitutes** (tests 1-3) are the defaults, and cost
+//! nothing to run:
+//!
+//! - `jobs.backend = "local"` drives an in-process Tokio queue — no Postgres
+//!   `LISTEN/NOTIFY`, `FOR UPDATE SKIP LOCKED`, or advisory locks.
+//! - `scheduler.backend = "in_process"` coordinates ticks with
 //!   [`InProcessSchedulerCoordinator`], which needs no `pg_advisory_lock`.
-//! - The Postgres-only paths are explicitly refused under the `sqlite` feature
-//!   with actionable messages, rather than mis-typed against a `SQLite` pool.
+//! - The Postgres-only paths are refused under the `sqlite` feature with
+//!   actionable messages, rather than mis-typed against a `SQLite` pool.
 //!
-//! This test confirms the ask is satisfied on a real `SQLite` pool/app:
+//! **The durable, table-backed substitutes** (tests 4-15) are what an app picks
+//! when work must survive a restart or be shared by two processes on the host:
 //!
-//! 1. **Jobs (true enqueue → run)** — a real `SQLite` pool backs an [`AppState`],
-//!    the default `local` job runtime is started, a job is enqueued through the
-//!    public [`job::enqueue`] path, and it is driven to completion: the handler
-//!    body actually executes (a process-global counter is incremented) and the
-//!    admin backend records exactly one completion.
-//! 2. **Scheduler (acquire → run → release)** — the default `in_process`
-//!    coordinator is built from config against the same `SQLite`-backed
-//!    `AppState`, grants a lease for a task tick, the task body runs under the
-//!    lease, and the lease releases cleanly — mirroring what the scheduler
-//!    runtime's `execute_fixed_delay_task` does per tick.
-//! 3. **Postgres-only paths are refused under `SQLite`** — building a
-//!    `scheduler.backend = "postgres"` coordinator, starting a
-//!    `jobs.backend = "postgres"` runtime, and taking an advisory
-//!    [`lock::Lock`] all return the documented actionable errors, confirming
-//!    the guards cited on #1907.
+//! - `jobs.backend = "sqlite"` keeps the queue in `autumn_jobs` in the app's own
+//!   file. Tests cover a job running end to end, durability across a restart,
+//!   recovery of a claim a crashed worker left behind, retry-then-dead-letter,
+//!   delayed enqueues, exactly-once claiming under four competing workers,
+//!   uniqueness coalescing, concurrency limits, and the table-backed dashboard.
+//! - `scheduler.backend = "sqlite"` leases each `(task, tick)`, so exactly one
+//!   of two coordinators wins a tick, a released tick frees, a per-replica task
+//!   never contends, and an expired lease is stealable.
 //!
-//! Boundary note: parts 1 and 2 exercise the runtime primitives through their
-//! public entry points (`job::start_runtime` + `job::enqueue`;
-//! `scheduler::coordinator_from_config` + `SchedulerCoordinator::try_acquire`).
-//! Registering a `#[scheduled]` task and letting the app's scheduler loop fire
-//! it is an `AppBuilder`-level concern exercised elsewhere; here we drive the
-//! coordinator directly (the exact acquire/run/release the loop performs) so the
-//! single-host coordination path itself is asserted on `SQLite` without booting a
-//! full timer loop.
+//! Boundary note: the scheduler tests drive the coordinator directly — the exact
+//! acquire/run/release the scheduler loop performs per tick — so the
+//! coordination path is asserted without booting a full timer loop. Registering
+//! a `#[scheduled]` task and letting the app's loop fire it is an
+//! `AppBuilder`-level concern exercised elsewhere.
+//!
+//! The job client is process-global, so every test that installs a runtime holds
+//! [`job::global_job_runtime_test_lock`] for its duration.
+//!
+//! A **file** target (tempfile) is deliberate throughout: an in-memory `SQLite`
+//! database is private per connection, so a second process — or a restarted one —
+//! would see nothing.
 //!
 //! Run it explicitly (never via a members-enable edge — that would trip the
 //! feature-unification hazard):
@@ -56,7 +57,9 @@ use std::time::Duration;
 use autumn_web::AppState;
 use autumn_web::config::{DatabaseConfig, JobConfig, SchedulerBackend, SchedulerConfig};
 use autumn_web::db::{RuntimeConnection, create_pool};
-use autumn_web::job::{self, JobAdminQuery, JobInfo};
+use autumn_web::job::{
+    self, JobAdminQuery, JobConcurrency, JobInfo, JobUniqueness, JobUniquenessWindow,
+};
 use autumn_web::lock;
 use autumn_web::scheduler;
 use autumn_web::task::TaskCoordination;
@@ -88,6 +91,9 @@ fn build_sqlite_pool(tmp: &tempfile::TempDir) -> SqlitePool {
 /// completion on a `SQLite`-backed app — no Postgres queue primitives involved.
 #[tokio::test]
 async fn local_job_backend_runs_a_job_end_to_end_on_sqlite() {
+    // The job client is process-global, so runtime-installing tests in this
+    // binary must not overlap.
+    let _guard = job::global_job_runtime_test_lock().lock().await;
     JOB_RAN.store(0, Ordering::SeqCst);
 
     let tmp = tempfile::TempDir::new().expect("temp dir");
@@ -160,6 +166,7 @@ async fn local_job_backend_runs_a_job_end_to_end_on_sqlite() {
     );
 
     shutdown.cancel();
+    job::clear_global_job_client();
 }
 
 /// (2) The default `in_process` scheduler coordinator grants a lease, the task
@@ -224,6 +231,7 @@ async fn in_process_scheduler_coordinator_fires_a_task_on_sqlite() {
 /// #1907 that redirect operators to the in-process substitutes.
 #[tokio::test]
 async fn postgres_only_coordination_is_refused_under_sqlite() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
     let tmp = tempfile::TempDir::new().expect("temp dir");
     let pool = build_sqlite_pool(&tmp);
     let state = AppState::for_test().with_profile("dev").with_pool(pool);
@@ -254,8 +262,12 @@ async fn postgres_only_coordination_is_refused_under_sqlite() {
         .expect_err("a postgres job runtime must be refused under sqlite");
     let msg = err.to_string();
     assert!(
+        msg.contains("jobs.backend=sqlite"),
+        "the refusal points at the durable sqlite queue; got: {msg}"
+    );
+    assert!(
         msg.contains("jobs.backend=local"),
-        "the refusal points at the local substitute; got: {msg}"
+        "the refusal also names the in-process substitute; got: {msg}"
     );
 
     // Advisory locks require the Postgres backend. (`Lock` is not `Debug`.)
@@ -267,4 +279,798 @@ async fn postgres_only_coordination_is_refused_under_sqlite() {
         msg.contains("advisory locks require the Postgres backend"),
         "the advisory-lock refusal names the Postgres requirement; got: {msg}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Durable SQLite job backend (`jobs.backend = "sqlite"`) and the single-host
+// lease scheduler (`scheduler.backend = "sqlite"`) — issue #1907.
+//
+// The `local` backend above is in-process: a restart loses queued work, and two
+// processes on one host share nothing. These tests cover the durable substitute
+// the SQLite tier promises — a job queue that is a table in the same SQLite
+// file, claimed with a single-writer claim and reclaimable after a crash.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use autumn_web::config::{JobSqliteConfig, ProcessRole, split_role_requires_durable_backend};
+use autumn_web::reexports::diesel;
+
+/// One `BIGINT` column, for the counting assertions below.
+#[derive(diesel::QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    value: i64,
+}
+
+/// One `TEXT` column, for the status/error assertions below.
+#[derive(diesel::QueryableByName)]
+struct TextRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    value: String,
+}
+
+async fn count(pool: &SqlitePool, sql: &str) -> i64 {
+    // Imported inside the helpers only: `RunQueryDsl` has a blanket impl, so a
+    // file-scope import would shadow `AtomicUsize::load` with its own `load`.
+    use diesel_async::RunQueryDsl as _;
+    let mut conn = pool.get().await.expect("sqlite connection");
+    diesel::sql_query(sql)
+        .get_result::<CountRow>(&mut *conn)
+        .await
+        .expect("count query")
+        .value
+}
+
+/// Whether the runtime has created the durable queue table yet.
+async fn queue_table_exists(pool: &SqlitePool) -> bool {
+    use diesel_async::RunQueryDsl as _;
+    let Ok(mut conn) = pool.get().await else {
+        return false;
+    };
+    diesel::sql_query("SELECT COUNT(*) AS value FROM autumn_jobs")
+        .get_result::<CountRow>(&mut *conn)
+        .await
+        .is_ok()
+}
+
+async fn text(pool: &SqlitePool, sql: &str) -> String {
+    use diesel_async::RunQueryDsl as _;
+    let mut conn = pool.get().await.expect("sqlite connection");
+    diesel::sql_query(sql)
+        .get_result::<TextRow>(&mut *conn)
+        .await
+        .expect("text query")
+        .value
+}
+
+/// Poll `f` until it reports true, or fail after `tries` 25ms rounds.
+async fn eventually(tries: usize, label: &str, mut f: impl AsyncFnMut() -> bool) {
+    for _ in 0..tries {
+        if f().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for {label}");
+}
+
+/// A durable job config pinned to the SQLite backend.
+fn sqlite_job_config(max_attempts: u32) -> JobConfig {
+    JobConfig {
+        backend: "sqlite".to_string(),
+        workers: 2,
+        max_attempts,
+        initial_backoff_ms: 10,
+        sqlite: JobSqliteConfig {
+            visibility_timeout_ms: 500,
+            poll_interval_ms: 20,
+        },
+        ..JobConfig::default()
+    }
+}
+
+fn job_info(name: &str, max_attempts: u32, handler: autumn_web::job::JobHandler) -> JobInfo {
+    JobInfo {
+        version: 1,
+        name: name.to_string(),
+        max_attempts,
+        initial_backoff_ms: 10,
+        queue: "default".to_string(),
+        uniqueness: None,
+        concurrency: None,
+        handler,
+    }
+}
+
+static DURABLE_RAN: AtomicUsize = AtomicUsize::new(0);
+
+/// (4) `jobs.backend = "sqlite"` runs an enqueued job to completion, and the
+/// work is a row in the app's own SQLite file rather than in-process state.
+#[tokio::test]
+async fn sqlite_job_backend_runs_a_job_end_to_end() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    DURABLE_RAN.store(0, Ordering::SeqCst);
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    job::start_runtime(
+        vec![job_info("sqlite_durable_job", 3, |_state, _payload| {
+            Box::pin(async move {
+                DURABLE_RAN.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        })],
+        &state,
+        &shutdown,
+        &sqlite_job_config(3),
+        true,
+    )
+    .expect("the durable sqlite job runtime starts");
+
+    job::enqueue("sqlite_durable_job", serde_json::json!({ "n": 1 }))
+        .await
+        .expect("enqueue routes to the sqlite backend");
+
+    eventually(400, "the durable job to complete", async || {
+        DURABLE_RAN.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    eventually(400, "the row to settle as completed", async || {
+        count(
+            &pool,
+            "SELECT COUNT(*) AS value FROM autumn_jobs WHERE status = 'completed'",
+        )
+        .await
+            == 1
+    })
+    .await;
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
+static RESTART_RAN: AtomicUsize = AtomicUsize::new(0);
+
+/// (5) The queue is durable: a job enqueued by a process that runs no workers
+/// survives in the file and runs when a worker process starts later.
+#[tokio::test]
+async fn sqlite_job_backend_is_durable_across_a_restart() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    RESTART_RAN.store(0, Ordering::SeqCst);
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let handler: autumn_web::job::JobHandler = |_state, _payload| {
+        Box::pin(async move {
+            RESTART_RAN.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    };
+
+    // Web role: installs the enqueue client, runs no workers.
+    {
+        let state = AppState::for_test()
+            .with_profile("dev")
+            .with_pool(pool.clone());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        job::start_runtime(
+            vec![job_info("sqlite_restart_job", 3, handler)],
+            &state,
+            &shutdown,
+            &sqlite_job_config(3),
+            false,
+        )
+        .expect("the enqueue-only sqlite runtime starts");
+        job::enqueue("sqlite_restart_job", serde_json::json!({}))
+            .await
+            .expect("enqueue persists the job");
+        shutdown.cancel();
+        job::clear_global_job_client();
+    }
+
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) AS value FROM autumn_jobs WHERE status = 'enqueued'"
+        )
+        .await,
+        1,
+        "the job waits in the SQLite file with no worker process alive"
+    );
+    assert_eq!(
+        RESTART_RAN.load(Ordering::SeqCst),
+        0,
+        "no worker ran it yet"
+    );
+
+    // Worker role on the same file, as if the process restarted.
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    job::start_runtime(
+        vec![job_info("sqlite_restart_job", 3, handler)],
+        &state,
+        &shutdown,
+        &sqlite_job_config(3),
+        true,
+    )
+    .expect("the worker sqlite runtime starts");
+
+    eventually(400, "the persisted job to run after restart", async || {
+        RESTART_RAN.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
+static RECOVERED_RAN: AtomicUsize = AtomicUsize::new(0);
+
+/// (6) A crash mid-job leaves the row reclaimable: a claim older than the
+/// visibility timeout is recovered and run.
+#[tokio::test]
+async fn sqlite_job_backend_recovers_a_crashed_claim() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    RECOVERED_RAN.store(0, Ordering::SeqCst);
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    job::start_runtime(
+        vec![job_info("sqlite_recovered_job", 3, |_state, _payload| {
+            Box::pin(async move {
+                RECOVERED_RAN.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        })],
+        &state,
+        &shutdown,
+        &sqlite_job_config(3),
+        true,
+    )
+    .expect("the durable sqlite job runtime starts");
+
+    // The runtime creates the queue schema on first use, so wait for the table
+    // before writing to it directly.
+    eventually(400, "the queue schema to be created", async || {
+        queue_table_exists(&pool).await
+    })
+    .await;
+
+    // Forge the row a dead worker would have left behind: claimed long ago and
+    // never settled.
+    {
+        use diesel_async::RunQueryDsl as _;
+        let mut conn = pool.get().await.expect("sqlite connection");
+        diesel::sql_query(
+            "INSERT INTO autumn_jobs \
+             (id, name, queue, payload, status, attempt, max_attempts, initial_backoff_ms, \
+              enqueued_at, run_at, started_at, claimed_by, claimed_at) \
+             VALUES ('crashed-1', 'sqlite_recovered_job', 'default', '{}', 'running', 1, 3, 10, \
+                     0, 0, 0, 'dead-worker', 0)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("insert a stale claim");
+    }
+
+    eventually(400, "the stale claim to be recovered and run", async || {
+        RECOVERED_RAN.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
+static FAILING_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+/// (7) A failing job retries with backoff and dead-letters on the final
+/// attempt, exactly as on Postgres.
+#[tokio::test]
+async fn sqlite_job_backend_retries_then_dead_letters() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    FAILING_RUNS.store(0, Ordering::SeqCst);
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    job::start_runtime(
+        vec![job_info("sqlite_failing_job", 2, |_state, _payload| {
+            Box::pin(async move {
+                FAILING_RUNS.fetch_add(1, Ordering::SeqCst);
+                Err(autumn_web::AutumnError::internal_server_error_msg(
+                    "always fails",
+                ))
+            })
+        })],
+        &state,
+        &shutdown,
+        &sqlite_job_config(2),
+        true,
+    )
+    .expect("the durable sqlite job runtime starts");
+
+    job::enqueue("sqlite_failing_job", serde_json::json!({}))
+        .await
+        .expect("enqueue");
+
+    eventually(400, "the job to exhaust its attempts", async || {
+        count(
+            &pool,
+            "SELECT COUNT(*) AS value FROM autumn_jobs WHERE status = 'failed'",
+        )
+        .await
+            == 1
+    })
+    .await;
+
+    assert_eq!(
+        FAILING_RUNS.load(Ordering::SeqCst),
+        2,
+        "the handler ran once per attempt before dead-lettering"
+    );
+    let error = text(
+        &pool,
+        "SELECT last_error AS value FROM autumn_jobs WHERE status = 'failed'",
+    )
+    .await;
+    assert!(
+        error.contains("always fails"),
+        "the dead-lettered row keeps the last error; got: {error}"
+    );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
+static DELAYED_RAN: AtomicUsize = AtomicUsize::new(0);
+
+/// (8) A delayed enqueue is not claimable before it is due.
+#[tokio::test]
+async fn sqlite_job_backend_honors_a_delayed_enqueue() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    DELAYED_RAN.store(0, Ordering::SeqCst);
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    job::start_runtime(
+        vec![job_info("sqlite_delayed_job", 3, |_state, _payload| {
+            Box::pin(async move {
+                DELAYED_RAN.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        })],
+        &state,
+        &shutdown,
+        &sqlite_job_config(3),
+        true,
+    )
+    .expect("the durable sqlite job runtime starts");
+
+    job::enqueue_in(
+        "sqlite_delayed_job",
+        serde_json::json!({}),
+        Duration::from_secs(3600),
+    )
+    .await
+    .expect("delayed enqueue");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        DELAYED_RAN.load(Ordering::SeqCst),
+        0,
+        "a job due in an hour must not run now"
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) AS value FROM autumn_jobs WHERE status = 'enqueued'"
+        )
+        .await,
+        1,
+        "the delayed job waits in the table"
+    );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
+static ONCE_RAN: AtomicUsize = AtomicUsize::new(0);
+
+/// (9) The single-writer claim runs each row exactly once, even with several
+/// worker loops competing for the same backlog.
+#[tokio::test]
+async fn sqlite_job_backend_claims_each_job_exactly_once() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    ONCE_RAN.store(0, Ordering::SeqCst);
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    let mut config = sqlite_job_config(3);
+    config.workers = 4;
+    job::start_runtime(
+        vec![job_info("sqlite_once_job", 3, |_state, _payload| {
+            Box::pin(async move {
+                ONCE_RAN.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        })],
+        &state,
+        &shutdown,
+        &config,
+        true,
+    )
+    .expect("the durable sqlite job runtime starts");
+
+    for n in 0..20 {
+        job::enqueue("sqlite_once_job", serde_json::json!({ "n": n }))
+            .await
+            .expect("enqueue");
+    }
+
+    eventually(800, "all 20 jobs to complete", async || {
+        count(
+            &pool,
+            "SELECT COUNT(*) AS value FROM autumn_jobs WHERE status = 'completed'",
+        )
+        .await
+            == 20
+    })
+    .await;
+
+    // Give any duplicate claim a chance to surface before asserting.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        ONCE_RAN.load(Ordering::SeqCst),
+        20,
+        "each enqueued row ran exactly once across 4 competing workers"
+    );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
+/// (10) A durable SQLite queue makes a web/worker split on one host valid.
+#[test]
+fn sqlite_jobs_backend_counts_as_durable_for_split_roles() {
+    assert!(
+        !split_role_requires_durable_backend(ProcessRole::Worker, "sqlite"),
+        "a worker role on the durable sqlite queue is a valid split"
+    );
+    assert!(
+        split_role_requires_durable_backend(ProcessRole::Worker, "local"),
+        "the in-process local queue still cannot back a split role"
+    );
+}
+
+/// (11) `scheduler.backend = "sqlite"` elects one leader per tick across
+/// processes on the host, and a released lease frees the tick.
+#[tokio::test]
+async fn sqlite_scheduler_lease_elects_one_leader_per_tick() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test().with_profile("dev").with_pool(pool);
+
+    let config_a = SchedulerConfig {
+        backend: SchedulerBackend::Sqlite,
+        replica_id: Some("replica-a".to_string()),
+        ..SchedulerConfig::default()
+    };
+    let config_b = SchedulerConfig {
+        backend: SchedulerBackend::Sqlite,
+        replica_id: Some("replica-b".to_string()),
+        ..SchedulerConfig::default()
+    };
+    let a = scheduler::coordinator_from_config(&config_a, &state).expect("coordinator a");
+    let b = scheduler::coordinator_from_config(&config_b, &state).expect("coordinator b");
+    assert_eq!(a.backend(), "sqlite");
+    assert!(
+        a.is_fleet_distributed(),
+        "the lease coordinator distributes ticks across processes"
+    );
+
+    let lease_a = a
+        .try_acquire("digest", "digest:1", TaskCoordination::Fleet)
+        .await
+        .expect("acquire does not error")
+        .expect("the first coordinator wins the tick");
+    assert_eq!(lease_a.leader_id(), "replica-a");
+
+    let lost = b
+        .try_acquire("digest", "digest:1", TaskCoordination::Fleet)
+        .await
+        .expect("acquire does not error");
+    assert!(
+        lost.is_none(),
+        "the second coordinator must observe the tick as taken"
+    );
+
+    lease_a.release().await.expect("release");
+
+    let lease_b = b
+        .try_acquire("digest", "digest:1", TaskCoordination::Fleet)
+        .await
+        .expect("acquire does not error")
+        .expect("a released tick is free again");
+    assert_eq!(lease_b.leader_id(), "replica-b");
+    lease_b.release().await.expect("release");
+
+    // A per-replica task never contends: both coordinators run it.
+    for coordinator in [&a, &b] {
+        let lease = coordinator
+            .try_acquire("heartbeat", "heartbeat:1", TaskCoordination::PerReplica)
+            .await
+            .expect("acquire does not error")
+            .expect("per-replica ticks are never leased away");
+        assert_eq!(lease.backend(), "per_replica");
+        lease.release().await.expect("release");
+    }
+}
+
+/// (12) An expired lease is stealable, so a crashed leader cannot wedge a task.
+#[tokio::test]
+async fn sqlite_scheduler_lease_expires_after_its_ttl() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test().with_profile("dev").with_pool(pool);
+
+    let config = SchedulerConfig {
+        backend: SchedulerBackend::Sqlite,
+        lease_ttl_secs: 1,
+        replica_id: Some("replica-a".to_string()),
+        ..SchedulerConfig::default()
+    };
+    let a = scheduler::coordinator_from_config(&config, &state).expect("coordinator a");
+    let b = scheduler::coordinator_from_config(
+        &SchedulerConfig {
+            replica_id: Some("replica-b".to_string()),
+            ..config.clone()
+        },
+        &state,
+    )
+    .expect("coordinator b");
+
+    // Drop the lease without releasing it: release is explicit, so this is the
+    // leader crashing mid-tick.
+    let lease = a
+        .try_acquire("sweep", "sweep:1", TaskCoordination::Fleet)
+        .await
+        .expect("acquire")
+        .expect("first acquire wins");
+    drop(lease);
+
+    assert!(
+        b.try_acquire("sweep", "sweep:1", TaskCoordination::Fleet)
+            .await
+            .expect("acquire")
+            .is_none(),
+        "the lease is held until its TTL expires"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+    assert!(
+        b.try_acquire("sweep", "sweep:1", TaskCoordination::Fleet)
+            .await
+            .expect("acquire")
+            .is_some(),
+        "an expired lease is stealable so a crashed leader cannot wedge the task"
+    );
+}
+
+/// (13) A unique job coalesces duplicate enqueues, using the same partial
+/// unique index the Postgres backend uses.
+#[tokio::test]
+async fn sqlite_job_backend_deduplicates_unique_enqueues() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    let mut info = job_info("sqlite_unique_job", 3, |_state, _payload| {
+        Box::pin(async move { Ok(()) })
+    });
+    info.uniqueness = Some(JobUniqueness {
+        by: vec!["order_id".to_string()],
+        window: JobUniquenessWindow::Running,
+    });
+
+    // No workers: nothing drains the queue, so the row count is the dedup
+    // answer on its own.
+    job::start_runtime(vec![info], &state, &shutdown, &sqlite_job_config(3), false)
+        .expect("the enqueue-only sqlite runtime starts");
+
+    for _ in 0..3 {
+        job::enqueue("sqlite_unique_job", serde_json::json!({ "order_id": 7 }))
+            .await
+            .expect("enqueue");
+    }
+    // A different key is a different job.
+    job::enqueue("sqlite_unique_job", serde_json::json!({ "order_id": 8 }))
+        .await
+        .expect("enqueue");
+
+    assert_eq!(
+        count(&pool, "SELECT COUNT(*) AS value FROM autumn_jobs").await,
+        2,
+        "three enqueues of one unique key coalesce to a single row"
+    );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
+static CONCURRENT_NOW: AtomicUsize = AtomicUsize::new(0);
+static CONCURRENT_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// (14) A `#[job(concurrency = 1)]` limit is honored at claim time, so the
+/// claim query never runs more than the declared number at once.
+#[tokio::test]
+async fn sqlite_job_backend_honors_a_concurrency_limit() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    CONCURRENT_NOW.store(0, Ordering::SeqCst);
+    CONCURRENT_PEAK.store(0, Ordering::SeqCst);
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    let mut info = job_info("sqlite_capped_job", 3, |_state, _payload| {
+        Box::pin(async move {
+            let running = CONCURRENT_NOW.fetch_add(1, Ordering::SeqCst) + 1;
+            CONCURRENT_PEAK.fetch_max(running, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            CONCURRENT_NOW.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        })
+    });
+    info.concurrency = Some(JobConcurrency {
+        limit: 1,
+        key: None,
+    });
+
+    let mut config = sqlite_job_config(3);
+    config.workers = 4;
+    job::start_runtime(vec![info], &state, &shutdown, &config, true)
+        .expect("the durable sqlite job runtime starts");
+
+    for n in 0..4 {
+        job::enqueue("sqlite_capped_job", serde_json::json!({ "n": n }))
+            .await
+            .expect("enqueue");
+    }
+
+    eventually(800, "all capped jobs to complete", async || {
+        count(
+            &pool,
+            "SELECT COUNT(*) AS value FROM autumn_jobs WHERE status = 'completed'",
+        )
+        .await
+            == 4
+    })
+    .await;
+
+    assert_eq!(
+        CONCURRENT_PEAK.load(Ordering::SeqCst),
+        1,
+        "the declared concurrency limit of 1 was never exceeded"
+    );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
+/// (15) The durable backend installs a table-backed dashboard, so the admin
+/// view reports the shared queue rather than one process's memory.
+#[tokio::test]
+async fn sqlite_job_backend_reports_the_shared_queue_to_the_dashboard() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    job::start_runtime(
+        vec![job_info("sqlite_admin_job", 3, |_state, _payload| {
+            Box::pin(async move { Ok(()) })
+        })],
+        &state,
+        &shutdown,
+        &sqlite_job_config(3),
+        false,
+    )
+    .expect("the enqueue-only sqlite runtime starts");
+
+    job::enqueue("sqlite_admin_job", serde_json::json!({ "n": 1 }))
+        .await
+        .expect("enqueue");
+    job::enqueue_in(
+        "sqlite_admin_job",
+        serde_json::json!({ "n": 2 }),
+        Duration::from_secs(3600),
+    )
+    .await
+    .expect("delayed enqueue");
+
+    let admin = job::job_admin_backend(&state).expect("the sqlite runtime installs a dashboard");
+    let snapshot = admin
+        .snapshot(JobAdminQuery::default())
+        .await
+        .expect("admin snapshot");
+
+    assert_eq!(
+        snapshot.enqueued.total, 1,
+        "the ready job shows as enqueued: {:?}",
+        snapshot.enqueued.records
+    );
+    assert_eq!(
+        snapshot.scheduled.total, 1,
+        "the delayed job shows as scheduled: {:?}",
+        snapshot.scheduled.records
+    );
+    let scheduled = snapshot
+        .scheduled
+        .records
+        .first()
+        .expect("one scheduled record");
+    assert_eq!(scheduled.name, "sqlite_admin_job");
+    assert!(
+        scheduled.scheduled_for.is_some(),
+        "a scheduled record reports its due time"
+    );
+
+    // A cancel of a still-enqueued job takes it out of every list.
+    let ready = snapshot
+        .enqueued
+        .records
+        .first()
+        .expect("one enqueued record");
+    admin.cancel(&ready.id).await.expect("cancel the ready job");
+    let after = admin
+        .snapshot(JobAdminQuery::default())
+        .await
+        .expect("admin snapshot");
+    assert_eq!(
+        after.enqueued.total, 0,
+        "a canceled job leaves the enqueued list"
+    );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
 }

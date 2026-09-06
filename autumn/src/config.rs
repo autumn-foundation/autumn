@@ -114,7 +114,7 @@
 //! | `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` | `usize` |
 //! | `AUTUMN_CHANNELS__REDIS__URL` | `channels.redis.url` | `String` |
 //! | `AUTUMN_CHANNELS__REDIS__KEY_PREFIX` | `channels.redis.key_prefix` | `String` |
-//! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `postgres` / `redis` |
+//! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `postgres` / `redis` / `sqlite` |
 //! | `AUTUMN_JOBS__WORKERS` | `jobs.workers` | `usize` |
 //! | `AUTUMN_JOBS__PIN` | `jobs.pin` | comma-separated queue names |
 //! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
@@ -125,7 +125,7 @@
 //! | `AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS` | `jobs.postgres.visibility_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__TTL_SECS` | `jobs.tracking.ttl_secs` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` | `jobs.tracking.route_enabled` | `bool` |
-//! | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` | `in_process` / `postgres` |
+//! | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` | `in_process` / `postgres` / `sqlite` |
 //! | `AUTUMN_RETENTION__SWEEP_INTERVAL` | `retention.sweep_interval` | duration `String` |
 //! | `AUTUMN_RETENTION__JOB_HISTORY` | `retention.job_history` | duration `String` |
 //! | `AUTUMN_RETENTION__COMMIT_HOOKS` | `retention.commit_hooks` | duration `String` |
@@ -2772,6 +2772,13 @@ pub enum SchedulerBackend {
     InProcess,
     /// Fleet coordination with Postgres advisory locks.
     Postgres,
+    /// Single-host coordination with a `SQLite` lease table (issue #1907).
+    ///
+    /// Each `(task, tick)` is leased in the app's own database file, so several
+    /// processes on one host elect exactly one leader per tick. `SQLite` has no
+    /// advisory locks, and a `SQLite` deployment is single-host by definition.
+    #[serde(alias = "single_host")]
+    Sqlite,
 }
 
 impl SchedulerBackend {
@@ -2781,6 +2788,7 @@ impl SchedulerBackend {
         match value.trim().to_ascii_lowercase().as_str() {
             "in_process" | "in-process" | "local" | "memory" => Some(Self::InProcess),
             "postgres" | "postgresql" => Some(Self::Postgres),
+            "sqlite" | "single_host" | "single-host" => Some(Self::Sqlite),
             _ => None,
         }
     }
@@ -2796,7 +2804,7 @@ impl SchedulerBackend {
     /// the equivalent query on an actually-built coordinator instance.
     #[must_use]
     pub const fn is_fleet_distributed(self) -> bool {
-        matches!(self, Self::Postgres)
+        matches!(self, Self::Postgres | Self::Sqlite)
     }
 }
 
@@ -2884,7 +2892,11 @@ impl ProcessRole {
 /// A split role runs the HTTP tier and the job/scheduler tier in **separate
 /// processes**, so it needs a jobs backend the two processes can share. Only the
 /// recognized durable backends [`start_runtime`](crate::job::start_runtime)
-/// dispatches to durably — exactly `"postgres"` or `"redis"` — qualify. Every
+/// dispatches to durably — exactly `"postgres"`, `"redis"`, or `"sqlite"` —
+/// qualify. The `"sqlite"` queue is a table in the app's own database file, so
+/// two processes on the **same host** share it; a `SQLite` deployment is
+/// single-host by definition, and a multi-replica `SQLite` topology is already
+/// refused at boot (issue #1907). Every
 /// other value (the in-process `"local"` queue, a typo like `"postgresql"`, or a
 /// blank backend) falls through to the per-process local runtime, where a
 /// [`Web`](ProcessRole::Web) replica would enqueue into a queue no separate
@@ -2896,7 +2908,7 @@ impl ProcessRole {
 /// process. Returns `true` when the combination is **invalid**.
 #[must_use]
 pub fn split_role_requires_durable_backend(role: ProcessRole, jobs_backend: &str) -> bool {
-    role != ProcessRole::Combined && !matches!(jobs_backend, "postgres" | "redis")
+    role != ProcessRole::Combined && !matches!(jobs_backend, "postgres" | "redis" | "sqlite")
 }
 
 /// `[retention]` — one retention window per framework-owned dataset
@@ -3366,6 +3378,8 @@ pub struct JobConfig {
     /// - `local` (default): in-process Tokio queue
     /// - `postgres`: Postgres-backed durable queue (requires `db` feature)
     /// - `redis`: Redis-backed durable queue (requires `redis` feature)
+    /// - `sqlite`: durable queue in the app's own `SQLite` file (requires the
+    ///   `sqlite` feature)
     #[serde(default = "default_job_backend")]
     pub backend: String,
     /// Number of concurrent worker loops to spawn.
@@ -3405,6 +3419,9 @@ pub struct JobConfig {
     /// Postgres backend options.
     #[serde(default)]
     pub postgres: JobPostgresConfig,
+    /// `SQLite` backend options.
+    #[serde(default)]
+    pub sqlite: JobSqliteConfig,
     /// Tracked-job progress/result store options (`enqueue_tracked`, the
     /// built-in `GET /_autumn/jobs/{token}` status route).
     #[serde(default)]
@@ -3423,6 +3440,7 @@ impl Default for JobConfig {
             fleet: JobFleetConfig::default(),
             redis: JobRedisConfig::default(),
             postgres: JobPostgresConfig::default(),
+            sqlite: JobSqliteConfig::default(),
             tracking: JobTrackingConfig::default(),
         }
     }
@@ -3783,6 +3801,41 @@ impl Default for JobPostgresConfig {
             visibility_timeout_ms: default_jobs_pg_visibility_timeout_ms(),
         }
     }
+}
+
+/// `SQLite` backend configuration options for the job runner (issue #1907).
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobSqliteConfig {
+    /// Duration before an in-flight job claim is considered stale and recovered.
+    ///
+    /// A worker that dies mid-job has its claim reclaimed within this bound.
+    /// Default: 30 seconds.
+    #[serde(default = "default_jobs_sqlite_visibility_timeout_ms")]
+    pub visibility_timeout_ms: u64,
+    /// How long an idle worker waits before it polls the queue table again.
+    ///
+    /// `SQLite` has no `LISTEN`/`NOTIFY`, so a worker polls. An enqueue from the
+    /// same process wakes a worker at once; this bound only sets how fast a
+    /// worker sees work another process enqueued. Default: 250ms.
+    #[serde(default = "default_jobs_sqlite_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+}
+
+impl Default for JobSqliteConfig {
+    fn default() -> Self {
+        Self {
+            visibility_timeout_ms: default_jobs_sqlite_visibility_timeout_ms(),
+            poll_interval_ms: default_jobs_sqlite_poll_interval_ms(),
+        }
+    }
+}
+
+const fn default_jobs_sqlite_visibility_timeout_ms() -> u64 {
+    30_000
+}
+
+const fn default_jobs_sqlite_poll_interval_ms() -> u64 {
+    250
 }
 
 /// Tracked-job progress/result store configuration.
@@ -5026,7 +5079,7 @@ impl AutumnConfig {
     /// - `AUTUMN_HEALTH__ENABLED` → `health.enabled` (bool)
     ///
     /// # Jobs
-    /// - `AUTUMN_JOBS__BACKEND` → `jobs.backend` (`local` / `redis`)
+    /// - `AUTUMN_JOBS__BACKEND` → `jobs.backend` (`local` / `redis` / `sqlite`)
     /// - `AUTUMN_JOBS__WORKERS` → `jobs.workers` (`usize`)
     /// - `AUTUMN_JOBS__PIN` → `jobs.pin` (comma-separated queue names)
     /// - `AUTUMN_JOBS__MAX_ATTEMPTS` → `jobs.max_attempts` (`u32`)
@@ -6049,7 +6102,7 @@ impl AutumnConfig {
                 Some(backend) => self.scheduler.backend = backend,
                 None => eprintln!(
                     "Warning: AUTUMN_SCHEDULER__BACKEND={val:?} is not valid \
-                     (expected in_process or postgres), ignoring"
+                     (expected in_process, postgres or sqlite), ignoring"
                 ),
             }
         }
@@ -18362,6 +18415,68 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             ProcessRole::Worker,
             "redis"
         ));
+        // The SQLite queue is a table two processes on one host share, so it
+        // backs a split role too (issue #1907).
+        assert!(!split_role_requires_durable_backend(
+            ProcessRole::Web,
+            "sqlite"
+        ));
+        assert!(!split_role_requires_durable_backend(
+            ProcessRole::Worker,
+            "sqlite"
+        ));
+    }
+
+    /// Issue #1907: the single-host lease backend is selectable, aliased, and
+    /// reports itself as fleet-distributed.
+    #[test]
+    fn scheduler_backend_sqlite_is_selectable_and_fleet_distributed() {
+        assert_eq!(
+            SchedulerBackend::from_env_value("sqlite"),
+            Some(SchedulerBackend::Sqlite)
+        );
+        assert_eq!(
+            SchedulerBackend::from_env_value(" SINGLE_HOST "),
+            Some(SchedulerBackend::Sqlite)
+        );
+        assert_eq!(SchedulerBackend::from_env_value("nonsense"), None);
+        assert!(SchedulerBackend::Sqlite.is_fleet_distributed());
+        assert!(!SchedulerBackend::InProcess.is_fleet_distributed());
+
+        let config: AutumnConfig =
+            toml::from_str("[scheduler]\nbackend = \"sqlite\"\n").expect("sqlite backend");
+        assert_eq!(config.scheduler.backend, SchedulerBackend::Sqlite);
+        let aliased: AutumnConfig =
+            toml::from_str("[scheduler]\nbackend = \"single_host\"\n").expect("single_host alias");
+        assert_eq!(aliased.scheduler.backend, SchedulerBackend::Sqlite);
+
+        let env = MockEnv::new().with("AUTUMN_SCHEDULER__BACKEND", "sqlite");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.scheduler.backend, SchedulerBackend::Sqlite);
+    }
+
+    /// Issue #1907: `[jobs.sqlite]` carries the durable queue's knobs and
+    /// defaults to values an app never has to set.
+    #[test]
+    fn jobs_sqlite_section_parses_with_defaults() {
+        let defaults = JobSqliteConfig::default();
+        assert_eq!(defaults.visibility_timeout_ms, 30_000);
+        assert_eq!(defaults.poll_interval_ms, 250);
+
+        let config: AutumnConfig = toml::from_str(
+            "[jobs]\nbackend = \"sqlite\"\n\n[jobs.sqlite]\nvisibility_timeout_ms = 5000\n\
+             poll_interval_ms = 50\n",
+        )
+        .expect("sqlite job section");
+        assert_eq!(config.jobs.backend, "sqlite");
+        assert_eq!(config.jobs.sqlite.visibility_timeout_ms, 5_000);
+        assert_eq!(config.jobs.sqlite.poll_interval_ms, 50);
+
+        // Omitting the section keeps the defaults.
+        let bare: AutumnConfig =
+            toml::from_str("[jobs]\nbackend = \"sqlite\"\n").expect("bare jobs section");
+        assert_eq!(bare.jobs.sqlite.visibility_timeout_ms, 30_000);
     }
 
     #[test]

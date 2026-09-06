@@ -110,7 +110,7 @@ not a rewrite.
 | One host, write volume comfortably below a single serialized writer | **SQLite** |
 | Multiple replicas / multiple hosts sharing data | **Postgres** |
 | Read replicas, sharding, or heavy write concurrency | **Postgres** |
-| You need Postgres-specific FTS features (language-stemming dictionaries), `LISTEN/NOTIFY`, or advisory-lock leader election | **Postgres** |
+| You need Postgres-specific FTS features (language-stemming dictionaries), `LISTEN/NOTIFY`, or **cross-host** leader election | **Postgres** |
 
 ---
 
@@ -140,8 +140,8 @@ buckets on SQLite:
 | `autumn migrate check` (production-safety classifier) | ✅ | ✅ | Offline SQL-file safety linter (reads no DB URL, so it does not fail on a `sqlite://` target); its safety rules target Postgres migration semantics — there is no SQLite-specific classification yet. | ⚠️ **Partial** — the linter runs (no DB connection), but its rules are Postgres-oriented; no SQLite-specific classification |
 | Migration serialization (concurrent boot) | ✅ `pg_advisory_lock` | ⚠️ | Startup migrations run **unlocked** — no advisory lock and no `BEGIN IMMEDIATE` reservation on the migration path. Concurrent same-host starts are not serialized by an explicit reservation; they rely on SQLite's single-writer semantics plus the pool `busy_timeout`. (Note: application **write-RMW** sites *do* issue `BEGIN IMMEDIATE` since #1996 — this row is only about the migration path.) | ⚠️ **Not serialized** — no advisory lock / no migration-path `BEGIN IMMEDIATE`; explicit reservation is a known gap (planned) |
 | Sessions + auth (DB-backed) | ✅ | ✅ | Session/auth tables live in SQLite; no external store. | ⛔ **Planned — #1908** |
-| Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | Single-writer claim on the jobs table — durable and restart-safe, **no Redis required**. | ⛔ **Planned — #1907** |
-| `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | Single host is always the leader; every tick fires locally (no election needed). | ⛔ **Planned — #1907** |
+| Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | `jobs.backend = "sqlite"`: a single-writer claim on the `autumn_jobs` table in the app's own file — durable and restart-safe, **no Redis required**. Retries, backoff, dead-lettering, uniqueness windows, concurrency limits, and the job dashboard match Postgres. | ✅ **Available now** (#1907) |
+| `#[scheduled]` tasks | ✅ advisory-lock leader election | ✅ | `scheduler.backend = "in_process"` (the default) fires every tick locally, because one process is always the leader. `scheduler.backend = "sqlite"` leases each tick in a table, so several processes on the host elect exactly one leader per tick. | ✅ **Available now** (#1907) |
 | Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⚠️ / ⛔ | Single-host mutual exclusion within the process; a multi-replica configuration is refused at boot. | ⛔ **Planned — #1905** (multi-replica boot-refuse ships now) |
 | Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (single host has nothing to notify). | ⛔ **Planned — #1905** |
 | `autumn db backup` / `restore` | ✅ `pg_dump`/`pg_restore` | ✅ | Online-safe snapshot of the data file (safe against a live app). Backup tooling is still `pg_dump`/`pg_restore`-shaped today. | ⛔ **Planned — #1909** |
@@ -207,9 +207,8 @@ SQLite-dialect smoke SQL against, so the generated smoke test remains
 Postgres-shaped. Tracked under the runtime slice #1905.
 
 The support-matrix rows still marked **Planned** name follow-on subsystem slices
-whose SQLite support has not landed yet (sessions/auth #1908, durable jobs and
-`#[scheduled]` tasks #1907, backup/restore/scrub/retention/deploy persistence
-#1909). A **Planned** row does **not** mean the app refuses to boot — the runtime
+whose SQLite support has not landed yet (sessions/auth #1908,
+backup/restore/scrub/retention/deploy persistence #1909). A **Planned** row does **not** mean the app refuses to boot — the runtime
 boots and serves; those subsystems are simply not wired for SQLite until their
 tracking issue lands.
 
@@ -242,11 +241,27 @@ implemented**.
 ### `#[scheduled]` tasks
 
 The [multi-replica scheduler](./scheduled-multi-replica.md) uses advisory-lock
-leader election so that a fleet fires each tick exactly once. On SQLite the
-single host **is always the leader** — there is no fleet to elect within — so
-every scheduled tick fires locally with no coordination round-trip. Design
-scheduled tasks to be idempotent regardless of tier; the at-most-once-per-tick
-contract holds because there is only one ticker.
+leader election so that a fleet fires each tick exactly once. SQLite has no
+advisory locks, so it gets two single-host coordinators instead:
+
+- `scheduler.backend = "in_process"` (the **default**). The single process is
+  always the leader, so every tick fires locally with no coordination
+  round-trip. This is right for the ordinary one-process deployment.
+- `scheduler.backend = "sqlite"`. Each `(task, tick)` is leased in the
+  `autumn_scheduler_leases` table in the app's own database file, so **several
+  processes on the one host** elect exactly one leader per tick. Use it when a
+  web tier and a worker tier run side by side, or across a rolling restart where
+  the old and new process overlap.
+
+The lease carries an expiry, not a session. A leader that dies without releasing
+frees the tick after `scheduler.lease_ttl_secs` (default 60), rather than
+wedging the task. Set the TTL above the longest a tick body can take, so a live
+leader is never preempted mid-tick.
+
+`scheduler.backend = "postgres"` is refused at boot under SQLite, with a message
+naming both substitutes.
+
+Design scheduled tasks to be idempotent regardless of tier.
 
 ### Distributed lock
 
@@ -269,12 +284,39 @@ cache there is. See [Feature flags](./feature-flags.md) and
 ### Durable jobs without Redis
 
 This is the headline of the tier. `#[job]` work is durable and restart-safe on
-SQLite with **no Redis and no Postgres** — the job queue is a table in the same
-SQLite file, and a worker claims work with a single-writer claim (the SQLite
-analogue of `FOR UPDATE SKIP LOCKED`). A crash mid-job leaves the row reclaimable
-after restart, exactly as on Postgres. A job or scheduler *backend* that
-genuinely requires Redis or Postgres is refused at boot rather than pretending to
-be durable. See [Jobs](./jobs.md).
+SQLite with **no Redis and no Postgres**. Set:
+
+```toml
+[jobs]
+backend = "sqlite"
+```
+
+The queue is the `autumn_jobs` table in the same SQLite file. A worker claims
+work with a single-writer claim — one `UPDATE … WHERE id = (SELECT … LIMIT 1)
+RETURNING …`, which is the SQLite analogue of `FOR UPDATE SKIP LOCKED`, because
+SQLite serializes writers. A crash mid-job leaves the row reclaimable: a claim
+older than `jobs.sqlite.visibility_timeout_ms` (default 30s) is re-enqueued, or
+dead-lettered when its attempts are spent. The runtime creates the table and its
+indexes at start, so no migration is needed.
+
+Everything the Postgres queue gives you carries over: attempt counting,
+exponential backoff, dead-lettering, `#[job(unique)]` windows,
+`#[job(concurrency = N)]` limits, named queues and `[jobs] pin`, and the
+`/admin/jobs` dashboard — which reads the table, so every process on the host
+sees the same queue.
+
+Two differences from Postgres, both by design:
+
+- **Workers poll.** SQLite has no `LISTEN`/`NOTIFY`, so an idle worker rechecks
+  the table every `jobs.sqlite.poll_interval_ms` (default 250ms). Lower it for
+  latency, raise it to cut idle wakeups.
+- **The queue is host-local.** Two processes on one host share it; two hosts do
+  not. A multi-replica SQLite topology is already refused at boot.
+
+`jobs.backend = "local"` (the default) stays the right choice when the work does
+not need to survive a restart: it is in-process and needs no table.
+`jobs.backend = "postgres"` is refused at boot under SQLite, with a message
+naming the durable substitute. See [Jobs](./jobs.md).
 
 ### Backup, restore, scrub, retention
 

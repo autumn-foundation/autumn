@@ -31,6 +31,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **sqlite:** durable background jobs and a single-host scheduler on the SQLite
+  tier (issue #1907). `jobs.backend = "sqlite"` puts the queue in an
+  `autumn_jobs` table in the app's own database file, so `#[job]` work is
+  durable and restart-safe with **no Redis and no Postgres**. SQLite serializes
+  writers, so a worker claims a row with one
+  `UPDATE … WHERE id = (SELECT … LIMIT 1) RETURNING …` — the single-host analog
+  of `FOR UPDATE SKIP LOCKED` — and a claim left behind by a crashed worker is
+  re-enqueued once it outlives `jobs.sqlite.visibility_timeout_ms`. Attempt
+  counting, exponential backoff, dead-lettering, `#[job(unique)]` windows,
+  `#[job(concurrency = N)]` limits, named queues and `[jobs] pin` all behave as
+  they do on Postgres, and the `/admin/jobs` dashboard reads the table, so every
+  process on the host sees one queue. Workers poll (`jobs.sqlite.poll_interval_ms`,
+  default 250ms) because SQLite has no `LISTEN`/`NOTIFY`. The runtime creates
+  the table and its indexes itself — framework migrations are Postgres SQL — so
+  there is nothing to run by hand. Alongside it, `scheduler.backend = "sqlite"`
+  leases each `(task, tick)` in an `autumn_scheduler_leases` table, so several
+  processes on one host elect exactly one leader per tick; the lease expires
+  after `scheduler.lease_ttl_secs` rather than wedging the task when a leader
+  dies. A durable SQLite queue is shared by both processes of a web/worker
+  split, so that topology is now valid on the tier. Both backends need the
+  non-default `sqlite` cargo feature, and both are refused with an actionable
+  message on a build without it. Nothing on the Postgres path changes.
+
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
   `http-outbound`, `db`, `jobs` and `render` beside `http-request`, and a new
