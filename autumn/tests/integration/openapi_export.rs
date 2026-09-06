@@ -76,6 +76,17 @@ enum AgreeingSplitRename {
     InProgress,
 }
 
+// Rejected shapes (trybuild owns the compile-fail cases, listed here so the
+// contract is readable in one place):
+//
+//   #[serde(rename_all(serialize = "snake_case"), tag = "kind")]   // guard bypass
+//   #[serde(rename_all(serialize = "snake_case", deserialize = "camelCase"))]
+//   #[serde(rename_all(serialize = "snake_case"))]                 // ONE side is
+//                                                                  // asymmetric too:
+//                                                                  // serde still
+//                                                                  // deserializes the
+//                                                                  // original spelling
+
 #[test]
 fn a_split_rename_that_agrees_is_accepted_and_applied() {
     let schema = <AgreeingSplitRename as OpenApiSchema>::schema();

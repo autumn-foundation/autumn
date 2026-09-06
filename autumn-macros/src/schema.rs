@@ -317,12 +317,18 @@ pub fn serde_split_rename(attrs: &[syn::Attribute], key: &'static str) -> Option
                     }
                     Ok(())
                 })?;
-                // Only a genuine disagreement is a problem: `serialize` alone,
-                // or both sides spelled the same, round-trips fine.
-                if let (Some(ser), Some(de)) = (ser, de)
-                    && ser != de
-                {
-                    split = Some(key);
+                // Asymmetric in either shape. Both sides present and
+                // disagreeing is the obvious one. ONE side present is equally
+                // asymmetric and easier to miss: `rename_all(serialize =
+                // "snake_case")` renames only the output, so serde still
+                // DESERIALIZES the original spelling — advertising the
+                // serialize side would have a client send a value the handler
+                // rejects. Only a split whose two sides are spelled the same
+                // round-trips, and that is the sole accepted case.
+                match (ser, de) {
+                    (Some(ser), Some(de)) if ser == de => {}
+                    (None, None) => {}
+                    _ => split = Some(key),
                 }
             } else {
                 consume_unrecognized_meta(&meta)?;
@@ -593,6 +599,30 @@ pub fn emit_schema_fn_body_ext(
     extra_required: &[&&Field],
     rename_all_rule: Option<&str>,
 ) -> TokenStream {
+    emit_schema_fn_body_full(
+        fields,
+        all_optional,
+        extra_required,
+        rename_all_rule,
+        &|_| false,
+    )
+}
+
+/// As [`emit_schema_fn_body_ext`], plus `treat_as_optional`: a predicate naming
+/// fields that must NOT be `required` even though their type is not `Option<T>`.
+///
+/// Requiredness has to follow what the generated `Deserialize` accepts, not what
+/// the Rust type looks like. `#[model]` puts `#[serde(default)]` on a
+/// non-`Option` `bool` in the `New*` struct, so a POST body may omit it and get
+/// `false` — advertising it as required would force a generated client to send a
+/// value the server does not need (issue #802).
+pub fn emit_schema_fn_body_full(
+    fields: &[&&Field],
+    all_optional: bool,
+    extra_required: &[&&Field],
+    rename_all_rule: Option<&str>,
+    treat_as_optional: &dyn Fn(&Field) -> bool,
+) -> TokenStream {
     // Resolve each field's advertised property name once — through the shared
     // serde helpers so the schema honors `#[serde(rename)]` /
     // `#[serde(rename_all)]` and strips raw-ident `r#` prefixes — and reuse the
@@ -616,7 +646,7 @@ pub fn emit_schema_fn_body_ext(
     } else {
         fields
             .iter()
-            .filter(|f| !is_option_type(&f.ty))
+            .filter(|f| !is_option_type(&f.ty) && !treat_as_optional(f))
             .filter_map(|f| schema_property_name(f, rename_all_rule))
             .collect()
     };

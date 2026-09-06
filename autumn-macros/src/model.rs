@@ -20,8 +20,8 @@ use syn::{DeriveInput, Field, LitStr};
 use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_commentable};
 use crate::schema::{
     apply_serde_rename_all_rule, emit_schema_fn_body, emit_schema_fn_body_ext,
-    field_is_translatable, field_serde_serialize_rename, has_attr, is_option_type,
-    serde_rename_all_serialize_rule, type_name_str,
+    emit_schema_fn_body_full, field_is_translatable, field_serde_serialize_rename, has_attr,
+    is_option_type, serde_rename_all_serialize_rule, type_name_str,
 };
 
 /// Parsed `#[model(...)]` attribute arguments.
@@ -7468,15 +7468,32 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // fails to deserialize every response) and publish the names of private and
     // encrypted columns in the contract. Write schemas keep them: they are only
     // skipped on the way OUT, and a client still sets them.
+    // An explicit `#[serde(skip)]` / `#[serde(skip_serializing)]` the author
+    // wrote is exactly as absent from a response as the two cases above, and
+    // `field_already_skips_serialization` is the predicate that already knows
+    // it — consult it rather than re-deriving the answer.
     let serializable_field_refs: Vec<&&Field> = all_field_refs
         .iter()
-        .filter(|f| !field_is_classified(f) && !field_hidden_from_json(f))
+        .filter(|f| {
+            !field_is_classified(f)
+                && !field_hidden_from_json(f)
+                && !field_already_skips_serialization(f)
+        })
         .copied()
         .collect();
     let query_struct_schema_body =
         emit_schema_fn_body(&serializable_field_refs, false, schema_rename_all_rule);
-    let new_struct_schema_body =
-        emit_schema_fn_body(&fields_for_new, false, schema_rename_all_rule);
+    // `NewModel` carries `#[serde(default)]` on every non-`Option` `bool` (see
+    // the `bool_default` wiring in the struct emitter), so a POST body may omit
+    // one and get `false`. Requiredness has to follow that, not the Rust type,
+    // or a generated client is forced to send a value the server does not need.
+    let new_struct_schema_body = emit_schema_fn_body_full(
+        &fields_for_new,
+        false,
+        &[],
+        schema_rename_all_rule,
+        &|f: &Field| !is_option_type(&f.ty) && type_name_str(&f.ty) == "bool",
+    );
     let update_struct_schema_body = {
         let extra: &[&&Field] = lock_version_field.as_slice();
         emit_schema_fn_body_ext(&fields_for_new, true, extra, schema_rename_all_rule)
