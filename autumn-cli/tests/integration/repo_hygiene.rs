@@ -983,6 +983,38 @@ fn cli_tests_cold_start_ignored_tests_are_ci_named() {
     }
 }
 
+/// Drop YAML comment text from a workflow file.
+///
+/// The coverage guard below matches `--test <name>` against workflow source, so
+/// without this a target whose invocation was commented out — or merely
+/// mentioned in prose — would satisfy it while no job runs the target, which is
+/// the very hole the guard exists to close.
+///
+/// A `#` opens a comment when it starts the line or follows whitespace and is
+/// not inside a quoted string; a `#` inside a shell word (`$#`) is left alone.
+fn strip_yaml_comments(yaml: &str) -> String {
+    let mut out = String::with_capacity(yaml.len());
+    for line in yaml.lines() {
+        let (mut in_single, mut in_double, mut after_ws) = (false, false, true);
+        let mut end = line.len();
+        for (idx, ch) in line.char_indices() {
+            match ch {
+                '\'' if !in_double => in_single = !in_single,
+                '"' if !in_single => in_double = !in_double,
+                '#' if !in_single && !in_double && after_ws => {
+                    end = idx;
+                    break;
+                }
+                _ => {}
+            }
+            after_ws = ch.is_whitespace();
+        }
+        out.push_str(line.get(..end).unwrap_or(line));
+        out.push('\n');
+    }
+    out
+}
+
 /// Every `sqlite`-gated `[[test]]` target in `autumn/Cargo.toml` must be named
 /// in a CI workflow (issue #1908).
 ///
@@ -1005,7 +1037,8 @@ fn sqlite_test_targets_are_ci_named() {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", manifest_path.display()));
 
     // Match the `--test <name>` invocation flag across every workflow, not the
-    // bare name: a mention in a comment must not satisfy the check.
+    // bare name, and only in live YAML: `strip_yaml_comments` removes commented
+    // -out invocations and prose mentions, so neither can satisfy the check.
     let workflows_dir = root.join(".github/workflows");
     let mut invocations = String::new();
     for entry in std::fs::read_dir(&workflows_dir)
@@ -1013,7 +1046,7 @@ fn sqlite_test_targets_are_ci_named() {
         .flatten()
     {
         if let Ok(body) = std::fs::read_to_string(entry.path()) {
-            invocations.push_str(&body.replace('\\', " "));
+            invocations.push_str(&strip_yaml_comments(&body).replace('\\', " "));
             invocations.push(' ');
         }
     }
