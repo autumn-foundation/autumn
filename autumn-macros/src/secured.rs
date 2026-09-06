@@ -24,7 +24,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ExprLit, Lit, LitStr, Meta, Token, parse_quote};
+use syn::{Expr, ExprLit, Lit, LitStr, Meta, Token};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -260,32 +260,15 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // reaches a `FromRequest` body extractor (`Json` / `Form` / `Multipart`)
     // and short-circuits on the first rejection, so an unauthenticated /
     // unauthorized / replayed request never causes the body to be parsed.
-    let gate_item = quote! {
-        #[doc(hidden)]
-        #[allow(non_camel_case_types)]
-        pub struct #gate_ident;
-
-        #[doc(hidden)]
-        impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState>
-            for #gate_ident
-        {
-            type Rejection = ::autumn_web::reexports::axum::response::Response;
-
-            fn from_request_parts(
-                parts: &mut ::autumn_web::reexports::axum::http::request::Parts,
-                state: &::autumn_web::AppState,
-            ) -> impl ::core::future::Future<Output = ::core::result::Result<Self, Self::Rejection>>
-                + Send {
-                async move {
-                    #role_scope_consts
-                    #session_check
-                    #scope_check
-                    #replay_check
-                    ::core::result::Result::Ok(#gate_ident)
-                }
-            }
-        }
-    };
+    let gate_item = crate::request_gate::wrap_gate(
+        &gate_ident,
+        &quote! {
+            #role_scope_consts
+            #session_check
+            #scope_check
+            #replay_check
+        },
+    );
 
     let original_body = &input_fn.block;
     let original_response = match &input_fn.sig.output {
@@ -307,15 +290,7 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Insert the gate as the FIRST parameter — ahead of every other
     // extractor, including any earlier-inserted guard gate (which then
     // correctly runs AFTER this one; see `should_own_replay`'s doc comment).
-    let gate_param: syn::FnArg = parse_quote! { _: #gate_ident };
-    input_fn.sig.inputs.insert(0, gate_param);
-
-    input_fn
-        .attrs
-        .push(parse_quote!(#[allow(clippy::too_many_arguments)]));
-    input_fn.sig.output = parse_quote! {
-        -> ::autumn_web::reexports::axum::response::Response
-    };
+    crate::request_gate::insert_gate_param(&mut input_fn, &gate_ident);
 
     input_fn.block = syn::parse_quote! {
         {
@@ -337,6 +312,28 @@ mod tests {
 
     use super::{parse_secured_args, secured_macro};
     use crate::static_route::static_get_macro;
+
+    /// Characterization test (Echo refactor, clone class: the
+    /// `FromRequestParts` gate skeleton shared with `step_up`/`throttle`):
+    /// pins `#[secured("admin", scopes = ["posts:write"])]`'s exact expansion
+    /// — exercising the role check, the scope check, and (as the only guard
+    /// on this handler) the replay lookup all at once — so that factoring the
+    /// gate's struct+impl skeleton into `request_gate::wrap_gate` cannot
+    /// silently change a single token of it.
+    #[test]
+    fn secured_macro_expansion_is_unchanged_by_the_gate_skeleton_refactor() {
+        let generated = secured_macro(
+            quote! { "admin", scopes = ["posts:write"] },
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert_eq!(
+            generated,
+            include_str!("../testdata/secured_golden.txt").trim_end()
+        );
+    }
 
     #[test]
     fn secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
