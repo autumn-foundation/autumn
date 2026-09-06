@@ -1700,6 +1700,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`route_macro` lost a guarded handler's OpenAPI response schema under
+  `#[throttle]`/`#[step_up]` (issue #2516):** #2488 moved the
+  `#[throttle]`/`#[step_up]` auth/rate-limit checks out of the handler body
+  and into a sibling `FromRequestParts` gate, but stopped emitting the
+  guard's marker const (`__AUTUMN_THROTTLE_ROUTE_ID` /
+  `__AUTUMN_STEP_UP_MAX_AGE`) into the handler body — `#[secured]` still
+  does. `api_doc::infer_response_body`'s recovery of a guarded handler's
+  pre-rewrite return type (#1677/#2484) requires that marker to trust the
+  `__autumn_inner` binding it reads the type back from, so a
+  `#[throttle]`/`#[step_up]`-guarded route written above `#[post]`/etc.
+  silently lost its documented `Json<T>` response the moment #2488 merged.
+  Both macros now emit their marker const into the handler body a second
+  time (unused there, `#[allow(dead_code)]`), mirroring the pattern
+  `secured_macro` already used. Caught as a fully red `autumn-macros` test
+  suite on `trunk-dev` itself (4 `route::tests::route_macro_infers_response_schema_*`
+  tests), not by a diff — two individually-green PRs (#2484, #2488) composed
+  into a broken `trunk-dev`. [no-plugin] — restores previously-documented
+  behavior; no new or changed API.
+
 - **hot-upgrade example: `live_upgrade` test no longer conflates a mid-flight
   reset with a refused connection, and no longer lets an unbounded number of
   resets pass silently (issue #2462):**
