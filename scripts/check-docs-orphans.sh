@@ -430,22 +430,43 @@ def strip_comments(txt):
 HIDDEN_HTML = re.compile(
     r'<(script|style|template)\b[^>]*>.*?</\1\s*>', re.S | re.I)
 SRC_ATTR = re.compile(r'\bsrc\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)', re.I)
+# A raw anchor IS navigation, so its destination is resolved like any other —
+# through `add_relative`, which means `<a href="mail.md">` and
+# `<a href="../guide/mail.md">` work, not just the repo-root spelling the
+# bare-path scan happens to catch.
+ANCHOR_HREF = re.compile(
+    r'<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))', re.I)
 
 
 def mask_hidden_html(txt):
-    """Blank non-rendered raw HTML — in PROSE only.
+    """Blank non-rendered raw HTML — in PROSE, and not inside a code span.
 
     Inside a fence, `<script src="/static/js/x.js">` is a sample the reader can
     see and copy, which is the same reason a bare path in a fence counts. Five
-    guide pages ship exactly that. Masking it everywhere would delete visible
-    text; masking it nowhere lets a `<script>` block in prose, which renders as
-    nothing, keep an orphan alive.
+    guide pages ship exactly that, and an inline `` `<script src="…">` `` is the
+    same thing in miniature. Masking those would delete visible text; masking
+    nothing lets a `<script>` block in prose, which renders as nothing, keep an
+    orphan alive.
+
+    Replacements are space-for-space so offsets stay valid for the callers that
+    blank spans by position.
     """
     out = []
     for kind, seg in split_fences(txt):
-        if kind == 'prose':
-            seg = HIDDEN_HTML.sub(lambda m: ' ' * len(m.group(0)), seg)
-            seg = SRC_ATTR.sub(lambda m: ' ' * len(m.group(0)), seg)
+        if kind != 'prose':
+            out.append(seg)
+            continue
+        protected = [(m.start(), m.end()) for m in CODE_SPAN.finditer(seg)]
+        for pat in (HIDDEN_HTML, SRC_ATTR):
+            pieces, last = [], 0
+            for m in pat.finditer(seg):
+                if any(a <= m.start() < b for a, b in protected):
+                    continue
+                pieces.append(seg[last:m.start()])
+                pieces.append(' ' * (m.end() - m.start()))
+                last = m.end()
+            pieces.append(seg[last:])
+            seg = ''.join(pieces)
         out.append(seg)
     return ''.join(out)
 
@@ -496,8 +517,14 @@ def edges_from(f):
     # below, so blank their spans first: a bare scan over `[old]: docs/guide/x.md`
     # would re-admit an unused definition that renders as nothing, which is the
     # hole the usage check exists to close.
-    scan = mask_hidden_html(txt)
-    scan = REF_DEF.sub(lambda m: ' ' * len(m.group(0)), scan)
+    # ONE masked view, used by every navigation extractor below. Masking a
+    # single scanner and leaving its siblings on the raw text is a mistake this
+    # gate has made three times — reference definitions bypassing the usage
+    # check, and hidden HTML bypassing the link scan — so the masking happens
+    # once, here, and nothing downstream reads `txt` for navigation again.
+    txt = mask_hidden_html(txt)
+
+    scan = REF_DEF.sub(lambda m: ' ' * len(m.group(0)), txt)
     blank = lambda m: ' ' * len(m.group(0))
     scan = IMAGE_INLINE.sub(blank, scan)
     scan = IMAGE_REF.sub(blank, scan)
@@ -509,6 +536,9 @@ def edges_from(f):
     for pattern in (MD_LINK, MD_LINK_NESTED):
         for m in pattern.finditer(txt):
             add_relative(m.group(1) if m.group(1) is not None else m.group(2))
+
+    for m in ANCHOR_HREF.finditer(txt):
+        add_relative(next(g for g in m.groups() if g is not None))
 
     # A reference USE inside code — `` `[mail][]` `` — is the one code case that
     # does not count, and it is not an exception to the visible/invisible rule
@@ -536,8 +566,11 @@ def edges_from(f):
     # Markdown resolves a duplicated label to its FIRST definition, so a stale
     # `[mail]: mail.md` sitting below a live `[mail]: https://example.com` names
     # a page the reader never reaches — and must not keep it out of the report.
+    # Definitions come from the prose-only view for the same reason usages do:
+    # a `[mail]: mail.md` DEMONSTRATED inside a fence defines nothing, and
+    # resolving it would let a documentation sample keep an orphan alive.
     seen_labels = set()
-    for m in REF_DEF.finditer(txt):
+    for m in REF_DEF.finditer(ref_txt):
         label = ref_label(m.group(1))
         if label in seen_labels:
             continue
@@ -1139,6 +1172,37 @@ self_test() {
     > "$c9be/docs/guide/mail.md"
   git -C "$c9be" add -A && git -C "$c9be" commit -qm waiver-in-script
   check "a waiver inside a script block does not exempt the page" fail "$c9be"
+
+  # An HTML sample in inline code is visible text, not raw HTML to mask.
+  local c9bf="$tmp/c9bf"; make_corpus "$c9bf"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\nWrite `<script src="docs/guide/mail.md"></script>` to load it.\n' \
+    > "$c9bf/README.md"
+  git -C "$c9bf" add -A && git -C "$c9bf" commit -qm html-sample-in-code-span
+  check "an HTML sample in inline code stays visible" pass "$c9bf"
+
+  # Raw anchors resolve like any other destination, relative spellings included.
+  local c9bg="$tmp/c9bg"; make_corpus "$c9bg"
+  printf '# Jobs\n\n<a href="mail.md">Mail</a>\n' > "$c9bg/docs/guide/jobs.md"
+  git -C "$c9bg" add -A && git -C "$c9bg" commit -qm anchor-relative
+  check "a raw anchor with a relative href resolves" pass "$c9bg"
+
+  local c9bh="$tmp/c9bh"; make_corpus "$c9bh"
+  printf '# Jobs\n\n<a href="../guide/mail.md">Mail</a>\n' > "$c9bh/docs/guide/jobs.md"
+  git -C "$c9bh" add -A && git -C "$c9bh" commit -qm anchor-dotdot
+  check "a raw anchor with a ../ href resolves" pass "$c9bh"
+
+  # A markdown link hidden in a script block exposes no navigation.
+  local c9bi="$tmp/c9bi"; make_corpus "$c9bi"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n<script>const x = "[mail](docs/guide/mail.md)";</script>\n' \
+    > "$c9bi/README.md"
+  git -C "$c9bi" add -A && git -C "$c9bi" commit -qm md-link-in-script
+  check "a markdown link inside a script block is not an edge" fail "$c9bi"
+
+  # A reference definition demonstrated inside a fence defines nothing.
+  local c9bj="$tmp/c9bj"; make_corpus "$c9bj"
+  printf '# Jobs\n\nSee [mail].\n\n```\n[mail]: mail.md\n```\n' > "$c9bj/docs/guide/jobs.md"
+  git -C "$c9bj" add -A && git -C "$c9bj" commit -qm fenced-refdef
+  check "a reference definition inside a fence defines nothing" fail "$c9bj"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
