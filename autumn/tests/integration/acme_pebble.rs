@@ -200,16 +200,22 @@ async fn drives_a_real_pebble_order_end_to_end() {
     let config = AcmeConfig {
         domains: domains.clone(),
         contact_email: "acme-pebble-test@example.com".to_owned(),
-        directory: AcmeDirectory::Custom {
-            url: directory_url,
-        },
+        directory: AcmeDirectory::Custom { url: directory_url },
         cache_dir: cache_dir.path().to_path_buf(),
         http_challenge_port: PEBBLE_HTTP01_PORT,
-        renew_before_days: 30,
+        // Pebble's bundled config declares a `default` (90-day) AND a
+        // `shortlived` (6-day) profile, and which one it hands back to an
+        // order that does not request one by name is Pebble's choice, not
+        // ours — observed empirically to sometimes be the 6-day profile. `1`
+        // stays safely under either, so this assertion is about autumn's own
+        // renew-before-expiry decision, not a bet on which profile Pebble picks.
+        renew_before_days: 1,
         ca_root_path: Some(root_path),
         dns: None,
     };
-    config.validate().expect("the test's own ACME config must be valid");
+    config
+        .validate()
+        .expect("the test's own ACME config must be valid");
 
     let placeholder = autumn_web::acme::renewal::self_signed_placeholder(&domains)
         .expect("self-signed placeholder builds");
@@ -272,7 +278,9 @@ async fn drives_a_real_pebble_order_end_to_end() {
         snap.last_failure.is_none(),
         "expected no ACME failure, got: {:?} (reported failures: {:?})",
         snap.last_failure,
-        failures.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
     assert!(
         snap.last_success_unix.is_some(),
