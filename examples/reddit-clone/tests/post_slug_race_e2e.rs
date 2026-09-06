@@ -28,7 +28,7 @@ use diesel::sql_types::{BigInt, Text};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use example_e2e::{DEFAULT_READY_TIMEOUT, provision_postgres, spawn_example};
+use example_e2e::{DEFAULT_READY_TIMEOUT, ExampleProcess, PgTopology, provision_postgres, spawn_example};
 
 /// How many identical, fully concurrent submits to fire. The issue's own
 /// harness used 2 (a plain double-click) and 10 (a `threading.Barrier` stress
@@ -72,9 +72,56 @@ struct SlugCount {
     count: i64,
 }
 
-#[tokio::test]
-#[ignore = "requires Docker (testcontainers)"]
-async fn concurrent_identical_submits_never_share_a_slug() {
+#[derive(diesel::QueryableByName)]
+struct Count {
+    #[diesel(sql_type = BigInt)]
+    count: i64,
+}
+
+#[derive(diesel::QueryableByName)]
+struct Slug {
+    #[diesel(sql_type = Text)]
+    slug: String,
+}
+
+/// No duplicate `(subreddit_id, slug)` pair exists anywhere in the table —
+/// the invariant `posts_subreddit_id_slug_key` (and the retry loop that backs
+/// off it) exists to guarantee, whatever raced to produce the current rows.
+async fn assert_no_duplicate_slugs(conn: &mut AsyncPgConnection, context: &str) {
+    let duplicates: Vec<SlugCount> = diesel::sql_query(
+        "SELECT slug, COUNT(*) AS count FROM posts \
+         GROUP BY subreddit_id, slug HAVING COUNT(*) > 1",
+    )
+    .load(conn)
+    .await
+    .expect("duplicate-slug verification query");
+    assert!(
+        duplicates.is_empty(),
+        "duplicate (subreddit_id, slug) pairs survived {context}: {}",
+        duplicates
+            .iter()
+            .map(|d| format!("{} (x{})", d.slug, d.count))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
+/// Build a pool against the testcontainer's own URL — the verification path
+/// every test below uses to ask the database, not the application, whether
+/// the invariant held.
+fn pg_pool(url: &str) -> Pool<AsyncPgConnection> {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.to_string());
+    Pool::builder(manager).max_size(4).build().expect("build pool")
+}
+
+/// Boot the real, unmodified compiled binary against a fresh testcontainer
+/// Postgres, register one user (auto-logged-in, mirroring the issue's own
+/// repro), and create one subreddit for it to post/edit into. Returns
+/// everything the caller needs kept alive for the test's duration — dropping
+/// [`PgTopology`]/[`ExampleProcess`] tears down the container/process.
+async fn boot_with_one_subreddit(
+    subreddit_name: &str,
+) -> (PgTopology, ExampleProcess, Arc<reqwest::Client>, String) {
     let db = provision_postgres(1).await;
     let app = spawn_example(
         env!("CARGO_BIN_EXE_reddit-clone"),
@@ -114,13 +161,13 @@ async fn concurrent_identical_submits_never_share_a_slug() {
         register.status()
     );
 
-    // Create a subreddit to submit into.
+    // Create a subreddit to post/edit into.
     let csrf = hidden_value_from(&client, &format!("{base_url}/r/create"), "_csrf").await;
     let create = client
         .post(format!("{base_url}/r/create"))
         .form(&[
             ("_csrf", csrf.as_str()),
-            ("name", "raceclub"),
+            ("name", subreddit_name),
             ("description", ""),
         ])
         .send()
@@ -131,6 +178,14 @@ async fn concurrent_identical_submits_never_share_a_slug() {
         "create subreddit should redirect; got {}",
         create.status()
     );
+
+    (db, app, client, base_url)
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn concurrent_identical_submits_never_share_a_slug() {
+    let (db, _app, client, base_url) = boot_with_one_subreddit("raceclub").await;
 
     // `/r/{slug}/submit` pre-fills `subreddit_id` as a hidden input, so the
     // numeric id never needs to be hardcoded (the issue's own script assumed
@@ -186,41 +241,113 @@ async fn concurrent_identical_submits_never_share_a_slug() {
 
     // The database is the oracle, exactly as the issue's own verification
     // query was: no two posts in the same subreddit may share a slug.
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(db.urls()[0].clone());
-    let pool = Pool::builder(manager).max_size(4).build().expect("pool");
+    let pool = pg_pool(&db.urls()[0]);
     let mut conn = pool.get().await.expect("connection");
+    assert_no_duplicate_slugs(&mut conn, &format!("{CONCURRENT_SUBMITS} concurrent identical submits")).await;
 
-    let duplicates: Vec<SlugCount> = diesel::sql_query(
-        "SELECT slug, COUNT(*) AS count FROM posts \
-         GROUP BY subreddit_id, slug HAVING COUNT(*) > 1",
-    )
-    .load(&mut conn)
-    .await
-    .expect("duplicate-slug verification query");
-    assert!(
-        duplicates.is_empty(),
-        "duplicate (subreddit_id, slug) pairs survived {CONCURRENT_SUBMITS} concurrent \
-         identical submits: {}",
-        duplicates
-            .iter()
-            .map(|d| format!("{} (x{})", d.slug, d.count))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-
-    #[derive(diesel::QueryableByName, Debug)]
-    struct Count {
-        #[diesel(sql_type = BigInt)]
-        count: i64,
-    }
-    let distinct_slugs: Count =
-        diesel::sql_query("SELECT COUNT(DISTINCT slug) AS count FROM posts")
-            .get_result(&mut conn)
-            .await
-            .expect("distinct-slug count");
+    let distinct_slugs: Count = diesel::sql_query("SELECT COUNT(DISTINCT slug) AS count FROM posts")
+        .get_result(&mut conn)
+        .await
+        .expect("distinct-slug count");
     assert_eq!(
         distinct_slugs.count, CONCURRENT_SUBMITS as i64,
         "every concurrent submit must land its own distinct slug, not merely avoid an exact \
          duplicate (e.g. two racers must not both fall back to the same suffix)"
+    );
+}
+
+/// Regression test for the *edit* path's identical TOCTOU (#2544):
+/// `unique_slug_excluding` has the same SELECT-then-write shape as
+/// `unique_slug`, so two different posts edited to the same new title at the
+/// same time can race for the same base slug just as two `/submit`s can.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn concurrent_identical_edits_never_share_a_slug() {
+    let (db, _app, client, base_url) = boot_with_one_subreddit("editrace").await;
+    let pool = pg_pool(&db.urls()[0]);
+
+    // Seed two distinct posts sequentially — no race here, the race under
+    // test is in the concurrent edit that follows.
+    for title in ["Seed Post Alpha", "Seed Post Beta"] {
+        let submit_form_url = format!("{base_url}/r/editrace/submit");
+        let csrf = hidden_value_from(&client, &submit_form_url, "_csrf").await;
+        let subreddit_id = hidden_value_from(&client, &submit_form_url, "subreddit_id").await;
+        let submit = client
+            .post(format!("{base_url}/submit"))
+            .form(&[
+                ("_csrf", csrf.as_str()),
+                ("subreddit_id", subreddit_id.as_str()),
+                ("title", title),
+                ("url", ""),
+                ("body", "seed"),
+            ])
+            .send()
+            .await
+            .expect("POST /submit (seed)");
+        assert!(
+            submit.status().is_redirection(),
+            "seed submit for {title:?} should redirect; got {}",
+            submit.status()
+        );
+    }
+
+    let mut conn = pool.get().await.expect("connection");
+    let slug_a = diesel::sql_query("SELECT slug FROM posts WHERE title = $1")
+        .bind::<Text, _>("Seed Post Alpha")
+        .get_result::<Slug>(&mut conn)
+        .await
+        .expect("look up seeded post Alpha")
+        .slug;
+    let slug_b = diesel::sql_query("SELECT slug FROM posts WHERE title = $1")
+        .bind::<Text, _>("Seed Post Beta")
+        .get_result::<Slug>(&mut conn)
+        .await
+        .expect("look up seeded post Beta")
+        .slug;
+    drop(conn);
+
+    // Edit BOTH distinct posts to the exact same new title at once — the
+    // `update` analogue of the issue's double-submit: two different posts'
+    // edits race for the identical `unique_slug_excluding` base slug.
+    const NEW_TITLE: &str = "Renamed Race Post";
+    let edits = [slug_a, slug_b].into_iter().map(|slug| {
+        let client = client.clone();
+        let base_url = base_url.clone();
+        tokio::spawn(async move {
+            let edit_url = format!("{base_url}/r/editrace/posts/{slug}/edit");
+            let csrf = hidden_value_from(&client, &edit_url, "_csrf").await;
+            client
+                .post(format!("{base_url}/r/editrace/posts/{slug}"))
+                .form(&[
+                    ("_csrf", csrf.as_str()),
+                    ("title", NEW_TITLE),
+                    ("body", "renamed"),
+                ])
+                .send()
+                .await
+        })
+    });
+    let results = futures::future::join_all(edits).await;
+    for result in results {
+        let response = result
+            .expect("edit task panicked")
+            .expect("POST update request failed");
+        assert!(
+            response.status().is_redirection(),
+            "every concurrent edit must still succeed (303 See Other) — got {}",
+            response.status()
+        );
+    }
+
+    let mut conn = pool.get().await.expect("connection");
+    assert_no_duplicate_slugs(&mut conn, "2 concurrent identical edits").await;
+
+    let distinct_slugs: Count = diesel::sql_query("SELECT COUNT(DISTINCT slug) AS count FROM posts")
+        .get_result(&mut conn)
+        .await
+        .expect("distinct-slug count");
+    assert_eq!(
+        distinct_slugs.count, 2,
+        "both concurrently edited posts must land their own distinct slug"
     );
 }
