@@ -203,7 +203,15 @@ def read(f):
 # spaces), one level of balanced parentheses (`](guide(v2).md)`), and an
 # optional link title in any of its three delimiters.
 DEST_BARE = r'(?:[^()\s]|\([^()\s]*\))+'
-TITLE = r'''(?:\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\((?:[^()\\]|\\.)*\)))?'''
+# A title may wrap lines but not contain a BLANK one, and the whitespace before
+# it is bounded the same way as the destination's: a blank line ends the
+# paragraph, so `[x](y.md\n\n "t")` renders no link at all. Bounding `_WS` and
+# leaving this grammar open was the same half-a-rule mistake in one regex.
+_TBODY = r'(?:[^{q}\\\n]|\\.|\n(?![ \t]*\n))*'
+TITLE = (r'(?:' + r'(?:[ \t]*\n?[ \t]*)' +
+         r'(?:"' + _TBODY.format(q='"') + r'"'
+         r"|'" + _TBODY.format(q="'") + r"'"
+         r'|\(' + _TBODY.format(q='()') + r'\)))?')
 # `[\s--\n]` style bounds: whitespace inside a destination may span ONE newline
 # but never a blank line — a blank line ends the paragraph, so `[x](y.md\n\n)`
 # renders no link at all and must not record an edge.
@@ -1762,6 +1770,24 @@ self_test() {
   printf '# Jobs\n\nSee [mail](mail&period;md).\n' > "$c9da/docs/guide/jobs.md"
   git -C "$c9da" add -A && git -C "$c9da" commit -qm named-char-ref
   check "a named character reference in a destination resolves" pass "$c9da"
+
+  # A title separated from its destination by a blank line renders no link.
+  local c9db="$tmp/c9db"; make_corpus "$c9db"
+  printf '# Jobs\n\nSee [mail](mail.md\n\n "title").\n' > "$c9db/docs/guide/jobs.md"
+  git -C "$c9db" add -A && git -C "$c9db" commit -qm title-across-blank
+  check "a title after a blank line is not a link" fail "$c9db"
+
+  # ...nor does one whose own body contains a blank line.
+  local c9dc="$tmp/c9dc"; make_corpus "$c9dc"
+  printf '# Jobs\n\nSee [mail](mail.md "one\n\ntwo").\n' > "$c9dc/docs/guide/jobs.md"
+  git -C "$c9dc" add -A && git -C "$c9dc" commit -qm title-body-blank
+  check "a title containing a blank line is not a link" fail "$c9dc"
+
+  # ...but a title wrapped across one line still resolves.
+  local c9dd="$tmp/c9dd"; make_corpus "$c9dd"
+  printf '# Jobs\n\nSee [mail](mail.md "the mail\nguide").\n' > "$c9dd/docs/guide/jobs.md"
+  git -C "$c9dd" add -A && git -C "$c9dd" commit -qm title-wrapped
+  check "a title wrapped across one line resolves" pass "$c9dd"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
