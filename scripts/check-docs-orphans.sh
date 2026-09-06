@@ -2068,8 +2068,13 @@ def has_content(image_span, masked_span, raw_span=None):
     # as though the reader saw no such thing. `decode_visible` leaves code
     # spans alone, which is right here too: `` [`&#32;`](mail.md) `` shows the
     # reader `&#32;` and is a genuine label.
+    # ASCII whitespace only. U+00A0 and the other Unicode spaces PAINT — an
+    # anchor holding just `&nbsp;` is 4px wide and clickable — so a bare
+    # `.strip()`, which counts them as whitespace, called a live link empty.
+    # The zero-width characters are removed above precisely because they do
+    # not paint; these are the opposite case and must survive.
     return bool(decode_visible(ANY_TAG.sub('', masked_span))
-                .translate(_ZERO_WIDTH).strip()
+                .translate(_ZERO_WIDTH).strip(' \t\n\r\f\v')
                 or ANY_IMAGE.search(image_span))
 
 
@@ -2199,6 +2204,14 @@ def edges_from(f):
         # U+00A0 stays IN the path, so `<a href="&nbsp;mail.md">` resolves
         # to `\xa0mail.md` and reaches the tracked file not at all —
         # Python's bare `.strip()` removed it and recorded the edge anyway.
+        if not markdown:
+            # URL parsing removes tab and line breaks from ANYWHERE in the
+            # URL, not just its ends: `<a href="ma\nil.md">` navigates to
+            # `mail.md`, and leaving the newline in reported a live link as an
+            # orphan. Measured through `new URL()`, which also shows a space
+            # and U+00A0 are NOT removed — they percent-encode and stay in the
+            # path, which is why only these three go.
+            raw = raw.translate({0x09: None, 0x0a: None, 0x0d: None})
         raw = raw.split('#', 1)[0].split('?', 1)[0].strip(' \t\n\r\f\v')
         raw = urllib.parse.unquote(raw)
         raw = (raw.replace('\x00\x00', '\\\\')
@@ -4666,6 +4679,38 @@ self_test() {
     > "$c9ku/docs/guide/jobs.md"
   git -C "$c9ku" add -A && git -C "$c9ku" commit -qm li-reopened
   check "a reopened li ends the hidden one" pass "$c9ku"
+
+  # U+00A0 PAINTS — an anchor holding just `&nbsp;` is 4px wide and clickable
+  # — so a bare `.strip()`, which treats it as whitespace, called a live link
+  # empty. The zero-width characters are removed for the opposite reason.
+  local c9ln="$tmp/c9ln"; make_corpus "$c9ln"
+  printf '# Jobs\n\n[&nbsp;](mail.md)\n' > "$c9ln/docs/guide/jobs.md"
+  git -C "$c9ln" add -A && git -C "$c9ln" commit -qm nbsp-label
+  check "a non-breaking space is a visible label" pass "$c9ln"
+
+  # ...while an ASCII space paints nothing and is still empty.
+  local c9lo="$tmp/c9lo"; make_corpus "$c9lo"
+  printf '# Jobs\n\n[ ](mail.md)\n' > "$c9lo/docs/guide/jobs.md"
+  git -C "$c9lo" add -A && git -C "$c9lo" commit -qm ascii-space-label
+  check "an ASCII space is not a visible label" fail "$c9lo"
+
+  # URL parsing removes tab and line breaks from ANYWHERE in the URL, so this
+  # href navigates to `mail.md` and the page is reachable.
+  local c9lp="$tmp/c9lp"; make_corpus "$c9lp"
+  printf '# Jobs\n\n<a href="ma\nil.md">Mail</a>\n' > "$c9lp/docs/guide/jobs.md"
+  git -C "$c9lp" add -A && git -C "$c9lp" commit -qm newline-in-href
+  check "a line break inside an href is removed" pass "$c9lp"
+
+  local c9lq="$tmp/c9lq"; make_corpus "$c9lq"
+  printf '# Jobs\n\n<a href="ma\til.md">Mail</a>\n' > "$c9lq/docs/guide/jobs.md"
+  git -C "$c9lq" add -A && git -C "$c9lq" commit -qm tab-in-href
+  check "a tab inside an href is removed" pass "$c9lq"
+
+  # ...but a SPACE is not removed, it percent-encodes and stays in the path.
+  local c9lr="$tmp/c9lr"; make_corpus "$c9lr"
+  printf '# Jobs\n\n<a href="ma il.md">Mail</a>\n' > "$c9lr/docs/guide/jobs.md"
+  git -C "$c9lr" add -A && git -C "$c9lr" commit -qm space-in-href
+  check "a space inside an href stays in the path" fail "$c9lr"
 
   # U+00A0 stays IN a URL path, so this href resolves to `\xa0mail.md` and
   # reaches the tracked file not at all. Python's bare `.strip()` removed it.
