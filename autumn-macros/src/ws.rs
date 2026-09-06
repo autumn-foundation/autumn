@@ -44,6 +44,26 @@ const INCOMPATIBLE_GUARD_MSG: &str = "`#[secured]`/`#[step_up]`/`#[throttle]`/`#
      inside the upgrade handler instead — add a `Session` (or other) extractor parameter and \
      reject the upgrade before returning a `WsHandler`.";
 
+/// The exact fully qualified return type every guard
+/// (`secured`/`step_up`/`throttle`/`authorize`) rewrites its wrapped
+/// handler to (confirmed identical across `secured.rs`/`step_up.rs`/
+/// `throttle.rs`/`authorize.rs`).
+const GUARD_RESPONSE_PATH: [&str; 5] = ["autumn_web", "reexports", "axum", "response", "Response"];
+
+/// Whether `path` is exactly the guard-generated
+/// `::autumn_web::reexports::axum::response::Response` return type, matched
+/// segment-by-segment rather than by last segment alone — a legitimate
+/// `#[ws]` handler could otherwise return an unrelated user type merely
+/// named `Response` (fourth Codex review pass on #2513).
+fn is_guard_response_path(path: &syn::Path) -> bool {
+    path.segments.len() == GUARD_RESPONSE_PATH.len()
+        && path
+            .segments
+            .iter()
+            .zip(GUARD_RESPONSE_PATH.iter())
+            .all(|(segment, expected)| segment.ident == expected)
+}
+
 fn is_app_state_type(ty: &syn::Type) -> bool {
     if let syn::Type::Path(type_path) = ty
         && type_path.qself.is_none()
@@ -149,11 +169,16 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // the exact same `-> ::autumn_web::reexports::axum::response::Response`
     // (confirmed identical across secured.rs/step_up.rs/throttle.rs/
     // authorize.rs), which a legitimate `#[ws]` handler — required to
-    // return `impl WsHandler` — never would.
+    // return `impl WsHandler` — never would. Matched by the *full* path,
+    // not just the last segment: a legitimate `#[ws]` handler could return
+    // a user-defined type merely named `Response` that implements
+    // `WsHandler` (e.g. `my_crate::Response`), and a last-segment-only
+    // match would misclassify that as a guard-generated return type and
+    // reject a perfectly valid handler (fourth Codex review pass on #2513).
     let already_returns_response = matches!(
         &input_fn.sig.output,
         syn::ReturnType::Type(_, ty)
-            if matches!(ty.as_ref(), syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "Response"))
+            if matches!(ty.as_ref(), syn::Type::Path(p) if is_guard_response_path(&p.path))
     );
     if !leading_guard_items.is_empty()
         || unexpanded_guard_attr.is_some()
@@ -473,6 +498,29 @@ mod tests {
         assert!(
             generated.contains("cannot be combined with"),
             "the error must explain why the combination is rejected: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_accepts_a_handler_returning_an_unrelated_response_type() {
+        // A `#[ws]` handler returning a user-defined type merely *named*
+        // `Response` (not the guard-generated
+        // `::autumn_web::reexports::axum::response::Response`) must not be
+        // misclassified as guard-incompatible: the return-type check must
+        // match the full path, not just the last segment (fourth Codex
+        // review pass on #2513).
+        let generated = ws_macro(
+            quote! { "/echo" },
+            quote! {
+                async fn echo() -> my_crate::Response { my_crate::Response::new() }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("compile_error"),
+            "a handler returning an unrelated `Response`-named type must not be rejected: \
+             {generated}"
         );
     }
 

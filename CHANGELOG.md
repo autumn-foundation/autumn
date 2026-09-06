@@ -1712,18 +1712,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alongside the real one in the gate, mirroring `#[secured]`'s existing
   `role_scope_consts`/`markers` split.
 
-- **macros: `#[secured]` above `#[static_get]` was protected at runtime but
-  reported unsecured to `routes audit`:** the fix above taught
-  `#[static_get]` to accept a guard's leading gate items via
-  `parse::parse_async_handler_with_leading_items`, but its generated
-  `ApiDoc` still hardcoded `secured: false, required_roles: &[]` instead of
-  reading the `#[secured]` marker back off the handler the way the
-  `#[get]`/`#[post]` route macro does — a `#[secured("admin")]`-guarded
-  static route was correctly gated on every request, yet `routes audit`
-  classified it `unclassified` and its declared roles were missing from
-  posture output. Fixed by deriving all three fields from
-  `api_doc::extract_secured_info(&input_fn)`, mirroring `crate::route`
-  exactly (found by Codex review on #2513).
+- **macros: `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` stacked
+  with `#[static_get]` is now a compile error, not a false "protected"
+  certification:** the fix above taught `#[static_get]` to accept a guard's
+  leading gate items via `parse::parse_async_handler_with_leading_items`,
+  and an initial pass had it read the guard's role/scope marker back off the
+  handler via `api_doc::extract_secured_info(&input_fn)` — mirroring
+  `crate::route` — so a `#[secured("admin")]`-guarded static route would
+  report `secured: true` to `routes audit` instead of the previous hardcoded
+  `secured: false`. A follow-up Codex pass caught that this was actively
+  wrong, not just incomplete: cached SSG/ISR responses are served by the
+  static-first middleware *before* the inner router (session, auth) is ever
+  reached (`AppBuilder::static_gate`'s doc comment spells this out), so the
+  guard only ever runs on the rare synchronous render/revalidate call, never
+  on a cache hit — the overwhelming majority of live traffic to a cached
+  page. Certifying `secured: true` there made `routes audit` wrongly attest
+  the page as protected when an anonymous request against a warm cache entry
+  gets the cached HTML unauthenticated either way. `#[static_get]` now
+  rejects the combination outright, in both attribute orders, mirroring
+  `#[ws]`'s identical guard-incompatibility check below, and the error
+  points authors at `AppBuilder::static_gate` — the gate actually built to
+  protect pre-rendered pages (Codex review on #2513, P1).
 
 - **macros: `#[secured]`/`#[step_up]`/`#[throttle]` above `#[ws]` never
   actually worked, and generated silently-broken code rather than a clear
@@ -1766,7 +1775,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same hardcoded `secured: false, required_roles: &[]` gap `#[static_get]`
   had for the (still-supported) case of a live `#[authorize]` attribute or
   policy check — fixed the same way, via `api_doc::extract_secured_info`
-  (Codex review on #2513, P2).
+  (Codex review on #2513, P2). That return-type check itself had a false-
+  positive gap a fifth Codex pass caught: it matched a `Response` return
+  type by its *last path segment only*, so a `#[ws]` handler legitimately
+  returning some unrelated user type merely *named* `Response` (e.g.
+  `my_crate::Response`, implementing the public `WsHandler` trait) would be
+  misclassified as guard-incompatible and rejected outright. Fixed by
+  matching the guard's exact fully qualified return path segment-by-segment
+  (`::autumn_web::reexports::axum::response::Response`) instead of just the
+  final identifier.
 
 - **hot-upgrade example: `live_upgrade` test no longer conflates a mid-flight
   reset with a refused connection, and no longer lets an unbounded number of

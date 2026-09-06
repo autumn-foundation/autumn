@@ -16,6 +16,19 @@ use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, LitInt, LitStr, Token};
 
+/// Attribute names of the body-guard macros that cannot meaningfully gate a
+/// `#[static_get]` route. See `static_get_macro`'s rejection of the
+/// combination in either attribute order.
+const INCOMPATIBLE_GUARD_ATTRS: [&str; 4] = ["secured", "step_up", "throttle", "authorize"];
+
+/// Error message for `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]`
+/// combined with `#[static_get]`, in either attribute order.
+const INCOMPATIBLE_GUARD_MSG: &str = "`#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` \
+     cannot be combined with `#[static_get]`: cached SSG/ISR responses are served by the \
+     static-first middleware before the inner router (session, auth) is ever reached, so this \
+     guard would not protect a cache hit. Use `AppBuilder::static_gate` to gate pre-rendered \
+     pages instead.";
+
 /// Parsed attributes for `#[static_get("/path", params = fn, revalidate = N)]`.
 struct StaticGetAttrs {
     path: LitStr,
@@ -178,14 +191,36 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // wired.
     let is_public = crate::api_doc::is_public(&input_fn);
 
-    // Derive `secured`/`required_roles`/`required_scopes` from any `#[secured]`
-    // markers on the handler, the same way `crate::route` does. Without this a
-    // `#[secured(...)]` stacked above `#[static_get]` (guard expands first, so
-    // this macro sees its leading gate items and marker via
-    // `parse_async_handler_with_leading_items`) would be protected at runtime
-    // but reported as `unclassified`/roleless to `routes audit`.
-    let (secured, required_roles, required_scopes) =
-        crate::api_doc::extract_secured_info(&input_fn);
+    // `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` cannot
+    // meaningfully gate a `#[static_get]` route: cached SSG/ISR responses
+    // are served by the static-first middleware *before* the inner router
+    // (session, auth) is ever reached (see `AppBuilder::static_gate`'s doc
+    // comment in `autumn/src/app.rs`), so a route-level guard here only
+    // ever runs on the rare synchronous render/revalidate call, never on a
+    // cache hit — the overwhelming majority of live traffic to a cached
+    // page. An earlier version of this macro derived `secured: true` from
+    // such a guard, which made `routes audit` wrongly certify the page as
+    // protected (P1, #2513 Codex review). Reject the combination outright,
+    // in both stacking orders, mirroring `crate::ws`'s identical guard
+    // check, and point authors at the gate actually built for this:
+    // `AppBuilder::static_gate`.
+    let unexpanded_guard_attr = input_fn.attrs.iter().find(|attr| {
+        attr.path().segments.last().is_some_and(|segment| {
+            INCOMPATIBLE_GUARD_ATTRS.contains(&segment.ident.to_string().as_str())
+        })
+    });
+    if !leading_guard_items.is_empty() || unexpanded_guard_attr.is_some() {
+        let err = unexpanded_guard_attr.map_or_else(
+            || syn::Error::new_spanned(&leading_guard_items, INCOMPATIBLE_GUARD_MSG),
+            |attr| syn::Error::new_spanned(attr, INCOMPATIBLE_GUARD_MSG),
+        );
+        return err.to_compile_error();
+    }
+
+    // No guard is present at this point, so the route is always unsecured.
+    let secured = false;
+    let required_roles = quote! { &[] };
+    let required_scopes = quote! { &[] };
 
     // Build the revalidate expression
     let revalidate_expr = attrs.revalidate.map_or_else(
@@ -302,11 +337,19 @@ mod tests {
     }
 
     #[test]
-    fn static_get_derives_secured_metadata_when_guard_expands_first() {
+    fn static_get_rejects_a_secured_guard_expanded_above_it() {
         // `#[secured("admin")]` above `#[static_get]`: the guard expands
-        // first and leaves its role marker in the handler body, which
-        // `static_get_macro` must now read via `extract_secured_info` (#2513
-        // Codex review) instead of hardcoding `secured: false`.
+        // first and leaves a leading gate sibling item plus a role marker
+        // in the handler body. An earlier version of this macro read that
+        // marker via `extract_secured_info` and recorded `secured: true` —
+        // but cached SSG/ISR responses are served by the static-first
+        // middleware *before* the guard (or the inner router at all) ever
+        // runs, so that certification was false for the overwhelming
+        // majority of live traffic to the cached page (a cache hit).
+        // `routes audit` would have wrongly attested the page as protected
+        // (P1, #2513 Codex review, fifth finding on this PR). Reject the
+        // combination outright instead, mirroring `crate::ws`'s identical
+        // guard check.
         let secured = crate::secured::secured_macro(
             quote! { "admin" },
             quote! {
@@ -316,13 +359,49 @@ mod tests {
         let generated = static_get_macro(quote! { "/about" }, secured).to_string();
 
         assert!(
-            generated.contains("secured : true"),
-            "a #[secured]-above-#[static_get] route must record secured = true: {generated}"
+            generated.contains("compile_error"),
+            "a #[secured] guard stacked above #[static_get] must be a compile error, not a \
+             false `secured: true` certification: {generated}"
         );
         assert!(
-            generated.contains(r#"required_roles : & ["admin"]"#),
-            "roles from a #[secured] guard must survive into the static route's ApiDoc: \
-             {generated}"
+            generated.contains("cannot be combined with"),
+            "the error must explain why the combination is rejected: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_rejects_a_live_unexpanded_secured_attribute() {
+        // The *other* stacking order: `#[static_get]` outermost, `#[secured]`
+        // still a live, unexpanded attribute below it.
+        let generated = static_get_macro(
+            quote! { "/about" },
+            quote! {
+                #[secured("admin")]
+                async fn about() -> &'static str { "about" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a live, unexpanded #[secured] attribute below #[static_get] must also be a \
+             compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_rejects_a_step_up_guard_expanded_above_it() {
+        let stepped_up = crate::step_up::step_up_macro(
+            quote! {},
+            quote! {
+                async fn about() -> &'static str { "about" }
+            },
+        );
+        let generated = static_get_macro(quote! { "/about" }, stepped_up).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a #[step_up] guard stacked above #[static_get] must be a compile error: {generated}"
         );
     }
 
