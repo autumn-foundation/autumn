@@ -520,13 +520,21 @@ def strip_comments(txt):
 # The unclosed alternative matters for the same reason it does for comments: an
 # opener with no matching close makes the rest of the file raw HTML, so
 # Markdown-shaped text after it renders as nothing.
-HIDDEN_HTML = re.compile(
-    r'<(script|style|template)\b[^>]*>.*?</\1\s*>'
-    r'|<(?:script|style|template)\b[^>]*>.*', re.S | re.I)
+HIDDEN_TAGS = r'script|style|template'
+# Comments and hidden-HTML openers are found by ONE scan, because whichever
+# opens FIRST wins and neither can decide that alone. `<!-- <script> -->` is a
+# sample INSIDE a comment: matching hidden HTML first read it as an unclosed
+# script and blanked the rest of the page, losing live links below it. The
+# mirror was already true and is why the openers cannot simply be stripped in
+# the other order — a `<!--` inside a closed `<script>` is script data, not a
+# comment, and parsing comments first truncated the document at it.
+# This is the third place in this file that needed the same rule; `split_fences`
+# and `comment_block_spans` settle fences against comments the same way.
+FIRST_OPENER = re.compile(r'(<!--)|(<(' + HIDDEN_TAGS + r')\b[^>]*>)', re.I)
 # `<pre>` and `<textarea>` are CommonMark type-1 raw blocks alongside script and
 # style, so Markdown inside them is literal — but unlike script and style their
 # contents are SHOWN. A path in a `<pre>` block is on screen and still counts,
-# which is why they belong here and not in HIDDEN_HTML: this bounds Markdown
+# which is why they belong here and not among the hidden tags: this bounds Markdown
 # extraction only.
 # The end condition is the LINE, not the tag: CommonMark ends a type-1 block on
 # the line carrying a close tag, and that whole line is part of the block. So
@@ -557,7 +565,16 @@ ATTR_VALUE = re.compile(
 # page references invisibly, not somewhere the reader can click.
 ATTR_VALUE_ANY = re.compile(
     r'\b[A-Za-z_:][-\w:.]*\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)', re.I)
-ANCHOR_TAG = re.compile(r'<a(?:\s[^>]*)?>', re.I)
+# The attribute grammar is HTML_TAG's, not `[^>]*`, for the reason HTML_TAG
+# already carries: a quoted `>` does not end a tag. `<a title="1 > 0"
+# data-note="docs/guide/mail.md">` ended here inside `title`, so `data-note`
+# fell outside the anchor bounds, was never masked, and its invisible path kept
+# an orphan alive. Fixing HTML_TAG and leaving this one is the same
+# rule-applied-to-one-sibling mistake this file keeps making.
+ANCHOR_TAG = re.compile(
+    r'<a'
+    r'(?:\s+[A-Za-z_:][-\w:.]*(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+))?)*'
+    r'\s*/?>', re.I)
 # The `](…)` destination of a rendered link, blanked before the bare-path scan.
 LINK_DEST = re.compile(r'\]' + DEST)
 # A whole raw tag, used to bound where `src=` may be masked. Unscoped, that
@@ -572,7 +589,7 @@ HTML_TAG = re.compile(
     r'\s*/?>')
 # A raw HTML BLOCK of any tag — CommonMark type 6. Its contents are raw HTML,
 # so `[mail]` inside `<div>…</div>` stays literal and resolves no reference.
-# Unlike `HIDDEN_HTML` the text is still VISIBLE, so this bounds Markdown
+# Unlike the hidden tags the text is still VISIBLE, so this bounds Markdown
 # extraction only; bare paths inside it still count.
 # A type-6 block starts on a line beginning with a tag — trailing content on
 # that line is allowed, `<div>example` opens one — and ends at the next BLANK
@@ -612,7 +629,7 @@ RAW_DELIM = (
 # reference — `![` … `]]` with one level of nesting. Blanking it there left a
 # bare `<` and `>` behind, RAW_BLOCK no longer matched the line, and a link
 # sharing it went back to counting as a route. Only these three are protected;
-# a type 6/7 block still needs `HIDDEN_HTML` to reach a `<script>` inside it.
+# a type 6/7 block still needs `hidden_spans` to reach a `<script>` inside it.
 RAW_DELIM_BLOCK = re.compile(RAW_DELIM, re.M | re.S)
 RAW_BLOCK = re.compile(
     RAW_DELIM +
@@ -633,8 +650,13 @@ RAW_BLOCK_TYPE7 = re.compile(
 # through `add_relative`, which means `<a href="mail.md">` and
 # `<a href="../guide/mail.md">` work, not just the repo-root spelling the
 # bare-path scan happens to catch.
+# Attributes are skipped as whole units here too, for the mirror of the reason
+# ANCHOR_TAG needs it: `<a title="1 > 0" href="mail.md">` hid the href behind a
+# quoted `>`, so a link the reader CAN click stopped counting — the direction
+# that reports a reachable page as an orphan.
 ANCHOR_HREF = re.compile(
-    r'<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))', re.I)
+    r'<a(?:\s+[A-Za-z_:][-\w:.]*(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+))?)*?'
+    r'\s+href\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))', re.I)
 
 
 ATX_HEADING = re.compile(r'^ {0,3}#{1,6}(?:\s|$)')
@@ -746,6 +768,38 @@ def sub_in_prose(pat, txt, only_at_block_start=False):
     return ''.join(out)
 
 
+def hidden_spans(seg, protected):
+    """Spans of raw HTML the reader never sees, resolved against comments by
+    which construct OPENS FIRST.
+
+    Consuming each construct whole and continuing past it is what makes the
+    precedence fall out: a `<script>` reached while inside a comment is never
+    the leftmost opener, and a `<!--` inside a script is skipped for the same
+    reason. An unclosed opener of either kind runs to the end of the segment,
+    which is what Markdown does with it.
+    """
+    spans, pos = [], 0
+    while True:
+        m = FIRST_OPENER.search(seg, pos)
+        if not m:
+            return spans
+        if any(a <= m.start() < b for a, b in protected):
+            # A sample in a code span opens nothing; step past just the marker
+            # so an opener AFTER the span is still found.
+            pos = m.start() + 1
+            continue
+        if m.group(1):
+            end = seg.find('-->', m.end())
+            if end == -1:
+                return spans
+            pos = end + 3
+            continue
+        close = re.search(r'</' + m.group(3) + r'\s*>', seg[m.end():], re.I)
+        end = len(seg) if close is None else m.end() + close.end()
+        spans.append((m.start(), end))
+        pos = end
+
+
 def fold_escapes(txt):
     """Collapse the three backslash escapes that change what a construct IS.
 
@@ -810,10 +864,10 @@ def mask_invisible(txt):
             pieces.append(seg[last:])
             seg = ''.join(pieces)
 
-        # Attributes are blanked BEFORE `HIDDEN_HTML`, because a tag boundary
+        # Attributes are blanked BEFORE hidden HTML, because a tag boundary
         # has to be known before script-shaped TEXT can be treated as a script.
         # In `<span title="<script>">`, the quoted `<script>` is attribute text
-        # and every link below it is still live; running `HIDDEN_HTML` first
+        # and every link below it is still live; resolving hidden HTML first
         # made that span open a raw block and erased the rest of the page —
         # or everything up to an unrelated later `</script>`.
         anchors = [(m.start(), m.end()) for m in ANCHOR_TAG.finditer(seg)]
@@ -821,7 +875,12 @@ def mask_invisible(txt):
                   if not any(a <= t[0] < b for a, b in anchors)]
         blank(ATTR_VALUE, bound=anchors)
         blank(ATTR_VALUE_ANY, bound=others)
-        blank(HIDDEN_HTML)
+        # Hidden HTML is resolved AFTER attribute masking, so script-shaped
+        # attribute TEXT is already spaces and cannot open anything, and by a
+        # comment-aware scan rather than a bare pattern, so a script shown
+        # inside a comment cannot either.
+        for a, b in hidden_spans(seg, protected):
+            seg = seg[:a] + ' ' * (b - a) + seg[b:]
         # Images last, and here rather than at the bare-path scan, so a
         # `![alt](x.md)` SAMPLE in a fence or code span keeps its visible
         # destination while a rendered image does not.
@@ -2062,6 +2121,39 @@ self_test() {
     > "$c9dy/docs/guide/jobs.md"
   git -C "$c9dy" add -A && git -C "$c9dy" commit -qm definition-after-prose
   check "a definition continuing a paragraph still defines nothing" fail "$c9dy"
+
+  # A script SHOWN inside a comment opens nothing: the comment opened first.
+  local c9dz="$tmp/c9dz"; make_corpus "$c9dz"
+  printf '# Jobs\n\n<!-- <script> -->\n\nSee [mail](mail.md).\n' \
+    > "$c9dz/docs/guide/jobs.md"
+  git -C "$c9dz" add -A && git -C "$c9dz" commit -qm script-in-comment
+  check "a script shown inside a comment hides nothing" pass "$c9dz"
+
+  # ...and the mirror still holds: a comment inside a script is script data,
+  # so it opens no comment and cannot truncate the page.
+  local c9ea="$tmp/c9ea"; make_corpus "$c9ea"
+  printf '# Jobs\n\n<script>\n<!--\n</script>\n\nSee [mail](mail.md).\n' \
+    > "$c9ea/docs/guide/jobs.md"
+  git -C "$c9ea" add -A && git -C "$c9ea" commit -qm comment-in-script
+  check "a comment inside a script opens no comment" pass "$c9ea"
+
+  # A quoted `>` does not end an anchor, so the attribute after it is still
+  # masked and its invisible path confers nothing.
+  local c9eb="$tmp/c9eb"; make_corpus "$c9eb"
+  printf '# Jobs\n\n<a title="1 > 0" data-note="docs/guide/mail.md">x</a>\n' \
+    > "$c9eb/docs/guide/jobs.md"
+  git -C "$c9eb" add -A && git -C "$c9eb" commit -qm anchor-quoted-gt
+  check "an attribute after a quoted > is still masked" fail "$c9eb"
+
+  # ...and the href behind two of them is still found, since that IS
+  # navigation. TWO, because with one the masking pass happened to blank the
+  # offending attribute before `ANCHOR_HREF` ran and the bug did not show —
+  # the single-attribute spelling verifies an accident, not the rule.
+  local c9ec="$tmp/c9ec"; make_corpus "$c9ec"
+  printf '# Jobs\n\n<a title="1 > 0" data-x="2 > 1" href="mail.md">mail</a>\n' \
+    > "$c9ec/docs/guide/jobs.md"
+  git -C "$c9ec" add -A && git -C "$c9ec" commit -qm anchor-href-after-quoted-gt
+  check "an href after quoted > characters still counts as an edge" pass "$c9ec"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
