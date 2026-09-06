@@ -1458,6 +1458,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliberately differ (no Unix socket, no in-place upgrade handoff). Issue
   #1603.
 
+- **ci:** `autumn-cli`'s consolidated `cli_tests` binary now gets the same
+  discovery sweep as the `autumn` crate's `integration_tests` binary
+  (#1945): a bare `--ignored` run over `cli_tests` in ci.yml's
+  Docker-dependent-tests step, so a new `#[ignore = "requires Docker
+  (testcontainers)"]` test in any `autumn-cli/tests/integration/*.rs` module
+  runs in CI automatically. Before this, only two hand-picked filters
+  (`offsite`, `db_scrub`) ran anything from that binary, leaving 46 Docker
+  tests across 8 modules (`db.rs`, `db_pull.rs`,
+  `generate_lock_version_postgres.rs`, `generate_references_postgres.rs`,
+  `migrate_down.rs`, `schema_migrate.rs`, `schema_pull.rs`, `test_command.rs`)
+  dark since they were written — PR #1985's noted follow-up. The sweep's
+  `--skip` list routes the binary's other `#[ignore]`d tests — the ones that
+  scaffold and cargo-check/build/run a fresh generated project instead of
+  touching Docker — to `generator-conformance.yml`, where 15 of them (across
+  `api_scaffold`, `cloud_native_scaffold`, `generate_position_scaffold`,
+  `scaffold_belongs_to`, `scaffold_bulk_delete`, `scaffold_rich_text`,
+  `scaffold_search`, `scaffold_trash`, `seed_model_linking`, `serve`, and two
+  in `scaffold_form_for`) are now named there for the first time, closing the
+  same gap for that half of the binary. The sweep also `--skip`s the
+  pre-existing `generate_json_postgres.rs` Docker test, which already ran in
+  `generator-conformance.yml` before this change, so it isn't doubled up.
+  Two new `autumn-cli/tests/integration/repo_hygiene.rs` tests guard both
+  halves of the wiring going forward. [no-plugin]
+
 ### Changed
 
 - **acme:** [no-plugin] Internal cleanup, no behavior change (#1864): the owner-only
@@ -1750,6 +1774,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/security/2026-09-03-webhook-ssrf/`.
 
 ### Fixed
+
+- **`autumn new`'s starter template shipped three cookie-consent routes that
+  failed `autumn routes audit` (issue #1214 follow-up):** the cookie-consent
+  banner feature added `POST /consent/accept`, `POST /consent/reject`, and
+  `GET /consent/manage` to `main.rs.tmpl`, but — unlike every other starter
+  handler — never marked them `#[public]`, so a fresh `autumn new` app failed
+  its own generated CI's routes-audit gate before a single line of app code
+  was written. Invisible until now: `scaffolded_app_passes_routes_audit_gate`
+  (added for #2154 specifically to catch this class of regression) was one of
+  the `cli_tests` tests #1945 revived — it had never run in CI before. Added
+  `#[public]` to all three handlers, matching the pattern documented right
+  above them in the template. [no-plugin] — restores previously-documented
+  behavior; no new or changed API.
 
 - **`route_macro` lost a guarded handler's OpenAPI response schema under
   `#[throttle]`/`#[step_up]` (issue #2516):** #2488 moved the
