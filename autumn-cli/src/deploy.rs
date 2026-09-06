@@ -2245,10 +2245,19 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
                 .to_owned(),
         );
     };
+    // A deploy addresses paths as text — in a systemd unit, in a shell line — so
+    // one it cannot render is one it cannot ship. `file:app%FF.db` decodes to such
+    // a name.
+    let Some(raw) = path.to_str().map(str::to_owned) else {
+        return SqliteDataFile::Refused(format!(
+            "the configured SQLite database path ({}) is not valid UTF-8, so a deploy \
+             cannot address it. Rename the file.",
+            path.display()
+        ));
+    };
     // Normalize BEFORE any containment check: a lexical prefix compare on
     // `/srv/app/shared/../releases/r1/app.db` would call it durable, while the
     // kernel resolves it into `releases/`, where retention deletes it.
-    let raw = path.to_string_lossy().into_owned();
     let Some(text) = lexically_normalized(&raw) else {
         return SqliteDataFile::Refused(format!(
             "the configured SQLite database path {raw} climbs above the filesystem root."
@@ -2260,8 +2269,16 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
         // symlink into it. Only `shared/` survives, so only `shared/` is a
         // durable place inside the app dir. A path outside the app dir is the
         // operator's own and is left alone.
-        let app_dir = cfg.app_dir.trim_end_matches('/');
-        if within(&text, app_dir) && !within(&text, &cfg.shared_dir()) {
+        //
+        // `app_dir` is normalized too, not just the database path: `[deploy]
+        // app_dir = "/srv/autumn/tmp/../myapp"` names the same directory as
+        // `/srv/autumn/myapp`, and comparing the raw spelling would miss a
+        // database sitting in the releases dir it resolves to.
+        let app_dir = lexically_normalized(&cfg.app_dir).unwrap_or_default();
+        let shared = lexically_normalized(&cfg.shared_dir()).unwrap_or_default();
+        // An app dir that is not an absolute path grades nothing — `within` on an
+        // empty root would swallow every absolute path.
+        if app_dir.starts_with('/') && within(&text, &app_dir) && !within(&text, &shared) {
             return SqliteDataFile::Refused(format!(
                 "the configured SQLite database {text} lives inside the deploy's own app \
                  directory ({app_dir}), where only `shared/` survives: `releases/` is \
@@ -5888,6 +5905,59 @@ mod tests {
                 "{bad} must be refused, got {got:?}"
             );
         }
+    }
+
+    /// `[deploy] app_dir` can carry lexical aliases too. Comparing the raw
+    /// spelling would let a database sitting in the releases dir it resolves to
+    /// pass as durable, and release retention would then delete it.
+    #[test]
+    fn classify_sqlite_data_file_normalizes_the_app_dir_as_well() {
+        let aliased = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                host: Some("203.0.113.10".to_owned()),
+                app_dir: Some("/srv/autumn/tmp/../myapp/".to_owned()),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("resolves");
+
+        let inside = classify_sqlite_data_file(
+            Some("sqlite:///srv/autumn/myapp/releases/r1/app.db"),
+            &aliased,
+        );
+        let SqliteDataFile::Refused(detail) = inside else {
+            panic!("a database in the resolved releases dir must be refused, got {inside:?}");
+        };
+        assert!(
+            detail.contains("/srv/autumn/myapp"),
+            "the refusal must name the RESOLVED app dir: {detail}"
+        );
+        // The deploy's own persistent dir still passes, aliased spelling or not.
+        assert!(matches!(
+            classify_sqlite_data_file(
+                Some("sqlite:///srv/autumn/myapp/shared/data/app.db"),
+                &aliased
+            ),
+            SqliteDataFile::Persistent(_)
+        ));
+        // …and a path genuinely outside it is still the operator's own.
+        assert!(matches!(
+            classify_sqlite_data_file(Some("sqlite:///var/lib/myapp/app.db"), &aliased),
+            SqliteDataFile::Persistent(_)
+        ));
+    }
+
+    /// A deploy addresses paths as text, so one it cannot render it cannot ship.
+    /// `file:app%FF.db` decodes to exactly such a name.
+    #[cfg(unix)]
+    #[test]
+    fn classify_sqlite_data_file_refuses_a_non_utf8_path() {
+        let got = classify_sqlite_data_file(Some("file:app%FF.db"), &deploy_cfg());
+        let SqliteDataFile::Refused(detail) = got else {
+            panic!("a non-UTF-8 path must be refused, got {got:?}");
+        };
+        assert!(detail.contains("not valid UTF-8"), "{detail}");
     }
 
     #[test]

@@ -134,7 +134,18 @@ fn open(path: &Path) -> Result<SqliteConnection, SnapshotError> {
             path: path.display().to_string(),
         });
     }
-    let target = path.to_string_lossy().into_owned();
+    // Refuse a non-UTF-8 path rather than open a lossy rendering of it, which
+    // would be a DIFFERENT file. `file:app%FF.db` decodes to such a name, and
+    // diesel takes the connection string as `&str`.
+    let Some(target) = path.to_str() else {
+        return Err(SnapshotError::Open {
+            path: path.display().to_string(),
+            detail: "the path is not valid UTF-8, and SQLite is opened through a UTF-8 \
+                     connection string"
+                .to_owned(),
+        });
+    };
+    let target = target.to_owned();
     let mut conn = SqliteConnection::establish(&target).map_err(|e| SnapshotError::Open {
         path: target.clone(),
         detail: e.to_string(),

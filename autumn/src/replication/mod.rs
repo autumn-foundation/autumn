@@ -227,18 +227,42 @@ pub fn database_file(url: &str) -> Option<PathBuf> {
     });
     let decoded = percent_decode(path);
     if decoded.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(decoded))
+        return None;
     }
+    decoded_path(decoded)
+}
+
+/// Turn decoded `SQLite` URI bytes into a path.
+///
+/// `SQLite` percent-decodes to BYTES and hands them to `open(2)`, so
+/// `file:app%FF.db` names `app\xFF.db` — a real filename on a POSIX host and not
+/// valid UTF-8. A lossy conversion would name `app\u{FFFD}.db` instead: a
+/// different file, which is how a backup comes to report a live database missing.
+#[cfg(unix)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the non-unix sibling genuinely refuses; one signature keeps the caller single"
+)]
+fn decoded_path(bytes: Vec<u8>) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+/// Non-POSIX hosts name files in UTF-16, so a non-UTF-8 byte sequence names no
+/// file at all. Refuse it rather than guess with a replacement character.
+#[cfg(not(unix))]
+fn decoded_path(bytes: Vec<u8>) -> Option<PathBuf> {
+    String::from_utf8(bytes).ok().map(PathBuf::from)
 }
 
 /// Percent-decode a `SQLite` URI path the way `sqlite3_open` does.
 ///
 /// `%HH` with two hex digits becomes that byte; anything else — a stray `%`, a
 /// truncated or non-hex escape — is left alone, matching `SQLite`'s own lenient
-/// parser. Decoding is byte-wise, so a multi-byte UTF-8 escape reassembles.
-fn percent_decode(path: &str) -> String {
+/// parser. Returns BYTES, not a `String`: the result is a filename, and a
+/// filename need not be valid UTF-8.
+fn percent_decode(path: &str) -> Vec<u8> {
     let bytes = path.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -263,7 +287,7 @@ fn percent_decode(path: &str) -> String {
             index = index.saturating_add(1);
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 /// Strip `scheme://user:pass@` userinfo out of every URL embedded in `detail`.
@@ -549,6 +573,7 @@ mod tests {
             ("file:caf%C3%A9.db", "café.db"),
             // A stray or truncated escape is left alone, like SQLite's own parser.
             ("file:100%.db", "100%.db"),
+            ("file:a%2Fb.db", "a/b.db"),
             ("file:a%zz.db", "a%zz.db"),
             ("file:trailing%", "trailing%"),
         ] {
@@ -559,6 +584,27 @@ mod tests {
         assert_eq!(
             database_file("sqlite://app%20data.db"),
             Some(PathBuf::from("app%20data.db"))
+        );
+    }
+
+    /// `SQLite` decodes a URI filename to BYTES and hands them to `open(2)`, so
+    /// `file:app%FF.db` names a real POSIX file whose name is not valid UTF-8.
+    /// A lossy conversion would name a DIFFERENT file (`app\u{FFFD}.db`), which
+    /// is how a backup comes to report a live database missing.
+    #[cfg(unix)]
+    #[test]
+    fn database_file_keeps_non_utf8_bytes_a_file_uri_decodes_to() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let resolved = database_file("file:app%FF.db").expect("names a file");
+        assert_eq!(
+            resolved.as_os_str().as_bytes(),
+            b"app\xFF.db",
+            "the decoded bytes must survive, not become a replacement character"
+        );
+        assert!(
+            resolved.to_str().is_none(),
+            "this path is deliberately not valid UTF-8"
         );
     }
 
