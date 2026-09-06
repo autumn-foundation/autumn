@@ -230,7 +230,12 @@ DEST = r'\(' + _WS + r'(?:' + ANGLE_DEST + r'|(' + DEST_BARE + r'))' + TITLE + _
 # inside the label. The nesting form exists because a linked image puts one
 # link inside another — `[![alt](img.png)](page.md)` — where the flat pattern
 # finds only the image.
-FLAT = r'(?:[^\[\]\\]|\\.)'
+# A label may wrap across a line but not across a BLANK one: the blank ends the
+# paragraph, and `[Mail` / blank / `](mail.md)` renders no link at all.
+# `[^\[\]\\]` admitted the newline like any other character, so that non-link
+# recorded an edge and could conceal an orphan. The destination and the title
+# already carried this bound; the label is the third side of the same link.
+FLAT = r'(?:[^\[\]\\\n]|\\.|\n(?![ \t]*\n))'
 # `!` joins the lookbehind because `![alt](x.md)` is an IMAGE: its destination
 # is a resource the page loads, not a page the reader can navigate to, and the
 # path is never visible on screen. By this gate's visible-or-clickable rule it
@@ -270,12 +275,18 @@ def decode_char_refs(s):
 # label contains a bracket — `[^\]]+` would stop at the escaped one and lose the
 # definition entirely. Same `FLAT` shape the sibling uses for exactly this.
 REF_DEF = re.compile(
-    r'^ {0,3}\[((?:[^\[\]\\]|\\.)+)\]:(?:[ \t]*\n?[ \t]*)(?:' + ANGLE_DEST + r'|(\S+))'
+    r'^ {0,3}\[(' + FLAT + r'+)\]:(?:[ \t]*\n?[ \t]*)(?:' + ANGLE_DEST + r'|(\S+))'
     # A title that OPENS and never closes makes the whole line a paragraph —
     # there is no definition at all. Truncating at the destination recorded a
     # target the reader never reaches. Pinned by the repo's
     # `…_rejects_a_definition_with_an_unterminated_title`.
-    r'(?![ \t]*(?:"[^"\n]*$|\'[^\'\n]*$|\([^)\n]*$))', re.M)
+    r'(?![ \t]*(?:"[^"\n]*$|\'[^\'\n]*$|\([^)\n]*$))'
+    # ...and nothing but whitespace and an optional title may follow the
+    # destination. This resolved the `mail.md` PREFIX of `[m]: mail.md trailing
+    # garbage`, which is a paragraph and defines nothing, so a page reachable
+    # only through that label was recorded as reachable and a real orphan
+    # passed. Matching a valid-looking prefix is the whole failure.
+    + r'(?=' + TITLE + r'[ \t]*$)', re.M)
 # The same, extended to the optional title — on the destination's line or the
 # one after it, per CommonMark. Used only to blank the definition's full span.
 # The title is `TITLE` itself, not a second spelling of it. Its own copy let a
@@ -285,8 +296,15 @@ REF_DEF = re.compile(
 # reported as an orphan the reader can in fact click. A blank line ends the
 # paragraph and there is no title, which is what `TITLE` already encodes.
 REF_DEF_FULL = re.compile(
-    r'^ {0,3}\[(?:[^\[\]\\]|\\.)+\]:(?:[ \t]*\n?[ \t]*)(?:<[^<>\r\n]*>|\S+)'
-    + TITLE, re.M)
+    r'^ {0,3}\[(?:' + FLAT + r')+\]:(?:[ \t]*\n?[ \t]*)(?:<[^<>\r\n]*>|\S+)'
+    # A definition ENDS at the end of its line: after the destination only
+    # whitespace and an optional title may follow. `[m]: mail.md trailing
+    # garbage` is a paragraph, not a definition, so blanking its span hid text
+    # the reader can see — and the matching rule in `REF_DEF` recorded the
+    # `mail.md` prefix as a route, letting a real orphan through. Requiring the
+    # line to end also subsumes the unterminated-title case for free: a title
+    # that opens and never closes leaves the line unfinished.
+    + TITLE + r'(?=[ \t]*$)', re.M)
 # ...but a definition only becomes a link the reader can click when some label
 # USES it. A leftover `[old]: mail.md` with no `[…][old]` anywhere renders as
 # nothing at all, so counting it as an edge would let an obsolete line launder a
@@ -508,8 +526,19 @@ def strip_comments(txt):
         # themselves stay, since a bare path in code is still findable.
         masked = CODE_SPAN.sub(lambda m: ' ' * len(m.group(0)), seg)
         for cm in reversed(list(HTML_COMMENT_CLOSED.finditer(masked))):
-            seg = seg[:cm.start()] + ' ' * (cm.end() - cm.start()) + seg[cm.end():]
-            masked = masked[:cm.start()] + ' ' * (cm.end() - cm.start()) + masked[cm.end():]
+            # A comment that BEGINS a line is a type-2 raw HTML block, and the
+            # line carrying its terminator belongs to the block: `<!-- note -->
+            # [Mail](mail.md)` leaves the link literal. Mid-line the same
+            # comment is inline HTML and the link after it renders, which is
+            # why this reads the text before it rather than blanking to the end
+            # of every comment. Same end-condition rule as types 1 and 3-5.
+            start, end = cm.start(), cm.end()
+            bol = masked.rfind('\n', 0, start) + 1
+            if masked[bol:start].strip() == '' and start - bol <= 3:
+                eol = masked.find('\n', end)
+                end = len(masked) if eol == -1 else eol
+            seg = seg[:start] + ' ' * (end - start) + seg[end:]
+            masked = masked[:start] + ' ' * (end - start) + masked[end:]
         idx = masked.find(UNCLOSED)
         if idx != -1:
             # Everything from here to the end of the document is commented out.
@@ -640,10 +669,19 @@ BLOCK_TAGS = (
 # line belongs to the block — `<?demo ?> [Mail][m]` leaves the reference
 # literal, so a later `[m]: mail.md` cannot make it a route. Stopping at `?>`
 # handed the tail to the reference scanner and marked the orphan reachable.
+# Terminated forms first, then the run-to-EOF ones. An UNCLOSED `<?demo` keeps
+# its block open through the end of the file, so everything below it is raw
+# HTML and a `[Mail](mail.md)` there is literal. Requiring the closing
+# delimiter left those blocks unmasked entirely, which is the direction that
+# lets a real orphan pass — the same unclosed-opener rule comments and type-1
+# blocks already carry.
 RAW_DELIM = (
     r'^ {0,3}<\?.*?\?>[^\n]*'
     r'|^ {0,3}<!\[CDATA\[.*?\]\]>[^\n]*'
-    r'|^ {0,3}<![A-Za-z][^>]*>[^\n]*')
+    r'|^ {0,3}<![A-Za-z][^>]*>[^\n]*'
+    r'|^ {0,3}<\?.*'
+    r'|^ {0,3}<!\[CDATA\[.*'
+    r'|^ {0,3}<![A-Za-z].*')
 # The same three on their own, because `mask_invisible` needs them: nothing
 # inside one is Markdown, and `<![CDATA[x]]>` happens to READ as an image
 # reference — `![` … `]]` with one level of nesting. Blanking it there left a
@@ -2268,6 +2306,44 @@ self_test() {
     > "$c9el/docs/guide/jobs.md"
   git -C "$c9el" add -A && git -C "$c9el" commit -qm setext-no-paragraph
   check "an underline with nothing above it completes no heading" fail "$c9el"
+
+  # A line-initial comment is a raw block: the line carrying its terminator
+  # belongs to it, so markdown sharing that line is literal.
+  local c9em="$tmp/c9em"; make_corpus "$c9em"
+  printf '# Jobs\n\n<!-- note --> [mail](mail.md)\n' > "$c9em/docs/guide/jobs.md"
+  git -C "$c9em" add -A && git -C "$c9em" commit -qm comment-block-terminator-line
+  check "text sharing a line with a block comment stays literal" fail "$c9em"
+
+  # ...but MID-line the same comment is inline HTML, and the link renders.
+  local c9en="$tmp/c9en"; make_corpus "$c9en"
+  printf '# Jobs\n\nSee <!-- note --> [mail](mail.md)\n' > "$c9en/docs/guide/jobs.md"
+  git -C "$c9en" add -A && git -C "$c9en" commit -qm comment-inline-keeps-link
+  check "a link after an inline comment still counts" pass "$c9en"
+
+  # An unterminated type-3 block runs to EOF, so the link below it is literal.
+  local c9eo="$tmp/c9eo"; make_corpus "$c9eo"
+  printf '# Jobs\n\n<?demo\n\nSee [mail](mail.md).\n' > "$c9eo/docs/guide/jobs.md"
+  git -C "$c9eo" add -A && git -C "$c9eo" commit -qm unterminated-pi
+  check "an unterminated processing instruction runs to EOF" fail "$c9eo"
+
+  # A label cannot cross a blank line: the paragraph ends and no link renders.
+  local c9ep="$tmp/c9ep"; make_corpus "$c9ep"
+  printf '# Jobs\n\nSee [mail\n\n](mail.md).\n' > "$c9ep/docs/guide/jobs.md"
+  git -C "$c9ep" add -A && git -C "$c9ep" commit -qm label-across-blank
+  check "a label broken by a blank line is not a link" fail "$c9ep"
+
+  # ...but one wrapped across a single line still resolves.
+  local c9eq="$tmp/c9eq"; make_corpus "$c9eq"
+  printf '# Jobs\n\nSee [the mail\nguide](mail.md).\n' > "$c9eq/docs/guide/jobs.md"
+  git -C "$c9eq" add -A && git -C "$c9eq" commit -qm label-wrapped
+  check "a label wrapped across one line resolves" pass "$c9eq"
+
+  # A definition ends at its line: trailing garbage makes it a paragraph.
+  local c9er="$tmp/c9er"; make_corpus "$c9er"
+  printf '# Jobs\n\nSee [mail][m].\n\n[m]: mail.md trailing garbage\n' \
+    > "$c9er/docs/guide/jobs.md"
+  git -C "$c9er" add -A && git -C "$c9er" commit -qm def-trailing-garbage
+  check "a definition with trailing garbage defines nothing" fail "$c9er"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
