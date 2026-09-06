@@ -446,6 +446,12 @@ HIDDEN_HTML = re.compile(
 # attribute name.
 ATTR_VALUE = re.compile(
     r'\b(?!href\b)[A-Za-z_:][-\w:.]*\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)', re.I)
+# The same with no exception, for tags that are not anchors. `href` is spared
+# only on `<a>`: on `<link rel="alternate" href="…">` it names a resource the
+# page references invisibly, not somewhere the reader can click.
+ATTR_VALUE_ANY = re.compile(
+    r'\b[A-Za-z_:][-\w:.]*\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)', re.I)
+ANCHOR_TAG = re.compile(r'<a(?:\s[^>]*)?>', re.I)
 # A whole raw tag, used to bound where `src=` may be masked. Unscoped, that
 # pattern also eats the query of `[Mail](mail.md?src=guide)`, which is an
 # ordinary Markdown link the sibling gate resolves.
@@ -456,6 +462,20 @@ HTML_TAG = re.compile(r'<[A-Za-z][A-Za-z0-9-]*(?:\s[^>]*)?/?>')
 # bare-path scan happens to catch.
 ANCHOR_HREF = re.compile(
     r'<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))', re.I)
+
+
+def sub_in_prose(pat, txt):
+    """Blank `pat` where Markdown renders it, leaving fences alone.
+
+    Anything that decides "this text is not rendered" has to be scoped this
+    way — a construct shown inside a fence is a sample whose path is on screen.
+    Every time a rule in this file was applied document-wide instead, it
+    deleted a visible path; this helper exists so the scoping is one call
+    rather than something to remember.
+    """
+    return ''.join(
+        pat.sub(lambda m: ' ' * len(m.group(0)), seg) if kind == 'prose' else seg
+        for kind, seg in split_fences(txt))
 
 
 def mask_invisible(txt):
@@ -499,7 +519,11 @@ def mask_invisible(txt):
             seg = ''.join(pieces)
 
         blank(HIDDEN_HTML)
-        blank(ATTR_VALUE, bound=tags)
+        anchors = [(m.start(), m.end()) for m in ANCHOR_TAG.finditer(seg)]
+        others = [t for t in tags
+                  if not any(a <= t[0] < b for a, b in anchors)]
+        blank(ATTR_VALUE, bound=anchors)
+        blank(ATTR_VALUE_ANY, bound=others)
         # Images last, and here rather than at the bare-path scan, so a
         # `![alt](x.md)` SAMPLE in a fence or code span keeps its visible
         # destination while a rendered image does not.
@@ -566,7 +590,7 @@ def edges_from(f):
     # carry an optional title — `[old]: https://example.com "docs/guide/x.md"` —
     # and a title left behind is scanned as a bare path even though the whole
     # unused definition renders nothing.
-    scan = REF_DEF_FULL.sub(lambda m: ' ' * len(m.group(0)), txt)
+    scan = sub_in_prose(REF_DEF_FULL, txt)
     for m in BARE.finditer(scan):
         t = normalize(m.group(1))
         if t in traversable:
@@ -1318,6 +1342,19 @@ self_test() {
     > "$c9bu/docs/guide/jobs.md"
   git -C "$c9bu" add -A && git -C "$c9bu" commit -qm refdef-title
   check "a path in an unused definition's title confers nothing" fail "$c9bu"
+
+  # A definition DEMONSTRATED in a fence still shows its path on screen.
+  local c9bv="$tmp/c9bv"; make_corpus "$c9bv"
+  printf '# Jobs\n\n```\n[mail]: docs/guide/mail.md\n```\n' > "$c9bv/docs/guide/jobs.md"
+  git -C "$c9bv" add -A && git -C "$c9bv" commit -qm fenced-refdef-visible
+  check "a definition shown in a fence keeps its visible path" pass "$c9bv"
+
+  # `href` is navigation only on an anchor.
+  local c9bw="$tmp/c9bw"; make_corpus "$c9bw"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n<link rel="alternate" href="docs/guide/mail.md">\n' \
+    > "$c9bw/README.md"
+  git -C "$c9bw" add -A && git -C "$c9bw" commit -qm link-element-href
+  check "an href on a non-anchor element is not an edge" fail "$c9bw"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
