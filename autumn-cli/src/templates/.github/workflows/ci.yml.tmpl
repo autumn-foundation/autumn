@@ -157,9 +157,13 @@ jobs:
       # locally and fail here for a dependency reason.
       - name: Audit dependencies (RustSec advisories and declared policy)
         run: |
+          # Matches every TOML spelling of a section header or key:
+          # [bans], [ bans ], [bans.build], [[bans.deny]], bans.deny = …,
+          # bans = { … }. `autumn doctor` matches the same set, so the two
+          # derivations agree. A commented line never matches.
           checks="advisories"
           for section in bans licenses sources; do
-            if grep -qE "^[[:space:]]*\[$section\]" deny.toml; then
+            if grep -qE "^[[:space:]]*(\[\[?[[:space:]]*)?$section[[:space:]]*[].=]" deny.toml; then
               checks="$checks $section"
             fi
           done

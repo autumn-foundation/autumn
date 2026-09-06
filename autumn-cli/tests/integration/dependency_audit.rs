@@ -156,8 +156,12 @@ fn scaffolded_ci_audits_dependencies_by_default() {
     let (_tmp, project) = scaffold("audit-app", &[]);
     let ci = code_only(&read_project_file(&project, ".github/workflows/ci.yml"));
 
+    // Scoped to the audit step: a whole-file `contains` is satisfied by the
+    // seed appearing anywhere, including in a step that no longer audits.
+    let audit = workflow_step(&ci, AUDIT_STEP);
     assert!(
-        ci.contains("cargo deny") && ci.contains(UNCONDITIONAL_ADVISORIES),
+        audit.contains("cargo deny --offline check $checks")
+            && audit.contains(UNCONDITIONAL_ADVISORIES),
         "the generated CI must run a dependency-advisory audit as a real step:\n{ci}"
     );
     assert!(
@@ -297,7 +301,7 @@ fn the_scaffolded_policy_ships_its_widest_scopes() {
 
     let ci = code_only(&read_project_file(&project, ".github/workflows/ci.yml"));
     assert!(
-        ci.contains(UNCONDITIONAL_ADVISORIES),
+        workflow_step(&ci, AUDIT_STEP).contains(UNCONDITIONAL_ADVISORIES),
         "narrowing the policy is pointless if the workflow stops asking for the \
          advisories check:\n{ci}"
     );
@@ -432,7 +436,7 @@ fn the_api_flavor_ships_the_same_gate() {
     let (_tmp, project) = scaffold("api-audit-app", &["--api"]);
     let ci = code_only(&read_project_file(&project, ".github/workflows/ci.yml"));
     assert!(
-        ci.contains(UNCONDITIONAL_ADVISORIES),
+        workflow_step(&ci, AUDIT_STEP).contains(UNCONDITIONAL_ADVISORIES),
         "the --api scaffold must audit its dependencies too:\n{ci}"
     );
     let deny = read_project_file(&project, "deny.toml");
@@ -745,8 +749,9 @@ fn every_flavor_ships_the_gate_and_its_policy() {
         let name = format!("gate-{}-app", flavor_slug(flags));
         let (_tmp, project) = scaffold(&name, flags);
         let ci = code_only(&read_project_file(&project, ".github/workflows/ci.yml"));
+        let audit = workflow_step(&ci, AUDIT_STEP);
         assert!(
-            ci.contains("--offline check $checks") && ci.contains(UNCONDITIONAL_ADVISORIES),
+            audit.contains("--offline check $checks") && audit.contains(UNCONDITIONAL_ADVISORIES),
             "`autumn new {}` must still audit its dependencies:\n{ci}",
             flags.join(" ")
         );

@@ -2,14 +2,18 @@
 //! (issue #1633).
 //!
 //! Detection is not re-implemented here. Doctor and dev run the same auditor
-//! (`cargo deny`), against the same policy file (`deny.toml`) and the same
-//! waiver store (`[advisories] ignore`) that the CI gate from issue #1600 runs.
-//! A local verdict and the CI verdict therefore cannot disagree.
+//! (`cargo deny`) against the same policy file (`deny.toml`), the same waiver
+//! store (`[advisories] ignore`) and the same check list as the CI gate from
+//! issue #1600. Two differences remain and are reported, not hidden: CI pins
+//! its auditor version, and CI fetches the advisory database before it audits.
+//! See `docs/guide/supply-chain.md`, "Part 3b — the dev loop".
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
+use std::time::Duration;
 use std::time::SystemTime;
 
 /// The app-level dependency policy file. Also the CI gate's config.
@@ -22,19 +26,34 @@ pub const POLICY_FILE: &str = "deny.toml";
 pub const OPTIONAL_CHECKS: &[&str] = &["bans", "licenses", "sources"];
 
 /// An advisory database older than this is reported as stale.
-pub const STALE_AFTER_DAYS: u64 = 30;
+///
+/// The CI gate fetches the database on every run. A local verdict is only as
+/// fresh as local data, so the window is short enough that a weekly fetch
+/// keeps the two comparable.
+pub const STALE_AFTER_DAYS: u64 = 7;
 
 /// Diagnostic codes that report on the policy file, not on the dependency
-/// tree. They never change the CI verdict, so reporting them is noise.
+/// tree. Observed from cargo-deny 0.20.2.
+///
+/// These are dropped only when the policy grades them below an error. A policy
+/// can promote any of them (`unused-ignored-advisory = "deny"`, for one), and a
+/// promoted one fails the CI gate, so dropping it by code alone would report a
+/// clean tree that CI rejects.
 const CONFIG_ONLY_CODES: &[&str] = &[
     "advisory-ignored",
     "advisory-not-detected",
+    "unknown-advisory",
+    "yanked-not-detected",
     "license-not-encountered",
     "license-exception-not-encountered",
+    "unmatched-source",
+    "unmatched-organization",
     "unmatched-skip",
     "unmatched-skip-root",
-    "unmatched-organization",
-    "unmatched-bypass",
+    "unmatched-path-bypass",
+    "unmatched-glob",
+    "unused-wrapper",
+    "unmatched-wrapper",
     // Always paired with `unlicensed`, which names the same crate.
     "no-license-field",
     "deprecated",
@@ -87,17 +106,19 @@ pub enum Evaluation {
     /// No policy file. The CI gate fails on this too.
     NoPolicy,
     /// `cargo deny` is not on PATH.
-    AuditorMissing,
+    AuditorMissing { checks: Vec<String> },
     /// The `RustSec` database was never fetched, so nothing can be verified.
-    DatabaseMissing,
+    DatabaseMissing { checks: Vec<String> },
     /// The auditor produced a verdict.
     Audited {
         findings: Vec<Finding>,
         checks: Vec<String>,
         db_age_days: Option<u64>,
+        /// The auditor version, as it reported itself.
+        auditor: String,
     },
     /// The auditor ran but produced no verdict.
-    Unavailable(String),
+    Unavailable { reason: String, checks: Vec<String> },
 }
 
 /// The cargo-deny checks this policy file activates, in command order.
@@ -116,29 +137,98 @@ pub fn policy_checks(policy: &str) -> Vec<String> {
     checks
 }
 
-/// True when `policy` declares `[section]` on an uncommented line.
+/// True when `policy` declares `section` on an uncommented line.
 fn declares_section(policy: &str, section: &str) -> bool {
-    let header = format!("[{section}]");
-    policy.lines().any(|line| code_of(line) == header)
+    policy
+        .lines()
+        .any(|line| line_declares(code_of(line), section))
+}
+
+/// True when one policy line declares `section`, in any TOML spelling.
+///
+/// `[bans]`, `[ bans ]`, `[bans.build]`, `[[bans.deny]]`, `bans.deny = …` and
+/// `bans = { … }` all configure the same check. The scaffolded workflow matches
+/// the same set, so the two derivations agree.
+fn line_declares(code: &str, section: &str) -> bool {
+    let body = code
+        .strip_prefix("[[")
+        .or_else(|| code.strip_prefix('['))
+        .map_or(code, ascii_trim_start);
+    let Some(rest) = body.strip_prefix(section) else {
+        return false;
+    };
+    matches!(ascii_trim_start(rest).chars().next(), Some(']' | '.' | '='))
 }
 
 /// The code part of one policy line: comment stripped, trimmed.
+///
+/// ASCII whitespace only. Rust's `trim` also strips U+00A0, which POSIX
+/// `[[:space:]]` does not, and a rule the workflow cannot mirror is a rule the
+/// two derivations disagree on.
 fn code_of(line: &str) -> &str {
-    let line = line.trim();
+    let line = ascii_trim(line);
     if line.starts_with('#') {
         return "";
     }
-    line.split('#').next().unwrap_or("").trim()
+    ascii_trim(line.split('#').next().unwrap_or(""))
+}
+
+fn ascii_trim(text: &str) -> &str {
+    text.trim_matches(|c: char| c.is_ascii_whitespace())
+}
+
+fn ascii_trim_start(text: &str) -> &str {
+    text.trim_start_matches(|c: char| c.is_ascii_whitespace())
 }
 
 /// A custom `db-path` declared by the policy, if any.
+///
+/// Read from the raw line, not from [`code_of`]: a path may contain `#`.
+/// `~` and `$CARGO_HOME` are expanded, as cargo-deny expands them.
 pub fn policy_db_path(policy: &str) -> Option<String> {
     policy.lines().find_map(|line| {
-        let value = code_of(line).strip_prefix("db-path")?.trim_start();
-        let value = value.strip_prefix('=')?.trim();
-        let value = value.strip_prefix('"')?.strip_suffix('"')?;
-        (!value.is_empty()).then(|| value.to_owned())
+        let line = ascii_trim(line);
+        if line.starts_with('#') {
+            return None;
+        }
+        let value = ascii_trim(line.strip_prefix("db-path")?).strip_prefix('=')?;
+        let value = ascii_trim(value);
+        // TOML basic and literal strings.
+        let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let value = &value[quote.len_utf8()..];
+        let value = &value[..value.find(quote)?];
+        (!value.is_empty()).then(|| expand_path(value))
     })
+}
+
+/// Expand the path prefixes cargo-deny accepts in `db-path`.
+fn expand_path(path: &str) -> String {
+    let home = env_var("HOME");
+    let cargo_home = env_var("CARGO_HOME").or_else(|| home.as_ref().map(|h| format!("{h}/.cargo")));
+    expand_path_with(path, home.as_deref(), cargo_home.as_deref())
+}
+
+/// [`expand_path`], with the environment injected. Pure, so it is testable
+/// without mutating the process environment.
+pub fn expand_path_with(path: &str, home: Option<&str>, cargo_home: Option<&str>) -> String {
+    // Longest prefix first: `${CARGO_HOME}` also starts with `$CARGO_HOME`.
+    for (prefix, value) in [
+        ("${CARGO_HOME}", cargo_home),
+        ("$CARGO_HOME", cargo_home),
+        ("~", home),
+    ] {
+        if let Some(rest) = path.strip_prefix(prefix)
+            && let Some(value) = value
+        {
+            return format!("{value}{rest}");
+        }
+    }
+    path.to_owned()
+}
+
+/// A set, non-empty environment variable.
+fn env_var(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|value| !value.is_empty())
 }
 
 // ── CVSS v3 base score ───────────────────────────────────────────────────────
@@ -146,10 +236,9 @@ pub fn policy_db_path(policy: &str) -> Option<String> {
 /// CVSS v3 base score for `vector`, or `None` when it is not a complete v3
 /// vector. CVSS v3.1 specification, section 8.1.
 ///
-/// The arithmetic is written as the specification writes it. A fused
-/// multiply-add is more accurate, and that is the problem: the score is
-/// rounded up to one decimal, so a more accurate intermediate can land on the
-/// other side of a boundary from every reference implementation.
+/// Do not fuse the multiplications. The score is rounded up to one decimal, so
+/// a more accurate intermediate can cross a band boundary that every reference
+/// implementation stays on the near side of.
 #[allow(
     clippy::suboptimal_flops,
     reason = "matches the CVSS reference implementations"
@@ -316,36 +405,62 @@ fn code(fields: &serde_json::Value) -> &str {
 /// The advisory id an `advisory-ignored` marker names.
 fn waived_id(fields: &serde_json::Value) -> Option<String> {
     let labels = fields.get("labels")?.as_array()?;
-    let label = labels
+    let span_of = |label: &serde_json::Value| {
+        label
+            .get("span")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    // The second label on this diagnostic is the developer's `reason` text.
+    // Falling back to it blindly would let a reason of "yanked" mark real
+    // findings waived, so the fallback requires an id-shaped span.
+    labels
         .iter()
         .find(|label| {
             label.get("message").and_then(serde_json::Value::as_str)
                 == Some("advisory ignored here")
         })
-        .or_else(|| labels.first())?;
-    Some(label.get("span")?.as_str()?.to_owned())
+        .and_then(&span_of)
+        .or_else(|| {
+            labels
+                .iter()
+                .filter_map(span_of)
+                .find(|span| is_advisory_id(span))
+        })
+}
+
+/// True when `span` is shaped like an advisory id rather than prose.
+fn is_advisory_id(span: &str) -> bool {
+    !span.is_empty()
+        && span.len() <= 64
+        && span
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// One finding, or `None` when the diagnostic reports on the policy file
 /// rather than on the dependency tree.
 fn finding_from(fields: &serde_json::Value, waived: &HashSet<String>) -> Option<Finding> {
     let code = code(fields);
-    if code.is_empty() || CONFIG_ONLY_CODES.contains(&code) {
-        return None;
-    }
     let level = fields
         .get("severity")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("note");
     let advisory = fields.get("advisory").filter(|value| !value.is_null());
-    // A finding is something the policy graded: an error or a warning. Notes
-    // and helps are context — one per private workspace crate, for one — and
-    // reporting them buries the findings that matter. A waived advisory is the
-    // exception: it is graded down to a note but still carries its advisory.
+    // A finding is what the policy graded: an error or a warning. Notes and
+    // helps are context, one per private workspace crate. A waived advisory is
+    // the exception: it is graded down to a note but still carries its advisory.
     if !matches!(level, "error" | "warning") && advisory.is_none() {
         return None;
     }
     let blocking = level == "error";
+    // Config diagnostics report on the policy file, not on the tree. They are
+    // noise — until the policy grades one an error, which is what turns the CI
+    // gate red. Dropping those by code would report a tree CI rejects as clean.
+    if CONFIG_ONLY_CODES.contains(&code) && !blocking {
+        return None;
+    }
+    let code = if code.is_empty() { "finding" } else { code };
 
     let id = advisory
         .and_then(|advisory| advisory.get("id"))
@@ -452,9 +567,9 @@ fn package_of(fields: &serde_json::Value, advisory: Option<&serde_json::Value>) 
 /// least high, a warned one at most medium. CVSS only separates critical from
 /// high inside what the policy already denies.
 ///
-/// A waiver is the exception. cargo-deny grades a waived advisory down to a
-/// note, so the emitted severity says nothing about the advisory; a reader has
-/// to see what the waiver accepted, so a waived finding keeps its own severity.
+/// A waived finding has no consequence to grade, so it is graded by its own
+/// CVSS band or kind. It can therefore read lower than the same finding
+/// unwaived: the number describes the advisory, not the gate.
 fn grade(advisory: Option<&serde_json::Value>, blocking: bool, waived: bool) -> Severity {
     let base = advisory.map_or(Severity::Low, |advisory| {
         match advisory
@@ -477,15 +592,6 @@ fn grade(advisory: Option<&serde_json::Value>, blocking: bool, waived: bool) -> 
     }
 }
 
-/// The worst severity among unwaived findings.
-pub fn worst_severity(findings: &[Finding]) -> Option<Severity> {
-    findings
-        .iter()
-        .filter(|finding| !finding.waived)
-        .map(|finding| finding.severity)
-        .max()
-}
-
 // ── Advisory database age ────────────────────────────────────────────────────
 
 /// Whole days between `then` and `now`. A clock that moved backwards reads as
@@ -496,20 +602,34 @@ pub fn age_days(then: SystemTime, now: SystemTime) -> u64 {
 }
 
 /// Newest modification time among the database checkouts under `dbs_dir`.
+///
+/// A fetch into an existing checkout writes inside `.git`; it never touches the
+/// checkout's own directory, whose mtime is therefore the clone date. Reading
+/// the root alone reports a database fetched this morning as months old.
 pub fn newest_db_mtime(dbs_dir: &Path) -> Option<SystemTime> {
     std::fs::read_dir(dbs_dir)
         .ok()?
         .filter_map(Result::ok)
         .filter(|entry| entry.path().is_dir())
-        .filter_map(|entry| entry.metadata().ok()?.modified().ok())
+        .filter_map(|entry| {
+            let checkout = entry.path();
+            let git = checkout.join(".git");
+            [git, checkout]
+                .into_iter()
+                .filter_map(|path| path.metadata().ok()?.modified().ok())
+                .max()
+        })
         .max()
 }
 
 /// Where cargo-deny keeps the `RustSec` database when the policy names no path.
 fn default_db_dir() -> PathBuf {
-    let cargo_home = std::env::var_os("CARGO_HOME")
+    // `var_os` reports a set-but-empty variable as `Some("")`, which would make
+    // the database path relative and report a present database as missing.
+    let set = |key: &str| std::env::var_os(key).filter(|value| !value.is_empty());
+    let cargo_home = set("CARGO_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+        .or_else(|| set("HOME").map(|home| PathBuf::from(home).join(".cargo")))
         .unwrap_or_else(|| PathBuf::from(".cargo"));
     cargo_home.join("advisory-dbs")
 }
@@ -521,70 +641,153 @@ const BANNER_ID_LIMIT: usize = 5;
 
 /// Lines `autumn dev` prints at startup. Empty means silent.
 ///
-/// Silence is the default: a clean tree, a waived tree, and every state where
-/// the policy cannot be evaluated all add nothing to the dev loop. Doctor is
-/// where those are reported.
+/// Only findings the policy denies are reported: those are the ones that turn
+/// the CI gate red. A warned finding — a duplicate crate, a yanked crate — is
+/// doctor's to report. A clean tree, a fully waived tree, and every state where
+/// the policy could not be evaluated are all silent.
 pub fn dev_lines(eval: &Evaluation) -> Vec<String> {
     let Evaluation::Audited { findings, .. } = eval else {
         return Vec::new();
     };
-    let Some(worst) = worst_severity(findings) else {
+    let blocking: Vec<&Finding> = findings
+        .iter()
+        .filter(|finding| !finding.waived && finding.blocking)
+        .collect();
+    let count = blocking.len();
+    if count == 0 {
         return Vec::new();
-    };
-    let active: Vec<&Finding> = findings.iter().filter(|finding| !finding.waived).collect();
-    let count = active.len();
+    }
     let plural = if count == 1 { "" } else { "s" };
+    let worst = blocking
+        .iter()
+        .map(|finding| finding.severity)
+        .max()
+        .unwrap_or(Severity::High);
 
     if worst < Severity::Critical {
         return vec![format!(
-            "  \u{26A0}\u{FE0F}  {count} dependency finding{plural} ({} worst) \u{2014} run `autumn doctor` for detail.",
+            "  \u{26A0}\u{FE0F}  {count} blocking dependency finding{plural} (worst: {}) \u{2014} run `autumn doctor` for detail.",
             worst.label()
         )];
     }
 
-    let critical: Vec<&str> = active
+    let critical: Vec<&str> = blocking
         .iter()
         .filter(|finding| finding.severity == Severity::Critical)
         .map(|finding| finding.id.as_str())
         .collect();
-    let mut named = critical
-        .iter()
-        .take(BANNER_ID_LIMIT)
-        .copied()
-        .collect::<Vec<_>>()
-        .join(", ");
-    if critical.len() > BANNER_ID_LIMIT {
-        let _ = write!(named, ", and {} more", critical.len() - BANNER_ID_LIMIT);
-    }
     vec![
         "  \u{26A0}\u{FE0F}  CRITICAL DEPENDENCY ADVISORY".to_owned(),
         format!(
-            "     {count} finding{plural}, {} critical: {named}",
-            critical.len()
+            "     {count} blocking finding{plural}, {} critical: {}",
+            critical.len(),
+            name_some(&critical, BANNER_ID_LIMIT)
         ),
         "     Run `autumn doctor` for detail. `deny.toml` holds the policy and the waivers."
             .to_owned(),
     ]
 }
 
+/// Name up to `limit` ids, then count the rest.
+pub fn name_some(ids: &[&str], limit: usize) -> String {
+    let mut named = ids
+        .iter()
+        .take(limit)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if ids.len() > limit {
+        let _ = write!(named, ", and {} more", ids.len() - limit);
+    }
+    named
+}
+
 // ── Evaluation ───────────────────────────────────────────────────────────────
+
+/// How long `autumn doctor` waits for a verdict.
+///
+/// Offline is not the same as bounded: the auditor runs `cargo metadata`,
+/// which waits on Cargo's package-cache lock while another build holds it.
+/// Doctor reports a verdict or reports that it got none. It never hangs.
+pub const DOCTOR_BUDGET: Duration = Duration::from_secs(30);
+
+/// Run the evaluation on its own thread.
+///
+/// The caller decides how long to wait. A caller that gives up leaves the
+/// thread to finish and drop its result.
+pub fn spawn_evaluation(root: &Path) -> mpsc::Receiver<Evaluation> {
+    let (sender, receiver) = mpsc::channel();
+    let root = root.to_path_buf();
+    std::thread::spawn(move || {
+        // A closed receiver means the caller moved on. Nothing to report.
+        let _ = sender.send(evaluate(&root));
+    });
+    receiver
+}
+
+/// Wait up to `budget` for a spawned evaluation. `None` means it did not
+/// finish.
+pub fn await_evaluation(
+    receiver: &mpsc::Receiver<Evaluation>,
+    budget: Duration,
+) -> Option<Evaluation> {
+    receiver.recv_timeout(budget).ok()
+}
+
+/// Evaluate the policy, giving up after `budget`.
+///
+/// A budget that expires is reported as no verdict, never as a clean tree.
+pub fn evaluate_within(root: &Path, budget: Duration) -> Evaluation {
+    let receiver = spawn_evaluation(root);
+    await_evaluation(&receiver, budget).unwrap_or_else(|| Evaluation::Unavailable {
+        reason: format!("the audit did not finish within {}s", budget.as_secs()),
+        checks: Vec::new(),
+    })
+}
+
+/// The directory holding the app's policy file, searching upward from `start`.
+///
+/// The CI gate runs at the repository root. A developer inside a workspace
+/// member must get that same graph, not "no policy".
+pub fn find_policy_root(start: &Path) -> Option<PathBuf> {
+    let start = start.canonicalize().ok()?;
+    for dir in start.ancestors() {
+        if dir.join(POLICY_FILE).is_file() {
+            return Some(dir.to_path_buf());
+        }
+        // The repository root bounds the search.
+        if dir.join(".git").exists() {
+            break;
+        }
+    }
+    None
+}
 
 /// Evaluate the dependency policy for the app rooted at `root`.
 ///
 /// Always offline: the advisory database is never fetched here, so this cannot
-/// hang and cannot depend on the network. `cargo deny fetch db` refreshes it.
+/// depend on the network. `cargo deny fetch db` refreshes it.
 pub fn evaluate(root: &Path) -> Evaluation {
+    let Some(root) = find_policy_root(root) else {
+        return Evaluation::NoPolicy;
+    };
     let Ok(policy) = std::fs::read_to_string(root.join(POLICY_FILE)) else {
         return Evaluation::NoPolicy;
     };
-    if !auditor_present() {
-        return Evaluation::AuditorMissing;
-    }
-    let dbs_dir = policy_db_path(&policy).map_or_else(default_db_dir, PathBuf::from);
-    let Some(mtime) = newest_db_mtime(&dbs_dir) else {
-        return Evaluation::DatabaseMissing;
-    };
     let checks = policy_checks(&policy);
+    let Some(auditor) = auditor_version() else {
+        return Evaluation::AuditorMissing { checks };
+    };
+
+    // A policy that names its own database is cargo-deny's to resolve: this
+    // pre-check only guards the default location, so an unreadable custom path
+    // reports whatever the auditor says rather than a database that is missing.
+    let custom_db = policy_db_path(&policy);
+    let mtime = newest_db_mtime(&custom_db.map_or_else(default_db_dir, PathBuf::from));
+    if mtime.is_none() && !policy_declares_db_path(&policy) {
+        return Evaluation::DatabaseMissing { checks };
+    }
+
     let output = Command::new("cargo")
         .args([
             "deny",
@@ -596,30 +799,61 @@ pub fn evaluate(root: &Path) -> Evaluation {
             "check",
         ])
         .args(&checks)
-        .current_dir(root)
+        .current_dir(&root)
         .output();
     let output = match output {
         Ok(output) => output,
-        Err(error) => return Evaluation::Unavailable(format!("could not run cargo-deny: {error}")),
+        Err(error) => {
+            return Evaluation::Unavailable {
+                reason: one_line(&format!("could not run cargo-deny: {error}")),
+                checks,
+            };
+        }
     };
     // cargo-deny writes its diagnostic stream to stderr.
     let stream = String::from_utf8_lossy(&output.stderr);
-    parse_audit(&stream).map_or_else(
-        || Evaluation::Unavailable(first_error(&stream)),
-        |findings| Evaluation::Audited {
-            findings,
+    let Some(findings) = parse_audit(&stream) else {
+        return Evaluation::Unavailable {
+            reason: first_error(&stream),
             checks,
-            db_age_days: Some(age_days(mtime, SystemTime::now())),
-        },
-    )
+        };
+    };
+    // The auditor's exit code is what the CI gate acts on. A rejection this
+    // parse cannot account for means the stream was read wrongly, so report no
+    // verdict rather than a clean tree.
+    if !output.status.success() && !findings.iter().any(|finding| finding.blocking) {
+        return Evaluation::Unavailable {
+            reason: "the auditor rejected this tree for a reason that could not be read; run `cargo deny check` to see it".to_owned(),
+            checks,
+        };
+    }
+    Evaluation::Audited {
+        findings,
+        checks,
+        db_age_days: mtime.map(|mtime| age_days(mtime, SystemTime::now())),
+        auditor,
+    }
 }
 
-/// True when `cargo deny` is on PATH.
-fn auditor_present() -> bool {
-    Command::new("cargo")
+/// True when the policy names its own advisory database location.
+fn policy_declares_db_path(policy: &str) -> bool {
+    policy_db_path(policy).is_some()
+}
+
+/// The `cargo deny` version on PATH, if any.
+///
+/// Reported alongside the verdict: the scaffolded CI pins its auditor, a local
+/// run uses whatever is installed, and a reader comparing the two needs both.
+fn auditor_version() -> Option<String> {
+    let output = Command::new("cargo")
         .args(["deny", "--version"])
         .output()
-        .is_ok_and(|output| output.status.success())
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let reported = String::from_utf8_lossy(&output.stdout);
+    Some(one_line(reported.lines().next().unwrap_or("cargo-deny")))
 }
 
 /// The first error the auditor logged, for an evaluation that produced no
@@ -632,17 +866,7 @@ fn first_error(stream: &str) -> String {
             entry.get("fields").and_then(|fields| fields.get("level"))
                 == Some(&serde_json::Value::String("ERROR".to_owned()))
         })
-        .and_then(|entry| {
-            Some(
-                entry
-                    .get("fields")?
-                    .get("message")?
-                    .as_str()?
-                    .lines()
-                    .next()?
-                    .to_owned(),
-            )
-        })
+        .and_then(|entry| Some(one_line(entry.get("fields")?.get("message")?.as_str()?)))
         .unwrap_or_else(|| "cargo-deny produced no verdict".to_owned())
 }
 
@@ -710,6 +934,22 @@ mod tests {
 {"fields":{"advisory":{"cvss":"CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N","id":"RUSTSEC-2099-0002","informational":null,"package":"newcrate","title":"remote code execution"},"code":"vulnerability","graphs":[{"Krate":{"name":"newcrate","version":"2.0.0"}}],"message":"remote code execution","severity":"error"},"type":"diagnostic"}
 {"fields":{"advisories":{"errors":1,"helps":0,"notes":0,"warnings":0}},"type":"summary"}
 "#;
+
+    /// A stale waiver, under a policy that promotes it to an error.
+    /// `unused-ignored-advisory = "deny"` makes cargo-deny exit 1 on this.
+    const PROMOTED_CONFIG_DIAGNOSTIC: &str = r#"
+{"fields":{"code":"advisory-not-detected","labels":[{"column":13,"line":4,"message":"no crate matched advisory criteria","span":"RUSTSEC-2020-0071"}],"message":"advisory was not encountered","severity":"error"},"type":"diagnostic"}
+{"fields":{"advisories":{"errors":1,"helps":0,"notes":0,"warnings":0}},"type":"summary"}
+"#;
+
+    fn audited(findings: Vec<Finding>) -> Evaluation {
+        Evaluation::Audited {
+            findings,
+            checks: vec!["advisories".to_owned()],
+            db_age_days: Some(1),
+            auditor: "cargo-deny 0.20.2".to_owned(),
+        }
+    }
 
     fn finding(id: &str, severity: Severity, waived: bool, blocking: bool) -> Finding {
         Finding {
@@ -954,17 +1194,17 @@ mod tests {
     }
 
     #[test]
-    fn a_waived_finding_keeps_the_severity_it_would_have_had() {
-        // Regression: waiving is not downgrading. A reader has to see what the
-        // waiver accepted, so a waived critical stays critical.
+    fn a_waived_finding_is_graded_by_its_own_severity() {
+        // A waived finding has no consequence to grade, so the number
+        // describes the advisory rather than the gate.
         let findings = parse_audit(WAIVED_VULNERABILITY).expect("summary present");
         assert_eq!(findings.len(), 1);
         let finding = &findings[0];
         assert!(finding.waived);
         assert!(!finding.blocking);
         assert_eq!(finding.severity, Severity::Critical);
-        // It is still not a failure, and still not dev-loop noise.
-        assert_eq!(worst_severity(&findings), None);
+        // It is still not dev-loop noise.
+        assert!(dev_lines(&audited(findings)).is_empty());
     }
 
     #[test]
@@ -978,20 +1218,187 @@ mod tests {
         assert!(findings[0].blocking);
     }
 
-    // ── worst_severity ───────────────────────────────────────────────────────
+    // ── Bounded waiting ──────────────────────────────────────────────────────
 
     #[test]
-    fn worst_severity_ignores_waived_findings() {
-        let findings = vec![
-            finding("RUSTSEC-1", Severity::Critical, true, false),
-            finding("RUSTSEC-2", Severity::Medium, false, false),
-        ];
-        assert_eq!(worst_severity(&findings), Some(Severity::Medium));
+    fn a_verdict_that_arrives_in_time_is_returned() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Evaluation::NoPolicy).expect("send");
         assert_eq!(
-            worst_severity(&[finding("RUSTSEC-1", Severity::Critical, true, false)]),
-            None
+            await_evaluation(&receiver, Duration::from_secs(5)),
+            Some(Evaluation::NoPolicy)
         );
-        assert_eq!(worst_severity(&[]), None);
+    }
+
+    #[test]
+    fn a_verdict_that_outruns_its_budget_is_not_returned() {
+        // Offline is not the same as bounded: the auditor runs `cargo
+        // metadata`, which waits on Cargo's package-cache lock while another
+        // build holds it.
+        let (sender, receiver) = mpsc::channel::<Evaluation>();
+        let result = await_evaluation(&receiver, Duration::from_millis(20));
+        assert_eq!(result, None);
+        drop(sender);
+    }
+
+    #[test]
+    fn an_expired_budget_never_reads_as_a_clean_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // No policy file, so this returns before any budget can matter — the
+        // point is the shape of the timeout verdict, asserted below.
+        assert_eq!(
+            evaluate_within(dir.path(), Duration::from_secs(5)),
+            Evaluation::NoPolicy
+        );
+        assert!(
+            dev_lines(&Evaluation::Unavailable {
+                reason: "the audit did not finish within 30s".to_owned(),
+                checks: Vec::new(),
+            })
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_doctor_budget_is_bounded() {
+        // A doctor run that stalls on an auditor is worse than one that says
+        // it got no verdict.
+        assert!(DOCTOR_BUDGET <= Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_config_diagnostic_the_policy_promoted_is_a_finding() {
+        // Regression, reproduced against cargo-deny 0.20.2: with
+        // `unused-ignored-advisory = "deny"` a stale waiver is an ERROR and the
+        // CI gate exits 1. Dropping it by code reported "all clear" on a tree
+        // CI rejects.
+        let findings = parse_audit(PROMOTED_CONFIG_DIAGNOSTIC).expect("summary present");
+        assert_eq!(findings.len(), 1, "got {findings:?}");
+        assert!(findings[0].blocking);
+        assert!(findings[0].severity >= Severity::High);
+    }
+
+    #[test]
+    fn the_same_config_diagnostic_below_error_is_still_noise() {
+        let warned = PROMOTED_CONFIG_DIAGNOSTIC
+            .replace(r#""severity":"error""#, r#""severity":"warning""#)
+            .replace(r#""errors":1"#, r#""errors":0"#);
+        assert_eq!(parse_audit(&warned), Some(Vec::new()));
+    }
+
+    #[test]
+    fn every_toml_spelling_of_a_section_widens_the_check_list() {
+        // All of these configure cargo-deny's `bans` check. A spelling the
+        // derivation misses is a policy the team believes is enforced and is
+        // not — silently, on both sides.
+        for policy in [
+            "[bans]\n",
+            "[ bans ]\n",
+            "[bans] # inline note\n",
+            "[bans.build]\n",
+            "[[bans.deny]]\n",
+            "bans.deny = []\n",
+            "bans = { multiple-versions = \"allow\" }\n",
+        ] {
+            assert!(
+                policy_checks(policy).contains(&"bans".to_owned()),
+                "not detected: {policy:?}"
+            );
+        }
+        // And these do not.
+        for policy in ["[bansible]\n", "[advisories]\n", "# [bans]\n", "#[bans]\n"] {
+            assert_eq!(
+                policy_checks(policy),
+                vec!["advisories".to_owned()],
+                "wrongly detected: {policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_ascii_indentation_is_not_treated_as_whitespace() {
+        // Rust's `trim` strips U+00A0; POSIX `[[:space:]]` does not. A rule the
+        // scaffolded workflow cannot mirror is a rule the two disagree on.
+        assert_eq!(
+            policy_checks("\u{00A0}[bans]\n"),
+            vec!["advisories".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_home_or_cargo_home_prefix_is_expanded() {
+        // cargo-deny expands these; reading them literally makes doctor report
+        // a database that exists as never fetched.
+        let home = Some("/home/tester");
+        let cargo = Some("/home/tester/.cargo");
+        assert_eq!(
+            expand_path_with("~/mirror", home, cargo),
+            "/home/tester/mirror"
+        );
+        assert_eq!(
+            expand_path_with("$CARGO_HOME/advisory-dbs", home, cargo),
+            "/home/tester/.cargo/advisory-dbs"
+        );
+        assert_eq!(
+            expand_path_with("${CARGO_HOME}/advisory-dbs", home, cargo),
+            "/home/tester/.cargo/advisory-dbs"
+        );
+        assert_eq!(expand_path_with("/srv/db", home, cargo), "/srv/db");
+        // No HOME to expand with: the path is left alone rather than mangled.
+        assert_eq!(expand_path_with("~/mirror", None, None), "~/mirror");
+    }
+
+    #[test]
+    fn a_db_path_is_read_through_quoting_and_comments() {
+        // TOML literal strings, and a path containing `#`.
+        assert_eq!(
+            policy_db_path("db-path = '/srv/db#1'\n").as_deref(),
+            Some("/srv/db#1")
+        );
+        assert_eq!(
+            policy_db_path("db-path = \"/srv/db\" # mirrored nightly\n").as_deref(),
+            Some("/srv/db")
+        );
+    }
+
+    #[test]
+    fn the_policy_is_found_from_inside_a_workspace_member() {
+        // CI runs the audit at the repository root. A developer in a member
+        // crate must get that graph, not "no policy".
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join(POLICY_FILE), "[advisories]\n").expect("policy");
+        let member = root.path().join("crates").join("app");
+        std::fs::create_dir_all(&member).expect("member");
+        assert_eq!(
+            find_policy_root(&member).map(|found| found.canonicalize().expect("canonical")),
+            Some(root.path().canonicalize().expect("canonical"))
+        );
+    }
+
+    #[test]
+    fn the_search_for_a_policy_stops_at_the_repository_root() {
+        let outer = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outer.path().join(POLICY_FILE), "[advisories]\n").expect("policy");
+        let repo = outer.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("git");
+        assert_eq!(find_policy_root(&repo), None);
+    }
+
+    #[test]
+    fn a_fetch_into_an_existing_checkout_refreshes_the_age() {
+        // A fetch writes inside `.git` and never touches the checkout's own
+        // directory, so reading the root alone reports this morning's fetch as
+        // months old.
+        let dbs = tempfile::tempdir().expect("tempdir");
+        let checkout = dbs.path().join("advisory-db-abc");
+        std::fs::create_dir(&checkout).expect("checkout");
+        let root_mtime = newest_db_mtime(dbs.path()).expect("mtime");
+        std::fs::create_dir(checkout.join(".git")).expect("git");
+        let fetched = newest_db_mtime(dbs.path()).expect("mtime");
+        assert!(
+            fetched >= root_mtime,
+            "a fetch must not read as older than the clone"
+        );
     }
 
     // ── age_days ─────────────────────────────────────────────────────────────
@@ -1024,12 +1431,7 @@ mod tests {
 
     #[test]
     fn a_clean_tree_adds_no_lines_to_dev_output() {
-        let eval = Evaluation::Audited {
-            findings: Vec::new(),
-            checks: vec!["advisories".to_owned()],
-            db_age_days: Some(1),
-        };
-        assert!(dev_lines(&eval).is_empty());
+        assert!(dev_lines(&audited(Vec::new())).is_empty());
     }
 
     #[test]
@@ -1038,9 +1440,12 @@ mod tests {
         // those are reported.
         for eval in [
             Evaluation::NoPolicy,
-            Evaluation::AuditorMissing,
-            Evaluation::DatabaseMissing,
-            Evaluation::Unavailable("cargo metadata failed".to_owned()),
+            Evaluation::AuditorMissing { checks: Vec::new() },
+            Evaluation::DatabaseMissing { checks: Vec::new() },
+            Evaluation::Unavailable {
+                reason: "cargo metadata failed".to_owned(),
+                checks: Vec::new(),
+            },
         ] {
             assert!(dev_lines(&eval).is_empty(), "{eval:?} must be silent");
         }
@@ -1048,28 +1453,20 @@ mod tests {
 
     #[test]
     fn dev_stays_silent_when_every_finding_is_waived() {
-        let eval = Evaluation::Audited {
-            findings: vec![finding("RUSTSEC-1", Severity::Critical, true, false)],
-            checks: vec!["advisories".to_owned()],
-            db_age_days: Some(1),
-        };
+        let eval = audited(vec![finding("RUSTSEC-1", Severity::Critical, true, false)]);
         assert!(dev_lines(&eval).is_empty());
     }
 
     #[test]
     fn a_non_critical_tree_gets_exactly_one_dev_line() {
-        let eval = Evaluation::Audited {
-            findings: vec![
-                finding("RUSTSEC-1", Severity::High, false, true),
-                finding("RUSTSEC-2", Severity::Low, false, false),
-            ],
-            checks: vec!["advisories".to_owned()],
-            db_age_days: Some(1),
-        };
+        let eval = audited(vec![
+            finding("RUSTSEC-1", Severity::High, false, true),
+            finding("RUSTSEC-2", Severity::Low, false, false),
+        ]);
         let lines = dev_lines(&eval);
         assert_eq!(lines.len(), 1, "got {lines:?}");
         assert!(
-            lines[0].contains('2'),
+            lines[0].contains('1'),
             "the count must appear: {}",
             lines[0]
         );
@@ -1087,16 +1484,12 @@ mod tests {
 
     #[test]
     fn a_critical_finding_gets_a_loud_banner() {
-        let eval = Evaluation::Audited {
-            findings: vec![finding(
-                "RUSTSEC-2099-0001",
-                Severity::Critical,
-                false,
-                true,
-            )],
-            checks: vec!["advisories".to_owned()],
-            db_age_days: Some(1),
-        };
+        let eval = audited(vec![finding(
+            "RUSTSEC-2099-0001",
+            Severity::Critical,
+            false,
+            true,
+        )]);
         let lines = dev_lines(&eval);
         assert!(
             lines.len() > 1,

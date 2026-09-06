@@ -243,51 +243,90 @@ pub fn check_plugin_residue_impl(wirings: &[PluginWiring]) -> CheckResult {
 /// How many findings the dependency check names before it counts the rest.
 const DEPENDENCY_DETAIL_LIMIT: usize = 10;
 
+/// How many waived ids the single-line clean state names.
+const DEPENDENCY_WAIVER_NAME_LIMIT: usize = 3;
+
 /// Grade the app's dependency policy evaluation (issue #1633).
 ///
 /// Pure and injectable, like every other `_impl` check here. The verdict is
-/// the CI gate's verdict: a finding the policy denies fails, a finding it warns
-/// about warns, and a waived finding is neither. Every state where the policy
-/// could not be evaluated warns — never a silent pass, and never a failure over
-/// a tool or a database the developer has not installed yet.
+/// the CI gate's verdict: a denied finding fails, a warned finding warns, and a
+/// waived finding is neither.
+///
+/// The states where the policy could not be evaluated split. A missing auditor
+/// or an unfetched database is the stock state of a machine that has not opted
+/// in, so those PASS and say so in their detail — `exit_code` promotes any
+/// warning to exit 1, and warning there would make `autumn doctor --strict`
+/// red for everyone (the rule the `platform_support` check follows). A missing
+/// policy file or an audit that produced no verdict is a repository or run
+/// problem, and warns.
 pub fn check_dependencies_impl(eval: &crate::deps::Evaluation) -> CheckResult {
     use crate::deps::{Evaluation, STALE_AFTER_DAYS};
 
-    let (detail, hint) = match eval {
+    let (status, detail, hint) = match eval {
+        Evaluation::AuditorMissing { checks } => (
+            CheckStatus::Pass,
+            format!(
+                "not evaluated — cargo-deny is not installed (`cargo install --locked cargo-deny`); {}",
+                dependency_checks_phrase(checks)
+            ),
+            None,
+        ),
+        Evaluation::DatabaseMissing { checks } => (
+            CheckStatus::Pass,
+            format!(
+                "not evaluated — no local advisory database (`cargo deny fetch db`); {}",
+                dependency_checks_phrase(checks)
+            ),
+            None,
+        ),
         Evaluation::NoPolicy => (
+            CheckStatus::Warn,
             format!(
                 "no {} — the app has no dependency policy, and its CI gate needs one",
                 crate::deps::POLICY_FILE
             ),
-            "copy the `deny.toml` that `autumn new` generates; docs/guide/supply-chain.md explains it",
+            Some(
+                "copy the `deny.toml` that `autumn new` generates; docs/guide/supply-chain.md explains it",
+            ),
         ),
-        Evaluation::AuditorMissing => (
-            "cargo-deny is not installed, so the dependency policy was not evaluated".to_owned(),
-            "cargo install --locked cargo-deny",
-        ),
-        Evaluation::DatabaseMissing => (
-            "the RustSec advisory database has never been fetched, so no advisory was checked"
-                .to_owned(),
-            "cargo deny fetch db",
-        ),
-        Evaluation::Unavailable(reason) => (
+        Evaluation::Unavailable { reason, .. } => (
+            CheckStatus::Warn,
             format!("the dependency audit produced no verdict: {reason}"),
-            "run `cargo deny check advisories` to see the auditor's own error",
+            Some("run `cargo deny check advisories` to see the auditor's own error"),
         ),
         Evaluation::Audited {
             findings,
             checks,
             db_age_days,
+            auditor,
         } => {
-            return grade_dependency_findings(findings, checks, *db_age_days, STALE_AFTER_DAYS);
+            return grade_dependency_findings(
+                findings,
+                checks,
+                *db_age_days,
+                auditor,
+                STALE_AFTER_DAYS,
+            );
         }
     };
     CheckResult {
         name: "dependencies",
-        status: CheckStatus::Warn,
+        status,
         detail: Some(detail),
-        hint: Some(hint),
+        hint,
     }
+}
+
+/// The checks a policy activates.
+///
+/// Spelled the same way in every state, evaluated or not: this is the fragment
+/// a reader — and the scaffold's parity test — compares against the check list
+/// the generated CI workflow derives.
+fn dependency_checks_phrase(checks: &[String]) -> String {
+    if checks.is_empty() {
+        return "checks: none".to_owned();
+    }
+    format!("checks: {}", checks.join(", "))
 }
 
 /// Grade a completed audit.
@@ -295,6 +334,7 @@ fn grade_dependency_findings(
     findings: &[crate::deps::Finding],
     checks: &[String],
     db_age_days: Option<u64>,
+    auditor: &str,
     stale_after_days: u64,
 ) -> CheckResult {
     let stale = db_age_days.is_some_and(|age| age > stale_after_days);
@@ -310,9 +350,9 @@ fn grade_dependency_findings(
         CheckStatus::Pass
     };
 
-    // Context every reader needs to map this verdict onto the CI gate: which
-    // checks the policy activates, and how old the data behind them is.
-    let mut context = format!("checks: {}", checks.join(", "));
+    // Context every reader needs to map this verdict onto the CI gate: the
+    // auditor, the checks the policy activates, and how old the data is.
+    let mut context = format!("{auditor}; {}", dependency_checks_phrase(checks));
     if let Some(age) = db_age_days {
         let plural = if age == 1 { "" } else { "s" };
         let _ = write!(context, "; advisory data {age} day{plural} old");
@@ -320,17 +360,28 @@ fn grade_dependency_findings(
             context.push_str(" (stale)");
         }
     }
+    let stale_hint = "`cargo deny fetch db` refreshes the advisory database; the verdict above is only as fresh as that data";
+    let finding_hint = "`deny.toml` holds the policy and the waivers; docs/guide/supply-chain.md explains how to fix or waive a finding";
 
-    if findings.is_empty() {
+    // Nothing live: one line, whatever the waivers hold. An app scaffolded by
+    // `autumn new` always carries a waiver, so listing waivers here would make
+    // the single-line clean state unreachable for every generated app.
+    if live.is_empty() {
+        let waived: Vec<&str> = findings.iter().map(|finding| finding.id.as_str()).collect();
+        let summary = if waived.is_empty() {
+            "no advisories or policy violations".to_owned()
+        } else {
+            format!(
+                "no live findings; {} waived ({})",
+                waived.len(),
+                crate::deps::name_some(&waived, DEPENDENCY_WAIVER_NAME_LIMIT)
+            )
+        };
         return CheckResult {
             name: "dependencies",
             status,
-            detail: Some(format!(
-                "no advisories or policy violations — {context}"
-            )),
-            hint: stale.then_some(
-                "`cargo deny fetch db` refreshes the advisory database; the verdict above is only as fresh as that data",
-            ),
+            detail: Some(crate::deps::one_line(&format!("{summary} — {context}"))),
+            hint: stale.then_some(stale_hint),
         };
     }
 
@@ -342,7 +393,7 @@ fn grade_dependency_findings(
 
     let waived = findings.len() - live.len();
     let plural = if findings.len() == 1 { "" } else { "s" };
-    let mut counts = format!("{} dependency finding{plural}", findings.len());
+    let mut counts = format!("{} finding{plural}", findings.len());
     if blocking > 0 {
         let _ = write!(counts, ", {blocking} blocking");
     }
@@ -370,9 +421,9 @@ fn grade_dependency_findings(
         name: "dependencies",
         status,
         detail: Some(lines.join("\n")),
-        hint: Some(
-            "`deny.toml` holds the policy and the waivers; docs/guide/supply-chain.md explains how to fix or waive a finding",
-        ),
+        // Stale data explains a verdict the reader may not otherwise trust, so
+        // it outranks the fix-or-waive pointer.
+        hint: Some(if stale { stale_hint } else { finding_hint }),
     }
 }
 
@@ -2838,7 +2889,6 @@ pub const fn exit_code(summary: &Summary, strict: bool) -> i32 {
 }
 
 pub fn format_check_line(result: &CheckResult) -> String {
-    use std::fmt::Write as _;
     let g = glyph(&result.status);
     let mut line = format!("{g} {}", result.name);
     if let Some(ref detail) = result.detail {
@@ -6150,7 +6200,6 @@ fn acme_short_hash(input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
     let mut out = String::with_capacity(16);
     for byte in &digest[..8] {
-        use std::fmt::Write as _;
         let _ = write!(out, "{byte:02x}");
     }
     out
@@ -6668,7 +6717,6 @@ fn acme_cert_id(domains: &[String]) -> String {
     let digest = hasher.finalize();
     let mut out = String::with_capacity(32);
     for byte in &digest[..16] {
-        use std::fmt::Write as _;
         let _ = write!(out, "{byte:02x}");
     }
     out
@@ -8869,10 +8917,15 @@ pub fn run(opts: DoctorOptions) {
     // 19. Dependency advisories and policy (issue #1633): the app's lockfile
     //     graded against its own `deny.toml` — the same policy file, waiver
     //     store and auditor that #1600's CI gate runs, so this verdict predicts
-    //     that gate. Always offline: the advisory database is never fetched
-    //     here, so the check cannot hang and cannot depend on the network.
+    //     that gate. Always offline — the advisory database is never fetched
+    //     here — and bounded, so a `cargo metadata` waiting on Cargo's
+    //     package-cache lock reports no verdict rather than hanging doctor.
+    //     See `crate::deps` for what parity does and does not cover.
     tasks.push(Box::new(|| {
-        check_dependencies_impl(&crate::deps::evaluate(std::path::Path::new(".")))
+        check_dependencies_impl(&crate::deps::evaluate_within(
+            std::path::Path::new("."),
+            crate::deps::DOCTOR_BUDGET,
+        ))
     }));
 
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
@@ -19064,6 +19117,7 @@ redirect_uri = "http://localhost/callback"
                 findings,
                 checks: vec!["advisories".to_owned()],
                 db_age_days,
+                auditor: "cargo-deny 0.20.2".to_owned(),
             }
         }
 
@@ -19182,25 +19236,56 @@ redirect_uri = "http://localhost/callback"
         }
 
         #[test]
-        fn a_missing_auditor_warns_with_an_install_hint() {
-            let result = check_dependencies_impl(&Evaluation::AuditorMissing);
-            assert_eq!(result.status, CheckStatus::Warn);
+        fn a_machine_without_the_auditor_does_not_fail_doctor_strict() {
+            // `exit_code` treats any warning as a failure under `--strict`, and
+            // cargo-deny is not installed by any Autumn install path. Warning
+            // here would make `autumn doctor --strict` — a Tier 1 command —
+            // exit 1 on every machine that has not opted in.
+            let result = check_dependencies_impl(&Evaluation::AuditorMissing {
+                checks: vec!["advisories".to_owned()],
+            });
+            assert_eq!(result.status, CheckStatus::Pass);
+            let summary = compute_summary(std::slice::from_ref(&result));
+            assert_eq!(exit_code(&summary, true), 0);
+            let detail = result.detail.expect("detail");
             assert!(
-                result.hint.expect("hint").contains("cargo install"),
-                "the hint must say how to install the auditor"
+                detail.contains("not evaluated"),
+                "a pass must not read as a verdict: {detail}"
+            );
+            assert!(
+                detail.contains("cargo install"),
+                "the detail must say how to enable it: {detail}"
             );
         }
 
         #[test]
-        fn an_unfetched_database_warns_rather_than_reporting_a_clean_tree() {
-            let result = check_dependencies_impl(&Evaluation::DatabaseMissing);
-            assert_eq!(result.status, CheckStatus::Warn);
+        fn an_unfetched_database_does_not_fail_doctor_strict_either() {
+            // Same reasoning: the database is only populated by an explicit
+            // `cargo deny fetch db`.
+            let result = check_dependencies_impl(&Evaluation::DatabaseMissing {
+                checks: vec!["advisories".to_owned()],
+            });
+            assert_eq!(result.status, CheckStatus::Pass);
+            let summary = compute_summary(std::slice::from_ref(&result));
+            assert_eq!(exit_code(&summary, true), 0);
             let detail = result.detail.expect("detail");
-            assert!(detail.contains("advisory database"), "{detail}");
+            assert!(detail.contains("not evaluated"), "{detail}");
             assert!(
-                result.hint.expect("hint").contains("cargo deny fetch db"),
-                "the hint must say how to fetch it"
+                detail.contains("cargo deny fetch db"),
+                "the detail must say how to fetch it: {detail}"
             );
+        }
+
+        #[test]
+        fn an_unevaluated_policy_still_names_the_checks_it_would_run() {
+            // The derived check list is what a reader compares against CI, so
+            // it must survive a state where nothing could be audited.
+            let result = check_dependencies_impl(&Evaluation::AuditorMissing {
+                checks: vec!["advisories".to_owned(), "licenses".to_owned()],
+            });
+            let detail = result.detail.expect("detail");
+            assert!(detail.contains("advisories"), "{detail}");
+            assert!(detail.contains("licenses"), "{detail}");
         }
 
         #[test]
@@ -19231,9 +19316,10 @@ redirect_uri = "http://localhost/callback"
 
         #[test]
         fn an_auditor_that_produced_no_verdict_warns_with_the_reason() {
-            let result = check_dependencies_impl(&Evaluation::Unavailable(
-                "cargo metadata failed".to_owned(),
-            ));
+            let result = check_dependencies_impl(&Evaluation::Unavailable {
+                reason: "cargo metadata failed".to_owned(),
+                checks: Vec::new(),
+            });
             assert_eq!(result.status, CheckStatus::Warn);
             assert!(
                 result
@@ -19378,6 +19464,7 @@ redirect_uri = "http://localhost/callback"
                 findings: Vec::new(),
                 checks: vec!["advisories".to_owned(), "licenses".to_owned()],
                 db_age_days: Some(1),
+                auditor: "cargo-deny 0.20.2".to_owned(),
             });
             let detail = result.detail.expect("detail");
             assert!(detail.contains("advisories"), "{detail}");

@@ -515,19 +515,11 @@ impl DevReloadState {
 
 /// How long `autumn dev` waits for the dependency policy evaluation.
 ///
-/// Startup is never blocked on it: an evaluation that is not ready by then is
-/// abandoned and the dev loop says nothing (issue #1633).
+/// The wait is paid AFTER the initial build, which is far longer than the
+/// audit, so the audit is normally already done and this costs nothing. It is
+/// never paid before the build: dependency findings must not slow a cold start
+/// (issue #1633).
 const DEPENDENCY_AUDIT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Start the dependency policy evaluation beside dev startup.
-fn spawn_dependency_audit() -> mpsc::Receiver<crate::deps::Evaluation> {
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        // A closed receiver means startup moved on. Nothing to report.
-        let _ = sender.send(crate::deps::evaluate(Path::new(".")));
-    });
-    receiver
-}
 
 /// Startup lines for an evaluation that may not have finished in time.
 fn dependency_startup_lines(eval: Option<&crate::deps::Evaluation>) -> Vec<String> {
@@ -539,7 +531,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
     eprintln!("\u{1F342} autumn dev\n");
 
     // Start the dependency audit first so it overlaps the rest of startup.
-    let dependency_audit = spawn_dependency_audit();
+    let dependency_audit = crate::deps::spawn_evaluation(Path::new("."));
 
     // Warn when maintenance mode is currently active so the operator is not
     // surprised by 503 responses during local development.
@@ -567,24 +559,22 @@ pub fn run(package: Option<&str>, show_config: bool) {
             None
         }
     };
-    // Dependency findings (issue #1633). Quiet by default: an advisory-clean,
-    // policy-clean tree adds nothing here, and nothing below ever blocks the
-    // rebuild loop.
-    let evaluation = dependency_audit.recv_timeout(DEPENDENCY_AUDIT_TIMEOUT).ok();
-    let dependency_lines = dependency_startup_lines(evaluation.as_ref());
-    if !dependency_lines.is_empty() {
-        for line in &dependency_lines {
-            eprintln!("{line}");
-        }
-        eprintln!();
-    }
-
     // Initial build. There is no prior server here (cold start), so a browser
     // overlay isn't reachable — the CLI doesn't know the app's port and no
     // process is up to answer the state endpoint. We still record the failure
     // in the state file (harmless, and dismissed by the first green build);
     // the terminal errors remain the primary feedback for this case.
     let (built, diagnostics) = cargo_build_capturing(package);
+
+    // Dependency findings (issue #1633), reported after the build so a cold
+    // start never waits on the auditor. Quiet by default: an advisory-clean,
+    // policy-clean tree adds nothing here, and nothing below ever blocks the
+    // rebuild loop.
+    let evaluation = crate::deps::await_evaluation(&dependency_audit, DEPENDENCY_AUDIT_TIMEOUT);
+    for line in dependency_startup_lines(evaluation.as_ref()) {
+        eprintln!("{line}");
+    }
+
     if !built {
         eprintln!("\u{2717} Initial build failed. Fix errors and save to retry.\n");
         if let Some(state) = reload_state.as_mut()
@@ -3856,6 +3846,7 @@ watch_dirs = ["views", "locales"]
             findings: Vec::new(),
             checks: vec!["advisories".to_owned()],
             db_age_days: Some(1),
+            auditor: "cargo-deny 0.20.2".to_owned(),
         };
         assert!(dependency_startup_lines(Some(&clean)).is_empty());
     }
@@ -3865,5 +3856,22 @@ watch_dirs = ["views", "locales"]
         // A dev loop that stalls on an auditor is worse than one that says
         // nothing.
         assert!(DEPENDENCY_AUDIT_TIMEOUT <= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn the_dependency_wait_is_paid_after_the_build_not_before_it() {
+        // A cold start must not wait on the auditor. The source order is the
+        // contract: the audit is awaited only after `cargo_build_capturing`.
+        let source = include_str!("dev.rs");
+        let build = source
+            .find("let (built, diagnostics) = cargo_build_capturing(package);")
+            .expect("initial build");
+        let wait = source
+            .find("crate::deps::await_evaluation(&dependency_audit")
+            .expect("dependency wait");
+        assert!(
+            build < wait,
+            "the dependency wait must come after the initial build"
+        );
     }
 }

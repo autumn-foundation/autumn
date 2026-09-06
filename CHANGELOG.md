@@ -33,23 +33,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **cli:** dependency advisories and policy reach the dev loop (issue #1633).
   `autumn doctor` gains a `dependencies` check that grades the app's lockfile
-  against its own `deny.toml` — the same policy file, waiver store and auditor
-  that #1600's CI gate runs, so a local verdict predicts the CI verdict rather
-  than approximating it. Each finding reports its advisory or violation id, its
-  severity, the crate and the title; a waived finding shows as waived and never
-  fails. Severity is consequence: what the policy denies grades high or
-  critical (CVSS v3 separates the two), what it warns about grades low or
-  medium. `autumn dev` stays quiet — a clean or fully waived tree adds nothing
-  to its output, findings add one summary line, and only a critical advisory
-  gets a startup banner. Nothing there blocks startup or the rebuild loop.
-  Neither command fetches: both run `cargo deny --offline`, doctor reports the
-  advisory data's age and warns once when it is stale, a missing auditor or
-  database is a warning rather than a silent pass, and `autumn dev` is silent
-  in every one of those states. `autumn new` now scaffolds `[licenses]`,
-  `[bans]` and `[sources]` into `deny.toml` as commented, quiet defaults, and
-  the generated CI workflow derives its check list from the sections that file
-  declares — so uncommenting one widens the local check and the CI gate
-  together. See docs/guide/supply-chain.md.
+  against its own `deny.toml` — the same policy file, waiver store, check list
+  and auditor that #1600's CI gate runs, so a local verdict predicts the CI
+  verdict. Two differences remain and are reported rather than hidden: CI pins
+  cargo-deny 0.20.2 while a local run uses whatever is installed, and CI
+  fetches the advisory database every run while doctor reads local data and
+  names its age. Each finding reports its advisory or violation id, severity,
+  crate and title; a waived finding shows as waived and never fails, and a
+  tree with nothing live is exactly one line. Severity is consequence: what the
+  policy denies grades high or critical (CVSS v3 separates the two), what it
+  warns about grades low or medium. `autumn dev` reports only findings the
+  policy **denies** — the ones that turn CI red — so a clean tree, a fully
+  waived tree and a tree with only warn-level findings all add nothing to its
+  output; a critical advisory gets a startup banner. The audit is read after
+  the initial build, so a cold start never waits on it. Neither command
+  fetches: both run `cargo deny --offline`, doctor warns once when the advisory
+  data is over 7 days old, and a missing auditor or database is a **pass** that
+  reads `not evaluated` — never a silent pass, and never a warning that would
+  make `autumn doctor --strict` red on every machine that has not installed an
+  optional tool. `autumn new` now scaffolds `[licenses]`, `[bans]` and
+  `[sources]` into `deny.toml` as commented, quiet defaults, and the generated
+  CI workflow derives its check list from the sections that file declares — in
+  every TOML spelling, by the same rule doctor uses — so uncommenting one
+  widens the local check and the CI gate together. See
+  docs/guide/supply-chain.md.
 
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,

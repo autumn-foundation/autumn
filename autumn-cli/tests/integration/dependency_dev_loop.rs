@@ -13,7 +13,8 @@
 //! * the **docs** — the policy, the severity defaults, the offline behavior,
 //!   and how a local finding maps to the CI failure it predicts.
 //!
-//! A parity claim nobody tested is a parity claim that quietly stops holding.
+//! These artifacts only ever execute in someone else's CI, so their invariants
+//! have to be pinned here rather than discovered during an incident.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -231,9 +232,140 @@ fn doctor_reports_a_dependency_check_on_a_scaffolded_app() {
         check["detail"].as_str().is_some_and(|d| !d.is_empty()),
         "the dependency check must say what it found: {check}"
     );
-    // Whatever the local toolbox holds, the check never silently passes over an
-    // unevaluated policy: a missing auditor or database is a warning.
-    assert_ne!(check["status"], "error", "unexpected status: {check}");
+    // A fresh scaffold's policy is clean, and an unevaluated policy says so in
+    // its detail rather than reporting a finding. Either way it never fails.
+    assert_ne!(check["status"], "fail", "unexpected status: {check}");
+}
+
+/// The check list `autumn doctor` derives for the policy in `project`.
+///
+/// Read from the `checks: …` fragment doctor prints in every state, so this
+/// works whether or not cargo-deny is installed on the machine running it.
+fn doctor_checks(project: &Path) -> Vec<String> {
+    let output = Command::new(autumn_bin())
+        .args(["doctor", "--json"])
+        .current_dir(project)
+        .output()
+        .expect("failed to run autumn doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("doctor --json: {e}\n{stdout}"));
+    let detail = parsed["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|check| check["name"] == "dependencies")
+        .and_then(|check| check["detail"].as_str())
+        .unwrap_or_else(|| panic!("no dependencies detail\n{stdout}"))
+        .to_owned();
+    let listed = detail
+        .split("checks: ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("doctor must name the checks it derived: {detail}"));
+    listed
+        .split([';', '\n'])
+        .next()
+        .unwrap_or_default()
+        .split(", ")
+        .map(|check| check.trim().to_owned())
+        .filter(|check| !check.is_empty())
+        .collect()
+}
+
+/// The check list the generated workflow derives, by running its own shell.
+#[cfg(unix)]
+fn workflow_checks(workflow: &str, project: &Path) -> Vec<String> {
+    let mut script = String::new();
+    for line in workflow
+        .lines()
+        .skip_while(|line| !line.trim().starts_with("checks=\"advisories\""))
+        .take_while(|line| !line.trim().starts_with("cargo deny"))
+        // The step echoes the derived list for its own log; the value is what
+        // this test reads.
+        .filter(|line| !line.trim().starts_with("echo "))
+    {
+        script.push_str(line.trim_start());
+        script.push('\n');
+    }
+    assert!(
+        script.contains("for section in"),
+        "could not extract the derivation from the workflow:\n{workflow}"
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(format!("set -e\n{script}\nprintf '%s' \"$checks\""))
+        .current_dir(project)
+        .output()
+        .expect("failed to run the workflow derivation");
+    assert!(
+        output.status.success(),
+        "the workflow derivation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Every TOML spelling that declares a cargo-deny section, and the policies
+/// that only look like they do.
+const SECTION_SPELLINGS: &[(&str, bool)] = &[
+    ("[bans]\n", true),
+    ("[ bans ]\n", true),
+    ("[bans] # inline note\n", true),
+    ("[bans.build]\n", true),
+    ("[[bans.deny]]\n", true),
+    ("bans.deny = []\n", true),
+    ("bans = { multiple-versions = \"allow\" }\n", true),
+    ("  [bans]\n", true),
+    ("[bansible]\n", false),
+    ("# [bans]\n", false),
+    ("#[bans]\n", false),
+    ("[advisories]\n", false),
+];
+
+/// `autumn doctor` and the generated workflow must derive the same check list
+/// from the same policy file — the whole basis of AC4's parity claim.
+///
+/// This runs the workflow's own shell, so it cannot pass by agreeing with a
+/// re-implementation of the rule.
+#[cfg(unix)]
+#[test]
+fn doctor_and_the_generated_workflow_derive_the_same_checks() {
+    let (_tmp, project) = scaffold("deriveapp");
+    let workflow = read_project_file(&project, ".github/workflows/ci.yml");
+    let policy_path = project.join("deny.toml");
+
+    for (policy, declares_bans) in SECTION_SPELLINGS {
+        fs::write(&policy_path, policy).expect("write policy");
+        let expected = if *declares_bans {
+            vec!["advisories".to_owned(), "bans".to_owned()]
+        } else {
+            vec!["advisories".to_owned()]
+        };
+        let from_workflow = workflow_checks(&workflow, &project);
+        let from_doctor = doctor_checks(&project);
+        assert_eq!(
+            from_workflow, expected,
+            "the workflow derived the wrong checks for {policy:?}"
+        );
+        assert_eq!(
+            from_doctor, expected,
+            "doctor derived the wrong checks for {policy:?}"
+        );
+    }
+}
+
+/// The scaffolded policy itself must derive advisories only — a fresh app is
+/// not silently opted into a license or ban policy it never wrote.
+#[cfg(unix)]
+#[test]
+fn the_shipped_policy_derives_advisories_only_on_both_sides() {
+    let (_tmp, project) = scaffold("shippedapp");
+    let workflow = read_project_file(&project, ".github/workflows/ci.yml");
+    assert_eq!(workflow_checks(&workflow, &project), vec!["advisories"]);
+    assert_eq!(doctor_checks(&project), vec!["advisories"]);
 }
 
 // ── Docs ─────────────────────────────────────────────────────────────────────
@@ -266,15 +398,30 @@ fn the_docs_explain_the_dev_loop_contract() {
 fn the_docs_map_a_local_finding_onto_the_ci_failure_it_predicts() {
     let docs = read_repo_file("docs/guide/supply-chain.md");
     assert!(
-        docs.contains("## The dev loop"),
-        "docs/guide/supply-chain.md needs a dev-loop section"
+        docs.contains("## Part 3b — the dev loop"),
+        "docs/guide/supply-chain.md needs a dev-loop section, in the file's own \
+         `Part N` scheme"
     );
-    assert!(
-        docs.contains("STALE") || docs.contains("stale"),
-        "the docs must define the stale-data behavior"
-    );
-    assert!(
-        docs.contains("waiv"),
-        "the docs must say waivers are shared with the CI gate"
-    );
+    for (claim, needle) in [
+        ("the stale-data behaviour", "stale"),
+        (
+            "that the waiver store is shared with the CI gate",
+            "`[advisories] ignore` entry",
+        ),
+        ("the auditor-version difference", "cargo-deny@0.20.2"),
+        (
+            "that CI fetches the database and doctor does not",
+            "fetches the RustSec database",
+        ),
+        ("how a waived finding is graded", "its own CVSS band"),
+        (
+            "that an unevaluated policy passes rather than warns",
+            "not evaluated",
+        ),
+    ] {
+        assert!(
+            docs.contains(needle),
+            "docs/guide/supply-chain.md must explain {claim} (looked for {needle:?})"
+        );
+    }
 }
