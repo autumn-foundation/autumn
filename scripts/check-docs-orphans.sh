@@ -347,8 +347,12 @@ REF_DEF_FULL = re.compile(
 # would be read against a definition whose label the same escape kept whole,
 # and the two would never line up.
 _LBL = FLAT  # see LABEL_MAX above: one label grammar, not two
+# The FIRST label is captured too, because the collapsed form `[label][]`
+# takes its label from there. Finding it with `index(']')` picked the
+# ESCAPED bracket in `[a\\]b][]` and produced `a\\`, which matches no
+# definition — a link the reader can click, reported as an orphan.
 REF_USE_FULL = re.compile(
-    r'(?<![\\!])\[' + _LBL + r'*\]\[(' + _LBL + LABEL_MAX_OPT + r')\]')
+    r'(?<![\\!])\[(' + _LBL + r'*)\]\[(' + _LBL + LABEL_MAX_OPT + r')\]')
 REF_USE_SHORTCUT = re.compile(
     r'(?<![\\!])\[(' + _LBL + LABEL_MAX + r')\](?![\(\[:])')
 # Every full-reference span, image or not. Used to blank them before the
@@ -370,7 +374,15 @@ REF_USE_ANY = re.compile(
 # whole before the bare-path scan, hiding a route the reader can read.
 IMAGE_LABEL = r'!\[(?:' + FLAT + r'|\[' + FLAT + r'*\])*\]'
 IMAGE_INLINE = re.compile(IMAGE_LABEL + DEST)
-IMAGE_REF = re.compile(IMAGE_LABEL + r'(?:\[' + FLAT + r'*\])?')
+# The label is captured twice because an image reference names its
+# definition in one of three places: `![alt][ref]` (the second), `![ref][]`
+# and `![ref]` (the first). Which one is used decides whether this is an
+# image at all — an UNRESOLVED reference renders as literal text, so
+# `![alt][docs/guide/mail.md]` with no such definition puts that path on
+# screen, and masking it unconditionally reported the page as an orphan.
+IMAGE_REF = re.compile(
+    r'!\[((?:' + FLAT + r'|\[' + FLAT + r'*\])*)\]'
+    r'(?:\[(' + FLAT + r'*)\])?')
 # Any inline link span, image or not. Blanked before the shortcut scan: links
 # cannot nest, so in `[outer [mail]](https://example.com)` only the OUTER link
 # renders and the inner `[mail]` is ordinary label text — not a shortcut
@@ -717,8 +729,16 @@ ATTR_VALUE_ANY = re.compile(r'\b' + ATTR_ASSIGNED, re.I)
 # rule-applied-to-one-sibling mistake this file keeps making.
 ANCHOR_TAG = re.compile(
     r'<a(?:' + _TWS + r'+' + ATTR + r')*' + _TWS + r'*/?>', re.I)
-# The `](…)` destination of a rendered link, blanked before the bare-path scan.
-LINK_DEST = re.compile(r'\]' + DEST)
+# The destination of a rendered link, blanked before the bare-path scan —
+# matched with the LABEL in front of it, because `](docs/guide/mail.md)`
+# with no opening bracket renders literally and its path is visible text.
+# `\]` alone blanked that away and reported the page it names as an orphan.
+# Only the destination is blanked, never the label: the label IS on screen,
+# so `[see docs/guide/mail.md](https://example.com)` names a route in words
+# the reader can read.
+LINK_DEST = re.compile(r'(?<![\\!])\[' + FLAT + r'*\](' + DEST + r')')
+LINK_DEST_NESTED = re.compile(
+    r'(?<![\\!])\[(?:' + FLAT + r'|\[' + FLAT + r'*\])*\](' + DEST + r')')
 # A whole raw tag, used to bound where `src=` may be masked. Unscoped, that
 # pattern also eats the query of `[Mail](mail.md?src=guide)`, which is an
 # ordinary Markdown link the sibling gate resolves.
@@ -835,7 +855,13 @@ INDENTED_CODE = re.compile(r'^ {4}')
 REF_DEF_LINE = re.compile(
     r'^ {0,3}\[' + FLAT + LABEL_MAX + r'\]:[ \t]*'
     r'(?:<[^<>\r\n]*>|' + DEST_BARE + r')'
-    r'(?:[ \t]+(?:"[^"\n]*"|\'[^\'\n]*\'|\([^()\n]*\)))?[ \t]*$')
+    r'(?P<title>[ \t]+(?:"[^"\n]*"|\'[^\'\n]*\'|\([^()\n]*\)))?[ \t]*$')
+# A definition's title may sit on the line AFTER its destination, where it
+# is still part of that definition. Read as a paragraph, it closed the run:
+# `[x]: url` / `"title"` / `[m]: mail.md` rejected the third line and
+# reported a page the reader can click as an orphan.
+TITLE_ONLY_LINE = re.compile(
+    r'^ {0,3}(?:"[^"\n]*"|\'[^\'\n]*\'|\([^()\n]*\))[ \t]*$')
 
 
 # Raw HTML blocks whose end condition is a DELIMITER rather than a blank line
@@ -893,6 +919,9 @@ def block_starts(txt):
     # The end condition of an open delimiter-terminated raw block: a compiled
     # pattern for type 1, a literal terminator for types 3-5, or None.
     html_end = None
+    # Set when the previous line was a definition with no title of its own, so
+    # a title on this line continues it rather than starting a paragraph.
+    title_may_follow = False
     for line in txt.split('\n'):
         if not para_open:
             starts.add(pos)
@@ -923,12 +952,17 @@ def block_starts(txt):
             # the same line under a paragraph is lazy continuation text and
             # falls through to the `else`.
             para_open = False
+        elif title_may_follow and TITLE_ONLY_LINE.match(line):
+            para_open = False
         elif not para_open and REF_DEF_LINE.match(line):
             # A definition is a block that opens no paragraph, which is what
             # keeps a RUN of them working — only the first follows a blank
             # line. Rejecting the second of `[first]: jobs.md` / `[mail]:
             # mail.md` reported a page the reader can reach as an orphan.
             para_open = False
+            title_may_follow = REF_DEF_LINE.match(line).group('title') is None
+            pos += len(line) + 1
+            continue
         elif para_open and SETEXT_UNDERLINE.match(line):
             # It needs an open paragraph to underline: with none, `===` is
             # ordinary text and `---` is a thematic break, which the next arm
@@ -941,8 +975,35 @@ def block_starts(txt):
             para_open = False
         else:
             para_open = True
+        title_may_follow = False
         pos += len(line) + 1
     return starts
+
+
+def blank_link_dests(txt):
+    """Blank the DESTINATION of every rendered link, leaving its label alone.
+
+    `sub_in_prose` cannot do this: it blanks whole matches, and the label of a
+    link is visible text that may itself name a path. So the match has to carry
+    the label — to prove there IS a link — while only the destination's span is
+    replaced.
+    """
+    out = []
+    for kind, seg in split_fences(txt):
+        if kind != 'prose':
+            out.append(seg)
+            continue
+        protected = [(m.start(), m.end()) for m in CODE_SPAN.finditer(seg)]
+        spans = []
+        for pat in (LINK_DEST, LINK_DEST_NESTED):
+            for m in pat.finditer(seg):
+                if any(a <= m.start() < b for a, b in protected):
+                    continue
+                spans.append(m.span(1))
+        for a, b in spans:
+            seg = seg[:a] + ' ' * (b - a) + seg[b:]
+        out.append(seg)
+    return ''.join(out)
 
 
 def sub_in_prose(pat, txt, only_at_block_start=False):
@@ -1032,6 +1093,13 @@ def fold_escapes(txt):
             .replace('\\<', '\x02\x02'))
 
 
+def _image_resolves(m, defined):
+    """Whether an image reference names a definition that exists."""
+    first, second = m.group(1), m.group(2)
+    label = second if second is not None and second.strip() else first
+    return ref_label(label) in defined
+
+
 def mask_invisible(txt):
     """Blank everything a reader cannot see — in PROSE, and not inside a code
     span. This is the ONE place that decides what is invisible, because scoping
@@ -1049,6 +1117,9 @@ def mask_invisible(txt):
     Replacements are space-for-space so offsets stay valid for the callers that
     blank spans by position.
     """
+    defined = {lbl for lbl in
+               (ref_label(d.group(1)) for d in REF_DEF.finditer(txt))
+               if lbl is not None}
     out = []
     for kind, seg in split_fences(txt):
         if kind != 'prose':
@@ -1059,7 +1130,7 @@ def mask_invisible(txt):
                       for m in RAW_DELIM_BLOCK.finditer(seg)]
         tags = [(m.start(), m.end()) for m in HTML_TAG.finditer(seg)]
 
-        def blank(pat, bound=None):
+        def blank(pat, bound=None, when=None):
             nonlocal seg
             pieces, last = [], 0
             for m in pat.finditer(seg):
@@ -1067,6 +1138,8 @@ def mask_invisible(txt):
                     continue
                 if bound is not None and not any(
                         a <= m.start() < b for a, b in bound):
+                    continue
+                if when is not None and not when(m):
                     continue
                 pieces.append(seg[last:m.start()])
                 pieces.append(' ' * (m.end() - m.start()))
@@ -1095,7 +1168,13 @@ def mask_invisible(txt):
         # `![alt](x.md)` SAMPLE in a fence or code span keeps its visible
         # destination while a rendered image does not.
         blank(IMAGE_INLINE)
-        blank(IMAGE_REF)
+        # An image REFERENCE is an image only if its label resolves. The
+        # definition set is read from the whole text rather than the resolved
+        # one computed later in `edges_from`, which is not available this
+        # early; it over-accepts only a definition that a block-start check
+        # would reject, and that is the direction that keeps a real image
+        # masked.
+        blank(IMAGE_REF, when=lambda m: _image_resolves(m, defined))
         out.append(seg)
     return ''.join(out)
 
@@ -1170,7 +1249,7 @@ def edges_from(f):
     # feed the bare-path scan a path out of its query string; that destination
     # is `MD_LINK`'s to resolve, and it resolves to an external URL. Prose only:
     # the same text in a fence shows the path and still counts.
-    scan = sub_in_prose(LINK_DEST, txt)
+    scan = blank_link_dests(txt)
     # Only where a block can START. A definition cannot interrupt a
     # paragraph, so after ordinary prose `[mail]: docs/guide/mail.md` is not
     # one — it renders as visible text, and its path is a route the reader
@@ -1242,10 +1321,11 @@ def edges_from(f):
     # no label at all; it must not join the used set, or an over-long
     # definition below would find a match for it.
     for m in REF_USE_FULL.finditer(uses_txt):
-        # `[label][]` (collapsed) leaves group 1 empty; the label is the text.
-        inner = m.group(1)
-        lbl = (ref_label(inner) if inner.strip()
-               else ref_label(m.group(0)[1:m.group(0).index(']')]))
+        # `[label][]` (collapsed) leaves the SECOND label empty; the label is
+        # then the first one, which the pattern captures rather than this
+        # having to find where it ends.
+        inner = m.group(2)
+        lbl = ref_label(inner) if inner.strip() else ref_label(m.group(1))
         if lbl is not None:
             used.add(lbl)
     # Blank every full-reference span before looking for shortcuts, so the
@@ -2724,6 +2804,49 @@ self_test() {
     > "$c9fs/docs/guide/jobs.md"
   git -C "$c9fs" add -A && git -C "$c9fs" commit -qm def-after-valid-def
   check "a definition under a valid one still defines" pass "$c9fs"
+
+  # A collapsed reference takes its label from the FIRST bracket, and an
+  # escaped `]` inside it does not end that label.
+  local c9ft="$tmp/c9ft"; make_corpus "$c9ft"
+  printf '# Jobs\n\nSee [a\\]b][].\n\n[a\\]b]: mail.md\n' > "$c9ft/docs/guide/jobs.md"
+  git -C "$c9ft" add -A && git -C "$c9ft" commit -qm collapsed-escaped-bracket
+  check "a collapsed label with an escaped bracket resolves" pass "$c9ft"
+
+  # A definition's title may sit on the next line, and the definition after it
+  # still starts a block.
+  local c9fu="$tmp/c9fu"; make_corpus "$c9fu"
+  printf '# Jobs\n\nSee [mail][m].\n\n[x]: https://example.test\n"title"\n[m]: mail.md\n' \
+    > "$c9fu/docs/guide/jobs.md"
+  git -C "$c9fu" add -A && git -C "$c9fu" commit -qm continuation-title
+  check "a definition after a continuation title resolves" pass "$c9fu"
+
+  # A `](path)` tail with no opening bracket renders literally, so its path is
+  # visible text and must not be blanked with real link destinations.
+  local c9fv="$tmp/c9fv"; make_corpus "$c9fv"
+  printf '# Jobs\n\nstray ](docs/guide/mail.md)\n' > "$c9fv/docs/guide/jobs.md"
+  git -C "$c9fv" add -A && git -C "$c9fv" commit -qm stray-link-tail
+  check "a stray link tail leaves its path visible" pass "$c9fv"
+
+  # ...while a real link's destination is still not visible text.
+  local c9fw="$tmp/c9fw"; make_corpus "$c9fw"
+  printf '# Jobs\n\nSee [q](https://example.test/?x=docs/guide/mail.md).\n' \
+    > "$c9fw/docs/guide/jobs.md"
+  git -C "$c9fw" add -A && git -C "$c9fw" commit -qm real-link-dest-masked
+  check "a real link destination is not scanned as a bare path" fail "$c9fw"
+
+  # An unresolved image reference is literal text, so its path is on screen.
+  local c9fx="$tmp/c9fx"; make_corpus "$c9fx"
+  printf '# Jobs\n\n![alt][docs/guide/mail.md]\n' > "$c9fx/docs/guide/jobs.md"
+  git -C "$c9fx" add -A && git -C "$c9fx" commit -qm unresolved-image-ref
+  check "an unresolved image reference is visible text" pass "$c9fx"
+
+  # ...but a RESOLVED one is an image, and neither its label nor its
+  # destination is something the reader can read.
+  local c9fy="$tmp/c9fy"; make_corpus "$c9fy"
+  printf '# Jobs\n\n![alt][img]\n\n[img]: docs/guide/mail.md\n' \
+    > "$c9fy/docs/guide/jobs.md"
+  git -C "$c9fy" add -A && git -C "$c9fy" commit -qm resolved-image-ref
+  check "a resolved image reference confers nothing" fail "$c9fy"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
