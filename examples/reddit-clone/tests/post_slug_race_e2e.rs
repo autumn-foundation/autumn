@@ -28,7 +28,9 @@ use diesel::sql_types::{BigInt, Text};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use example_e2e::{DEFAULT_READY_TIMEOUT, ExampleProcess, PgTopology, provision_postgres, spawn_example};
+use example_e2e::{
+    DEFAULT_READY_TIMEOUT, ExampleProcess, PgTopology, provision_postgres, spawn_example,
+};
 
 /// How many identical, fully concurrent submits to fire. The issue's own
 /// harness used 2 (a plain double-click) and 10 (a `threading.Barrier` stress
@@ -111,7 +113,10 @@ async fn assert_no_duplicate_slugs(conn: &mut AsyncPgConnection, context: &str) 
 /// the invariant held.
 fn pg_pool(url: &str) -> Pool<AsyncPgConnection> {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.to_string());
-    Pool::builder(manager).max_size(4).build().expect("build pool")
+    Pool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("build pool")
 }
 
 /// Boot the real, unmodified compiled binary against a fresh testcontainer
@@ -243,12 +248,17 @@ async fn concurrent_identical_submits_never_share_a_slug() {
     // query was: no two posts in the same subreddit may share a slug.
     let pool = pg_pool(&db.urls()[0]);
     let mut conn = pool.get().await.expect("connection");
-    assert_no_duplicate_slugs(&mut conn, &format!("{CONCURRENT_SUBMITS} concurrent identical submits")).await;
+    assert_no_duplicate_slugs(
+        &mut conn,
+        &format!("{CONCURRENT_SUBMITS} concurrent identical submits"),
+    )
+    .await;
 
-    let distinct_slugs: Count = diesel::sql_query("SELECT COUNT(DISTINCT slug) AS count FROM posts")
-        .get_result(&mut conn)
-        .await
-        .expect("distinct-slug count");
+    let distinct_slugs: Count =
+        diesel::sql_query("SELECT COUNT(DISTINCT slug) AS count FROM posts")
+            .get_result(&mut conn)
+            .await
+            .expect("distinct-slug count");
     assert_eq!(
         distinct_slugs.count, CONCURRENT_SUBMITS as i64,
         "every concurrent submit must land its own distinct slug, not merely avoid an exact \
@@ -342,10 +352,11 @@ async fn concurrent_identical_edits_never_share_a_slug() {
     let mut conn = pool.get().await.expect("connection");
     assert_no_duplicate_slugs(&mut conn, "2 concurrent identical edits").await;
 
-    let distinct_slugs: Count = diesel::sql_query("SELECT COUNT(DISTINCT slug) AS count FROM posts")
-        .get_result(&mut conn)
-        .await
-        .expect("distinct-slug count");
+    let distinct_slugs: Count =
+        diesel::sql_query("SELECT COUNT(DISTINCT slug) AS count FROM posts")
+            .get_result(&mut conn)
+            .await
+            .expect("distinct-slug count");
     assert_eq!(
         distinct_slugs.count, 2,
         "both concurrently edited posts must land their own distinct slug"

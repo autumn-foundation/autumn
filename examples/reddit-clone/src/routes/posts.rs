@@ -1642,7 +1642,7 @@ pub async fn delete_post(
 // ── Helpers ────────────────────────────────────────────────────
 
 /// The database-level backstop for post-slug uniqueness (migration
-/// `20260906000000_posts_slug_unique_per_subreddit`), named so a violation of
+/// `20260906163932_posts_slug_unique_per_subreddit`), named so a violation of
 /// it can be told apart from any other unique constraint on this connection.
 const POSTS_SLUG_UNIQUE_CONSTRAINT: &str = "posts_subreddit_id_slug_key";
 

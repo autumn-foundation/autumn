@@ -1933,7 +1933,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arbitrary one of the two forever — the other post's own permalink now
   silently served someone else's title, body, and comments with a `200` and
   no error. Fixed with a composite `UNIQUE (subreddit_id, slug)` constraint
-  (migration `20260906000000_posts_slug_unique_per_subreddit`) plus a retry
+  (migration `20260906163932_posts_slug_unique_per_subreddit`) plus a retry
   loop in `submit`/`update`: the existing `SELECT`-based guess stays as a
   fast path, but a losing insert/update now comes back as a unique-violation
   on that named constraint, which the loser catches and retries with the
