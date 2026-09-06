@@ -117,8 +117,7 @@ impl FsAcmeStore {
 
     /// The per-directory subdirectory holding this store's account + certs
     /// (`{dir}/{directory_label}/`).
-    #[must_use]
-    pub fn cert_dir(&self) -> PathBuf {
+    fn cert_dir(&self) -> PathBuf {
         self.dir.join(&self.directory_label)
     }
 
@@ -127,14 +126,12 @@ impl FsAcmeStore {
     }
 
     /// The on-disk path of the certificate chain PEM for `id`.
-    #[must_use]
-    pub fn chain_path(&self, id: &CertId) -> PathBuf {
+    fn chain_path(&self, id: &CertId) -> PathBuf {
         self.cert_dir().join(format!("{}.chain.pem", id.as_str()))
     }
 
     /// The on-disk path of the private key PEM for `id`.
-    #[must_use]
-    pub fn key_path(&self, id: &CertId) -> PathBuf {
+    fn key_path(&self, id: &CertId) -> PathBuf {
         self.cert_dir().join(format!("{}.key.pem", id.as_str()))
     }
 

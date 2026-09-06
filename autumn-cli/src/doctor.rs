@@ -6444,13 +6444,16 @@ fn resolve_acme_stored_cert_data(
 /// configured domains", a benign first-run state) when either half is
 /// absent.
 ///
-/// When the `acme` feature is enabled (the default — see this crate's `tls`
-/// feature), this reuses `FsAcmeStore::find_cert_for_domains` directly
-/// (issue #1864) rather than re-deriving the on-disk layout, so doctor and
-/// the runtime store can never drift apart on where a certificate lives. The
-/// feature-less fallback below re-derives the same layout by hand, since it
-/// cannot name the feature-gated `FsAcmeStore` type at all.
-#[cfg(feature = "acme")]
+/// This crate's `tls` feature — on by default — pulls in `autumn-web/acme`
+/// (see `tls = [...]` in `Cargo.toml`); this crate's OWN, separate `acme`
+/// feature flag is not in `default` and is not what gates
+/// `autumn_web::acme`'s availability, so `tls` is the cfg to key off here.
+/// When it's enabled, this reuses `FsAcmeStore::find_cert_for_domains`
+/// directly (issue #1864) rather than re-deriving the on-disk layout, so
+/// doctor and the runtime store can never drift apart on where a certificate
+/// lives. The feature-less fallback below re-derives the same layout by
+/// hand, since it cannot name the feature-gated `FsAcmeStore` type at all.
+#[cfg(feature = "tls")]
 fn configured_acme_cert_pair(
     cache_dir: &std::path::Path,
     directory_label: &str,
@@ -6462,11 +6465,12 @@ fn configured_acme_cert_pair(
 
 /// Feature-less fallback: replicates `FsAcmeStore::find_cert_for_domains`'s
 /// on-disk layout and `CertId::from_domains`'s hashing by hand, because
-/// `autumn_web::acme` is not compiled in without the `acme` feature. Keep in
-/// EXACT sync with `store.rs` — a `#[cfg(feature = "acme")]` test
+/// `autumn_web::acme` is not compiled in without this crate's `tls` feature
+/// (see the sibling `#[cfg(feature = "tls")]` implementation above). Keep in
+/// EXACT sync with `store.rs` — a `#[cfg(feature = "tls")]` test
 /// (`doctor_cert_id_matches_store`) asserts `acme_cert_id` stays byte-for-byte
 /// equal to `CertId::from_domains`.
-#[cfg(not(feature = "acme"))]
+#[cfg(not(feature = "tls"))]
 fn configured_acme_cert_pair(
     cache_dir: &std::path::Path,
     directory_label: &str,
@@ -6486,10 +6490,10 @@ fn configured_acme_cert_pair(
 /// The stable certificate id for a domain set, replicating
 /// `autumn_web::acme::store::CertId::from_domains`. Only compiled for the
 /// feature-less fallback above (or under test, where the drift-guard
-/// comparison needs it too even when `acme` is enabled): sort + dedup the
+/// comparison needs it too even when `tls` is enabled): sort + dedup the
 /// domains, SHA-256 each with a trailing NUL separator, and hex-encode the
 /// first 16 digest bytes.
-#[cfg(any(not(feature = "acme"), test))]
+#[cfg(any(not(feature = "tls"), test))]
 fn acme_cert_id(domains: &[String]) -> String {
     use sha2::{Digest as _, Sha256};
     let mut sorted: Vec<&str> = domains.iter().map(String::as_str).collect();
@@ -13118,9 +13122,11 @@ directory = \"production\"
 
     // Drift guard (#1608, Codex): the doctor's feature-less replica of the cert-id
     // hashing MUST stay byte-for-byte equal to the store's
-    // `CertId::from_domains`. Only compiled with the `acme` feature (which pulls
-    // in `autumn_web::acme`), so the two derivations are compared directly.
-    #[cfg(feature = "acme")]
+    // `CertId::from_domains`. Only compiled with this crate's `tls` feature
+    // (on by default — it pulls in `autumn_web::acme`; this crate's own,
+    // separate `acme` feature is not what gates it, see #1864), so the two
+    // derivations are compared directly.
+    #[cfg(feature = "tls")]
     #[test]
     fn doctor_cert_id_matches_store() {
         let cases: &[&[&str]] = &[
