@@ -633,13 +633,14 @@ jobs:
           # test that instead scaffolds and cargo-checks/builds/runs a fresh
           # project — those are slow, generator-shaped gates that belong in
           # generator-conformance.yml's own matrix'd job, where each is named
-          # explicitly (`console`, `scaffold_i18n`, `scaffold_encrypted`,
-          # `scaffold_validation`, `scaffold_form_for`, `api_scaffold`,
-          # `cloud_native_scaffold`, `generate_position_scaffold`,
-          # `scaffold_belongs_to`, `scaffold_bulk_delete`,
-          # `scaffold_rich_text`, `scaffold_search`, `scaffold_trash`,
-          # `seed_model_linking`, `serve` — skipped whole-module here since
-          # every ignored test in each is non-Docker).
+          # explicitly. Skipped BY EXACT NAME rather than whole-module: a
+          # `--skip <module>::` would also silently swallow any *Docker* test
+          # later added to one of these same files, defeating the "no
+          # workflow edit" guarantee this sweep exists to give (Codex finding
+          # on this PR). A newly-added non-Docker test in one of these
+          # modules DOES need a line added here (and a step in
+          # generator-conformance.yml) — that omission just makes it run
+          # here too until skipped, never silently dark.
           # `scrubbed_database_migrates_clean_and_boots_the_app` additionally
           # compiles and boots a generated app and needs the diesel CLI, so it
           # runs in generator-conformance.yml's Postgres gate instead.
@@ -654,21 +655,37 @@ jobs:
           cargo test -p autumn-cli --test cli_tests -- \
             --ignored \
             --test-threads=1 \
-            --skip console:: \
-            --skip scaffold_i18n:: \
-            --skip scaffold_encrypted:: \
-            --skip scaffold_validation:: \
-            --skip scaffold_form_for:: \
-            --skip api_scaffold:: \
-            --skip cloud_native_scaffold:: \
-            --skip generate_position_scaffold:: \
-            --skip scaffold_belongs_to:: \
-            --skip scaffold_bulk_delete:: \
-            --skip scaffold_rich_text:: \
-            --skip scaffold_search:: \
-            --skip scaffold_trash:: \
-            --skip seed_model_linking:: \
-            --skip serve:: \
+            --skip console_bare_playground_target_compiles_untouched \
+            --skip console_playground_target_compiles_with_a_repository_round_trip \
+            --skip console_run_exits_non_zero_when_the_database_is_unreachable \
+            --skip console_run_surfaces_a_compile_error_in_the_playground \
+            --skip i18n_scaffold_cargo_checks \
+            --skip i18n_scaffold_with_owner_scoped_search_cargo_checks \
+            --skip i18n_scaffold_with_state_machine_and_attachment_cargo_checks \
+            --skip i18n_scaffold_with_trash_and_search_cargo_checks \
+            --skip encrypted_admin_scaffold_cargo_checks \
+            --skip encrypted_api_scaffold_cargo_checks \
+            --skip encrypted_live_scaffold_cargo_checks \
+            --skip encrypted_nested_scaffold_cargo_checks \
+            --skip encrypted_scaffold_cargo_checks \
+            --skip constrained_scaffold_cargo_checks \
+            --skip generated_attachment_scaffold_cargo_checks \
+            --skip generated_attachment_scaffold_multipart_test_passes \
+            --skip generated_form_for_scaffold_cargo_checks \
+            --skip generated_scaffold_with_missing_reference_target_cargo_checks \
+            --skip api_scaffold_cargo_checks \
+            --skip scaffolded_api_app_passes_routes_audit_gate \
+            --skip scaffolded_app_passes_routes_audit_gate \
+            --skip scoped_position_generated_project_cargo_checks \
+            --skip soft_delete_position_generated_project_cargo_checks \
+            --skip unscoped_position_generated_project_cargo_checks \
+            --skip belongs_to_scaffold_cargo_checks \
+            --skip bulk_delete_generated_project_cargo_checks \
+            --skip richtext_scaffold_cargo_checks \
+            --skip searchable_scaffold_cargo_checks \
+            --skip trash_generated_project_cargo_checks \
+            --skip linked_seed_binary_cargo_checks \
+            --skip serve_daemon_start_status_stop_over_unix_socket \
             --skip scaffolded_json_field_generates_compiles_inserts_and_selects \
             --skip scrubbed_database_migrates_clean_and_boots_the_app
           # Consolidated `integration_tests` binary: discover-and-run ALL the

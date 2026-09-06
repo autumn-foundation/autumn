@@ -941,10 +941,22 @@ fn cli_tests_cold_start_ignored_tests_are_ci_named() {
     // Unlike the Docker-gated tests above, these `#[ignore]`d tests each
     // scaffold and cargo-check/build/run a fresh project — too slow for the
     // fast Docker sweep, and ci.yml's cli_tests invocation explicitly
-    // `--skip`s their modules for exactly that reason. So each one must be
-    // named explicitly in generator-conformance.yml (matching every other
+    // `--skip`s each of them by exact name for that reason. So each one must
+    // be named explicitly in generator-conformance.yml (matching every other
     // generator-shaped gate above) or it never runs anywhere — the gap issue
     // #1945 flagged as the `cli_tests` binary's remaining per-test triage.
+    //
+    // Matched as the full `<name> -- --ignored --exact` INVOCATION, not the
+    // bare name (same rationale and normalization as
+    // `generator_conformance_ci_gate_is_configured` above): a bare substring
+    // check would stay green after cargo lost its `--ignored --exact` flags,
+    // gained a typo that selects zero tests, or the whole `run:` step was
+    // deleted while the test name lingered in a comment.
+    let invocations = generator_conformance
+        .replace('\\', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     for test_name in [
         "integration::api_scaffold::api_scaffold_cargo_checks",
         "integration::cloud_native_scaffold::scaffolded_app_passes_routes_audit_gate",
@@ -963,9 +975,10 @@ fn cli_tests_cold_start_ignored_tests_are_ci_named() {
         "integration::scaffold_form_for::generated_scaffold_with_missing_reference_target_cargo_checks",
     ] {
         assert!(
-            generator_conformance.contains(test_name),
-            "generator-conformance.yml must invoke `{test_name}` via --ignored; \
-             this cli_tests test is CI-gated, not abandoned — see issue #1945",
+            invocations.contains(&format!("{test_name} -- --ignored --exact")),
+            "generator-conformance.yml must INVOKE `{test_name}` (not merely name it \
+             in a comment) via --ignored --exact; this cli_tests test is CI-gated, \
+             not abandoned — see issue #1945",
         );
     }
 }
