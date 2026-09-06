@@ -182,8 +182,11 @@ def read(f):
         return ''
 
 
-# `](target)` — the target stops at whitespace, `#` (anchor) or `)`.
-MD_LINK = re.compile(r'\]\(\s*<?([^)\s<>#]+\.md)')
+# `](target)`. Two spellings: angle-wrapped, which is how CommonMark carries a
+# destination containing spaces (`](<docs/guide/mail guide.md>)`) and which the
+# sibling `check-docs-links.sh` accepts, and bare, which stops at whitespace,
+# `#` (anchor) or `)`.
+MD_LINK = re.compile(r'\]\(\s*(?:<([^<>\n]*?\.md)>|([^)\s<>#]+\.md))')
 # A reference definition: `[mail]: mail.md`, optionally `<…>`-wrapped. Markdown
 # allows up to three leading spaces. Reference-style links are a syntax
 # check-docs-links.sh already parses and self-tests, so a page linked only that
@@ -239,17 +242,48 @@ def normalize(p):
 # the file as far as Markdown is concerned, so a missing `-->` must not leave
 # the links after it counting as routes. Closed form is tried first, so a
 # terminated comment still strips only itself.
-HTML_COMMENT = re.compile(r'<!--.*?-->|<!--.*', re.S)
+HTML_COMMENT_CLOSED = re.compile(r'<!--.*?-->', re.S)
+UNCLOSED = '<!--'
+# A fence opener/closer: ``` or ~~~ , up to three spaces of indent.
+FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})', re.M)
+
+
+def strip_comments(txt):
+    """Remove HTML comments, but only where Markdown would treat them as
+    comments. Inside a fenced code block `<!--` is literal text — an
+    illustrative unclosed one in a sample must not comment out the live links
+    that follow the closing fence, which is a false positive that would block a
+    docs change. So fences are passed through untouched, and the run-to-EOF rule
+    for an unclosed comment applies only to prose spans."""
+    parts, pos, in_fence, marker = [], 0, False, None
+    for m in FENCE.finditer(txt):
+        tok = m.group(1)
+        if not in_fence:
+            parts.append(('prose', txt[pos:m.start()]))
+            in_fence, marker, pos = True, tok[0] * 3, m.start()
+        elif tok.startswith(marker):
+            parts.append(('fence', txt[pos:m.end()]))
+            in_fence, marker, pos = False, None, m.end()
+    parts.append(('fence' if in_fence else 'prose', txt[pos:]))
+
+    out = []
+    for kind, seg in parts:
+        if kind == 'fence':
+            out.append(seg)
+            continue
+        seg = HTML_COMMENT_CLOSED.sub(' ', seg)
+        if UNCLOSED in seg:
+            # Everything from here to the end of the document is commented out.
+            out.append(seg[:seg.index(UNCLOSED)])
+            return ''.join(out)
+        out.append(seg)
+    return ''.join(out)
 
 
 def edges_from(f):
     """Guide pages this file gives a reader a way to reach."""
-    txt = HTML_COMMENT.sub(' ', read(f))
+    txt = strip_comments(read(f))
     out = set()
-    for m in BARE.finditer(txt):
-        t = normalize(m.group(1))
-        if t in traversable:
-            out.add(t)
     base = posixpath.dirname(f)
 
     def add_relative(raw):
@@ -257,12 +291,28 @@ def edges_from(f):
         if not raw.endswith('.md'):
             return
         # An absolute-looking `/docs/guide/x.md` is a site path, not a file path.
-        t = normalize(raw.lstrip('/') if raw.startswith('/') else posixpath.join(base, raw))
+        raw = raw.lstrip('/') if raw.startswith('/') else raw
+        # Try both readings: relative to this file, and from the repo root. A
+        # guide page writing `](docs/guide/mail.md)` means the latter, and a
+        # base-join would silently produce `docs/guide/docs/guide/mail.md`.
+        for cand in (posixpath.join(base, raw), raw):
+            t = normalize(cand)
+            if t in traversable:
+                out.add(t)
+                return
+
+    # Reference definitions are resolved ONLY through the usage-aware path
+    # below, so blank their spans first: a bare scan over `[old]: docs/guide/x.md`
+    # would re-admit an unused definition that renders as nothing, which is the
+    # hole the usage check exists to close.
+    scan = REF_DEF.sub(lambda m: ' ' * len(m.group(0)), txt)
+    for m in BARE.finditer(scan):
+        t = normalize(m.group(1))
         if t in traversable:
             out.add(t)
 
     for m in MD_LINK.finditer(txt):
-        add_relative(m.group(1))
+        add_relative(m.group(1) if m.group(1) is not None else m.group(2))
 
     used = set()
     for m in REF_USE_FULL.finditer(txt):
@@ -513,6 +563,46 @@ self_test() {
     > "$c13b/skills/x/references/notes.md"
   git -C "$c13b" add -A && git -C "$c13b" commit -qm waypoint-unlinked
   check "an unlinked skill reference page does not confer reachability" fail "$c13b"
+
+  # An unused definition written as a repo-root path must not slip past the
+  # usage check via the bare-path scan.
+  local c9p="$tmp/c9p"; make_corpus "$c9p"
+  printf '# Jobs\n\ntext\n\n[old]: docs/guide/mail.md\n' > "$c9p/docs/guide/jobs.md"
+  git -C "$c9p" add -A && git -C "$c9p" commit -qm ref-unused-rootpath
+  check "an unused repo-root reference definition confers nothing" fail "$c9p"
+
+  # ...while a USED one written the same way still resolves.
+  local c9q="$tmp/c9q"; make_corpus "$c9q"
+  printf '# Jobs\n\nSee [mail][m].\n\n[m]: docs/guide/mail.md\n' > "$c9q/docs/guide/jobs.md"
+  git -C "$c9q" add -A && git -C "$c9q" commit -qm ref-used-rootpath
+  check "a used repo-root reference definition resolves" pass "$c9q"
+
+  # A repo-root inline link written from inside the guide must not be
+  # base-joined into docs/guide/docs/guide/....
+  local c9r="$tmp/c9r"; make_corpus "$c9r"
+  printf '# Jobs\n\nSee [mail](docs/guide/mail.md).\n' > "$c9r/docs/guide/jobs.md"
+  git -C "$c9r" add -A && git -C "$c9r" commit -qm inline-rootpath
+  check "a repo-root inline link from inside the guide resolves" pass "$c9r"
+
+  # Angle-wrapped destinations, including one containing a space.
+  local c9s="$tmp/c9s"; make_corpus "$c9s"
+  printf '# Jobs\n\nSee [mail](<mail.md>).\n' > "$c9s/docs/guide/jobs.md"
+  git -C "$c9s" add -A && git -C "$c9s" commit -qm angle-plain
+  check "an angle-wrapped inline destination resolves" pass "$c9s"
+
+  local c9t="$tmp/c9t"; make_corpus "$c9t"
+  mv "$c9t/docs/guide/mail.md" "$c9t/docs/guide/mail guide.md"
+  printf '# Jobs\n\nSee [mail](<mail guide.md>).\n' > "$c9t/docs/guide/jobs.md"
+  git -C "$c9t" add -A && git -C "$c9t" commit -qm angle-spaces
+  check "an angle-wrapped destination containing a space resolves" pass "$c9t"
+
+  # An illustrative unclosed `<!--` inside a fence is literal code: it must not
+  # comment out the live links after the closing fence.
+  local c9u="$tmp/c9u"; make_corpus "$c9u"
+  printf '# Jobs\n\n```html\n<!-- sample, not closed\n```\n\nSee [mail](mail.md).\n' \
+    > "$c9u/docs/guide/jobs.md"
+  git -C "$c9u" add -A && git -C "$c9u" commit -qm unclosed-in-fence
+  check "an unclosed comment inside a fence does not hide later links" pass "$c9u"
 
   # An ordinary docs page can sit mid-path: README -> hub -> guide. Dropping
   # that hop would report a reachable guide as an orphan.
