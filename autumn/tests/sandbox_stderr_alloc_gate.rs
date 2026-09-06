@@ -25,7 +25,8 @@
 #![cfg(feature = "plugin-sandbox")]
 
 use autumn_web::plugin_sandbox::{
-    DeclaredRoute, ResourceLimits, SandboxCapability, SandboxHost, SandboxManifest, SandboxRequest,
+    CapabilityGrants, CapabilityQuotas, DeclaredRoute, ResourceLimits, SandboxCapability,
+    SandboxHost, SandboxManifest, SandboxRequest,
 };
 
 /// Fills its whole stderr budget with one byte, then answers normally.
@@ -77,6 +78,8 @@ fn manifest() -> SandboxManifest {
             path: "/hello/greet".to_owned(),
         }],
         limits: ResourceLimits::default(),
+        grants: CapabilityGrants::default(),
+        quotas: CapabilityQuotas::default(),
     }
 }
 
