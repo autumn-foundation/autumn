@@ -61,15 +61,19 @@ second day). Of those 4:
 
 | Run | Conclusion | macOS `Test` | Signature |
 |---|---|---|---|
-| 34015049004 | failure | **success** | `Test (windows-latest)` failed instead — see below |
-| 34014673780 | success | success (implied) | — |
-| 34012120234 | success | success (implied) | — |
-| 34011415218 | failure | **success** | `Test (ubuntu-latest)` → `Run Docker-dependent tests` failed, unrelated |
+| 34015049004 | failure | **success** (confirmed via `list_workflow_jobs`) | `Test (windows-latest)` failed instead — see below |
+| 34014673780 | success | **success** (confirmed via `list_workflow_jobs`) | — |
+| 34012120234 | success | **success** (confirmed via `list_workflow_jobs`) | — |
+| 34011415218 | failure | **success** (confirmed via `list_workflow_jobs`) | `Test (ubuntu-latest)` → `Run Docker-dependent tests` failed, unrelated |
 
-Both runs that reached the macOS `Test` job passed it cleanly — directionally
-consistent with `#2510` holding, but **n=2 is nowhere near the 20-50 this
-role requires** to call the ledger entry closed; treat as "no disconfirming
-evidence yet," not confirmation.
+All four runs reached and passed the macOS `Test` job cleanly (`Test` has no
+skip condition and is gated only by `lint`/`meta`, so a failure elsewhere in
+the same run — Windows or an unrelated Docker step — doesn't affect its own
+job-level result; checked each of the four directly rather than inferring
+from the run's overall conclusion). **n=4** — directionally consistent with
+`#2510` holding, but still nowhere near the 20-50 this role requires to call
+the ledger entry closed; treat as "no disconfirming evidence yet," not
+confirmation.
 
 **Finding 3 — a new single-occurrence non-Linux timing failure.**
 Run `34015049004`'s `Test (windows-latest)` job failed with a *different*
@@ -123,22 +127,29 @@ instead of after someone tries to dispatch it and gets nothing.
 - Finding 1: binary/structural (workflow either registers or it doesn't),
   confirmed via GitHub's own parser error text — not a rate, nothing to
   baseline.
-- Findings 2/3: n=2 and n=1 respectively, both explicitly below any
+- Findings 2/3: n=4 and n=1 respectively, both explicitly below any
   threshold this role treats as evidence. No before/after — nothing was
   changed.
 
 ## 🔬 Reproduce
 
-Finding 1:
+Finding 1 — pinned to the specific already-failed run IDs this report cites,
+not a live query against the workflow registry: PR #2527 may fix the file
+(a working replacement was posted on it), and once it does, re-querying the
+*current* registry state would no longer show the parse failure this report
+documents. The historical runs stay a fixed record regardless:
 ```
-# From a checkout of claude/sleepy-brown-3faebr (or any branch carrying
-# the workflow file as it stands in PR #2527):
-gh api repos/autumn-foundation/autumn/actions/workflows | \
-  jq '.workflows[] | select(.path | endswith("manual-macos-contention-check.yml"))'
-# .name == the file path, not "Manual macOS contention check ..." -> parse failure
+gh api repos/autumn-foundation/autumn/actions/runs/33982014341 | \
+  jq '{conclusion, event, jobs_url: (.jobs_url // .url)}'
+gh api repos/autumn-foundation/autumn/actions/runs/33982014341/jobs | jq '.total_count'
+# conclusion: "failure", total_count: 0 -- zero jobs ever created for this run.
+# Same for 33960142406 and 33962504398, the other two pushes that hit it.
 ```
-Or simply open the "Run workflow" dispatch UI for it — it will not appear,
-because GitHub never accepted the file as valid.
+Rendering `https://github.com/autumn-foundation/autumn/actions/runs/33982014341`
+in a browser shows the "Invalid workflow file" banner with the exact
+line/column and expression quoted in Symptom above — that error text is
+attached to this specific run, not to the live registry, so it survives the
+file being fixed later.
 
 Findings 2/3: `actions_list list_workflow_runs` for `ci.yml`,
 `event=pull_request`, `status=completed`, filtered to non-`cancelled`
