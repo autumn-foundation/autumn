@@ -60,7 +60,7 @@ export async function createNote(input: NewNote): Promise<Note> {
 
 export async function togglePinned(id: string): Promise<Note> {
   const data = await graphql<{ togglePinned: Note }>(
-    `${NOTE_FIELDS} mutation TogglePinned($id: Int!) { togglePinned(id: $id) { ...NoteFields } }`,
+    `${NOTE_FIELDS} mutation TogglePinned($id: ID!) { togglePinned(id: $id) { ...NoteFields } }`,
     { id },
   );
   return data.togglePinned;
@@ -68,7 +68,7 @@ export async function togglePinned(id: string): Promise<Note> {
 
 export async function deleteNote(id: string): Promise<boolean> {
   const data = await graphql<{ deleteNote: boolean }>(
-    `mutation DeleteNote($id: Int!) { deleteNote(id: $id) }`,
+    `mutation DeleteNote($id: ID!) { deleteNote(id: $id) }`,
     { id },
   );
   return data.deleteNote;

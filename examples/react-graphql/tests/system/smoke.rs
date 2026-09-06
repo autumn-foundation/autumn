@@ -64,7 +64,20 @@ async fn react_app_renders_and_mutates_over_graphql() {
     page.expect_text("3 notes, 1 pinned")
         .await
         .expect("note count updated");
+
+    // A second mutation shape — `togglePinned(id: ID!)` — through the Pin
+    // button on the note just created (id 3: BIGSERIAL after the two seeds;
+    // the pinned section renders first, so "first Pin button" would be the
+    // welcome note's Unpin). This is the client's variable-typed operation, so
+    // a schema/client drift in the `ID` scalar surfaces here, not in
+    // production.
+    page.click(r#"li[data-note-id="3"] button:not(.danger)"#)
+        .await
+        .expect("click Pin on the newest note");
+    page.expect_text("3 notes, 2 pinned")
+        .await
+        .expect("toggle mutation round-tripped");
     page.expect_no_console_errors()
         .await
-        .expect("no console errors after the mutation");
+        .expect("no console errors after the mutations");
 }
