@@ -591,10 +591,9 @@ impl SqliteJobTrackingStore {
     /// before them, so the guard has to be in the statement.
     ///
     /// A lost swap re-reads and reapplies rather than dropping the write: the
-    /// mutation may be a `complete`, which must not be lost. Reapplying is safe
-    /// because the `apply_*` helpers refuse to move a record that has already
-    /// settled — so the loser of a race observes the winner's terminal state
-    /// and leaves it alone. `f` is therefore `Fn`, not `FnOnce`.
+    /// mutation may be a `complete`, which must not be lost. Reapplying cannot
+    /// clobber the winner, because `try_update_once` leaves an already-settled
+    /// record alone. `f` is therefore `Fn`, not `FnOnce`.
     async fn update(
         &self,
         key: &str,
@@ -653,6 +652,16 @@ impl SqliteJobTrackingStore {
                     "job tracking deserialize failed: {error}"
                 ))
             })?;
+        // A settled record is final. `apply_complete` and `apply_fail` replace
+        // the status unconditionally — unlike `apply_set_progress`, which
+        // already checks — so without this a stale attempt of the same job
+        // could flip the authoritative attempt's `failed` to `succeeded`, or
+        // the reverse. Delivery is at-least-once, so that overlap is ordinary.
+        // Only `reset_for_retry` moves a record out of a terminal state, and it
+        // does not come through here.
+        if record.status.is_terminal() {
+            return Ok(true);
+        }
         f(&mut record);
         record.updated_at = now;
         let payload = serde_json::to_string(&record).map_err(|error| {

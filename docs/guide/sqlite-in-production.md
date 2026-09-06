@@ -336,8 +336,10 @@ Three differences from Postgres, all by design:
   process wakes a worker directly; work another process enqueued is seen within
   `jobs.sqlite.poll_interval_ms` (default 250ms). Lower it for latency, raise it
   to cut idle wakeups.
-- **The queue is host-local.** Two processes on one host share it; two hosts do
-  not. Nothing enforces that at boot — the tier's Postgres-only primitives
+- **The queue is host-local, and must be a file.** Two processes on one host
+  share it; two hosts do not. A split web/worker role on an **in-memory** target
+  is refused at boot, because each process would get its own database. Nothing
+  enforces the two-hosts case at boot — the tier's Postgres-only primitives
   (`replica_url`, shards, `jobs.backend = "postgres"`,
   `scheduler.backend = "postgres"`) are each refused, but a second host pointed
   at the same file over a network filesystem is not detected. Do not do it; see

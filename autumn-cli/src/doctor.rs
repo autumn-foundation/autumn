@@ -3579,8 +3579,30 @@ fn check_database_topology_contract(
 /// replica's enqueue never reaches a worker replica's queue.
 /// [`autumn_web::config::split_role_requires_durable_backend`] flags that invalid
 /// combo; the app itself rejects it at startup, and doctor surfaces it up front.
-fn check_split_topology_on_local(role: ProcessRole, jobs_backend: &str) -> CheckResult {
+fn check_split_topology_on_local(
+    role: ProcessRole,
+    jobs_backend: &str,
+    database_url: Option<&str>,
+) -> CheckResult {
     let backend = jobs_backend.trim();
+    // The sqlite queue is shareable only because both processes open the same
+    // FILE. An in-memory target gives each its own database, so the web replica
+    // enqueues where no worker can look (issue #1907).
+    if autumn_web::config::split_role_requires_file_backed_sqlite(role, backend, database_url) {
+        return CheckResult {
+            name: "process_role_backend",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "role={} with jobs.backend=\"sqlite\" on an in-memory database: an in-memory \
+                 SQLite target is private to each process, so a split web/worker topology would \
+                 enqueue into a queue no worker process can see",
+                role.as_str(),
+            )),
+            hint: Some(
+                "Point database.url at a sqlite:// FILE for a split web/worker role, or run the combined role",
+            ),
+        };
+    }
     if autumn_web::config::split_role_requires_durable_backend(role, jobs_backend) {
         return CheckResult {
             name: "process_role_backend",
@@ -7731,9 +7753,15 @@ pub fn run(opts: DoctorOptions) {
     }));
 
     // 4b. Process role vs. jobs backend: a split web/worker role can't share the
-    // in-process `local` job queue across separate processes.
+    // in-process `local` job queue across separate processes — nor an in-memory
+    // SQLite database, which is private to each of them.
+    let split_topology_db_url = db_topology.primary_url.clone();
     tasks.push(Box::new(move || {
-        check_split_topology_on_local(process_role, &jobs_backend)
+        check_split_topology_on_local(
+            process_role,
+            &jobs_backend,
+            split_topology_db_url.as_deref(),
+        )
     }));
 
     // 4c. Queue pinning zero-coverage guard (#1623): warn if jobs.pin leaves a
@@ -15345,7 +15373,7 @@ foo = "bar"
 
     #[test]
     fn split_topology_fails_on_web_role_with_local_backend() {
-        let result = check_split_topology_on_local(ProcessRole::Web, "local");
+        let result = check_split_topology_on_local(ProcessRole::Web, "local", None);
         assert_eq!(result.status, CheckStatus::Fail);
         let detail = result.detail.unwrap_or_default();
         assert!(
@@ -15361,14 +15389,14 @@ foo = "bar"
 
     #[test]
     fn split_topology_fails_on_worker_role_with_local_backend() {
-        let result = check_split_topology_on_local(ProcessRole::Worker, "local");
+        let result = check_split_topology_on_local(ProcessRole::Worker, "local", None);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.detail.unwrap_or_default().contains("worker"));
     }
 
     #[test]
     fn split_topology_passes_for_combined_role_on_local_backend() {
-        let result = check_split_topology_on_local(ProcessRole::Combined, "local");
+        let result = check_split_topology_on_local(ProcessRole::Combined, "local", None);
         assert_eq!(result.status, CheckStatus::Pass);
         // Combined never splits, so the detail need not mention the backend.
         assert_eq!(result.detail.as_deref(), Some("role=combined"));
@@ -15377,7 +15405,7 @@ foo = "bar"
 
     #[test]
     fn split_topology_passes_for_web_role_on_postgres_backend() {
-        let result = check_split_topology_on_local(ProcessRole::Web, "postgres");
+        let result = check_split_topology_on_local(ProcessRole::Web, "postgres", None);
         assert_eq!(result.status, CheckStatus::Pass);
         let detail = result.detail.unwrap_or_default();
         assert!(detail.contains("role=web"), "got: {detail}");
@@ -15386,7 +15414,7 @@ foo = "bar"
 
     #[test]
     fn split_topology_passes_for_worker_role_on_redis_backend() {
-        let result = check_split_topology_on_local(ProcessRole::Worker, "redis");
+        let result = check_split_topology_on_local(ProcessRole::Worker, "redis", None);
         assert_eq!(result.status, CheckStatus::Pass);
         let detail = result.detail.unwrap_or_default();
         assert!(detail.contains("role=worker"), "got: {detail}");
@@ -15397,11 +15425,27 @@ foo = "bar"
     /// host open, so it backs a split role.
     #[test]
     fn split_topology_passes_for_worker_role_on_sqlite_backend() {
-        let result = check_split_topology_on_local(ProcessRole::Worker, "sqlite");
+        let result = check_split_topology_on_local(
+            ProcessRole::Worker,
+            "sqlite",
+            Some("sqlite:///var/lib/app.db"),
+        );
         assert_eq!(result.status, CheckStatus::Pass);
         let detail = result.detail.unwrap_or_default();
         assert!(detail.contains("role=worker"), "got: {detail}");
         assert!(detail.contains("sqlite"), "got: {detail}");
+    }
+
+    /// Issue #1907: the sqlite queue backs a split role only on a FILE.
+    #[test]
+    fn split_topology_fails_for_sqlite_on_an_in_memory_database() {
+        let result =
+            check_split_topology_on_local(ProcessRole::Web, "sqlite", Some("sqlite::memory:"));
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("in-memory"), "got: {detail}");
+        let hint = result.hint.unwrap_or_default();
+        assert!(hint.contains("FILE"), "the hint names the fix: {hint}");
     }
 
     #[test]
@@ -15409,7 +15453,7 @@ foo = "bar"
         // A typo like `postgresql` is not a recognized durable backend: it falls
         // through to the in-process local runtime, so a split role must be
         // rejected exactly as it is for the literal `local`.
-        let result = check_split_topology_on_local(ProcessRole::Web, "postgresql");
+        let result = check_split_topology_on_local(ProcessRole::Web, "postgresql", None);
         assert_eq!(result.status, CheckStatus::Fail);
         let detail = result.detail.unwrap_or_default();
         assert!(
@@ -15426,7 +15470,7 @@ foo = "bar"
     #[test]
     fn split_topology_fails_on_web_role_with_blank_backend() {
         // A blank backend also falls through to the local runtime.
-        let result = check_split_topology_on_local(ProcessRole::Web, "");
+        let result = check_split_topology_on_local(ProcessRole::Web, "", None);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.detail.unwrap_or_default().contains("web"));
     }
@@ -16566,7 +16610,7 @@ foo = "bar"
 
         // ...and doctor therefore flags the split-on-local misconfiguration the
         // runtime rejects at startup, instead of wrongly passing.
-        let result = check_split_topology_on_local(role, &backend);
+        let result = check_split_topology_on_local(role, &backend, None);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.detail.unwrap_or_default().contains("worker"));
     }

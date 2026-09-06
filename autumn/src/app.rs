@@ -3617,6 +3617,28 @@ impl AppBuilder {
             std::process::exit(1);
         }
 
+        // The sqlite queue backs a split role only because both processes open
+        // the same file. Against an in-memory target each gets its own private
+        // database, so the web replica would enqueue where no worker can ever
+        // look — the same silent stranding, one step further in (issue #1907).
+        if crate::config::split_role_requires_file_backed_sqlite(
+            role,
+            &config.jobs.backend,
+            config.database.effective_primary_url(),
+        ) {
+            tracing::error!(
+                role = role.as_str(),
+                "process role '{}' with jobs.backend = \"sqlite\" requires a FILE-backed \
+                 database: an in-memory SQLite target is private to each process, so the web \
+                 replica would enqueue into a queue no worker process can see. Point \
+                 database.url at a sqlite:// file, or run the combined role.",
+                role.as_str(),
+            );
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            std::process::exit(1);
+        }
+
         #[cfg(feature = "mail")]
         if mount_unsubscribe_endpoint {
             config.mail.mount_unsubscribe_endpoint = true;

@@ -2908,9 +2908,60 @@ impl ProcessRole {
 ///
 /// The combined role is always valid because it enqueues and drains in one
 /// process. Returns `true` when the combination is **invalid**.
+///
+/// This answers only the *backend shape*. `sqlite` also needs a file-backed
+/// database to be shareable at all — see
+/// [`split_role_requires_file_backed_sqlite`], which the boot guard checks
+/// alongside this one.
 #[must_use]
 pub fn split_role_requires_durable_backend(role: ProcessRole, jobs_backend: &str) -> bool {
     role != ProcessRole::Combined && !matches!(jobs_backend, "postgres" | "redis" | "sqlite")
+}
+
+/// Whether a `SQLite` target is in memory rather than a file.
+///
+/// An in-memory database is private to the process that opened it — even the
+/// `cache=shared` spellings, which share only within one process. Nothing
+/// written by one process is visible to another.
+///
+/// Deliberately self-contained rather than calling `crate::db`'s equivalent:
+/// that one is gated on the `sqlite` feature, and this has to answer for
+/// `autumn doctor`, which reads a `sqlite://` config from a Postgres build.
+/// The two must agree on the spellings; see
+/// `crate::db::sqlite_target_is_any_in_memory`.
+#[must_use]
+pub fn is_in_memory_sqlite_target(url: &str) -> bool {
+    let target = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .unwrap_or(url);
+    target == ":memory:"
+        || target == "file::memory:"
+        || target.starts_with("file::memory:?")
+        || target.contains("mode=memory")
+}
+
+/// Whether a split role on the `SQLite` jobs backend is invalid because the
+/// database is in memory (issue #1907).
+///
+/// The `sqlite` queue is durable enough for a split web/worker topology only
+/// because both processes open the same **file**. Against an in-memory target
+/// each process gets its own database, so the web replica enqueues into a queue
+/// the worker can never see and every job is silently stranded — the exact
+/// failure [`split_role_requires_durable_backend`] exists to prevent, which it
+/// cannot see because it is given only the backend name.
+///
+/// `None` for `database_url` answers `false`: a `sqlite` backend with no
+/// database configured fails earlier, with its own error.
+#[must_use]
+pub fn split_role_requires_file_backed_sqlite(
+    role: ProcessRole,
+    jobs_backend: &str,
+    database_url: Option<&str>,
+) -> bool {
+    role != ProcessRole::Combined
+        && jobs_backend == "sqlite"
+        && database_url.is_some_and(is_in_memory_sqlite_target)
 }
 
 /// `[retention]` — one retention window per framework-owned dataset
@@ -18436,6 +18487,63 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         assert!(!split_role_requires_durable_backend(
             ProcessRole::Worker,
             "sqlite"
+        ));
+    }
+
+    /// Issue #1907: a split role on the sqlite queue needs a FILE-backed
+    /// database. An in-memory target is private to each process, so the web
+    /// replica would enqueue where no worker can look.
+    #[test]
+    fn split_role_on_sqlite_requires_a_file_backed_database() {
+        // Every in-memory spelling is refused for a split role.
+        for url in [
+            "sqlite::memory:",
+            "sqlite://:memory:",
+            ":memory:",
+            "file::memory:",
+            "file::memory:?cache=shared",
+            "sqlite:file::memory:?cache=shared",
+            "sqlite://app.db?mode=memory",
+        ] {
+            assert!(
+                is_in_memory_sqlite_target(url),
+                "{url} must read as in-memory"
+            );
+            assert!(
+                split_role_requires_file_backed_sqlite(ProcessRole::Web, "sqlite", Some(url)),
+                "a split role on {url} must be refused"
+            );
+        }
+
+        // A file target is exactly what makes the split valid.
+        for url in ["sqlite:///var/lib/app.db", "sqlite://./app.db", "app.db"] {
+            assert!(
+                !is_in_memory_sqlite_target(url),
+                "{url} must read as file-backed"
+            );
+            assert!(
+                !split_role_requires_file_backed_sqlite(ProcessRole::Web, "sqlite", Some(url)),
+                "a split role on {url} is valid"
+            );
+        }
+
+        // The combined role shares nothing, so it is fine either way.
+        assert!(!split_role_requires_file_backed_sqlite(
+            ProcessRole::Combined,
+            "sqlite",
+            Some("sqlite::memory:")
+        ));
+        // Other backends do not answer to this rule.
+        assert!(!split_role_requires_file_backed_sqlite(
+            ProcessRole::Worker,
+            "postgres",
+            Some("sqlite::memory:")
+        ));
+        // No database configured fails earlier, with its own error.
+        assert!(!split_role_requires_file_backed_sqlite(
+            ProcessRole::Worker,
+            "sqlite",
+            None
         ));
     }
 

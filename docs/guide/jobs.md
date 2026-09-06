@@ -258,7 +258,10 @@ its own memory, where no separate `worker` replica can ever drain it.
 
 `sqlite` qualifies because the queue is a table both processes open — but only
 while they run on the **same host**, which a SQLite deployment does by
-definition.
+definition, and only against a **file-backed** database. An in-memory target
+(`sqlite::memory:`, `file::memory:`, `?mode=memory`) is private to each process,
+so a split role on one is refused at boot and flagged by
+`autumn doctor --strict`.
 
 Autumn rejects this combination at startup — a `web` or `worker` role on the
 `local` backend exits with a clear error rather than silently dropping work —

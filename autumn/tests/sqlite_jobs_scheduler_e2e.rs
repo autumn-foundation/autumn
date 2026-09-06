@@ -1548,7 +1548,9 @@ async fn sqlite_job_backend_prunes_expired_ttl_unique_history() {
 /// the token to a counter instead.
 #[tokio::test]
 async fn sqlite_tracking_store_swaps_on_a_version_not_a_timestamp() {
-    use autumn_web::job_tracking::{JobTrackingStore as _, SqliteJobTrackingStore, TrackedJobOwner};
+    use autumn_web::job_tracking::{
+        JobTrackingStore as _, SqliteJobTrackingStore, TrackedJobOwner,
+    };
 
     let tmp = tempfile::TempDir::new().expect("temp dir");
     let pool = build_sqlite_pool(&tmp);
@@ -1625,4 +1627,58 @@ async fn sqlite_tracking_store_swaps_on_a_version_not_a_timestamp() {
         "the completion is what a reader sees, got {:?}",
         record.status
     );
+}
+
+/// (24) A settled tracked record is final: a stale attempt of the same job
+/// cannot flip the authoritative attempt's result.
+///
+/// `apply_complete` and `apply_fail` replace the status unconditionally — only
+/// the store refuses to move a terminal record — so this pins that refusal.
+#[tokio::test]
+async fn sqlite_tracking_store_keeps_a_settled_record_settled() {
+    use autumn_web::job_tracking::{
+        JobTrackingStore as _, SqliteJobTrackingStore, TrackedJobOwner,
+    };
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let store = SqliteJobTrackingStore::new(pool, 3_600);
+
+    store
+        .create("k1", TrackedJobOwner::Anonymous)
+        .await
+        .expect("create");
+    store.mark_running("k1").await.expect("mark running");
+    store
+        .fail("k1", "the authoritative attempt failed".to_string())
+        .await
+        .expect("fail");
+
+    // A stale attempt reporting success must not overwrite that.
+    store
+        .complete("k1", serde_json::json!({ "stale": true }))
+        .await
+        .expect("a stale completion is accepted, not errored");
+    // Nor may it walk the record backwards.
+    store.mark_running("k1").await.expect("stale mark running");
+
+    let record = store
+        .get("k1")
+        .await
+        .expect("get")
+        .expect("the record is still live");
+    assert!(
+        matches!(
+            record.status,
+            autumn_web::job_tracking::TrackedJobStatus::Failed
+        ),
+        "the first terminal result stands, got {:?}",
+        record.status
+    );
+    assert_eq!(
+        record.error.as_deref(),
+        Some("the authoritative attempt failed"),
+        "the authoritative error is preserved"
+    );
+    assert!(record.result.is_none(), "no stale result is attached");
 }
