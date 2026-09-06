@@ -426,6 +426,13 @@ pub(super) fn perform(
                 ) {
                     Ok(page) => {
                         let mut rows = page.rows;
+                        // Recorded before the cut, not inferred after it. A
+                        // store that returned more than `want` and called the
+                        // page complete would otherwise have the excess removed
+                        // here and still be reported as complete, so the guest
+                        // would treat a shortened page as the end of the table
+                        // and never ask for the rest.
+                        let over_asked = rows.len() > want;
                         rows.truncate(want);
                         // The store's own report, OR'd with a re-check of what
                         // it handed back: the trait is an embedder's to
@@ -437,7 +444,7 @@ pub(super) fn perform(
                             id,
                             value: CallValue::Rows {
                                 rows,
-                                truncated: page.truncated || cut,
+                                truncated: page.truncated || over_asked || cut,
                             },
                         }
                     }
@@ -828,7 +835,14 @@ impl PluginStore for MemoryPluginStore {
                 continue;
             };
             let weight = super::row_weight(row);
-            if !out.is_empty() && total.saturating_add(weight) > max_bytes {
+            // No "but keep the first one" exemption, the same as
+            // `bounded_rows` one layer up — and this is the sibling that pass
+            // missed. `seed` can place a row the plugin path would have
+            // refused, and the exemption cloned it in full, under this mutex,
+            // on every query that matched it, for a guest to repeat as often
+            // as it liked. The layer above drops it anyway, so the clone
+            // bought nothing but the copy.
+            if total.saturating_add(weight) > max_bytes {
                 // A row that matched and was left out. Reported rather than
                 // merely omitted: the caller cannot see the difference between
                 // this and a table with nothing more in it, and neither can the

@@ -195,11 +195,28 @@ impl SandboxedPlugin {
     /// silent success.
     ///
     /// `services.tenant` is ignored — the tenant is the *request's*, resolved
-    /// per request — and `services.rate` replaces the limiter built from the
+    /// per request — and `services.rate` may replace the limiter built from the
     /// manifest, for an embedder that wants one shared across a fleet.
+    ///
+    /// *May*, not *does*: a replacement is taken only when it is no looser than
+    /// the manifest's. Sharing limiting state across instances is what this is
+    /// for; raising the ceiling is not, and silently allowing it would make the
+    /// `calls_per_second` on the consent screen a number the operator approved
+    /// and the plugin need not obey. A looser limiter is ignored and the
+    /// manifest's kept, so wiring one by mistake costs coordination rather than
+    /// containment.
     #[must_use]
     pub fn with_services(mut self, services: CapabilityServices) -> Self {
-        let rate = services.rate.clone().or_else(|| self.services.rate.clone());
+        let approved = self
+            .services
+            .rate
+            .as_ref()
+            .map_or(u32::MAX, |rate| rate.per_second());
+        let rate = services
+            .rate
+            .clone()
+            .filter(|supplied| supplied.per_second() <= approved)
+            .or_else(|| self.services.rate.clone());
         self.services = CapabilityServices {
             tenant: None,
             rate,
@@ -1030,6 +1047,50 @@ sha256 = "{digest}"
 
     fn hello_plugin() -> SandboxedPlugin {
         plugin_from(guests::HELLO, GREET_ROUTE, ResourceLimits::default())
+    }
+
+    #[test]
+    fn a_supplied_rate_limiter_cannot_raise_the_approved_ceiling() {
+        use crate::plugin_sandbox::capability::CapabilityRateLimiter;
+
+        let plugin = hello_plugin();
+        let approved = plugin
+            .services
+            .rate
+            .as_ref()
+            .expect("the manifest limiter is always built")
+            .per_second();
+
+        // Looser than the manifest: taken, this would let the plugin exceed the
+        // `calls_per_second` the operator approved on the consent screen.
+        let looser = plugin.clone().with_services(CapabilityServices {
+            rate: Some(Arc::new(CapabilityRateLimiter::new(
+                approved.saturating_mul(10).max(approved + 1),
+            ))),
+            ..CapabilityServices::none()
+        });
+        assert_eq!(
+            looser
+                .services
+                .rate
+                .as_ref()
+                .expect("a limiter is always present")
+                .per_second(),
+            approved,
+            "a looser limiter must be ignored and the manifest's kept"
+        );
+
+        // At or below it: taken, because sharing limiting state across
+        // instances is what the parameter is for.
+        let shared = Arc::new(CapabilityRateLimiter::new(approved));
+        let tighter = plugin.with_services(CapabilityServices {
+            rate: Some(Arc::clone(&shared)),
+            ..CapabilityServices::none()
+        });
+        assert!(
+            Arc::ptr_eq(tighter.services.rate.as_ref().expect("present"), &shared),
+            "an equal-or-tighter limiter must be the one actually used"
+        );
     }
 
     /// The app a test drives: a sandboxed plugin mounted beside an ordinary

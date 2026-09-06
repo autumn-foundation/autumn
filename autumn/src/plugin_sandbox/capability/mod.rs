@@ -2710,6 +2710,43 @@ path = "/shop/panel"
     }
 
     #[test]
+    fn an_oversized_first_row_is_refused_by_the_store_too() {
+        // `bounded_rows` dropped its "keep the first one" exemption a while
+        // back; the store's own query loop kept its copy of the same
+        // exemption, so an oversized row was cloned in full under the store's
+        // mutex on every query that matched it and only then discarded a layer
+        // up. The clone was the cost, and a guest could repeat it at will.
+        let store = db::MemoryPluginStore::new();
+        let orders = db::physical_table("shop", "orders").expect("derivable");
+        let tenant = tenant_segment(Some("alpha"));
+        // Seeded past what `check_row` would accept, which is the only way such
+        // a row exists at all.
+        let huge = "x".repeat(super::MAX_RESULT_BYTES + 1);
+        store.seed(&orders, &tenant, "r1", row(&[("blob", huge.as_str())]));
+
+        let page = store
+            .query(
+                &db::Scope {
+                    table: orders,
+                    tenant,
+                },
+                &PluginRow::new(),
+                10,
+                super::MAX_RESULT_BYTES,
+                None,
+            )
+            .expect("the store answers");
+        assert!(
+            page.rows.is_empty(),
+            "a row over the whole result budget must not be cloned out of the store"
+        );
+        assert!(
+            page.truncated,
+            "and the caller must be told there was something it did not get"
+        );
+    }
+
+    #[test]
     fn a_generated_row_id_never_lands_on_a_seeded_one() {
         // `seed` places a row at an id of the caller's choosing and cannot
         // advance the insert counter, because that id need not be a number. So

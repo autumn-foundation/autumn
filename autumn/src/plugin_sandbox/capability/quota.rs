@@ -183,6 +183,16 @@ impl CapabilityRateLimiter {
         }
     }
 
+    /// The rate this limiter was built for, in calls per second per capability.
+    ///
+    /// Exposed so a caller handed someone else's limiter can tell whether it is
+    /// looser than the one the manifest asked for; see
+    /// `SandboxedPlugin::with_services`.
+    #[must_use]
+    pub const fn per_second(&self) -> u32 {
+        self.per_second
+    }
+
     /// Take one token for `capability`, refilling for elapsed time first.
     ///
     /// Returns `false` when the bucket is empty, which the caller turns into a
