@@ -1370,7 +1370,8 @@ fn build_pool(
         return Err(PoolError::UnsupportedBackend(format!(
             "SQLite is a recognized database backend but its runtime pool is only available in \
              a build of autumn-web compiled with `--features sqlite`; this is a default \
-             (Postgres) build (target: {url:?})"
+             (Postgres) build (target: {target:?})",
+            target = redact_pool_target(url)
         )));
     }
 
@@ -1439,6 +1440,20 @@ fn normalize_sqlite_target(url: &str) -> String {
 /// A **shared-cache** in-memory database (`cache=shared`) is the deliberate
 /// exception: it IS shareable across the pool's connections within one process,
 /// so it must NOT be forced single-slot and returns `false` here.
+/// Whether `url` is one of the two scheme-less spellings
+/// [`normalize_sqlite_target`] maps to `:memory:` — the bare `:memory:` token
+/// and the empty string.
+///
+/// [`crate::config::DatabaseBackend::detect`] classifies by scheme, so it
+/// returns `None` for both even though the pool has always accepted them (and
+/// `run_pending_sqlite` still lists `:memory:` among the spellings it takes).
+/// Kept adjacent to `normalize_sqlite_target`'s matching branch so the two
+/// cannot drift.
+#[cfg(feature = "sqlite")]
+fn sqlite_target_is_bare_in_memory(url: &str) -> bool {
+    url.is_empty() || url == ":memory:"
+}
+
 #[cfg(feature = "sqlite")]
 fn sqlite_target_is_memory(target: &str) -> bool {
     if target.contains("cache=shared") {
@@ -1525,6 +1540,41 @@ fn sqlite_target_is_read_only(target: &str) -> bool {
 /// database (so migrations applied on one would be invisible on another).
 /// In-memory targets are therefore forced to a single slot; file targets
 /// respect the configured size (still small by convention).
+/// Mask credentials in a database target before it goes into an error message.
+///
+/// Pool-construction failures are surfaced verbatim at boot — `setup_database`
+/// wraps them as `"Failed to create database pool: {e}"` and the run path logs
+/// that through `tracing::error!`, so under `log.format = "json"` the text lands
+/// in whatever ships the structured log stream. The messages below name the
+/// offending target to stay actionable, and that target is whatever string the
+/// configuration supplied: on the `None` arm it is by definition not a target
+/// this backend understands, so it can just as easily be a credential-bearing
+/// URL for some other system. `format_config_summary` already masks the same
+/// URL one line earlier (`mask_database_url`), so leaving it raw here undoes
+/// that a line later.
+///
+/// A parseable URL keeps its shape with the password replaced, which is what
+/// makes the message useful. A string that does not parse as a URL is passed
+/// through **unless** it contains `@` — a bare filesystem path
+/// (`/var/lib/app.db`) is exactly the case where naming the target is the whole
+/// point of the message and there is no credential to protect, while an
+/// unparseable string carrying `@` is masked wholesale rather than risking a
+/// malformed credential.
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+fn redact_pool_target(url: &str) -> String {
+    if let Ok(mut parsed) = url::Url::parse(url) {
+        if parsed.password().is_some() {
+            let _ = parsed.set_password(Some("****"));
+            return parsed.to_string();
+        }
+        return url.to_owned();
+    }
+    if url.contains('@') {
+        return "****".to_owned();
+    }
+    url.to_owned()
+}
+
 #[cfg(feature = "sqlite")]
 fn build_sqlite_pool(
     url: &str,
@@ -1556,13 +1606,25 @@ fn build_sqlite_pool(
     //     mapping and `autumn migrate` all classify through `detect` and would
     //     report "no recognized backend" while this pool quietly served a
     //     database out of a junk file.
+    //
+    // The bare in-memory spellings are the one accepted target `detect` does
+    // NOT classify (it recognizes schemes, and these carry none), so they are
+    // admitted explicitly rather than by scheme: `normalize_sqlite_target` has
+    // a dedicated branch mapping `""` and `:memory:` to `:memory:`
+    // (`rest.is_empty() || rest == ":memory:"`), `run_pending_sqlite` names
+    // `:memory:` among the spellings it accepts, and `TestApp::with_transactional_db`
+    // routes whatever URL it is handed straight through `create_pool`. They also
+    // cannot become a stray file, which is the failure this guard exists to
+    // prevent. Refusing them would be a regression, not a tightening.
     match crate::config::DatabaseBackend::detect(url) {
+        _ if sqlite_target_is_bare_in_memory(url) => {}
         Some(crate::config::DatabaseBackend::Sqlite) => {}
         Some(crate::config::DatabaseBackend::Postgres) => {
             return Err(PoolError::UnsupportedBackend(format!(
                 "this build of autumn-web targets SQLite (compiled with `--features sqlite`) but \
                  the configured database URL is a Postgres target; configure a `sqlite:` URL \
-                 instead (target: {url:?})"
+                 instead (target: {target:?})",
+                target = redact_pool_target(url)
             )));
         }
         None => {
@@ -1570,7 +1632,8 @@ fn build_sqlite_pool(
                 "this build of autumn-web targets SQLite (compiled with `--features sqlite`) but \
                  the configured database URL names no recognized database backend; configure a \
                  SQLite target spelled `sqlite:<path>`, `sqlite://<path>`, or `file:<path>` — a \
-                 bare filesystem path is not accepted (target: {url:?})"
+                 bare filesystem path is not accepted (target: {target:?})",
+                target = redact_pool_target(url)
             )));
         }
     }
@@ -1752,9 +1815,11 @@ fn reject_unusable_sqlite_replica(primary_url: &str, replica_url: &str) -> Resul
     let primary_target = normalize_sqlite_target(primary_url);
     if sqlite_target_is_memory(&replica_target) || replica_target != primary_target {
         return Err(PoolError::UnsupportedBackend(format!(
-            "SQLite does not support a separate read replica: replica_url {replica_url:?} \
-             is in-memory or differs from primary_url {primary_url:?}. Configure only a \
-             primary, or point the replica at the same database file as the primary."
+            "SQLite does not support a separate read replica: replica_url {replica:?} \
+             is in-memory or differs from primary_url {primary:?}. Configure only a \
+             primary, or point the replica at the same database file as the primary.",
+            replica = redact_pool_target(replica_url),
+            primary = redact_pool_target(primary_url)
         )));
     }
     Ok(())
@@ -4280,21 +4345,16 @@ mod tests {
         format!("sqlite:file:{name}?mode=memory&cache=shared")
     }
 
-    /// A replica target for `primary`.
+    /// A replica target to pair with `primary`.
     ///
-    /// On Postgres a replica is a genuinely distinct database. SQLite has no
-    /// replication in this pool architecture, so `reject_unusable_sqlite_replica`
-    /// only accepts a replica that normalizes to the SAME target as the primary
-    /// — which is exactly what these mechanics tests need (two pools, distinct
-    /// sizes) and is asserted in its own right by the
-    /// `create_topology_rejects_*_sqlite_replica` tests above.
+    /// Postgres-only, and deliberately so: `database_backend_consistency`
+    /// refuses any `replica_url` alongside a SQLite primary, so every caller is
+    /// `#[cfg(not(feature = "sqlite"))]` and there is no SQLite spelling to
+    /// give. The SQLite side of the replica contract lives in the
+    /// `create_topology_*_sqlite_replica` tests.
     #[cfg(not(feature = "sqlite"))]
     fn test_replica_url(_primary: &str, name: &str) -> String {
         format!("postgres://localhost/{name}")
-    }
-    #[cfg(feature = "sqlite")]
-    fn test_replica_url(primary: &str, _name: &str) -> String {
-        primary.to_owned()
     }
 
     // ── Pool creation tests ──────────────────────────────────────
@@ -4402,6 +4462,58 @@ mod tests {
         assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
     }
 
+    // A refusal names the offending target to stay actionable, and that target
+    // is whatever the configuration supplied — on the `None` arm, by
+    // definition not something this backend understands, so quite possibly a
+    // credential-bearing URL for another system. The message is logged at boot
+    // through `tracing::error!`, one line after `format_config_summary` masked
+    // the very same URL, so it must not hand the password back.
+    #[test]
+    fn redact_pool_target_masks_credentials_but_keeps_plain_targets_legible() {
+        assert_eq!(
+            redact_pool_target("mysql://user:secret@host/db"),
+            "mysql://user:****@host/db"
+        );
+        assert_eq!(
+            redact_pool_target("postgres://user:secret@localhost:5432/app"),
+            "postgres://user:****@localhost:5432/app"
+        );
+        // No credential to protect: naming the target IS the message's value.
+        assert_eq!(
+            redact_pool_target("sqlite:///var/lib/app.db"),
+            "sqlite:///var/lib/app.db"
+        );
+        assert_eq!(redact_pool_target("/var/lib/app.db"), "/var/lib/app.db");
+        assert_eq!(redact_pool_target("sqlite::memory:"), "sqlite::memory:");
+        // Unparseable AND credential-shaped: mask wholesale rather than guess.
+        assert_eq!(redact_pool_target("://user:secret@host/db"), "****");
+    }
+
+    // The end-to-end contract the helper exists for: no refusal this module
+    // produces may carry a password into the boot log.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn pool_refusals_never_echo_a_password() {
+        for url in [
+            "postgres://user:hunter2@localhost/app",
+            "mysql://user:hunter2@localhost/app",
+        ] {
+            let config = DatabaseConfig {
+                url: Some(url.into()),
+                ..Default::default()
+            };
+            let Err(err) = create_pool(&config) else {
+                panic!("a non-sqlite target must refuse: {url}");
+            };
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("hunter2"),
+                "refusal leaked the password: {msg}"
+            );
+            assert!(msg.contains("****"), "refusal must show it masked: {msg}");
+        }
+    }
+
     // A target that names NEITHER backend must refuse too, not be opened as a
     // file whose name happens to be that string. `normalize_sqlite_target`
     // strips only the `sqlite:`/`sqlite://` schemes and passes anything else
@@ -4438,6 +4550,38 @@ mod tests {
             assert!(
                 msg.contains("sqlite:") && msg.contains(url),
                 "message must name the offending target and the accepted scheme, got: {msg}"
+            );
+        }
+    }
+
+    // …but the two scheme-less spellings `normalize_sqlite_target` explicitly
+    // maps to `:memory:` are NOT "unrecognized": `DatabaseBackend::detect`
+    // classifies by scheme and these carry none, yet the pool has always taken
+    // them, `run_pending_sqlite` lists `:memory:` among its accepted spellings,
+    // and `TestApp::with_transactional_db` hands its URL straight to
+    // `create_pool`. Refusing them would be a regression, so the guard admits
+    // them explicitly. Neither can become a stray file.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_pool_still_accepts_bare_in_memory_spellings() {
+        for url in [":memory:", ""] {
+            let config = DatabaseConfig {
+                url: Some(url.into()),
+                ..Default::default()
+            };
+            let pool = create_pool(&config)
+                .unwrap_or_else(|e| panic!("bare in-memory target {url:?} must build: {e}"));
+            assert!(
+                pool.is_some(),
+                "bare in-memory target {url:?} must yield a pool"
+            );
+            // Private in-memory: every connection is its own database, so the
+            // pool must stay single-slot (same rule `build_sqlite_pool` applies
+            // to the scheme-spelled forms).
+            assert_eq!(
+                pool.expect("pool").status().max_size,
+                1,
+                "bare in-memory target {url:?} must be single-slot"
             );
         }
     }
@@ -4882,6 +5026,14 @@ mod tests {
 
     // ── Db extractor tests ───────────────────────────────────────
 
+    // Postgres-only: `database_backend_consistency` refuses ANY `replica_url`
+    // alongside a SQLite primary ("read replicas require the postgres
+    // backend"), so a two-pool topology is unreachable under the backend flip.
+    // Running this under `sqlite` would only assert pool mechanics for a
+    // configuration no validated deployment can have; the SQLite side of the
+    // replica contract is asserted by `create_topology_rejects_*_sqlite_replica`
+    // and `create_topology_allows_same_file_sqlite_replica` instead.
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn database_topology_builds_primary_and_replica_pools() {
         let primary = test_primary_url("primary");
@@ -5012,6 +5164,14 @@ mod tests {
         );
     }
 
+    // Postgres-only: `database_backend_consistency` refuses ANY `replica_url`
+    // alongside a SQLite primary ("read replicas require the postgres
+    // backend"), so a two-pool topology is unreachable under the backend flip.
+    // Running this under `sqlite` would only assert pool mechanics for a
+    // configuration no validated deployment can have; the SQLite side of the
+    // replica contract is asserted by `create_topology_rejects_*_sqlite_replica`
+    // and `create_topology_allows_same_file_sqlite_replica` instead.
+    #[cfg(not(feature = "sqlite"))]
     #[tokio::test]
     async fn database_topology_from_pools_retains_replica() {
         let primary = test_primary_url("primary");

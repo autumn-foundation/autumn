@@ -875,6 +875,8 @@ jobs:
             commentable:: \
             ledger:: \
             repository_commit_hooks:: \
+            substrate:: \
+            sqlite_sharding_unsupported_guard_tests \
             app::tests::custom_pool_provider_with_established_sqlite_pool_fails_closed_on_statement_timeout \
             app::tests::custom_pool_provider_no_database_mode_boots_with_statement_timeout
       - name: Run the sqlite integration suite

@@ -1767,12 +1767,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The SQLite backend's own unit tests never ran in CI (issue #1905):** the
   `sqlite-runtime` job builds the crate, lints it with `clippy --lib`, then
   runs `cargo test … --test <name>`. `--test` selects test *targets*, so the
-  ~26 `#[cfg(feature = "sqlite")]` unit tests inside the crate — pool sizing,
+  ~33 `#[cfg(feature = "sqlite")]` unit tests inside the crate — pool sizing,
   the replica rejections, in-memory/read-only target classification, provider
-  dispatch — were compiled on every run and executed on none. Under that
-  blind spot the ungated pool and topology tests sitting beside them had
-  rotted into 10 hard failures against the backend flip, because their
-  fixtures hard-code `postgres://` URLs the SQLite pool refuses. Those
+  dispatch, the sharding refusals, the sim substrate — were run by nothing.
+  Nor were they even *compiled*: `clippy --lib` without `--all-targets` does
+  not build `#[cfg(test)]` code, so the crate's unit-test tree had never been
+  type-checked under the backend flip. Under that blind spot the ungated pool
+  and topology tests sitting beside them had rotted into 10 hard failures
+  against it, because their fixtures hard-code `postgres://` URLs the SQLite
+  pool refuses. Those
   fixtures are now backend-parametric (the mechanics they assert — `max_size`,
   the connect-timeout → wait/create mapping, replica retention, the read-pool
   fallback — are backend-independent, so they now run on *both* backends
