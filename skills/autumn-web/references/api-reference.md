@@ -128,6 +128,7 @@ copy of the publish order.
 | `#[public]` | Marks a route handler as deliberately unauthenticated for the `autumn routes audit` coverage manifest — mirrors `#[secured]`, classifying the route `public` vs `gated`/`framework`/`unclassified` (0.6.0, #1604) |
 | `#[authorize]` | Record-level policy guard |
 | `#[api_doc]` | Route OpenAPI metadata |
+| `#[derive(OpenApiSchema)]` | Field-accurate component schema for a plain `Query<T>` / `Json<T>` type, registered in the back-fill inventory so no `register_schema` call is needed. Named-field structs, and enums whose variants are all unit variants (a JSON string enum honoring `rename` / `rename_all` / `skip`). Generic types, tuple structs, data-carrying variants and non-default enum representations (`#[serde(tag/content/untagged)]`) are compile errors — write the impl by hand for those. `#[model]` types register themselves and need no derive (#802) |
 | `#[oauth2_callback]` | OAuth2/OIDC callback route |
 | `#[cached]` | Memoize function results; `key(a, b)` narrows the cache key, `reads(Model, …)` declares the cache-coherence dependency set, `acknowledge_stale = "…"` opts out of the gate (#1716) |
 | `#[scheduled]`, `tasks![...]` | Recurring scheduled tasks |
@@ -1054,7 +1055,7 @@ double-submits and replays.
 | `jobs(Vec<JobInfo>)` | Background jobs |
 | `one_off_tasks(Vec<OneOffTaskInfo>)` | CLI tasks |
 | `migrations(EmbeddedMigrations)` | Diesel embedded migrations |
-| `openapi(OpenApiConfig)` | OpenAPI generation |
+| `openapi(OpenApiConfig)` | OpenAPI generation; `register_schema(key, json)` seeds a hand-written component schema (seeded first, so it wins over anything derived). Get the document out with `autumn openapi export` — no boot, no database (#802) |
 | `mount_mcp(path)`, `expose_all_as_mcp()`, `secure_mcp(layer)` | MCP endpoint projection (`mcp`); `Route::mcp()/mcp_exclude()/mcp_stream()` toggle exposure per route (plugin fluent opt-in) |
 | `exception_filter(...)`, `error_pages(...)` | Error rendering |
 | `scoped(prefix, layer, routes)` | Scoped route group |
