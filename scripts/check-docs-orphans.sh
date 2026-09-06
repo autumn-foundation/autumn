@@ -640,6 +640,14 @@ ANCHOR_HREF = re.compile(
 ATX_HEADING = re.compile(r'^ {0,3}#{1,6}(?:\s|$)')
 THEMATIC_BREAK = re.compile(r'^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$')
 FENCE_LINE = re.compile(r'^ {0,3}(?:`{3,}|~{3,})')
+# Four columns of indent is a code block — but only where a paragraph is not
+# already open, since indented code cannot interrupt one. Tabs expand to
+# four-column stops, which is what makes a single leading tab count.
+INDENTED_CODE = re.compile(r'^ {4}')
+# A definition, as one line sees it. Same shape the sibling's
+# `is_link_definition` uses, non-space after the colon included, so both agree
+# on what keeps a RUN of definitions going.
+REF_DEF_LINE = re.compile(r'^ {0,3}\[(?:[^\[\]\\]|\\.)+\]:[ \t]*\S')
 
 
 def block_starts(txt):
@@ -657,6 +665,15 @@ def block_starts(txt):
     and pins both cases (`…_keeps_a_type_seven_tag_inline_inside_a_paragraph`,
     `…_lets_a_type_six_tag_interrupt_a_paragraph`).
 
+    The indented-code arm is measured from column 0, so it is right at the top
+    level and wrong inside a list item, where four spaces is the item's own
+    content indent rather than code. Getting that right needs the container
+    tracking `check-migration-guides.sh` carries (`entry_content_indent`) and
+    this file does not — the same gap already recorded for fences in
+    `strip_comments`. Left out, the top-level case was wrong in the direction
+    that hides an orphan: `    sample` / `<span>` / `[Mail](mail.md)` counted
+    the link, when the tag opens a raw block and the link is literal.
+
     A block-quote line OPENS a paragraph rather than closing one, which is why
     it is not in the list below. `> note` / `[m]: mail.md` is lazy continuation:
     a definition cannot interrupt a paragraph, so the second line is ordinary
@@ -672,6 +689,18 @@ def block_starts(txt):
             starts.add(pos)
         stripped = line.strip()
         if not stripped:
+            para_open = False
+        elif not para_open and INDENTED_CODE.match(line.expandtabs(4)):
+            # Indented code. This arm is reachable only with no paragraph open,
+            # which is exactly the rule: indented code cannot interrupt one, so
+            # the same line under a paragraph is lazy continuation text and
+            # falls through to the `else`.
+            para_open = False
+        elif not para_open and REF_DEF_LINE.match(line):
+            # A definition is a block that opens no paragraph, which is what
+            # keeps a RUN of them working — only the first follows a blank
+            # line. Rejecting the second of `[first]: jobs.md` / `[mail]:
+            # mail.md` reported a page the reader can reach as an orphan.
             para_open = False
         elif (ATX_HEADING.match(line) or THEMATIC_BREAK.match(line)
                 or FENCE_LINE.match(line)):
@@ -2002,6 +2031,37 @@ self_test() {
     > "$c9du/docs/guide/mail.md"
   git -C "$c9du" add -A && git -C "$c9du" commit -qm waiver-escaped-backslash
   check "an escaped backslash before a waiver still waives" pass "$c9du"
+
+  # Indented code ends where the indentation does, so the tag below it opens a
+  # raw block and the link inside that block is literal.
+  local c9dv="$tmp/c9dv"; make_corpus "$c9dv"
+  printf '# Jobs\n\n    sample\n<span>\nSee [mail](mail.md).\n' \
+    > "$c9dv/docs/guide/jobs.md"
+  git -C "$c9dv" add -A && git -C "$c9dv" commit -qm indented-code-then-tag
+  check "a tag after indented code opens a raw block" fail "$c9dv"
+
+  # ...but indented code cannot INTERRUPT a paragraph: under prose the same
+  # line is continuation text, the paragraph stays open, and the tag is inline.
+  local c9dw="$tmp/c9dw"; make_corpus "$c9dw"
+  printf '# Jobs\n\nprose\n    sample\n<span>\nSee [mail](mail.md).\n' \
+    > "$c9dw/docs/guide/jobs.md"
+  git -C "$c9dw" add -A && git -C "$c9dw" commit -qm indented-code-in-paragraph
+  check "an indented line inside a paragraph opens no code block" pass "$c9dw"
+
+  # A run of definitions: the second is a definition too, so the route resolves.
+  local c9dx="$tmp/c9dx"; make_corpus "$c9dx"
+  printf '# Jobs\n\nSee [mail][mail].\n\n[first]: jobs.md\n[mail]: mail.md\n' \
+    > "$c9dx/docs/guide/jobs.md"
+  git -C "$c9dx" add -A && git -C "$c9dx" commit -qm definition-run
+  check "the second definition in a run still defines" pass "$c9dx"
+
+  # ...and the rule stays narrow: after real prose a definition still defines
+  # nothing, because it cannot interrupt the paragraph.
+  local c9dy="$tmp/c9dy"; make_corpus "$c9dy"
+  printf '# Jobs\n\nSee [mail][mail].\n\nprose\n[mail]: mail.md\n' \
+    > "$c9dy/docs/guide/jobs.md"
+  git -C "$c9dy" add -A && git -C "$c9dy" commit -qm definition-after-prose
+  check "a definition continuing a paragraph still defines nothing" fail "$c9dy"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
