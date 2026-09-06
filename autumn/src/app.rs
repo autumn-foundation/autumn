@@ -7767,7 +7767,10 @@ fn graph_route_summary(route: &Route, scope_prefix: Option<&str>) -> crate::grap
             roles,
             scopes,
             policy: route.api_doc.has_policy
-                || route.repository.as_ref().is_some_and(|meta| meta.has_policy),
+                || route
+                    .repository
+                    .as_ref()
+                    .is_some_and(|meta| meta.has_policy),
             repository_scope: route
                 .repository
                 .as_ref()

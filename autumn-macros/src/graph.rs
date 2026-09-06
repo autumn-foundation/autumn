@@ -168,6 +168,35 @@ fn literal_text(literal: &str) -> String {
 /// keep. Single-quoted strings (with `''` escapes) and double-quoted
 /// identifiers are therefore tracked, and block comments nest, as they do in
 /// Postgres.
+/// The Postgres dollar-quote delimiter starting at `i`, if there is one.
+///
+/// Returns the whole delimiter including both `$` — `$$`, `$body$`, `$tag_1$` —
+/// so the caller can look for the identical closing run.
+///
+/// A tag follows identifier rules and so may not begin with a digit, which is
+/// precisely what separates a real delimiter from the `$1`/`$2` bind
+/// placeholders that appear throughout this workspace's SQL. Mistaking `$1` for
+/// an opening quote would swallow the rest of the statement.
+fn dollar_tag(chars: &[char], i: usize) -> Option<String> {
+    if chars.get(i) != Some(&'$') {
+        return None;
+    }
+    let mut end = i + 1;
+    // An empty tag (`$$`) is valid; a non-empty one may not start with a digit.
+    if let Some(first) = chars.get(end)
+        && (first.is_ascii_alphabetic() || *first == '_')
+    {
+        end += 1;
+        while chars
+            .get(end)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+        {
+            end += 1;
+        }
+    }
+    (chars.get(end) == Some(&'$')).then(|| chars[i..=end].iter().collect())
+}
+
 fn strip_sql_comments(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
@@ -203,6 +232,39 @@ fn strip_sql_comments(text: &str) -> String {
                 i += 2;
                 // A block comment separates whatever surrounds it.
                 out.push(' ');
+            }
+            ('$', _) if dollar_tag(&chars, i).is_some() => {
+                // Postgres dollar quoting: `$$…$$` or `$tag$…$tag$`. Same
+                // hazard as the ordinary quotes below — `SELECT $$-- x$$ FROM
+                // posts` carries a `--` that starts no comment, and eating the
+                // rest of it would drop the `posts` edge.
+                //
+                // `dollar_tag` is what keeps this away from `$1`/`$2` bind
+                // placeholders, which are far more common in this codebase than
+                // dollar-quoted strings: a tag may not start with a digit, so
+                // `$1` is not an opening delimiter and falls through to be
+                // copied like any other character.
+                let delimiter: String = dollar_tag(&chars, i).expect("guarded above");
+                out.push_str(&delimiter);
+                i += delimiter.chars().count();
+                // Copy through to the matching closing delimiter. An unclosed
+                // one runs to the end, which is the conservative direction:
+                // the text is preserved rather than discarded.
+                while i < chars.len() {
+                    if chars[i] == '$'
+                        && chars[i..]
+                            .iter()
+                            .take(delimiter.chars().count())
+                            .copied()
+                            .eq(delimiter.chars())
+                    {
+                        out.push_str(&delimiter);
+                        i += delimiter.chars().count();
+                        break;
+                    }
+                    out.push(chars[i]);
+                    i += 1;
+                }
             }
             ('\'' | '"', _) => {
                 // Copy the quoted run verbatim; nothing inside it is a comment.
@@ -690,6 +752,32 @@ mod tests {
         assert!(sql_symbols(block).contains(&"posts".to_owned()));
     }
 
+    /// The same hazard for Postgres dollar quoting, which the first version of
+    /// the comment stripper missed: `$$…$$` and `$tag$…$tag$` are string
+    /// literals, so a `--` inside one starts no comment.
+    ///
+    /// The `$1` case is the reason the tag rules matter. Bind placeholders are
+    /// everywhere in this workspace's SQL, and treating `$1` as an opening
+    /// delimiter would swallow the rest of every parameterised statement.
+    #[test]
+    fn dollar_quoted_text_is_not_scanned_for_comments() {
+        let bare = "\"SELECT $$-- marker$$ FROM posts\"";
+        assert_eq!(sql_shape(bare), Some(false));
+        assert!(
+            sql_symbols(bare).contains(&"posts".to_owned()),
+            "a dollar-quoted -- must not eat the FROM clause"
+        );
+
+        let tagged = "\"SELECT $body$-- marker$body$ FROM posts\"";
+        assert_eq!(sql_shape(tagged), Some(false));
+        assert!(sql_symbols(tagged).contains(&"posts".to_owned()));
+
+        // `$1` is a placeholder, not a delimiter.
+        let placeholder = "\"DELETE FROM posts WHERE id = $1 AND slug = $2\"";
+        assert_eq!(sql_shape(placeholder), Some(true));
+        assert!(sql_symbols(placeholder).contains(&"posts".to_owned()));
+    }
+
     /// The hazard the fix introduces if it is written naively: a `--` inside a
     /// quoted string starts no comment, and treating it as one would swallow the
     /// rest of the statement — losing exactly the edge the fix is meant to keep.
@@ -708,7 +796,8 @@ mod tests {
     /// query as a write.
     #[test]
     fn a_mutation_verb_in_a_comment_is_not_mutation_evidence() {
-        let literal = "\"WITH recent AS (SELECT id FROM posts) SELECT * FROM recent -- never DELETE\"";
+        let literal =
+            "\"WITH recent AS (SELECT id FROM posts) SELECT * FROM recent -- never DELETE\"";
         assert_eq!(sql_shape(literal), Some(false));
     }
 
