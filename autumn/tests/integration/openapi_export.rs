@@ -62,6 +62,35 @@ fn enum_honors_rename_all_rename_and_skip() {
     );
 }
 
+// A list-valued serde meta before the representation key. The guard has to
+// consume `rename_all(...)` to reach `tag`; if it does not, `parse_nested_meta`
+// aborts on the unread group and the enum is wrongly advertised as a string
+// enum. Kept as a compile-time fixture: `trybuild` owns the rejection cases,
+// but this documents the shape that regressed.
+//
+//   #[derive(OpenApiSchema)]
+//   #[serde(rename_all(serialize = "snake_case"), tag = "kind")]
+//   enum Bypass { A, B }        // must NOT compile
+//
+// The equivalent positive case — a combined attribute with no representation
+// key — still derives normally:
+#[derive(Serialize, Deserialize, OpenApiSchema)]
+#[serde(rename_all(serialize = "snake_case", deserialize = "camelCase"))]
+#[allow(dead_code)]
+enum CombinedRenameOnly {
+    InProgress,
+}
+
+#[test]
+fn a_list_valued_rename_all_still_applies_its_serialize_side() {
+    let schema = <CombinedRenameOnly as OpenApiSchema>::schema();
+    assert_eq!(
+        schema["enum"],
+        serde_json::json!(["in_progress"]),
+        "the serialize side of a split rename_all is what the schema advertises: {schema}"
+    );
+}
+
 #[test]
 fn enum_schema_name_is_the_bare_type_name() {
     assert_eq!(<Priority as OpenApiSchema>::schema_name(), "Priority");

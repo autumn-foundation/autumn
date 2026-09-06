@@ -91,9 +91,8 @@ pub fn field_serde_serialize_rename(field: &syn::Field) -> Option<String> {
                         Ok(())
                     });
                 }
-            } else if let Ok(value) = meta.value() {
-                // Consume any `= value` so sibling metas keep parsing.
-                let _: syn::Result<syn::Lit> = value.parse();
+            } else {
+                consume_unrecognized_meta(&meta)?;
             }
             Ok(())
         });
@@ -220,14 +219,36 @@ pub fn serde_enum_representation(attrs: &[syn::Attribute]) -> Option<&'static st
             } else if meta.path.is_ident("content") && found.is_none() {
                 found = Some("content");
             }
-            // Consume any `= value` so sibling metas keep parsing.
-            if let Ok(value) = meta.value() {
-                let _: syn::Result<syn::Lit> = value.parse();
-            }
+            consume_unrecognized_meta(&meta)?;
             Ok(())
         });
     }
     found
+}
+
+/// Consume whatever follows an unrecognized `#[serde(...)]` key so
+/// `parse_nested_meta` can reach the keys that come after it.
+///
+/// Two shapes have to be swallowed, not one. `key = "value"` is the obvious
+/// case. The other is a **list**, `key(a = "x", b = "y")` — and missing it is
+/// not cosmetic: `meta.value()` fails on a list (there is no `=`), so the
+/// parenthesized group stays unread, `parse_nested_meta` aborts on it, and
+/// every later key goes unvisited. A caller that swallows the resulting error
+/// then sees a clean "nothing found".
+///
+/// That is exactly how `#[serde(rename_all(serialize = "snake_case"), tag =
+/// "kind")]` slipped past [`serde_enum_representation`]: `tag` was never
+/// reached, so an internally tagged enum was advertised as a plain string enum.
+/// Anything that gates on absence must therefore consume both shapes.
+fn consume_unrecognized_meta(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<()> {
+    if let Ok(value) = meta.value() {
+        let _: syn::Result<syn::Lit> = value.parse();
+    } else if meta.input.peek(syn::token::Paren) {
+        let content;
+        syn::parenthesized!(content in meta.input);
+        let _: proc_macro2::TokenStream = content.parse()?;
+    }
+    Ok(())
 }
 
 /// The serde attributes on an enum variant, read for `rename` / `skip`.
@@ -254,9 +275,8 @@ pub fn variant_serde_serialize_rename(variant: &syn::Variant) -> Option<String> 
                         Ok(())
                     });
                 }
-            } else if let Ok(value) = meta.value() {
-                // Consume any `= value` so sibling metas keep parsing.
-                let _: syn::Result<syn::Lit> = value.parse();
+            } else {
+                consume_unrecognized_meta(&meta)?;
             }
             Ok(())
         });
@@ -264,16 +284,44 @@ pub fn variant_serde_serialize_rename(variant: &syn::Variant) -> Option<String> 
     renamed
 }
 
-/// Whether a variant carries `#[serde(skip)]` / `#[serde(skip_serializing)]`,
-/// in which case it never appears on the wire and must not be advertised.
+/// A **directional** skip on a variant — `skip_serializing` or
+/// `skip_deserializing` — returned as the attribute word.
+///
+/// One schema describes both directions, so a variant present in only one of
+/// them has no correct rendering. `skip_deserializing` is the dangerous
+/// direction: the variant IS serialized, so a serialize-side schema advertises
+/// it, and a client that sends it back gets an unknown-variant error from
+/// serde. `skip_serializing` is the mirror — dropping it would deny an input
+/// the handler accepts. Neither can be inferred away, so the derive refuses the
+/// enum instead of publishing a half-true set. Plain `#[serde(skip)]` is
+/// unambiguous (gone from both directions) and stays supported.
+pub fn variant_directional_skip(variant: &syn::Variant) -> Option<&'static str> {
+    let mut found = None;
+    for attr in variant.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("skip_serializing") {
+                found = Some("skip_serializing");
+            } else if meta.path.is_ident("skip_deserializing") {
+                found = Some("skip_deserializing");
+            } else {
+                consume_unrecognized_meta(&meta)?;
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
+/// Whether a variant carries `#[serde(skip)]`, in which case it never appears
+/// on the wire in either direction and must not be advertised.
 pub fn variant_is_serde_skipped(variant: &syn::Variant) -> bool {
     let mut skipped = false;
     for attr in variant.attrs.iter().filter(|a| a.path().is_ident("serde")) {
         let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("skip") || meta.path.is_ident("skip_serializing") {
+            if meta.path.is_ident("skip") {
                 skipped = true;
-            } else if let Ok(value) = meta.value() {
-                let _: syn::Result<syn::Lit> = value.parse();
+            } else {
+                consume_unrecognized_meta(&meta)?;
             }
             Ok(())
         });

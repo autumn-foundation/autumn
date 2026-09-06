@@ -175,6 +175,34 @@ fn enum_schema_body(
         ));
     }
 
+    // A variant present in only one serde direction has no correct rendering in
+    // a document that describes both. Refuse rather than publish a set that is
+    // right for responses and wrong for requests (or the reverse).
+    if let Some(variant) = data
+        .variants
+        .iter()
+        .find(|v| crate::schema::variant_directional_skip(v).is_some())
+    {
+        let attribute = crate::schema::variant_directional_skip(variant)
+            .expect("the find predicate just matched it");
+        let consequence = if attribute == "skip_deserializing" {
+            "it is still serialized, so advertising it would tell a client it may send a \
+             value serde rejects as an unknown variant"
+        } else {
+            "it is still accepted on input, so omitting it would deny a value the handler takes"
+        };
+        return Err(syn::Error::new_spanned(
+            variant,
+            format!(
+                "#[derive(OpenApiSchema)] cannot describe a variant skipped in only one serde \
+                 direction: one schema covers both requests and responses, and with \
+                 `#[serde({attribute})]` {consequence}. Use `#[serde(skip)]` if the variant \
+                 should not appear at all, or write the `OpenApiSchema` impl by hand and \
+                 register it with `OpenApiConfig::register_schema`."
+            ),
+        ));
+    }
+
     let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
     let values: Vec<String> = data
         .variants

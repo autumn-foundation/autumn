@@ -6367,7 +6367,6 @@ impl AppBuilder {
             api_versions,
             openapi,
             config_loader_factory,
-            telemetry_provider,
             plugin_config_roots,
             ..
         } = self;
@@ -6381,12 +6380,10 @@ impl AppBuilder {
             std::process::exit(2);
         };
 
-        let (config, _telemetry_guard) = load_config_and_telemetry(
-            config_loader_factory,
-            telemetry_provider,
-            plugin_config_roots,
-        )
-        .await;
+        // Config only: `TelemetryProvider::init` can reach a collector or read
+        // production credentials, and telemetry cannot affect the document, so
+        // an export advertised as touching nothing must not run it.
+        let config = load_config_only(config_loader_factory, plugin_config_roots).await;
 
         let mut openapi_config = openapi_config;
         openapi_config.api_versions = api_versions;
@@ -9934,6 +9931,38 @@ async fn load_config_and_telemetry(
     telemetry_provider: Option<Box<dyn crate::telemetry::TelemetryProvider>>,
     plugin_config_roots: BTreeSet<String>,
 ) -> (AutumnConfig, crate::telemetry::TelemetryGuard) {
+    let config = load_config_only(config_loader, plugin_config_roots).await;
+
+    // 2. Initialize logging/telemetry via the installed provider, falling
+    //    back to the default `tracing-subscriber + OTLP` initializer.
+    let provider: Box<dyn crate::telemetry::TelemetryProvider> = telemetry_provider
+        .unwrap_or_else(|| Box::new(crate::telemetry::TracingOtlpTelemetryProvider::new()));
+    let telemetry_guard = provider
+        .init(&config.log, &config.telemetry, config.profile.as_deref())
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to initialize telemetry: {error}");
+            std::process::exit(1);
+        });
+
+    (config, telemetry_guard)
+}
+
+/// Resolve the effective configuration WITHOUT initializing telemetry.
+///
+/// Split out of [`load_config_and_telemetry`] for the one-shot dump modes that
+/// need config but must not touch the outside world. A custom
+/// `TelemetryProvider::init` may open a collector connection, read credentials
+/// or otherwise reach production resources, and telemetry cannot influence what
+/// those modes emit — so `autumn openapi export`, advertised as binding no port
+/// and opening no database, must not trigger it either (issue #802).
+///
+/// Everything up to and including [`AutumnConfig::apply_retention_caps`] is
+/// shared with the telemetry-initializing path, so the config the two resolve is
+/// identical.
+async fn load_config_only(
+    config_loader: Option<ConfigLoaderFactory>,
+    plugin_config_roots: BTreeSet<String>,
+) -> AutumnConfig {
     // 1. Load configuration via the installed loader, falling back to the
     //    five-layer TOML + env default.
     //
@@ -9978,18 +10007,7 @@ async fn load_config_and_telemetry(
     // `[retention]` section is untouched.
     config.apply_retention_caps();
 
-    // 2. Initialize logging/telemetry via the installed provider, falling
-    //    back to the default `tracing-subscriber + OTLP` initializer.
-    let provider: Box<dyn crate::telemetry::TelemetryProvider> = telemetry_provider
-        .unwrap_or_else(|| Box::new(crate::telemetry::TracingOtlpTelemetryProvider::new()));
-    let telemetry_guard = provider
-        .init(&config.log, &config.telemetry, config.profile.as_deref())
-        .unwrap_or_else(|error| {
-            eprintln!("Failed to initialize telemetry: {error}");
-            std::process::exit(1);
-        });
-
-    (config, telemetry_guard)
+    config
 }
 
 /// Register the embedded `static/` tree (if any) as the process-wide asset
