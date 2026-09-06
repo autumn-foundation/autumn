@@ -91,6 +91,32 @@ async fn protected_route_redirects_to_login_when_unauthenticated() {
 
 // ── Full flow (requires Docker) ──────────────────────────────────────────────
 
+/// Split a `.sql` migration file into individual statements.
+///
+/// `execute_sql` runs each call through Diesel's extended-query (prepared
+/// statement) protocol, which Postgres refuses outright for a multi-statement
+/// string ("cannot insert multiple commands into a prepared statement") —
+/// `execute_sql`'s own doc example is a single `CREATE TABLE`, and
+/// `examples/saas`'s equivalent test schema calls it once per table for
+/// exactly this reason. `up.sql` has to run as one `execute_sql` call per
+/// statement instead. Comment lines are stripped before splitting on `;`:
+/// two of them contain a literal `;` in prose (e.g. "...typed FK; application
+/// code...", "`pending`; accepting..."), which a naive split would otherwise
+/// treat as a statement boundary.
+fn schema_statements(sql: &str) -> Vec<String> {
+    let without_comments: String = sql
+        .lines()
+        .map(|line| line.split("--").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    without_comments
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Create the schema and return a CSRF-disabled, DB-backed client. `mail_dir`
 /// captures every invite email as an `.eml` file (AC4's "delivered to the dev
 /// mailbox").
@@ -107,10 +133,11 @@ static SCHEMA_READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 async fn db_client(mail_dir: &std::path::Path) -> TestClient {
     let db = TestDb::shared().await;
     if SCHEMA_READY.get().is_none() {
-        db.execute_sql(include_str!(
+        for statement in schema_statements(include_str!(
             "../migrations/00000000000000_create_teams/up.sql"
-        ))
-        .await;
+        )) {
+            db.execute_sql(&statement).await;
+        }
         let _ = SCHEMA_READY.set(());
     }
     db.execute_sql("TRUNCATE invitations, memberships, organizations, users RESTART IDENTITY")
@@ -1155,4 +1182,45 @@ async fn removed_member_loses_access_immediately_despite_cached_session() {
         .send()
         .await
         .assert_status(401);
+}
+
+#[cfg(test)]
+mod schema_statements_tests {
+    use super::schema_statements;
+
+    /// Every statement in the real migration parses as non-empty SQL with no
+    /// leftover comment text, and none contains a stray `--` (which would
+    /// mean a comment got merged into a statement instead of stripped) — a
+    /// regression test for the "cannot insert multiple commands into a
+    /// prepared statement" failure this parsing exists to avoid.
+    #[test]
+    fn splits_the_real_migration_into_individual_statements() {
+        let statements = schema_statements(include_str!(
+            "../migrations/00000000000000_create_teams/up.sql"
+        ));
+        assert_eq!(statements.len(), 9, "statements: {statements:#?}");
+        for statement in &statements {
+            assert!(!statement.is_empty());
+            assert!(
+                !statement.contains("--"),
+                "comment leaked into a statement: {statement}"
+            );
+        }
+        assert!(statements[0].starts_with("CREATE TABLE users"));
+        assert!(
+            statements
+                .last()
+                .unwrap()
+                .starts_with("CREATE UNIQUE INDEX")
+        );
+    }
+
+    /// A `;` inside a `--` comment must not be treated as a statement
+    /// boundary (the actual bug this function was written to avoid).
+    #[test]
+    fn semicolon_inside_a_comment_is_not_a_statement_boundary() {
+        let sql = "-- a comment; with a semicolon\nCREATE TABLE t (id INT);";
+        let statements = schema_statements(sql);
+        assert_eq!(statements, vec!["CREATE TABLE t (id INT)".to_owned()]);
+    }
 }
