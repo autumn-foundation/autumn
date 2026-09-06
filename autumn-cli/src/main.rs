@@ -456,6 +456,7 @@ pub enum GraphSubcommands {
 
 /// Arguments for `autumn openapi export`.
 #[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
 pub struct OpenApiExportArgs {
     /// Package to inspect (for workspaces).
     #[arg(short, long)]
@@ -490,6 +491,14 @@ pub struct OpenApiExportArgs {
     /// Build with `--no-default-features`.
     #[arg(long)]
     no_default_features: bool,
+    /// Export from the release build rather than the debug one.
+    ///
+    /// A route or schema gated behind `#[cfg(not(debug_assertions))]` exists
+    /// only in the release binary, so a debug export can describe a contract
+    /// the deployed build does not serve. Use this wherever `--check` is
+    /// gating the shipped artifact.
+    #[arg(long)]
+    release: bool,
 }
 
 /// Subcommands for `autumn openapi`.
@@ -4895,6 +4904,7 @@ fn run_command(command: Commands) {
                 check: args.check.as_deref(),
                 strict: args.strict,
                 features,
+                release: args.release,
             });
         }
         Commands::Graph(command) => {
@@ -8623,6 +8633,7 @@ mod tests {
             Commands::Openapi(OpenApiSubcommands::Export(args)) => {
                 assert_eq!(args.out.as_deref(), Some(Path::new("openapi.json")));
                 assert!(args.strict);
+                assert!(!args.release, "debug is the default profile");
                 assert_eq!(args.package.as_deref(), Some("bookmarks"));
             }
             _ => panic!("expected Openapi export subcommand"),

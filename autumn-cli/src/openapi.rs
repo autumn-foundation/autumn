@@ -22,7 +22,7 @@ use std::process::Command;
 
 use autumn_web::openapi::{OpaqueSchema, OpenApiSpec, opaque_component_schemas};
 
-use crate::routes::{CargoFeatures, compile_binary_with, find_binary};
+use crate::routes::{CargoFeatures, compile_binary_with_profile, find_binary_in_profile};
 
 /// Options controlling `autumn openapi export`.
 pub struct ExportOptions<'a> {
@@ -36,6 +36,13 @@ pub struct ExportOptions<'a> {
     /// Fail when any component schema degraded to the opaque placeholder.
     pub strict: bool,
     pub features: CargoFeatures,
+    /// Build and run the release binary instead of the debug one.
+    ///
+    /// A route or schema behind `#[cfg(not(debug_assertions))]` exists only in
+    /// the release build, so a debug-built export describes a contract the
+    /// deployed binary does not serve — and `--check` would pass against it.
+    /// Mirrors the profile flag the other manifest commands take.
+    pub release: bool,
 }
 
 /// Run `autumn openapi export`.
@@ -72,8 +79,10 @@ pub fn run(opts: &ExportOptions<'_>) {
 /// Build the app and read its `OpenAPI` dump, exiting with an actionable message
 /// when the binary has no spec to give.
 fn dump_spec(opts: &ExportOptions<'_>) -> String {
-    compile_binary_with(opts.package, opts.bin, &opts.features);
-    let binary = find_binary(opts.package, opts.bin);
+    // Build and locate under the SAME profile: a command that builds then runs
+    // must agree with itself about which binary it means.
+    compile_binary_with_profile(opts.package, opts.bin, &opts.features, opts.release);
+    let binary = find_binary_in_profile(opts.package, opts.bin, opts.release);
 
     let output = Command::new(&binary)
         .env("AUTUMN_DUMP_OPENAPI", "1")

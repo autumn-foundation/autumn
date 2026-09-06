@@ -7458,9 +7458,19 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // #1654: a classified column has no `Serialize` impl, so it can never appear
     // in a JSON body. Advertising it in the read schema would document a property
     // no response can carry. The write schemas keep it: a client still *sets* it.
+    //
+    // #802: the same is true of a field hidden from JSON — `#[private]`, or
+    // `#[encrypted]` without `admin_visible`. Those get `skip_serializing`
+    // injected below, so a response never carries them either. This filter did
+    // not matter while the read schema went unregistered and every model
+    // resolved to an opaque placeholder; now that `#[model]` advertises itself,
+    // omitting it would mark always-absent fields `required` (a strict client
+    // fails to deserialize every response) and publish the names of private and
+    // encrypted columns in the contract. Write schemas keep them: they are only
+    // skipped on the way OUT, and a client still sets them.
     let serializable_field_refs: Vec<&&Field> = all_field_refs
         .iter()
-        .filter(|f| !field_is_classified(f))
+        .filter(|f| !field_is_classified(f) && !field_hidden_from_json(f))
         .copied()
         .collect();
     let query_struct_schema_body =

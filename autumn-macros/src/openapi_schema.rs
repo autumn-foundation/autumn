@@ -120,6 +120,53 @@ fn enum_schema_body(
     input: &DeriveInput,
     data: &syn::DataEnum,
 ) -> syn::Result<proc_macro2::TokenStream> {
+    reject_undescribable_enum(input, data)?;
+
+    let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
+    let values: Vec<String> = data
+        .variants
+        .iter()
+        .filter(|v| !crate::schema::variant_is_serde_skipped(v))
+        .map(|v| {
+            let raw = v.ident.to_string();
+            let raw = raw.strip_prefix("r#").unwrap_or(&raw).to_owned();
+            // Precedence mirrors serde: a variant-level `#[serde(rename)]` wins
+            // over the container `#[serde(rename_all)]`, which wins over the
+            // raw identifier.
+            crate::schema::variant_serde_serialize_rename(v)
+                .or_else(|| {
+                    rename_all_rule.as_deref().and_then(|rule| {
+                        crate::schema::apply_serde_rename_all_rule_to_variant(rule, &raw)
+                    })
+                })
+                .unwrap_or(raw)
+        })
+        .collect();
+
+    if values.is_empty() {
+        return Err(syn::Error::new_spanned(
+            input,
+            "#[derive(OpenApiSchema)] needs at least one non-skipped variant to advertise",
+        ));
+    }
+
+    Ok(quote! {
+        ::autumn_web::reexports::serde_json::json!({
+            "type": "string",
+            "enum": [#(#values),*],
+        })
+    })
+}
+
+/// Refuse every enum shape whose real wire form the derive cannot describe.
+///
+/// Split out of [`enum_schema_body`] to keep that function inside the
+/// line budget, and because these four checks are one idea: a JSON string enum
+/// is only the truth when serde's default representation applies to unit
+/// variants with a single, symmetric spelling. Anything else is refused rather
+/// than approximated — a confidently wrong contract is worse than no derive,
+/// since a generated client acts on it.
+fn reject_undescribable_enum(input: &DeriveInput, data: &syn::DataEnum) -> syn::Result<()> {
     if let Some(variant) = data
         .variants
         .iter()
@@ -203,38 +250,30 @@ fn enum_schema_body(
         ));
     }
 
-    let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
-    let values: Vec<String> = data
-        .variants
-        .iter()
-        .filter(|v| !crate::schema::variant_is_serde_skipped(v))
-        .map(|v| {
-            let raw = v.ident.to_string();
-            let raw = raw.strip_prefix("r#").unwrap_or(&raw).to_owned();
-            // Precedence mirrors serde: a variant-level `#[serde(rename)]` wins
-            // over the container `#[serde(rename_all)]`, which wins over the
-            // raw identifier.
-            crate::schema::variant_serde_serialize_rename(v)
-                .or_else(|| {
-                    rename_all_rule.as_deref().and_then(|rule| {
-                        crate::schema::apply_serde_rename_all_rule_to_variant(rule, &raw)
-                    })
-                })
-                .unwrap_or(raw)
-        })
-        .collect();
-
-    if values.is_empty() {
-        return Err(syn::Error::new_spanned(
-            input,
-            "#[derive(OpenApiSchema)] needs at least one non-skipped variant to advertise",
+    // A split rename is the same asymmetry as a directional skip: one schema,
+    // two disagreeing wire spellings. Advertising the serialize side would have
+    // a generated client send `in_progress` to a handler whose `Deserialize`
+    // accepts `inProgress`.
+    let split = crate::schema::serde_split_rename(&input.attrs, "rename_all")
+        .map(|key| (key, None))
+        .or_else(|| {
+            data.variants.iter().find_map(|v| {
+                crate::schema::serde_split_rename(&v.attrs, "rename").map(|key| (key, Some(v)))
+            })
+        });
+    if let Some((key, variant)) = split {
+        let message = format!(
+            "#[derive(OpenApiSchema)] cannot describe a split `#[serde({key}(serialize = ..., \
+             deserialize = ...))]` whose two sides differ: one schema is advertised for both \
+             requests and responses, so a client generated from the serialize spelling would \
+             send a value the handler's `Deserialize` rejects. Use a symmetric \
+             `{key} = \"...\"`, or write the `OpenApiSchema` impl by hand and register it with \
+             `OpenApiConfig::register_schema`."
+        );
+        return Err(variant.map_or_else(
+            || syn::Error::new_spanned(input, message.clone()),
+            |v| syn::Error::new_spanned(v, message.clone()),
         ));
     }
-
-    Ok(quote! {
-        ::autumn_web::reexports::serde_json::json!({
-            "type": "string",
-            "enum": [#(#values),*],
-        })
-    })
+    Ok(())
 }

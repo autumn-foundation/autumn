@@ -65,29 +65,24 @@ fn enum_honors_rename_all_rename_and_skip() {
 // A list-valued serde meta before the representation key. The guard has to
 // consume `rename_all(...)` to reach `tag`; if it does not, `parse_nested_meta`
 // aborts on the unread group and the enum is wrongly advertised as a string
-// enum. Kept as a compile-time fixture: `trybuild` owns the rejection cases,
-// but this documents the shape that regressed.
-//
-//   #[derive(OpenApiSchema)]
-//   #[serde(rename_all(serialize = "snake_case"), tag = "kind")]
-//   enum Bypass { A, B }        // must NOT compile
-//
-// The equivalent positive case — a combined attribute with no representation
-// key — still derives normally:
+// enum. Both that and a *disagreeing* split rename are now compile errors, so
+// the rejection cases live in trybuild; this fixture pins the shape that is
+// still accepted — a split whose two sides agree round-trips, so there is one
+// spelling to advertise and no asymmetry to refuse.
 #[derive(Serialize, Deserialize, OpenApiSchema)]
-#[serde(rename_all(serialize = "snake_case", deserialize = "camelCase"))]
+#[serde(rename_all(serialize = "snake_case", deserialize = "snake_case"))]
 #[allow(dead_code)]
-enum CombinedRenameOnly {
+enum AgreeingSplitRename {
     InProgress,
 }
 
 #[test]
-fn a_list_valued_rename_all_still_applies_its_serialize_side() {
-    let schema = <CombinedRenameOnly as OpenApiSchema>::schema();
+fn a_split_rename_that_agrees_is_accepted_and_applied() {
+    let schema = <AgreeingSplitRename as OpenApiSchema>::schema();
     assert_eq!(
         schema["enum"],
         serde_json::json!(["in_progress"]),
-        "the serialize side of a split rename_all is what the schema advertises: {schema}"
+        "both sides say snake_case, so the advertised value round-trips: {schema}"
     );
 }
 

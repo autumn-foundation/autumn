@@ -284,6 +284,55 @@ pub fn variant_serde_serialize_rename(variant: &syn::Variant) -> Option<String> 
     renamed
 }
 
+/// Whether a `#[serde(...)]` attribute list carries a **split** `rename_all` or
+/// `rename` — the `name(serialize = "...", deserialize = "...")` form — where
+/// the two sides disagree.
+///
+/// A symmetric `rename_all = "snake_case"` applies to both directions and is
+/// exact. The split form is not: the schema can only advertise one string, so a
+/// generated client sends the serialize spelling while the handler's
+/// `Deserialize` accepts the other. Same asymmetry as a directional skip, same
+/// answer — refuse rather than publish a value that only works one way.
+///
+/// Returns the attribute word (`rename_all` / `rename`) when the two sides are
+/// present and differ.
+pub fn serde_split_rename(attrs: &[syn::Attribute], key: &'static str) -> Option<&'static str> {
+    let mut split = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident(key)
+                && meta.value().is_err()
+                && meta.input.peek(syn::token::Paren)
+            {
+                let (mut ser, mut de) = (None::<String>, None::<String>);
+                meta.parse_nested_meta(|inner| {
+                    if let Ok(value) = inner.value()
+                        && let Ok(syn::Lit::Str(lit)) = value.parse::<syn::Lit>()
+                    {
+                        if inner.path.is_ident("serialize") {
+                            ser = Some(lit.value());
+                        } else if inner.path.is_ident("deserialize") {
+                            de = Some(lit.value());
+                        }
+                    }
+                    Ok(())
+                })?;
+                // Only a genuine disagreement is a problem: `serialize` alone,
+                // or both sides spelled the same, round-trips fine.
+                if let (Some(ser), Some(de)) = (ser, de)
+                    && ser != de
+                {
+                    split = Some(key);
+                }
+            } else {
+                consume_unrecognized_meta(&meta)?;
+            }
+            Ok(())
+        });
+    }
+    split
+}
+
 /// A **directional** skip on a variant — `skip_serializing` or
 /// `skip_deserializing` — returned as the attribute word.
 ///
