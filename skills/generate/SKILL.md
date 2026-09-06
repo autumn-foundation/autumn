@@ -49,6 +49,14 @@ created (`autumn destroy scaffold Post title:String`, `--dry-run` supported).
 It never touches a database — only generated files/migrations. On the
 published 0.5.0 CLI, revert by hand (git) instead.
 
+`destroy` refuses to delete a file you edited. `generate` records a digest of
+every file it owns in `.autumn/generated.toml` (commit it), and `destroy`
+deletes a file whose content matches that digest or the current templates.
+A CLI upgrade that changed a template therefore no longer forces `--force`.
+Two cases still need it: a project generated before the manifest existed, and
+a file you edited and want deleted anyway. Re-running `generate <same args>
+--force` re-records the digest and is the better fix for the first.
+
 ## Field type reference
 
 Use the exact tokens below — the DSL parser is case-sensitive and does not

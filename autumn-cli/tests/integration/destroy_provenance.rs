@@ -52,6 +52,9 @@ fn project_with_model(name: &str) -> (tempfile::TempDir, PathBuf) {
     (tmp, project)
 }
 
+/// Mirrors `generate::provenance::text_digest`. `autumn-cli` is a bin-only
+/// crate, so an integration test cannot import it; a drift here fails these
+/// tests rather than passing them.
 fn digest(contents: &str) -> String {
     use sha2::{Digest as _, Sha256};
     hex::encode(Sha256::digest(contents.replace("\r\n", "\n").as_bytes()))
@@ -155,5 +158,13 @@ fn a_project_without_a_manifest_behaves_as_before() {
 fn the_manifest_is_committed_not_ignored() {
     let (_tmp, project) = project_with_model("prov-committed");
     let gitignore = fs::read_to_string(project.join(".gitignore")).unwrap();
-    assert!(!gitignore.contains(".autumn"), "{gitignore}");
+    assert!(
+        !gitignore.lines().any(|line| {
+            let pattern = line.trim().trim_end_matches('/');
+            !pattern.is_empty()
+                && !pattern.starts_with('#')
+                && MANIFEST.starts_with(pattern.trim_start_matches('/'))
+        }),
+        "the baseline must be trackable: {gitignore}"
+    );
 }

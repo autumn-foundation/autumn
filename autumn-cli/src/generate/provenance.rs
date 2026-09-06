@@ -23,7 +23,7 @@
 //! exactly the previous behaviour, `--force` included.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -58,8 +58,8 @@ pub fn bytes_digest(bytes: &[u8]) -> String {
     digest(bytes)
 }
 
-/// SHA-256, hex encoded. Not a commitment to anything — it only has to tell
-/// "these are the bytes Autumn wrote" from "these are not", stably across hosts.
+/// SHA-256, hex encoded. Not used for security — it only has to tell "these are
+/// the bytes Autumn wrote" from "these are not", stably across hosts.
 fn digest(bytes: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
     hex::encode(Sha256::digest(bytes))
@@ -83,8 +83,15 @@ impl Provenance {
     /// Read the manifest under `root`. A missing, unreadable, or malformed
     /// manifest is an empty one: no baseline is the safe answer, never an error
     /// that would abort a generator run.
+    ///
+    /// A symlinked manifest reads as empty too. Read through one and whoever
+    /// controls the target supplies the digests that decide what `destroy`
+    /// deletes — from outside the repository, where no diff shows it.
     #[must_use]
     pub fn load(root: &Path) -> Self {
+        if refuse_symlink(root, &root.join(MANIFEST_PATH)).is_err() {
+            return Self::default();
+        }
         let text = std::fs::read_to_string(root.join(MANIFEST_PATH)).unwrap_or_default();
         let file: ManifestFile = toml::from_str(&text).unwrap_or_default();
         Self {
@@ -140,17 +147,20 @@ impl Provenance {
     /// Write the manifest under `root`, removing it once it holds nothing.
     ///
     /// # Errors
-    /// Filesystem failures, and a symlinked manifest path — writing through one
-    /// could write outside the project.
+    /// Filesystem failures, and a symlinked manifest path — writing or
+    /// unlinking through one could reach outside the project.
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
         let path = root.join(MANIFEST_PATH);
+        // Before the removal below as well as the write: `unlink` resolves the
+        // directories on the way to its target, so a symlinked `.autumn/` would
+        // delete a file outside the project.
+        refuse_symlink(root, &path)?;
         if self.entries.is_empty() {
             return match std::fs::remove_file(&path) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 other => other,
             };
         }
-        refuse_symlink(root, &path)?;
         let body = toml::to_string(&ManifestFile {
             files: self.entries.clone(),
         })
@@ -166,6 +176,11 @@ impl Provenance {
 /// Publish `body` at `path` through a temp file in the same directory, so a
 /// concurrent reader sees either the old manifest or the new one, never a
 /// half-written file.
+///
+/// This makes each save atomic, not the read-modify-write around it: two
+/// generators running in one project at once can still lose one run's entries.
+/// Accepted — the loser's files fall back to comparing against the current
+/// render, which is what `destroy` did before the manifest existed.
 fn write_atomically(directory: &Path, path: &Path, body: &str) -> std::io::Result<()> {
     use std::io::Write as _;
 
@@ -197,10 +212,13 @@ fn refuse_symlink(root: &Path, path: &Path) -> std::io::Result<()> {
         cursor.push(component);
         match std::fs::symlink_metadata(&cursor) {
             // Not there yet — creating it is exactly what a first save does.
-            Err(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            // Anything else is unknown, which is not the same as absent.
+            Err(e) => return Err(e),
             Ok(m) if m.file_type().is_symlink() => {
                 return Err(std::io::Error::other(format!(
-                    "{} is a symlink; writing through it could write outside the project",
+                    "{} is a symlink; reading or writing through it could reach \
+                     outside the project",
                     path.display()
                 )));
             }
@@ -211,10 +229,25 @@ fn refuse_symlink(root: &Path, path: &Path) -> std::io::Result<()> {
 }
 
 /// `path` as a project-relative, forward-slashed manifest key.
+///
+/// Built from ordinary components only. `strip_prefix` is lexical, so
+/// `<root>/../secret` strips to `../secret` — a key naming a file outside the
+/// project. Rejecting anything but [`Component::Normal`] keeps every key
+/// project-relative, and joining the parts spells a key the same way on Windows
+/// as on Unix without rewriting a separator a filename may legitimately hold.
 fn key(root: &Path, path: &Path) -> Option<String> {
-    let relative: PathBuf = path.strip_prefix(root).ok()?.to_path_buf();
-    let key = relative.to_str()?.replace('\\', "/");
-    (!key.is_empty()).then_some(key)
+    let relative = path.strip_prefix(root).ok()?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_str()?),
+            Component::Prefix(_)
+            | Component::RootDir
+            | Component::CurDir
+            | Component::ParentDir => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 #[cfg(test)]

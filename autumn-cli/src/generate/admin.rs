@@ -2486,6 +2486,25 @@ pub struct Account {
     }
 
     #[test]
+    fn destroy_admin_fallback_still_refuses_a_hand_edited_file() {
+        // The #1048 guard under the #1835 code path: the recorded digest makes
+        // the fallback plan usable, and an edit still has to break it.
+        let tmp = project_with_model("post");
+        let plan = plan_admin(tmp.path(), "Post", &["title:String".into()]).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
+        fs::write(tmp.path().join("src/admin/post.rs"), "// my own code\n").unwrap();
+
+        let err = plan_admin_destroy_fallback(tmp.path(), "Post")
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap_err();
+
+        assert!(matches!(err, GenerateError::Diverged(_)));
+        assert!(tmp.path().join("src/admin/post.rs").exists());
+    }
+
+    #[test]
     fn destroy_admin_fallback_without_provenance_still_needs_force() {
         // The pre-#1835 path, still taken by a project generated before the
         // manifest existed: content is unverifiable (the model is gone and

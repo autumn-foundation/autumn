@@ -698,8 +698,8 @@ impl Plan {
 
         // Digests of the files this run actually owns, for `revert` to compare
         // against once the template has moved on (issue #1835). Recorded even
-        // when a later action fails: the files already on disk are ours, and a
-        // re-run has to be able to tell that.
+        // when a later action fails: the files already written are ours, and a
+        // later `destroy` still has to recognise them.
         let mut written: Vec<(PathBuf, String)> = Vec::new();
         let result = self.write_actions(&mut written);
         self.record_provenance(written);
@@ -898,9 +898,46 @@ impl Plan {
         }
 
         let mut touched_dirs: Vec<PathBuf> = Vec::new();
+        // What was actually removed, so the manifest is pruned to match even
+        // when a later removal fails part-way (issue #1835).
+        let mut removed = Removed::default();
+        let result = self.apply_revert(&plan, &mut touched_dirs, &mut removed);
 
+        for dir in touched_dirs {
+            prune_empty_ancestors(dir, &self.project_root);
+        }
+
+        self.forget_provenance(&removed);
+        result?;
+
+        // Nested sub-module declarations (e.g. `src/mailers/mod.rs`'s
+        // `pub mod previews;`) must be synced BEFORE `src/main.rs`'s, so a
+        // now-empty-and-deleted `src/mailers/mod.rs` is already gone by the
+        // time the `mod mailers;` orphan check runs.
+        sync_mod_declarations_in(
+            &self.project_root.join("src").join("mailers"),
+            &["previews"],
+            &self.project_root,
+        );
+        sync_main_rs_mod_declarations(&self.project_root);
+
+        Ok(())
+    }
+
+    /// Delete and rewrite what `plan` calls for, recording what actually went.
+    ///
+    /// Split out of [`Self::revert`] so the manifest is pruned on the error
+    /// path too: a run that removes three files and then fails on the fourth
+    /// must not leave the manifest describing files that are already gone.
+    fn apply_revert(
+        &self,
+        plan: &RevertPlan,
+        touched_dirs: &mut Vec<PathBuf>,
+        removed: &mut Removed,
+    ) -> Result<(), GenerateError> {
         for path in &plan.files_to_remove {
             fs::remove_file(path)?;
+            removed.files.push(path.clone());
             println!("  Removed {}", relative_display(path, &self.project_root));
             if let Some(parent) = path.parent() {
                 touched_dirs.push(parent.to_path_buf());
@@ -909,6 +946,7 @@ impl Plan {
 
         for dir in &plan.migrations_to_remove {
             fs::remove_dir_all(dir)?;
+            removed.dirs.push(dir.clone());
             println!("  Removed {}", relative_display(dir, &self.project_root));
             touched_dirs.push(self.project_root.join("migrations"));
         }
@@ -925,42 +963,26 @@ impl Plan {
                 }
             }
         }
-
-        for dir in touched_dirs {
-            prune_empty_ancestors(dir, &self.project_root);
-        }
-
-        self.forget_provenance(&plan);
-
-        // Nested sub-module declarations (e.g. `src/mailers/mod.rs`'s
-        // `pub mod previews;`) must be synced BEFORE `src/main.rs`'s, so a
-        // now-empty-and-deleted `src/mailers/mod.rs` is already gone by the
-        // time the `mod mailers;` orphan check runs.
-        sync_mod_declarations_in(
-            &self.project_root.join("src").join("mailers"),
-            &["previews"],
-            &self.project_root,
-        );
-        sync_main_rs_mod_declarations(&self.project_root);
-
         Ok(())
     }
 
-    /// Drop the provenance entries for everything this revert removed, so the
-    /// manifest never outlives the files it describes (issue #1835) — a stale
-    /// entry would otherwise vouch for whatever is written at that path next.
+    /// Drop the provenance entries for the files this revert removed, so the
+    /// manifest does not outlive what it describes (issue #1835).
     ///
     /// Best effort, like [`Self::record_provenance`]: the files are already
     /// gone, and failing here would report a destroy that in fact succeeded.
-    fn forget_provenance(&self, plan: &RevertPlan) {
+    fn forget_provenance(&self, removed: &Removed) {
+        if removed.files.is_empty() && removed.dirs.is_empty() {
+            return;
+        }
         let mut recorded = provenance::Provenance::load(&self.project_root);
         if recorded.is_empty() {
             return;
         }
-        for path in &plan.files_to_remove {
+        for path in &removed.files {
             recorded.forget(&self.project_root, path);
         }
-        for dir in &plan.migrations_to_remove {
+        for dir in &removed.dirs {
             recorded.forget_dir(&self.project_root, dir);
         }
         if let Err(e) = recorded.save(&self.project_root) {
@@ -1212,6 +1234,15 @@ impl Plan {
             warnings,
         }
     }
+}
+
+/// What a real [`Plan::revert`] actually deleted — the plan minus whatever a
+/// mid-run failure stopped it from reaching. The provenance manifest is pruned
+/// against this, never against the plan (issue #1835).
+#[derive(Default)]
+struct Removed {
+    files: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
 }
 
 /// The concrete result of [`Plan::compute_revert_plan`] — everything
@@ -1594,32 +1625,42 @@ enum MigrationOutcome {
 /// disambiguate between multiple same-suffix migration directories, so it
 /// never honours `--force` (a loose match here would let `--force` guess
 /// wrong on top of bypassing safety, rather than just bypassing safety).
-fn migration_dir_matches_actions(
-    dir: &Path,
-    actions: &[&Action],
-    recorded: &provenance::Provenance,
-    project_root: &Path,
-) -> bool {
+/// Compares against the current render only, never a recorded digest: this
+/// picks WHICH directory to delete, out of candidates found by scanning
+/// `migrations/`, rather than gating a path the plan already named. The
+/// manifest is project content, so honouring it here would let a crafted or
+/// stale entry aim `remove_dir_all` at a hand-written migration. Candidates
+/// that no longer match the current render stay `Ambiguous` — the pre-#1835
+/// answer, and the safe one. Provenance still relaxes the per-file check once
+/// one directory has been identified.
+fn migration_dir_matches_actions(dir: &Path, actions: &[&Action]) -> bool {
     actions.iter().all(|action| {
         let Some(file_name) = action.path().file_name() else {
             return true;
         };
-        if matches!(action, Action::Modify { .. }) {
-            return true;
-        }
-        is_generator_output(action, &dir.join(file_name), recorded, project_root)
+        let expected: &str = match action {
+            Action::Create { contents, .. } | Action::CreateIfAbsent { contents, .. } => contents,
+            Action::CreateBytes { .. } | Action::Modify { .. } => return true,
+        };
+        fs::read_to_string(dir.join(file_name)).is_ok_and(|actual| actual == *expected)
     })
 }
 
-/// Whether the file at `path` is this generator's own output.
+/// Whether the file at `path` is generator output rather than a developer's.
 ///
-/// True when it matches what the plan would write now, and also when it
+/// True when it matches what this plan would write now, and also when it
 /// matches the digest `generate` recorded for it — the same file, written by a
 /// CLI whose template has since moved on (issue #1835). A developer's edit
 /// matches neither, and stays protected.
 ///
-/// A `Modify` target is shared, never owned by one plan; callers filter those
-/// out before reaching here.
+/// The recorded digest is keyed by PATH, not by which plan wrote it, so a file
+/// one generator owns also reads as generator output to another plan naming
+/// the same path. That is deliberate: the caller has already decided the path
+/// belongs to the resource being destroyed, and the question left here is only
+/// whether a human has since changed the file.
+///
+/// A `Modify` target is shared, never owned by one plan; every caller filters
+/// those out first, and the arm below is the belt-and-braces answer.
 fn is_generator_output(
     action: &Action,
     path: &Path,
@@ -1699,7 +1740,7 @@ fn resolve_migration_removal(
             // non-deterministic).
             let mut matching: Vec<PathBuf> = candidates
                 .into_iter()
-                .filter(|dir| migration_dir_matches_actions(dir, actions, recorded, project_root))
+                .filter(|dir| migration_dir_matches_actions(dir, actions))
                 .collect();
             if matching.len() != 1 {
                 return MigrationOutcome::Ambiguous(suffix.to_owned());
@@ -2664,6 +2705,214 @@ mod tests {
         newer.revert(Flags::default()).unwrap();
 
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn provenance_accumulates_across_generator_runs() {
+        let (tmp, mut first) = fixture();
+        first.create(tmp.path().join("src/models/post.rs"), "// post\n");
+        first.execute(Flags::default()).unwrap();
+
+        let mut second = Plan::new(tmp.path());
+        second.create(tmp.path().join("src/models/comment.rs"), "// comment\n");
+        second.execute(Flags::default()).unwrap();
+
+        let recorded = provenance::Provenance::load(tmp.path());
+        assert!(
+            recorded.contains("src/models/post.rs"),
+            "a second generator must not drop the first's baseline"
+        );
+        assert!(recorded.contains("src/models/comment.rs"));
+    }
+
+    #[test]
+    fn destroying_one_resource_keeps_another_resources_provenance() {
+        let (tmp, mut first) = fixture();
+        let post = tmp.path().join("src/models/post.rs");
+        first.create(post.clone(), "// post\n");
+        first.execute(Flags::default()).unwrap();
+
+        let mut second = Plan::new(tmp.path());
+        let comment = tmp.path().join("src/models/comment.rs");
+        second.create(comment.clone(), "// comment\n");
+        second.execute(Flags::default()).unwrap();
+
+        first.revert(Flags::default()).unwrap();
+
+        assert!(!post.exists());
+        assert!(comment.exists(), "a sibling resource survives");
+        let recorded = provenance::Provenance::load(tmp.path());
+        assert!(!recorded.contains("src/models/post.rs"));
+        assert!(recorded.contains("src/models/comment.rs"));
+    }
+
+    #[test]
+    fn a_recorded_path_reads_as_generator_output_to_any_plan_naming_it() {
+        // The digest is keyed by path, not by which plan wrote it. A plan that
+        // names a recorded path therefore deletes it even though the plan's own
+        // render differs — the caller has already decided the path belongs to
+        // the resource being destroyed. Pinned so the widening is deliberate.
+        let (tmp, mut written_by) = fixture();
+        let shared_path = tmp.path().join("src/controllers/post.rs");
+        written_by.create(shared_path.clone(), "// written by the scaffold\n");
+        written_by.execute(Flags::default()).unwrap();
+
+        let mut other = Plan::new(tmp.path());
+        other.create(
+            shared_path.clone(),
+            "// what the controller generator renders\n",
+        );
+        other.revert(Flags::default()).unwrap();
+
+        assert!(!shared_path.exists());
+    }
+
+    #[test]
+    fn execute_records_provenance_even_when_a_later_action_fails() {
+        let (tmp, mut plan) = fixture();
+        let good = tmp.path().join("src/models/post.rs");
+        // A directory cannot be overwritten by a file write.
+        let blocked = tmp.path().join("src/models/blocked.rs");
+        fs::create_dir_all(&blocked).unwrap();
+
+        plan.create(good.clone(), "// post\n");
+        plan.create(blocked, "// never lands\n");
+        plan.execute(Flags {
+            dry_run: false,
+            force: true,
+        })
+        .unwrap_err();
+
+        assert!(good.exists());
+        assert!(
+            provenance::Provenance::load(tmp.path()).contains("src/models/post.rs"),
+            "a file already written is still ours"
+        );
+    }
+
+    #[test]
+    fn revert_prunes_provenance_for_what_it_removed_before_failing() {
+        let (tmp, mut plan) = fixture();
+        let removable = tmp.path().join("a.rs");
+        let blocked = tmp.path().join("z.rs");
+        plan.create(removable.clone(), "// a\n");
+        plan.create(blocked.clone(), "// z\n");
+        plan.execute(Flags::default()).unwrap();
+
+        // Replace the second target with a directory: `remove_file` fails on it.
+        fs::remove_file(&blocked).unwrap();
+        fs::create_dir_all(&blocked).unwrap();
+
+        plan.revert(Flags {
+            dry_run: false,
+            force: true,
+        })
+        .unwrap_err();
+
+        assert!(!removable.exists());
+        assert!(
+            !provenance::Provenance::load(tmp.path()).contains("a.rs"),
+            "an entry must never outlive the file it describes"
+        );
+    }
+
+    #[test]
+    fn destroying_a_migration_prunes_its_provenance_entries() {
+        no_db_env(|| {
+            let (tmp, mut plan) = fixture();
+            let dir = tmp.path().join("migrations/20260101000000_create_posts");
+            plan.create(dir.join("up.sql"), "CREATE TABLE posts ();\n");
+            plan.create(dir.join("down.sql"), "DROP TABLE posts;\n");
+            plan.execute(Flags::default()).unwrap();
+            assert!(
+                provenance::Provenance::load(tmp.path())
+                    .contains("migrations/20260101000000_create_posts/up.sql")
+            );
+
+            let mut newer = Plan::new(tmp.path());
+            let fresh = tmp.path().join("migrations/99999999999999_create_posts");
+            newer.create(fresh.join("up.sql"), "CREATE TABLE posts ();\n");
+            newer.create(fresh.join("down.sql"), "DROP TABLE posts;\n");
+            newer.revert(Flags::default()).unwrap();
+
+            let recorded = provenance::Provenance::load(tmp.path());
+            assert!(!recorded.contains("migrations/20260101000000_create_posts/up.sql"));
+            assert!(!recorded.contains("migrations/20260101000000_create_posts/down.sql"));
+        });
+    }
+
+    #[test]
+    fn same_suffix_migrations_are_disambiguated_by_the_current_render_alone() {
+        // Two directories share a suffix. One still matches what the plan
+        // renders; the other only matches its own recorded digest. Selection
+        // must follow the render, so manifest content can never aim
+        // `remove_dir_all` at the wrong directory.
+        no_db_env(|| {
+            let (tmp, mut older) = fixture();
+            let older_dir = tmp.path().join("migrations/20260101000000_create_posts");
+            older.create(older_dir.join("up.sql"), "CREATE TABLE posts (old INT);\n");
+            older.create(older_dir.join("down.sql"), "DROP TABLE posts;\n");
+            older.execute(Flags::default()).unwrap();
+
+            let mut current = Plan::new(tmp.path());
+            let current_dir = tmp.path().join("migrations/20260202000000_create_posts");
+            current.create(current_dir.join("up.sql"), "CREATE TABLE posts ();\n");
+            current.create(current_dir.join("down.sql"), "DROP TABLE posts;\n");
+            current.execute(Flags::default()).unwrap();
+
+            let mut destroy = Plan::new(tmp.path());
+            let fresh = tmp.path().join("migrations/99999999999999_create_posts");
+            destroy.create(fresh.join("up.sql"), "CREATE TABLE posts ();\n");
+            destroy.create(fresh.join("down.sql"), "DROP TABLE posts;\n");
+            destroy.revert(Flags::default()).unwrap();
+
+            assert!(!current_dir.exists(), "the matching directory is removed");
+            assert!(older_dir.exists(), "the other one is never guessed at");
+        });
+    }
+
+    #[test]
+    fn a_crlf_rewritten_binary_asset_is_still_divergence() {
+        let (tmp, mut plan) = fixture();
+        let asset = tmp.path().join("static/vendor.bin");
+        plan.create_bytes(asset.clone(), b"a\nb".to_vec());
+        plan.execute(Flags::default()).unwrap();
+        fs::write(&asset, b"a\r\nb").unwrap();
+
+        let err = plan.revert(Flags::default()).unwrap_err();
+
+        assert!(matches!(err, GenerateError::Diverged(_)));
+        assert!(asset.exists(), "bytes are never LF-normalised");
+    }
+
+    #[test]
+    fn a_modify_only_plan_records_nothing() {
+        let (tmp, mut plan) = fixture();
+        plan.modify(tmp.path().join("src/main.rs"), "fn main() {}\n");
+        plan.execute(Flags::default()).unwrap();
+
+        assert!(!tmp.path().join(provenance::MANIFEST_PATH).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_generator_run_still_writes_its_files_when_provenance_cannot_be_recorded() {
+        let (tmp, mut plan) = fixture();
+        let outside = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join(".autumn")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("escaped.toml"),
+            tmp.path().join(provenance::MANIFEST_PATH),
+        )
+        .unwrap();
+
+        let target = tmp.path().join("out.txt");
+        plan.create(target.clone(), "hello");
+        plan.execute(Flags::default())
+            .expect("recording is best effort, never fatal to a generator run");
+
+        assert!(target.exists());
+        assert!(!outside.path().join("escaped.toml").exists());
     }
 
     #[test]
