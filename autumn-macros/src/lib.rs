@@ -23,6 +23,7 @@ mod edge;
 mod edge_routes_macro;
 mod event;
 mod feature_flag;
+mod graph;
 mod i18n;
 mod idempotency_guard;
 mod inbound_mail;
@@ -284,9 +285,40 @@ pub fn paths(input: TokenStream) -> TokenStream {
 ///         .await;
 /// }
 /// ```
+///
+/// # Runtime arguments
+///
+/// All optional; with none of them the runtime is
+/// `Builder::new_multi_thread().enable_all()`, tokio's own defaults.
+///
+/// | Argument | Value | Effect |
+/// | --- | --- | --- |
+/// | `flavor` | `"multi_thread"` (default) or `"current_thread"` | picks the `Builder` constructor |
+/// | `worker_threads` | `usize` expression | `Builder::worker_threads` (multi-thread only) |
+/// | `max_blocking_threads` | `usize` expression | `Builder::max_blocking_threads` |
+/// | `thread_name` | `Into<String>` expression | `Builder::thread_name` |
+/// | `thread_stack_size` | `usize` expression | `Builder::thread_stack_size` |
+/// | `thread_keep_alive` | duration string, e.g. `"30s"` | `Builder::thread_keep_alive` |
+/// | `configure` | path to `fn(&mut tokio::runtime::Builder)` | runs last, after the arguments above |
+///
+/// ```ignore
+/// fn tune_runtime(builder: &mut autumn_web::reexports::tokio::runtime::Builder) {
+///     builder.on_thread_start(|| eprintln!("runtime thread started"));
+/// }
+///
+/// #[autumn_web::main(worker_threads = 4, thread_name = "autumn-worker", configure = tune_runtime)]
+/// async fn main() {
+///     autumn_web::app().routes(routes![hello]).run().await;
+/// }
+/// ```
+///
+/// The numeric arguments take arbitrary expressions, not just literals, so
+/// `worker_threads = std::thread::available_parallelism().map_or(4, |n| n.get())`
+/// works. `configure` is the escape hatch for `Builder` methods this list does
+/// not name.
 #[proc_macro_attribute]
-pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    main_macro::main_macro(item.into()).into()
+pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
+    main_macro::main_macro(attr.into(), item.into()).into()
 }
 
 /// Annotate an async function as a deterministic simulation test (S-1797, W1).

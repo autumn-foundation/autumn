@@ -1798,17 +1798,14 @@ impl RequestBuilder {
             return Err(err);
         }
 
-        // Replay serves outbound calls from the capsule's effect tape (#1634)
-        // and never dials the peer. A call the tape cannot answer is a
-        // divergence, already logged by `next_http`, and fails closed here.
-        //
-        // The unconditional block below stays as the backstop for a replay
-        // process whose current task carries no tape — app boot, a state
-        // initializer, work the handler spawned — because a capsule records no
-        // response for any of those either. The check is here rather than on
-        // the client because a handler can build one any way it likes
-        // (`Client::new()`, `from_state`, a stored one) and every path must be
-        // closed.
+        // Replay serves outbound calls from the capsule's effect tape (#1634) and never
+        // dials the peer. A call the tape cannot answer is a divergence, already logged by
+        // `next_http`, and fails closed here. The unconditional block below stays as the
+        // backstop for a replay process whose current task carries no tape — app boot, a
+        // state initializer, work the handler spawned — because a capsule records no
+        // response for any of those either. The check is here rather than on the client
+        // because a handler can build one any way it likes (`Client::new()`, `from_state`,
+        // a stored one) and every path must be closed.
         #[cfg(feature = "reporting")]
         if let Some(tape) = crate::capsule::effects::current_tape() {
             let method = self.method.to_string();
@@ -2108,15 +2105,14 @@ impl RequestBuilder {
             ));
         }
 
-        // Reject `pin_to` on an IP-literal URL host up front — deterministically,
-        // before any network I/O. reqwest/hyper treat an IP-literal host as
-        // already-resolved and do NOT consult the DNS resolver, so the
-        // `resolve_to_addrs` override installed by `build_oneshot_client` (which
-        // is what enforces the pin) is skipped and the socket connects to the
-        // literal in the URL rather than the pinned address — silently violating
-        // `pin_to`'s documented guarantee. `get_ssrf_safe` never sets `pin_addr`
-        // (and validates+connects to the same literal, so it stays safe), so this
-        // guard targets only the explicit `pin_to` primitive.
+        // Reject `pin_to` on an IP-literal URL host up front, deterministically, before
+        // any network I/O. reqwest and hyper treat an IP-literal host as already resolved
+        // and do not consult the DNS resolver, so the `resolve_to_addrs` override
+        // `build_oneshot_client` installs — which is what enforces the pin — is skipped
+        // and the socket connects to the literal in the URL rather than the pinned
+        // address, silently violating `pin_to`'s documented guarantee. `get_ssrf_safe`
+        // never sets `pin_addr`, and validates and connects to the same literal, so it
+        // stays safe; this guard targets only the explicit `pin_to` primitive.
         if self.pin_addr.is_some() && url_host_is_ip_literal(&self.url)? {
             return Err(ClientError::PinRequiresDomainHost(
                 "pin_to cannot be honored for an IP-literal URL host because the \
@@ -3369,19 +3365,17 @@ mod tests {
         assert!(other.base_url.is_none());
     }
 
-    // PR #2480 review, round 4 (redesign): `breaker_scoped()` moved breaker
-    // accounting for the custom send path from an external wrapper
-    // (`BreakerGuardedCall`, now removed) to a flag `send_recorded` itself
-    // reads — which is what makes the mock bypass, the capsule-replay bypass,
-    // and correct capsule *recording* of an open-breaker attempt all free:
-    // they were already correctly ordered around `send_recorded` before this
-    // flag existed, for every other caller.
+    // PR #2480 review, round 4 (redesign): `breaker_scoped()` moved breaker accounting for
+    // the custom send path from an external wrapper — `BreakerGuardedCall`, now removed —
+    // to a flag `send_recorded` itself reads. That is what makes the mock bypass, the
+    // capsule-replay bypass, and correct capsule recording of an open-breaker attempt all
+    // free: they were already correctly ordered around `send_recorded` before this flag
+    // existed, for every other caller.
     //
-    // This test locks in the one thing the external wrapper got wrong (P1,
-    // round 1): keying the breaker by the alias a caller passed to
-    // `post`/`get`/etc. rather than the expanded destination. `self.url` is
-    // set once, by `Client::build_request`, before any `breaker_scoped()` /
-    // `ssrf_safe()` flag is even read — so there is no separate "pass the
+    // This test locks in the one thing the external wrapper got wrong (P1, round 1):
+    // keying the breaker by the alias a caller passed to `post`/`get` rather than the
+    // expanded destination. `self.url` is set once, by `Client::build_request`, before any
+    // `breaker_scoped()` or `ssrf_safe()` flag is read, so there is no separate "pass the
     // right URL" step left to get wrong.
     #[test]
     fn breaker_scoped_keys_by_resolved_url_not_alias() {

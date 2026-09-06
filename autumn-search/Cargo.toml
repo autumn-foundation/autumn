@@ -41,5 +41,9 @@ testcontainers-modules = { workspace = true }
 # tests lay out a throwaway project directory rather than mocking the loader.
 tempfile = "3"
 
+[[bench]]
+name = "keyword_search"
+harness = false
+
 [lints]
 workspace = true

@@ -68,6 +68,7 @@ fn list_tasks(binary: &std::path::Path, opts: &TaskOptions<'_>) {
         // where the task listing JSON is expected.
         .env_remove(crate::data_flow::DUMP_ENV)
         .env_remove(crate::agents::DUMP_ENV)
+        .env_remove(crate::graph::DUMP_ENV)
         .env("AUTUMN_ENV", opts.profile)
         .env("AUTUMN_PROFILE", opts.profile)
         .stdout(Stdio::piped())
@@ -116,6 +117,7 @@ fn run_task(binary: &std::path::Path, opts: &TaskOptions<'_>) {
         // without ever running the task.
         .env_remove(crate::data_flow::DUMP_ENV)
         .env_remove(crate::agents::DUMP_ENV)
+        .env_remove(crate::graph::DUMP_ENV)
         .env("AUTUMN_TASK_ARGS_JSON", args_json)
         .env("AUTUMN_ENV", opts.profile)
         .env("AUTUMN_PROFILE", opts.profile)

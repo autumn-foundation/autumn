@@ -160,6 +160,14 @@ const SAFE_FREE_FNS: &[&str] = &["drop"];
 /// query issued through it is still counted.
 const HANDLE_ACCESSORS: &[&str] = &["db", "repo", "repository", "pool", "conn", "connection"];
 
+/// `Result`/`Option`-unwrapping methods that stand in for the `?` operator
+/// (`ctx.conn().await.expect("connection")`, the documented shape in
+/// `autumn/src/seed.rs`) without themselves issuing a query. Deliberately
+/// narrow: only the two spellings actually used for this in the codebase —
+/// `.ok()`, `.unwrap_or_else(...)`, and friends are a known, unaddressed gap
+/// (see `docs/guide/query-budgets.md` update tracking #2546).
+const RESULT_UNWRAP_METHODS: &[&str] = &["expect", "unwrap"];
+
 /// Exact type names that name a database handle.
 const HANDLE_TYPES: &[&str] = &[
     "Db",
@@ -1119,6 +1127,30 @@ impl Analyzer {
             Expr::RawAddr(r) => self.expr_is_handle(&r.expr),
             Expr::Paren(p) => self.expr_is_handle(&p.expr),
             Expr::Group(g) => self.expr_is_handle(&g.expr),
+            // `self.conn().await?` is a common shape for a fallible/async
+            // handle accessor (a pooled connection getter) — without peeling
+            // `.await`/`?`, `conn` in `let mut conn = self.conn().await?;`
+            // silently falls through to "not a handle," and every later
+            // query issued through `conn` goes uncounted with no diagnostic
+            // at all (#2546 review). Deliberately recurses into the
+            // *narrower* `awaited_expr_is_fresh_handle`, not `expr_is_handle`
+            // itself: peeling through to a bare `Expr::Path` here would
+            // re-derive handle-ness from `chain_root_is_handle`'s "deferred
+            // future" tracking (`let pending = repo.find_all(); let rows =
+            // pending.await?;`) and wrongly mark `rows` — the resolved
+            // `Vec<Post>` — as a handle too, miscounting a harmless
+            // `rows.len()` as another query (caught by the existing
+            // `a_deferred_repository_future_is_counted_once` unit test).
+            //
+            // Deliberately has NO matching `Expr::Await` arm here (only
+            // `Expr::Try`, which peels through its own inner `Await` via
+            // `awaited_expr_is_fresh_handle`): a *fallible* accessor's
+            // `.await` alone yields `Result<Conn, E>`, not `Conn` — only the
+            // `?` actually unwraps to the handle. Promoting a bare
+            // `self.conn().await` (no `?`) would treat that `Result` itself
+            // as a handle, so a later `result.is_err()` or `.unwrap()` call
+            // gets miscounted as a query (#2546 review, round 3).
+            Expr::Try(t) => self.awaited_expr_is_fresh_handle(&t.expr),
             Expr::Unary(u) => matches!(u.op, syn::UnOp::Deref(_)) && self.expr_is_handle(&u.expr),
             // A field of a handle is a handle (`db.inner`), and so is a field
             // that conventionally holds one (`self.repo`, `state.db`) — a
@@ -1128,6 +1160,39 @@ impl Analyzer {
                 let method = mc.method.to_string();
                 if HANDLE_ACCESSORS.contains(&method.as_str()) {
                     return true;
+                }
+                // `.expect(...)`/`.unwrap()` stand in for `?` on a fallible
+                // accessor (`ctx.conn().await.expect("connection")`, #2546
+                // review round 5) — the unwrap call itself issues nothing,
+                // so it is never counted, but the value it unwraps can still
+                // be a fresh handle. Recurses into the narrower
+                // `awaited_expr_is_fresh_handle`, not `expr_is_handle`, for
+                // the same reason `Expr::Try` does below: a bare
+                // `Expr::Path` here must not re-derive handle-ness from
+                // `chain_root_is_handle`'s unrelated deferred-future
+                // tracking.
+                //
+                // KNOWN LIMITATION (#2546 review, round 7): splitting the
+                // accessor call and the unwrap across two statements
+                // (`let result = ctx.conn().await; let mut db =
+                // result.unwrap();`) still isn't caught — the receiver here
+                // is `Expr::Path("result")`, which `awaited_expr_is_fresh_handle`
+                // deliberately never matches (that is what keeps round
+                // three's `result.is_err()` case from being miscounted).
+                // Catching the split form soundly would mean tracking a
+                // *third* binding state alongside "is a handle" and "is
+                // not" — "is a `Result` that becomes a handle once
+                // unwrapped" — threaded through every place `handles` is
+                // scoped and restored (`block`, `enter_binding_scope`,
+                // `rebind`, tuple destructuring). That is a real,
+                // structural change to the analyzer's state model, not
+                // another naming-list entry, and this round's evidence is
+                // a constructed example rather than a concrete occurrence
+                // in this codebase (unlike rounds two, five, and six, each
+                // pinned to a real file:line). Left as an acknowledged gap
+                // rather than taken on speculatively.
+                if RESULT_UNWRAP_METHODS.contains(&method.as_str()) {
+                    return self.awaited_expr_is_fresh_handle(&mc.receiver);
                 }
                 HANDLE_BUILDERS.contains(&method.as_str()) && self.expr_is_handle(&mc.receiver)
             }
@@ -1149,6 +1214,63 @@ impl Analyzer {
         }
     }
 
+    /// The peeled target of a `.await`/`?`: does *this* expression freshly
+    /// produce a handle, as opposed to naming a variable that was already
+    /// tracked by `chain_root_is_handle`'s deferred-future provenance?
+    /// Deliberately omits `Expr::Path` (and anything that bottoms out in
+    /// one) — see the comment on `expr_is_handle`'s `Expr::Await`/`Expr::Try`
+    /// arms for why re-deriving handle-ness from a bound name here is wrong.
+    fn awaited_expr_is_fresh_handle(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Reference(r) => self.awaited_expr_is_fresh_handle(&r.expr),
+            Expr::RawAddr(r) => self.awaited_expr_is_fresh_handle(&r.expr),
+            Expr::Paren(p) => self.awaited_expr_is_fresh_handle(&p.expr),
+            Expr::Group(g) => self.awaited_expr_is_fresh_handle(&g.expr),
+            Expr::Await(a) => self.awaited_expr_is_fresh_handle(&a.base),
+            Expr::Try(t) => self.awaited_expr_is_fresh_handle(&t.expr),
+            Expr::Field(f) => self.expr_is_handle(&f.base) || member_is_handle_accessor(&f.member),
+            // Deliberately checks only `HANDLE_ACCESSORS`, never
+            // `HANDLE_BUILDERS`: reaching this arm means the call was
+            // *awaited* (peeled through `Expr::Await`/`Expr::Try` above), and
+            // the method-chain cost counter's own rule is that an awaited
+            // builder-named call "really did run" as the terminal query — "a
+            // user finder may share a builder's name." So `let rows =
+            // repo.page(1).await?;` is correctly counted as one query by
+            // that counter, but `rows` itself is the query's *result*, not a
+            // handle; matching `HANDLE_BUILDERS` here as well would promote
+            // `rows` too and miscount a later `rows.len()` as a second query
+            // (#2546 review, round 4). A `HANDLE_ACCESSORS` name is
+            // different: those never issue a query even when awaited — they
+            // only ever produce a handle to query with next.
+            //
+            // KNOWN LIMITATION (#2546 review, round 6): a checkout idiom
+            // like `db.pool().get().await?` (deadpool/bb8-style, and the
+            // shape `autumn-cli`'s own generated scaffold tests emit at
+            // `autumn-cli/src/generate/scaffold.rs:14419`) is *not* caught
+            // here — `get` is not a recognized accessor name, so this falls
+            // through to `false`. A fix was attempted: recurse into the
+            // receiver for any non-accessor terminal name, so `get` would
+            // inherit handle-ness from the `pool` accessor beneath it. That
+            // did catch the checkout idiom, but it is syntactically
+            // indistinguishable from a genuine terminal query made through
+            // an accessor-obtained handle
+            // (`state.db().find_recipients(...).await?`, the exact shape
+            // `query_budget_job_shaped_accessor_batched.rs` already pins as
+            // required to compile clean) — both are "some name, chained off
+            // an accessor call, then awaited." Recursing into the receiver
+            // fixed the former and silently reintroduced round four's exact
+            // regression on the latter, verified with the same fixture and
+            // reverted before landing. There is no reliable syntactic
+            // signal — no type information is available to this proc
+            // macro — that tells "a checkout wrapper" apart from "a named
+            // query" when both share this shape, so this stays a real,
+            // acknowledged boundary of the analysis rather than a bug
+            // fixable by another naming heuristic.
+            Expr::MethodCall(mc) => HANDLE_ACCESSORS.contains(&mc.method.to_string().as_str()),
+            _ => false,
+        }
+    }
+
     /// Does a block *evaluate to* a handle — i.e. does its tail expression?
     fn block_tail_is_handle(&self, block: &Block) -> bool {
         match block.stmts.last() {
@@ -1165,6 +1287,22 @@ impl Analyzer {
             }
             Expr::Paren(p) => self.chain_root_is_handle(&p.expr),
             Expr::Group(g) => self.chain_root_is_handle(&g.expr),
+            // Deliberately does NOT peel `Expr::Await`/`Expr::Try` the way
+            // `expr_is_handle` does: this function backs `bind_handles`'
+            // "future built but not yet awaited" tracking (`let fut =
+            // repo.find_all();` — the doc's "a repository future is counted
+            // where it is built, not where it is awaited"), where *any*
+            // chain rooted at a handle should keep provenance even through a
+            // non-accessor terminal call. Peeling here would make an
+            // already-awaited, already-resolved query result (`let posts =
+            // repo.find_all().await?;`) register as a handle too — `posts`
+            // is a `Vec<Post>`, and a bare `.len()` on it was miscounted as
+            // a third query before this comment was added (regression
+            // caught by the existing `query_budget_over_budget.rs`
+            // fixture). `expr_is_handle`'s own `Expr::Await`/`Expr::Try` arms
+            // already cover the real gap (an accessor call like
+            // `self.conn().await?`) without this broader, unawaited-chain
+            // reach.
             _ => false,
         }
     }
@@ -1184,6 +1322,13 @@ impl Analyzer {
             Expr::RawAddr(r) => self.expr_carries_handle(&r.expr),
             Expr::Paren(p) => self.expr_carries_handle(&p.expr),
             Expr::Group(g) => self.expr_carries_handle(&g.expr),
+            // No separate `Expr::Await`/`Expr::Try` arms: the `expr_is_handle`
+            // check above already covers them via `awaited_expr_is_fresh_handle`,
+            // which deliberately does not fall through to a bare `Expr::Path`
+            // — recursing into the full `expr_carries_handle` here instead
+            // would reach `Expr::Path` through its own `Expr::Await`/`Expr::Try`
+            // (if added) and reintroduce the same false-positive this file
+            // documents on `expr_is_handle`.
             _ => false,
         }
     }

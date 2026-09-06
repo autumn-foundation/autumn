@@ -7,7 +7,182 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **plugin-sandbox:** three consequences of #1632 that an existing sandbox
+  embedder will notice. `SandboxManifest` gains `grants` and `quotas` fields, so
+  a struct literal over it needs two more lines — prefer `SandboxManifest::parse`
+  and edit the public fields of what comes back, which is unaffected;
+  `SandboxManifest::grants(cap)` is renamed `is_granted(cap)`, because `grants`
+  is now the field holding what each capability is scoped to. The per-request
+  host footprint gained the capability reply queue and the audit ledger, so a
+  manifest tuned to the previous ceiling may now be refused at load with
+  `LimitOutOfRange` on "the per-request host footprint × max_concurrency" —
+  lower `max_concurrency` or `max_response_bytes` (an otherwise-default manifest
+  still admits `max_concurrency = 16`). And the `autumn plugin-check` gating
+  line for a sandboxed plugin now reads "no session, auth, filesystem or
+  environment capability" and names the grant scopes, rather than claiming no
+  database or network capability over a manifest that holds one — and it is
+  carried by a `capability-grants` check present on every sandboxed report,
+  rather than only by the sensitive-surfaces check, which a plugin whose prefix
+  is not named like `/admin` never reaches. Non-breaking
+  for the stable surface: all of it is behind the non-default `plugin-sandbox`
+  feature, which `STABILITY.md` places outside SemVer.
+
 ### Added
+
+- **plugin-sandbox:** the capability vocabulary grows past request handling
+  (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
+  `http-outbound`, `db`, `jobs` and `render` beside `http-request`, and a new
+  `[grants]` table says what each is scoped to — hostnames, plugin-owned tables,
+  job types, render slots — with per-request `[quotas]` an operator can tune.
+  The guest asks over the NDJSON channel it already answers on
+  (`{"op":"call","call":"kv-get",…}` → `{"op":"call_result",…}`), so **a plugin
+  granted every capability imports exactly what a plugin granted none imports**
+  and the #1609 escape corpus keeps proving what it proved. Scoping is by
+  derivation rather than by check: the guest names a logical key, table, host or
+  job type and the host derives the physical one from the manifest and the
+  active tenant, so cross-tenant and host-table access are unspellable rather
+  than refused. Render hooks return a fragment *tree* the host renders, not HTML
+  it sanitises — no parser, so no parser differential — and a hook that traps,
+  overruns its fuel or emits a tag the renderer will not produce omits the
+  fragment rather than taking the page down with it. Every call, allowed or
+  refused, lands
+  in a bounded per-plugin activity log that answers "what did this plugin do in
+  the last hour" from one surface: hosts called, KV/DB usage, jobs enqueued,
+  denials and quota hits, recorded as shapes and never as values — and, when a
+  plugin outruns its own ledger, a line saying every count below it is a floor.
+  The `jobs` capability **enqueues**; running the result is the host's, and this
+  wire version has no frame for delivering a job back into a guest.
+  `autumn plugin inspect --against <installed-artifact>` reviews an upgrade as
+  an upgrade — capabilities, grant lists, quotas, **routes and resource
+  ceilings**, since a new route is an endpoint nobody approved and a raised
+  `fuel` is authority that touches no capability name — printing exactly what
+  grew and exiting non-zero when anything did. `autumn plugin inspect`
+  (text and JSON) now carries the grant lists and quotas, and stops printing
+  "no database access" over a manifest that was just granted `db`. Fifteen-plus
+  adversarial corpus of cross-capability escape attempts runs end-to-end through
+  the real interpreter in `tests/integration/plugin_sandbox_capabilities.rs`.
+  Every result the guest can size is bounded before it is built rather than
+  after: a row carries at most 256 KiB across its columns (checked on the way
+  *in*, so a stored row can always be read back), one `db-get`/`db-query` answer
+  carries at most 512 KiB and says `"truncated": true` when that cut it short,
+  and the budget travels into `PluginStore::query` so a store never materialises
+  what the reply would discard — with an `after` cursor so a page that was cut
+  can actually be continued, and a query filter refusing `row_id` because
+  stripping it would turn "the row with this id" into "every row this tenant
+  has". The outbound response-header ceilings travel into `OutboundRequest`
+  beside `max_response_bytes`, the render context is bounded before it is cloned
+  onto a worker, and `CacheKvStore` uses the serde-aware cache API so a plugin's
+  KV survives on a cross-replica backend rather than silently storing nothing. The shipped `MemoryJobSink` has a finite default
+  depth and no unbounded spelling — this slice ships no consumer that drains it.
+  The activity log counts what it evicts as well as what a per-request ledger
+  overflowed, and both are timestamped and windowed like ordinary events, so a
+  "last hour" neither presents the last twenty seconds as the hour nor carries a
+  lifetime total into a window the calls were not in. See
+  `docs/guide/sandboxed-plugins.md`. **Non-breaking**: everything here is behind
+  the non-default `plugin-sandbox` feature, which `STABILITY.md` already places
+  outside SemVer, and a first-slice manifest parses and runs unchanged —
+  `[grants]` and `[quotas]` both default, and an unknown capability name is
+  still a refusal rather than a silently dropped grant. The only source-level
+  change for an embedder is that `SandboxManifest` gains `grants`/`quotas` and
+  `SandboxOutcome` gains `activity`, so a struct literal over either must name
+  the new fields.
+- **deploy:** `autumn deploy check` now prints the same config-manifest signal
+  `autumn deploy up` already prints (#1952 check/up parity) — a confirming
+  line naming the `autumn.toml` (and, when present, `autumn-<profile>.toml`)
+  that will be uploaded, or the loud "no autumn.toml found" warning when the
+  project has none. Before this, an operator relying on `deploy check` as the
+  documented way to catch a broken deploy before touching the server had no
+  signal at all that the deployed app would silently run built-in defaults —
+  they only found out once they actually ran `up`. Purely informational: it
+  is not a graded preflight check and never affects `check`'s exit code. See
+  `docs/guide/deployment.md`'s "Your `autumn.toml` is deployed alongside the
+  binary" section for the full behavior this closes out. [no-plugin]
+
+- **testing:** a real-ACME end-to-end test drives the ACME order state
+  machine (order → HTTP-01 → finalize → issue) against a real, independently-
+  implemented ACME server — [Pebble](https://github.com/letsencrypt/pebble),
+  run as a Docker container via `testcontainers`' `host-port-exposure` tunnel
+  — asserting a genuine, parseable, not-yet-expired certificate is obtained
+  and hot-swapped into the live TLS resolver. Every other ACME test drives
+  the same `AcmeRenewalTask` against an in-process fake CA; this closes the
+  test-depth gap explicitly deferred from #1608/PR #1858 (issue #1863), so a
+  protocol-level regression (challenge ordering, the finalize payload shape,
+  polling) that the fake CA cannot see would still be caught. Wired into a
+  dedicated, Docker-gated CI step separate from both the fast ACME lane (no
+  Docker/network) and the general Docker-dependent-tests sweep. Test-only
+  coverage, no new agent-facing surface. [no-plugin]
+- **graph:** a queryable architecture graph derived from the app's own macros
+  (issue #1747). Autumn already declares every architectural element through
+  proc-macros it owns, but none of that survived expansion as something you
+  could ask a question of. It does now: `#[route]`/`#[static_get]`,
+  `#[model]`, `#[repository]` and `#[job]`/`#[scheduled]`/`#[task]` each
+  register a node, and the framework assembles them into a typed graph at link
+  time — nodes for every declared element (each route carrying its mounted path
+  and declared auth requirement, each model its table), edges for
+  repository→model declarations, for the repository a handler takes as an
+  extractor, and for every model, table or raw-SQL table name a route or job
+  body mentions. `autumn graph show|touches <NAME>|impact <NAME>` answers
+  against it — "which routes and jobs touch `posts`", "what does changing
+  `Post` break" — and `--check` fails the build when a declared element or an
+  edge quietly disappears. The same graph is served from `/actuator/graph`
+  (sensitive-gated, like `/env`) so a running single binary can answer
+  questions about itself with no side file to go stale. Because node identity
+  comes from the declaration, nothing can fall out silently:
+  `examples/reddit-clone/tests/architecture_graph.rs` censuses the reference
+  app's *sources* for every declaring attribute, runs the binary's own graph
+  dump, and fails when the two disagree — including a hand-verified
+  ground-truth list that pins `impact Post` to total recall over both access
+  styles the app uses (repository extractors and raw Diesel), the
+  `#[repository(api = …)]` auto-API routes, and a scheduled task that reaches
+  the table only through `sql_query("UPDATE posts …")`. Edges from a route or
+  job are a name-based derivation over that item's own tokens, deliberately
+  biased toward over-reporting; every edge carries its provenance
+  (`declaration`/`signature`/`body`) and the document carries the derivation's
+  limits, so it cannot be read as more than it is. See
+  `docs/guide/architecture-graph.md`.
+- **macros:** `#[autumn_web::main]` takes optional arguments that reach the
+  Tokio runtime it builds. Previously the attribute discarded its argument
+  list entirely (`_attr`), so the only way to size a worker pool, name the
+  worker threads, or install an `on_thread_start` hook was to abandon the
+  macro and hand-roll `main` — which also meant re-implementing the two
+  compile-context side effects it exists for, the `autumn.toml` root and the
+  `/actuator/info` build provenance, both of which must be expanded in the
+  *app* crate to be correct. The attribute owns the
+  `tokio::runtime::Builder` call, so the knobs are now arguments on it:
+  `flavor` (`"multi_thread"`, the default, or `"current_thread"`),
+  `worker_threads`, `max_blocking_threads`, `thread_name`,
+  `thread_stack_size`, `thread_keep_alive` (a duration string such as
+  `"30s"`, the same spelling `#[throttle(per = ...)]` accepts), and
+  `configure` — the path of a `fn(&mut tokio::runtime::Builder)` that runs
+  last, after the declarative arguments, as the escape hatch for every
+  `Builder` method the list does not name (`on_thread_start`,
+  `global_queue_interval`, …) and as the way to override one of them. The
+  numeric arguments take arbitrary expressions rather than only literals, so
+  `worker_threads = std::thread::available_parallelism().map_or(4, |n| n.get())`
+  is as valid as `worker_threads = 4`.
+
+  With no arguments the expansion is byte-for-byte what it was before, so
+  nothing changes for an app that does not opt in. What *does* change is that
+  an argument list is no longer silently dropped: a typo (`worker_thread`), a
+  repeated argument, an unknown `flavor`, a literal `0` where tokio would
+  panic at startup, a malformed `thread_keep_alive`, and a `worker_threads`
+  paired with `flavor = "current_thread"` (where the runtime has no worker
+  pool to size and the value would do nothing) are each a compile error naming
+  the problem. The `configure` path is bound to a typed `fn` pointer before it
+  is called, so a wrong signature is reported against the `configure = ...`
+  the user wrote rather than inside the expansion. Covered by expansion unit
+  tests in `autumn-macros/src/main_macro.rs`, by two compile-fail fixtures for
+  the refusals (`tests/compile-fail/main_unknown_runtime_arg.rs`,
+  `tests/compile-fail/main_worker_threads_current_thread.rs`), and — because
+  trybuild `pass` fixtures are compiled *and run* — by two behavioral ones
+  (`tests/compile-pass/main_runtime_args.rs`,
+  `tests/compile-pass/main_runtime_current_thread.rs`) that boot the tuned
+  runtime and assert the settings actually landed on it: the blocking thread
+  carries the requested `thread_name`, and the `configure` hook's
+  `on_thread_start` has fired. Documented in the getting-started guide under
+  "Tuning the Tokio runtime".
 
 - **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
   update validation left after #1719/#1742/#1778/#1801 (issue #1751).
@@ -510,6 +685,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `actions/attest-build-provenance`, and autumn's own `examples/hello` runs the
   gate in the publish gate (`scripts/check-posture-gate.sh`). See
   `docs/guide/posture-gate.md`.
+
+  `posture-gate.yml` and `ci.yml` still install the `autumn` CLI pinned to
+  the app's own `autumn-web` version by default (#2495): pinning alone left
+  every newly scaffolded gate red between a subcommand landing and the next
+  release, and stuck red afterwards until someone re-ran `autumn upgrade
+  --apply` — but always installing the latest published release instead
+  would trade that for a worse problem, running these gates under a CLI
+  this project's own compatibility check (`autumn doctor`) calls
+  incompatible the moment a minor release ships, with the gap only growing
+  as later, unrelated releases ship. So only `posture-gate.yml`'s verdict
+  job — which never compiles the pull request, only reads JSON — falls
+  back, for that run alone, when the pinned CLI lacks `routes posture`: it
+  probes forward through the next few releases and installs the first one
+  that has it, landing on a specific, bounded release rather than a moving
+  "latest" that keeps drifting from the app's own pin. The fallback does
+  not resolve itself — the workflow still installs the app's pinned
+  `autumn-web` version first on every run — so it keeps firing until the
+  app raises that pin (and reruns `autumn upgrade --apply`) to a release
+  that already has the command. `ci.yml`'s `a11y verify` and `routes audit`
+  steps (like
+  `posture-gate.yml`'s own `manifest` job) compile and introspect the pull
+  request's own code, so they never fall back — they now probe for their
+  subcommand the same way `posture-gate.yml`'s verdict job already did, and
+  fail with an actionable message naming the pin to raise, rather than a
+  raw unknown-subcommand error. Scaffolded workflow YAML only; no new or
+  changed CLI surface for agents to reach for. [no-plugin]
 
 - **Build-time authority envelope for agent-operable handlers (#1691):** an
   endpoint exposed as an MCP tool is an action an autonomous agent can take
@@ -1390,8 +1591,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliberately differ (no Unix socket, no in-place upgrade handoff). Issue
   #1603.
 
+- **ci:** `autumn-cli`'s consolidated `cli_tests` binary now gets the same
+  discovery sweep as the `autumn` crate's `integration_tests` binary
+  (#1945): a bare `--ignored` run over `cli_tests` in ci.yml's
+  Docker-dependent-tests step, so a new `#[ignore = "requires Docker
+  (testcontainers)"]` test in any `autumn-cli/tests/integration/*.rs` module
+  runs in CI automatically. Before this, only two hand-picked filters
+  (`offsite`, `db_scrub`) ran anything from that binary, leaving 46 Docker
+  tests across 8 modules (`db.rs`, `db_pull.rs`,
+  `generate_lock_version_postgres.rs`, `generate_references_postgres.rs`,
+  `migrate_down.rs`, `schema_migrate.rs`, `schema_pull.rs`, `test_command.rs`)
+  dark since they were written — PR #1985's noted follow-up. The sweep's
+  `--skip` list routes the binary's other `#[ignore]`d tests — the ones that
+  scaffold and cargo-check/build/run a fresh generated project instead of
+  touching Docker — to `generator-conformance.yml`, where 15 of them (across
+  `api_scaffold`, `cloud_native_scaffold`, `generate_position_scaffold`,
+  `scaffold_belongs_to`, `scaffold_bulk_delete`, `scaffold_rich_text`,
+  `scaffold_search`, `scaffold_trash`, `seed_model_linking`, `serve`, and two
+  in `scaffold_form_for`) are now named there for the first time, closing the
+  same gap for that half of the binary. The sweep also `--skip`s the
+  pre-existing `generate_json_postgres.rs` Docker test, which already ran in
+  `generator-conformance.yml` before this change, so it isn't doubled up.
+  Two new `autumn-cli/tests/integration/repo_hygiene.rs` tests guard both
+  halves of the wiring going forward. [no-plugin]
+
 ### Changed
 
+- **ci: the Docker/testcontainer sweep runs as its own `Test (Docker)` job
+  instead of the last step of `Test (ubuntu-latest)`:** as step 16 of that job
+  it inherited a disk already filled by the whole workspace build plus eight
+  feature-flipped rebuilds, and died compiling its own dependencies
+  (`bollard`, `bollard-stubs`, a re-linked `autumn-web`) with `No space left on
+  device` and 23–41 MB free — before a single test body ran, with steps 1–15
+  and both the macOS and Windows legs green. The two steps move verbatim (the
+  diff is purely additive: a job boundary inserted in front of them), so the
+  same commands run the same sweep, on a runner whose disk they are the only
+  claimant of. Branch protection still names only the per-OS `Test (…)` checks,
+  so `Test (Docker)` needs adding there to block merge again. [no-plugin] —
+  CI-only; no API, behaviour or feature change. (#1747)
+- **acme:** [no-plugin] Internal cleanup, no behavior change (#1864): the owner-only
+  temp-write-then-rename idiom, previously duplicated between
+  `acme::store::FsAcmeStore` and the failure-capture capsule writer, is now
+  one shared helper; `FsAcmeStore` gained a `find_cert_for_domains`/
+  `list_certs` API that `autumn doctor`'s ACME preflight reuses instead of
+  re-deriving the on-disk cert-path layout by hand; and the ACME renewal
+  spawn site queries fleet-distribution through a named
+  `SchedulerCoordinator`/`SchedulerBackend` predicate instead of matching the
+  scheduler config enum inline.
+- **ci:** the test suite is now **sharded across runners** instead of running as
+  one job per OS [no-plugin] — CI scheduling only; it adds no framework surface
+  an agent could reach for, and the notes for humans editing tests live in
+  CLAUDE.md rather than the plugin. On the 2026-08-26 trunk run
+  `Test (windows-latest)` alone was 128 minutes and *was* the critical path of a
+  2h27m run. Two things dominated, both measured from that run's logs. First,
+  `compile_fail::` (trybuild) was 37.1 of the 46.8 minutes the consolidated
+  `integration_tests` binary spent running on Windows, and it was the *tail* —
+  the binary finished 0.2s after trybuild did, on every OS. Each case shells out
+  a nested `cargo` build and trybuild serialises them behind a project-dir lock,
+  so only more runners make it faster. Second, the eight non-default feature
+  lanes ran in sequence in that same job, ~44 minutes of pure recompilation on
+  Windows despite being independent builds.
+
+  `test` is now four job families running side by side — `test` (the workspace
+  suite), `trybuild` (four shards), `test-features` (one job per feature set)
+  and `test-docker` — behind one aggregate `Test suite` gate. First fully-green
+  sharded run: **2h27m → 1h57m**. `trybuild`, `test-features` and `coverage`
+  were then narrowed further: the first two to Linux only (a trybuild golden is
+  pinned to the rustc version, not the OS; a feature lane asks about a feature,
+  not a platform), and `coverage` — by then a co-equal 55-minute tail — split
+  into four lanes by feature set, each uploading under its own Codecov flag.
+  That took the workflow from 47 expanded jobs to 32. Those three changes land
+  after the 1h57m measurement, so the new total is not yet measured.
+
+  Test-layout consequences, all of which keep every test running and
+  merge-blocking: `compile_pass_tests` split into `_a`/`_b` (a disjoint split of
+  the same fixture list, no fixture added or removed); the `sim_*` determinism
+  modules got a single-threaded second step, because removing trybuild freed the
+  libtest thread pool and the remaining ~1880 tests went from trickling through
+  trybuild's gaps (863s) to full parallelism (61s), enough to flip them on a
+  4-vCPU runner; and `capsule_cache_effect` moved to its own binary, because it
+  installs a process-global cache that any concurrent `TestApp::build` clears.
+  Every shard runs `cargo test --workspace` deliberately — the trybuild fixture
+  list is `#[cfg(feature = ...)]`-gated, so narrowing a shard would silently
+  compile fewer fixtures and still report green — and each asserts a non-zero
+  pass count, because `cargo test` exits 0 when a filter matches nothing.
+  **Branch protection must be repointed** from the per-OS `Test (…)` checks to
+  `Test suite` (`test-gate`), the one name that stays stable as shards come and
+  go.
 - **plugin-conformance:** **Breaking:** `plugin_conformance::ConformanceConfig`
   gains a `contract` field and is now `#[non_exhaustive]`, so it can no longer
   be built with a struct literal — use `ConformanceConfig::new(name)` and the
@@ -1701,7 +1987,384 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correctness change, since the computed value does not vary by tenant. See
   `docs/security/2026-09-05-cached-tenant-key/`.
 
+### Performance
+
+- **`MemorySearchBackend::keyword_search` no longer re-tokenizes every
+  document's fields on every query:** `score` (in `autumn-search/src/memory.rs`)
+  called `tokenize` — which allocates a `String` per token via
+  `str::to_lowercase` — on every indexed field of every document, on every
+  single `keyword_search` call. Profiling a realistic 5,000-document,
+  two-field (~206 words/document) corpus with `valgrind --tool=callgrind`
+  found this re-tokenization (the scan loop itself plus `str::to_lowercase`)
+  accounted for ~66% of the call's instructions. A document's tokens don't
+  change between searches, only between writes, so `MemorySearchBackend` now
+  tokenizes each document's fields once, when it is written (`StoredDocument`
+  in `memory.rs`), and every later `keyword_search`/`score` call reuses the
+  cached tokens instead of recomputing them. Purely an internal
+  representation change to the in-memory reference/dev backend — no public
+  API moved and ranking behavior is unchanged (same 128 `autumn-search` tests
+  pass unmodified in assertions). New harness:
+  `autumn-search/benches/keyword_search.rs`. Measured on the same machine, one
+  session: instructions (callgrind, 5 queries over the corpus) 12,029,984,210
+  → 1,820,921,069 (**-84.9%**); marginal allocation blocks/query (dhat)
+  1,038,586 → 8,586 (**-99.2%**); marginal allocation bytes/query (dhat)
+  6,563,220 → 530,398 (**-91.9%**).
+
 ### Fixed
+
+- **`#[query_budget]` silently missed queries issued through a handle bound
+  via an async/fallible accessor (e.g. `let mut conn = self.conn().await?;`),
+  a real shape in `PostgresSearchStore::write_documents`:** neither
+  `Analyzer::expr_is_handle` nor `chain_root_is_handle` peeled
+  `Expr::Await`/`Expr::Try` before checking whether a call was one of the
+  recognized handle accessors (`db`, `repo`, `repository`, `pool`, `conn`,
+  `connection`), so `conn` never entered the tracked-handle set and every
+  later query issued through it (e.g. a diesel-async
+  `query.execute(&mut conn)` inside a loop) went uncounted with **no
+  diagnostic at all** — worse than the analysis's own "never assume
+  query-free" contract, which is meant to *report* what it cannot prove, not
+  silently drop it. `expr_is_handle` now recognizes `self.conn().await?`
+  through a new, deliberately narrower `awaited_expr_is_fresh_handle` helper
+  that only fires on the `?`-unwrapped shape — a bare `self.conn().await`
+  (no `?`) still yields the `Result` itself, not the handle, and is not
+  promoted, so a later `result.is_err()`/`.unwrap()` is not miscounted as a
+  query. [no-plugin] — analysis-only fix inside `autumn-macros`; no API
+  change.
+- **macros: stacked `#[secured]`/`#[step_up]`/`#[throttle]` above a route
+  attribute broke instead of composing (issue #2516):** #1668 moved each of
+  these three body guards' checks out of the handler body and into a
+  `FromRequestParts` gate — a hidden struct + trait impl now emitted as
+  sibling items ahead of the (rewritten) handler function, rather than
+  wrapping the body in place. Every macro downstream of one of these guards
+  — the route macro (`#[get]`/`#[post]`/etc.), and the three guards
+  themselves when stacked on each other — still assumed its `item` input was
+  exactly one function, so a guard written above another guard or the route
+  attribute handed the next macro a multi-item stream it rejected outright
+  with a confusing "route macros can only be applied to functions" error,
+  silently on every PR touching route macros regardless of whether the
+  guards were involved (the failure is in the default, always-compiled
+  `autumn-macros` unit suite). Fixed by teaching every one of those call
+  sites (`parse::split_leading_items_and_fn`, shared by the route/static/ws
+  macros and reused directly by the three guards) to recover the trailing
+  function from a longer item sequence and re-emit everything before it
+  verbatim, so an earlier guard's gate type is never dropped. Separately,
+  `#[step_up]`/`#[throttle]`'s move to a gate had also stopped emitting
+  their `__AUTUMN_STEP_UP_MAX_AGE`/`__AUTUMN_THROTTLE_ROUTE_ID` marker
+  consts into the handler body, which is what lets the route macro tell a
+  real guard's `__autumn_inner` return-type wrapper apart from unrelated
+  code (#1677) — restored by emitting an inert copy of each into the body
+  alongside the real one in the gate, mirroring `#[secured]`'s existing
+  `role_scope_consts`/`markers` split.
+
+- **macros: `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` stacked
+  with `#[static_get]` is now a compile error, not a false "protected"
+  certification:** the fix above taught `#[static_get]` to accept a guard's
+  leading gate items via `parse::parse_async_handler_with_leading_items`,
+  and an initial pass had it read the guard's role/scope marker back off the
+  handler via `api_doc::extract_secured_info(&input_fn)` — mirroring
+  `crate::route` — so a `#[secured("admin")]`-guarded static route would
+  report `secured: true` to `routes audit` instead of the previous hardcoded
+  `secured: false`. A follow-up Codex pass caught that this was actively
+  wrong, not just incomplete: cached SSG/ISR responses are served by the
+  static-first middleware *before* the inner router (session, auth) is ever
+  reached (`AppBuilder::static_gate`'s doc comment spells this out), so the
+  guard only ever runs on the rare synchronous render/revalidate call, never
+  on a cache hit — the overwhelming majority of live traffic to a cached
+  page. Certifying `secured: true` there made `routes audit` wrongly attest
+  the page as protected when an anonymous request against a warm cache entry
+  gets the cached HTML unauthenticated either way. `#[static_get]` now
+  rejects the combination outright, in both attribute orders, and the error
+  points authors at `AppBuilder::static_gate` — the gate actually built to
+  protect pre-rendered pages (Codex review on #2513, P1). That rejection's
+  first version detected a guard expanded *above* `#[static_get]` by
+  checking for a leading sibling gate item — a shape only a test that
+  hand-concatenates one macro's raw multi-item output into another's input
+  can produce; the real compiler never bundles a sibling item alongside the
+  one it hands to the next attribute macro in a stack (confirmed by
+  `param_helpers::extract_fn_item`'s own doc comment, added for exactly this
+  reason elsewhere in this crate). So in genuine compiled code that leading-
+  item check could never fire, and the rejection for this — the more
+  natural — attribute order silently never worked, an eighth Codex finding
+  on #2513 caught. Fixed by checking what actually does survive onto the
+  single function the real compiler hands `static_get_macro`: the guard's
+  own pre-body gate parameter for `#[secured]`/`#[step_up]`/`#[throttle]`
+  (`param_helpers::has_any_guard_gate_param`), and the role/policy-check
+  body marker for `#[authorize]`, which inserts no such parameter
+  (`api_doc::extract_secured_info`, the same recovery the `#[get]`/`#[post]`
+  route macro already relies on for this scenario). The accompanying unit
+  tests were corrected the same way — sliced through
+  `param_helpers::extract_fn_item` rather than fed a raw multi-item macro
+  output — so they exercise the shape the compiler actually produces instead
+  of a synthetic one, and would have caught this gap themselves.
+
+- **macros: `#[secured]`/`#[step_up]`/`#[throttle]` above `#[ws]` never
+  actually worked, and generated silently-broken code rather than a clear
+  error:** `ws_macro` builds a two-function wrapper that calls the user's
+  handler by hand, and for each non-`AppState` parameter it echoed that
+  parameter's *pattern* straight back as the call argument. A guard expanded
+  above `#[ws]` inserts a leading `_: __AutumnXGate` parameter, and `_` is a
+  pattern, not a valid expression — `#fn_name(_)` does not compile (Codex
+  review on #2513, P1). Fixing that forwarding surfaced a deeper,
+  pre-existing incompatibility Codex caught on the very next review pass:
+  every one of those three guards unconditionally rewrites the wrapped
+  function's return type to `Response` and threads its original return value
+  through `IntoResponse::into_response`, which cannot hold for a `#[ws]`
+  handler — it returns `impl WsHandler` (a plain closure), not something
+  `IntoResponse`. Properly supporting the combination would mean teaching
+  all three guard macros to special-case a WebSocket handler's return type,
+  a cross-cutting redesign out of scope here. `#[ws]` now rejects the
+  combination outright with a purpose-written compile error (mirroring the
+  existing `#[edge]`-on-`#[ws]` rejection) instead of ever emitting code that
+  fails to compile deep inside guard-generated internals; the error explains
+  the incompatibility and suggests checking authorization via an extractor
+  inside the upgrade handler instead. That rejection initially only checked
+  for an already-*expanded* guard above `#[ws]` (a non-empty leading-items
+  stream); a third Codex pass caught that the *other* attribute order —
+  `#[ws]` outermost, the guard still a live, unexpanded attribute below it —
+  slips past that check entirely (nothing has expanded yet, so there are no
+  leading items) and generates the same silently-broken code, just one macro
+  expansion later. The rejection then also scanned the handler's still-live
+  attributes for `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` — but
+  a fourth Codex pass caught that `#[authorize]` above `#[ws]` (already
+  expanded) slips past *both* checks: unlike the other three guards,
+  `authorize_macro` emits no separate `FromRequestParts` gate sibling item
+  (so leading items stay empty) and it removes its own attribute once
+  consumed (so the live-attribute scan finds nothing either). Rather than
+  keep chasing each guard's particular expansion shape, the rejection now
+  checks the actual invariant directly: all four guards rewrite the return
+  type to the exact same `-> Response` (confirmed identical across all four
+  guards' source), which a legitimate `#[ws]` handler — required to return
+  `impl WsHandler` — never would. Separately, `#[ws]`'s `ApiDoc` had the
+  same hardcoded `secured: false, required_roles: &[]` gap `#[static_get]`
+  had for the (still-supported) case of a live `#[authorize]` attribute or
+  policy check — fixed the same way, via `api_doc::extract_secured_info`
+  (Codex review on #2513, P2). That return-type check itself had a false-
+  positive gap a fifth Codex pass caught: it matched a `Response` return
+  type by its *last path segment only*, so a `#[ws]` handler legitimately
+  returning some unrelated user type merely *named* `Response` (e.g.
+  `my_crate::Response`, implementing the public `WsHandler` trait) would be
+  misclassified as guard-incompatible and rejected outright. Fixed by
+  matching the guard's exact fully qualified return path segment-by-segment
+  (`::autumn_web::reexports::axum::response::Response`) instead of just the
+  final identifier.
+
+- **macros: `#[static_get]`/`#[ws]` missed a `#[secured]`/`#[step_up]`/
+  `#[throttle]`/`#[authorize]` guard hidden behind
+  `#[cfg_attr(predicate, ...)]`:** both rejections' "guard still a live,
+  unexpanded attribute below the route macro" check compared each
+  attribute's own path against the guard names directly, so it correctly
+  caught a bare `#[secured("admin")]` written below `#[static_get]`/`#[ws]`
+  but missed the identical case written as
+  `#[cfg_attr(feature = "auth", secured("admin"))]` — `cfg_attr` is a
+  built-in attribute the compiler does not resolve until after every
+  attribute macro has finished expanding, so the outer route macro sees a
+  live `cfg_attr` attribute, not `secured`, and let the combination through
+  uncaught (ninth Codex finding on #2513). Fixed by teaching the shared scan
+  (`param_helpers::attr_or_cfg_attr_matches_any`, now used by both
+  `static_route.rs` and `ws.rs`) to also look inside a `cfg_attr`'s own
+  argument list for a wrapped guard attribute.
+
+- **macros: `#[static_get]`/`#[ws]` also missed a guard attribute imported
+  under an alias (e.g. `use ::autumn_web::secured as auth;` then
+  `#[auth("admin")]`):** a proc-macro attribute is invoked on raw syntax
+  before the compiler resolves imports, so there is no API for a proc macro
+  to ask "does this path actually name `autumn_web::secured`" — an aliased
+  guard's spelling is fundamentally invisible to the name-based scan the
+  ninth finding's fix still relied on, however thorough (tenth Codex finding
+  on #2513, and a materially different problem from the ninth: no name-based
+  check, however exhaustive, can close this one). Fixed the only way a
+  syntactic scan can be made sound against a rename it cannot see through:
+  `#[static_get]`/`#[ws]` now unconditionally leave a marker const in the
+  body of every handler they accept
+  (`param_helpers::STATIC_ROUTE_HANDLER_MARKER`/`WS_HANDLER_MARKER`,
+  mirroring the `__AUTUMN_STEP_UP_MAX_AGE`/`__AUTUMN_THROTTLE_ROUTE_ID`
+  body-marker-const technique already used to communicate across a macro
+  expansion boundary elsewhere in this crate), and each of
+  `secured_macro`/`step_up_macro`/`throttle_macro`/`authorize_macro` now
+  checks for it (`param_helpers::reject_if_incompatible_route_marker`)
+  immediately after parsing its own input — before doing any of its own
+  work — regardless of what name or alias the compiler invoked it under.
+  Covered by five new tests (one per guard, plus `#[ws]`) that construct the
+  exact scenario an alias produces: accept a still-unrecognized attribute
+  through `#[static_get]`/`#[ws]` first, then invoke the guard's macro
+  function directly on the result, proving the rejection fires without
+  ever relying on the guard's surface name.
+
+- **macros: the tenth finding's marker could still be missed when another
+  attribute macro sat between `#[static_get]`/`#[ws]` and the aliased
+  guard:** `has_body_const_marker` only scanned a handler's top-level body
+  statements, but `#[cached]` — a real, already-shipped macro in this crate
+  — re-homes a handler's entire original body one level deeper, inside a
+  `(|| async move { … })().await` closure IIFE (`cached_macro`'s
+  `compute`). `#[static_get] #[cached] #[auth("admin")]` (`auth` an alias
+  for `secured`) would leave the marker buried inside that IIFE, invisible
+  to the flat scan, silently reopening the exact cache-bypass hole this
+  whole rejection exists to close (eleventh Codex finding on #2513).
+  `edge::stmts_have_marker` already solves this same "wrapper shape buries
+  a marker" problem for `#[edge]` — by recursing into any expression an
+  earlier guard's rewrite (or `#[cached]`'s IIFE, once taught the shape)
+  might hide a marker inside — via the shared
+  `idempotency_guard::expr_nested_async_body` helper, so `#[static_get]`'s
+  new marker check needed the same descent, not a special case of its own.
+  Taught `expr_nested_async_body` to also unwrap a zero-argument closure
+  call (`(|| async move { … })()`, `#[cached]`'s exact shape), and switched
+  `param_helpers::has_body_const_marker` to delegate to
+  `edge::stmts_have_marker` instead of its own flat scan, so every consumer
+  of the marker-const technique benefits uniformly. Covered by a new test
+  that runs a handler through `#[static_get]` then `#[cached]` before the
+  aliased guard, confirmed red (the marker present but buried, no compile
+  error) before the fix and green after.
+- **Database pool refusals echoed credentials into the boot log (issue
+  #1905):** the pool's boot-time refusals name the offending target so the
+  message is actionable, and did so verbatim. `setup_database` surfaces
+  `PoolError` as `"Failed to create database pool: {e}"` and the run path logs
+  it through `tracing::error!`, so under `log.format = "json"` a password
+  reached the structured log stream — one line after `format_config_summary`
+  had masked the same URL. Every refusal in the pool module now routes its
+  target through a redactor: userinfo passwords are replaced, and for a
+  Postgres target or one naming no backend at all the query string goes too,
+  since `?password=`, `?sslpassword=` and `?api_key=` are real spellings that
+  a userinfo check never sees and an unclassifiable target offers no way to
+  enumerate. A SQLite target passes through whole — a local file URI carries
+  no credentials, and its query string (`mode=ro`, `mode=memory`,
+  `cache=shared`) is the diagnostic detail the replica and read-only messages
+  exist to report. The libpq keyword/value form (`host=db user=app
+  password=hunter2`) is rebuilt from an allowlist of the keys that identify
+  the target (`host`, `hostaddr`, `port`, `dbname`, `user`) — an allowlist
+  rather than a `password`/`sslpassword` denylist, so a key this code has
+  never heard of cannot default to being printed. Anything the redactor cannot
+  classify — a malformed keyword/value string among them — is masked outright:
+  the default is to hide, and the one exception is a single path-shaped token
+  carrying no `=`, `@`, `?` or whitespace, so a bare filesystem path stays
+  legible where naming it is the whole value of the message.
+
+- **SQLite pool construction accepted a target that names no backend (issue
+  #1905):** under `--features sqlite`, `build_sqlite_pool` guarded only
+  against a Postgres target. Everything else fell through to
+  `normalize_sqlite_target`, which strips the `sqlite:` / `sqlite://` schemes
+  and passes anything it does not recognize along verbatim — as a
+  **filename** — so a `mysql://…` URL, a typo of the scheme
+  (`sqllite:///app.db`) or a bare filesystem path (`/var/lib/app.db`) built a
+  pool over a junk file rather than refusing. On the ordinary boot path
+  `DatabaseConfig::validate` already rejects those shapes, so this was not a
+  live misboot for an app configured through `autumn.toml`; the gap was in
+  the **public** `create_pool` / `create_topology` / `create_shard_topology`
+  API, which a programmatically-built `DatabaseConfig` or a custom
+  `DatabasePoolProvider` reaches without that screen. The pool is the layer
+  that decides what the string *means*, so it now decides the same way
+  everything else does: it accepts only a target `DatabaseBackend::detect`
+  classifies as SQLite — the same predicate `autumn doctor`, the generator's
+  DDL mapping and `autumn migrate` use — and its refusal names both the
+  offending target and the accepted spellings (`sqlite:<path>`,
+  `sqlite://<path>`, `file:<path>`). This makes the runtime match the
+  published contract that a bare filesystem path is not a recognized SQLite
+  target.
+
+- **The SQLite backend's own unit tests never ran in CI (issue #1905):** the
+  `sqlite-runtime` job builds the crate, lints it with `clippy --lib`, then
+  runs `cargo test … --test <name>`. `--test` selects test *targets*, so the
+  ~33 `#[cfg(feature = "sqlite")]` unit tests inside the crate — pool sizing,
+  the replica rejections, in-memory/read-only target classification, provider
+  dispatch, the sharding refusals, the sim substrate — were run by nothing.
+  Nor were they even *compiled*: `clippy --lib` without `--all-targets` does
+  not build `#[cfg(test)]` code, so the crate's unit-test tree had never been
+  type-checked under the backend flip. Under that blind spot the ungated pool
+  and topology tests sitting beside them had rotted into 10 hard failures
+  against it, because their fixtures hard-code `postgres://` URLs the SQLite
+  pool refuses. Those
+  fixtures are now backend-parametric (the mechanics they assert — `max_size`,
+  the connect-timeout → wait/create mapping, replica retention, the read-pool
+  fallback — are backend-independent, so they now run on *both* backends
+  rather than being silenced on one), and the job gained a
+  `--features sqlite --lib` step covering every module that carries
+  SQLite-specific logic. The `sqlite_json_field_conversion` `[[test]]` target
+  (#1341), declared in `autumn/Cargo.toml` and named by no CI lane, is now
+  run by the integration step alongside its siblings.
+
+- **ci: `live_upgrade` no longer fails because the hot-upgrade example inherits
+  the dev profile's 1-second drain budget:** the test asserts the production
+  guarantee that a predecessor drains and exits 0 after handing over, but ran
+  under the `dev` profile, which shortens `shutdown_timeout_secs` from the 30s
+  default to 1s so Ctrl-C is snappy while developing. The load loop keeps
+  driving traffic for 3.5s past the cutover, so that budget expires while
+  requests are still arriving and whatever is in flight is aborted
+  (`exit_code: 1`) — nothing wrong with the upgrade path, just a budget shorter
+  than the load window. The test now pins `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS`
+  to the production default, exactly as it already pins the prestop grace.
+  Reproduced locally under CPU oversubscription (which also disproved the
+  intuitive "slow cutover" explanation — it reproduces with the cutover
+  completing in 135 ms), and verified non-hiding: under the same load the
+  connection assertions still fired on their own, so the drain budget was not
+  what was holding them up. Independent of, and complementary to, the
+  refused/reset split below — that one classifies *which* connection failures
+  count, this one stops the predecessor being killed mid-drain.
+  [no-plugin] — test-only; no API or behaviour change. (#1747, #2372, #2462)
+- **`autumn new`'s starter template shipped three cookie-consent routes that
+  failed `autumn routes audit` (issue #1214 follow-up):** the cookie-consent
+  banner feature added `POST /consent/accept`, `POST /consent/reject`, and
+  `GET /consent/manage` to `main.rs.tmpl`, but — unlike every other starter
+  handler — never marked them `#[public]`, so a fresh `autumn new` app failed
+  its own generated CI's routes-audit gate before a single line of app code
+  was written. Invisible until now: `scaffolded_app_passes_routes_audit_gate`
+  (added for #2154 specifically to catch this class of regression) was one of
+  the `cli_tests` tests #1945 revived — it had never run in CI before. Added
+  `#[public]` to all three handlers, matching the pattern documented right
+  above them in the template. [no-plugin] — restores previously-documented
+  behavior; no new or changed API.
+- **`route_macro` lost a guarded handler's OpenAPI response schema under
+  `#[throttle]`/`#[step_up]` (issue #2516):** #2488 moved the
+  `#[throttle]`/`#[step_up]` auth/rate-limit checks out of the handler body
+  and into a sibling `FromRequestParts` gate, but stopped emitting the
+  guard's marker const (`__AUTUMN_THROTTLE_ROUTE_ID` /
+  `__AUTUMN_STEP_UP_MAX_AGE`) into the handler body — `#[secured]` still
+  does. `api_doc::infer_response_body`'s recovery of a guarded handler's
+  pre-rewrite return type (#1677/#2484) requires that marker to trust the
+  `__autumn_inner` binding it reads the type back from, so a
+  `#[throttle]`/`#[step_up]`-guarded route written above `#[post]`/etc.
+  silently lost its documented `Json<T>` response the moment #2488 merged.
+  Both macros now emit their marker const into the handler body a second
+  time (unused there, `#[allow(dead_code)]`), mirroring the pattern
+  `secured_macro` already used. Caught as a fully red `autumn-macros` test
+  suite on `trunk-dev` itself (4 `route::tests::route_macro_infers_response_schema_*`
+  tests), not by a diff — two individually-green PRs (#2484, #2488) composed
+  into a broken `trunk-dev`. [no-plugin] — restores previously-documented
+  behavior; no new or changed API.
+
+- **hot-upgrade example: `live_upgrade` test no longer conflates a mid-flight
+  reset with a refused connection, and no longer lets an unbounded number of
+  resets pass silently (issue #2462):**
+  `upgrades_in_place_under_load_without_dropping_a_connection_or_the_state`
+  counted every request failure — `ECONNREFUSED` (nothing listening, the
+  actual zero-downtime violation) and `ECONNRESET`/`ECONNABORTED` (a
+  connection torn down mid-flight) — into one `connect_errors` counter, then
+  asserted zero on it with a message claiming *"no connection may be
+  refused"*. That failed once, intermittently, on `Test (macos-latest)` with
+  two `ECONNRESET`s, and the message actively misled: it named refusal when
+  the actual cause was a reset. Refused and reset are now classified
+  separately (`is_connection_refused`/`is_mid_flight_reset`); a mid-flight
+  reset gets one retry (`with_reset_retry`, after a short 20ms backoff so it
+  lands after the handover settles rather than in the same window that reset
+  the first attempt), while a refused connection is a hard, zero-tolerance
+  failure on the first attempt — never retried, since there is nothing to
+  wait out. A retried success's `latency` is overwritten to span the whole
+  attempt (failed try + backoff + retry), not just the retry's own timing, so
+  a genuine cutover latency spike can't hide behind a cheap retry.
+  Autumn's in-place upgrade hands the successor the *same* listening socket
+  by duplicating its fd across the `exec` (`HandoffSocket::from_listener`),
+  not by binding a second `SO_REUSEPORT` socket, so — unlike this issue's own
+  initial theory — there is no accept-queue race between two listeners to
+  blame a reset on; the root cause of the one observed instance remains
+  unconfirmed. Retrying past a reset is therefore now bounded
+  (`MAX_TOLERATED_RESETS`, asserted): an isolated anomaly doesn't fail the
+  run, but a systemic source of resets — real evidence of a defect in the
+  handoff or drain path — still does, rather than being silently retried
+  away every time. The failure message and a `println!` summary say which of
+  refused/hard-failed/retried happened.
+  `with_reset_retry`'s branching (retry-then-succeed, a second reset still
+  fails, a refusal is never retried, an unrelated error kind is never
+  retried, and the spanning-latency behavior) is unit-tested directly against
+  fake attempt closures, independent of the real network/signal machinery the
+  rest of the test drives.
 
 - **🔒 `autumn generate auth`: a concurrent successful login could be silently
   re-locked by a racing failed attempt (issue #2500):** the generated
@@ -1735,7 +2398,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pattern doesn't, plus the mirror-image ordering where a lock that
   genuinely wins the race correctly rejects the concurrent login instead of
   silently granting a session.
-
 - **🧭 Wayfinder: keyboard bypass-blocks link added to 6 supported example
   apps (a11y `bypass` Serious 7/8 → 0/8; `landmark-one-main` Moderate 1/8 → 0/8):**
   `autumn check --a11y` — the framework's own WCAG audit, run against each
@@ -2968,6 +3630,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **new `throttle_check` profiling harness; findings, no fix:** added
+  `autumn/benches/throttle_check.rs`, driving real traffic through a
+  `#[throttle]`-guarded route and an identical unthrottled route at
+  equal-length paths with an identical response body (issue #1350's
+  per-route rate limiter had no committed benchmark before this). Several
+  review rounds fixed real measurement bugs before these numbers were final:
+  `key = "token"` with an identical `Authorization: Bearer` header sent to
+  BOTH routes (not `key = "ip"` — `TestApp` requests carry no `ConnectInfo`,
+  which would make `extract_throttle_key` return `None` and profile
+  `__check_throttle`'s no-client bypass instead of the real
+  `limiter.decide()` path; and not an asymmetric header, which would fold
+  its own construction cost into the measurement); equal-length routes/body
+  (`/route-a`/`/route-b`, both `"ok"`), since differently-sized paths and
+  response bodies also leaked into the byte delta; a `THROTTLE_LIMIT` guard
+  plus an assertion on every measured response, so a large `--iterations`
+  can never silently drain the bucket and profile denials instead of the
+  documented warm `Decision::Allowed` path; asserting (not just
+  `black_box`ing) the measured status on BOTH routes, since an earlier
+  version asserted only the throttled side, putting that assertion's own
+  comparison/branch instructions asymmetrically into the callgrind delta;
+  and widening the frame-level DHAT attribution beyond `rate_limit::`-named
+  frames to also catch `#[throttle]`'s generated `FromRequestParts` gate
+  cloning `parts.headers` *before* ever calling into the `rate_limit` module
+  (`autumn-macros/src/throttle.rs`), which the first attribution pass missed
+  entirely; and base-subtracting the callgrind instruction counts (an
+  `--iterations 0` run per route, matching the DHAT methodology) rather than
+  dividing raw process totals by request count, which had been diluting both
+  routes' per-request figures with shared process-startup/router-construction
+  cost. Full, corrected `#[throttle]` overhead against the
+  ~140-151-block/~27.3-28.7KB per-request baseline `config_alloc_gate`
+  already gates (#2232): ~10 blocks / ~885 bytes per request (~6.6%/~3.1%,
+  under the 10%-of-allocations floor) and ~5.3% more instructions than an
+  unthrottled route on the marginal, base-subtracted count (callgrind,
+  `--route throttled` vs. `--route plain`) — which, read as "would a fix
+  removing this entire overhead clear the 5%-of-instructions floor,"
+  technically says yes, though only just. But no *safe, autonomous,
+  smallest-fix* candidate gets there: the only narrowly-scoped,
+  mechanistically-clear piece —
+  two redundant `format!` calls building an almost-always-cache-hit
+  `HashMap` key (`resolve_throttle_params`'s `registry_key`,
+  `__check_throttle`'s `cache_key`) — accounts for only ~6 of those ~10
+  blocks and isn't separately visible above a 1%-of-instructions self-cost
+  threshold on its own. The rest (two `HeaderMap` clones, one in the
+  generated gate and one in `extract_throttle_key`, plus the LRU-backed
+  `MemoryStore::decide` bucket lookup) is load-bearing rate-limiting state
+  tracking, not an obvious redundancy, and this bench's minimal 1-2-header
+  requests likely *understate* the gate's `parts.headers.clone()` cost for
+  a real multi-header production request. Fixing the aggregate would mean
+  restructuring the limiter's per-request key derivation and bucket-lookup
+  path together — a maintainer decision on a security-relevant surface, not
+  an unreviewed autonomous change. Recorded as a findings issue rather than
+  shipped; the harness itself is the lasting artifact, giving `#[throttle]`
+  its first profiling coverage.
 - **new `repository_crud` profiling harness; findings, no fix (#2486):** added
   `autumn/benches/repository_crud.rs`, driving real `save`/`find_by_id`/`page`
   calls through a `#[repository]`-generated repository against a live

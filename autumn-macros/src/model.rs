@@ -1726,20 +1726,19 @@ fn emit_association_items(
                             // below never runs).
                             let _ = #target::__autumn_preload_retain(::std::vec::Vec::new())?;
                             // The same target row can appear once per linking
-                            // parent (that's the point of many-to-many), so
+                            // parent — that is the point of many-to-many — so
                             // recursing into nested associations must run on a
-                            // *deduplicated* set of targets, not once per join
-                            // row — otherwise two parents sharing a target
-                            // would each get their own independent (and only
-                            // one of them fully grouped) copy of its nested
-                            // associations. Dedup by id, recurse once, then
-                            // share the single recursed record across every
-                            // parent via `Arc`. Filter and dedup in the same
-                            // pass: each kept row is moved directly into
-                            // `__unique_by_id` (no clone) and only its
-                            // lightweight `(parent_key, target_id)` pair is
-                            // kept in `__links` for the final grouping pass
-                            // below.
+                            // deduplicated set of targets, not once per join row.
+                            // Otherwise two parents sharing a target would each
+                            // get their own independent copy of its nested
+                            // associations, only one of them fully grouped.
+                            // Dedup by id, recurse once, then share the single
+                            // recursed record across every parent via `Arc`.
+                            // Filtering and dedup happen in one pass: each kept
+                            // row moves directly into `__unique_by_id` with no
+                            // clone, and only its lightweight `(parent_key,
+                            // target_id)` pair stays in `__links` for the
+                            // grouping pass below.
                             let mut __unique_by_id: ::std::collections::HashMap<i64, #target> =
                                 ::std::collections::HashMap::new();
                             let mut __links: ::std::vec::Vec<(i64, i64)> = ::std::vec::Vec::new();
@@ -2110,18 +2109,17 @@ fn emit_votable_items(
             __autumn_votable_model.#agg_column
         };
     };
-    // `by = <Reactor>` is otherwise never mentioned in the generated code (the
-    // edge table stores a bare `i64` reactor fk), so a typo'd model name would
-    // compile silently. Force its name resolution the way every other
-    // association attribute does.
+    // `by = <Reactor>` is otherwise never mentioned in the generated code — the edge
+    // table stores a bare `i64` reactor fk — so a typo'd model name would compile
+    // silently. Force its name resolution the way every other association attribute
+    // does.
     //
-    // Deliberately name-resolution only — NOT a `ModelPrimaryKey<IdType =
-    // i64>` bound: `by` accepts hand-written reactor structs (reddit-clone's
-    // `User` keeps `password_hash` out of `#[model]`'s generated surface on
-    // purpose), and those implement no framework trait to constrain. The
-    // reactor's `i64`-primary-key requirement is documented contract; a
-    // non-BIGINT reactor fk fails loudly on first use with a database type
-    // error, not silent corruption.
+    // Name resolution only, deliberately not a `ModelPrimaryKey<IdType = i64>` bound:
+    // `by` accepts hand-written reactor structs (reddit-clone's `User` keeps
+    // `password_hash` out of `#[model]`'s generated surface on purpose), and those
+    // implement no framework trait to constrain. The reactor's `i64`-primary-key
+    // requirement is documented contract; a non-BIGINT reactor fk fails loudly on
+    // first use with a database type error, not silent corruption.
     let reactor_ident = &spec.reactor;
     let reactor_guard = quote! {
         const _: ::core::marker::PhantomData<#reactor_ident> =
@@ -2194,28 +2192,25 @@ fn emit_votable_items(
     let not_found_msg = format!("{model_ident} not found");
 
     // ── Tenant isolation (PR #2177 review, P1) ───────────────────────────
-    // Through a `#[repository(..., tenant_scoped)]` repository, filtering the
-    // target by primary key alone lets a caller who can guess an id react to
-    // ANOTHER tenant's row — an edge insert plus an aggregate UPDATE across
-    // the tenant boundary. So when the model carries a `tenant_id` column the
-    // predicate the repository's own finders would apply is resolved once, up
-    // front, and threaded through S1 (the locking existence guard), S5 (the
-    // aggregate UPDATE) and `reaction_of`'s target probe.
     //
-    // `__autumn_m2m_tenant_scope()` is three-valued and matches the finders
-    // exactly: `Some(tenant)` scopes, `None` (non-`tenant_scoped` repository,
-    // or `across_tenants()`) does not, and a `tenant_scoped` repository with
-    // no tenant context is an error before anything is read or written.
+    // Through a `#[repository(..., tenant_scoped)]` repository, filtering the target by
+    // primary key alone lets a caller who can guess an id react to another tenant's
+    // row: an edge insert plus an aggregate UPDATE across the tenant boundary. So when
+    // the model carries a `tenant_id` column, the predicate the repository's finders
+    // would apply is resolved once up front and threaded through S1 (the locking
+    // existence guard), S5 (the aggregate UPDATE), and `reaction_of`'s target probe.
     //
-    // Both arms stay whole, statically-typed queries rather than one boxed
-    // query with a conditional predicate: the `pg` arm of S1 carries
-    // `.for_no_key_update()`, which a `into_boxed()` query cannot express.
+    // `__autumn_m2m_tenant_scope()` is three-valued and matches the finders exactly:
+    // `Some(tenant)` scopes, `None` (non-`tenant_scoped`, or `across_tenants()`) does
+    // not, and a `tenant_scoped` repository with no tenant context is an error before
+    // anything is read or written.
     //
-    // The call is emitted UNCONDITIONALLY — even for a model with no
-    // `tenant_id` column, where the returned scope is unused — because the
-    // method also carries the cross-shard reject: on a sharded repository in
-    // `across_tenants()` mode there is no single right shard for a reaction to
-    // land on, and the guard errors before any connection is acquired.
+    // Both arms stay whole, statically-typed queries rather than one boxed query with a
+    // conditional predicate: the `pg` arm of S1 carries `.for_no_key_update()`, which an
+    // `into_boxed()` query cannot express. The call is emitted unconditionally, even
+    // for a model with no `tenant_id` column, because it also carries the cross-shard
+    // reject: on a sharded repository in `across_tenants()` mode there is no single
+    // right shard for a reaction, and the guard errors before any connection is taken.
     let resolve_tenant = if has_tenant_id {
         quote! {
             let __tenant: ::core::option::Option<::std::string::String> =
@@ -2299,16 +2294,15 @@ fn emit_votable_items(
         quote! { let __persisted: usize = #unscoped; }
     };
 
-    // `reaction_of`'s tenant boundary. The edge table has no tenant column, so
-    // the target row *is* the boundary: a target owned by another tenant has
-    // no visible reaction here, which is `Ok(None)` — not an error, matching
-    // what the reactor would see for a target that simply has no edge. The
-    // predicate is an `EXISTS` on the target projection folded into the edge
-    // lookup itself, NOT a separate probe statement: two statements under
-    // READ COMMITTED would be a TOCTOU window where a concurrent tenant
-    // reassignment lands between them and the foreign edge leaks anyway.
-    // Deliberately unlocked and NOT soft-delete filtered, mirroring
-    // `reaction_of`'s stance of reporting the edge regardless.
+    // `reaction_of`'s tenant boundary. The edge table has no tenant column, so the
+    // target row is the boundary: a target owned by another tenant has no visible
+    // reaction here, which is `Ok(None)` rather than an error — the same thing the
+    // reactor would see for a target with no edge. The predicate is an `EXISTS` on the
+    // target projection folded into the edge lookup itself, not a separate probe: two
+    // statements under READ COMMITTED would leave a TOCTOU window where a concurrent
+    // tenant reassignment lands between them and the foreign edge leaks anyway.
+    // Deliberately unlocked and not soft-delete filtered, mirroring `reaction_of`'s
+    // stance of reporting the edge regardless.
     let reaction_of_tenant_exists = quote! {
         .filter(::autumn_web::reexports::diesel::dsl::exists(
             #edge_mod::#table_ident::table
@@ -2684,18 +2678,18 @@ fn emit_votable_items(
                 >(&mut *conn, |conn| {
                     async move {
                         // S1: take the row lock on the target before anything
-                        // is read, and use the same statement as the
-                        // existence/soft-delete guard. `FOR NO KEY UPDATE`, not
-                        // `FOR UPDATE`: this transaction only ever writes the
-                        // target's aggregate column, never its key, and the
-                        // weaker mode still conflicts with itself (so reactions
-                        // on one target stay serialized) while NOT conflicting
-                        // with the `FOR KEY SHARE` locks Postgres takes for
-                        // foreign-key checks — a concurrent `INSERT INTO
-                        // comments (post_id) …` therefore does not queue behind
-                        // a vote. On SQLite the enclosing `BEGIN IMMEDIATE`
-                        // already serializes writers, so the unsupported
-                        // locking clause is redundant as well as unemittable.
+                        // is read, in the same statement as the existence and
+                        // soft-delete guard. `FOR NO KEY UPDATE`, not `FOR
+                        // UPDATE`: this transaction only ever writes the
+                        // target's aggregate column, never its key. The weaker
+                        // mode still conflicts with itself, so reactions on one
+                        // target stay serialized, but does not conflict with the
+                        // `FOR KEY SHARE` locks Postgres takes for foreign-key
+                        // checks, so a concurrent `INSERT INTO comments
+                        // (post_id) …` does not queue behind a vote. On SQLite
+                        // the enclosing `BEGIN IMMEDIATE` already serializes
+                        // writers, so the clause is redundant as well as
+                        // unemittable.
                         let __target: ::core::option::Option<i64> =
                             ::autumn_web::backend_select! {
                                 pg => { #s1_pg },
@@ -4387,15 +4381,14 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
         },
         "NaiveDate" => quote! { ::autumn_web::form::FieldControl::Date },
         "NaiveDateTime" => quote! { ::autumn_web::form::FieldControl::DateTime },
-        // `<input type="datetime-local">` posts an *offsetless* wall-clock
-        // value, so only zone parameters with a sound interpretation of that
-        // shape get the picker: `Utc` and the server's `Local` (each wired to
-        // a matching tolerant deserializer — see `datetime_local_serde_attr`).
-        // Any other zone (`FixedOffset`, chrono-tz zones, or a bare
-        // `DateTime` alias whose zone the derive can't see) falls back to a
-        // text input: the pre-filled value is the field's serialized RFC 3339
-        // string, which chrono's default `Deserialize` round-trips as-is —
-        // honest, if plainer, instead of a picker whose submission 400s.
+        // `<input type="datetime-local">` posts an offsetless wall-clock value, so only
+        // zone parameters with a sound interpretation of that shape get the picker:
+        // `Utc` and the server's `Local`, each wired to a matching tolerant deserializer
+        // (see `datetime_local_serde_attr`). Any other zone — `FixedOffset`, a chrono-tz
+        // zone, or a bare `DateTime` alias whose zone the derive cannot see — falls back
+        // to a text input, pre-filled with the field's serialized RFC 3339 string, which
+        // chrono's default `Deserialize` round-trips as-is. Plainer, but honest, rather
+        // than a picker whose submission 400s.
         "DateTime" => {
             let picker_zone = crate::api_doc::unwrap_single_generic(inner_ty, "DateTime")
                 .is_some_and(|tz| matches!(type_name_str(&tz).as_str(), "Utc" | "Local"));
@@ -5088,15 +5081,14 @@ fn emit_state_machine_lifecycle(
         field_str,
     } = state_machine_names(field);
 
-    // Normalize each effect edge's `from`/`to` by stripping a leading raw-
-    // identifier prefix (issue #1973 / Codex P2 on #2027). The `#[lifecycle]`
-    // macro stores variant names in `STATE_MACHINE_TRANSITIONS` with `r#`
-    // already stripped (see `lifecycle::variant_name_str`), but the effect
-    // edges parsed at the binding site preserve it (e.g. `Draft -> r#type`).
-    // Without this alignment the const assertion below would check `"r#type"`
-    // against a table containing `"type"` (falsely rejecting a real edge) and
-    // the generated match arm would never fire (silently dropping the effect).
-    // Guard/on_commit/on are carried through unchanged.
+    // Normalize each effect edge's `from`/`to` by stripping a leading raw-identifier
+    // prefix (#1973, Codex P2 on #2027). The `#[lifecycle]` macro stores variant names
+    // in `STATE_MACHINE_TRANSITIONS` with `r#` already stripped (see
+    // `lifecycle::variant_name_str`), but the effect edges parsed at the binding site
+    // keep it, as in `Draft -> r#type`. Without this alignment the const assertion
+    // below would check `"r#type"` against a table containing `"type"`, falsely
+    // rejecting a real edge, and the generated match arm would never fire, silently
+    // dropping the effect. Guard, on_commit, and on are carried through unchanged.
     let normalized_effects: Vec<StateMachineTransition> = effects
         .iter()
         .map(|t| StateMachineTransition {
@@ -5263,6 +5255,27 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
+    // ── Architecture-graph relation tables (#1747) ───────────────────────
+    // The edge tables this model's declared relations write. `#[votable]` and
+    // `#[commentable]` generate methods on the model's *repository*, so a route
+    // holding that repository reaches these tables without ever naming them.
+    // Sorted and deduplicated so the emitted graph is byte-deterministic.
+    let mut graph_relation_tables: Vec<String> = Vec::new();
+    if let Some(spec) = votable.as_ref() {
+        graph_relation_tables.push(spec.table.clone());
+    }
+    if let Some(spec) = commentable.as_ref() {
+        graph_relation_tables.push(spec.table.clone());
+    }
+    graph_relation_tables.sort();
+    graph_relation_tables.dedup();
+    let graph_relations = if graph_relation_tables.is_empty() {
+        quote! { &[] }
+    } else {
+        let tables = graph_relation_tables.iter().map(String::as_str);
+        quote! { &[#(#tables),*] }
+    };
+
     let filtered_outer_attrs: Vec<&syn::Attribute> = outer_attrs
         .iter()
         .filter(|a| {
@@ -5338,15 +5351,14 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 )
                 .to_compile_error();
             };
-            // The aggregate is `SUM(value)` / `COUNT(*)` — both `BIGINT` — and
-            // the generated `Reaction::aggregate` is `i64`, so anything else is
-            // a schema mismatch, not a convenience to be coerced. Two layers
-            // (PR #2177 review): a *directed* error here for the spellings that
-            // are definitely wrong (a bare non-`i64` primitive, an `Option`),
-            // and a generated `const` type guard (emit_votable_items) for
-            // everything else — so `std::primitive::i64` and aliases that
-            // really are `i64` compile, while a wrong alias still fails at the
-            // guard rather than at runtime.
+            // The aggregate is `SUM(value)` or `COUNT(*)`, both `BIGINT`, and the
+            // generated `Reaction::aggregate` is `i64`, so anything else is a schema
+            // mismatch rather than a convenience to coerce. Two layers (PR #2177
+            // review): a directed error here for the spellings that are definitely
+            // wrong — a bare non-`i64` primitive, an `Option` — and a generated `const`
+            // type guard (`emit_votable_items`) for everything else. So
+            // `std::primitive::i64` and aliases that really are `i64` compile, while a
+            // wrong alias fails at the guard rather than at runtime.
             let aggregate_ty = aggregate_field.ty.to_token_stream().to_string();
             let definitely_not_i64: &[&str] = &[
                 "i8", "i16", "i32", "i128", "u8", "u16", "u32", "u64", "u128", "usize", "isize",
@@ -5708,19 +5720,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // ── #1191: the engine-agnostic search index definition + document ───────
+    // ── #1191: the engine-agnostic search index definition and document ─────
     //
-    // #842 already emits `AutumnSearchableModel` (the metadata the in-core
-    // Postgres/SQLite FTS reads). `SearchIndexed` is the *pluggable* half: it
-    // hands `autumn-search` an `IndexDefinition` and a per-record
-    // `SearchDocument` so any backend (Postgres+pgvector, Meilisearch, a
-    // vector store) can index the model with zero hand-written glue.
+    // #842 already emits `AutumnSearchableModel`, the metadata the in-core
+    // Postgres/SQLite FTS reads. `SearchIndexed` is the pluggable half: it hands
+    // `autumn-search` an `IndexDefinition` and a per-record `SearchDocument`, so any
+    // backend — Postgres with pgvector, Meilisearch, a vector store — can index the
+    // model with no hand-written glue.
     //
-    // Emitted only for a model that is actually searchable, declares at least
-    // one searchable field, and has an `i64` primary key — the id type every
-    // search index keys on (the in-core FTS `search()` already assumes it).
-    // A `#[searchable]` model with, say, a `Uuid` key keeps its #842 behaviour
-    // and simply has no plugin index.
+    // Emitted only for a model that is searchable, declares at least one searchable
+    // field, and has an `i64` primary key, the id type every search index keys on and
+    // the in-core FTS `search()` already assumes. A `#[searchable]` model with a `Uuid`
+    // key keeps its #842 behaviour and simply has no plugin index.
     let search_pk_ident: Option<&syn::Ident> = pk_field_for_factory.and_then(|(id, ty)| {
         matches!(ty, syn::Type::Path(tp) if tp.path.is_ident("i64")).then_some(id)
     });
@@ -5752,35 +5763,32 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 },
             );
-            // A model with a `tenant_id` column carries its tenant into every
-            // document, so any backend can fail closed on a cross-tenant read.
+            // A model with a `tenant_id` column carries its tenant into every document,
+            // so any backend can fail closed on a cross-tenant read.
             //
-            // Keyed on the name AND the type. An unrelated `tenant_id: i64`
-            // would otherwise stamp `tenant_id = "42"` on every document and
-            // make every real-tenant search return nothing; a `tenant_id` of
-            // some other type would fail to compile INSIDE generated code,
-            // pointing at a trait the user never mentioned. The rest of the
-            // macro's tenancy path already assumes `String`/`Option<String>`.
+            // Keyed on the name and the type. An unrelated `tenant_id: i64` would
+            // otherwise stamp `tenant_id = "42"` on every document and make every
+            // real-tenant search return nothing, and a `tenant_id` of some other type
+            // would fail to compile inside generated code, pointing at a trait the user
+            // never mentioned. The rest of the macro's tenancy path already assumes
+            // `String`/`Option<String>`.
             //
-            // This is the COLUMN check only. Whether the index is *scoped* to
-            // the tenant is a separate question, resolved at runtime from the
-            // repository — see `#tenant_scoped_expr` below.
+            // This is the column check only. Whether the index is scoped to the tenant
+            // is resolved at runtime from the repository — see `#tenant_scoped_expr`.
             let has_tenant_column = all_fields.iter().any(|f| {
                 f.ident.as_ref().is_some_and(|i| i == "tenant_id")
                     && is_string_or_option_string(&f.ty)
             });
-            // Tenant SCOPING follows `#[repository(tenant_scoped)]`, exactly as
-            // soft-delete follows `#[repository(soft_delete)]` — and for the
-            // same reason. A `tenant_id` column that is denormalized or audit
-            // data, on a repository that does not opt in, has unscoped
-            // finders; marking its index tenant-scoped anyway would make every
-            // search outside a tenant context fail with `TenantContextMissing`
-            // and every search inside one silently filter, neither of which
-            // matches what the app's own reads do.
+            // Tenant scoping follows `#[repository(tenant_scoped)]`, exactly as
+            // soft-delete follows `#[repository(soft_delete)]`, and for the same reason.
+            // A `tenant_id` column that is denormalized or audit data, on a repository
+            // that does not opt in, has unscoped finders; marking its index
+            // tenant-scoped anyway would make every search outside a tenant context
+            // fail with `TenantContextMissing` and every search inside one silently
+            // filter, neither of which matches the app's own reads.
             //
-            // Column presence is still required: without a `tenant_id` the
-            // documents carry no tenant to filter on, so scoping would match
-            // nothing.
+            // Column presence is still required: with no `tenant_id` the documents
+            // carry no tenant to filter on, so scoping would match nothing.
             let tenant_scoped_expr = if has_tenant_column {
                 quote! { <Self>::__autumn_repo_tenant_scope() }
             } else {
@@ -5831,19 +5839,19 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         // a model keyed on `article_id` would otherwise fail at
                         // runtime with an undefined column.
                         .with_key_column(#search_pk_column)
-                        // Resolved at RUNTIME through the same seam preload
+                        // Resolved at runtime through the same seam preload
                         // uses: `#[repository(soft_delete)]` overrides this
-                        // inherently on the model, and `#[model]` cannot see
-                        // the repository attribute. A `deleted_at` column
-                        // alone does NOT mean soft delete — it is often audit
-                        // history, and those rows must stay indexed because
-                        // the model's finders still return them.
+                        // inherently on the model, and `#[model]` cannot see the
+                        // repository attribute. A `deleted_at` column alone does
+                        // not mean soft delete — it is often audit history, and
+                        // those rows must stay indexed because the model's
+                        // finders still return them.
                         //
-                        // UNQUALIFIED `<Self>::`, never `<Self as Trait>::`:
-                        // the override is an *inherent* associated fn, and
-                        // naming the trait would resolve straight past it to
-                        // the blanket `false` default — silently disabling the
-                        // filter for every genuinely soft-deleted model.
+                        // Unqualified `<Self>::`, never `<Self as Trait>::`: the
+                        // override is an inherent associated fn, and naming the
+                        // trait would resolve past it to the blanket `false`
+                        // default, silently disabling the filter for every
+                        // genuinely soft-deleted model.
                         .with_soft_delete(<Self>::__autumn_repo_soft_delete_scope())
                     }
 
@@ -6272,18 +6280,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let ty = &f.ty;
             let attrs = user_attrs(f);
             // #1778: keep the field's full `#[validate(...)]` rules on the read
-            // model so the *effective merged model* (existing row ∪ patch) can be
-            // validated on the update path via `from_patch`. The model's fields
-            // are concrete `T` (not `Patch<T>`), so every validator — including
-            // the ones the `Patch<T>` path cannot express (`ip` on `Option`,
-            // `does_not_contain`, and the cross-field `custom`/`must_match`/
-            // `nested`) — compiles and runs here without hitting the E0119
-            // trait-coherence walls that block them on `Patch<T>`. (`nested`
-            // carries its own separate hazard even here: see
-            // `NON_PATCH_VALIDATORS`'s doc comment for the `ValidateExt`
-            // collision it can trigger.) The struct only derives
-            // `validator::Validate` when `has_validation` is set (see below), so
-            // the attribute is always registered when present.
+            // model, so the effective merged model (existing row plus patch) can be
+            // validated on the update path via `from_patch`. The model's fields are
+            // concrete `T`, not `Patch<T>`, so every validator compiles and runs
+            // here — including the ones `Patch<T>` cannot express (`ip` on
+            // `Option`, `does_not_contain`, and the cross-field `custom`,
+            // `must_match`, `nested`) — without hitting the E0119 coherence walls
+            // that block them there. `nested` carries its own hazard even here: see
+            // `NON_PATCH_VALIDATORS`'s doc comment for the `ValidateExt` collision.
+            // The struct derives `validator::Validate` only when `has_validation` is
+            // set, so the attribute is always registered when present.
             let val_attrs = validate_attrs(f);
             // Encrypted columns route through an AEAD wrapper transparently:
             // `serialize_as` encrypts on write, `deserialize_as` decrypts on read.
@@ -6301,14 +6307,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let private = (field_hidden_from_json(f) && !field_already_skips_serialization(f))
                 .then(|| quote! { #[serde(skip_serializing)] });
             // #1654: a `#[classified]` column is generated as the taint wrapper
-            // rather than a bare `String`, so the classification is a property of
-            // the type. Diesel round-trips through the opaque `ClassifiedText`
-            // column wrapper, which is the only conversion out of `Classified`
-            // that is not a declassification -- and it dead-ends in the database.
-            // The Diesel wrapper carries the same marker as the field: an
-            // `F`-erasing column type would let a value be converted in as one
-            // column and back out as another, releasing it through the wrong
-            // boundary and recording it against the wrong column.
+            // rather than a bare `String`, so the classification is a property of the
+            // type. Diesel round-trips through the opaque `ClassifiedText` column
+            // wrapper, the only conversion out of `Classified` that is not a
+            // declassification, and it dead-ends in the database. The Diesel wrapper
+            // carries the same marker as the field: an `F`-erasing column type would
+            // let a value go in as one column and come back out as another, releasing
+            // it through the wrong boundary and recording it against the wrong column.
             let classified_marker = classified_marker_for(f);
             let (ident_ty, classified_diesel) = classified_marker.map_or_else(
                 || (quote! { #ty }, quote! {}),
@@ -6356,16 +6361,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // deserializer (which also still accepts RFC 3339 JSON bodies);
             // see `datetime_local_serde_attr`.
             let datetime_local = datetime_local_serde_attr(ty);
-            // #1654 (review round 2): the write structs carry the taint wrapper
-            // too. Taking personal data *in* is not a release -- `Classified`
-            // keeps its `Deserialize`, and the declarative validators see
-            // through it (see `autumn/src/classify/validate.rs`), so the form
-            // and validation paths are unaffected. What must not happen is the
-            // plaintext being moved back *out*: these fields are `pub`, so a
-            // bare `String` here let a handler write
+            // #1654 (review round 2): the write structs carry the taint wrapper too.
+            // Taking personal data in is not a release — `Classified` keeps its
+            // `Deserialize`, and the declarative validators see through it (see
+            // `autumn/src/classify/validate.rs`), so the form and validation paths
+            // are unaffected. What must not happen is the plaintext moving back out:
+            // these fields are `pub`, so a bare `String` here let a handler write
             // `Json(View { email: input.email })` and release the value with no
-            // boundary and no audit record. `skip_serializing` alone could not
-            // stop that -- it only governs serializing the write struct itself.
+            // boundary and no audit record. `skip_serializing` alone cannot stop that
+            // — it governs only serializing the write struct itself.
             let classified = classified_marker_for(f);
             let classified_skip = (classified.is_some()
                 && !field_already_skips_serialization(f))
@@ -6384,21 +6388,20 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
 
     // Build UpdateX fields:
-    // - Regular mutable fields: Patch<T>, propagating the field's `#[validate]`
-    //   attributes (#1719). The struct derives `validator::Validate` below, and
+    // - Regular mutable fields: `Patch<T>`, propagating the field's `#[validate]`
+    //   attributes (#1719). The struct derives `validator::Validate` below and
     //   `Patch<T>` implements validator's per-field traits (see
     //   `autumn/src/hooks.rs`), so a failing declarative rule (`length`, `email`,
     //   `url`, `range`, `contains`, …) on a `Set` value surfaces as a 422 on
-    //   PATCH/PUT, while an absent (`Unchanged`/`Clear`) field is skipped —
-    //   mirroring the create path. `required` is the one non-skip rule: its
-    //   `Patch<T>` impl fails `Clear`/`Set(None)` so a PATCH can't null a
-    //   required column. Non-declarative/struct-level validators (`custom`,
-    //   `must_match`, `nested`, `credit_card`, `non_control_character`) have no
-    //   *usable* `Patch<T>` impl and are filtered out here by
-    //   `validate_attrs_for_patch` (they still run on `NewX`); see that helper
-    //   for the documented create-vs-update limitation.
-    // - #[lock_version] field: plain required T (the client supplies the
-    //   version they read; the framework increments it atomically)
+    //   PATCH/PUT, while an absent `Unchanged`/`Clear` field is skipped, mirroring
+    //   create. `required` is the one non-skip rule: its `Patch<T>` impl fails
+    //   `Clear`/`Set(None)`, so a PATCH cannot null a required column.
+    //   Non-declarative and struct-level validators (`custom`, `must_match`,
+    //   `nested`, `credit_card`, `non_control_character`) have no usable `Patch<T>`
+    //   impl and are filtered out by `validate_attrs_for_patch`; they still run on
+    //   `NewX`. See that helper for the create-vs-update limitation.
+    // - `#[lock_version]` field: a plain required `T`. The client supplies the
+    //   version it read, and the framework increments it atomically.
     let mut update_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
@@ -6455,18 +6458,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    // #1778: statement that validates the effective *merged model* inside
-    // `from_patch` (existing row ∪ patch). Because `after` is a concrete `#name`
-    // — not `Patch<T>` — the model's `#[validate(...)]` rules run against real
-    // values, so the validators that hit E0119 coherence walls on `Patch<T>`
-    // (`ip` on `Option`, `does_not_contain`) and the cross-field ones
-    // (`custom`, `must_match`, `nested`) are all enforced on the update path,
-    // returning the same 422 field-error map as create. (`nested` still
-    // carries its own, separate `ValidateExt` hazard here -- see
-    // `NON_PATCH_VALIDATORS`'s doc comment; #1751.) Runs before the
-    // `before_update` hook, mirroring create (where `validate_new` runs before
-    // `before_create`). Emitted only when the model declares validation; when it
-    // does not there is nothing to check and the model derives no `Validate`.
+    // #1778: the statement that validates the effective merged model inside
+    // `from_patch` (existing row plus patch). Because `after` is a concrete `#name`
+    // and not `Patch<T>`, the model's `#[validate(...)]` rules run against real
+    // values, so the validators that hit E0119 coherence walls on `Patch<T>` (`ip` on
+    // `Option`, `does_not_contain`) and the cross-field ones (`custom`, `must_match`,
+    // `nested`) are all enforced on the update path, returning the same 422 field-error
+    // map as create. `nested` still carries its own `ValidateExt` hazard here — see
+    // `NON_PATCH_VALIDATORS`'s doc comment (#1751). Runs before the `before_update`
+    // hook, mirroring create. Emitted only when the model declares validation.
     let merged_validate_stmt = if has_validation {
         quote! {
             {
@@ -6573,21 +6573,19 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .find(|f| f.ident.as_ref().is_some_and(|id| id == "tenant_id"))
         .copied();
 
-    // `__autumn_preload_retain`: applies this model's read scoping to rows
-    // loaded by another model's `preload`, in-memory, so eager-loaded
-    // associations hide the same rows the model's repository finders do.
-    // Built from the model's own field set (the loading model can't see these
-    // columns): soft-delete drops `deleted_at IS NOT NULL`; tenant scoping
-    // keeps only rows matching the ambient `CURRENT_TENANT` when one is set.
+    // `__autumn_preload_retain` applies this model's read scoping, in memory, to rows
+    // loaded by another model's `preload`, so eager-loaded associations hide the same
+    // rows the model's repository finders do. It is built from the model's own field
+    // set, which the loading model cannot see: soft-delete drops `deleted_at IS NOT
+    // NULL`, and tenant scoping keeps only rows matching the ambient `CURRENT_TENANT`
+    // when one is set.
     //
-    // IMPORTANT: do not add an `if rows.is_empty() { return Ok(rows); }`
-    // early return ahead of the tenant check below. Many-to-many preload
-    // loaders (`through =`) call `__autumn_preload_retain(Vec::new())` as a
-    // fail-closed parity probe specifically to get the "no tenant context"
-    // error even when their join returns zero rows (model.rs, the
-    // `__autumn_m2m_...` loader block) — an empty-input early return would
-    // silently skip that check and break tenant isolation for a whole class
-    // of m2m preloads with no matching join rows. See
+    // Do not add an `if rows.is_empty() { return Ok(rows); }` early return ahead of the
+    // tenant check below. Many-to-many preload loaders (`through =`) call
+    // `__autumn_preload_retain(Vec::new())` as a fail-closed parity probe, precisely to
+    // get the "no tenant context" error even when their join returns zero rows. An
+    // empty-input early return would skip that check and break tenant isolation for a
+    // whole class of m2m preloads. See
     // `preload_retain_empty_rows_still_fails_closed_without_tenant` below.
     let deleted_at_field = all_fields
         .iter()
@@ -6878,26 +6876,22 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         )
     };
 
-    // SQLite counterpart of `#execute_upsert_body`: the per-row loop body that
-    // builds one `INSERT … ON CONFLICT(id) DO UPDATE …` statement, applies the
-    // SAME tenant/lock-version `DO UPDATE … WHERE` refinements Postgres uses
-    // (SQLite's `ON CONFLICT DO UPDATE` supports a `WHERE` clause), runs it, and
-    // pushes any RETURNING row (issue #1996, PR #2021). Matching Postgres' WHERE
-    // is load-bearing for two reasons:
-    //   * tenant isolation (SECURITY): the conflict target is `id` only and the
-    //     shared set-clause (`__autumn_upsert_set`) writes `tenant_id`, so
-    //     without `WHERE tenant_id = <current>` an id owned by another tenant
-    //     would be MOVED into the caller's tenant. With the predicate the DO
-    //     UPDATE simply does not fire for a cross-tenant id → the row is left
-    //     untouched and drops out of RETURNING (silent, no leak).
-    //   * optimistic locking: `WHERE lock_version = excluded.lock_version` leaves
-    //     a stale-version row untouched, dropping it from RETURNING.
+    // SQLite counterpart of `#execute_upsert_body`: the per-row loop body that builds
+    // one `INSERT … ON CONFLICT(id) DO UPDATE …`, applies the same tenant and
+    // lock-version `DO UPDATE … WHERE` refinements Postgres uses — SQLite's `ON
+    // CONFLICT DO UPDATE` supports a `WHERE` clause — runs it, and pushes any RETURNING
+    // row (#1996, PR #2021). Matching Postgres's WHERE is load-bearing twice over:
+    //   * tenant isolation (security): the conflict target is `id` alone and the shared
+    //     set-clause (`__autumn_upsert_set`) writes `tenant_id`, so without `WHERE
+    //     tenant_id = <current>` an id owned by another tenant would be moved into the
+    //     caller's tenant. With the predicate the DO UPDATE does not fire for a
+    //     cross-tenant id: the row is left untouched and drops out of RETURNING.
+    //   * optimistic locking: `WHERE lock_version = excluded.lock_version` leaves a
+    //     stale-version row untouched, dropping it from RETURNING.
     // A dropped row yields no RETURNING output, so per-row `get_result` returns
-    // `Error::NotFound`; `.optional()?` maps that to `None` so the row is simply
-    // absent from the returned Vec — exactly like Postgres' `get_results` omits
-    // filtered rows. The caller's fail-closed reconciliation (re-select dropped
-    // ids under tenant scope → 409 only if still present for this tenant) then
-    // behaves identically on both backends.
+    // `Error::NotFound` and `.optional()?` maps that to `None`, leaving the row absent
+    // from the returned Vec — exactly as Postgres's `get_results` omits filtered rows.
+    // The caller's fail-closed reconciliation then behaves identically on both backends.
     let execute_upsert_body_sqlite = {
         let build_stmt = quote! {
             let stmt = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
@@ -7147,14 +7141,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // Normal field: a single setter that assigns directly.
                 || {
                     // #2373: the setter keeps its `impl Into<#ty>` bound over the
-                    // *declared* type and classifies inside. Binding it to the
-                    // wrapper instead would break every `.email("ada@example.com")`
-                    // call, because `Classified<String, F>` only converts from
-                    // `String` -- not from `&str` -- and a blanket
-                    // `From<U: Into<T>>` would overlap the existing `From<T>`.
-                    // Taking plaintext *in* is not a release, so the setter is
-                    // the right place to wrap: the value is classified from the
-                    // moment it is stored, and callers are unaffected.
+                    // declared type and classifies inside. Binding it to the wrapper
+                    // would break every `.email("ada@example.com")` call, because
+                    // `Classified<String, F>` converts only from `String`, not from
+                    // `&str`, and a blanket `From<U: Into<T>>` would overlap the
+                    // existing `From<T>`. Taking plaintext in is not a release, so the
+                    // setter is the right place to wrap: the value is classified from
+                    // the moment it is stored, and callers are unaffected.
                     let store = if classified_marker_for(f).is_some() {
                         quote! { ::autumn_web::classify::Classified::new(val.into()) }
                     } else {
@@ -7203,17 +7196,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
-    // Per-field value bindings for NON-assoc fields, honoring `.fake()`.
+    // Per-field value bindings for non-assoc fields, honoring `.fake()`.
     //
-    // When the factory is in `.fake()` mode and the field was NOT explicitly set
-    // via its setter, draw a fake value inferred from the field name/type;
-    // otherwise use the value already stored on the factory. Each binding is a
-    // `let {ident} = …;` so both `build()` and `create()` can construct the
-    // record with struct-shorthand (`NewX { {ident}, … }`).
+    // In `.fake()` mode, a field not explicitly set via its setter draws a fake value
+    // inferred from the field name and type; otherwise the value already stored on the
+    // factory is used. Each binding is a `let {ident} = …;`, so both `build()` and
+    // `create()` can construct the record with struct shorthand.
     //
-    // `.clone()` (rather than moving `self.{ident}`) is required because the
-    // fake branch reads `self.__autumn_fake`/`self.__autumn_set` and the value
-    // is only conditionally consumed. All `NewX` field types are `Clone`.
+    // `.clone()`, rather than moving `self.{ident}`, is required because the fake
+    // branch reads `self.__autumn_fake`/`self.__autumn_set` and the value is only
+    // conditionally consumed. All `NewX` field types are `Clone`.
     let factory_value_bindings: Vec<TokenStream> = fields_for_new
         .iter()
         .filter(|f| factory_assoc_type(f).is_none())
@@ -7651,15 +7643,14 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #ident: #ident }
         })
         .collect();
-    // #1654: the durable commit-hook / ledger payload is a second copy of the
-    // record, assembled by serializing every column into JSON. A classified
-    // column has no `Serialize` impl -- that is the guarantee -- so the payload
-    // cannot be built, and building it through a back door would put the value
-    // in a `serde_json::Value` that anything could then hand to a sink. Gating
-    // the durable-payload sink is a follow-up slice; until then the combination
-    // fails loudly at the point it is used, naming the column and what to do.
-    // Both callers (`commit_hooks = true` and `ledgered = true`) are opt-in, so
-    // an ordinary repository over a classified model is unaffected.
+    // #1654: the durable commit-hook and ledger payload is a second copy of the record,
+    // assembled by serializing every column into JSON. A classified column has no
+    // `Serialize` impl — that is the guarantee — so the payload cannot be built, and
+    // building it through a back door would put the value in a `serde_json::Value` that
+    // anything could hand to a sink. Gating the durable-payload sink is a follow-up
+    // slice; until then the combination fails loudly where it is used, naming the
+    // column and the fix. Both callers (`commit_hooks = true`, `ledgered = true`) are
+    // opt-in, so an ordinary repository over a classified model is unaffected.
     let commit_hook_serialize_body = if has_classified {
         let cols = classified_column_names.join("`, `");
         let message = format!(
@@ -8103,21 +8094,19 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
 
                 // Postgres builds one batched `INSERT … ON CONFLICT … DO UPDATE …
-                // RETURNING` over the whole chunk; SQLite cannot express a
-                // multi-row `VALUES` with the `DEFAULT` keyword (`BatchInsert<…,
-                // false>` has no `QueryFragment<Sqlite>`), so it upserts row by
-                // row, each `INSERT … ON CONFLICT(id) DO UPDATE … WHERE … RETURNING`
-                // (valid single-row on SQLite with the `returning_clauses`
-                // flag). The caller (`save_many`/`upsert_many`) already runs this
-                // inside a transaction, so the per-row loop stays atomic. The
-                // per-row body (`#execute_upsert_body_sqlite`) applies the SAME
-                // tenant/lock-version `DO UPDATE … WHERE` refinements as the
-                // Postgres arm — `diesel::upsert::excluded` is the backend-agnostic
-                // form (vs. `pg::upsert::excluded`) and SQLite's `ON CONFLICT DO
-                // UPDATE` supports a `WHERE` clause — so cross-tenant ids are left
-                // untouched (SECURITY: no cross-tenant row movement) and stale
-                // lock-version rows drop out of RETURNING, matching Postgres
-                // exactly (issue #1996, PR #2021).
+                // RETURNING` over the whole chunk. SQLite cannot express a multi-row
+                // `VALUES` with the `DEFAULT` keyword — `BatchInsert<…, false>` has no
+                // `QueryFragment<Sqlite>` — so it upserts row by row, each `INSERT …
+                // ON CONFLICT(id) DO UPDATE … WHERE … RETURNING`, valid single-row on
+                // SQLite with the `returning_clauses` flag. The caller
+                // (`save_many`/`upsert_many`) already runs this inside a transaction,
+                // so the per-row loop stays atomic. The per-row body
+                // (`#execute_upsert_body_sqlite`) applies the same tenant and
+                // lock-version `DO UPDATE … WHERE` refinements as the Postgres arm —
+                // `diesel::upsert::excluded` is the backend-agnostic form — so
+                // cross-tenant ids are left untouched, with no cross-tenant row
+                // movement, and stale lock-version rows drop out of RETURNING, matching
+                // Postgres exactly (#1996, PR #2021).
                 ::autumn_web::backend_select! {
                     pg => {
                         let stmt = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
@@ -8385,6 +8374,25 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // feature (which implies `db`, and hence `create_many`); otherwise it
         // expands to nothing, so models compile unchanged when seeding is off.
         ::autumn_web::__autumn_register_fake_seeder!(#name, stringify!(#name));
+
+        // ── Architecture-graph node (#1747) ────────────────────────────
+        // The model's own declaration of the table it maps to: the join key
+        // every route, job and repository edge resolves against.
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::graph::ModelGraphDescriptor {
+                model: ::core::stringify!(#name),
+                model_path: ::core::concat!(
+                    ::core::module_path!(),
+                    "::",
+                    ::core::stringify!(#name)
+                ),
+                table: #table_name,
+                relations: #graph_relations,
+                module_path: ::core::module_path!(),
+                file: ::core::file!(),
+                line: ::core::line!(),
+            }
+        }
 
         // ── Durable commit-hook codec ───────────────────────────────────
         // Hidden durable commit-hook codec. These methods serialize fields
@@ -8724,13 +8732,13 @@ mod tests {
 
     // ── `counter_cache` on `#[belongs_to]` (#1325) ────────────────────────
     //
-    // The attribute parses as a bare flag and as an explicit column, resolves
-    // the column by the `{snake(child)}_count` convention, and rejects the
-    // shapes that would silently produce wrong SQL: a counter on the parent's
-    // `has_many` (nothing there owns the foreign key), a counter over a
-    // `through =` join table (the foreign key is a join-table column), a
-    // non-identifier column name (it is spliced into `format!`ed SQL), and two
-    // legs resolving onto one parent column (both would move it).
+    // The attribute parses as a bare flag and as an explicit column, resolves the
+    // column by the `{snake(child)}_count` convention, and rejects the shapes that
+    // would silently produce wrong SQL: a counter on the parent's `has_many`, where
+    // nothing owns the foreign key; a counter over a `through =` join table, where the
+    // foreign key is a join-table column; a non-identifier column name, since it is
+    // spliced into `format!`ed SQL; and two legs resolving onto one parent column,
+    // where both would move it.
 
     /// `resolve_associations`' `Ok` type is not `Debug`, so unwrap the error by
     /// matching rather than through `expect_err`.
@@ -10086,15 +10094,13 @@ mod tests {
     #[test]
     fn votable_react_locks_the_target_row_on_pg_only() {
         // A locking clause is a parse error on SQLite, so the row lock lives in
-        // the `pg` arm of `backend_select!` (the unselected arm is never
-        // type-checked); SQLite gets its mutual exclusion from BEGIN IMMEDIATE.
-        //
-        // `FOR NO KEY UPDATE`, not `FOR UPDATE`: react() only writes a
-        // non-key column, and the weaker mode still self-conflicts (reactions
-        // on one target stay serialized) without conflicting with the
-        // `FOR KEY SHARE` locks Postgres takes for foreign-key checks — so a
-        // concurrent `INSERT INTO comments (post_id) …` does not queue behind a
-        // vote.
+        // the `pg` arm of `backend_select!` — the unselected arm is never
+        // type-checked — and SQLite gets its mutual exclusion from BEGIN
+        // IMMEDIATE. `FOR NO KEY UPDATE`, not `FOR UPDATE`: `react()` writes only
+        // a non-key column, and the weaker mode still self-conflicts, keeping
+        // reactions on one target serialized, without conflicting with the `FOR
+        // KEY SHARE` locks Postgres takes for foreign-key checks, so a concurrent
+        // `INSERT INTO comments (post_id) …` does not queue behind a vote.
         let generated = model_macro(
             quote! {},
             quote! {
@@ -10310,20 +10316,19 @@ mod tests {
              M2mConnSource, not read from the task-local directly, got: {votable}"
         );
 
-        // Exactly four tenant-filtered sites, each load-bearing and each the
-        // *scoped* half of a two-arm match (the other arm is today's unfiltered
-        // query, taken for a non-tenant_scoped repository or `across_tenants()`):
+        // Exactly four tenant-filtered sites, each load-bearing and each the scoped
+        // half of a two-arm match; the other arm is the unfiltered query, taken for a
+        // non-`tenant_scoped` repository or `across_tenants()`:
         //
         //   1. S1, `pg` arm     — the locking existence guard,
         //   2. S1, `sqlite` arm — the same guard without the row lock,
-        //   3. S5              — the aggregate UPDATE,
-        //   4. `reaction_of`   — the tenant EXISTS folded into the edge lookup.
+        //   3. S5               — the aggregate UPDATE,
+        //   4. `reaction_of`    — the tenant EXISTS folded into the edge lookup.
         //
-        // The arms stay separate whole queries rather than one boxed query
-        // with a conditional predicate, because S1's `pg` arm carries
-        // `.for_no_key_update()`. Pinned exactly: a fifth would mean a
-        // duplicated statement, a fourth-minus-one that some path lost its
-        // filter and can write across the tenant boundary again.
+        // The arms stay separate whole queries rather than one boxed query with a
+        // conditional predicate, because S1's `pg` arm carries `.for_no_key_update()`.
+        // Pinned exactly: a fifth would mean a duplicated statement, and a third that
+        // some path lost its filter and can write across the tenant boundary again.
         assert_eq!(
             votable.matches("tenant_id . eq").count(),
             4,
@@ -10365,14 +10370,13 @@ mod tests {
     #[test]
     fn votable_model_without_tenant_id_emits_no_tenant_scoping() {
         // AC: zero query cost. A model with no `tenant_id` column can have no
-        // meaningful `tenant_scoped` repository (its own derived queries would
-        // not compile), so the reaction queries must carry no tenant
-        // projection, predicate, or runtime branch. The ONE tenant token that
-        // must still appear is the discarded `__autumn_m2m_tenant_scope()?`
-        // call in each method: it carries the cross-shard reject (PR #2177 —
-        // across_tenants() on a sharded repository has no single right shard
-        // for a reaction), and on a plain repository it is a constant
-        // `Ok(None)`.
+        // meaningful `tenant_scoped` repository — its own derived queries would not
+        // compile — so the reaction queries must carry no tenant projection,
+        // predicate, or runtime branch. The one tenant token that must still appear is
+        // the discarded `__autumn_m2m_tenant_scope()?` call in each method: it carries
+        // the cross-shard reject (PR #2177 — `across_tenants()` on a sharded repository
+        // has no single right shard for a reaction), and on a plain repository it is a
+        // constant `Ok(None)`.
         let generated = model_macro(
             quote! {},
             quote! {
@@ -12073,25 +12077,23 @@ mod tests {
 
     #[test]
     fn update_model_drops_every_non_patch_validator_but_new_model_keeps_them() {
-        // #1751 (residual long tail of #1742/#1719): lock in that the FULL
-        // `NON_PATCH_VALIDATORS` denylist — not just `custom` — is stripped from
-        // the generated `UpdateModel` `Patch<T>` fields while `NewModel` keeps
-        // every one. These are enforced on create only and are genuinely
-        // unfixable on the PATCH path without the merged-model redesign:
-        //   * `must_match` / `nested` — cross-field / struct-level; no
-        //     single-field `Patch<T>` trait exists for them. (`nested` also
-        //     carries a separate, `Patch<T>`-independent `ValidateExt` hazard
-        //     even where it does compile — see `NON_PATCH_VALIDATORS`'s doc
-        //     comment — but that hazard is orthogonal to this Patch-filtering
-        //     test, which is pure token-level and never compiles its output.)
-        //   * `credit_card` (`ValidateCreditCard`) / `non_control_character`
-        //     (`ValidateNonControlCharacter`) — not exported under this
-        //     workspace's `validator` feature set, so no `Patch<T>` impl can be
-        //     written without enabling new features (out of scope for a latent
-        //     case).
-        // This is pure token-level filtering (`model_macro` does not compile the
-        // output), so the combination need not be semantically valid — only that
-        // each validator ident is dropped from the patch struct.
+        // #1751 (the residual tail of #1742/#1719): lock in that the full
+        // `NON_PATCH_VALIDATORS` denylist, not just `custom`, is stripped from the
+        // generated `UpdateModel` `Patch<T>` fields while `NewModel` keeps every one.
+        // These are enforced on create only and are genuinely unfixable on the PATCH
+        // path without the merged-model redesign:
+        //   * `must_match` and `nested` are cross-field or struct-level, and no
+        //     single-field `Patch<T>` trait exists for them. `nested` also carries a
+        //     separate, `Patch<T>`-independent `ValidateExt` hazard even where it does
+        //     compile — see `NON_PATCH_VALIDATORS`'s doc comment — but that is
+        //     orthogonal to this token-level test.
+        //   * `credit_card` (`ValidateCreditCard`) and `non_control_character`
+        //     (`ValidateNonControlCharacter`) are not exported under this workspace's
+        //     `validator` feature set, so no `Patch<T>` impl can be written without
+        //     enabling new features.
+        // This is pure token-level filtering — `model_macro` does not compile its
+        // output — so the combination need not be semantically valid; only that each
+        // validator ident is dropped from the patch struct.
         let output = model_macro(
             TokenStream::new(),
             quote! {
@@ -12294,17 +12296,17 @@ mod tests {
 
     #[test]
     fn update_model_drops_ip_only_on_option_fields_new_model_keeps_all() {
-        // #1719 / Codex P2: `validator` provides no `impl ValidateIp for
-        // Option<T>` (only the `impl<T: ToString> ValidateIp for T` blanket),
-        // so `Patch<Option<String>>: ValidateIp` is unsatisfied and the
-        // generated `UpdateModel` would fail to compile for an `Option<String>`
-        // + `#[validate(ip)]` field. We therefore drop `ip` from the PATCH
-        // fields ONLY when the field is `Option<…>`, while:
-        //   * keeping `ip` on a non-`Option` field (`Patch<String>: ValidateIp`
-        //     holds via the `ToString` blanket),
-        //   * keeping `length` on the `Option` field (validator ships an
-        //     `Option<T>` impl for it, so it must NOT be over-filtered),
-        //   * keeping every validator on `NewModel` (its derive unwraps Option).
+        // #1719 / Codex P2: `validator` provides no `impl ValidateIp for Option<T>`,
+        // only the `impl<T: ToString> ValidateIp for T` blanket, so
+        // `Patch<Option<String>>: ValidateIp` is unsatisfied and the generated
+        // `UpdateModel` would fail to compile for an `Option<String>` field carrying
+        // `#[validate(ip)]`. So `ip` is dropped from the patch fields only when the
+        // field is `Option<…>`, while:
+        //   * `ip` is kept on a non-`Option` field, where `Patch<String>: ValidateIp`
+        //     holds via the `ToString` blanket,
+        //   * `length` is kept on the `Option` field, since validator ships an
+        //     `Option<T>` impl and it must not be over-filtered,
+        //   * every validator is kept on `NewModel`, whose derive unwraps `Option`.
         let output = model_macro(
             TokenStream::new(),
             quote! {

@@ -7,6 +7,8 @@ mod acme_dns01;
 mod acme_end_to_end;
 #[cfg(feature = "acme")]
 mod acme_fake_ca;
+#[cfg(feature = "acme-pebble")]
+mod acme_pebble;
 mod acting_as_integration;
 mod after_commit_integration;
 #[cfg(feature = "mcp")]
@@ -138,6 +140,7 @@ mod htmx_serving;
 mod i18n_integration;
 mod idempotency_middleware;
 mod idempotency_tenant_scope;
+mod idempotency_token_principal;
 mod impersonation;
 #[cfg(feature = "db")]
 mod impersonation_versioned_db;
@@ -238,6 +241,10 @@ mod process_role_worker_gating;
 // here is never picked up by that bare `--ignored` run.
 #[cfg(all(feature = "plugin-sandbox", feature = "test-support"))]
 mod plugin_sandbox;
+// The grown capability vocabulary (#1632): the adversarial corpus for KV,
+// outbound HTTP, DB, jobs, render hooks, quotas and the audit surface.
+#[cfg(all(feature = "plugin-sandbox", feature = "test-support"))]
+mod plugin_sandbox_capabilities;
 mod push_end_to_end;
 mod push_router;
 #[cfg(feature = "db")]
@@ -376,6 +383,8 @@ mod validate_merged_model;
 mod validate_on_update_blind;
 mod validate_patch_option_ip;
 mod webhook_outbound;
+#[cfg(feature = "db")]
+mod webhook_outbound_dispatch_fanout_profile;
 #[cfg(feature = "maud")]
 mod widget_css_coverage;
 #[cfg(feature = "maud")]

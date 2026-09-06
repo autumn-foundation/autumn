@@ -1,0 +1,257 @@
+//! Render slots: where a host page lets a sandboxed plugin put something
+//! (issue #1632).
+//!
+//! Two halves, and both are needed:
+//!
+//! * the **plugin's manifest** names the slots it is willing to fill, which is
+//!   what an operator approves on the consent screen, and
+//! * the **host application** declares the slots that exist, which is what
+//!   stops a plugin from filling a place the app never offered.
+//!
+//! A slot only renders when both agree. Neither half alone is enough: a
+//! manifest-only rule lets an artifact name `checkout-total` and appear in a
+//! checkout the app never meant to extend, and a host-only rule would hand a
+//! slot to a plugin whose operator never approved it.
+//!
+//! ```rust,ignore
+//! let slots = RenderSlots::declaring(["order-summary"])
+//!     .with(plugin.clone())?;
+//!
+//! // ...in a handler, on the order page:
+//! let extra = slots.render("order-summary", &[("order".into(), id)]).await;
+//! ```
+//!
+//! # Nothing here can break the page
+//!
+//! [`RenderSlots::render`] returns a `String`, never a `Result`. Every failure a
+//! plugin can produce — a trap, an exhausted fuel budget, a fragment carrying a
+//! tag the renderer will not emit, a hook over its `render_bytes` quota, a
+//! plugin at its concurrency ceiling — contributes nothing to the string and is
+//! logged. A page that renders one plugin's fragment and omits another's is the
+//! designed outcome, not a degraded one.
+
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
+use std::sync::Arc;
+
+use super::manifest::SandboxCapability;
+use super::plugin::SandboxedPlugin;
+
+/// The slots this application offers, and the plugins that may fill them.
+#[derive(Clone, Default)]
+pub struct RenderSlots {
+    declared: Vec<String>,
+    plugins: Vec<Arc<SandboxedPlugin>>,
+}
+
+/// Why a plugin could not be registered against this application's slots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SlotError {
+    /// The plugin's manifest names a slot this application does not offer.
+    ///
+    /// Refused at registration rather than ignored at render time: an operator
+    /// who approved `checkout-total` on the consent screen should learn at boot
+    /// that this app has no such slot, not wonder later why nothing appears.
+    UndeclaredSlot {
+        /// The plugin that asked.
+        plugin: String,
+        /// The slot it named.
+        slot: String,
+    },
+}
+
+impl std::fmt::Display for SlotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UndeclaredSlot { plugin, slot } => write!(
+                f,
+                "sandboxed plugin `{plugin}` was granted the render slot {slot:?}, which this \
+                 application does not declare; declare it or do not install this plugin"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SlotError {}
+
+impl std::fmt::Debug for RenderSlots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderSlots")
+            .field("declared", &self.declared)
+            .field(
+                "plugins",
+                &self
+                    .plugins
+                    .iter()
+                    .map(|plugin| plugin.manifest().name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl RenderSlots {
+    /// The slots this application offers.
+    #[must_use]
+    pub fn declaring(slots: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            declared: slots.into_iter().map(Into::into).collect(),
+            plugins: Vec::new(),
+        }
+    }
+
+    /// Every slot this application declares.
+    #[must_use]
+    pub fn declared(&self) -> &[String] {
+        &self.declared
+    }
+
+    /// Let `plugin` fill the slots its manifest names.
+    ///
+    /// A plugin without the `render` capability registers fine and fills
+    /// nothing — installing one to serve its prefix and no slot is ordinary.
+    ///
+    /// # Errors
+    ///
+    /// [`SlotError::UndeclaredSlot`] if the manifest names a slot this
+    /// application does not offer.
+    pub fn with(mut self, plugin: Arc<SandboxedPlugin>) -> Result<Self, SlotError> {
+        let manifest = plugin.manifest();
+        if manifest.is_granted(SandboxCapability::Render) {
+            for slot in &manifest.grants.slots {
+                if !self.declared.iter().any(|declared| declared == slot) {
+                    return Err(SlotError::UndeclaredSlot {
+                        plugin: manifest.name.clone(),
+                        slot: slot.clone(),
+                    });
+                }
+            }
+        }
+        self.plugins.push(plugin);
+        Ok(self)
+    }
+
+    /// The fragments every granted plugin produced for `slot`, concatenated in
+    /// registration order.
+    ///
+    /// Empty when the slot is not declared, when no plugin was granted it, or
+    /// when every plugin that was granted it failed — all three are the same
+    /// thing to a page.
+    ///
+    /// Sequential rather than concurrent: each hook holds a blocking worker for
+    /// its fuel budget, and a page with several slots would otherwise fan a
+    /// single request out across the blocking pool. The per-plugin concurrency
+    /// ceiling bounds the total either way; doing them in turn keeps one page's
+    /// share of the pool equal to one.
+    pub async fn render(&self, slot: &str, context: &[(String, String)]) -> String {
+        if !self.declared.iter().any(|declared| declared == slot) {
+            // Not an error, and not silent either: a handler naming a slot the
+            // app never declared is a typo that would otherwise present as a
+            // panel that simply never appears.
+            tracing::warn!(
+                slot,
+                "a handler asked for a render slot this application does not declare"
+            );
+            return String::new();
+        }
+        let mut out = String::new();
+        for plugin in &self.plugins {
+            let manifest = plugin.manifest();
+            if !manifest.is_granted(SandboxCapability::Render)
+                || !manifest.grants.allows(SandboxCapability::Render, slot)
+            {
+                continue;
+            }
+            if let Some(fragment) = plugin.render_slot(slot, context).await {
+                out.push_str(&fragment);
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin_sandbox::{SandboxArtifact, SandboxManifest};
+
+    fn manifest_toml(slots: &str) -> String {
+        format!(
+            r#"
+name = "shop"
+version = "0.1.0"
+wire_version = 1
+prefix = "/shop"
+capabilities = ["http-request", "render"]
+sha256 = "{digest}"
+
+[[routes]]
+method = "GET"
+path = "/shop/panel"
+
+[grants]
+slots = [{slots}]
+"#,
+            digest = "a".repeat(64)
+        )
+    }
+
+    fn plugin(slots: &str) -> Arc<SandboxedPlugin> {
+        let manifest = SandboxManifest::parse(&manifest_toml(slots)).expect("valid");
+        let module = wat::parse_str(super::super::test_guests::RENDER_CLIENT).expect("valid WAT");
+        let artifact = SandboxArtifact::seal(manifest, module).expect("seals");
+        Arc::new(SandboxedPlugin::from_artifact(&artifact).expect("loads"))
+    }
+
+    #[test]
+    fn a_plugin_naming_a_slot_the_app_never_declared_is_refused_at_boot() {
+        let slots = RenderSlots::declaring(["order-summary"]);
+        assert_eq!(
+            slots.with(plugin("\"checkout-total\"")).err(),
+            Some(SlotError::UndeclaredSlot {
+                plugin: "shop".to_owned(),
+                slot: "checkout-total".to_owned(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slot_neither_half_agreed_on_renders_nothing() {
+        let slots = RenderSlots::declaring(["order-summary", "sidebar"])
+            .with(plugin("\"order-summary\""))
+            .expect("registers");
+        // Declared by the app, granted by the manifest: the fragment renders.
+        assert!(!slots.render("order-summary", &[]).await.is_empty());
+        // Declared by the app, not granted by the manifest.
+        assert!(slots.render("sidebar", &[]).await.is_empty());
+        // Granted by nothing and declared by nothing.
+        assert!(slots.render("checkout-total", &[]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failing_hook_contributes_nothing_and_the_page_still_renders() {
+        let slots = RenderSlots::declaring(["order-summary", "unsafe-tag"])
+            .with(plugin("\"order-summary\", \"unsafe-tag\""))
+            .expect("registers");
+        assert!(slots.render("unsafe-tag", &[]).await.is_empty());
+        // The plugin that failed one slot still fills the other.
+        assert!(!slots.render("order-summary", &[]).await.is_empty());
+    }
+}
