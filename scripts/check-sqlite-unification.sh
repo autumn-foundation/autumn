@@ -24,8 +24,11 @@
 #      or `autumn-cli` enables `sqlite`. Covers the inline form
 #      (`autumn-web = { features = ["sqlite"] }`), the section form
 #      (`[dev-dependencies.autumn-web]` + `features = [...]`), the dotted-key
-#      form (`autumn-web.features = [...]`) and a renamed dependency
-#      (`web = { package = "autumn-web", … }`).
+#      form (`autumn-web.features = [...]`) and a renamed dependency in any of
+#      its three spellings (`web = { package = "autumn-web", … }`,
+#      `[dependencies.web]` + `package = "autumn-web"`, `web.package = "…"`) —
+#      a rename splits the crate name away from the `features` list, so the
+#      manifest is read twice and the aliases resolved before the rules run.
 #   2. No `[features]` entry forwards `autumn-web/sqlite` / `autumn-cli/sqlite`
 #      unless the entry is ITSELF named `sqlite` AND the manifest belongs to one
 #      of those two crates. That single exception is autumn-cli's own opt-in
@@ -146,6 +149,13 @@ scan_manifest() {
       return name
     }
     function report(msg) { printf "%s:%d: %s\n", FILENAME, entry_line, msg }
+    # The value of a `key = "value"` entry.
+    function quoted_value(entry,   value) {
+      value = entry
+      sub(/^[^=]*=[ \t]*"/, "", value)
+      sub(/".*$/, "", value)
+      return value
+    }
 
     # ── Pass 1: whose manifest is this, and what does it define? ─────────
     NR == FNR {
@@ -159,6 +169,23 @@ scan_manifest() {
       }
       if (section == "[features]" && norm ~ /^sqlite[ \t]*=/ && norm ~ ("\"(" flip ")/sqlite\""))
         defines_flip_sqlite = 1
+
+      # A RENAMED dependency names its real crate in a `package` key that can
+      # sit anywhere in the entry, so the rules cannot see it one line at a
+      # time. Both spellings are collected here and resolved in pass 2:
+      #
+      #   [dependencies.web]        |  [dependencies]
+      #   package = "autumn-web"    |  web.package = "autumn-web"
+      #   features = ["sqlite"]     |  web.features = ["sqlite"]
+      #
+      # Cargo accepts both and both enable the flip.
+      if (dep_section_crate() != "" && norm ~ /^package[ \t]*=/)
+        section_package[section] = quoted_value(norm)
+      if (is_dep_table() && norm ~ /^[A-Za-z0-9_-]+\.package[ \t]*=/) {
+        alias = norm
+        sub(/\.package.*$/, "", alias)
+        dotted_package[alias] = quoted_value(norm)
+      }
       next
     }
 
@@ -177,14 +204,28 @@ scan_manifest() {
       forwards = (norm ~ ("\"(" flip ")/sqlite\""))
 
       # ── 1. A dependency edge that enables the flip ────────────────────
-      if (is_dep_table() && mentions_sqlite \
-          && (norm ~ ("^(" flip ")[ \t]*=") \
-              || norm ~ ("^(" flip ")\\.features[ \t]*=") \
-              || norm ~ ("package[ \t]*=[ \t]*\"(" flip ")\""))) {
-        report("dependency edge enables the `sqlite` backend flip")
-        next
+      if (is_dep_table() && mentions_sqlite) {
+        # Inline: by key, or renamed with `package` in the same entry.
+        if (norm ~ ("^(" flip ")[ \t]*=") \
+            || norm ~ ("package[ \t]*=[ \t]*\"(" flip ")\"")) {
+          report("dependency edge enables the `sqlite` backend flip")
+          next
+        }
+        # Dotted: `autumn-web.features`, or an alias pass 1 resolved.
+        if (norm ~ /^[A-Za-z0-9_-]+\.features[ \t]*=/) {
+          alias = norm
+          sub(/\.features.*$/, "", alias)
+          if (alias ~ ("^(" flip ")$") \
+              || (alias in dotted_package && dotted_package[alias] ~ ("^(" flip ")$"))) {
+            report("dependency edge enables the `sqlite` backend flip")
+            next
+          }
+        }
       }
+      # Section form: the crate is the last header segment, unless a
+      # `package` key inside the section renamed it.
       crate = dep_section_crate()
+      if (crate != "" && (section in section_package)) crate = section_package[section]
       if (crate ~ ("^(" flip ")$") && norm ~ /^features[ \t]*=/ && mentions_sqlite) {
         report("dependency edge enables the `sqlite` backend flip")
         next
@@ -352,6 +393,37 @@ autumn-web.workspace = true
 autumn-web.features = ["sqlite"]
 EOF
   check_fail "dotted-key dependency form" dotted
+
+  # A rename splits the crate name away from the `features` list, so neither
+  # line names the flip on its own. Both spellings, and `features` written
+  # BEFORE the `package` key that resolves it.
+  make_case renamed_section <<'EOF'
+[dependencies.web]
+package = "autumn-web"
+features = ["sqlite"]
+EOF
+  check_fail "renamed dependency in table form" renamed_section
+
+  make_case renamed_section_reordered <<'EOF'
+[dependencies.web]
+features = ["sqlite"]
+package = "autumn-web"
+EOF
+  check_fail "renamed dependency in table form, package last" renamed_section_reordered
+
+  make_case renamed_dotted <<'EOF'
+[dependencies]
+web.package = "autumn-web"
+web.features = ["sqlite"]
+EOF
+  check_fail "renamed dependency in dotted form" renamed_dotted
+
+  make_case renamed_unrelated <<'EOF'
+[dependencies.store]
+package = "some-store"
+features = ["sqlite"]
+EOF
+  check_pass "a rename of an unrelated crate is not an edge" renamed_unrelated
 
   make_case single_quoted <<'EOF'
 [dependencies]
