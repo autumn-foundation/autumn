@@ -1512,14 +1512,32 @@ def definition_labels(txt):
 # is visible and clickable — and stripping every tag left it looking empty.
 # Only elements that reliably render are listed; an `<input type=hidden>`
 # is markup, not content.
-# `iframe` was in this list for one round and is deliberately not now. Its
-# CONTENTS are hidden (see `HIDDEN_TAGS`), so the whole element is blanked
-# before this test ever runs and listing it here did nothing but conflict —
-# and an embedded document is not an icon: an anchor wrapping one has no
-# clickable area of its own. It was added speculatively while generalising
-# `<svg>`, which is the reported case and the one that is real.
+#
+# `progress` and `meter` are here because they paint with no attributes at all
+# and are not interactive: `<a href=…><progress></progress></a>` gives the
+# anchor a 160x17 box that hit-tests inside it, so it is a link the reader can
+# see and click.
+#
+# Measured and NOT added: `button`, `input`, `select` and `textarea` also paint
+# and also hit-test inside a wrapping anchor. They are left out because
+# interactive content inside `<a>` is invalid HTML that a docs page will not
+# contain, and because "clicking navigates" cannot tell them apart — in a
+# synthetic click every one of these navigates, since the event simply bubbles.
+# Painting-without-attributes and non-interactive is the line that actually
+# separates them.
+#
+# `iframe` was in this list for one round and is deliberately not now, for ONE
+# reason rather than the two given here before: its CONTENTS are hidden (see
+# `HIDDEN_TAGS`), so the whole element is blanked before this test ever runs
+# and listing it did nothing but conflict. The second reason this comment used
+# to give — that an anchor wrapping one "has no clickable area of its own" —
+# is simply false, and measuring for `progress` is what exposed it: an iframe
+# gives its anchor a 304x17 box that hit-tests inside it, exactly like the
+# elements that are listed. The conclusion held up; that half of the argument
+# for it never should have been written down unchecked.
 ANY_IMAGE = re.compile(
-    r'!\[|<(?:img|svg|video|canvas|picture|object|embed)\b', re.I)
+    r'!\[|<(?:img|svg|video|canvas|picture|object|embed|progress|meter)\b',
+    re.I)
 # An element carrying `hidden`, and its OPENING tag only — the matching close
 # is found by a scan, because same-name nesting cannot be balanced by a regular
 # expression. `<span hidden><span></span>Mail</span>` closed at the INNER
@@ -4351,6 +4369,28 @@ self_test() {
     > "$c9jn/docs/guide/jobs.md"
   git -C "$c9jn" add -A && git -C "$c9jn" commit -qm svg-display-none
   check "inline CSS does hide an svg" fail "$c9jn"
+
+  # `progress` paints with no attributes at all, so an anchor around one is a
+  # link the reader can see and click (160x17, hit-testing inside the anchor).
+  local c9kb="$tmp/c9kb"; make_corpus "$c9kb"
+  printf '# Jobs\n\n<a href="mail.md"><progress></progress></a>\n' \
+    > "$c9kb/docs/guide/jobs.md"
+  git -C "$c9kb" add -A && git -C "$c9kb" commit -qm progress-content
+  check "a progress bar is link content" pass "$c9kb"
+
+  local c9kc="$tmp/c9kc"; make_corpus "$c9kc"
+  printf '# Jobs\n\n<a href="mail.md"><meter></meter></a>\n' \
+    > "$c9kc/docs/guide/jobs.md"
+  git -C "$c9kc" add -A && git -C "$c9kc" commit -qm meter-content
+  check "a meter is link content" pass "$c9kc"
+
+  # ...but hiding it still hides it, so this is about painting rather than
+  # about the tag name being on the list.
+  local c9kd="$tmp/c9kd"; make_corpus "$c9kd"
+  printf '# Jobs\n\n<a href="mail.md"><progress hidden></progress></a>\n' \
+    > "$c9kd/docs/guide/jobs.md"
+  git -C "$c9kd" add -A && git -C "$c9kd" commit -qm hidden-progress
+  check "a hidden progress bar is not link content" fail "$c9kd"
 
   # A style attribute is a CASCADE: the later declaration wins, so this link
   # is visible and matching any `display:none` occurrence rejected it.
