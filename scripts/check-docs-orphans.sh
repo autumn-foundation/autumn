@@ -208,7 +208,12 @@ DEST_BARE = r'(?:[^()\s]|\([^()\s]*\))+'
 # paragraph, so `[x](y.md\n\n "t")` renders no link at all. Bounding `_WS` and
 # leaving this grammar open was the same half-a-rule mistake in one regex.
 _TBODY = r'(?:[^{q}\\\n]|\\.|\n(?![ \t]*\n))*'
-TITLE = (r'(?:' + r'(?:[ \t]*\n?[ \t]*)' +
+# The separator is REQUIRED: CommonMark says a title must be separated from
+# the destination by whitespace, so `[Mail](<mail.md>"title")` renders no
+# link at all. Allowing zero characters there accepted it and recorded the
+# destination of something the reader cannot click. One space or tab, or a
+# single line ending — never a blank line, which ends the paragraph.
+TITLE = (r'(?:' + r'(?:[ \t]+|[ \t]*\n[ \t]*)' +
          r'(?:"' + _TBODY.format(q='"') + r'"'
          r"|'" + _TBODY.format(q="'") + r"'"
          r'|\(' + _TBODY.format(q='()') + r'\)))?')
@@ -822,7 +827,33 @@ INDENTED_CODE = re.compile(r'^ {4}')
 # A definition, as one line sees it. Same shape the sibling's
 # `is_link_definition` uses, non-space after the colon included, so both agree
 # on what keeps a RUN of definitions going.
-REF_DEF_LINE = re.compile(r'^ {0,3}\[(?:[^\[\]\\]|\\.)+\]:[ \t]*\S')
+# A definition-SHAPED line is not a definition. `[bad]: url trailing garbage`
+# is a paragraph, so the `[mail]: mail.md` under it cannot interrupt one and
+# defines nothing — but this test said both were definitions, left the
+# paragraph closed, and let the second resolve. The complete syntax is what
+# decides, the same as it does for `REF_DEF` itself.
+REF_DEF_LINE = re.compile(
+    r'^ {0,3}\[' + FLAT + LABEL_MAX + r'\]:[ \t]*'
+    r'(?:<[^<>\r\n]*>|' + DEST_BARE + r')'
+    r'(?:[ \t]+(?:"[^"\n]*"|\'[^\'\n]*\'|\([^()\n]*\)))?[ \t]*$')
+
+
+# Raw HTML blocks whose end condition is a DELIMITER rather than a blank line
+# (types 1 and 3-5). `block_starts` has to know about these: it reads the
+# unmasked text, where the lines of a visible `<pre>` block look like ordinary
+# prose, so a definition directly under a `</pre>` was taken for paragraph
+# continuation. It is a definition — the block ended at the close tag — and
+# leaving it unblanked let its path count as a visible route.
+# Types 6 and 7 need no entry: they end at a blank line, which already closes
+# the paragraph, so the only line they could get wrong does not exist.
+HTML_OPEN_TYPE1 = re.compile(
+    r'^ {0,3}<(?:' + TYPE1_TAGS + r')(?=[\s>]|$)', re.I)
+HTML_CLOSE_TYPE1 = re.compile(r'</(?:' + TYPE1_TAGS + r')\s*>', re.I)
+HTML_DELIM_OPENERS = (
+    (re.compile(r'^ {0,3}<!\[CDATA\['), ']]>'),
+    (re.compile(r'^ {0,3}<\?'), '?>'),
+    (re.compile(r'^ {0,3}<![A-Za-z]'), '>'),
+)
 
 
 def block_starts(txt):
@@ -859,11 +890,32 @@ def block_starts(txt):
     `md_paragraph_open`.
     """
     starts, pos, para_open = set(), 0, False
+    # The end condition of an open delimiter-terminated raw block: a compiled
+    # pattern for type 1, a literal terminator for types 3-5, or None.
+    html_end = None
     for line in txt.split('\n'):
         if not para_open:
             starts.add(pos)
         stripped = line.strip()
-        if not stripped:
+        if html_end is not None:
+            # Inside such a block no paragraph is open, and the line carrying
+            # the end condition belongs to the block — so the line AFTER it
+            # starts a new one.
+            para_open = False
+            if (html_end.search(line) if hasattr(html_end, 'search')
+                    else html_end in line):
+                html_end = None
+        elif HTML_OPEN_TYPE1.match(line):
+            para_open = False
+            if not HTML_CLOSE_TYPE1.search(line):
+                html_end = HTML_CLOSE_TYPE1
+        elif any(o.match(line) for o, _ in HTML_DELIM_OPENERS):
+            para_open = False
+            opener, term = next(
+                (o, t) for o, t in HTML_DELIM_OPENERS if o.match(line))
+            if term not in line[opener.match(line).end():]:
+                html_end = term
+        elif not stripped:
             para_open = False
         elif not para_open and INDENTED_CODE.match(line.expandtabs(4)):
             # Indented code. This arm is reachable only with no paragraph open,
@@ -2632,6 +2684,46 @@ self_test() {
   printf '# Jobs\n\n<!demo\n\nSee [mail](mail.md).\n' > "$c9fn/docs/guide/jobs.md"
   git -C "$c9fn" add -A && git -C "$c9fn" commit -qm lowercase-declaration
   check "a lowercase declaration opens a raw block" fail "$c9fn"
+
+  # A definition directly under a closed `<pre>` block IS a definition: the
+  # block ended at the close tag, so the line below it starts a new block and
+  # the definition renders as nothing. Its path must not count as visible.
+  local c9fo="$tmp/c9fo"; make_corpus "$c9fo"
+  printf '# Jobs\n\n<pre>\nx\n</pre>\n[mail]: docs/guide/mail.md\n' \
+    > "$c9fo/docs/guide/jobs.md"
+  git -C "$c9fo" add -A && git -C "$c9fo" commit -qm def-after-pre-block
+  check "an unused definition under a closed <pre> is not a route" fail "$c9fo"
+
+  # A title must be SEPARATED from its destination, or there is no link.
+  local c9fp="$tmp/c9fp"; make_corpus "$c9fp"
+  printf '# Jobs\n\nSee [mail](<mail.md>"title").\n' > "$c9fp/docs/guide/jobs.md"
+  git -C "$c9fp" add -A && git -C "$c9fp" commit -qm title-unseparated
+  check "a title jammed against its destination is not a link" fail "$c9fp"
+
+  # ...but a properly separated one still resolves.
+  local c9fq="$tmp/c9fq"; make_corpus "$c9fq"
+  printf '# Jobs\n\nSee [mail](<mail.md> "title").\n' > "$c9fq/docs/guide/jobs.md"
+  git -C "$c9fq" add -A && git -C "$c9fq" commit -qm title-separated
+  check "a separated title still resolves" pass "$c9fq"
+
+  # An invalid definition is a paragraph, so the valid-looking line under it
+  # cannot interrupt one and defines nothing.
+  local c9fr="$tmp/c9fr"; make_corpus "$c9fr"
+  # A RELATIVE destination, so the bare-path scan cannot see it and the only
+  # possible route is the definition itself. Spelled `docs/guide/mail.md`, the
+  # line is visible paragraph text whose path counts on its own — correctly,
+  # and the test would then pass either way and prove nothing.
+  printf '# Jobs\n\nSee [mail][mail].\n\n[bad]: https://example.test trailing garbage\n[mail]: mail.md\n' \
+    > "$c9fr/docs/guide/jobs.md"
+  git -C "$c9fr" add -A && git -C "$c9fr" commit -qm def-after-invalid-def
+  check "a definition under an invalid one defines nothing" fail "$c9fr"
+
+  # ...while a run of VALID definitions still resolves, as before.
+  local c9fs="$tmp/c9fs"; make_corpus "$c9fs"
+  printf '# Jobs\n\nSee [mail][mail].\n\n[ok]: https://example.test\n[mail]: mail.md\n' \
+    > "$c9fs/docs/guide/jobs.md"
+  git -C "$c9fs" add -A && git -C "$c9fs" commit -qm def-after-valid-def
+  check "a definition under a valid one still defines" pass "$c9fs"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
