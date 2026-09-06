@@ -14,11 +14,11 @@ use autumn_web::prelude::*;
 use autumn_web::reexports::axum::middleware::from_fn;
 use autumn_web::test::{TestApp, TestClient, TestDb};
 
-use saas::routes;
+use {{crate_name}}::routes;
 
 fn app_routes() -> Vec<autumn_web::Route> {
     routes![
-        saas::index,
+        {{crate_name}}::index,
         routes::auth::signup_form,
         routes::auth::signup,
         routes::auth::login_form,
@@ -171,13 +171,13 @@ async fn db_client() -> TestClient {
     // Hand the remember middleware the shared pool and resolved config, exactly
     // as `main`'s startup hook does, and register the middleware layer so a
     // remember cookie rotates into a session before the tenancy gate.
-    saas::remember::init_remember_pool(db.pool(), autumn_web::auth::RememberConfig::default());
+    {{crate_name}}::remember::init_remember_pool(db.pool(), autumn_web::auth::RememberConfig::default());
 
     TestApp::new()
         .routes(app_routes())
         .config(config)
         .with_db(db.pool())
-        .layer(from_fn(saas::remember::remember_me_middleware))
+        .layer(from_fn({{crate_name}}::remember::remember_me_middleware))
         .build()
 }
 
