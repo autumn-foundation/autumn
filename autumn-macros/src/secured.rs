@@ -338,6 +338,25 @@ mod tests {
     use super::{parse_secured_args, secured_macro};
     use crate::static_route::static_get_macro;
 
+    /// Characterization test (Echo refactor, clone class: the
+    /// `FromRequestParts` gate skeleton shared with `step_up`/`throttle`):
+    /// pins `#[secured("admin", scopes = ["posts:write"])]`'s exact expansion
+    /// — exercising the role check, the scope check, and (as the only guard
+    /// on this handler) the replay lookup all at once — so that factoring the
+    /// gate's struct+impl skeleton into `request_gate::wrap_gate` cannot
+    /// silently change a single token of it.
+    #[test]
+    fn secured_macro_expansion_is_unchanged_by_the_gate_skeleton_refactor() {
+        let generated = secured_macro(
+            quote! { "admin", scopes = ["posts:write"] },
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert_eq!(generated, include_str!("../testdata/secured_golden.txt").trim_end());
+    }
+
     #[test]
     fn secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
         // Simulates real source using `use ::autumn_web::secured as auth;`:

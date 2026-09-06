@@ -488,6 +488,25 @@ mod tests {
     use super::throttle_macro;
     use crate::static_route::static_get_macro;
 
+    /// Characterization test (Echo refactor, clone class: the
+    /// `FromRequestParts` gate skeleton shared with `secured`/`step_up`):
+    /// pins `#[throttle(limit = 5, per = "1m", key = "principal")]`'s exact
+    /// expansion — exercising the rate-limit check and (as the only guard on
+    /// this handler) the replay lookup at once — so that factoring the
+    /// gate's struct+impl skeleton into `request_gate::wrap_gate` cannot
+    /// silently change a single token of it.
+    #[test]
+    fn throttle_macro_expansion_is_unchanged_by_the_gate_skeleton_refactor() {
+        let generated = throttle_macro(
+            quote! { limit = 5, per = "1m", key = "principal" },
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert_eq!(generated, include_str!("../testdata/throttle_golden.txt").trim_end());
+    }
+
     #[test]
     fn throttle_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
         // See `secured::tests::secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias`

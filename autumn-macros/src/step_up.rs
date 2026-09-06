@@ -381,6 +381,25 @@ mod tests {
     use super::step_up_macro;
     use crate::static_route::static_get_macro;
 
+    /// Characterization test (Echo refactor, clone class: the
+    /// `FromRequestParts` gate skeleton shared with `secured`/`throttle`):
+    /// pins `#[step_up(max_age = "5m")]`'s exact expansion — exercising the
+    /// session extraction, the freshness check, and (as the only guard on
+    /// this handler) the replay lookup all at once — so that factoring the
+    /// gate's struct+impl skeleton into `request_gate::wrap_gate` cannot
+    /// silently change a single token of it.
+    #[test]
+    fn step_up_macro_expansion_is_unchanged_by_the_gate_skeleton_refactor() {
+        let generated = step_up_macro(
+            quote! { max_age = "5m" },
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert_eq!(generated, include_str!("../testdata/step_up_golden.txt").trim_end());
+    }
+
     #[test]
     fn step_up_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
         // See `secured::tests::secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias`
