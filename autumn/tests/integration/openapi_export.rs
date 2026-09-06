@@ -227,9 +227,22 @@ fn datetime_and_uuid_fields_are_inline_scalars_not_dangling_refs() {
     let props = &schema["properties"];
 
     assert_eq!(props["created_at"]["type"], "string");
-    assert_eq!(props["created_at"]["format"], "date-time");
     assert_eq!(props["seen_on"]["format"], "date");
     assert_eq!(props["id"]["format"], "uuid");
+
+    // A naive value carries NO RFC 3339 format: chrono writes it without a UTC
+    // offset, so claiming `date-time` would describe a payload a strict
+    // validator rejects and a generator would type as timezone-aware.
+    assert!(
+        props["created_at"].get("format").is_none(),
+        "NaiveDateTime must not claim an offset-bearing format: {schema}"
+    );
+    assert!(
+        props["created_at"]["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("no UTC offset")),
+        "the shape it does serialize is documented instead: {schema}"
+    );
 
     // The point: none of them emits a `$ref` to a component nothing registers,
     // which the back-fill would resolve to the opaque placeholder. A

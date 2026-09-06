@@ -146,13 +146,21 @@ fn enum_schema_body(
         // the way it is actually written, so the diagnostic quotes real syntax.
         let (written, becomes) = match repr {
             "untagged" => ("#[serde(untagged)]", "`null`"),
-            other => (
-                if other == "tag" {
-                    "#[serde(tag = \"...\")]"
-                } else {
-                    "#[serde(content = \"...\")]"
-                },
-                "an object",
+            "tag" => ("#[serde(tag = \"...\")]", "an object"),
+            "content" => ("#[serde(content = \"...\")]", "an object"),
+            // Conversion attributes route the value through another type
+            // entirely, so the variant names never reach the wire at all.
+            "into" => (
+                "#[serde(into = \"...\")]",
+                "whatever the conversion type serializes as",
+            ),
+            "from" => (
+                "#[serde(from = \"...\")]",
+                "whatever the conversion type serializes as",
+            ),
+            _ => (
+                "#[serde(try_from = \"...\")]",
+                "whatever the conversion type serializes as",
             ),
         };
         return Err(syn::Error::new_spanned(

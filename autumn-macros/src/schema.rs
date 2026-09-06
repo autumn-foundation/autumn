@@ -192,6 +192,12 @@ pub fn apply_serde_rename_all_rule_to_variant(rule: &str, variant: &str) -> Opti
 /// | `#[serde(tag = "t")]` | `{"t": "Variant"}` — an object |
 /// | `#[serde(tag = "t", content = "c")]` | `{"t": "Variant"}` — an object |
 /// | `#[serde(untagged)]` | `null` |
+/// | `#[serde(into = "u8")]` / `from` / `try_from` | whatever the conversion type serializes as |
+///
+/// The conversion attributes belong here for the same reason: serde routes the
+/// value through another type entirely, so the variant names never reach the
+/// wire and a string-enum schema would describe a payload the handler does not
+/// accept.
 ///
 /// Returns `None` for the default representation.
 pub fn serde_enum_representation(attrs: &[syn::Attribute]) -> Option<&'static str> {
@@ -205,6 +211,12 @@ pub fn serde_enum_representation(attrs: &[syn::Attribute]) -> Option<&'static st
                 found = Some("tag");
             } else if meta.path.is_ident("untagged") {
                 found = Some("untagged");
+            } else if meta.path.is_ident("into") {
+                found = Some("into");
+            } else if meta.path.is_ident("from") {
+                found = Some("from");
+            } else if meta.path.is_ident("try_from") {
+                found = Some("try_from");
             } else if meta.path.is_ident("content") && found.is_none() {
                 found = Some("content");
             }
@@ -373,13 +385,36 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     // this was one untyped field on almost every model on an API boundary
     // (issue #802). Each maps to the standard OpenAPI `format` for what serde
     // actually writes.
-    if let Some((json_type, format)) = scalar_json_type_and_format(&name) {
-        return quote! {
-            ::autumn_web::reexports::serde_json::json!({
-                "type": #json_type,
-                "format": #format,
-            })
-        };
+    if let Some((json_type, format, description)) = scalar_json_schema(&name) {
+        let format_insert = format.map(|f| {
+            quote! { __scalar.insert("format".to_owned(), #f.into()); }
+        });
+        let description_insert = description.map(|d| {
+            quote! { __scalar.insert("description".to_owned(), #d.into()); }
+        });
+        // Matching is on the type's LAST PATH SEGMENT, because a proc macro sees
+        // only the tokens as written and `use chrono::NaiveDateTime;` is the
+        // normal spelling. An application type that happens to share one of
+        // these names would otherwise be described as the external scalar, so
+        // check the derived-schema inventory FIRST at runtime: a colliding type
+        // carrying `#[derive(OpenApiSchema)]` resolves to its own real schema,
+        // and only a type nothing registered falls through to the scalar. (The
+        // same last-segment limitation already governs `primitive_json_type`
+        // for `String`, `bool` and the numerics.)
+        return quote! {{
+            match ::autumn_web::openapi::registered_derived_schema(
+                ::core::any::type_name::<#ty>()
+            ) {
+                ::core::option::Option::Some(__derived) => __derived,
+                ::core::option::Option::None => {
+                    let mut __scalar = ::autumn_web::reexports::serde_json::Map::new();
+                    __scalar.insert("type".to_owned(), #json_type.into());
+                    #format_insert
+                    #description_insert
+                    ::autumn_web::reexports::serde_json::Value::Object(__scalar)
+                }
+            }
+        }};
     }
 
     crate::api_doc::primitive_json_type(&name).map_or_else(
@@ -403,22 +438,42 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     )
 }
 
-/// JSON-Schema `type` + `format` for a non-primitive type that nevertheless
-/// serializes as a single scalar.
+/// JSON-Schema `type`, optional `format`, and optional `description` for a
+/// non-primitive type that nevertheless serializes as a single scalar.
 ///
-/// Deliberately narrow: only types whose serde output is unambiguous. `chrono`'s
-/// date/time types serialize as RFC 3339 / ISO 8601 strings and `Uuid` as a
-/// hyphenated string, so each has one right answer. Numeric-adjacent wrappers
-/// (`Decimal`, `BigDecimal`) are left out on purpose — whether they serialize as
-/// a JSON number or a string depends on which serde feature the app enabled, and
-/// an opaque placeholder is better than a confidently wrong scalar.
-fn scalar_json_type_and_format(name: &str) -> Option<(&'static str, &'static str)> {
+/// Deliberately narrow: only types whose serde output is unambiguous.
+/// Numeric-adjacent wrappers (`Decimal`, `BigDecimal`) are left out on purpose —
+/// whether they serialize as a JSON number or a string depends on which serde
+/// feature the app enabled, and an opaque placeholder beats a confidently wrong
+/// scalar.
+///
+/// The **naive** chrono types deliberately carry NO `format`. `OpenAPI`'s
+/// `date-time` and `time` are RFC 3339 productions that *require* a UTC offset,
+/// but `NaiveDateTime` / `NaiveTime` serialize without one
+/// (`2026-09-06T18:00:00`). Claiming the standard format would make a strict
+/// validator reject the server's real payload, and lead a generator to emit a
+/// timezone-aware client type that cannot parse it. A bare `string` plus a
+/// description is less specific but true. `NaiveDate` keeps `date`, whose RFC
+/// 3339 production (`full-date`) has no offset to begin with, and `DateTime<Tz>`
+/// keeps `date-time` because chrono does write an offset for it.
+fn scalar_json_schema(
+    name: &str,
+) -> Option<(&'static str, Option<&'static str>, Option<&'static str>)> {
     Some(match name {
         // `DateTime<Utc>` reaches here as its last path segment, `DateTime`.
-        "NaiveDateTime" | "DateTime" => ("string", "date-time"),
-        "NaiveDate" => ("string", "date"),
-        "NaiveTime" => ("string", "time"),
-        "Uuid" => ("string", "uuid"),
+        "DateTime" => ("string", Some("date-time"), None),
+        "NaiveDate" => ("string", Some("date"), None),
+        "NaiveDateTime" => (
+            "string",
+            None,
+            Some("ISO 8601 date-time with no UTC offset, e.g. 2026-09-06T18:00:00"),
+        ),
+        "NaiveTime" => (
+            "string",
+            None,
+            Some("ISO 8601 time with no UTC offset, e.g. 18:00:00"),
+        ),
+        "Uuid" => ("string", Some("uuid"), None),
         _ => return None,
     })
 }
