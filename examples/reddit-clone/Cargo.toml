@@ -25,7 +25,7 @@ toml = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
-validator = { version = "0.20", features = ["derive"] }
+validator = { version = "0.21", features = ["derive"] }
 scoped-futures = "0.1"
 thiserror = { workspace = true }
 url = "2"
