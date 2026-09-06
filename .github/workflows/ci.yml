@@ -478,19 +478,33 @@ jobs:
             || { echo "::error::the sim_ lane ran no tests — the filter no longer matches the sim_* modules"; exit 1; }
 
   trybuild:
-    name: Trybuild ${{ matrix.shard }} (${{ matrix.os }})
+    name: Trybuild ${{ matrix.shard }}
     needs: [lint, meta]
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
         # The four shards partition `compile_fail::` exactly. `pass_a`/`pass_b`
         # are two halves of one fixture list (see the comment on
         # `compile_pass_tests_a`); `rest` is everything else in the module --
         # the feature-gated registries and the two guide-consistency tests,
         # which together measured under a second.
         shard: [fail, pass_a, pass_b, rest]
-    runs-on: ${{ matrix.os == 'ubuntu-latest' && fromJSON(needs.meta.outputs.heavy_runs_on) || matrix.os }}
+    # Linux only. trybuild was the whole tail of this workflow: on the first
+    # fully-green sharded run the seven macOS/Windows shards took 38-55 min
+    # each and `Trybuild pass_a (windows)` at 55.1 min WAS the critical path,
+    # against 6-9 min for the same shards on Linux.
+    #
+    # What that buys, and what it costs: a trybuild case asserts the exact
+    # rustc diagnostic text of a committed `.stderr` golden. Those goldens are
+    # sensitive to the rustc VERSION, not to the OS -- all three legs pinned
+    # `dtolnay/rust-toolchain@stable` and rendered byte-identical output, which
+    # is why the same golden file serves all three. So running them three times
+    # re-proved the same property on three machines. What is genuinely lost is
+    # a diagnostic that differs per platform (a path separator or an OS-gated
+    # `#[cfg]` reaching a fixture); nothing in the current fixture set is
+    # OS-conditional, and a compile error that only appears on Windows would
+    # still be caught by `Test (windows-latest)` failing to build.
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
       - uses: actions/checkout@v7
       - name: Free disk space (Linux)
@@ -564,7 +578,7 @@ jobs:
         run: rm -rf target/tests
 
   test-features:
-    name: Test ${{ matrix.lane }} (${{ matrix.os }})
+    name: Test ${{ matrix.lane }}
     needs: [lint, meta]
     strategy:
       fail-fast: false
@@ -572,15 +586,28 @@ jobs:
         # Each lane is a feature set that `cargo test --workspace` does not
         # compile, so each is its own re-build of autumn-web. They share nothing
         # but the source tree, which is why they belong on separate runners.
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        lane: [markdown, inbound-mail, i18n, plugin-sandbox, system-tests]
-        include:
-          # Linux-only lanes, unchanged from the `if: runner.os == 'Linux'`
-          # guards they used to carry inline. Each step's own comment says why.
-          - { os: ubuntu-latest, lane: redis-tls }
-          - { os: ubuntu-latest, lane: tls }
-          - { os: ubuntu-latest, lane: acme }
-    runs-on: ${{ matrix.os == 'ubuntu-latest' && fromJSON(needs.meta.outputs.heavy_runs_on) || matrix.os }}
+        #
+        # Linux only. These lanes ask "does this feature's own suite pass?",
+        # which is a question about the feature, not about the platform -- and
+        # `feature-combinations.yml` already proves every feature COMPILES
+        # standalone via `cargo hack --each-feature`. Running five lanes on
+        # three OSes was 15 jobs to answer one question five times; three of
+        # them (redis-tls, tls, acme) were already Linux-only. Cross-platform
+        # behaviour is still covered where it belongs: the default feature set
+        # runs on all three OSes in `test`, and `Windows Tier 1 journey` drives
+        # a real app end-to-end on Windows.
+        lane:
+          [
+            markdown,
+            inbound-mail,
+            i18n,
+            plugin-sandbox,
+            system-tests,
+            redis-tls,
+            tls,
+            acme,
+          ]
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
       - uses: actions/checkout@v7
       - name: Free disk space (Linux)
@@ -1088,14 +1115,48 @@ jobs:
           done
 
   coverage:
-    name: Coverage
+    name: Coverage (${{ matrix.lane }})
     # `test`, NOT `test-gate`: coverage instruments the workspace suite, so the
     # `test` job is the only thing it actually depends on. Hanging it off the
     # aggregate would make an unrelated red shard (a feature lane, a trybuild
     # shard) skip coverage entirely, and would delay its start until the
     # slowest shard finished. See the note on `test-gate`.
     needs: [test, meta]
+    strategy:
+      fail-fast: false
+      matrix:
+        # Four lanes over the legs this job used to run back-to-back in one
+        # 55-minute step. Once trybuild moved to Linux only, coverage WAS the
+        # critical path, so splitting it is what moves the workflow's floor.
+        #
+        # The split is by feature set, because that is what forces a rebuild:
+        # `workspace` and `autumn-web` are the two expensive instrumented
+        # builds and get a runner each; `sandbox-sqlite` carries the two
+        # feature-flipped lanes; `db-ignored` carries the Docker/testcontainer
+        # `--ignored` legs, which are wall-clock-bound rather than CPU-bound.
+        #
+        # Each lane reports its own lcov and uploads under its own Codecov
+        # flag; Codecov merges the four uploads for the commit. That is the
+        # supported way to shard llvm-cov across runners -- merging raw
+        # profdata instead would mean shipping each lane's instrumented object
+        # files between jobs.
+        lane: [workspace, autumn-web, sandbox-sqlite, db-ignored]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    env:
+      # Every autumn-web feature EXCEPT `sqlite`. Hoisted to job scope so the
+      # lanes below share one definition. It is the coverage sibling of
+      # `autumn_web_semver_features` in scripts/check-semver.sh (both
+      # deliberately EXCLUDE `sqlite` to avoid the backend flip described on
+      # the `workspace` lane); keep the `sqlite`-exclusion invariant in sync.
+      # Coverage is not bound by the crates.io baseline, so this list is a
+      # deliberate superset (adds `offline-sync`, `embed-assets`, `tls`,
+      # `acme`, `managed-pg*`, `system-tests`, `test-support`, ...).
+      PG_FEATURES: "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,plugin-sandbox"
+      # `postgresql_embedded`'s build script downloads Postgres binaries via
+      # the GitHub API; unauthenticated it hits the 60 req/hr rate limit and
+      # fails the build with a 403. Authenticate with the job's token to get
+      # the higher rate limit.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
       - name: Free disk space
@@ -1115,6 +1176,10 @@ jobs:
           df -h
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.7.8
+        with:
+          # One cache per lane: each builds a different feature set, so sharing
+          # a key would thrash the entry rather than warm it.
+          key: coverage-${{ matrix.lane }}
       - name: Install cargo-llvm-cov
         # Pin @v2 and pass the tool explicitly. The bare @cargo-llvm-cov tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
@@ -1122,14 +1187,10 @@ jobs:
         uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-llvm-cov
-      - name: Generate coverage
-        env:
-          # `postgresql_embedded`'s build script downloads Postgres binaries via
-          # the GitHub API; unauthenticated it hits the 60 req/hr rate limit and
-          # fails the build with a 403. Authenticate with the job's token to get
-          # the higher rate limit.
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate coverage (workspace catch-all)
+        if: matrix.lane == 'workspace'
         run: |
+          set -euo pipefail
           cargo llvm-cov clean --workspace
           # `--all-features` on a `--workspace` run is structurally unsafe here.
           # Only two workspace members own a `sqlite` feature — autumn-web and
@@ -1144,35 +1205,37 @@ jobs:
           # apps. Cargo has no "all-features except one crate feature" flag, and
           # excluding victim crates one-by-one is whack-a-mole. Instead exclude
           # the two crates that OWN a `sqlite` feature so NO selected package can
-          # turn the flip on, then cover each explicitly:
-          #   - autumn-web: covered below with an explicit Postgres feature list
-          #     (`$PG_FEATURES`, every feature EXCEPT `sqlite`) plus a dedicated
-          #     sqlite+mail lane (see #1614 note below).
+          # turn the flip on; each is covered by a lane of its own:
+          #   - autumn-web: the `autumn-web` lane, with `$PG_FEATURES`.
           #   - autumn-cli: its `postgres`/`sqlite` backends are MUTUALLY
           #     EXCLUSIVE ("NEVER `--all-features`", per autumn-cli/Cargo.toml),
           #     so it can never be part of an `--all-features` build at all; it is
-          #     covered by its own `-p autumn-cli` test lanes below.
+          #     covered by the `db-ignored` lane's `-p autumn-cli` legs.
           # With both feature-owners excluded the catch-all resolves autumn-web
           # to Postgres, so autumn-admin-plugin / autumn-media-plugin / the
           # example apps compile again and need NO exclusion.
-          #
-          # `$PG_FEATURES` = every autumn-web feature except `sqlite`. It is the
-          # coverage sibling of `autumn_web_semver_features` in
-          # scripts/check-semver.sh (both deliberately EXCLUDE `sqlite` to avoid
-          # the backend flip); keep the `sqlite`-exclusion invariant in sync.
-          # Coverage is not bound by the crates.io baseline, so this list is a
-          # deliberate superset (adds `offline-sync`, `embed-assets`, `tls`,
-          # `acme`, `managed-pg*`, `system-tests`, `test-support`, …).
-          PG_FEATURES="ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,plugin-sandbox"
           cargo llvm-cov --workspace --exclude autumn-web --exclude autumn-cli \
             --all-features --no-report
+          cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Generate coverage (autumn-web, Postgres feature set)
+        if: matrix.lane == 'autumn-web'
+        run: |
+          set -euo pipefail
+          cargo llvm-cov clean --workspace
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES"
+          cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Generate coverage (plugin-sandbox + sqlite)
+        if: matrix.lane == 'sandbox-sqlite'
+        run: |
+          set -euo pipefail
+          cargo llvm-cov clean --workspace
           # The plugin-sandbox suites have their own merge-blocking test lane
-          # above; without a coverage leg the whole module is instrumented and
-          # never executed, which reads as a large new uncovered surface.
+          # in `test-features`; without a coverage leg the whole module is
+          # instrumented and never executed, which reads as a large new
+          # uncovered surface.
           #
           # The test-name filter goes after `--`, unlike the `cargo test` lane
-          # above where it is a bare positional. `cargo llvm-cov` has its own
+          # where it is a bare positional. `cargo llvm-cov` has its own
           # subcommands (`report`, `clean`, `nextest`, …), so a bare word in
           # that position is read as one:
           #     error: unrecognized subcommand plugin_sandbox
@@ -1180,16 +1243,22 @@ jobs:
             --lib -- plugin_sandbox
           cargo llvm-cov --no-report -p autumn-web --features "plugin-sandbox,test-support" \
             --test integration_tests -- plugin_sandbox
-          # Explicit sqlite+mail lane (#1614). Excluding autumn-cli above removed
-          # the only place the `--all-features` catch-all compiled autumn-web
-          # under the `sqlite` + `mail` union — which is exactly the
-          # `DbSuppressionStore` backend-flip this PR fixes, so coverage must
-          # keep compiling it. Restore it here, isolated to `-p autumn-web` so the
-          # sqlite flip can never leak onto the Pg-assuming workspace crates. A
-          # named sqlite `[[test]]` target keeps it off the pg-URL lib unit tests
-          # (which assume Postgres) — same rule the `sqlite-runtime` job follows.
+          # Explicit sqlite+mail lane (#1614). Excluding autumn-cli from the
+          # catch-all removed the only place it compiled autumn-web under the
+          # `sqlite` + `mail` union — exactly the `DbSuppressionStore`
+          # backend-flip #1614 fixed, so coverage must keep compiling it.
+          # Isolated to `-p autumn-web` so the sqlite flip can never leak onto
+          # the Pg-assuming workspace crates. A named sqlite `[[test]]` target
+          # keeps it off the pg-URL lib unit tests (which assume Postgres) —
+          # the same rule the `sqlite-runtime` job follows.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --test sqlite_boot_serve
+          cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Generate coverage (Docker/testcontainer --ignored legs)
+        if: matrix.lane == 'db-ignored'
+        run: |
+          set -euo pipefail
+          cargo llvm-cov clean --workspace
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test db_hooks_lifecycle -- --ignored
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
@@ -1213,6 +1282,10 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
+          # One flag per lane so Codecov can tell the four uploads apart and
+          # merge them into a single commit report rather than treating a later
+          # upload as a replacement for an earlier one.
+          flags: ${{ matrix.lane }}
           fail_ci_if_error: false
 
   msrv:
