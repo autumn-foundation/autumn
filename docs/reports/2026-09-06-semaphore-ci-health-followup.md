@@ -52,27 +52,54 @@ returns zero rows tied to this file). The harness would have silently done
 nothing the first time someone tried to click "Run workflow."
 
 **Finding 2 — two days of organic post-fix signal on the open items.**
-Since `#2510` (the `live_upgrade` reclassification fix) merged at
-2026-09-05T20:25 UTC, `pull_request` CI traffic has been dominated by
-same-PR push churn under `cancel-in-progress` (one page of 50 runs sampled,
-0450→1004 UTC 2026-09-06, held only **4** non-cancelled completions — the
-same throughput pattern the 2026-09-04 census flagged, now confirmed on a
-second day). Of those 4:
+An earlier revision of this section sampled only one page (50 runs,
+0450→1004 UTC 2026-09-06) and reported n=4, missing roughly eight hours back
+to the actual `#2510` merge boundary. Corrected by paginating back to
+2026-09-05T20:25:01Z (the merge timestamp) and taking the full union of
+non-cancelled `pull_request` runs across both pages, de-duplicated by run
+id: **15 non-cancelled runs** in the complete post-merge window
+(2026-09-05T20:25:01Z → 2026-09-06T10:04:30Z).
 
-| Run | Conclusion | macOS `Test` | Signature |
+| Run | Created | Conclusion | macOS `Test` outcome |
 |---|---|---|---|
-| 34015049004 | failure | **success** (confirmed via `list_workflow_jobs`) | `Test (windows-latest)` failed instead — see below |
-| 34014673780 | success | **success** (confirmed via `list_workflow_jobs`) | — |
-| 34012120234 | success | **success** (confirmed via `list_workflow_jobs`) | — |
-| 34011415218 | failure | **success** (confirmed via `list_workflow_jobs`) | `Test (ubuntu-latest)` → `Run Docker-dependent tests` failed, unrelated |
+| 33990863920 | 20:41:36Z | failure | **N/A** — `Lint`→`Clippy` failed; `Test` matrix never started |
+| 33991297425 | 20:50:36Z | success | success |
+| 33991380662 | 20:52:23Z | success | success |
+| 33991666414 | 20:58:39Z | failure | success† |
+| 33991943884 | 21:04:15Z | success | success |
+| 33994441171 | 21:55:47Z | failure | success (ubuntu `Test`→`Run tests` failed instead, unrelated) |
+| 33999094160 | 23:35:50Z | failure | **N/A** — `Lint`→`Check formatting` failed; `Test` matrix never started |
+| 34000856070 | 00:16:31Z | failure | success (`Coverage`→`Generate coverage` failed instead, unrelated) |
+| 34002298881 | 00:49:36Z | success | success |
+| 34003050046 | 01:06:58Z | success | success |
+| 34008308279 | 03:10:04Z | success | success |
+| 34011415218 | 04:24:22Z | failure | success (ubuntu `Test`→`Run Docker-dependent tests` failed, unrelated) |
+| 34012120234 | 04:41:03Z | success | success |
+| 34014673780 | 05:43:04Z | success | success |
+| 34015049004 | 05:52:10Z | failure | success (`Test (windows-latest)` failed instead — Finding 3, below) |
 
-All four runs reached and passed the macOS `Test` job cleanly (`Test` has no
-skip condition and is gated only by `lint`/`meta`, so a failure elsewhere in
-the same run — Windows or an unrelated Docker step — doesn't affect its own
-job-level result; checked each of the four directly rather than inferring
-from the run's overall conclusion). **n=4** — directionally consistent with
-`#2510` holding, but still nowhere near the 20-50 this role requires to call
-the ledger entry closed; treat as "no disconfirming evidence yet," not
+† `33991666414` and `34003050046` run on `claude/test-sharding-ci-performance-*`,
+a branch modifying `ci.yml` itself to shard the `Test` job (extra jobs like
+`Test system-tests (macos-latest)`, `Test markdown (macos-latest)` alongside
+the ordinary `Test (macos-latest)`) — not the mainline workflow structure.
+`34003050046`'s `Test (macos-latest)` job passed outright. `33991666414`'s
+`Test (macos-latest)` job conclusion is `failure`, but its `Run tests` step
+— the step that actually runs `cargo test --workspace` and would contain a
+`live_upgrade`/`cache_stampede`/`sim_fault_plan` hit — passed; the failure is
+in a custom step this experimental branch added (`Run the simulation suite
+single-threaded`) that doesn't exist in mainline `ci.yml` and has nothing to
+do with the corpus this census tracks. Counted as a pass on that basis, not
+pooled uncritically with the mainline-workflow rows.
+
+Two runs (`33990863920`, `33999094160`) never reached the `Test` matrix at
+all — `needs: [lint, meta]` blocked them before any OS leg started — so they
+are excluded from the denominator entirely, the same convention the
+2026-09-04 census used. That leaves **13 eligible executions, 13 clean
+macOS passes, 0 hits on `live_upgrade` / `cache_stampede` / `sim_fault_plan`**
+since `#2510` merged — directionally consistent with the fix holding, and a
+meaningfully larger sample than the n=4 an earlier revision of this section
+reported, but still short of the 20-50 this role requires to close the
+ledger entry outright; treat as "no disconfirming evidence yet at n=13," not
 confirmation.
 
 **Finding 3 — a new single-occurrence non-Linux timing failure.**
@@ -127,9 +154,9 @@ instead of after someone tries to dispatch it and gets nothing.
 - Finding 1: binary/structural (workflow either registers or it doesn't),
   confirmed via GitHub's own parser error text — not a rate, nothing to
   baseline.
-- Findings 2/3: n=4 and n=1 respectively, both explicitly below any
-  threshold this role treats as evidence. No before/after — nothing was
-  changed.
+- Findings 2/3: n=13 (13/13 clean) and n=1 respectively, both explicitly
+  below any threshold this role treats as evidence. No before/after —
+  nothing was changed.
 
 ## 🔬 Reproduce
 
