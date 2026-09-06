@@ -101,7 +101,12 @@ indexmap = "2"
 inventory = "0.3"
 moka = { version = "0.12", features = ["sync"] }
 chrono = { version = "0.4", features = ["serde"] }
-testcontainers = "0.27"
+# `host-port-exposure` (#1863) opens an SSH tunnel so a container can reach a
+# `127.0.0.1`-bound listener on THIS host via the injected
+# `host.testcontainers.internal` alias — needed for the real-Pebble ACME
+# end-to-end test, whose HTTP-01 validation request originates inside the
+# Pebble container. Additive: no other testcontainers use is affected.
+testcontainers = { version = "0.27", features = ["host-port-exposure"] }
 testcontainers-modules = { version = "0.15", features = ["postgres", "redis", "minio"] }
 # Keep time on the 0.3 release line for the testcontainers/bollard dependency
 # graph used by integration tests.
