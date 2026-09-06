@@ -521,14 +521,20 @@ BLOCK_TAGS = (
 # closing delimiter rather than at a blank line. The repo's migration gate pins
 # all three (`…_treats_a_cdata_block_as_literal` and its two siblings), and
 # omitting them let a link inside any of the three count as navigation.
+# Types 3-6 MAY interrupt a paragraph, so they need no context test.
 RAW_BLOCK = re.compile(
     r'^ {0,3}<\?.*?\?>'
     r'|^ {0,3}<!\[CDATA\[.*?\]\]>'
     r'|^ {0,3}<![A-Za-z][^>]*>'
-    r'|^ {0,3}(?:</?(?:' + BLOCK_TAGS + r')(?:[\s/>][^\n]*)?'
-    r'|</?[A-Za-z][A-Za-z0-9-]*(?:\s[^\n]*?)?/?>[ \t]*)$'
+    r'|^ {0,3}</?(?:' + BLOCK_TAGS + r')(?:[\s/>][^\n]*)?$'
     r'(?:\n(?![ \t]*$)[^\n]*)*',
     re.M | re.I | re.S)
+# Type 7 — any complete tag alone on its line — may NOT. Applied only where a
+# block can start, or `prose` / `<span>` / `[Mail](mail.md)` masks a live link.
+RAW_BLOCK_TYPE7 = re.compile(
+    r'^ {0,3}</?[A-Za-z][A-Za-z0-9-]*(?:\s[^\n]*?)?/?>[ \t]*$'
+    r'(?:\n(?![ \t]*$)[^\n]*)*',
+    re.M)
 # A raw anchor IS navigation, so its destination is resolved like any other —
 # through `add_relative`, which means `<a href="mail.md">` and
 # `<a href="../guide/mail.md">` work, not just the repo-root spelling the
@@ -537,7 +543,45 @@ ANCHOR_HREF = re.compile(
     r'<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))', re.I)
 
 
-def sub_in_prose(pat, txt):
+ATX_HEADING = re.compile(r'^ {0,3}#{1,6}(?:\s|$)')
+THEMATIC_BREAK = re.compile(r'^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$')
+FENCE_LINE = re.compile(r'^ {0,3}(?:`{3,}|~{3,})')
+
+
+def block_starts(txt):
+    """Offsets of lines where a new block may begin — i.e. no paragraph is open.
+
+    Two separate rules need this, which is why it is a function rather than
+    another `\\n\\n` test. A CommonMark type-7 raw HTML block may NOT interrupt
+    a paragraph, so `prose` / `<span>` / `[Mail](mail.md)` leaves the tag inline
+    and the link live. A reference definition may not interrupt one either —
+    but it MAY follow a completed block, so `## Links` / `[mail]: mail.md`
+    defines, with no blank line between. Requiring a preceding blank line got
+    the first case wrong in one direction and the second in the other.
+
+    `check-migration-guides.sh` tracks the same state as `md_paragraph_open`,
+    and pins both cases (`…_keeps_a_type_seven_tag_inline_inside_a_paragraph`,
+    `…_lets_a_type_six_tag_interrupt_a_paragraph`).
+    """
+    starts, pos, para_open = set(), 0, False
+    for line in txt.split('\n'):
+        if not para_open:
+            starts.add(pos)
+        stripped = line.strip()
+        if not stripped:
+            para_open = False
+        elif (ATX_HEADING.match(line) or THEMATIC_BREAK.match(line)
+                or FENCE_LINE.match(line)):
+            # A completed block of its own: it closes any paragraph above and
+            # leaves none open below.
+            para_open = False
+        else:
+            para_open = True
+        pos += len(line) + 1
+    return starts
+
+
+def sub_in_prose(pat, txt, only_at_block_start=False):
     """Blank `pat` where Markdown renders it, leaving fences alone.
 
     Anything that decides "this text is not rendered" has to be scoped this
@@ -555,9 +599,12 @@ def sub_in_prose(pat, txt):
         # blanking link destinations erased an image sample written in
         # backticks. "Rendered" means outside fences AND outside code spans.
         protected = [(m.start(), m.end()) for m in CODE_SPAN.finditer(seg)]
+        allowed = block_starts(seg) if only_at_block_start else None
         pieces, last = [], 0
         for m in pat.finditer(seg):
             if any(a <= m.start() < b for a, b in protected):
+                continue
+            if allowed is not None and m.start() not in allowed:
                 continue
             pieces.append(seg[last:m.start()])
             pieces.append(' ' * (m.end() - m.start()))
@@ -704,6 +751,7 @@ def edges_from(f):
     # path itself is visible text there — the same visible/invisible split that
     # governs fences.
     md_txt = sub_in_prose(RAW_BLOCK, txt)
+    md_txt = sub_in_prose(RAW_BLOCK_TYPE7, md_txt, only_at_block_start=True)
 
     for pattern in (MD_LINK, MD_LINK_NESTED):
         for m in pattern.finditer(md_txt):
@@ -762,9 +810,9 @@ def edges_from(f):
     # So a definition counts only where a block can start — at the top of the
     # view, or after a blank line.
     seen_labels = set()
+    ref_block_starts = block_starts(ref_txt)
     for m in REF_DEF.finditer(ref_txt):
-        before = ref_txt[:m.start()]
-        if before.strip() and not before.rstrip(' \t').endswith('\n\n'):
+        if m.start() not in ref_block_starts:
             continue
         label = ref_label(m.group(1))
         if label in seen_labels:
@@ -1612,6 +1660,35 @@ self_test() {
   printf '# Jobs\n\n<!DOCTYPE html>\n\nSee [mail](mail.md).\n' > "$c9cq/docs/guide/jobs.md"
   git -C "$c9cq" add -A && git -C "$c9cq" commit -qm declaration-closes
   check "a closed declaration does not swallow the next link" pass "$c9cq"
+
+  # A definition may follow a completed block with no blank line between.
+  local c9cr="$tmp/c9cr"; make_corpus "$c9cr"
+  printf '# Jobs\n\nSee [mail][m].\n\n## Links\n[m]: mail.md\n' > "$c9cr/docs/guide/jobs.md"
+  git -C "$c9cr" add -A && git -C "$c9cr" commit -qm refdef-after-heading
+  check "a definition right after a heading resolves" pass "$c9cr"
+
+  local c9cs="$tmp/c9cs"; make_corpus "$c9cs"
+  printf '# Jobs\n\nSee [mail][m].\n\n---\n[m]: mail.md\n' > "$c9cs/docs/guide/jobs.md"
+  git -C "$c9cs" add -A && git -C "$c9cs" commit -qm refdef-after-break
+  check "a definition right after a thematic break resolves" pass "$c9cs"
+
+  # A type-7 tag cannot interrupt a paragraph, so the link stays live.
+  local c9ct="$tmp/c9ct"; make_corpus "$c9ct"
+  printf '# Jobs\n\nordinary prose\n<span>\n[mail](mail.md)\n' > "$c9ct/docs/guide/jobs.md"
+  git -C "$c9ct" add -A && git -C "$c9ct" commit -qm type7-inline
+  check "a type-7 tag inside a paragraph leaves the link live" pass "$c9ct"
+
+  # ...but one starting a block does open a raw block.
+  local c9cu="$tmp/c9cu"; make_corpus "$c9cu"
+  printf '# Jobs\n\n<span>\n[mail](mail.md)\n' > "$c9cu/docs/guide/jobs.md"
+  git -C "$c9cu" add -A && git -C "$c9cu" commit -qm type7-block
+  check "a type-7 tag at a block start opens a raw block" fail "$c9cu"
+
+  # A type-6 tag MAY interrupt a paragraph.
+  local c9cv="$tmp/c9cv"; make_corpus "$c9cv"
+  printf '# Jobs\n\nordinary prose\n<div>\n[mail](mail.md)\n' > "$c9cv/docs/guide/jobs.md"
+  git -C "$c9cv" add -A && git -C "$c9cv" commit -qm type6-interrupts
+  check "a type-6 tag interrupts a paragraph" fail "$c9cv"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
