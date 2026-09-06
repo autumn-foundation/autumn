@@ -42,16 +42,25 @@
 -- inside one transaction, but the reconciliation below only takes row-level
 -- locks — an old process could commit a brand-new duplicate after the scan
 -- but before `ADD CONSTRAINT` takes its lock, failing validation on a row
--- reconciliation never saw (Codex review on this PR). `SHARE ROW EXCLUSIVE`
--- blocks concurrent writers (INSERT/UPDATE/DELETE) without blocking reads,
--- for the rest of this transaction — through the scan, the reconciliation,
--- and `ADD CONSTRAINT` — so cleanup and constraint creation see one
--- consistent snapshot. A writer blocked here that lands after this commits
--- gets validated against the new constraint like any other post-migration
--- write, per `is_post_slug_conflict`'s retry loop (or a visible error, from
--- old code that predates it — an acceptable trade-off: the invariant holds
--- from this point on even against code that doesn't know about it yet).
-LOCK TABLE posts IN SHARE ROW EXCLUSIVE MODE;
+-- reconciliation never saw (Codex review on this PR). Take a table lock
+-- upfront so cleanup and constraint creation share one consistent snapshot.
+--
+-- That lock has to be `ACCESS EXCLUSIVE` from the start, not the weaker
+-- `SHARE ROW EXCLUSIVE` (blocks writers, not readers) an earlier revision of
+-- this migration took: `ADD CONSTRAINT` below still needs `ACCESS EXCLUSIVE`
+-- regardless, and requesting it from a transaction that already holds a
+-- weaker, conflicting-with-others lock is a textbook lock-upgrade deadlock.
+-- Postgres's lock queue is fair: if a writer's `ROW EXCLUSIVE` request
+-- arrives (and queues) while this transaction holds only `SHARE ROW
+-- EXCLUSIVE`, this transaction's later request to upgrade to `ACCESS
+-- EXCLUSIVE` queues *behind* that writer — which is itself waiting on this
+-- transaction to finish. Neither can proceed; Postgres's deadlock detector
+-- eventually kills one of the two with an ugly error (Codex review on this
+-- PR). Acquiring `ACCESS EXCLUSIVE` immediately needs no later upgrade, so
+-- there is nothing for a subsequent writer to queue ahead of. The cost is
+-- that reads block for this transaction's (brief) duration too — no worse
+-- than `ADD CONSTRAINT` alone already imposes, just moved earlier.
+LOCK TABLE posts IN ACCESS EXCLUSIVE MODE;
 
 DO $$
 DECLARE
