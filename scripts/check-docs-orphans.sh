@@ -316,8 +316,14 @@ UNESCAPE = re.compile(r'\\([!-/:-@\[-`{-~])')
 # (`…_resolves_a_character_reference_in_a_destination`), while
 # `check-docs-links.sh` rejects them. Reconciling that is a change to the link
 # gate's contract and belongs in its own PR, not smuggled into this one.
+# CommonMark decodes only SEMICOLON-terminated references. `html.unescape` is
+# HTML5-lenient and takes `&#46md` too, which renders literally — so decoding it
+# invented a `.md` the reader never sees and marked an orphan reachable.
+CHAR_REF = re.compile(r'&(?:#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|[A-Za-z][A-Za-z0-9]*);')
+
+
 def decode_char_refs(s):
-    return html.unescape(s)
+    return CHAR_REF.sub(lambda m: html.unescape(m.group(0)), s)
 # A reference definition: `[mail]: mail.md`, optionally `<…>`-wrapped. Markdown
 # allows up to three leading spaces. Reference-style links are a syntax
 # check-docs-links.sh already parses and self-tests, so a page linked only that
@@ -486,15 +492,23 @@ def normalize(p):
 # the file as far as Markdown is concerned, so a missing `-->` must not leave
 # the links after it counting as routes. Closed form is tried first, so a
 # terminated comment still strips only itself.
-# Two grammars, because a comment mid-line is INLINE html and has to be a
-# well-formed one: its text may not begin with `>` or `->`, may not contain
-# `--`, and may not end with `-`. `<!-->` satisfies none of that, so
-# `prose <!--> [Mail](mail.md) -->` renders the link — and stripping through
-# the later `-->` deleted it. At the START of a line the same `<!-->` DOES
-# open a type-2 block, which is why the loose form is still what the
-# line-initial case uses. Both verified against markdown-it-py.
+# Two grammars, because a comment MID-LINE is inline html and ends where the
+# renderer says it does. `<!-->` and `<!--->` are COMPLETE comments — which
+# is why `prose <!--> [Mail](mail.md) -->` renders the link and leaves the
+# trailing `-->` as literal text — and any other `<!--` runs to its first
+# `-->`, `--` inside and all.
+#
+# CORRECTION to what this said before: it forbade `--` in the body and
+# called `<!-->` invalid. Both are wrong against markdown-it-py, which
+# passes `<!-- a -- b -->` through as raw HTML. The outcome for `<!-->` was
+# right by accident; the `--` rule was a live false NEGATIVE, since a path
+# inside `<!-- docs/guide/mail.md -- x -->` went unstripped and counted as
+# visible text that the browser does not show.
+#
+# At the START of a line the loose form still governs: a type-2 block opens
+# on `<!--` whatever follows and ends at the first `-->`.
 HTML_COMMENT_CLOSED = re.compile(r'<!--.*?-->', re.S)
-HTML_COMMENT_INLINE = re.compile(r'<!--(?!>|->)(?:[^-]|-(?!-))*-->', re.S)
+HTML_COMMENT_INLINE = re.compile(r'<!--->|<!-->|<!--(?!>|->).*?-->', re.S)
 UNCLOSED = '<!--'
 # A paragraph break: one line with nothing on it.
 BLANK_LINE = re.compile(r'\n[ \t]*\n')
@@ -576,6 +590,12 @@ def raw_block_line_spans(txt):
         else:
             m = FENCE_ONLY.match(line)
             stripped = line.lstrip()
+            # A backtick info string may not contain a backtick, so ```` ```bad` ````
+            # opens nothing and the line is ordinary paragraph text. `split_fences`
+            # already knew; this scan accepted every fence-shaped line and closed
+            # the paragraph, so a definition under one was blanked and the path it
+            # holds — visible, because that definition cannot interrupt a
+            # paragraph — stopped counting.
             if m and not (m.group(1)[0] == '`' and '`' in m.group(2)):
                 in_fence, marker = True, (m.group(1)[0], len(m.group(1)))
             elif (stripped.startswith('<!--')
@@ -1030,6 +1050,22 @@ HTML_DELIM_OPENERS = (
 )
 
 
+def is_fence_line(line):
+    """Whether the line opens or closes a fence — validated, not merely shaped.
+
+    A backtick info string may not itself contain a backtick, so ```` ```bad` ````
+    opens nothing and is ordinary paragraph text. `split_fences` and the line
+    scan both check that; the paragraph tracker did not, and closed the
+    paragraph on it — so a definition under such a line was blanked, and the
+    path it holds stopped counting even though the whole line renders as
+    visible text (a definition cannot interrupt a paragraph).
+    """
+    m = FENCE_ONLY.match(line)
+    if not m:
+        return False
+    return not (m.group(1)[0] == '`' and '`' in m.group(2))
+
+
 def block_starts(txt):
     """Offsets of lines where a new block may begin — i.e. no paragraph is open.
 
@@ -1133,7 +1169,7 @@ def block_starts(txt):
             # already settles.
             para_open = False
         elif (ATX_HEADING.match(line) or THEMATIC_BREAK.match(line)
-                or FENCE_LINE.match(line)):
+                or is_fence_line(line)):
             # A completed block of its own: it closes any paragraph above and
             # leaves none open below.
             para_open = False
@@ -1296,13 +1332,21 @@ def hidden_spans(seg, protected):
             bol = seg.rfind('\n', 0, m.start()) + 1
             line_initial = (seg[bol:m.start()].strip() == ''
                             and m.start() - bol <= 3)
-            if not line_initial and not HTML_COMMENT_INLINE.match(seg, m.start()):
-                pos = m.start() + 1
+            if line_initial:
+                # A type-2 block: opens on `<!--` whatever follows, ends at the
+                # first `-->`, and an unclosed one runs to the end.
+                end = seg.find('-->', m.end())
+                if end == -1:
+                    return spans
+                pos = end + 3
                 continue
-            end = seg.find('-->', m.end())
-            if end == -1:
-                return spans
-            pos = end + 3
+            # Mid-line the comment ends where the INLINE grammar says it does,
+            # and that is the whole point here: `<!-->` is a complete comment,
+            # so the scan must resume right after it and find the `<style>` in
+            # `prose <!--> <style>…</style> -->` — searching for a later `-->`
+            # skipped straight past the element whose contents are hidden.
+            cm = HTML_COMMENT_INLINE.match(seg, m.start())
+            pos = cm.end() if cm else m.start() + 1
             continue
         name = m.group(3) if m.group(3) is not None else m.group(5)
         close = re.search(r'</' + name + r'\s*>', seg[m.end():], re.I)
@@ -1360,17 +1404,17 @@ def definition_labels(txt):
 ANY_IMAGE = re.compile(r'!\[|<img\b', re.I)
 
 
-def has_content(raw_span, masked_span):
+def has_content(image_span, masked_span):
     """Whether a link's content leaves the reader anything to click.
 
-    Two views, because neither alone is right. The MASKED one has comments and
-    hidden HTML already blanked, so `<a href=…><!-- hidden --></a>` reads as
-    the nothing it renders as — the raw text there looks like content but is a
-    comment. The RAW one is what says an IMAGE is content: masking blanks
-    images as invisible, and a linked image is the clearest clickable thing
-    there is.
+    Two views, because neither alone is right. The MASKED one has comments,
+    hidden HTML AND images blanked, so it answers "is there text". The other
+    keeps images but has comments and hidden HTML removed, so it answers "is
+    there an image" — and only one the page actually shows: reading the raw
+    source instead counted the `![fake](x.png)` inside
+    `<a href=…><!-- ![fake](x.png) --></a>`, an anchor that renders nothing.
     """
-    return bool(masked_span.strip() or ANY_IMAGE.search(raw_span))
+    return bool(masked_span.strip() or ANY_IMAGE.search(image_span))
 
 
 def _image_resolves(m, defined):
@@ -1380,7 +1424,7 @@ def _image_resolves(m, defined):
     return ref_label(label) in defined
 
 
-def mask_invisible(txt):
+def mask_invisible(txt, keep_images=False):
     """Blank everything a reader cannot see — in PROSE, and not inside a code
     span. This is the ONE place that decides what is invisible, because scoping
     one masker and leaving a sibling document-wide is a bug this gate has
@@ -1445,6 +1489,9 @@ def mask_invisible(txt):
         # Images last, and here rather than at the bare-path scan, so a
         # `![alt](x.md)` SAMPLE in a fence or code span keeps its visible
         # destination while a rendered image does not.
+        if keep_images:
+            out.append(seg)
+            continue
         blank(IMAGE_INLINE)
         # An image REFERENCE is an image only if its label resolves. The
         # definition set is read from the whole text rather than the resolved
@@ -1467,6 +1514,9 @@ def edges_from(f):
     #    image and blanks a live link.
     raw = fold_escapes(read(f))
     txt = raw
+    # Comments and hidden HTML gone, images kept: the one view that can say
+    # whether an image is something the reader can see and click.
+    img_view = strip_comments(mask_invisible(raw, keep_images=True))
     # 2. Raw HTML is identified BEFORE comments. A `<!--` inside a closed
     #    `<script>` is script data, not a Markdown comment, and parsing comments
     #    first truncated the document at it. This order also settles the
@@ -1568,7 +1618,7 @@ def edges_from(f):
         for m in pattern.finditer(md_txt):
             # Offsets line up across both views because every masker replaces
             # space for space.
-            if not has_content(raw[m.start(1):m.end(1)],
+            if not has_content(img_view[m.start(1):m.end(1)],
                                md_txt[m.start(1):m.end(1)]):
                 continue
             add_relative(m.group(2) if m.group(2) is not None else m.group(3))
@@ -1593,7 +1643,7 @@ def edges_from(f):
         # non-whitespace rather than for text.
         close = ANCHOR_CLOSE.search(raw, tag.end())
         stop = close.start() if close else len(raw)
-        if not has_content(raw[tag.end():stop], txt[tag.end():stop]):
+        if not has_content(img_view[tag.end():stop], txt[tag.end():stop]):
             continue
         add_relative(next(g for g in m.groups() if g is not None),
                      markdown=False)
@@ -1634,7 +1684,7 @@ def edges_from(f):
         # rendered content — the FIRST label — has to carry something. The
         # inline form and the raw anchor already required it; this was the
         # third spelling of the same link and the one left out.
-        if not has_content(raw[m.start(1):m.end(1)],
+        if not has_content(img_view[m.start(1):m.end(1)],
                            uses_txt[m.start(1):m.end(1)]):
             continue
         inner = m.group(2)
@@ -3486,6 +3536,36 @@ self_test() {
     > "$c9hj/docs/guide/jobs.md"
   git -C "$c9hj" add -A && git -C "$c9hj" commit -qm midline-ok-attr
   check "a well-formed mid-line opener still hides what follows" fail "$c9hj"
+
+  # An unterminated character reference renders literally: no `.md` on screen.
+  local c9hk="$tmp/c9hk"; make_corpus "$c9hk"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\nSee docs/guide/mail&#46md\n' \
+    > "$c9hk/README.md"
+  git -C "$c9hk" add -A && git -C "$c9hk" commit -qm unterminated-char-ref
+  check "an unterminated character reference decodes to nothing" fail "$c9hk"
+
+  # A backtick info string may not hold a backtick, so this opens no fence and
+  # the definition under it is visible paragraph text.
+  local c9hl="$tmp/c9hl"; make_corpus "$c9hl"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n```bad`\n[old]: docs/guide/mail.md\n' \
+    > "$c9hl/README.md"
+  git -C "$c9hl" add -A && git -C "$c9hl" commit -qm invalid-fence-then-def
+  check "a definition under an invalid fence stays visible" pass "$c9hl"
+
+  # A comment body may contain `--`, so the path inside one is still hidden.
+  local c9hm="$tmp/c9hm"; make_corpus "$c9hm"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\nprose <!-- docs/guide/mail.md -- x -->\n' \
+    > "$c9hm/README.md"
+  git -C "$c9hm" add -A && git -C "$c9hm" commit -qm dashes-in-comment
+  check "a path in a comment containing -- is still hidden" fail "$c9hm"
+
+  # An image spelled inside a comment renders nothing, so the anchor holding
+  # only that comment is still empty.
+  local c9hn="$tmp/c9hn"; make_corpus "$c9hn"
+  printf '# Jobs\n\n<a href="mail.md"><!-- ![fake](x.png) --></a>\n' \
+    > "$c9hn/docs/guide/jobs.md"
+  git -C "$c9hn" add -A && git -C "$c9hn" commit -qm image-inside-comment
+  check "an image inside a comment is not anchor content" fail "$c9hn"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
