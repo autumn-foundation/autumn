@@ -212,9 +212,15 @@ DEST = r'\(\s*(?:<([^<>]*)>|(' + DEST_BARE + r'))' + TITLE + r'\s*\)'
 # link inside another — `[![alt](img.png)](page.md)` — where the flat pattern
 # finds only the image.
 FLAT = r'(?:[^\[\]\\]|\\.)'
-MD_LINK = re.compile(r'(?<!\\)\[' + FLAT + r'*\]' + DEST)
+# `!` joins the lookbehind because `![alt](x.md)` is an IMAGE: its destination
+# is a resource the page loads, not a page the reader can navigate to, and the
+# path is never visible on screen. By this gate's visible-or-clickable rule it
+# is therefore not an edge, so a stale image reference cannot keep an orphan
+# alive. The nested pattern still resolves the outer target of a linked image,
+# `[![alt](img.png)](page.md)`, which IS navigation.
+MD_LINK = re.compile(r'(?<![\\!])\[' + FLAT + r'*\]' + DEST)
 MD_LINK_NESTED = re.compile(
-    r'(?<!\\)\[(?:' + FLAT + r'|\[' + FLAT + r'*\])*\]' + DEST)
+    r'(?<![\\!])\[(?:' + FLAT + r'|\[' + FLAT + r'*\])*\]' + DEST)
 # Markdown drops the backslash from an escaped ASCII punctuation character, so
 # `guide\(v2\).md` addresses the file `guide(v2).md` — same rule as the sibling.
 UNESCAPE = re.compile(r'\\([!-/:-@\[-`{-~])')
@@ -347,14 +353,25 @@ def strip_comments(txt):
 def edges_from(f):
     """Guide pages this file gives a reader a way to reach."""
     txt = strip_comments(read(f))
+    # An escaped backslash consumes the next one, so `\\\\[x](y.md)` renders a
+    # literal backslash and a LIVE link, while `\\[x](y.md)` renders literal
+    # text. A fixed-width lookbehind cannot count the run to tell them apart, so
+    # pairs are folded to a placeholder first — same trick as the sibling gate,
+    # but with a same-LENGTH placeholder here because reference-definition spans
+    # are blanked by offset further down and the positions must stay valid.
+    txt = txt.replace('\\\\', '\x00\x00')
     out = set()
     base = posixpath.dirname(f)
 
     def add_relative(raw):
         # Percent-decode before comparing to tracked filenames: `mail%20guide.md`
         # addresses `mail guide.md`, and the sibling gate decodes it too.
-        raw = urllib.parse.unquote(raw.split('#', 1)[0].strip())
-        raw = UNESCAPE.sub(r'\1', raw)
+        # Anchor first, then query — the sibling's order. `mail.md?view=all` and
+        # `mail.md?view=all#frag` both address `mail.md`; leaving the query on
+        # would fail the `.md` test below and call a live link an orphan.
+        raw = raw.split('#', 1)[0].split('?', 1)[0].strip()
+        raw = urllib.parse.unquote(raw)
+        raw = UNESCAPE.sub(r'\1', raw.replace('\x00\x00', '\\\\'))
         if not raw.endswith('.md'):
             return
         # An absolute-looking `/docs/guide/x.md` is a site path, not a file path.
@@ -828,6 +845,30 @@ self_test() {
   printf '# Mail\n\n```\n<!-- orphan-allow: example -->\n```\n' > "$c9ag/docs/guide/mail.md"
   git -C "$c9ag" add -A && git -C "$c9ag" commit -qm waiver-in-fence
   check "a waiver shown in a fence does not exempt the page" fail "$c9ag"
+
+  # An even backslash run leaves the bracket UNescaped: `\\[x](y.md)` renders a
+  # literal backslash and a live link.
+  local c9ah="$tmp/c9ah"; make_corpus "$c9ah"
+  printf '# Jobs\n\nLive: \\\\\\\\[mail](mail.md)\n' > "$c9ah/docs/guide/jobs.md"
+  git -C "$c9ah" add -A && git -C "$c9ah" commit -qm even-backslash-run
+  check "an even backslash run leaves the link live" pass "$c9ah"
+
+  # An image destination is a resource the page loads, never a path on screen.
+  local c9ai="$tmp/c9ai"; make_corpus "$c9ai"
+  printf '# Jobs\n\n![mail](mail.md)\n' > "$c9ai/docs/guide/jobs.md"
+  git -C "$c9ai" add -A && git -C "$c9ai" commit -qm image-destination
+  check "an image destination is not a navigation edge" fail "$c9ai"
+
+  # A query string addresses the same file; the sibling strips it too.
+  local c9aj="$tmp/c9aj"; make_corpus "$c9aj"
+  printf '# Jobs\n\nSee [mail](mail.md?view=all).\n' > "$c9aj/docs/guide/jobs.md"
+  git -C "$c9aj" add -A && git -C "$c9aj" commit -qm query-string
+  check "a destination carrying a query string resolves" pass "$c9aj"
+
+  local c9ak="$tmp/c9ak"; make_corpus "$c9ak"
+  printf '# Jobs\n\nSee [mail](mail.md?view=all#retries).\n' > "$c9ak/docs/guide/jobs.md"
+  git -C "$c9ak" add -A && git -C "$c9ak" commit -qm query-and-anchor
+  check "a destination carrying a query and an anchor resolves" pass "$c9ak"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
