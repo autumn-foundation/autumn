@@ -1083,16 +1083,13 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         } else if meta.path.is_ident("retention") {
             // `retention(after = "30d", basis = created_at)` and/or
             // `retention(purge_deleted_after = "90d")`, plus optional
-            // `batch_size = N` and `every = "..."` (issue #1342).
+            // `batch_size = N` and `every = "..."` (#1342).
             //
-            // Regression (#1342 review round 22): the round-21 fix caught a
-            // repeated KEY within one retention(...) clause, but repeating
-            // the ENTIRE clause — e.g. `retention(after = "90d", basis =
-            // created_at), retention(after = "7d", basis = created_at)` —
-            // still silently overwrote `retention` with the second policy
-            // below, with no error. Since retention(...) controls
-            // irreversible deletion, this must fail loudly at compile time
-            // too, the same reason round 21 rejects a repeated key.
+            // Repeating the whole clause — `retention(after = "90d", basis =
+            // created_at), retention(after = "7d", basis = created_at)` — once
+            // silently overwrote `retention` with the second policy below, with no
+            // error. `retention(...)` controls irreversible deletion, so this must
+            // fail loudly at compile time, for the same reason a repeated key does.
             if retention.is_some() {
                 return Err(meta.error(
                     "duplicate retention(...) clause: #[repository(...)] may declare at most \
@@ -1105,16 +1102,12 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             let mut batch_size: Option<u64> = None;
             let mut every: Option<String> = None;
             meta.parse_nested_meta(|nested| {
-                // Regression (#1342 review round 21): each arm previously
-                // just overwrote its `Option`, so a repeated key silently
-                // kept the LAST value with no error — e.g.
-                // `retention(after = "90d", after = "7d", basis =
-                // created_at)` compiled and hard-deleted rows after 7 days,
-                // not the presumably-intended 90. Since retention(...)
-                // controls irreversible deletion, a typo'd or
-                // generated-twice key must fail loudly rather than
-                // silently picking whichever assignment happened to run
-                // last.
+                // Each arm once just overwrote its `Option`, so a repeated key
+                // silently kept the last value: `retention(after = "90d", after =
+                // "7d", basis = created_at)` compiled and hard-deleted rows after
+                // 7 days, not the intended 90. `retention(...)` controls
+                // irreversible deletion, so a typo'd or twice-generated key must
+                // fail loudly rather than pick whichever assignment ran last.
                 if nested.path.is_ident("after") {
                     if after.is_some() {
                         return Err(nested.error("duplicate `after = \"...\"` in retention(...)"));
@@ -2005,15 +1998,14 @@ fn vh_insert_ts(
         quote! { ::core::option::Option::None::<&str> }
     };
 
-    // #2429: the `__vh_json` / `__vh_before_json` / `__vh_after_json` bindings
-    // are freshly serialized per mutation and used for nothing but the diff, so
-    // they are handed to the `*_owned` entry points **by value**. Those move
-    // each retained column name and value straight into the `ColumnChange`,
-    // where the `&Value` variants had to clone every one of them and then drop
-    // the original — two allocations and two drops per retained field on the
-    // audit-trail write path of every versioned repository. Output is identical
-    // (`autumn/src/version_history.rs` holds the owned and borrowed functions to
-    // an exact parity matrix); do not reintroduce a borrow here.
+    // #2429: the `__vh_json` / `__vh_before_json` / `__vh_after_json` bindings are
+    // freshly serialized per mutation and feed nothing but the diff, so they go to
+    // the `*_owned` entry points by value. Those move each retained column name
+    // and value straight into the `ColumnChange`, where the `&Value` variants had
+    // to clone and then drop each one — two allocations and two drops per retained
+    // field on the audit-trail write path of every versioned repository. Output is
+    // identical (`autumn/src/version_history.rs` holds the owned and borrowed
+    // functions to an exact parity matrix); do not reintroduce a borrow here.
     let changes_ts = match op {
         "insert" => quote! {
             {
@@ -2148,20 +2140,18 @@ fn ledger_append_ts(
 ) -> TokenStream {
     let op_variant = version_op_variant(op);
 
-    // `ledgered` implies `soft_delete`, so a delete here is always a soft delete:
-    // the row survives with `deleted_at` set. Version history's delete entry
-    // records the row's *pre*-delete values, and the record handed to this
-    // builder is that same pre-delete load — but every ledger revision snapshots
-    // the state *after* its write, or as-of reconstruction after a delete would
-    // return a row whose `deleted_at` is null while a live `with_deleted()` query
-    // shows it set.
+    // `ledgered` implies `soft_delete`, so a delete here is always soft: the row
+    // survives with `deleted_at` set. Version history's delete entry records the
+    // row's pre-delete values, and the record handed to this builder is that same
+    // pre-delete load — but every ledger revision snapshots the state after its
+    // write, or as-of reconstruction after a delete would return a row whose
+    // `deleted_at` is null while a live `with_deleted()` query shows it set.
     //
     // The `deleted_at` the UPDATE wrote is read back from the table rather than
     // recomputed: the several soft-delete paths bind it from differently-scoped
-    // locals (and the bulk paths from a per-chunk one), so reading the stored
-    // value is both the only spelling that compiles everywhere and the only one
-    // guaranteed byte-identical to what the row now holds. One extra indexed
-    // lookup, on ledgered deletes only.
+    // locals, and the bulk paths from a per-chunk one, so reading the stored value
+    // is the only spelling that compiles everywhere and the only one guaranteed
+    // byte-identical to the row. One extra indexed lookup, on ledgered deletes only.
     let table_ident = format_ident!("{table_name_ts}");
     let soft_delete_stamp = if op == "delete" {
         quote! {
@@ -2309,21 +2299,17 @@ fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> Token
             .map_err(::autumn_web::AutumnError::from)?;
     };
 
-    // Shared transaction body for move_to/move_up/move_down, parameterized
-    // only on how `__autumn_target` is computed from `__autumn_current` (the
-    // row's position as of THIS transaction's own locked read) and
-    // `__autumn_len`. Codex review (issue #1358): move_up/move_down used to
-    // read the row's position in a separate, UNLOCKED query, compute an
-    // absolute target from it, then hand that stale absolute index to
-    // move_to — a TOCTOU window where a concurrent mover could change the
-    // row's real position between the read and move_to's own locked
-    // re-read, making the precomputed target land somewhere other than "one
-    // step" from the row's actual current position (including, in the
-    // wrong direction). Generating move_up/move_down as full standalone
-    // methods that compute their relative target from the SAME locked
-    // `__autumn_current` this body already reads removes the second,
-    // external read entirely — there is no longer a gap for another
-    // transaction to land in.
+    // Shared transaction body for move_to/move_up/move_down, parameterized only on
+    // how `__autumn_target` is computed from `__autumn_current` — the row's
+    // position as of this transaction's own locked read — and `__autumn_len`.
+    // move_up/move_down used to read the row's position in a separate, unlocked
+    // query, compute an absolute target, then hand that stale index to move_to: a
+    // TOCTOU window in which a concurrent mover could change the row's real
+    // position between the read and move_to's locked re-read, landing the row
+    // somewhere other than one step away, possibly in the wrong direction (#1358).
+    // Generating move_up/move_down as standalone methods that compute their
+    // relative target from the same locked `__autumn_current` this body reads
+    // removes the external read, and with it the gap.
     let move_transaction_body = |target_expr: proc_macro2::TokenStream| {
         quote! {
             #scope_lookup
@@ -2401,20 +2387,17 @@ fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> Token
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 let mut conn = self.__autumn_acquire_conn().await?;
-                // Codex review (issue #1358): the advisory lock closes the
-                // id-order-vs-position-order row-lock deadlock between this
-                // method and the compaction triggers, but a genuinely
-                // concurrent delete/soft-delete can still win a row lock on
-                // one of this scope's rows BEFORE reaching its own
-                // trigger's advisory-lock attempt — a lock-type inversion
-                // (row lock then advisory lock, vs. this method's advisory
-                // lock then row locks) Postgres's deadlock detector
-                // resolves by aborting one side with `40P01`. Retry a
-                // bounded few times on that (or the `40001` serialization
-                // failure a stricter isolation level could raise) rather
-                // than surface a transient deadlock as a hard failure — the
-                // same classification `Db::tx_with` already relies on for
-                // its own retry loop.
+                // The advisory lock closes the id-order-vs-position-order row-lock
+                // deadlock between this method and the compaction triggers, but a
+                // concurrent delete or soft-delete can still win a row lock on one
+                // of this scope's rows before reaching its own trigger's advisory
+                // lock. That is a lock-type inversion — row lock then advisory
+                // lock, against this method's advisory lock then row locks — which
+                // Postgres's deadlock detector resolves by aborting one side with
+                // `40P01`. Retry a bounded few times on that, or on the `40001`
+                // serialization failure a stricter isolation level could raise,
+                // rather than surface a transient deadlock as a hard failure. Same
+                // classification `Db::tx_with` uses for its own retry loop (#1358).
                 let mut __autumn_attempt: u32 = 0;
                 loop {
                 let __autumn_move_result = ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(
@@ -2480,22 +2463,18 @@ fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> Token
     );
     let move_up_down = quote! { #move_up #move_down };
 
-    // Both `move_before`/`move_after` derive `other_id`'s position from the
-    // SAME `__autumn_locked` row set `move_transaction_body` already loads
-    // for `id` — not a separate, unlocked, external read — so there is no
-    // TOCTOU window for a concurrent mover to invalidate (Codex review,
-    // issue #1358: an earlier version read `other_id`'s position externally
-    // before entering the lock, so a concurrent move of `other_id` between
-    // that read and the transaction could land the row somewhere other than
-    // immediately before/after the requested neighbor). `__autumn_locked`
-    // is already filtered to `id`'s own scope, so "not found in it" also
-    // doubles as the cross-scope check — a stricter one, in fact: it
-    // catches `other_id` not existing or being soft-deleted the same way it
-    // catches a genuine cross-scope mismatch, where the previous external
-    // lookup surfaced those as a 404 instead of this 400. That's an
-    // intentional, minor behavior change: from the caller's perspective,
-    // "can't find `other_id` in my scope" reads the same regardless of
-    // which of the three caused it.
+    // `move_before` and `move_after` derive `other_id`'s position from the same
+    // `__autumn_locked` row set `move_transaction_body` already loads for `id`,
+    // not a separate unlocked read, so there is no TOCTOU window for a concurrent
+    // mover. An earlier version read `other_id`'s position before entering the
+    // lock, so a concurrent move of `other_id` could land the row somewhere other
+    // than immediately before or after the requested neighbor (#1358).
+    // `__autumn_locked` is already filtered to `id`'s scope, so "not found in it"
+    // doubles as the cross-scope check — a stricter one: it catches `other_id`
+    // missing or soft-deleted the same way it catches a genuine cross-scope
+    // mismatch, where the external lookup surfaced those as a 404 rather than this
+    // 400. That behaviour change is intentional and minor: to the caller, "can't
+    // find `other_id` in my scope" reads the same whichever cause applies.
     let other_target_lookup = |cmp_gt: proc_macro2::TokenStream,
                                adjust: proc_macro2::TokenStream| {
         quote! {
@@ -2603,20 +2582,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // ── #1325 counter caches ────────────────────────────────────────────────
     //
-    // `#[model]` and `#[repository]` are separate proc-macro invocations, so
-    // this macro cannot see the model's `#[belongs_to(..., counter_cache)]`
-    // attributes. The bridge is the same one `Model::dependents()` uses: the
-    // model emits *inherent* `counter_caches()` / `HAS_COUNTER_CACHES` items
-    // that shadow an empty blanket impl, and the generated code names them by
-    // concrete path. Each fragment below is emitted unconditionally into every
-    // mutation path; for a model with no counter cache the slice is empty (the
-    // loop body never runs and no statement is issued) and the flag is a `const
-    // false` the optimizer folds away, so nothing changes for the 99% of models
-    // that have none.
+    // `#[model]` and `#[repository]` are separate proc-macro invocations, so this
+    // macro cannot see the model's `#[belongs_to(..., counter_cache)]` attributes.
+    // The bridge is the one `Model::dependents()` uses: the model emits inherent
+    // `counter_caches()` / `HAS_COUNTER_CACHES` items that shadow an empty blanket
+    // impl, and the generated code names them by concrete path. Each fragment
+    // below is emitted into every mutation path unconditionally. For a model with
+    // no counter cache the slice is empty, so the loop body never runs and no
+    // statement is issued, and the flag is a `const false` the optimizer folds
+    // away.
     //
-    // Both fragments carry their own `use` of the trait, inside a block
-    // expression, so a model relying on the blanket impl resolves without this
-    // macro having to inject an import into every arm's scope.
+    // Both fragments carry their own `use` of the trait inside a block expression,
+    // so a model relying on the blanket impl resolves without this macro injecting
+    // an import into every arm's scope.
     let cc_specs = quote! {
         {
             #[allow(unused_imports)]
@@ -2685,27 +2663,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // Several no-hooks mutation paths are deliberately transaction-free: they
-    // issue exactly one statement, so a `BEGIN`/`COMMIT` round trip would be
-    // pure overhead. A counter cache makes that one statement two, which must
-    // commit or roll back together — so those paths need a transaction if, and
-    // only if, the model declares a counter cache, which this macro cannot see
-    // (`#[model]` is a separate invocation) and learns from the model's
-    // `const HAS_COUNTER_CACHES`.
+    // issue exactly one statement, so a `BEGIN`/`COMMIT` round trip would be pure
+    // overhead. A counter cache makes that one statement two, which must commit or
+    // roll back together. Those paths therefore need a transaction if and only if
+    // the model declares a counter cache — which this macro cannot see, and learns
+    // from the model's `const HAS_COUNTER_CACHES`.
     //
-    // That used to be spelled as an early-return transactional variant followed
-    // by the original statement — i.e. the **whole mutation body twice**, at
-    // seven sites per repository. Free at runtime (the const folds), but not at
-    // compile time: both copies are parsed, name-resolved, type-checked and
-    // borrow-checked on every build, and together they were ~13.5% of every
-    // generated repository. `maybe_immediate_transaction` takes the const as a
-    // runtime flag and opens a transaction only when it is set, so the body is
-    // emitted once and the runtime behaviour is unchanged — no transaction is
-    // opened for a model with no counter cache.
+    // That used to be spelled as an early-return transactional variant followed by
+    // the original statement: the whole mutation body twice, at seven sites per
+    // repository. Free at runtime, since the const folds, but not at compile time —
+    // both copies are parsed, name-resolved, type-checked, and borrow-checked on
+    // every build, together about 13.5% of every generated repository.
+    // `maybe_immediate_transaction` takes the const as a runtime flag and opens a
+    // transaction only when it is set, so the body is emitted once and runtime
+    // behaviour is unchanged.
     //
     // `body` is spliced inside `|conn| async move { … }`, so it must end in
     // `Ok(<value>)` and may use `conn` freely. The result is a complete tail
-    // expression: call sites splice it *instead of* their bare statement, not
-    // before it.
+    // expression: call sites splice it instead of their bare statement, not before it.
     let cc_tx_wrap = |ret_ty: &TokenStream, body: &TokenStream| {
         quote! {
             {
@@ -2787,13 +2762,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // ── #1369 dependent destroy/nullify ─────────────────────────────
     //
     // Every generated repository exposes an internal, connection-taking helper
-    // that applies a `DependentAction` to *this* model's rows selected by an
-    // arbitrary foreign-key column. It runs on the caller's connection (and
-    // therefore inside the caller's transaction), so a parent repository's
-    // `delete_by_id` can cascade to its children transactionally. The helper is
-    // generated for every repository (cheap, no callers when unused) so the
-    // parent side only needs the child repository *type* — it never has to know
-    // the child's Diesel schema module.
+    // that applies a `DependentAction` to this model's rows, selected by an
+    // arbitrary foreign-key column. It runs on the caller's connection, and so
+    // inside the caller's transaction, letting a parent repository's `delete_by_id`
+    // cascade to its children transactionally. It is generated for every
+    // repository — cheap, and unused when nothing calls it — so the parent side
+    // needs only the child repository type, never the child's Diesel schema module.
     let dependent_child_helper = {
         // Per-row DESTROY: mirror the repository delete path for one child id
         // (`__cid`) on the caller's connection — load for-update (soft-delete
@@ -2831,21 +2805,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // pointing at a hard-deleted parent is both FK-invalid (NOT NULL FK) and a
         // semantic orphan. Non-soft-delete children are always hard-deleted.
         let destroy_mutation = if config.soft_delete && config.ledgered {
-            // #1699: a ledgered child is never hard-deleted, even by a cascade —
-            // erasing the row erases the record the ledger reconstructs, which is
-            // exactly what `ledgered` refusing `purge` and requiring `soft_delete`
-            // exists to prevent.
+            // #1699: a ledgered child is never hard-deleted, even by a cascade.
+            // Erasing the row erases the record the ledger reconstructs, which is
+            // what `ledgered` refusing `purge` and requiring `soft_delete` prevents.
             //
-            // When the parent is soft-deleted the child follows suit and records a
-            // revision, as it would for any other delete. When the parent is being
-            // *hard*-deleted there is no good outcome left: erasing the child is
-            // refused above, and soft-deleting it leaves a live foreign key pointing
-            // at a row that is about to disappear — which the database rejects,
-            // rolling the whole cascade back with an opaque constraint error. The
-            // parent's macro cannot see that this child is ledgered (separate
-            // `#[repository]` invocations), so the combination is refused here, at
-            // runtime, with a typed error that names the fix. That is the escape
-            // hatch the issue allows where compile-time enforcement cannot reach.
+            // A soft-deleted parent takes the child with it and records a revision,
+            // as any other delete would. A hard-deleted parent leaves no good
+            // outcome: erasing the child is refused above, and soft-deleting it
+            // leaves a live foreign key pointing at a row about to disappear, which
+            // the database rejects, rolling the cascade back with an opaque
+            // constraint error. The parent's macro cannot see that this child is
+            // ledgered — separate `#[repository]` invocations — so the combination
+            // is refused here at runtime, with a typed error naming the fix.
             quote! {
                 #destroy_count_bind = {
                     if !__parent_soft {
@@ -2932,17 +2903,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        // Live-child filter (`AND deleted_at IS NULL`), gated on the PARENT's
-        // delete kind at runtime (#1369). The filter applies only when the parent
-        // is being soft-deleted: the parent row survives, so an already
-        // soft-deleted child is logically gone and would cause no FK problem, and
-        // a live-only selection is correct. When the parent is HARD-deleted the
-        // filter is dropped so the cascade (and the restrict EXISTS probe) operate
-        // on EVERY physically-present child row — otherwise a pre-soft-deleted
-        // child whose NOT NULL FK still points at the parent would survive the
-        // filter and make the subsequent hard parent DELETE fail (destroy) or slip
-        // past the existence check as a raw DB 500 instead of a 409 (restrict).
-        // Non-soft-delete children have no `deleted_at` column, so no filter ever.
+        // Live-child filter (`AND deleted_at IS NULL`), gated at runtime on the
+        // parent's delete kind (#1369). It applies only when the parent is
+        // soft-deleted: the parent row survives and an already soft-deleted child
+        // is logically gone, so a live-only selection is correct. For a
+        // hard-deleted parent the filter is dropped, so the cascade and the
+        // restrict EXISTS probe cover every physically-present child row —
+        // otherwise a pre-soft-deleted child whose NOT NULL FK still points at the
+        // parent would survive it and make the hard parent DELETE fail, or slip
+        // past the existence check as a raw DB 500 instead of a 409. Non-soft-delete
+        // children have no `deleted_at` column, so they never get a filter.
         let destroy_live_filter = if config.soft_delete {
             quote! { if __parent_soft { " AND \"deleted_at\" IS NULL" } else { "" } }
         } else {
@@ -2970,19 +2940,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {}
         };
         // #1369 AC4: inline OOB delete broadcast for a broadcasts-only child,
-        // built from the child record we already hold (`__record`) so no
-        // pre-fetch is needed. Mirrors the inline delete broadcast the normal
-        // `delete_by_id` wrapper emits (static/dynamic topic, tenant scoping,
-        // custom `broadcast_render`), keyed on the destroyed child record.
-        // #1369 broadcast timing: do NOT publish the cascaded child's OOB delete
-        // mid-transaction. If a later dependent action or the parent mutation
-        // fails and the tx rolls back, a mid-tx publish can't be retracted and
-        // clients would drop a fragment for a child that still exists. Instead,
-        // accumulate (topic, dom_id) into `__ret_broadcasts` and hand them back to
-        // the parent, which publishes them only AFTER the tx commits (mirroring
-        // the normal inline delete broadcast, which effectively fires post-commit
-        // for that single op). Commit-hook children defer via the durable outbox
-        // and are unaffected (they never accumulate here — no double publish).
+        // built from the child record already held (`__record`), so no pre-fetch is
+        // needed. Mirrors the inline delete broadcast the normal `delete_by_id`
+        // wrapper emits — static/dynamic topic, tenant scoping, custom
+        // `broadcast_render` — keyed on the destroyed child record.
+        //
+        // Do not publish a cascaded child's OOB delete mid-transaction: if a later
+        // dependent action or the parent mutation fails and the tx rolls back, a
+        // mid-tx publish cannot be retracted and clients would drop a fragment for
+        // a child that still exists. Accumulate (topic, dom_id) into
+        // `__ret_broadcasts` and hand them to the parent, which publishes after
+        // commit. Commit-hook children defer via the durable outbox and never
+        // accumulate here, so they cannot double-publish.
         let destroy_broadcast = if dep_needs_broadcast {
             let base_topic = match generate_topic_format(
                 config
@@ -3039,18 +3008,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        // #1739 grandchild recursion: within the Destroy arm, after selecting a
-        // child row but before removing it, recurse into THIS model's own
-        // `dependent(...)` cascade keyed on the child's id, so grandchildren (and
-        // deeper) are destroyed/nullified inside the SAME transaction. Only
-        // `destroy` recurses: `delete_all` stays single-level (#1739 scope), and
-        // `nullify`/`restrict` remove no rows that could themselves own children.
-        // Restrict grandchildren are probed before mutating ones (mirroring the
-        // single-record restrict-first ordering); a restrict 409 anywhere in the
-        // tree rolls the whole transaction back. Cycle guard: `__visited` holds
-        // every (table, id) already on the destroy path; an already-seen row is
-        // skipped (see the per-row guard in the loop), so self-/mutual-referential
-        // graphs terminate rather than looping forever.
+        // #1739 grandchild recursion: inside the Destroy arm, after selecting a
+        // child row but before removing it, recurse into this model's own
+        // `dependent(...)` cascade keyed on the child's id, so grandchildren and
+        // deeper are destroyed or nullified in the same transaction. Only `destroy`
+        // recurses: `delete_all` stays single-level (#1739 scope), and
+        // `nullify`/`restrict` remove no rows that could own children. Restrict
+        // grandchildren are probed before mutating ones, mirroring the
+        // single-record restrict-first ordering; a restrict 409 anywhere in the
+        // tree rolls the whole transaction back. `__visited` holds every (table,
+        // id) already on the destroy path, and an already-seen row is skipped (see
+        // the per-row guard in the loop), so cyclic graphs terminate.
         let has_dependents = !config.dependents.is_empty();
         // The grandchildren follow this child's delete kind: a soft-delete child
         // is only soft-deleted when its parent is (`__parent_soft`), so its own
@@ -3115,26 +3083,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let compiletime_grandchild_mutating = quote! {
             #(#grandchild_mutating_calls)*
         };
-        // Codex P1 (model-side deps): when this repo has NO repository-attribute
-        // `dependent(...)`, its grandchildren may be declared ONLY on the child
-        // model (via `#[has_many(..., dependent = ...)]`), which populates the
-        // runtime `Model::dependents()` slice but leaves `config.dependents`
-        // empty. The #1739 compile-time recursion above is then empty, so without
-        // this the child row would be deleted while its own children still
-        // FK-reference it (FK failure on a hard delete, or silent orphans). So
-        // consult THIS model's runtime specs and recurse into each grandchild,
-        // mirroring the top-level model-side dispatch: restrict-probe first (a
-        // 409 rolls the whole tx back), then mutating. Reuses the existing
-        // `__visited` (table, id) cycle-guard set, the boxed-future `fn`
-        // recursion (the `Send` edge stays erased through the fn-pointer), and
-        // the `__ret_broadcasts` deferred-broadcast buffer for grandchild
-        // broadcasts. For a model with no dependents this is a cheap no-op that
-        // iterates an empty `&[]`, so the plain path stays behavior-equivalent.
-        // Codex round-5-A: same restrict/mutating split as the compile-time path,
-        // for the model-declared runtime walk. #1800 case 2: the two blocks are now
-        // emitted in SEPARATE loops (the restrict probe pre-scans every selected
-        // child id before any child hook), so each block re-binds
-        // `__autumn_gc_rt_deps` independently rather than sharing one binding.
+        // Codex P1 (model-side deps): when this repo declares no
+        // repository-attribute `dependent(...)`, its grandchildren may be declared
+        // only on the child model, via `#[has_many(..., dependent = ...)]`. That
+        // populates the runtime `Model::dependents()` slice but leaves
+        // `config.dependents` empty, so the compile-time recursion above is empty
+        // and the child row would be deleted while its own children still
+        // FK-reference it — an FK failure on a hard delete, or silent orphans.
+        // Consult this model's runtime specs instead and recurse into each
+        // grandchild, mirroring the top-level model-side dispatch: restrict-probe
+        // first, where a 409 rolls the whole tx back, then mutating. It reuses the
+        // `__visited` cycle guard, the boxed-future `fn` recursion that keeps the
+        // `Send` edge erased, and the `__ret_broadcasts` buffer. For a model with
+        // no dependents it iterates an empty `&[]`.
+        //
+        // #1800 case 2: the restrict and mutating blocks are emitted in separate
+        // loops — the restrict probe pre-scans every selected child id before any
+        // child hook — so each re-binds `__autumn_gc_rt_deps` independently rather
+        // than sharing one binding.
         let runtime_grandchild_restrict = quote! {
             // Inherent `dependents()` (real specs) shadows the blanket trait
             // method (empty); unqualified so the shadow wins, `&[]` otherwise.
@@ -3199,18 +3165,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { use ::autumn_web::repository::AutumnDependents as _; }
         };
 
-        // Declaration + return of the deferred-broadcast buffer for the Destroy
-        // arm. A broadcasts-only child accumulates its own OOB delete fragments;
-        // additionally, when this repo has dependents (#1739), grandchild cascades
-        // return their broadcasts here to propagate up to the top-level parent for
-        // post-commit publishing. Repos with neither return an empty buffer.
-        // The Destroy arm always declares `__ret_broadcasts` now (hence `true`):
-        // with repo-attribute deps for the #1739 compile-time grandchild
-        // broadcasts (`has_dependents`), and without them for the Codex-P1
-        // runtime model-side grandchild walk, which always emits its
-        // `__ret_broadcasts.extend(...)` even though the loop is a no-op for a
-        // model with no dependents. `dep_needs_broadcast` still additionally
-        // drives this repo's own broadcasts-only child accumulation.
+        // Declaration and return of the deferred-broadcast buffer for the Destroy
+        // arm. A broadcasts-only child accumulates its own OOB delete fragments,
+        // and when this repo has dependents (#1739) grandchild cascades return
+        // their broadcasts here to propagate up to the top-level parent for
+        // post-commit publishing. A repo with neither returns an empty buffer.
+        // The arm always declares `__ret_broadcasts` (hence `true`): with
+        // repo-attribute deps for the #1739 compile-time grandchild broadcasts,
+        // and without them for the model-side runtime walk, which always emits its
+        // `__ret_broadcasts.extend(...)` even when the loop is a no-op.
+        // `dep_needs_broadcast` still drives this repo's own accumulation.
         let needs_ret_buffer = true;
         let destroy_ret_decl = if needs_ret_buffer {
             quote! {
@@ -3236,20 +3200,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        // #1800 case 1: record every HANDLED row in the monotonic `__deleted` set
-        // (soft OR physical) so the bulk `delete_many` root dedup / hook
+        // #1800 case 1: record every handled row — soft or physical — in the
+        // monotonic `__deleted` set, so the bulk `delete_many` root dedup and hook
         // double-fire guard skips a root already processed as another root's
-        // descendant — a soft-deleted descendant MUST land here or its
-        // `before_delete` fires a second time in the bulk root loop. Separately
-        // record ONLY physically-removed rows in `__physical`: a soft delete
-        // (`SET deleted_at`, when this is a `#[soft_delete]` child AND the parent is
-        // soft-deleted) leaves the row physically present, so the diamond
-        // revisit-skip (which consults `__physical`, not `__deleted`) must NOT see
-        // it — otherwise a LATER hard-delete path (reached through a hard-deleted
-        // sibling/parent in a mixed soft/hard diamond) would skip it, leaving a
-        // dangling FK or FK-failing the hard delete. A non-soft child, or a soft
-        // child under a HARD parent, is always physically deleted, so it is recorded
-        // in BOTH sets.
+        // descendant. A soft-deleted descendant must land here, or its
+        // `before_delete` fires again in the bulk root loop.
+        //
+        // Record only physically-removed rows in `__physical`. A soft delete leaves
+        // the row present, so the diamond revisit-skip — which consults `__physical`,
+        // not `__deleted` — must not see it; otherwise a later hard-delete path,
+        // reached through a hard-deleted sibling or parent in a mixed diamond, would
+        // skip it and leave a dangling FK or fail the hard delete. A non-soft child,
+        // or a soft child under a hard parent, is always physically deleted and
+        // lands in both sets.
         let destroy_deleted_mark = if config.soft_delete {
             quote! {
                 __deleted.insert((#table_name, __cid));
@@ -3263,16 +3226,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __physical.insert((#table_name, __cid));
             }
         };
-        // #1800 case 1 (companion guard): because a soft-deleted row is deliberately
-        // NOT recorded in `__physical` (only in the "all handled" `__deleted`), the
-        // Phase-2 revisit-skip — which consults `__physical` so the diamond's hard
-        // branch can still reach it — does NOT suppress a later SOFT re-visit of the
-        // SAME row (a pure-soft diamond), which would otherwise re-fire its
-        // `before_delete` hook and re-issue a no-op UPDATE. Skip it here instead: if
-        // this visit would soft-delete (`__parent_soft`) and the row is already
-        // soft-deleted, it is logically gone and nothing more is owed. A HARD
-        // re-visit (`!__parent_soft`) still proceeds to physically delete the row
-        // (the diamond's hard branch).
+        // #1800 case 1, companion guard. A soft-deleted row is deliberately absent
+        // from `__physical` and present only in `__deleted`, so the Phase-2
+        // revisit-skip — which consults `__physical` so the diamond's hard branch
+        // can still reach the row — does not suppress a later soft re-visit of the
+        // same row in a pure-soft diamond, which would re-fire `before_delete` and
+        // re-issue a no-op UPDATE. Skip it here instead: if this visit would
+        // soft-delete (`__parent_soft`) and the row is already soft-deleted, it is
+        // logically gone. A hard re-visit still proceeds to physically delete it.
         let destroy_soft_revisit_skip = if config.soft_delete {
             quote! {
                 if __parent_soft && __record.deleted_at.is_some() {
@@ -3313,12 +3274,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // `async fn`. The Destroy cascade is recursive and, for a self- or
             // mutual-referential `dependent(...)` graph, calls back into an
             // `__autumn_apply_dependent_on_conn` of this same type. An `async fn`'s
-            // anonymous future cannot then be proven `Send` (the auto-trait check
-            // is circular: the future's `Send`-ness depends on itself), so the
-            // whole cascade — and every `delete_by_id` that drives it — would fail
-            // its `+ Send` bound. Returning a `Pin<Box<dyn Future + Send>>` erases
-            // the recursive edge behind a trait object whose `Send` is axiomatic,
-            // breaking the cycle while keeping the cascade `Send`.
+            // anonymous future cannot then be proven `Send` — the auto-trait check
+            // is circular — so the cascade, and every `delete_by_id` driving it,
+            // would fail its `+ Send` bound. A `Pin<Box<dyn Future + Send>>` erases
+            // the recursive edge behind a trait object whose `Send` is axiomatic.
             #[doc(hidden)]
             // Codex round-5-B split the single cycle set into an active-path stack
             // plus a monotonic handled set; #1800 case 1 added the physical-delete
@@ -3332,26 +3291,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __parent_id: i64,
                 __action: ::autumn_web::repository::DependentAction,
                 __parent_soft: bool,
-                // Codex round-5-B + #1800 case 1: THREE guard sets threaded through
-                // the recursion.
-                // `__path` is the ACTIVE recursion stack — a (table, id) is pushed
+                // Three guard sets are threaded through the recursion (Codex
+                // round-5-B, #1800 case 1).
+                //
+                // `__path` is the active recursion stack: a (table, id) is pushed
                 // before descending into its children and popped once its subtree
-                // completes; it breaks self-/mutual-referential cycles ONLY.
-                // `__deleted` is a MONOTONIC set of every row HANDLED by the cascade
-                // — soft OR physical. The bulk `delete_many` root dedup / hook
-                // double-fire guard consults it so a root already processed as
-                // another root's descendant is neither re-cascaded nor re-hooked
-                // (this is why a soft-handled row MUST be recorded here — #1800).
-                // `__physical` is the subset of rows PHYSICALLY removed; the diamond
-                // traversal revisit-skip consults ONLY it, so a hard-delete path can
-                // still physically remove a row a soft-delete path merely marked
-                // `deleted_at` on (a mixed soft/hard diamond) without the "all
-                // handled" set suppressing it.
-                // Separating `__path` from the others is what lets a batch process a
-                // descendant root before its ancestor without the ancestor's cascade
-                // pre-skipping a still-referenced intermediate (the removed
-                // monotonic-preseed's immediate-FK bug). See the Destroy arm's
-                // guards below.
+                // completes. It breaks self- and mutual-referential cycles only.
+                //
+                // `__deleted` is a monotonic set of every row the cascade handled,
+                // soft or physical. The bulk `delete_many` root dedup and hook
+                // double-fire guard consults it, so a root already processed as
+                // another root's descendant is neither re-cascaded nor re-hooked —
+                // which is why a soft-handled row must be recorded here (#1800).
+                //
+                // `__physical` is the subset physically removed; the diamond
+                // revisit-skip consults only it, so a hard-delete path can still
+                // remove a row a soft-delete path merely marked `deleted_at` on.
+                // Keeping `__path` separate lets a batch process a descendant root
+                // before its ancestor without the ancestor's cascade pre-skipping a
+                // still-referenced intermediate.
                 __path: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
                 __deleted: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
                 __physical: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
@@ -3369,15 +3327,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #dep_autumn_dependents_use
                 let __table: &str = #table_name;
                 match __action {
-                    // Restrict / Nullify / DeleteAll are pure dynamic SQL over
-                    // `__table` and `__fk_column`, both already runtime `&str`s
-                    // here — nothing in them is checked against this model's
-                    // `schema.rs`. They live in `autumn_web::repository` so the
-                    // statements and their `QueryableByName` rows compile once
-                    // for the program rather than once per repository. Only
-                    // `Destroy` below stays generated: it loads and deletes
-                    // through diesel's typed DSL and recurses through this
-                    // repository's own pool.
+                    // Restrict, Nullify, and DeleteAll are pure dynamic SQL over
+                    // `__table` and `__fk_column`, both runtime `&str`s here, and
+                    // nothing in them is checked against this model's `schema.rs`.
+                    // They live in `autumn_web::repository` so the statements and
+                    // their `QueryableByName` rows compile once per program rather
+                    // than once per repository. Only `Destroy` stays generated: it
+                    // loads and deletes through diesel's typed DSL and recurses
+                    // through this repository's own pool.
                     ::autumn_web::repository::DependentAction::Restrict => {
                         ::autumn_web::repository::dependent_restrict(
                             conn,
@@ -3428,37 +3385,34 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
                             id: i64,
                         }
-                        // Codex P2 ("Lock children before the restrict pre-scan"):
-                        // this id selection acquires `FOR UPDATE` on every selected
-                        // child row BEFORE the read-only restrict pre-scan below runs
-                        // its `EXISTS` probes. Under READ COMMITTED an FK insert of a
-                        // `restrict` grandchild takes a `FOR KEY SHARE` lock on the
-                        // referenced child row; holding `FOR UPDATE` on that row here
-                        // blocks such an insert until this transaction commits/rolls
-                        // back, so a concurrent grandchild cannot slip in between the
-                        // pre-scan `EXISTS` probe and either the Phase-2 child reload /
-                        // `before_delete` hook or the child delete. The Phase-2 reload
-                        // still calls `.for_update()`, but that is now a re-lock of a
-                        // row already held (a no-op) rather than the FIRST lock — the
-                        // TOCTOU window between probe and hook/delete is closed. The
-                        // lock is hoisted from Phase 2 to here (same parent -> child
-                        // order, same rows), so it introduces no new lock-ordering /
-                        // deadlock class. `ORDER BY id` also makes the lock acquisition
-                        // order deterministic across concurrent cascades. This covers
-                        // the single `delete_by_id` path and both `delete_many` bulk
-                        // paths (they all reach this shared helper), and both soft and
-                        // hard child deletes (the `#destroy_live_filter` gate is applied
-                        // BEFORE `FOR UPDATE`, so the locked row set matches the rows
-                        // the pre-scan + mutating pass operate on).
-                        // The `FOR UPDATE` locking clause is emitted only on
-                        // Postgres. `SQLite` rejects `SELECT … FOR UPDATE`
-                        // outright, and it needs no such clause: its single-writer
-                        // database-level lock already serializes concurrent
-                        // cascades (the same rationale that degrades the DSL
-                        // `maybe_for_update!` seam to a plain read on `SQLite`).
-                        // The suffix is selected in autumn-web's compilation via
-                        // `backend_select!`, so the Postgres SQL is byte-identical
-                        // to before and the `SQLite` form simply drops the clause.
+                        // Codex P2, "lock children before the restrict pre-scan":
+                        // this id selection takes `FOR UPDATE` on every selected
+                        // child row before the read-only restrict pre-scan below.
+                        // Under READ COMMITTED an FK insert of a `restrict`
+                        // grandchild takes `FOR KEY SHARE` on the referenced child
+                        // row, so holding `FOR UPDATE` here blocks that insert until
+                        // this transaction ends. A concurrent grandchild therefore
+                        // cannot slip in between the pre-scan `EXISTS` probe and
+                        // either the Phase-2 reload / `before_delete` hook or the
+                        // child delete. The Phase-2 reload still calls
+                        // `.for_update()`, but that is now a no-op re-lock rather
+                        // than the first lock. The lock is hoisted from Phase 2 to
+                        // here, over the same rows in the same parent→child order,
+                        // so it adds no new deadlock class, and `ORDER BY id` makes
+                        // acquisition order deterministic across concurrent cascades.
+                        // This covers `delete_by_id` and both `delete_many` bulk
+                        // paths, and both soft and hard child deletes:
+                        // `#destroy_live_filter` is applied before `FOR UPDATE`, so
+                        // the locked rows match the rows the later passes operate on.
+                        //
+                        // The `FOR UPDATE` clause is emitted only on Postgres.
+                        // SQLite rejects `SELECT … FOR UPDATE` and needs no such
+                        // clause: its single-writer database-level lock already
+                        // serializes concurrent cascades — the rationale that also
+                        // degrades the DSL `maybe_for_update!` seam to a plain read.
+                        // `backend_select!` picks the suffix in autumn-web's own
+                        // compilation, so the Postgres SQL is byte-identical to
+                        // before and the SQLite form drops the clause.
                         let __for_update: &str = ::autumn_web::backend_select! {
                             pg => { " FOR UPDATE" },
                             sqlite => { "" },
@@ -3473,43 +3427,40 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 .load::<__AutumnDepId>(conn)
                                 .await
                                 .map_err(::autumn_web::AutumnError::from)?;
-                        // #1800 case 2: PRE-SCAN pass. Probe the `restrict`
-                        // grandchildren of EVERY selected child id BEFORE any child
+                        // #1800 case 2, pre-scan pass: probe the `restrict`
+                        // grandchildren of every selected child id before any child
                         // `before_delete` hook fires. Codex round-5-A already ordered
-                        // a child's own grandchild restrict ahead of that SAME child's
-                        // hook, but the probe was still inside the per-child mutating
-                        // loop — so with multiple siblings an EARLIER sibling's
-                        // before_delete fired and only THEN a LATER sibling's restrict
-                        // grandchild returned the 409. The transaction rolls back, but
-                        // a non-transactional hook side effect does not. Hoisting the
-                        // read-only probe into its own pass over all ids closes that
-                        // window; the probe mutates neither `__path` nor `__deleted`
-                        // (a `restrict` action is a pure `SELECT EXISTS`), so it is
-                        // safe to run ahead of — and without re-running in — the
-                        // mutating pass below.
+                        // a child's own grandchild restrict ahead of that child's
+                        // hook, but the probe sat inside the per-child mutating loop,
+                        // so with several siblings an earlier sibling's
+                        // `before_delete` fired and only then did a later sibling's
+                        // restrict grandchild return the 409. The transaction rolls
+                        // back; a non-transactional hook side effect does not.
+                        // Hoisting the read-only probe into its own pass closes that
+                        // window. The probe mutates neither `__path` nor `__deleted`
+                        // — a `restrict` action is a pure `SELECT EXISTS` — so it is
+                        // safe ahead of, and need not re-run in, the mutating pass.
                         for __row in &__ids {
                             let __cid = __row.id;
-                            // #1800 (Codex "Re-probe restricts on hard revisits"):
-                            // skip a row already PHYSICALLY removed elsewhere (its
-                            // restrict grandchildren, if any, were probed on that
-                            // path). This consults `__physical`, NOT the "all handled"
-                            // `__deleted`, to stay consistent with the Phase-2 diamond
-                            // revisit-skip below: a row merely SOFT-deleted on an
-                            // earlier path is still in `__deleted` but NOT in
-                            // `__physical`, so a later HARD-delete revisit (mixed
-                            // soft/hard diamond) still re-runs this restrict pre-scan.
-                            // If the pre-scan keyed on `__deleted` it would skip the
-                            // probe while Phase-2 (keyed on `__physical`) still hard-
-                            // deletes the row — firing the child hook and falling
-                            // through to a raw FK failure instead of the typed 409
-                            // when the row has a soft-deleted restrict dependent. The
-                            // hard-path probe drops the live filter (`__parent_soft`
-                            // is false on that path), so it INCLUDES the soft-deleted
-                            // dependent and returns the 409 before any hook. The probe
-                            // body may be empty (no restrict grandchildren), so this is
-                            // written as a positive guard rather than an early
-                            // `continue` (which clippy flags as redundant when it is
-                            // the loop's last statement).
+                            // #1800, "re-probe restricts on hard revisits": skip a
+                            // row already physically removed elsewhere, whose
+                            // restrict grandchildren were probed on that path. This
+                            // consults `__physical`, not the all-handled
+                            // `__deleted`, to match the Phase-2 diamond revisit-skip
+                            // below: a row merely soft-deleted on an earlier path is
+                            // in `__deleted` but not in `__physical`, so a later
+                            // hard-delete revisit still re-runs this pre-scan. Keyed
+                            // on `__deleted` it would skip the probe while Phase 2,
+                            // keyed on `__physical`, still hard-deletes the row —
+                            // firing the child hook and falling through to a raw FK
+                            // failure instead of the typed 409 when the row has a
+                            // soft-deleted restrict dependent. The hard-path probe
+                            // drops the live filter, since `__parent_soft` is false
+                            // there, so it includes the soft-deleted dependent and
+                            // returns the 409 before any hook. The probe body may be
+                            // empty, so this is a positive guard rather than an early
+                            // `continue`, which clippy flags as redundant when it is
+                            // the loop's last statement.
                             if !__physical.contains(&(#table_name, __cid)) {
                                 #grandchild_restrict_cascade
                             }
@@ -3518,16 +3469,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         // have passed, fire hooks and mutate.
                         for __row in __ids {
                             let __cid = __row.id;
-                            // Codex round-5-B + #1800 case 1: the diamond traversal
-                            // revisit-skip. Skip a row already PHYSICALLY removed
-                            // (genuinely gone) — dedup across independent batch roots
-                            // / branches. This consults `__physical`, NOT the "all
-                            // handled" `__deleted`: a row soft-deleted on an earlier
-                            // path is NOT physically gone, so a later HARD path (mixed
-                            // soft/hard diamond) must still reach and physically remove
-                            // it. A redundant SOFT re-visit is instead caught by the
-                            // `__record.deleted_at` guard below (once reloaded), so a
-                            // soft-handled row is not re-hooked either.
+                            // The diamond traversal revisit-skip (Codex round-5-B,
+                            // #1800 case 1). Skip a row already physically removed,
+                            // which dedups across independent batch roots and
+                            // branches. It consults `__physical`, not the all-handled
+                            // `__deleted`: a row soft-deleted on an earlier path is
+                            // not physically gone, so a later hard path in a mixed
+                            // diamond must still remove it. A redundant soft re-visit
+                            // is caught by the `__record.deleted_at` guard below once
+                            // reloaded, so a soft-handled row is not re-hooked either.
                             if __physical.contains(&(#table_name, __cid)) {
                                 continue;
                             }
@@ -3542,15 +3492,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             if !__path.insert((#table_name, __cid)) {
                                 continue;
                             }
-                            // #1369: reload the EXACT id the (parent-soft-gated)
-                            // selection returned — do NOT re-apply `#sd_filter`
-                            // (`deleted_at IS NULL`) here. On a hard parent delete
-                            // the selection intentionally includes already
-                            // soft-deleted children (their FK still references the
-                            // parent), so a live-only reload would return `None`,
-                            // skip the hard delete, and leave the row to FK-fail
-                            // the parent DELETE. The id set is authoritative for
-                            // the parent kind; the row is locked with `for_update`.
+                            // #1369: reload the exact id the parent-soft-gated
+                            // selection returned. Do not re-apply `#sd_filter`
+                            // (`deleted_at IS NULL`) here: on a hard parent delete
+                            // the selection deliberately includes already
+                            // soft-deleted children, whose FK still references the
+                            // parent, so a live-only reload would return `None`, skip
+                            // the hard delete, and leave the row to FK-fail the parent
+                            // DELETE. The id set is authoritative for the parent kind,
+                            // and the row is locked with `for_update`.
                             let __record = ::autumn_web::maybe_for_update!(#table_ident::table.find(__cid))
 
                                 .first::<#model_name>(conn)
@@ -3600,21 +3550,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // #1740 + Codex P1: bulk `delete_many` dependent cascade. `delete_many`
-    // historically bypassed `dependent(...)` entirely (a plain bulk parent
-    // delete), silently orphaning children. These tokens splice the SAME cascade
-    // the single-record delete path runs into both `delete_many_body` codegen
-    // branches (hooks and no-hooks). A repository-attribute `dependent(...)`
-    // drives it at compile time; a model-declared `#[has_many(dependent = ...)]`
-    // drives it at run time via `Model::dependents()` (Codex P1). A model with no
-    // dependents at all keeps its exact prior bulk codegen (byte-identical plain
-    // path, `()` tx return). Correctness over raw throughput: children are
-    // cascaded per parent row via the shared `__autumn_apply_dependent_on_conn`
-    // helper (so `destroy` recurses into grandchildren for free, #1739), which is
-    // the "per row" tradeoff called out in the issue.
+    // #1740 + Codex P1: bulk `delete_many` dependent cascade. `delete_many` once
+    // bypassed `dependent(...)` entirely — a plain bulk parent delete — silently
+    // orphaning children. These tokens splice the same cascade the single-record
+    // delete path runs into both `delete_many_body` codegen branches, hooks and
+    // no-hooks. A repository-attribute `dependent(...)` drives it at compile time;
+    // a model-declared `#[has_many(dependent = ...)]` drives it at run time via
+    // `Model::dependents()`. A model with no dependents keeps its exact prior bulk
+    // codegen. Correctness over raw throughput: children cascade per parent row
+    // through the shared `__autumn_apply_dependent_on_conn` helper, so `destroy`
+    // recurses into grandchildren for free (#1739).
     //
     // The parent's delete kind drives the child `destroy` cascade: soft when the
-    // parent repo is `#[soft_delete]` (its bulk path soft-deletes), hard otherwise.
+    // parent repo is `#[soft_delete]`, hard otherwise.
     let delete_many_parent_soft_lit = if config.soft_delete {
         quote! { true }
     } else {
@@ -3690,26 +3638,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .map_err(::autumn_web::AutumnError::from)?;
         }
     };
-    // Shared preamble: preload the affected (tenant/live-filtered, row-locked)
-    // parents and collect their ids, and declare the two cascade-guard sets +
-    // deferred-broadcast buffer. Used by BOTH the compile-time (repo-attribute)
-    // and runtime (Codex P1, model-declared) cascade blocks.
+    // Shared preamble: preload the affected parents — tenant- and live-filtered,
+    // row-locked — collect their ids, and declare the two cascade-guard sets plus
+    // the deferred-broadcast buffer. Used by both the compile-time
+    // (repo-attribute) and runtime (model-declared) cascade blocks.
     //
-    // Codex round-5-B: the bulk cascade threads TWO guard sets, NOT one monotonic
-    // visited set. `__autumn_path` is the ACTIVE recursion stack (pushed before a
-    // node's own cascade, popped right after — cycle-break ONLY); `__autumn_deleted`
-    // is the monotonic set of rows actually removed. The removed round-2/round-4
-    // monotonic pre-seed marked a batch root visited BEFORE it was deleted, so a
-    // self-referential `dependent = destroy` batch that happened to process a
-    // descendant root before its ancestor made the ancestor's cascade skip that
-    // descendant while deleting the intermediate it still references — tripping an
-    // IMMEDIATE foreign-key constraint. With the split, a descendant root's own
-    // Phase-2 iteration pushes then pops itself on `__autumn_path`, so it is NOT on
-    // the path (and not yet in `__autumn_deleted`) when the ancestor's cascade later
-    // reaches it: the ancestor cascades it deepest-first (no FK), and once it is
-    // truly removed `__autumn_deleted` skips it everywhere after (no double delete,
-    // no double hook — including the bulk-root hook loop, which consults it too).
-    // Cycles still terminate via `__autumn_path`.
+    // The bulk cascade threads two guard sets, not one monotonic visited set.
+    // `__autumn_path` is the active recursion stack, pushed before a node's own
+    // cascade and popped right after, and breaks cycles only. `__autumn_deleted`
+    // is the monotonic set of rows actually removed. A monotonic pre-seed marked a
+    // batch root visited before it was deleted, so a self-referential `dependent =
+    // destroy` batch that processed a descendant root before its ancestor made the
+    // ancestor's cascade skip that descendant while deleting the intermediate it
+    // still references, tripping an immediate foreign-key constraint. With the
+    // split, a descendant root's Phase-2 iteration pushes and pops itself on
+    // `__autumn_path`, so it is neither on the path nor yet in `__autumn_deleted`
+    // when the ancestor's cascade reaches it: the ancestor cascades it
+    // deepest-first, and once truly removed `__autumn_deleted` skips it everywhere
+    // after — no double delete, no double hook, including in the bulk-root hook
+    // loop. Cycles still terminate via `__autumn_path`.
     let delete_many_collect_parents = quote! {
         let mut __autumn_path: ::std::collections::HashSet<(&'static str, i64)> =
             ::std::collections::HashSet::new();
@@ -4359,13 +4306,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // ── Build struct fields, extractor init, and CRUD bodies ──────────────
     //
-    // When `hooks_type` is present, the struct gains a `hooks` field,
-    // the extractor initialises it with `Default::default()`, and the
-    // save / update / delete methods are wrapped in a transactional
-    // hook lifecycle (before_* ΓåÆ persist).
-    //
-    // When absent, the generated code is identical to the pre-hooks version
-    // (zero-cost path).
+    // With `hooks_type` present, the struct gains a `hooks` field, the extractor
+    // initialises it with `Default::default()`, and the save, update, and delete
+    // methods are wrapped in a transactional hook lifecycle (before_* → persist).
+    // Without it, the generated code is identical to the pre-hooks version.
 
     let tenant_struct_field = if config.tenant_scoped {
         quote! { across_tenants: bool, }
@@ -4607,22 +4551,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Bridge this repository to the many-to-many mutation traits `#[model]`
     // generates for `#[has_many(Target, through = ...)]` associations on
-    // `#model_name` (see `M2mConnSource`). Emitted unconditionally — cheap
-    // when the model has no `through =` associations (nothing calls it) —
-    // so it doesn't need to know which associations exist, only its own
-    // model and write-connection helper.
-    // The tenant a `#[votable]` `react()` / `reaction_of()` must filter its
-    // *target* lookup on. Resolved with exactly the idiom the derived queries
-    // use: `across_tenants()` opts out, a missing context fails closed.
-    // §1d parity for reactions: on a sharded repository, across_tenants()
-    // cannot target a single shard's connection, so `react()` would mutate —
-    // and `reaction_of()` silently read — whichever shard happens to back the
-    // routed pool. Reject like the derived-write / preload guards, but key off
-    // the runtime `across_tenants` flag ALONE (the grouped-aggregate stance,
-    // not the older `__autumn_shards.is_some()` conjunction): a repo built
-    // without shard context (`with_pool_untracked`) would otherwise slip past
-    // and silently hit whichever single pool backs it. Empty (zero-cost)
-    // unless sharded + tenant_scoped.
+    // `#model_name` (see `M2mConnSource`). Emitted unconditionally — cheap when
+    // the model has no `through =` associations, since nothing calls it — so it
+    // needs only its own model and write-connection helper.
+    // The tenant a `#[votable]` `react()` / `reaction_of()` must filter its target
+    // lookup on, resolved with the idiom the derived queries use:
+    // `across_tenants()` opts out, and a missing context fails closed.
+    // §1d parity for reactions: on a sharded repository `across_tenants()` cannot
+    // target a single shard's connection, so `react()` would mutate — and
+    // `reaction_of()` silently read — whichever shard backs the routed pool.
+    // Reject as the derived-write and preload guards do, but key off the runtime
+    // `across_tenants` flag alone (the grouped-aggregate stance, not the older
+    // `__autumn_shards.is_some()` conjunction): a repo built without shard context
+    // (`with_pool_untracked`) would otherwise slip past and silently hit whichever
+    // single pool backs it. Empty unless sharded and tenant-scoped.
     let m2m_cross_shard_guard = if config.sharded && config.tenant_scoped {
         quote! {
             if self.across_tenants {
@@ -8254,15 +8196,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let mut offset = 0;
                         for chunk in proposed_rows.chunks(1000) {
                             let mut chunk_updated = Vec::new();
-                            // Owned (`.clone()`, not the borrowed `proposed`): an
-                            // `#[encrypted]` column routes through diesel
-                            // `serialize_as`, which CONSUMES the value, so diesel
-                            // implements `AsChangeset` only for the owned model —
-                            // never `&Model`. Borrowing here failed to compile any
-                            // hooks-enabled (or `broadcasts = true`) repository over
-                            // a model with an encrypted column. The single-record
-                            // hooks paths above already clone for the same reason;
-                            // cloning also works for every plain model.
+                            // Owned via `.clone()`, not the borrowed `proposed`: an
+                            // `#[encrypted]` column routes through diesel's
+                            // `serialize_as`, which consumes the value, so diesel
+                            // implements `AsChangeset` only for the owned model. A
+                            // borrow here failed to compile any hooks-enabled or
+                            // `broadcasts = true` repository over a model with an
+                            // encrypted column. The single-record hooks paths clone
+                            // for the same reason, and cloning suits plain models too.
                             for proposed in chunk {
                                 let update_target = #table_ident::table.find(proposed.id);
                                 let proposed = ::core::clone::Clone::clone(proposed);
@@ -8310,19 +8251,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let delete_many_body = {
-            // Codex review (issue #1358): the position insert-assign trigger
-            // takes its advisory lock, but the delete/soft-delete-compact
-            // triggers fire once PER ROW — each computing its shift from
-            // that row's own `OLD.position`. A single multi-row `DELETE ...
-            // WHERE id = ANY(chunk)` (or the soft-delete equivalent
-            // `UPDATE ... SET deleted_at = ...`) removes several rows from
-            // the SAME scope in one statement; their row-level triggers
-            // don't see each other's removals, so the relative shifts can
-            // under- or over-compact, leaving a gap or a duplicate rank.
-            // Forcing chunk size to 1 when a position field exists turns
-            // every chunk's delete/update into a single-row statement, so
-            // each trigger firing sees a fully-settled table and the
-            // existing single-row-safe compaction logic stays correct.
+            // The position insert-assign trigger takes its advisory lock, but the
+            // delete and soft-delete-compact triggers fire once per row, each
+            // computing its shift from that row's own `OLD.position`. A single
+            // multi-row `DELETE ... WHERE id = ANY(chunk)`, or the soft-delete
+            // `UPDATE ... SET deleted_at = ...`, removes several rows from the same
+            // scope in one statement; their row-level triggers do not see each
+            // other's removals, so the relative shifts can under- or over-compact
+            // and leave a gap or a duplicate rank. Forcing chunk size to 1 when a
+            // position field exists makes every chunk single-row, so each trigger
+            // firing sees a settled table and the single-row-safe compaction logic
+            // stays correct (#1358).
             let delete_chunk_size: usize = if config.position.is_some() { 1 } else { 1000 };
             let tenant_id_setup = if config.tenant_scoped {
                 quote! {
@@ -8601,16 +8540,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     current_rows.extend(chunk_rows);
                                 }
 
-                                // #1740: cascade dependent actions for every parent BEFORE
-                                // the bulk parent delete, so no child is orphaned and the
-                                // parent delete never trips a foreign-key constraint.
-                                // Codex round-5-B: the cascade runs FIRST so a batch root
-                                // that is also another root's descendant is deleted (and
-                                // recorded in `__autumn_deleted`) here — its `before_delete`
-                                // fires exactly once as that descendant; the root hook loop
-                                // below then skips it (`#delete_many_root_skip`), avoiding a
-                                // second firing, and the tolerant bulk `id = ANY` delete no
-                                // longer touches it.
+                                // #1740: cascade dependent actions for every parent
+                                // before the bulk parent delete, so no child is
+                                // orphaned and the parent delete never trips a
+                                // foreign-key constraint. The cascade runs first, so
+                                // a batch root that is also another root's descendant
+                                // is deleted here and recorded in `__autumn_deleted`,
+                                // firing `before_delete` exactly once. The root hook
+                                // loop below then skips it (`#delete_many_root_skip`)
+                                // and the tolerant bulk `id = ANY` delete no longer
+                                // touches it.
                                 #delete_many_cascade
 
                                 for record in &current_rows {
@@ -8907,39 +8846,36 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         // #1801: opt-in merged-model validation on the no-hooks update path.
-        // `#knob_validate_current` is spliced into branches where `current`
-        // (the loaded row) is already in scope — it borrows the row, validates
-        // the merged model via `from_patch`, and discards the draft (we only
-        // want its 422 side-effect; the blind write below is unchanged).
-        // `#knob_load_and_validate` (plain, no tenant filter) and
-        // `#knob_load_and_validate_tenant` (tenant-filtered) are spliced into the
-        // otherwise-blind no-lock sub-branches: each first SELECTs the current row
-        // (only when the knob is set — no unconditional extra query), then
-        // validates. The tenant variant is used in the tenant_scoped blind branch
-        // so its SELECT matches that branch's own tenant-filtered UPDATE and the
-        // sibling version-checked load — otherwise a cross-tenant `id` would load a
-        // foreign row and surface 422 instead of the correct 404. All expand to
-        // nothing when the knob is off, keeping the blind path byte-for-byte.
         //
-        // Note (normalize-vs-persist asymmetry): `from_patch` normalizes the merged
-        // model before validating, but the blind path deliberately persists the
-        // un-normalized `changes.__to_changeset()` (the validation here is
-        // side-effect-only — we keep only its 422). So a value that passes only
-        // because normalization cleaned it up is stored raw. This is a known,
-        // deliberate limitation of the opt-in blind path; the hooked/#1804 path
-        // persists the normalized draft instead.
+        // `#knob_validate_current` is spliced into branches where `current`, the
+        // loaded row, is already in scope: it borrows the row, validates the merged
+        // model via `from_patch`, and discards the draft — only the 422 side effect
+        // is wanted, and the blind write below is unchanged.
+        // `#knob_load_and_validate` and `#knob_load_and_validate_tenant` go into the
+        // otherwise-blind no-lock sub-branches: each SELECTs the current row, only
+        // when the knob is set, then validates. The tenant variant is used in the
+        // tenant-scoped blind branch so its SELECT matches that branch's
+        // tenant-filtered UPDATE and the sibling version-checked load; otherwise a
+        // cross-tenant `id` would load a foreign row and surface 422 instead of 404.
+        // All expand to nothing when the knob is off.
         //
-        // Concurrency (known, deliberate): this merged validation is point-in-time
-        // against a non-locked snapshot (a plain SELECT, no `FOR UPDATE`). It
-        // reliably rejects a single request that is invalid once merged (the #1801
-        // acceptance criterion), but does not provide a serializable cross-field
-        // invariant under concurrent partial writes to different fields — two
-        // concurrent requests can each validate against the same old row and then
-        // persist a combination the validator would reject. This matches the blind
-        // path's intentionally non-transactional, last-write-wins-per-column
-        // semantics; callers needing atomic cross-field enforcement should use a
-        // versioned or `hooks = ...` repository, whose update runs
-        // `SELECT ... FOR UPDATE` inside the mutation transaction.
+        // Normalize-vs-persist asymmetry: `from_patch` normalizes the merged model
+        // before validating, but the blind path deliberately persists the
+        // un-normalized `changes.__to_changeset()`, since only the 422 is kept. A
+        // value that passes only because normalization cleaned it up is stored raw.
+        // This is a known limitation of the opt-in blind path; the hooked/#1804 path
+        // persists the normalized draft.
+        //
+        // Concurrency: this merged validation is point-in-time against a non-locked
+        // snapshot — a plain SELECT, no `FOR UPDATE`. It reliably rejects a single
+        // request that is invalid once merged (the #1801 acceptance criterion), but
+        // gives no serializable cross-field invariant under concurrent partial
+        // writes: two requests can each validate against the same old row and then
+        // persist a combination the validator would reject. That matches the blind
+        // path's non-transactional, last-write-wins-per-column semantics. Callers
+        // needing atomic cross-field enforcement should use a versioned or
+        // `hooks = ...` repository, whose update runs `SELECT ... FOR UPDATE` inside
+        // the mutation transaction.
         let draft_ext_trait = format_ident!("{}DraftExt", model_name);
         let knob_validate_current = if config.validate_on_update_fetch {
             quote! {
@@ -10240,18 +10176,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let update_many_body = {
-            // Codex review (issue #1358): unlike the hooks-enabled
-            // `update_many` (which already updates one row per statement —
-            // each gets its own individually derived `draft`), this path
-            // issues ONE `UPDATE ... WHERE id = ANY(chunk) SET <changes>`
-            // per chunk, applying the SAME changeset to every row in it. If
-            // `changes` reassigns a scoped position field's scope column,
-            // multiple same-scope rows can be rescoped in that single
-            // statement — the same per-row-trigger-sees-only-its-own-OLD
-            // batching race `delete_many`'s chunk-size fix closes, just via
-            // `rescope` instead of `compact`/`compact_soft`. Force
-            // single-row chunks whenever a position field exists so every
-            // `rescope` trigger firing sees a fully-settled table.
+            // Unlike the hooks-enabled `update_many`, which updates one row per
+            // statement with its own derived `draft`, this path issues one
+            // `UPDATE ... WHERE id = ANY(chunk) SET <changes>` per chunk and applies
+            // the same changeset to every row. If `changes` reassigns a scoped
+            // position field's scope column, several same-scope rows can be rescoped
+            // in that one statement — the same batching race `delete_many`'s
+            // chunk-size fix closes, via `rescope` instead of `compact`. Force
+            // single-row chunks whenever a position field exists, so every `rescope`
+            // trigger firing sees a settled table (#1358).
             let update_chunk_size: usize = if config.position.is_some() { 1 } else { 1000 };
             let vh_update_pair = if config.versioned {
                 let vh = vh_insert_ts(
@@ -10897,45 +10830,42 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             let size_check = if config.tenant_scoped {
-                // Tenant-scoped path: replace the old coarse post-upsert size check
-                // with a drop-triggered, tenant-scoped RECONCILIATION (ref #1963 +
-                // the Codex P2 fail-closed follow-up).
+                // Tenant-scoped path: a drop-triggered, tenant-scoped reconciliation
+                // replacing the old coarse post-upsert size check (#1963, plus the
+                // Codex P2 fail-closed follow-up).
                 //
                 // The versioned tenant-scoped upsert SQL is
                 //   INSERT ... ON CONFLICT (id) DO UPDATE SET ..., lock_version = lock_version + 1
                 //   WHERE lock_version = excluded.lock_version AND tenant_id = $t RETURNING *
-                // so a row can be silently dropped (not RETURNed) for EITHER of two
-                // reasons: (1) a tenant_id mismatch — a cross-tenant row we must NOT
-                // touch and must stay SILENT about (this is exactly the #1963
-                // false-positive we are avoiding); or (2) a lock_version mismatch — a
-                // genuine SAME-tenant optimistic-lock conflict that must be LOUD (409).
+                // so a row can be silently dropped for either of two reasons: a
+                // tenant_id mismatch — a cross-tenant row we must not touch and must
+                // stay silent about, the #1963 false positive — or a lock_version
+                // mismatch, a genuine same-tenant optimistic-lock conflict that must
+                // be loud (409).
                 //
-                // The pre-upsert per-row lock check above only sees rows present in
-                // `existing_rows` at load time. A row inserted by a DIFFERENT write
-                // path (raw insert / save / save_many / another repo — none of which
-                // take this upsert's `pg_advisory_xact_lock`, which only versioned
-                // `upsert_many` acquires) BETWEEN our FOR UPDATE snapshot and the
-                // upsert is invisible to it. With the old size check gone entirely, a
-                // real same-tenant lock conflict on such a raced-in row was returned
-                // as `Ok` instead of a 409 — the Codex P2 bug.
+                // The pre-upsert per-row lock check sees only rows present in
+                // `existing_rows` at load time. A row inserted by a different write
+                // path — raw insert, save, save_many, another repo, none of which
+                // take the `pg_advisory_xact_lock` that only versioned `upsert_many`
+                // acquires — between our FOR UPDATE snapshot and the upsert is
+                // invisible to it. With the size check gone, a real same-tenant lock
+                // conflict on such a raced-in row returned `Ok` instead of a 409.
                 //
-                // The fix is fail-closed AND cannot reintroduce the #1963 false
-                // positive: only when a drop actually happened do we re-select the
-                // dropped ids UNDER THE CURRENT TENANT SCOPE (mirroring `load_expr`).
-                // If a dropped id is STILL PRESENT under this tenant, its tenant_id
-                // matched, so the only reason it was dropped is a lock_version
-                // mismatch (reason 2) → we fail closed with the SAME `Conflict` shape
-                // the pre-upsert detector emits. If NONE of the dropped ids are
-                // present under this tenant, every drop was cross-tenant/absent
-                // (reason 1) → we stay SILENT (`Ok`), preserving the #1963 behavior.
-                // Because it fires ONLY when a dropped id still exists under the
-                // current tenant, a cross-tenant row — filtered out of this re-select
-                // by construction — can never trip it.
+                // The fix fails closed without reintroducing the false positive: only
+                // when a drop happened do we re-select the dropped ids under the
+                // current tenant scope, mirroring `load_expr`. A dropped id still
+                // present under this tenant had a matching tenant_id, so the only
+                // reason it was dropped is a lock_version mismatch: fail closed with
+                // the same `Conflict` shape the pre-upsert detector emits. If none of
+                // the dropped ids are present under this tenant, every drop was
+                // cross-tenant or absent, so stay silent (`Ok`). Because it fires only
+                // when a dropped id still exists under the current tenant, a
+                // cross-tenant row — filtered out of this re-select by construction —
+                // can never trip it.
                 //
-                // Gated at runtime by `has_lock` (mirroring the pre-upsert detector):
-                // a non-versioned tenant-scoped model has no `lock_version`, so its
-                // drops are ALWAYS cross-tenant and this reconciliation never fires,
-                // leaving that path a silent no-op exactly as #1963 requires.
+                // Gated at runtime by `has_lock`, mirroring the pre-upsert detector: a
+                // non-versioned tenant-scoped model has no `lock_version`, so its drops
+                // are always cross-tenant and this reconciliation never fires.
                 quote! {
                     if has_lock && upserted.len() != records.len() {
                         let __autumn_done: ::std::collections::HashSet<_> =
@@ -11124,14 +11054,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // ── #1325 counter-cache repair ──────────────────────────────────────────
     //
-    // Recompute the maintained column(s) from the source of truth. Idempotent by
-    // construction (the column is *assigned* a `COUNT(*)`, never adjusted), so
-    // it is both the backfill for a table adopting the column and the repair for
-    // drift introduced by writes that bypassed the repository.
+    // Recompute the maintained columns from the source of truth. Idempotent by
+    // construction — the column is assigned a `COUNT(*)`, never adjusted — so it is
+    // both the backfill for a table adopting the column and the repair for drift
+    // from writes that bypassed the repository.
     //
-    // Always emitted: for a model with no counter cache the spec slice is empty,
-    // so the method is a zero-statement no-op returning 0 rather than a missing
-    // method the caller has to feature-detect.
+    // Always emitted: for a model with no counter cache the spec slice is empty, so
+    // the method is a zero-statement no-op returning 0 rather than a missing method
+    // the caller must feature-detect.
     let counter_cache_recompute_methods = quote! {
         /// Recompute every counter cache this model maintains, for **all**
         /// parent rows, from the source of truth (#1325).
@@ -11181,29 +11111,29 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // ── #1369: transactional dependent cascade for delete_by_id ──────
     //
     // When the repository declares `dependent(...)` associations, override the
-    // default `delete_body` with one that (1) always opens a transaction, (2)
-    // loads and locks the parent, (3) applies every declared dependent action
-    // to the children on that same connection *before* deleting the parent, and
-    // (4) deletes the parent. Any error rolls the whole graph back. Children are
-    // removed/nullified before the parent delete so no FK/orphan can occur.
+    // default `delete_body` with one that opens a transaction, loads and locks the
+    // parent, applies every declared dependent action to the children on that same
+    // connection, then deletes the parent. Any error rolls the whole graph back,
+    // and children are removed or nullified first, so no FK violation or orphan
+    // can occur.
     //
-    // This override is computed before the `cross_shard_write_guard` tuple below
-    // so the guard is prepended here too: on a sharded + tenant_scoped repo an
-    // `across_tenants()` delete is rejected rather than cascading across shards
-    // from a single routed connection (honoring the #1592/#1664/#1687 guards; a
-    // cascade cannot silently skip children living on other shards).
+    // Computed before the `cross_shard_write_guard` tuple below, so the guard is
+    // prepended here too: on a sharded, tenant-scoped repo an `across_tenants()`
+    // delete is rejected rather than cascading across shards from one routed
+    // connection (#1592/#1664/#1687) — a cascade must not silently skip children
+    // on other shards.
     let delete_body = {
         // #1738: the parent-side cascade body is shared between the
-        // repository-attribute (compile-time `dependent(...)`) form and the
-        // model-declared `#[has_many(dependent = ...)]` form (dispatched at run
-        // time via `Model::dependents()`). The parent load/mutation/hook/version
-        // tokens below are identical for both; only the per-child cascade calls
-        // differ (a compile-time list vs a runtime `RuntimeDependentSpec` slice),
-        // so those are passed into `assemble_cascade_body`.
-        //
-        // The parent's own delete kind (soft vs hard) drives the child `destroy`
-        // cascade (#1369 P1): a soft-delete child is only soft-deleted alongside
-        // a soft-deleted parent; a hard-deleted parent hard-deletes its children.
+        // repository-attribute form (compile-time `dependent(...)`) and the
+        // model-declared form (`#[has_many(dependent = ...)]`, dispatched at run
+        // time via `Model::dependents()`). The parent load, mutation, hook, and
+        // version tokens below are identical for both; only the per-child cascade
+        // calls differ — a compile-time list against a runtime
+        // `RuntimeDependentSpec` slice — so those are passed into
+        // `assemble_cascade_body`. The parent's own delete kind drives the child
+        // `destroy` cascade (#1369 P1): a soft-delete child is soft-deleted only
+        // alongside a soft-deleted parent, and a hard-deleted parent hard-deletes
+        // its children.
         let parent_soft_lit = if config.soft_delete {
             quote! { true }
         } else {
@@ -11412,16 +11342,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        // Assemble the full transactional delete body around a given cascade,
-        // split into its read-only `restrict` PROBE block and its mutating block.
-        // Shared by the repository-attribute and model-declared (#1738) cascade
-        // forms. #1800 case 3: the parent's `restrict` dependents are probed
-        // BEFORE the parent's own `before_delete` hook fires (mirroring the
-        // child-tier ordering) — a `restrict` 409 must not leave a
-        // non-transactional parent hook side effect behind on a doomed
-        // transaction. The mutating dependents still run AFTER the hook (so a
-        // hook that vetoes the delete short-circuits them) and BEFORE the parent
-        // row mutation (so no FK dangles).
+        // Assemble the full transactional delete body around a given cascade, split
+        // into its read-only `restrict` probe block and its mutating block. Shared
+        // by the repository-attribute and model-declared (#1738) forms. The parent's
+        // `restrict` dependents are probed before the parent's own `before_delete`
+        // hook fires, mirroring the child-tier ordering: a `restrict` 409 must not
+        // leave a non-transactional parent hook side effect behind on a doomed
+        // transaction (#1800 case 3). The mutating dependents still run after the
+        // hook, so a vetoing hook short-circuits them, and before the parent row
+        // mutation, so no FK dangles.
         let assemble_cascade_body =
             |cascade_restrict_calls: proc_macro2::TokenStream,
              cascade_mutating_calls: proc_macro2::TokenStream| {
@@ -11508,15 +11437,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         if config.dependents.is_empty() {
             // ── #1738: model-declared `#[has_many(dependent = ...)]` cascade ──
             //
-            // No repository-attribute `dependent(...)` was declared, so consult
-            // the model's runtime `Model::dependents()` (an inherent shadow of
+            // No repository-attribute `dependent(...)` was declared, so consult the
+            // model's runtime `Model::dependents()` — an inherent shadow of
             // `AutumnDependents::dependents`, emitted by `#[model]` only when the
             // struct declares dependent associations; otherwise the blanket impl
-            // yields an empty slice). When empty this is exactly the prior plain
-            // delete body; when non-empty it drives the SAME transactional
-            // cascade as the repository-attribute form, resolving each child
-            // repository through the `Pg{Child}Repository` convention baked into
-            // the spec's `cascade` thunk.
+            // yields an empty slice. When empty this is the prior plain delete body;
+            // when non-empty it drives the same transactional cascade as the
+            // repository-attribute form, resolving each child repository through the
+            // `Pg{Child}Repository` convention baked into the spec's `cascade` thunk.
             let runtime_cascade_restrict = quote! {
                 // Codex round-5-B cycle guard: the ACTIVE recursion path, seeded
                 // with this parent row so a grandchild that references an ancestor
@@ -11589,19 +11517,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             // ── #1369 repository-attribute `dependent(...)` cascade ──────────
             //
-            // Precedence (#1738): a repository that declares `dependent(...)` is
-            // the explicit escape hatch (for children whose repository does not
-            // follow the `Pg{Child}Repository` convention, or lives in another
-            // crate). Its compile-time specs are authoritative; any model-side
+            // Precedence (#1738): a repository declaring `dependent(...)` is the
+            // explicit escape hatch, for children whose repository does not follow
+            // the `Pg{Child}Repository` convention or lives in another crate. Its
+            // compile-time specs are authoritative, and any model-side
             // `#[has_many(dependent = ...)]` is ignored here.
             //
-            // #1369 restrict ordering: probe every `restrict` dependent BEFORE
-            // running any mutating dependent (`destroy`/`delete_all`/`nullify`).
-            // Mutating actions fire child `before_delete` hooks (counters, cache
-            // invalidation, external calls) that are NOT commit hooks — a later
-            // `restrict` 409 rolls back the DB but cannot retract those side
-            // effects. Hoisting all restrict probes ahead of the mutating pass
-            // means a blocked delete never touches a child hook.
+            // Restrict ordering: probe every `restrict` dependent before running any
+            // mutating dependent. Mutating actions fire child `before_delete` hooks —
+            // counters, cache invalidation, external calls — that are not commit
+            // hooks, so a later `restrict` 409 rolls back the DB but cannot retract
+            // them. Hoisting the probes ahead of the mutating pass means a blocked
+            // delete never touches a child hook.
             let emit_cascade_call = |dep: &DependentSpec| {
                 let child_repo = &dep.child_repo;
                 let fk = &dep.fk;
@@ -11644,19 +11571,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // ── #1788: both-sites override diagnostic ────────────────────
                 //
                 // The repository-attribute `dependent(...)` above is authoritative
-                // and drives this cascade. But the model MAY ALSO declare
-                // `#[has_many(..., dependent = ...)]`; if so, that model-side
-                // declaration is silently overridden (repo-attr wins, see the
-                // precedence note above) and is inert. Emit a debug-only warn so a
-                // user does not wrongly believe the model-side `dependent` is
-                // active. Mirrors the `across_tenants()` debug-warn template
-                // (`cfg!(debug_assertions)`-gated `tracing::warn!`): zero-cost in
-                // release builds. The unqualified `#model_name::dependents()` call
-                // resolves to the model's inherent shadow (real specs) when present
-                // and to the blanket `AutumnDependents` fallback (empty slice)
-                // otherwise, so the `use` is required for the fallback to resolve.
-                // Runs at the very top of the restrict (Phase 1) block, before any
-                // restrict probe or the parent `before_delete` hook fires.
+                // and drives this cascade, but the model may also declare
+                // `#[has_many(..., dependent = ...)]`. That model-side declaration
+                // is then silently overridden and inert, so emit a debug-only warn
+                // rather than let a user believe it is active. Mirrors the
+                // `across_tenants()` debug-warn template — a
+                // `cfg!(debug_assertions)`-gated `tracing::warn!` — so it costs
+                // nothing in release. The unqualified `#model_name::dependents()`
+                // call resolves to the model's inherent shadow when present and to
+                // the blanket `AutumnDependents` fallback otherwise, so the `use` is
+                // required for the fallback to resolve. Runs at the top of the
+                // restrict (Phase 1) block, before any probe or the parent
+                // `before_delete` hook.
                 if ::core::cfg!(debug_assertions) {
                     use ::autumn_web::repository::AutumnDependents as _;
                     if !#model_name::dependents().is_empty() {
@@ -11815,16 +11741,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
         // Determine whether a pre-fetch is needed before the delete/update body.
-        // Pre-fetch is required when:
-        //  - the topic is dynamic (contains a field placeholder like "{category}"),
-        //    because after deletion the record is gone and the topic cannot be
-        //    interpolated; and for updates we need the pre-mutation topic to detect
+        // It is required when:
+        //  - the topic is dynamic (it contains a field placeholder such as
+        //    "{category}"): after deletion the record is gone and the topic cannot
+        //    be interpolated, and an update needs the pre-mutation topic to detect
         //    topic changes and publish a delete on the old channel.
-        //  - broadcast_render is configured, because the custom render fn must run
-        //    on the live record to extract the real DOM id for delete broadcasts.
+        //  - `broadcast_render` is configured: the custom render fn must run on the
+        //    live record to extract the real DOM id for delete broadcasts.
         //
-        // The simple case (static topic, no broadcast_render — what `--live`
-        // scaffolds) keeps the existing fast, zero-extra-query path.
+        // The simple case — static topic, no `broadcast_render`, what `--live`
+        // scaffolds — keeps the fast, zero-extra-query path.
         let raw_topic_outer = config
             .broadcast_topic
             .as_deref()
@@ -12113,14 +12039,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
         // ── update_many broadcast ─────────────────────────────────────────
-        // Only broadcast OuterHTML for the simplest case: static topic + default render.
-        // Skipped when update_needs_prefetch (dynamic topic OR custom render) because:
-        // - dynamic topic: OuterHTML sent to the post-update topic leaves old-topic
-        //   subscribers with stale elements and new-topic clients with a failed swap.
-        // - custom render: the rendered element id may encode a mutable field; clients
-        //   hold the element under the pre-update id, so a swap keyed by the post-update
-        //   id misses its target.
-        // Both cases require N pre-fetches to handle correctly; use commit_hooks = true.
+        // Broadcast OuterHTML only for the simplest case: static topic and default
+        // render. Skipped when `update_needs_prefetch` (dynamic topic or custom
+        // render), because a dynamic topic sends OuterHTML to the post-update topic,
+        // leaving old-topic subscribers with stale elements and new-topic clients
+        // with a failed swap; and a custom render may encode a mutable field in the
+        // element id, so a swap keyed by the post-update id misses the element
+        // clients hold under the pre-update id. Both need N pre-fetches to handle
+        // correctly — use `commit_hooks = true`.
         let ium = if update_needs_prefetch {
             quote! {}
         } else {
@@ -12417,17 +12343,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .unwrap_or_else(|| DEFAULT_RETENTION_SWEEP_INTERVAL.to_string());
         let max_batches = MAX_RETENTION_BATCHES_PER_RUN;
         let model_name_str = model_name.to_string();
-        // Table-qualified, not model-qualified: two modules can declare
-        // same-named model types (`auth::Session`, `admin::Session`), which
-        // would collide on a model-derived task name — the scheduler
-        // coordinates by name, so a collision merges two policies' actuator
-        // state and can drop one under the Postgres advisory-lock backend.
-        // Table names are already a hard uniqueness requirement the schema
-        // itself enforces — but only the exact string, not its lowercased
-        // form: Postgres allows distinct quoted tables like "Events" and
-        // "events", so `to_lowercase()` here would reintroduce exactly the
-        // collision this is meant to prevent (#1342 review round 6). Use
-        // `table_name` verbatim.
+        // Table-qualified, not model-qualified: two modules can declare same-named
+        // model types (`auth::Session`, `admin::Session`), which would collide on a
+        // model-derived task name. The scheduler coordinates by name, so a collision
+        // merges two policies' actuator state and can drop one under the Postgres
+        // advisory-lock backend. Table names are already uniquely enforced by the
+        // schema — but only as exact strings: Postgres allows distinct quoted tables
+        // "Events" and "events", so `to_lowercase()` here would reintroduce the very
+        // collision this prevents (#1342). Use `table_name` verbatim.
         let task_name_str = format!("retention-sweep-{table_name}");
         // When both `after` and `purge_deleted_after` are declared, split
         // the per-run batch budget between them instead of sharing one
@@ -12446,57 +12369,48 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             max_batches
         };
 
-        // Age-based branch: soft-deletes on a soft_delete repository
-        // (never re-touching an already soft-deleted row), hard-deletes
-        // otherwise. Absent unless `after` was declared.
+        // Age-based branch: soft-deletes on a soft_delete repository, never
+        // re-touching an already soft-deleted row, and hard-deletes otherwise.
+        // Absent unless `after` was declared.
         //
-        // The query/mutation fragments are hoisted out into `age_fragments`
-        // (rather than built inline in a single `quote!{}` loop, as in
-        // earlier rounds) because the loop body is needed *twice*: once for
-        // the capped primary pass below, and again — after `purge_block`
-        // runs and its actual usage is known — as a reclaim pass that lets
-        // age consume whatever budget purge left unused (#1342 review round
-        // 13), symmetric with round 11's purge-borrows-from-age fix.
-        // `build_age_loop` below builds each pass's token stream from these
-        // shared fragments.
+        // The query and mutation fragments are hoisted into `age_fragments` rather
+        // than built inline, because the loop body is needed twice: once for the
+        // capped primary pass below, and again — after `purge_block` runs and its
+        // actual usage is known — as a reclaim pass letting age consume whatever
+        // budget purge left unused (#1342), symmetric with the
+        // purge-borrows-from-age fix. `build_age_loop` below builds each pass's
+        // token stream from these shared fragments.
         let age_fragments = spec.after.as_ref().map(|_after| {
             let basis_ident = spec
                 .basis
                 .as_ref()
                 .expect("validated by parse_repo_args: after requires basis")
                 .clone();
-            // Yields the number of rows the statement actually touched (not
-            // the SELECT's candidate count) so a row that changed state
-            // between the SELECT and this statement — e.g. a concurrent
-            // `restore()`, or (when `basis` is a mutable column like
-            // `last_seen_at`) a concurrent update that un-stales the row —
-            // is reflected correctly in `rows_swept` rather than
-            // over-reported. Re-checking `basis < __age_cutoff` here, not
-            // just `id`, is what makes the second case safe. Regression
-            // (#1342 review round 3): a counter-cached model swept by
-            // `retention(...)` must move its parent's counter exactly like
-            // every other delete path does, or every swept live child
-            // leaves its parent's stored count permanently inflated.
-            // `counter_cache_before_delete_many` has to run on
-            // still-present, still-live rows BEFORE the mutation, so the
-            // `#cc_has` arm locks (`FOR UPDATE`) the subset of `ids` still
-            // eligible under the recheck filter first — a candidate can
-            // have dropped out since the batch SELECT, e.g. a concurrent
-            // update that un-staled `basis` — then decrements against
-            // exactly that locked set before mutating it. A model with no
-            // counter cache keeps the original single-statement path.
+            // Yields the number of rows the statement actually touched, not the
+            // SELECT's candidate count, so a row that changed state between the
+            // SELECT and this statement — a concurrent `restore()`, or, when `basis`
+            // is a mutable column like `last_seen_at`, a concurrent update that
+            // un-stales the row — is counted correctly in `rows_swept` rather than
+            // over-reported. Re-checking `basis < __age_cutoff` here, not just `id`,
+            // is what makes the second case safe.
             //
-            // `scoped_immediate_transaction`, not `scoped_transaction`
-            // (#1342 review round 9): on `SQLite`, `maybe_for_update!`
-            // degrades to a plain read (no `FOR UPDATE`), so a deferred
-            // transaction wouldn't take a write lock until the first write
-            // below — leaving a window for a concurrent writer to commit
-            // between the locked-ids SELECT and that write, which SQLite
-            // reports as `SQLITE_BUSY_SNAPSHOT` rather than waiting on the
-            // configured busy timeout. `scoped_immediate_transaction` is
-            // what every other generated read-then-write mutation path
-            // (e.g. the update-by-id counter-cache capture) uses for
-            // exactly this reason.
+            // A counter-cached model swept by `retention(...)` must move its parent's
+            // counter exactly as every other delete path does, or each swept live
+            // child leaves its parent's stored count permanently inflated (#1342).
+            // `counter_cache_before_delete_many` has to run on still-present,
+            // still-live rows before the mutation, so the `#cc_has` arm first locks
+            // (`FOR UPDATE`) the subset of `ids` still eligible under the recheck
+            // filter — a candidate can have dropped out since the batch SELECT — then
+            // decrements against exactly that locked set before mutating it. A model
+            // with no counter cache keeps the original single-statement path.
+            //
+            // `scoped_immediate_transaction`, not `scoped_transaction`: on SQLite,
+            // `maybe_for_update!` degrades to a plain read, so a deferred transaction
+            // would not take a write lock until the first write below, leaving a
+            // window for a concurrent writer to commit between the locked-ids SELECT
+            // and that write — which SQLite reports as `SQLITE_BUSY_SNAPSHOT` rather
+            // than waiting on the busy timeout. Every other generated read-then-write
+            // path uses the immediate form for this reason.
             let apply_stmt = if config.soft_delete {
                 quote! {
                     let __applied: u64 = if dry_run {
@@ -12511,18 +12425,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             &mut *conn,
                             |conn| async move {
                                 // `order(id.asc())` before the `FOR UPDATE`
-                                // lock (#1342 review round 22): on
-                                // Postgres, a sweep here can race a normal
-                                // `delete_many` locking an overlapping
-                                // batch of the same counter-cached
+                                // lock (#1342): on Postgres a sweep here can
+                                // race a normal `delete_many` locking an
+                                // overlapping batch of the same counter-cached
                                 // children. `delete_many`'s own
                                 // `counter_cache_before_delete_many` locks
-                                // ascending by id specifically to avoid a
-                                // deadlock — but that ordering only helps
-                                // if EVERY locker uses it. Without it here,
-                                // the two transactions could acquire the
-                                // same rows in opposite orders and one
-                                // gets aborted.
+                                // ascending by id to avoid a deadlock, but that
+                                // only helps if every locker does the same.
+                                // Without it here, the two transactions could
+                                // take the same rows in opposite orders and one
+                                // would be aborted.
                                 let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
                                     #table_ident::table
                                         .filter(#table_ident::id.eq_any(ids))
@@ -12646,16 +12558,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let __age_chrono =
                         ::autumn_web::reexports::chrono::Duration::from_std(__age_duration)
                             .expect("retention `after` duration out of range");
-                    // Checked, not `-` (#1342 review round 16): `after`
-                    // fitting in `chrono::Duration`'s range doesn't mean
-                    // subtracting it from *this* clock reading stays inside
-                    // `NaiveDateTime`'s representable range — e.g. a custom
-                    // clock near `NaiveDateTime::MIN` (test clocks, or a
-                    // misconfigured system clock) can still underflow even
-                    // for a boot-validated `after`. `-` panics on overflow;
-                    // this fails with the same actionable message boot
-                    // validation already uses for the config-level version
-                    // of this check.
+                    // Checked, not `-` (#1342): `after` fitting in
+                    // `chrono::Duration`'s range does not mean subtracting it
+                    // from this clock reading stays inside `NaiveDateTime`'s
+                    // range. A custom clock near `NaiveDateTime::MIN` — a test
+                    // clock, or a misconfigured system clock — can underflow
+                    // even for a boot-validated `after`. `-` panics on overflow;
+                    // this fails with the same actionable message boot validation
+                    // uses for the config-level check.
                     let __age_cutoff = ::autumn_web::time::ClockSource::now(state.clock())
                         .naive_utc()
                         .checked_sub_signed(__age_chrono)
@@ -12665,15 +12575,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #after,
                             "\"))]"
                         ));
-                    // `Option<i64>`, not a sentinel `i64` floor: no `i64`
-                    // value is guaranteed below every possible id
-                    // (`i64::MIN` itself is a legal id, and
-                    // `id.gt(i64::MIN)` would exclude exactly that row),
-                    // and this repository's PK convention doesn't forbid
-                    // id <= 0 rows (e.g. after a manual import). `None`
-                    // means "first page, no lower bound"; every later page
-                    // — including the reclaim pass's first page — carries a
-                    // real cursor.
+                    // `Option<i64>`, not a sentinel `i64` floor: no `i64` is
+                    // guaranteed below every possible id — `i64::MIN` is itself a
+                    // legal id, and `id.gt(i64::MIN)` would exclude exactly that
+                    // row — and this repository's PK convention does not forbid
+                    // ids at or below zero, as a manual import can produce. `None`
+                    // means "first page, no lower bound"; every later page,
+                    // including the reclaim pass's first, carries a real cursor.
                     let mut __age_last_id: ::core::option::Option<i64> = ::core::option::Option::None;
                     let mut __age_batches: u32 = 0;
                     #capped_decl
@@ -12843,16 +12751,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 );
                                 // Re-check `deleted_at < __cutoff` at delete
                                 // time, not just `id`: a row concurrently
-                                // `restore()`d between the SELECT above and
-                                // this DELETE must survive, not be purged
-                                // out from under the restore. The `#cc_has`
-                                // arm additionally locks the still-eligible
-                                // subset and runs `counter_cache_before_delete_many`
-                                // on it before purging — normally a no-op here
-                                // (the row's counter already moved when it was
-                                // soft-deleted), but keeps the purge path
-                                // symmetric with the age branch and correct
-                                // if that invariant ever changes.
+                                // `restore()`d between the SELECT above and this
+                                // DELETE must survive rather than be purged out
+                                // from under the restore. The `#cc_has` arm also
+                                // locks the still-eligible subset and runs
+                                // `counter_cache_before_delete_many` on it before
+                                // purging. That is normally a no-op — the row's
+                                // counter moved when it was soft-deleted — but it
+                                // keeps the purge path symmetric with the age
+                                // branch, and correct if that invariant changes.
                                 let __applied: u64 = if dry_run {
                                     __n
                                 } else if #cc_has {
@@ -12931,29 +12838,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {}
         };
 
-        // Validate `after`/`purge_deleted_after` at task-registration time
-        // (boot), matching `every` below — otherwise a typo'd unit (e.g.
-        // "30dd") compiles and boots cleanly and only panics on the sweep's
-        // first scheduled tick, which can be well after an operator was
-        // watching the deploy.
+        // Validate `after`/`purge_deleted_after` at task-registration time (boot),
+        // matching `every` below. Otherwise a typo'd unit such as "30dd" compiles
+        // and boots cleanly and panics only on the sweep's first scheduled tick,
+        // well after anyone was watching the deploy.
         //
-        // Also validates the `chrono::Duration` conversion, not just
-        // `parse_duration`'s `std::time::Duration` (#1342 review round 15):
-        // a value that parses fine as a `std::time::Duration` — e.g. a huge
-        // second count like `"18446744073709551615s"` — can still overflow
-        // `chrono::Duration`'s range, which the sweep loop converts to in
-        // order to compute the cutoff. Without this, that class of error
-        // still only surfaced on the first scheduled tick rather than here.
-        // Regression (#1342 review round 16): `chrono::Duration::from_std`
-        // validates that a duration fits chrono's range, but a value that
-        // fits there — e.g. `after = "100000000d"` (~274,000 years) — can
-        // still place the cutoff outside `NaiveDateTime`'s representable
-        // range once subtracted from a clock reading, panicking on the
-        // sweep's first scheduled tick. Checked against the real wall clock
-        // (not the test-mockable `ClockSource`, which `task_info()` — a
-        // plain `fn() -> TaskInfo` with no `state` parameter — has no access
-        // to) as a sanity bound: any `after`/`purge_deleted_after` this
-        // large overflows regardless of which moment "now" turns out to be.
+        // This also validates the `chrono::Duration` conversion, not just
+        // `parse_duration`'s `std::time::Duration` (#1342): a value that parses as
+        // a `std::time::Duration` — a huge second count like
+        // `"18446744073709551615s"` — can still overflow `chrono::Duration`, which
+        // the sweep loop converts to when computing the cutoff.
+        //
+        // `chrono::Duration::from_std` checks that a duration fits chrono's range,
+        // but a value that fits — `after = "100000000d"`, about 274,000 years — can
+        // still place the cutoff outside `NaiveDateTime`'s range once subtracted
+        // from a clock reading. That is checked against the real wall clock, not the
+        // test-mockable `ClockSource`, which `task_info()` — a plain
+        // `fn() -> TaskInfo` with no `state` parameter — cannot reach. It is a
+        // sanity bound: an `after` that large overflows whatever "now" turns out to be.
         let after_boot_validation = spec.after.as_ref().map_or_else(
             || quote! {},
             |after| {
@@ -13020,18 +12922,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             },
         );
-        // Regression (#1342 review round 10): the `dependents.is_empty()`
-        // check in `parse_repo_args` only sees repository-attribute
-        // `dependent(...)`. A model can ALSO declare
-        // `#[has_many(..., dependent = ...)]` / `#[has_one(...)]` directly —
-        // a separate proc-macro invocation (`#[model]`) this macro cannot
-        // see at compile time, resolved instead through the same runtime
-        // `Model::dependents()` (via `AutumnDependents`) the normal cascade
-        // delete path already drives. The sweep still mutates rows directly
-        // and never calls it, so the exact orphan/restrict-bypass risk the
-        // repository-attribute rejection exists for applies here too. Check
-        // at boot (mirroring the duration validation above) rather than on
-        // the sweep's first scheduled tick.
+        // The `dependents.is_empty()` check in `parse_repo_args` sees only
+        // repository-attribute `dependent(...)`. A model can also declare
+        // `#[has_many(..., dependent = ...)]` or `#[has_one(...)]` directly, in a
+        // separate `#[model]` invocation this macro cannot see at compile time,
+        // resolved instead through the same runtime `Model::dependents()` the normal
+        // cascade delete path drives. The sweep mutates rows directly and never
+        // calls it, so the orphan and restrict-bypass risk the repository-attribute
+        // rejection exists for applies here too. Check at boot, like the duration
+        // validation above, rather than on the first scheduled tick (#1342).
         let model_dependents_boot_validation = quote! {
             {
                 #[allow(unused_imports)]
@@ -13051,21 +12950,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 );
             }
         };
-        // Regression (#1342 review round 11): `parse_repo_args` only rejects
-        // `batch_size` values that overflow `i64` (the Postgres `LIMIT`
-        // bound). It doesn't know the *bind-parameter* limit, because that's
-        // backend-specific (`MAX_BIND_PARAMS` is 32766 on SQLite, 65535 on
-        // Postgres) and which backend is active is a Cargo feature of the
-        // *consuming* crate — invisible to this proc macro, which only sees
-        // its own crate's features. Each swept batch binds one parameter per
-        // row id (`id.eq_any(ids)`) plus up to two more (the age/purge
-        // cutoff, and — for a soft-delete age sweep — the new `deleted_at`
-        // timestamp), so a `batch_size` within 2 of the backend's limit
-        // would compile and boot cleanly, then fail every real sweep with
-        // "too many SQL variables". `MAX_BIND_PARAMS` resolves per-backend
-        // correctly at the boot-time assert below because it's evaluated in
-        // the consuming crate, where the `sqlite`/postgres feature choice is
-        // actually visible.
+        // `parse_repo_args` rejects only `batch_size` values that overflow `i64`,
+        // the Postgres `LIMIT` bound. It cannot know the bind-parameter limit: that
+        // is backend-specific (`MAX_BIND_PARAMS` is 32766 on SQLite, 65535 on
+        // Postgres) and which backend is active is a Cargo feature of the consuming
+        // crate, invisible to a proc macro that sees only its own crate's features.
+        // Each swept batch binds one parameter per row id (`id.eq_any(ids)`) plus up
+        // to two more — the age or purge cutoff, and for a soft-delete age sweep the
+        // new `deleted_at` timestamp — so a `batch_size` within 2 of the backend's
+        // limit would compile and boot cleanly, then fail every real sweep with "too
+        // many SQL variables". `MAX_BIND_PARAMS` resolves per backend at the
+        // boot-time assert below, because that is evaluated in the consuming crate
+        // where the feature choice is visible (#1342).
         let batch_size_bind_boot_validation = quote! {
             assert!(
                 (#batch_size_i64 as u64) + 2 <= ::autumn_web::repository::MAX_BIND_PARAMS as u64,
@@ -13140,16 +13036,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #age_cutoff_and_state_decl
                 #purge_batches_used_decl
 
-                // Each batch commits independently — no transaction spans
-                // the whole run — so a mid-run failure still leaves earlier
-                // batches' mutations committed. Capturing the sweep's
-                // Result here, instead of letting a bare `?` inside these
-                // blocks return straight out of this function, lets the
-                // partial `rows_swept` still reach `log_retention_sweep`
-                // below before the error propagates (#1342 review round
-                // 16) — otherwise those committed rows would be
-                // permanently missing from `retention_sweep_rows_total`
-                // and no structured report would record the partial work.
+                // Each batch commits independently — no transaction spans the run —
+                // so a mid-run failure leaves earlier batches committed. Capturing
+                // the sweep's `Result` here, rather than letting a bare `?` inside
+                // these blocks return straight out of the function, lets the partial
+                // `rows_swept` reach `log_retention_sweep` below before the error
+                // propagates (#1342). Otherwise those committed rows would be missing
+                // from `retention_sweep_rows_total` and no structured report would
+                // record the partial work.
                 let __sweep_result: ::autumn_web::AutumnResult<()> = async {
                     #age_block
                     #purge_block
@@ -13228,13 +13122,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // ── Pagination methods (`page` always; `cursor_page` when cursor_key is declared) ──
     //
-    // `page` executes a COUNT(*) + a LIMIT/OFFSET query and wraps the result in
-    // `Page<Model>`. `cursor_page` uses keyset pagination on the primary key `id`
-    // (always i64 per the Autumn PK convention) so the cursor is stable and
-    // requires no knowledge of the model's field types.  When `cursor_key = field`
-    // is declared, the query also orders by that field (descending) as a secondary
-    // sort key; the cursor payload remains the last-seen `id` so that filtering
-    // is always correct.
+    // `page` runs a COUNT(*) plus a LIMIT/OFFSET query and wraps the result in
+    // `Page<Model>`. `cursor_page` uses keyset pagination on the primary key `id`,
+    // always i64 per the Autumn PK convention, so the cursor is stable and needs no
+    // knowledge of the model's field types. When `cursor_key = field` is declared,
+    // the query also orders by that field descending as a secondary sort key; the
+    // cursor payload stays the last-seen `id`, so filtering is always correct.
     let pagination_trait_method = quote! {
         /// Fetch one page of records using offset pagination.
         ///
@@ -13353,13 +13246,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // ── #1126: allowlisted sort/filter list method ──────────────────────
     //
-    // `list()` is `page()` plus allowlisted ordering + equality filtering. The
-    // ordering/filtering DSL is *typed* — the `#[model]` macro generated
-    // `__autumn_list_apply_filters` / `__autumn_list_apply_order` over a boxed
-    // Diesel query, matching requested keys against the model's own columns.
-    // An unknown `sort`/`filter[..]` key hits the default arm and is ignored,
-    // so a request like `?sort=id;DROP TABLE` can never reach SQL. Filters are
-    // applied to both the COUNT and the page query so `total` is consistent.
+    // `list()` is `page()` plus allowlisted ordering and equality filtering. The DSL
+    // is typed: `#[model]` generates `__autumn_list_apply_filters` and
+    // `__autumn_list_apply_order` over a boxed Diesel query, matching requested keys
+    // against the model's own columns. An unknown `sort` or `filter[..]` key hits
+    // the default arm and is ignored, so `?sort=id;DROP TABLE` can never reach SQL.
+    // Filters apply to both the COUNT and the page query, so `total` stays consistent.
     let list_trait_method = quote! {
         /// Fetch one page of records applying **allowlisted** sort + equality
         /// filters from a [`::autumn_web::pagination::ListQuery`], with offset
@@ -13467,14 +13359,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // ── #1841: owner-scoped list method ─────────────────────────────────
     //
     // `list_scoped(owner_id, ..)` is `list(..)` with an unconditional
-    // `owner_column = owner_id` filter applied to BOTH the COUNT and the page
-    // query *before* the allowlisted sort/filter helpers run, so `total` and the
-    // returned rows agree and neither can be widened by a request-supplied
-    // filter. Emitted only when `owner =` is declared; otherwise both fragments
-    // are empty and every existing `#[repository]` is byte-for-byte unchanged.
-    // The owner filter composes with tenant scoping (both are `.filter(..)` on
-    // the boxed query) so a repository that is both tenant- and owner-scoped
-    // narrows by tenant AND owner.
+    // `owner_column = owner_id` filter applied to both the COUNT and the page query
+    // before the allowlisted sort/filter helpers run, so `total` and the returned
+    // rows agree and neither can be widened by a request-supplied filter. Emitted
+    // only when `owner =` is declared; otherwise both fragments are empty. The owner
+    // filter composes with tenant scoping — both are `.filter(..)` on the boxed
+    // query — so a repository that is both narrows by tenant and owner.
     let (list_scoped_trait_method, list_scoped_impl_method) = if let Some(ref owner_col) =
         owner_col_ident
     {
@@ -13573,20 +13463,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         (quote! {}, quote! {})
     };
 
-    // `cursor_page` is only generated when the user declares `cursor_key = field`.
+    // `cursor_page` is generated only when the user declares `cursor_key = field`.
+    // Two modes, depending on whether `cursor_key_type` is also declared:
     //
-    // Two modes depending on whether `cursor_key_type` is also declared:
-    //
-    // **With `cursor_key_type = Type`** (always correct):
-    //   Cursor payload is `(Type, i64)`.  The WHERE clause advances the
-    //   `(cursor_key DESC, id DESC)` sort order exactly:
+    // With `cursor_key_type = Type` (always correct): the cursor payload is
+    //   `(Type, i64)`, and the WHERE clause advances the `(cursor_key DESC, id
+    //   DESC)` sort order exactly:
     //     WHERE (cursor_key < after_k) OR (cursor_key = after_k AND id < after_id)
     //
-    // **Without `cursor_key_type`** (correct for correlated cursor_key / id):
-    //   Cursor payload is `id` (i64) only.  The filter is `id < after_id`.
-    //   This is correct when cursor_key values are monotonically correlated
-    //   with id (e.g. `created_at` on an auto-increment table).  For
-    //   non-monotonic data (backfills, imports) implement cursor_page manually.
+    // Without `cursor_key_type`: the cursor payload is `id` alone and the filter is
+    //   `id < after_id`. This is correct when cursor_key values are monotonically
+    //   correlated with id, e.g. `created_at` on an auto-increment table. For
+    //   non-monotonic data (backfills, imports) implement `cursor_page` manually.
     let tenant_query_filter = if config.tenant_scoped {
         quote! {
             if !self.across_tenants {
@@ -13724,20 +13612,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         (quote! {}, quote! {})
     };
 
-    // ── Batched iteration (find_in_batches / find_each), issue #1395 ─────────
+    // ── Batched iteration (find_in_batches / find_each), #1395 ──────────────
     //
-    // Generated for EVERY repository (not gated on cursor_key): a primary-key
-    // ascending keyset walk that streams the whole table in bounded-memory
-    // chunks. Each batch is `WHERE id > last ORDER BY id ASC LIMIT batch_size`
-    // (no id predicate on the first batch), reusing the same soft-delete
-    // filter, tenant scoping and read-routing as `find_all`/`cursor_page`, so
-    // those semantics come for free.
+    // Generated for every repository, not gated on cursor_key: a primary-key
+    // ascending keyset walk that streams the whole table in bounded-memory chunks.
+    // Each batch is `WHERE id > last ORDER BY id ASC LIMIT batch_size`, with no id
+    // predicate on the first batch, reusing the same soft-delete filter, tenant
+    // scoping, and read-routing as `find_all`/`cursor_page`.
     //
-    // The generic driver + handle types live in `autumn_web::batches`; the
-    // macro only emits a thin per-repo `BatchSource` impl (the keyset query)
-    // plus two inherent constructors. Sharded repos mirror `cursor_page`:
-    // cross-shard `across_tenants` iteration is rejected (shard fan-out is out
-    // of scope per #1395); a single routed shard iterates normally.
+    // The generic driver and handle types live in `autumn_web::batches`; the macro
+    // emits only a thin per-repo `BatchSource` impl — the keyset query — plus two
+    // inherent constructors. Sharded repos mirror `cursor_page`: cross-shard
+    // `across_tenants` iteration is rejected, since shard fan-out is out of scope
+    // for #1395, and a single routed shard iterates normally.
     let batch_cross_shard_guard = if config.sharded && config.tenant_scoped {
         quote! {
             // Reject on the runtime `across_tenants` flag alone — independent of
@@ -13850,16 +13737,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // ── Typed grouped aggregate queries (issue #1364) ───────────────────────
+    // ── Typed grouped aggregate queries (#1364) ─────────────────────────────
     //
-    // Emitted as inherent methods on the Pg* struct (parallel to
-    // find_in_batches / find_or_create_by): each returns a lazy
-    // `GroupedAggregate<'_, K, V>` builder. Under the hood a parameterized
-    // `diesel::sql_query` with a QueryableByName row (concrete SQL types baked
-    // from the declared `Vec<(K, V)>`), routed through the read-role helper and
-    // composing the same soft-delete + tenant predicates as `count`. Filter
-    // values are bound (never interpolated). sum/avg/min/max cannot be merged
-    // across shards, so across_tenants() on a sharded repo is rejected.
+    // Emitted as inherent methods on the Pg* struct, parallel to
+    // `find_in_batches`/`find_or_create_by`: each returns a lazy
+    // `GroupedAggregate<'_, K, V>` builder. Underneath is a parameterized
+    // `diesel::sql_query` with a `QueryableByName` row whose SQL types are baked
+    // from the declared `Vec<(K, V)>`, routed through the read-role helper and
+    // composing the same soft-delete and tenant predicates as `count`. Filter values
+    // are bound, never interpolated, and `across_tenants()` on a sharded repo is
+    // rejected because sum/avg/min/max cannot merge across shards.
     let grouped_aggregate_methods = {
         // Baked literals shared by every generated method.
         let table_q = format!("\"{table_name}\"");
@@ -13905,15 +13792,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             (quote! {}, quote! {}, quote! {})
         };
 
-        // Reject cross-shard aggregates whenever the repo is (compile-time)
-        // sharded + tenant-scoped AND the runtime `across_tenants` flag is set —
-        // independent of whether a live shard set (`__autumn_shards`) is loaded.
-        // sum/avg/min/max cannot be merged across shards, and an across-tenant
-        // scan without a shard set (e.g. built via `with_pool_untracked`, where
-        // `__autumn_shards` is `None`) would bind a NULL tenant predicate and
-        // silently return a PARTIAL result over only the current pool. Gating on
-        // `__autumn_shards.is_some()` missed exactly that no-shard-set case, so
-        // the guard fires purely on the sharded config + the `across_tenants`
+        // Reject cross-shard aggregates whenever the repo is sharded and
+        // tenant-scoped at compile time and the runtime `across_tenants` flag is
+        // set, whether or not a live shard set (`__autumn_shards`) is loaded.
+        // sum/avg/min/max cannot merge across shards, and an across-tenant scan with
+        // no shard set — built via `with_pool_untracked`, where `__autumn_shards` is
+        // `None` — would bind a NULL tenant predicate and silently return a partial
+        // result over the current pool alone. Gating on `__autumn_shards.is_some()`
+        // missed exactly that case, so the guard keys on the sharded config and the
         // flag (#1364).
         let cross_shard_guard = if config_sharded && config_tenant_scoped {
             quote! {
@@ -13946,20 +13832,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let agg_expr = &spec.agg_sql_expr;
             let group_col_q = format!("\"{}\"", spec.group_col);
 
-            // #1364 encryption correctness: grouped aggregates cannot operate on
-            // an at-rest `#[encrypted(...)]` column. The stored value is
-            // ciphertext, so grouping would return ciphertext keys deserialized
-            // into the declared key type, and `.filter_eq(plaintext)` would bind
-            // plaintext against a ciphertext column and match nothing (the
-            // `find_by` path avoids this by routing string params through the
-            // registry encoder; this raw-SQL path cannot). Whether a column is
-            // encrypted is only known at runtime — the mode is declared on the
-            // model, which the repository macro cannot see (see
-            // `encode_derived_query_param`) — so this is a runtime guard against
-            // the SAME registry the `find_by` surface consults, not a
-            // `compile_error!`. It rejects only columns that are actually
-            // encrypted, so non-encrypted grouping (e.g. `count_grouped_by_kind`
-            // on a plain `String`) is unchanged. The escape hatch is a raw query.
+            // #1364 encryption correctness: grouped aggregates cannot operate on an
+            // at-rest `#[encrypted(...)]` column. The stored value is ciphertext, so
+            // grouping would return ciphertext keys deserialized into the declared
+            // key type, and `.filter_eq(plaintext)` would bind plaintext against a
+            // ciphertext column and match nothing. The `find_by` path avoids this by
+            // routing string params through the registry encoder; this raw-SQL path
+            // cannot. Whether a column is encrypted is known only at runtime — the
+            // mode is declared on the model, which this macro cannot see — so this is
+            // a runtime guard against the same registry `find_by` consults, not a
+            // `compile_error!`. It rejects only genuinely encrypted columns, so
+            // grouping a plain `String` is unchanged. The escape hatch is a raw query.
             let enc_guard = {
                 let fn_name_str = spec.fn_ident.to_string();
                 let group_col_raw = spec.group_col.as_str();
@@ -14038,15 +13921,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     agg_val: #value_type,
                                 }
 
-                                // Group expression: bucketed (date_trunc) or the raw column.
-                                // For a `timestamptz` (`DateTime<Utc>`) key, `#bucket_zone_arg`
-                                // is `, 'UTC'` so the 3-arg `date_trunc('unit', col, 'UTC')`
-                                // (Postgres 12+) truncates in UTC — otherwise the 2-arg form
-                                // would truncate in the DB session `TimeZone`, drifting bucket
-                                // boundaries across deployments (#1364). For a `NaiveDateTime`
-                                // (`timestamp`) key it is empty, keeping the deterministic
-                                // 2-arg field truncation. SELECT and GROUP BY reuse this same
-                                // string, so the bucket expression always matches exactly.
+                                // Group expression: bucketed (date_trunc) or the raw
+                                // column. For a `timestamptz` (`DateTime<Utc>`) key,
+                                // `#bucket_zone_arg` is `, 'UTC'`, so the 3-arg
+                                // `date_trunc('unit', col, 'UTC')` (Postgres 12+)
+                                // truncates in UTC; the 2-arg form would truncate in
+                                // the DB session `TimeZone` and drift bucket
+                                // boundaries across deployments (#1364). For a
+                                // `NaiveDateTime` key it is empty. SELECT and GROUP BY
+                                // reuse this string, so the expressions always match.
                                 let __group_expr: ::std::string::String = match __opts.bucket {
                                     ::core::option::Option::Some(__b) => format!(
                                         "date_trunc('{unit}', {col}{zone})",
@@ -14065,14 +13948,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 #soft_delete_cond
                                 #tenant_cond
                                 // A non-nullable declared key type cannot represent a
-                                // NULL group (and `Option<K>` is rejected at compile
-                                // time), so exclude rows whose raw group column is NULL —
-                                // otherwise `GROUP BY` would emit a NULL-key group that
-                                // fails to deserialize at runtime (#1364). Guarding the
-                                // raw column also drops null-timestamp rows under
-                                // `.bucket()` (date_trunc of NULL is NULL). No bind param,
-                                // so the `$n` numbering below is unaffected. Harmless
-                                // no-op when the column is already NOT NULL.
+                                // NULL group, and `Option<K>` is rejected at compile
+                                // time, so exclude rows whose raw group column is
+                                // NULL: `GROUP BY` would otherwise emit a NULL-key
+                                // group that fails to deserialize (#1364). Guarding
+                                // the raw column also drops null-timestamp rows under
+                                // `.bucket()`, since date_trunc of NULL is NULL. No
+                                // bind param, so `$n` numbering below is unaffected,
+                                // and it is a no-op on a NOT NULL column.
                                 __conds.push(format!("{col} IS NOT NULL", col = #group_col_q));
                                 let __eq_n = { __n += 1; __n };
                                 __conds.push(format!("(${n} IS NULL OR {col} = ${n})", n = __eq_n, col = #group_col_q));
@@ -14141,21 +14024,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { #(#__methods)* }
     };
 
-    // ── Race-safe get-or-insert (find_or_create_by_*, issue #1382) ──────────
+    // ── Race-safe get-or-insert (find_or_create_by_*, #1382) ────────────────
     //
-    // Emitted as inherent async methods on the Pg* struct (parallel to
-    // find_in_batches) — they return `(Model, bool)` and take an extra `new`
-    // insert value, so they don't fit the trait finder surface. Recipe:
-    //   1. Preliminary lookup on the READ path (replica-eligible), honoring
-    //      tenant scoping + soft-delete. Found → `(row, false)`, no hooks.
-    //   2. Else INSERT on the PRIMARY with `ON CONFLICT DO NOTHING`, which
-    //      avoids the Postgres 23505 transaction abort entirely — no
-    //      unique-violation error ever escapes to a caller.
-    //        - Some(row) → a real insert happened → `(row, true)`; the same
-    //          before_create / after_create / commit-hook weaving as `save`
-    //          runs (only on this created path).
-    //        - None → a concurrent caller won the race → re-lookup on the
-    //          PRIMARY (read-your-writes) → `(row, false)`, no hooks.
+    // Emitted as inherent async methods on the Pg* struct, parallel to
+    // `find_in_batches`. They return `(Model, bool)` and take an extra `new` insert
+    // value, so they do not fit the trait finder surface. The recipe:
+    //   1. Preliminary lookup on the read path (replica-eligible), honoring tenant
+    //      scoping and soft-delete. Found → `(row, false)`, no hooks.
+    //   2. Otherwise INSERT on the primary with `ON CONFLICT DO NOTHING`, which
+    //      avoids the Postgres 23505 transaction abort entirely, so no
+    //      unique-violation error escapes to a caller.
+    //        - Some(row): a real insert happened → `(row, true)`, with the same
+    //          before_create / after_create / commit-hook weaving as `save`.
+    //        - None: a concurrent caller won the race → re-lookup on the primary
+    //          for read-your-writes → `(row, false)`, no hooks.
     // Unlike `upsert_many`, this is generated even on hooked repositories.
     let foc_sd_boxed = if config.soft_delete {
         quote! { query = query.filter(#table_ident::deleted_at.is_null()); }
@@ -14824,16 +14706,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         // List endpoint behavior, in order of precedence:
         //
-        // 1. `scope = SomeScope`: invoke the registered scope (the
-        //    most efficient form ΓÇö the scope filters at the SQL level
-        //    via Diesel).
-        // 2. `policy = SomePolicy` without `scope`: load every
-        //    record, then filter through `Policy::can_show` per row.
-        //    Slower than (1) for large tables, but closes the
-        //    "policy guards show/update/delete but list returns
-        //    everything" data-exposure path. Users who care about
-        //    perf should also set `scope = SomeScope`.
-        // 3. Neither: plain `repo.find_all()` (public list).
+        // 1. `scope = SomeScope`: invoke the registered scope. The most efficient
+        //    form — the scope filters at the SQL level via Diesel.
+        // 2. `policy = SomePolicy` without `scope`: load every record, then filter
+        //    through `Policy::can_show` per row. Slower than (1) on large tables,
+        //    but it closes the "policy guards show/update/delete but list returns
+        //    everything" exposure path. Set `scope = SomeScope` too if performance
+        //    matters.
+        // 3. Neither: plain `repo.find_all()`, a public list.
         let scope_list_body = if config.scope_type.is_some() {
             // Scope filters at the SQL level, but the filtered set is still
             // returned in full — window it in memory so the response stays
@@ -15020,17 +14900,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! { ::core::option::Option::None }
         };
-        // Companion probe for `scope = ...`. ONLY attached to the
-        // `_api_list` route's metadata ΓÇö the other auto-generated
-        // routes (`*_api_get` / `*_api_create` / `*_api_update` /
-        // `*_api_delete`) never call `scope.list`, so flagging them
-        // for missing scope registration would fire the prod fail-
-        // fast even when the user intentionally mounted only
-        // non-list endpoints with `scope = ...` configured (the
-        // app's reads happen via custom queries, but the scope is
-        // still declared so `Note::scope(&ctx)` works in hand-
-        // written list handlers). The non-list routes below get
-        // `scope_check: None` regardless.
+        // Companion probe for `scope = ...`, attached only to the `_api_list`
+        // route's metadata. The other auto-generated routes (`*_api_get`,
+        // `*_api_create`, `*_api_update`, `*_api_delete`) never call `scope.list`,
+        // so flagging them for missing scope registration would fire the prod
+        // fail-fast even when the user deliberately mounted only non-list endpoints
+        // with `scope = ...` configured — reads happen via custom queries, but the
+        // scope is still declared so `Note::scope(&ctx)` works in hand-written list
+        // handlers. The non-list routes get `scope_check: None` regardless.
         let list_scope_check_fn = if config.scope_type.is_some() {
             quote! {
                 ::core::option::Option::Some(
@@ -15055,16 +14932,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         // #1253: run the model's `#[validate(...)]` rules on the decoded write
-        // payload before it reaches the DB, returning a 422 Problem Details
-        // with the per-field `errors` map on failure. Uses autoref
-        // specialization (`MaybeValidate`) so a payload type that does not
-        // implement `validator::Validate` (e.g. a `NewModel` with no
-        // `#[validate]` fields, or a hand-written insert type) compiles to a
-        // no-op — no migration burden for existing repositories.
+        // payload before it reaches the DB, returning a 422 Problem Details with the
+        // per-field `errors` map on failure. Autoref specialization (`MaybeValidate`)
+        // makes a payload type that does not implement `validator::Validate` — a
+        // `NewModel` with no `#[validate]` fields, or a hand-written insert type —
+        // compile to a no-op, so existing repositories need no migration.
         //
-        // `?`-flavoured for the plain `AutumnResult` handlers; the policy-backed
-        // handlers return `IdempotencyReplayOr`, so they get an explicit
-        // early-return that wraps the error in `Inner`.
+        // `?`-flavoured for the plain `AutumnResult` handlers. The policy-backed
+        // handlers return `IdempotencyReplayOr`, so they get an explicit early return
+        // that wraps the error in `Inner`.
         let validate_new = quote! {
             {
                 // Both traits must be in scope for autoref resolution to
@@ -15222,23 +15098,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             } else {
                 let draft_ext_trait = format_ident!("{}DraftExt", model_name);
                 quote! {
-                    // #1801: also validate the effective merged model (existing
-                    // row ∪ patch) so the full validator set runs against
-                    // concrete values, matching the hooked-repo precedent
-                    // (#1804). Runs after 404/403/patch-422 and reuses the
-                    // already-loaded `__existing` (no extra query). We only want
-                    // the 422 side-effect, so the draft is discarded and the
-                    // blind `repo.update` below is unchanged. Wrapped (not `?`)
-                    // because this handler returns `IdempotencyReplayOr`; sits
+                    // #1801: also validate the effective merged model (existing row
+                    // plus patch), so the full validator set runs against concrete
+                    // values, matching the hooked-repo precedent (#1804). Runs after
+                    // the 404, 403, and patch-422 checks and reuses the already-loaded
+                    // `__existing`, so there is no extra query. Only the 422 side
+                    // effect is wanted, so the draft is discarded and the blind
+                    // `repo.update` below is unchanged. Wrapped rather than `?`
+                    // because this handler returns `IdempotencyReplayOr`, and it sits
                     // with the other pure pre-replay checks so it cannot affect
                     // idempotency replay semantics.
                     //
-                    // Concurrency (known, deliberate): this is point-in-time —
-                    // it validates against the `__existing` snapshot loaded for
-                    // the 404/policy gate, not under a row lock held through
-                    // `repo.update`, so it is best-effort under concurrent writes
-                    // for the same reason as the blind path above (deliberate,
-                    // given the always-on zero-extra-query design).
+                    // Concurrency: this is point-in-time. It validates against the
+                    // `__existing` snapshot loaded for the 404/policy gate, not under
+                    // a row lock held through `repo.update`, so it is best-effort
+                    // under concurrent writes — the same deliberate trade-off as the
+                    // blind path above, given the zero-extra-query design.
                     if let ::core::result::Result::Err(err) =
                         <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__existing, &patch)
                     {
@@ -16382,31 +16257,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // §1d: when sharded + tenant_scoped, fan out across all shards concurrently
-    // for across_tenants reads.  Uses ShardSet::fan_out_shards for concurrent
-    // execution.  The sub-repo is built with `__autumn_for_shard`, which honors
-    // each shard's read routing and the parent request context and sets
-    // `__autumn_shards = None`, preventing recursion.
-    // §1d: fan out `find_all` across all shards for `across_tenants()`. The
-    // per-shard work runs through the inherent `__autumn_find_all_one_shard`
-    // helper (emitted below) rather than the trait method, so `find_all`'s
-    // RPITIT future never transitively names its own opaque type — which would
-    // make its `Send` auto-trait unprovable once hooks/versioning add captured
-    // state to the future.
+    // §1d: when sharded and tenant-scoped, fan `find_all` out across all shards
+    // concurrently for `across_tenants()` reads, via `ShardSet::fan_out_shards`. The
+    // sub-repo is built with `__autumn_for_shard`, which honors each shard's read
+    // routing and the parent request context and sets `__autumn_shards = None` to
+    // prevent recursion. The per-shard work runs through the inherent
+    // `__autumn_find_all_one_shard` helper below rather than the trait method, so
+    // `find_all`'s RPITIT future never transitively names its own opaque type —
+    // which would make its `Send` auto-trait unprovable once hooks or versioning add
+    // captured state to the future.
     let (find_all_impl, find_all_one_shard_helper) = if config.sharded && config.tenant_scoped {
         let base = find_all_impl;
         let dispatch = quote! {
-            // Dispatch the cross-shard fan-out BEFORE acquiring any connection:
-            // no routed-shard connection is held here, so a dead parent replica
-            // or exhausted parent pool can't fail the fan-out. Each shard's own
-            // read route/fallback is chosen by `__autumn_for_shard` (#1d).
+            // Dispatch the cross-shard fan-out before acquiring any connection: no
+            // routed-shard connection is held here, so a dead parent replica or an
+            // exhausted parent pool cannot fail the fan-out. `__autumn_for_shard`
+            // chooses each shard's own read route and fallback (§1d).
             //
-            // Without a shard set (e.g. a repo built via `with_pool_untracked`,
-            // where `__autumn_shards` is `None`), an across-tenant read would
-            // bind a NULL tenant predicate and silently return a PARTIAL result
-            // over only the current pool, so we reject rather than fall through
-            // to the single-pool query — mirroring the `count` guard (#1692,
-            // #1741).
+            // Without a shard set — a repo built via `with_pool_untracked`, where
+            // `__autumn_shards` is `None` — an across-tenant read would bind a NULL
+            // tenant predicate and silently return a partial result over the current
+            // pool alone, so reject rather than fall through to the single-pool
+            // query, mirroring the `count` guard (#1692, #1741).
             if self.across_tenants {
                 let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
                     return ::core::result::Result::Err(
@@ -16801,23 +16673,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
-        // #1910 SQLite FTS5 full-text search. Postgres uses tsvector ranked
-        // search (`websearch_to_tsquery`/`ts_rank_cd`); SQLite has no tsvector, so
-        // the `backend_select!` sqlite arm below queries an external-content FTS5
-        // virtual table (`"<table>__fts"`, tokenized with `unicode61`) that the
-        // `AddSearch` migration creates and keeps in sync with triggers. The id
-        // SELECT joins that FTS table to the base table (so the tenant /
-        // soft-delete / owner predicates still filter the BASE table exactly as
-        // the pg arm does), matches with `WHERE "<table>__fts" MATCH ?`, and ranks
-        // with `ORDER BY bm25("<table>__fts", <weights>)` — per-column weights
-        // derived from the `#[searchable(weight=...)]` priorities (A→10, B→5, C→2,
-        // else 1), so a higher-priority field sorts first (bm25 returns lower =
-        // better, so a larger weight yields a more-negative score). `unicode61`
-        // folds case for the full Unicode range (fixing the old ASCII-only `lower`
-        // limitation — e.g. `äpfel` now matches `Äpfel`). This fragment builds the
+        // #1910 SQLite FTS5 full-text search. Postgres uses tsvector ranked search
+        // (`websearch_to_tsquery`/`ts_rank_cd`); SQLite has no tsvector, so the
+        // `backend_select!` sqlite arm below queries an external-content FTS5 virtual
+        // table (`"<table>__fts"`, tokenized with `unicode61`) that the `AddSearch`
+        // migration creates and keeps in sync with triggers. The id SELECT joins that
+        // FTS table to the base table, so the tenant, soft-delete, and owner
+        // predicates still filter the base table exactly as the pg arm does; it
+        // matches with `WHERE "<table>__fts" MATCH ?` and ranks with `ORDER BY
+        // bm25("<table>__fts", <weights>)`. The per-column weights come from the
+        // `#[searchable(weight=...)]` priorities (A→10, B→5, C→2, else 1), so a
+        // higher-priority field sorts first: bm25 scores lower as better, and a larger
+        // weight yields a more negative score. `unicode61` folds case across the full
+        // Unicode range, so `äpfel` now matches `Äpfel`. This fragment builds the
         // trusted `__autumn_bm25_weights` literal list and the fail-closed
-        // `__autumn_fts_match_opt` (see `sqlite_fts5_match_query`); it is spliced
-        // into each sqlite arm (never the pg arm), so it is only built where used.
+        // `__autumn_fts_match_opt` (see `sqlite_fts5_match_query`), and is spliced
+        // into each sqlite arm only.
         let sqlite_fts_setup = quote! {
             // Trusted per-column bm25 weights from the developer-declared
             // SEARCH_FIELDS priorities — never request input, so spliced as SQL
@@ -17284,14 +17155,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // ── #1841: owner-scoped full-text search (`search_page_scoped`) ──────
     //
-    // Emitted only when the repository is BOTH `searchable` AND `owner =`
-    // scoped. It clones `search_page` and adds the owner filter to ALL THREE
-    // query phases — the COUNT raw SQL, the id-SELECT raw SQL, and the typed
-    // hydration query — so `total`, the paged id set, and the hydrated rows all
-    // agree and none can leak another user's rows. The owner id is bound as a
-    // positional parameter (never string-interpolated); the parameter index
-    // shifts by one when tenant scoping already occupies `$3`, mirroring the
-    // tenant code's `$3/$4/$5` arity handling.
+    // Emitted only when the repository is both `searchable` and `owner =` scoped. It
+    // clones `search_page` and adds the owner filter to all three query phases — the
+    // COUNT raw SQL, the id-SELECT raw SQL, and the typed hydration query — so
+    // `total`, the paged id set, and the hydrated rows agree and none can leak
+    // another user's rows. The owner id is bound as a positional parameter, never
+    // string-interpolated; the parameter index shifts by one when tenant scoping
+    // already occupies `$3`, mirroring the tenant code's `$3/$4/$5` arity handling.
     let (search_page_scoped_trait_method, search_page_scoped_impl_method) = if let (
         true,
         ::core::option::Option::Some(owner_col),
@@ -17832,18 +17702,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    // #1996: version-history read fork. The Postgres and SQLite arms differ in
-    // three ways that must be forked through `backend_select!` (each arm names
-    // its own diesel types / SQL so the unselected arm is never type-checked):
+    // #1996: version-history read fork. The Postgres and SQLite arms differ in three
+    // ways that must be forked through `backend_select!`, so each arm names its own
+    // diesel types and SQL and the unselected arm is never type-checked:
     //   1. the `recorded_at` column type — Postgres `Timestamptz` has no
-    //      `FromSql<_, Sqlite>`; SQLite must use `TimestamptzSqlite`;
-    //   2. the raw SQL casts — `COUNT(*)::bigint`, `$n::text`, `$n::timestamptz`
+    //      `FromSql<_, Sqlite>`, so SQLite uses `TimestamptzSqlite`;
+    //   2. the raw SQL casts — `COUNT(*)::bigint`, `$n::text`, `$n::timestamptz`,
     //      and `changes::text` are Postgres-only and SQLite rejects them;
-    //   3. the timestamp-filter bind types (`Nullable<Timestamptz>` vs
+    //   3. the timestamp-filter bind types (`Nullable<Timestamptz>` against
     //      `Nullable<TimestamptzSqlite>`).
-    // The count row struct and the row→`VersionEntry` mapping are backend-agnostic
-    // (the SQLite `recorded_at` still deserializes into `DateTime<Utc>`), so they
-    // are built once here and spliced into both arms.
+    // The count row struct and the row-to-`VersionEntry` mapping are
+    // backend-agnostic, so they are built once here and spliced into both arms.
     let vh_count_struct = quote! {
         #[derive(::autumn_web::reexports::diesel::QueryableByName)]
         struct __AutumnVersionHistoryCount {
@@ -18953,34 +18822,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ) -> ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerPin> {
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
 
-                    // Two indexed single-row lookups. Pinning a head is the
-                    // thing an operator polls on a schedule, so it must not cost
-                    // a scan and a JSON parse of every revision the record ever
-                    // had.
+                    // Two indexed single-row lookups. Pinning a head is something an
+                    // operator polls on a schedule, so it must not cost a scan and a
+                    // JSON parse of every revision the record ever had.
                     //
-                    // The two tenant predicates are spelled differently on
-                    // purpose. The head leg keeps `($3 IS NULL OR tenant_id =
-                    // $3)`, byte-for-byte what `ledger_revisions` uses, so the
-                    // head this returns is always the head of the chain that
-                    // routine walks. The mark leg uses `COALESCE($3, '')`,
-                    // because that is the key the append writes and the
-                    // migration backfills — `tenant_key` is NOT NULL. They agree
-                    // for every reachable configuration: the cross-tenant guard
-                    // above rejects `across_tenants`, so a tenant-scoped
-                    // repository always binds `Some`, and an unscoped one always
-                    // wrote `tenant_id IS NULL` / `tenant_key = ''`.
-                    //
-                    // The two tenant predicates are spelled differently on
-                    // purpose. The head leg keeps `($3 IS NULL OR tenant_id =
-                    // $3)`, byte-for-byte what `ledger_revisions` uses, so the
-                    // head this returns is always the head of the chain that
-                    // routine walks. The mark leg uses `COALESCE($3, '')`,
-                    // because that is the key the append writes and the
-                    // migration backfills — `tenant_key` is NOT NULL. They agree
-                    // for every reachable configuration: `ledger_cross_tenant_guard`
-                    // above rejects `across_tenants`, so a tenant-scoped
-                    // repository always binds `Some`, and an unscoped one always
-                    // wrote `tenant_id IS NULL` / `tenant_key = ''`.
+                    // The two tenant predicates are spelled differently on purpose.
+                    // The head leg keeps `($3 IS NULL OR tenant_id = $3)`,
+                    // byte-for-byte what `ledger_revisions` uses, so the head this
+                    // returns is always the head of the chain that routine walks. The
+                    // mark leg uses `COALESCE($3, '')`, the key the append writes and
+                    // the migration backfills, because `tenant_key` is NOT NULL. They
+                    // agree for every reachable configuration:
+                    // `ledger_cross_tenant_guard` above rejects `across_tenants`, so a
+                    // tenant-scoped repository always binds `Some`, and an unscoped
+                    // one always wrote `tenant_id IS NULL` / `tenant_key = ''`.
                     #ledger_cross_shard_guard
                     #ledger_cross_tenant_guard
                     #ledger_tenant_setup
@@ -19659,15 +19514,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             async fn save(&self, new: &#new_name) -> ::autumn_web::AutumnResult<#model_name> {
-                // #1379: normalize `#[normalize]` columns on the insert path,
-                // before the `before_create` hook and the DB write, so
-                // validators and the database observe the canonical value.
-                // Dispatches through the autoref-specialization probe: the `Yes`
-                // arm clones and canonicalizes only for models whose `New*`
-                // implements `Normalize`; the `No` arm hands back the caller's
-                // borrow unchanged, so models with no `#[normalize]` columns (and
-                // hand-written `New*` types that don't implement `Normalize`) pay
-                // no clone. `Borrow` unifies the owned/borrowed arms to `&#new_name`.
+                // #1379: normalize `#[normalize]` columns on the insert path, before
+                // the `before_create` hook and the DB write, so validators and the
+                // database see the canonical value. Dispatches through the
+                // autoref-specialization probe: the `Yes` arm clones and canonicalizes
+                // only for models whose `New*` implements `Normalize`, and the `No`
+                // arm hands back the caller's borrow unchanged, so a model with no
+                // `#[normalize]` columns pays no clone. `Borrow` unifies the owned and
+                // borrowed arms to `&#new_name`.
                 #[allow(unused_imports)]
                 use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
                 #[allow(unused_imports)]
@@ -19808,15 +19662,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ///     for comment in post.comments()? { /* ... */ }
             /// }
             /// ```
-            // Generic over the record + spec types so the `Preloadable` bound
-            // rests on a *generic* parameter, not the concrete model. A bound
-            // on a concrete type that has no `Preloadable` impl is rejected
-            // eagerly; a bound on a generic type parameter is only checked at
-            // call sites. This keeps the method available on repositories whose
-            // model is hand-written (not via `#[model]`, e.g. zero-column test
-            // models) — they simply never call `preload`. In normal use the
-            // record type is inferred from the finder result, i.e. this
-            // repository's model.
+            // Generic over the record and spec types so the `Preloadable` bound rests
+            // on a generic parameter, not the concrete model. A bound on a concrete
+            // type with no `Preloadable` impl is rejected eagerly; a bound on a
+            // generic parameter is checked only at call sites. That keeps the method
+            // available on repositories whose model is hand-written rather than
+            // `#[model]`-generated — zero-column test models, say — which simply never
+            // call `preload`. In normal use the record type is inferred from the
+            // finder result, this repository's model.
             pub async fn preload<__Model, __Spec>(
                 &self,
                 records: ::std::vec::Vec<__Model>,
@@ -20001,21 +19854,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // Postgres statement_timeout is a signed 32-bit integer; cap to be safe.
                 let timeout_ms = timeout_ms.min(i32::MAX as u64);
 
-                // `SET statement_timeout` is Postgres session syntax; SQLite
-                // rejects it ("near \"SET\": syntax error"). SQLite also cannot
-                // enforce a per-statement wall-clock timeout at all through the
-                // async connection wrapper (diesel's SqliteConnection exposes no
-                // interrupt/progress-handler hook), so this arm CANNOT honor a
-                // configured `database.statement_timeout`. Rather than silently
-                // ignore it here, autumn-web fails the boot fast whenever a
-                // non-zero `statement_timeout` is configured under the sqlite
-                // backend (`reject_sqlite_statement_timeout`, called from
-                // `create_pool` / `create_topology` / `create_shard_topology` in
-                // db.rs). That boot guard guarantees `timeout_ms` is always 0 by
-                // the time it reaches this arm, so the no-op below is correct and
-                // reachable-with-a-real-timeout never happens — not a silent gap.
-                // `busy_timeout` (installed at connection setup) still bounds lock
-                // waits; a real statement timeout is tracked by #1996/#1910.
+                // `SET statement_timeout` is Postgres session syntax; SQLite rejects
+                // it ("near \"SET\": syntax error"). SQLite also cannot enforce a
+                // per-statement wall-clock timeout through the async connection
+                // wrapper, because diesel's `SqliteConnection` exposes no interrupt or
+                // progress-handler hook, so this arm cannot honor a configured
+                // `database.statement_timeout`. Rather than ignore it silently,
+                // autumn-web fails the boot fast whenever a non-zero
+                // `statement_timeout` is configured under the sqlite backend
+                // (`reject_sqlite_statement_timeout`, called from `create_pool`,
+                // `create_topology`, and `create_shard_topology` in db.rs). That guard
+                // means `timeout_ms` is always 0 by the time it reaches this arm, so
+                // the no-op below is correct rather than a silent gap. `busy_timeout`,
+                // installed at connection setup, still bounds lock waits; a real
+                // statement timeout is tracked by #1996/#1910.
                 ::autumn_web::backend_select! {
                     pg => {{
                         ::autumn_web::reexports::diesel::sql_query(
@@ -20920,15 +20772,14 @@ mod tests {
 
     #[test]
     fn repository_macro_m2m_tenant_scope_rejects_across_tenants_on_sharded_repo() {
-        // PR #2177: `#[votable]`'s react()/reaction_of() resolve their tenant
-        // scope through `M2mConnSource::__autumn_m2m_tenant_scope()` before
-        // acquiring any connection. On a sharded repository there is no single
-        // right shard for an `across_tenants()` reaction to land on — a write
-        // would mutate whichever shard backs the routed pool, and a read would
-        // silently return `None` for edges on other shards — so the scope
-        // method itself must reject, keyed off the runtime `across_tenants`
-        // flag alone (the grouped-aggregate stance: no `__autumn_shards`
-        // conjunct, or `with_pool_untracked` repos slip past).
+        // PR #2177: `#[votable]`'s `react()`/`reaction_of()` resolve their tenant
+        // scope through `M2mConnSource::__autumn_m2m_tenant_scope()` before acquiring
+        // any connection. On a sharded repository there is no single right shard for
+        // an `across_tenants()` reaction: a write would mutate whichever shard backs
+        // the routed pool, and a read would silently return `None` for edges on other
+        // shards. The scope method must therefore reject, keyed off the runtime
+        // `across_tenants` flag alone — no `__autumn_shards` conjunct, or
+        // `with_pool_untracked` repos slip past.
         let generated = repository_macro(
             quote! { Event, table = "events", tenant_scoped, sharded },
             quote! {
@@ -21270,17 +21121,15 @@ mod tests {
 
     #[test]
     fn repository_macro_grouped_aggregate_guards_encrypted_columns() {
-        // §1364 encryption correctness: whether a column is `#[encrypted(...)]`
-        // is declared on the model and is only known at runtime (the repository
-        // macro sees the trait, not the model's fields — see
-        // `encode_derived_query_param`), so a `compile_error!` cannot name the
-        // encrypted column. Instead the generated grouped-aggregate method emits
-        // a runtime guard against the SAME `is_encrypted_column` registry the
-        // `find_by` surface consults, rejecting both the group column and the
-        // aggregated numeric column before running any SQL. It fires only for
-        // columns that are actually encrypted, so non-encrypted grouping is
-        // unchanged (asserted separately by the other grouped-aggregate tests,
-        // whose generated bodies never early-return).
+        // §1364 encryption correctness: whether a column is `#[encrypted(...)]` is
+        // declared on the model and known only at runtime — the repository macro sees
+        // the trait, not the model's fields — so a `compile_error!` cannot name the
+        // encrypted column. The generated grouped-aggregate method instead emits a
+        // runtime guard against the same `is_encrypted_column` registry the `find_by`
+        // surface consults, rejecting both the group column and the aggregated
+        // numeric column before running any SQL. It fires only for genuinely
+        // encrypted columns, so non-encrypted grouping is unchanged, as the other
+        // grouped-aggregate tests assert.
         let generated = repository_macro(
             quote! { Event, table = "events" },
             quote! {
@@ -22716,16 +22565,15 @@ mod tests {
 
     #[test]
     fn repository_macro_delete_many_uses_path_and_deleted_not_monotonic_preseed() {
-        // Codex round-5-B: the bulk `delete_many` cascade must NOT use a single
-        // monotonic visited set that pre-seeds a batch root before it is deleted
-        // (that made an ancestor's cascade skip a still-referenced descendant batch
-        // root and trip an IMMEDIATE FK). The old `__autumn_visited` set is gone,
-        // replaced by TWO structures: an ACTIVE-path stack (`__autumn_path`, pushed
-        // then popped around each root's own cascade — cycle-break only) and a
-        // monotonic `__autumn_deleted` set of rows actually removed. Phase 2 must
-        // (a) push the current root onto the path before its mutating cascade,
-        // (b) pop it right after, and (c) skip a root already in `__autumn_deleted`
-        // (cascade-deleted as another root's descendant) — never a pre-seed.
+        // Codex round-5-B: the bulk `delete_many` cascade must not use a single
+        // monotonic visited set that pre-seeds a batch root before it is deleted —
+        // that made an ancestor's cascade skip a still-referenced descendant root and
+        // trip an immediate FK. `__autumn_visited` is replaced by two structures: an
+        // active-path stack (`__autumn_path`, pushed and popped around each root's own
+        // cascade, for cycle-breaking only) and a monotonic `__autumn_deleted` set of
+        // rows actually removed. Phase 2 must push the current root onto the path
+        // before its mutating cascade, pop it right after, and skip a root already in
+        // `__autumn_deleted` — never pre-seed.
         let generated = repository_macro(
             quote! { Node, dependent(PgNodeRepository, fk = "parent_id", on_delete = destroy) },
             quote! { pub trait NodeRepository {} },
@@ -23047,15 +22895,14 @@ mod tests {
 
     #[test]
     fn repository_macro_dependent_destroy_reload_does_not_filter_deleted_at() {
-        // #1369 (second live-filter site): the per-ID reload that fetches each
-        // selected child must NOT re-apply `deleted_at IS NULL`. The id-selection
-        // is already parent-soft-gated, so on a HARD parent delete it returns
-        // already-soft-deleted children too; a live-only reload would return
-        // `None`, skip the hard delete, and leave the FK to fail the parent
-        // DELETE. Assert the reload loads the selected id straight into the
-        // `maybe_for_update!` lock seam (`FOR UPDATE` on Postgres, a plain read
-        // on `SQLite`) with no intervening `deleted_at` filter, even for a
-        // soft_delete child.
+        // #1369 (second live-filter site): the per-id reload fetching each selected
+        // child must not re-apply `deleted_at IS NULL`. The id selection is already
+        // parent-soft-gated, so on a hard parent delete it returns already-soft-deleted
+        // children too; a live-only reload would return `None`, skip the hard delete,
+        // and leave the FK to fail the parent DELETE. Assert the reload loads the
+        // selected id straight into the `maybe_for_update!` lock seam — `FOR UPDATE`
+        // on Postgres, a plain read on SQLite — with no intervening `deleted_at`
+        // filter, even for a soft_delete child.
         let generated = repository_macro(
             quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
             quote! { pub trait CommentRepository {} },
@@ -23233,25 +23080,23 @@ mod tests {
 
     #[test]
     fn repository_macro_destroy_arm_locks_child_ids_before_restrict_prescan() {
-        // Codex P2 ("Lock children before the restrict pre-scan"): the child-id
-        // selection that feeds the sibling restrict PRE-SCAN must acquire
-        // `FOR UPDATE` on the selected child rows. Otherwise, under READ
-        // COMMITTED, a concurrent FK insert of a `restrict` grandchild can commit
-        // AFTER this EXISTS pass and BEFORE the Phase-2 `for_update` child reload,
-        // so the child `before_delete` hook still fires and the hard delete falls
-        // through to a raw FK error (or a soft delete proceeds despite a live
-        // restrict dependent). Holding `FOR UPDATE` on the child row blocks the
-        // concurrent grandchild insert's `FOR KEY SHARE` on that referenced row,
-        // closing the TOCTOU window between probe and hook/delete.
+        // Codex P2, "lock children before the restrict pre-scan": the child-id
+        // selection feeding the sibling restrict pre-scan must take `FOR UPDATE` on
+        // the selected child rows. Otherwise, under READ COMMITTED, a concurrent FK
+        // insert of a `restrict` grandchild can commit after this EXISTS pass and
+        // before the Phase-2 `for_update` child reload, so the child `before_delete`
+        // hook still fires and the hard delete falls through to a raw FK error — or a
+        // soft delete proceeds despite a live restrict dependent. Holding `FOR UPDATE`
+        // on the child row blocks the concurrent insert's `FOR KEY SHARE` on that
+        // referenced row, closing the TOCTOU window between probe and hook or delete.
         //
-        // The child-id SELECT now appends a backend-gated lock suffix rather than
-        // a hard-coded `FOR UPDATE`: `... ORDER BY id{}` where the `{}` binding
-        // (`__for_update`) is `" FOR UPDATE"` on Postgres and `""` on `SQLite`
-        // (which rejects `SELECT … FOR UPDATE`), selected in autumn-web's
-        // compilation via `backend_select!`. The Postgres SQL is byte-identical to
-        // before. Structurally: the backend-gated `FOR UPDATE` lock must still be
-        // applied to the `SELECT id ... ORDER BY id` query, which must precede the
-        // `for __row in & __ids` pre-scan loop.
+        // The child-id SELECT appends a backend-gated lock suffix rather than a
+        // hard-coded `FOR UPDATE`: `... ORDER BY id{}`, where `__for_update` binds
+        // `" FOR UPDATE"` on Postgres and `""` on SQLite, which rejects `SELECT …
+        // FOR UPDATE`, selected in autumn-web's compilation via `backend_select!`.
+        // The Postgres SQL is byte-identical to before. Structurally, the lock must
+        // still apply to the `SELECT id ... ORDER BY id` query, which must precede
+        // the `for __row in & __ids` pre-scan loop.
         let generated = repository_macro(
             quote! {
                 Comment,
@@ -23409,17 +23254,16 @@ mod tests {
 
     #[test]
     fn repository_macro_grandchild_restrict_prescan_skip_uses_physical_not_handled_set() {
-        // #1800 (Codex "Re-probe restricts on hard revisits"): the grandchild
-        // `restrict` PRE-SCAN skip must consult the PHYSICAL-delete set, NOT the
-        // "all handled" `__deleted` set. In a mixed soft/hard diamond a row that was
-        // soft-deleted on an earlier (soft-parent) path sits in `__deleted` but not
-        // in `__physical`. The Phase-2 mutating loop keys its revisit-skip on
-        // `__physical`, so it still hard-deletes that row on a later hard-delete
-        // path; the pre-scan MUST therefore also key on `__physical` so it re-runs
-        // the restrict probe on that hard revisit. If it kept keying on `__deleted`
-        // the probe would be skipped while the hard delete proceeds — firing the
-        // child hook and falling through to a raw FK failure instead of the typed
-        // 409 when the row has a soft-deleted restrict dependent.
+        // #1800, "re-probe restricts on hard revisits": the grandchild `restrict`
+        // pre-scan skip must consult the physical-delete set, not the all-handled
+        // `__deleted` set. In a mixed soft/hard diamond, a row soft-deleted on an
+        // earlier soft-parent path sits in `__deleted` but not in `__physical`. The
+        // Phase-2 mutating loop keys its revisit-skip on `__physical` and still
+        // hard-deletes that row on a later hard path, so the pre-scan must key on
+        // `__physical` too and re-run the restrict probe. Keyed on `__deleted` the
+        // probe would be skipped while the hard delete proceeds — firing the child
+        // hook and falling through to a raw FK failure instead of the typed 409 when
+        // the row has a soft-deleted restrict dependent.
         let generated = repository_macro(
             quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = restrict) },
             quote! { pub trait CommentRepository {} },
@@ -24155,13 +23999,13 @@ mod tests {
 
     // ── #1325 counter caches ──────────────────────────────────────────────
     //
-    // Whether a model *has* a counter cache is a run-time fact (`#[model]` and
-    // `#[repository]` are separate proc-macro invocations), so the maintenance
-    // calls are emitted unconditionally and resolve to a no-op for a model
-    // without one. These assertions pin that they are emitted at all, on the
-    // right method, and — for the paths that were transaction-free — that the
-    // transactional twin sits behind the `HAS_COUNTER_CACHES` const so the
-    // original single-statement path is still reachable.
+    // Whether a model has a counter cache is a runtime fact, since `#[model]` and
+    // `#[repository]` are separate proc-macro invocations, so the maintenance calls
+    // are emitted unconditionally and resolve to a no-op for a model without one.
+    // These assertions pin that they are emitted at all, on the right method, and —
+    // for the paths that were transaction-free — that the transactional twin sits
+    // behind the `HAS_COUNTER_CACHES` const, so the single-statement path stays
+    // reachable.
 
     #[test]
     fn save_increments_after_the_insert() {
@@ -26101,15 +25945,13 @@ mod tests {
 
     #[test]
     fn repository_macro_retention_maintains_counter_cache_before_mutating() {
-        // Regression (#1342 review round 3): a counter-cached model swept by
-        // retention(...) must move its parent's counter, mirroring
-        // delete_many's cc_before_delete_chunk. Every mutation site — the
-        // age branch's soft-delete UPDATE and the purge branch's hard
-        // DELETE — must call counter_cache_before_delete_many before
-        // applying the mutation. Scoped to the retention_run section (via
-        // `generated_fn`, the same helper the #1325 counter-cache tests
-        // use) so this doesn't just count the base CRUD trait's unrelated
-        // `delete_many` occurrences of the same function name.
+        // A counter-cached model swept by `retention(...)` must move its parent's
+        // counter, mirroring `delete_many`'s `cc_before_delete_chunk`. Every mutation
+        // site — the age branch's soft-delete UPDATE and the purge branch's hard
+        // DELETE — must call `counter_cache_before_delete_many` before applying the
+        // mutation. Scoped to the retention_run section via `generated_fn`, the helper
+        // the #1325 counter-cache tests use, so this does not just count the base CRUD
+        // trait's unrelated `delete_many` occurrences of the same name (#1342).
         let generated = repository_macro(
             quote! {
                 Post,
@@ -26137,15 +25979,13 @@ mod tests {
 
     #[test]
     fn repository_macro_retention_counter_cache_uses_immediate_transaction() {
-        // Regression (#1342 review round 9): on SQLite, maybe_for_update!
-        // degrades to a plain read (no FOR UPDATE), so a deferred
-        // scoped_transaction wouldn't take a write lock until the first
-        // write, leaving a window for a concurrent writer to commit between
-        // the locked-ids SELECT and that write — SQLite reports that as
-        // SQLITE_BUSY_SNAPSHOT rather than waiting on the busy timeout.
-        // Every counter-cache sweep transaction must use
-        // scoped_immediate_transaction instead, matching every other
-        // generated read-then-write mutation path.
+        // On SQLite, `maybe_for_update!` degrades to a plain read, so a deferred
+        // `scoped_transaction` would not take a write lock until the first write,
+        // leaving a window for a concurrent writer to commit between the locked-ids
+        // SELECT and that write — which SQLite reports as `SQLITE_BUSY_SNAPSHOT`
+        // rather than waiting on the busy timeout. Every counter-cache sweep
+        // transaction must use `scoped_immediate_transaction` instead, matching every
+        // other generated read-then-write mutation path (#1342).
         let generated = repository_macro(
             quote! {
                 Post,
@@ -26177,16 +26017,13 @@ mod tests {
 
     #[test]
     fn repository_macro_retention_counter_cache_locks_ordered_by_id() {
-        // Regression (#1342 review round 22, P2): on Postgres, a
-        // counter-cached sweep's FOR UPDATE lock query raced a concurrent
-        // delete_many locking an overlapping batch of the same children.
-        // delete_many's own counter_cache_before_delete_many locks
-        // ascending by id specifically to avoid a deadlock, but that
-        // ordering only helps if EVERY locker uses it — without an
-        // explicit order() here too, the two transactions could acquire
-        // the same rows in opposite orders and one would be aborted.
-        // Applies to all three mutation sites: age soft-delete, age
-        // hard-delete, and purge hard-delete.
+        // On Postgres a counter-cached sweep's `FOR UPDATE` lock query raced a
+        // concurrent `delete_many` locking an overlapping batch of the same children.
+        // `delete_many`'s own `counter_cache_before_delete_many` locks ascending by id
+        // to avoid a deadlock, but that only helps if every locker does the same:
+        // without an explicit `order()` here too, the two transactions could take the
+        // same rows in opposite orders and one would be aborted. Applies to all three
+        // mutation sites — age soft-delete, age hard-delete, purge hard-delete (#1342).
         let generated = repository_macro(
             quote! {
                 Post,
@@ -26444,16 +26281,14 @@ mod tests {
 
     #[test]
     fn repository_macro_retention_rejects_model_declared_dependents_at_boot() {
-        // Regression (#1342 review round 10): parse_repo_args's
-        // `dependents.is_empty()` check only sees repository-attribute
-        // `dependent(...)` — it can't see a model-declared
-        // `#[has_many(..., dependent = ...)]`/`#[has_one(...)]`, resolved
-        // only at runtime via `Model::dependents()` (a separate proc-macro
-        // invocation, `#[model]`). The generated task_info builder must
-        // assert that runtime slice is empty, at boot, for the same reason
-        // the compile-time dependent(...) rejection exists: the sweep
-        // mutates rows directly and never drives the cascade-aware delete
-        // path Model::dependents() feeds.
+        // `parse_repo_args`'s `dependents.is_empty()` check sees only
+        // repository-attribute `dependent(...)`. It cannot see a model-declared
+        // `#[has_many(..., dependent = ...)]` or `#[has_one(...)]`, resolved only at
+        // runtime via `Model::dependents()` from the separate `#[model]` invocation.
+        // The generated `task_info` builder must assert that runtime slice is empty at
+        // boot, for the same reason the compile-time rejection exists: the sweep
+        // mutates rows directly and never drives the cascade-aware delete path
+        // `Model::dependents()` feeds (#1342).
         let generated = repository_macro(
             quote! { Post, retention(after = "30d", basis = created_at) },
             quote! { pub trait PostRepository {} },
@@ -26531,15 +26366,13 @@ mod tests {
 
     #[test]
     fn repository_macro_retention_age_reclaims_unused_purge_batch_capacity() {
-        // Regression (#1342 review round 13): round 11 only let the purge
-        // phase borrow the age phase's unused capacity. The reverse case —
-        // a large age backlog and a small (or empty) purge backlog — was
-        // still capped at a fixed half-budget for age with no way to
-        // reclaim what purge left unused. Age's reclaim pass must be
-        // generated: gated on whether the primary pass actually hit its
-        // cap (`__age_capped`), sized from the budget minus purge's actual
-        // usage (`__purge_batches_used`), and resuming via the same shared
-        // cursor/counter state the primary pass left behind.
+        // Round 11 let only the purge phase borrow the age phase's unused capacity.
+        // The reverse — a large age backlog with a small or empty purge backlog — was
+        // still capped at a fixed half-budget for age, with no way to reclaim what
+        // purge left unused. Age's reclaim pass must be generated: gated on whether
+        // the primary pass hit its cap (`__age_capped`), sized from the budget minus
+        // purge's actual usage (`__purge_batches_used`), and resuming from the shared
+        // cursor and counter state the primary pass left behind (#1342).
         let generated = repository_macro(
             quote! {
                 Post,
@@ -26585,15 +26418,12 @@ mod tests {
 
     #[test]
     fn repository_macro_purge_delete_rechecks_deleted_at_at_delete_time() {
-        // Regression (#1342 review): the purge branch's DELETE must
-        // re-check `deleted_at < cutoff`, not just `id`, so a row
-        // concurrently `restore()`d between the SELECT and this DELETE
-        // survives instead of being purged out from under the restore.
-        //
-        // Before the fix, `deleted_at . lt` appeared exactly once (the
-        // SELECT's WHERE clause) anywhere in the generated code. After the
-        // fix it appears twice: once in the SELECT, once again as the
-        // DELETE's second `.filter(...)`.
+        // The purge branch's DELETE must re-check `deleted_at < cutoff`, not just
+        // `id`, so a row concurrently `restore()`d between the SELECT and this DELETE
+        // survives instead of being purged out from under the restore. Before the fix
+        // `deleted_at . lt` appeared exactly once in the generated code, in the
+        // SELECT's WHERE clause; after it appears twice — in the SELECT and as the
+        // DELETE's second `.filter(...)` (#1342).
         let generated = repository_macro(
             quote! { Post, soft_delete, retention(purge_deleted_after = "90d") },
             quote! { pub trait PostRepository {} },
@@ -26784,16 +26614,14 @@ mod tests {
              ({ledger_appends} ledger vs {history_appends} history)"
         );
         assert!(history_appends > 0, "sanity: history writes are emitted");
-        // What each append then *does* — read the database clock, the chain head
-        // and the high-water mark in one statement, allocate past the greater of
-        // head and mark, insert the revision, and raise the mark in the same
-        // transaction (#2323) — is no longer something this macro can get wrong
-        // per write path. It is one runtime function, `ledger::append_revision`,
-        // and it is covered by that module's own tests. This macro's remaining
-        // obligation is the one asserted above: that no write path skips it.
-        //
-        // The call must also carry the model-side inputs the runtime cannot
-        // derive on its own.
+        // What each append then does — read the database clock, the chain head, and
+        // the high-water mark in one statement, allocate past the greater of head and
+        // mark, insert the revision, and raise the mark in the same transaction
+        // (#2323) — is no longer something this macro can get wrong per write path.
+        // It is one runtime function, `ledger::append_revision`, covered by that
+        // module's own tests. This macro's remaining obligation is the one asserted
+        // above: that no write path skips it. The call must also carry the model-side
+        // inputs the runtime cannot derive on its own.
         for field in [
             "table_name : \"posts\"",
             "record_id : __lg_record_id",

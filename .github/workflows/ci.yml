@@ -1203,6 +1203,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "autumn setup failed with $LASTEXITCODE" }
 
       - name: "Journey: the app builds on Windows"
+        env:
+          # `--bundled-pg` compiles `postgresql_embedded`, whose build script
+          # downloads Postgres binaries via the GitHub API; unauthenticated it
+          # hits the 60 req/hr rate limit and fails the build with a 403.
+          # Authenticate with the job's token to get the higher rate limit, as
+          # the coverage job already does.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # `Continue`, not `Stop`: cargo writes progress to stderr, and under
           # `Stop` a piped native command turns that into a NativeCommandError.

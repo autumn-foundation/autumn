@@ -95,16 +95,15 @@ fn implicitly_closes(open_tag: &str, new_tag: &str) -> bool {
             (open_tag, new_tag),
             ("li", "li")
                 | ("dt" | "dd", "dt" | "dd")
-                // A new table section (`<thead>`/`<tbody>`/`<tfoot>`)
-                // closes an open cell/row/section the same way a new
-                // `<tr>` does — `<table><thead><tr><th>H<tbody>...` omits
-                // `</th>`, `</tr>`, *and* `</thead>` together, and without
-                // this the whole `<tbody>` (and its row/cell) nested
-                // *inside* the still-open header cell, so
-                // `extract_table_rows` (which only reads a `<tr>`'s
-                // *direct* `<td>`/`<th>` children) flattened the body
-                // row's text into the header cell instead of emitting it
-                // as a separate row.
+                // A new table section (`<thead>`/`<tbody>`/`<tfoot>`) closes
+                // an open cell, row, or section the same way a new `<tr>`
+                // does: `<table><thead><tr><th>H<tbody>...` omits `</th>`,
+                // `</tr>`, and `</thead>` together. Without this the whole
+                // `<tbody>`, with its row and cell, nested inside the
+                // still-open header cell, so `extract_table_rows` — which
+                // reads only a `<tr>`'s direct `<td>`/`<th>` children —
+                // flattened the body row's text into the header cell instead
+                // of emitting a separate row.
                 | ("tr", "tr" | "thead" | "tbody" | "tfoot")
                 | ("td" | "th", "td" | "th" | "tr" | "thead" | "tbody" | "tfoot")
                 | ("thead" | "tbody" | "tfoot", "thead" | "tbody" | "tfoot")
@@ -615,24 +614,21 @@ fn handle_closing_tag(
         .find(|c: char| c == '>' || c == '/' || c.is_whitespace())
         .unwrap_or(rest.len());
     let name = rest[..name_end].to_ascii_lowercase();
-    // Two tiers: the cheap `MAX_TAG_SCAN`-bounded search handles every
-    // realistic closing tag (attributes are already rare there, let alone
-    // oversized ones) in O(1), so it's tried first on every single `</` in
-    // the document — essential here (unlike the *unconditionally* unbounded
-    // search `oversized_tag_body_start`/`push_oversized_generic_tag` use),
-    // since without this cheap gate, many consecutive ordinary closing tags
-    // (say `</div></span></div>...`, no attributes at all) would each pay
-    // an unbounded `find_tag_end` call's initial quote-presence scan
-    // reaching toward whatever quote character comes next in the document —
-    // redone by every one of them, the same O(closing tags × distance)
-    // shape the bound elsewhere in this module exists to prevent. Once a
-    // closing tag's own attribute list *itself* exceeds `MAX_TAG_SCAN`
-    // (already an unusual, `MAX_TAG_SCAN`-bytes-costly-to-trigger case),
-    // the second attempt is unbounded — safe there for the same reason
-    // `oversized_tag_body_start` doesn't need a window either. `rest.len()`
-    // (EOF) is the correct fallback if even that never finds a real `>`,
-    // since an unbounded search means "not found" genuinely means "nowhere
-    // in the rest of the document," not "gave up early."
+    // Two tiers. The cheap `MAX_TAG_SCAN`-bounded search handles every realistic
+    // closing tag in O(1) — attributes are rare there, let alone oversized ones — so
+    // it is tried first on every `</` in the document. That gate is essential here,
+    // unlike the unconditionally unbounded search
+    // `oversized_tag_body_start`/`push_oversized_generic_tag` use: without it, many
+    // consecutive ordinary closing tags (`</div></span></div>...`, no attributes) would
+    // each pay an unbounded `find_tag_end` call's initial quote-presence scan reaching
+    // toward whatever quote comes next in the document — the same O(closing tags ×
+    // distance) shape the bound elsewhere in this module exists to prevent.
+    //
+    // Once a closing tag's own attribute list exceeds `MAX_TAG_SCAN` — already unusual
+    // and `MAX_TAG_SCAN` bytes costly to trigger — the second attempt is unbounded, safe
+    // for the same reason `oversized_tag_body_start` needs no window. `rest.len()` (EOF)
+    // is the right fallback if even that finds no real `>`: after an unbounded search,
+    // "not found" genuinely means "nowhere in the rest of the document".
     let tag_end = find_tag_end(bounded_prefix(rest, MAX_TAG_SCAN)).or_else(|| find_tag_end(rest));
     let new_pos = pos + 2 + tag_end.map_or(rest.len(), |i| i + 1);
 
@@ -716,15 +712,15 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
                 close_implied_tags(&mut stack, &tag);
 
                 if is_raw_text_element(&tag) {
-                    // `<script>`/`<style>`/`<title>`/`<textarea>` content is
-                    // never tokenized as markup — see `consume_raw_text` —
-                    // so a `<` that merely *looks* like the start of a tag
-                    // (a JS comparison, a CSS selector combinator, a `<`
-                    // typed into a textarea's default value) can't swallow
-                    // the real closing tag. Entities are still decoded
-                    // (matching the normal text-node path below) — a no-op
-                    // for the two tags whose content is discarded anyway,
-                    // and required for `title`/`textarea`'s real content.
+                    // `<script>`, `<style>`, `<title>`, and `<textarea>`
+                    // content is never tokenized as markup (see
+                    // `consume_raw_text`), so a `<` that merely looks like the
+                    // start of a tag — a JS comparison, a CSS selector
+                    // combinator, a `<` typed into a textarea's default value —
+                    // cannot swallow the real closing tag. Entities are still
+                    // decoded, matching the normal text-node path below: a
+                    // no-op for the two tags whose content is discarded, and
+                    // required for `title` and `textarea`.
                     let (text, new_pos) = consume_raw_text(input, pos, &tag);
                     pos = new_pos;
                     let mut children = Vec::new();
@@ -760,27 +756,23 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
                 }
                 continue;
             }
-            // `parse_open_tag` found no `>` within `MAX_TAG_SCAN` — normally
-            // that just means an unterminated/malformed tag, handled below
-            // by falling back to literal text one byte at a time. But for
-            // the seven tags `oversized_raw_text_tag_name` recognizes
-            // (their own `>` pushed past the bound by e.g. an oversized
-            // attribute), that fallback would leak their content into the
-            // visible document — see that function's docs for the full
-            // three-way (four, counting `textarea`) split in how each
-            // group is handled below. First skip past the oversized tag's
-            // *own* attribute list (its content must never be scanned
-            // before its real `>` is found — see `oversized_tag_body_start`),
-            // then: for `script`/`style`/`title`, discard straight through
-            // to the closing tag (or EOF) via the same raw-text scan
-            // already used for a normally-parsed instance, without
-            // emitting any node for the unparseable opening tag itself;
-            // for `textarea`, the same scan but keeping (not discarding)
-            // the real content, see `push_oversized_raw_text_content_tag`;
-            // for `head`/`noscript`/`template` — whose content is real,
-            // generally-parsed markup rather than raw text, see
-            // `push_oversized_nested_tag` — push a real frame and fall
-            // through to normal parsing instead.
+            // `parse_open_tag` found no `>` within `MAX_TAG_SCAN`. Normally that means
+            // an unterminated or malformed tag, handled below by falling back to
+            // literal text one byte at a time. But for the seven tags
+            // `oversized_raw_text_tag_name` recognizes — whose own `>` was pushed past
+            // the bound by an oversized attribute — that fallback would leak their
+            // content into the visible document. See that function's docs for the full
+            // split in how each group is handled.
+            //
+            // First skip past the oversized tag's own attribute list: its content must
+            // never be scanned before its real `>` is found (see
+            // `oversized_tag_body_start`). Then, for `script`/`style`/`title`, discard
+            // straight through to the closing tag or EOF via the same raw-text scan a
+            // normally-parsed instance uses, emitting no node for the unparseable
+            // opening tag. For `textarea`, the same scan but keeping the real content
+            // (`push_oversized_raw_text_content_tag`). For `head`/`noscript`/`template`,
+            // whose content is generally-parsed markup rather than raw text, push a real
+            // frame and fall through to normal parsing (`push_oversized_nested_tag`).
             if let Some(name) = oversized_raw_text_tag_name(&input[pos..]) {
                 let after_name = pos + 1 + name.len();
                 let body_start = oversized_tag_body_start(input, after_name, len);
@@ -1394,16 +1386,14 @@ mod tests {
 
     #[test]
     fn an_omitted_li_closing_tag_is_implied_through_any_unrecognized_wrapper_tag() {
-        // Regression: `is_phrasing_wrapper` used to be its own allowlist of
-        // "known transparent tags", one step behind `inline_spans`'s
-        // actually-exhaustive "anything unrecognized is transparent" rule —
-        // `mark`/`time`/`cite` (and any other tag `layout.rs` doesn't
-        // specially recognize) are just as transparent as `span`, but
-        // weren't in the allowlist, so `<ul><li><mark>One<li>Two</ul>` left
-        // the second `<li>` nested under the first instead of closing it.
-        // Now that the check is inverted against the closed set of tags the
-        // renderer *does* special-case, an arbitrary never-listed tag
-        // (`made-up-tag`) is covered too, not just these three.
+        // Regression: `is_phrasing_wrapper` used to be its own allowlist of known
+        // transparent tags, one step behind `inline_spans`'s exhaustive "anything
+        // unrecognized is transparent" rule. `mark`, `time`, and `cite` — and any other
+        // tag `layout.rs` does not specially recognize — are as transparent as `span`
+        // but were absent from the allowlist, so `<ul><li><mark>One<li>Two</ul>` left the
+        // second `<li>` nested under the first instead of closing it. Now that the check
+        // is inverted against the closed set of tags the renderer does special-case, an
+        // arbitrary never-listed tag is covered too.
         for wrapper in ["mark", "time", "cite", "made-up-tag"] {
             let html = format!("<ul><li><{wrapper}>One<li>Two</ul>");
             let nodes = parse(&html);
@@ -1426,18 +1416,16 @@ mod tests {
 
     #[test]
     fn an_omitted_li_closing_tag_is_implied_through_an_ordinary_block_wrapper() {
-        // Regression: `is_structural_tag` used to reuse `closes_open_paragraph`'s
-        // tag list wholesale, wrongly treating `div` (and other ordinary
-        // block tags with no implied-close semantics of their own, like
-        // headings/`section`/`blockquote`) as a scope *barrier* the same
-        // way genuine ones (`ul`/`table`) are — so `<ul><li><div>One<li>Two</ul>`
-        // left the second `<li>` nested inside the `<div>` inside the
-        // first `<li>` instead of closing it, and `extract_list_items`
-        // emitted only one marker. `div` gets real block-level rendering
-        // treatment from `layout.rs` (see `is_block_boundary_in_inline_context`),
-        // but that's an orthogonal concern from parsing-level scope —
-        // a still-open `<li>` beneath it must stay reachable, the same as
-        // through a purely inline wrapper like `<mark>`.
+        // Regression: `is_structural_tag` used to reuse `closes_open_paragraph`'s tag
+        // list wholesale, wrongly treating `div` — and other ordinary block tags with no
+        // implied-close semantics, such as headings, `section`, and `blockquote` — as a
+        // scope barrier the way genuine ones like `ul` and `table` are. So
+        // `<ul><li><div>One<li>Two</ul>` left the second `<li>` nested inside the `<div>`
+        // inside the first `<li>`, and `extract_list_items` emitted only one marker.
+        // `div` does get block-level rendering treatment from `layout.rs` (see
+        // `is_block_boundary_in_inline_context`), but that is orthogonal to parsing-level
+        // scope: a still-open `<li>` beneath it must stay reachable, as through a purely
+        // inline wrapper like `<mark>`.
         for wrapper in ["div", "h2", "section", "blockquote", "header"] {
             let html = format!("<ul><li><{wrapper}>One<li>Two</ul>");
             let nodes = parse(&html);
@@ -1849,15 +1837,13 @@ mod tests {
 
     #[test]
     fn oversized_tag_with_a_closing_tag_look_alike_in_its_own_attribute_is_not_fooled() {
-        // Regression: the oversized-tag fallback's raw-text scan started
-        // right after the tag *name* — still inside the still-unparsed,
-        // still-open attribute list — rather than after the tag's own
-        // real `>`. A quoted attribute value containing a `</script`-
-        // looking substring *before* that real `>` (e.g.
-        // `<script data-x="</script>` followed by oversized attribute
-        // data and then `">Secret</script>`) got mistaken for the actual
-        // closing tag, after which the rest of the attribute value and
-        // "Secret" were reparsed as ordinary visible markup/text.
+        // Regression: the oversized-tag fallback's raw-text scan started right after the
+        // tag name — still inside the unparsed, still-open attribute list — rather than
+        // after the tag's real `>`. A quoted attribute value containing a
+        // `</script`-looking substring before that real `>`, as in `<script
+        // data-x="</script>` followed by oversized attribute data and then
+        // `">Secret</script>`, was mistaken for the closing tag, after which the rest of
+        // the attribute value and "Secret" were reparsed as visible markup and text.
         let oversized_attr = format!("</script>{}", "Q".repeat(5000));
         let html = format!(r#"<script data-x="{oversized_attr}">Secret</script><p>Visible</p>"#);
         let nodes = parse(&html);
@@ -1875,15 +1861,13 @@ mod tests {
 
     #[test]
     fn oversized_title_tag_does_not_leak_into_the_visible_document() {
-        // Regression: `oversized_raw_text_tag_name` only recognized
-        // `<script`/`<style`, not `<title` — so a `<title>` carrying an
-        // oversized attribute fell through to the plain literal-text
-        // fallback the same way an oversized `<script>` used to. Worse
-        // than script/style: inside a still-open `<head>`, that fallback's
-        // non-whitespace text also implicitly closes the head (see
-        // `push_text`), so both the attribute value *and* the title text
-        // leaked into the visible document despite `title` being
-        // `is_non_rendered`.
+        // Regression: `oversized_raw_text_tag_name` recognized only `<script` and
+        // `<style`, not `<title`, so a `<title>` carrying an oversized attribute fell
+        // through to the plain literal-text fallback the way an oversized `<script>`
+        // used to. That is worse than script or style: inside a still-open `<head>`, the
+        // fallback's non-whitespace text also implicitly closes the head (see
+        // `push_text`), so both the attribute value and the title text leaked into the
+        // visible document despite `title` being `is_non_rendered`.
         let oversized_attr = "Q".repeat(5000);
         let html = format!(
             r#"<head><title data-x="{oversized_attr}">Secret</title></head><p>Visible</p>"#
@@ -1951,15 +1935,14 @@ mod tests {
     #[test]
     fn oversized_head_tag_does_not_swallow_the_rest_of_the_document_at_an_implicit_close() {
         // Regression: an earlier fix added `head` to the same
-        // raw-text-scan-to-literal-closing-tag suppression as the other
-        // five non-rendered tags — but `<head>`'s closing tag is legally
-        // optional (HTML5, and this parser's own `implicitly_closes`,
-        // close it as soon as non-head content begins), so a document
-        // that omits `</head>` entirely — an oversized `<head data-x="...">`
-        // directly followed by `<body>Visible</body>`, with no `</head>`
-        // anywhere — used to have that raw-text scan search for a literal
-        // `</head>` all the way to EOF, discarding the *entire rest of the
-        // document* including the visible body.
+        // raw-text-scan-to-literal-closing-tag suppression as the other five
+        // non-rendered tags. But `<head>`'s closing tag is legally optional —
+        // HTML5, and this parser's own `implicitly_closes`, close it as soon as
+        // non-head content begins — so a document omitting `</head>` entirely,
+        // such as an oversized `<head data-x="...">` directly followed by
+        // `<body>Visible</body>`, had that raw-text scan search for a literal
+        // `</head>` all the way to EOF, discarding the entire rest of the
+        // document including the visible body.
         let oversized_attr = "Q".repeat(5000);
         let html = format!(r#"<head data-x="{oversized_attr}"><body>Visible</body>"#);
         let nodes = parse(&html);
@@ -1977,19 +1960,16 @@ mod tests {
 
     #[test]
     fn oversized_template_nested_inside_itself_hides_everything_up_to_the_outer_close() {
-        // Regression: the oversized-tag fallback used to route `<template>`
-        // through the same raw-text scan as `script`/`style`/`title`
-        // (`consume_raw_text`), which stops at the *first* literal closing
-        // tag and — for these three genuinely raw-text tags — never
-        // pushes a node for the (unparseable) opening tag at all. For a
-        // nested `<template><template>inner</template>leak</template>`
-        // body, that first closing tag is the *inner* one, so the old code
-        // discarded everything up through it, emitted no `template`
-        // element whatsoever, and resumed *normal top-level* parsing
-        // right on "leak" — turning it into a bare top-level text node
-        // (rendered) instead of staying nested inside the outer
-        // template's subtree (hidden by `layout.rs`'s `is_non_rendered`)
-        // the way real HTML5 nesting requires.
+        // Regression: the oversized-tag fallback used to route `<template>` through the
+        // same raw-text scan as `script`/`style`/`title` (`consume_raw_text`), which
+        // stops at the first literal closing tag and — for those three genuinely
+        // raw-text tags — pushes no node for the unparseable opening tag at all. For a
+        // nested `<template><template>inner</template>leak</template>` body, that first
+        // closing tag is the inner one, so the old code discarded everything up through
+        // it, emitted no `template` element, and resumed normal top-level parsing right
+        // on "leak" — making it a bare top-level text node, rendered, instead of staying
+        // nested inside the outer template's subtree, hidden by `layout.rs`'s
+        // `is_non_rendered`, as real HTML5 nesting requires.
         let oversized_attr = "Q".repeat(5000);
         let html = format!(
             r#"<template data-x="{oversized_attr}"><template>inner</template>leak</template><p>Visible</p>"#
@@ -2026,16 +2006,14 @@ mod tests {
 
     #[test]
     fn oversized_textarea_tag_still_renders_its_content_as_raw_text() {
-        // Regression: `textarea` was entirely missing from
-        // `oversized_raw_text_tag_name`'s recognized set — an oversized
-        // `<textarea data-x="...4KiB...">` (its own `>` pushed past
-        // `MAX_TAG_SCAN`) fell all the way through to `parse`'s generic
-        // "unrecognized tag" fallback, which (a) rendered the opening
-        // tag's oversized attribute soup as literal visible text and (b)
-        // tokenized the textarea's real content as ordinary markup
-        // instead of raw text — a `<b>`-looking sequence inside it would
-        // wrongly become a real `<b>` element instead of staying literal,
-        // unlike a normal-sized `<textarea>`.
+        // Regression: `textarea` was missing entirely from
+        // `oversized_raw_text_tag_name`'s recognized set, so an oversized `<textarea
+        // data-x="...4KiB...">` — its own `>` pushed past `MAX_TAG_SCAN` — fell through
+        // to `parse`'s generic unrecognized-tag fallback. That rendered the opening
+        // tag's oversized attribute soup as literal visible text, and tokenized the
+        // textarea's real content as ordinary markup instead of raw text, so a
+        // `<b>`-looking sequence inside it wrongly became a real `<b>` element rather
+        // than staying literal, unlike a normal-sized `<textarea>`.
         let oversized_attr = "Q".repeat(5000);
         let html = format!(r#"<textarea data-x="{oversized_attr}">a<b</textarea><p>Visible</p>"#);
         let nodes = parse(&html);
@@ -2093,16 +2071,14 @@ mod tests {
 
     #[test]
     fn oversized_ordinary_tag_self_closing_and_void_variants_still_work() {
-        // Covers the same behavior `push_oversized_generic_tag` has to
-        // replicate from the normal (non-oversized) tag-push path: an
-        // oversized void element must not push a real stack frame (it
-        // would otherwise swallow later sibling content as its own
-        // children instead of leaving it as a sibling), while an oversized
-        // *non-void* self-closing tag (XHTML-style `/>`) must still open a
-        // real, non-empty frame — real browsers ignore that flag entirely
-        // on an ordinary HTML element, so `<my-widget ... />Visible`
-        // nests "Visible" as `my-widget`'s own content, the same as a
-        // normal-sized `<my-widget ...>Visible` (no closing tag) would.
+        // Covers the behavior `push_oversized_generic_tag` has to replicate from the
+        // normal tag-push path. An oversized void element must not push a real stack
+        // frame, or it would swallow later sibling content as its own children. An
+        // oversized non-void self-closing tag (XHTML-style `/>`) must still open a real,
+        // non-empty frame: real browsers ignore that flag entirely on an ordinary HTML
+        // element, so `<my-widget ... />Visible` nests "Visible" as `my-widget`'s own
+        // content, exactly as a normal-sized `<my-widget ...>Visible` with no closing
+        // tag would.
         let oversized_attr = "Q".repeat(5000);
         let html = format!(r#"<my-widget data-x="{oversized_attr}" />Visible"#);
         let nodes = parse(&html);
@@ -2174,18 +2150,15 @@ mod tests {
 
     #[test]
     fn oversized_ordinary_tag_far_beyond_any_fixed_bound_still_finds_its_real_close() {
-        // Regression: an earlier fix bounded the oversized-attribute search
-        // to a fixed window (`MAX_OVERSIZED_TAG_SCAN`, 256 KiB) and, once
-        // beyond it, resumed parsing mid-attribute instead of at the real
-        // `>` — for a base64 data URI attribute genuinely larger than that
-        // window, e.g. `<img src="...over 256 KiB of base64...">Visible`,
-        // this leaked the remaining attribute-value suffix (and the
-        // literal `">`) as visible PDF text before "Visible", not just
-        // silently dropping content but actively rendering garbage.
-        // `push_oversized_generic_tag`'s search is unbounded now (safe
-        // since `find_tag_end` itself is linear in distance-to-answer, not
-        // window size — see its docs), so an attribute of *any* size still
-        // resolves to its real `>` exactly, with nothing leaked.
+        // Regression: an earlier fix bounded the oversized-attribute search to a fixed
+        // 256 KiB window (`MAX_OVERSIZED_TAG_SCAN`) and, past it, resumed parsing
+        // mid-attribute instead of at the real `>`. For a base64 data URI attribute
+        // larger than that window — `<img src="...over 256 KiB of base64...">Visible` —
+        // this leaked the remaining attribute-value suffix and the literal `">` as
+        // visible PDF text before "Visible", actively rendering garbage rather than just
+        // dropping content. `push_oversized_generic_tag`'s search is unbounded now, safe
+        // because `find_tag_end` is linear in distance-to-answer rather than window size
+        // (see its docs), so an attribute of any size resolves to its real `>` exactly.
         let oversized_attr = "Q".repeat(300 * 1024);
         let html = format!(r#"<img src="{oversized_attr}">Visible"#);
         let nodes = parse(&html);
@@ -2213,19 +2186,16 @@ mod tests {
 
     #[test]
     fn long_run_of_single_quoted_oversized_divs_is_linear_not_quadratic() {
-        // Regression: `find_tag_end`'s old fast pre-check
-        // (`!window.contains('"') && !window.contains('\'')`) was safe when
-        // `window` was always `MAX_TAG_SCAN`-bounded, but `oversized_tag_body_start`/
-        // `push_oversized_generic_tag` call it unbounded, on the entire
-        // remaining document. For many single-quoted oversized tags in a
-        // row with no `"` anywhere in the whole document,
-        // `window.contains('"')` alone had to scan the *entire* remaining
-        // document to confirm that absence, on every single tag — genuinely
-        // O(n^2) (confirmed by timing before the fix: 16,000 such tags took
-        // over two minutes, each doubling roughly quadrupling the time).
-        // Removed that pre-check entirely in favor of `window.find('>')`,
-        // which doesn't need to prove anything about the rest of the
-        // window once it finds a match.
+        // Regression: `find_tag_end`'s old fast pre-check (`!window.contains('"') &&
+        // !window.contains('\'')`) was safe while `window` was always
+        // `MAX_TAG_SCAN`-bounded, but `oversized_tag_body_start` and
+        // `push_oversized_generic_tag` call it unbounded, over the entire remaining
+        // document. For many single-quoted oversized tags in a row with no `"` anywhere
+        // in the document, `window.contains('"')` alone had to scan the whole remainder
+        // to confirm that absence, on every tag — genuinely O(n²). Timing before the fix:
+        // 16,000 such tags took over two minutes, and each doubling roughly quadrupled
+        // it. That pre-check is gone in favour of `window.find('>')`, which need prove
+        // nothing about the rest of the window once it finds a match.
         let candidate = format!("<div data-x='{}'>", "A".repeat(5000));
         let html = candidate.repeat(2_000);
         let start = std::time::Instant::now();
@@ -2405,18 +2375,15 @@ mod tests {
 
     #[test]
     fn ordinary_closing_tag_with_a_browser_tolerated_attribute_still_matches_its_opener() {
-        // Regression: `handle_closing_tag` took *everything* before the
-        // first `>` as the tag name (only trimmed, never split at
-        // whitespace) — so `</div data-x="...">` took the whole
-        // `"div data-x=\""`-shaped blob as the "name", which never matches
-        // the real open `div`, leaving it (and everything after) nested
-        // inside the still-open element instead of closing it. Worse, if
-        // that stray attribute value itself contained a literal `>` (real
-        // browsers *do* enter a quote-aware state here, same as for a
-        // raw-text closing tag), the naive un-quote-aware `>` search
-        // stopped at the quoted one and leaked the rest of the attribute
-        // value plus genuine subsequent content as visible text — the
-        // reported repro: `<div>One</div data-x=">secret">Two`.
+        // Regression: `handle_closing_tag` took everything before the first `>` as the
+        // tag name — trimmed, never split at whitespace — so `</div data-x="...">` took
+        // the whole `"div data-x=\""`-shaped blob as the name. That never matches the
+        // real open `div`, leaving it, and everything after, nested inside the still-open
+        // element instead of closing it. Worse, if that stray attribute value contained a
+        // literal `>` — real browsers do enter a quote-aware state here, as for a
+        // raw-text closing tag — the un-quote-aware `>` search stopped at the quoted one
+        // and leaked the rest of the attribute value plus genuine following content as
+        // visible text. The reported repro: `<div>One</div data-x=">secret">Two`.
         let nodes = parse(r#"<div>One</div data-x=">secret">Two"#);
         assert_eq!(
             nodes.len(),

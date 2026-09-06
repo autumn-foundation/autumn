@@ -38,6 +38,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`declaration`/`signature`/`body`) and the document carries the derivation's
   limits, so it cannot be read as more than it is. See
   `docs/guide/architecture-graph.md`.
+- **macros:** `#[autumn_web::main]` takes optional arguments that reach the
+  Tokio runtime it builds. Previously the attribute discarded its argument
+  list entirely (`_attr`), so the only way to size a worker pool, name the
+  worker threads, or install an `on_thread_start` hook was to abandon the
+  macro and hand-roll `main` — which also meant re-implementing the two
+  compile-context side effects it exists for, the `autumn.toml` root and the
+  `/actuator/info` build provenance, both of which must be expanded in the
+  *app* crate to be correct. The attribute owns the
+  `tokio::runtime::Builder` call, so the knobs are now arguments on it:
+  `flavor` (`"multi_thread"`, the default, or `"current_thread"`),
+  `worker_threads`, `max_blocking_threads`, `thread_name`,
+  `thread_stack_size`, `thread_keep_alive` (a duration string such as
+  `"30s"`, the same spelling `#[throttle(per = ...)]` accepts), and
+  `configure` — the path of a `fn(&mut tokio::runtime::Builder)` that runs
+  last, after the declarative arguments, as the escape hatch for every
+  `Builder` method the list does not name (`on_thread_start`,
+  `global_queue_interval`, …) and as the way to override one of them. The
+  numeric arguments take arbitrary expressions rather than only literals, so
+  `worker_threads = std::thread::available_parallelism().map_or(4, |n| n.get())`
+  is as valid as `worker_threads = 4`.
+
+  With no arguments the expansion is byte-for-byte what it was before, so
+  nothing changes for an app that does not opt in. What *does* change is that
+  an argument list is no longer silently dropped: a typo (`worker_thread`), a
+  repeated argument, an unknown `flavor`, a literal `0` where tokio would
+  panic at startup, a malformed `thread_keep_alive`, and a `worker_threads`
+  paired with `flavor = "current_thread"` (where the runtime has no worker
+  pool to size and the value would do nothing) are each a compile error naming
+  the problem. The `configure` path is bound to a typed `fn` pointer before it
+  is called, so a wrong signature is reported against the `configure = ...`
+  the user wrote rather than inside the expansion. Covered by expansion unit
+  tests in `autumn-macros/src/main_macro.rs`, by two compile-fail fixtures for
+  the refusals (`tests/compile-fail/main_unknown_runtime_arg.rs`,
+  `tests/compile-fail/main_worker_threads_current_thread.rs`), and — because
+  trybuild `pass` fixtures are compiled *and run* — by two behavioral ones
+  (`tests/compile-pass/main_runtime_args.rs`,
+  `tests/compile-pass/main_runtime_current_thread.rs`) that boot the tuned
+  runtime and assert the settings actually landed on it: the blocking thread
+  carries the requested `thread_name`, and the `configure` hook's
+  `on_thread_start` has fired. Documented in the getting-started guide under
+  "Tuning the Tokio runtime".
+
 - **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
   update validation left after #1719/#1742/#1778/#1801 (issue #1751).
   `must_match` — like `custom`, `ip` on `Option<_>` fields, and
@@ -539,6 +581,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `actions/attest-build-provenance`, and autumn's own `examples/hello` runs the
   gate in the publish gate (`scripts/check-posture-gate.sh`). See
   `docs/guide/posture-gate.md`.
+
+  `posture-gate.yml` and `ci.yml` still install the `autumn` CLI pinned to
+  the app's own `autumn-web` version by default (#2495): pinning alone left
+  every newly scaffolded gate red between a subcommand landing and the next
+  release, and stuck red afterwards until someone re-ran `autumn upgrade
+  --apply` — but always installing the latest published release instead
+  would trade that for a worse problem, running these gates under a CLI
+  this project's own compatibility check (`autumn doctor`) calls
+  incompatible the moment a minor release ships, with the gap only growing
+  as later, unrelated releases ship. So only `posture-gate.yml`'s verdict
+  job — which never compiles the pull request, only reads JSON — falls
+  back, for that run alone, when the pinned CLI lacks `routes posture`: it
+  probes forward through the next few releases and installs the first one
+  that has it, landing on a specific, bounded release rather than a moving
+  "latest" that keeps drifting from the app's own pin. The fallback does
+  not resolve itself — the workflow still installs the app's pinned
+  `autumn-web` version first on every run — so it keeps firing until the
+  app raises that pin (and reruns `autumn upgrade --apply`) to a release
+  that already has the command. `ci.yml`'s `a11y verify` and `routes audit`
+  steps (like
+  `posture-gate.yml`'s own `manifest` job) compile and introspect the pull
+  request's own code, so they never fall back — they now probe for their
+  subcommand the same way `posture-gate.yml`'s verdict job already did, and
+  fail with an actionable message naming the pin to raise, rather than a
+  raw unknown-subcommand error. Scaffolded workflow YAML only; no new or
+  changed CLI surface for agents to reach for. [no-plugin]
 
 - **Build-time authority envelope for agent-operable handlers (#1691):** an
   endpoint exposed as an MCP tool is an action an autonomous agent can take
@@ -1733,6 +1801,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused/reset split below — that one classifies *which* connection failures
   count, this one stops the predecessor being killed mid-drain.
   [no-plugin] — test-only; no API or behaviour change. (#1747, #2372, #2462)
+- **`route_macro` lost a guarded handler's OpenAPI response schema under
+  `#[throttle]`/`#[step_up]` (issue #2516):** #2488 moved the
+  `#[throttle]`/`#[step_up]` auth/rate-limit checks out of the handler body
+  and into a sibling `FromRequestParts` gate, but stopped emitting the
+  guard's marker const (`__AUTUMN_THROTTLE_ROUTE_ID` /
+  `__AUTUMN_STEP_UP_MAX_AGE`) into the handler body — `#[secured]` still
+  does. `api_doc::infer_response_body`'s recovery of a guarded handler's
+  pre-rewrite return type (#1677/#2484) requires that marker to trust the
+  `__autumn_inner` binding it reads the type back from, so a
+  `#[throttle]`/`#[step_up]`-guarded route written above `#[post]`/etc.
+  silently lost its documented `Json<T>` response the moment #2488 merged.
+  Both macros now emit their marker const into the handler body a second
+  time (unused there, `#[allow(dead_code)]`), mirroring the pattern
+  `secured_macro` already used. Caught as a fully red `autumn-macros` test
+  suite on `trunk-dev` itself (4 `route::tests::route_macro_infers_response_schema_*`
+  tests), not by a diff — two individually-green PRs (#2484, #2488) composed
+  into a broken `trunk-dev`. [no-plugin] — restores previously-documented
+  behavior; no new or changed API.
+
 - **hot-upgrade example: `live_upgrade` test no longer conflates a mid-flight
   reset with a refused connection, and no longer lets an unbounded number of
   resets pass silently (issue #2462):**

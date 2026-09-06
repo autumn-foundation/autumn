@@ -983,6 +983,42 @@ pub use autumn_macros::mailer_preview;
 ///         .await;
 /// }
 /// ```
+///
+/// # Tuning the runtime
+///
+/// The attribute owns the `tokio::runtime::Builder` call, so its optional
+/// arguments reach the builder knobs an app would otherwise have to drop the
+/// macro to set: `flavor` (`"multi_thread"`, the default, or
+/// `"current_thread"`), `worker_threads`, `max_blocking_threads`,
+/// `thread_name`, `thread_stack_size`, `thread_keep_alive` (a duration string
+/// such as `"30s"`), and `configure` — the path of a
+/// `fn(&mut tokio::runtime::Builder)` that runs last, after the others, for
+/// everything the list does not name.
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+/// use autumn_web::reexports::tokio;
+///
+/// #[get("/")]
+/// async fn index() -> &'static str { "hi" }
+///
+/// fn tune_runtime(builder: &mut tokio::runtime::Builder) {
+///     builder.global_queue_interval(64);
+/// }
+///
+/// #[autumn_web::main(worker_threads = 4, thread_name = "autumn-worker", configure = tune_runtime)]
+/// async fn main() {
+///     autumn_web::app()
+///         .routes(routes![index])
+///         .run()
+///         .await;
+/// }
+/// ```
+///
+/// With no arguments the runtime is `Builder::new_multi_thread().enable_all()`
+/// — tokio's defaults, which is what most apps should keep. Autumn's own
+/// background work (jobs, scheduled tasks, the mailer) shares this runtime, so
+/// a worker count set below what the machine offers throttles that too.
 pub use autumn_macros::main;
 /// Annotate an async function as a deterministic simulation test (S-1797).
 ///
