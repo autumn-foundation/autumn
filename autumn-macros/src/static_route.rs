@@ -302,9 +302,18 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let path_params_tokens = crate::api_doc::emit_path_param_slice(&path_params);
     let seo_defaults = attrs.seo.emit();
 
+    // ── Architecture-graph node (#1747) ─────────────────────────
+    // `#[static_get]` builds its own `Route` rather than delegating to
+    // `crate::route`, so it registers its own graph node too — marked as a
+    // static route, which is the one fact that distinguishes it from a `#[get]`.
+    let graph_descriptor =
+        crate::graph::emit_route_descriptor(&input_fn, "GET", &quote! { #path }, true);
+
     quote! {
         #leading_guard_items
         #input_fn
+
+        #graph_descriptor
 
         #[doc(hidden)]
         #vis fn #route_info_name() -> ::autumn_web::Route {

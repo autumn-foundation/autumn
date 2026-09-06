@@ -95,6 +95,17 @@
           "provenance": "provable"
         },
         {
+          "path": "/actuator/graph",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
           "path": "/actuator/health",
           "method": "GET",
           "name": "actuator",

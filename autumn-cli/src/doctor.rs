@@ -6391,15 +6391,19 @@ fn acme_online_probe_domains(config: &AcmeDoctorConfig) -> Vec<String> {
 
 /// Inspect the stored ACME certificate for the CONFIGURED domains under the
 /// configured directory namespace and grade its expiry, offline (reuses the
-/// #1603 `inspect_leaf` path). `cert_dir` must be the namespaced store directory
-/// (`{cache_dir}/{directory_label}/`), NOT the bare cache dir; `domains` is the
-/// active `acme.domains`. Returns [`TlsDoctorData::NotConfigured`] when no cert
-/// for the configured domains is stored yet (a first run before issuance is not
-/// a failure).
-fn resolve_acme_stored_cert_data(cert_dir: &std::path::Path, domains: &[String]) -> TlsDoctorData {
+/// #1603 `inspect_leaf` path). `cache_dir` + `directory_label` are the same
+/// pair `FsAcmeStore` is constructed from; `domains` is the active
+/// `acme.domains`. Returns [`TlsDoctorData::NotConfigured`] when no cert for
+/// the configured domains is stored yet (a first run before issuance is not a
+/// failure).
+fn resolve_acme_stored_cert_data(
+    cache_dir: &std::path::Path,
+    directory_label: &str,
+    domains: &[String],
+) -> TlsDoctorData {
     // Inspect EXACTLY the cert the runtime loads for these domains
     // (`CertId::from_domains(domains)`), not whichever file is newest.
-    let Some((chain, key)) = configured_acme_cert_pair(cert_dir, domains) else {
+    let Some((chain, key)) = configured_acme_cert_pair(cache_dir, directory_label, domains) else {
         return TlsDoctorData::NotConfigured;
     };
 
@@ -6429,24 +6433,50 @@ fn resolve_acme_stored_cert_data(cert_dir: &std::path::Path, domains: &[String])
     }
 }
 
-/// Locate the stored `{cert_id}.chain.pem` + `{cert_id}.key.pem` pair for the
-/// CONFIGURED domains in `cert_dir`, where `cert_id` is derived from `domains`
-/// exactly as `autumn_web::acme::store::CertId::from_domains` does.
+/// Locate the stored chain+key pair for the CONFIGURED domains under
+/// `{cache_dir}/{directory_label}/` — the same directory namespace the
+/// runtime's `FsAcmeStore` loads from. Inspecting the cert id derived from
+/// the ACTIVE `acme.domains` (rather than whichever file is newest) matches
+/// what `build_acme_tls_listener` loads: if `domains` changed and old cert
+/// files remain, an expired-but-ignored old cert must not fail `--strict`,
+/// and a healthy old cert for other domains must not be reported as the
+/// stored cert for these domains. Returns `None` (→ "no cert yet for the
+/// configured domains", a benign first-run state) when either half is
+/// absent.
 ///
-/// `cert_dir` MUST be the configured directory namespace
-/// (`{cache_dir}/{directory-label}/`) — the one the runtime's `FsAcmeStore`
-/// actually loads from. Inspecting the cert id derived from the ACTIVE
-/// `acme.domains` (rather than whichever file is newest) matches what
-/// `build_acme_tls_listener` loads: if `domains` changed and old cert files
-/// remain, an expired-but-ignored old cert must not fail `--strict`, and a
-/// healthy old cert for other domains must not be reported as the stored cert
-/// for these domains. Returns `None` (→ "no cert yet for the configured
-/// domains", a benign first-run state) when either half is absent, mirroring
-/// `FsAcmeStore::load_cert`'s treatment of a partial pair as absent.
+/// This crate's `tls` feature — on by default — pulls in `autumn-web/acme`
+/// (see `tls = [...]` in `Cargo.toml`); this crate's OWN, separate `acme`
+/// feature flag is not in `default` and is not what gates
+/// `autumn_web::acme`'s availability, so `tls` is the cfg to key off here.
+/// When it's enabled, this reuses `FsAcmeStore::find_cert_for_domains`
+/// directly (issue #1864) rather than re-deriving the on-disk layout, so
+/// doctor and the runtime store can never drift apart on where a certificate
+/// lives. The feature-less fallback below re-derives the same layout by
+/// hand, since it cannot name the feature-gated `FsAcmeStore` type at all.
+#[cfg(feature = "tls")]
 fn configured_acme_cert_pair(
-    cert_dir: &std::path::Path,
+    cache_dir: &std::path::Path,
+    directory_label: &str,
     domains: &[String],
 ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    autumn_web::acme::store::FsAcmeStore::new(cache_dir, directory_label)
+        .find_cert_for_domains(domains)
+}
+
+/// Feature-less fallback: replicates `FsAcmeStore::find_cert_for_domains`'s
+/// on-disk layout and `CertId::from_domains`'s hashing by hand, because
+/// `autumn_web::acme` is not compiled in without this crate's `tls` feature
+/// (see the sibling `#[cfg(feature = "tls")]` implementation above). Keep in
+/// EXACT sync with `store.rs` — a `#[cfg(feature = "tls")]` test
+/// (`doctor_cert_id_matches_store`) asserts `acme_cert_id` stays byte-for-byte
+/// equal to `CertId::from_domains`.
+#[cfg(not(feature = "tls"))]
+fn configured_acme_cert_pair(
+    cache_dir: &std::path::Path,
+    directory_label: &str,
+    domains: &[String],
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let cert_dir = cache_dir.join(directory_label);
     let id = acme_cert_id(domains);
     let chain = cert_dir.join(format!("{id}.chain.pem"));
     let key = cert_dir.join(format!("{id}.key.pem"));
@@ -6458,11 +6488,12 @@ fn configured_acme_cert_pair(
 }
 
 /// The stable certificate id for a domain set, replicating
-/// `autumn_web::acme::store::CertId::from_domains` (which lives behind the
-/// `acme` feature while this doctor path also compiles feature-less). Keep in
-/// EXACT sync with `store.rs`: sort + dedup the domains, SHA-256 each with a
-/// trailing NUL separator, and hex-encode the first 16 digest bytes. A
-/// `#[cfg(feature = "acme")]` test asserts this equals the store's derivation.
+/// `autumn_web::acme::store::CertId::from_domains`. Only compiled for the
+/// feature-less fallback above (or under test, where the drift-guard
+/// comparison needs it too even when `tls` is enabled): sort + dedup the
+/// domains, SHA-256 each with a trailing NUL separator, and hex-encode the
+/// first 16 digest bytes.
+#[cfg(any(not(feature = "tls"), test))]
 fn acme_cert_id(domains: &[String]) -> String {
     use sha2::{Digest as _, Sha256};
     let mut sorted: Vec<&str> = domains.iter().map(String::as_str).collect();
@@ -8305,8 +8336,11 @@ pub fn run(opts: DoctorOptions) {
             // Offline: stored certificate expiry (reuses the #1603 inspect path).
             // Scan ONLY the configured directory namespace the runtime store loads
             // from ({cache_dir}/{directory_label}/), never sibling namespaces.
-            let cert_dir = acme.cache_dir.join(&acme.directory_label);
-            let stored = resolve_acme_stored_cert_data(&cert_dir, &acme.domains);
+            let stored = resolve_acme_stored_cert_data(
+                &acme.cache_dir,
+                &acme.directory_label,
+                &acme.domains,
+            );
             tasks.push(Box::new(move || check_acme_stored_cert_impl(&stored)));
 
             // Offline: the private-CA trust anchor, if one is configured. A bad
@@ -13020,7 +13054,8 @@ directory = \"production\"
     #[test]
     fn acme_scan_inspects_configured_domain_cert() {
         let dir = tempfile::tempdir().unwrap();
-        let cert_dir = dir.path().join("production");
+        let label = "production";
+        let cert_dir = dir.path().join(label);
         std::fs::create_dir_all(&cert_dir).unwrap();
 
         let configured = vec!["app.example.com".to_owned()];
@@ -13038,14 +13073,14 @@ directory = \"production\"
         // lookup finds nothing, so the old cert is NOT reported as the stored one.
         write_pair(&old_id);
         assert!(
-            configured_acme_cert_pair(&cert_dir, &configured).is_none(),
+            configured_acme_cert_pair(dir.path(), label, &configured).is_none(),
             "a cert for different domains must not be reported as the stored cert"
         );
 
         // Now add the configured-domains cert alongside the old one: the lookup
         // targets EXACTLY the configured id, ignoring the old file.
         write_pair(&configured_id);
-        let picked = configured_acme_cert_pair(&cert_dir, &configured)
+        let picked = configured_acme_cert_pair(dir.path(), label, &configured)
             .expect("configured-domains cert must be found");
         assert!(
             picked.0.to_string_lossy().contains(&configured_id),
@@ -13064,31 +13099,66 @@ directory = \"production\"
     #[test]
     fn acme_scan_absent_configured_cert_is_not_stored() {
         let dir = tempfile::tempdir().unwrap();
-        let cert_dir = dir.path().join("production");
+        let label = "production";
+        let cert_dir = dir.path().join(label);
         std::fs::create_dir_all(&cert_dir).unwrap();
         let domains = vec!["app.example.com".to_owned()];
         let id = acme_cert_id(&domains);
 
         // Nothing stored yet.
-        assert!(configured_acme_cert_pair(&cert_dir, &domains).is_none());
+        assert!(configured_acme_cert_pair(dir.path(), label, &domains).is_none());
 
         // Only the chain (no key) — mirrors FsAcmeStore treating a partial pair as
         // absent.
         std::fs::write(cert_dir.join(format!("{id}.chain.pem")), b"chain").unwrap();
-        assert!(configured_acme_cert_pair(&cert_dir, &domains).is_none());
+        assert!(configured_acme_cert_pair(dir.path(), label, &domains).is_none());
 
         // The graded result for an absent cert is the benign "not configured yet".
         assert_eq!(
-            resolve_acme_stored_cert_data(&cert_dir, &domains),
+            resolve_acme_stored_cert_data(dir.path(), label, &domains),
             TlsDoctorData::NotConfigured
+        );
+    }
+
+    // Codex review (#1864): a directory (or any other non-regular node)
+    // occupying a cert path is a genuinely broken cache, not an absent one.
+    // It must grade as Invalid (a --strict FAIL), never the benign
+    // NotConfigured Pass — otherwise doctor blesses a cache that will fail to
+    // load at boot.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn acme_scan_occupied_directory_is_invalid_not_not_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let label = "production";
+        let cert_dir = dir.path().join(label);
+        let domains = vec!["app.example.com".to_owned()];
+        let id = acme_cert_id(&domains);
+
+        // The chain path is occupied by a directory instead of a file; the
+        // key path is a normal (if bogus) file.
+        std::fs::create_dir_all(cert_dir.join(format!("{id}.chain.pem"))).unwrap();
+        std::fs::write(cert_dir.join(format!("{id}.key.pem")), b"key").unwrap();
+
+        assert!(
+            configured_acme_cert_pair(dir.path(), label, &domains).is_some(),
+            "an occupied path must be reported as present, not absent"
+        );
+        assert!(
+            matches!(
+                resolve_acme_stored_cert_data(dir.path(), label, &domains),
+                TlsDoctorData::Invalid { .. }
+            ),
+            "an occupied-but-unreadable cert must FAIL --strict, not pass as NotConfigured"
         );
     }
 
     // Drift guard (#1608, Codex): the doctor's feature-less replica of the cert-id
     // hashing MUST stay byte-for-byte equal to the store's
-    // `CertId::from_domains`. Only compiled with the `acme` feature (which pulls
-    // in `autumn_web::acme`), so the two derivations are compared directly.
-    #[cfg(feature = "acme")]
+    // `CertId::from_domains`. Only compiled with this crate's `tls` feature
+    // (on by default — it pulls in `autumn_web::acme`; this crate's own,
+    // separate `acme` feature is not what gates it, see #1864), so the two
+    // derivations are compared directly.
+    #[cfg(feature = "tls")]
     #[test]
     fn doctor_cert_id_matches_store() {
         let cases: &[&[&str]] = &[

@@ -21,6 +21,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/guide/deployment.md`'s "Your `autumn.toml` is deployed alongside the
   binary" section for the full behavior this closes out. [no-plugin]
 
+- **testing:** a real-ACME end-to-end test drives the ACME order state
+  machine (order → HTTP-01 → finalize → issue) against a real, independently-
+  implemented ACME server — [Pebble](https://github.com/letsencrypt/pebble),
+  run as a Docker container via `testcontainers`' `host-port-exposure` tunnel
+  — asserting a genuine, parseable, not-yet-expired certificate is obtained
+  and hot-swapped into the live TLS resolver. Every other ACME test drives
+  the same `AcmeRenewalTask` against an in-process fake CA; this closes the
+  test-depth gap explicitly deferred from #1608/PR #1858 (issue #1863), so a
+  protocol-level regression (challenge ordering, the finalize payload shape,
+  polling) that the fake CA cannot see would still be caught. Wired into a
+  dedicated, Docker-gated CI step separate from both the fast ACME lane (no
+  Docker/network) and the general Docker-dependent-tests sweep. Test-only
+  coverage, no new agent-facing surface. [no-plugin]
+- **graph:** a queryable architecture graph derived from the app's own macros
+  (issue #1747). Autumn already declares every architectural element through
+  proc-macros it owns, but none of that survived expansion as something you
+  could ask a question of. It does now: `#[route]`/`#[static_get]`,
+  `#[model]`, `#[repository]` and `#[job]`/`#[scheduled]`/`#[task]` each
+  register a node, and the framework assembles them into a typed graph at link
+  time — nodes for every declared element (each route carrying its mounted path
+  and declared auth requirement, each model its table), edges for
+  repository→model declarations, for the repository a handler takes as an
+  extractor, and for every model, table or raw-SQL table name a route or job
+  body mentions. `autumn graph show|touches <NAME>|impact <NAME>` answers
+  against it — "which routes and jobs touch `posts`", "what does changing
+  `Post` break" — and `--check` fails the build when a declared element or an
+  edge quietly disappears. The same graph is served from `/actuator/graph`
+  (sensitive-gated, like `/env`) so a running single binary can answer
+  questions about itself with no side file to go stale. Because node identity
+  comes from the declaration, nothing can fall out silently:
+  `examples/reddit-clone/tests/architecture_graph.rs` censuses the reference
+  app's *sources* for every declaring attribute, runs the binary's own graph
+  dump, and fails when the two disagree — including a hand-verified
+  ground-truth list that pins `impact Post` to total recall over both access
+  styles the app uses (repository extractors and raw Diesel), the
+  `#[repository(api = …)]` auto-API routes, and a scheduled task that reaches
+  the table only through `sql_query("UPDATE posts …")`. Edges from a route or
+  job are a name-based derivation over that item's own tokens, deliberately
+  biased toward over-reporting; every edge carries its provenance
+  (`declaration`/`signature`/`body`) and the document carries the derivation's
+  limits, so it cannot be read as more than it is. See
+  `docs/guide/architecture-graph.md`.
 - **macros:** `#[autumn_web::main]` takes optional arguments that reach the
   Tokio runtime it builds. Previously the attribute discarded its argument
   list entirely (`_attr`), so the only way to size a worker pool, name the
@@ -1470,8 +1512,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliberately differ (no Unix socket, no in-place upgrade handoff). Issue
   #1603.
 
+- **ci:** `autumn-cli`'s consolidated `cli_tests` binary now gets the same
+  discovery sweep as the `autumn` crate's `integration_tests` binary
+  (#1945): a bare `--ignored` run over `cli_tests` in ci.yml's
+  Docker-dependent-tests step, so a new `#[ignore = "requires Docker
+  (testcontainers)"]` test in any `autumn-cli/tests/integration/*.rs` module
+  runs in CI automatically. Before this, only two hand-picked filters
+  (`offsite`, `db_scrub`) ran anything from that binary, leaving 46 Docker
+  tests across 8 modules (`db.rs`, `db_pull.rs`,
+  `generate_lock_version_postgres.rs`, `generate_references_postgres.rs`,
+  `migrate_down.rs`, `schema_migrate.rs`, `schema_pull.rs`, `test_command.rs`)
+  dark since they were written — PR #1985's noted follow-up. The sweep's
+  `--skip` list routes the binary's other `#[ignore]`d tests — the ones that
+  scaffold and cargo-check/build/run a fresh generated project instead of
+  touching Docker — to `generator-conformance.yml`, where 15 of them (across
+  `api_scaffold`, `cloud_native_scaffold`, `generate_position_scaffold`,
+  `scaffold_belongs_to`, `scaffold_bulk_delete`, `scaffold_rich_text`,
+  `scaffold_search`, `scaffold_trash`, `seed_model_linking`, `serve`, and two
+  in `scaffold_form_for`) are now named there for the first time, closing the
+  same gap for that half of the binary. The sweep also `--skip`s the
+  pre-existing `generate_json_postgres.rs` Docker test, which already ran in
+  `generator-conformance.yml` before this change, so it isn't doubled up.
+  Two new `autumn-cli/tests/integration/repo_hygiene.rs` tests guard both
+  halves of the wiring going forward. [no-plugin]
+
 ### Changed
 
+- **ci: the Docker/testcontainer sweep runs as its own `Test (Docker)` job
+  instead of the last step of `Test (ubuntu-latest)`:** as step 16 of that job
+  it inherited a disk already filled by the whole workspace build plus eight
+  feature-flipped rebuilds, and died compiling its own dependencies
+  (`bollard`, `bollard-stubs`, a re-linked `autumn-web`) with `No space left on
+  device` and 23–41 MB free — before a single test body ran, with steps 1–15
+  and both the macOS and Windows legs green. The two steps move verbatim (the
+  diff is purely additive: a job boundary inserted in front of them), so the
+  same commands run the same sweep, on a runner whose disk they are the only
+  claimant of. Branch protection still names only the per-OS `Test (…)` checks,
+  so `Test (Docker)` needs adding there to block merge again. [no-plugin] —
+  CI-only; no API, behaviour or feature change. (#1747)
+- **acme:** [no-plugin] Internal cleanup, no behavior change (#1864): the owner-only
+  temp-write-then-rename idiom, previously duplicated between
+  `acme::store::FsAcmeStore` and the failure-capture capsule writer, is now
+  one shared helper; `FsAcmeStore` gained a `find_cert_for_domains`/
+  `list_certs` API that `autumn doctor`'s ACME preflight reuses instead of
+  re-deriving the on-disk cert-path layout by hand; and the ACME renewal
+  spawn site queries fleet-distribution through a named
+  `SchedulerCoordinator`/`SchedulerBackend` predicate instead of matching the
+  scheduler config enum inline.
 - **plugin-conformance:** **Breaking:** `plugin_conformance::ConformanceConfig`
   gains a `contract` field and is now `#[non_exhaustive]`, so it can no longer
   be built with a struct literal — use `ConformanceConfig::new(name)` and the
@@ -1938,6 +2025,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that runs a handler through `#[static_get]` then `#[cached]` before the
   aliased guard, confirmed red (the marker present but buried, no compile
   error) before the fix and green after.
+- **Database pool refusals echoed credentials into the boot log (issue
+  #1905):** the pool's boot-time refusals name the offending target so the
+  message is actionable, and did so verbatim. `setup_database` surfaces
+  `PoolError` as `"Failed to create database pool: {e}"` and the run path logs
+  it through `tracing::error!`, so under `log.format = "json"` a password
+  reached the structured log stream — one line after `format_config_summary`
+  had masked the same URL. Every refusal in the pool module now routes its
+  target through a redactor: userinfo passwords are replaced, and for a
+  Postgres target or one naming no backend at all the query string goes too,
+  since `?password=`, `?sslpassword=` and `?api_key=` are real spellings that
+  a userinfo check never sees and an unclassifiable target offers no way to
+  enumerate. A SQLite target passes through whole — a local file URI carries
+  no credentials, and its query string (`mode=ro`, `mode=memory`,
+  `cache=shared`) is the diagnostic detail the replica and read-only messages
+  exist to report. The libpq keyword/value form (`host=db user=app
+  password=hunter2`) is rebuilt from an allowlist of the keys that identify
+  the target (`host`, `hostaddr`, `port`, `dbname`, `user`) — an allowlist
+  rather than a `password`/`sslpassword` denylist, so a key this code has
+  never heard of cannot default to being printed. Anything the redactor cannot
+  classify — a malformed keyword/value string among them — is masked outright:
+  the default is to hide, and the one exception is a single path-shaped token
+  carrying no `=`, `@`, `?` or whitespace, so a bare filesystem path stays
+  legible where naming it is the whole value of the message.
+
+- **SQLite pool construction accepted a target that names no backend (issue
+  #1905):** under `--features sqlite`, `build_sqlite_pool` guarded only
+  against a Postgres target. Everything else fell through to
+  `normalize_sqlite_target`, which strips the `sqlite:` / `sqlite://` schemes
+  and passes anything it does not recognize along verbatim — as a
+  **filename** — so a `mysql://…` URL, a typo of the scheme
+  (`sqllite:///app.db`) or a bare filesystem path (`/var/lib/app.db`) built a
+  pool over a junk file rather than refusing. On the ordinary boot path
+  `DatabaseConfig::validate` already rejects those shapes, so this was not a
+  live misboot for an app configured through `autumn.toml`; the gap was in
+  the **public** `create_pool` / `create_topology` / `create_shard_topology`
+  API, which a programmatically-built `DatabaseConfig` or a custom
+  `DatabasePoolProvider` reaches without that screen. The pool is the layer
+  that decides what the string *means*, so it now decides the same way
+  everything else does: it accepts only a target `DatabaseBackend::detect`
+  classifies as SQLite — the same predicate `autumn doctor`, the generator's
+  DDL mapping and `autumn migrate` use — and its refusal names both the
+  offending target and the accepted spellings (`sqlite:<path>`,
+  `sqlite://<path>`, `file:<path>`). This makes the runtime match the
+  published contract that a bare filesystem path is not a recognized SQLite
+  target.
+
+- **The SQLite backend's own unit tests never ran in CI (issue #1905):** the
+  `sqlite-runtime` job builds the crate, lints it with `clippy --lib`, then
+  runs `cargo test … --test <name>`. `--test` selects test *targets*, so the
+  ~33 `#[cfg(feature = "sqlite")]` unit tests inside the crate — pool sizing,
+  the replica rejections, in-memory/read-only target classification, provider
+  dispatch, the sharding refusals, the sim substrate — were run by nothing.
+  Nor were they even *compiled*: `clippy --lib` without `--all-targets` does
+  not build `#[cfg(test)]` code, so the crate's unit-test tree had never been
+  type-checked under the backend flip. Under that blind spot the ungated pool
+  and topology tests sitting beside them had rotted into 10 hard failures
+  against it, because their fixtures hard-code `postgres://` URLs the SQLite
+  pool refuses. Those
+  fixtures are now backend-parametric (the mechanics they assert — `max_size`,
+  the connect-timeout → wait/create mapping, replica retention, the read-pool
+  fallback — are backend-independent, so they now run on *both* backends
+  rather than being silenced on one), and the job gained a
+  `--features sqlite --lib` step covering every module that carries
+  SQLite-specific logic. The `sqlite_json_field_conversion` `[[test]]` target
+  (#1341), declared in `autumn/Cargo.toml` and named by no CI lane, is now
+  run by the integration step alongside its siblings.
+
+- **ci: `live_upgrade` no longer fails because the hot-upgrade example inherits
+  the dev profile's 1-second drain budget:** the test asserts the production
+  guarantee that a predecessor drains and exits 0 after handing over, but ran
+  under the `dev` profile, which shortens `shutdown_timeout_secs` from the 30s
+  default to 1s so Ctrl-C is snappy while developing. The load loop keeps
+  driving traffic for 3.5s past the cutover, so that budget expires while
+  requests are still arriving and whatever is in flight is aborted
+  (`exit_code: 1`) — nothing wrong with the upgrade path, just a budget shorter
+  than the load window. The test now pins `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS`
+  to the production default, exactly as it already pins the prestop grace.
+  Reproduced locally under CPU oversubscription (which also disproved the
+  intuitive "slow cutover" explanation — it reproduces with the cutover
+  completing in 135 ms), and verified non-hiding: under the same load the
+  connection assertions still fired on their own, so the drain budget was not
+  what was holding them up. Independent of, and complementary to, the
+  refused/reset split below — that one classifies *which* connection failures
+  count, this one stops the predecessor being killed mid-drain.
+  [no-plugin] — test-only; no API or behaviour change. (#1747, #2372, #2462)
+- **`autumn new`'s starter template shipped three cookie-consent routes that
+  failed `autumn routes audit` (issue #1214 follow-up):** the cookie-consent
+  banner feature added `POST /consent/accept`, `POST /consent/reject`, and
+  `GET /consent/manage` to `main.rs.tmpl`, but — unlike every other starter
+  handler — never marked them `#[public]`, so a fresh `autumn new` app failed
+  its own generated CI's routes-audit gate before a single line of app code
+  was written. Invisible until now: `scaffolded_app_passes_routes_audit_gate`
+  (added for #2154 specifically to catch this class of regression) was one of
+  the `cli_tests` tests #1945 revived — it had never run in CI before. Added
+  `#[public]` to all three handlers, matching the pattern documented right
+  above them in the template. [no-plugin] — restores previously-documented
+  behavior; no new or changed API.
 
 - **`route_macro` lost a guarded handler's OpenAPI response schema under
   `#[throttle]`/`#[step_up]` (issue #2516):** #2488 moved the
