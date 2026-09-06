@@ -7,6 +7,8 @@ mod acme_dns01;
 mod acme_end_to_end;
 #[cfg(feature = "acme")]
 mod acme_fake_ca;
+#[cfg(feature = "acme-pebble")]
+mod acme_pebble;
 mod acting_as_integration;
 mod after_commit_integration;
 #[cfg(feature = "mcp")]
@@ -236,6 +238,10 @@ mod process_role_worker_gating;
 // here is never picked up by that bare `--ignored` run.
 #[cfg(all(feature = "plugin-sandbox", feature = "test-support"))]
 mod plugin_sandbox;
+// The grown capability vocabulary (#1632): the adversarial corpus for KV,
+// outbound HTTP, DB, jobs, render hooks, quotas and the audit surface.
+#[cfg(all(feature = "plugin-sandbox", feature = "test-support"))]
+mod plugin_sandbox_capabilities;
 mod push_end_to_end;
 mod push_router;
 #[cfg(feature = "db")]

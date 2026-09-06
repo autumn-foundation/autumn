@@ -564,6 +564,46 @@ jobs:
           cargo test -p autumn-web --features acme \
             --test integration_tests acme_end_to_end:: | tee "${RUNNER_TEMP}/acme-e2e.log"
           assert_ran "${RUNNER_TEMP}/acme-e2e.log" "acme_end_to_end"
+      - name: Run real-ACME (Pebble) end-to-end test
+        # Issue #1863, deferred from #1608/PR #1858: every ACME test above
+        # drives `instant-acme` against `acme_fake_ca`, an in-process stand-in
+        # built because Pebble needs a container plus container→host
+        # networking for the HTTP-01 fetch. `acme_pebble` closes that gap by
+        # driving the SAME `AcmeRenewalTask` against a real, independently-
+        # implemented ACME server (Pebble), so a protocol-level regression the
+        # stand-in cannot see would fail here even if every test above stayed
+        # green.
+        #
+        # A DEDICATED step, separate from both the fast ACME lane above (no
+        # Docker/network) and the general "Run Docker-dependent tests" sweep
+        # below (whose feature set excludes `acme`/`tls` — see CLAUDE.md): it
+        # needs Docker (`testcontainers`, gated by `test-support`) to run
+        # Pebble itself, plus the `host-port-exposure` tunnel sidecar image.
+        # `host-port-exposure` lives behind its OWN `acme-pebble` feature
+        # (implying `acme` + `test-support`) rather than being turned on for
+        # every `testcontainers` consumer workspace-wide — an ordinary
+        # `cargo test -p autumn-web --features test-support` (or a plain
+        # `--workspace` run) must not pull in the `russh`/crypto dependency
+        # subtree that feature adds (Codex review, #2541). So this step, and
+        # only this step, stays out of the default `cargo test --workspace`
+        # run and out of contributors' non-Docker inner loop. Pebble is
+        # hermetic (no real Let's Encrypt rate limits at stake), so this runs
+        # on every CI invocation of this job rather than being hand-triggered.
+        #
+        # `test-threads=1`-equivalent by construction: exactly one ignored
+        # test in this filter, and it binds Pebble's fixed HTTP-01 port
+        # (5002) directly, so it must not run concurrently with itself.
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
+          }
+          cargo test -p autumn-web --features acme-pebble \
+            --test integration_tests acme_pebble:: -- --ignored \
+            | tee "${RUNNER_TEMP}/acme-pebble.log"
+          assert_ran "${RUNNER_TEMP}/acme-pebble.log" "acme_pebble"
       - name: Run system-test harness (non-browser) tests
         # `system-tests` is not a default feature. The `cargo test --workspace`
         # above happens to compile it today only because `example-e2e` depends
@@ -577,6 +617,49 @@ jobs:
         run: |
           cargo test -p autumn-web --features system-tests --lib system_test::
           cargo test -p autumn-web --features system-tests --test integration_tests system_test_api
+
+  # The Docker/testcontainer sweep runs as its own job rather than as the last
+  # step of `test` (#1747). As step 16 of that job it inherited a disk already
+  # filled by the whole workspace build plus eight feature-flipped rebuilds,
+  # and then died compiling its own dependencies — `bollard`, `bollard-stubs`
+  # and a re-linked `autumn-web` — with "No space left on device" and 23-41 MB
+  # free, before a single test body ran. Steps 1-15 of that job were green, as
+  # were the macOS and Windows legs, so the sweep was not failing on anything
+  # it tested; it was failing on being last in line for the disk.
+  #
+  # Nothing here is skipped, reordered or weakened: the two steps below are the
+  # ones that were inline, verbatim, on a runner whose disk they are the only
+  # claimant of. They keep their `runner.os == 'Linux'` guards, which stay true
+  # on this runner, so the commands are byte-for-byte the ones that ran before.
+  #
+  # NOTE: this is a NEW check name, so branch protection — which requires the
+  # per-OS `Test (…)` checks — does not require it yet. Until an admin adds it,
+  # a failure here is visible on the PR but does not itself block merge. #2519
+  # restructures these jobs more broadly and carries the same follow-up; expect
+  # to reconcile with it (it names the equivalent job `test-docker` too).
+  test-docker:
+    name: Test (Docker)
+    needs: [lint, meta]
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space
+        run: |
+          # The same reclaim the `test` job does: drop the preinstalled
+          # toolchains a Rust build never uses, before the cache is restored.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
       - name: Install Postgres client tools (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -594,9 +677,26 @@ jobs:
           pg_dump --version
           pg_restore --version
           ssh -V
+      - name: Install diesel_cli (Linux)
+        if: runner.os == 'Linux'
+        # #1945: the cli_tests Docker sweep below now reaches
+        # `db_pull.rs`/`generate_lock_version_postgres.rs`/
+        # `generate_references_postgres.rs`/`migrate_down.rs`/`test_command.rs`
+        # and `db.rs`'s reset tests, which drive `autumn migrate`/`autumn db
+        # reset`/`autumn test` against Postgres — all of which shell out to
+        # the `diesel` CLI via `check_diesel_cli()` (`autumn-cli/src/migrate.rs`)
+        # and exit non-zero without it on PATH. Same install command as
+        # generator-conformance.yml's `scaffold-postgres` job.
+        run: cargo install diesel_cli --version "=2.2.0" --no-default-features --features postgres --locked
       - name: Run Docker-dependent tests
         if: runner.os == 'Linux'
-        timeout-minutes: 45
+        # 45 -> 75 (#1945): 46 more container-spinning `cli_tests` Docker
+        # tests now sweep in here (see the `cli_tests` bare `--ignored`
+        # invocation below), on top of the 10 that raised this to 45 in
+        # PR #1985. The prior step ran in ~25 min against the old 45-minute
+        # budget, and these are typical single-Postgres-container tests
+        # (seconds to low minutes each), so +30 min is a conservative margin.
+        timeout-minutes: 75
         run: |
           cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
           cargo test -p autumn-web --test repository_shard_replica_routing -- --ignored
@@ -626,26 +726,79 @@ jobs:
           cargo test -p autumn-cli --test flags -- --ignored
           cargo test -p autumn-cli --test config -- --ignored
           cargo test -p autumn-cli --test experiments -- --ignored
-          # Offsite-backup DR round-trip (#1744): seed -> `autumn db backup
-          # --upload` -> restore from offsite -> row-level equality, against real
-          # MinIO + Postgres testcontainers. The `offsite` filter selects both
-          # ignored tests in autumn-cli/tests/integration/offsite_backup.rs.
-          # Needs Docker (testcontainers) + host pg_dump/pg_restore (installed
-          # above). Runs in the existing Docker-dependent Linux step rather than a
-          # separate required gate.
-          cargo test -p autumn-cli --test cli_tests -- --ignored offsite
-          # PII scrub round-trip (#1602): seed known PII -> `autumn db backup`
-          # -> `autumn db scrub --artifact` into a separate staging database ->
-          # assert ZERO occurrences of any original value in the result, plus
-          # the fail-closed refusals (undeclared column, renamed column,
-          # production profile). Needs Docker (testcontainers) + host
-          # pg_dump/pg_restore (installed above). autumn-cli's Docker-gated
-          # tests are NOT auto-swept the way autumn-web's are, so this line is
-          # the only thing that runs them.
-          # `scrubbed_database_migrates_clean_and_boots_the_app` is skipped
-          # here: it compiles and boots a generated app and needs the diesel
-          # CLI, so it runs in generator-conformance.yml's Postgres gate.
-          cargo test -p autumn-cli --test cli_tests -- --ignored db_scrub \
+          # Consolidated `cli_tests` binary: discover-and-run every Docker/
+          # testcontainer `#[ignore]`d test the same way the autumn-web sweep
+          # below does (#1923, #1945). Needs Docker (testcontainers) + host
+          # pg_dump/pg_restore (installed above). Before this, autumn-cli's
+          # Docker-gated tests were NOT auto-swept: only the two filtered
+          # invocations below (`offsite`, `db_scrub`) ran anything, so
+          # `db.rs` (5), `db_pull.rs` (3), `generate_lock_version_postgres.rs`
+          # (1), `generate_references_postgres.rs` (1), `migrate_down.rs` (6),
+          # `schema_migrate.rs` (1), `schema_pull.rs` (25), and
+          # `test_command.rs` (4) — 46 tests across 8 modules — never ran
+          # anywhere in CI (PR #1985's noted follow-up). A bare `--ignored`
+          # sweep now runs every Docker test in the binary, so a newly-added
+          # `#[ignore = "requires Docker (testcontainers)"]` test in any
+          # module runs here automatically, with no workflow edit.
+          #
+          # Everything named in `--skip` below is a NON-Docker `#[ignore]`d
+          # test that instead scaffolds and cargo-checks/builds/runs a fresh
+          # project — those are slow, generator-shaped gates that belong in
+          # generator-conformance.yml's own matrix'd job, where each is named
+          # explicitly. Skipped BY EXACT NAME rather than whole-module: a
+          # `--skip <module>::` would also silently swallow any *Docker* test
+          # later added to one of these same files, defeating the "no
+          # workflow edit" guarantee this sweep exists to give (Codex finding
+          # on this PR). A newly-added non-Docker test in one of these
+          # modules DOES need a line added here (and a step in
+          # generator-conformance.yml) — that omission just makes it run
+          # here too until skipped, never silently dark.
+          # `scrubbed_database_migrates_clean_and_boots_the_app` additionally
+          # compiles and boots a generated app and needs the diesel CLI, so it
+          # runs in generator-conformance.yml's Postgres gate instead.
+          # `scaffolded_json_field_generates_compiles_inserts_and_selects`
+          # (generate_json_postgres.rs) IS a Docker test and predates this
+          # sweep — it already runs in generator-conformance.yml's Postgres
+          # gate, so it's skipped here too rather than doubled up: unlike the
+          # other Docker tests above, its own doc comment says it also does a
+          # full `autumn new` -> `generate scaffold` -> `cargo check` ->
+          # `migrate`, the same cost profile as the cold-start-compile tests
+          # this step is deliberately kept fast by routing elsewhere.
+          cargo test -p autumn-cli --test cli_tests -- \
+            --ignored \
+            --test-threads=1 \
+            --skip console_bare_playground_target_compiles_untouched \
+            --skip console_playground_target_compiles_with_a_repository_round_trip \
+            --skip console_run_exits_non_zero_when_the_database_is_unreachable \
+            --skip console_run_surfaces_a_compile_error_in_the_playground \
+            --skip i18n_scaffold_cargo_checks \
+            --skip i18n_scaffold_with_owner_scoped_search_cargo_checks \
+            --skip i18n_scaffold_with_state_machine_and_attachment_cargo_checks \
+            --skip i18n_scaffold_with_trash_and_search_cargo_checks \
+            --skip encrypted_admin_scaffold_cargo_checks \
+            --skip encrypted_api_scaffold_cargo_checks \
+            --skip encrypted_live_scaffold_cargo_checks \
+            --skip encrypted_nested_scaffold_cargo_checks \
+            --skip encrypted_scaffold_cargo_checks \
+            --skip constrained_scaffold_cargo_checks \
+            --skip generated_attachment_scaffold_cargo_checks \
+            --skip generated_attachment_scaffold_multipart_test_passes \
+            --skip generated_form_for_scaffold_cargo_checks \
+            --skip generated_scaffold_with_missing_reference_target_cargo_checks \
+            --skip api_scaffold_cargo_checks \
+            --skip scaffolded_api_app_passes_routes_audit_gate \
+            --skip scaffolded_app_passes_routes_audit_gate \
+            --skip scoped_position_generated_project_cargo_checks \
+            --skip soft_delete_position_generated_project_cargo_checks \
+            --skip unscoped_position_generated_project_cargo_checks \
+            --skip belongs_to_scaffold_cargo_checks \
+            --skip bulk_delete_generated_project_cargo_checks \
+            --skip richtext_scaffold_cargo_checks \
+            --skip searchable_scaffold_cargo_checks \
+            --skip trash_generated_project_cargo_checks \
+            --skip linked_seed_binary_cargo_checks \
+            --skip serve_daemon_start_status_stop_over_unix_socket \
+            --skip scaffolded_json_field_generates_compiles_inserts_and_selects \
             --skip scrubbed_database_migrates_clean_and_boots_the_app
           # Consolidated `integration_tests` binary: discover-and-run ALL the
           # Docker/testcontainer `#[ignore]`d DB tests instead of a hand-curated
@@ -876,6 +1029,38 @@ jobs:
         # `sim-sweep` (W6 PR3, issue #1797) is a `[[bin]]`, not part of `--lib`
         # above, so it needs its own explicit clippy invocation.
         run: cargo clippy -p autumn-web --features "sqlite,sim-testing" --bin sim-sweep -- -D warnings
+      - name: Run the sqlite-backend lib unit tests
+        # `--test <name>` selects test TARGETS only, so the integration step
+        # below never runs the crate's own `#[cfg(feature = "sqlite")]` unit
+        # tests — the pool sizing, replica-rejection, target-classification and
+        # provider-dispatch coverage that lives inside `autumn/src/db.rs`,
+        # `app.rs` and `repository_commit_hooks.rs`. Until this step existed
+        # those ~26 tests were compiled (by the clippy steps above) but never
+        # executed, and the ungated pool/topology tests alongside them had
+        # rotted into hard failures under the backend flip without anyone
+        # noticing. Same shape as the other feature-gated `--lib <module>::`
+        # lanes above (markdown, i18n, tls, acme).
+        #
+        # Module-filtered, NOT a bare `--lib`: the rest of the crate's unit
+        # tests still build their fixtures on hard-coded `postgres://` URLs,
+        # which `build_sqlite_pool` correctly refuses. Making those
+        # backend-parametric is tracked separately; the filter names every
+        # module that carries SQLite-specific logic, so nothing sqlite-gated is
+        # left unexecuted. The two `app::` tests are named individually because
+        # the rest of `app::tests` is in that not-yet-parametric set.
+        run: |
+          cargo test -p autumn-web --features sqlite --lib -- \
+            db:: \
+            config:: \
+            migrate:: \
+            counter_cache:: \
+            commentable:: \
+            ledger:: \
+            repository_commit_hooks:: \
+            substrate:: \
+            sqlite_sharding_unsupported_guard_tests \
+            app::tests::custom_pool_provider_with_established_sqlite_pool_fails_closed_on_statement_timeout \
+            app::tests::custom_pool_provider_no_database_mode_boots_with_statement_timeout
       - name: Run the sqlite integration suite
         # Named sqlite `[[test]]` targets only. `test-support` is required by the
         # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,
@@ -898,6 +1083,7 @@ jobs:
             --test sqlite_statement_timeout_fail_closed \
             --test sqlite_crud_basic \
             --test sqlite_field_conversions \
+            --test sqlite_json_field_conversion \
             --test sqlite_upsert_isolation \
             --test sqlite_votable \
             --test sqlite_dependent_destroy \

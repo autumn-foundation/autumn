@@ -132,6 +132,11 @@ pub mod capacity;
 #[cfg(feature = "reporting")]
 pub mod capsule;
 pub mod circuit_breaker;
+// Shared owner-only atomic-write helper (issue #1864): stage-then-rename,
+// used by both `acme::store` and `capsule::persist` (secrets and
+// must-never-be-torn data respectively). Crate-private — an internal helper,
+// not part of the public API.
+mod fs_atomic;
 // Compile-time data classification (issue #1654): carries a "personal data"
 // classification on the *type* of a `#[model]` column and gates the `Json`
 // response sink on it, so a leak is a build failure rather than a production
@@ -469,6 +474,11 @@ pub mod __fuzz {
     pub use crate::plugin_sandbox::__fuzz_parse_manifest as parse_sandbox_manifest;
     #[cfg(feature = "plugin-sandbox")]
     pub use crate::plugin_sandbox::__fuzz_read_artifact as read_sandbox_artifact;
+    // The render-hook fragment tree (#1632): the one guest-supplied structure
+    // that becomes markup a browser parses, so its failure mode is stored XSS
+    // rather than a refused request.
+    #[cfg(feature = "plugin-sandbox")]
+    pub use crate::plugin_sandbox::__fuzz_render_fragment as render_sandbox_fragment;
 
     // Body handling: form-urlencoded (always) + inbound-mail MIME (feature-gated).
     pub use crate::form::__fuzz_decode_urlencoded as decode_urlencoded_form;
@@ -611,6 +621,11 @@ pub mod experiments;
 pub mod feature_flags;
 pub mod form;
 pub mod gdpr;
+// A plain comment, not a doc comment, for the same reason `classify` carries
+// one: an outer `///` here is merged with the module's `//!` docs and the whole
+// block then resolves its intra-doc links in *this* scope. The module
+// documents itself.
+pub mod graph;
 pub mod job;
 pub mod job_tracking;
 /// Safe, method-aware link helpers: [`links::link_to`] anchors and

@@ -23,6 +23,7 @@ mod edge;
 mod edge_routes_macro;
 mod event;
 mod feature_flag;
+mod graph;
 mod i18n;
 mod idempotency_guard;
 mod inbound_mail;
