@@ -21,13 +21,17 @@ use serde::{Deserialize, Serialize};
 
 // ── Enum derive ────────────────────────────────────────────────────
 
+// Never constructed: these exist to be *described*, and the assertions read
+// their derived schema rather than any value.
 #[derive(Serialize, Deserialize, OpenApiSchema)]
+#[allow(dead_code)]
 enum Priority {
     Low,
     High,
 }
 
 #[derive(Serialize, Deserialize, OpenApiSchema)]
+#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 enum RenamedStatus {
     Open,
@@ -67,11 +71,13 @@ fn enum_schema_name_is_the_bare_type_name() {
 
 // A struct WITHOUT the derive: the spec back-fills the placeholder for it.
 #[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
 struct UntypedBody {
     _whatever: String,
 }
 
 #[derive(Serialize, Deserialize, OpenApiSchema)]
+#[allow(dead_code)]
 struct TypedBody {
     name: String,
 }
