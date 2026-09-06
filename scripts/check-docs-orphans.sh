@@ -408,16 +408,26 @@ _LBL = FLAT  # see LABEL_MAX above: one label grammar, not two
 # takes its label from there. Finding it with `index(']')` picked the
 # ESCAPED bracket in `[a\\]b][]` and produced `a\\`, which matches no
 # definition — a link the reader can click, reported as an orphan.
+# The FIRST label is link TEXT and may nest balanced brackets, exactly as an
+# inline label may (see `_nested_brackets`). The SECOND is a reference LABEL,
+# which by CommonMark ends at the first unescaped `]` and so cannot nest — two
+# different grammars that happen to share a delimiter.
 REF_USE_FULL = re.compile(
-    r'(?<![\\!])\[(' + _LBL + r'*)\]\[(' + _LBL + LABEL_MAX_OPT + r')\]')
+    r'(?<![\\!])\[((?:' + _nested_brackets(16) + r')*)\]'
+    r'\[(' + _LBL + LABEL_MAX_OPT + r')\]')
 REF_USE_SHORTCUT = re.compile(
     r'(?<![\\!])\[(' + _LBL + LABEL_MAX + r')\](?![\(\[:])')
 # Every full-reference span, image or not. Used to blank them before the
 # shortcut scan: in `![alt][mail]` the guard correctly stops REF_USE_FULL, but
 # the trailing `[mail]` then looks exactly like a standalone shortcut link, so
 # an image would resurrect the label the guard just rejected.
+# Nested first label here too, and this one is why it matters: when the blank
+# fails the trailing `[m]` of `[<span hidden>[x]</span>][m]` is left looking
+# like a standalone shortcut link, so a label the reader cannot see resurrects
+# as a route.
 REF_USE_ANY = re.compile(
-    r'\[' + _LBL + r'*\]\[' + _LBL + LABEL_MAX_OPT + r'\]')
+    r'\[(?:' + _nested_brackets(16) + r')*\]\[' + _LBL + LABEL_MAX_OPT
+    + r'\]')
 # An image and its destination, in both spellings. Blanked before the bare-path
 # scan for the same reason the inline pattern guards against `!`: the path in
 # `![alt](docs/guide/x.md)` is a resource the page loads, never text on screen,
@@ -1879,6 +1889,19 @@ ANY_TAG = re.compile(
     r'|</[A-Za-z][A-Za-z0-9-]*' + _TWS + r'*>', re.I)
 
 
+# Characters that occupy no width, so a label made only of them is a link with
+# nothing to click. `[&#8203;](mail.md)` decodes to U+200B, which Python's
+# `.strip()` keeps because it is not whitespace, so the anchor counted as a
+# label and its target as reachable.
+#
+# Measured one by one as the sole content of an anchor, not taken from a
+# category: these six give it a 0px box. U+00A0 NBSP is deliberately NOT among
+# them — it paints 4px — which also means Python's `.strip()`, which DOES treat
+# it as whitespace, is wrong about it in the other direction. That is a false
+# positive of its own, unreported and left alone rather than folded in here.
+_ZERO_WIDTH = {ord(c): None for c in '\u200b\u200c\u200d\u2060\ufeff\u00ad'}
+
+
 def has_content(image_span, masked_span, raw_span=None):
     """Whether a link's content leaves the reader anything to click.
 
@@ -1926,7 +1949,8 @@ def has_content(image_span, masked_span, raw_span=None):
     # as though the reader saw no such thing. `decode_visible` leaves code
     # spans alone, which is right here too: `` [`&#32;`](mail.md) `` shows the
     # reader `&#32;` and is a genuine label.
-    return bool(decode_visible(ANY_TAG.sub('', masked_span)).strip()
+    return bool(decode_visible(ANY_TAG.sub('', masked_span))
+                .translate(_ZERO_WIDTH).strip()
                 or ANY_IMAGE.search(image_span))
 
 
@@ -4467,6 +4491,35 @@ self_test() {
     > "$c9jn/docs/guide/jobs.md"
   git -C "$c9jn" add -A && git -C "$c9jn" commit -qm svg-display-none
   check "inline CSS does hide an svg" fail "$c9jn"
+
+  # A full reference's FIRST label is link text and nests too. When the blank
+  # missed it, the trailing `[m]` was left looking like a standalone shortcut
+  # link, resurrecting a label the reader cannot see.
+  local c9kp="$tmp/c9kp"; make_corpus "$c9kp"
+  printf '# Jobs\n\n[<span hidden>[x]</span>][m]\n\n[m]: mail.md\n' \
+    > "$c9kp/docs/guide/jobs.md"
+  git -C "$c9kp" add -A && git -C "$c9kp" commit -qm hidden-nested-ref-label
+  check "a hidden nested reference label is not a route" fail "$c9kp"
+
+  # ...while the same shape with a VISIBLE label is a route, so the nesting
+  # support did not simply start rejecting full references.
+  local c9kq="$tmp/c9kq"; make_corpus "$c9kq"
+  printf '# Jobs\n\n[outer [x]][m]\n\n[m]: mail.md\n' > "$c9kq/docs/guide/jobs.md"
+  git -C "$c9kq" add -A && git -C "$c9kq" commit -qm visible-nested-ref-label
+  check "a visible nested reference label is a route" pass "$c9kq"
+
+  # A label of only zero-width characters gives the anchor a 0px box.
+  local c9kr="$tmp/c9kr"; make_corpus "$c9kr"
+  printf '# Jobs\n\n[&#8203;](mail.md)\n' > "$c9kr/docs/guide/jobs.md"
+  git -C "$c9kr" add -A && git -C "$c9kr" commit -qm zero-width-label
+  check "a zero-width label is not a label" fail "$c9kr"
+
+  # ...but a decoded character that PAINTS still is, so this removes the
+  # zero-width ones rather than everything that decodes.
+  local c9ks="$tmp/c9ks"; make_corpus "$c9ks"
+  printf '# Jobs\n\n[&#65;](mail.md)\n' > "$c9ks/docs/guide/jobs.md"
+  git -C "$c9ks" add -A && git -C "$c9ks" commit -qm painting-entity-label
+  check "an entity that paints is still a label" pass "$c9ks"
 
   # A label may nest brackets to any depth so long as they balance, and this
   # matched only one level for most of the PR.
