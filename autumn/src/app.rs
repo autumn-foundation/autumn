@@ -7663,7 +7663,7 @@ pub(crate) fn is_dump_routes_mode() -> bool {
     std::env::var("AUTUMN_DUMP_ROUTES").as_deref() == Ok("1")
 }
 
-/// Whether the process should dump the generated OpenAPI document and exit.
+/// Whether the process should dump the generated `OpenAPI` document and exit.
 ///
 /// Set by `autumn openapi export`. Unlike the routes dump this is checked even
 /// when the `openapi` feature is off, so the CLI gets an explicit "no spec here"
