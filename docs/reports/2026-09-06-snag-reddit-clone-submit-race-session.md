@@ -79,9 +79,16 @@ session), so Postgres 16 ran as a native service rather than the
   silently serves the wrong post. Data integrity, medium severity (no crash,
   no data loss, no security exposure — but user-invisible wrong content with
   no error signal anywhere in the path). No fix proposed: the correct
-  remedy (partial unique index + `ON CONFLICT` retry vs. `SELECT ... FOR
-  UPDATE` vs. an advisory lock) is a design decision, out of charter for a
-  QA-only pass.
+  remedy is a design decision, out of charter for a QA-only pass — a
+  composite `UNIQUE` constraint/index on `(subreddit_id, slug)` with
+  `ON CONFLICT` retry, an advisory lock keyed on `(subreddit_id, slug)`, and
+  serializing inserts by locking the *parent subreddit row* with
+  `SELECT ... FOR UPDATE` (not the post row, which doesn't exist yet at the
+  point uniqueness needs to be checked — a Codex review on this PR
+  correctly flagged an earlier draft of this list for eliding that
+  distinction, and for calling the index option "partial," which implies a
+  `WHERE` predicate this table has no soft-delete column to justify) are
+  each reasonable but not equivalent in behavior/cost.
 - No regression test committed this session: reproducing this reliably needs
   true concurrent requests against a live Postgres-backed server
   (`threading.Barrier`-style synchronization), which doesn't fit the
