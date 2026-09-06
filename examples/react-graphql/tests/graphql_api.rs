@@ -311,7 +311,8 @@ async fn mutations_round_trip_through_the_repository() {
         "createdAt is RFC 3339: {created}"
     );
 
-    // `update` with a `Patch::Set` on one field leaves the others alone.
+    // The toggle runs under `with_lock` (row lock + transaction) and touches
+    // only `pinned`; every other column comes back unchanged.
     let toggled = gql(
         &client,
         "mutation($id: Int!) { togglePinned(id: $id) { id title pinned } }",
@@ -445,10 +446,12 @@ async fn unknown_note_ids_are_graphql_errors() {
         json!({}),
     )
     .await;
-    let message = body["errors"][0]["message"]
-        .as_str()
-        .expect("error message");
+    let error = &body["errors"][0];
+    let message = error["message"].as_str().expect("error message");
     assert!(message.contains("9999"), "got: {body}");
+    // `with_lock` refuses a missing row with a 404 `AutumnError`, and the
+    // adapter carries that status like any other.
+    assert_eq!(error["extensions"]["status"], 404, "got: {body}");
 }
 
 #[tokio::test]

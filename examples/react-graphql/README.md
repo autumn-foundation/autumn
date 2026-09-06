@@ -36,7 +36,8 @@ untouched because the bundle is an external ES module.
 | `#[repository(Note, hooks = …, api = "/api/notes")]` | `src/repositories.rs` | Generated CRUD, a derived `find_by_pinned` finder, and generated REST read handlers mounted next to GraphQL |
 | Repository from `AppState`, outside an extractor | `src/notes.rs`, `src/lib.rs` | `PgNoteRepository::with_pool_untracked(pool)` in resolvers and in the `on_startup` seed |
 | Embedded migrations | `src/lib.rs`, `migrations/` | `embed_migrations!()`, applied on boot in development and by tests to their testcontainer |
-| `AutumnError` → GraphQL error | `src/notes.rs` | Message on the field, HTTP status in `extensions.status`, so a client can tell a 422 from a 503 |
+| `AutumnError` → GraphQL error | `src/notes.rs` | 4xx messages on the field, 5xx redacted and logged; HTTP status in `extensions.status`, so a client can tell a 422 from a 503 |
+| `with_lock` pessimistic toggle | `src/notes.rs` | `togglePinned` flips the flag under `SELECT … FOR UPDATE` so overlapping toggles serialise; a missing row is the helper's own 404 |
 | `Plugin` with `nest` + `declare_plugin_routes` | `src/graphql_plugin.rs` | Mounts `POST /graphql`, `GET /graphql?query=…` (queries only — a mutation over `GET` is a `405`), `GET /graphql/sdl`; routes show in `autumn routes` with plugin attribution and satisfy `autumn routes audit` |
 | `PluginContract` + conformance harness | `src/graphql_plugin.rs`, `tests/graphql_api.rs` | Declares the `autumn-web` series; `run_conformance` proves attribution, prefix, collisions and contract in one test |
 | Maud page shell + `asset_url` | `src/lib.rs` | Autumn renders the document; `asset_url` gives fingerprinted URLs in a release build with an asset manifest |
@@ -53,7 +54,8 @@ untouched because the bundle is an external ES module.
 - PostgreSQL (or Docker: `docker compose up -d` in this directory starts one on
   `localhost:5432` matching `autumn.toml`)
 
-Node 20+ and npm are needed only to **change** the frontend.
+Node 20.19+ or 22.12+ (the range Vite 8 and `@vitejs/plugin-react` 5 declare in
+`engines`) and npm are needed only to **change** the frontend.
 
 ## Quick start
 

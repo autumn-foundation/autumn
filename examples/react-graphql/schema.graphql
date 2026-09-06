@@ -5,7 +5,17 @@ type Mutation {
 	"""
 	createNote(input: NewNoteInput!): Note!
 	"""
-	Flip a note's pinned flag. Errors if the id is unknown.
+	Flip a note's pinned flag atomically. Errors (`404`) if the id is
+	unknown.
+	
+	A read-then-`update` would race: two overlapping toggles could both
+	read `false` and both write `true`. `with_lock` is the repository's
+	pessimistic helper — `SELECT … FOR UPDATE` on the row inside a
+	transaction, then the closure with the locked record and the
+	transaction connection — so each toggle observes the previous one.
+	The write inside is plain Diesel on that connection, which is the
+	documented shape for `with_lock` closures. A missing row is refused by
+	`with_lock` itself with a `404` `AutumnError`, mapped like every other.
 	"""
 	togglePinned(id: Int!): Note!
 	"""

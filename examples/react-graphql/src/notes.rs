@@ -9,11 +9,14 @@
 use async_graphql::{
     Context, EmptySubscription, ErrorExtensions, InputObject, Object, Result, Schema,
 };
-use autumn_web::hooks::Patch;
+use autumn_web::reexports::diesel::prelude::*;
+use autumn_web::reexports::diesel_async::RunQueryDsl;
+use autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 use autumn_web::{AppState, AutumnError};
 
-use crate::models::{NewNote, Note, UpdateNote};
+use crate::models::{NewNote, Note};
 use crate::repositories::{NoteRepository, PgNoteRepository};
+use crate::schema::notes;
 
 /// The GraphQL `Note` object, resolved straight off the `#[model]` struct.
 ///
@@ -135,19 +138,32 @@ impl Mutation {
         repo(ctx)?.save(&new).await.map_err(to_gql)
     }
 
-    /// Flip a note's pinned flag. Errors if the id is unknown.
+    /// Flip a note's pinned flag atomically. Errors (`404`) if the id is
+    /// unknown.
+    ///
+    /// A read-then-`update` would race: two overlapping toggles could both
+    /// read `false` and both write `true`. `with_lock` is the repository's
+    /// pessimistic helper — `SELECT … FOR UPDATE` on the row inside a
+    /// transaction, then the closure with the locked record and the
+    /// transaction connection — so each toggle observes the previous one.
+    /// The write inside is plain Diesel on that connection, which is the
+    /// documented shape for `with_lock` closures. A missing row is refused by
+    /// `with_lock` itself with a `404` `AutumnError`, mapped like every other.
     async fn toggle_pinned(&self, ctx: &Context<'_>, id: i64) -> Result<Note> {
-        let repo = repo(ctx)?;
-        let current = repo
-            .find_by_id(id)
+        repo(ctx)?
+            .with_lock(id, |row, conn| {
+                async move {
+                    diesel::update(notes::table.find(row.id))
+                        .set(notes::pinned.eq(!row.pinned))
+                        .returning(Note::as_returning())
+                        .get_result::<Note>(conn)
+                        .await
+                        .map_err(AutumnError::from)
+                }
+                .scope_boxed()
+            })
             .await
-            .map_err(to_gql)?
-            .ok_or_else(|| format!("no note with id {id}"))?;
-        let changes = UpdateNote {
-            pinned: Patch::Set(!current.pinned),
-            ..Default::default()
-        };
-        repo.update(id, &changes).await.map_err(to_gql)
+            .map_err(to_gql)
     }
 
     /// Delete a note. Returns whether anything was deleted. A pinned note is
