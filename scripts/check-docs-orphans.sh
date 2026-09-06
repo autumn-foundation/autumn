@@ -1561,7 +1561,21 @@ def has_content(image_span, masked_span):
     # link, and stripping tags left `Mail` behind looking like a label.
     image_span = mask_hidden_subtrees(image_span)
     masked_span = mask_hidden_subtrees(masked_span)
-    return bool(ANY_TAG.sub('', masked_span).strip()
+    # `&#32;` is a space on screen, so `[&#32;](mail.md)` is an anchor with
+    # nothing in it — the same nothing as `[ ](mail.md)`, which was already
+    # rejected. Testing the undecoded source saw four non-blank characters and
+    # called it a label, so the entity spelling let an orphan through.
+    #
+    # ONLY THE TEXT VIEW, and only AFTER the tags come out. Both halves matter:
+    # a decoded reference is literal TEXT, never markup. markdown-it renders
+    # `<a href=…>&#33;&#91;x](y.png)</a>` as the visible characters
+    # `![x](y.png)`, not an image, so decoding the image view would invent one
+    # and mark a real orphan reachable; and `&#60;span&#62;` is the visible
+    # text `<span>`, so decoding before `ANY_TAG` ran would let it be stripped
+    # as though the reader saw no such thing. `decode_visible` leaves code
+    # spans alone, which is right here too: `` [`&#32;`](mail.md) `` shows the
+    # reader `&#32;` and is a genuine label.
+    return bool(decode_visible(ANY_TAG.sub('', masked_span)).strip()
                 or ANY_IMAGE.search(image_span))
 
 
@@ -3967,6 +3981,38 @@ self_test() {
     > "$c9is/docs/guide/jobs.md"
   git -C "$c9is" add -A && git -C "$c9is" commit -qm unclosed-hidden-element
   check "an unclosed hidden element hides the rest of the link" fail "$c9is"
+
+  # `&#32;` is a space on screen, so this is an anchor with nothing in it —
+  # the same nothing as `[ ](mail.md)`, which was already rejected.
+  local c9it="$tmp/c9it"; make_corpus "$c9it"
+  printf '# Jobs\n\n[&#32;](docs/guide/mail.md)\n' > "$c9it/docs/guide/jobs.md"
+  git -C "$c9it" add -A && git -C "$c9it" commit -qm entity-space-label
+  check "an entity-spelled space is not a label" fail "$c9it"
+
+  # ...and the same in a raw anchor, which shares the content test.
+  local c9iu="$tmp/c9iu"; make_corpus "$c9iu"
+  printf '# Jobs\n\n<a href="mail.md">&#32;</a>\n' > "$c9iu/docs/guide/jobs.md"
+  git -C "$c9iu" add -A && git -C "$c9iu" commit -qm entity-space-anchor
+  check "an entity-spelled space is not anchor content" fail "$c9iu"
+
+  # ...but a reference that decodes to a VISIBLE character is a real label,
+  # so the decode must not be mistaken for "entities mean empty".
+  local c9iv="$tmp/c9iv"; make_corpus "$c9iv"
+  printf '# Jobs\n\n[&#65;](docs/guide/mail.md)\n' > "$c9iv/docs/guide/jobs.md"
+  git -C "$c9iv" add -A && git -C "$c9iv" commit -qm entity-letter-label
+  check "an entity-spelled letter is a label" pass "$c9iv"
+
+  # ...and the decode must run AFTER the tags come out. `&#60;span&#62;` is
+  # the visible text `<span>`, not a tag; decoding first would let `ANY_TAG`
+  # strip it and report a live link as empty.
+  # (The code-span half of the decode is deliberately not tested here: inside
+  # this emptiness check the backticks are themselves non-blank text, so
+  # `` [`&#32;`](mail.md) `` passes whether or not code spans are exempt. Such
+  # a test would verify the delimiters, not the rule.)
+  local c9iw="$tmp/c9iw"; make_corpus "$c9iw"
+  printf '# Jobs\n\n<a href="mail.md">&#60;span&#62;</a>\n' > "$c9iw/docs/guide/jobs.md"
+  git -C "$c9iw" add -A && git -C "$c9iw" commit -qm entity-spelled-tag-text
+  check "an entity-spelled tag is visible text, not markup" pass "$c9iw"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
