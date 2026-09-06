@@ -1896,10 +1896,26 @@ def edges_from(f):
         # explicit scheme is the same thing said out loud; it survives today
         # only because `normalize` happens not to collapse it onto a tracked
         # path, which is an accident to stop depending on.
-        if raw.startswith('//') or SCHEME.match(raw):
+        # A LEADING SLASH resolves against the host, not the checkout, so
+        # `/docs/guide/mail.md` addresses `github.com/docs/guide/mail.md` and
+        # reaches this repository not at all. Stripping it spelled the tracked
+        # path exactly and recorded an edge no reader can follow.
+        #
+        # The comment here used to say "a site path, not a file path" and then
+        # strip the slash anyway, which was the bug: the sentence was right and
+        # the line under it did the opposite. `check-docs-links.sh` is the
+        # repo's authority on whether a destination resolves, and it already
+        # calls this one `link target escapes the repository` — `os.path.join`
+        # discards the left side on an absolute path, so it lands outside the
+        # root and is reported. A destination that gate rejects cannot make a
+        # page reachable here either.
+        #
+        # This subsumes the protocol-relative case rather than sitting beside
+        # it: `//docs/guide/mail.md` reads `docs` as a HOSTNAME and navigates
+        # away, and it starts with a slash too. An explicit scheme is the same
+        # thing said out loud.
+        if raw.startswith('/') or SCHEME.match(raw):
             return
-        # An absolute-looking `/docs/guide/x.md` is a site path, not a file path.
-        raw = raw.lstrip('/') if raw.startswith('/') else raw
         # Try both readings: relative to this file, and from the repo root. A
         # guide page writing `](docs/guide/mail.md)` means the latter, and a
         # base-join would silently produce `docs/guide/docs/guide/mail.md`.
@@ -3431,12 +3447,25 @@ self_test() {
   git -C "$c9et" add -A && git -C "$c9et" commit -qm absolute-url
   check "an absolute URL spelling a repo path is not an edge" fail "$c9et"
 
-  # ...but a single-slash site path is still a path into this repo.
+  # ...and a SINGLE slash is the same story: it resolves against the host, so
+  # `/docs/guide/mail.md` addresses `github.com/docs/guide/mail.md`.
+  # This case asserted the opposite for several commits, on nothing but an
+  # assertion — while the code comment beside it already said "a site path,
+  # not a file path" and stripped the slash anyway. `check-docs-links.sh`
+  # settles it: run on a page containing exactly this link it reports
+  # `link target escapes the repository`, so one gate was calling the link
+  # broken while this one counted it as navigation.
   local c9eu="$tmp/c9eu"; make_corpus "$c9eu"
   printf '# Jobs\n\n<a href="/docs/guide/mail.md">mail</a>\n' \
     > "$c9eu/docs/guide/jobs.md"
   git -C "$c9eu" add -A && git -C "$c9eu" commit -qm site-root-path
-  check "a site-root path still counts as an edge" pass "$c9eu"
+  check "a site-root path is not an edge" fail "$c9eu"
+
+  # ...while the same path without the slash is the route it looks like.
+  local c9ev="$tmp/c9ev"; make_corpus "$c9ev"
+  printf '# Jobs\n\n<a href="mail.md">mail</a>\n' > "$c9ev/docs/guide/jobs.md"
+  git -C "$c9ev" add -A && git -C "$c9ev" commit -qm relative-path
+  check "the same path without the slash is an edge" pass "$c9ev"
 
   # A malformed anchor renders as literal text, so its href is not navigation.
   local c9ev="$tmp/c9ev"; make_corpus "$c9ev"
