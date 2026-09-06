@@ -423,6 +423,33 @@ def strip_comments(txt):
     return ''.join(out)
 
 
+# Raw HTML whose contents the browser does not render as documentation, and
+# resource attributes whose value never appears on screen. `<a href>` is
+# deliberately absent: a raw anchor IS navigation and must keep conferring
+# reachability.
+HIDDEN_HTML = re.compile(
+    r'<(script|style|template)\b[^>]*>.*?</\1\s*>', re.S | re.I)
+SRC_ATTR = re.compile(r'\bsrc\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)', re.I)
+
+
+def mask_hidden_html(txt):
+    """Blank non-rendered raw HTML — in PROSE only.
+
+    Inside a fence, `<script src="/static/js/x.js">` is a sample the reader can
+    see and copy, which is the same reason a bare path in a fence counts. Five
+    guide pages ship exactly that. Masking it everywhere would delete visible
+    text; masking it nowhere lets a `<script>` block in prose, which renders as
+    nothing, keep an orphan alive.
+    """
+    out = []
+    for kind, seg in split_fences(txt):
+        if kind == 'prose':
+            seg = HIDDEN_HTML.sub(lambda m: ' ' * len(m.group(0)), seg)
+            seg = SRC_ATTR.sub(lambda m: ' ' * len(m.group(0)), seg)
+        out.append(seg)
+    return ''.join(out)
+
+
 def edges_from(f):
     """Guide pages this file gives a reader a way to reach."""
     txt = strip_comments(read(f))
@@ -469,7 +496,8 @@ def edges_from(f):
     # below, so blank their spans first: a bare scan over `[old]: docs/guide/x.md`
     # would re-admit an unused definition that renders as nothing, which is the
     # hole the usage check exists to close.
-    scan = REF_DEF.sub(lambda m: ' ' * len(m.group(0)), txt)
+    scan = mask_hidden_html(txt)
+    scan = REF_DEF.sub(lambda m: ' ' * len(m.group(0)), scan)
     blank = lambda m: ' ' * len(m.group(0))
     scan = IMAGE_INLINE.sub(blank, scan)
     scan = IMAGE_REF.sub(blank, scan)
@@ -546,7 +574,8 @@ def waiver_view(txt):
     would actually be an HTML comment.
     """
     kept = [seg for kind, seg in split_fences(txt) if kind == 'prose']
-    return CODE_SPAN.sub(' ', ''.join(kept))
+    kept = HIDDEN_HTML.sub(lambda m: ' ' * len(m.group(0)), ''.join(kept))
+    return CODE_SPAN.sub(' ', kept)
 
 
 defects, waived = [], 0
@@ -1075,6 +1104,41 @@ self_test() {
     > "$c9az/README.md"
   git -C "$c9az" add -A && git -C "$c9az" commit -qm nested-alt-image
   check "an image with nested alt text is still not an edge" fail "$c9az"
+
+  # A path in a resource attribute or a non-rendered raw-HTML block is not on
+  # screen, so it is not an edge.
+  local c9ba="$tmp/c9ba"; make_corpus "$c9ba"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n<img src="docs/guide/mail.md">\n' \
+    > "$c9ba/README.md"
+  git -C "$c9ba" add -A && git -C "$c9ba" commit -qm html-src-attr
+  check "a raw-HTML src attribute is not an edge" fail "$c9ba"
+
+  local c9bb="$tmp/c9bb"; make_corpus "$c9bb"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n<script>var p = "docs/guide/mail.md";</script>\n' \
+    > "$c9bb/README.md"
+  git -C "$c9bb" add -A && git -C "$c9bb" commit -qm html-script-block
+  check "a path inside a script block is not an edge" fail "$c9bb"
+
+  # ...but a raw anchor IS navigation.
+  local c9bc="$tmp/c9bc"; make_corpus "$c9bc"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n<a href="docs/guide/mail.md">Mail</a>\n' \
+    > "$c9bc/README.md"
+  git -C "$c9bc" add -A && git -C "$c9bc" commit -qm html-anchor
+  check "a raw HTML anchor still confers reachability" pass "$c9bc"
+
+  # ...and a script shown INSIDE a fence is visible sample text.
+  local c9bd="$tmp/c9bd"; make_corpus "$c9bd"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n```html\n<script src="docs/guide/mail.md"></script>\n```\n' \
+    > "$c9bd/README.md"
+  git -C "$c9bd" add -A && git -C "$c9bd" commit -qm html-in-fence
+  check "raw HTML shown inside a fence is still visible text" pass "$c9bd"
+
+  # A waiver hidden in a script block must not exempt the page.
+  local c9be="$tmp/c9be"; make_corpus "$c9be"
+  printf '# Mail\n\n<script>const s = "<!-- orphan-allow: example -->";</script>\n' \
+    > "$c9be/docs/guide/mail.md"
+  git -C "$c9be" add -A && git -C "$c9be" commit -qm waiver-in-script
+  check "a waiver inside a script block does not exempt the page" fail "$c9be"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
