@@ -320,7 +320,10 @@ fn trash_generated_project_cargo_checks() {
     let (_tmp, project) = scaffold_project("trash-check", &[], &["--soft-delete"]);
     assert_project_cargo_checks(&project);
 
-    let (_tmp_slug, project_slug) =
-        scaffold_project("trash-check-slug", &["slug:slug"], &["--soft-delete"]);
+    let (_tmp_slug, project_slug) = scaffold_project(
+        "trash-check-slug",
+        &["slug:slug{from:title}"],
+        &["--soft-delete"],
+    );
     assert_project_cargo_checks(&project_slug);
 }
