@@ -1482,6 +1482,22 @@ HIDDEN_OPEN = re.compile(
     + _Q1 + r'|[^\s"\'=<>`]+))?(?:' + _TWS + r'+' + ATTR + r')*'
     + _TWS + r'*/?>', re.I)
 
+# HTML void elements. They have no close tag and no contents, so a `hidden` one
+# ENDS AT ITS OPENING TAG — it hides itself and nothing after it. Searching for
+# the close that does not exist ran the scan below off the end of the span, so
+# `<a href="mail.md"><input hidden>Mail</a>` — a link the browser renders as the
+# clickable label `Mail` — came back empty and its target was reported orphaned.
+# Legacy `param`/`keygen` are here because browsers still parse them as void.
+VOID_ELEMENTS = frozenset((
+    'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta',
+    'source', 'track', 'wbr', 'param', 'keygen'))
+# A trailing `/>` self-closes ONLY here. In HTML the slash is ignored and the
+# element stays open — `<span hidden/>Mail</a>` hides `Mail`, which is why `/>`
+# is not treated as self-closing in general. `svg` and `math` are the two
+# elements that enter foreign content, where XML rules apply and `/>` does
+# close. Both halves confirmed against Chromium, not inferred.
+SELF_CLOSING_ROOTS = frozenset(('svg', 'math'))
+
 
 def mask_hidden_subtrees(txt):
     """Blank every `hidden` element, contents and all, space for space.
@@ -1495,6 +1511,16 @@ def mask_hidden_subtrees(txt):
         if not m:
             return out
         name = m.group(1)
+        lname = name.lower()
+        if lname in VOID_ELEMENTS or (
+                lname in SELF_CLOSING_ROOTS and m.group(0).endswith('/>')):
+            # No subtree to balance: the element is the whole of itself.
+            end = m.end()
+            out = out[:m.start()] + ' ' * (end - m.start()) + out[end:]
+            continue
+        # Running out of closes is not a bug here: an unclosed element is
+        # closed implicitly by its parent, so masking to the end of the span
+        # is what the browser shows — `<a …><span hidden>Mail</a>` is empty.
         depth, pos, end = 1, m.end(), len(out)
         tag = re.compile(r'<(/?)' + re.escape(name) + r'(?=[\s/>]|$)', re.I)
         while depth:
@@ -3900,6 +3926,47 @@ self_test() {
     > "$c9in/docs/guide/jobs.md"
   git -C "$c9in" add -A && git -C "$c9in" commit -qm text-after-hidden
   check "text after a hidden element is still content" pass "$c9in"
+
+  # A VOID element has no close tag, so a hidden one hides only itself and the
+  # label after it is a live, clickable route. Searching for the `</input>`
+  # that cannot exist masked the rest of the link and orphaned its target.
+  local c9io="$tmp/c9io"; make_corpus "$c9io"
+  printf '# Jobs\n\n<a href="mail.md"><input hidden>Mail</a>\n' \
+    > "$c9io/docs/guide/jobs.md"
+  git -C "$c9io" add -A && git -C "$c9io" commit -qm hidden-void-element
+  check "a hidden void element does not hide the label after it" pass "$c9io"
+
+  # Same for the void element that is also an image: hidden, so it is not
+  # content itself, but the text beside it still is.
+  local c9ip="$tmp/c9ip"; make_corpus "$c9ip"
+  printf '# Jobs\n\n<a href="mail.md"><img hidden src="x.png">Mail</a>\n' \
+    > "$c9ip/docs/guide/jobs.md"
+  git -C "$c9ip" add -A && git -C "$c9ip" commit -qm hidden-void-image
+  check "a hidden void image does not hide the label after it" pass "$c9ip"
+
+  # ...but `/>` on an HTML element is NOT self-closing. The parser drops the
+  # slash, the span stays open, and it swallows the label — pinned because
+  # generalising the void fix to every `/>` would call this a route.
+  local c9iq="$tmp/c9iq"; make_corpus "$c9iq"
+  printf '# Jobs\n\n<a href="mail.md"><span hidden/>Mail</a>\n' \
+    > "$c9iq/docs/guide/jobs.md"
+  git -C "$c9iq" add -A && git -C "$c9iq" commit -qm html-slash-not-self-closing
+  check "a slash does not self-close an HTML element" fail "$c9iq"
+
+  # ...while `svg` enters foreign content, where `/>` really does close.
+  local c9ir="$tmp/c9ir"; make_corpus "$c9ir"
+  printf '# Jobs\n\n<a href="mail.md"><svg hidden/>Mail</a>\n' \
+    > "$c9ir/docs/guide/jobs.md"
+  git -C "$c9ir" add -A && git -C "$c9ir" commit -qm foreign-content-self-closes
+  check "a slash self-closes a foreign-content root" pass "$c9ir"
+
+  # An unclosed non-void element is closed implicitly by its parent, so it
+  # hides everything to the end of the link — masking that far is correct.
+  local c9is="$tmp/c9is"; make_corpus "$c9is"
+  printf '# Jobs\n\n<a href="mail.md"><span hidden>Mail</a>\n' \
+    > "$c9is/docs/guide/jobs.md"
+  git -C "$c9is" add -A && git -C "$c9is" commit -qm unclosed-hidden-element
+  check "an unclosed hidden element hides the rest of the link" fail "$c9is"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
