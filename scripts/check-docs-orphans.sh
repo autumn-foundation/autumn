@@ -808,9 +808,15 @@ TAG_NAME_END = r'(?=[\s>]|$)'
 # browser never sees a script — the links below it stay live, and `[^>]*>`
 # masked them away. A well-formed one still masks, because the browser DOES
 # see that tag and swallows what follows it.
+# `template` hides its contents in a browser, which is why it is a hidden
+# tag — but it is NOT one of CommonMark's type-1 tags, and the name-only
+# alternative is that block's start condition. `<template` with no `>` is
+# escaped text, and the links under it stay live; only a COMPLETE
+# `<template>` tag hides anything.
+HIDDEN_TYPE1 = r'script|style'
 FIRST_OPENER = re.compile(
     r'(<!--)'
-    r'|(?:^ {0,3}(<(' + HIDDEN_TAGS + r')' + TAG_NAME_END + r'))'
+    r'|(?:^ {0,3}(<(' + HIDDEN_TYPE1 + r')' + TAG_NAME_END + r'))'
     r'|(<(' + HIDDEN_TAGS + r')(?:' + _TWS + r'+' + ATTR + r')*'
     + _TWS + r'*/?>)',
     re.I | re.M)
@@ -1533,7 +1539,12 @@ def edges_from(f):
         # Anchor first, then query — the sibling's order. `mail.md?view=all` and
         # `mail.md?view=all#frag` both address `mail.md`; leaving the query on
         # would fail the `.md` test below and call a live link an orphan.
-        raw = decode_char_refs(raw)
+        # HTML's rules for a raw href, CommonMark's for a Markdown
+        # destination. The tokenizer decodes `mail&#46md` without its
+        # semicolon and the browser navigates to `mail.md`, so a raw anchor
+        # written that way IS a route; the same text in a Markdown
+        # destination renders literally and is not.
+        raw = decode_char_refs(raw) if markdown else html.unescape(raw)
         raw = raw.split('#', 1)[0].split('?', 1)[0].strip()
         raw = urllib.parse.unquote(raw)
         raw = (raw.replace('\x00\x00', '\\\\')
@@ -1654,9 +1665,16 @@ def edges_from(f):
     # because the PATH is on screen; a reference use in a fence shows only the
     # label, while the path lives in a definition that renders as nothing at
     # all. Nothing a reader can see names the target, so it is not an edge.
+    # Blanked, not dropped, and space for space. Dropping the fences shortened
+    # this view, and its match offsets are used to slice `img_view` — so an
+    # image-only reference after a fenced block read unrelated earlier bytes
+    # and was rejected as empty. Every other view in this file preserves
+    # length; this one stopped, and the check that grew to depend on it went
+    # in the same commit.
     ref_txt = ''.join(
-        seg for kind, seg in split_fences(md_txt) if kind == 'prose')
-    ref_txt = CODE_SPAN.sub(' ', ref_txt)
+        seg if kind == 'prose' else ' ' * len(seg)
+        for kind, seg in split_fences(md_txt))
+    ref_txt = CODE_SPAN.sub(lambda m: ' ' * len(m.group(0)), ref_txt)
 
     # A definition is not a USE of anything, including of a label sitting in its
     # own title — `[old]: https://example.com "[mail]"` renders nothing at all.
@@ -3566,6 +3584,40 @@ self_test() {
     > "$c9hn/docs/guide/jobs.md"
   git -C "$c9hn" add -A && git -C "$c9hn" commit -qm image-inside-comment
   check "an image inside a comment is not anchor content" fail "$c9hn"
+
+  # An image-only reference AFTER a fence is still a clickable link: the views
+  # it is judged against have to line up.
+  local c9ho="$tmp/c9ho"; make_corpus "$c9ho"
+  # The fence has to be BIG. With a short one the shifted offset happens to
+  # land on non-blank bytes and the case passes either way — proving nothing.
+  # Interpolated into the FORMAT, not passed as `%s`: as an argument the
+  # `\n` stay literal backslash-n and the fence collapses to one line.
+  local fence; fence="$(printf 'yyyyyyyyyyyyyyyyyyyy\\n%.0s' $(seq 8))"
+  printf "# Jobs\n\n\`\`\`\n${fence}\`\`\`\n\n[![alt](x.png)][m]\n\n[m]: mail.md\n" \
+    > "$c9ho/docs/guide/jobs.md"
+  git -C "$c9ho" add -A && git -C "$c9ho" commit -qm image-ref-after-fence
+  check "an image reference after a fence is a route" pass "$c9ho"
+
+  # A raw href is decoded by the HTML tokenizer, which does not need the
+  # semicolon — the browser navigates there.
+  local c9hp="$tmp/c9hp"; make_corpus "$c9hp"
+  printf '# Jobs\n\n<a href="mail&#46md">mail</a>\n' > "$c9hp/docs/guide/jobs.md"
+  git -C "$c9hp" add -A && git -C "$c9hp" commit -qm raw-href-no-semicolon
+  check "a raw href decodes by HTML rules" pass "$c9hp"
+
+  # `<template` with no `>` opens nothing: it is not a type-1 tag.
+  local c9hq="$tmp/c9hq"; make_corpus "$c9hq"
+  printf '# Jobs\n\n<template\n\nSee [mail](mail.md).\n' > "$c9hq/docs/guide/jobs.md"
+  git -C "$c9hq" add -A && git -C "$c9hq" commit -qm template-name-only
+  check "a name-only template opener hides nothing" pass "$c9hq"
+
+  # ...while `<script` with no `>` still does, and a COMPLETE `<template>`
+  # still hides what it wraps.
+  local c9hr="$tmp/c9hr"; make_corpus "$c9hr"
+  printf '# Jobs\n\n<template>\nSee [mail](mail.md).\n</template>\n' \
+    > "$c9hr/docs/guide/jobs.md"
+  git -C "$c9hr" add -A && git -C "$c9hr" commit -qm template-complete
+  check "a complete template tag still hides its contents" fail "$c9hr"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
