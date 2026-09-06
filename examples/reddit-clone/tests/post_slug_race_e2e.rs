@@ -139,10 +139,15 @@ async fn boot_with_one_subreddit(
     let base_url = app.base_url().to_string();
 
     // One client, one cookie jar — the same session the issue's `-c jar.txt
-    // -b jar.txt` curl invocations shared across every request.
+    // -b jar.txt` curl invocations shared across every request. Redirects are
+    // disabled: every assertion below checks the app's own `303 See Other`
+    // (Codex review on this PR — reqwest follows redirects by default, which
+    // would silently replace that status with the destination page's `200`
+    // and mask a real failure).
     let client = Arc::new(
         reqwest::Client::builder()
             .cookie_store(true)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("build reqwest client"),
     );

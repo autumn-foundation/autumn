@@ -16,4 +16,27 @@
 -- its SELECT as a fast-path guess, but now retries with the next candidate
 -- slug when the database rejects the insert/update as a conflict instead of
 -- trusting the guess outright — see `src/routes/posts.rs`.
+--
+-- An install already hit by #2544 before upgrading may already HAVE
+-- duplicate `(subreddit_id, slug)` rows sitting in `posts` — exactly the
+-- damage this migration exists to prevent from now on. `ADD CONSTRAINT`
+-- validates every existing row, so it would otherwise fail outright on such
+-- an install, leaving it unable to complete this migration or boot the
+-- fixed application (Codex review on this PR). Reconcile first: keep the
+-- oldest row (lowest `id`) in each duplicate group untouched, and suffix
+-- every later duplicate with its own `id` — trivially unique, since ids
+-- are — so the constraint below can always be added cleanly. This never
+-- fires on a fresh database (no rows yet) or one that never hit the race.
+WITH duplicates AS (
+    SELECT id,
+           row_number() OVER (
+               PARTITION BY subreddit_id, slug ORDER BY id ASC
+           ) AS rn
+    FROM posts
+)
+UPDATE posts
+SET slug = posts.slug || '-dup-' || posts.id
+FROM duplicates
+WHERE posts.id = duplicates.id AND duplicates.rn > 1;
+
 ALTER TABLE posts ADD CONSTRAINT posts_subreddit_id_slug_key UNIQUE (subreddit_id, slug);
