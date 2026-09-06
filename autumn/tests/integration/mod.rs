@@ -138,6 +138,7 @@ mod htmx_serving;
 mod i18n_integration;
 mod idempotency_middleware;
 mod idempotency_tenant_scope;
+mod idempotency_token_principal;
 mod impersonation;
 #[cfg(feature = "db")]
 mod impersonation_versioned_db;
