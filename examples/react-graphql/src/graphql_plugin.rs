@@ -4,15 +4,19 @@
 //! [`async_graphql::Schema`] and it will:
 //!
 //! - mount `POST {path}` (JSON request body) and `GET {path}?query=…`
-//!   (GraphQL-over-HTTP query-string form) through [`AppBuilder::nest`];
+//!   (GraphQL-over-HTTP query-string form, **queries only** — a mutation or
+//!   subscription over `GET` is refused with `405`, since a `GET` is what
+//!   caches, prefetchers and cross-site navigations replay freely) through
+//!   [`AppBuilder::nest`];
 //! - mount `GET {path}/sdl`, serving the schema definition language so a
 //!   client can generate types from the running server;
 //! - inject the request's [`AppState`] into every execution's context data,
 //!   so resolvers reach `AppState` extensions (stores, services, pools) the
 //!   same way a route handler does;
-//! - install the schema itself as an `AppState` extension (via
-//!   [`AppBuilder::state_initializer`]), which is how the handlers below find
-//!   it and how the app can fetch it back;
+//! - hand the schema to its handlers as **router-local** state (an
+//!   `axum::Extension` layer on the nested router), not as an `AppState`
+//!   extension keyed by type — so two schemas built from the same root types
+//!   can be mounted at two paths without one overwriting the other;
 //! - declare its routes with [`AppBuilder::declare_plugin_routes`], so
 //!   `autumn routes` lists them with plugin attribution and
 //!   `autumn routes audit` sees a covered mount rather than an opaque router;
@@ -23,7 +27,6 @@
 //! on the surrounding crate.
 
 use std::borrow::Cow;
-use std::sync::Arc;
 
 use async_graphql::{ObjectType, Schema, SubscriptionType};
 use autumn_web::app::AppBuilder;
@@ -32,8 +35,8 @@ use autumn_web::plugin_contract::PluginContract;
 use autumn_web::route_listing::{RouteClassification, RouteInfo};
 use autumn_web::{AppState, AutumnError, AutumnResult};
 use axum::Router;
-use axum::extract::{RawQuery, State};
-use axum::http::header;
+use axum::extract::{Extension, Query, State};
+use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 
@@ -107,6 +110,11 @@ where
     }
 
     /// The raw axum router `build` nests at `path`.
+    ///
+    /// The schema rides on the router as an `Extension` layer: every request
+    /// that reaches these routes carries this plugin's schema, and a second
+    /// plugin at another path carries its own, even when the two share
+    /// `Q`/`M`/`S` and would collide as a type-keyed `AppState` extension.
     fn router(&self) -> Router<AppState> {
         let mut router = Router::new().route(
             "/",
@@ -115,7 +123,7 @@ where
         if self.serve_sdl {
             router = router.route("/sdl", get(sdl::<Q, M, S>));
         }
-        router
+        router.layer(Extension(self.schema.clone()))
     }
 }
 
@@ -143,10 +151,7 @@ where
         let router = self.router();
         let routes = self.route_infos();
         tracing::info!(path = %self.path, sdl = self.serve_sdl, "mounting GraphQL endpoint");
-        let schema = self.schema;
-        app.state_initializer(move |state| state.insert_extension(schema))
-            .nest(&self.path, router)
-            .declare_plugin_routes(routes)
+        app.nest(&self.path, router).declare_plugin_routes(routes)
     }
 }
 
@@ -160,74 +165,130 @@ fn route(method: &str, path: String, handler: &str) -> RouteInfo {
     }
 }
 
-/// Fetch the schema `build` installed on `AppState`.
-fn schema<Q, M, S>(state: &AppState) -> AutumnResult<Arc<Schema<Q, M, S>>>
-where
-    Q: ObjectType + 'static,
-    M: ObjectType + 'static,
-    S: SubscriptionType + 'static,
-{
-    state
-        .extension::<Schema<Q, M, S>>()
-        .ok_or_else(|| AutumnError::internal_server_error_msg("GraphQL schema is not installed"))
-}
-
 /// Execute one request, with `AppState` available to resolvers as context data.
 async fn execute<Q, M, S>(
+    schema: &Schema<Q, M, S>,
     state: AppState,
     request: async_graphql::Request,
-) -> AutumnResult<axum::Json<async_graphql::Response>>
+) -> axum::Json<async_graphql::Response>
 where
     Q: ObjectType + 'static,
     M: ObjectType + 'static,
     S: SubscriptionType + 'static,
 {
-    let schema = schema::<Q, M, S>(&state)?;
-    let response = schema.execute(request.data(state)).await;
-    Ok(axum::Json(response))
+    axum::Json(schema.execute(request.data(state)).await)
 }
 
 /// `POST {path}` with a JSON body of `{ query, variables?, operationName? }`.
 async fn post_graphql<Q, M, S>(
     State(state): State<AppState>,
+    Extension(schema): Extension<Schema<Q, M, S>>,
     axum::Json(request): axum::Json<async_graphql::Request>,
-) -> AutumnResult<axum::Json<async_graphql::Response>>
+) -> axum::Json<async_graphql::Response>
 where
     Q: ObjectType + 'static,
     M: ObjectType + 'static,
     S: SubscriptionType + 'static,
 {
-    execute::<Q, M, S>(state, request).await
+    execute(&schema, state, request).await
+}
+
+/// The GraphQL-over-HTTP `GET` parameters. `operationName` is the spelling
+/// the spec (and every client) uses; `operation_name` is accepted too.
+/// `variables` and `extensions` arrive as JSON text inside the URL.
+#[derive(serde::Deserialize)]
+struct GetParams {
+    #[serde(default)]
+    query: String,
+    #[serde(alias = "operationName")]
+    operation_name: Option<String>,
+    variables: Option<String>,
+    extensions: Option<String>,
+}
+
+impl GetParams {
+    fn into_request(self) -> AutumnResult<async_graphql::Request> {
+        if self.query.trim().is_empty() {
+            return Err(AutumnError::bad_request_msg("missing `query` parameter"));
+        }
+        let mut request = async_graphql::Request::new(self.query);
+        if let Some(name) = self.operation_name {
+            request = request.operation_name(name);
+        }
+        if let Some(raw) = self.variables {
+            let json: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+                AutumnError::bad_request_msg(format!("invalid `variables`: {err}"))
+            })?;
+            request = request.variables(async_graphql::Variables::from_json(json));
+        }
+        if let Some(raw) = self.extensions {
+            request.extensions = serde_json::from_str(&raw).map_err(|err| {
+                AutumnError::bad_request_msg(format!("invalid `extensions`: {err}"))
+            })?;
+        }
+        Ok(request)
+    }
 }
 
 /// `GET {path}?query=…&variables=…&operationName=…` — the query-string form
 /// from the GraphQL-over-HTTP spec, handy for `curl` and for cacheable reads.
+///
+/// Only `query` operations are accepted here. A `GET` is safe and cacheable by
+/// contract, so a mutation smuggled into a URL could be replayed by a
+/// prefetcher, a shared cache, or a cross-site link; the spec's answer is
+/// `405 Method Not Allowed`, and the request is refused before any resolver
+/// runs.
 async fn get_graphql<Q, M, S>(
     State(state): State<AppState>,
-    RawQuery(query_string): RawQuery,
+    Extension(schema): Extension<Schema<Q, M, S>>,
+    Query(params): Query<GetParams>,
 ) -> AutumnResult<axum::Json<async_graphql::Response>>
 where
     Q: ObjectType + 'static,
     M: ObjectType + 'static,
     S: SubscriptionType + 'static,
 {
-    let raw =
-        query_string.ok_or_else(|| AutumnError::bad_request_msg("missing `query` parameter"))?;
-    let request = async_graphql::http::parse_query_string(&raw)
-        .map_err(|err| AutumnError::bad_request_msg(format!("invalid GraphQL request: {err}")))?;
-    execute::<Q, M, S>(state, request).await
+    let request = params.into_request()?;
+    ensure_query_operation(&request)?;
+    Ok(execute(&schema, state, request).await)
+}
+
+/// Refuse anything but a `query` operation, before execution.
+///
+/// A document that fails to parse is let through: the executor will report
+/// the syntax error in the normal GraphQL `errors` shape, which is more useful
+/// to a client than a transport-level rejection.
+fn ensure_query_operation(request: &async_graphql::Request) -> AutumnResult<()> {
+    use async_graphql::parser::types::{DocumentOperations, OperationType};
+
+    let Ok(document) = async_graphql::parser::parse_query(&request.query) else {
+        return Ok(());
+    };
+    let operation_type = match (&document.operations, request.operation_name.as_deref()) {
+        (DocumentOperations::Single(op), _) => Some(op.node.ty),
+        (DocumentOperations::Multiple(ops), Some(name)) => ops.get(name).map(|op| op.node.ty),
+        // Several named operations and no selection: the executor will reject
+        // that as ambiguous; refusing here would only mask its message.
+        (DocumentOperations::Multiple(_), None) => None,
+    };
+    match operation_type {
+        Some(OperationType::Query) | None => Ok(()),
+        Some(other) => Err(AutumnError::bad_request_msg(format!(
+            "{other} operations are not allowed over GET; use POST"
+        ))
+        .with_status(StatusCode::METHOD_NOT_ALLOWED)),
+    }
 }
 
 /// `GET {path}/sdl` — the schema in GraphQL SDL, as `text/plain`.
-async fn sdl<Q, M, S>(State(state): State<AppState>) -> AutumnResult<impl IntoResponse>
+async fn sdl<Q, M, S>(Extension(schema): Extension<Schema<Q, M, S>>) -> impl IntoResponse
 where
     Q: ObjectType + 'static,
     M: ObjectType + 'static,
     S: SubscriptionType + 'static,
 {
-    let schema = schema::<Q, M, S>(&state)?;
-    Ok((
+    (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         schema.sdl(),
-    ))
+    )
 }

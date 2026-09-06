@@ -35,33 +35,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on an Autumn backend that talks GraphQL through a plugin, against a real
   Postgres `#[model]`. Two files carry the point. `src/graphql_plugin.rs` is a
   generic `GraphqlPlugin<Q, M, S>` that adapts any `async-graphql` schema onto
-  an app — `AppBuilder::nest` for the raw router, `declare_plugin_routes` so
-  `autumn routes` and the audit gate see it, a `state_initializer` that puts
-  the schema on `AppState`, per-execution injection of `AppState` into the
-  GraphQL context, and a `PluginContract`. `src/notes.rs` shows what that
-  buys: every resolver builds the generated `PgNoteRepository` from the pool on
-  `AppState` (`with_pool_untracked`, the constructor for code with no
-  request), so `#[normalize(trim)]`, the model's `#[validate]` rules, and the
-  repository's `MutationHooks` (`before_create` validation, a `before_delete`
-  rule refusing to delete a pinned note) apply identically to a GraphQL
-  mutation, the generated `api = "/api/notes"` REST handlers mounted beside
-  it, and the `on_startup` seed. `AutumnError`s become GraphQL field errors
-  carrying the HTTP status in `extensions.status`. The plugin serves `POST
-  /graphql`, the GraphQL-over-HTTP `GET` form, and `GET /graphql/sdl`, whose
-  output is drift-tested against a committed `schema.graphql` the TypeScript
-  types are written against. The Vite/React 19 bundle is committed under
-  `static/app/` (fixed file names, no hash) and served by the standard
-  `/static` mount under the default `script-src 'self'` CSP, so `cargo run`
-  needs no Node toolchain; `autumn build --embed` bakes it into the binary
-  (`embed_static!` + `.embedded_static`, behind the crate's `embed-assets`
-  feature); `npm run dev` proxies `/graphql` to the Rust server for hot-reload
-  work. Tested in two tiers plus a smoke: `TestApp` tests with
-  no Docker (shell, SDL drift, `plugin_conformance::run_conformance`, error
-  mapping), `TestDb` testcontainer tests that apply the example's real embedded
-  migration (rows, hooks, normalisation, validation, REST/GraphQL parity), and
-  a Chromium smoke that drives the real binary against a testcontainer
-  Postgres through a query and a form mutation. Cataloged as a supported
-  example.
+  an app — `AppBuilder::nest` for the raw router (with the schema as
+  router-local `Extension` state, so two schemas can share root types at two
+  paths), `declare_plugin_routes` so `autumn routes` and the audit gate see it,
+  per-execution injection of `AppState` into the GraphQL context, a
+  `PluginContract`, and a `GET` transport that refuses non-query operations
+  with `405`. `src/notes.rs` shows what that buys: every resolver builds the
+  generated `PgNoteRepository` from the pool on `AppState`
+  (`with_pool_untracked`, the constructor for code with no request), so
+  `#[normalize(trim)]`, the model's `#[validate]` rules, and the repository's
+  `MutationHooks` (`before_create` validation, a `before_delete` rule refusing
+  to delete a pinned note) apply identically to a GraphQL mutation, the
+  generated `api = "/api/notes"` REST handlers mounted beside it, and the
+  `on_startup` seed. `AutumnError`s become GraphQL field errors carrying the
+  HTTP status in `extensions.status`. The plugin serves `POST /graphql`, the
+  GraphQL-over-HTTP `GET` form, and `GET /graphql/sdl`, whose output is
+  drift-tested against a committed `schema.graphql` the TypeScript types are
+  written against. The Vite/React 19 bundle is committed under `static/app/`
+  (fixed file names, no hash) and served by the standard `/static` mount under
+  the default `script-src 'self'` CSP, so `cargo run` needs no Node toolchain;
+  `autumn build --embed` bakes it into the binary (`embed_static!` +
+  `.embedded_static`, behind the crate's `embed-assets` feature); `npm run dev`
+  proxies `/graphql` to the Rust server for hot-reload work. Tested in two
+  tiers plus a smoke: `TestApp` tests with no Docker (shell, SDL drift,
+  `plugin_conformance::run_conformance`, error mapping, the `GET` guard,
+  two plugins at two paths), `TestDb` testcontainer tests that apply the
+  example's real embedded migration (rows, hooks, normalisation, validation,
+  REST/GraphQL parity), and a Chromium smoke that drives the real binary
+  against a testcontainer Postgres through a query and a form mutation.
+  Cataloged as a supported example.
+
+- **plugin-sandbox:** the capability vocabulary grows past request handling
+  (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
+  `http-outbound`, `db`, `jobs` and `render` beside `http-request`, and a new
+  `[grants]` table says what each is scoped to — hostnames, plugin-owned tables,
+  job types, render slots — with per-request `[quotas]` an operator can tune.
+  The guest asks over the NDJSON channel it already answers on
+  (`{"op":"call","call":"kv-get",…}` → `{"op":"call_result",…}`), so **a plugin
+  granted every capability imports exactly what a plugin granted none imports**
+  and the #1609 escape corpus keeps proving what it proved. Scoping is by
+  derivation rather than by check: the guest names a logical key, table, host or
+  job type and the host derives the physical one from the manifest and the
+  active tenant, so cross-tenant and host-table access are unspellable rather
+  than refused. Render hooks return a fragment *tree* the host renders, not HTML
+  it sanitises — no parser, so no parser differential — and a hook that traps,
+  overruns its fuel or emits a tag the renderer will not produce omits the
+  fragment rather than taking the page down with it. Every call, allowed or
+  refused, lands
+  in a bounded per-plugin activity log that answers "what did this plugin do in
+  the last hour" from one surface: hosts called, KV/DB usage, jobs enqueued,
+  denials and quota hits, recorded as shapes and never as values — and, when a
+  plugin outruns its own ledger, a line saying every count below it is a floor.
+  The `jobs` capability **enqueues**; running the result is the host's, and this
+  wire version has no frame for delivering a job back into a guest.
+  `autumn plugin inspect --against <installed-artifact>` reviews an upgrade as
+  an upgrade — capabilities, grant lists, quotas, **routes and resource
+  ceilings**, since a new route is an endpoint nobody approved and a raised
+  `fuel` is authority that touches no capability name — printing exactly what
+  grew and exiting non-zero when anything did. `autumn plugin inspect`
+  (text and JSON) now carries the grant lists and quotas, and stops printing
+  "no database access" over a manifest that was just granted `db`. Fifteen-plus
+  adversarial corpus of cross-capability escape attempts runs end-to-end through
+  the real interpreter in `tests/integration/plugin_sandbox_capabilities.rs`.
+  Every result the guest can size is bounded before it is built rather than
+  after: a row carries at most 256 KiB across its columns (checked on the way
+  *in*, so a stored row can always be read back), one `db-get`/`db-query` answer
+  carries at most 512 KiB and says `"truncated": true` when that cut it short,
+  and the budget travels into `PluginStore::query` so a store never materialises
+  what the reply would discard — with an `after` cursor so a page that was cut
+  can actually be continued, and a query filter refusing `row_id` because
+  stripping it would turn "the row with this id" into "every row this tenant
+  has". The outbound response-header ceilings travel into `OutboundRequest`
+  beside `max_response_bytes`, the render context is bounded before it is cloned
+  onto a worker, and `CacheKvStore` uses the serde-aware cache API so a plugin's
+  KV survives on a cross-replica backend rather than silently storing nothing. The shipped `MemoryJobSink` has a finite default
+  depth and no unbounded spelling — this slice ships no consumer that drains it.
+  The activity log counts what it evicts as well as what a per-request ledger
+  overflowed, and both are timestamped and windowed like ordinary events, so a
+  "last hour" neither presents the last twenty seconds as the hour nor carries a
+  lifetime total into a window the calls were not in. See
+  `docs/guide/sandboxed-plugins.md`. **Non-breaking**: everything here is behind
+  the non-default `plugin-sandbox` feature, which `STABILITY.md` already places
+  outside SemVer, and a first-slice manifest parses and runs unchanged —
+  `[grants]` and `[quotas]` both default, and an unknown capability name is
+  still a refusal rather than a silently dropped grant. The only source-level
+  change for an embedder is that `SandboxManifest` gains `grants`/`quotas` and
+  `SandboxOutcome` gains `activity`, so a struct literal over either must name
+  the new fields.
+- **deploy:** `autumn deploy check` now prints the same config-manifest signal
+  `autumn deploy up` already prints (#1952 check/up parity) — a confirming
+  line naming the `autumn.toml` (and, when present, `autumn-<profile>.toml`)
+  that will be uploaded, or the loud "no autumn.toml found" warning when the
+  project has none. Before this, an operator relying on `deploy check` as the
+  documented way to catch a broken deploy before touching the server had no
+  signal at all that the deployed app would silently run built-in defaults —
+  they only found out once they actually ran `up`. Purely informational: it
+  is not a graded preflight check and never affects `check`'s exit code. See
+  `docs/guide/deployment.md`'s "Your `autumn.toml` is deployed alongside the
+  binary" section for the full behavior this closes out. [no-plugin]
 
 - **testing:** a real-ACME end-to-end test drives the ACME order state
   machine (order → HTTP-01 → finalize → issue) against a real, independently-
@@ -1601,6 +1672,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spawn site queries fleet-distribution through a named
   `SchedulerCoordinator`/`SchedulerBackend` predicate instead of matching the
   scheduler config enum inline.
+- **ci:** the test suite is now **sharded across runners** instead of running as
+  one job per OS [no-plugin] — CI scheduling only; it adds no framework surface
+  an agent could reach for, and the notes for humans editing tests live in
+  CLAUDE.md rather than the plugin. On the 2026-08-26 trunk run
+  `Test (windows-latest)` alone was 128 minutes and *was* the critical path of a
+  2h27m run. Two things dominated, both measured from that run's logs. First,
+  `compile_fail::` (trybuild) was 37.1 of the 46.8 minutes the consolidated
+  `integration_tests` binary spent running on Windows, and it was the *tail* —
+  the binary finished 0.2s after trybuild did, on every OS. Each case shells out
+  a nested `cargo` build and trybuild serialises them behind a project-dir lock,
+  so only more runners make it faster. Second, the eight non-default feature
+  lanes ran in sequence in that same job, ~44 minutes of pure recompilation on
+  Windows despite being independent builds.
+
+  `test` is now four job families running side by side — `test` (the workspace
+  suite), `trybuild` (four shards), `test-features` (one job per feature set)
+  and `test-docker` — behind one aggregate `Test suite` gate. First fully-green
+  sharded run: **2h27m → 1h57m**. `trybuild`, `test-features` and `coverage`
+  were then narrowed further: the first two to Linux only (a trybuild golden is
+  pinned to the rustc version, not the OS; a feature lane asks about a feature,
+  not a platform), and `coverage` — by then a co-equal 55-minute tail — split
+  into four lanes by feature set, each uploading under its own Codecov flag.
+  That took the workflow from 47 expanded jobs to 32. Those three changes land
+  after the 1h57m measurement, so the new total is not yet measured.
+
+  Test-layout consequences, all of which keep every test running and
+  merge-blocking: `compile_pass_tests` split into `_a`/`_b` (a disjoint split of
+  the same fixture list, no fixture added or removed); the `sim_*` determinism
+  modules got a single-threaded second step, because removing trybuild freed the
+  libtest thread pool and the remaining ~1880 tests went from trickling through
+  trybuild's gaps (863s) to full parallelism (61s), enough to flip them on a
+  4-vCPU runner; and `capsule_cache_effect` moved to its own binary, because it
+  installs a process-global cache that any concurrent `TestApp::build` clears.
+  Every shard runs `cargo test --workspace` deliberately — the trybuild fixture
+  list is `#[cfg(feature = ...)]`-gated, so narrowing a shard would silently
+  compile fewer fixtures and still report green — and each asserts a non-zero
+  pass count, because `cargo test` exits 0 when a filter matches nothing.
+  **Branch protection must be repointed** from the per-OS `Test (…)` checks to
+  `Test suite` (`test-gate`), the one name that stays stable as shards come and
+  go.
 - **plugin-conformance:** **Breaking:** `plugin_conformance::ConformanceConfig`
   gains a `contract` field and is now `#[non_exhaustive]`, so it can no longer
   be built with a struct literal — use `ConformanceConfig::new(name)` and the
@@ -1880,6 +1991,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   internal-only receiver during development) will see those deliveries start
   failing after upgrade — this is the intended effect of closing the gap. See
   `docs/security/2026-09-03-webhook-ssrf/`.
+
+### Performance
+
+- **`MemorySearchBackend::keyword_search` no longer re-tokenizes every
+  document's fields on every query:** `score` (in `autumn-search/src/memory.rs`)
+  called `tokenize` — which allocates a `String` per token via
+  `str::to_lowercase` — on every indexed field of every document, on every
+  single `keyword_search` call. Profiling a realistic 5,000-document,
+  two-field (~206 words/document) corpus with `valgrind --tool=callgrind`
+  found this re-tokenization (the scan loop itself plus `str::to_lowercase`)
+  accounted for ~66% of the call's instructions. A document's tokens don't
+  change between searches, only between writes, so `MemorySearchBackend` now
+  tokenizes each document's fields once, when it is written (`StoredDocument`
+  in `memory.rs`), and every later `keyword_search`/`score` call reuses the
+  cached tokens instead of recomputing them. Purely an internal
+  representation change to the in-memory reference/dev backend — no public
+  API moved and ranking behavior is unchanged (same 128 `autumn-search` tests
+  pass unmodified in assertions). New harness:
+  `autumn-search/benches/keyword_search.rs`. Measured on the same machine, one
+  session: instructions (callgrind, 5 queries over the corpus) 12,029,984,210
+  → 1,820,921,069 (**-84.9%**); marginal allocation blocks/query (dhat)
+  1,038,586 → 8,586 (**-99.2%**); marginal allocation bytes/query (dhat)
+  6,563,220 → 530,398 (**-91.9%**).
 
 ### Fixed
 

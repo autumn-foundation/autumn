@@ -14,8 +14,9 @@
 //!   builds the repository from the pool on `AppState`, so GraphQL is one
 //!   more door into the same model, not a second data layer.
 //! - [`graphql_plugin`] — a small, generic [`graphql_plugin::GraphqlPlugin`]
-//!   that adapts any `async_graphql::Schema` onto an Autumn app. It knows
-//!   nothing about notes.
+//!   that adapts any `async_graphql::Schema` onto an Autumn app: nested
+//!   router with router-local schema state, declared routes, `AppState`
+//!   flowing into every execution, a contract. It knows nothing about notes.
 //! - [`index`] — the Maud page shell the React bundle mounts into.
 //!
 //! The binary in `src/main.rs` calls [`app`]; the integration tests build the

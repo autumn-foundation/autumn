@@ -37,7 +37,7 @@ untouched because the bundle is an external ES module.
 | Repository from `AppState`, outside an extractor | `src/notes.rs`, `src/lib.rs` | `PgNoteRepository::with_pool_untracked(pool)` in resolvers and in the `on_startup` seed |
 | Embedded migrations | `src/lib.rs`, `migrations/` | `embed_migrations!()`, applied on boot in development and by tests to their testcontainer |
 | `AutumnError` → GraphQL error | `src/notes.rs` | Message on the field, HTTP status in `extensions.status`, so a client can tell a 422 from a 503 |
-| `Plugin` with `nest` + `declare_plugin_routes` | `src/graphql_plugin.rs` | Mounts `POST /graphql`, `GET /graphql?query=…`, `GET /graphql/sdl`; routes show in `autumn routes` with plugin attribution and satisfy `autumn routes audit` |
+| `Plugin` with `nest` + `declare_plugin_routes` | `src/graphql_plugin.rs` | Mounts `POST /graphql`, `GET /graphql?query=…` (queries only — a mutation over `GET` is a `405`), `GET /graphql/sdl`; routes show in `autumn routes` with plugin attribution and satisfy `autumn routes audit` |
 | `PluginContract` + conformance harness | `src/graphql_plugin.rs`, `tests/graphql_api.rs` | Declares the `autumn-web` series; `run_conformance` proves attribution, prefix, collisions and contract in one test |
 | Maud page shell + `asset_url` | `src/lib.rs` | Autumn renders the document; `asset_url` gives fingerprinted URLs in a release build with an asset manifest |
 | Committed Vite bundle, fixed file names | `frontend/vite.config.ts` | `app.js` / `app.css` with no content hash, so the shell references them by name |
@@ -215,12 +215,11 @@ autumn_web::app()
     .await;
 ```
 
-`GraphqlPlugin::build` does four things with the `AppBuilder` it is handed:
+`GraphqlPlugin::build` does three things with the `AppBuilder` it is handed:
 
 | Call | Why |
 |------|-----|
-| `state_initializer(\|state\| state.insert_extension(schema))` | Installs the schema on `AppState`, where the handlers find it per request |
-| `nest("/graphql", router)` | Mounts a raw axum router: `POST /` and `GET /` execute, `GET /sdl` prints the schema |
+| `nest("/graphql", router)` | Mounts a raw axum router: `POST /` and `GET /` execute, `GET /sdl` prints the schema. The schema rides on that router as an `axum::Extension` layer — router-local state — so a second `GraphqlPlugin` at another path keeps its own even when both share root types |
 | `declare_plugin_routes(routes)` | A nested router is opaque to `autumn routes`; declaring makes the routes visible, attributed to the plugin, and audit-clean |
 | `contract()` → `PluginContract` | Names the plugin, its version, and the `autumn-web` series it supports |
 
@@ -275,6 +274,6 @@ cd frontend && npm run typecheck
 | GET | `/api/notes/{id}` | `#[repository(api)]` | One note as JSON, or 404 |
 | GET | `/static/app/app.js`, `/static/app/app.css` | framework | The committed Vite bundle |
 | POST | `/graphql` | plugin | Execute `{ query, variables?, operationName? }` |
-| GET | `/graphql?query=…` | plugin | Execute a read in query-string form |
+| GET | `/graphql?query=…` | plugin | Execute a read in query-string form; mutations are refused with `405` |
 | GET | `/graphql/sdl` | plugin | The schema as `text/plain` SDL |
 | GET | `/health` | framework | Liveness |

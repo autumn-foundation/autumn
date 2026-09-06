@@ -1,4 +1,4 @@
-// Diesel table definition matching `migrations/00000000000000_create_notes`.
+// Diesel table definition matching `migrations/20260906230421_create_notes`.
 diesel::table! {
     notes (id) {
         id -> Int8,

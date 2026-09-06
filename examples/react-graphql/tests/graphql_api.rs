@@ -57,6 +57,57 @@ async fn sdl_route_serves_the_schema_as_text() {
         .assert_body_contains("createNote(input: NewNoteInput!): Note!");
 }
 
+/// `GET` is safe and cacheable by contract; a mutation must not be reachable
+/// through it. Refused before any resolver runs — no pool is needed to see it.
+#[tokio::test]
+async fn a_mutation_over_get_is_refused_with_405() {
+    let client = client_without_db();
+    let mutation = "mutation%20%7B%20deleteNote(id%3A%201)%20%7D";
+    let response = client
+        .get(&format!("{GRAPHQL_PATH}?query={mutation}"))
+        .send()
+        .await;
+    response
+        .assert_status(405)
+        .assert_body_contains("mutation operations are not allowed over GET");
+
+    // A named operation is selected by `operationName`, same rule.
+    let doc = "query%20A%20%7B%20notes%20%7B%20id%20%7D%20%7D%20mutation%20B%20%7B%20deleteNote(id%3A%201)%20%7D";
+    client
+        .get(&format!("{GRAPHQL_PATH}?query={doc}&operationName=B"))
+        .send()
+        .await
+        .assert_status(405);
+    // ...and the query in the same document is still fine (fails later on the
+    // missing pool, as a GraphQL error, not at the transport).
+    client
+        .get(&format!("{GRAPHQL_PATH}?query={doc}&operationName=A"))
+        .send()
+        .await
+        .assert_ok();
+}
+
+/// Two plugins built from the same root types can be mounted at two paths:
+/// each router carries its own schema, so neither overwrites the other.
+#[tokio::test]
+async fn two_plugins_coexist_at_different_paths() {
+    let client = TestApp::new()
+        .plugin(graphql())
+        .plugin(graphql().path("/graphql-v2").without_sdl())
+        .build();
+
+    client.get("/graphql/sdl").send().await.assert_ok();
+    client
+        .get("/graphql-v2/sdl")
+        .send()
+        .await
+        .assert_status(404);
+    for path in ["/graphql", "/graphql-v2"] {
+        let body = gql_at(&client, path, "{ __typename }").await;
+        assert_eq!(body["data"]["__typename"], "Query", "at {path}: {body}");
+    }
+}
+
 #[tokio::test]
 async fn a_get_without_a_query_string_is_a_400() {
     client_without_db()
@@ -163,6 +214,17 @@ async fn gql(client: &TestClient, query: &str, variables: Value) -> Value {
     let response = client
         .post(GRAPHQL_PATH)
         .json(&json!({ "query": query, "variables": variables }))
+        .send()
+        .await;
+    response.assert_ok();
+    response.json()
+}
+
+/// Same, against an arbitrary mount path and no variables.
+async fn gql_at(client: &TestClient, path: &str, query: &str) -> Value {
+    let response = client
+        .post(path)
+        .json(&json!({ "query": query }))
         .send()
         .await;
     response.assert_ok();
