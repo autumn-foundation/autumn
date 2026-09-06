@@ -23,20 +23,48 @@
 -- validates every existing row, so it would otherwise fail outright on such
 -- an install, leaving it unable to complete this migration or boot the
 -- fixed application (Codex review on this PR). Reconcile first: keep the
--- oldest row (lowest `id`) in each duplicate group untouched, and suffix
--- every later duplicate with its own `id` — trivially unique, since ids
--- are — so the constraint below can always be added cleanly. This never
--- fires on a fresh database (no rows yet) or one that never hit the race.
-WITH duplicates AS (
-    SELECT id,
-           row_number() OVER (
-               PARTITION BY subreddit_id, slug ORDER BY id ASC
-           ) AS rn
-    FROM posts
-)
-UPDATE posts
-SET slug = posts.slug || '-dup-' || posts.id
-FROM duplicates
-WHERE posts.id = duplicates.id AND duplicates.rn > 1;
+-- oldest row (lowest `id`) in each duplicate group untouched, and reassign
+-- every later duplicate the next free `base-2`/`base-3`/... slug — the same
+-- suffix search `unique_slug` itself does, checked against the table's LIVE
+-- state (each `UPDATE` below is visible to the next iteration's `EXISTS`,
+-- same transaction) rather than assumed unique from the row id alone. A
+-- first cut of this migration suffixed with the row's own id instead
+-- (`base-dup-<id>`), which does not hold up: an id-based suffix can itself
+-- already be taken by some unrelated row (e.g. `foo` duplicated at id=2
+-- while an unrelated `foo-2` already exists elsewhere in the same
+-- subreddit), which would make the `ADD CONSTRAINT` below fail on exactly
+-- the collision this cleanup exists to remove (Codex review on this PR).
+-- This never fires on a fresh database (no rows yet) or one that never hit
+-- the race.
+DO $$
+DECLARE
+    dup RECORD;
+    candidate TEXT;
+    suffix BIGINT;
+BEGIN
+    FOR dup IN
+        SELECT id, subreddit_id, slug AS base_slug
+        FROM (
+            SELECT id, subreddit_id, slug,
+                   row_number() OVER (
+                       PARTITION BY subreddit_id, slug ORDER BY id ASC
+                   ) AS rn
+            FROM posts
+        ) ranked
+        WHERE rn > 1
+        ORDER BY id ASC
+    LOOP
+        suffix := 2;
+        LOOP
+            candidate := dup.base_slug || '-' || suffix;
+            EXIT WHEN NOT EXISTS (
+                SELECT 1 FROM posts
+                WHERE subreddit_id = dup.subreddit_id AND slug = candidate
+            );
+            suffix := suffix + 1;
+        END LOOP;
+        UPDATE posts SET slug = candidate WHERE id = dup.id;
+    END LOOP;
+END $$;
 
 ALTER TABLE posts ADD CONSTRAINT posts_subreddit_id_slug_key UNIQUE (subreddit_id, slug);
