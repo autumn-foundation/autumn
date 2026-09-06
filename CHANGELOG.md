@@ -2282,7 +2282,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[public]` to all three handlers, matching the pattern documented right
   above them in the template. [no-plugin] — restores previously-documented
   behavior; no new or changed API.
-
 - **`route_macro` lost a guarded handler's OpenAPI response schema under
   `#[throttle]`/`#[step_up]` (issue #2516):** #2488 moved the
   `#[throttle]`/`#[step_up]` auth/rate-limit checks out of the handler body
@@ -2370,7 +2369,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pattern doesn't, plus the mirror-image ordering where a lock that
   genuinely wins the race correctly rejects the concurrent login instead of
   silently granting a session.
-
 - **🧭 Wayfinder: keyboard bypass-blocks link added to 6 supported example
   apps (a11y `bypass` Serious 7/8 → 0/8; `landmark-one-main` Moderate 1/8 → 0/8):**
   `autumn check --a11y` — the framework's own WCAG audit, run against each
