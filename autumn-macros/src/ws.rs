@@ -30,6 +30,40 @@ fn reject_seo_argument(attr: &TokenStream) -> Option<TokenStream> {
     )
 }
 
+/// Attribute names of the body-guard macros that unconditionally rewrite a
+/// handler's return type to `Response` — incompatible with `#[ws]`'s
+/// `impl WsHandler` return type. See `ws_macro`'s rejection of the
+/// combination in either attribute order.
+const INCOMPATIBLE_GUARD_ATTRS: [&str; 4] = ["secured", "step_up", "throttle", "authorize"];
+
+/// Error message for `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]`
+/// combined with `#[ws]`, in either attribute order.
+pub const INCOMPATIBLE_GUARD_MSG: &str = "`#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` cannot be combined with `#[ws]`, \
+     in either attribute order: those guards rewrite the handler to return an HTTP \
+     `Response`, but a `#[ws]` handler must return `impl WsHandler`. Check authorization \
+     inside the upgrade handler instead — add a `Session` (or other) extractor parameter and \
+     reject the upgrade before returning a `WsHandler`.";
+
+/// The exact fully qualified return type every guard
+/// (`secured`/`step_up`/`throttle`/`authorize`) rewrites its wrapped
+/// handler to (confirmed identical across `secured.rs`/`step_up.rs`/
+/// `throttle.rs`/`authorize.rs`).
+const GUARD_RESPONSE_PATH: [&str; 5] = ["autumn_web", "reexports", "axum", "response", "Response"];
+
+/// Whether `path` is exactly the guard-generated
+/// `::autumn_web::reexports::axum::response::Response` return type, matched
+/// segment-by-segment rather than by last segment alone — a legitimate
+/// `#[ws]` handler could otherwise return an unrelated user type merely
+/// named `Response` (fourth Codex review pass on #2513).
+fn is_guard_response_path(path: &syn::Path) -> bool {
+    path.segments.len() == GUARD_RESPONSE_PATH.len()
+        && path
+            .segments
+            .iter()
+            .zip(GUARD_RESPONSE_PATH.iter())
+            .all(|(segment, expected)| segment.ident == expected)
+}
+
 fn is_app_state_type(ty: &syn::Type) -> bool {
     if let syn::Type::Path(type_path) = ty
         && type_path.qself.is_none()
@@ -90,10 +124,97 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err,
     };
 
-    let input_fn = match parse::parse_async_handler(item) {
-        Ok(f) => f,
-        Err(err) => return err,
-    };
+    let (leading_guard_items, mut input_fn) =
+        match parse::parse_async_handler_with_leading_items(item) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+
+    // A body guard (`#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]`)
+    // expanded above `#[ws]` leaves its `FromRequestParts` gate as a leading
+    // sibling item (`parse::split_leading_items_and_fn`) — but every one of
+    // those guards unconditionally rewrites the wrapped function's return
+    // type to `Response` and threads its original return value through
+    // `IntoResponse::into_response` (see `secured.rs`/`step_up.rs`/
+    // `throttle.rs`/`authorize.rs`). That does not hold for a `#[ws]`
+    // handler: it returns `impl WsHandler` (a plain closure), not something
+    // `IntoResponse`, and this macro's two-function wrapper expects to call
+    // it and get a `WsHandler` back, not a `Response` (#2513 Codex review —
+    // binding the gate parameter to a real identifier fixed the forwarding
+    // call but left this deeper return-type mismatch). Reject the
+    // combination outright rather than emit code that fails to compile deep
+    // inside guard-generated code with a confusing error.
+    //
+    // The same incompatibility exists in the *other* stacking order —
+    // `#[ws]` outermost, the guard still a live, unexpanded attribute below
+    // it — which leaves `leading_guard_items` empty (nothing has expanded
+    // yet) but `input_fn.attrs` still carrying the guard attribute; that
+    // guard then rewrites `echo`'s return type to `Response` *after* this
+    // macro has already generated a wrapper expecting `impl WsHandler`
+    // (second Codex review pass on #2513). Check both. This scan must also
+    // see a guard hidden behind `#[cfg_attr(predicate, secured(..))]`:
+    // `cfg_attr` is not resolved until after every attribute macro has
+    // finished expanding, so a plain `attr.path()` name check sees only
+    // `cfg_attr`, never the guard it wraps (Codex review on #2513, ninth
+    // finding, same gap as `static_route.rs`'s identical scan) —
+    // `param_helpers::attr_or_cfg_attr_matches_any` looks inside `cfg_attr`'s
+    // own argument list for this reason.
+    let unexpanded_guard_attr = input_fn.attrs.iter().find(|attr| {
+        crate::param_helpers::attr_or_cfg_attr_matches_any(attr, &INCOMPATIBLE_GUARD_ATTRS)
+    });
+    // `#[authorize]` above `#[ws]` (already expanded) slips past both checks
+    // above: unlike the other three guards it emits no separate gate sibling
+    // item (so `leading_guard_items` is typically empty) and it *removes*
+    // its own attribute once consumed (so `input_fn.attrs` no longer carries
+    // it either) — see `authorize_macro`'s `#leading_items #input_fn`
+    // emission vs. the other three guards' `#leading_items #gate_item
+    // #input_fn` (third Codex review pass on #2513). Rather than keep
+    // enumerating every guard's particular expansion shape, check the
+    // actual invariant directly: all four guards rewrite the return type to
+    // the exact same `-> ::autumn_web::reexports::axum::response::Response`
+    // (confirmed identical across secured.rs/step_up.rs/throttle.rs/
+    // authorize.rs), which a legitimate `#[ws]` handler — required to
+    // return `impl WsHandler` — never would. Matched by the *full* path,
+    // not just the last segment: a legitimate `#[ws]` handler could return
+    // a user-defined type merely named `Response` that implements
+    // `WsHandler` (e.g. `my_crate::Response`), and a last-segment-only
+    // match would misclassify that as a guard-generated return type and
+    // reject a perfectly valid handler (fourth Codex review pass on #2513).
+    let already_returns_response = matches!(
+        &input_fn.sig.output,
+        syn::ReturnType::Type(_, ty)
+            if matches!(ty.as_ref(), syn::Type::Path(p) if is_guard_response_path(&p.path))
+    );
+    if !leading_guard_items.is_empty()
+        || unexpanded_guard_attr.is_some()
+        || already_returns_response
+    {
+        let err = if let Some(attr) = unexpanded_guard_attr {
+            syn::Error::new_spanned(attr, INCOMPATIBLE_GUARD_MSG)
+        } else if !leading_guard_items.is_empty() {
+            syn::Error::new_spanned(leading_guard_items, INCOMPATIBLE_GUARD_MSG)
+        } else {
+            syn::Error::new_spanned(&input_fn.sig.output, INCOMPATIBLE_GUARD_MSG)
+        };
+        return err.to_compile_error();
+    }
+
+    // No guard is visible by name or by expansion artifact at this point,
+    // but a still-pending guard attribute imported under an alias (e.g.
+    // `use ::autumn_web::secured as auth;` then `#[auth("admin")]`) is
+    // exactly as live and unexpanded as a plainly-spelled one, and
+    // completely invisible to `attr_or_cfg_attr_matches_any`'s name-based
+    // scan — a proc-macro attribute runs before the compiler resolves
+    // imports (Codex review on #2513, tenth finding). Leave a marker for
+    // that guard's OWN macro to find once IT expands, regardless of what
+    // name it was invoked under — see `param_helpers::WS_HANDLER_MARKER`'s
+    // doc comment. Must happen before `fn_name`/`vis` below borrow from
+    // `input_fn`, since those borrows need to outlive this mutation to
+    // reach the final `quote!` at the bottom.
+    crate::param_helpers::prepend_body_const_marker(
+        &mut input_fn,
+        crate::param_helpers::WS_HANDLER_MARKER,
+    );
 
     let fn_name = &input_fn.sig.ident;
     let vis = &input_fn.vis;
@@ -107,21 +228,37 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // wired.
     let is_public = crate::api_doc::is_public(&input_fn);
 
+    // Derive `secured`/`required_roles`/`required_scopes` from any
+    // `#[secured]` markers on the handler, the same way `crate::route` and
+    // `crate::static_route` do (#2513 Codex review): otherwise a
+    // `#[secured(...)]`-guarded WebSocket route is protected at runtime but
+    // reported as `unclassified`/roleless to `routes audit`.
+    let (secured, required_roles, required_scopes) =
+        crate::api_doc::extract_secured_info(&input_fn);
+
     // Separate user params into AppState params (supplied from extracted state)
     // and extractor params (become Axum extractors on the upgrade handler).
     let mut extractor_params = Vec::new();
     let mut call_args = Vec::new();
 
-    for arg in &input_fn.sig.inputs {
+    for (idx, arg) in input_fn.sig.inputs.iter().enumerate() {
         if let syn::FnArg::Typed(pat_type) = arg {
             if is_app_state_type(&pat_type.ty) {
                 // AppState param — supply from our extracted state
                 call_args.push(quote! { __autumn_state.clone() });
             } else {
-                // Regular extractor — add to upgrade handler params
-                let pat = &pat_type.pat;
-                extractor_params.push(arg.clone());
-                call_args.push(quote! { #pat });
+                // Regular extractor — add to upgrade handler params, bound to
+                // a freshly generated identifier rather than echoing the
+                // original parameter's pattern back as a call argument: a
+                // guard (`#[secured]`/`#[step_up]`/`#[throttle]`) expanded
+                // above `#[ws]` inserts a leading `_: __AutumnXGate` parameter
+                // (#2513 Codex review), and `_` is a pattern, not a valid
+                // call-argument expression — `#fn_name(_)` does not compile.
+                let attrs = &pat_type.attrs;
+                let ty = &pat_type.ty;
+                let local_ident = format_ident!("__autumn_ws_extractor_{idx}");
+                extractor_params.push(quote! { #(#attrs)* #local_ident: #ty });
+                call_args.push(quote! { #local_ident });
             }
         }
     }
@@ -162,6 +299,7 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let path_params_tokens = crate::api_doc::emit_path_param_slice(&path_params);
 
     quote! {
+        #leading_guard_items
         #input_fn
 
         #upgrade_handler
@@ -191,8 +329,9 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     success_status: 101,
                     hidden: true,
                     query_schema: ::core::option::Option::None,
-                    secured: false,
-                    required_roles: &[],
+                    secured: #secured,
+                    required_roles: #required_roles,
+                    required_scopes: #required_scopes,
                     register_schemas: ::core::option::Option::None,
                     api_version: ::core::option::Option::None,
                     public: #is_public,
@@ -240,6 +379,34 @@ mod tests {
     use super::ws_macro;
 
     #[test]
+    fn secured_rejects_when_invoked_on_a_ws_handler_via_an_alias() {
+        // Same gap as `static_route.rs`'s marker, for `#[ws]`: see
+        // `secured::tests::secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias`
+        // for the full rationale (Codex review on #2513, tenth finding).
+        let accepted = ws_macro(
+            quote! { "/echo" },
+            quote! {
+                #[auth("admin")]
+                async fn echo() -> impl WsHandler { |socket| async move {} }
+            },
+        );
+        assert!(
+            !accepted.to_string().contains("compile_error"),
+            "ws_macro cannot recognize an aliased guard attribute by name: {accepted}"
+        );
+
+        let accepted_fn = crate::param_helpers::extract_fn_item(accepted, "echo");
+        let generated =
+            crate::secured::secured_macro(quote! { "admin" }, quote! { #accepted_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "secured_macro must reject a handler already marked as a #[ws] route, regardless \
+             of what alias attribute name the source used to invoke it: {generated}"
+        );
+    }
+
+    #[test]
     fn ws_defaults_public_false() {
         let generated = ws_macro(
             quote! { "/echo" },
@@ -252,6 +419,183 @@ mod tests {
         );
         // The handler's module path is captured for audit diagnostics.
         assert!(generated.contains("module_path"));
+        assert!(
+            generated.contains("secured : false"),
+            "an unguarded ws route must record secured = false: {generated}"
+        );
+        assert!(
+            generated.contains("required_roles : & []"),
+            "an unguarded ws route must have no required roles: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_rejects_a_secured_guard_expanded_above_it() {
+        // `#[secured("admin")]` above `#[ws]`: the guard expands first and
+        // inserts a leading `_: __AutumnSecuredGate_echo` gate parameter.
+        // Binding that parameter to a generated identifier (rather than
+        // echoing its wildcard pattern back as a call argument) fixes the
+        // immediate forwarding error, but `#[secured]` also unconditionally
+        // rewrites the handler's return type to `Response` and wraps its
+        // original return value through `IntoResponse` — which cannot hold
+        // for a `#[ws]` handler, whose return type is `impl WsHandler`, a
+        // plain closure (second Codex finding on #2513, deeper than the
+        // first). Rather than emit code that fails to compile in
+        // guard-generated internals, `#[ws]` must reject the combination
+        // outright with a clear error.
+        let secured = crate::secured::secured_macro(
+            quote! { "admin" },
+            quote! {
+                async fn echo() -> impl WsHandler { |socket| async move {} }
+            },
+        );
+        let generated = ws_macro(quote! { "/echo" }, secured).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a #[secured] guard stacked above #[ws] must be a compile error, not silently \
+             broken codegen: {generated}"
+        );
+        assert!(
+            generated.contains("cannot be combined with"),
+            "the error must explain why the combination is rejected: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_rejects_a_live_unexpanded_secured_attribute() {
+        // The *other* stacking order: `#[ws("/echo")]` outermost, `#[secured]`
+        // still a live, unexpanded attribute below it. `#[ws]` sees a single
+        // function with `#[secured]` still attached — `leading_guard_items`
+        // is empty, since nothing has expanded yet — so the check above (on
+        // `leading_guard_items`) alone misses this order entirely: `#[ws]`
+        // would generate its wrapper assuming `impl WsHandler`, then
+        // `#[secured]` expands afterward and rewrites `echo`'s return type
+        // to `Response` out from under it (third Codex finding on #2513).
+        let generated = ws_macro(
+            quote! { "/echo" },
+            quote! {
+                #[secured("admin")]
+                async fn echo() -> impl WsHandler { |socket| async move {} }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a live, unexpanded #[secured] attribute below #[ws] must also be a compile \
+             error: {generated}"
+        );
+        assert!(
+            generated.contains("cannot be combined with"),
+            "the error must explain why the combination is rejected: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_rejects_a_secured_attribute_wrapped_in_cfg_attr() {
+        // Same gap as `static_route.rs`'s identical scan: a guard hidden
+        // behind `#[cfg_attr(predicate, secured(..))]` below `#[ws]` is just
+        // as live and unexpanded as a bare `#[secured]` attribute in the
+        // same position — `cfg_attr` is not resolved until after every
+        // attribute macro has finished expanding. Ninth Codex finding on
+        // #2513.
+        let generated = ws_macro(
+            quote! { "/echo" },
+            quote! {
+                #[cfg_attr(feature = "auth", secured("admin"))]
+                async fn echo() -> impl WsHandler { |socket| async move {} }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a #[secured] guard wrapped in #[cfg_attr] below #[ws] must also be a compile \
+             error: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_rejects_a_step_up_guard_expanded_above_it() {
+        let stepped_up = crate::step_up::step_up_macro(
+            quote! {},
+            quote! {
+                async fn echo() -> impl WsHandler { |socket| async move {} }
+            },
+        );
+        let generated = ws_macro(quote! { "/echo" }, stepped_up).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a #[step_up] guard stacked above #[ws] must be a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_rejects_a_throttle_guard_expanded_above_it() {
+        let throttled = crate::throttle::throttle_macro(
+            quote! { limit = 10, per = "1m" },
+            quote! {
+                async fn echo() -> impl WsHandler { |socket| async move {} }
+            },
+        );
+        let generated = ws_macro(quote! { "/echo" }, throttled).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a #[throttle] guard stacked above #[ws] must be a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_rejects_an_authorize_guard_expanded_above_it() {
+        // `#[authorize]` above `#[ws]`: unlike `#[secured]`/`#[step_up]`/
+        // `#[throttle]`, `authorize_macro` emits no separate gate sibling
+        // item (just `#leading_items #input_fn`) and removes its own
+        // attribute once consumed, so neither `leading_guard_items` nor a
+        // live attribute on `input_fn` catches this ordering — only the
+        // rewritten `-> Response` return type does (third Codex finding on
+        // #2513, deeper than the first two).
+        let authorized = crate::authorize::authorize_macro(
+            quote! { "view", resource = Room },
+            quote! {
+                async fn echo() -> impl WsHandler { |socket| async move {} }
+            },
+        );
+        let generated = ws_macro(quote! { "/echo" }, authorized).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "an #[authorize] guard stacked above #[ws] must be a compile error: {generated}"
+        );
+        assert!(
+            generated.contains("cannot be combined with"),
+            "the error must explain why the combination is rejected: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_accepts_a_handler_returning_an_unrelated_response_type() {
+        // A `#[ws]` handler returning a user-defined type merely *named*
+        // `Response` (not the guard-generated
+        // `::autumn_web::reexports::axum::response::Response`) must not be
+        // misclassified as guard-incompatible: the return-type check must
+        // match the full path, not just the last segment (fourth Codex
+        // review pass on #2513).
+        let generated = ws_macro(
+            quote! { "/echo" },
+            quote! {
+                async fn echo() -> my_crate::Response { my_crate::Response::new() }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("compile_error"),
+            "a handler returning an unrelated `Response`-named type must not be rejected: \
+             {generated}"
+        );
     }
 
     #[test]

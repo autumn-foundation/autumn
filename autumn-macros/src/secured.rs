@@ -24,7 +24,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ExprLit, ItemFn, Lit, LitStr, Meta, Token, parse_quote};
+use syn::{Expr, ExprLit, Lit, LitStr, Meta, Token, parse_quote};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -112,15 +112,19 @@ fn parse_scope_array(expr: &Expr) -> syn::Result<Vec<String>> {
 }
 
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let SecuredArgs { roles, scopes } = match parse_secured_args(attr) {
         Ok(r) => r,
         Err(err) => return err.to_compile_error(),
     };
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
 
     if input_fn.sig.asyncness.is_none() {
@@ -129,6 +133,15 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             "#[secured] can only be applied to async functions",
         )
         .to_compile_error();
+    }
+
+    // `#[secured]` written below `#[static_get]`/`#[ws]` — including under an
+    // alias those macros' own by-name attribute scan cannot see — is caught
+    // here instead, once this guard's own macro is the one running (Codex
+    // review on #2513, tenth finding). See
+    // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
+    if let Some(err) = crate::param_helpers::reject_if_incompatible_route_marker(&input_fn) {
+        return err;
     }
 
     // The session/role check is emitted for the classic forms (`#[secured]`,
@@ -312,6 +325,7 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     quote! {
+        #leading_items
         #gate_item
         #input_fn
     }
@@ -322,6 +336,91 @@ mod tests {
     use quote::quote;
 
     use super::{parse_secured_args, secured_macro};
+    use crate::static_route::static_get_macro;
+
+    #[test]
+    fn secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
+        // Simulates real source using `use ::autumn_web::secured as auth;`:
+        //   #[static_get("/private")]
+        //   #[auth("admin")]
+        //   async fn private() -> &'static str { "private" }
+        // `static_get_macro` cannot recognize `auth` by name (Codex review on
+        // #2513, tenth finding) and must accept the combination rather than
+        // reject it, leaving the incompatibility for the guard's own macro to
+        // catch via the marker it left behind. The compiler invokes the SAME
+        // `secured_macro` function regardless of what alias the source used
+        // to name it — aliasing changes only the surface spelling, never
+        // which function actually runs — so calling `secured_macro` directly
+        // here is exactly what real, aliased source code produces.
+        let accepted = static_get_macro(
+            quote! { "/private" },
+            quote! {
+                #[auth("admin")]
+                async fn private() -> &'static str { "private" }
+            },
+        );
+        assert!(
+            !accepted.to_string().contains("compile_error"),
+            "static_get_macro cannot recognize an aliased guard attribute by name, so it must \
+             accept (not reject) at this point, deferring to the guard's own marker check: \
+             {accepted}"
+        );
+
+        let accepted_fn = crate::param_helpers::extract_fn_item(accepted, "private");
+        let generated = secured_macro(quote! { "admin" }, quote! { #accepted_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "secured_macro must reject a handler already marked as a #[static_get] route, \
+             regardless of what alias attribute name the source used to invoke it: {generated}"
+        );
+    }
+
+    #[test]
+    fn secured_rejects_when_a_marker_is_buried_inside_a_cached_wrapper() {
+        // Simulates real source using `use ::autumn_web::secured as auth;`:
+        //   #[static_get("/private")]
+        //   #[cached]
+        //   #[auth("admin")]
+        //   async fn private() -> &'static str { "private" }
+        // `#[static_get]` injects `STATIC_ROUTE_HANDLER_MARKER` into the top
+        // of the original body, but `#[cached]` — the next attribute to
+        // expand — re-homes that ENTIRE body (marker included) one level
+        // deeper, inside its own `(|| async move { ... })().await` closure
+        // IIFE (`cached_macro`'s `compute`). A marker scan that only looks at
+        // the function's top-level statements would miss it entirely,
+        // reopening the exact cache-bypass hole this whole rejection exists
+        // to close (Codex review on #2513, eleventh finding).
+        let marked = static_get_macro(
+            quote! { "/private" },
+            quote! {
+                #[cached]
+                #[auth("admin")]
+                async fn private() -> &'static str { "private" }
+            },
+        );
+        assert!(
+            !marked.to_string().contains("compile_error"),
+            "static_get_macro cannot recognize #[cached] or the aliased guard by name, so it \
+             must accept at this point: {marked}"
+        );
+
+        let marked_fn = crate::param_helpers::extract_fn_item(marked, "private");
+        let cached = crate::cached::cached_macro(quote! {}, quote! { #marked_fn });
+        assert!(
+            !cached.to_string().contains("compile_error"),
+            "#[cached] knows nothing about route guards and must accept unconditionally: {cached}"
+        );
+
+        let cached_fn = crate::param_helpers::extract_fn_item(cached, "private");
+        let generated = secured_macro(quote! { "admin" }, quote! { #cached_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "secured_macro must still find the #[static_get] marker even after #[cached] buried \
+             it inside a closure IIFE: {generated}"
+        );
+    }
 
     #[test]
     fn secured_string_literal_replay_guard_still_injects_replay_stop() {
