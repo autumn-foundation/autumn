@@ -228,6 +228,21 @@ MD_LINK_NESTED = re.compile(
 # Markdown drops the backslash from an escaped ASCII punctuation character, so
 # `guide\(v2\).md` addresses the file `guide(v2).md` — same rule as the sibling.
 UNESCAPE = re.compile(r'\\([!-/:-@\[-`{-~])')
+# A numeric character reference in a destination: `mail&#46;md` and
+# `mail&#x2e;md` both address `mail.md`. The migration-guide gate already pins
+# this behaviour (`repo_hygiene.rs`
+# migration_guide_gate_resolves_a_character_reference_in_a_destination), and
+# comparing the encoded spelling rejects a link that works for the reader.
+CHAR_REF = re.compile(r'&#(?:[xX]([0-9a-fA-F]+)|(\d+));')
+
+
+def decode_char_refs(s):
+    def one(m):
+        try:
+            return chr(int(m.group(1), 16) if m.group(1) else int(m.group(2)))
+        except (ValueError, OverflowError):
+            return m.group(0)
+    return CHAR_REF.sub(one, s)
 # A reference definition: `[mail]: mail.md`, optionally `<…>`-wrapped. Markdown
 # allows up to three leading spaces. Reference-style links are a syntax
 # check-docs-links.sh already parses and self-tests, so a page linked only that
@@ -622,6 +637,7 @@ def edges_from(f):
         # Anchor first, then query — the sibling's order. `mail.md?view=all` and
         # `mail.md?view=all#frag` both address `mail.md`; leaving the query on
         # would fail the `.md` test below and call a live link an orphan.
+        raw = decode_char_refs(raw)
         raw = raw.split('#', 1)[0].split('?', 1)[0].strip()
         raw = urllib.parse.unquote(raw)
         raw = (raw.replace('\x00\x00', '\\\\')
@@ -719,8 +735,17 @@ def edges_from(f):
     # Definitions come from the prose-only view for the same reason usages do:
     # a `[mail]: mail.md` DEMONSTRATED inside a fence defines nothing, and
     # resolving it would let a documentation sample keep an orphan alive.
+    # A definition cannot INTERRUPT a paragraph: after an ordinary prose line
+    # it is literal text, and the reference above it resolves to nothing. The
+    # migration-guide gate pins the same rule
+    # (`migration_guide_gate_ignores_a_definition_continuing_a_paragraph`).
+    # So a definition counts only where a block can start — at the top of the
+    # view, or after a blank line.
     seen_labels = set()
     for m in REF_DEF.finditer(ref_txt):
+        before = ref_txt[:m.start()]
+        if before.strip() and not before.rstrip(' \t').endswith('\n\n'):
+            continue
         label = ref_label(m.group(1))
         if label in seen_labels:
             continue
@@ -1518,6 +1543,31 @@ self_test() {
   printf '# Jobs\n\n<span>text\n[mail](mail.md)\n' > "$c9ci/docs/guide/jobs.md"
   git -C "$c9ci" add -A && git -C "$c9ci" commit -qm inline-tag-not-block
   check "an inline tag with trailing text opens no raw block" pass "$c9ci"
+
+  # A character reference in a destination decodes to the real path.
+  local c9cj="$tmp/c9cj"; make_corpus "$c9cj"
+  printf '# Jobs\n\nSee [mail](mail&#46;md).\n' > "$c9cj/docs/guide/jobs.md"
+  git -C "$c9cj" add -A && git -C "$c9cj" commit -qm decimal-char-ref
+  check "a decimal character reference in a destination resolves" pass "$c9cj"
+
+  local c9ck="$tmp/c9ck"; make_corpus "$c9ck"
+  printf '# Jobs\n\nSee [mail](mail&#x2e;md).\n' > "$c9ck/docs/guide/jobs.md"
+  git -C "$c9ck" add -A && git -C "$c9ck" commit -qm hex-char-ref
+  check "a hex character reference in a destination resolves" pass "$c9ck"
+
+  # A definition cannot interrupt a paragraph.
+  local c9cl="$tmp/c9cl"; make_corpus "$c9cl"
+  printf '# Jobs\n\nSee [mail][upgrade].\nmore prose here.\n[upgrade]: mail.md\n' \
+    > "$c9cl/docs/guide/jobs.md"
+  git -C "$c9cl" add -A && git -C "$c9cl" commit -qm refdef-continues-paragraph
+  check "a definition continuing a paragraph defines nothing" fail "$c9cl"
+
+  # ...but one after a blank line is a real definition.
+  local c9cm="$tmp/c9cm"; make_corpus "$c9cm"
+  printf '# Jobs\n\nSee [mail][upgrade].\n\n[upgrade]: mail.md\n' \
+    > "$c9cm/docs/guide/jobs.md"
+  git -C "$c9cm" add -A && git -C "$c9cm" commit -qm refdef-after-blank
+  check "a definition after a blank line resolves" pass "$c9cm"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
