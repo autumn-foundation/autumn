@@ -1460,6 +1460,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **acme:** Internal cleanup, no behavior change (#1864): the owner-only
+  temp-write-then-rename idiom, previously duplicated between
+  `acme::store::FsAcmeStore` and the failure-capture capsule writer, is now
+  one shared helper; `FsAcmeStore` gained a `find_cert_for_domains`/
+  `list_certs` API that `autumn doctor`'s ACME preflight reuses instead of
+  re-deriving the on-disk cert-path layout by hand; and the ACME renewal
+  spawn site queries fleet-distribution through a named
+  `SchedulerCoordinator`/`SchedulerBackend` predicate instead of matching the
+  scheduler config enum inline.
 - **plugin-conformance:** **Breaking:** `plugin_conformance::ConformanceConfig`
   gains a `contract` field and is now `#[non_exhaustive]`, so it can no longer
   be built with a struct literal — use `ConformanceConfig::new(name)` and the
