@@ -4,7 +4,8 @@
 // GraphQL Code Generator pointed at that endpoint.
 
 export interface Note {
-  id: number;
+  /** The GraphQL `ID` scalar: a string on the wire, even though the column is a BIGINT. */
+  id: string;
   title: string;
   body: string;
   pinned: boolean;

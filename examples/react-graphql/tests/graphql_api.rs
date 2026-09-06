@@ -14,6 +14,9 @@
 //! cargo test -p react-graphql --test graphql_api -- --include-ignored --test-threads=1   # both
 //! ```
 
+use std::sync::Arc;
+
+use autumn_web::auth::{InMemoryApiTokenStore, RequireApiToken};
 use autumn_web::plugin::Plugin;
 use autumn_web::plugin_conformance::{ConformanceConfig, run_conformance};
 use autumn_web::test::{TestApp, TestClient, TestDb};
@@ -62,7 +65,7 @@ async fn sdl_route_serves_the_schema_as_text() {
 #[tokio::test]
 async fn a_mutation_over_get_is_refused_with_405() {
     let client = client_without_db();
-    let mutation = "mutation%20%7B%20deleteNote(id%3A%201)%20%7D";
+    let mutation = "mutation%20%7B%20deleteNote(id%3A%20%221%22)%20%7D";
     let response = client
         .get(&format!("{GRAPHQL_PATH}?query={mutation}"))
         .send()
@@ -72,7 +75,7 @@ async fn a_mutation_over_get_is_refused_with_405() {
         .assert_body_contains("mutation operations are not allowed over GET");
 
     // A named operation is selected by `operationName`, same rule.
-    let doc = "query%20A%20%7B%20notes%20%7B%20id%20%7D%20%7D%20mutation%20B%20%7B%20deleteNote(id%3A%201)%20%7D";
+    let doc = "query%20A%20%7B%20notes%20%7B%20id%20%7D%20%7D%20mutation%20B%20%7B%20deleteNote(id%3A%20%221%22)%20%7D";
     client
         .get(&format!("{GRAPHQL_PATH}?query={doc}&operationName=B"))
         .send()
@@ -106,6 +109,40 @@ async fn two_plugins_coexist_at_different_paths() {
         let body = gql_at(&client, path, "{ __typename }").await;
         assert_eq!(body["data"]["__typename"], "Query", "at {path}: {body}");
     }
+}
+
+/// `GraphqlPlugin::guard` is the seam for protecting a nested router:
+/// `AppBuilder::scoped` wraps the `routes![]` it is given and never sees a
+/// router a plugin nests. Here the framework's bearer-token layer guards every
+/// plugin route, `sdl` included, and the declared routes flip to `Gated`.
+#[tokio::test]
+async fn guard_layer_protects_every_plugin_route() {
+    let store = Arc::new(InMemoryApiTokenStore::default().with_token("s3cret", "tests"));
+    let plugin = graphql().guard(RequireApiToken::new(store), "RequireApiToken");
+    assert!(
+        plugin.route_infos().iter().all(|r| {
+            r.classification == autumn_web::route_listing::RouteClassification::Gated
+                && r.middleware == ["RequireApiToken"]
+        }),
+        "guarded routes are declared Gated with the guard's label"
+    );
+    let client = TestApp::new().plugin(plugin).build();
+
+    client.get("/graphql/sdl").send().await.assert_status(401);
+    client
+        .post(GRAPHQL_PATH)
+        .json(&json!({ "query": "{ __typename }" }))
+        .send()
+        .await
+        .assert_status(401);
+
+    client
+        .get("/graphql/sdl")
+        .header("authorization", "Bearer s3cret")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("type Note {");
 }
 
 #[tokio::test]
@@ -267,9 +304,11 @@ async fn rest_and_graphql_see_the_same_rows() {
     let graphql = graphql["data"]["notes"].as_array().expect("array").clone();
 
     let mut rest_ids: Vec<i64> = rest.iter().map(|n| n["id"].as_i64().expect("id")).collect();
+    // GraphQL publishes the BIGINT as the `ID` scalar (a string); REST as a JSON
+    // number. Same rows either way.
     let mut graphql_ids: Vec<i64> = graphql
         .iter()
-        .map(|n| n["id"].as_i64().expect("id"))
+        .map(|n| n["id"].as_str().expect("id").parse().expect("numeric id"))
         .collect();
     rest_ids.sort_unstable();
     graphql_ids.sort_unstable();
@@ -304,8 +343,8 @@ async fn mutations_round_trip_through_the_repository() {
     );
     assert_eq!(note["body"], "Honeycrisp");
     assert_eq!(note["pinned"], false);
-    let id = note["id"].as_i64().expect("id");
-    assert_eq!(id, 3, "BIGSERIAL continues after the two seeds");
+    let id = note["id"].as_str().expect("id is the ID scalar");
+    assert_eq!(id, "3", "BIGSERIAL continues after the two seeds");
     assert!(
         note["createdAt"].as_str().is_some_and(|s| s.contains('T')),
         "createdAt is RFC 3339: {created}"
@@ -315,7 +354,7 @@ async fn mutations_round_trip_through_the_repository() {
     // only `pinned`; every other column comes back unchanged.
     let toggled = gql(
         &client,
-        "mutation($id: Int!) { togglePinned(id: $id) { id title pinned } }",
+        "mutation($id: ID!) { togglePinned(id: $id) { id title pinned } }",
         json!({ "id": id }),
     )
     .await;
@@ -327,32 +366,32 @@ async fn mutations_round_trip_through_the_repository() {
 
     // The derived `find_by_pinned` finder, newest first.
     let pinned = gql(&client, "{ notes(pinnedOnly: true) { id } }", json!({})).await;
-    let ids: Vec<i64> = pinned["data"]["notes"]
+    let ids: Vec<&str> = pinned["data"]["notes"]
         .as_array()
         .expect("array")
         .iter()
-        .map(|n| n["id"].as_i64().expect("id"))
+        .map(|n| n["id"].as_str().expect("id"))
         .collect();
-    assert_eq!(ids, vec![id, 2], "pinned only, newest first: {pinned}");
+    assert_eq!(ids, vec![id, "2"], "pinned only, newest first: {pinned}");
 
     // It is pinned now, so unpin it first (the `before_delete` hook would
     // refuse otherwise — see `deleting_a_pinned_note_is_refused_by_the_hook`).
     gql(
         &client,
-        "mutation($id: Int!) { togglePinned(id: $id) { pinned } }",
+        "mutation($id: ID!) { togglePinned(id: $id) { pinned } }",
         json!({ "id": id }),
     )
     .await;
     let deleted = gql(
         &client,
-        "mutation($id: Int!) { deleteNote(id: $id) }",
+        "mutation($id: ID!) { deleteNote(id: $id) }",
         json!({ "id": id }),
     )
     .await;
     assert_eq!(deleted["data"]["deleteNote"], true, "delete: {deleted}");
     let again = gql(
         &client,
-        "mutation($id: Int!) { deleteNote(id: $id) }",
+        "mutation($id: ID!) { deleteNote(id: $id) }",
         json!({ "id": id }),
     )
     .await;
@@ -363,7 +402,7 @@ async fn mutations_round_trip_through_the_repository() {
 
     let missing = gql(
         &client,
-        "query($id: Int!) { note(id: $id) { id } }",
+        "query($id: ID!) { note(id: $id) { id } }",
         json!({ "id": id }),
     )
     .await;
@@ -407,7 +446,7 @@ async fn a_blank_title_is_rejected_by_model_validation() {
 async fn deleting_a_pinned_note_is_refused_by_the_hook() {
     let client = seeded_client().await;
 
-    let refused = gql(&client, "mutation { deleteNote(id: 2) }", json!({})).await;
+    let refused = gql(&client, "mutation { deleteNote(id: \"2\") }", json!({})).await;
     let message = refused["errors"][0]["message"]
         .as_str()
         .unwrap_or_else(|| panic!("expected a hook error, got: {refused}"));
@@ -417,7 +456,7 @@ async fn deleting_a_pinned_note_is_refused_by_the_hook() {
         "status travels in extensions: {refused}"
     );
 
-    let still_there = gql(&client, "{ note(id: 2) { id pinned } }", json!({})).await;
+    let still_there = gql(&client, "{ note(id: \"2\") { id pinned } }", json!({})).await;
     assert_eq!(
         still_there["data"]["note"]["pinned"], true,
         "rolled back: {still_there}"
@@ -425,11 +464,11 @@ async fn deleting_a_pinned_note_is_refused_by_the_hook() {
 
     gql(
         &client,
-        "mutation { togglePinned(id: 2) { pinned } }",
+        "mutation { togglePinned(id: \"2\") { pinned } }",
         json!({}),
     )
     .await;
-    let deleted = gql(&client, "mutation { deleteNote(id: 2) }", json!({})).await;
+    let deleted = gql(&client, "mutation { deleteNote(id: \"2\") }", json!({})).await;
     assert_eq!(
         deleted["data"]["deleteNote"], true,
         "unpinned, so deletable: {deleted}"
@@ -442,7 +481,7 @@ async fn unknown_note_ids_are_graphql_errors() {
     let client = seeded_client().await;
     let body = gql(
         &client,
-        "mutation { togglePinned(id: 9999) { id } }",
+        "mutation { togglePinned(id: \"9999\") { id } }",
         json!({}),
     )
     .await;
@@ -452,6 +491,13 @@ async fn unknown_note_ids_are_graphql_errors() {
     // `with_lock` refuses a missing row with a 404 `AutumnError`, and the
     // adapter carries that status like any other.
     assert_eq!(error["extensions"]["status"], 404, "got: {body}");
+
+    // An `ID` that is not an integer is a client error, not a lookup miss.
+    let body = gql(&client, "{ note(id: \"abc\") { id } }", json!({})).await;
+    assert_eq!(
+        body["errors"][0]["extensions"]["status"], 400,
+        "got: {body}"
+    );
 }
 
 #[tokio::test]

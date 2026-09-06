@@ -17,7 +17,7 @@ type Mutation {
 	documented shape for `with_lock` closures. A missing row is refused by
 	`with_lock` itself with a `404` `AutumnError`, mapped like every other.
 	"""
-	togglePinned(id: Int!): Note!
+	togglePinned(id: ID!): Note!
 	"""
 	Delete a note. Returns whether anything was deleted. A pinned note is
 	refused by the repository's `before_delete` hook, which surfaces here
@@ -28,7 +28,7 @@ type Mutation {
 	a `404` instead of `false`. `delete_by_id` reports a missing row as a
 	`404` `AutumnError`, which is exactly the "nothing to delete" answer.
 	"""
-	deleteNote(id: Int!): Boolean!
+	deleteNote(id: ID!): Boolean!
 }
 
 """
@@ -45,11 +45,13 @@ The GraphQL `Note` object, resolved straight off the `#[model]` struct.
 
 An `#[Object]` impl block turns an existing type into a GraphQL object
 without changing its definition, which keeps `models.rs` free of any
-GraphQL vocabulary. `id` is exposed as `Int` (the schema's `i32`) for
-client simplicity; the column is `BIGINT`.
+GraphQL vocabulary. The `BIGSERIAL` key is exposed as the `ID` scalar (a
+string on the wire): GraphQL `Int` is a signed 32-bit contract, so an
+`i64` published as `Int` would break standards-compliant clients once
+the sequence passes 2³¹.
 """
 type Note {
-	id: Int!
+	id: ID!
 	title: String!
 	body: String!
 	pinned: Boolean!
@@ -67,7 +69,7 @@ type Query {
 	"""
 	One note by id, or `null`.
 	"""
-	note(id: Int!): Note
+	note(id: ID!): Note
 }
 
 """

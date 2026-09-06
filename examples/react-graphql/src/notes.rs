@@ -7,7 +7,7 @@
 //! transactions behave identically no matter which door a write comes in.
 
 use async_graphql::{
-    Context, EmptySubscription, ErrorExtensions, InputObject, Object, Result, Schema,
+    Context, EmptySubscription, ErrorExtensions, ID, InputObject, Object, Result, Schema,
 };
 use autumn_web::reexports::diesel::prelude::*;
 use autumn_web::reexports::diesel_async::RunQueryDsl;
@@ -22,12 +22,14 @@ use crate::schema::notes;
 ///
 /// An `#[Object]` impl block turns an existing type into a GraphQL object
 /// without changing its definition, which keeps `models.rs` free of any
-/// GraphQL vocabulary. `id` is exposed as `Int` (the schema's `i32`) for
-/// client simplicity; the column is `BIGINT`.
+/// GraphQL vocabulary. The `BIGSERIAL` key is exposed as the `ID` scalar (a
+/// string on the wire): GraphQL `Int` is a signed 32-bit contract, so an
+/// `i64` published as `Int` would break standards-compliant clients once
+/// the sequence passes 2³¹.
 #[Object]
 impl Note {
-    async fn id(&self) -> i64 {
-        self.id
+    async fn id(&self) -> ID {
+        ID::from(self.id)
     }
     async fn title(&self) -> &str {
         &self.title
@@ -89,6 +91,17 @@ fn to_gql(err: AutumnError) -> async_graphql::Error {
     async_graphql::Error::new(message).extend_with(|_, e| e.set("status", status.as_u16()))
 }
 
+/// Parse a client-supplied `ID` back into the `BIGINT` key. Anything that is
+/// not an integer is a client error, not a lookup miss.
+fn parse_id(id: &ID) -> Result<i64> {
+    id.parse::<i64>().map_err(|_| {
+        to_gql(AutumnError::bad_request_msg(format!(
+            "`{}` is not a valid note id",
+            id.0
+        )))
+    })
+}
+
 /// Newest first. `id` is a `BIGSERIAL`, so descending id is creation order;
 /// the generated finders carry no `ORDER BY`, and Postgres promises nothing
 /// about row order without one, so sort explicitly rather than reverse.
@@ -118,7 +131,8 @@ impl Query {
     }
 
     /// One note by id, or `null`.
-    async fn note(&self, ctx: &Context<'_>, id: i64) -> Result<Option<Note>> {
+    async fn note(&self, ctx: &Context<'_>, id: ID) -> Result<Option<Note>> {
+        let id = parse_id(&id)?;
         repo(ctx)?.find_by_id(id).await.map_err(to_gql)
     }
 }
@@ -150,7 +164,8 @@ impl Mutation {
     /// The write inside is plain Diesel on that connection, which is the
     /// documented shape for `with_lock` closures. A missing row is refused by
     /// `with_lock` itself with a `404` `AutumnError`, mapped like every other.
-    async fn toggle_pinned(&self, ctx: &Context<'_>, id: i64) -> Result<Note> {
+    async fn toggle_pinned(&self, ctx: &Context<'_>, id: ID) -> Result<Note> {
+        let id = parse_id(&id)?;
         repo(ctx)?
             .with_lock(id, |row, conn| {
                 async move {
@@ -175,7 +190,8 @@ impl Mutation {
     /// same note would both pass an existence check and the loser would see
     /// a `404` instead of `false`. `delete_by_id` reports a missing row as a
     /// `404` `AutumnError`, which is exactly the "nothing to delete" answer.
-    async fn delete_note(&self, ctx: &Context<'_>, id: i64) -> Result<bool> {
+    async fn delete_note(&self, ctx: &Context<'_>, id: ID) -> Result<bool> {
+        let id = parse_id(&id)?;
         match repo(ctx)?.delete_by_id(id).await {
             Ok(()) => Ok(true),
             Err(err) if err.status() == axum::http::StatusCode::NOT_FOUND => Ok(false),

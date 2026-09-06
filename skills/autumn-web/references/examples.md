@@ -456,9 +456,11 @@ Rules the plugin encodes, keep them when adapting it: `GET ?query=` accepts
 **query operations only** (a mutation over `GET` is `405` before any resolver
 runs — caches and prefetchers replay `GET`s); parse the `GET` parameters
 yourself because `async_graphql::http::parse_query_string` reads
-`operation_name`, not the spec's `operationName`; every declared route is
-`RouteClassification::Public`, so wrap the mount in a `.scoped(...)` guard if
-the schema must not be public.
+`operation_name`, not the spec's `operationName`; guard the mount with
+`.guard(RequireApiToken::new(store), "RequireApiToken")` — a `.scoped(...)`
+around the app's own `routes![]` never reaches a router a plugin nests, so
+the plugin applies the layer itself and declares its routes `Gated`; expose a
+`BIGSERIAL` key as the `ID` scalar, never `Int` (32-bit by contract).
 
 **Resolvers go through the repository — never a second data layer.** With
 `AppState` in the context, a resolver builds the generated repository the

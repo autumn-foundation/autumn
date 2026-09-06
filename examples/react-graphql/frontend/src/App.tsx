@@ -42,7 +42,7 @@ export function App() {
     }
   }
 
-  async function onTogglePinned(id: number) {
+  async function onTogglePinned(id: string) {
     try {
       const updated = await togglePinned(id);
       setNotes((current) => current.map((n) => (n.id === id ? updated : n)));
@@ -52,7 +52,7 @@ export function App() {
     }
   }
 
-  async function onDelete(id: number) {
+  async function onDelete(id: string) {
     try {
       if (await deleteNote(id)) {
         setNotes((current) => current.filter((n) => n.id !== id));
@@ -158,8 +158,8 @@ export function App() {
 interface NoteListProps {
   heading: string;
   notes: Note[];
-  onTogglePinned: (id: number) => void;
-  onDelete: (id: number) => void;
+  onTogglePinned: (id: string) => void;
+  onDelete: (id: string) => void;
 }
 
 function NoteList({ heading, notes, onTogglePinned, onDelete }: NoteListProps) {

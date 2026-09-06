@@ -40,6 +40,8 @@ untouched because the bundle is an external ES module.
 | `AutumnError` → GraphQL error | `src/notes.rs` | 4xx messages on the field, 5xx redacted and logged; HTTP status in `extensions.status`, so a client can tell a 422 from a 503 |
 | `with_lock` pessimistic toggle | `src/notes.rs` | `togglePinned` flips the flag under `SELECT … FOR UPDATE` so overlapping toggles serialise; a missing row is the helper's own 404 |
 | `Plugin` with `nest` + `declare_plugin_routes` | `src/graphql_plugin.rs` | Mounts `POST /graphql`, `GET /graphql?query=…` (queries only — a mutation over `GET` is a `405`), `GET /graphql/sdl`; routes show in `autumn routes` with plugin attribution and satisfy `autumn routes audit` |
+| `GraphqlPlugin::guard` | `src/graphql_plugin.rs` | Wraps the nested router in any tower layer (`RequireApiToken` in the test); declared routes become `Gated` |
+| `ID` scalar for a `BIGSERIAL` key | `src/notes.rs` | GraphQL `Int` is 32-bit by contract, so the `i64` key crosses the wire as `ID` (a string) and is parsed back with a `400` on garbage |
 | `PluginContract` + conformance harness | `src/graphql_plugin.rs`, `tests/graphql_api.rs` | Declares the `autumn-web` series; `run_conformance` proves attribution, prefix, collisions and contract in one test |
 | Maud page shell + `asset_url` | `src/lib.rs` | Autumn renders the document; `asset_url` gives fingerprinted URLs in a release build with an asset manifest |
 | Committed Vite bundle, fixed file names | `frontend/vite.config.ts` | `app.js` / `app.css` with no content hash, so the shell references them by name |
@@ -246,10 +248,25 @@ than loosen the CSP for a dev tool, the plugin serves the SDL at
 
 ### Guarding the endpoint
 
-The plugin mounts no guard: every route it declares is classified `Public`.
-To require a bearer token, mount it under a scoped layer the same way
-`examples/todo-app` guards its JSON API, or put the whole app behind session
-auth. The plugin does not care where it is mounted.
+Unguarded, every route the plugin declares is classified `Public`. To require
+a bearer token, hand the framework's layer to the plugin:
+
+```rust
+use autumn_web::auth::{DbApiTokenStore, RequireApiToken};
+
+GraphqlPlugin::new(schema)
+    .guard(RequireApiToken::new(Arc::new(DbApiTokenStore::new(pool))), "RequireApiToken")
+```
+
+`guard` exists because `AppBuilder::scoped(prefix, layer, routes![…])` wraps
+only the routes handed to it — a raw router a plugin nests is never among
+them, so a `.scoped(...)` around the app's own routes would leave
+`POST /graphql` open. The plugin applies the layer as the outermost on its
+router, so it runs before every handler including `GET /sdl`, and the
+declared routes flip to `Gated` with the label as their middleware in
+`autumn routes`. The `guard_layer_protects_every_plugin_route` test shows it
+with `InMemoryApiTokenStore`. (A global `AppBuilder::layer` guards
+everything; `guard` is for guarding just this mount.)
 
 ## Tests
 

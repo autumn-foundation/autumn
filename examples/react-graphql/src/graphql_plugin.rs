@@ -20,7 +20,10 @@
 //! - declare its routes with [`AppBuilder::declare_plugin_routes`], so
 //!   `autumn routes` lists them with plugin attribution and
 //!   `autumn routes audit` sees a covered mount rather than an opaque router;
-//! - state a [`PluginContract`] naming the `autumn-web` series it targets.
+//! - state a [`PluginContract`] naming the `autumn-web` series it targets;
+//! - optionally wrap its whole router in a guard layer ([`GraphqlPlugin::guard`])
+//!   — the only way to guard a nested router, since `AppBuilder::scoped`
+//!   applies to the `routes![]` it is given, not to routers a plugin nests.
 //!
 //! It lives inside this example for readability, but it is exactly the shape
 //! a published `autumn-plugin-graphql` crate would take — nothing here depends
@@ -56,6 +59,17 @@ pub struct GraphqlPlugin<Q, M, S> {
     schema: Schema<Q, M, S>,
     path: String,
     serve_sdl: bool,
+    /// A layer applied over the whole nested router, plus the label
+    /// `autumn routes` shows for it. Boxed as a router transform so the
+    /// plugin stays non-generic over the layer type.
+    guard: Option<Guard>,
+}
+
+type RouterTransform = Box<dyn FnOnce(Router<AppState>) -> Router<AppState> + Send>;
+
+struct Guard {
+    apply: RouterTransform,
+    label: String,
 }
 
 impl<Q, M, S> GraphqlPlugin<Q, M, S>
@@ -71,7 +85,35 @@ where
             schema,
             path: "/graphql".to_owned(),
             serve_sdl: true,
+            guard: None,
         }
+    }
+
+    /// Guard every route this plugin mounts with `layer` — for example
+    /// `RequireApiToken`, so `/graphql` needs `Authorization: Bearer …`.
+    ///
+    /// This is the seam a nested router needs: `AppBuilder::scoped(prefix,
+    /// layer, routes![…])` wraps only the routes handed to it, and a raw
+    /// router registered with `nest` is never among them. The layer is the
+    /// outermost on the plugin's router, so it runs before any handler,
+    /// including `GET /sdl`. `label` is what `autumn routes` lists as the
+    /// route's middleware; the routes are then classified `Gated` rather
+    /// than `Public`.
+    #[must_use]
+    pub fn guard<L>(mut self, layer: L, label: impl Into<String>) -> Self
+    where
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<axum::extract::Request> + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<axum::extract::Request>>::Response: IntoResponse + 'static,
+        <L::Service as tower::Service<axum::extract::Request>>::Error:
+            Into<std::convert::Infallible> + 'static,
+        <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
+    {
+        self.guard = Some(Guard {
+            apply: Box::new(move |router| router.layer(layer)),
+            label: label.into(),
+        });
+        self
     }
 
     /// Mount under a different path (for example `/api/graphql`).
@@ -90,20 +132,33 @@ where
 
     /// The routes this plugin mounts, as `autumn routes` will list them.
     ///
-    /// Every route is classified [`RouteClassification::Public`]: the plugin
-    /// mounts no guard of its own. Wrap the mount in your own layer (or put
-    /// the app behind a session) if the schema must not be public.
+    /// Without a [`guard`](Self::guard) every route is classified
+    /// [`RouteClassification::Public`] — the plugin mounts no guard of its
+    /// own. With one, they are `Gated` and carry the guard's label as their
+    /// middleware.
     #[must_use]
     pub fn route_infos(&self) -> Vec<RouteInfo> {
+        let guard = self.guard.as_ref().map(|g| g.label.as_str());
         let mut routes = vec![
-            route("POST", self.path.clone(), "graphql_plugin::post_graphql"),
-            route("GET", self.path.clone(), "graphql_plugin::get_graphql"),
+            route(
+                "POST",
+                self.path.clone(),
+                "graphql_plugin::post_graphql",
+                guard,
+            ),
+            route(
+                "GET",
+                self.path.clone(),
+                "graphql_plugin::get_graphql",
+                guard,
+            ),
         ];
         if self.serve_sdl {
             routes.push(route(
                 "GET",
                 format!("{}/sdl", self.path),
                 "graphql_plugin::sdl",
+                guard,
             ));
         }
         routes
@@ -115,7 +170,7 @@ where
     /// that reaches these routes carries this plugin's schema, and a second
     /// plugin at another path carries its own, even when the two share
     /// `Q`/`M`/`S` and would collide as a type-keyed `AppState` extension.
-    fn router(&self) -> Router<AppState> {
+    fn router(&mut self) -> Router<AppState> {
         let mut router = Router::new().route(
             "/",
             post(post_graphql::<Q, M, S>).get(get_graphql::<Q, M, S>),
@@ -123,7 +178,12 @@ where
         if self.serve_sdl {
             router = router.route("/sdl", get(sdl::<Q, M, S>));
         }
-        router.layer(Extension(self.schema.clone()))
+        let router = router.layer(Extension(self.schema.clone()));
+        // Applied last, so the guard is the outermost layer and runs first.
+        match self.guard.take() {
+            Some(guard) => (guard.apply)(router),
+            None => router,
+        }
     }
 }
 
@@ -147,20 +207,21 @@ where
         )
     }
 
-    fn build(self, app: AppBuilder) -> AppBuilder {
-        let router = self.router();
+    fn build(mut self, app: AppBuilder) -> AppBuilder {
         let routes = self.route_infos();
+        let router = self.router();
         tracing::info!(path = %self.path, sdl = self.serve_sdl, "mounting GraphQL endpoint");
         app.nest(&self.path, router).declare_plugin_routes(routes)
     }
 }
 
-fn route(method: &str, path: String, handler: &str) -> RouteInfo {
+fn route(method: &str, path: String, handler: &str, guard: Option<&str>) -> RouteInfo {
     RouteInfo {
         method: method.to_owned(),
         path,
         handler: handler.to_owned(),
-        classification: RouteClassification::Public,
+        classification: guard.map_or(RouteClassification::Public, |_| RouteClassification::Gated),
+        middleware: guard.map(str::to_owned).into_iter().collect(),
         ..Default::default()
     }
 }
