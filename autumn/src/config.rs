@@ -2931,11 +2931,20 @@ pub fn split_role_requires_durable_backend(role: ProcessRole, jobs_backend: &str
 /// `crate::db::sqlite_target_is_any_in_memory`.
 #[must_use]
 pub fn is_in_memory_sqlite_target(url: &str) -> bool {
+    if url.starts_with("file:") {
+        return url == "file::memory:"
+            || url.starts_with("file::memory:?")
+            || url.contains("mode=memory");
+    }
     let target = url
         .strip_prefix("sqlite://")
         .or_else(|| url.strip_prefix("sqlite:"))
         .unwrap_or(url);
-    target == ":memory:"
+    // An empty target is in memory too: a bare `sqlite://` or `sqlite:` names
+    // no file, and `crate::db::normalize_sqlite_target` turns it into
+    // `:memory:` before handing it to `sqlite3_open`.
+    target.is_empty()
+        || target == ":memory:"
         || target == "file::memory:"
         || target.starts_with("file::memory:?")
         || target.contains("mode=memory")
@@ -18504,6 +18513,10 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             "file::memory:?cache=shared",
             "sqlite:file::memory:?cache=shared",
             "sqlite://app.db?mode=memory",
+            // A bare scheme names no file: `normalize_sqlite_target` turns
+            // both of these into `:memory:`.
+            "sqlite://",
+            "sqlite:",
         ] {
             assert!(
                 is_in_memory_sqlite_target(url),

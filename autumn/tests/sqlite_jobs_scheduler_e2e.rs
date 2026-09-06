@@ -1682,3 +1682,55 @@ async fn sqlite_tracking_store_keeps_a_settled_record_settled() {
     );
     assert!(record.result.is_none(), "no stale result is attached");
 }
+
+/// (25) `scheduler.backend = "sqlite"` is refused on an in-memory database.
+///
+/// The lease table coordinates processes only because they open the same file.
+/// In memory each has its own, so every replica would claim the same tick and
+/// run it — while `is_fleet_distributed()` reports the opposite.
+#[tokio::test]
+async fn sqlite_scheduler_lease_is_refused_on_an_in_memory_database() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let config = SchedulerConfig {
+        backend: SchedulerBackend::Sqlite,
+        ..SchedulerConfig::default()
+    };
+
+    // A file-backed app builds the coordinator.
+    let file_state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(build_sqlite_pool(&tmp));
+    file_state.insert_extension(autumn_web::config::AutumnConfig {
+        database: autumn_web::config::DatabaseConfig {
+            url: Some(format!("sqlite://{}", tmp.path().join("f.db").display())),
+            ..autumn_web::config::DatabaseConfig::default()
+        },
+        ..autumn_web::config::AutumnConfig::default()
+    });
+    assert!(
+        scheduler::coordinator_from_config(&config, &file_state).is_ok(),
+        "a file-backed target is exactly what makes the lease shareable"
+    );
+
+    // Every in-memory spelling is refused, the bare scheme included.
+    for url in ["sqlite::memory:", "file::memory:?cache=shared", "sqlite://"] {
+        let state = AppState::for_test()
+            .with_profile("dev")
+            .with_pool(build_sqlite_pool(&tmp));
+        state.insert_extension(autumn_web::config::AutumnConfig {
+            database: autumn_web::config::DatabaseConfig {
+                url: Some(url.to_string()),
+                ..autumn_web::config::DatabaseConfig::default()
+            },
+            ..autumn_web::config::AutumnConfig::default()
+        });
+        let message = match scheduler::coordinator_from_config(&config, &state) {
+            Ok(_) => panic!("the sqlite coordinator must be refused on {url}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("FILE-backed"),
+            "the refusal names the requirement for {url}; got: {message}"
+        );
+    }
+}

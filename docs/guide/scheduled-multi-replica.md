@@ -66,7 +66,9 @@ Set the TTL longer than both the spread between the processes' timers and the
 longest a tick body can take. This is stricter than the Postgres coordinator,
 which frees the tick key as soon as the leader finishes.
 
-`backend = "sqlite"` requires the `sqlite` cargo feature.
+`backend = "sqlite"` requires the `sqlite` cargo feature, and a **file-backed**
+database: an in-memory target is private to each process, so every replica would
+claim the same tick and run it. That is refused at boot.
 
 A single-process SQLite app needs none of this: keep the default
 `backend = "in_process"`, where the one process is always the leader.

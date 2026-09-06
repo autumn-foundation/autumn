@@ -559,6 +559,28 @@ pub fn coordinator_from_config(
                         "scheduler.backend = \"sqlite\" requires a configured database pool",
                     )
                 })?;
+                // The lease table coordinates processes only because they open
+                // the same FILE. On an in-memory target each has its own table,
+                // so every replica would win the same tick and run it — while
+                // `is_fleet_distributed()` reports the opposite. Refuse rather
+                // than promise coordination that cannot happen (issue #1907).
+                if state
+                    .extension::<crate::config::AutumnConfig>()
+                    .and_then(|config| {
+                        config
+                            .database
+                            .effective_primary_url()
+                            .map(crate::config::is_in_memory_sqlite_target)
+                    })
+                    .unwrap_or(false)
+                {
+                    return Err(AutumnError::service_unavailable_msg(
+                        "scheduler.backend = \"sqlite\" requires a FILE-backed database: an \
+                         in-memory SQLite target is private to each process, so every replica \
+                         would claim the same tick and run it. Point database.url at a \
+                         sqlite:// file, or use scheduler.backend = \"in_process\"",
+                    ));
+                }
                 Ok(Arc::new(SqliteLeaseSchedulerCoordinator::new(
                     pool,
                     replica_id,
