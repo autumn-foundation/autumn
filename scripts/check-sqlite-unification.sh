@@ -21,16 +21,27 @@
 #
 # WHAT IT CHECKS  (every `Cargo.toml` in the tree, `target/` aside)
 #   1. No dependency, dev-dependency or build-dependency edge on `autumn-web`
-#      or `autumn-cli` lists `sqlite` in its `features`. Covers the inline form
-#      (`autumn-web = { features = ["sqlite"] }`) and the section form
-#      (`[dev-dependencies.autumn-web]` + `features = [...]`).
+#      or `autumn-cli` enables `sqlite`. Covers the inline form
+#      (`autumn-web = { features = ["sqlite"] }`), the section form
+#      (`[dev-dependencies.autumn-web]` + `features = [...]`), the dotted-key
+#      form (`autumn-web.features = [...]`) and a renamed dependency
+#      (`web = { package = "autumn-web", … }`).
 #   2. No `[features]` entry forwards `autumn-web/sqlite` / `autumn-cli/sqlite`
-#      unless the entry is ITSELF named `sqlite`. That single exception is
-#      autumn-cli's own opt-in backend (`sqlite = ["autumn-web/sqlite", …]`),
-#      which is selected the same explicit way autumn-web's is.
+#      unless the entry is ITSELF named `sqlite` AND the manifest belongs to one
+#      of those two crates. That single exception is autumn-cli's own opt-in
+#      backend (`sqlite = ["autumn-web/sqlite", …]`), selected the same explicit
+#      way autumn-web's is; the same line in any other crate is an edge.
 #   3. No `default` feature list enables `sqlite`, bare or forwarded.
 #
 # It is a manifest gate, not a build: no toolchain, ~1 second, self-testing.
+#
+# Deliberately scans EVERY `Cargo.toml` under the root, including crates the
+# root workspace excludes (fuzz targets, benchmark harnesses, `src-tauri`).
+# Those cannot unify with the main graph, so the rule does not strictly apply
+# there — but a manifest moving in or out of the workspace is a one-line edit,
+# and a gate that followed `members` would silently stop covering a crate on
+# that edit. Erring toward scanning costs a false positive nobody has hit;
+# erring the other way costs the invariant.
 #
 # Usage:
 #   ./scripts/check-sqlite-unification.sh              # self-test, then check
@@ -49,122 +60,201 @@ die() {
 FLIP_CRATES='autumn-web|autumn-cli'
 
 # ---------------------------------------------------------------------------
-# The checker. Prints one line per violation on stdout; exits 0 either way so
-# callers decide. `$1` is the manifest to scan.
+# The checker. Prints one line per violation on stdout for the single manifest
+# in `$1`. Scans IN-PROCESS — no `xargs`, no re-exec of `$0`: a gate whose
+# scanner can fail to launch while the caller still reports "OK" is worse than
+# no gate.
+#
+# The file is read TWICE (awk's `NR == FNR` idiom). Pass 1 answers two
+# questions the per-line rules need up front — which crate this manifest
+# belongs to, and whether it defines a `sqlite` feature that forwards the flip
+# — because `default = ["sqlite"]` means the flip only in a manifest that does.
 # ---------------------------------------------------------------------------
 scan_manifest() {
   local manifest="$1"
   awk -v flip="$FLIP_CRATES" '
-    # Join a logical entry that spans lines: keep appending until every
-    # bracket and brace opened on the line has closed. A `features` array
-    # written one element per line is the common shape, and a line-at-a-time
-    # scan would miss it entirely.
-    function balanced(s,   i, c, depth) {
-      depth = 0
+    BEGIN {
+      SQ = sprintf("%c", 39)   # a literal single quote, unwritable inline here
+      pkg = ""
+      defines_flip_sqlite = 0
+    }
+
+    # ── TOML lexing ──────────────────────────────────────────────────────
+    #
+    # All three helpers are STRING-AWARE and know both quote styles. A `#`
+    # inside a string is not a comment; a `[` inside one does not open an
+    # array. Getting either wrong desynchronizes the section tracker for the
+    # rest of the file, which fails OPEN.
+    function strip_comment(s,   i, c, q, out) {
+      q = ""; out = ""
       for (i = 1; i <= length(s); i++) {
         c = substr(s, i, 1)
+        if (q != "") { if (c == q) q = "" }
+        else if (c == "\"" || c == SQ) q = c
+        else if (c == "#") break
+        out = out c
+      }
+      return out
+    }
+    function balanced(s,   i, c, q, depth) {
+      depth = 0; q = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (q != "") { if (c == q) q = ""; continue }
+        if (c == "\"" || c == SQ) { q = c; continue }
         if (c == "[" || c == "{") depth++
         else if (c == "]" || c == "}") depth--
       }
       return depth <= 0
     }
-    function strip_comment(s,   i, c, inq, out) {
-      inq = 0; out = ""
-      for (i = 1; i <= length(s); i++) {
-        c = substr(s, i, 1)
-        if (c == "\"") inq = !inq
-        if (c == "#" && !inq) break
-        out = out c
+    # TOML literal strings are as valid as basic ones, so match against a copy
+    # with the quotes normalized rather than writing every pattern twice.
+    function normalize_quotes(s) { gsub(SQ, "\"", s); return s }
+
+    # ── Entry assembly ───────────────────────────────────────────────────
+    #
+    # Joins a logical entry that spans lines — a `features` array written one
+    # element per line is the common shape, and a line-at-a-time scan would
+    # miss it entirely. Returns "" while an entry is still open.
+    function feed(line,   entry) {
+      sub(/\r$/, "", line)              # a CRLF checkout must not blind the gate
+      line = strip_comment(line)
+      if (pending != "") {
+        pending = pending " " line
+        if (!balanced(pending)) return ""
+        entry = pending; pending = ""
+        return entry
       }
-      return out
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (line == "") return ""
+      if (line ~ /^\[/) { section = line; return "" }   # a header ends any entry
+      if (!balanced(line)) { pending = line; entry_line = FNR; return "" }
+      entry_line = FNR
+      return line
+    }
+
+    function is_dep_table() {
+      return section ~ /(^\[|\.)(dependencies|dev-dependencies|build-dependencies)\]$/
+    }
+    # `[dependencies.autumn-web]` — the crate is in the header, not the key.
+    function dep_section_crate(   name) {
+      if (!match(section, /(^\[|\.)(dependencies|dev-dependencies|build-dependencies)\.[A-Za-z0-9_-]+\]$/))
+        return ""
+      name = section
+      sub(/\]$/, "", name)
+      sub(/.*\./, "", name)
+      return name
     }
     function report(msg) { printf "%s:%d: %s\n", FILENAME, entry_line, msg }
 
-    {
-      line = strip_comment($0)
-      if (pending != "") {
-        pending = pending " " line
-        if (!balanced(pending)) next
-        entry = pending; pending = ""
-      } else {
-        gsub(/^[ \t]+|[ \t]+$/, "", line)
-        if (line == "") next
-        # A table header ends any entry and selects the context.
-        if (line ~ /^\[/) {
-          section = line
-          next
-        }
-        if (!balanced(line)) { pending = line; entry_line = FNR; next }
-        entry = line; entry_line = FNR
+    # ── Pass 1: whose manifest is this, and what does it define? ─────────
+    NR == FNR {
+      entry = feed($0)
+      if (entry == "") next
+      norm = normalize_quotes(entry)
+      if (section == "[package]" && norm ~ /^name[ \t]*=/) {
+        pkg = norm
+        sub(/^name[ \t]*=[ \t]*"/, "", pkg)
+        sub(/".*$/, "", pkg)
       }
+      if (section == "[features]" && norm ~ /^sqlite[ \t]*=/ && norm ~ ("\"(" flip ")/sqlite\""))
+        defines_flip_sqlite = 1
+      next
+    }
 
-      # ── Context ───────────────────────────────────────────────────────
-      # Dependency tables, including target-specific and section forms.
-      is_dep_table  = (section ~ /(^\[|\.)(dependencies|dev-dependencies|build-dependencies)\]$/)
-      # `[dependencies.autumn-web]` — the crate is in the header, not the key.
-      dep_section_crate = ""
-      if (match(section, /(^\[|\.)(dependencies|dev-dependencies|build-dependencies)\.[A-Za-z0-9_-]+\]$/)) {
-        dep_section_crate = section
-        sub(/\]$/, "", dep_section_crate)
-        sub(/.*\./, "", dep_section_crate)
-      }
-      is_features_table = (section == "[features]")
+    # ── Pass 2: the rules ────────────────────────────────────────────────
+    FNR == 1 {
+      pending = ""; section = ""
+      # autumn-web owns the flip, so a bare "sqlite" in ITS default list is the
+      # flip itself, with nothing to forward to.
+      if (pkg ~ ("^(" flip ")$")) defines_flip_sqlite = 1
+    }
+    {
+      entry = feed($0)
+      if (entry == "") next
+      norm = normalize_quotes(entry)
+      mentions_sqlite = (norm ~ /"sqlite"/)
+      forwards = (norm ~ ("\"(" flip ")/sqlite\""))
 
       # ── 1. A dependency edge that enables the flip ────────────────────
-      # Named by key, or renamed with an explicit `package = "autumn-web"`.
-      if (is_dep_table && entry ~ /"sqlite"/ \
-          && (entry ~ ("^(" flip ")[ \t]*=") || entry ~ ("package[ \t]*=[ \t]*\"(" flip ")\""))) {
+      if (is_dep_table() && mentions_sqlite \
+          && (norm ~ ("^(" flip ")[ \t]*=") \
+              || norm ~ ("^(" flip ")\\.features[ \t]*=") \
+              || norm ~ ("package[ \t]*=[ \t]*\"(" flip ")\""))) {
         report("dependency edge enables the `sqlite` backend flip")
         next
       }
-      if (dep_section_crate != "" && dep_section_crate ~ ("^(" flip ")$") \
-          && entry ~ /^features[ \t]*=/ && entry ~ /"sqlite"/) {
+      crate = dep_section_crate()
+      if (crate ~ ("^(" flip ")$") && norm ~ /^features[ \t]*=/ && mentions_sqlite) {
         report("dependency edge enables the `sqlite` backend flip")
         next
       }
 
-      # ── 2 & 3. A feature that forwards the flip ───────────────────────
-      if (is_features_table) {
-        key = entry
+      # ── 2 & 3. A feature that forwards or defaults into the flip ──────
+      if (section == "[features]") {
+        key = norm
         sub(/[ \t]*=.*$/, "", key)
-        forwards = (entry ~ ("\"(" flip ")/sqlite\""))
-        # A bare "sqlite" element only means the flip inside the autumn-web
-        # manifest, where `sqlite` is the feature being defined.
-        bare = (FILENAME ~ /(^|\/)autumn\/Cargo\.toml$/ && entry ~ /"sqlite"/)
-        if (key == "default" && (forwards || bare)) {
+        if (key == "default" && (forwards || (mentions_sqlite && defines_flip_sqlite))) {
           report("`default` enables the `sqlite` backend flip")
         } else if (forwards && key != "sqlite") {
           report("feature `" key "` forwards the `sqlite` backend flip")
+        } else if (forwards && !(pkg ~ ("^(" flip ")$"))) {
+          # A same-named `sqlite` feature is the sanctioned opt-in ONLY in the
+          # two crates that own the flip. Anywhere else it is an edge wearing
+          # the exception as a name.
+          report("feature `sqlite` forwards the backend flip from a crate that does not own it")
         }
       }
     }
-  ' "$manifest"
+  ' "$manifest" "$manifest"
 }
 
-# Scan every manifest under `$1`. Prints violations; returns 1 if any.
+# Scan every manifest under `$1`. Prints violations; returns 1 if any, 2 if the
+# scan could not run (no manifests found, or a scanner failure). Reporting OK
+# because nothing ran is the failure mode this guards.
 gate_check() {
   local root="$1"
-  local findings
-  findings="$(
-    find "$root" -name Cargo.toml -not -path '*/target/*' -print0 |
-      sort -z |
-      xargs -0 -I{} "$0" --scan-one {}
-  )"
+  local findings="" manifest out
+  local -i count=0
+
+  while IFS= read -r manifest; do
+    count+=1
+    if ! out="$(scan_manifest "$manifest")"; then
+      echo "scanner failed on $manifest" >&2
+      return 2
+    fi
+    if [[ -n "$out" ]]; then
+      findings+="$out"$'\n'
+    fi
+  done < <(find "$root" -name Cargo.toml -not -path '*/target/*' | sort)
+
+  if (( count == 0 )); then
+    echo "no Cargo.toml found under $root" >&2
+    return 2
+  fi
   if [[ -n "$findings" ]]; then
-    printf '%s\n' "$findings"
+    printf '%s' "$findings"
     return 1
   fi
   return 0
 }
 
 run_real_check() {
-  local root
-  root="$(cd "$(dirname "$0")/.." && pwd)"
+  local root status=0
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+  # Resolved, not assumed: a symlinked or relocated script that scanned the
+  # wrong tree would find no manifests and — before the count check in
+  # `gate_check` — report OK.
+  [[ -f "$root/autumn/Cargo.toml" ]] ||
+    die "expected the repository root at $root, but $root/autumn/Cargo.toml is missing"
+
   echo "==> scanning workspace manifests for a \`sqlite\` backend-flip edge"
-  if gate_check "$root"; then
-    echo "OK: no manifest enables the \`sqlite\` feature through a dependency edge."
-  else
-    die "a manifest enables the \`sqlite\` backend flip.
+  gate_check "$root" || status=$?
+  case "$status" in
+    0) echo "OK: no manifest enables the \`sqlite\` feature through a dependency edge." ;;
+    2) die "the manifest scan could not run — see above. A gate that cannot
+  scan must not report OK." ;;
+    *) die "a manifest enables the \`sqlite\` backend flip.
 
 \`sqlite\` swaps db::RuntimeConnection for the WHOLE dependency graph, so a
 single edge breaks every Postgres consumer. Build the SQLite lane with an
@@ -173,18 +263,21 @@ explicit invocation instead:
     cargo build -p autumn-web --features sqlite
     cargo build -p autumn-cli --no-default-features --features sqlite
 
-See the \`sqlite = [...]\` comment in autumn/Cargo.toml."
-  fi
+See the \`sqlite = [...]\` comment in autumn/Cargo.toml." ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
 # Self-test: prove the checker still catches what it claims to.
 # ---------------------------------------------------------------------------
 self_test() {
-  local tmp pass=0 total=0
+  local tmp
+  local -i pass=0 total=0
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
 
+  # Each case is a whole crate directory, so `check_pass` cannot be satisfied
+  # by an empty scan: `gate_check` returns 2 when it finds no manifest.
   make_case() {
     local dir="$tmp/$1"
     mkdir -p "$dir"
@@ -192,22 +285,24 @@ self_test() {
   }
 
   check_fail() {
-    local name="$1" dir="$2"
-    total=$((total + 1))
-    if gate_check "$tmp/$dir" >/dev/null 2>&1; then
-      echo "  FAIL: $name — violation not caught"
+    local name="$1" dir="$2" status=0
+    total+=1
+    gate_check "$tmp/$dir" >/dev/null 2>&1 || status=$?
+    if (( status == 1 )); then
+      pass+=1
     else
-      pass=$((pass + 1))
+      echo "  FAIL: $name — violation not caught (status $status)"
     fi
   }
 
   check_pass() {
-    local name="$1" dir="$2"
-    total=$((total + 1))
-    if gate_check "$tmp/$dir" >/dev/null 2>&1; then
-      pass=$((pass + 1))
+    local name="$1" dir="$2" status=0
+    total+=1
+    gate_check "$tmp/$dir" >/dev/null 2>&1 || status=$?
+    if (( status == 0 )); then
+      pass+=1
     else
-      echo "  FAIL: $name — legitimate manifest rejected"
+      echo "  FAIL: $name — legitimate manifest rejected (status $status)"
     fi
   }
 
@@ -245,24 +340,77 @@ autumn-cli = { version = "0.7", features = ["sqlite"] }
 EOF
   check_fail "target-specific dependency edge" target_dep
 
-  make_case forward <<'EOF'
-[features]
-embedded = ["autumn-web/sqlite"]
-EOF
-  check_fail "feature forwarding the flip under another name" forward
-
-  make_case default_forward <<'EOF'
-[features]
-default = ["autumn-web/sqlite"]
-sqlite = ["autumn-web/sqlite"]
-EOF
-  check_fail "default enabling the flip" default_forward
-
   make_case renamed <<'EOF'
 [dependencies]
 web = { package = "autumn-web", version = "0.7", features = ["sqlite"] }
 EOF
   check_fail "renamed dependency edge" renamed
+
+  make_case dotted <<'EOF'
+[dependencies]
+autumn-web.workspace = true
+autumn-web.features = ["sqlite"]
+EOF
+  check_fail "dotted-key dependency form" dotted
+
+  make_case single_quoted <<'EOF'
+[dependencies]
+autumn-web = { version = "0.7", features = ['sqlite'] }
+EOF
+  check_fail "single-quoted feature name" single_quoted
+
+  mkdir -p "$tmp/crlf"
+  printf '[dev-dependencies]\r\nautumn-web = { path = "../autumn", features = ["sqlite"] }\r\n' \
+    >"$tmp/crlf/Cargo.toml"
+  check_fail "CRLF line endings" crlf
+
+  make_case desync <<'EOF'
+[package]
+name = "example"
+description = "an [experimental framework"
+
+[dependencies]
+autumn-web = { version = "0.7", features = ["sqlite"] }
+EOF
+  check_fail "an unbalanced bracket inside a string does not desync the scan" desync
+
+  make_case forward <<'EOF'
+[package]
+name = "example"
+
+[features]
+embedded = ["autumn-web/sqlite"]
+EOF
+  check_fail "feature forwarding the flip under another name" forward
+
+  make_case same_name_elsewhere <<'EOF'
+[package]
+name = "example-app"
+
+[features]
+sqlite = ["autumn-web/sqlite"]
+EOF
+  check_fail "the same-named exception does not travel to other crates" same_name_elsewhere
+
+  make_case default_forward <<'EOF'
+[package]
+name = "autumn-cli"
+
+[features]
+default = ["autumn-web/sqlite"]
+sqlite = ["autumn-web/sqlite"]
+EOF
+  check_fail "default forwarding the flip" default_forward
+
+  make_case default_bare <<'EOF'
+[package]
+name = "autumn-cli"
+
+[features]
+default = ["tls", "sqlite"]
+sqlite = ["autumn-web/sqlite", "diesel_migrations/sqlite"]
+EOF
+  check_fail "default enabling the crate's own flip feature" default_bare
 
   make_case commented <<'EOF'
 [dependencies]
@@ -271,7 +419,20 @@ autumn-web = { version = "0.7", features = ["db"] }
 EOF
   check_pass "a commented-out edge is not an edge" commented
 
+  make_case hash_in_string <<'EOF'
+[package]
+name = "example"
+description = "tracks issue #1905"
+
+[dependencies]
+autumn-web = { version = "0.7", features = ["db"] }
+EOF
+  check_pass "a # inside a string is not a comment" hash_in_string
+
   make_case same_name <<'EOF'
+[package]
+name = "autumn-cli"
+
 [features]
 default = ["postgres"]
 sqlite = ["autumn-web/sqlite", "diesel_migrations/sqlite"]
@@ -285,10 +446,31 @@ autumn-web = { version = "0.7", features = ["db", "mail"] }
 EOF
   check_pass "another crate's sqlite feature is unrelated" unrelated
 
+  make_case default_without_flip <<'EOF'
+[package]
+name = "some-store"
+
+[features]
+default = ["sqlite"]
+sqlite = ["rusqlite"]
+EOF
+  check_pass "an unrelated crate's own sqlite feature in default" default_without_flip
+
+  # The scan must refuse to report OK when it scanned nothing.
+  total+=1
+  mkdir -p "$tmp/empty"
+  local status=0
+  gate_check "$tmp/empty" >/dev/null 2>&1 || status=$?
+  if (( status == 2 )); then
+    pass+=1
+  else
+    echo "  FAIL: an empty tree must not report OK (status $status)"
+  fi
+
   echo "self-test: $pass/$total passed"
-  [[ "$pass" -eq "$total" ]] || die "sqlite-unification self-test failed — the
-  checker is not catching what it claims to. Fix the checker before trusting a
-  green gate."
+  (( pass == total )) || die "sqlite-unification self-test failed — the checker
+  is not catching what it claims to. Fix the checker before trusting a green
+  gate."
   trap - EXIT
   rm -rf "$tmp"
 }
@@ -296,10 +478,6 @@ EOF
 # ---------------------------------------------------------------------------
 
 case "${1-}" in
-  --scan-one)
-    # Internal: scan a single manifest (used by `gate_check`'s xargs).
-    scan_manifest "$2"
-    ;;
   --self-test)
     self_test
     ;;

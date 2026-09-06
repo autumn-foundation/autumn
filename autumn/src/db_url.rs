@@ -127,14 +127,11 @@ pub fn redact_target(url: &str) -> String {
         let redacted_query = parsed
             .query()
             .map(|query| filter_query(query, &PG_DIAGNOSTIC_PARAMS, is_postgres));
-        let query_changed = match redacted_query.as_deref() {
-            Some(redacted) => {
-                let changed = Some(redacted) != parsed.query();
-                parsed.set_query(Some(redacted));
-                changed
-            }
-            None => false,
-        };
+        let query_changed = redacted_query.as_deref().is_some_and(|redacted| {
+            let changed = Some(redacted) != parsed.query();
+            parsed.set_query(Some(redacted));
+            changed
+        });
         // Re-rendering a parsed URL normalizes it, so only hand back the
         // rewritten form when something actually had to be hidden.
         if has_password || query_changed {
@@ -270,14 +267,16 @@ pub fn redact_targets_in_message(msg: &str) -> String {
         .map(|chunk| {
             let trimmed = chunk.trim_end();
             let trailing = &chunk[trimmed.len()..];
-            match target_start(trimmed) {
-                Some(at) => format!(
-                    "{}{}{trailing}",
-                    &trimmed[..at],
-                    redact_target(&trimmed[at..])
-                ),
-                None => chunk.to_owned(),
-            }
+            target_start(trimmed).map_or_else(
+                || chunk.to_owned(),
+                |at| {
+                    format!(
+                        "{}{}{trailing}",
+                        &trimmed[..at],
+                        redact_target(&trimmed[at..])
+                    )
+                },
+            )
         })
         .collect()
 }
@@ -323,7 +322,7 @@ fn scheme_start(token: &str, sep: usize) -> usize {
 }
 
 /// The characters a URL scheme may contain (RFC 3986).
-fn is_scheme_char(c: char) -> bool {
+const fn is_scheme_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.'
 }
 

@@ -975,9 +975,9 @@ jobs:
       - name: Check MSRV compiles
         run: cargo check --workspace
 
-  # SQLite runtime lane gate (issue #1614, AC#11). This is the ONLY place in CI
-  # that enables autumn-web's `sqlite` feature, and it does so via an EXPLICIT
-  # `--features sqlite` on each dedicated invocation below — NEVER via
+  # SQLite runtime lane gate (issue #1614, AC#11). Enables autumn-web's
+  # `sqlite` feature via an EXPLICIT `--features sqlite` on each dedicated
+  # invocation below — NEVER via
   # `--all-features` and never via a workspace dependency edge. `sqlite` is a
   # backend-flip feature: it flips `db::RuntimeConnection` from `AsyncPgConnection`
   # to a SQLite connection, so unifying it with the Postgres-assuming features
@@ -986,9 +986,15 @@ jobs:
   # No Postgres `services:` / Docker: the sqlite tests use tempfile/in-memory
   # SQLite with no external DB. The job builds + lints autumn-web under the
   # sqlite backend and runs the sqlite integration suite by NAMED `[[test]]`
-  # target — a bare `cargo test --features sqlite` is unsafe (it would compile
-  # the Postgres `integration_tests` binary and the pg-URL lib unit tests under
-  # the flipped backend and fail).
+  # target — a bare `cargo test --features sqlite` is unsafe because it would
+  # compile the Postgres `integration_tests` binary under the flipped backend.
+  # The crate's own LIB unit tests are a different matter: #1905 made their
+  # fixtures backend-parametric, so the lib step below runs a bare `--lib`.
+  #
+  # This is not quite the only place CI enables `sqlite` — the coverage job
+  # has a dedicated `--features "sqlite,mail"` lane — but both are EXPLICIT
+  # per-invocation, never `--all-features` and never a dependency edge (which
+  # `scripts/check-sqlite-unification.sh` now enforces).
   sqlite-runtime:
     name: SQLite runtime (feature=sqlite)
     runs-on: ubuntu-latest
