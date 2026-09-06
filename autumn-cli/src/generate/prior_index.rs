@@ -11,7 +11,7 @@
 //! Static text analysis only: `generate migration` is offline and has no
 //! database to introspect.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::migrate::safety::{normalize_statement, split_statements, strip_block_comments};
@@ -54,14 +54,31 @@ pub fn scan_prior_indexes(migrations_dir: &Path, table: &str) -> Vec<PriorIndex>
     // Insertion-ordered by a monotonic sequence, so the result keeps creation
     // order while `DROP INDEX` can still remove by name.
     let mut live: BTreeMap<String, (usize, PriorIndex)> = BTreeMap::new();
+    // Index names are global in SQLite, not per table. `IF NOT EXISTS` no-ops
+    // against a name taken by ANY table, so track every live name — not only the
+    // ones on the table being scanned.
+    let mut taken: BTreeSet<String> = BTreeSet::new();
     let mut seq = 0usize;
 
     for (i, (raw, normalized)) in statements.iter().enumerate().skip(from) {
         let name = &names_at[i];
-        if let Some(index) = parse_create_index(raw, normalized, name) {
-            live.insert(normalize_identifier(&index.name), (seq, index));
-            seq += 1;
+        if let Some(header) = parse_index_header(normalized) {
+            let key = normalize_identifier(header.name);
+            // SQLite keeps the ORIGINAL definition here; replacing it would let
+            // a later `Remove…From…` drop an index it never looked at.
+            if header.if_not_exists && taken.contains(&key) {
+                continue;
+            }
+            taken.insert(key.clone());
+            if let Some(index) = parse_create_index(raw, &header, name) {
+                live.insert(key, (seq, index));
+                seq += 1;
+            } else {
+                // A create on some other table still claims the name.
+                live.remove(&key);
+            }
         } else if let Some(dropped) = parse_dropped_index_name(normalized) {
+            taken.remove(&dropped);
             live.remove(&dropped);
         } else if let Some((old, new)) = parse_column_rename(normalized, name) {
             // SQLite rewrites an index's column references on RENAME COLUMN, so
@@ -175,28 +192,47 @@ fn parse_table_rename(normalized: &str) -> Option<(String, String)> {
     Some((normalize_identifier(old), normalize_identifier(new)))
 }
 
-/// Parse a `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table> …`
-/// statement targeting `table`. `raw` is the original text (kept for the
-/// rollback re-create); `normalized` is its comment-stripped, lowercased,
-/// whitespace-collapsed form.
-fn parse_create_index(raw: &str, normalized: &str, table: &str) -> Option<PriorIndex> {
+/// Build a [`PriorIndex`] from an already-parsed `header` when the index targets
+/// `table`. `raw` is the original statement text, kept for the rollback
+/// re-create.
+fn parse_create_index(raw: &str, header: &IndexHeader<'_>, table: &str) -> Option<PriorIndex> {
+    let after_table = strip_on_table(header.after_name, table)?;
+    Some(PriorIndex {
+        // Take the name from the raw statement, so the emitted `DROP INDEX`
+        // keeps the original casing and quoting.
+        name: raw_token_matching(raw, header.name),
+        create_sql: recreate_sql(raw),
+        tokens: identifier_tokens(after_table),
+    })
+}
+
+/// The name and options of a `CREATE INDEX`, before its target table is known.
+struct IndexHeader<'a> {
+    /// Index name, lowercased as it appears in the normalized statement.
+    name: &'a str,
+    /// Whether the statement carries `IF NOT EXISTS`.
+    if_not_exists: bool,
+    /// The rest of the statement, starting at `on <table>`.
+    after_name: &'a str,
+}
+
+/// Parse the leading `CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS]
+/// <name>` of a normalized statement, whatever table it targets.
+fn parse_index_header(normalized: &str) -> Option<IndexHeader<'_>> {
     let rest = normalized
         .strip_prefix("create unique index ")
         .or_else(|| normalized.strip_prefix("create index "))?;
     // `CONCURRENTLY` is Postgres-only. Accept the spelling anyway: a Postgres
     // migration history is still worth reading correctly.
     let rest = rest.strip_prefix("concurrently ").unwrap_or(rest);
-    let rest = rest.strip_prefix("if not exists ").unwrap_or(rest);
-
+    let (rest, if_not_exists) = rest
+        .strip_prefix("if not exists ")
+        .map_or((rest, false), |r| (r, true));
     let (name, after_name) = split_index_name(rest)?;
-    let after_table = strip_on_table(after_name, table)?;
-
-    Some(PriorIndex {
-        // Take the name from the raw statement, so the emitted `DROP INDEX`
-        // keeps the original casing and quoting.
-        name: raw_token_matching(raw, name),
-        create_sql: recreate_sql(raw),
-        tokens: identifier_tokens(after_table),
+    Some(IndexHeader {
+        name,
+        if_not_exists,
+        after_name,
     })
 }
 
@@ -363,28 +399,27 @@ fn blank_string_literals(sql: &str) -> String {
 /// `date(created_at)` yields `created_at` alone.
 fn identifier_tokens(sql: &str) -> Vec<String> {
     let sql = blank_string_literals(sql);
-    let bytes = sql.as_bytes();
     let mut out = Vec::new();
     let mut start = None;
     for (i, c) in sql.char_indices() {
-        let is_ident = c.is_alphanumeric() || c == '_';
-        if is_ident {
+        if c.is_alphanumeric() || c == '_' {
             start.get_or_insert(i);
             continue;
         }
         if let Some(from) = start.take() {
-            push_identifier(&mut out, &sql[from..i], bytes.get(i).copied());
+            push_identifier(&mut out, &sql[from..i], &sql[i..]);
         }
     }
     if let Some(from) = start {
-        push_identifier(&mut out, &sql[from..], None);
+        push_identifier(&mut out, &sql[from..], "");
     }
     out
 }
 
-/// Record `token` unless the character that ended it opens a call.
-fn push_identifier(out: &mut Vec<String>, token: &str, terminator: Option<u8>) {
-    if terminator == Some(b'(') {
+/// Record `token` unless what follows it opens a call. `lower (title)` is valid
+/// SQL, so the whitespace before the parenthesis is skipped.
+fn push_identifier(out: &mut Vec<String>, token: &str, rest: &str) {
+    if rest.trim_start().starts_with('(') {
         return;
     }
     out.push(token.to_lowercase());
@@ -690,6 +725,63 @@ mod tests {
             .map(|i| i.name)
             .collect();
         assert_eq!(names, vec!["idx_fresh"], "got {names:?}");
+    }
+
+    #[test]
+    fn if_not_exists_keeps_the_original_definition() {
+        // SQLite no-ops the second CREATE, leaving the index on `body`. Taking
+        // the second definition would make RemoveTitleFromPosts drop a live
+        // index on a column it never touched.
+        let t = tree(&[
+            ("2026_01_01_000000_a", "CREATE INDEX i ON posts (body);"),
+            (
+                "2026_01_02_000000_b",
+                "CREATE INDEX IF NOT EXISTS i ON posts (title);",
+            ),
+        ]);
+        let found = scan_prior_indexes(t.path(), "posts");
+        assert_eq!(found.len(), 1, "got {found:?}");
+        assert!(found[0].covers("body"), "got {found:?}");
+        assert!(!found[0].covers("title"), "got {found:?}");
+    }
+
+    #[test]
+    fn if_not_exists_respects_a_name_taken_by_another_table() {
+        // Index names are global in SQLite, so this create no-ops too.
+        let t = tree(&[
+            ("2026_01_01_000000_a", "CREATE INDEX i ON comments (body);"),
+            (
+                "2026_01_02_000000_b",
+                "CREATE INDEX IF NOT EXISTS i ON posts (title);",
+            ),
+        ]);
+        assert!(
+            scan_prior_indexes(t.path(), "posts").is_empty(),
+            "the name was already taken"
+        );
+    }
+
+    #[test]
+    fn a_plain_create_on_another_table_reclaims_the_name() {
+        // Without IF NOT EXISTS the name is re-pointed, so `posts` loses it.
+        let t = tree(&[
+            ("2026_01_01_000000_a", "CREATE INDEX i ON posts (title);"),
+            ("2026_01_02_000000_b", "CREATE INDEX i ON comments (body);"),
+        ]);
+        assert!(scan_prior_indexes(t.path(), "posts").is_empty());
+    }
+
+    #[test]
+    fn a_spaced_function_call_is_not_a_column() {
+        // `lower (title)` is valid SQL; recording `lower` as a column would drop
+        // this unique index when a column named `lower` is removed.
+        let t = tree(&[(
+            "2026_01_01_000000_a",
+            "CREATE UNIQUE INDEX ux ON posts (lower (title));",
+        )]);
+        let found = scan_prior_indexes(t.path(), "posts");
+        assert!(!found[0].covers("lower"), "got {found:?}");
+        assert!(found[0].covers("title"), "got {found:?}");
     }
 
     #[test]

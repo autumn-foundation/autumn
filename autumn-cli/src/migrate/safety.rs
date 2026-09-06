@@ -407,6 +407,9 @@ const CREATE_INDEX_SQLITE_OP: &str = "CREATE INDEX";
 /// The value of an `add column` subcommand's `DEFAULT` clause, lowercased, or
 /// `None` when the subcommand carries no default.
 ///
+/// The keyword is matched at a word boundary, so `DEFAULT(0)` — valid SQL with
+/// no space — is read, while a column named `defaulted` is not.
+///
 /// Three shapes are read whole rather than split on whitespace: a parenthesized
 /// expression (`(lower(x))`), a quoted literal including one with spaces
 /// (`'a b'`, with `''` as the escaped quote), and a signed number (`-1`).
@@ -415,12 +418,21 @@ const CREATE_INDEX_SQLITE_OP: &str = "CREATE INDEX";
 fn add_column_default_token(subcommand: &str) -> Option<String> {
     let mut from = 0;
     let rest = loop {
-        let at = subcommand[from..].find(" default ")? + from;
+        let at = subcommand[from..].find(" default")? + from;
+        let after = &subcommand[at + " default".len()..];
+        // `DEFAULT(0)` needs no space, but `defaulted` is a different word.
+        let value = match after.strip_prefix(' ') {
+            Some(v) => Some(v),
+            None if after.starts_with('(') => Some(after),
+            None => None,
+        };
         // `SET DEFAULT` here is an FK action, not this column's default.
-        if !subcommand[..at].trim_end().ends_with(" set") {
-            break subcommand[at + " default ".len()..].trim_start();
+        if let Some(value) = value
+            && !subcommand[..at].trim_end().ends_with(" set")
+        {
+            break value.trim_start();
         }
-        from = at + " default ".len();
+        from = at + " default".len();
     };
     if rest.starts_with('(') {
         let mut depth = 0usize;
@@ -2698,6 +2710,28 @@ mod tests {
                 sqlite_ops(sql)
             );
         }
+    }
+
+    #[test]
+    fn sqlite_reads_a_default_with_no_space_before_the_value() {
+        // `DEFAULT(0)` is valid SQL. Missing it made the NOT NULL rule fire and
+        // block a statement SQLite applies cleanly.
+        assert!(
+            classify_sql_for(
+                DatabaseBackend::Sqlite,
+                "ALTER TABLE posts ADD COLUMN views INTEGER NOT NULL DEFAULT(0);"
+            )
+            .is_empty(),
+            "got {:?}",
+            sqlite_ops("ALTER TABLE posts ADD COLUMN views INTEGER NOT NULL DEFAULT(0);")
+        );
+        // A column whose name merely starts with `default` is not a keyword.
+        let f = sqlite_finding(
+            "ALTER TABLE posts ADD COLUMN defaulted TEXT NOT NULL;",
+            "ADD COLUMN NOT NULL (no default)",
+        )
+        .expect("finding expected");
+        assert_eq!(f.risk, RiskLevel::Unsupported);
     }
 
     #[test]
