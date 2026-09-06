@@ -3154,6 +3154,51 @@ mod tests {
     }
 
     #[test]
+    fn switching_the_database_backend_drops_the_baseline() {
+        // The backend appears in no argument, and it decides the SQL a
+        // migration holds and the `schema.rs` block a `SchemaTable` revert
+        // expects. Without it in the identity, a project moved from SQLite to
+        // Postgres would accept the old digest and destroy the model and its
+        // migration while silently leaving the schema entry behind (Codex
+        // review of PR #2551).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("src/models/post.rs");
+
+        temp_env::with_vars([("DATABASE_URL", Some("sqlite://app.db"))], || {
+            let mut generated = Plan::new(tmp.path());
+            generated.create(target.clone(), "// built for SQLite\n");
+            generated.execute(Flags::default()).unwrap();
+        });
+
+        temp_env::with_vars([("DATABASE_URL", Some("postgres://localhost/app"))], || {
+            let mut destroy = Plan::new(tmp.path());
+            destroy.create(target.clone(), "// built for Postgres\n");
+            let err = destroy.revert(Flags::default()).unwrap_err();
+            assert!(matches!(err, GenerateError::Diverged(_)));
+        });
+
+        assert!(target.exists(), "a backend switch is not a template change");
+    }
+
+    #[test]
+    fn an_unchanged_database_backend_keeps_the_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("src/models/post.rs");
+
+        temp_env::with_vars([("DATABASE_URL", Some("sqlite://app.db"))], || {
+            let mut generated = Plan::new(tmp.path());
+            generated.create(target.clone(), "// v1 template\n");
+            generated.execute(Flags::default()).unwrap();
+
+            let mut destroy = Plan::new(tmp.path());
+            destroy.create(target.clone(), "// v2 template\n");
+            destroy.revert(Flags::default()).unwrap();
+        });
+
+        assert!(!target.exists());
+    }
+
+    #[test]
     fn revert_applies_mod_decl_revert_and_deletes_now_empty_file() {
         let (tmp, mut plan) = fixture();
         let mod_path = tmp.path().join("mod.rs");

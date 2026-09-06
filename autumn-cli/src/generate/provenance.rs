@@ -113,14 +113,19 @@ struct ManifestFile {
 ///   because they legitimately differ between the two runs.
 /// - A digest of the generator config those arguments resolve from — the
 ///   auto-discovered [`GENERATE_CONFIG_FILENAME`], which does not appear in the
-///   arguments at all, and any file a `--config` names. Without it, editing the
-///   recipe between `generate` and a textually identical `destroy` would leave
-///   the arguments looking unchanged while the plan is rebuilt from different
-///   fields: `destroy` would accept the old owned files by digest and then
-///   apply shared-file reverts the original generation never made.
+///   arguments at all, and any file a `--config` names.
+/// - The resolved database backend, which the arguments do not name either and
+///   which decides the SQL a migration holds and the `schema.rs` block a
+///   [`Revert::SchemaTable`](super::emit::Revert::SchemaTable) expects.
 ///
-/// Editing the config for any resource therefore drops the baseline for all of
-/// them, back to comparing against the current render. Deliberate: a stale
+/// Without the last two, an input the arguments cannot see would change the
+/// plan while the identity looked unchanged: `destroy` would accept the old
+/// owned files by digest and then apply shared-file reverts the original
+/// generation never made — removing the model and its migration while silently
+/// leaving its `schema.rs` entry behind.
+///
+/// Changing the recipe or the backend therefore drops the baseline for every
+/// resource, back to comparing against the current render. Deliberate: a stale
 /// baseline is worse than no baseline.
 #[must_use]
 pub fn current_invocation(root: &Path) -> String {
@@ -130,7 +135,8 @@ pub fn current_invocation(root: &Path) -> String {
         .collect();
     let inputs = normalize_invocation(args.iter().cloned());
     let config = config_fingerprint(root, &args);
-    format!("{inputs}{RECORD_SEPARATOR}{config}")
+    let backend = backend_fingerprint(root);
+    format!("{inputs}{RECORD_SEPARATOR}{config}{RECORD_SEPARATOR}{backend}")
 }
 
 /// An identity built from a generator's RESOLVED inputs instead of its raw
@@ -144,10 +150,28 @@ pub fn current_invocation(root: &Path) -> String {
 /// manifest exists to serve.
 ///
 /// No config fingerprint: `parts` already carries every resolved input, so
-/// there is nothing left for a config file to change.
+/// there is nothing left for a config file to change. The backend still
+/// counts — it decides what a migration in the plan holds — so `root` is
+/// taken for it.
 #[must_use]
-pub fn resolved_invocation(parts: &[&str]) -> String {
-    parts.join(&UNIT_SEPARATOR.to_string())
+pub fn resolved_invocation(root: &Path, parts: &[&str]) -> String {
+    let inputs = parts.join(&UNIT_SEPARATOR.to_string());
+    let backend = backend_fingerprint(root);
+    format!("{inputs}{RECORD_SEPARATOR}{backend}")
+}
+
+/// The project's resolved database backend, as a stable name.
+///
+/// Resolved rather than fingerprinted from its sources: `autumn.toml`, the
+/// profile overlays, `.env` and the database environment variables all feed
+/// [`detect_backend`](super::detect_backend), and only the answer changes what
+/// a generator emits. Hashing the sources instead would drop the baseline on
+/// every unrelated config edit.
+fn backend_fingerprint(root: &Path) -> &'static str {
+    match super::detect_backend(root) {
+        autumn_web::config::DatabaseBackend::Postgres => "postgres",
+        autumn_web::config::DatabaseBackend::Sqlite => "sqlite",
+    }
 }
 
 /// A digest over every generator config file this run could have read.

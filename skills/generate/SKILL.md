@@ -53,9 +53,9 @@ published 0.5.0 CLI, revert by hand (git) instead.
 every file it owns in `.autumn/generated.toml` (commit it), and `destroy`
 deletes a file whose content matches that digest or the current templates.
 A CLI upgrade that changed a template therefore no longer forces `--force`.
-The entry records the command's arguments and a fingerprint of the
-`autumn.generate.toml` they resolve from, so the digest counts only when both
-are repeated.
+The entry records the command's arguments, a fingerprint of the
+`autumn.generate.toml` they resolve from, and the resolved database backend, so
+the digest counts only when all three match.
 Two cases still need it: a project generated before the manifest existed, and
 a file you edited and want deleted anyway. Re-running the original generator
 command with `--force` re-records the digest and is the better fix for the
