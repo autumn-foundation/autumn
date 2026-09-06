@@ -79,7 +79,7 @@ async fn a_mutation_over_get_is_refused_with_405() {
         .await
         .assert_status(405);
     // ...and the query in the same document is still fine (fails later on the
-    // missing pool, as a GraphQL error, not at the transport).
+    // missing pool, as a redacted GraphQL error, not at the transport).
     client
         .get(&format!("{GRAPHQL_PATH}?query={doc}&operationName=A"))
         .send()
@@ -118,14 +118,20 @@ async fn a_get_without_a_query_string_is_a_400() {
 }
 
 /// Without a pool, resolvers fail as a GraphQL error on the field, not as a
-/// 500 — the transport stays healthy and the client sees why.
+/// 500 — the transport stays healthy. And because a GraphQL response is an
+/// HTTP 200 that never meets the framework's problem-details redaction, the
+/// resolver's error mapper redacts server-side (`5xx`) messages itself: the
+/// client sees a generic message plus the status, never the detail.
 #[tokio::test]
-async fn a_missing_pool_is_reported_as_a_graphql_error() {
+async fn a_missing_pool_is_a_redacted_graphql_error() {
     let body = gql(&client_without_db(), "{ notes { id } }", json!({})).await;
-    let message = body["errors"][0]["message"]
-        .as_str()
-        .expect("error message");
-    assert!(message.contains("no database pool"), "got: {body}");
+    let error = &body["errors"][0];
+    assert_eq!(error["message"], "internal server error", "got: {body}");
+    assert_eq!(error["extensions"]["status"], 503, "got: {body}");
+    assert!(
+        !body.to_string().contains("pool"),
+        "server-side detail must not reach the wire: {body}"
+    );
 }
 
 /// `schema.graphql` is the contract the TypeScript client is written against.

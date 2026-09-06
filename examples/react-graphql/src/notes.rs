@@ -58,20 +58,32 @@ fn repo(ctx: &Context<'_>) -> Result<PgNoteRepository> {
     let pool = ctx
         .data::<AppState>()?
         .pool()
-        .ok_or("no database pool configured")?
+        .ok_or_else(|| AutumnError::service_unavailable_msg("no database pool configured"))
+        .map_err(to_gql)?
         .clone();
     Ok(PgNoteRepository::with_pool_untracked(pool))
 }
 
 /// Map a repository/framework error onto a GraphQL field error.
 ///
-/// The message is what `AutumnError` would put in the problem-details
-/// `detail`, and the HTTP status it would have used travels in
-/// `extensions.status`, so a client can still tell a 422 (validation, the
-/// pinned-delete rule) from a 503 (no pool) without an HTTP status to read.
+/// A GraphQL response is an HTTP `200`, so it never passes through the
+/// framework's problem-details filter that redacts server-side errors. This
+/// does the equivalent: a client error (`4xx` — validation, the pinned-delete
+/// rule, an unknown id) keeps its message, which was written for the client;
+/// a server error (`5xx` — a failed query, a lost connection, no pool) is
+/// logged with its detail and replaced by a generic message, so database
+/// diagnostics never reach the wire. Either way the HTTP status the error
+/// would have carried travels in `extensions.status`, so a client can still
+/// tell a `422` from a `503` without an HTTP status to read.
 fn to_gql(err: AutumnError) -> async_graphql::Error {
-    let status = err.status().as_u16();
-    async_graphql::Error::new(err.to_string()).extend_with(|_, e| e.set("status", status))
+    let status = err.status();
+    let message = if status.is_server_error() {
+        tracing::error!(status = %status, error = %err, "GraphQL resolver failed");
+        "internal server error".to_owned()
+    } else {
+        err.to_string()
+    };
+    async_graphql::Error::new(message).extend_with(|_, e| e.set("status", status.as_u16()))
 }
 
 /// Newest first. `find_all`/`find_by_pinned` return primary-key order, and

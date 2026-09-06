@@ -46,6 +46,7 @@ export function App() {
     try {
       const updated = await togglePinned(id);
       setNotes((current) => current.map((n) => (n.id === id ? updated : n)));
+      setStatus({ kind: "ready" });
     } catch (err) {
       setStatus({ kind: "error", message: (err as Error).message });
     }
@@ -56,6 +57,9 @@ export function App() {
       if (await deleteNote(id)) {
         setNotes((current) => current.filter((n) => n.id !== id));
       }
+      // A success clears any alert left by an earlier failed action (e.g.
+      // "note is pinned" from a refused delete that has since been unpinned).
+      setStatus({ kind: "ready" });
     } catch (err) {
       setStatus({ kind: "error", message: (err as Error).message });
     }

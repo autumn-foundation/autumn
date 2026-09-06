@@ -255,6 +255,7 @@ auth. The plugin does not care where it is mounted.
 cargo test -p react-graphql
 
 # Tier 2 — Docker: rows, hooks, normalisation, validation, REST/GraphQL parity.
+# (CI runs this tier in the Docker job of ci.yml.)
 # Serial, because they share one migrated table.
 cargo test -p react-graphql --test graphql_api -- --include-ignored --test-threads=1
 

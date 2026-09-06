@@ -32,14 +32,29 @@ impl MutationHooks for NoteHooks {
     type UpdateModel = UpdateNote;
 
     /// Enforce the model's `#[validate]` rules on the (already normalised)
-    /// insert. A failure is the same 422 field-error map the REST handler
-    /// produces; GraphQL surfaces its message on the field.
+    /// insert, as a `422`. The per-field messages are folded into the error
+    /// text, so a GraphQL client — which sees only `errors[].message` — learns
+    /// which field failed and why. (A bare `?` on the validator's error would
+    /// convert it through the generic path and surface as a `500`.)
     async fn before_create(
         &self,
         _ctx: &mut MutationContext,
         new: &mut NewNote,
     ) -> AutumnResult<()> {
-        new.clone().validate()?;
+        if let Err(errors) = new.validate() {
+            let mut messages: Vec<String> = errors
+                .field_errors()
+                .iter()
+                .flat_map(|(field, errs)| {
+                    errs.iter().map(move |e| {
+                        let reason = e.message.as_deref().unwrap_or(&e.code);
+                        format!("{field}: {reason}")
+                    })
+                })
+                .collect();
+            messages.sort();
+            return Err(AutumnError::unprocessable_msg(messages.join("; ")));
+        }
         Ok(())
     }
 
