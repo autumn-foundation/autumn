@@ -36,6 +36,23 @@
 -- the collision this cleanup exists to remove (Codex review on this PR).
 -- This never fires on a fresh database (no rows yet) or one that never hit
 -- the race.
+--
+-- During a rolling deploy, an old (pre-fix) process can still be accepting
+-- `/submit` while this migration runs. Diesel applies this whole file
+-- inside one transaction, but the reconciliation below only takes row-level
+-- locks — an old process could commit a brand-new duplicate after the scan
+-- but before `ADD CONSTRAINT` takes its lock, failing validation on a row
+-- reconciliation never saw (Codex review on this PR). `SHARE ROW EXCLUSIVE`
+-- blocks concurrent writers (INSERT/UPDATE/DELETE) without blocking reads,
+-- for the rest of this transaction — through the scan, the reconciliation,
+-- and `ADD CONSTRAINT` — so cleanup and constraint creation see one
+-- consistent snapshot. A writer blocked here that lands after this commits
+-- gets validated against the new constraint like any other post-migration
+-- write, per `is_post_slug_conflict`'s retry loop (or a visible error, from
+-- old code that predates it — an acceptable trade-off: the invariant holds
+-- from this point on even against code that doesn't know about it yet).
+LOCK TABLE posts IN SHARE ROW EXCLUSIVE MODE;
+
 DO $$
 DECLARE
     dup RECORD;
