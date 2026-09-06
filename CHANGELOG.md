@@ -1458,6 +1458,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliberately differ (no Unix socket, no in-place upgrade handoff). Issue
   #1603.
 
+- **ci:** `autumn-cli`'s consolidated `cli_tests` binary now gets the same
+  discovery sweep as the `autumn` crate's `integration_tests` binary
+  (#1945): a bare `--ignored` run over `cli_tests` in ci.yml's
+  Docker-dependent-tests step, so a new `#[ignore = "requires Docker
+  (testcontainers)"]` test in any `autumn-cli/tests/integration/*.rs` module
+  runs in CI automatically. Before this, only two hand-picked filters
+  (`offsite`, `db_scrub`) ran anything from that binary, leaving 42 Docker
+  tests across 7 modules (`db.rs`, `db_pull.rs`,
+  `generate_lock_version_postgres.rs`, `generate_references_postgres.rs`,
+  `migrate_down.rs`, `schema_migrate.rs`, `schema_pull.rs`) dark since they
+  were written — PR #1985's noted follow-up. The sweep's `--skip` list routes
+  the binary's other `#[ignore]`d tests — the ones that scaffold and
+  cargo-check/build/run a fresh generated project instead of touching
+  Docker — to `generator-conformance.yml`, where 15 of them (across
+  `api_scaffold`, `cloud_native_scaffold`, `generate_position_scaffold`,
+  `scaffold_belongs_to`, `scaffold_bulk_delete`, `scaffold_rich_text`,
+  `scaffold_search`, `scaffold_trash`, `seed_model_linking`, `serve`, and two
+  in `scaffold_form_for`) are now named there for the first time, closing the
+  same gap for that half of the binary. Two new
+  `autumn-cli/tests/integration/repo_hygiene.rs` tests guard both halves of
+  the wiring going forward.
+
 ### Changed
 
 - **plugin-conformance:** **Breaking:** `plugin_conformance::ConformanceConfig`

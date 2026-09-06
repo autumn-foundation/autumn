@@ -397,6 +397,106 @@ jobs:
             integration::scaffold_validation::constrained_scaffold_cargo_checks \
             -- --ignored --exact
 
+      # ── cli_tests per-test triage (#1945) ───────────────────────────────
+      #
+      # These `#[ignore]`d tests each scaffold a fresh project and cargo-check
+      # (or build/run) it, same as the blocks above — they are NOT Docker
+      # tests, so ci.yml's Docker-dependent sweep explicitly `--skip`s their
+      # modules. Before this, none of them ran anywhere: issue #1945 flagged
+      # the `cli_tests` binary's heterogeneous ignored set as needing
+      # per-test triage, and PR #1985 folded in the Docker-gated tests but
+      # left this generator-shaped half unrouted. Named explicitly here, same
+      # as the blocks above, or they never run.
+      - name: api_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::api_scaffold::api_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: scaffolded_app_passes_routes_audit_gate
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::cloud_native_scaffold::scaffolded_app_passes_routes_audit_gate \
+            -- --ignored --exact
+
+      - name: scaffolded_api_app_passes_routes_audit_gate
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::cloud_native_scaffold::scaffolded_api_app_passes_routes_audit_gate \
+            -- --ignored --exact
+
+      - name: unscoped_position_generated_project_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::generate_position_scaffold::unscoped_position_generated_project_cargo_checks \
+            -- --ignored --exact
+
+      - name: scoped_position_generated_project_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::generate_position_scaffold::scoped_position_generated_project_cargo_checks \
+            -- --ignored --exact
+
+      - name: soft_delete_position_generated_project_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::generate_position_scaffold::soft_delete_position_generated_project_cargo_checks \
+            -- --ignored --exact
+
+      - name: belongs_to_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_belongs_to::belongs_to_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: bulk_delete_generated_project_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_bulk_delete::bulk_delete_generated_project_cargo_checks \
+            -- --ignored --exact
+
+      - name: richtext_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_rich_text::richtext_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: searchable_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_search::searchable_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: trash_generated_project_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_trash::trash_generated_project_cargo_checks \
+            -- --ignored --exact
+
+      - name: linked_seed_binary_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::seed_model_linking::linked_seed_binary_cargo_checks \
+            -- --ignored --exact
+
+      - name: serve_daemon_start_status_stop_over_unix_socket
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::serve::serve_daemon_start_status_stop_over_unix_socket \
+            -- --ignored --exact
+
+      - name: generated_form_for_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_form_for::generated_form_for_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: generated_scaffold_with_missing_reference_target_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_form_for::generated_scaffold_with_missing_reference_target_cargo_checks \
+            -- --ignored --exact
+
   # ── Generated-app variant conformance matrix ────────────────────────────────
   #
   # One matrixed job that scaffolds a fresh project in a specific "variant"

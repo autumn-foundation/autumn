@@ -567,7 +567,11 @@ jobs:
           ssh -V
       - name: Run Docker-dependent tests
         if: runner.os == 'Linux'
-        timeout-minutes: 45
+        # 45 -> 75 (#1945): 42 more container-spinning `cli_tests` Docker
+        # tests now sweep in here (see the `cli_tests` bare `--ignored`
+        # invocation below), on top of the 10 that raised this to 45 in
+        # PR #1985.
+        timeout-minutes: 75
         run: |
           cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
           cargo test -p autumn-web --test repository_shard_replica_routing -- --ignored
@@ -597,26 +601,52 @@ jobs:
           cargo test -p autumn-cli --test flags -- --ignored
           cargo test -p autumn-cli --test config -- --ignored
           cargo test -p autumn-cli --test experiments -- --ignored
-          # Offsite-backup DR round-trip (#1744): seed -> `autumn db backup
-          # --upload` -> restore from offsite -> row-level equality, against real
-          # MinIO + Postgres testcontainers. The `offsite` filter selects both
-          # ignored tests in autumn-cli/tests/integration/offsite_backup.rs.
-          # Needs Docker (testcontainers) + host pg_dump/pg_restore (installed
-          # above). Runs in the existing Docker-dependent Linux step rather than a
-          # separate required gate.
-          cargo test -p autumn-cli --test cli_tests -- --ignored offsite
-          # PII scrub round-trip (#1602): seed known PII -> `autumn db backup`
-          # -> `autumn db scrub --artifact` into a separate staging database ->
-          # assert ZERO occurrences of any original value in the result, plus
-          # the fail-closed refusals (undeclared column, renamed column,
-          # production profile). Needs Docker (testcontainers) + host
-          # pg_dump/pg_restore (installed above). autumn-cli's Docker-gated
-          # tests are NOT auto-swept the way autumn-web's are, so this line is
-          # the only thing that runs them.
-          # `scrubbed_database_migrates_clean_and_boots_the_app` is skipped
-          # here: it compiles and boots a generated app and needs the diesel
-          # CLI, so it runs in generator-conformance.yml's Postgres gate.
-          cargo test -p autumn-cli --test cli_tests -- --ignored db_scrub \
+          # Consolidated `cli_tests` binary: discover-and-run every Docker/
+          # testcontainer `#[ignore]`d test the same way the autumn-web sweep
+          # below does (#1923, #1945). Needs Docker (testcontainers) + host
+          # pg_dump/pg_restore (installed above). Before this, autumn-cli's
+          # Docker-gated tests were NOT auto-swept: only the two filtered
+          # invocations below (`offsite`, `db_scrub`) ran anything, so
+          # `db.rs` (5), `db_pull.rs` (3), `generate_lock_version_postgres.rs`
+          # (1), `generate_references_postgres.rs` (1), `migrate_down.rs` (6),
+          # `schema_migrate.rs` (1), and `schema_pull.rs` (25) — 42 tests —
+          # never ran anywhere in CI (PR #1985's noted follow-up). A bare
+          # `--ignored` sweep now runs every Docker test in the binary, so a
+          # newly-added `#[ignore = "requires Docker (testcontainers)"]` test
+          # in any module runs here automatically, with no workflow edit.
+          #
+          # Everything named in `--skip` below is a NON-Docker `#[ignore]`d
+          # test that instead scaffolds and cargo-checks/builds/runs a fresh
+          # project — those are slow, generator-shaped gates that belong in
+          # generator-conformance.yml's own matrix'd job, where each is named
+          # explicitly (`console`, `scaffold_i18n`, `scaffold_encrypted`,
+          # `scaffold_validation`, `scaffold_form_for`, `api_scaffold`,
+          # `cloud_native_scaffold`, `generate_position_scaffold`,
+          # `scaffold_belongs_to`, `scaffold_bulk_delete`,
+          # `scaffold_rich_text`, `scaffold_search`, `scaffold_trash`,
+          # `seed_model_linking`, `serve` — skipped whole-module here since
+          # every ignored test in each is non-Docker).
+          # `scrubbed_database_migrates_clean_and_boots_the_app` additionally
+          # compiles and boots a generated app and needs the diesel CLI, so it
+          # runs in generator-conformance.yml's Postgres gate instead.
+          cargo test -p autumn-cli --test cli_tests -- \
+            --ignored \
+            --test-threads=1 \
+            --skip console:: \
+            --skip scaffold_i18n:: \
+            --skip scaffold_encrypted:: \
+            --skip scaffold_validation:: \
+            --skip scaffold_form_for:: \
+            --skip api_scaffold:: \
+            --skip cloud_native_scaffold:: \
+            --skip generate_position_scaffold:: \
+            --skip scaffold_belongs_to:: \
+            --skip scaffold_bulk_delete:: \
+            --skip scaffold_rich_text:: \
+            --skip scaffold_search:: \
+            --skip scaffold_trash:: \
+            --skip seed_model_linking:: \
+            --skip serve:: \
             --skip scrubbed_database_migrates_clean_and_boots_the_app
           # Consolidated `integration_tests` binary: discover-and-run ALL the
           # Docker/testcontainer `#[ignore]`d DB tests instead of a hand-curated
