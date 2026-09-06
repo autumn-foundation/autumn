@@ -135,19 +135,28 @@ impl FsAcmeStore {
         self.cert_dir().join(format!("{}.key.pem", id.as_str()))
     }
 
-    /// The stored chain+key pair for `domains`, if both files are present.
+    /// The stored chain+key pair for `domains`, if both paths are present.
     ///
     /// Mirrors [`AcmeStore::load_cert`]'s treatment of a partial pair as
     /// absent, but works purely off the filesystem (no read/parse), so a
     /// caller that only needs the paths — like `autumn doctor`'s offline
     /// certificate scan — can locate them without re-deriving this store's
     /// on-disk layout independently (issue #1864).
+    ///
+    /// Deliberately checks `exists()`, not "is a regular file": a path
+    /// occupied by a directory (or another non-regular node) is a genuinely
+    /// broken cache, not an absent one, and the caller's own read (e.g.
+    /// `tls::inspect_leaf`, or this store's `load_cert`) is what surfaces
+    /// that as an error — same as it always has for a present-but-corrupt
+    /// file. Reporting `None` (→ "not provisioned yet", benign) for that case
+    /// would let `autumn doctor --strict` bless a cache that will fail to
+    /// load at boot.
     #[must_use]
     pub fn find_cert_for_domains(&self, domains: &[String]) -> Option<(PathBuf, PathBuf)> {
         let id = CertId::from_domains(domains);
         let chain = self.chain_path(&id);
         let key = self.key_path(&id);
-        if chain.is_file() && key.is_file() {
+        if chain.exists() && key.exists() {
             Some((chain, key))
         } else {
             None
@@ -556,6 +565,29 @@ mod tests {
             store
                 .find_cert_for_domains(&["app.example.com".to_owned()])
                 .is_none()
+        );
+    }
+
+    // Codex review (#1864): a path occupied by a directory (or any other
+    // non-regular node) is a genuinely broken cache, not an absent one — it
+    // must be reported as present (`Some`) so the caller's own read attempt
+    // surfaces the real error, exactly as it always has for a present but
+    // corrupt file. Reporting `None` here would have `autumn doctor` grade a
+    // cache that will fail to load at boot as the benign "not configured yet".
+    #[tokio::test]
+    async fn find_cert_for_domains_reports_an_occupied_directory_as_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsAcmeStore::new(dir.path(), "production");
+        let id = CertId::from_domains(&["app.example.com".into()]);
+        tokio::fs::create_dir_all(store.chain_path(&id))
+            .await
+            .unwrap();
+        tokio::fs::write(store.key_path(&id), b"KEY").await.unwrap();
+
+        assert_eq!(
+            store.find_cert_for_domains(&["app.example.com".to_owned()]),
+            Some((store.chain_path(&id), store.key_path(&id))),
+            "an occupied-but-invalid chain path must not read as absent"
         );
     }
 

@@ -13120,6 +13120,38 @@ directory = \"production\"
         );
     }
 
+    // Codex review (#1864): a directory (or any other non-regular node)
+    // occupying a cert path is a genuinely broken cache, not an absent one.
+    // It must grade as Invalid (a --strict FAIL), never the benign
+    // NotConfigured Pass — otherwise doctor blesses a cache that will fail to
+    // load at boot.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn acme_scan_occupied_directory_is_invalid_not_not_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let label = "production";
+        let cert_dir = dir.path().join(label);
+        let domains = vec!["app.example.com".to_owned()];
+        let id = acme_cert_id(&domains);
+
+        // The chain path is occupied by a directory instead of a file; the
+        // key path is a normal (if bogus) file.
+        std::fs::create_dir_all(cert_dir.join(format!("{id}.chain.pem"))).unwrap();
+        std::fs::write(cert_dir.join(format!("{id}.key.pem")), b"key").unwrap();
+
+        assert!(
+            configured_acme_cert_pair(dir.path(), label, &domains).is_some(),
+            "an occupied path must be reported as present, not absent"
+        );
+        assert!(
+            matches!(
+                resolve_acme_stored_cert_data(dir.path(), label, &domains),
+                TlsDoctorData::Invalid { .. }
+            ),
+            "an occupied-but-unreadable cert must FAIL --strict, not pass as NotConfigured"
+        );
+    }
+
     // Drift guard (#1608, Codex): the doctor's feature-less replica of the cert-id
     // hashing MUST stay byte-for-byte equal to the store's
     // `CertId::from_domains`. Only compiled with this crate's `tls` feature
