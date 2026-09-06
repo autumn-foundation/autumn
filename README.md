@@ -246,7 +246,8 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Data Classification](docs/guide/data-classification.md) — `#[classified]`: a personal-data column is carried as a taint on the *type*, so returning it from a JSON response without passing a declared declassification boundary is a compile error, and `autumn data-flow` emits the diffable manifest of which sinks each classified field can reach
 - [Compile-Time Query Budgets](docs/guide/query-budgets.md) — `#[query_budget(N)]`: the build fails when a handler's reachable paths can exceed its declared query count, catching N+1 regressions on every branch instead of only the ones a test exercises
 - [The Agent Authority Envelope](docs/guide/agent-authority.md) — `#[agent_operable(grant = ...)]`: an agent-callable handler's blast radius becomes a compile-time constant, so a write, outbound host, webhook, job or cross-tenant query the declared grant does not allow fails the build, `autumn agents manifest --check` keeps the diffable record (including MCP tools nothing governs), and every `tools/call` is audited against what the compiler proved
-- [Signed Webhook Intake](docs/guide/signed-webhooks.md)
+- [Signed Webhook Intake](docs/guide/signed-webhooks.md) — webhooks arriving **in**: verifying a sender's signature, replay protection, and the intake route
+- [Outbound Signed Webhooks](docs/guide/outbound-webhooks.md) — sending outbound webhooks **out** to endpoints your own users/customers register: `WebhookSubscription`, `WebhookOutboundManager::dispatch()`, the retrying `autumn_webhook_delivery` job, and dead-letter inspection and replay under `/actuator/webhooks/*`
 - [Platform Support](docs/guide/platform-support.md) — the Windows tier policy: which commands run natively, which need WSL2, and the `windows-latest` CI job that gates the native journey
 - [Docs Smoke Procedure](docs/guide/docs-smoke.md) - release gate for first-run docs
 - [Release Checklist](docs/release-checklist.md)
@@ -266,7 +267,9 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Exposing Your API as MCP Tools](docs/guide/mcp.md) — project typed endpoints into a Model Context Protocol server with `#[api_doc(mcp)]` + `mount_mcp`
 - [Mail Guide](docs/guide/mail.md)
 - [Widget Stories](docs/guide/stories.md) — the `/_stories` widget gallery and the `story!` macro
+- [Active Search & Autocomplete](docs/guide/active-search-and-autocomplete.md) — a search box whose results appear as you type, and typeahead/autocomplete pickers that store the chosen record's ID, via `active_search` and `autocomplete_input`; built on htmx and server-rendered Maud fragments with no client-side JavaScript library
 - [View Formatting Helpers](docs/guide/format-helpers.md) — `number_to_currency`, `pluralize`, `truncate`, `time_ago_in_words`, and friends for Maud templates
+- [Per-User Time Zones](docs/guide/time-zones.md) — rendering timestamps in each user's own time zone: the `TimeZone` extractor resolving their IANA zone, `set_time_zone_in_session`, `local_datetime`, and pairing it with the `Clock` extractor so date/time rendering stays deterministic and test-injectable
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
 - [Capacity Contracts](docs/guide/capacity-contracts.md)
 - [Logging & PII](docs/guide/logging-pii.md)
