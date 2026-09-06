@@ -303,6 +303,33 @@ async fn signup_rejects_weak_password() {
     );
 }
 
+/// A wrong-password login attempt with "Remember me" ticked must re-render
+/// the checkbox as checked. Before this fix, the failed re-render always
+/// rendered it unchecked regardless of what was submitted; a user who then
+/// only corrected the password (not noticing the box had been un-ticked)
+/// would post `remember` absent on the successful retry, silently skipping
+/// the persistent cookie they'd asked for (Codex finding on this PR).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn login_with_wrong_password_preserves_the_remember_choice() {
+    let client = db_client().await;
+    signup(&client, "keeper@acme.test").await;
+    client.log_out();
+
+    let resp = client
+        .post("/login")
+        .form("email=keeper@acme.test&password=wrong-password&remember=on")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(
+        resp.text()
+            .contains(r#"name="remember" value="on" checked"#),
+        "expected the remember checkbox to stay checked on a failed login, got: {}",
+        resp.text()
+    );
+}
+
 /// A password that fails the policy for more than one reason at once (here:
 /// both too short and too similar to the email) must show every failure as
 /// its own list item, and the typed email must survive the re-render.

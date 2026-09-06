@@ -196,15 +196,22 @@ pub async fn signup(
 
 // ── Login ────────────────────────────────────────────────────────────────────
 
-/// Render the login form, optionally with an `email` to re-fill and an
-/// authentication `error` to show inline.
+/// Render the login form, optionally with an `email` to re-fill, a
+/// `remember` checkbox state to preserve, and an authentication `error` to
+/// show inline.
 ///
 /// Mirrors `signup_page`: a failed login used to `Err(...)` straight to the
 /// framework's generic full-page error screen (`ErrorPageFilter`), which
 /// threw the user off the login page entirely — losing the email they'd
 /// typed and giving no adjacent, actionable way to retry — instead of
 /// keeping them on the form the way a rejected signup already does.
-fn login_page(email: &str, error: Option<&str>) -> Markup {
+///
+/// `remember` must also be threaded through: rendering the checkbox
+/// unchecked on a failure the user typed `remember=on` for meant a
+/// password-only retry silently posted `remember` absent, so the login that
+/// then succeeded never issued the persistent cookie the user asked for
+/// (Codex finding on this PR).
+fn login_page(email: &str, remember: bool, error: Option<&str>) -> Markup {
     layout(
         "Log in",
         false,
@@ -225,7 +232,7 @@ fn login_page(email: &str, error: Option<&str>) -> Markup {
                           autocomplete="current-password" class="w-full border rounded px-3 py-2";
                 }
                 label class="flex items-center gap-2 text-sm text-gray-600" {
-                    input #remember type="checkbox" name="remember" value="on"
+                    input #remember type="checkbox" name="remember" value="on" checked[remember]
                           class="rounded border-gray-300";
                     "Remember me on this device"
                 }
@@ -243,7 +250,7 @@ fn login_page(email: &str, error: Option<&str>) -> Markup {
 
 #[get("/login")]
 pub async fn login_form() -> Markup {
-    login_page("", None)
+    login_page("", false, None)
 }
 
 #[post("/login")]
@@ -255,6 +262,7 @@ pub async fn login(
     Form(form): Form<LoginForm>,
 ) -> AutumnResult<Response> {
     let email = form.email.trim().to_lowercase();
+    let remember = form.remember.is_some();
     // Reject over-long inputs before any DB query or bcrypt work — they can never
     // match a stored account and only waste CPU.
     if email.len() > 254 || form.password.len() > 128 {
@@ -264,7 +272,10 @@ pub async fn login(
         // response (the default request-body limit) — Codex finding on this
         // PR, originally raised against the equivalent signup guard.
         let echoed_email: String = email.chars().take(254).collect();
-        return Ok(login_page(&echoed_email, Some("Invalid email or password")).into_response());
+        return Ok(
+            login_page(&echoed_email, remember, Some("Invalid email or password"))
+                .into_response(),
+        );
     }
 
     let user: Option<User> = users::table
@@ -281,11 +292,13 @@ pub async fn login(
         Some(u) => u,
         None => {
             let _ = verify_password(&form.password, DUMMY_HASH).await;
-            return Ok(login_page(&email, Some("Invalid email or password")).into_response());
+            return Ok(
+                login_page(&email, remember, Some("Invalid email or password")).into_response()
+            );
         }
     };
     if !verify_password(&form.password, &user.password_hash).await? {
-        return Ok(login_page(&email, Some("Invalid email or password")).into_response());
+        return Ok(login_page(&email, remember, Some("Invalid email or password")).into_response());
     }
 
     establish_session(&session, &user).await;
