@@ -1760,7 +1760,14 @@ def inert_spans(view, src):
         if not (m.start() < len(view) and view[m.start()] == '<'):
             at = m.start() + 1
             continue
-        end = element_end(src, m, m.group(1))
+        # BALANCED over the masked view, not `src`. Only the OPENING tag has
+        # to be read from `src` (for its attributes); the close that ends the
+        # subtree is structure, and a `</div>` written inside a comment or a
+        # script is not structure. Balancing over `src` ended the span at the
+        # spelling in `<div inert><!-- </div> --><a href=…>Mail</a></div>`,
+        # letting an anchor the browser will not activate count as a route.
+        # Offsets line up because both views are length-preserving.
+        end = element_end(view, m, m.group(1))
         spans.append((m.start(), end))
         at = max(end, m.end())
 
@@ -4456,6 +4463,16 @@ self_test() {
     > "$c9kh/docs/guide/jobs.md"
   git -C "$c9kh" add -A && git -C "$c9kh" commit -qm commented-inert
   check "a commented-out inert deactivates nothing" pass "$c9kh"
+
+  # ...and a close spelled inside a COMMENT does not end the subtree, so the
+  # anchor after it is still inert. The opening tag has to be read from the
+  # raw text for its attributes; the close is structure and must be balanced
+  # over the masked view, which is the half that was wrong.
+  local c9kl="$tmp/c9kl"; make_corpus "$c9kl"
+  printf '# Jobs\n\nx <div inert><!-- </div> --><a href="mail.md">Mail</a></div>\n' \
+    > "$c9kl/docs/guide/jobs.md"
+  git -C "$c9kl" add -A && git -C "$c9kl" commit -qm commented-close-in-inert
+  check "a commented close does not end an inert subtree" fail "$c9kl"
 
   # A bare PATH inside an inert subtree is still on screen and still counts:
   # inert kills the link, not the text.
