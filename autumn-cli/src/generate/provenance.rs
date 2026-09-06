@@ -204,7 +204,13 @@ fn config_fingerprint(root: &Path, args: &[String]) -> String {
             continue; // named twice; one contribution is enough.
         }
         seen.push(source);
-        let contents = std::fs::read(source).map_or_else(|_| "absent".to_owned(), |b| digest(&b));
+        // LF-normalised like every other text digest here: a CRLF checkout of a
+        // committed recipe parses identically as TOML, and must not read as a
+        // different input. Non-UTF-8 bytes are hashed as they lie.
+        let contents = std::fs::read(source).map_or_else(
+            |_| "absent".to_owned(),
+            |bytes| std::str::from_utf8(&bytes).map_or_else(|_| digest(&bytes), text_digest),
+        );
         material.push_str(&contents);
         material.push(RECORD_SEPARATOR);
     }
@@ -562,6 +568,30 @@ mod tests {
         assert_eq!(
             current_invocation(here.path()),
             current_invocation(there.path())
+        );
+    }
+
+    #[test]
+    fn a_crlf_checkout_of_the_config_is_the_same_input() {
+        // `core.autocrlf` rewrites the committed recipe on checkout. It parses
+        // identically as TOML, so it must not drop the baseline — the same rule
+        // the generated-file digests follow (Codex review of PR #2551).
+        let lf = tmp();
+        let crlf = tmp();
+        std::fs::write(
+            lf.path().join(GENERATE_CONFIG_FILENAME),
+            "[scaffold.Post]\nfields = [\"title:String\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            crlf.path().join(GENERATE_CONFIG_FILENAME),
+            "[scaffold.Post]\r\nfields = [\"title:String\"]\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            current_invocation(lf.path()),
+            current_invocation(crlf.path())
         );
     }
 
