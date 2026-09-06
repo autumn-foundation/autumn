@@ -4447,7 +4447,8 @@ fn datetime_local_serde_attr(ty: &syn::Type) -> Option<TokenStream> {
     // (it never passes through this crate's own generic `::autumn_web`
     // token rewrite — see `crate_path`'s module doc, #1828), so it must be
     // built from the actively resolved crate name directly.
-    let crate_root = crate::crate_path::current_target();
+    let crate_root =
+        crate::crate_path::escaped_target_path_segment(&crate::crate_path::current_target());
     if nullable {
         // `deserialize_with` disables serde's implicit missing-`Option`-field
         // -is-`None` handling; `default` restores it so a JSON body may still

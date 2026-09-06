@@ -60,7 +60,7 @@ pub fn event_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // so it must be built from the actively resolved crate name directly.
     let serde_crate_path = format!(
         "::{}::reexports::serde",
-        crate::crate_path::current_target()
+        crate::crate_path::escaped_target_path_segment(&crate::crate_path::current_target())
     );
 
     quote! {

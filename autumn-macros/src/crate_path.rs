@@ -306,10 +306,50 @@ fn rewrite(ts: TokenStream, target: &str) -> TokenStream {
 /// a keyword (`type = { package = "autumn-web" }`, unusual but valid TOML)
 /// would otherwise panic `Ident::new` (Codex review, #2552).
 fn ident_for_target(target: &str, span: proc_macro2::Span) -> Ident {
-    if syn::parse_str::<Ident>(target).is_ok() {
-        Ident::new(target, span)
+    let (raw, bare) = raw_escape(target);
+    if raw {
+        Ident::new_raw(bare, span)
     } else {
-        Ident::new_raw(target, span)
+        Ident::new(bare, span)
+    }
+}
+
+/// Whether `target` needs raw-identifier escaping to be used as a path
+/// segment, and its bare (un-prefixed) name either way.
+///
+/// `target` (from [`current_target`]) takes one of three shapes:
+/// - a normal name (`"autumn_web"`) — not raw, used as-is;
+/// - a bare keyword (`"type"`) from the *automatic*, unvalidated resolution
+///   path (`match_crate_override` already rejects a bare keyword `crate =
+///   "..."` override, so this can't come from there) — needs escaping;
+/// - an explicit override already spelled with the escape (`"r#type"`,
+///   `match_crate_override`'s validation accepts this — `syn::parse_str`
+///   parses a raw identifier as a valid `Ident`) — the literal two-character
+///   `r#` prefix must be stripped *before* handing the bare name to
+///   `Ident::new_raw`, which (like `Ident::new`) panics if given text
+///   containing `#` (Codex review, #2552).
+#[allow(clippy::option_if_let_else)]
+fn raw_escape(target: &str) -> (bool, &str) {
+    if let Some(bare) = target.strip_prefix("r#") {
+        (true, bare)
+    } else if syn::parse_str::<Ident>(target).is_ok() {
+        (false, target)
+    } else {
+        (true, target)
+    }
+}
+
+/// The source text for [`current_target`] as a path segment, escaped for
+/// embedding inside a string literal that gets re-parsed as a path — the
+/// shape `#[serde(crate = "...")]` and `#[serde(deserialize_with = "...")]`
+/// need (`model.rs`, `event.rs`), since those never pass through the token
+/// rewrite [`ident_for_target`] backs (see the module doc).
+pub fn escaped_target_path_segment(target: &str) -> String {
+    let (raw, bare) = raw_escape(target);
+    if raw {
+        format!("r#{bare}")
+    } else {
+        bare.to_owned()
     }
 }
 
@@ -343,6 +383,37 @@ mod tests {
         let out = rewrite(input, "type");
         let s = ts_string(&out);
         assert!(s.contains(":: r#type :: Route"), "got: {s}");
+    }
+
+    #[test]
+    fn rewrite_strips_and_reapplies_an_explicit_raw_override() {
+        // The *only* way `crate = "..."` can target a keyword-named
+        // dependency is already spelled with the raw-identifier escape
+        // (`crate = "r#type"`) — `match_crate_override`'s own validation
+        // rejects a bare `crate = "type"` the same way `Ident::new` would.
+        // The literal two-character `r#` prefix in that override string
+        // must never reach `Ident::new`/`Ident::new_raw` directly (both
+        // panic on a literal `#` character) — it has to be stripped and
+        // reapplied as raw-ness, not as text.
+        let input = quote! { fn foo() -> ::autumn_web::Route { } };
+        let out = rewrite(input, "r#type");
+        let s = ts_string(&out);
+        assert!(s.contains(":: r#type :: Route"), "got: {s}");
+    }
+
+    #[test]
+    fn escaped_target_path_segment_escapes_a_bare_keyword() {
+        assert_eq!(escaped_target_path_segment("type"), "r#type");
+    }
+
+    #[test]
+    fn escaped_target_path_segment_normalizes_an_already_raw_override() {
+        assert_eq!(escaped_target_path_segment("r#type"), "r#type");
+    }
+
+    #[test]
+    fn escaped_target_path_segment_leaves_a_normal_name_alone() {
+        assert_eq!(escaped_target_path_segment("autumn_web"), "autumn_web");
     }
 
     #[test]
