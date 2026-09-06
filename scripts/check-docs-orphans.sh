@@ -359,10 +359,13 @@ REF_USE_ANY = re.compile(
 # The alt text may itself contain a bracketed span — `![nested [alt]](x.md)` —
 # and a pattern that stops at the inner bracket leaves the image unmasked, so
 # the bare scan picks its destination back up.
-IMAGE_INLINE = re.compile(
-    r'!\[(?:(?:[^\[\]\\]|\\.)|\[(?:[^\[\]\\]|\\.)*\])*\]' + DEST)
-IMAGE_REF = re.compile(
-    r'!\[(?:(?:[^\[\]\\]|\\.)|\[(?:[^\[\]\\]|\\.)*\])*\](?:\[[^\]]*\])?')
+# An image label is a link label: `FLAT`, blank-line bound included. Its own
+# copy admitted one, so `![alt` / blank / `docs/guide/mail.md](x.png)` — which
+# renders as a broken image and then the PATH as visible text — was masked
+# whole before the bare-path scan, hiding a route the reader can read.
+IMAGE_LABEL = r'!\[(?:' + FLAT + r'|\[' + FLAT + r'*\])*\]'
+IMAGE_INLINE = re.compile(IMAGE_LABEL + DEST)
+IMAGE_REF = re.compile(IMAGE_LABEL + r'(?:\[' + FLAT + r'*\])?')
 # Any inline link span, image or not. Blanked before the shortcut scan: links
 # cannot nest, so in `[outer [mail]](https://example.com)` only the OUTER link
 # renders and the inner `[mail]` is ordinary label text — not a shortcut
@@ -421,6 +424,8 @@ def normalize(p):
 # terminated comment still strips only itself.
 HTML_COMMENT_CLOSED = re.compile(r'<!--.*?-->', re.S)
 UNCLOSED = '<!--'
+# A paragraph break: one line with nothing on it.
+BLANK_LINE = re.compile(r'\n[ \t]*\n')
 # A fence opener/closer: ``` or ~~~ , up to three spaces of indent, plus the
 # rest of the line — which decides whether the line is a fence at all.
 FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})(.*)$', re.M)
@@ -569,9 +574,20 @@ def strip_comments(txt):
             # of every comment. Same end-condition rule as types 1 and 3-5.
             start, end = cm.start(), cm.end()
             bol = masked.rfind('\n', 0, start) + 1
-            if masked[bol:start].strip() == '' and start - bol <= 3:
+            line_initial = (masked[bol:start].strip() == ''
+                            and start - bol <= 3)
+            if line_initial:
                 eol = masked.find('\n', end)
                 end = len(masked) if eol == -1 else eol
+            elif BLANK_LINE.search(masked[start:end]):
+                # Mid-line, this is INLINE html, and inline html cannot cross a
+                # blank line: the paragraph ends there, so `prose <!-- note` /
+                # blank / `[Mail](mail.md)` / `-->` is not a comment at all and
+                # the link is live. Removing it took the link with it. A
+                # LINE-INITIAL comment is a type-2 block and does span blank
+                # lines, ending only at its `-->`, which is why this is the one
+                # arm that checks.
+                continue
             seg = seg[:start] + ' ' * (end - start) + seg[end:]
             masked = masked[:start] + ' ' * (end - start) + masked[end:]
         # Only a LINE-INITIAL opener runs to EOF. That is the type-2 block
@@ -667,10 +683,16 @@ PRE_BLOCK = re.compile(
 # destination, the title and the label already carry, applied to the fourth
 # place a blank line could get through.
 _TWS = r'(?:[ \t]|\n(?![ \t]*\n))'
+# ...and so does the inside of a quoted value. Bounding only the whitespace
+# BETWEEN attributes left the other half open: `<a title="hello` / blank /
+# `world" href="mail.md">` is two paragraphs and no anchor, and its href was
+# still being recorded. Same rule, the other side of the quote.
+_Q = r'"(?:[^"\n]|\n(?![ \t]*\n))*"'
+_Q1 = r"'(?:[^'\n]|\n(?![ \t]*\n))*'"
 ATTR_ASSIGNED = (r'[A-Za-z_:][-\w:.]*' + _TWS + r'*=' + _TWS +
-                 r'*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+)')
+                 r'*(?:' + _Q + r'|' + _Q1 + r'|[^\s"\'=<>`]+)')
 ATTR = (r'[A-Za-z_:][-\w:.]*(?:' + _TWS + r'*=' + _TWS +
-        r'*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+))?')
+        r'*(?:' + _Q + r'|' + _Q1 + r'|[^\s"\'=<>`]+))?')
 # Every attribute value EXCEPT `href`. An attribute is not rendered text, so a
 # path, a reference label or a comment marker parked in one — `<span
 # data-note="[mail](mail.md)">` — is invisible and confers nothing. `href` is
@@ -778,7 +800,9 @@ RAW_BLOCK_TYPE7 = re.compile(
 ANCHOR_HREF = re.compile(
     r'<a(?:' + _TWS + r'+' + ATTR + r')*?'
     + _TWS + r'+href' + _TWS + r'*=' + _TWS +
-    r'*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'=<>`]+))', re.I)
+    r'*(?:"((?:[^"\n]|\n(?![ \t]*\n))*)"'
+    r"|'((?:[^'\n]|\n(?![ \t]*\n))*)'"
+    r'|([^\s"\'=<>`]+))', re.I)
 
 
 ATX_HEADING = re.compile(r'^ {0,3}#{1,6}(?:\s|$)')
@@ -1095,7 +1119,13 @@ def edges_from(f):
     # is `MD_LINK`'s to resolve, and it resolves to an external URL. Prose only:
     # the same text in a fence shows the path and still counts.
     scan = sub_in_prose(LINK_DEST, txt)
-    scan = sub_in_prose(REF_DEF_FULL, scan)
+    # Only where a block can START. A definition cannot interrupt a
+    # paragraph, so after ordinary prose `[mail]: docs/guide/mail.md` is not
+    # one — it renders as visible text, and its path is a route the reader
+    # can read. Blanking it here while the resolution loop below applied
+    # `block_starts` was the same rule in one view and not its sibling, and
+    # it reported a reachable page as an orphan.
+    scan = sub_in_prose(REF_DEF_FULL, scan, only_at_block_start=True)
     for m in BARE.finditer(scan):
         t = normalize(m.group(1))
         if t in traversable:
@@ -1149,7 +1179,11 @@ def edges_from(f):
     # still reads `ref_txt`, where the definitions are intact. Blanking them for
     # the bare-path scan and not here was the same one-view-not-its-sibling
     # mistake that `sub_in_prose` and `mask_invisible` were each introduced for.
-    uses_txt = REF_DEF_FULL.sub(lambda m: ' ' * len(m.group(0)), ref_txt)
+    _use_starts = block_starts(ref_txt)
+    uses_txt = REF_DEF_FULL.sub(
+        lambda m: (' ' * len(m.group(0))
+                   if m.start() in _use_starts else m.group(0)),
+        ref_txt)
 
     used = set()
     # `None` from `ref_label` means the label is over the character cap and is
@@ -2552,6 +2586,52 @@ self_test() {
     > "$c9fh/docs/guide/jobs.md"
   git -C "$c9fh" add -A && git -C "$c9fh" commit -qm longer-tag-name
   check "a longer tag name is not a type-1 opener" pass "$c9fh"
+
+  # A quoted attribute value cannot cross a blank line either, so the tag is
+  # not a tag and its href is not a route.
+  local c9fi="$tmp/c9fi"; make_corpus "$c9fi"
+  printf '# Jobs\n\n<a title="hello\n\nworld" href="mail.md">mail</a>\n' \
+    > "$c9fi/docs/guide/jobs.md"
+  git -C "$c9fi" add -A && git -C "$c9fi" commit -qm attr-across-blank
+  check "an attribute value broken by a blank line is not an anchor" fail "$c9fi"
+
+  # A MID-LINE comment is inline HTML and cannot span a blank line, so it is no
+  # comment and the link inside it is live.
+  local c9fj="$tmp/c9fj"; make_corpus "$c9fj"
+  printf '# Jobs\n\nprose <!-- note\n\nSee [mail](mail.md).\n\n-->\n' \
+    > "$c9fj/docs/guide/jobs.md"
+  git -C "$c9fj" add -A && git -C "$c9fj" commit -qm inline-comment-across-blank
+  check "a mid-line comment does not span a blank line" pass "$c9fj"
+
+  # ...but a LINE-INITIAL one is a type-2 block and does, ending at its `-->`.
+  local c9fk="$tmp/c9fk"; make_corpus "$c9fk"
+  printf '# Jobs\n\n<!-- note\n\nSee [mail](mail.md).\n\n-->\n' \
+    > "$c9fk/docs/guide/jobs.md"
+  git -C "$c9fk" add -A && git -C "$c9fk" commit -qm block-comment-across-blank
+  check "a line-initial comment spans blank lines to its close" fail "$c9fk"
+
+  # An image label carries the same paragraph bound, so the path below the
+  # break is visible text rather than part of a masked image span.
+  local c9fl="$tmp/c9fl"; make_corpus "$c9fl"
+  printf '# Jobs\n\n![alt\n\ndocs/guide/mail.md](x.png)\n' \
+    > "$c9fl/docs/guide/jobs.md"
+  git -C "$c9fl" add -A && git -C "$c9fl" commit -qm image-label-across-blank
+  check "a path below a broken image label is still visible" pass "$c9fl"
+
+  # A definition-shaped line that cannot interrupt a paragraph is visible text,
+  # so its path is a route — it must not be blanked before the bare-path scan.
+  local c9fm="$tmp/c9fm"; make_corpus "$c9fm"
+  printf '# Jobs\n\nprose\n[mail]: docs/guide/mail.md\n' > "$c9fm/docs/guide/jobs.md"
+  git -C "$c9fm" add -A && git -C "$c9fm" commit -qm def-in-paragraph-visible
+  check "a definition continuing a paragraph is visible text" pass "$c9fm"
+
+  # A lowercase declaration opens a block: CommonMark 0.31 dropped the
+  # uppercase-only condition, and the sibling gate matches `^<![a-zA-Z]`.
+  # Diverging would make the two gates disagree about the same line.
+  local c9fn="$tmp/c9fn"; make_corpus "$c9fn"
+  printf '# Jobs\n\n<!demo\n\nSee [mail](mail.md).\n' > "$c9fn/docs/guide/jobs.md"
+  git -C "$c9fn" add -A && git -C "$c9fn" commit -qm lowercase-declaration
+  check "a lowercase declaration opens a raw block" fail "$c9fn"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
