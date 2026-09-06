@@ -960,6 +960,38 @@ jobs:
         # `sim-sweep` (W6 PR3, issue #1797) is a `[[bin]]`, not part of `--lib`
         # above, so it needs its own explicit clippy invocation.
         run: cargo clippy -p autumn-web --features "sqlite,sim-testing" --bin sim-sweep -- -D warnings
+      - name: Run the sqlite-backend lib unit tests
+        # `--test <name>` selects test TARGETS only, so the integration step
+        # below never runs the crate's own `#[cfg(feature = "sqlite")]` unit
+        # tests — the pool sizing, replica-rejection, target-classification and
+        # provider-dispatch coverage that lives inside `autumn/src/db.rs`,
+        # `app.rs` and `repository_commit_hooks.rs`. Until this step existed
+        # those ~26 tests were compiled (by the clippy steps above) but never
+        # executed, and the ungated pool/topology tests alongside them had
+        # rotted into hard failures under the backend flip without anyone
+        # noticing. Same shape as the other feature-gated `--lib <module>::`
+        # lanes above (markdown, i18n, tls, acme).
+        #
+        # Module-filtered, NOT a bare `--lib`: the rest of the crate's unit
+        # tests still build their fixtures on hard-coded `postgres://` URLs,
+        # which `build_sqlite_pool` correctly refuses. Making those
+        # backend-parametric is tracked separately; the filter names every
+        # module that carries SQLite-specific logic, so nothing sqlite-gated is
+        # left unexecuted. The two `app::` tests are named individually because
+        # the rest of `app::tests` is in that not-yet-parametric set.
+        run: |
+          cargo test -p autumn-web --features sqlite --lib -- \
+            db:: \
+            config:: \
+            migrate:: \
+            counter_cache:: \
+            commentable:: \
+            ledger:: \
+            repository_commit_hooks:: \
+            substrate:: \
+            sqlite_sharding_unsupported_guard_tests \
+            app::tests::custom_pool_provider_with_established_sqlite_pool_fails_closed_on_statement_timeout \
+            app::tests::custom_pool_provider_no_database_mode_boots_with_statement_timeout
       - name: Run the sqlite integration suite
         # Named sqlite `[[test]]` targets only. `test-support` is required by the
         # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,
@@ -982,6 +1014,7 @@ jobs:
             --test sqlite_statement_timeout_fail_closed \
             --test sqlite_crud_basic \
             --test sqlite_field_conversions \
+            --test sqlite_json_field_conversion \
             --test sqlite_upsert_isolation \
             --test sqlite_votable \
             --test sqlite_dependent_destroy \
