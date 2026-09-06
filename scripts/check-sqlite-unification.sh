@@ -166,9 +166,13 @@ scan_manifest() {
     # real names alone leaves a rename free to enable the flip.
     function forwards_flip(e,   tail, name) {
       tail = e
-      while (match(tail, /"[A-Za-z0-9_-]+\/sqlite"/)) {
+      # `dep?/feature` is the WEAK forwarding syntax cargo accepts — "enable
+      # the feature only if something else enabled the dependency". A `default`
+      # that pairs it with `dep:autumn-web` enables both, so the `?` spelling
+      # flips the backend exactly like the plain one.
+      while (match(tail, /"[A-Za-z0-9_-]+\??\/sqlite"/)) {
         name = substr(tail, RSTART + 1, RLENGTH - 2)
-        sub(/\/sqlite$/, "", name)
+        sub(/\??\/sqlite$/, "", name)
         if (name ~ ("^(" flip ")$")) return 1
         if (name in alias_of && alias_of[name] ~ ("^(" flip ")$")) return 1
         tail = substr(tail, RSTART + RLENGTH)
@@ -497,6 +501,18 @@ EOF
 
   # Cargo writes the dependency ALIAS in a feature path, not the real crate
   # name, so a rename hides the flip from a match on the real names alone.
+  make_case forward_weak <<'EOF'
+[package]
+name = "consumer"
+
+[dependencies]
+autumn-web = { version = "0.7", optional = true }
+
+[features]
+default = ["dep:autumn-web", "autumn-web?/sqlite"]
+EOF
+  check_fail "weak dependency-feature forwarding" forward_weak
+
   make_case forward_renamed <<'EOF'
 [package]
 name = "consumer"

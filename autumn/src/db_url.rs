@@ -124,6 +124,15 @@ pub fn redact_target(url: &str) -> String {
         if has_password {
             let _ = parsed.set_password(Some("****"));
         }
+        // A fragment is not part of any database target Autumn accepts, so
+        // nothing in one is worth printing and there are no key names to
+        // allowlist. `#password=hunter2` survived every other check here:
+        // `password()` is `None`, `query()` is `None`, and the fail-closed
+        // scan above only looks for `@`.
+        let has_fragment = parsed.fragment().is_some();
+        if has_fragment {
+            parsed.set_fragment(Some("****"));
+        }
         let redacted_query = parsed
             .query()
             .map(|query| filter_query(query, &PG_DIAGNOSTIC_PARAMS, is_postgres));
@@ -134,7 +143,7 @@ pub fn redact_target(url: &str) -> String {
         });
         // Re-rendering a parsed URL normalizes it, so only hand back the
         // rewritten form when something actually had to be hidden.
-        if has_password || query_changed {
+        if has_password || query_changed || has_fragment {
             return parsed.to_string();
         }
         return url.to_owned();
@@ -175,6 +184,12 @@ pub fn redact_target(url: &str) -> String {
 /// (`sqlite://admin:pa?ss@db/app.db`), and looking only inside a `//` authority
 /// would miss the documented scheme-only spellings (`sqlite:user:pw@h/app.db`).
 fn redact_sqlite_target(url: &str) -> String {
+    // Same reasoning as the URL arm: a `SQLite` target has no fragment, so
+    // whatever rides in one is masked rather than echoed.
+    let (url, fragment) = match url.split_once('#') {
+        Some((target, _)) => (target, "#****"),
+        None => (url, ""),
+    };
     let (scheme, rest) = split_sqlite_scheme(url);
     let (userinfo, rest) = match rest.rsplit_once('@') {
         Some((_, after)) => ("****@", after),
@@ -185,13 +200,15 @@ fn redact_sqlite_target(url: &str) -> String {
         None => (rest, None),
     };
     let head = format!("{scheme}{userinfo}{target}");
-    match query {
-        Some(query) => format!(
-            "{head}?{}",
-            filter_query(query, &SQLITE_DIAGNOSTIC_PARAMS, true)
-        ),
-        None => head,
-    }
+    query.map_or_else(
+        || format!("{head}{fragment}"),
+        |query| {
+            format!(
+                "{head}?{}{fragment}",
+                filter_query(query, &SQLITE_DIAGNOSTIC_PARAMS, true)
+            )
+        },
+    )
 }
 
 /// Split a `SQLite` target into its scheme prefix and the rest.
@@ -467,6 +484,31 @@ mod tests {
         assert_eq!(
             redact_target("postgres://app@db.internal/app"),
             "postgres://app@db.internal/app"
+        );
+    }
+
+    // A fragment is not part of any database target Autumn accepts, and it
+    // survived every other check: `Url::password()` is `None`, `query()` is
+    // `None`, and the fail-closed scan looks only for `@`. The whole string
+    // then reached `DatabaseConfig::validate`'s boot error.
+    #[test]
+    fn a_url_fragment_cannot_carry_a_secret_out() {
+        assert_eq!(
+            redact_target("mysql://host/db#password=hunter2"),
+            "mysql://host/db#****"
+        );
+        assert_eq!(
+            redact_target("postgres://host/db#password=hunter2"),
+            "postgres://host/db#****"
+        );
+        assert_eq!(
+            redact_target("sqlite:///var/lib/app.db#password=hunter2"),
+            "sqlite:///var/lib/app.db#****"
+        );
+        // The diagnostic parts still survive alongside it.
+        assert_eq!(
+            redact_target("sqlite://file:app.db?mode=ro#password=hunter2"),
+            "sqlite://file:app.db?mode=ro#****"
         );
     }
 
