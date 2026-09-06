@@ -427,3 +427,30 @@ fn the_docs_map_a_local_finding_onto_the_ci_failure_it_predicts() {
         );
     }
 }
+
+/// The docs must not promise a warning where the check passes.
+///
+/// Regression: the offline section still said a never-fetched database "warns
+/// once" after the implementation was changed to pass with a `not evaluated`
+/// detail. Documentation that oversells a gate is worse than none — a reader
+/// relies on `--strict` to catch an unevaluated tree, and it does not.
+#[test]
+fn the_docs_never_promise_a_warning_for_a_state_that_passes() {
+    let docs = read_repo_file("docs/guide/supply-chain.md");
+    for state in ["Database never fetched", "cargo-deny not installed"] {
+        let bullet = docs
+            .split("- **")
+            .find(|b| b.starts_with(state))
+            .unwrap_or_else(|| panic!("no bullet for {state:?}"));
+        let bullet = bullet.split("\n- **").next().unwrap_or(bullet);
+        // Both states are graded `pass` by `check_dependencies_impl`.
+        assert!(
+            bullet.contains("pass"),
+            "the {state:?} bullet must say it passes: {bullet}"
+        );
+        assert!(
+            !bullet.contains("warns once"),
+            "the {state:?} bullet still promises a warning: {bullet}"
+        );
+    }
+}

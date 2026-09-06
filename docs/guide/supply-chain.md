@@ -625,8 +625,12 @@ Neither command ever fetches. Both run `cargo deny --offline` against whatever
 RustSec data is already on disk, so neither can hang on the network and neither
 depends on it.
 
-- **Database never fetched** — `autumn doctor` warns once, hinting `cargo deny
-  fetch db`. It does not report a clean tree it could not verify.
+- **Database never fetched** — `autumn doctor` **passes**, with a detail that
+  reads `not evaluated` and hints `cargo deny fetch db`. Same reasoning as a
+  missing auditor below: no Autumn install path fetches the database, so
+  warning here would make `autumn doctor --strict` red on every machine that
+  has not opted in. It never reports a clean tree it could not verify — but do
+  not rely on `--strict` to notice an unevaluated tree; read the detail.
 - **Database present** — doctor reports its age (`advisory data 3 days old`),
   measured from the last fetch. Data older than 7 days is marked **stale** and
   warns, even on a tree with no findings: CI audits against a database it
