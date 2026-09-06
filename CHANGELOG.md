@@ -1460,7 +1460,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **acme:** Internal cleanup, no behavior change (#1864): the owner-only
+- **acme:** [no-plugin] Internal cleanup, no behavior change (#1864): the owner-only
   temp-write-then-rename idiom, previously duplicated between
   `acme::store::FsAcmeStore` and the failure-capture capsule writer, is now
   one shared helper; `FsAcmeStore` gained a `find_cert_for_domains`/
