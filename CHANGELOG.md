@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **macros:** `#[autumn_web::main]` takes optional arguments that reach the
+  Tokio runtime it builds. Previously the attribute discarded its argument
+  list entirely (`_attr`), so the only way to size a worker pool, name the
+  worker threads, or install an `on_thread_start` hook was to abandon the
+  macro and hand-roll `main` — which also meant re-implementing the two
+  compile-context side effects it exists for, the `autumn.toml` root and the
+  `/actuator/info` build provenance, both of which must be expanded in the
+  *app* crate to be correct. The attribute owns the
+  `tokio::runtime::Builder` call, so the knobs are now arguments on it:
+  `flavor` (`"multi_thread"`, the default, or `"current_thread"`),
+  `worker_threads`, `max_blocking_threads`, `thread_name`,
+  `thread_stack_size`, `thread_keep_alive` (a duration string such as
+  `"30s"`, the same spelling `#[throttle(per = ...)]` accepts), and
+  `configure` — the path of a `fn(&mut tokio::runtime::Builder)` that runs
+  last, after the declarative arguments, as the escape hatch for every
+  `Builder` method the list does not name (`on_thread_start`,
+  `global_queue_interval`, …) and as the way to override one of them. The
+  numeric arguments take arbitrary expressions rather than only literals, so
+  `worker_threads = std::thread::available_parallelism().map_or(4, |n| n.get())`
+  is as valid as `worker_threads = 4`.
+
+  With no arguments the expansion is byte-for-byte what it was before, so
+  nothing changes for an app that does not opt in. What *does* change is that
+  an argument list is no longer silently dropped: a typo (`worker_thread`), a
+  repeated argument, an unknown `flavor`, a literal `0` where tokio would
+  panic at startup, a malformed `thread_keep_alive`, and a `worker_threads`
+  paired with `flavor = "current_thread"` (where the runtime has no worker
+  pool to size and the value would do nothing) are each a compile error naming
+  the problem. The `configure` path is bound to a typed `fn` pointer before it
+  is called, so a wrong signature is reported against the `configure = ...`
+  the user wrote rather than inside the expansion. Covered by expansion unit
+  tests in `autumn-macros/src/main_macro.rs`, by two compile-fail fixtures for
+  the refusals (`tests/compile-fail/main_unknown_runtime_arg.rs`,
+  `tests/compile-fail/main_worker_threads_current_thread.rs`), and — because
+  trybuild `pass` fixtures are compiled *and run* — by two behavioral ones
+  (`tests/compile-pass/main_runtime_args.rs`,
+  `tests/compile-pass/main_runtime_current_thread.rs`) that boot the tuned
+  runtime and assert the settings actually landed on it: the blocking thread
+  carries the requested `thread_name`, and the `configure` hook's
+  `on_thread_start` has fired. Documented in the getting-started guide under
+  "Tuning the Tokio runtime".
+
 - **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
   update validation left after #1719/#1742/#1778/#1801 (issue #1751).
   `must_match` — like `custom`, `ip` on `Option<_>` fields, and
