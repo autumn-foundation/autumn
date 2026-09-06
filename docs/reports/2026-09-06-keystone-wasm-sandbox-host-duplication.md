@@ -194,11 +194,16 @@ diff <(sed -n '801,814p' autumn-edge/src/host.rs) \
 grep -n '"clock_res_get"\|"fd_tell"' autumn/src/plugin_sandbox/host.rs
 grep -n 'clock_res_get\|fd_tell' autumn-edge/src/host.rs   # no output
 
-# The design doc's own self-flagged, unresolved risk
-grep -n "could drift" docs/plans/2026-08-27-sandboxed-plugins-first-slice.md
+# The design doc's own self-flagged, unresolved risk. The phrase wraps across
+# a markdown line break ("...could\ndrift."), so a plain single-line grep for
+# "could drift" finds nothing -- use a multiline-capable match instead.
+rg -U 'could\s+drift' docs/plans/2026-08-27-sandboxed-plugins-first-slice.md
 
 # No prior ADR or report names this pairing. Query the tree *before* this
-# file was added (HEAD^) — after this change lands, the same grep against the
-# working tree will also match this report itself and prove nothing.
-git grep -rln "plugin_sandbox" HEAD^ -- docs/adr/ docs/reports/   # no output
+# report was added, not a fixed "HEAD^" — this file may since have gained
+# follow-up commits (typo/accuracy fixes), which would shift what HEAD^ means
+# and make a hardcoded HEAD^ match this report itself.
+report=docs/reports/2026-09-06-keystone-wasm-sandbox-host-duplication.md
+added_at=$(git log --diff-filter=A --format=%H -- "$report" | tail -1)
+git grep -rln "plugin_sandbox" "${added_at}^" -- docs/adr/ docs/reports/   # no output
 ```
