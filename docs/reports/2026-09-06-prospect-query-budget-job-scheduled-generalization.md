@@ -304,15 +304,42 @@ where every other `#[query_budget]` fixture lives (no new test harness):
   correctly-scoped "no" is a valid outcome, not a lesser one, when the
   alternative is trading a rarer false negative for a more common false
   positive.
+- **Update (seventh Codex review round) — a real gap, declined for a
+  different reason: the fix itself is structural, not another heuristic.**
+  Splitting round five's `.expect()`/`.unwrap()` shape across two
+  statements — `let result = ctx.conn().await; let mut db =
+  result.unwrap();` — is not caught: the receiver at the unwrap site is
+  `Expr::Path("result")`, which `awaited_expr_is_fresh_handle` deliberately
+  never matches (round three's fix for exactly this reason — matching a
+  bare `Expr::Path` there is what caused `result.is_err()` to be
+  miscounted in the first place). Confirmed by tracing the code; this is a
+  real, verified gap.
 
-  Six review rounds have now each found one distinct edge of the same
+  Unlike rounds two through six, closing it soundly is not a matter of
+  peeling one more AST node or narrowing one more branch. It needs a
+  *third* binding state alongside "is a handle" and "is not a handle" —
+  "is a `Result` that becomes a handle once unwrapped" — carried from the
+  first `let` to the second, which means threading a new tracked set
+  through every place `handles` is already scoped and restored (`block`'s
+  clone-and-restore-declared-names, `enter_binding_scope`, `rebind`, tuple
+  destructuring). That is a structural change to the analyzer's state
+  model, and this round's evidence is a constructed example, not a cited
+  file:line the way rounds two (`postgres.rs:365`), five (`seed.rs`), and
+  six (`scaffold.rs:14419`) each were. Declined for now and documented in
+  code alongside round six's limitation — not because the finding is
+  wrong, but because taking on a structural change to fix an
+  unsubstantiated shape is exactly the "unbounded scope creep" this
+  report's own round-five update already named as out of bounds.
+
+  Seven review rounds have now each found one distinct edge of the same
   underlying shape (an awaited/unwrapped expression can mean three
   different things — a fresh handle, an unopened `Result`, or an executed
   query's result — and only the first should ever be promoted). Five
-  rounds landed a real fix plus a regression fixture pinning it; the sixth
+  rounds landed a real fix plus a regression fixture pinning it; two
   landed a verified, documented, and deliberately un-fixed limitation
-  instead, because the alternative fix was checked and found to cost more
-  than it bought.
+  instead — once because the alternative fix was checked and found to cost
+  more than it bought, once because the fix itself would be a structural
+  change disproportionate to unsubstantiated evidence.
 
 ## 📊 Assay
 

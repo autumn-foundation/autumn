@@ -1171,6 +1171,26 @@ impl Analyzer {
                 // `Expr::Path` here must not re-derive handle-ness from
                 // `chain_root_is_handle`'s unrelated deferred-future
                 // tracking.
+                //
+                // KNOWN LIMITATION (#2546 review, round 7): splitting the
+                // accessor call and the unwrap across two statements
+                // (`let result = ctx.conn().await; let mut db =
+                // result.unwrap();`) still isn't caught — the receiver here
+                // is `Expr::Path("result")`, which `awaited_expr_is_fresh_handle`
+                // deliberately never matches (that is what keeps round
+                // three's `result.is_err()` case from being miscounted).
+                // Catching the split form soundly would mean tracking a
+                // *third* binding state alongside "is a handle" and "is
+                // not" — "is a `Result` that becomes a handle once
+                // unwrapped" — threaded through every place `handles` is
+                // scoped and restored (`block`, `enter_binding_scope`,
+                // `rebind`, tuple destructuring). That is a real,
+                // structural change to the analyzer's state model, not
+                // another naming-list entry, and this round's evidence is
+                // a constructed example rather than a concrete occurrence
+                // in this codebase (unlike rounds two, five, and six, each
+                // pinned to a real file:line). Left as an acknowledged gap
+                // rather than taken on speculatively.
                 if RESULT_UNWRAP_METHODS.contains(&method.as_str()) {
                     return self.awaited_expr_is_fresh_handle(&mc.receiver);
                 }
