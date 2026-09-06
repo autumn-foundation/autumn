@@ -31,6 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **autumn-macros:** every macro's generated code now resolves the
+  `autumn-web` crate path via [`proc-macro-crate`](https://docs.rs/proc-macro-crate)
+  instead of a hardcoded `::autumn_web` (issue #1828), so a downstream crate
+  that depends on `autumn-web` under a renamed Cargo key (`web = { package =
+  "autumn-web" }`) can use `#[get]`, `#[model]`, `#[repository]` and every
+  other Autumn macro with no changes. For the rarer case of hosting two
+  differently-keyed `autumn-web` versions in one crate at once (e.g.
+  mid-upgrade), where automatic detection is ambiguous, every attribute macro
+  additionally accepts an explicit `crate = "..."` override, e.g.
+  `#[get("/x", crate = "autumn_web_05")]`.
+
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
   `http-outbound`, `db`, `jobs` and `render` beside `http-request`, and a new
