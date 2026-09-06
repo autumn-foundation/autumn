@@ -1,5 +1,5 @@
-//! `#[derive(OpenApiSchema)]` — a standalone derive that gives a plain struct a
-//! field-accurate `OpenApiSchema` impl (issue #1972).
+//! `#[derive(OpenApiSchema)]` — a standalone derive that gives a plain struct or
+//! unit-variant enum a field-accurate `OpenApiSchema` impl (issue #1972).
 //!
 //! Before this derive, the only automatic `OpenApiSchema` impls came from
 //! `#[model]` codegen and the primitive macro impls, so any other handler-arg
@@ -8,12 +8,17 @@
 //! its `OpenAPI` / MCP `inputSchema` degraded to a generic
 //! `{"type":"object","title":"X"}` placeholder.
 //!
-//! This derive mirrors the schema `#[model]` already generates
+//! For structs this mirrors the schema `#[model]` already generates
 //! (`crate::schema::emit_schema_fn_body`): each field becomes a JSON-schema
-//! property and every non-`Option` field is `required`. It additionally submits
-//! the schema into the compile-time `DerivedSchemaDescriptor` inventory that the
-//! spec/MCP back-fill loops consult, so a referenced struct resolves to its real
-//! schema with no manual registration.
+//! property and every non-`Option` field is `required`. For enums it emits the
+//! closed-set form (`{"type":"string","enum":[…]}`) that serde's default
+//! externally-tagged representation produces for unit variants — the shape a
+//! client generator turns into a TypeScript string union or a Rust enum.
+//!
+//! Either way the derive submits the schema into the compile-time
+//! `DerivedSchemaDescriptor` inventory that the spec/MCP back-fill loops
+//! consult, so a referenced type resolves to its real schema with no manual
+//! registration.
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -37,9 +42,25 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
         .into();
     }
 
-    let fields = match &input.data {
+    let schema_body = match &input.data {
         Data::Struct(data) => match &data.fields {
-            Fields::Named(named) => &named.named,
+            Fields::Named(named) => {
+                // `emit_schema_fn_body` expects `&[&&Field]` (it was written
+                // against the `Vec<&&Field>` the model macro collects); build
+                // that shape here.
+                let field_refs: Vec<&syn::Field> = named.named.iter().collect();
+                let field_ref_refs: Vec<&&syn::Field> = field_refs.iter().collect();
+                // Honor a container `#[serde(rename_all = "...")]` on the
+                // derived struct so the advertised property names + `required`
+                // entries match the serialized wire names — same
+                // helper/precedence `#[model]` and `FormModel` use.
+                let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
+                crate::schema::emit_schema_fn_body(
+                    &field_ref_refs,
+                    false,
+                    rename_all_rule.as_deref(),
+                )
+            }
             _ => {
                 return syn::Error::new_spanned(
                     &input,
@@ -49,26 +70,19 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
                 .into();
             }
         },
-        _ => {
+        Data::Enum(data) => match enum_schema_body(&input, data) {
+            Ok(body) => body,
+            Err(e) => return e.to_compile_error().into(),
+        },
+        Data::Union(_) => {
             return syn::Error::new_spanned(
                 &input,
-                "#[derive(OpenApiSchema)] is only supported on structs",
+                "#[derive(OpenApiSchema)] is only supported on structs and enums",
             )
             .to_compile_error()
             .into();
         }
     };
-
-    // `emit_schema_fn_body` expects `&[&&Field]` (it was written against the
-    // `Vec<&&Field>` the model macro collects); build that shape here.
-    let field_refs: Vec<&syn::Field> = fields.iter().collect();
-    let field_ref_refs: Vec<&&syn::Field> = field_refs.iter().collect();
-    // Honor a container `#[serde(rename_all = "...")]` on the derived struct so
-    // the advertised property names + `required` entries match the serialized
-    // wire names — same helper/precedence `#[model]` and `FormModel` use.
-    let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
-    let schema_body =
-        crate::schema::emit_schema_fn_body(&field_ref_refs, false, rename_all_rule.as_deref());
 
     quote! {
         impl ::autumn_web::openapi::OpenApiSchema for #name {
@@ -91,4 +105,67 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
         }
     }
     .into()
+}
+
+/// Emit the `schema()` body for a unit-variant enum: the closed string set
+/// serde's default representation puts on the wire.
+///
+/// Data-carrying variants are rejected rather than approximated. Serde's
+/// externally-tagged form for those is a `oneOf` of single-key wrapper objects
+/// whose exact shape also depends on `#[serde(tag/content/untagged)]`, so
+/// guessing would advertise a contract the handler does not actually accept —
+/// worse than the placeholder, because it is confidently wrong. The error names
+/// the hand-written escape hatch instead.
+fn enum_schema_body(
+    input: &DeriveInput,
+    data: &syn::DataEnum,
+) -> syn::Result<proc_macro2::TokenStream> {
+    if let Some(variant) = data
+        .variants
+        .iter()
+        .find(|v| !matches!(v.fields, Fields::Unit))
+    {
+        return Err(syn::Error::new_spanned(
+            variant,
+            "#[derive(OpenApiSchema)] supports only enums whose variants are all unit variants \
+             (they map to a JSON string enum). For a data-carrying enum, write the \
+             `OpenApiSchema` impl by hand and register it with \
+             `OpenApiConfig::register_schema`.",
+        ));
+    }
+
+    let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
+    let values: Vec<String> = data
+        .variants
+        .iter()
+        .filter(|v| !crate::schema::variant_is_serde_skipped(v))
+        .map(|v| {
+            let raw = v.ident.to_string();
+            let raw = raw.strip_prefix("r#").unwrap_or(&raw).to_owned();
+            // Precedence mirrors serde: a variant-level `#[serde(rename)]` wins
+            // over the container `#[serde(rename_all)]`, which wins over the
+            // raw identifier.
+            crate::schema::variant_serde_serialize_rename(v)
+                .or_else(|| {
+                    rename_all_rule.as_deref().and_then(|rule| {
+                        crate::schema::apply_serde_rename_all_rule_to_variant(rule, &raw)
+                    })
+                })
+                .unwrap_or(raw)
+        })
+        .collect();
+
+    if values.is_empty() {
+        return Err(syn::Error::new_spanned(
+            input,
+            "#[derive(OpenApiSchema)] needs at least one non-skipped variant to advertise",
+        ));
+    }
+
+    Ok(quote! {
+        ::autumn_web::reexports::serde_json::json!({
+            "type": "string",
+            "enum": [#(#values),*],
+        })
+    })
 }

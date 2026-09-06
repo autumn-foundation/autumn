@@ -8491,6 +8491,38 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
+        // Advertise all three schemas by identity in the compile-time inventory
+        // the OpenAPI/MCP back-fill consults (issue #802). Without this the
+        // `impl`s above exist but nothing can FIND them: the back-fill resolves
+        // a referenced type through `DerivedSchemaDescriptor`, so a
+        // `#[repository(api = "..")]` endpoint's own model exported as the
+        // generic `{"type":"object","title":"X"}` placeholder — an untyped blob
+        // in every generated client — even though the real schema was compiled
+        // in all along.
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::openapi::DerivedSchemaDescriptor {
+                name: stringify!(#name),
+                identity: ::autumn_web::openapi::type_name_of::<#name>,
+                schema: <#name as ::autumn_web::openapi::OpenApiSchema>::schema,
+            }
+        }
+
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::openapi::DerivedSchemaDescriptor {
+                name: stringify!(#new_name),
+                identity: ::autumn_web::openapi::type_name_of::<#new_name>,
+                schema: <#new_name as ::autumn_web::openapi::OpenApiSchema>::schema,
+            }
+        }
+
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::openapi::DerivedSchemaDescriptor {
+                name: stringify!(#update_name),
+                identity: ::autumn_web::openapi::type_name_of::<#update_name>,
+                schema: <#update_name as ::autumn_web::openapi::OpenApiSchema>::schema,
+            }
+        }
+
         impl ::autumn_web::repository::AutumnSearchableModel for #name {
             const IS_SEARCHABLE: bool = #is_searchable;
             const SEARCH_LANGUAGE: &'static str = #search_language;

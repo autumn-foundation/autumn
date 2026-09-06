@@ -136,6 +136,101 @@ pub fn apply_serde_rename_all_rule(rule: &str, field: &str) -> Option<String> {
     }
 }
 
+/// Apply an enum-level `#[serde(rename_all = "...")]` casing rule to a
+/// (`PascalCase`) variant identifier, mirroring `serde_derive`'s
+/// `RenameRule::apply_to_variant`.
+///
+/// Deliberately NOT routed through [`apply_serde_rename_all_rule`]: that helper
+/// takes an already-`snake_case` *field* name, so its `lowercase`/`snake_case`
+/// arms are identity. A variant arrives in `PascalCase`, so each rule needs the
+/// serde variant algorithm instead — `InProgress` must become `in_progress`
+/// under `snake_case` and `inprogress` (not `in_progress`) under `lowercase`.
+///
+/// Returns `None` for a rule string serde itself would reject; the `Serialize`
+/// derive on the same enum then reports the error, so this does not duplicate it.
+pub fn apply_serde_rename_all_rule_to_variant(rule: &str, variant: &str) -> Option<String> {
+    // serde's own variant→snake_case: insert `_` before every uppercase char
+    // after the first, then lowercase. (`XMLHttpRequest` → `x_m_l_http_request`,
+    // matching serde exactly rather than guessing at acronym runs.)
+    fn snake(variant: &str) -> String {
+        let mut out = String::with_capacity(variant.len() + 4);
+        for (i, ch) in variant.char_indices() {
+            if i > 0 && ch.is_uppercase() {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        }
+        out
+    }
+    match rule {
+        "lowercase" => Some(variant.to_ascii_lowercase()),
+        "UPPERCASE" => Some(variant.to_ascii_uppercase()),
+        "PascalCase" => Some(variant.to_owned()),
+        "camelCase" => {
+            let mut chars = variant.chars();
+            chars
+                .next()
+                .map(|first| first.to_lowercase().collect::<String>() + chars.as_str())
+        }
+        "snake_case" => Some(snake(variant)),
+        "SCREAMING_SNAKE_CASE" => Some(snake(variant).to_ascii_uppercase()),
+        "kebab-case" => Some(snake(variant).replace('_', "-")),
+        "SCREAMING-KEBAB-CASE" => Some(snake(variant).to_ascii_uppercase().replace('_', "-")),
+        _ => None,
+    }
+}
+
+/// The serde attributes on an enum variant, read for `rename` / `skip`.
+///
+/// Mirrors [`field_serde_serialize_rename`] but over a
+/// [`syn::Variant`](syn::Variant)'s attribute list.
+pub fn variant_serde_serialize_rename(variant: &syn::Variant) -> Option<String> {
+    let mut renamed = None;
+    for attr in variant.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                if let Ok(value) = meta.value() {
+                    if let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>() {
+                        renamed = Some(s.value());
+                    }
+                } else {
+                    let _ = meta.parse_nested_meta(|inner| {
+                        if let Ok(value) = inner.value()
+                            && let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>()
+                            && inner.path.is_ident("serialize")
+                        {
+                            renamed = Some(s.value());
+                        }
+                        Ok(())
+                    });
+                }
+            } else if let Ok(value) = meta.value() {
+                // Consume any `= value` so sibling metas keep parsing.
+                let _: syn::Result<syn::Lit> = value.parse();
+            }
+            Ok(())
+        });
+    }
+    renamed
+}
+
+/// Whether a variant carries `#[serde(skip)]` / `#[serde(skip_serializing)]`,
+/// in which case it never appears on the wire and must not be advertised.
+pub fn variant_is_serde_skipped(variant: &syn::Variant) -> bool {
+    let mut skipped = false;
+    for attr in variant.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("skip") || meta.path.is_ident("skip_serializing") {
+                skipped = true;
+            } else if let Ok(value) = meta.value() {
+                let _: syn::Result<syn::Lit> = value.parse();
+            }
+            Ok(())
+        });
+    }
+    skipped
+}
+
 /// The JSON-schema property name a field serializes to, honoring serde attrs.
 ///
 /// Precedence mirrors serde: a field-level `#[serde(rename = "...")]` wins over

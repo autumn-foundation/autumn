@@ -324,7 +324,7 @@ The full attribute-expansion story lives in
 
 ## 4. Component schemas
 
-A referenced type resolves to `#/components/schemas/<Key>` from one of three
+A referenced type resolves to `#/components/schemas/<Key>` from one of four
 sources, and the generator fills the document in this order:
 
 1. **`OpenApiConfig::register_schema(key, json)`** — schemas you register
@@ -333,31 +333,33 @@ sources, and the generator fills the document in this order:
    `#[repository(api = "/api/…")]` uses one to document its generated list
    endpoint's pagination request (`PageRequest` / `CursorRequest`) and response
    envelope (`<Model>Page` / `<Model>CursorPage`).
-3. **`#[derive(OpenApiSchema)]`** — the derive registers the struct in a
+3. **`#[model]`** — a model and its `New*` / `Update*` companions register
+   themselves, so a handler taking `Json<NewBookmark>` or returning
+   `Json<Bookmark>` documents real fields with no wiring at all.
+4. **`#[derive(OpenApiSchema)]`** — the derive registers the type in the same
    compile-time inventory, and the generator back-fills any referenced type
-   that nothing above already registered. This is the only zero-wiring path.
+   that nothing above already registered.
 
-A referenced type that none of the three covers becomes the placeholder
+A referenced type that none of the four covers becomes the placeholder
 `{"type": "object", "title": "<Key>"}`. The endpoint is still documented; only
-its field list is missing.
+its field list is missing — and `autumn openapi export`
+([§11](#11-exporting-the-spec)) names every type in that state, so it is a
+reported condition rather than a silent one.
 
-> **Gotcha — implementing `OpenApiSchema` is not the same as registering it.**
-> Only the *derive* feeds the back-fill inventory. A hand-written
-> `impl OpenApiSchema` is never consulted while building the document — and
-> that includes the impls `#[model]` generates for a model and its `New*` /
-> `Update*` companions. A handler returning `Json<Bookmark>` therefore
-> documents `Bookmark` as a placeholder until you say so explicitly:
+> **A hand-written `impl OpenApiSchema` is still not a registration.** Sources 3
+> and 4 work because the macro *also* submits a compile-time inventory entry;
+> an impl you write yourself submits nothing, so the generator never finds it.
+> Register those explicitly:
 >
 > ```rust
 > use autumn_web::openapi::OpenApiSchema;
 >
 > OpenApiConfig::new("Bookmarks API", "1.0.0")
->     .register_schema("Bookmark", <Bookmark as OpenApiSchema>::schema())
->     .register_schema("NewBookmark", <NewBookmark as OpenApiSchema>::schema())
+>     .register_schema("Report", <Report as OpenApiSchema>::schema())
 > ```
 >
-> The key is the component key the `$ref` uses — the model's short type name in
-> the ordinary, no-collision case.
+> The key is the component key the `$ref` uses — the type's short name in the
+> ordinary, no-collision case.
 
 ```rust
 use autumn_web::openapi::OpenApiSchema;
@@ -375,9 +377,37 @@ The derive mirrors the schema `#[model]` builds: each named field becomes a
 property, every non-`Option` field is `required`, `Vec<T>` becomes an array,
 `Option<T>` becomes nullable, and a container `#[serde(rename_all = "…")]` or
 field-level `#[serde(rename = "…")]` is honored so property names match the
-wire format. It rejects generic types and non-struct / tuple-struct inputs with
-a clear compile error — use a manual `impl OpenApiSchema` plus
-`register_schema` for those.
+wire format.
+
+It also covers **enums whose variants are all unit variants**, which become the
+closed string set serde puts on the wire:
+
+```rust
+#[derive(serde::Deserialize, OpenApiSchema)]
+#[serde(rename_all = "snake_case")]
+enum Status {
+    Open,
+    InProgress,      // "in_progress"
+    #[serde(rename = "done!")]
+    Closed,          // "done!"
+    #[serde(skip)]
+    Internal,        // omitted — never on the wire
+}
+```
+
+```json
+{ "type": "string", "enum": ["open", "in_progress", "done!"] }
+```
+
+A generated client turns that into a TypeScript string union or a Rust enum,
+rather than the untyped blob a derive-less enum used to produce.
+
+It rejects generic types, tuple structs, and enums with **data-carrying
+variants** with a clear compile error — use a manual `impl OpenApiSchema` plus
+`register_schema` for those. Data-carrying variants are refused rather than
+guessed at because serde's representation for them depends on
+`#[serde(tag/content/untagged)]`, so an inferred shape could confidently
+advertise a contract the handler does not accept.
 
 The rename handling is exact for the ordinary symmetric attributes. The **split
 form** — `#[serde(rename_all(serialize = "kebab-case", deserialize =
@@ -598,41 +628,105 @@ layer, or serve JSON only (`swagger_ui_path(None)`) and ship the UI elsewhere.
 
 ## 11. Exporting the spec
 
-**At build time — if your app pre-renders.** `autumn build` (which runs the app
-with `AUTUMN_BUILD_STATIC=1`) writes both `dist/openapi.json` and
-`dist/openapi.yaml` next to the pre-rendered pages when `.openapi(...)` is
-configured. That artifact is what you publish, feed to a client generator, or
-diff between releases.
+### `autumn openapi export`
 
-> **The spec export rides along with static generation.** `autumn build` bails
-> out early — `No static routes registered. Nothing to build.` — before it
-> reaches the OpenAPI writer, so an app with no `#[static_get]` routes gets no
-> `dist/openapi.json` no matter how `.openapi(...)` is configured. A pure JSON
-> API (`examples/bookmarks` among them) has to take the spec from the running
-> endpoint instead.
+```bash
+autumn openapi export --out openapi.json
+```
 
-**From a running app** — the path that always works, pre-rendering or not:
+This compiles the app and runs it in a dump mode that binds no port and opens no
+database connection, then writes the document. It builds that document through
+the same pair `/openapi.json` uses, so an exported spec and a served one cannot
+drift.
+
+| Flag | Effect |
+|------|--------|
+| *(none)* | Write the document to stdout |
+| `--out <path>` | Write it to a file, creating parent directories |
+| `--check <path>` | Re-export and compare against a committed copy; exit non-zero on drift |
+| `--strict` | Also fail when any component schema is an opaque placeholder |
+| `-p/--package`, `--bin` | Pick the target in a workspace |
+| `--features`, `--all-features`, `--no-default-features` | Build the app under a specific feature set |
+
+An app built without the `openapi` feature, or one that never called
+`.openapi(...)`, gets an explicit error naming which of the two it is — not an
+empty file.
+
+### Generating a client
+
+The exported document is what the standard generators consume, so a typed client
+is one command away in either language:
+
+```bash
+autumn openapi export --out openapi.json
+
+# TypeScript
+npx openapi-typescript openapi.json -o src/api.d.ts
+
+# Rust
+cargo progenitor -i openapi.json -o ./client -n my-api-client
+```
+
+Autumn deliberately does **not** ship its own client emitters. The JSON-Schema
+surface a correct generator has to handle — `oneOf`/`allOf`, discriminators,
+nullability, recursive `$ref`s, reserved-word mangling — is a large permanent
+maintenance burden that the existing tools already carry well. Autumn's job is
+to hand them a spec worth generating from.
+
+### Opaque schemas
+
+Every export reports the component schemas that resolved to the
+`{"type": "object", "title": "…"}` placeholder of [§4](#4-component-schemas),
+naming the operations that reach them:
+
+```text
+⚠ 1 component schema(s) have no field-level type and export as an opaque object:
+    ReportFilter ← GET /reports
+```
+
+These are the types a generated client can only see as `unknown` (TypeScript) or
+`serde_json::Value` (Rust). Fix each by adding `#[derive(OpenApiSchema)]` to the
+type or registering a schema by hand. `--strict` makes their presence a failure,
+which is the setting to use when the spec drives codegen.
+
+### In CI
+
+```bash
+autumn openapi export --check openapi.json --strict
+```
+
+`--check` compares parsed JSON rather than bytes, so reindenting the committed
+file is not a failure — only a real contract change is. On drift it prints the
+operations that were added, removed, or changed before failing, so the reason is
+visible in the log without opening the diff.
+
+Pair it with an OpenAPI-diff tool if you want to fail specifically on *breaking*
+changes rather than all of them. Either gate only sees what the document
+describes, which is why `--strict` belongs alongside it: a placeholder type has
+no fields in the spec at all, so renaming or dropping one gives the diff nothing
+to catch.
+
+### At build time
+
+`autumn build` (which runs the app with `AUTUMN_BUILD_STATIC=1`) also writes
+`dist/openapi.json` and `dist/openapi.yaml` next to the pre-rendered pages when
+`.openapi(...)` is configured — useful when you are publishing the spec
+alongside a static site.
+
+> **That path rides along with static generation.** `autumn build` bails out
+> early — `No static routes registered. Nothing to build.` — before it reaches
+> the OpenAPI writer, so an app with no `#[static_get]` routes gets no
+> `dist/openapi.json` however `.openapi(...)` is configured. `autumn openapi
+> export` has no such precondition; prefer it unless you specifically want the
+> YAML sibling next to a static build.
+
+### From a running app
 
 ```bash
 curl -fsS http://127.0.0.1:3000/openapi.json > openapi.json
-npx @openapitools/openapi-generator-cli generate \
-  -i openapi.json -g typescript-fetch -o ./client
 ```
 
-**In CI**, the cheapest useful gate is a breaking-change diff: regenerate the
-spec on the PR branch, compare it against the committed copy with an
-OpenAPI-diff tool, and fail on removals. Because the spec is derived from
-handler types, that diff catches contract breaks — a removed route, a changed
-method or status, a parameter that vanished — as part of the normal build.
-
-A diff can only see what the document describes, so **field-level** breaks are
-caught exactly for the types that carry a field-accurate schema: anything with
-`#[derive(OpenApiSchema)]` or an explicit `register_schema`. A type resolving
-to the `{"type": "object", "title": "…"}` placeholder of
-[§4](#4-component-schemas) — including a `#[model]` you have not registered —
-has no fields in the spec at all, so renaming or dropping one changes nothing
-for the diff to fail on. If you intend to lean on this gate, make sure the
-types on your API boundary are not placeholders first.
+Equivalent output, when you already have the app running.
 
 ---
 
@@ -696,7 +790,7 @@ contract the OpenAPI operation is. See
 
 | Symptom | Cause |
 |---------|-------|
-| A schema shows as `{"type": "object", "title": "X"}` | Nothing registered it — add `#[derive(OpenApiSchema)]`, or `register_schema` for a `#[model]` / hand-written impl ([§4](#4-component-schemas)) |
+| A schema shows as `{"type": "object", "title": "X"}` | Nothing registered it — add `#[derive(OpenApiSchema)]`, or `register_schema` for a hand-written impl ([§4](#4-component-schemas)). `autumn openapi export` lists every type in this state ([§11](#11-exporting-the-spec)) |
 | A response body disappeared after adding `#[throttle]` / `#[secured]` | Guard expanded outermost and rewrote the return type — move the route macro above it |
 | `#[api_doc]` had no effect | It is on a `#[static_get]`/`#[ws]` handler, above `#[oauth2_callback]`, or on a function with no route macro at all |
 | The success status is `200` on a `201`-returning handler | Add `#[api_doc(status = 201)]` |
@@ -704,6 +798,7 @@ contract the OpenAPI operation is. See
 | Startup *panics* on a duplicate route instead of erroring cleanly | The colliding handler came from `AppBuilder::merge`, which the pre-mount check cannot inspect ([§1](#1-turn-it-on)) |
 | `/openapi.json` 404s in production | `[openapi] enabled = false` in that profile, or `.openapi(...)` was never called |
 | `autumn build` wrote no `dist/openapi.json` | It printed `No static routes registered` and exited first — the export rides along with static generation ([§11](#11-exporting-the-spec)) |
+| `autumn openapi export` says there is no spec to export | The app was built without the `openapi` feature, or never called `.openapi(...)` — the message names which ([§11](#11-exporting-the-spec)) |
 | A query struct documents one opaque `object` parameter | Expected shape — `style: form, explode: true` means clients send its fields as individual keys |
 
 ---
