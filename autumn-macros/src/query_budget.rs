@@ -1133,7 +1133,15 @@ impl Analyzer {
             // `Vec<Post>` — as a handle too, miscounting a harmless
             // `rows.len()` as another query (caught by the existing
             // `a_deferred_repository_future_is_counted_once` unit test).
-            Expr::Await(a) => self.awaited_expr_is_fresh_handle(&a.base),
+            //
+            // Deliberately has NO matching `Expr::Await` arm here (only
+            // `Expr::Try`, which peels through its own inner `Await` via
+            // `awaited_expr_is_fresh_handle`): a *fallible* accessor's
+            // `.await` alone yields `Result<Conn, E>`, not `Conn` — only the
+            // `?` actually unwraps to the handle. Promoting a bare
+            // `self.conn().await` (no `?`) would treat that `Result` itself
+            // as a handle, so a later `result.is_err()` or `.unwrap()` call
+            // gets miscounted as a query (#2546 review, round 3).
             Expr::Try(t) => self.awaited_expr_is_fresh_handle(&t.expr),
             Expr::Unary(u) => matches!(u.op, syn::UnOp::Deref(_)) && self.expr_is_handle(&u.expr),
             // A field of a handle is a handle (`db.inner`), and so is a field

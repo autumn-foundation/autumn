@@ -465,6 +465,10 @@ fn compile_pass_tests() {
     // pattern batched ahead of the loop compiles clean — the analysis is
     // actually counting, not just always rejecting the job/scheduled shape.
     t.pass("tests/compile-pass/query_budget_job_shaped_accessor_batched.rs");
+    // A bare `.await` (no `?`) on a fallible accessor must not promote the
+    // `Result` itself to a handle (PR #2546 review, round 3) — otherwise
+    // `result.is_err()` here would be miscounted as a database query.
+    t.pass("tests/compile-pass/query_budget_bare_await_not_promoted.rs");
 
     // Maud + form/json handlers (require maud feature)
     #[cfg(feature = "maud")]

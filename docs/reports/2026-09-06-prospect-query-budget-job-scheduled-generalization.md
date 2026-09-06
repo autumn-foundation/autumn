@@ -200,6 +200,25 @@ where every other `#[query_budget]` fixture lives (no new test harness):
   walker is measurably more correct after this assay than before it, for
   any code — job/scheduled-shaped or not — that obtains a handle through
   an async/fallible accessor.
+- **Update (third Codex review round) — the first fix over-promoted a
+  bare `.await`.** Adding `Expr::Await`/`Expr::Try` to `expr_is_handle`
+  peeled *both* shapes: `self.conn().await?` (the target) and a bare
+  `self.conn().await` with no `?`. The bare shape yields `Result<Conn, E>`
+  — the `Result` itself, not the handle inside it — but was being promoted
+  to a handle anyway, so a later `result.is_err()` or `.unwrap()` on it got
+  miscounted as a database query, a real false positive on otherwise valid
+  code (verified by reading the match arms; a fallible accessor's `.await`
+  alone never unwraps the `Result`, only `?` does). Fixed by removing the
+  `Expr::Await` arm from `expr_is_handle` itself — only `Expr::Try` is
+  peeled at that level, which still reaches the inner `Await` node through
+  `awaited_expr_is_fresh_handle`'s own (safe, because already inside a
+  confirmed `?`-unwrapped context) `Expr::Await` arm. New compile-pass
+  fixture: `query_budget_bare_await_not_promoted.rs`, pinning that
+  `result.is_err()` after a bare `store.conn().await` stays a
+  `#[query_budget(0)]`-clean build. CHANGELOG entry added per this
+  workspace's own contribution rule (a user-visible `#[query_budget]`
+  behavior change under `## [Unreleased]` → `### Fixed`), flagged as
+  missing by the same review pass.
 
 ## 📊 Assay
 
@@ -214,14 +233,15 @@ autumn-web --test integration_tests`, default features `db,maud,htmx,...`):
 | `query_budget_real_job_accessor_n_plus_one.rs` (real `#[job]`) | compile-fail | **compile-fail** | same diagnostic, pointing at `for id in args.recipient_ids` |
 | `query_budget_real_scheduled_accessor_n_plus_one.rs` (real `#[scheduled]`) | compile-fail | **compile-fail** | same diagnostic, pointing at `for id in ids` |
 | `query_budget_await_try_accessor_n_plus_one.rs` (`self.conn().await?` shape) | compile-fail | **compiled clean pre-fix (confirmed false negative); compile-fail post-fix** | same diagnostic, naming `execute`, pointing at `for _id in ids` |
+| `query_budget_bare_await_not_promoted.rs` (`store.conn().await` — no `?` — then `result.is_err()`) | compile-pass | **compile-pass** | clean build at `#[query_budget(0)]` |
 
 First run generated fresh `.stderr` snapshots via trybuild's standard
 `wip/`-then-promote flow (no snapshot existed yet, matching how every other
 compile-fail fixture in this suite was originally added); every subsequent
 run, after moving the generated snapshots into `tests/compile-fail/`,
 reproduced them byte-for-byte (`query_budget_compile_fail_tests ... ok`,
-~5s incremental with the full 8-fixture family). `compile_pass_tests` (60
-fixtures including the batched control) also passed clean. The
+~5s incremental with the full 8-fixture family). `compile_pass_tests` (61
+fixtures including both controls) also passed clean. The
 `autumn-macros` fix was additionally checked against the crate's own
 `#[cfg(test)]` suite (`cargo test -p autumn-macros --lib`, 1087 tests) to
 catch exactly the kind of regression the first attempt at this fix
@@ -309,11 +329,13 @@ Fixtures: `autumn/tests/compile-fail/query_budget_accessor_handle_n_plus_one.rs`
 `autumn/tests/compile-fail/query_budget_real_scheduled_accessor_n_plus_one.rs`,
 `autumn/tests/compile-fail/query_budget_await_try_accessor_n_plus_one.rs`
 (all five with pinned `.stderr` snapshots), and
-`autumn/tests/compile-pass/query_budget_job_shaped_accessor_batched.rs`.
+`autumn/tests/compile-pass/query_budget_job_shaped_accessor_batched.rs`,
+`autumn/tests/compile-pass/query_budget_bare_await_not_promoted.rs`.
 Wired into `autumn/tests/integration/compile_fail.rs`'s existing
 `query_budget_compile_fail_tests` / `compile_pass_tests` functions. The
-`autumn-macros` fix itself is `expr_is_handle`'s `Expr::Await`/`Expr::Try`
-arms plus the new `awaited_expr_is_fresh_handle` helper and
+`autumn-macros` fix itself is `expr_is_handle`'s `Expr::Try` arm (no
+`Expr::Await` arm at that level — see the third-review-round update above)
+plus the new `awaited_expr_is_fresh_handle` helper and
 `chain_root_is_handle`'s comment explaining why it deliberately does *not*
 peel the same way, all in `autumn-macros/src/query_budget.rs`.
 
