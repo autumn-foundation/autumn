@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   protocol-level regression (challenge ordering, the finalize payload shape,
   polling) that the fake CA cannot see would still be caught. Wired into a
   dedicated, Docker-gated CI step separate from both the fast ACME lane (no
-  Docker/network) and the general Docker-dependent-tests sweep.
+  Docker/network) and the general Docker-dependent-tests sweep. Test-only
+  coverage, no new agent-facing surface. [no-plugin]
 - **macros:** `#[autumn_web::main]` takes optional arguments that reach the
   Tokio runtime it builds. Previously the attribute discarded its argument
   list entirely (`_attr`), so the only way to size a worker pool, name the
