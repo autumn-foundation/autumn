@@ -3697,6 +3697,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   action: revoke statement calls 2,050 → 1. See
   `docs/reports/2026-08-31-ledger-admin-bulk-delete-batch/`.
 
+- **`FeatureFlagAdminModel`'s admin panel bulk "delete" action now issues
+  one `DELETE` CTE instead of one per selected flag:** it never overrode
+  `AdminModel::execute_action`'s trait default, so it inherited the same
+  per-id loop the `TokenAdminModel` fix above closed — a full connection
+  checkout plus a single-row `DELETE ... WHERE id = $1 RETURNING key`
+  (feeding the `feature_flag_changes` audit insert) per id. It now
+  overrides `execute_action` for `"delete"` to batch every id into one
+  `WHERE id = ANY($1)` round trip; the returned count, final row state,
+  and audit trail are unchanged (an already-deleted or nonexistent id is
+  still a silent no-op, still counted as "applied"). Measured against a
+  4,000-row fixture with an 820-id bulk action: delete-CTE statement
+  calls 820 → 1, buffers 9,639 → 6,977 (-27.6%). See
+  `docs/reports/2026-09-06-ledger-feature-flag-admin-bulk-delete-batch/`.
+
 - **scaffolded form helpers no longer re-escape their own constant HTML at
   render time:** `text_input`, `password_input`, `textarea_input`,
   `number_input`, `checkbox_input`, `date_input`/`datetime_input` (and their
