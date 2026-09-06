@@ -887,6 +887,18 @@ REF_DEF_LINE = re.compile(
 # is still part of that definition. Read as a paragraph, it closed the run:
 # `[x]: url` / `"title"` / `[m]: mail.md` rejected the third line and
 # reported a page the reader can click as an orphan.
+# A definition may also break BEFORE its destination: `[x]:` on one line and
+# the URL on the next is one definition, and the definition after it is
+# another. Reading the label line as a paragraph rejected that one, left it
+# unblanked, and fed its path to the bare-path scan — so an unused
+# definition, which renders nothing at all, marked its target reachable.
+# The sibling collector supports the same three-line grammar
+# (check-migration-guides.sh:1235-1243).
+DEF_LABEL_ONLY = re.compile(
+    r'^ {0,3}\[' + FLAT + LABEL_MAX + r'\]:[ \t]*$')
+DEST_ONLY_LINE = re.compile(
+    r'^ {0,3}(?:<[^<>\r\n]*>|' + DEST_BARE + r')'
+    r'(?P<title>[ \t]+(?:"[^"\n]*"|\'[^\'\n]*\'|\([^()\n]*\)))?[ \t]*$')
 TITLE_ONLY_LINE = re.compile(
     r'^ {0,3}(?:"[^"\n]*"|\'[^\'\n]*\'|\([^()\n]*\))[ \t]*$')
 
@@ -949,6 +961,9 @@ def block_starts(txt):
     # Set when the previous line was a definition with no title of its own, so
     # a title on this line continues it rather than starting a paragraph.
     title_may_follow = False
+    # Set when the previous line was a label with no destination, so this line
+    # completes that definition instead of starting a paragraph.
+    dest_expected = False
     for line in txt.split('\n'):
         if not para_open:
             starts.add(pos)
@@ -979,6 +994,19 @@ def block_starts(txt):
             # the same line under a paragraph is lazy continuation text and
             # falls through to the `else`.
             para_open = False
+        elif dest_expected and DEST_ONLY_LINE.match(line):
+            para_open = False
+            title_may_follow = (
+                DEST_ONLY_LINE.match(line).group('title') is None)
+            dest_expected = False
+            pos += len(line) + 1
+            continue
+        elif not para_open and DEF_LABEL_ONLY.match(line):
+            para_open = False
+            dest_expected = True
+            title_may_follow = False
+            pos += len(line) + 1
+            continue
         elif title_may_follow and TITLE_ONLY_LINE.match(line):
             para_open = False
         elif not para_open and REF_DEF_LINE.match(line):
@@ -1003,6 +1031,7 @@ def block_starts(txt):
         else:
             para_open = True
         title_may_follow = False
+        dest_expected = False
         pos += len(line) + 1
     return starts
 
@@ -1247,7 +1276,7 @@ def edges_from(f):
     out = set()
     base = posixpath.dirname(f)
 
-    def add_relative(raw):
+    def add_relative(raw, markdown=True):
         # Percent-decode before comparing to tracked filenames: `mail%20guide.md`
         # addresses `mail guide.md`, and the sibling gate decodes it too.
         # Anchor first, then query — the sibling's order. `mail.md?view=all` and
@@ -1259,7 +1288,14 @@ def edges_from(f):
         raw = (raw.replace('\x00\x00', '\\\\')
                .replace('\x01\x01', '\\!')
                .replace('\x02\x02', '\\<'))
-        raw = UNESCAPE.sub(r'\1', raw)
+        # Only for a MARKDOWN destination. A backslash in a raw HTML `href`
+        # is a literal character, so `<a href="docs/guide/mail\.md">` points
+        # at `mail\.md` and reaches the tracked file not at all — unescaping
+        # it recorded an edge no reader can follow. Verified against
+        # markdown-it-py, which keeps the backslash in the raw href and
+        # drops it from `[mail](docs/guide/mail\.md)`.
+        if markdown:
+            raw = UNESCAPE.sub(r'\1', raw)
         if not raw.endswith('.md'):
             return
         # A destination that leaves the site cannot make a guide page
@@ -1341,7 +1377,8 @@ def edges_from(f):
     for tag in ANCHOR_TAG.finditer(txt):
         m = ANCHOR_HREF.search(tag.group(0))
         if m:
-            add_relative(next(g for g in m.groups() if g is not None))
+            add_relative(next(g for g in m.groups() if g is not None),
+                         markdown=False)
 
     # A reference USE inside code — `` `[mail][]` `` — is the one code case that
     # does not count, and it is not an exception to the visible/invisible rule
@@ -2962,6 +2999,34 @@ self_test() {
     > "$c9gd/docs/guide/jobs.md"
   git -C "$c9gd" add -A && git -C "$c9gd" commit -qm fenced-def-image-ref
   check "a fenced definition does not turn text into an image" pass "$c9gd"
+
+  # A backslash in a raw HTML href is a literal character, not a Markdown
+  # escape, so the anchor points at a file that does not exist.
+  local c9ge="$tmp/c9ge"; make_corpus "$c9ge"
+  printf '# Jobs\n\n<a href="mail\\.md">mail</a>\n' > "$c9ge/docs/guide/jobs.md"
+  git -C "$c9ge" add -A && git -C "$c9ge" commit -qm raw-href-backslash
+  check "a backslash in a raw href is not unescaped" fail "$c9ge"
+
+  # ...while the same escape in a MARKDOWN destination still resolves.
+  local c9gf="$tmp/c9gf"; make_corpus "$c9gf"
+  printf '# Jobs\n\nSee [mail](mail\\.md).\n' > "$c9gf/docs/guide/jobs.md"
+  git -C "$c9gf" add -A && git -C "$c9gf" commit -qm markdown-dest-backslash
+  check "a backslash in a markdown destination is unescaped" pass "$c9gf"
+
+  # A definition may break before its destination, and the definition after it
+  # is a definition too — so an UNUSED one renders nothing and is no route.
+  local c9gg="$tmp/c9gg"; make_corpus "$c9gg"
+  printf '# Jobs\n\n[x]:\nhttps://example.test\n[m]: docs/guide/mail.md\n' \
+    > "$c9gg/docs/guide/jobs.md"
+  git -C "$c9gg" add -A && git -C "$c9gg" commit -qm next-line-destination
+  check "an unused definition after a wrapped one is not visible" fail "$c9gg"
+
+  # ...but USED, the same definition is a route the reader can click.
+  local c9gh="$tmp/c9gh"; make_corpus "$c9gh"
+  printf '# Jobs\n\nSee [mail][m].\n\n[x]:\nhttps://example.test\n[m]: mail.md\n' \
+    > "$c9gh/docs/guide/jobs.md"
+  git -C "$c9gh" add -A && git -C "$c9gh" commit -qm next-line-destination-used
+  check "a used definition after a wrapped one resolves" pass "$c9gh"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
