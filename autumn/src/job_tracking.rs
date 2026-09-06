@@ -474,9 +474,14 @@ pub struct SqliteJobTrackingStore {
 struct SqliteTrackingRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     record: String,
-    /// The value the compare-and-swap in `try_update_once` writes against.
+    /// The token the compare-and-swap in `try_update_once` writes against.
+    ///
+    /// A counter, not the timestamp: two writes inside one millisecond — or any
+    /// write under a clock that does not advance, which is every `#[sim_test]`
+    /// — leave `updated_at` unchanged, so a stale writer's swap would still
+    /// match and overwrite the fresher record.
     #[diesel(sql_type = diesel::sql_types::BigInt)]
-    updated_at: i64,
+    version: i64,
 }
 
 /// How many times a tracked-job update re-reads after losing its swap.
@@ -542,7 +547,8 @@ impl SqliteJobTrackingStore {
                key        TEXT   PRIMARY KEY NOT NULL, \
                record     TEXT   NOT NULL, \
                updated_at BIGINT NOT NULL, \
-               expires_at BIGINT NOT NULL)",
+               expires_at BIGINT NOT NULL, \
+               version    BIGINT NOT NULL DEFAULT 0)",
             "CREATE INDEX IF NOT EXISTS idx_autumn_job_tracking_expires_at \
              ON autumn_job_tracking (expires_at)",
         ] {
@@ -554,6 +560,21 @@ impl SqliteJobTrackingStore {
                         "job tracking schema setup failed: {error}"
                     ))
                 })?;
+        }
+        // A table an earlier build created has no `version`. SQLite has no
+        // `ADD COLUMN IF NOT EXISTS`, so the error is the check — but only the
+        // duplicate-column case means "already migrated"; anything else must
+        // propagate and leave the cell retryable.
+        if let Err(error) = diesel::sql_query(
+            "ALTER TABLE autumn_job_tracking ADD COLUMN version BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&mut *conn)
+        .await
+            && !error.to_string().contains("duplicate column name")
+        {
+            return Err(AutumnError::internal_server_error_msg(format!(
+                "job tracking schema setup failed: {error}"
+            )));
         }
         let _ = self.schema.set(());
         Ok(conn)
@@ -584,10 +605,12 @@ impl SqliteJobTrackingStore {
                 return Ok(());
             }
         }
-        tracing::warn!(
-            "job tracking update lost its compare-and-swap {CAS_RETRIES} times; giving up"
-        );
-        Ok(())
+        // Never `Ok(())`: the caller would take a dropped `complete` or `fail`
+        // for a settled job, and the status endpoint would sit at running until
+        // the record expired.
+        Err(AutumnError::internal_server_error_msg(format!(
+            "job tracking update lost its compare-and-swap {CAS_RETRIES} times"
+        )))
     }
 
     /// One read-modify-write attempt. Returns whether the swap landed.
@@ -608,7 +631,7 @@ impl SqliteJobTrackingStore {
         let now_ms = now.timestamp_millis();
         let mut conn = self.conn().await?;
         let row = diesel::sql_query(
-            "SELECT record, updated_at FROM autumn_job_tracking \
+            "SELECT record, version FROM autumn_job_tracking \
              WHERE key = ? AND expires_at > ?",
         )
         .bind::<diesel::sql_types::Text, _>(key)
@@ -638,17 +661,18 @@ impl SqliteJobTrackingStore {
             ))
         })?;
 
-        // `updated_at = ?` is the swap: it matches only while no one else has
-        // written since the row above was read.
+        // `version = ?` is the swap, and the write bumps it: it matches only
+        // while no one else has written since the row above was read.
         let written = diesel::sql_query(
-            "UPDATE autumn_job_tracking SET record = ?, updated_at = ?, expires_at = ? \
-             WHERE key = ? AND updated_at = ?",
+            "UPDATE autumn_job_tracking \
+             SET record = ?, updated_at = ?, expires_at = ?, version = version + 1 \
+             WHERE key = ? AND version = ?",
         )
         .bind::<diesel::sql_types::Text, _>(&payload)
         .bind::<diesel::sql_types::BigInt, _>(now_ms)
         .bind::<diesel::sql_types::BigInt, _>(self.expires_at_ms(now_ms))
         .bind::<diesel::sql_types::Text, _>(key)
-        .bind::<diesel::sql_types::BigInt, _>(row.updated_at)
+        .bind::<diesel::sql_types::BigInt, _>(row.version)
         .execute(&mut *conn)
         .await
         .map_err(|error| {
@@ -690,12 +714,13 @@ impl JobTrackingStore for SqliteJobTrackingStore {
             let payload = Self::pending_record(owner, now)?;
             let mut conn = self.conn().await?;
             diesel::sql_query(
-                "INSERT INTO autumn_job_tracking (key, record, updated_at, expires_at) \
-                 VALUES (?, ?, ?, ?) \
+                "INSERT INTO autumn_job_tracking (key, record, updated_at, expires_at, version) \
+                 VALUES (?, ?, ?, ?, 0) \
                  ON CONFLICT(key) DO UPDATE SET \
                      record = excluded.record, \
                      updated_at = excluded.updated_at, \
-                     expires_at = excluded.expires_at",
+                     expires_at = excluded.expires_at, \
+                     version = autumn_job_tracking.version + 1",
             )
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Text, _>(&payload)
@@ -762,7 +787,8 @@ impl JobTrackingStore for SqliteJobTrackingStore {
             // written since `expected_updated_at` was read, so a retry that
             // settles faster than this call returns is never clobbered.
             diesel::sql_query(
-                "UPDATE autumn_job_tracking SET record = ?, updated_at = ?, expires_at = ? \
+                "UPDATE autumn_job_tracking \
+                 SET record = ?, updated_at = ?, expires_at = ?, version = version + 1 \
                  WHERE key = ? AND updated_at = ?",
             )
             .bind::<diesel::sql_types::Text, _>(&payload)
@@ -789,7 +815,7 @@ impl JobTrackingStore for SqliteJobTrackingStore {
             let now_ms = self.now_ms();
             let mut conn = self.conn().await?;
             let row = diesel::sql_query(
-                "SELECT record, updated_at FROM autumn_job_tracking \
+                "SELECT record, version FROM autumn_job_tracking \
                  WHERE key = ? AND expires_at > ?",
             )
             .bind::<diesel::sql_types::Text, _>(key)

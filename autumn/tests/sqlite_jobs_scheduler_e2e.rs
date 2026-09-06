@@ -1539,3 +1539,90 @@ async fn sqlite_job_backend_prunes_expired_ttl_unique_history() {
     shutdown.cancel();
     job::clear_global_job_client();
 }
+
+/// (23) The tracked-record compare-and-swap is versioned, not timestamped.
+///
+/// Under a clock that does not advance — every `#[sim_test]`, and any two
+/// writes inside one millisecond — a timestamp token never changes, so a stale
+/// writer's swap would still match and overwrite a fresher record. This pins
+/// the token to a counter instead.
+#[tokio::test]
+async fn sqlite_tracking_store_swaps_on_a_version_not_a_timestamp() {
+    use autumn_web::job_tracking::{JobTrackingStore as _, SqliteJobTrackingStore, TrackedJobOwner};
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+
+    // A clock frozen at one instant: `updated_at` is identical for every write.
+    let clock = std::sync::Arc::new(autumn_web::time::FixedClock::at(
+        chrono::DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid instant"),
+    ));
+    let store = SqliteJobTrackingStore::new(pool.clone(), 3_600).with_clock(clock);
+
+    store
+        .create("k1", TrackedJobOwner::Anonymous)
+        .await
+        .expect("create");
+    let created = count(
+        &pool,
+        "SELECT version AS value FROM autumn_job_tracking WHERE key = 'k1'",
+    )
+    .await;
+
+    store.mark_running("k1").await.expect("mark running");
+    let after_running = count(
+        &pool,
+        "SELECT version AS value FROM autumn_job_tracking WHERE key = 'k1'",
+    )
+    .await;
+    assert!(
+        after_running > created,
+        "every write must move the swap token, even on a frozen clock: \
+         {created} -> {after_running}"
+    );
+
+    // The timestamp did not move, which is exactly why it cannot be the token.
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) AS value FROM autumn_job_tracking \
+             WHERE key = 'k1' AND updated_at = 1700000000000"
+        )
+        .await,
+        1,
+        "the frozen clock wrote the same updated_at both times"
+    );
+
+    // A writer holding the pre-`mark_running` version must not land.
+    {
+        use diesel_async::RunQueryDsl as _;
+        let mut conn = pool.get().await.expect("sqlite connection");
+        let stale = diesel::sql_query(
+            "UPDATE autumn_job_tracking SET record = '{}' WHERE key = 'k1' AND version = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(created)
+        .execute(&mut *conn)
+        .await
+        .expect("stale update runs");
+        assert_eq!(stale, 0, "a stale version must match no row");
+    }
+
+    // A terminal write still lands, and is what the reader observes.
+    store
+        .complete("k1", serde_json::json!({ "ok": true }))
+        .await
+        .expect("complete");
+    let record = store
+        .get("k1")
+        .await
+        .expect("get")
+        .expect("the record is still live");
+    assert!(
+        matches!(
+            record.status,
+            autumn_web::job_tracking::TrackedJobStatus::Succeeded
+        ),
+        "the completion is what a reader sees, got {:?}",
+        record.status
+    );
+}

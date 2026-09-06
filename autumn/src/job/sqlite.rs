@@ -732,6 +732,11 @@ async fn recover_stale_claims(pool: &SqlitePool, visibility_timeout_ms: u64, sta
     let cutoff = now.saturating_sub(i64::try_from(visibility_timeout_ms).unwrap_or(i64::MAX));
     // Restore a pending-window unique key with the status change, so the row is
     // never claimable with the key missing.
+    //
+    // A row on its final attempt is dead-lettered instead of re-enqueued, so
+    // there is nothing to restore it onto — but it keeps `pending_unique_key`
+    // rather than having it cleared, because that is the only surviving copy
+    // and an operator's retry restores the key from it.
     let sql = format!(
         "UPDATE autumn_jobs \
          SET status = CASE WHEN attempt < max_attempts THEN '{STATUS_ENQUEUED}' \
@@ -754,7 +759,10 @@ async fn recover_stale_claims(pool: &SqlitePool, visibility_timeout_ms: u64, sta
                THEN pending_unique_key \
                ELSE unique_key \
              END, \
-             pending_unique_key = NULL \
+             pending_unique_key = CASE \
+               WHEN attempt < max_attempts THEN NULL \
+               ELSE pending_unique_key \
+             END \
          WHERE id IN ( \
            SELECT id FROM autumn_jobs \
            WHERE status = '{STATUS_RUNNING}' AND claimed_at IS NOT NULL AND claimed_at <= ? \
