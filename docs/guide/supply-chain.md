@@ -637,10 +637,13 @@ depends on it.
   not installed by any Autumn install path, so warning here would make
   `autumn doctor --strict` red on every machine that has not opted in. A pass
   that says "not evaluated" is never a silent pass.
-- **The audit produced no verdict** — a warning naming the auditor's own error.
-  This includes the case where cargo-deny rejects the tree for a reason the
-  parse could not account for: doctor reports no verdict rather than a clean
-  tree.
+- **The audit produced no verdict** — a warning naming the reason. This covers
+  a `deny.toml` that is not valid TOML (cargo-deny loads the policy before it
+  audits, so the CI gate fails outright on one), a section written in a
+  spelling only one of the two derivations can see, and cargo-deny rejecting
+  the tree for a reason the diagnostic parse could not account for. All three
+  are reported *before* the missing-tool checks above: those pass, and a pass
+  on a repository CI rejects is the one outcome this check exists to prevent.
 - **`autumn dev`** — silent in every one of those states.
 
 Refresh the data with one command, network permitting:

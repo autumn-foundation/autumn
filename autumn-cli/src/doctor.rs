@@ -292,7 +292,9 @@ pub fn check_dependencies_impl(eval: &crate::deps::Evaluation) -> CheckResult {
         Evaluation::Unavailable { reason, .. } => (
             CheckStatus::Warn,
             format!("the dependency audit produced no verdict: {reason}"),
-            Some("run `cargo deny check advisories` to see the auditor's own error"),
+            Some(
+                "`deny.toml` is the policy both `autumn doctor` and the CI gate read; `cargo deny check` shows the auditor's own error",
+            ),
         ),
         Evaluation::Audited {
             findings,

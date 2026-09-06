@@ -138,6 +138,27 @@ pub fn policy_checks(policy: &str) -> Vec<String> {
     checks
 }
 
+/// Optional checks the policy declares that the scaffolded workflow's grep
+/// cannot see.
+///
+/// Doctor parses TOML; the workflow greps, because a shell cannot parse TOML.
+/// The two agree on every spelling a person writes by hand, but a basic key
+/// carrying an escape (`["ban\u0073"]`) decodes to `bans` for one and not the
+/// other. Rather than let that diverge silently, it is reported.
+pub fn checks_invisible_to_ci(policy: &str) -> Vec<String> {
+    let parsed = declared_sections(policy);
+    OPTIONAL_CHECKS
+        .iter()
+        .filter(|section| {
+            parsed.iter().any(|key| key == *section)
+                && !policy
+                    .lines()
+                    .any(|line| line_declares(code_of(line), section))
+        })
+        .map(|section| (*section).to_owned())
+        .collect()
+}
+
 /// The top-level table keys the policy declares.
 ///
 /// Parsed as TOML, so every spelling that reaches cargo-deny is seen the same
@@ -801,6 +822,33 @@ pub fn evaluate(root: &Path) -> Evaluation {
         return Evaluation::NoPolicy;
     };
     let checks = policy_checks(&policy);
+
+    // Both states below are reported BEFORE the optional-tool checks. Those
+    // report "not evaluated" and pass, which would be a green local run on a
+    // repository the CI gate rejects.
+    //
+    // cargo-deny loads the policy before it audits anything, so a policy that
+    // is not valid TOML fails the gate outright.
+    if let Err(error) = policy.parse::<toml::Table>() {
+        return Evaluation::Unavailable {
+            reason: one_line(&format!("{POLICY_FILE} is not valid TOML: {error}")),
+            checks,
+        };
+    }
+    // A section only one of the two derivations can see means the local check
+    // list and the CI check list differ, so no verdict here predicts that gate.
+    let invisible = checks_invisible_to_ci(&policy);
+    if !invisible.is_empty() {
+        return Evaluation::Unavailable {
+            reason: format!(
+                "{POLICY_FILE} declares {} in a spelling the CI workflow's check-list derivation cannot detect; write it as [{}]",
+                invisible.join(", "),
+                invisible.join("], [")
+            ),
+            checks,
+        };
+    }
+
     let Some(auditor) = auditor_version() else {
         return Evaluation::AuditorMissing { checks };
     };
@@ -1240,6 +1288,67 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::High);
         assert!(findings[0].blocking);
+    }
+
+    #[test]
+    fn a_malformed_policy_is_reported_before_the_optional_tool_checks() {
+        // Regression, reproduced: with a malformed `deny.toml` and no
+        // cargo-deny installed, doctor reported "not evaluated" and PASSED,
+        // while cargo-deny — and so the CI gate — exits 1 loading the file.
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            root.path().join(POLICY_FILE),
+            "[advisories]\nthis is not toml =\n",
+        )
+        .expect("policy");
+        match evaluate(root.path()) {
+            Evaluation::Unavailable { reason, .. } => {
+                assert!(reason.contains("not valid TOML"), "{reason}");
+            }
+            other => panic!("a malformed policy must not read as evaluable: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_spelling_only_doctor_can_see_is_reported_rather_than_diverging() {
+        // Doctor parses TOML; the scaffolded workflow greps. A basic key with
+        // an escape decodes for one and not the other, so the two check lists
+        // would differ — the one thing this design exists to prevent.
+        let escaped = "[advisories]\n[\"ban\\u0073\"]\n";
+        assert!(
+            policy_checks(escaped).contains(&"bans".to_owned()),
+            "the TOML parse must decode the key"
+        );
+        assert_eq!(checks_invisible_to_ci(escaped), vec!["bans".to_owned()]);
+
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join(POLICY_FILE), escaped).expect("policy");
+        match evaluate(root.path()) {
+            Evaluation::Unavailable { reason, .. } => {
+                assert!(reason.contains("bans"), "{reason}");
+                assert!(reason.contains("[bans]"), "the fix must be named: {reason}");
+            }
+            other => panic!("a divergent spelling must not read as evaluable: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_hand_written_spelling_is_visible_to_both_derivations() {
+        for policy in [
+            "[bans]\n",
+            "[ bans ]\n",
+            "[bans] # note\n",
+            "[bans.build]\n",
+            "[[bans.deny]]\n",
+            "bans.deny = []\n",
+            "[\"bans\"]\n",
+            "['bans']\n",
+        ] {
+            assert!(
+                checks_invisible_to_ci(policy).is_empty(),
+                "wrongly reported as invisible: {policy:?}"
+            );
+        }
     }
 
     // ── Bounded waiting ──────────────────────────────────────────────────────
