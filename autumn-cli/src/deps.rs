@@ -862,9 +862,9 @@ pub fn evaluate(root: &Path) -> Evaluation {
         return Evaluation::DatabaseMissing { checks };
     }
 
-    let output = Command::new("cargo")
+    let mut command = Command::new(AUDITOR);
+    command
         .args([
-            "deny",
             "--offline",
             "--format",
             "json",
@@ -873,8 +873,9 @@ pub fn evaluate(root: &Path) -> Evaluation {
             "check",
         ])
         .args(&checks)
-        .current_dir(&root)
-        .output();
+        .current_dir(&root);
+    no_toolchain_installs(&mut command);
+    let output = command.output();
     let output = match output {
         Ok(output) => output,
         Err(error) => {
@@ -914,15 +915,38 @@ fn policy_declares_db_path(policy: &str) -> bool {
     policy_db_path(policy).is_some()
 }
 
-/// The `cargo deny` version on PATH, if any.
+/// The auditor binary, invoked directly rather than as `cargo deny`.
+///
+/// `cargo` on PATH is rustup's shim: it reads the *project's*
+/// `rust-toolchain.toml` and installs that toolchain before running anything.
+/// Doctor runs inside the user's project, so going through the shim turns a
+/// read-only check into a toolchain download — and an interrupted one leaves a
+/// half-installed toolchain that breaks the next real `cargo build`. It also
+/// misreports: a shim failure surfaced here as "cargo-deny is not installed".
+/// cargo subcommands are plain `cargo-<name>` executables on PATH, so calling
+/// the binary skips rustup entirely and behaves identically (issue #1633).
+const AUDITOR: &str = "cargo-deny";
+
+/// Forbid a child from installing a Rust toolchain.
+///
+/// cargo-deny shells out to `cargo metadata`, which is rustup's shim again: on
+/// a project pinning a toolchain this machine lacks, that call *downloads* it.
+/// `autumn doctor` is a read-only check and must never mutate the user's
+/// toolchain — least of all halfway, which is what leaves the next `cargo
+/// build` broken. With this set, rustup errors instead, and the audit reports
+/// no verdict (issue #1633).
+fn no_toolchain_installs(command: &mut Command) {
+    command.env("RUSTUP_AUTO_INSTALL", "0");
+}
+
+/// The auditor's version, if it is installed.
 ///
 /// Reported alongside the verdict: the scaffolded CI pins its auditor, a local
 /// run uses whatever is installed, and a reader comparing the two needs both.
 fn auditor_version() -> Option<String> {
-    let output = Command::new("cargo")
-        .args(["deny", "--version"])
-        .output()
-        .ok()?;
+    let mut command = Command::new(AUDITOR);
+    no_toolchain_installs(&mut command);
+    let output = command.arg("--version").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1349,6 +1373,43 @@ mod tests {
                 "wrongly reported as invisible: {policy:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_auditor_is_never_invoked_through_the_rustup_shim() {
+        // Regression, caught by the Windows Tier 1 journey: `cargo` on PATH is
+        // rustup's shim, which reads the *project's* `rust-toolchain.toml` and
+        // installs that toolchain before running anything. Doctor runs inside
+        // the user's project, so `cargo deny` there turned a read-only check
+        // into a toolchain download; the next `cargo build` then failed with
+        // "the 'cargo.exe' binary ... is not applicable to the '1.88.0-...'
+        // toolchain". Invoking `cargo-deny` skips rustup entirely.
+        let source = include_str!("deps.rs");
+        let code = &source[..source.find("#[cfg(test)]").expect("test module")];
+        assert!(
+            !code.contains("Command::new(\"cargo\")"),
+            "this module must not run anything through the `cargo` shim"
+        );
+        assert_eq!(AUDITOR, "cargo-deny");
+        // cargo-deny reaches `cargo metadata` on its own, so every spawn must
+        // also forbid an install. One guard call per spawned command.
+        assert_eq!(
+            code.matches("Command::new(").count(),
+            code.matches("no_toolchain_installs(&mut").count(),
+            "every command this module spawns must be guarded"
+        );
+    }
+
+    #[test]
+    fn a_read_only_check_never_installs_a_toolchain() {
+        let mut command = Command::new(AUDITOR);
+        no_toolchain_installs(&mut command);
+        let set: Vec<_> = command
+            .get_envs()
+            .filter(|(key, _)| *key == "RUSTUP_AUTO_INSTALL")
+            .collect();
+        assert_eq!(set.len(), 1, "the guard must be set exactly once");
+        assert_eq!(set[0].1, Some(std::ffi::OsStr::new("0")));
     }
 
     // ── Bounded waiting ──────────────────────────────────────────────────────
