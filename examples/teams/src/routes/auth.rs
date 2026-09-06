@@ -292,13 +292,22 @@ pub async fn login(
     // validated for length, so an attacker could otherwise post a `next`
     // field sized against the request-body limit (32MiB default) and have it
     // echoed back into every failed-login re-render (Codex finding on this
-    // PR, originally raised against the analogous email echo).
+    // PR, originally raised against the analogous email echo). 2048, not
+    // email's 254: `safe_next` imposes no length contract of its own, so a
+    // tighter bound would silently truncate (and thereby corrupt) a longer
+    // but legitimate same-origin destination — e.g. a path with a real query
+    // string — on the very first failed attempt, redirecting a since-
+    // corrected retry to the wrong place instead of the one the user actually
+    // asked for (Codex finding on this fix). 2048 is far beyond anything this
+    // app's own routes ever produce, while still cutting an attacker's
+    // payload off by three orders of magnitude short of the request-body
+    // limit.
     let next: String = form
         .next
         .as_deref()
         .unwrap_or_default()
         .chars()
-        .take(254)
+        .take(2048)
         .collect();
     if email.len() > 254 || form.password.len() > 128 {
         // Same bound as the equivalent signup guard: this branch is the only
