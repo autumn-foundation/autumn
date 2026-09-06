@@ -295,8 +295,24 @@ LABEL_MAX_OPT = '{0,999}'
 # clickable image — and needs no exception, since the label text is not
 # blank.
 MD_LINK = re.compile(r'(?<![\\!])\[(' + FLAT + r'*)\]' + DEST)
+# A label may nest brackets to any depth, so long as they balance:
+# `[outer [middle [Mail]]](mail.md)` is a real link that renders
+# `outer [middle [Mail]]`. This stood at ONE level for most of this PR and was
+# recorded as a known limitation; it is a false positive, so a page whose only
+# route was written that way was reported as an orphan.
+#
+# Bounded depth rather than true recursion, exactly as `_nested_parens` already
+# does for destinations — the pattern grows linearly per level, so this stays a
+# regular expression instead of becoming a scanner.
+def _nested_brackets(depth):
+    body = FLAT
+    for _ in range(depth):
+        body = r'(?:' + FLAT + r'|\[(?:' + body + r')*\])'
+    return body
+
+
 MD_LINK_NESTED = re.compile(
-    r'(?<![\\!])\[((?:' + FLAT + r'|\[' + FLAT + r'*\])*)\]' + DEST)
+    r'(?<![\\!])\[((?:' + _nested_brackets(16) + r')*)\]' + DEST)
 # Markdown drops the backslash from an escaped ASCII punctuation character, so
 # `guide\(v2\).md` addresses the file `guide(v2).md` — same rule as the sibling.
 UNESCAPE = re.compile(r'\\([!-/:-@\[-`{-~])')
@@ -666,8 +682,10 @@ def strip_comments(txt):
     docs change. So fences are passed through untouched, and the run-to-EOF rule
     for an unclosed comment applies only to prose spans.
 
-    FOUR KNOWN LIMITATIONS, all narrow, all false POSITIVES, and all left
-    deliberately because the available fixes cost more than the bugs:
+    THREE REMAINING LIMITATIONS of the four once listed here, all narrow, all
+    false POSITIVES, and all left deliberately because the available fixes cost
+    more than the bugs. (3) has since been fixed and is kept as a note, because
+    the argument that justified leaving it was wrong in a way worth seeing.
 
     1. A four-space-INDENTED code block is not recognised, so an unclosed
        `<!--` inside one is read as a real comment. A naive "four spaces means
@@ -691,13 +709,15 @@ def strip_comments(txt):
        An unclosed `<!--` in such a block is then read as a real comment and
        truncates the rest of the page.
 
-    3. Link labels nest only one level deep. `[outer [inner [deep]]](x.md)` is
-       valid Markdown that neither this gate nor `check-docs-links.sh` matches,
-       because balanced nesting to arbitrary depth is not expressible as a
-       regular expression — it needs a bracket-matching scan. Both gates share
-       the limit, so neither disagrees with the other about such a link, and
-       one level covers the shape that actually occurs (a linked image,
-       `[![alt](img.png)](page.md)`).
+    3. FIXED, and left here so the reasoning that kept it is on record. This
+       said link labels nest only one level, because "balanced nesting to
+       arbitrary depth is not expressible as a regular expression". True, and
+       beside the point: `_nested_parens` in this same file had already been
+       matching nested destinations for the whole PR by unrolling to a BOUNDED
+       depth, which is expressible and which grows the pattern linearly. Labels
+       now do the same at depth 16 (`_nested_brackets`), measured at no cost to
+       the corpus run. `check-docs-links.sh` still stops at one level, so it is
+       now the stricter of the two on this shape.
 
     4. Code spans are masked before comments are located, so a comment whose
        terminator sits inside backticks — `<!-- note ``-->`` -->` — has that
@@ -1876,6 +1896,18 @@ def has_content(image_span, masked_span, raw_span=None):
     # A `hidden` subtree is not shown, so neither its text nor an image inside
     # it is content. `<a href=…><span hidden>Mail</span></a>` renders an empty
     # link, and stripping tags left `Mail` behind looking like a label.
+    #
+    # KNOWN GAP, a false negative, and one that a text rule provably cannot
+    # close. `[**<!-- c -->**](mail.md)` renders `<strong>` around nothing, so
+    # the link is empty — but `[**   **](mail.md)` renders the six visible
+    # characters `**   **`, because an opener followed by whitespace is not
+    # left-flanking and no emphasis forms. After the comment is masked space
+    # for space the two are the SAME STRING, so no test applied here can
+    # separate them: masking destroys the character that decided it. Stripping
+    # leftover delimiters would call the second one empty and orphan a page
+    # whose link works. Closing it means running emphasis parsing, not adding
+    # a rule — the same answer as the list-item definitions in
+    # `strip_quote_markers`, and for the same reason.
     # The RAW span goes along only so inline `display:none` can be read; the
     # views themselves are what get blanked.
     image_span = mask_hidden_subtrees(image_span, raw_span)
@@ -4435,6 +4467,24 @@ self_test() {
     > "$c9jn/docs/guide/jobs.md"
   git -C "$c9jn" add -A && git -C "$c9jn" commit -qm svg-display-none
   check "inline CSS does hide an svg" fail "$c9jn"
+
+  # A label may nest brackets to any depth so long as they balance, and this
+  # matched only one level for most of the PR.
+  local c9km="$tmp/c9km"; make_corpus "$c9km"
+  printf '# Jobs\n\n[outer [middle [Mail]]](mail.md)\n' > "$c9km/docs/guide/jobs.md"
+  git -C "$c9km" add -A && git -C "$c9km" commit -qm nested-label-three
+  check "a label nested three deep is still a link" pass "$c9km"
+
+  local c9kn="$tmp/c9kn"; make_corpus "$c9kn"
+  printf '# Jobs\n\n[a [b [c [d [Mail]]]]](mail.md)\n' > "$c9kn/docs/guide/jobs.md"
+  git -C "$c9kn" add -A && git -C "$c9kn" commit -qm nested-label-five
+  check "a label nested five deep is still a link" pass "$c9kn"
+
+  # ...and an empty label is still empty however deep the pattern reaches.
+  local c9ko="$tmp/c9ko"; make_corpus "$c9ko"
+  printf '# Jobs\n\n[](mail.md)\n' > "$c9ko/docs/guide/jobs.md"
+  git -C "$c9ko" add -A && git -C "$c9ko" commit -qm empty-label-still-empty
+  check "an empty label is still not a route" fail "$c9ko"
 
   # `inert` does not hide, it DEACTIVATES: the anchor still paints at 30x17
   # but cannot be activated, so the reader cannot follow it.
