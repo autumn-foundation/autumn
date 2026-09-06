@@ -1244,6 +1244,44 @@ the systemd unit via `EnvironmentFile`. They are never inlined into the
 world-readable unit, never placed on a command line, and never printed to logs
 or error messages.
 
+### Where a SQLite data file lives
+
+On the [SQLite tier](./sqlite-in-production.md) the database is a **file**, and a
+file inside a release directory does not survive the next deploy: each release
+gets its own directory, a slot unit's `WorkingDirectory` is that directory, and
+release retention deletes old ones. So `autumn deploy` treats the data file as
+persistent state:
+
+| Configured `[database] url` | What the deploy does |
+| --- | --- |
+| Relative — `sqlite://app.db` | Keeps the real file at `app_dir/shared/data/app.db` and links each release at `app.db`. |
+| Absolute outside the releases dir — `sqlite:///var/lib/myapp/app.db` | Leaves it exactly there; it is already release-independent. |
+| Absolute inside the app dir but outside `shared/` (`releases/…`, `current/…`) | Refused at preflight — retention would delete it. |
+| Relative but not a plain name — `sqlite://../x.db`, `sqlite://.` | Refused at preflight — it does not name a file inside the release dir. |
+| In-memory — `sqlite::memory:` | Refused at preflight — it does not survive a restart, let alone a deploy. |
+
+`shared/` is created by the deploy's `prepare-dirs` step, is never pruned, and is
+seen by both blue/green slots, so the file a release writes is the file the next
+release reads. SQLite follows the symlink when it names the `-wal`, `-shm` and
+`-journal` sidecars, so those land beside the shared file too. The link is created
+**before** the migration one-shot, so migrations and the app always open the same
+database. `deploy rollback` re-links its target before it starts it, because a
+release deployed before adoption holds no file at that path.
+
+**Upgrading an app deployed before this contract existed:** if the data file is
+still a real file in the currently serving release, the next `deploy up` moves it
+(and its sidecars) into `shared/data` and links it from there. Nothing to do by
+hand. **Take a backup first** (`autumn db backup`): the move happens while the
+old release is still serving, and it is the one deploy that relocates live data.
+
+The deploy never deletes a database file. A real file it finds at the link path
+in some other release — a rollback target from before the move — is set aside as
+`shared/data/<file>.superseded`, out of retention's reach; a deploy that would
+overwrite an existing one refuses instead.
+
+Back it up with [`autumn db backup`](./daemon.md#database-backups), which takes an
+online-safe snapshot of the file with no external tools.
+
 ### Troubleshooting
 
 - **Preflight is failing.** Run `autumn deploy check` (or `autumn doctor --online`)

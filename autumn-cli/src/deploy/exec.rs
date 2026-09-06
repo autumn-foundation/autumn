@@ -821,6 +821,10 @@ pub fn first_deploy_ops(
             shell_quote(&shared_dir)
         ),
     )));
+    // Keep the SQLite data file out of the release dir (#1909). Immediately after
+    // `prepare-dirs` and before the migrate one-shot, so the migration and the app
+    // open the same file.
+    ops.extend(sqlite_data_link_op(cfg, &release_dir).map(DeployOp::Run));
     ops.push(DeployOp::UploadFile {
         label: "upload-binary",
         local: binary_local.to_path_buf(),
@@ -1015,6 +1019,9 @@ pub fn cutover_ops(
             shell_quote(&shared_dir)
         ),
     )));
+    // Keep the SQLite data file out of the release dir (#1909) — same position as
+    // on the first-deploy path, and still before the migrate one-shot.
+    ops.extend(sqlite_data_link_op(cfg, &release_dir).map(DeployOp::Run));
     ops.push(DeployOp::UploadFile {
         label: "upload-binary",
         local: binary_local.to_path_buf(),
@@ -1368,7 +1375,13 @@ pub fn rollback_ops(
         .port
         .saturating_sub(if target.slot == SLOT_GREEN { 2 } else { 1 });
     let former_live_fallback_port = slot_app_port(public_port, other_slot(target.slot));
-    vec![
+    let mut ops = Vec::new();
+    // Re-link the rollback target at the shared SQLite data file (#1909) before its
+    // unit is written or started. A release deployed BEFORE the file was adopted
+    // into `shared/` no longer holds one at that path, so without this the
+    // rolled-back release would boot against a fresh, empty database.
+    ops.extend(sqlite_data_link_op(cfg, &target.release_dir).map(DeployOp::Run));
+    ops.extend([
         // Re-render the target slot's unit BEFORE bringing it up, so rollback can
         // never restart a slot unit that an earlier failed redeploy clobbered (see
         // the `target_unit` comment above). The unit is rendered from the target's
@@ -1437,7 +1450,8 @@ pub fn rollback_ops(
             "drain-rolled-back-slot",
             format!("systemctl disable --now {rolled_back_unit}.service"),
         )),
-    ]
+    ]);
+    ops
 }
 
 /// Teardown for an on-demand rollback that fails AT OR BEFORE the health-gated
@@ -1650,6 +1664,8 @@ pub const PRE_MIGRATE_LABELS: &[&str] = &[
     "proxy-install",
     "proxy-restart-if-changed",
     "prepare-dirs",
+    // #1909: the SQLite data-file link, emitted only for a SQLite app.
+    "link-data",
     "upload-binary",
     "upload-config",
     "write-env",
@@ -1721,6 +1737,101 @@ fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> Rem
             bin = shell_quote(&bin),
         ),
     )
+}
+
+/// The op that makes a `SQLite` data file survive a deploy (issue #1909), or
+/// `None` when there is nothing to keep (a Postgres app, or an absolute path
+/// already outside the app dir).
+///
+/// A slot unit's `WorkingDirectory` is the release dir, so a relative
+/// `sqlite://app.db` resolves inside a directory that is replaced on every
+/// deploy and deleted by retention. So the real file lives under `shared/data`,
+/// and the release is linked at the path the app resolves. This op creates that
+/// directory; `shared/` is never pruned and both slots see it. `SQLite` follows
+/// the symlink when it names the `-wal`/`-shm`/`-journal` sidecars, so they land
+/// beside the shared file too.
+///
+/// It runs immediately after `prepare-dirs`, and so BEFORE the migrate one-shot.
+/// A migration that ran first would apply to a file in the release dir that the
+/// app never opens.
+///
+/// Three steps, in order:
+///
+/// 1. **Adopt.** When the shared file does not exist yet but the currently
+///    serving release holds a REAL one (not a link), move it into `shared/data`.
+///    This is the upgrade path for an app deployed before this contract existed:
+///    without it the first deploy after the upgrade starts against an empty
+///    database and orphans the old one. **Sidecars move first, the database
+///    last**, so `shared/data/<file>` existing means the move finished — a retry
+///    after a dropped connection resumes instead of skipping a half-done move
+///    and silently dropping the old WAL.
+/// 2. **Link the serving release back.** Adoption takes the file out from under
+///    a release that keeps serving until cutover, and that release opens its
+///    database lazily. Without a link at the old path it would create a fresh,
+///    empty one and serve it.
+/// 3. **Link this release.** A stale link at the release path is removed.
+///    Anything else there is a real database — a rollback target from before
+///    adoption — so it is moved beside the shared file as `<file>.superseded`,
+///    under `shared/`, where retention never reaches it. The op refuses rather
+///    than overwrite an existing `.superseded`, so it can never destroy a
+///    database.
+///
+/// Every interpolated path is shell-quoted. Each `mv` and `ln` carries
+/// `|| exit 1`: a silently failed one leaves a dangling link, and the app then
+/// creates an empty database.
+#[must_use]
+pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Option<RemoteCommand> {
+    let relative = cfg.sqlite_data_file.as_ref()?;
+    let shared = cfg.shared_sqlite_data_file()?;
+    let superseded = format!("{shared}.superseded");
+    let shared_parent = parent_dir(&shared);
+    let in_release = format!("{release_dir}/{relative}");
+    let release_parent = parent_dir(&in_release);
+    let current_dir = cfg.current_symlink();
+    let current = format!("{current_dir}/{relative}");
+    let current_parent = parent_dir(&current);
+    Some(RemoteCommand::new(
+        "link-data",
+        format!(
+            "mkdir -p {shared_parent} {release_parent} && \
+             if [ ! -e {shared} ] && [ -f {current} ] && [ ! -L {current} ]; then \
+             for s in -wal -shm -journal; do \
+             if [ -f {current}$s ]; then mv {current}$s {shared}$s || exit 1; fi; \
+             done; \
+             mv {current} {shared} || exit 1; \
+             fi && \
+             if [ -e {shared} ] && [ -d {current_dir} ] && [ ! -e {current} ] && \
+             [ ! -L {current} ]; then \
+             mkdir -p {current_parent} && ln -s {shared} {current} || exit 1; \
+             fi && \
+             if [ -e {in_release} ] && [ ! -L {in_release} ]; then \
+             if [ -e {superseded} ]; then \
+             echo \"autumn deploy: refusing to move {in_release} aside: \
+             {superseded} already exists\" >&2; exit 1; \
+             fi; \
+             mv -f {in_release} {superseded} || exit 1; \
+             for s in -wal -shm -journal; do \
+             if [ -e {in_release}$s ]; then \
+             mv -f {in_release}$s {superseded}$s || exit 1; fi; \
+             done; \
+             fi && \
+             rm -f {in_release} && ln -s {shared} {in_release}",
+            shared_parent = shell_quote(&shared_parent),
+            release_parent = shell_quote(&release_parent),
+            shared = shell_quote(&shared),
+            superseded = shell_quote(&superseded),
+            current = shell_quote(&current),
+            current_dir = shell_quote(&current_dir),
+            current_parent = shell_quote(&current_parent),
+            in_release = shell_quote(&in_release),
+        ),
+    ))
+}
+
+/// The parent directory of a remote path, or `.` when it has none.
+fn parent_dir(path: &str) -> String {
+    path.rsplit_once('/')
+        .map_or_else(|| ".".to_owned(), |(head, _)| head.to_owned())
 }
 
 /// Prune shell: keep the newest `keep` release dirs, delete the rest — but NEVER
@@ -3503,6 +3614,12 @@ mod tests {
             "myapp",
         )
         .expect("deploy config resolves")
+    }
+
+    /// [`resolved`] plus the #1909 `SQLite` data-file contract: a relative
+    /// `sqlite://app.db`, which is the shape that needs relocating.
+    fn resolved_sqlite() -> ResolvedDeployConfig {
+        resolved().with_sqlite_data_file(Some("app.db".to_owned()))
     }
 
     const RELEASE_ID: &str = "20260714T120000Z";
@@ -7177,5 +7294,310 @@ mod tests {
             !exec.run_labels().contains(&"proxy-route"),
             "proxy must not be routed after a failed readiness gate"
         );
+    }
+
+    // ── SQLite data-file persistence (issue #1909) ─────────────────────────
+
+    /// A Postgres app emits no data-link op at all, so its op sequence is
+    /// byte-identical to pre-#1909.
+    #[test]
+    fn no_data_link_op_without_a_sqlite_data_file() {
+        assert!(sqlite_data_link_op(&resolved(), RELEASE_DIR).is_none());
+        let labels: Vec<&str> = sample_ops(Secret::new("X=1\n"))
+            .iter()
+            .map(DeployOp::label)
+            .collect();
+        assert!(!labels.contains(&"link-data"), "{labels:?}");
+    }
+
+    /// The link op is what makes the data file outlive the release: the real file
+    /// sits in `shared/data`, the release dir only holds a symlink at the path the
+    /// app resolves.
+    #[test]
+    fn the_data_link_op_points_the_release_at_the_shared_file() {
+        let cfg = resolved_sqlite();
+        let op = sqlite_data_link_op(&cfg, RELEASE_DIR).expect("a SQLite app links its data file");
+        assert_eq!(op.label, "link-data");
+        assert!(
+            op.shell.contains(
+                "ln -s '/srv/autumn/myapp/shared/data/app.db' \
+                    '/srv/autumn/myapp/releases/20260714T120000Z/app.db'"
+            ),
+            "the release path must be a link to the shared file: {}",
+            op.shell
+        );
+        // The shared dir must exist before the link is made, and a stale entry at
+        // the release path must be cleared or `ln` would link INSIDE a directory.
+        assert!(
+            op.shell
+                .contains("mkdir -p '/srv/autumn/myapp/shared/data'"),
+            "{}",
+            op.shell
+        );
+        assert!(
+            op.shell
+                .contains("rm -f '/srv/autumn/myapp/releases/20260714T120000Z/app.db'"),
+            "{}",
+            op.shell
+        );
+    }
+
+    /// The upgrade path for an app deployed BEFORE #1909: its data file is a real
+    /// file inside the currently serving release. Without adoption the first
+    /// post-upgrade deploy would start against an empty database and orphan it.
+    #[test]
+    fn the_data_link_op_adopts_a_real_file_from_the_current_release() {
+        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        assert!(
+            op.shell
+                .contains("[ ! -e '/srv/autumn/myapp/shared/data/app.db' ]")
+                && op
+                    .shell
+                    .contains("[ -f '/srv/autumn/myapp/current/app.db' ]")
+                && op
+                    .shell
+                    .contains("[ ! -L '/srv/autumn/myapp/current/app.db' ]"),
+            "adoption must be guarded on: no shared file yet, and a REAL (not \
+             already-linked) file in the current release: {}",
+            op.shell
+        );
+        assert!(
+            op.shell.contains(
+                "mv '/srv/autumn/myapp/current/app.db' \
+                '/srv/autumn/myapp/shared/data/app.db'"
+            ),
+            "{}",
+            op.shell
+        );
+        assert!(
+            op.shell.contains("for s in -wal -shm"),
+            "the sidecars of a crashed app must be adopted with the database: {}",
+            op.shell
+        );
+        // A silently failed move would leave the link dangling and the app would
+        // create a fresh, empty database — the loss this op exists to prevent.
+        assert!(
+            op.shell.contains("mv '/srv/autumn/myapp/current/app.db'$s"),
+            "sidecar adoption must move the same paths: {}",
+            op.shell
+        );
+        // The sidecars move FIRST and the database LAST, so the shared file
+        // existing means the move finished. A retry after a dropped connection
+        // then resumes instead of skipping a half-done move and dropping the WAL.
+        let sidecar_move = op
+            .shell
+            .find("mv '/srv/autumn/myapp/current/app.db'$s")
+            .expect("sidecar move");
+        let db_move = op
+            .shell
+            .find("mv '/srv/autumn/myapp/current/app.db' '/srv/autumn/myapp/shared/data/app.db'")
+            .expect("database move");
+        assert!(
+            sidecar_move < db_move,
+            "sidecars must move before the database: {}",
+            op.shell
+        );
+    }
+
+    /// Adoption takes the file out from under a release that keeps serving until
+    /// cutover, and that release opens its database lazily. Without a link back
+    /// at the old path it creates a fresh, empty one and serves it.
+    #[test]
+    fn the_data_link_op_links_the_still_serving_release_back() {
+        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        assert!(
+            op.shell.contains(
+                "ln -s '/srv/autumn/myapp/shared/data/app.db' '/srv/autumn/myapp/current/app.db'"
+            ),
+            "the serving release must be re-linked at the shared file: {}",
+            op.shell
+        );
+        // …but only when `current` exists, so a first deploy never creates it as a
+        // real directory.
+        assert!(
+            op.shell.contains("[ -d '/srv/autumn/myapp/current' ]"),
+            "the back-link must be guarded on an existing `current`: {}",
+            op.shell
+        );
+    }
+
+    /// The op must never delete a database file. A rollback target deployed
+    /// before adoption still holds a real one at that path; it is moved aside,
+    /// not removed.
+    #[test]
+    fn the_data_link_op_never_deletes_a_real_database_file() {
+        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        assert!(
+            !op.shell.contains("rm -rf"),
+            "no recursive delete may touch a database path: {}",
+            op.shell
+        );
+        assert!(
+            op.shell.contains(
+                "if [ -e '/srv/autumn/myapp/releases/20260714T120000Z/app.db' ] && \
+                 [ ! -L '/srv/autumn/myapp/releases/20260714T120000Z/app.db' ]"
+            ),
+            "a real file must be distinguished from a stale link: {}",
+            op.shell
+        );
+        // It is moved beside the SHARED file, under `shared/`, where release
+        // retention never reaches it.
+        assert!(
+            op.shell.contains(
+                "mv -f '/srv/autumn/myapp/releases/20260714T120000Z/app.db' \
+                 '/srv/autumn/myapp/shared/data/app.db.superseded'"
+            ),
+            "a real file must be moved aside into shared/: {}",
+            op.shell
+        );
+        // …and never over an existing one.
+        assert!(
+            op.shell
+                .contains("if [ -e '/srv/autumn/myapp/shared/data/app.db.superseded' ]"),
+            "an existing superseded copy must be refused, not overwritten: {}",
+            op.shell
+        );
+    }
+
+    /// Both journal modes leave sidecars. WAL leaves `-wal`/`-shm`; the default
+    /// rollback journal leaves `-journal`, and `VACUUM INTO` writes its output in
+    /// that mode whatever the source used. All three must move with the database.
+    #[test]
+    fn the_data_link_op_moves_every_sidecar_kind() {
+        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        assert_eq!(
+            op.shell.matches("for s in -wal -shm -journal").count(),
+            2,
+            "both the adopt and the move-aside step must cover every sidecar: {}",
+            op.shell
+        );
+    }
+
+    /// The link must exist before the migrate one-shot runs, on BOTH deploy paths:
+    /// a migration applied to a file in the release dir is a migration the app
+    /// never sees.
+    #[test]
+    fn the_data_link_precedes_the_migration_on_both_deploy_paths() {
+        let cfg = resolved_sqlite();
+        let plan = SlotPlan {
+            live_slot: SLOT_GREEN,
+            live_port: 3002,
+            candidate_slot: SLOT_BLUE,
+            candidate_port: 3001,
+            public_port: 3000,
+        };
+        let unit = super::super::render_app_unit(&cfg, RELEASE_DIR, 3001, SLOT_BLUE);
+        for (path, ops) in [
+            (
+                "first deploy",
+                first_deploy_ops(
+                    &cfg,
+                    &proxy(),
+                    &unit,
+                    Secret::new("X=1\n"),
+                    Path::new("/tmp/app"),
+                    &[],
+                    RELEASE_ID,
+                    &plan,
+                    MigrateStep::Run,
+                ),
+            ),
+            (
+                "redeploy",
+                cutover_ops(
+                    &cfg,
+                    &proxy(),
+                    &unit,
+                    Secret::new("X=1\n"),
+                    Path::new("/tmp/app"),
+                    &[],
+                    RELEASE_ID,
+                    &plan,
+                    &ProxyServiceOptions {
+                        tls: false,
+                        host: None,
+                    },
+                    MigrateStep::Run,
+                ),
+            ),
+        ] {
+            let labels: Vec<&str> = ops.iter().map(DeployOp::label).collect();
+            let link = labels
+                .iter()
+                .position(|l| *l == "link-data")
+                .unwrap_or_else(|| panic!("{path}: no link-data op in {labels:?}"));
+            let prepare = labels
+                .iter()
+                .position(|l| *l == "prepare-dirs")
+                .expect("prepare-dirs");
+            let migrate = labels
+                .iter()
+                .position(|l| *l == "migrate")
+                .expect("migrate");
+            assert!(
+                prepare < link && link < migrate,
+                "{path}: the link must sit between prepare-dirs and migrate: {labels:?}"
+            );
+        }
+    }
+
+    /// A rollback target deployed before adoption no longer holds the file at that
+    /// path, so the rolled-back release must be re-linked before it is started.
+    #[test]
+    fn rollback_relinks_the_target_release_before_starting_it() {
+        let target = RollbackTarget {
+            release_dir: "/srv/autumn/myapp/releases/20260713T120000Z".to_owned(),
+            slot: SLOT_GREEN,
+            port: 3002,
+        };
+        let ops = rollback_ops(&resolved_sqlite(), &proxy(), &target);
+        let labels: Vec<&str> = ops.iter().map(DeployOp::label).collect();
+        let link = labels
+            .iter()
+            .position(|l| *l == "link-data")
+            .unwrap_or_else(|| panic!("no link-data op in {labels:?}"));
+        let start = labels
+            .iter()
+            .position(|l| *l == "restart-previous")
+            .expect("restart-previous");
+        assert!(
+            link < start,
+            "the link must precede the restart: {labels:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                DeployOp::Run(c)
+                    if c.shell
+                        .contains("'/srv/autumn/myapp/releases/20260713T120000Z/app.db'")
+            )),
+            "the rollback must link the TARGET release dir, not the current one"
+        );
+        // A Postgres rollback is unchanged.
+        let plain: Vec<&str> = rollback_ops(&resolved(), &proxy(), &target)
+            .iter()
+            .map(DeployOp::label)
+            .collect();
+        assert!(!plain.contains(&"link-data"), "{plain:?}");
+    }
+
+    /// Release retention removes release DIRS. `rm -rf` unlinks a symlink rather
+    /// than following it, so pruning a release can never reach the shared data
+    /// file — but only as long as the prune shell never opts into following.
+    #[test]
+    fn pruning_a_release_never_follows_the_data_symlink() {
+        let shell = prune_releases_shell(
+            "/srv/autumn/myapp/releases",
+            "/srv/autumn/myapp/current",
+            "/srv/autumn/myapp/shared/previous-release",
+            3,
+        );
+        assert!(shell.contains("rm -rf"), "{shell}");
+        for follows in ["-follow", "-L ", "--dereference", "cp -L"] {
+            assert!(
+                !shell.contains(follows),
+                "the prune must not follow symlinks ({follows}): {shell}"
+            );
+        }
     }
 }

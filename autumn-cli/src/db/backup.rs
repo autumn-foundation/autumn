@@ -41,6 +41,7 @@ use std::sync::Arc;
 use autumn_web::alerts::{Alert, AlertChannel, AlertCondition};
 
 use crate::db::s3::{self, S3Client, S3Config, S3Credentials};
+use crate::db::sqlite_snapshot;
 use crate::migrate;
 
 /// Environment variable that pins the directory holding `pg_dump`/`pg_restore`.
@@ -174,6 +175,15 @@ pub enum BackupError {
     /// A shelled-out tool exited non-zero. Carries the tool name and a
     /// credential-safe context string.
     ToolFailed { tool: String, context: String },
+    /// A `SQLite` snapshot or restore failed (issue #1909). `detail` is a
+    /// [`sqlite_snapshot::SnapshotError`] rendering — a file path, never a
+    /// credential (`SQLite` targets carry none).
+    SqliteFailed {
+        /// `"backup"` or `"restore"`.
+        op: &'static str,
+        /// Operator-facing detail.
+        detail: String,
+    },
     /// A filesystem operation failed.
     Io {
         context: String,
@@ -235,6 +245,7 @@ impl std::fmt::Display for BackupError {
             Self::ToolFailed { tool, context } => {
                 write!(f, "`{tool}` failed: {context}")
             }
+            Self::SqliteFailed { op, detail } => write!(f, "SQLite {op} failed: {detail}"),
             Self::Io { context, source } => write!(f, "{context}: {source}"),
             Self::IntegrityFailed { detail } => write!(
                 f,
@@ -292,6 +303,60 @@ impl BackupError {
     }
 }
 
+/// Which mechanism captures and restores ONE target (issue #1909).
+///
+/// [`BackupFormat`] grades Postgres artifacts only. A `SQLite` target is always a
+/// `.sqlite` file, whatever `--format` says. Each manifest entry records its own
+/// backend, so a mixed run restores every entry through the mechanism that wrote
+/// it. A manifest without the field is Postgres.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TargetBackend {
+    /// `pg_dump`/`pg_restore`/`psql`. The default, and what an absent manifest
+    /// field means.
+    #[default]
+    Postgres,
+    /// `SQLite`'s own `VACUUM INTO` snapshot ([`crate::db::sqlite_snapshot`]).
+    Sqlite,
+}
+
+impl TargetBackend {
+    /// Classify a resolved connection URL. Anything that is not an explicit
+    /// `sqlite:`/`file:` target is Postgres, mirroring `autumn migrate`'s rule
+    /// (`is_sqlite_target`): an unrecognized string keeps the historical path.
+    fn detect(url: &str) -> Self {
+        match autumn_web::config::DatabaseBackend::detect(url) {
+            Some(autumn_web::config::DatabaseBackend::Sqlite) => Self::Sqlite,
+            _ => Self::Postgres,
+        }
+    }
+
+    /// The manifest spelling.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Sqlite => "sqlite",
+        }
+    }
+
+    /// Read a manifest spelling. An empty or unknown value is Postgres, so a
+    /// manifest without the field restores exactly as before.
+    fn from_manifest(raw: &str) -> Self {
+        if raw.eq_ignore_ascii_case("sqlite") {
+            Self::Sqlite
+        } else {
+            Self::Postgres
+        }
+    }
+
+    /// The artifact file extension for this backend and (Postgres) format.
+    const fn extension(self, format: BackupFormat) -> &'static str {
+        match self {
+            Self::Postgres => format.extension(),
+            Self::Sqlite => "sqlite",
+        }
+    }
+}
+
 /// A single database captured by (or to be restored from) a backup run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedTarget {
@@ -299,6 +364,8 @@ struct ResolvedTarget {
     label: String,
     /// The resolved connection URL (never printed).
     url: String,
+    /// Which backend captures this target.
+    backend: TargetBackend,
 }
 
 // ─── Entry points ───────────────────────────────────────────────────────────
@@ -331,7 +398,14 @@ pub(super) fn backup(args: &BackupArgs) -> Result<(), BackupError> {
     // AUTUMN_MANAGED_PG_DATA_DIR isn't inherited) so a managed backup needs zero
     // external tools on PATH (issue #1595).
     let tools = PgTools::locate_with_extra(managed_pg_data_dir());
-    let pg_dump = tools.require("pg_dump")?;
+    // Resolve `pg_dump` only when the run holds a Postgres target (issue #1909).
+    // An all-SQLite app has no client tools and needs none. A mixed run still
+    // fails before any artifact is written.
+    let pg_dump = if targets.iter().any(|t| t.backend == TargetBackend::Postgres) {
+        Some(tools.require("pg_dump")?)
+    } else {
+        None
+    };
 
     let profile = migrate::effective_profile(args.profile.as_deref());
 
@@ -360,17 +434,24 @@ pub(super) fn backup(args: &BackupArgs) -> Result<(), BackupError> {
     // Everything below writes into `run_dir`. On ANY failure we remove the
     // whole run directory so a partial/empty artifact is never left behind and
     // never counted toward retention (AC #1).
-    let result = backup_into(&run_dir, &targets, args.format, &pg_dump, &tools, &profile);
+    let result = backup_into(
+        &run_dir,
+        &targets,
+        args.format,
+        pg_dump.as_deref(),
+        &tools,
+        &profile,
+    );
     if let Err(e) = result {
         let _ = std::fs::remove_dir_all(&run_dir);
         return Err(e);
     }
 
     eprintln!(
-        "\n\u{2713} Backup complete: {} ({} target(s), {} format).",
+        "\n\u{2713} Backup complete: {} ({} target(s), {}).",
         run_dir.display(),
         targets.len(),
-        args.format.pg_dump_format_flag(),
+        run_format_note(&targets, args.format),
     );
 
     // Retention runs only AFTER a verified-successful backup, so a failed run
@@ -407,6 +488,20 @@ pub(super) fn backup(args: &BackupArgs) -> Result<(), BackupError> {
         }
     }
     Ok(())
+}
+
+/// The format phrase in the completion line.
+///
+/// `--format` grades Postgres artifacts only. An all-SQLite run therefore reports
+/// `SQLite snapshot`, not a format it ignored. A mixed run names both.
+fn run_format_note(targets: &[ResolvedTarget], format: BackupFormat) -> String {
+    let sqlite = targets.iter().any(|t| t.backend == TargetBackend::Sqlite);
+    let postgres = targets.iter().any(|t| t.backend == TargetBackend::Postgres);
+    match (postgres, sqlite) {
+        (true, true) => format!("{} format + SQLite snapshot", format.pg_dump_format_flag()),
+        (false, true) => "SQLite snapshot".to_owned(),
+        _ => format!("{} format", format.pg_dump_format_flag()),
+    }
 }
 
 /// Best-effort operator alert for a failed offsite upload (#1743).
@@ -488,13 +583,13 @@ fn backup_into(
     run_dir: &Path,
     targets: &[ResolvedTarget],
     format: BackupFormat,
-    pg_dump: &Path,
+    pg_dump: Option<&Path>,
     tools: &PgTools,
     profile: &str,
 ) -> Result<(), BackupError> {
     let mut manifest_targets = Vec::with_capacity(targets.len());
     for target in targets {
-        let file_name = artifact_file_name(&target.label, format);
+        let file_name = artifact_file_name(&target.label, target.backend, format);
         let out_path = run_dir.join(&file_name);
         eprintln!(
             "\u{2500}\u{2500} backing up {} \u{2500}\u{2500}",
@@ -502,14 +597,32 @@ fn backup_into(
         );
 
         let db = parsed_db_name(&target.url);
-        run_pg_dump(pg_dump, &target.url, &out_path, format, &db)?;
-        verify_artifact(&out_path, format, &db, tools)?;
+        match target.backend {
+            TargetBackend::Postgres => {
+                // `pg_dump` is `Some` whenever any Postgres target is in the run
+                // (resolved in `backup` above), so this arm always has it.
+                let pg_dump = pg_dump.ok_or_else(|| BackupError::ToolMissing {
+                    tool: "pg_dump".to_owned(),
+                })?;
+                run_pg_dump(pg_dump, &target.url, &out_path, format, &db)?;
+            }
+            TargetBackend::Sqlite => {
+                sqlite_snapshot::snapshot(&target.url, &out_path).map_err(|e| {
+                    BackupError::SqliteFailed {
+                        op: "backup",
+                        detail: e.to_string(),
+                    }
+                })?;
+            }
+        }
+        verify_artifact(&out_path, target.backend, format, &db, tools)?;
         eprintln!("  \u{2713} {file_name} verified.");
 
         manifest_targets.push(ManifestTarget {
             label: target.label.clone(),
             file: file_name,
             database: db,
+            backend: target.backend.as_str().to_owned(),
         });
     }
 
@@ -789,10 +902,18 @@ fn run_pg_dump(
 /// * Plain: the file must be non-empty AND end with `pg_dump`'s completion marker.
 fn verify_artifact(
     path: &Path,
+    backend: TargetBackend,
     format: BackupFormat,
     db: &str,
     tools: &PgTools,
 ) -> Result<(), BackupError> {
+    // A SQLite artifact IS a database: grade it with `PRAGMA integrity_check`
+    // (issue #1909) rather than a Postgres archive reader.
+    if backend == TargetBackend::Sqlite {
+        return sqlite_snapshot::verify(path).map_err(|e| BackupError::IntegrityFailed {
+            detail: format!("{db}: {e}"),
+        });
+    }
     let len = std::fs::metadata(path)
         .map_err(BackupError::io(format!("stat {}", path.display())))?
         .len();
@@ -933,11 +1054,35 @@ fn apply_restore_plan(plan: &RestorePlan, args: &RestoreArgs) -> Result<(), Back
     // with zero external tools on PATH (issue #1595).
     let tools = PgTools::locate_with_extra(managed_pg_data_dir());
 
+    // Refuse a backend mismatch before anything else (issue #1909). Each entry's
+    // mechanism comes from the MANIFEST, the database it writes to from the
+    // CONFIG, so restoring a SQLite run into a Postgres environment (or the
+    // reverse) would otherwise fail deep inside a driver with an unrelated
+    // message. Names labels and backends only — never a URL.
+    for (entry, url) in &targets {
+        let recorded = TargetBackend::from_manifest(&entry.backend);
+        let configured = TargetBackend::detect(url);
+        if recorded != configured {
+            return Err(BackupError::BadArtifact {
+                detail: format!(
+                    "the {:?} artifact is a {} backup, but the configured {:?} database is \
+                     {}.\n  Restore it against the backend it was taken from, or fix \
+                     database.primary_url for this profile.",
+                    entry.label,
+                    recorded.as_str(),
+                    entry.label,
+                    configured.as_str()
+                ),
+            });
+        }
+    }
+
     // Verify EVERY artifact before mutating ANY database (AC #4): refuse to
     // start a destructive restore we can't finish.
     for (entry, _url) in &targets {
         let db = format!("(artifact) {}", entry.label);
-        verify_artifact(&plan.dir.join(&entry.file), format, &db, &tools)?;
+        let backend = TargetBackend::from_manifest(&entry.backend);
+        verify_artifact(&plan.dir.join(&entry.file), backend, format, &db, &tools)?;
         eprintln!("  \u{2713} {} integrity verified.", entry.file);
     }
 
@@ -948,7 +1093,14 @@ fn apply_restore_plan(plan: &RestorePlan, args: &RestoreArgs) -> Result<(), Back
         );
         let artifact = plan.dir.join(&entry.file);
         let db = parsed_db_name(url);
-        run_restore_one(&tools, url, &artifact, format, &db)?;
+        run_restore_one(
+            &tools,
+            url,
+            &artifact,
+            TargetBackend::from_manifest(&entry.backend),
+            format,
+            &db,
+        )?;
         eprintln!("  \u{2713} restored {}.", entry.label);
     }
 
@@ -961,9 +1113,18 @@ fn run_restore_one(
     tools: &PgTools,
     url: &str,
     artifact: &Path,
+    backend: TargetBackend,
     format: BackupFormat,
     db: &str,
 ) -> Result<(), BackupError> {
+    // A SQLite artifact replaces the data file it was taken from; no external
+    // tool, and no `--clean` equivalent needed (issue #1909).
+    if backend == TargetBackend::Sqlite {
+        return sqlite_snapshot::restore(artifact, url).map_err(|e| BackupError::SqliteFailed {
+            op: "restore",
+            detail: e.to_string(),
+        });
+    }
     match format {
         BackupFormat::Custom => {
             let pg_restore = tools.require("pg_restore")?;
@@ -1067,12 +1228,13 @@ impl RestorePlan {
             // restore target from `--shard` or the filename convention (never
             // blindly `control`, which would corrupt the control DB with shard
             // data).
-            let format = infer_format_from_path(path).ok_or_else(|| BackupError::BadArtifact {
-                detail: format!(
-                    "{} is neither a run directory nor a .dump/.sql artifact",
-                    path.display()
-                ),
-            })?;
+            let (backend, format) =
+                infer_artifact_kind(path).ok_or_else(|| BackupError::BadArtifact {
+                    detail: format!(
+                        "{} is neither a run directory nor a .dump/.sql/.sqlite artifact",
+                        path.display()
+                    ),
+                })?;
             let dir = path
                 .parent()
                 .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
@@ -1088,6 +1250,7 @@ impl RestorePlan {
                     label,
                     file,
                     database: String::new(),
+                    backend: backend.as_str().to_owned(),
                 }],
             });
         }
@@ -1254,6 +1417,7 @@ fn build_targets(
         TargetSelector::ControlOnly => control
             .map(|url| {
                 vec![ResolvedTarget {
+                    backend: TargetBackend::detect(&url),
                     label: "control".to_owned(),
                     url,
                 }]
@@ -1269,12 +1433,14 @@ fn build_targets(
             Ok(vec![ResolvedTarget {
                 label: format!("shard:{name}"),
                 url: url.clone(),
+                backend: TargetBackend::detect(url),
             }])
         }
         TargetSelector::All => {
             let mut targets = Vec::new();
             if let Some(control_url) = control {
                 targets.push(ResolvedTarget {
+                    backend: TargetBackend::detect(&control_url),
                     label: "control".to_owned(),
                     url: control_url,
                 });
@@ -1283,6 +1449,7 @@ fn build_targets(
             }
             for (name, url) in shards {
                 targets.push(ResolvedTarget {
+                    backend: TargetBackend::detect(&url),
                     label: format!("shard:{name}"),
                     url,
                 });
@@ -1543,6 +1710,11 @@ struct ManifestTarget {
     /// The database name captured (credential-free; for humans).
     #[serde(default)]
     database: String,
+    /// Which backend produced this artifact: `"postgres"` or `"sqlite"`. An
+    /// absent field means `"postgres"`. Per target, not per run, so a mixed
+    /// topology restores each entry through the mechanism that wrote it.
+    #[serde(default)]
+    backend: String,
 }
 
 /// Self-describing metadata for a backup run. Written as `manifest.json`; the
@@ -1641,8 +1813,8 @@ fn create_unique_run_dir(root: &Path, base: &str) -> Result<PathBuf, BackupError
 }
 
 /// The artifact file name for one target and format.
-fn artifact_file_name(label: &str, format: BackupFormat) -> String {
-    let ext = format.extension();
+fn artifact_file_name(label: &str, backend: TargetBackend, format: BackupFormat) -> String {
+    let ext = backend.extension(format);
     if label == "control" {
         format!("control.{ext}")
     } else if let Some(name) = label.strip_prefix("shard:") {
@@ -1712,11 +1884,13 @@ fn single_file_target_label(file: &str, shard: Option<&str>) -> Result<String, B
     Ok("control".to_owned())
 }
 
-/// Infer a backup format from a file extension.
-fn infer_format_from_path(path: &Path) -> Option<BackupFormat> {
+/// Infer a bare artifact file's backend and (Postgres) format from its
+/// extension — the inverse of [`artifact_file_name`].
+fn infer_artifact_kind(path: &Path) -> Option<(TargetBackend, BackupFormat)> {
     match path.extension().and_then(|e| e.to_str()) {
-        Some("dump") => Some(BackupFormat::Custom),
-        Some("sql") => Some(BackupFormat::Plain),
+        Some("dump") => Some((TargetBackend::Postgres, BackupFormat::Custom)),
+        Some("sql") => Some((TargetBackend::Postgres, BackupFormat::Plain)),
+        Some("sqlite") => Some((TargetBackend::Sqlite, BackupFormat::default())),
         _ => None,
     }
 }
@@ -2807,16 +2981,29 @@ mod tests {
     #[test]
     fn artifact_file_name_distinguishes_control_and_shards() {
         assert_eq!(
-            artifact_file_name("control", BackupFormat::Custom),
+            artifact_file_name("control", TargetBackend::Postgres, BackupFormat::Custom),
             "control.dump"
         );
         assert_eq!(
-            artifact_file_name("shard:us_east", BackupFormat::Custom),
+            artifact_file_name(
+                "shard:us_east",
+                TargetBackend::Postgres,
+                BackupFormat::Custom
+            ),
             "shard-us_east.dump"
         );
         assert_eq!(
-            artifact_file_name("shard:us east", BackupFormat::Plain),
+            artifact_file_name(
+                "shard:us east",
+                TargetBackend::Postgres,
+                BackupFormat::Plain
+            ),
             "shard-us_east.sql"
+        );
+        // A SQLite target's artifact is a database file, whatever `--format` said.
+        assert_eq!(
+            artifact_file_name("control", TargetBackend::Sqlite, BackupFormat::Plain),
+            "control.sqlite"
         );
     }
 
@@ -3080,8 +3267,14 @@ mod tests {
         let archive = tmp.path().join("control.dump");
         std::fs::write(&archive, b"PGDMP synthetic archive").unwrap();
 
-        verify_artifact(&archive, BackupFormat::Custom, "app", &tools)
-            .expect("verify resolves the bundled pg_restore and accepts the TOC");
+        verify_artifact(
+            &archive,
+            TargetBackend::Postgres,
+            BackupFormat::Custom,
+            "app",
+            &tools,
+        )
+        .expect("verify resolves the bundled pg_restore and accepts the TOC");
     }
 
     #[test]
@@ -3218,17 +3411,224 @@ mod tests {
         assert_eq!(got, None);
     }
 
+    // ── SQLite backend dispatch (issue #1909) ──────────────────────────────
+
+    #[test]
+    fn target_backend_detects_sqlite_and_defaults_everything_else_to_postgres() {
+        for sqlite in ["sqlite:///var/lib/app.db", "sqlite:app.db", "file:app.db"] {
+            assert_eq!(
+                TargetBackend::detect(sqlite),
+                TargetBackend::Sqlite,
+                "{sqlite}"
+            );
+        }
+        for postgres in [
+            "postgres://u:p@h:5432/app",
+            "postgresql://h/app",
+            "host=db user=app sslmode=require",
+            // An unrecognized target keeps the historical Postgres path rather
+            // than being guessed at, mirroring `autumn migrate`'s rule.
+            "/var/lib/app.db",
+            "",
+        ] {
+            assert_eq!(
+                TargetBackend::detect(postgres),
+                TargetBackend::Postgres,
+                "{postgres:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_backend_defaults_to_postgres_for_pre_1909_artifacts() {
+        // A manifest written before #1909 has no `backend` field, so serde fills
+        // an empty string; it must restore through the Postgres path exactly as
+        // it always did.
+        let legacy: Manifest = serde_json::from_str(
+            r#"{"autumn_version":"0.6.0","created_at":"2026-07-10T04:05:06+00:00",
+                "profile":"prod","format":"custom",
+                "targets":[{"label":"control","file":"control.dump","database":"app"}]}"#,
+        )
+        .expect("a pre-#1909 manifest must still parse");
+        assert_eq!(legacy.targets[0].backend, "");
+        assert_eq!(
+            TargetBackend::from_manifest(&legacy.targets[0].backend),
+            TargetBackend::Postgres
+        );
+        assert_eq!(
+            TargetBackend::from_manifest("sqlite"),
+            TargetBackend::Sqlite
+        );
+        assert_eq!(
+            TargetBackend::from_manifest("SQLite"),
+            TargetBackend::Sqlite
+        );
+    }
+
+    /// The mismatch guard must refuse before anything is touched, and must name
+    /// the backends without ever quoting the URL (which carries a password).
+    #[test]
+    fn restoring_an_artifact_into_the_wrong_backend_is_refused_up_front() {
+        let entry = |backend: &str| ManifestTarget {
+            label: "control".to_owned(),
+            file: "control.sqlite".to_owned(),
+            database: "app".to_owned(),
+            backend: backend.to_owned(),
+        };
+        let url = "postgres://app:hunter2@db.example.com/app";
+        assert_ne!(
+            TargetBackend::from_manifest(&entry("sqlite").backend),
+            TargetBackend::detect(url),
+            "the guard's premise: a SQLite artifact against a Postgres URL"
+        );
+        // …and a legacy manifest (no backend field) against a Postgres URL must
+        // still agree, so the guard can never refuse an existing restore.
+        assert_eq!(
+            TargetBackend::from_manifest(&entry("").backend),
+            TargetBackend::detect(url)
+        );
+        // A legacy manifest against a SQLite URL is a real mismatch too.
+        assert_ne!(
+            TargetBackend::from_manifest(&entry("").backend),
+            TargetBackend::detect("sqlite://app.db")
+        );
+    }
+
+    #[test]
+    fn build_targets_classifies_a_sqlite_control_url() {
+        let targets = build_targets(
+            Some("sqlite://app.db".to_owned()),
+            Vec::new(),
+            &TargetSelector::All,
+        )
+        .expect("a lone sqlite control resolves");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].backend, TargetBackend::Sqlite);
+    }
+
+    #[test]
+    fn run_format_note_reports_the_snapshot_a_sqlite_run_actually_took() {
+        let sqlite = ResolvedTarget {
+            label: "control".to_owned(),
+            url: "sqlite://app.db".to_owned(),
+            backend: TargetBackend::Sqlite,
+        };
+        let postgres = ResolvedTarget {
+            label: "shard:east".to_owned(),
+            url: "postgres://h/east".to_owned(),
+            backend: TargetBackend::Postgres,
+        };
+        // `--format` grades Postgres artifacts only, so an all-SQLite run must not
+        // claim a `custom` format it ignored.
+        assert_eq!(
+            run_format_note(std::slice::from_ref(&sqlite), BackupFormat::Custom),
+            "SQLite snapshot"
+        );
+        assert_eq!(
+            run_format_note(std::slice::from_ref(&postgres), BackupFormat::Plain),
+            "plain format"
+        );
+        assert_eq!(
+            run_format_note(&[postgres, sqlite], BackupFormat::Custom),
+            "custom format + SQLite snapshot"
+        );
+    }
+
+    /// The whole `SQLite` backup → restore contract through `backup_into` and
+    /// `run_restore_one`, with **no Postgres client tools involved**: a `SQLite` app
+    /// on the zero-ops tier has none, so `pg_dump` is passed as `None` here exactly
+    /// as `backup` resolves it.
+    #[test]
+    fn sqlite_target_round_trips_through_backup_into_and_restore() {
+        use diesel::connection::SimpleConnection as _;
+        use diesel::{Connection as _, RunQueryDsl as _, sql_query};
+
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("app.db");
+        let url = format!("sqlite://{}", db.display());
+        {
+            let mut conn = diesel::SqliteConnection::establish(&db.to_string_lossy())
+                .expect("establish sqlite");
+            conn.batch_execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL); \
+                 INSERT INTO t (v) VALUES ('a'), ('b');",
+            )
+            .expect("seed");
+        }
+
+        let run_dir = dir.path().join("run");
+        std::fs::create_dir_all(&run_dir).expect("mkdir");
+        let targets = vec![ResolvedTarget {
+            label: "control".to_owned(),
+            url: url.clone(),
+            backend: TargetBackend::Sqlite,
+        }];
+        let tools = PgTools::with_dirs(Vec::new());
+        backup_into(
+            &run_dir,
+            &targets,
+            BackupFormat::Custom,
+            None,
+            &tools,
+            "prod",
+        )
+        .expect("a SQLite backup needs no pg_dump");
+
+        let artifact = run_dir.join("control.sqlite");
+        assert!(
+            artifact.is_file(),
+            "the artifact is a .sqlite database file"
+        );
+        let manifest = read_manifest(&run_dir).expect("manifest");
+        assert_eq!(manifest.targets[0].backend, "sqlite");
+        assert_eq!(manifest.targets[0].file, "control.sqlite");
+
+        // Simulate data loss, then restore.
+        {
+            let mut conn = diesel::SqliteConnection::establish(&db.to_string_lossy())
+                .expect("establish sqlite");
+            conn.batch_execute("DELETE FROM t;").expect("delete");
+        }
+        run_restore_one(
+            &tools,
+            &url,
+            &artifact,
+            TargetBackend::Sqlite,
+            BackupFormat::Custom,
+            "app",
+        )
+        .expect("a SQLite restore needs no pg_restore");
+
+        let mut conn =
+            diesel::SqliteConnection::establish(&db.to_string_lossy()).expect("establish sqlite");
+        let rows: Vec<Count> = sql_query("SELECT COUNT(*) AS n FROM t")
+            .load(&mut conn)
+            .expect("count");
+        assert_eq!(rows[0].n, 2, "the restore must bring the rows back");
+    }
+
     #[test]
     fn infer_format_from_extension() {
         assert_eq!(
-            infer_format_from_path(Path::new("control.dump")),
-            Some(BackupFormat::Custom)
+            infer_artifact_kind(Path::new("control.dump")),
+            Some((TargetBackend::Postgres, BackupFormat::Custom))
         );
         assert_eq!(
-            infer_format_from_path(Path::new("control.sql")),
-            Some(BackupFormat::Plain)
+            infer_artifact_kind(Path::new("control.sql")),
+            Some((TargetBackend::Postgres, BackupFormat::Plain))
         );
-        assert_eq!(infer_format_from_path(Path::new("control.txt")), None);
+        // A bare `.sqlite` artifact restores through the SQLite path (#1909).
+        assert_eq!(
+            infer_artifact_kind(Path::new("control.sqlite")),
+            Some((TargetBackend::Sqlite, BackupFormat::Custom))
+        );
+        assert_eq!(infer_artifact_kind(Path::new("control.txt")), None);
     }
 
     #[test]
@@ -3343,11 +3743,13 @@ mod tests {
                     label: "control".to_owned(),
                     file: "control.dump".to_owned(),
                     database: "app".to_owned(),
+                    backend: "postgres".to_owned(),
                 },
                 ManifestTarget {
                     label: "shard:east".to_owned(),
                     file: "shard-east.dump".to_owned(),
                     database: "east".to_owned(),
+                    backend: "postgres".to_owned(),
                 },
             ],
         };
@@ -3449,6 +3851,7 @@ mod tests {
                 label: "control".to_owned(),
                 file: "control.dump".to_owned(),
                 database: "app".to_owned(),
+                backend: "postgres".to_owned(),
             }],
         };
         write_manifest(tmp.path(), &manifest).unwrap();
@@ -4400,12 +4803,13 @@ mod tests {
         let targets = vec![ResolvedTarget {
             label: "control".to_owned(),
             url: url.clone(),
+            backend: TargetBackend::Postgres,
         }];
         backup_into(
             &run_dir,
             &targets,
             BackupFormat::Custom,
-            &pg_dump,
+            Some(&pg_dump),
             &tools,
             "dev",
         )
@@ -4421,8 +4825,15 @@ mod tests {
 
         // Restore.
         let artifact = run_dir.join("control.dump");
-        run_restore_one(&tools, &url, &artifact, BackupFormat::Custom, "dev")
-            .expect("restore succeeds");
+        run_restore_one(
+            &tools,
+            &url,
+            &artifact,
+            TargetBackend::Postgres,
+            BackupFormat::Custom,
+            "dev",
+        )
+        .expect("restore succeeds");
 
         // Row-level equality.
         let rows: Vec<Rt> = sql_query("SELECT id, name FROM backup_rt ORDER BY id")

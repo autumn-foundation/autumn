@@ -3,6 +3,7 @@ mod api_scaffold;
 mod cloud_native_scaffold;
 mod console;
 mod db;
+mod db_backup_sqlite;
 mod db_pull;
 mod db_scrub;
 mod dependency_audit;
