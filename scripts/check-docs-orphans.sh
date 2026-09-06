@@ -229,7 +229,11 @@ UNESCAPE = re.compile(r'\\([!-/:-@\[-`{-~])')
 # check-docs-links.sh already parses and self-tests, so a page linked only that
 # way is genuinely reachable; without this the gate would report it as an
 # orphan and block a docs change written in a spelling the corpus supports.
-REF_DEF = re.compile(r'^ {0,3}\[([^\]]+)\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
+# The label honours escapes, so `[closing \]]: mail.md` is one definition whose
+# label contains a bracket — `[^\]]+` would stop at the escaped one and lose the
+# definition entirely. Same `FLAT` shape the sibling uses for exactly this.
+REF_DEF = re.compile(
+    r'^ {0,3}\[((?:[^\[\]\\]|\\.)+)\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
 # ...but a definition only becomes a link the reader can click when some label
 # USES it. A leftover `[old]: mail.md` with no `[…][old]` anywhere renders as
 # nothing at all, so counting it as an edge would let an obsolete line launder a
@@ -243,8 +247,23 @@ REF_DEF = re.compile(r'^ {0,3}\[([^\]]+)\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
 # `\[mail][]` renders as literal text, and `![mail][]` is an image whose
 # destination is a resource rather than a page. Neither must keep a definition
 # alive and go on hiding an orphan.
-REF_USE_FULL = re.compile(r'(?<![\\!])\[[^\]]*\]\[([^\]]*)\]')
-REF_USE_SHORTCUT = re.compile(r'(?<![\\!])\[([^\]]+)\](?![\(\[:])')
+# Labels honour escapes on BOTH sides of the match, or `[mail][closing \]]`
+# would be read against a definition whose label the same escape kept whole,
+# and the two would never line up.
+_LBL = r'(?:[^\[\]\\]|\\.)'
+REF_USE_FULL = re.compile(r'(?<![\\!])\[' + _LBL + r'*\]\[(' + _LBL + r'*)\]')
+REF_USE_SHORTCUT = re.compile(r'(?<![\\!])\[(' + _LBL + r'+)\](?![\(\[:])')
+# Every full-reference span, image or not. Used to blank them before the
+# shortcut scan: in `![alt][mail]` the guard correctly stops REF_USE_FULL, but
+# the trailing `[mail]` then looks exactly like a standalone shortcut link, so
+# an image would resurrect the label the guard just rejected.
+REF_USE_ANY = re.compile(r'\[' + _LBL + r'*\]\[' + _LBL + r'*\]')
+# An image and its destination, in both spellings. Blanked before the bare-path
+# scan for the same reason the inline pattern guards against `!`: the path in
+# `![alt](docs/guide/x.md)` is a resource the page loads, never text on screen,
+# so it is not something a reader can find the page by.
+IMAGE_INLINE = re.compile(r'!\[(?:[^\[\]\\]|\\.)*\]' + DEST)
+IMAGE_REF = re.compile(r'!\[(?:[^\[\]\\]|\\.)*\](?:\[[^\]]*\])?')
 
 
 def ref_label(s):
@@ -415,6 +434,9 @@ def edges_from(f):
     # would re-admit an unused definition that renders as nothing, which is the
     # hole the usage check exists to close.
     scan = REF_DEF.sub(lambda m: ' ' * len(m.group(0)), txt)
+    blank = lambda m: ' ' * len(m.group(0))
+    scan = IMAGE_INLINE.sub(blank, scan)
+    scan = IMAGE_REF.sub(blank, scan)
     for m in BARE.finditer(scan):
         t = normalize(m.group(1))
         if t in traversable:
@@ -439,10 +461,22 @@ def edges_from(f):
         inner = m.group(1)
         used.add(ref_label(inner) if inner.strip()
                  else ref_label(m.group(0)[1:m.group(0).index(']')]))
-    for m in REF_USE_SHORTCUT.finditer(ref_txt):
+    # Blank every full-reference span before looking for shortcuts, so the
+    # `[mail]` tail of `![alt][mail]` is not re-read as a link of its own.
+    shortcut_txt = REF_USE_ANY.sub(lambda m: ' ' * len(m.group(0)), ref_txt)
+    for m in REF_USE_SHORTCUT.finditer(shortcut_txt):
         used.add(ref_label(m.group(1)))
+
+    # Markdown resolves a duplicated label to its FIRST definition, so a stale
+    # `[mail]: mail.md` sitting below a live `[mail]: https://example.com` names
+    # a page the reader never reaches — and must not keep it out of the report.
+    seen_labels = set()
     for m in REF_DEF.finditer(txt):
-        if ref_label(m.group(1)) not in used:
+        label = ref_label(m.group(1))
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        if label not in used:
             continue
         add_relative(m.group(2) if m.group(2) is not None else m.group(3))
     return out
@@ -942,6 +976,40 @@ self_test() {
     > "$c9aq/docs/guide/mail.md"
   git -C "$c9aq" add -A && git -C "$c9aq" commit -qm trailing-text-closer
   check "a closing fence with trailing text does not end the block" fail "$c9aq"
+
+  # A reference label may contain an escaped bracket.
+  local c9ar="$tmp/c9ar"; make_corpus "$c9ar"
+  printf '# Jobs\n\nSee [mail][closing \\]].\n\n[closing \\]]: mail.md\n' \
+    > "$c9ar/docs/guide/jobs.md"
+  git -C "$c9ar" add -A && git -C "$c9ar" commit -qm escaped-bracket-label
+  check "an escaped bracket in a reference label resolves" pass "$c9ar"
+
+  # `![alt][mail]` is an image; its trailing label must not read as a shortcut.
+  local c9as="$tmp/c9as"; make_corpus "$c9as"
+  printf '# Jobs\n\n![alt][mail]\n\n[mail]: mail.md\n' > "$c9as/docs/guide/jobs.md"
+  git -C "$c9as" add -A && git -C "$c9as" commit -qm image-full-ref
+  check "an explicit image reference confers nothing" fail "$c9as"
+
+  # The bare-path scan must honour the image guard too.
+  local c9at="$tmp/c9at"; make_corpus "$c9at"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n![diagram](docs/guide/mail.md)\n' \
+    > "$c9at/README.md"
+  git -C "$c9at" add -A && git -C "$c9at" commit -qm image-rootpath
+  check "a repo-root image destination is not a bare-path edge" fail "$c9at"
+
+  # A duplicated label resolves to its FIRST definition.
+  local c9au="$tmp/c9au"; make_corpus "$c9au"
+  printf '# Jobs\n\nSee [mail].\n\n[mail]: https://example.com\n[mail]: mail.md\n' \
+    > "$c9au/docs/guide/jobs.md"
+  git -C "$c9au" add -A && git -C "$c9au" commit -qm duplicate-definition
+  check "a shadowed duplicate definition confers nothing" fail "$c9au"
+
+  # ...and the first definition still resolves when it is the real one.
+  local c9av="$tmp/c9av"; make_corpus "$c9av"
+  printf '# Jobs\n\nSee [mail].\n\n[mail]: mail.md\n[mail]: https://example.com\n' \
+    > "$c9av/docs/guide/jobs.md"
+  git -C "$c9av" add -A && git -C "$c9av" commit -qm first-definition-wins
+  check "the first of duplicate definitions resolves" pass "$c9av"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"

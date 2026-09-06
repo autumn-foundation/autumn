@@ -1261,8 +1261,11 @@ Two things to get right when generating this code:
   that a delivery carries only `Content-Type` and `Autumn-Signature` — no event
   or delivery ID, and the signature's `t=` changes per attempt — so if the
   receiver must deduplicate, put a stable ID in the payload yourself and reuse
-  it on every retry. Receivers should be idempotent regardless: retries make
-  delivery at-least-once anyway. An enqueue that fails is the one handled case —
+  it on every retry. Make receivers idempotent regardless — but do not call the
+  result at-least-once: retries can duplicate an event only once the job is
+  enqueued, and before that the loss window above still applies. Idempotency
+  buys protection from duplicates, not from loss.
+  An enqueue that fails is the one handled case —
   marked `is_dlq` and replayable.
 
 Do not
