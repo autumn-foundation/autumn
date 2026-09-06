@@ -1231,11 +1231,28 @@ Read `docs/guide/signed-webhooks.md` and `examples/signed-webhooks/`.
 Everything above is webhooks arriving **in**. For the other direction — letting
 your own users/customers register an endpoint and dispatching signed events to
 it — use `autumn_web::webhook_outbound`: `WebhookSubscription` (their endpoint,
-signing secret and subscribed topics), a pluggable `OutboundWebhookStore`
-(`InMemoryOutboundWebhookStore` by default), and `WebhookOutboundManager` off
-`AppState`, whose `.dispatch()` transactionally logs and enqueues the event. The
+signing secret and subscribed topics), a pluggable `OutboundWebhookHandler`, and
+`WebhookOutboundManager` off `AppState`. The
 `autumn_webhook_delivery` job signs and POSTs it with retries and deactivation;
-dead-letter inspection and replay live under `/actuator/webhooks/*`. Do not
+dead-letter inspection and replay live under `/actuator/webhooks/*`.
+
+Two things to get right when generating this code:
+
+- **There is no default store.** `OutboundWebhookPlugin::new(store)` takes one as
+  a required argument. `InMemoryOutboundWebhookHandler` ships with the framework
+  but is process-local — subscriptions and delivery logs vanish on restart and
+  are not shared across replicas — so it is for tests, development and
+  single-process apps. Anything multi-replica needs a durable shared
+  implementation of the trait. (`OutboundWebhookStore` /
+  `InMemoryOutboundWebhookStore` are compatibility aliases; prefer the
+  `…Handler` names in new code.)
+- **`dispatch()` is not transactional.** It writes a delivery-log row per
+  subscription and *then* enqueues the job; no transaction spans the pluggable
+  store and the queue, so a crash between the two leaves a logged event that was
+  never enqueued. Do not present it to a user as an outbox guarantee. An enqueue
+  that fails is marked `is_dlq` and is replayable.
+
+Do not
 hand-roll outbound delivery with a bare HTTP client — the user-supplied
 destination URL is an SSRF sink (`docs/security/2026-09-03-webhook-ssrf/`), and
 the subsystem is where that is handled. Read
