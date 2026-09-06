@@ -312,16 +312,14 @@ impl Revert {
                 ..
             } => remove_schema_table(content, table, expected_block),
             Self::CargoDeps { names, .. } => {
-                // In addition to the `owner_dir` sibling-directory check
-                // already applied by the caller, only remove a name if
-                // nothing else in the project's source tree still
-                // references it — a hand-added dependency unrelated to any
-                // generator (issue #1048 PR review) survives the same way a
-                // dependency shared with a sibling resource already does.
-                // Best-effort: usage via a re-export or a derive macro that
-                // never spells out the crate's own name (e.g. plain
-                // `#[derive(Serialize)]` with no qualified `serde::` path)
-                // isn't detected.
+                // In addition to the `owner_dir` sibling-directory check the caller
+                // already applied, remove a name only if nothing else in the project's
+                // source tree still references it — a hand-added dependency unrelated
+                // to any generator (#1048 PR review) survives the way a dependency
+                // shared with a sibling resource already does. Best-effort: usage via a
+                // re-export, or a derive macro that never spells out the crate's own
+                // name — a plain `#[derive(Serialize)]` with no qualified `serde::`
+                // path — is not detected.
                 let survives: Vec<&str> = names
                     .iter()
                     .map(String::as_str)
@@ -475,15 +473,14 @@ pub(super) fn keys_still_referenced_in(
     // `common.` prefix was never what made a call site live.
     let mut surviving: HashSet<String> = scan.referenced.iter().cloned().collect();
 
-    // A key built at runtime — `locale.t(&format!("common.{action}"))`, or a
-    // bare `locale.t(key)` — names no key a static scan can record, so
-    // `scan_source` files it under `dynamic` instead. Dropping those prunes
-    // definitions such a call still reaches at runtime, leaving a missing-key
-    // marker in a surviving view. `autumn i18n check` suppresses its unused-key
-    // report for exactly these sites, so this has to be at least as
-    // conservative — otherwise pruning deletes what the checker declines to
-    // complain about. `key_prefix` is the leading literal, empty meaning "could
-    // be any key", so `starts_with` covers both.
+    // A key built at runtime — `locale.t(&format!("common.{action}"))`, or a bare
+    // `locale.t(key)` — names no key a static scan can record, so `scan_source` files it
+    // under `dynamic`. Dropping those prunes definitions such a call still reaches at
+    // runtime, leaving a missing-key marker in a surviving view. `autumn i18n check`
+    // suppresses its unused-key report for exactly these sites, so this must be at least
+    // as conservative, or pruning would delete what the checker declines to complain
+    // about. `key_prefix` is the leading literal, empty meaning "could be any key", so
+    // `starts_with` covers both.
     if !scan.dynamic.is_empty() {
         surviving.extend(
             super::scaffold_i18n::defined_keys(bundle)
@@ -1001,16 +998,15 @@ impl Plan {
             if matches {
                 files_to_remove.push(path.to_path_buf());
             } else {
-                // Unlike an owned `Create`, a `CreateIfAbsent` target may
-                // have pre-existed before ANY generator ever ran (`generate`
-                // silently skips writing to it either way) — e.g. a
-                // hand-rolled `templates/mailers/_layout.html`. Divergence
-                // here can't be attributed to "this destroy's own edit gone
-                // stale" the way it can for an owned `Create`, so it's never
-                // treated as a blocking error and never force-deleted
-                // (issue #1048 PR review): guessing wrong would destroy
-                // real, pre-existing project content this destroy never
-                // touched. Just leave it and say why.
+                // Unlike an owned `Create`, a `CreateIfAbsent` target may have existed
+                // before any generator ran — `generate` silently skips writing to it
+                // either way — such as a hand-rolled
+                // `templates/mailers/_layout.html`. Divergence here cannot be
+                // attributed to this destroy's own edit gone stale the way it can for
+                // an owned `Create`, so it is never a blocking error and never
+                // force-deleted (#1048 PR review): guessing wrong would destroy real,
+                // pre-existing project content this destroy never touched. Leave it and
+                // say why.
                 warnings.push(format!(
                     "{} doesn't match what this generator produces; leaving it in \
                      place since it may predate this resource — remove it by hand \
@@ -1051,37 +1047,32 @@ impl Plan {
         }
 
         let grouped_reverts = group_reverts_by_path(&self.reverts);
-        // Every path this destroy is ITSELF also rewriting (e.g.
-        // `src/schema.rs`, emptied by a `SchemaTable` revert) must be
-        // excluded from `crate_referenced_elsewhere_in_project`'s scan
-        // alongside `files_to_remove`: its pre-destroy content (still on
-        // disk at scan time — the real rewrite/deletion happens later, in
-        // `Plan::revert`'s apply phase) isn't evidence of anything a
-        // *different* resource still needs, since this same operation is
-        // about to change it too. `scan_overrides` (below) supplies each
-        // such file's real final content instead, so this exclusion only
-        // ever falls back to "treat as absent" for a file that becomes
-        // empty (deleted) — never for one that survives with other content.
+        // Every path this destroy is itself rewriting — `src/schema.rs`, emptied by a
+        // `SchemaTable` revert — must be excluded from
+        // `crate_referenced_elsewhere_in_project`'s scan alongside `files_to_remove`.
+        // Its pre-destroy content, still on disk at scan time since the real rewrite
+        // happens later in `Plan::revert`'s apply phase, is not evidence of anything a
+        // different resource still needs, because this same operation is about to change
+        // it too. `scan_overrides` below supplies each such file's real final content
+        // instead, so this exclusion only ever falls back to "treat as absent" for a file
+        // that becomes empty, never for one that survives with other content.
         let mut cargo_deps_excluding = files_to_remove.clone();
         cargo_deps_excluding.extend(grouped_reverts.iter().map(|(path, _)| path.clone()));
 
-        // Precompute the final, post-destroy content of every modified file
-        // OTHER than `Cargo.toml` via each file's own, self-contained
-        // reverts (none of them — `SchemaTable`, `ModDecl`, etc. — consult
-        // another file's content). `Cargo.toml`'s `CargoDeps`/
-        // `CargoAutumnWebFeature`/`CargoAutumnWebDevFeature` reverts are the
-        // only ones that DO (the project-wide crate/feature usage scan),
-        // and always target `Cargo.toml` itself, so computing every other
-        // file's result first and excluding `Cargo.toml` here avoids any
-        // ordering cycle. This is what lets that scan see what
-        // `src/schema.rs` (or `src/main.rs`, a `mod.rs`, ...) will actually
-        // look like once this destroy is done — e.g. a table this destroy
-        // ISN'T touching, still present after its own removal — rather than
-        // either stale pre-destroy content (would wrongly count a table
-        // being removed as "still needed") or hiding the file from the scan
-        // entirely (would wrongly hide unrelated content in the same file
-        // that legitimately still needs the dependency) — issue #1048 PR
-        // review.
+        // Precompute the final, post-destroy content of every modified file other than
+        // `Cargo.toml`, via each file's own self-contained reverts — none of
+        // `SchemaTable`, `ModDecl`, and the rest consult another file's content.
+        // `Cargo.toml`'s `CargoDeps`, `CargoAutumnWebFeature`, and
+        // `CargoAutumnWebDevFeature` reverts are the only ones that do, through the
+        // project-wide crate and feature usage scan, and they always target `Cargo.toml`
+        // itself — so computing every other file's result first and excluding
+        // `Cargo.toml` here avoids an ordering cycle. That is what lets the scan see what
+        // `src/schema.rs`, `src/main.rs`, or a `mod.rs` will actually look like once this
+        // destroy is done: a table this destroy is not touching, still present after its
+        // own removal. The alternatives are worse — stale pre-destroy content would
+        // wrongly count a table being removed as still needed, and hiding the file from
+        // the scan entirely would wrongly hide unrelated content in the same file that
+        // legitimately still needs the dependency (#1048 PR review).
         let cargo_toml_path = self.project_root.join("Cargo.toml");
         let mut scan_overrides: HashMap<PathBuf, String> = HashMap::new();
         for (path, reverts) in &grouped_reverts {
@@ -1317,15 +1308,14 @@ pub fn crate_reference_markers(crate_name: &str) -> Vec<String> {
 /// back to the `owner_dir` check alone.
 fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
     match feature {
-        // `maud`/`htmx` are in autumn-web's own `default = [...]` feature
-        // set (see `autumn/Cargo.toml`) — a project's default-features
-        // dependency already carries them regardless of any generator, so
-        // removing the *explicit* `features = [...]` entry never actually
-        // disables the capability, and a project-wide marker check would
-        // wrongly treat autumn's own default-feature boilerplate (e.g.
-        // `src/main.rs`'s stock `layout()`, which always calls
-        // `maud::html!`) as "still needed" in every project. No check
-        // needed — fall through to the `owner_dir` check alone.
+        // `maud` and `htmx` are in autumn-web's own `default = [...]` feature set (see
+        // `autumn/Cargo.toml`), so a project's default-features dependency already
+        // carries them regardless of any generator. Removing the explicit `features =
+        // [...]` entry therefore never disables the capability, and a project-wide
+        // marker check would wrongly treat autumn's own default-feature boilerplate —
+        // `src/main.rs`'s stock `layout()`, which always calls `maud::html!` — as still
+        // needed in every project. No check needed: fall through to the `owner_dir`
+        // check alone.
         "mail" => &["Mail::builder("],
         "oauth2" => &["OAuth2"],
         "webauthn" => &["Webauthn"],
@@ -1340,22 +1330,21 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         // the type (e.g. the template-shipped `tests/integration_test.rs`'s
         // "Add DB-backed tests with `TestDb`...") doesn't count as usage.
         "test-support" => &["TestDb::"],
-        // Attachment scaffolds (`generate scaffold ... --attachment`) enable
-        // both `multipart` and `storage`, but a hand-written route can also
-        // use these APIs directly. Destroying the last attachment model must
-        // not strip a feature such a route still needs (PR #1867 review).
+        // Attachment scaffolds (`generate scaffold ... --attachment`) enable both
+        // `multipart` and `storage`, but a hand-written route can use these APIs
+        // directly. Destroying the last attachment model must not strip a feature such
+        // a route still needs (PR #1867 review).
         //
-        // Bare `Multipart` (not `extract::Multipart`) so the marker also
-        // catches a hand-written route that pulls the extractor in through
-        // `use autumn_web::prelude::*;` and names it UNQUALIFIED — the prelude
-        // re-exports `Multipart` (`autumn/src/prelude.rs`), so such a route
-        // contains neither `extract::Multipart` nor any storage path, and the
-        // narrower marker would let `destroy` wrongly strip the feature (PR
-        // #1867 review follow-up). This still matches the fully-qualified
-        // `autumn_web::extract::Multipart` the scaffold itself emits and any
-        // `use ...::Multipart;` import; the only extra hits are identifiers
-        // like `MultipartField`/`MultipartError`, which are themselves part of
-        // the multipart API surface, so over-retaining on them is harmless.
+        // Bare `Multipart`, not `extract::Multipart`, so the marker also catches a
+        // hand-written route that pulls the extractor in through `use
+        // autumn_web::prelude::*;` and names it unqualified. The prelude re-exports
+        // `Multipart` (`autumn/src/prelude.rs`), so such a route contains neither
+        // `extract::Multipart` nor any storage path, and the narrower marker would let
+        // `destroy` wrongly strip the feature. This still matches the fully-qualified
+        // `autumn_web::extract::Multipart` the scaffold emits and any `use
+        // ...::Multipart;` import; the only extra hits are identifiers like
+        // `MultipartField` and `MultipartError`, themselves part of the multipart API
+        // surface, so over-retaining on them is harmless.
         "multipart" => &["Multipart"],
         // `autumn_web::storage::` covers the model's blob column type
         // (`autumn_web::storage::Blob`) as well as route usage of the store

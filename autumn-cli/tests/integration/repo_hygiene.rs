@@ -895,6 +895,94 @@ fn generator_conformance_ci_gate_is_configured() {
     );
 }
 
+// ── cli_tests per-test triage (issue #1945) ───────────────────────────────
+
+#[test]
+fn cli_tests_docker_ignored_tests_are_ci_swept() {
+    let root = workspace_root();
+    let ci_path = root.join(".github/workflows/ci.yml");
+    let ci_yml = std::fs::read_to_string(&ci_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", ci_path.display()));
+
+    // A newly-added `#[ignore = "requires Docker (testcontainers)"]` test in
+    // ANY `autumn-cli/tests/integration/*.rs` module must run in CI with no
+    // workflow edit, the same guarantee the autumn-web sweep already gives
+    // (#1923). That only holds if ci.yml's cli_tests invocation is a BARE
+    // `--ignored` sweep (discovers every ignored test in the binary) rather
+    // than a specific-test filter — matched as the literal invocation tail,
+    // not a substring of the surrounding comment, so deleting the sweep
+    // itself would still fail this even though "cli_tests" stays mentioned
+    // in prose above it.
+    let invocation = ci_yml
+        .replace('\\', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        invocation
+            .contains("cargo test -p autumn-cli --test cli_tests -- --ignored --test-threads=1"),
+        "ci.yml must run a BARE `--ignored` sweep over `cli_tests` so a newly-added \
+         Docker `#[ignore]`d test runs automatically; see issue #1945",
+    );
+}
+
+#[test]
+fn cli_tests_cold_start_ignored_tests_are_ci_named() {
+    let root = workspace_root();
+    let generator_conformance_path = root.join(".github/workflows/generator-conformance.yml");
+    let generator_conformance = std::fs::read_to_string(&generator_conformance_path)
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to read {}: {err}",
+                generator_conformance_path.display()
+            )
+        });
+
+    // Unlike the Docker-gated tests above, these `#[ignore]`d tests each
+    // scaffold and cargo-check/build/run a fresh project — too slow for the
+    // fast Docker sweep, and ci.yml's cli_tests invocation explicitly
+    // `--skip`s each of them by exact name for that reason. So each one must
+    // be named explicitly in generator-conformance.yml (matching every other
+    // generator-shaped gate above) or it never runs anywhere — the gap issue
+    // #1945 flagged as the `cli_tests` binary's remaining per-test triage.
+    //
+    // Matched as the full `<name> -- --ignored --exact` INVOCATION, not the
+    // bare name (same rationale and normalization as
+    // `generator_conformance_ci_gate_is_configured` above): a bare substring
+    // check would stay green after cargo lost its `--ignored --exact` flags,
+    // gained a typo that selects zero tests, or the whole `run:` step was
+    // deleted while the test name lingered in a comment.
+    let invocations = generator_conformance
+        .replace('\\', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for test_name in [
+        "integration::api_scaffold::api_scaffold_cargo_checks",
+        "integration::cloud_native_scaffold::scaffolded_app_passes_routes_audit_gate",
+        "integration::cloud_native_scaffold::scaffolded_api_app_passes_routes_audit_gate",
+        "integration::generate_position_scaffold::unscoped_position_generated_project_cargo_checks",
+        "integration::generate_position_scaffold::scoped_position_generated_project_cargo_checks",
+        "integration::generate_position_scaffold::soft_delete_position_generated_project_cargo_checks",
+        "integration::scaffold_belongs_to::belongs_to_scaffold_cargo_checks",
+        "integration::scaffold_bulk_delete::bulk_delete_generated_project_cargo_checks",
+        "integration::scaffold_rich_text::richtext_scaffold_cargo_checks",
+        "integration::scaffold_search::searchable_scaffold_cargo_checks",
+        "integration::scaffold_trash::trash_generated_project_cargo_checks",
+        "integration::seed_model_linking::linked_seed_binary_cargo_checks",
+        "integration::serve::serve_daemon_start_status_stop_over_unix_socket",
+        "integration::scaffold_form_for::generated_form_for_scaffold_cargo_checks",
+        "integration::scaffold_form_for::generated_scaffold_with_missing_reference_target_cargo_checks",
+    ] {
+        assert!(
+            invocations.contains(&format!("{test_name} -- --ignored --exact")),
+            "generator-conformance.yml must INVOKE `{test_name}` (not merely name it \
+             in a comment) via --ignored --exact; this cli_tests test is CI-gated, \
+             not abandoned — see issue #1945",
+        );
+    }
+}
+
 #[test]
 fn contributing_documents_ignored_generator_tests() {
     let root = workspace_root();

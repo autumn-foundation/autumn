@@ -43,6 +43,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use super::grants::{CapabilityGrants, CapabilityQuotas, ConsentDelta, added};
 use crate::route_listing::{RouteClassification, RouteInfo, RouteSource};
 
 /// The sandbox wire-protocol version this build speaks.
@@ -102,37 +103,94 @@ const ALLOWED_METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELET
 
 /// A capability a sandboxed plugin may be granted.
 ///
-/// The vocabulary is deliberately tiny in this slice: a plugin may handle HTTP
-/// requests under its own prefix, and that is all. Filesystem, network,
-/// environment and database access are not "not granted by default" — they do
-/// not exist as grantable capabilities at all, so there is no manifest a plugin
-/// author can write that asks for them.
+/// Every word here binds to a subsystem that *already* enforces scoping —
+/// tenancy on the cache and the repositories, named upstreams on the HTTP
+/// client, declared types on the job queue — so a grant attaches to an
+/// enforcement point rather than creating one. Filesystem access, environment
+/// variables, raw SQL, sessions, mail and file storage are not "not granted by
+/// default": they do not exist as grantable capabilities at all, so there is no
+/// manifest a plugin author can write that asks for them.
+///
+/// Capabilities are **data, not code**. A plugin granted `db` imports exactly
+/// what an ungranted one imports — the guest asks over the same NDJSON channel
+/// it already answers on — so growing this vocabulary never widens the module's
+/// import surface, and the escape corpus that proves the import surface is
+/// closed keeps proving it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum SandboxCapability {
     /// Serve HTTP requests routed to the plugin's declared prefix.
     HttpRequest,
+    /// Read and write a key/value namespace private to (this plugin, this
+    /// tenant).
+    Kv,
+    /// Call the hostnames `[grants].hosts` names, through the framework client.
+    HttpOutbound,
+    /// Read and write the plugin-owned, tenant-scoped tables `[grants].tables`
+    /// names. Never host-application tables, and never raw SQL.
+    Db,
+    /// Enqueue the job types `[grants].job_types` names.
+    Jobs,
+    /// Fill the host-declared render slots `[grants].slots` names.
+    Render,
 }
 
 impl SandboxCapability {
     /// Every capability this build understands, in manifest spelling.
-    pub const ALL: &'static [Self] = &[Self::HttpRequest];
+    pub const ALL: &'static [Self] = &[
+        Self::HttpRequest,
+        Self::Kv,
+        Self::HttpOutbound,
+        Self::Db,
+        Self::Jobs,
+        Self::Render,
+    ];
 
     /// The manifest spelling of this capability.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::HttpRequest => "http-request",
+            Self::Kv => "kv",
+            Self::HttpOutbound => "http-outbound",
+            Self::Db => "db",
+            Self::Jobs => "jobs",
+            Self::Render => "render",
         }
     }
 
     /// One line an operator can read on a consent screen.
+    ///
+    /// Each line names the *scope*, not just the surface, because "may use a
+    /// database" and "may read and write its own tables, for the active tenant
+    /// only" are different approvals and only one of them is true.
     #[must_use]
     pub const fn describe(self) -> &'static str {
         match self {
             Self::HttpRequest => {
                 "handle HTTP requests routed to this plugin's own prefix (no other authority)"
+            }
+            Self::Kv => {
+                "read and write a key/value namespace private to this plugin and the active \
+                 tenant; no other plugin's or tenant's keys are reachable or visible"
+            }
+            Self::HttpOutbound => {
+                "call the hostnames listed under `[grants].hosts`, and no others, through the \
+                 framework's HTTP client"
+            }
+            Self::Db => {
+                "read and write the plugin-owned tables listed under `[grants].tables`, scoped \
+                 to the active tenant; no host-application table and no raw SQL"
+            }
+            Self::Jobs => {
+                "enqueue the job types listed under `[grants].job_types`, which run under this \
+                 plugin's own grants and quotas"
+            }
+            Self::Render => {
+                "return a fragment for the host-declared render slots listed under \
+                 `[grants].slots`; the host renders it, so no script, style or event handler \
+                 can cross"
             }
         }
     }
@@ -145,10 +203,11 @@ impl SandboxCapability {
     /// does not understand — an older host must refuse a newer grant, never
     /// silently drop it.
     pub fn parse(raw: &str) -> Result<Self, ManifestError> {
-        match raw {
-            "http-request" => Ok(Self::HttpRequest),
-            other => Err(ManifestError::UnknownCapability(rejected(other))),
-        }
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|capability| capability.as_str() == raw)
+            .ok_or_else(|| ManifestError::UnknownCapability(rejected(raw)))
     }
 }
 
@@ -294,44 +353,43 @@ impl ResourceLimits {
     #[must_use]
     pub const fn request_footprint_bytes(&self) -> u128 {
         (self.memory_bytes as u128)
-            // Five, not four, and the fifth is a temporary the term used to
-            // miss. At the moment `to_line` runs, four copies of the body are
-            // live at once: the caller's, the clone `HostFrame::request` takes,
-            // the `String` `BASE64.encode` allocates, and the encoded text
+            // Five, not four, and the fifth is a temporary the term used to miss.
+            // At the moment `to_line` runs, four copies of the body are live at
+            // once: the caller's, the clone `HostFrame::request` takes, the
+            // `String` `BASE64.encode` allocates, and the encoded text
             // `serialize_str` copies into the serializer's output. The last two
-            // are 4/3 each because base64 expands, so the peak is
-            // 1 + 1 + 4/3 + 4/3 = 14/3 of the body — over the four this
-            // budgeted, by enough to matter at a concurrency near the product's
-            // own ceiling.
+            // are 4/3 each, because base64 expands, so the peak is
+            // 1 + 1 + 4/3 + 4/3 = 14/3 of the body, over the four this budgeted,
+            // by enough to matter at a concurrency near the product's ceiling.
             //
             // Counted rather than removed: serialising the base64 straight into
-            // the output would delete the temporary outright, which is the
-            // better fix and a larger one — it changes how the frame is written,
-            // and proving the allocation is gone needs more than reading the
-            // code. The bound is corrected here to what the code actually does;
-            // making the code do less is worth doing on its own.
+            // the output would delete the temporary outright, which is the better
+            // fix and a larger one — it changes how the frame is written, and
+            // proving the allocation is gone needs more than reading the code. The
+            // bound is corrected here to what the code does; making the code do
+            // less is worth doing on its own.
             .saturating_add((self.max_request_body_bytes as u128).saturating_mul(5))
             .saturating_add((self.max_response_bytes as u128).saturating_mul(5))
             // The instance's tables, bounded by `MAX_TABLE_ELEMENTS` at a
             // generous 16 bytes a reference. Small, but per-instance storage
             // the footprint would otherwise not know about at all.
             .saturating_add(crate::plugin_sandbox::host::MAX_TABLE_ELEMENTS as u128 * 16)
-            // The request's metadata: the caller's strings, the frame's clone
-            // of them, and the serialised line — which is the term that was
-            // wrong. `4 ×` priced the line at the raw byte count, but JSON is
-            // an *escaping* encoding: `serde_json` writes a control character
-            // as `\u0000`, six bytes for one, and every byte of a metadata
-            // field can be one. An HTTP request cannot carry them (the `http`
-            // crate refuses control characters in header values and URIs), but
-            // `SandboxHost::run` is public and an embedder builds the
-            // `SandboxRequest` by hand, so the bound has to hold for the API
-            // rather than for the adapter that is merely its politest caller.
+            // The request's metadata: the caller's strings, the frame's clone of
+            // them, and the serialised line — the term that was wrong. `4 x`
+            // priced the line at the raw byte count, but JSON is an escaping
+            // encoding: `serde_json` writes a control character as a six-byte
+            // `\uXXXX` escape, and every byte of a metadata field can be one. An
+            // HTTP request cannot carry them — the `http` crate refuses control
+            // characters in header values and URIs — but `SandboxHost::run` is
+            // public and an embedder builds the `SandboxRequest` by hand, so the
+            // bound has to hold for the API rather than for the adapter that is
+            // merely its politest caller.
             //
-            // The ceiling that bounds the raw bytes is the host's rather than
-            // this manifest's, but it is per-request storage all the same:
-            // leaving it out entirely is what made this product understate a
-            // near-maximum-concurrency plugin by hundreds of megabytes, and
-            // pricing it unescaped understated it again by as much.
+            // The ceiling that bounds the raw bytes is the host's rather than this
+            // manifest's, but it is per-request storage all the same: leaving it
+            // out entirely made this product understate a near-maximum-concurrency
+            // plugin by hundreds of megabytes, and pricing it unescaped understated
+            // it again by as much.
             .saturating_add(crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 8)
             // The instance's globals, at a generous 16 bytes each. Per-instance
             // storage the footprint would otherwise not know about at all — the
@@ -349,6 +407,29 @@ impl ResourceLimits {
             // per request is still per request — at a concurrency near this
             // product's own ceiling they are tens of megabytes.
             .saturating_add(crate::plugin_sandbox::host::FIXED_HOST_BUFFER_BYTES as u128)
+    }
+
+    /// Every limit, as `(field, value)`, in declaration order.
+    ///
+    /// One list, read by validation and by the upgrade diff alike — the failure
+    /// mode of writing them out twice is a ceiling that is enforced but that an
+    /// upgrade can raise without anyone being asked.
+    #[must_use]
+    pub const fn fields(&self) -> [(&'static str, u128); 6] {
+        [
+            ("fuel", self.fuel as u128),
+            ("memory_bytes", self.memory_bytes as u128),
+            (
+                "max_request_body_bytes",
+                self.max_request_body_bytes as u128,
+            ),
+            ("max_response_bytes", self.max_response_bytes as u128),
+            ("max_concurrency", self.max_concurrency as u128),
+            (
+                "request_body_timeout_ms",
+                self.request_body_timeout_ms as u128,
+            ),
+        ]
     }
 
     fn validate(&self) -> Result<(), ManifestError> {
@@ -489,9 +570,65 @@ pub enum ManifestError {
         /// This build's ceiling.
         max: u128,
     },
+    /// A `[grants]` list names things a capability the manifest never asked for
+    /// would be needed to reach.
+    GrantWithoutCapability {
+        /// The capability the list belongs to.
+        capability: SandboxCapability,
+        /// The `[grants]` field.
+        field: &'static str,
+    },
+    /// A capability was granted but its `[grants]` list is empty, so it names
+    /// nothing it could ever act on.
+    CapabilityWithoutGrant {
+        /// The capability with nothing to act on.
+        capability: SandboxCapability,
+        /// The `[grants]` field that should have named something.
+        field: &'static str,
+    },
+    /// A `[grants]` entry is not shaped like the thing a physical name is
+    /// derived from.
+    InvalidGrantEntry {
+        /// The `[grants]` field.
+        field: &'static str,
+        /// The offending entry.
+        entry: String,
+        /// What was expected instead.
+        reason: &'static str,
+    },
+    /// The same `[grants]` entry appears twice in one list.
+    DuplicateGrantEntry {
+        /// The `[grants]` field.
+        field: &'static str,
+        /// The repeated entry.
+        entry: String,
+    },
+    /// A `[grants]` list is longer than this build will hold.
+    TooManyGrantEntries {
+        /// The `[grants]` field.
+        field: &'static str,
+        /// How many it declared.
+        found: usize,
+        /// The ceiling.
+        max: usize,
+    },
+    /// A declared quota is zero or above this build's ceiling.
+    QuotaOutOfRange {
+        /// Which quota.
+        field: &'static str,
+        /// The declared value.
+        value: u32,
+        /// This build's ceiling.
+        max: u32,
+    },
 }
 
 impl fmt::Display for ManifestError {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per refusal, each writing the sentence an operator reads; the length \
+                  is the vocabulary's, and splitting it would separate a variant from its words"
+    )]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Toml(detail) => write!(f, "malformed sandbox plugin manifest: {detail}"),
@@ -579,6 +716,37 @@ impl fmt::Display for ManifestError {
                 f,
                 "sandbox limit `{field}` = {value} is out of range; expected 1..={max}"
             ),
+            Self::GrantWithoutCapability { capability, field } => write!(
+                f,
+                "`[grants].{field}` names something only the `{capability}` capability could \
+                 reach, but `capabilities` does not ask for it; the consent screen and the \
+                 runtime would disagree about what this plugin may do"
+            ),
+            Self::CapabilityWithoutGrant { capability, field } => write!(
+                f,
+                "the manifest grants `{capability}` but `[grants].{field}` is empty, so the \
+                 capability names nothing it could ever act on; an operator who approved it \
+                 would have approved authority the runtime can never honour"
+            ),
+            Self::InvalidGrantEntry {
+                field,
+                entry,
+                reason,
+            } => write!(f, "invalid `[grants].{field}` entry {entry:?}: {reason}"),
+            Self::DuplicateGrantEntry { field, entry } => write!(
+                f,
+                "`[grants].{field}` names {entry:?} more than once; a repeat conveys no \
+                 authority the first entry did not"
+            ),
+            Self::TooManyGrantEntries { field, found, max } => write!(
+                f,
+                "`[grants].{field}` declares {found} entries, over the {max}-entry ceiling; the \
+                 list is scanned against itself during validation and consulted on every call"
+            ),
+            Self::QuotaOutOfRange { field, value, max } => write!(
+                f,
+                "sandbox quota `{field}` = {value} is out of range; expected 1..={max}"
+            ),
         }
     }
 }
@@ -592,6 +760,19 @@ impl std::error::Error for ManifestError {}
 /// Construct one with [`SandboxManifest::parse`]; the constructor validates, so
 /// a `SandboxManifest` value in hand is always one this build is willing to
 /// enforce.
+///
+/// Deliberately **not** `#[non_exhaustive]`, unlike most of this subsystem's
+/// types: building one by hand is a supported path and one this repository
+/// depends on — `tests/sandbox_manifest_seal_alloc_gate.rs` hands `seal` a
+/// manifest with 20,000 routes precisely because `parse` would refuse it, and
+/// there is no other way to reach the code under test. That is also why
+/// [`SandboxHost::from_module`](crate::plugin_sandbox::SandboxHost::from_module)
+/// re-validates rather than trusting that parsing ran.
+///
+/// The cost is that adding a field to this struct is a source break for anyone
+/// writing such a literal, and the vocabulary is expected to grow. Prefer
+/// `parse` and edit the public fields of what comes back; the slice that adds
+/// the next capability will say so in the changelog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxManifest {
@@ -616,6 +797,16 @@ pub struct SandboxManifest {
     /// Per-request resource ceilings.
     #[serde(default)]
     pub limits: ResourceLimits,
+    /// The named things each granted capability is scoped to (issue #1632).
+    ///
+    /// Empty for a plugin that only serves its own prefix, which is what a
+    /// first-slice manifest looks like and why this defaults rather than being
+    /// required.
+    #[serde(default)]
+    pub grants: CapabilityGrants,
+    /// Per-request ceilings on each capability, operator-configurable.
+    #[serde(default)]
+    pub quotas: CapabilityQuotas,
 }
 
 impl SandboxManifest {
@@ -646,8 +837,13 @@ impl SandboxManifest {
     }
 
     /// Whether this manifest grants `capability`.
+    ///
+    /// Named `is_granted` rather than `grants` because `grants` is now the
+    /// *field* holding what each capability is scoped to, and
+    /// `manifest.grants(Render)` two lines above `manifest.grants.slots` is a
+    /// thing a reader has to stop and parse.
     #[must_use]
-    pub fn grants(&self, capability: SandboxCapability) -> bool {
+    pub fn is_granted(&self, capability: SandboxCapability) -> bool {
         self.capabilities.contains(&capability)
     }
 
@@ -730,11 +926,61 @@ impl SandboxManifest {
                 describe = capability.describe()
             );
         }
-        out.push_str(
-            "  denied, with no way to ask for it in this version:\n    \
-             filesystem access, outbound network access, environment variables,\n    \
-             database access, and any host authority not listed above\n",
-        );
+        // The scope of each grant, right under the capability list, because a
+        // capability name answers "may it?" and nothing in it answers "to
+        // what?". An operator reading `http-outbound` alone has approved the
+        // open internet.
+        for (label, capability) in [
+            (
+                "outbound hosts it may call",
+                SandboxCapability::HttpOutbound,
+            ),
+            ("tenant-scoped tables it owns", SandboxCapability::Db),
+            ("job types it may enqueue", SandboxCapability::Jobs),
+            ("render slots it may fill", SandboxCapability::Render),
+        ] {
+            let Some(entries) = self
+                .grants
+                .list_for(capability)
+                .filter(|list| !list.is_empty())
+            else {
+                continue;
+            };
+            let _ = writeln!(out, "  {label} (and only these):");
+            for entry in entries {
+                let _ = writeln!(out, "    {entry}");
+            }
+        }
+        // Only the authority this build cannot grant at all. Printing "no
+        // database access" under a manifest that was just granted `db` is a
+        // consent screen contradicting itself, and the reader believes the
+        // reassuring half.
+        out.push_str("  denied, with no way to ask for it in this version:\n    ");
+        let mut ungranted: Vec<&'static str> = vec![
+            "filesystem access",
+            "environment variables",
+            "session, auth and credential access",
+            "mail and file storage",
+            "raw SQL and host-application tables",
+        ];
+        if !self.is_granted(SandboxCapability::HttpOutbound) {
+            ungranted.insert(1, "outbound network access");
+        }
+        if !self.is_granted(SandboxCapability::Db) {
+            ungranted.insert(1, "database access");
+        }
+        if !self.is_granted(SandboxCapability::Kv) {
+            ungranted.insert(1, "key/value storage");
+        }
+        if !self.is_granted(SandboxCapability::Jobs) {
+            ungranted.insert(1, "background jobs");
+        }
+        out.push_str(&ungranted.join(", "));
+        out.push_str(",\n    and any host authority not listed above\n");
+        out.push_str("  per-request capability quotas:\n");
+        for (field, value) in self.quotas.fields() {
+            let _ = writeln!(out, "    {field} = {value}");
+        }
         out.push_str("  resource ceilings per request:\n");
         let _ = writeln!(
             out,
@@ -749,6 +995,75 @@ impl SandboxManifest {
             concurrency = self.limits.max_concurrency,
         );
         out
+    }
+
+    /// Everything this manifest asks for that `previous` — the manifest the
+    /// operator already approved — did not.
+    ///
+    /// The install flow asks this, not a version comparison, whether to
+    /// re-prompt. A plugin's authority can only grow in a manifest, and a
+    /// version string is the author's to write.
+    ///
+    /// Growth only: dropping a capability, a host or a table, or lowering a
+    /// quota, asks for less than was already approved. Prompting for those
+    /// trains operators to click through the prompt that matters.
+    #[must_use]
+    pub fn consent_delta_from(&self, previous: &Self) -> ConsentDelta {
+        ConsentDelta {
+            added_capabilities: added(&previous.capabilities, &self.capabilities),
+            added_hosts: added(&previous.grants.hosts, &self.grants.hosts),
+            added_tables: added(&previous.grants.tables, &self.grants.tables),
+            added_job_types: added(&previous.grants.job_types, &self.grants.job_types),
+            added_slots: added(&previous.grants.slots, &self.grants.slots),
+            raised_quotas: previous
+                .quotas
+                .fields()
+                .into_iter()
+                .zip(self.quotas.fields())
+                .filter(|((field, _), _)| {
+                    // A quota bounding a capability this upgrade no longer asks
+                    // for is not new authority: the calls it bounds cannot be
+                    // made at all. Reporting it made a *narrowing* upgrade —
+                    // dropping `kv` while leaving a raised `kv_reads` behind —
+                    // exit non-zero from `plugin inspect --against`, which is
+                    // exactly the prompt this delta exists to avoid, on the
+                    // change least in need of one.
+                    super::grants::CapabilityQuotas::governed_by(field)
+                        .is_none_or(|capability| self.is_granted(capability))
+                })
+                .filter_map(|((field, approved), (_, requested))| {
+                    (requested > approved).then_some((field, approved, requested))
+                })
+                .collect(),
+            // Routes are the router, not a description of it — an added one is
+            // an endpoint the approved manifest did not serve. Compared as the
+            // consent screen prints them, including the HEAD a declared GET
+            // implies, so a GET added to an existing path is caught with it.
+            added_routes: added(&previous.consent_routes(), &self.consent_routes()),
+            raised_limits: previous
+                .limits
+                .fields()
+                .into_iter()
+                .zip(self.limits.fields())
+                .filter_map(|((field, approved), (_, requested))| {
+                    (requested > approved).then_some((field, approved, requested))
+                })
+                .collect(),
+        }
+    }
+
+    /// The routes the consent screen names, as `"METHOD /path"`.
+    ///
+    /// Built from [`route_infos`](Self::route_infos) rather than from
+    /// `self.routes`, so the HEAD that HTTP serves wherever it serves GET is in
+    /// the list an upgrade is diffed against. A manifest that adds a bare GET
+    /// adds two mounted routes, and both are authority.
+    #[must_use]
+    fn consent_routes(&self) -> Vec<String> {
+        self.route_infos()
+            .into_iter()
+            .map(|route| format!("{} {}", route.method, route.path))
+            .collect()
     }
 
     pub(crate) fn validate(&self) -> Result<(), ManifestError> {
@@ -771,47 +1086,68 @@ impl SandboxManifest {
             return Err(ManifestError::InvalidVersion(rejected(&self.version)));
         }
         validate_prefix(&self.prefix)?;
-        if !self.grants(SandboxCapability::HttpRequest) {
+        if !self.is_granted(SandboxCapability::HttpRequest) {
             return Err(ManifestError::MissingCapability(
                 SandboxCapability::HttpRequest,
             ));
         }
-        // A repeat grants nothing the first did, so there is no manifest a
-        // repeat makes legal — and every request clones this vector and
-        // serialises it into the frame. Left unbounded it is per-request work
-        // that `request_footprint_bytes` never counted and `encoding_fuel`
-        // never priced, bought once in a manifest and paid for on every call.
-        // Refusing here, rather than deduplicating, keeps the list an operator
-        // reads on the consent screen the same list the guest is handed.
+        // A repeat grants nothing the first did, so no manifest is made legal by one —
+        // and every request clones this vector and serialises it into the frame. Left
+        // unbounded it is per-request work `request_footprint_bytes` never counted and
+        // `encoding_fuel` never priced, bought once in a manifest and paid for on every
+        // call. Refusing here, rather than deduplicating, keeps the list an operator reads
+        // on the consent screen the same list the guest is handed.
         //
-        // Scanned in place rather than into a `Vec::with_capacity`: that vector
-        // was only ever a duplicate set — it is dropped below without being
-        // read — so sizing it from `self.capabilities.len()` performed, on a
-        // list a direct caller chose, exactly the unbounded allocation this
-        // check exists to refuse.
+        // Scanned in place rather than into a `Vec::with_capacity`: that vector was only
+        // ever a duplicate set, dropped below without being read, so sizing it from
+        // `self.capabilities.len()` performed — on a list a direct caller chose — exactly
+        // the unbounded allocation this check exists to refuse.
         //
-        // Pigeonhole bounds the scan: a list longer than the number of
-        // distinct capabilities must repeat one, so a duplicate is certain
-        // within the first `ALL.len() + 1` entries and looking past them
-        // cannot change the answer. Derived from `ALL` rather than written as
-        // a number, so it stays right as the vocabulary grows.
+        // Pigeonhole bounds the scan: a list longer than the number of distinct
+        // capabilities must repeat one, so a duplicate is certain within the first
+        // `ALL.len() + 1` entries and looking past them cannot change the answer. Derived
+        // from `ALL` rather than written as a number, so it stays right as the vocabulary
+        // grows.
         //
-        // `with_capacity` from a length the caller chose looks like the
-        // unbounded-allocation defect this file refuses elsewhere, and today it
-        // is not one: `SandboxCapability` has a single fieldless variant, so it
-        // is a ZST and a `Vec` of it never allocates whatever the length says
-        // (measured: `size_of` is 0, `with_capacity(1_000_000)` takes 0 bytes).
-        // It becomes one the moment a second variant lands and the type gains a
-        // byte. Whoever adds that variant should size this from
-        // `SandboxCapability::ALL.len() + 1` instead — pigeonhole makes a
-        // duplicate certain within that many entries, so nothing past them can
-        // change the answer.
-        let mut granted: Vec<SandboxCapability> = Vec::with_capacity(self.capabilities.len());
+        // Sized from the vocabulary, never from `self.capabilities.len()`. That
+        // length is the caller's to choose — `from_module` takes a manifest an
+        // embedder filled in by hand, where no byte ceiling applies — and this
+        // type is no longer the ZST it was when it had one variant, so a
+        // capacity taken from it is an allocation an untrusted number sizes.
+        // Pigeonhole is what makes the smaller capacity sufficient rather than
+        // merely cheaper: a list longer than the number of distinct
+        // capabilities must repeat one, so the loop below returns before it
+        // could ever push entry `ALL.len() + 1`.
+        let mut granted: Vec<SandboxCapability> =
+            Vec::with_capacity(SandboxCapability::ALL.len().saturating_add(1));
         for capability in &self.capabilities {
             if granted.contains(capability) {
                 return Err(ManifestError::DuplicateCapability(*capability));
             }
             granted.push(*capability);
+        }
+        // After the duplicate scan, so `granted` is the deduplicated list, and
+        // before the routes, so a manifest whose grant table contradicts its
+        // capability list is refused on the contradiction rather than on
+        // whichever route happens to be malformed too.
+        self.grants.validate(&granted)?;
+        self.quotas.validate()?;
+        // A granted table whose physical name cannot be derived — because the
+        // plugin's name and the table's together overrun the identifier ceiling
+        // — is authority the consent screen displays and every call then denies
+        // as `malformed`. Refusing at load is the difference between an
+        // operator learning at install and an author learning at 3am: the same
+        // argument `FuelBelowFixedCharges` rests on.
+        for table in &self.grants.tables {
+            if !crate::plugin_sandbox::capability::db::is_derivable(&self.name, table) {
+                return Err(ManifestError::InvalidGrantEntry {
+                    field: "tables",
+                    entry: rejected(table),
+                    reason: "no physical table name can be derived for this plugin name and \
+                             table together; both are escaped into one identifier, and the \
+                             result must fit in 63 bytes",
+                });
+            }
         }
         validate_digest(&self.sha256)?;
         if self.routes.is_empty() {
@@ -991,7 +1327,7 @@ pub(super) const fn is_display_reordering(ch: char) -> bool {
 /// applies to text an untrusted party influenced, and it escapes as well as
 /// truncates — so a name carrying U+202E cannot reorder the consent screen or
 /// the log line that reports it refused.
-fn rejected(value: &str) -> String {
+pub(crate) fn rejected(value: &str) -> String {
     super::host::guest_text(value)
 }
 
@@ -1134,6 +1470,7 @@ fn validate_route_path(path: &str) -> Result<(), ManifestError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin_sandbox::grants::{MAX_QUOTA, is_grantable_ident, is_grantable_name};
 
     fn valid_toml() -> String {
         format!(
@@ -1269,7 +1606,7 @@ max_concurrency = 8
         assert_eq!(manifest.capabilities, vec![SandboxCapability::HttpRequest]);
         assert_eq!(manifest.routes.len(), 1);
         assert_eq!(manifest.limits.fuel, 200_000_000);
-        assert!(manifest.grants(SandboxCapability::HttpRequest));
+        assert!(manifest.is_granted(SandboxCapability::HttpRequest));
     }
 
     #[test]
@@ -1974,6 +2311,443 @@ max_concurrency = 8
         let rendered = manifest.to_toml().expect("serializes");
         let reparsed = SandboxManifest::parse(&rendered).expect("re-parses");
         assert_eq!(manifest, reparsed);
+    }
+
+    // ── Capability vocabulary (issue #1632) ──────────────────────────
+
+    /// The manifest for a plugin that asks for the whole grown vocabulary.
+    fn vocabulary_toml() -> String {
+        format!(
+            r#"
+name = "autumn-plugin-shop"
+version = "0.1.0"
+wire_version = 1
+prefix = "/shop"
+capabilities = ["http-request", "kv", "http-outbound", "db", "jobs", "render"]
+sha256 = "{digest}"
+
+[[routes]]
+method = "GET"
+path = "/shop/panel"
+
+[grants]
+hosts = ["api.example.com"]
+tables = ["orders"]
+job_types = ["reindex"]
+slots = ["order-summary"]
+"#,
+            digest = "b".repeat(64)
+        )
+    }
+
+    #[test]
+    fn the_vocabulary_covers_kv_outbound_db_jobs_and_render() {
+        let manifest = SandboxManifest::parse(&vocabulary_toml()).expect("valid");
+        for capability in [
+            SandboxCapability::HttpRequest,
+            SandboxCapability::Kv,
+            SandboxCapability::HttpOutbound,
+            SandboxCapability::Db,
+            SandboxCapability::Jobs,
+            SandboxCapability::Render,
+        ] {
+            assert!(manifest.is_granted(capability), "{capability}");
+            assert!(SandboxCapability::ALL.contains(&capability), "{capability}");
+        }
+    }
+
+    #[test]
+    fn every_capability_round_trips_through_its_manifest_spelling() {
+        for capability in SandboxCapability::ALL {
+            assert_eq!(
+                SandboxCapability::parse(capability.as_str()),
+                Ok(*capability)
+            );
+            assert!(!capability.describe().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_grant_list_without_its_capability_is_refused() {
+        // The operator read "no outbound network" in the capability list and
+        // "api.example.com" three lines below it. One of those is a lie, and
+        // the runtime must not pick which.
+        let src = vocabulary_toml().replace(r#", "http-outbound""#, "");
+        assert_eq!(
+            SandboxManifest::parse(&src),
+            Err(ManifestError::GrantWithoutCapability {
+                capability: SandboxCapability::HttpOutbound,
+                field: "hosts",
+            })
+        );
+    }
+
+    #[test]
+    fn a_capability_with_an_empty_grant_list_is_refused() {
+        let src = vocabulary_toml().replace(r#"hosts = ["api.example.com"]"#, "hosts = []");
+        assert_eq!(
+            SandboxManifest::parse(&src),
+            Err(ManifestError::CapabilityWithoutGrant {
+                capability: SandboxCapability::HttpOutbound,
+                field: "hosts",
+            })
+        );
+    }
+
+    #[test]
+    fn an_outbound_host_carrying_a_scheme_port_or_path_is_refused() {
+        for bad in [
+            "https://api.example.com",
+            "api.example.com:443",
+            "api.example.com/v1",
+            "user@api.example.com",
+            "API.example.com",
+            "",
+            "-api.example.com",
+            "api..example.com",
+            "*.example.com",
+        ] {
+            let src = vocabulary_toml().replace("api.example.com", bad);
+            assert!(
+                matches!(
+                    SandboxManifest::parse(&src),
+                    Err(ManifestError::InvalidGrantEntry { .. })
+                ),
+                "{bad} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_table_job_type_or_slot_that_is_not_a_plain_identifier_is_refused() {
+        for (field, bad) in [
+            ("orders", "orders; drop table users"),
+            ("orders", "orders--"),
+            ("orders", "Orders"),
+            ("orders", "public.users"),
+            ("reindex", "re index"),
+            ("order-summary", "order summary"),
+            ("order-summary", "Order-Summary"),
+        ] {
+            let src = vocabulary_toml().replace(field, bad);
+            assert!(
+                matches!(
+                    SandboxManifest::parse(&src),
+                    Err(ManifestError::InvalidGrantEntry { .. })
+                ),
+                "{bad} was accepted for {field}"
+            );
+        }
+        // A name carrying a quote cannot even be written in the manifest's own
+        // syntax without escaping, so the shape rule is asserted directly as
+        // well — `SandboxHost::from_module` takes a manifest an embedder built
+        // in memory, where TOML never ran.
+        for bad in ["\"orders\"", "orders`", "orders'", "ord ers", ""] {
+            assert!(!is_grantable_ident(bad), "{bad} is not an identifier");
+            assert!(!is_grantable_name(bad), "{bad} is not a name");
+        }
+    }
+
+    #[test]
+    fn a_repeated_grant_entry_is_refused() {
+        let src =
+            vocabulary_toml().replace(r#"tables = ["orders"]"#, r#"tables = ["orders", "orders"]"#);
+        assert!(matches!(
+            SandboxManifest::parse(&src),
+            Err(ManifestError::DuplicateGrantEntry { .. })
+        ));
+    }
+
+    #[test]
+    fn quotas_default_conservatively_and_are_operator_configurable() {
+        let manifest = SandboxManifest::parse(&vocabulary_toml()).expect("valid");
+        let defaults = CapabilityQuotas::default();
+        assert_eq!(manifest.quotas, defaults);
+        assert!(defaults.kv_reads > 0 && defaults.kv_reads <= MAX_QUOTA);
+
+        let src = format!("{}\n[quotas]\nkv_reads = 3\n", vocabulary_toml());
+        let raised = SandboxManifest::parse(&src).expect("valid");
+        assert_eq!(raised.quotas.kv_reads, 3);
+        // Everything the operator did not name keeps its conservative default.
+        assert_eq!(raised.quotas.kv_writes, defaults.kv_writes);
+    }
+
+    #[test]
+    fn a_zero_or_oversized_quota_is_refused() {
+        for value in ["0", "4294967295"] {
+            let src = format!("{}\n[quotas]\nkv_reads = {value}\n", vocabulary_toml());
+            assert!(
+                matches!(
+                    SandboxManifest::parse(&src),
+                    Err(ManifestError::QuotaOutOfRange { .. })
+                ),
+                "{value} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_upgrade_that_asks_for_more_needs_fresh_consent() {
+        // Same plugin, same routes, same ceilings — only the grant grows, so
+        // the delta isolates the thing under test. Diffing two *different*
+        // plugins would report every route as new and prove nothing about
+        // capabilities.
+        let previous = SandboxManifest::parse(
+            &vocabulary_toml()
+                .replace(
+                    r#"capabilities = ["http-request", "kv", "http-outbound", "db", "jobs", "render"]"#,
+                    r#"capabilities = ["http-request"]"#,
+                )
+                .replace(r#"hosts = ["api.example.com"]"#, "")
+                .replace(r#"tables = ["orders"]"#, "")
+                .replace(r#"job_types = ["reindex"]"#, "")
+                .replace(r#"slots = ["order-summary"]"#, ""),
+        )
+        .expect("valid");
+        let next = SandboxManifest::parse(&vocabulary_toml()).expect("valid");
+
+        let delta = next.consent_delta_from(&previous);
+        assert!(delta.requires_consent());
+        assert!(delta.added_capabilities.contains(&SandboxCapability::Kv));
+        assert!(
+            delta
+                .added_hosts
+                .iter()
+                .any(|host| host == "api.example.com")
+        );
+        assert!(delta.added_tables.iter().any(|table| table == "orders"));
+        assert!(delta.added_job_types.iter().any(|job| job == "reindex"));
+        assert!(delta.added_slots.iter().any(|slot| slot == "order-summary"));
+        assert!(
+            delta.added_routes.is_empty() && delta.raised_limits.is_empty(),
+            "only the grant moved: {delta:?}"
+        );
+        let summary = delta.summary();
+        assert!(summary.contains("api.example.com"), "{summary}");
+
+        // The same manifest twice asks for nothing new.
+        assert!(!next.consent_delta_from(&next).requires_consent());
+        // Dropping a capability is not something to re-prompt for.
+        assert!(!previous.consent_delta_from(&next).requires_consent());
+    }
+
+    #[test]
+    fn raising_a_quota_needs_fresh_consent_but_lowering_one_does_not() {
+        let base = format!("{}\n[quotas]\nkv_writes = 4\n", vocabulary_toml());
+        let raised = format!("{}\n[quotas]\nkv_writes = 40\n", vocabulary_toml());
+        let base = SandboxManifest::parse(&base).expect("valid");
+        let raised = SandboxManifest::parse(&raised).expect("valid");
+
+        let up = raised.consent_delta_from(&base);
+        assert!(up.requires_consent());
+        assert!(
+            up.raised_quotas
+                .iter()
+                .any(|(field, ..)| *field == "kv_writes")
+        );
+        assert!(!base.consent_delta_from(&raised).requires_consent());
+    }
+
+    #[test]
+    fn an_upgrade_that_mounts_a_new_route_needs_fresh_consent() {
+        // A route is the router, not a description of it: the host builds its
+        // mount from exactly this list, and the consent screen promises the
+        // plugin serves "these and only these". An upgrade adding one exposes
+        // an endpoint nobody approved.
+        let previous = SandboxManifest::parse(&vocabulary_toml()).expect("valid");
+        let next = SandboxManifest::parse(&format!(
+            "{}\n[[routes]]\nmethod = \"POST\"\npath = \"/shop/checkout\"\n",
+            vocabulary_toml()
+        ))
+        .expect("valid");
+
+        let delta = next.consent_delta_from(&previous);
+        assert!(delta.requires_consent());
+        assert!(
+            delta
+                .added_routes
+                .iter()
+                .any(|route| route == "POST /shop/checkout"),
+            "{:?}",
+            delta.added_routes
+        );
+        assert!(delta.summary().contains("/shop/checkout"));
+        // Dropping a route asks for less.
+        assert!(!previous.consent_delta_from(&next).requires_consent());
+    }
+
+    #[test]
+    fn the_head_a_new_get_implies_is_part_of_the_upgrade_too() {
+        // HTTP serves HEAD wherever it serves GET and the runtime mounts it, so
+        // a manifest adding one bare GET adds two mounted routes. Both are
+        // authority, and the diff is taken over the list the consent screen
+        // prints rather than the literal `[[routes]]`.
+        let previous = SandboxManifest::parse(&vocabulary_toml()).expect("valid");
+        let next = SandboxManifest::parse(&format!(
+            "{}\n[[routes]]\nmethod = \"GET\"\npath = \"/shop/orders\"\n",
+            vocabulary_toml()
+        ))
+        .expect("valid");
+        let delta = next.consent_delta_from(&previous);
+        assert!(
+            delta.added_routes.contains(&"GET /shop/orders".to_owned())
+                && delta.added_routes.contains(&"HEAD /shop/orders".to_owned()),
+            "{:?}",
+            delta.added_routes
+        );
+    }
+
+    #[test]
+    fn a_quota_for_a_dropped_capability_is_not_new_authority() {
+        // The narrowing upgrade this delta exists to wave through, made to look
+        // like growth by a number left behind. Dropping `kv` while a raised
+        // `kv_reads` stays in the table is not new authority — no KV call can
+        // be made at all — but it made `plugin inspect --against` exit
+        // non-zero, prompting on the change least in need of a prompt.
+        let approved =
+            SandboxManifest::parse(&format!("{}\n[quotas]\nkv_reads = 8\n", vocabulary_toml()))
+                .expect("valid");
+
+        // Same manifest with `kv` and its grants gone, and `kv_reads` raised.
+        let narrowed_src = vocabulary_toml().replace(
+            r#"capabilities = ["http-request", "kv", "http-outbound", "db", "jobs", "render"]"#,
+            r#"capabilities = ["http-request", "http-outbound", "db", "jobs", "render"]"#,
+        );
+        let narrowed =
+            SandboxManifest::parse(&format!("{narrowed_src}\n[quotas]\nkv_reads = 64\n"))
+                .expect("valid");
+
+        let delta = narrowed.consent_delta_from(&approved);
+        assert!(
+            !delta.requires_consent(),
+            "dropping a capability is not growth: {delta:?}"
+        );
+        assert!(
+            !delta
+                .raised_quotas
+                .iter()
+                .any(|(field, ..)| *field == "kv_reads"),
+            "{:?}",
+            delta.raised_quotas
+        );
+
+        // And the same raise *with* `kv` still granted is still reported, so
+        // the filter narrows the delta rather than defeating it.
+        let greedy =
+            SandboxManifest::parse(&format!("{}\n[quotas]\nkv_reads = 64\n", vocabulary_toml()))
+                .expect("valid");
+        assert!(
+            greedy
+                .consent_delta_from(&approved)
+                .raised_quotas
+                .iter()
+                .any(|(field, ..)| *field == "kv_reads"),
+            "a raise on a capability that is still granted must still prompt"
+        );
+    }
+
+    #[test]
+    fn every_quota_says_which_capability_it_bounds() {
+        // The pairing `governed_by` relies on, asserted rather than assumed:
+        // a quota added to `fields` without a mapping would silently become
+        // ungoverned, and an ungoverned quota is always reported — which is the
+        // behaviour the filter above exists to remove.
+        let ungoverned = ["calls", "calls_per_second"];
+        for (field, _) in CapabilityQuotas::default().fields() {
+            let governed = super::super::grants::CapabilityQuotas::governed_by(field).is_some();
+            assert_eq!(
+                governed,
+                !ungoverned.contains(&field),
+                "{field} is on the wrong side of the governed/ungoverned split"
+            );
+        }
+    }
+
+    #[test]
+    fn an_upgrade_that_raises_a_resource_ceiling_needs_fresh_consent() {
+        // The kind of growth that touches no capability name: `fuel`,
+        // `memory_bytes` and `max_concurrency` are what one plugin may cost the
+        // host, and an upgrade can multiply them by thousands while every word
+        // on the consent screen stays the same.
+        let modest = SandboxManifest::parse(&format!(
+            "{}\n[limits]\nfuel = 5000000\nmemory_bytes = 16777216\nmax_concurrency = 4\n",
+            vocabulary_toml()
+        ))
+        .expect("valid");
+        let greedy = SandboxManifest::parse(&format!(
+            "{}\n[limits]\nfuel = 100000000000\nmemory_bytes = 16777216\nmax_concurrency = 4\n",
+            vocabulary_toml()
+        ))
+        .expect("valid");
+
+        let delta = greedy.consent_delta_from(&modest);
+        assert!(delta.requires_consent());
+        assert!(
+            delta
+                .raised_limits
+                .iter()
+                .any(|(field, ..)| *field == "fuel"),
+            "{:?}",
+            delta.raised_limits
+        );
+        assert!(delta.summary().contains("fuel"));
+        // Lowering a ceiling asks for less.
+        assert!(!modest.consent_delta_from(&greedy).requires_consent());
+    }
+
+    #[test]
+    fn a_db_grant_whose_physical_name_cannot_be_derived_is_refused_at_load() {
+        // The alternative is a capability the consent screen displays and every
+        // call then denies as `malformed` — an operator approving authority the
+        // runtime can never honour.
+        let src = vocabulary_toml()
+            .replace("autumn-plugin-shop", &"p".repeat(40))
+            .replace("\"orders\"", &format!("\"{}\"", "t".repeat(30)));
+        assert!(
+            matches!(
+                SandboxManifest::parse(&src),
+                Err(ManifestError::InvalidGrantEntry {
+                    field: "tables",
+                    ..
+                })
+            ),
+            "{:?}",
+            SandboxManifest::parse(&src)
+        );
+    }
+
+    #[test]
+    fn the_consent_summary_enumerates_every_grant_detail_and_quota() {
+        let manifest = SandboxManifest::parse(&vocabulary_toml()).expect("valid");
+        let summary = manifest.consent_summary();
+        for expected in [
+            "api.example.com",
+            "orders",
+            "reindex",
+            "order-summary",
+            "kv_reads",
+        ] {
+            assert!(
+                summary.contains(expected),
+                "{expected} missing from {summary}"
+            );
+        }
+        // The blanket "no database, no network" line must not survive next to a
+        // manifest that was just granted both.
+        assert!(
+            !summary.contains("filesystem access, outbound network access"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn a_plugin_that_asks_for_nothing_extra_still_reads_as_denying_everything() {
+        let summary = SandboxManifest::parse(&valid_toml())
+            .expect("valid")
+            .consent_summary();
+        for denied in ["filesystem", "network", "environment", "database"] {
+            assert!(summary.contains(denied), "{denied} missing from {summary}");
+        }
     }
 
     #[test]

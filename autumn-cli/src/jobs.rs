@@ -42,6 +42,7 @@ pub fn run(opts: &ManifestOptions<'_>) {
         // with that manifest instead of the jobs one.
         .env_remove(crate::data_flow::DUMP_ENV)
         .env_remove(crate::agents::DUMP_ENV)
+        .env_remove(crate::graph::DUMP_ENV)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .output()

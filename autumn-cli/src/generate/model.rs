@@ -269,23 +269,21 @@ fn plan_model_with_options_impl(
     // the SQL migration and schema.rs block include the nullable column.
     let schema_fields = augment_fields_for_soft_delete(&fields, options.soft_delete)?;
 
-    // Issue #1318: `lock_version` is managed by the database, so it contributes
-    // nothing to `New{Model}` — and neither does any `--default` column. A model
-    // whose columns are ALL database-managed therefore emits an empty
-    // `New{Model}`, whose Diesel `Insertable` derive does not compile, so the
-    // generated project is dead on arrival.
+    // #1318: `lock_version` is managed by the database, so it contributes nothing to
+    // `New{Model}`, and neither does any `--default` column. A model whose columns are all
+    // database-managed therefore emits an empty `New{Model}`, whose Diesel `Insertable`
+    // derive does not compile, leaving the generated project dead on arrival.
     //
-    // The check is on the EFFECTIVE set rather than the declared token count:
-    // `Post title:String lock_version:i32 --default title=x` declares two
-    // columns and leaves zero. `metadata.defaults` carries both the explicit
-    // `--default` columns and (from `parse_model_metadata`) the lock column.
+    // The check is on the effective set rather than the declared token count: `Post
+    // title:String lock_version:i32 --default title=x` declares two columns and leaves
+    // zero. `metadata.defaults` carries both the explicit `--default` columns and, from
+    // `parse_model_metadata`, the lock column.
     //
     // Scoped to lock-version models deliberately. A model whose every column is
-    // `--default`ed — or one declared with no fields at all — has always emitted
-    // this same uncompilable struct; widening the refusal to those pre-existing
-    // cases is a separate change from wiring #1318, and would move a fieldless
-    // `generate scaffold Post` from a compile error to a planning error that an
-    // existing test pins.
+    // `--default`ed, or one declared with no fields, has always emitted this same
+    // uncompilable struct; widening the refusal to those pre-existing cases is a separate
+    // change from wiring #1318, and would move a fieldless `generate scaffold Post` from a
+    // compile error to a planning error an existing test pins.
     if !for_revert {
         validate_lock_version_field(&fields, &options.defaults)?;
     }
@@ -1093,28 +1091,24 @@ pub(super) fn plan_cargo_deps(
     if updated != existing {
         plan.modify(cargo_toml_path.clone(), updated);
     }
-    // Recorded unconditionally — mirroring every other `push_revert` call in
-    // this module — so `autumn destroy` (issue #1048), which recomputes
-    // this same plan against the *already-generated* Cargo.toml (where
-    // these deps are, by definition, already present), still knows to
-    // remove them. Gating this on "did the Modify actually change
-    // anything" would make it a no-op at destroy time, since re-running
-    // this same idempotent transform against post-generate disk never
-    // produces a diff.
+    // Recorded unconditionally, mirroring every other `push_revert` call in this module,
+    // so `autumn destroy` (#1048) — which recomputes this same plan against the
+    // already-generated Cargo.toml, where these deps are by definition present — still
+    // knows to remove them. Gating on "did the Modify actually change anything" would make
+    // it a no-op at destroy time, since re-running this idempotent transform against
+    // post-generate disk never produces a diff.
     //
-    // `TEMPLATE_SHIPPED_CARGO_DEPS` names are excluded: `autumn new`'s own
-    // template already declares them (see `templates/Cargo.toml.tmpl`), so
-    // `ensure_cargo_dependencies` never actually adds them for a real
-    // project — they're only in `MODEL_DEPS`/`SCAFFOLD_EXTRA_DEPS` as a
-    // safety net for a hand-rolled Cargo.toml missing them. Reverting them
-    // unconditionally would strip a framework dependency the project needs
-    // regardless of any generated resource.
+    // `TEMPLATE_SHIPPED_CARGO_DEPS` names are excluded: `autumn new`'s template already
+    // declares them (see `templates/Cargo.toml.tmpl`), so `ensure_cargo_dependencies`
+    // never adds them for a real project — they are in `MODEL_DEPS`/`SCAFFOLD_EXTRA_DEPS`
+    // only as a safety net for a hand-rolled Cargo.toml missing them. Reverting them
+    // unconditionally would strip a framework dependency the project needs regardless of
+    // any generated resource.
     //
-    // Known limitation (documented, out of scope per issue #1048): for any
-    // *other* name, if a *different* resource's generator also depends on
-    // it, destroying this resource still removes it — reverting a shared
-    // dependency across multiple generated resources needs the multi-step
-    // undo history the issue explicitly scopes out.
+    // Known limitation, out of scope per #1048: for any other name, if a different
+    // resource's generator also depends on it, destroying this resource still removes it.
+    // Reverting a shared dependency across several generated resources needs the
+    // multi-step undo history the issue explicitly scopes out.
     let names: Vec<String> = deps
         .iter()
         .map(|(name, _)| *name)
@@ -1169,17 +1163,16 @@ pub fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> Strin
         return out;
     };
 
-    // We split two concerns here:
-    // 1. The "scan extent" — how far the dependency section reaches when
-    //    deciding which deps are already declared. `[dependencies.<crate>]`
-    //    subtables are *part of* `[dependencies]`, so they extend the scan
-    //    until a real boundary like `[dev-dependencies]` or `[[bin]]`.
-    // 2. The "insertion point" — where to write new shorthand `key = value`
-    //    entries. This stops at the FIRST table header (subtable or not),
-    //    because TOML attaches shorthand keys to whichever section header
-    //    precedes them: a `chrono = "0.4"` placed *after* a
-    //    `[dependencies.chrono]` line would become a key inside that
-    //    subtable, not a sibling shorthand dep.
+    // Two concerns are split here:
+    // 1. The scan extent — how far the dependency section reaches when deciding which
+    //    deps are already declared. `[dependencies.<crate>]` subtables are part of
+    //    `[dependencies]`, so they extend the scan until a real boundary such as
+    //    `[dev-dependencies]` or `[[bin]]`.
+    // 2. The insertion point — where to write new shorthand `key = value` entries. This
+    //    stops at the first table header, subtable or not, because TOML attaches
+    //    shorthand keys to whichever section header precedes them: a `chrono = "0.4"`
+    //    placed after a `[dependencies.chrono]` line would become a key inside that
+    //    subtable rather than a sibling shorthand dep.
     let scan_end = lines[deps_idx + 1..]
         .iter()
         .position(|l| is_any_table_header(l) && !is_dep_subtable_boundary_marker(l))
@@ -2662,16 +2655,14 @@ fn render_enum_decl(field: &Field, default_variant: Option<&str>) -> String {
 
     let mut out = String::new();
 
-    // Always derive `Default`, even without an explicit `--default`: the
-    // `#[model]` macro's generated `UpdateX` patch struct wraps every field
-    // in `Patch<T>` and unconditionally derives `Default` on itself, and
-    // `#[derive(Default)]` on a generic type adds a `T: Default` bound for
-    // every type parameter regardless of which variant is `#[default]`d —
-    // so every field's Rust type must implement `Default`, the same
-    // requirement every other field kind already satisfies via `std`. Absent
-    // an explicit `--default field=variant`, the first declared variant is
-    // the natural, unsurprising choice (matching how other kinds default to
-    // a canonical baseline, e.g. `i32::default() == 0`).
+    // Always derive `Default`, even without an explicit `--default`. The `#[model]`
+    // macro's generated `UpdateX` patch struct wraps every field in `Patch<T>` and
+    // unconditionally derives `Default` on itself, and `#[derive(Default)]` on a generic
+    // type adds a `T: Default` bound for every type parameter whatever variant is
+    // `#[default]`ed — so every field's Rust type must implement `Default`, a requirement
+    // every other field kind already satisfies via `std`. Absent an explicit `--default
+    // field=variant`, the first declared variant is the unsurprising choice, matching how
+    // other kinds default to a canonical baseline such as `i32::default() == 0`.
     let default_raw = default_variant.unwrap_or_else(|| {
         field
             .variants
@@ -2805,16 +2796,14 @@ fn render_model_file(
             out.push('\n');
         }
     }
-    // Struct-level `#[commentable(...)]` (issue #1367) — emitted by the
-    // `comments:commentable` DSL token. It is what brings the repository's
-    // `add_comment`/`comment_thread`/`delete_comment` helpers into existence
-    // and registers this model with the framework's generic comment router.
-    //
-    // `by = User` is the convention `autumn generate auth` produces; a project
-    // whose author model is named differently changes that one word. No
-    // `author_name` is emitted on purpose: the generated `User` carries an
-    // `email`, and defaulting a *public* display name to it would leak
-    // addresses into every rendered thread.
+    // Struct-level `#[commentable(...)]` (#1367), emitted by the `comments:commentable`
+    // DSL token. It brings the repository's `add_comment`, `comment_thread`, and
+    // `delete_comment` helpers into existence and registers this model with the
+    // framework's generic comment router. `by = User` is the convention `autumn generate
+    // auth` produces; a project whose author model is named differently changes that one
+    // word. No `author_name` is emitted on purpose: the generated `User` carries an
+    // `email`, and defaulting a public display name to it would leak addresses into every
+    // rendered thread.
     if fields.iter().any(|f| f.kind.is_commentable()) {
         out.push_str(
             "// Threaded, polymorphic comments (#1367): one shared `comments` table,\n\
@@ -2935,22 +2924,20 @@ fn render_model_file(
         let _ = writeln!(out, "    pub {}: {},", f.name, f.rust_type());
     }
     if soft_delete {
-        // `deleted_at` must come *before* `created_at` here, matching the
-        // column order `create_table_sql_with_metadata_and_id`/
-        // `schema_table_block_with_id` emit (they append the soft-delete
-        // field to the field list, then always append `created_at` last).
-        // The repository macro's generated insert-then-`RETURNING` query
-        // loads into this struct positionally, so a struct field order that
-        // doesn't match the table's column order produces a Diesel
-        // `CompatibleType` mismatch at compile time.
+        // `deleted_at` must come before `created_at` here, matching the column
+        // order `create_table_sql_with_metadata_and_id` and
+        // `schema_table_block_with_id` emit: they append the soft-delete field to
+        // the field list, then always append `created_at` last. The repository
+        // macro's generated insert-then-`RETURNING` query loads into this struct
+        // positionally, so a struct field order that does not match the table's
+        // column order produces a Diesel `CompatibleType` mismatch at compile time.
         //
-        // `deleted_at` is otherwise DB-managed (NULL on insert, set only by
-        // the destroy handler): the migration declares it nullable with no
-        // explicit SQL DEFAULT, so Postgres inserts NULL whenever it's
-        // omitted from the INSERT column list. `#[default]` excludes it from
-        // `NewX`/`UpdateX` accordingly -- without it, the `#[model]` macro
-        // treats `deleted_at` as a required field, and neither the
-        // `create`/`update` handler ever populates it.
+        // `deleted_at` is otherwise DB-managed — NULL on insert, set only by the
+        // destroy handler. The migration declares it nullable with no explicit SQL
+        // DEFAULT, so Postgres inserts NULL whenever it is omitted from the INSERT
+        // column list, and `#[default]` excludes it from `NewX`/`UpdateX`
+        // accordingly. Without it the `#[model]` macro treats `deleted_at` as a
+        // required field that neither the create nor the update handler populates.
         out.push_str("    #[default]\n");
         out.push_str("    pub deleted_at: Option<chrono::NaiveDateTime>,\n");
     }
