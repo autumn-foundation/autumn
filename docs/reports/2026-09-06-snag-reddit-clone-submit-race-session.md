@@ -108,7 +108,18 @@ session), so Postgres 16 ran as a native service rather than the
    concurrent `/submit` requests against a real Postgres instance — this
    session intentionally left that to whoever picks up the fix, per Snag's
    "reproduction over patch" charter, since designing the concurrency
-   backstop and the test that proves it belong together.
+   backstop and the test that proves it belong together. **Note** (a Codex
+   review on this PR caught this): unlike `autumn-web`'s consolidated
+   `integration_tests` binary, `.github/workflows/ci.yml`'s "Run
+   Docker-dependent tests" step has no bare `--ignored` sweep over
+   `examples/reddit-clone`'s own test binary — every crate it runs is an
+   explicit, hand-curated `cargo test -p <crate> --test <target> --
+   --ignored` line. An `#[ignore]`d test dropped into
+   `examples/reddit-clone/tests/` following the house pattern would compile
+   but never actually run in CI. The fixing PR needs its own explicit
+   `cargo test -p reddit-clone --test <target> -- --ignored` line added to
+   that step (see `AGENTS.md:56-60` for the sweep's actual scope), not just
+   the `#[ignore]` attribute.
 2. **Race `reddit-clone`'s comment-creation path** the same way, to confirm
    or rule out the weaker "plain duplicate comment" hypothesis the prior
    session left as a digest entry.
