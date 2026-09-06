@@ -485,10 +485,46 @@ fn is_sqlite_constant_default(default: &str) -> bool {
     if inner.starts_with('\'') || inner.starts_with("x'") {
         return true;
     }
-    // Otherwise: a bare literal or signed number. A call or an operator makes
-    // it an expression.
+    // A number, including exponent form (`1e-3`), whose sign is part of the
+    // literal rather than an operator.
+    if is_numeric_literal(inner) {
+        return true;
+    }
+    // Otherwise: a bare keyword literal. A call or an operator makes it an
+    // expression.
     let unsigned = inner.trim_start_matches(['+', '-']).trim_start();
     !unsigned.contains(['(', ')', '+', '-', '*', '/', '|', '<', '>', '=', '\''])
+}
+
+/// Whether `value` is an `SQLite` numeric literal: an optionally signed integer
+/// or real, in plain, exponent (`1e-3`) or hex (`0x1f`) form.
+fn is_numeric_literal(value: &str) -> bool {
+    let body = value.strip_prefix(['+', '-']).unwrap_or(value);
+    if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        return !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    let (mantissa, exponent) = body
+        .split_once(['e', 'E'])
+        .map_or((body, None), |(m, e)| (m, Some(e)));
+    if !is_decimal(mantissa) {
+        return false;
+    }
+    exponent.is_none_or(|e| {
+        let digits = e.strip_prefix(['+', '-']).unwrap_or(e);
+        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+    })
+}
+
+/// Whether `value` is an unsigned decimal integer or real (`12`, `1.5`, `.5`).
+fn is_decimal(value: &str) -> bool {
+    let (int, frac) = value
+        .split_once('.')
+        .map_or((value, None), |(i, f)| (i, Some(f)));
+    if int.is_empty() && frac.is_none_or(str::is_empty) {
+        return false;
+    }
+    int.chars().all(|c| c.is_ascii_digit())
+        && frac.is_none_or(|f| f.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// A statement `SQLite` has no syntax for at all (issue #1906).
@@ -2662,6 +2698,32 @@ mod tests {
                 sqlite_ops(sql)
             );
         }
+    }
+
+    #[test]
+    fn sqlite_numeric_defaults_including_exponent_form_are_accepted() {
+        for sql in [
+            "ALTER TABLE s ADD COLUMN a REAL DEFAULT 1e-3;",
+            "ALTER TABLE s ADD COLUMN b REAL DEFAULT -1.5E+10;",
+            "ALTER TABLE s ADD COLUMN c REAL DEFAULT .5;",
+            "ALTER TABLE s ADD COLUMN d INTEGER DEFAULT 0x1f;",
+            "ALTER TABLE s ADD COLUMN e REAL DEFAULT (1e-3);",
+        ] {
+            assert!(
+                classify_sql_for(DatabaseBackend::Sqlite, sql).is_empty(),
+                "{sql} is a numeric literal, got {:?}",
+                sqlite_ops(sql)
+            );
+        }
+        // Still an expression, not a literal.
+        let expr = "ALTER TABLE s ADD COLUMN f REAL DEFAULT 1e-3+1;";
+        assert!(
+            classify_sql_for(DatabaseBackend::Sqlite, expr)
+                .iter()
+                .any(|f| f.risk == RiskLevel::Unsupported),
+            "{expr} -> {:?}",
+            sqlite_ops(expr)
+        );
     }
 
     #[test]

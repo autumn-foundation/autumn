@@ -65,13 +65,16 @@ pub fn scan_prior_indexes(migrations_dir: &Path, table: &str) -> Vec<PriorIndex>
             live.remove(&dropped);
         } else if let Some((old, new)) = parse_column_rename(normalized, name) {
             // SQLite rewrites an index's column references on RENAME COLUMN, so
-            // the recorded tokens must follow.
+            // both the recorded tokens and the replay SQL must follow. A stale
+            // `create_sql` would make the rollback re-create the index against a
+            // column name that no longer exists.
             for (_, index) in live.values_mut() {
                 for token in &mut index.tokens {
                     if *token == old {
                         token.clone_from(&new);
                     }
                 }
+                index.create_sql = rename_identifier(&index.create_sql, &old, &new);
             }
         } else if drops_table(normalized, name) {
             // Every index on the table goes with it.
@@ -286,6 +289,51 @@ fn recreate_sql(raw: &str) -> String {
     } else {
         format!("{trimmed};")
     }
+}
+
+/// Replace whole-identifier occurrences of `old` with `new` in `sql`.
+///
+/// Only complete identifiers are rewritten, so renaming `title` leaves
+/// `title_slug` alone. Single-quoted literals are skipped, as is a name followed
+/// by `(` — that is a function call, not a column. Double quotes sit outside the
+/// identifier, so a quoted `"title"` is rewritten and stays quoted.
+fn rename_identifier(sql: &str, old: &str, new: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut pending = String::new();
+    let mut in_literal = false;
+    let flush = |out: &mut String, pending: &mut String, next: Option<char>| {
+        if !pending.is_empty() {
+            if pending.to_lowercase() == old && next != Some('(') {
+                out.push_str(new);
+            } else {
+                out.push_str(pending);
+            }
+            pending.clear();
+        }
+    };
+    for c in sql.chars() {
+        if in_literal {
+            if c == '\'' {
+                in_literal = false;
+            }
+            out.push(c);
+            continue;
+        }
+        if c == '\'' {
+            flush(&mut out, &mut pending, Some(c));
+            in_literal = true;
+            out.push(c);
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            pending.push(c);
+            continue;
+        }
+        flush(&mut out, &mut pending, Some(c));
+        out.push(c);
+    }
+    flush(&mut out, &mut pending, None);
+    out
 }
 
 /// Replace the contents of single-quoted literals with spaces, keeping the
@@ -642,6 +690,47 @@ mod tests {
             .map(|i| i.name)
             .collect();
         assert_eq!(names, vec!["idx_fresh"], "got {names:?}");
+    }
+
+    #[test]
+    fn a_column_rename_rewrites_the_replay_sql_too() {
+        // A stale `create_sql` would make the rollback re-create the index
+        // against a column name that no longer exists.
+        let t = tree(&[
+            (
+                "2026_01_01_000000_a",
+                "CREATE INDEX i ON posts (title, title_slug) WHERE title IS NOT NULL;",
+            ),
+            (
+                "2026_01_02_000000_b",
+                "ALTER TABLE posts RENAME COLUMN title TO headline;",
+            ),
+        ]);
+        let found = scan_prior_indexes(t.path(), "posts");
+        assert_eq!(
+            found[0].create_sql,
+            "CREATE INDEX i ON posts (headline, title_slug) WHERE headline IS NOT NULL;",
+            "`title_slug` must not be touched"
+        );
+    }
+
+    #[test]
+    fn a_column_rename_leaves_string_literals_and_calls_alone() {
+        let t = tree(&[
+            (
+                "2026_01_01_000000_a",
+                "CREATE INDEX i ON posts (title(x)) WHERE tag = 'title';",
+            ),
+            (
+                "2026_01_02_000000_b",
+                "ALTER TABLE posts RENAME COLUMN title TO headline;",
+            ),
+        ]);
+        let found = scan_prior_indexes(t.path(), "posts");
+        assert_eq!(
+            found[0].create_sql, "CREATE INDEX i ON posts (title(x)) WHERE tag = 'title';",
+            "a call name and a literal are not the column"
+        );
     }
 
     #[test]

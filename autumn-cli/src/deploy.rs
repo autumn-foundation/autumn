@@ -2223,15 +2223,18 @@ fn collect_project_preflight(
             requires_database_pool(config),
         ),
         // Grade migrations against the backend of the SAME profile that will run
-        // them on the host (`AUTUMN_ENV=<resolved.profile>`, default `prod`), for
-        // the reason spelled out for the signing secret above: a project whose
-        // prod profile is SQLite and whose dev profile is Postgres would
-        // otherwise have its production migrations graded by Postgres rules.
+        // them on the host, for the reason spelled out for the signing secret
+        // above: a project whose prod profile is SQLite and whose dev profile is
+        // Postgres would otherwise have its production migrations graded by
+        // Postgres rules. `config` is already the reloaded TARGET-profile config
+        // (see `reload_config_for_deploy_profile`), so it is the one source that
+        // sees `.env.<profile>` — where a production URL often lives — and no
+        // separate detection can match it. Same URL the `database_url` grader
+        // below reads.
         grade_migrate_check_for(
-            crate::generate::detect_backend_offline(
-                Path::new("."),
-                Some(&canonicalize_deploy_profile(&resolved.profile)),
-            ),
+            resolve_writable_db_url(&config.database)
+                .and_then(autumn_web::config::DatabaseBackend::detect)
+                .unwrap_or(autumn_web::config::DatabaseBackend::Postgres),
             Path::new(MIGRATIONS_DIR),
         ),
     ]
