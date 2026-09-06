@@ -3970,17 +3970,33 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                             // write or an outbound POST on a request that is
                             // already going to fail, which is the property the
                             // charge-before-dispatch order exists to establish.
-                            while caller.data().has_pending_call() && caller.data().answer.is_none()
-                            {
-                                charge_units(&mut caller, CAPABILITY_CALL_FUEL)?;
-                                let _ = caller.data_mut().service_next();
-                                // Saturating, because this charge follows a call
-                                // that has already run: see
-                                // `charge_units_saturating`. The pre-charge above
-                                // is the trapping one, and it is what stops the
-                                // next call.
-                                let owed = caller.data_mut().take_pending_charge();
-                                charge_units_saturating(&mut caller, owed)?;
+                            //
+                            // And only when the write was accepted. A chunk can
+                            // carry a complete call frame followed by a line that
+                            // overruns the stdout budget: `write_stdout` parses
+                            // and queues the first, then refuses at the second and
+                            // answers `false`. Servicing the queue anyway would
+                            // commit that call's side effect on a request the
+                            // `!accepted` branch below is about to end as
+                            // `OutputBudget` — the guest is told the write failed
+                            // and may retry it, so the enqueue or the POST happens
+                            // twice. It is the same property the
+                            // charge-before-dispatch order establishes for fuel,
+                            // reached through the output ceiling instead.
+                            if accepted {
+                                while caller.data().has_pending_call()
+                                    && caller.data().answer.is_none()
+                                {
+                                    charge_units(&mut caller, CAPABILITY_CALL_FUEL)?;
+                                    let _ = caller.data_mut().service_next();
+                                    // Saturating, because this charge follows a
+                                    // call that has already run: see
+                                    // `charge_units_saturating`. The pre-charge
+                                    // above is the trapping one, and it is what
+                                    // stops the next call.
+                                    let owed = caller.data_mut().take_pending_charge();
+                                    charge_units_saturating(&mut caller, owed)?;
+                                }
                             }
                             // Charged whether the write was accepted or not, and
                             // drained before the branch below, so no exit from

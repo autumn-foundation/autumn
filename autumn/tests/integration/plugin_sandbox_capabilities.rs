@@ -183,6 +183,55 @@ fn verdict(host: &SandboxHost, services: CapabilityServices, path: &str) -> (u16
     (status, events)
 }
 
+#[test]
+fn a_call_parsed_from_a_rejected_write_never_reaches_a_backend() {
+    // The whole charge-before-dispatch order exists so a request that is going
+    // to fail cannot leave a side effect behind. The output ceiling reached the
+    // same state by another route: one `fd_write` carrying a complete `kv-set`
+    // and then a line that overruns the stdout budget, so `write_stdout` queues
+    // the call and *then* refuses. The queue was serviced before the refusal
+    // was acted on, so the write committed on a request whose caller is told it
+    // failed — and may retry it.
+    let manifest_src = manifest_toml(
+        &["http-request", "kv"],
+        r"
+[grants]
+hosts = []
+tables = []
+job_types = []
+slots = []
+
+[limits]
+max_response_bytes = 512
+",
+    );
+    // Comfortably past `2 * 512 + 4096`, and inside one 64 KiB host chunk, so
+    // the call and the overrun are decided together.
+    let host = load(&manifest_src, &guests::call_then_overrun(8192));
+    let wired = wired("alpha");
+    let kv = Arc::clone(&wired.kv);
+
+    let outcome = host.run_with(&request("/kv-set"), wired.services);
+    assert!(
+        outcome.result.is_err(),
+        "the overrun must end the request: {:?}",
+        outcome.result
+    );
+
+    // The point of the test: the request failed, so nothing may have been
+    // stored. Before the fix this key was present.
+    let key = autumn_web::plugin_sandbox::capability::kv::namespaced_key(
+        PLUGIN_NAME,
+        Some("alpha"),
+        "cart",
+    );
+    assert_eq!(
+        kv.get(&key),
+        Ok(None),
+        "a call parsed out of a rejected write must not reach the backend"
+    );
+}
+
 // ── The channel works at all ─────────────────────────────────────────────
 
 /// The issue's success metric asks for "one reference plugin built entirely

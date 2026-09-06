@@ -3361,6 +3361,55 @@ pub fn empty_iovecs(iovecs: u32, calls: u32) -> String {
     )
 }
 
+/// A guest whose single `fd_write` carries a complete `kv-set` frame and then
+/// a line that never ends, long enough to overrun the stdout budget.
+///
+/// The shape that made the defect reachable: `write_stdout` parses and queues
+/// the first frame, refuses at the second and answers `false`. Both land in one
+/// host-side chunk, so the queued call and the rejection are decided together —
+/// and the request is going to end as `OutputBudget` either way. If the queue is
+/// serviced anyway, the `kv-set` commits on a request whose caller is told the
+/// write failed and may retry it.
+///
+/// `pad` is the length of the unterminated tail; it must exceed
+/// `2 × max_response_bytes + 4096` for the write to be refused.
+#[must_use]
+pub fn call_then_overrun(pad: usize) -> String {
+    // Written out rather than escaped from a Rust literal: the WAT string needs
+    // `\"` for its quotes and `\0a` for the newline, and getting that wrong
+    // silently produces a frame the host cannot parse — which would make this
+    // guest prove nothing while still passing.
+    const FRAME: &str = r#"{\"op\":\"call\",\"call\":\"kv-set\",\"id\":1,\"key\":\"cart\",\"value\":\"one item\"}\0a"#;
+    // The frame's length in bytes, not in source characters: `\"` is one byte
+    // and `\0a` is one byte.
+    let frame_len =
+        FRAME.len() - (FRAME.matches(r#"\""#).count() + 2 * FRAME.matches(r"\0a").count());
+    let start = 4096;
+    let frame_end = start + frame_len;
+    let total = frame_len + pad;
+    format!(
+        r#"(module
+  (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 4 4)
+  (data (i32.const {start}) "{FRAME}")
+
+  (func (export "_start")
+    (local $i i32)
+    ;; A tail of 'X' immediately after the frame, with no newline anywhere in
+    ;; it, so the host's pending line grows past its ceiling.
+    (loop $l
+      (i32.store8 (i32.add (i32.const {frame_end}) (local.get $i)) (i32.const 88))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (i32.const {pad}))))
+    ;; One write, one chunk: the call and the overrun arrive together.
+    (i32.store (i32.const 0) (i32.const {start}))
+    (i32.store (i32.const 4) (i32.const {total}))
+    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 16))))
+)
+"#
+    )
+}
+
 // ── Capability-channel guests (issue #1632) ──────────────────────────────
 
 /// A plugin that uses the capability channel: it reads the request frame,
