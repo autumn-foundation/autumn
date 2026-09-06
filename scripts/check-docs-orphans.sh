@@ -4050,6 +4050,18 @@ self_test() {
   git -C "$c9iw" add -A && git -C "$c9iw" commit -qm entity-spelled-tag-text
   check "an entity-spelled tag is visible text, not markup" pass "$c9iw"
 
+  # A reference WITHOUT its semicolon is visible text, in a raw anchor too.
+  # The HTML tokenizer would decode `&#32` to a space, but it never sees this:
+  # Markdown renders first and escapes the bare `&`, so the browser is handed
+  # `&amp;#32` and paints the four characters `&#32` — 36px wide and clickable
+  # (markdown-it into Chromium, end to end). Applying HTML decoding rules here
+  # would discard a live link and invent an orphan, so CommonMark's stricter
+  # requirement is the correct one for this pipeline, not a mismatch to fix.
+  local c9ja="$tmp/c9ja"; make_corpus "$c9ja"
+  printf '# Jobs\n\n<a href="mail.md">&#32</a>\n' > "$c9ja/docs/guide/jobs.md"
+  git -C "$c9ja" add -A && git -C "$c9ja" commit -qm semicolonless-entity
+  check "a reference without its semicolon is visible text" pass "$c9ja"
+
   # The anchor's OWN `hidden` renders no link at all, however solid its label.
   # `has_content` is handed the content slice and never sees the opening tag,
   # so this is checked where the tag is.
