@@ -134,10 +134,11 @@ fn open(path: &Path) -> Result<SqliteConnection, SnapshotError> {
             path: path.display().to_string(),
         });
     }
-    // Refuse a non-UTF-8 path rather than open a lossy rendering of it, which
-    // would be a DIFFERENT file. `file:app%FF.db` decodes to such a name, and
-    // diesel takes the connection string as `&str`.
-    let Some(target) = path.to_str() else {
+    // Through the runtime's own `connection_string`, so the CLI opens exactly what
+    // the app opens. It refuses a path no `&str` can carry (`file:app%FF.db`
+    // decodes to such a name), and it keeps a filename that itself begins with
+    // `file:` from being re-read as a URI naming a different database.
+    let Some(target) = replication::connection_string(path) else {
         return Err(SnapshotError::Open {
             path: path.display().to_string(),
             detail: "the path is not valid UTF-8, and SQLite is opened through a UTF-8 \
@@ -145,7 +146,6 @@ fn open(path: &Path) -> Result<SqliteConnection, SnapshotError> {
                 .to_owned(),
         });
     };
-    let target = target.to_owned();
     let mut conn = SqliteConnection::establish(&target).map_err(|e| SnapshotError::Open {
         path: target.clone(),
         detail: e.to_string(),

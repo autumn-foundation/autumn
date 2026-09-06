@@ -55,7 +55,7 @@ pub mod status;
 pub mod wal;
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -204,7 +204,7 @@ pub fn database_file(url: &str) -> Option<PathBuf> {
     if target == ":memory:"
         || target == "file::memory:"
         || target.starts_with("file::memory:?")
-        || target.contains("mode=memory")
+        || uri_asks_for_memory(&target)
     {
         return None;
     }
@@ -254,6 +254,45 @@ fn decoded_path(bytes: Vec<u8>) -> Option<PathBuf> {
 #[cfg(not(unix))]
 fn decoded_path(bytes: Vec<u8>) -> Option<PathBuf> {
     String::from_utf8(bytes).ok().map(PathBuf::from)
+}
+
+/// Whether a `file:` URI asks for an in-memory database through its QUERY.
+///
+/// A substring test would refuse a durable file that merely happens to be named
+/// `mode=memory.db`, which `SQLite` opens as an ordinary file. Only `mode=memory`
+/// standing alone as a query parameter means in-memory.
+fn uri_asks_for_memory(target: &str) -> bool {
+    let Some(uri) = target.strip_prefix("file:") else {
+        return false;
+    };
+    // A fragment ends the query.
+    let uri = uri.split('#').next().unwrap_or(uri);
+    let Some((_, query)) = uri.split_once('?') else {
+        return false;
+    };
+    query
+        .split(['&', ';'])
+        .any(|parameter| parameter == "mode=memory")
+}
+
+/// The string to hand `sqlite3_open` for an already-resolved database FILE.
+///
+/// diesel opens with `SQLITE_OPEN_URI`, so a filename that itself begins with
+/// `file:` is re-read as a URI and names a DIFFERENT database — which
+/// `sqlite3_open` then creates, empty. A real file named `file:prod.db` (spelled
+/// `file:file%3Aprod.db` in config) would otherwise be backed up as a fresh empty
+/// `prod.db`, reported as a success. A `./` prefix makes it an unambiguous
+/// relative path; an absolute path cannot begin with `file:` and is untouched.
+///
+/// Returns `None` for a path no `&str` connection string can carry.
+#[must_use]
+pub fn connection_string(path: &Path) -> Option<String> {
+    let text = path.to_str()?;
+    Some(if text.starts_with("file:") {
+        format!("./{text}")
+    } else {
+        text.to_owned()
+    })
 }
 
 /// Percent-decode a `SQLite` URI path the way `sqlite3_open` does.
@@ -605,6 +644,65 @@ mod tests {
         assert!(
             resolved.to_str().is_none(),
             "this path is deliberately not valid UTF-8"
+        );
+    }
+
+    /// A filename that merely CONTAINS `mode=memory` is a durable file. Only the
+    /// URI query parameter asks for an in-memory database.
+    #[test]
+    fn database_file_reads_mode_memory_from_the_query_not_the_filename() {
+        for durable in [
+            "sqlite://mode=memory.db",
+            "sqlite:///var/lib/mode=memory.db",
+            "file:mode=memory.db",
+        ] {
+            assert!(
+                database_file(durable).is_some(),
+                "{durable} names a durable file"
+            );
+        }
+        for memory in [
+            "file:app?mode=memory",
+            "file:app?cache=shared&mode=memory",
+            "file:app?mode=memory#frag",
+        ] {
+            assert_eq!(database_file(memory), None, "{memory} is in-memory");
+        }
+        // A parameter that merely starts with it is a different parameter.
+        assert!(database_file("file:app?mode=memoryx").is_some());
+    }
+
+    /// diesel opens with `SQLITE_OPEN_URI`, so a filename that itself begins with
+    /// `file:` would be re-read as a URI — naming, and CREATING, a different
+    /// database. A backup would then snapshot an empty file and report success.
+    #[test]
+    fn connection_string_keeps_a_file_prefixed_name_from_becoming_a_uri() {
+        assert_eq!(
+            connection_string(Path::new("file:prod.db")).as_deref(),
+            Some("./file:prod.db")
+        );
+        // An absolute path cannot begin with `file:`, so it is untouched.
+        assert_eq!(
+            connection_string(Path::new("/srv/file:prod.db")).as_deref(),
+            Some("/srv/file:prod.db")
+        );
+        assert_eq!(
+            connection_string(Path::new("app.db")).as_deref(),
+            Some("app.db")
+        );
+    }
+
+    /// End to end: the config spelling for a file literally named `file:prod.db`
+    /// must reach THAT file, not a fresh empty `prod.db`.
+    #[test]
+    fn a_file_named_like_a_uri_round_trips_through_the_resolver() {
+        let resolved = database_file("file:file%3Aprod.db?mode=rwc").expect("names a file");
+        assert_eq!(resolved, PathBuf::from("file:prod.db"));
+        assert_eq!(
+            connection_string(&resolved).as_deref(),
+            Some("./file:prod.db"),
+            "handing the decoded name straight back to sqlite3_open would create \
+             a different, empty database"
         );
     }
 
