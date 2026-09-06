@@ -261,7 +261,13 @@ impl AcmeStore for FsAcmeStore {
                     return Err(e);
                 }
             };
-            publish_staged(&chain_tmp, &chain_path).await?;
+            // `publish_staged` cleans up its OWN tmp argument on failure, but
+            // if publishing the chain fails, `key_tmp` was never passed to
+            // it and would otherwise leak.
+            if let Err(e) = publish_staged(&chain_tmp, &chain_path).await {
+                let _ = tokio::fs::remove_file(&key_tmp).await;
+                return Err(e);
+            }
             publish_staged(&key_tmp, &key_path).await
         })
     }
@@ -463,6 +469,45 @@ mod tests {
             assert!(
                 !name.to_string_lossy().ends_with(".tmp"),
                 "no staged temp file should linger, found {name:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn save_cert_cleans_up_the_key_temp_when_chain_publish_fails() {
+        // Codex review (#1864): once both files stage under unpredictable
+        // per-attempt names, a chain-publish failure must not leak the
+        // already-staged key temp file — unlike the old fixed `.tmp` name,
+        // a fresh name every attempt means nothing overwrites it later.
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsAcmeStore::new(dir.path(), "staging");
+        let id = CertId::from_domains(&["app.example.com".into()]);
+
+        // Make the chain's publish (rename) fail: occupy its target path
+        // with a non-empty directory, which `rename` refuses to replace.
+        let chain_path = store.chain_path(&id);
+        tokio::fs::create_dir_all(&chain_path).await.unwrap();
+        tokio::fs::write(chain_path.join("occupied"), b"x")
+            .await
+            .unwrap();
+
+        let result = store
+            .save_cert(
+                &id,
+                &StoredCert {
+                    chain_pem: "CHAIN".into(),
+                    key_pem: "KEY".into(),
+                },
+            )
+            .await;
+        assert!(result.is_err(), "chain publish must fail as arranged");
+
+        let mut entries = tokio::fs::read_dir(store.cert_dir()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name();
+            assert!(
+                !name.to_string_lossy().ends_with(".tmp"),
+                "the key's staged temp file must not leak, found {name:?}"
             );
         }
     }

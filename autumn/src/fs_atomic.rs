@@ -53,17 +53,32 @@ pub fn stage_owner_only(path: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
         options.mode(0o600);
     }
 
-    let mut file = options.open(&tmp)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        // Belt-and-suspenders: `OpenOptions::mode` is also umask-masked, so
-        // re-assert 0600 explicitly after creation.
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    // Each attempt gets a fresh, unpredictable name (unlike the old fixed
+    // `{path}.tmp`, which a failed write would simply overwrite on retry), so
+    // a failure anywhere below must clean up `tmp` itself — otherwise a
+    // persisting fault (disk quota, a failing fsync) would accumulate an
+    // unbounded number of orphaned partial-secret files across retries
+    // instead of the single leaked file the old fixed name self-healed.
+    let write_and_sync = || -> std::io::Result<()> {
+        let mut file = options.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // Belt-and-suspenders: `OpenOptions::mode` is also umask-masked,
+            // so re-assert 0600 explicitly after creation.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(data)?;
+        file.sync_all()
+    };
+
+    match write_and_sync() {
+        Ok(()) => Ok(tmp),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
-    file.write_all(data)?;
-    file.sync_all()?;
-    Ok(tmp)
 }
 
 /// Atomically publish a staged temp file by renaming it over `path`. On
