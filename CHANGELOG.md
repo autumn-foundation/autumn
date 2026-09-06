@@ -40,10 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Copy`, deref to the wrapped type, convert with `From`/`Into`, and are
   `#[serde(transparent)]`. A generated `enum` is local to your app, so the model
   generator emits its `ToSql`/`FromSql<Text, Sqlite>` impls directly. All three
-  store `TEXT`. `SqliteDecimal` keeps sign, digits and scale (`0.10` reads back
-  as `0.10`); note that a `TEXT` column sorts lexicographically, so `ORDER BY` on
-  a decimal column compares strings — see
-  `docs/guide/sqlite-in-production.md`. Postgres output is unchanged.
+  store `TEXT`. `SqliteDecimal` writes the normalized value, so it keeps sign and
+  every significant digit but **not** trailing-zero scale: a column holding
+  `0.10` reads back as `0.1`, and one holding `19.9` reads back as `19.9` where
+  Postgres `NUMERIC(10,2)` would give `19.90`. The values are numerically equal —
+  format for display rather than relying on the stored scale. Normalizing is what
+  makes SQLite's byte-wise `=` and `UNIQUE` agree with Rust equality. Note also
+  that a `TEXT` column sorts lexicographically, so `ORDER BY` on a decimal column
+  compares strings — see `docs/guide/sqlite-in-production.md`. Postgres output is
+  unchanged.
 - **sqlite:** a SQLite app's `Cargo.toml` now describes the SQLite backend
   (#1924): diesel on its `sqlite` feature with the bundled `libsqlite3-sys`,
   `diesel-async` on the sync-connection wrapper, `autumn-web`'s `sqlite`
