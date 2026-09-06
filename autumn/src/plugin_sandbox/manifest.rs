@@ -1020,6 +1020,17 @@ impl SandboxManifest {
                 .fields()
                 .into_iter()
                 .zip(self.quotas.fields())
+                .filter(|((field, _), _)| {
+                    // A quota bounding a capability this upgrade no longer asks
+                    // for is not new authority: the calls it bounds cannot be
+                    // made at all. Reporting it made a *narrowing* upgrade —
+                    // dropping `kv` while leaving a raised `kv_reads` behind —
+                    // exit non-zero from `plugin inspect --against`, which is
+                    // exactly the prompt this delta exists to avoid, on the
+                    // change least in need of one.
+                    super::grants::CapabilityQuotas::governed_by(field)
+                        .is_none_or(|capability| self.is_granted(capability))
+                })
                 .filter_map(|((field, approved), (_, requested))| {
                     (requested > approved).then_some((field, approved, requested))
                 })
@@ -2584,6 +2595,72 @@ slots = ["order-summary"]
             "{:?}",
             delta.added_routes
         );
+    }
+
+    #[test]
+    fn a_quota_for_a_dropped_capability_is_not_new_authority() {
+        // The narrowing upgrade this delta exists to wave through, made to look
+        // like growth by a number left behind. Dropping `kv` while a raised
+        // `kv_reads` stays in the table is not new authority — no KV call can
+        // be made at all — but it made `plugin inspect --against` exit
+        // non-zero, prompting on the change least in need of a prompt.
+        let approved =
+            SandboxManifest::parse(&format!("{}\n[quotas]\nkv_reads = 8\n", vocabulary_toml()))
+                .expect("valid");
+
+        // Same manifest with `kv` and its grants gone, and `kv_reads` raised.
+        let narrowed_src = vocabulary_toml().replace(
+            r#"capabilities = ["http-request", "kv", "http-outbound", "db", "jobs", "render"]"#,
+            r#"capabilities = ["http-request", "http-outbound", "db", "jobs", "render"]"#,
+        );
+        let narrowed =
+            SandboxManifest::parse(&format!("{narrowed_src}\n[quotas]\nkv_reads = 64\n"))
+                .expect("valid");
+
+        let delta = narrowed.consent_delta_from(&approved);
+        assert!(
+            !delta.requires_consent(),
+            "dropping a capability is not growth: {delta:?}"
+        );
+        assert!(
+            !delta
+                .raised_quotas
+                .iter()
+                .any(|(field, ..)| *field == "kv_reads"),
+            "{:?}",
+            delta.raised_quotas
+        );
+
+        // And the same raise *with* `kv` still granted is still reported, so
+        // the filter narrows the delta rather than defeating it.
+        let greedy =
+            SandboxManifest::parse(&format!("{}\n[quotas]\nkv_reads = 64\n", vocabulary_toml()))
+                .expect("valid");
+        assert!(
+            greedy
+                .consent_delta_from(&approved)
+                .raised_quotas
+                .iter()
+                .any(|(field, ..)| *field == "kv_reads"),
+            "a raise on a capability that is still granted must still prompt"
+        );
+    }
+
+    #[test]
+    fn every_quota_says_which_capability_it_bounds() {
+        // The pairing `governed_by` relies on, asserted rather than assumed:
+        // a quota added to `fields` without a mapping would silently become
+        // ungoverned, and an ungoverned quota is always reported — which is the
+        // behaviour the filter above exists to remove.
+        let ungoverned = ["calls", "calls_per_second"];
+        for (field, _) in CapabilityQuotas::default().fields() {
+            let governed = super::super::grants::CapabilityQuotas::governed_by(field).is_some();
+            assert_eq!(
+                governed,
+                !ungoverned.contains(&field),
+                "{field} is on the wrong side of the governed/ungoverned split"
+            );
+        }
     }
 
     #[test]

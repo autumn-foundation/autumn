@@ -431,6 +431,29 @@ pub fn encoded_text_len(text: &str) -> usize {
         .fold(0, usize::saturating_add)
 }
 
+/// How many characters `value` occupies in decimal, sign included.
+///
+/// Counted rather than formatted: `weight` runs per value on the write path.
+const fn decimal_len(value: i64) -> usize {
+    // `i64::MIN` has no positive counterpart, so it cannot be negated to be
+    // counted. It is also the longest, which makes the special case the answer.
+    if value == i64::MIN {
+        return 20;
+    }
+    let negative = value < 0;
+    let mut left = value.unsigned_abs();
+    let mut digits = 1_usize;
+    while left >= 10 {
+        left /= 10;
+        digits = digits.saturating_add(1);
+    }
+    if negative {
+        digits.saturating_add(1)
+    } else {
+        digits
+    }
+}
+
 impl PluginValue {
     /// The bytes this value costs, measured as it will be *encoded*.
     ///
@@ -440,7 +463,22 @@ impl PluginValue {
     pub fn weight(&self) -> usize {
         match self {
             Self::Text(text) => encoded_text_len(text),
-            _ => 8,
+            // Measured, not assumed. A flat eight bytes for every scalar was
+            // wrong in the direction that matters: `i64::MIN` encodes as
+            // twenty, so a `kv_value_bytes` of eight admitted a value the
+            // operator's ceiling forbade — on the way in *and* on the way back
+            // out, since reads are checked against the same number.
+            // `null` and `true` are both four characters; `false` is five.
+            Self::Null | Self::Bool(true) => 4,
+            Self::Bool(false) => 5,
+            Self::Int(value) => decimal_len(*value),
+            // A bound rather than a measurement, and deliberately: the shortest
+            // round-trip form of an `f64` is at most twenty-four characters
+            // (`-2.2250738585072014e-308`), so this can never *under*-count,
+            // which is the only direction a ceiling may not be wrong in.
+            // Formatting one to find out would allocate on a path that runs per
+            // value.
+            Self::Float(_) => 24,
         }
     }
 }
@@ -2871,6 +2909,46 @@ path = "/shop/panel"
             .is_ok(),
             "the budget must be restored after each parse"
         );
+    }
+
+    #[test]
+    fn a_scalar_weighs_what_it_encodes_to() {
+        // A flat eight bytes for every non-text scalar was wrong in the one
+        // direction a ceiling may not be wrong in: `i64::MIN` encodes as
+        // twenty, so a `kv_value_bytes` of eight admitted a value the operator
+        // forbade — on the write, and again on the read, which is checked
+        // against the same number.
+        assert_eq!(PluginValue::Int(i64::MIN).weight(), 20);
+        assert_eq!(PluginValue::Int(i64::MAX).weight(), 19);
+        assert_eq!(PluginValue::Int(0).weight(), 1);
+        assert_eq!(PluginValue::Int(-1).weight(), 2);
+        assert_eq!(PluginValue::Int(999).weight(), 3);
+        assert_eq!(PluginValue::Int(-1000).weight(), 5);
+        assert_eq!(PluginValue::Null.weight(), 4);
+        assert_eq!(PluginValue::Bool(true).weight(), 4);
+        assert_eq!(PluginValue::Bool(false).weight(), 5);
+
+        // Against the encoder rather than against arithmetic, so the two cannot
+        // drift: no scalar may weigh less than it serializes to.
+        for value in [
+            PluginValue::Null,
+            PluginValue::Bool(true),
+            PluginValue::Bool(false),
+            PluginValue::Int(0),
+            PluginValue::Int(-1),
+            PluginValue::Int(i64::MIN),
+            PluginValue::Int(i64::MAX),
+            PluginValue::Float(-2.225_073_858_507_201_4e-308),
+            PluginValue::Float(1.0),
+        ] {
+            let encoded = serde_json::to_string(&value).expect("encodes");
+            assert!(
+                value.weight() >= encoded.len(),
+                "{value:?} weighs {} but encodes to {} bytes",
+                value.weight(),
+                encoded.len()
+            );
+        }
     }
 
     #[test]

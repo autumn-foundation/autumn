@@ -490,6 +490,29 @@ impl CapabilityQuotas {
         ]
     }
 
+    /// Which capability a quota bounds, or `None` when it bounds the channel
+    /// itself rather than one capability.
+    ///
+    /// Paired with [`fields`](Self::fields) by a test rather than by a second
+    /// list, for the reason the doc there gives: a quota that exists in one
+    /// place and not the other is the failure mode worth designing against.
+    #[must_use]
+    pub fn governed_by(field: &str) -> Option<SandboxCapability> {
+        match field {
+            "kv_reads" | "kv_writes" | "kv_value_bytes" => Some(SandboxCapability::Kv),
+            "outbound_calls"
+            | "outbound_response_bytes"
+            | "outbound_request_bytes"
+            | "outbound_timeout_ms" => Some(SandboxCapability::HttpOutbound),
+            "db_reads" | "db_writes" | "db_rows" => Some(SandboxCapability::Db),
+            "job_enqueues" => Some(SandboxCapability::Jobs),
+            "render_bytes" => Some(SandboxCapability::Render),
+            // `calls` and `calls_per_second` bound the capability channel as a
+            // whole, so they mean something whatever is granted.
+            _ => None,
+        }
+    }
+
     /// # Errors
     ///
     /// Returns [`ManifestError::QuotaOutOfRange`] for a zero or oversized
