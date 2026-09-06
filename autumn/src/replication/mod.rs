@@ -226,6 +226,15 @@ pub fn database_file(url: &str) -> Option<PathBuf> {
             .map_or("", |slash| rest.get(slash..).unwrap_or_default())
     });
     let decoded = percent_decode(path);
+    // `SQLite` hands the decoded name to a NUL-terminated C API, so an encoded NUL
+    // ends the filename: `file:app%00ignored.db` opens `app`. Keeping the tail
+    // would name a path the OS rejects outright — a backup would report the live
+    // database missing, and a deploy would carry a NUL into a remote command.
+    let decoded = decoded
+        .split(|byte| *byte == 0)
+        .next()
+        .unwrap_or_default()
+        .to_vec();
     if decoded.is_empty() {
         return None;
     }
@@ -615,6 +624,10 @@ mod tests {
             ("file:a%2Fb.db", "a/b.db"),
             ("file:a%zz.db", "a%zz.db"),
             ("file:trailing%", "trailing%"),
+            // An encoded NUL ends the filename, as it does for SQLite's own
+            // NUL-terminated open.
+            ("file:app%00ignored.db", "app"),
+            ("file:/srv/app%00.db?mode=rwc", "/srv/app"),
         ] {
             assert_eq!(database_file(url), Some(PathBuf::from(expected)), "{url}");
         }
@@ -668,6 +681,8 @@ mod tests {
         ] {
             assert_eq!(database_file(memory), None, "{memory} is in-memory");
         }
+        // A name that is nothing but a NUL names no file at all.
+        assert_eq!(database_file("file:%00"), None);
         // A parameter that merely starts with it is a different parameter.
         assert!(database_file("file:app?mode=memoryx").is_some());
     }
