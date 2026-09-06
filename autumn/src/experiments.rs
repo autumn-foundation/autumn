@@ -1662,9 +1662,14 @@ pub mod pg {
         }
 
         /// Create a store from Autumn's primary database configuration.
+        ///
+        /// Returns `None` when no primary URL is configured, and — since it
+        /// opens a `diesel::PgConnection` and issues `jsonb` /
+        /// `pg_advisory_xact_lock` SQL — when the configured target does not
+        /// name Postgres.
         #[must_use]
         pub fn from_database_config(config: &crate::config::DatabaseConfig) -> Option<Self> {
-            config.effective_primary_url().map(Self::new)
+            config.effective_primary_postgres_url().map(Self::new)
         }
 
         fn connect(&self) -> Result<diesel::PgConnection, ExperimentStoreError> {
@@ -2942,6 +2947,53 @@ mod tests {
             );
         } else {
             panic!("expected Backend error");
+        }
+    }
+
+    // ── Backend screening on the Postgres-only store ──────────────────────
+
+    // `PgExperimentStore` opens a `diesel::PgConnection` and writes `jsonb` and
+    // `pg_advisory_xact_lock` SQL — it cannot serve any other backend. Building one from a
+    // SQLite target used to succeed and fail on first use with a driver-level
+    // connection error naming Postgres, which is not a diagnosis an operator
+    // who configured `sqlite://` can act on.
+    #[cfg(feature = "db")]
+    #[test]
+    fn pg_experiment_store_refuses_a_non_postgres_target() {
+        use crate::config::DatabaseConfig;
+
+        let sqlite = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/app.db".to_owned()),
+            ..Default::default()
+        };
+        assert!(
+            pg::PgExperimentStore::from_database_config(&sqlite).is_none(),
+            "a SQLite target has no Postgres experiment store"
+        );
+
+        // Fails closed: a target no backend claims is refused too.
+        let unclassifiable = DatabaseConfig {
+            primary_url: Some("/var/lib/app.db".to_owned()),
+            ..Default::default()
+        };
+        assert!(
+            pg::PgExperimentStore::from_database_config(&unclassifiable).is_none(),
+            "an unclassifiable target has no Postgres experiment store"
+        );
+
+        // Both Postgres spellings still build.
+        for url in [
+            "postgres://localhost/app",
+            "host=db user=app dbname=app sslmode=require",
+        ] {
+            let pg_config = DatabaseConfig {
+                primary_url: Some(url.to_owned()),
+                ..Default::default()
+            };
+            assert!(
+                pg::PgExperimentStore::from_database_config(&pg_config).is_some(),
+                "{url} is a Postgres target"
+            );
         }
     }
 }

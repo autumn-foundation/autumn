@@ -24,28 +24,20 @@ networked server collapse to their **single-host** form, and the genuinely
 distributed features are **refused at boot** rather than silently degraded. This
 guide is the published contract for exactly which is which.
 
-> **Status.** The SQLite production tier lands in slices under issue #1614.
-> Postgres remains the default for `autumn new`; SQLite is an opt-in target. The
-> **Status** column in the matrix below reflects the rollout — a row marked
-> *planned* names the slice that delivers it and is **not available in this
-> build**. The boot-refuse guarantees (the "fails fast" rows) are part of the
-> contract from the first SQLite-enabled release, so an unsupported
-> configuration never boots into a surprise at first query.
+> **Status.** The SQLite runtime has landed (#1614 / #1905). Build the app with
+> the `sqlite` cargo feature and a `sqlite://` target boots, runs its startup
+> migrations, and serves, on a working connection pool with repository CRUD.
+> Postgres remains the default for `autumn new`; SQLite is an opt-in target.
 >
-> **The SQLite runtime has landed** (#1614). A `sqlite://` app now boots, runs
-> its startup migrations, and serves, with a working connection pool and
-> repository CRUD. The **Status** column below marks each capability
-> **Available** when it is verified in this build, or **Planned — #NNNN** when
-> that subsystem's SQLite support is still landing in a follow-on slice — a
-> *Planned* row no longer means the app refuses to boot, only that the named
-> subsystem is not yet wired for SQLite. This guide is
-> the published support contract for the rollout; rows are marked by the slice
-> that delivers them. What ships *today* is listed under
-> [What ships in this slice](#what-ships-in-this-slice).
+> The **Status** column in the matrix below is per capability: **Available now**
+> means verified in this build, **Planned — #NNNN** names the follow-on slice
+> that wires that subsystem for SQLite. A *Planned* row does **not** mean the
+> app refuses to boot — the runtime boots and serves; that one subsystem is
+> simply not wired yet. The boot-refuse guarantees (the "fails fast" rows) hold
+> from the first SQLite-enabled release, so an unsupported configuration never
+> boots into a surprise at first query.
 
 ---
-
-> **Update (this release):** the SQLite *runtime* has now landed behind the `sqlite` cargo feature. The sections further down that describe SQLite being *refused at boot* or list runtime rows as *planned* predate that work; the runtime now boots, migrates, and serves against a `sqlite://` database as described immediately below.
 
 ## Runtime (behind the `sqlite` feature)
 
@@ -142,8 +134,10 @@ buckets on SQLite:
 | Sessions + auth (DB-backed) | ✅ | ✅ | Session/auth tables live in SQLite; no external store. | ⛔ **Planned — #1908** |
 | Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | Single-writer claim on the jobs table — durable and restart-safe, **no Redis required**. | ⛔ **Planned — #1907** |
 | `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | Single host is always the leader; every tick fires locally (no election needed). | ⛔ **Planned — #1907** |
-| Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⚠️ / ⛔ | Single-host mutual exclusion within the process; a multi-replica configuration is refused at boot. | ⛔ **Planned — #1905** (multi-replica boot-refuse ships now) |
-| Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (single host has nothing to notify). | ⛔ **Planned — #1905** |
+| Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⛔ | **Refused.** `Lock::from_state` returns `PoolUnavailable` under the `sqlite` feature — SQLite has no cross-connection advisory lock, and pretending to hold one is worse than refusing. Single-host mutual exclusion is what a `Mutex` is for. | ✅ **Available now — refuses** |
+| Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (a single host has nothing to notify). `PgFlagStore` / `PgExperimentStore` are Postgres-only (they open a `PgConnection` and use `pg_notify`), so `from_database_config` returns `None` on a SQLite target and the app falls back to the in-memory store rather than building a store that cannot connect. | ⚠️ **Available now — in-process only** |
+| Runtime config store (`runtime_config::pg`) | ✅ `pg_advisory_xact_lock` | ⚠️ | Same shape: `PgConfigStore::from_database_config` returns `None` on a SQLite target; use `InMemoryConfigStore` or a custom `ConfigStore`. | ⚠️ **Available now — no DB-backed store** |
+| ISR regeneration coordinator (`static_gen`) | ✅ `pg_try_advisory_lock` | ⚠️ | `PostgresIsrCoordinator` takes a `Pool<AsyncPgConnection>`, which a SQLite build's app state cannot produce — it is unreachable under the flip rather than refused. Single-host ISR uses the in-process coordinator, which is what one host needs. | ⚠️ **Available now — in-process coordinator** |
 | `autumn db backup` / `restore` | ✅ `pg_dump`/`pg_restore` | ✅ | Online-safe snapshot of the data file (safe against a live app). Backup tooling is still `pg_dump`/`pg_restore`-shaped today. | ⛔ **Planned — #1909** |
 | `autumn db scrub` | ✅ | ✅ | Runs against the SQLite file. | ⛔ **Planned — #1909** |
 | Retention sweeps | ✅ | ✅ | Runs against the SQLite file. | ⛔ **Planned — #1909** |

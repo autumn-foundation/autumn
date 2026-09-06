@@ -30,7 +30,10 @@ enum RuntimeConfigStoreKind {
 }
 
 fn runtime_config_store_kind(config: &AutumnConfig) -> RuntimeConfigStoreKind {
-    if config.database.effective_primary_url().is_some() {
+    // Postgres-specific, not merely DB-backed: `PgConfigStore` takes
+    // `pg_advisory_xact_lock`. A target naming any other backend gets the
+    // in-memory store rather than a store that cannot connect.
+    if config.database.effective_primary_postgres_url().is_some() {
         RuntimeConfigStoreKind::Postgres
     } else {
         RuntimeConfigStoreKind::InMemory

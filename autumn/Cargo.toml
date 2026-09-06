@@ -96,11 +96,13 @@ offline-sync = ["db", "http-client"]
 # must use an explicit `--features` list that EXCLUDES `sqlite` (see
 # `.github/workflows/ci.yml`).
 #
-# PR1 is a no-op refactor: enabling it switches the connection *type alias* but
-# the SQLite pool CONSTRUCTION stays refused at runtime
-# (`PoolError::UnsupportedBackend`); a working pool is PR2. Needs no extra deps
-# — diesel's sqlite backend and diesel-async's sync-connection-wrapper are
-# already in the graph.
+# The runtime is wired (#1905): enabling this feature switches the connection
+# type alias AND builds a deadpool pool over
+# `SyncConnectionWrapper<SqliteConnection>`, so an app boots, migrates and
+# serves against a `sqlite://` target. Needs no extra deps — diesel's sqlite
+# backend and diesel-async's sync-connection-wrapper are already in the graph.
+# What this build REFUSES is a Postgres target (`PoolError::UnsupportedBackend`),
+# the mirror of the default build's refusal of a SQLite one.
 # `sqlite` pulls in `db` so it is genuinely self-sufficient: `db` owns the
 # shared, backend-neutral migration/pool plumbing this feature builds on — the
 # `crate::migrate` module (itself `#[cfg(feature = "db")]`), `deadpool`, and

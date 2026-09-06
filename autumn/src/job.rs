@@ -15664,10 +15664,17 @@ mod tests {
             )
             .expect_err("postgres backend must fail when no db pool is configured");
 
+            // Both builds refuse, for different reasons: the default build
+            // because no pool is configured, the sqlite build because there is
+            // no Postgres queue to configure one for. Assert whichever refusal
+            // this build owes the operator.
+            #[cfg(not(feature = "sqlite"))]
+            let expected = "jobs.backend=postgres requires a configured database";
+            #[cfg(feature = "sqlite")]
+            let expected = "jobs.backend=postgres is unsupported under the sqlite feature";
+
             assert!(
-                error
-                    .to_string()
-                    .contains("jobs.backend=postgres requires a configured database"),
+                error.to_string().contains(expected),
                 "unexpected error: {error}"
             );
             assert!(global_job_client().is_none());

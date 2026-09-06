@@ -88,6 +88,15 @@ step "./scripts/check-determinism-gate.sh   (self-test + seam gate; no toolchain
 step "./scripts/check-plugin-surface.sh   (self-test + plugin API contract; no toolchain)"
 ./scripts/check-plugin-surface.sh
 
+# --- 1d. SQLite feature-unification gate (issue #1905) -----------------------
+# Mirrors ci.yml `lint` job: `./scripts/check-sqlite-unification.sh`. Same shape
+# as the gates above — seconds, no toolchain, self-testing — and it covers the
+# one invariant this script otherwise cannot: the legs below never enable
+# `sqlite`, so a dependency edge that turns the backend flip on for the whole
+# graph would compile here and break the Postgres lane in CI.
+step "./scripts/check-sqlite-unification.sh   (self-test + manifest gate; no toolchain)"
+./scripts/check-sqlite-unification.sh
+
 # --- 2. Formatting -----------------------------------------------------------
 # Mirrors ci.yml `lint` job: `cargo fmt --all -- --check`.
 step "cargo fmt --all -- --check"

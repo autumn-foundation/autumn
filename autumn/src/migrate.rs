@@ -2304,54 +2304,13 @@ pub(crate) fn backoff_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(ms.min(5_000))
 }
 
-/// Redact the password from any `postgres://` or `postgresql://` URL embedded
-/// in `msg`.
+/// Redact credentials in any database URL embedded in `msg`.
 ///
-/// Replaces the password component with `****`, mirroring the approach used
-/// by `mask_database_url` in `autumn/src/app.rs`.  When the URL token cannot
-/// be parsed, the entire token is replaced with `****` as a safe fallback so
-/// a malformed-but-credential-bearing string is never surfaced (also matches
-/// `mask_database_url`'s parse-failure behaviour).  Leaves the rest of the
-/// message unchanged.
+/// Thin alias for the shared redactor. The local implementation this replaced
+/// recognized `postgres://` / `postgresql://` tokens only, so a
+/// `mysql://user:pw@host` in a driver message went out whole.
 pub(crate) fn redact_db_url_credentials(msg: &str) -> String {
-    let mut out = String::with_capacity(msg.len());
-    let mut rest = msg;
-    loop {
-        // Find the leftmost postgres:// or postgresql:// occurrence.
-        let pg = rest.find("postgres://");
-        let pgl = rest.find("postgresql://");
-        let start = match (pg, pgl) {
-            (None, None) => {
-                out.push_str(rest);
-                break;
-            }
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (Some(a), Some(b)) => a.min(b),
-        };
-        // Push everything before the URL token unchanged.
-        out.push_str(&rest[..start]);
-        rest = &rest[start..];
-        // Extract the URL-shaped token (everything until first whitespace or EOS).
-        let token_end = rest
-            .find(|c: char| c.is_ascii_whitespace())
-            .unwrap_or(rest.len());
-        let token = &rest[..token_end];
-        if let Ok(mut parsed) = url::Url::parse(token) {
-            if parsed.password().is_some() {
-                let _ = parsed.set_password(Some("****"));
-                out.push_str(parsed.as_str());
-            } else {
-                out.push_str(token);
-            }
-        } else {
-            // Parse failed — mask the whole token rather than risk leaking a
-            // malformed credential-bearing URL.
-            out.push_str("****");
-        }
-        rest = &rest[token_end..];
-    }
-    out
+    crate::db_url::redact_targets_in_message(msg)
 }
 
 /// Inner (dependency-injected) startup wait loop.
