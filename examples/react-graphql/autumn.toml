@@ -1,0 +1,21 @@
+# Config for the `react-graphql` example.
+#
+# Note what is NOT here: no CORS section. The React bundle is served by this
+# same server from `/static/app/`, so the browser's GraphQL calls are
+# same-origin. Under `npm run dev` the Vite dev server proxies `/graphql` here
+# (see frontend/vite.config.ts), which keeps them same-origin too.
+#
+# The default Content-Security-Policy (`script-src 'self'`) is also left
+# alone: the bundle is an external module script, so no inline script or
+# nonce is needed.
+[server]
+host = "127.0.0.1"
+port = 3000
+
+# `docker compose up -d` in this directory provides this database.
+[database]
+url = "postgres://autumn:autumn@localhost:5432/notes"
+
+[log]
+level = "info"
+format = "Pretty"

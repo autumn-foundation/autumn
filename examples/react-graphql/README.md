@@ -1,0 +1,280 @@
+# Autumn + React + GraphQL Example
+
+A **TypeScript React** single-page app on top of an **Autumn** backend, talking
+**GraphQL** through a plugin, against a real **Postgres** model. Read it in
+this order:
+
+1. **`src/models.rs`, `src/hooks.rs`, `src/repositories.rs`** — the data
+   layer, all framework-native: one `#[model]` with `#[normalize(trim)]` and
+   `#[validate]`, a `MutationHooks` impl, and a `#[repository]` that also
+   generates JSON REST handlers over the same rows.
+2. **`src/notes.rs`** — the `async-graphql` resolvers. Each one builds the
+   generated `PgNoteRepository` from the pool on `AppState`. GraphQL is one
+   more door into the model, not a second data layer: trimming, validation,
+   hooks, and transactions are identical whether a write arrives over
+   GraphQL, the generated REST handler, or the startup seed.
+3. **`src/graphql_plugin.rs`** — a generic `GraphqlPlugin` that adapts any
+   `async-graphql` schema onto an Autumn app. It is the extensibility
+   showcase: a `Plugin` that mounts a raw router, declares its routes for
+   `autumn routes` and the audit gate, installs an `AppState` extension, and
+   states a `PluginContract`. Nothing in it knows about notes.
+4. **`frontend/`** — Vite + React 19 + TypeScript with a 40-line typed
+   GraphQL client and no client-side framework beyond React. Its build output
+   is committed under `static/app/` and served by Autumn's standard `/static`
+   mount, so running the example needs no Node.
+
+Autumn renders the page shell (and owns the security headers); React owns
+`#root`. The default `script-src 'self'` Content-Security-Policy is left
+untouched because the bundle is an external ES module.
+
+## What it demonstrates
+
+| Feature | Where | What it does |
+|---------|-------|--------------|
+| `#[model]` with `#[normalize(trim)]` + `#[validate]` | `src/models.rs` | One struct yields `Note`, `NewNote`, `UpdateNote`; input is canonicalised before validation on every write path |
+| `MutationHooks` | `src/hooks.rs` | `before_create` runs the model's rules for direct repository callers; `before_delete` refuses to delete a pinned note — inside the transaction, for every door |
+| `#[repository(Note, hooks = …, api = "/api/notes")]` | `src/repositories.rs` | Generated CRUD, a derived `find_by_pinned` finder, and generated REST read handlers mounted next to GraphQL |
+| Repository from `AppState`, outside an extractor | `src/notes.rs`, `src/lib.rs` | `PgNoteRepository::with_pool_untracked(pool)` in resolvers and in the `on_startup` seed |
+| Embedded migrations | `src/lib.rs`, `migrations/` | `embed_migrations!()`, applied on boot in development and by tests to their testcontainer |
+| `AutumnError` → GraphQL error | `src/notes.rs` | Message on the field, HTTP status in `extensions.status`, so a client can tell a 422 from a 503 |
+| `Plugin` with `nest` + `declare_plugin_routes` | `src/graphql_plugin.rs` | Mounts `POST /graphql`, `GET /graphql?query=…`, `GET /graphql/sdl`; routes show in `autumn routes` with plugin attribution and satisfy `autumn routes audit` |
+| `PluginContract` + conformance harness | `src/graphql_plugin.rs`, `tests/graphql_api.rs` | Declares the `autumn-web` series; `run_conformance` proves attribution, prefix, collisions and contract in one test |
+| Maud page shell + `asset_url` | `src/lib.rs` | Autumn renders the document; `asset_url` gives fingerprinted URLs in a release build with an asset manifest |
+| Committed Vite bundle, fixed file names | `frontend/vite.config.ts` | `app.js` / `app.css` with no content hash, so the shell references them by name |
+| Single-binary deploy | `src/lib.rs`, `Cargo.toml` | `autumn build --embed` bakes the bundle into the binary via `embed_static!()` + `.embedded_static(..)`; `asset_url` switches to the embedded fingerprint manifest |
+| Typed GraphQL client, no Apollo | `frontend/src/api.ts` | One `fetch` per operation, typed against `frontend/src/types.ts` |
+| Schema drift gate | `tests/graphql_api.rs`, `schema.graphql` | The committed SDL must equal what the server serves — the TypeScript types are written against it |
+| Two test tiers | `tests/graphql_api.rs` | No-Docker tests for the shell, SDL and plugin conformance; Docker tests over a shared Postgres testcontainer with the real migration applied |
+| Chromium smoke | `tests/system/smoke.rs` | Real binary against a testcontainer Postgres: shell → bundle → GraphQL query → form mutation into the table, zero console errors |
+
+## Prerequisites
+
+- Rust 1.88.0+
+- PostgreSQL (or Docker: `docker compose up -d` in this directory starts one on
+  `localhost:5432` matching `autumn.toml`)
+
+Node 20+ and npm are needed only to **change** the frontend.
+
+## Quick start
+
+From the **workspace root** (`autumn/`):
+
+```bash
+docker compose -f examples/react-graphql/docker-compose.yml up -d   # or point [database].url at your own
+cargo run -p react-graphql
+```
+
+On boot in the development profile the app applies `migrations/` and seeds two
+notes into the empty table. Open <http://127.0.0.1:3000>: the notes load over
+GraphQL; add, pin, and delete notes from the page.
+
+### Prove it works
+
+```bash
+# The React shell, rendered by Autumn:
+curl -s http://127.0.0.1:3000/ | grep -o '<div id="root">'
+
+# A query (POST, JSON body):
+curl -s http://127.0.0.1:3000/graphql \
+  -H 'content-type: application/json' \
+  -d '{"query":"{ notes { id title pinned } }"}'
+# => {"data":{"notes":[{"id":2,"title":"Welcome to Autumn Notes","pinned":true},{"id":1,"title":"Try the GraphQL endpoint","pinned":false}]}}
+
+# The same rows through the generated REST handler (a `Page` envelope):
+curl -s http://127.0.0.1:3000/api/notes | head -c 120
+
+# The GraphQL-over-HTTP GET form:
+curl -s 'http://127.0.0.1:3000/graphql?query=%7B%20notes(pinnedOnly:true)%20%7B%20title%20%7D%20%7D'
+# => {"data":{"notes":[{"title":"Welcome to Autumn Notes"}]}}
+
+# A mutation — `#[normalize(trim)]` strips the padding before the INSERT:
+curl -s http://127.0.0.1:3000/graphql \
+  -H 'content-type: application/json' \
+  -d '{"query":"mutation { createNote(input: {title: \"  From curl  \"}) { id title } }"}'
+# => {"data":{"createNote":{"id":3,"title":"From curl"}}}
+
+# The model's rule, surfaced as a GraphQL error with the HTTP status it would have carried:
+curl -s http://127.0.0.1:3000/graphql \
+  -H 'content-type: application/json' \
+  -d '{"query":"mutation { createNote(input: {title: \"   \"}) { id } }"}'
+# => {"data":null,"errors":[{"message":"title: title must be 1–120 characters", ..., "extensions":{"status":422}}]}
+
+# The hook: the seeded welcome note is pinned, so it cannot be deleted:
+curl -s http://127.0.0.1:3000/graphql \
+  -H 'content-type: application/json' \
+  -d '{"query":"mutation { deleteNote(id: 2) }"}'
+# => {"data":null,"errors":[{"message":"note 2 is pinned; unpin it before deleting", ...}]}
+
+# The schema, for generating client types:
+curl -s http://127.0.0.1:3000/graphql/sdl
+```
+
+> If `localhost` gives you something unexpected, use `127.0.0.1` explicitly:
+> Autumn binds IPv4 loopback, and another process (Docker Desktop, for one)
+> may hold the IPv6 side of port 3000.
+
+## How a write travels
+
+```
+GraphQL mutation ─┐
+REST POST         ├─► PgNoteRepository::save(&NewNote)
+startup seed      ┘        │
+                           ├─ #[normalize(trim)]   canonicalise (model)
+                           ├─ before_create        validate + reject (hooks.rs)
+                           ├─ INSERT … RETURNING   inside one transaction
+                           └─ after_create         (unused here)
+```
+
+Two things are worth knowing about that pipeline, because they shape where
+the rules live:
+
+- **Normalisation runs before hooks.** A title of `"   "` is `""` by the time
+  `before_create` sees it, so `#[validate(length(min = 1))]` rejects it. Put
+  canonicalisation on the model, not in a hook.
+- **`repo.save` does not run `#[validate]` by itself.** The generated REST
+  `create` handler validates its payload before calling `save`; a resolver,
+  a task, or a seed calling the repository directly gets no such check. That
+  is why `NoteHooks::before_create` calls `validate()` — it makes the model's
+  rules hold for every caller, and lets the hook fold the per-field messages
+  into the error a GraphQL client will actually see.
+
+Having hooks also moves `update` onto the hooked path, which loads the row,
+merges the patch, normalises the merged model, and persists the normalised
+draft; a plain repository with no hooks takes a blind `UPDATE` instead. See
+`docs/guide/forms.md` and `docs/guide/hooks-and-transactions.md`.
+
+## Single-binary deploy
+
+The React bundle rides along in the binary:
+
+```bash
+autumn build --embed -p react-graphql
+```
+
+`--embed` fingerprints `static/` (writing `.autumn-manifest.json` and a
+content-hashed copy of each file next to the originals — both are ignored by
+git), then compiles with the `embed-assets` feature. `src/lib.rs` opts in with
+`embed_static!()` and `.embedded_static(..)` behind that feature, so the
+release binary serves `/static/app/app.c7bfed64.js` and friends from its own
+bytes with `cache-control: immutable`, and `asset_url` in the shell resolves
+to those hashed names. Copy the one file anywhere, point
+`AUTUMN_DATABASE__URL` at a Postgres, and it runs — no `static/` sidecar.
+
+A dev build never enables the feature, so `npm run build` output is picked up
+from disk without recompiling Rust.
+
+## Frontend development
+
+The committed bundle is what `cargo run` serves. To work on the React app:
+
+```bash
+cd examples/react-graphql/frontend
+npm install
+npm run dev        # Vite dev server on :5173, proxies /graphql to :3000
+```
+
+Keep `cargo run -p react-graphql` running in another terminal; the Vite dev
+server proxies every `/graphql` call to it (see `vite.config.ts`), so the
+browser still talks same-origin and no CORS configuration is needed. Edits to
+components hot-reload without touching the Rust process.
+
+### Rebuilding the committed bundle
+
+```bash
+cd examples/react-graphql/frontend
+npm run build      # typecheck, then write ../static/app/app.js + app.css
+```
+
+Commit the result. The bundle is a build product checked in on purpose, the
+same way `examples/flock` commits its wasm artifacts: it keeps the example
+runnable, testable, and smoke-able with nothing but `cargo`.
+
+### Keeping the types honest
+
+`frontend/src/types.ts` is a hand-written mirror of `schema.graphql`, and
+`schema.graphql` is drift-tested against what the server serves. When the
+schema changes:
+
+```bash
+cargo run -p react-graphql &
+curl -s http://127.0.0.1:3000/graphql/sdl > examples/react-graphql/schema.graphql
+```
+
+then update `types.ts` to match. A larger schema would run GraphQL Code
+Generator against that same endpoint instead.
+
+## How the plugin works
+
+```rust
+autumn_web::app()
+    .migrations(MIGRATIONS)
+    .routes(routes())                                  // shell + generated REST reads
+    .plugin(GraphqlPlugin::new(notes::build_schema()).path("/graphql"))
+    .on_startup(|state| async move { seed_if_empty(&state).await })
+    .run()
+    .await;
+```
+
+`GraphqlPlugin::build` does four things with the `AppBuilder` it is handed:
+
+| Call | Why |
+|------|-----|
+| `state_initializer(\|state\| state.insert_extension(schema))` | Installs the schema on `AppState`, where the handlers find it per request |
+| `nest("/graphql", router)` | Mounts a raw axum router: `POST /` and `GET /` execute, `GET /sdl` prints the schema |
+| `declare_plugin_routes(routes)` | A nested router is opaque to `autumn routes`; declaring makes the routes visible, attributed to the plugin, and audit-clean |
+| `contract()` → `PluginContract` | Names the plugin, its version, and the `autumn-web` series it supports |
+
+Each execution runs `schema.execute(request.data(state))`, so every resolver
+can call `ctx.data::<AppState>()` and from there `state.pool()`,
+`state.extension::<T>()`, or anything else a handler could. No second
+registry. `with_pool_untracked` is the repository constructor for exactly
+that situation — code with a pool but no request; in a route handler you
+would take `repo: PgNoteRepository` as an argument instead.
+
+The plugin ships inside this example for readability. It has no dependency
+on the surrounding crate, so lifting it into a published
+`autumn-plugin-graphql` crate is a copy of one file plus a `Cargo.toml`.
+
+### Why no GraphiQL
+
+`async-graphql` can serve a GraphiQL page, but that page loads its scripts
+from a CDN, which Autumn's default `script-src 'self'` policy blocks. Rather
+than loosen the CSP for a dev tool, the plugin serves the SDL at
+`/graphql/sdl`; point any GraphQL IDE at `/graphql` and paste the schema.
+
+### Guarding the endpoint
+
+The plugin mounts no guard: every route it declares is classified `Public`.
+To require a bearer token, mount it under a scoped layer the same way
+`examples/todo-app` guards its JSON API, or put the whole app behind session
+auth. The plugin does not care where it is mounted.
+
+## Tests
+
+```bash
+# Tier 1 — no Docker: shell, SDL drift, plugin conformance, error mapping.
+cargo test -p react-graphql
+
+# Tier 2 — Docker: rows, hooks, normalisation, validation, REST/GraphQL parity.
+# Serial, because they share one migrated table.
+cargo test -p react-graphql --test graphql_api -- --include-ignored --test-threads=1
+
+# Headless-Chromium smoke (requires Chromium + Docker; runs in the fleet e2e gate):
+cargo test -p react-graphql --features system-tests --test smoke -- --include-ignored
+
+# Frontend typecheck:
+cd frontend && npm run typecheck
+```
+
+## Available routes
+
+| Method | Path | Source | Response |
+|--------|------|--------|----------|
+| GET | `/` | app | The page shell React mounts into |
+| GET | `/api/notes` | `#[repository(api)]` | Paged JSON list of notes (`content`, `page`, `total_elements`, …) |
+| GET | `/api/notes/{id}` | `#[repository(api)]` | One note as JSON, or 404 |
+| GET | `/static/app/app.js`, `/static/app/app.css` | framework | The committed Vite bundle |
+| POST | `/graphql` | plugin | Execute `{ query, variables?, operationName? }` |
+| GET | `/graphql?query=…` | plugin | Execute a read in query-string form |
+| GET | `/graphql/sdl` | plugin | The schema as `text/plain` SDL |
+| GET | `/health` | framework | Liveness |

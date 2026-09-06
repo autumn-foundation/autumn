@@ -1,0 +1,69 @@
+type Mutation {
+	"""
+	Create a note. Trimming and the 1–120 character rule come from the
+	model, not from this resolver.
+	"""
+	createNote(input: NewNoteInput!): Note!
+	"""
+	Flip a note's pinned flag. Errors if the id is unknown.
+	"""
+	togglePinned(id: Int!): Note!
+	"""
+	Delete a note. Returns whether anything was deleted. A pinned note is
+	refused by the repository's `before_delete` hook, which surfaces here
+	as a field error.
+	"""
+	deleteNote(id: Int!): Boolean!
+}
+
+"""
+Input for `createNote`. The model's `#[normalize(trim)]` trims both fields
+and its `#[validate]` rejects an empty title; this type just carries them.
+"""
+input NewNoteInput {
+	title: String!
+	body: String! = ""
+}
+
+"""
+The GraphQL `Note` object, resolved straight off the `#[model]` struct.
+
+An `#[Object]` impl block turns an existing type into a GraphQL object
+without changing its definition, which keeps `models.rs` free of any
+GraphQL vocabulary. `id` is exposed as `Int` (the schema's `i32`) for
+client simplicity; the column is `BIGINT`.
+"""
+type Note {
+	id: Int!
+	title: String!
+	body: String!
+	pinned: Boolean!
+	"""
+	RFC 3339 UTC timestamp, so the client needs no date library.
+	"""
+	createdAt: String!
+}
+
+type Query {
+	"""
+	All notes, newest first. `pinnedOnly: true` narrows to pinned notes.
+	"""
+	notes(pinnedOnly: Boolean! = false): [Note!]!
+	"""
+	One note by id, or `null`.
+	"""
+	note(id: Int!): Note
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+schema {
+	query: Query
+	mutation: Mutation
+}

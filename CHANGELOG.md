@@ -31,74 +31,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **plugin-sandbox:** the capability vocabulary grows past request handling
-  (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
-  `http-outbound`, `db`, `jobs` and `render` beside `http-request`, and a new
-  `[grants]` table says what each is scoped to — hostnames, plugin-owned tables,
-  job types, render slots — with per-request `[quotas]` an operator can tune.
-  The guest asks over the NDJSON channel it already answers on
-  (`{"op":"call","call":"kv-get",…}` → `{"op":"call_result",…}`), so **a plugin
-  granted every capability imports exactly what a plugin granted none imports**
-  and the #1609 escape corpus keeps proving what it proved. Scoping is by
-  derivation rather than by check: the guest names a logical key, table, host or
-  job type and the host derives the physical one from the manifest and the
-  active tenant, so cross-tenant and host-table access are unspellable rather
-  than refused. Render hooks return a fragment *tree* the host renders, not HTML
-  it sanitises — no parser, so no parser differential — and a hook that traps,
-  overruns its fuel or emits a tag the renderer will not produce omits the
-  fragment rather than taking the page down with it. Every call, allowed or
-  refused, lands
-  in a bounded per-plugin activity log that answers "what did this plugin do in
-  the last hour" from one surface: hosts called, KV/DB usage, jobs enqueued,
-  denials and quota hits, recorded as shapes and never as values — and, when a
-  plugin outruns its own ledger, a line saying every count below it is a floor.
-  The `jobs` capability **enqueues**; running the result is the host's, and this
-  wire version has no frame for delivering a job back into a guest.
-  `autumn plugin inspect --against <installed-artifact>` reviews an upgrade as
-  an upgrade — capabilities, grant lists, quotas, **routes and resource
-  ceilings**, since a new route is an endpoint nobody approved and a raised
-  `fuel` is authority that touches no capability name — printing exactly what
-  grew and exiting non-zero when anything did. `autumn plugin inspect`
-  (text and JSON) now carries the grant lists and quotas, and stops printing
-  "no database access" over a manifest that was just granted `db`. Fifteen-plus
-  adversarial corpus of cross-capability escape attempts runs end-to-end through
-  the real interpreter in `tests/integration/plugin_sandbox_capabilities.rs`.
-  Every result the guest can size is bounded before it is built rather than
-  after: a row carries at most 256 KiB across its columns (checked on the way
-  *in*, so a stored row can always be read back), one `db-get`/`db-query` answer
-  carries at most 512 KiB and says `"truncated": true` when that cut it short,
-  and the budget travels into `PluginStore::query` so a store never materialises
-  what the reply would discard — with an `after` cursor so a page that was cut
-  can actually be continued, and a query filter refusing `row_id` because
-  stripping it would turn "the row with this id" into "every row this tenant
-  has". The outbound response-header ceilings travel into `OutboundRequest`
-  beside `max_response_bytes`, the render context is bounded before it is cloned
-  onto a worker, and `CacheKvStore` uses the serde-aware cache API so a plugin's
-  KV survives on a cross-replica backend rather than silently storing nothing. The shipped `MemoryJobSink` has a finite default
-  depth and no unbounded spelling — this slice ships no consumer that drains it.
-  The activity log counts what it evicts as well as what a per-request ledger
-  overflowed, and both are timestamped and windowed like ordinary events, so a
-  "last hour" neither presents the last twenty seconds as the hour nor carries a
-  lifetime total into a window the calls were not in. See
-  `docs/guide/sandboxed-plugins.md`. **Non-breaking**: everything here is behind
-  the non-default `plugin-sandbox` feature, which `STABILITY.md` already places
-  outside SemVer, and a first-slice manifest parses and runs unchanged —
-  `[grants]` and `[quotas]` both default, and an unknown capability name is
-  still a refusal rather than a silently dropped grant. The only source-level
-  change for an embedder is that `SandboxManifest` gains `grants`/`quotas` and
-  `SandboxOutcome` gains `activity`, so a struct literal over either must name
-  the new fields.
-- **deploy:** `autumn deploy check` now prints the same config-manifest signal
-  `autumn deploy up` already prints (#1952 check/up parity) — a confirming
-  line naming the `autumn.toml` (and, when present, `autumn-<profile>.toml`)
-  that will be uploaded, or the loud "no autumn.toml found" warning when the
-  project has none. Before this, an operator relying on `deploy check` as the
-  documented way to catch a broken deploy before touching the server had no
-  signal at all that the deployed app would silently run built-in defaults —
-  they only found out once they actually ran `up`. Purely informational: it
-  is not a graded preflight check and never affects `check`'s exit code. See
-  `docs/guide/deployment.md`'s "Your `autumn.toml` is deployed alongside the
-  binary" section for the full behavior this closes out. [no-plugin]
+- **examples:** `examples/react-graphql`, a TypeScript React single-page app
+  on an Autumn backend that talks GraphQL through a plugin, against a real
+  Postgres `#[model]`. Two files carry the point. `src/graphql_plugin.rs` is a
+  generic `GraphqlPlugin<Q, M, S>` that adapts any `async-graphql` schema onto
+  an app — `AppBuilder::nest` for the raw router, `declare_plugin_routes` so
+  `autumn routes` and the audit gate see it, a `state_initializer` that puts
+  the schema on `AppState`, per-execution injection of `AppState` into the
+  GraphQL context, and a `PluginContract`. `src/notes.rs` shows what that
+  buys: every resolver builds the generated `PgNoteRepository` from the pool on
+  `AppState` (`with_pool_untracked`, the constructor for code with no
+  request), so `#[normalize(trim)]`, the model's `#[validate]` rules, and the
+  repository's `MutationHooks` (`before_create` validation, a `before_delete`
+  rule refusing to delete a pinned note) apply identically to a GraphQL
+  mutation, the generated `api = "/api/notes"` REST handlers mounted beside
+  it, and the `on_startup` seed. `AutumnError`s become GraphQL field errors
+  carrying the HTTP status in `extensions.status`. The plugin serves `POST
+  /graphql`, the GraphQL-over-HTTP `GET` form, and `GET /graphql/sdl`, whose
+  output is drift-tested against a committed `schema.graphql` the TypeScript
+  types are written against. The Vite/React 19 bundle is committed under
+  `static/app/` (fixed file names, no hash) and served by the standard
+  `/static` mount under the default `script-src 'self'` CSP, so `cargo run`
+  needs no Node toolchain; `autumn build --embed` bakes it into the binary
+  (`embed_static!` + `.embedded_static`, behind the crate's `embed-assets`
+  feature); `npm run dev` proxies `/graphql` to the Rust server for hot-reload
+  work. Tested in two tiers plus a smoke: `TestApp` tests with
+  no Docker (shell, SDL drift, `plugin_conformance::run_conformance`, error
+  mapping), `TestDb` testcontainer tests that apply the example's real embedded
+  migration (rows, hooks, normalisation, validation, REST/GraphQL parity), and
+  a Chromium smoke that drives the real binary against a testcontainer
+  Postgres through a query and a form mutation. Cataloged as a supported
+  example.
 
 - **testing:** a real-ACME end-to-end test drives the ACME order state
   machine (order → HTTP-01 → finalize → issue) against a real, independently-
