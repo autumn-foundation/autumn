@@ -1062,7 +1062,33 @@ def blank_link_dests(txt):
     return ''.join(out)
 
 
-def sub_in_prose(pat, txt, only_at_block_start=False):
+QUOTE_PREFIX = re.compile(r'^ {0,3}(?:>[ \t]?)+', re.M)
+
+
+def strip_quote_markers(txt):
+    """Blank block-quote markers, space for space, so line-anchored patterns
+    see what is inside the quote.
+
+    A definition inside a quote is still a definition — `> [old]: x.md` renders
+    NOTHING — but every pattern here anchors at `^ {0,3}` and so could not
+    reach past the marker. The unused ones were then left in the bare-path
+    scan and their destinations counted as visible navigation, which is an
+    orphan passing; the used ones were not resolved at all, which is a
+    reachable page reported as an orphan. Same length, so offsets stay valid
+    and the ORIGINAL text is what gets blanked.
+
+    List items are deliberately not handled. Four spaces under a `- ` item is
+    the item's content indent and a definition there is invisible; the same
+    four spaces at the top level are an indented CODE block whose text is on
+    screen. Telling those apart needs the container tracking
+    `check-migration-guides.sh` carries and this file does not — the gap
+    already recorded for fences in `strip_comments`. Left alone, indented code
+    stays correct.
+    """
+    return QUOTE_PREFIX.sub(lambda m: ' ' * len(m.group(0)), txt)
+
+
+def sub_in_prose(pat, txt, only_at_block_start=False, view=None):
     """Blank `pat` where Markdown renders it, leaving fences alone.
 
     Anything that decides "this text is not rendered" has to be scoped this
@@ -1071,8 +1097,12 @@ def sub_in_prose(pat, txt, only_at_block_start=False):
     deleted a visible path; this helper exists so the scoping is one call
     rather than something to remember.
     """
+    # `view` is a same-length rendering of `txt` that the pattern is matched
+    # against while `txt` is what gets blanked — how a construct inside a
+    # container is found without its marker having to be part of the pattern.
+    src = txt if view is None else view
     out = []
-    for kind, seg in split_fences(txt):
+    for (kind, seg), (_, vseg) in zip(split_fences(txt), split_fences(src)):
         if kind != 'prose':
             out.append(seg)
             continue
@@ -1080,9 +1110,9 @@ def sub_in_prose(pat, txt, only_at_block_start=False):
         # blanking link destinations erased an image sample written in
         # backticks. "Rendered" means outside fences AND outside code spans.
         protected = [(m.start(), m.end()) for m in CODE_SPAN.finditer(seg)]
-        allowed = block_starts(seg) if only_at_block_start else None
+        allowed = block_starts(vseg) if only_at_block_start else None
         pieces, last = [], 0
-        for m in pat.finditer(seg):
+        for m in pat.finditer(vseg):
             if any(a <= m.start() < b for a, b in protected):
                 continue
             if allowed is not None and m.start() not in allowed:
@@ -1161,7 +1191,7 @@ def definition_labels(txt):
     the reader can see.
     """
     prose = ''.join(seg for kind, seg in split_fences(txt) if kind == 'prose')
-    prose = CODE_SPAN.sub(' ', prose)
+    prose = strip_quote_markers(CODE_SPAN.sub(' ', prose))
     starts = block_starts(prose)
     out = set()
     for m in REF_DEF.finditer(prose):
@@ -1341,7 +1371,8 @@ def edges_from(f):
     # can read. Blanking it here while the resolution loop below applied
     # `block_starts` was the same rule in one view and not its sibling, and
     # it reported a reachable page as an orphan.
-    scan = sub_in_prose(REF_DEF_FULL, scan, only_at_block_start=True)
+    scan = sub_in_prose(REF_DEF_FULL, scan, only_at_block_start=True,
+                        view=strip_quote_markers(scan))
     for m in BARE.finditer(scan):
         t = normalize(m.group(1))
         if t in traversable:
@@ -1396,11 +1427,13 @@ def edges_from(f):
     # still reads `ref_txt`, where the definitions are intact. Blanking them for
     # the bare-path scan and not here was the same one-view-not-its-sibling
     # mistake that `sub_in_prose` and `mask_invisible` were each introduced for.
-    _use_starts = block_starts(ref_txt)
-    uses_txt = REF_DEF_FULL.sub(
-        lambda m: (' ' * len(m.group(0))
-                   if m.start() in _use_starts else m.group(0)),
-        ref_txt)
+    _ref_view = strip_quote_markers(ref_txt)
+    _use_starts = block_starts(_ref_view)
+    _def_spans = [m.span() for m in REF_DEF_FULL.finditer(_ref_view)
+                  if m.start() in _use_starts]
+    uses_txt = ref_txt
+    for a, b in _def_spans:
+        uses_txt = uses_txt[:a] + ' ' * (b - a) + uses_txt[b:]
 
     used = set()
     # `None` from `ref_label` means the label is over the character cap and is
@@ -1449,9 +1482,13 @@ def edges_from(f):
     # (`migration_guide_gate_ignores_a_definition_continuing_a_paragraph`).
     # So a definition counts only where a block can start — at the top of the
     # view, or after a blank line.
+    # Quote markers are blanked for the same reason they are in the bare-path
+    # scan: a USED definition inside a quote is a route the reader can click,
+    # and a pattern anchored at `^ {0,3}` could not see past the `>`.
     seen_labels = set()
-    ref_block_starts = block_starts(ref_txt)
-    for m in REF_DEF.finditer(ref_txt):
+    ref_view = strip_quote_markers(ref_txt)
+    ref_block_starts = block_starts(ref_view)
+    for m in REF_DEF.finditer(ref_view):
         if m.start() not in ref_block_starts:
             continue
         label = ref_label(m.group(1))
@@ -3027,6 +3064,20 @@ self_test() {
     > "$c9gh/docs/guide/jobs.md"
   git -C "$c9gh" add -A && git -C "$c9gh" commit -qm next-line-destination-used
   check "a used definition after a wrapped one resolves" pass "$c9gh"
+
+  # An UNUSED definition inside a block quote renders nothing, so its
+  # destination is not visible text and confers no reachability.
+  local c9gi="$tmp/c9gi"; make_corpus "$c9gi"
+  printf '# Jobs\n\n> [old]: docs/guide/mail.md\n' > "$c9gi/docs/guide/jobs.md"
+  git -C "$c9gi" add -A && git -C "$c9gi" commit -qm quoted-unused-def
+  check "an unused definition in a block quote is not a route" fail "$c9gi"
+
+  # ...while a USED one inside a quote is a link the reader can click.
+  local c9gj="$tmp/c9gj"; make_corpus "$c9gj"
+  printf '# Jobs\n\n> [old]: mail.md\n>\n> See [mail][old].\n' \
+    > "$c9gj/docs/guide/jobs.md"
+  git -C "$c9gj" add -A && git -C "$c9gj" commit -qm quoted-used-def
+  check "a used definition in a block quote resolves" pass "$c9gj"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
