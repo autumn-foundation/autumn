@@ -448,6 +448,13 @@ def ref_label(s):
     # case fold, so `[Mail][\u1e9e]` resolves against `[ss]:` — `lower()`
     # gives `\u00df` there and matched nothing, reporting a page the reader
     # can click as an orphan. Verified against markdown-it-py.
+    #
+    # Case folding and whitespace are the WHOLE of it. Normalization does not
+    # unescape, so `[Mail][x\\!]` does not resolve against `[x!]:` — a review
+    # round proposed that it should, and the renderer says otherwise: only when
+    # BOTH sides spell the escape does it link. Escapes fold to placeholders
+    # before this point, uniformly across the document, so comparing them
+    # literally is what keeps that true.
     return ' '.join(s.split()).casefold()
 # A bare repo path. The leading guard keeps `…/docs/guide/x.md` inside a longer
 # path from matching at the wrong offset.
@@ -3618,6 +3625,24 @@ self_test() {
     > "$c9hr/docs/guide/jobs.md"
   git -C "$c9hr" add -A && git -C "$c9hr" commit -qm template-complete
   check "a complete template tag still hides its contents" fail "$c9hr"
+
+  # A label matches LITERALLY, backslash and all: normalization is case
+  # folding and whitespace, nothing else.
+  local c9hs="$tmp/c9hs"; make_corpus "$c9hs"
+  printf '# Jobs\n\nSee [mail][x\\!].\n\n[x\\!]: mail.md\n' > "$c9hs/docs/guide/jobs.md"
+  git -C "$c9hs" add -A && git -C "$c9hs" commit -qm label-escape-both
+  check "a label escaped on both sides resolves" pass "$c9hs"
+
+  # ...and escaping only one side is a different label.
+  local c9ht="$tmp/c9ht"; make_corpus "$c9ht"
+  printf '# Jobs\n\nSee [mail][x\\!].\n\n[x!]: mail.md\n' > "$c9ht/docs/guide/jobs.md"
+  git -C "$c9ht" add -A && git -C "$c9ht" commit -qm label-escape-use-only
+  check "a label escaped on one side does not resolve" fail "$c9ht"
+
+  local c9hu="$tmp/c9hu"; make_corpus "$c9hu"
+  printf '# Jobs\n\nSee [mail][x!].\n\n[x\\!]: mail.md\n' > "$c9hu/docs/guide/jobs.md"
+  git -C "$c9hu" add -A && git -C "$c9hu" commit -qm label-escape-def-only
+  check "a label escaped only in the definition does not resolve" fail "$c9hu"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
