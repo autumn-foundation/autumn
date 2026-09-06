@@ -63,6 +63,16 @@ pub fn scan_prior_indexes(migrations_dir: &Path, table: &str) -> Vec<PriorIndex>
             seq += 1;
         } else if let Some(name) = parse_dropped_index_name(normalized) {
             live.remove(&name);
+        } else if let Some((old, new)) = parse_column_rename(normalized, &names) {
+            // SQLite rewrites an index's column references on RENAME COLUMN, so
+            // the recorded tokens must follow.
+            for (_, index) in live.values_mut() {
+                for token in &mut index.tokens {
+                    if *token == old {
+                        token.clone_from(&new);
+                    }
+                }
+            }
         } else if drops_table(normalized, &names) {
             // Every index on the table goes with it.
             live.clear();
@@ -121,6 +131,24 @@ fn table_aliases(statements: &[(String, String)], table: &str) -> Vec<String> {
         }
     }
     names
+}
+
+/// `(old, new)` column names for an `ALTER TABLE <table> RENAME [COLUMN] <old>
+/// TO <new>` on one of `tables`, lowercased. `None` for a table rename.
+fn parse_column_rename(normalized: &str, tables: &[String]) -> Option<(String, String)> {
+    let rest = normalized.strip_prefix("alter table ")?;
+    let (table, rest) = rest.split_once(" rename ")?;
+    if !tables.contains(&normalize_identifier(table)) {
+        return None;
+    }
+    // `RENAME TO <table>` is a table rename, not a column rename.
+    let rest = rest.strip_prefix("column ").unwrap_or(rest);
+    let (old, rest) = rest.split_once(" to ")?;
+    if old.trim().is_empty() {
+        return None;
+    }
+    let new = rest.split([' ', ';']).next()?;
+    Some((normalize_identifier(old), normalize_identifier(new)))
 }
 
 /// `(old, new)` for an `ALTER TABLE <old> RENAME TO <new>` statement.
@@ -535,6 +563,58 @@ mod tests {
         let found = scan_prior_indexes(t.path(), "posts");
         assert_eq!(found.len(), 1, "got {found:?}");
         assert!(found[0].covers("title"));
+    }
+
+    #[test]
+    fn an_index_follows_a_later_column_rename() {
+        // SQLite rewrites the index's column reference on RENAME COLUMN, so a
+        // later `RemoveHeadlineFromPosts` must still find the index.
+        let t = tree(&[
+            (
+                "2026_01_01_000000_a",
+                "CREATE INDEX idx_posts_title ON posts (title);",
+            ),
+            (
+                "2026_01_02_000000_b",
+                "ALTER TABLE posts RENAME COLUMN title TO headline;",
+            ),
+        ]);
+        let found = scan_prior_indexes(t.path(), "posts");
+        assert_eq!(found.len(), 1, "got {found:?}");
+        assert!(found[0].covers("headline"), "got {found:?}");
+        assert!(!found[0].covers("title"), "the old name is gone: {found:?}");
+    }
+
+    #[test]
+    fn a_column_rename_on_another_table_is_ignored() {
+        let t = tree(&[
+            (
+                "2026_01_01_000000_a",
+                "CREATE INDEX idx_posts_title ON posts (title);",
+            ),
+            (
+                "2026_01_02_000000_b",
+                "ALTER TABLE comments RENAME COLUMN title TO headline;",
+            ),
+        ]);
+        let found = scan_prior_indexes(t.path(), "posts");
+        assert!(found[0].covers("title"), "got {found:?}");
+    }
+
+    #[test]
+    fn a_table_rename_is_not_read_as_a_column_rename() {
+        let t = tree(&[
+            (
+                "2026_01_01_000000_a",
+                "CREATE INDEX idx_articles_title ON articles (title);",
+            ),
+            (
+                "2026_01_02_000000_b",
+                "ALTER TABLE articles RENAME TO posts;",
+            ),
+        ]);
+        let found = scan_prior_indexes(t.path(), "posts");
+        assert!(found[0].covers("title"), "got {found:?}");
     }
 
     #[test]

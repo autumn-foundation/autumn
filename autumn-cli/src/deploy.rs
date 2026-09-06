@@ -1180,6 +1180,11 @@ pub fn grade_database_url(
 /// Grade `migrate check`: reuse the migration safety classifier and fail when a
 /// pending migration is unsafe for a live rolling deploy. A project with no
 /// migrations directory passes (there is nothing to check).
+///
+/// Detects the backend from the ambient profile. `autumn deploy` calls
+/// [`grade_migrate_check_for`] with the DEPLOY TARGET profile's backend instead
+/// (issue #1906 review); this form is for `autumn doctor`, which reports on the
+/// project as it stands locally.
 #[must_use]
 pub fn grade_migrate_check(migrations_dir: &Path) -> PreflightCheck {
     // Grade against the app's own backend (issue #1906): a SQLite app's
@@ -2217,7 +2222,18 @@ fn collect_project_preflight(
             database_configured,
             requires_database_pool(config),
         ),
-        grade_migrate_check(Path::new(MIGRATIONS_DIR)),
+        // Grade migrations against the backend of the SAME profile that will run
+        // them on the host (`AUTUMN_ENV=<resolved.profile>`, default `prod`), for
+        // the reason spelled out for the signing secret above: a project whose
+        // prod profile is SQLite and whose dev profile is Postgres would
+        // otherwise have its production migrations graded by Postgres rules.
+        grade_migrate_check_for(
+            crate::generate::detect_backend_offline(
+                Path::new("."),
+                Some(&canonicalize_deploy_profile(&resolved.profile)),
+            ),
+            Path::new(MIGRATIONS_DIR),
+        ),
     ]
 }
 

@@ -893,7 +893,19 @@ fn classify_statement(
     // spelling, ADD/DROP CONSTRAINT, SET SCHEMA, OWNER TO — is a parse error, so
     // one rule covers them all rather than a list that can fall behind Postgres.
     if sqlite && normalized.starts_with("alter table") {
-        for subcommand in alter_table_subcommands(normalized) {
+        let subcommands = alter_table_subcommands(normalized);
+        // SQLite takes exactly one action per ALTER TABLE; Postgres allows a
+        // comma-separated list.
+        if subcommands.len() > 1 {
+            findings.push(SafetyFinding {
+                operation: "Multi-action ALTER TABLE (unsupported on SQLite)".to_owned(),
+                risk: RiskLevel::Unsupported,
+                why: "SQLite takes one action per ALTER TABLE. A comma-separated list is a parse \
+                      error, so this statement fails at apply time.",
+                next_action: "Split the statement: one ALTER TABLE per action.",
+            });
+        }
+        for subcommand in subcommands {
             if is_sqlite_alter_subcommand(subcommand) {
                 continue;
             }
@@ -2737,6 +2749,28 @@ mod tests {
                 sqlite_ops(sql)
             );
         }
+    }
+
+    #[test]
+    fn sqlite_rejects_a_multi_action_alter_table() {
+        // SQLite takes one action per ALTER TABLE; both actions are individually
+        // valid, so only the statement-level rule catches this.
+        let f = sqlite_finding(
+            "ALTER TABLE posts ADD COLUMN a TEXT, ADD COLUMN b TEXT;",
+            "Multi-action ALTER TABLE (unsupported on SQLite)",
+        )
+        .expect("finding expected");
+        assert_eq!(f.risk, RiskLevel::Unsupported);
+        // One action is fine.
+        assert!(
+            classify_sql_for(
+                DatabaseBackend::Sqlite,
+                "ALTER TABLE posts ADD COLUMN a TEXT;"
+            )
+            .is_empty()
+        );
+        // Postgres allows the list.
+        assert!(classify_sql("ALTER TABLE posts ADD COLUMN a TEXT, ADD COLUMN b TEXT;").is_empty());
     }
 
     #[test]
