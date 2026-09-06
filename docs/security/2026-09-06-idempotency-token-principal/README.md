@@ -42,38 +42,44 @@ this route") — a fail-closed rejection, not a replay.
 
 ## 🔎 Root cause of the fail-closed behavior
 
-`RequireApiToken` can only ever reach a request as a custom
-`AppBuilder::layer()` (there is no other way to populate
-`ApiTokenScopes`/`ApiToken` before the handler runs — see
-`RequireApiTokenService::call`, `autumn/src/auth.rs`).
+`RequireApiToken` is a Tower `Layer`, so an app can mount it three ways, each
+protected by a different router branch:
 
-`autumn::router::custom_layers_require_fail_closed_idempotency` treats every
-custom `AppBuilder::layer()`/`static_gate()` registration as
-idempotency-opaque unless it is explicitly whitelisted —
-`is_idempotency_transparent_app_layer` allowlists only `SessionLayer` and the
-i18n bundle extension (`autumn/src/router.rs:2762-2780`). Installing
-`RequireApiToken` therefore flips `opaque_app_layers_present` for the whole
-app (`autumn/src/router.rs:642-650`), which makes
-`idempotency_layer_for_route` (`autumn/src/router.rs:2741-2753`) select
-`IdempotencyLayer::fail_closed_on_replay()` for **every** route in the app —
-including ones with no custom auth at all — instead of the normal
-`replay_through_inner()` path used for a plain `routes![]`-declared route.
-Scoped groups (`mount_scoped_groups`) and raw `merge()`/`nest()` routers
-(`mount_raw_routers`) get the same `.manual` (fail-closed) treatment
-unconditionally, for the identical reason (comments at
-`autumn/src/router.rs:3117-3123`).
+1. **`AppBuilder::layer()`/`static_gate()`** (this ledger's reproduction). Any
+   such registration not on `is_idempotency_transparent_app_layer`'s allowlist
+   (today: only `SessionLayer` and the i18n bundle extension —
+   `autumn/src/router.rs:2770-2780`) flips `opaque_app_layers_present` for the
+   whole app (`autumn/src/router.rs:642-650`), which makes
+   `idempotency_layer_for_route` (`autumn/src/router.rs:2741-2753`) select
+   `IdempotencyLayer::fail_closed_on_replay()` for **every** `routes![]`-declared
+   route in the app — including ones with no custom auth at all — instead of
+   the normal `replay_through_inner()` path.
+2. **A `.scoped(...)` group's own layer.** `mount_scoped_groups`
+   (`autumn/src/router.rs:3117-3123`) selects the fail-closed `.manual` layer
+   unconditionally for every route in a scoped group, regardless of
+   `opaque_app_layers_present` — the group's layer is never inspected.
+3. **Applied directly to a raw `axum::Router`** brought in via
+   `AppBuilder::merge()`/`nest()` (`RequireApiToken`'s own doc example in
+   `autumn/src/auth.rs` uses this form). `mount_raw_routers` selects the same
+   `.manual` layer unconditionally, for the identical reason.
 
-So the storage key genuinely does not carry the bearer principal — the
+So no mounting path relies on the router recognizing `RequireApiToken`
+specifically — (2) and (3) fail closed for *any* raw/scoped router regardless
+of what layers it carries, and (1) fails closed because `RequireApiToken`
+happens not to be on the allowlist a top-level `AppBuilder::layer()` is
+checked against.
+
+The storage key genuinely does not carry the bearer principal — the
 hypothesis about the key itself is correct — but a same-key collision from a
 different principal can never reach a stored response either way, because
-the coarser opaque-layer check already forces every route behind that layer
-into fail-closed mode. The mechanism trades correctness for safety: a
-genuine same-customer retry through `RequireApiToken` *also* gets `409`
-instead of the intended idempotent replay (a reliability cost, not a
-leak) — which is exactly what the doc comment at
-`autumn/src/idempotency.rs:134-140` calls out: "Opaque route layers that
-resolve their own tenants, bearer principals, or policy state must still use
-the fail-closed replay path instead of storage-key partitioning."
+one of the three branches above already forces fail-closed mode first. The
+mechanism trades correctness for safety: a genuine same-customer retry
+through `RequireApiToken` *also* gets `409` instead of the intended
+idempotent replay (a reliability cost, not a leak) — which is exactly what
+the doc comment at `autumn/src/idempotency.rs:134-140` calls out: "Opaque
+route layers that resolve their own tenants, bearer principals, or policy
+state must still use the fail-closed replay path instead of storage-key
+partitioning."
 
 ## 🩹 Fix
 
@@ -97,16 +103,12 @@ principal.
 
 ## 📡 Blast radius
 
-Swept the other two places idempotency-opaque layers are decided
-(`mount_scoped_groups`, `mount_raw_routers`) — both unconditionally select
-the fail-closed `.manual` layer regardless of what the group/raw router's own
-layers do, so the same negative result holds for `RequireApiToken` mounted
-inside a `scoped()` group or a raw `merge()`/`nest()` router, not just a
-top-level `AppBuilder::layer()`. Also checked
+All three mounting paths are covered above. Also checked
 `is_idempotency_transparent_app_layer`'s allowlist directly: only
 `SessionLayer` and the i18n bundle extension are on it, so no other
 principal-resolving layer (custom OIDC/JWT middleware, a hand-rolled API-key
-layer) is exempted either — the same fail-closed default applies uniformly.
+layer) reaching a top-level `AppBuilder::layer()` is exempted either — the
+same fail-closed default applies uniformly.
 
 ## 📜 Compatibility
 

@@ -82,11 +82,18 @@ async fn bearer_token_principals_do_not_replay_across_each_other() {
         Some("true"),
         "customer B's request must not be answered from customer A's cache slot"
     );
+    // `in_flight_conflict_response()` also returns 409 with no
+    // `X-Idempotent-Replayed` header (if the first request's lock were still
+    // held), so assert the fail-closed-on-replay path's distinctive body
+    // rather than the status code alone.
     assert_eq!(
         second.status,
         http::StatusCode::CONFLICT,
-        "expected the fail-closed-on-replay path (RequireApiToken is an opaque \
-         custom layer), got: {:?}",
+        "expected the fail-closed-on-replay path, got: {:?}",
         second.text()
+    );
+    assert_eq!(
+        second.text(),
+        "idempotency replay requires an inner replay stop for this route"
     );
 }
