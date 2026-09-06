@@ -98,13 +98,18 @@ mailer --list-unsubscribe` are backend-aware too (#1927): on a SQLite app they
 scaffold SQLite-dialect migrations (`INTEGER PRIMARY KEY AUTOINCREMENT`,
 `DEFAULT CURRENT_TIMESTAMP`, `INTEGER` foreign keys) instead of being rejected,
 and the generated auth session store is typed against
-`::autumn_web::RuntimeConnection` so it compiles on either backend (#1908). Field
-kinds with no working diesel SQLite conversion in the generated app's feature
-set — `Uuid`, `Attachment`, `Decimal`, `DateTime` (`DateTime<Utc>`), and
-`enum{…}` — are still **rejected at generate time** (with an actionable error)
-rather than emitting uncompilable code; `--searchable`, UUID primary keys, and
-`--sharded` likewise remain Postgres-only. First-class SQLite support for the
-rejected kinds is tracked in #1924.
+`::autumn_web::RuntimeConnection` so it compiles on either backend (#1908).
+**Every** field kind now has a working diesel SQLite conversion (#1924): a
+SQLite app's `Cargo.toml` gets the SQLite dependency set (diesel on `sqlite`,
+bundled `libsqlite3-sys`, `autumn-web/sqlite`, no `pq-sys`), a generated
+`enum{…}` carries `Text`/`Sqlite` impls, and `Uuid` / `decimal{p,s}` render
+`autumn_web::db::sqlite_types::{SqliteUuid, SqliteDecimal}` — `TEXT`-backed
+newtypes that are `Copy`, deref to the wrapped type, and are
+`#[serde(transparent)]` (`uuid::Uuid` and `rust_decimal::Decimal` are foreign
+types no crate but their own can convert for SQLite). `--searchable` works via
+FTS5 (#1910); UUID primary keys and `--sharded` remain Postgres-only. A
+scaffolded SQLite app's `tests/<model>.rs` still uses the Postgres-only
+`TestDb`, so `cargo test` on it does not compile yet (#1905).
 
 **Scaffold form behavior (trunk-dev)**: generated `create`/`update` handlers
 build a `Changeset` and, on a rejected submission, respond **422** and

@@ -205,6 +205,27 @@ impl ColumnType {
         .to_owned()
     }
 
+    /// [`rust_type`](Self::rust_type) for `backend` (issue #1924).
+    ///
+    /// Mirrors `dsl::FieldKind::rust_type_for`. Postgres is byte-for-byte
+    /// [`rust_type`](Self::rust_type); on `SQLite`, [`Uuid`](Self::Uuid) and
+    /// [`Decimal`](Self::Decimal) render `autumn-web`'s `TEXT`-backed newtypes,
+    /// because `uuid::Uuid` and `rust_decimal::Decimal` are foreign to
+    /// `autumn-web` and diesel blanket-implements `AsExpression` for every
+    /// `Expression`, leaving no crate that could give them a `SQLite`
+    /// conversion.
+    #[must_use]
+    pub fn rust_type_for(&self, backend: Backend) -> String {
+        match backend {
+            Backend::Postgres => self.rust_type(),
+            Backend::Sqlite => match self {
+                Self::Uuid => "autumn_web::db::sqlite_types::SqliteUuid".to_owned(),
+                Self::Decimal { .. } => "autumn_web::db::sqlite_types::SqliteDecimal".to_owned(),
+                _ => self.rust_type(),
+            },
+        }
+    }
+
     /// The diesel `table!` schema type token for `backend`.
     ///
     /// Mirrors `dsl::FieldKind::schema_type_for`. On `SQLite` the Postgres-only
@@ -328,26 +349,22 @@ impl ColumnType {
     /// `FromSql`/`ToSql` on diesel's `SQLite` backend in a generated app's feature
     /// set (diesel `sqlite` + `chrono`, without `uuid`/`numeric`).
     ///
-    /// Mirrors `dsl::FieldKind::sqlite_has_diesel_conversion`: `false` for
-    /// [`Uuid`](Self::Uuid), [`Decimal`](Self::Decimal), and [`Enum`](Self::Enum)
-    /// (still rejected at generate time on `SQLite`, issue #1924); `true` for
-    /// every other type — including [`Timestamp`](Self::Timestamp) via the core,
-    /// ungated diesel `Timestamp` sql-type, [`TimestampTz`](Self::TimestampTz)
-    /// via diesel's `SQLite` `TimestamptzSqlite`, and [`Attachment`](Self::Attachment)
-    /// via `autumn-web`'s local `Blob` `Text`/`Sqlite` conversion (all #1924),
-    /// and [`Json`](Self::Json) via diesel's own `FromSql`/`ToSql<Json,
-    /// Sqlite> for serde_json::Value` — no `autumn-web` code needed at all
-    /// (issue #1341).
+    /// Mirrors `dsl::FieldKind::sqlite_has_diesel_conversion`: `true` for every
+    /// mapped type as of issue #1924 — [`Timestamp`](Self::Timestamp) via the
+    /// core, ungated diesel `Timestamp` sql-type, [`TimestampTz`](Self::TimestampTz)
+    /// via diesel's `SQLite` `TimestamptzSqlite`, [`Attachment`](Self::Attachment)
+    /// via `autumn-web`'s local `Blob` `Text`/`Sqlite` conversion,
+    /// [`Uuid`](Self::Uuid) and [`Decimal`](Self::Decimal) via `autumn-web`'s
+    /// `TEXT`-backed newtypes (see [`ColumnType::rust_type_for`]),
+    /// [`Enum`](Self::Enum) via the app-local `Text`/`Sqlite` impls the model
+    /// generator emits, and [`Json`](Self::Json) via diesel's own
+    /// `FromSql`/`ToSql<Json, Sqlite> for serde_json::Value` (issue #1341).
+    ///
+    /// Only [`Opaque`](Self::Opaque) is `false`: it is introspection-only and
+    /// carries a raw Postgres type name with no known diesel conversion.
     #[must_use]
     pub const fn sqlite_has_diesel_conversion(&self) -> bool {
-        !matches!(
-            self,
-            Self::Uuid
-                | Self::Decimal { .. }
-                | Self::Enum { .. }
-                // Introspection-only: an opaque type has no known diesel conversion.
-                | Self::Opaque { .. }
-        )
+        !matches!(self, Self::Opaque { .. })
     }
 
     /// Inverse of the Postgres mapping: resolve a Postgres `udt_name` (the

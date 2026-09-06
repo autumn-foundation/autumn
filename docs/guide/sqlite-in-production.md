@@ -183,9 +183,10 @@ published support contract**. Available **today**:
 - **Backend-aware DDL generator** — `autumn generate` emits SQLite column types
   for the supported field kinds (see
   [field-type support](#sqlite-field-type-support)).
+- **Backend-aware app dependencies (#1924)** — a SQLite app's `Cargo.toml` gets
+  diesel on its `sqlite` feature with the bundled `libsqlite3-sys`, no `pq-sys`,
+  and `autumn-web`'s `sqlite` feature, so the generated code actually compiles.
 - **Generate-time rejections**, each naming its tracking issue:
-  - `Uuid` / `Decimal` / `Attachment` / `DateTime<Utc>` / `Enum` field kinds —
-    #1924.
   - `--id uuid` primary keys — #1905.
   - `ADD COLUMN NOT NULL` without a default (on both the add and rollback re-add
     paths).
@@ -467,11 +468,12 @@ rather than holding up a write.
 ## SQLite field-type support
 
 The backend-aware generator maps model field kinds to SQLite storage types at
-`autumn generate` time. Like the capability matrix above, this tier lands in
-slices: a field kind is either **mapped** to a working SQLite column type, or
-**rejected at generate time** with an actionable message that names its tracking
-issue — never emitted as output that compiles on Postgres but breaks at migrate
-time on SQLite.
+`autumn generate` time. As of #1924 **every** field kind maps to a working SQLite
+column type and a Rust type that compiles; two of them render an `autumn-web`
+newtype rather than the crate type Postgres uses (see [foreign field
+types](#foreign-field-types-on-sqlite)). A future kind with no working conversion
+is **rejected at generate time** with an actionable message rather than emitted
+as output that compiles on Postgres but breaks on SQLite.
 
 | Field kind | On SQLite | SQLite type | Note |
 | --- | :---: | --- | --- |
@@ -483,11 +485,57 @@ time on SQLite.
 | `f64` | ✅ | `REAL` | |
 | `Bytea` | ✅ | `BLOB` | |
 | `NaiveDateTime` | ✅ | `Timestamp` (TEXT) | Core, ungated `diesel::sql_types::Timestamp`. |
-| `DateTime<Utc>` | ⛔ | — | **Rejected at generate time — #1924.** Its only working SQLite conversion needs diesel's `TimestamptzSqlite`, exported only behind diesel's `sqlite` feature, which the generated app's Postgres-oriented deps do not enable. |
-| `Enum` | ⛔ | — | **Rejected at generate time — #1924.** The generated enum emits only Postgres (`Pg`) `ToSql`/`FromSql<Text>` impls, so SQLite repository loads/inserts do not compile. |
-| `Uuid` | ⛔ | — | **Rejected at generate time — #1924.** No working diesel SQLite `FromSql`/`ToSql` in the app's diesel feature set. |
-| `Decimal` | ⛔ | — | **Rejected at generate time — #1924.** Same reason. |
-| `Attachment` / `Blob` | ⛔ | — | **Rejected at generate time — #1924.** Same reason. |
+| `DateTime<Utc>` | ✅ | `TimestamptzSqlite` (TEXT) | RFC 3339 UTC text, so the column sorts chronologically. |
+| `json` / `jsonb` | ✅ | `Json` (TEXT) | diesel's own `serde_json::Value` conversion. |
+| `Attachment` / `Blob` | ✅ | `TEXT` | The blob metadata JSON. `Blob` is an `autumn-web` type, so it carries its own `Text`/`Sqlite` conversion. |
+| `Enum` | ✅ | `TEXT` | The generated enum is local to your app, so `autumn generate` emits its `ToSql`/`FromSql<Text, Sqlite>` impls directly. |
+| `Uuid` | ✅ | `TEXT` | Renders as `autumn_web::db::sqlite_types::SqliteUuid` — see [foreign field types](#foreign-field-types-on-sqlite). |
+| `Decimal` | ✅ | `TEXT` | Renders as `autumn_web::db::sqlite_types::SqliteDecimal` — see [foreign field types](#foreign-field-types-on-sqlite). |
+
+<a id="foreign-field-types-on-sqlite"></a>
+
+### Foreign field types on SQLite
+
+Two field kinds render a different Rust type on SQLite:
+
+| Field kind | Postgres | SQLite |
+| --- | --- | --- |
+| `Uuid` | `uuid::Uuid` | `autumn_web::db::sqlite_types::SqliteUuid` |
+| `decimal{p,s}` | `rust_decimal::Decimal` | `autumn_web::db::sqlite_types::SqliteDecimal` |
+
+`uuid::Uuid` and `rust_decimal::Decimal` belong to other crates, and so does
+every diesel item their SQLite conversion would name, so `autumn-web` can
+implement nothing for them — diesel already blanket-implements `AsExpression`
+for every `Expression`, which rules out even a custom SQL type. A newtype is the
+wrapper diesel prescribes for exactly this case.
+
+Both wrappers are `Copy`, deref to the wrapped type, convert with `From`/`Into`,
+and are `#[serde(transparent)]`, so `Display`, `FromStr` and JSON match the
+wrapped type exactly:
+
+```rust
+use autumn_web::db::sqlite_types::SqliteUuid;
+
+let id: SqliteUuid = some_uuid.into();
+assert_eq!(id.to_string(), some_uuid.to_string());
+let back: uuid::Uuid = *id;
+```
+
+Both store `TEXT`. `SqliteDecimal` keeps the full decimal representation — sign,
+every significant digit, and scale, so `0.10` reads back as `0.10` — which `REAL`
+would lose to a binary float.
+
+**Ordering limit.** A `TEXT` column compares and sorts lexicographically, so
+`ORDER BY` / `<` / `>` on a `SqliteDecimal` column compares strings, not numbers
+(`"9"` sorts after `"10"`). Sort or range-filter in Rust, or store minor units in
+an `i64`, when SQL ordering matters. `SqliteUuid` is unaffected — UUID columns
+are compared for equality. Postgres `NUMERIC` columns are unaffected.
+
+**Smoke test.** A scaffolded SQLite app's `tests/<model>.rs` still uses
+`autumn_web::test::TestDb`, a Postgres-only testcontainer, so `cargo test` on a
+generated SQLite app does not compile yet. The app itself does — `cargo run`,
+`cargo build` and `autumn migrate` are unaffected. A SQLite `TestDb` lands with
+the runtime slice, #1905.
 
 Additional generator shapes are refused on SQLite:
 
@@ -587,9 +635,8 @@ never as a runtime surprise on some unlucky code path days later.
   Postgres-only job/scheduler backend, a multi-replica lock) fails at boot with
   an actionable diagnostic.
 - A **generator** that would emit output which compiles on Postgres but breaks
-  on SQLite (for example a `Uuid` / `Decimal` field kind or an `--id uuid`
-  primary key) is rejected at **generate time**, with the reason stated — never
-  silent output that fails later.
+  on SQLite (for example an `--id uuid` primary key) is rejected at **generate
+  time**, with the reason stated — never silent output that fails later.
 
 So the operational rule is simple: if a SQLite app boots, every feature it is
 configured to use is supported on SQLite. There is no third state where an

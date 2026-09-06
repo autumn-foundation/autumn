@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
+use autumn_web::config::DatabaseBackend;
+
 use super::dsl::{
     EncryptedMode, Field, FieldKind, IdType, parse_fields, randomized_equality_lookup_reason,
 };
@@ -434,6 +436,9 @@ fn plan_scaffold_with_options_impl(
     for_revert: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
+    // Selects the SQLite-vs-Postgres halves of the scaffold's output: the field
+    // Rust types, the dependency set, and `autumn-web`'s feature list (#1924).
+    let backend = super::detect_backend(project_root);
     // Gate: UUID primary keys are not yet supported for scaffolds. Every scaffold
     // emits a `#[autumn_web::repository]`, whose macro-generated REST API is
     // currently hard-coded to `i64` primary keys (`Path<i64>`, `find_by_id`,
@@ -718,7 +723,7 @@ fn plan_scaffold_with_options_impl(
             slug.name
         )));
     }
-    let queries = parse_query_specs(&fields, &options_with_key.queries, for_revert)?;
+    let queries = parse_query_specs(&fields, &options_with_key.queries, for_revert, backend)?;
     let form_fields = fields
         .iter()
         .filter(|field| !metadata.defaults().contains_key(&field.name))
@@ -847,7 +852,6 @@ fn plan_scaffold_with_options_impl(
         // On a revert, the shared table stays as long as ANY other model still
         // declares `#[commentable]` — it is one table for all of them, so
         // taking it out with this model would break every other one.
-        let backend = super::detect_backend(project_root);
         let revert_would_orphan_another_model = for_revert
             && super::commentable::another_model_is_still_commentable(project_root, &snake_name);
         let emitted = !revert_would_orphan_another_model
@@ -1267,6 +1271,7 @@ fn plan_scaffold_with_options_impl(
             nesting.as_ref(),
             options_with_key.import,
             &labels,
+            backend,
         );
         let own_routes = super::nested::reapply_children(&previous_own_routes, &fresh_own_routes)
             .map_err(|refused| {
@@ -2282,7 +2287,7 @@ fn plan_scaffold_with_options_impl(
     // would clobber the first (each rendering is computed at plan time
     // against the on-disk Cargo.toml).
     plan.actions.retain(|a| !a.path().ends_with("Cargo.toml"));
-    let mut combined: Vec<(&str, &str)> = super::model::MODEL_DEPS
+    let mut combined: Vec<(&str, &str)> = super::model::model_deps(backend)
         .iter()
         .copied()
         .chain(SCAFFOLD_EXTRA_DEPS.iter().copied())
@@ -2305,7 +2310,12 @@ fn plan_scaffold_with_options_impl(
     if fields.iter().any(|f| f.kind.is_decimal()) {
         combined.push((
             "rust_decimal",
-            "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }",
+            match backend {
+                DatabaseBackend::Postgres => {
+                    "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }"
+                }
+                DatabaseBackend::Sqlite => "{ version = \"1\", features = [\"serde\"] }",
+            },
         ));
     }
     plan_cargo_deps(
@@ -2314,6 +2324,33 @@ fn plan_scaffold_with_options_impl(
         &combined,
         &project_root.join("src/models"),
     );
+
+    // Re-applied here, not inherited: the `retain` above dropped every staged
+    // `Cargo.toml` action, including the `sqlite` feature `plan_model` added
+    // (issue #1924) — the same reason `maud` and `i18n` are re-applied below.
+    if backend == DatabaseBackend::Sqlite {
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let updated = ensure_autumn_web_feature(&base, "sqlite");
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path.clone(), updated);
+        }
+        // Pushed unconditionally — see `plan_cargo_deps`'s matching comment.
+        plan.push_revert(Revert::CargoAutumnWebFeature {
+            path: cargo_path,
+            feature: "sqlite".to_owned(),
+            owner_dir: Some(project_root.join("src/models")),
+        });
+    }
 
     // The generated HTML routes render through `autumn_web::form::*` helpers
     // (issue #1124), which are gated behind autumn-web's `maud` feature — enable
@@ -2836,6 +2873,9 @@ fn parse_query_specs(
     fields: &[Field],
     queries: &[String],
     for_revert: bool,
+    // The lookup argument's Rust type must match the model field's, which
+    // differs for `Uuid`/`Decimal` on SQLite (issue #1924).
+    backend: DatabaseBackend,
 ) -> Result<Vec<QuerySpec>, GenerateError> {
     let mut parsed = Vec::with_capacity(queries.len());
     for query in queries {
@@ -2905,7 +2945,7 @@ fn parse_query_specs(
         parsed.push(QuerySpec {
             method: method.to_owned(),
             field_name: field_name.to_owned(),
-            rust_type: field.rust_type(),
+            rust_type: field.rust_type_for(backend),
         });
     }
     // Every `unique` field (issue #1032) gets a `find_by_<field>` repository
@@ -2922,7 +2962,7 @@ fn parse_query_specs(
             parsed.push(QuerySpec {
                 method: format!("find_by_{}", field.name),
                 field_name: field.name.clone(),
-                rust_type: field.rust_type(),
+                rust_type: field.rust_type_for(backend),
             });
         }
     }
@@ -3260,6 +3300,9 @@ fn render_model_form(
     // changes here is that `parse_local_datetime` also accepts the format the
     // CSV export writes, so an exported file re-imports on its datetime columns.
     import: bool,
+    // The form field types must match the model's, which differ for
+    // `Uuid`/`Decimal` on SQLite (issue #1924).
+    backend: DatabaseBackend,
 ) -> ModelFormParts {
     use std::fmt::Write;
     let mut struct_fields = String::new();
@@ -3459,7 +3502,7 @@ fn render_model_form(
             // pre-fill `0` and silently pass both `required` and a range that
             // spans the zero default. `into_new` unwraps the validated
             // `Some(_)`; `from_row` wraps a persisted native value in `Some`.
-            let rust_type = f.rust_type();
+            let rust_type = f.rust_type_for(backend);
             let _ = writeln!(struct_fields, "    pub {name}: Option<{rust_type}>,");
             let _ = writeln!(
                 into_new,
@@ -3488,7 +3531,7 @@ fn render_model_form(
             // A nullable field of the same kind needs none of this:
             // `Option<T>::default()` is `None`, which serializes to `null` and
             // renders blank via `field_value`.
-            let rust_type = f.rust_type();
+            let rust_type = f.rust_type_for(backend);
             let _ = writeln!(struct_fields, "    pub {name}: String,");
             let _ = writeln!(
                 into_new,
@@ -3512,7 +3555,7 @@ fn render_model_form(
             let _ = writeln!(
                 struct_fields,
                 "    pub {name}: {rust_type},",
-                rust_type = f.rust_type()
+                rust_type = f.rust_type_for(backend)
             );
             let _ = writeln!(into_new, "        {name}: form.{name}.clone(),");
             let _ = writeln!(from_row, "            {name}: row.{name}.clone(),");
@@ -3620,6 +3663,9 @@ fn render_routes_file(
     // Disabled (`--i18n` off) it returns each caller's literal expression
     // verbatim, so this whole template renders byte-for-byte as before.
     labels: &scaffold_i18n::ViewLabels,
+    // Selects the form field Rust types, which differ for `Uuid`/`Decimal` on
+    // SQLite (issue #1924).
+    backend: DatabaseBackend,
 ) -> String {
     let id_rust = id_type.rust_type();
     // Issue #1349: with `--i18n`, every view-rendering handler takes the
@@ -4321,6 +4367,7 @@ fn render_routes_file(
         validations,
         nesting.map(|n| n.fk.as_str()),
         import_enabled,
+        backend,
     );
     // Enum fields need their generated Rust type in scope here — `into_new`
     // parses into it and the `From<&Row>` seed matches against its variants

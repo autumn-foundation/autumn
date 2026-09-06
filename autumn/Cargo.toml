@@ -477,6 +477,12 @@ rusty-fork = "0.3.1"
 # dependency graph via the db feature — no new crates).
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
+# `serde` on top of the library `uuid` dep, so a `#[model]` in a test target can
+# carry a `Uuid` field (the `#[model]` macro derives Serialize/Deserialize).
+# Mirrors the `uuid` features `autumn generate` writes into a real app's
+# Cargo.toml (`generate::model::MODEL_DEPS`). Test-only: dev-dependency features
+# never reach a downstream consumer.
+uuid = { version = "1", features = ["serde"] }
 
 # docs.rs feature posture: include all features except those that require
 # system libraries unavailable in the docs.rs sandbox.
@@ -727,6 +733,21 @@ path = "tests/sqlite_crud_basic.rs"
 [[test]]
 name = "sqlite_field_conversions"
 path = "tests/sqlite_field_conversions.rs"
+
+# `Uuid` / `Decimal` / generated-enum model fields on SQLite (issue #1924).
+# `uuid::Uuid` and `rust_decimal::Decimal` are foreign types, so their SQLite
+# conversions hang off the LOCAL `db::sqlite_types::{UuidText, DecimalText}`
+# sql-types (orphan-rule-legal). Proves a `#[model]` carrying required and
+# nullable `Uuid`/`Decimal` fields plus a generated `enum{…}` field compiles,
+# round-trips (incl. decimal scale and NULLs), and binds in a WHERE clause on an
+# in-memory SQLite pool with no Docker. Un-rejects those kinds at generate time.
+# Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run:
+# `cargo test -p autumn-web --features sqlite --test sqlite_uuid_decimal_conversions`.
+[[test]]
+name = "sqlite_uuid_decimal_conversions"
+path = "tests/sqlite_uuid_decimal_conversions.rs"
 
 # `serde_json::Value` model-field round-trip on SQLite (issue #1341): proves a
 # `#[model]` carrying a required `serde_json::Value` and an
