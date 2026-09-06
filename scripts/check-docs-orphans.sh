@@ -466,9 +466,14 @@ HTML_TAG = re.compile(
 # so `[mail]` inside `<div>…</div>` stays literal and resolves no reference.
 # Unlike `HIDDEN_HTML` the text is still VISIBLE, so this bounds Markdown
 # extraction only; bare paths inside it still count.
+# A type-6 block starts on a line beginning with a tag — trailing content on
+# that line is allowed, `<div>example` opens one — and ends at the next BLANK
+# line, not at a closing tag. Requiring a stand-alone opener and a matching
+# close missed both halves of that.
 RAW_BLOCK = re.compile(
-    r'^ {0,3}<([A-Za-z][A-Za-z0-9-]*)(?:\s[^\n]*)?>\s*$.*?^ {0,3}</\1\s*>\s*$',
-    re.S | re.M)
+    r'^ {0,3}</?[A-Za-z][A-Za-z0-9-]*(?:\s[^\n]*|/?>[^\n]*)?$'
+    r'(?:\n(?![ \t]*$)[^\n]*)*',
+    re.M)
 # A raw anchor IS navigation, so its destination is resolved like any other —
 # through `add_relative`, which means `<a href="mail.md">` and
 # `<a href="../guide/mail.md">` work, not just the repo-root spelling the
@@ -560,7 +565,11 @@ def edges_from(f):
     #    offset further down and the positions must stay valid. This has to
     #    precede masking, or `mask_invisible` reads `\![x](y.md)` as an image
     #    and blanks a live link.
-    txt = read(f).replace('\\\\', '\x00\x00').replace('\\!', '\x01\x01')
+    #    `\<script>` is the same idea for a tag: the escape stops raw HTML, so
+    #    prose showing literal tags around a live link must keep that link.
+    txt = (read(f).replace('\\\\', '\x00\x00')
+           .replace('\\!', '\x01\x01')
+           .replace('\\<', '\x02\x02'))
     # 2. Raw HTML is identified BEFORE comments. A `<!--` inside a closed
     #    `<script>` is script data, not a Markdown comment, and parsing comments
     #    first truncated the document at it. This order also settles the
@@ -579,7 +588,9 @@ def edges_from(f):
         # would fail the `.md` test below and call a live link an orphan.
         raw = raw.split('#', 1)[0].split('?', 1)[0].strip()
         raw = urllib.parse.unquote(raw)
-        raw = raw.replace('\x00\x00', '\\\\').replace('\x01\x01', '\\!')
+        raw = (raw.replace('\x00\x00', '\\\\')
+               .replace('\x01\x01', '\\!')
+               .replace('\x02\x02', '\\<'))
         raw = UNESCAPE.sub(r'\1', raw)
         if not raw.endswith('.md'):
             return
@@ -620,7 +631,12 @@ def edges_from(f):
         for m in pattern.finditer(md_txt):
             add_relative(m.group(1) if m.group(1) is not None else m.group(2))
 
-    for m in ANCHOR_HREF.finditer(md_txt):
+    # Anchors read `txt`, NOT the raw-block-stripped view. A type-6 block
+    # suppresses MARKDOWN inside it, but its raw HTML is passed through and
+    # rendered, so `<a href="mail.md">` on its own line — which is itself such a
+    # block — is a link the reader can click. Stripping it here broke two
+    # anchor tests, which is what said the distinction is real.
+    for m in ANCHOR_HREF.finditer(txt):
         add_relative(next(g for g in m.groups() if g is not None))
 
     # A reference USE inside code — `` `[mail][]` `` — is the one code case that
@@ -633,15 +649,23 @@ def edges_from(f):
         seg for kind, seg in split_fences(md_txt) if kind == 'prose')
     ref_txt = CODE_SPAN.sub(' ', ref_txt)
 
+    # A definition is not a USE of anything, including of a label sitting in its
+    # own title — `[old]: https://example.com "[mail]"` renders nothing at all.
+    # Definition spans are blanked for the usage scans only; resolution below
+    # still reads `ref_txt`, where the definitions are intact. Blanking them for
+    # the bare-path scan and not here was the same one-view-not-its-sibling
+    # mistake that `sub_in_prose` and `mask_invisible` were each introduced for.
+    uses_txt = REF_DEF_FULL.sub(lambda m: ' ' * len(m.group(0)), ref_txt)
+
     used = set()
-    for m in REF_USE_FULL.finditer(ref_txt):
+    for m in REF_USE_FULL.finditer(uses_txt):
         # `[label][]` (collapsed) leaves group 1 empty; the label is the text.
         inner = m.group(1)
         used.add(ref_label(inner) if inner.strip()
                  else ref_label(m.group(0)[1:m.group(0).index(']')]))
     # Blank every full-reference span before looking for shortcuts, so the
     # `[mail]` tail of `![alt][mail]` is not re-read as a link of its own.
-    shortcut_txt = REF_USE_ANY.sub(lambda m: ' ' * len(m.group(0)), ref_txt)
+    shortcut_txt = REF_USE_ANY.sub(lambda m: ' ' * len(m.group(0)), uses_txt)
     shortcut_txt = INLINE_SPAN_ANY.sub(
         lambda m: ' ' * len(m.group(0)), shortcut_txt)
     for m in REF_USE_SHORTCUT.finditer(shortcut_txt):
@@ -1400,6 +1424,32 @@ self_test() {
   printf '# Jobs\n\n<div>\nSee docs/guide/mail.md\n</div>\n' > "$c9ca/docs/guide/jobs.md"
   git -C "$c9ca" add -A && git -C "$c9ca" commit -qm raw-block-bare-path
   check "a bare path inside a raw HTML block still counts" pass "$c9ca"
+
+  # A type-6 block opens even with trailing content and runs to a blank line.
+  local c9cb="$tmp/c9cb"; make_corpus "$c9cb"
+  printf '# Jobs\n\n<div>example\n[mail](mail.md)\n' > "$c9cb/docs/guide/jobs.md"
+  git -C "$c9cb" add -A && git -C "$c9cb" commit -qm raw-block-trailing-opener
+  check "a raw block opener with trailing content still opens one" fail "$c9cb"
+
+  # ...and the block ends at the blank line, so later links are live again.
+  local c9cc="$tmp/c9cc"; make_corpus "$c9cc"
+  printf '# Jobs\n\n<div>example\ntext\n\nSee [mail](mail.md).\n' > "$c9cc/docs/guide/jobs.md"
+  git -C "$c9cc" add -A && git -C "$c9cc" commit -qm raw-block-ends-at-blank
+  check "a link after the blank line ending a raw block is live" pass "$c9cc"
+
+  # An escaped `<` shows a literal tag and opens no raw HTML.
+  local c9cd="$tmp/c9cd"; make_corpus "$c9cd"
+  printf '# Jobs\n\nShow \\<script\\> around [mail](mail.md) \\</script\\>.\n' \
+    > "$c9cd/docs/guide/jobs.md"
+  git -C "$c9cd" add -A && git -C "$c9cd" commit -qm escaped-tag-opener
+  check "an escaped tag opener leaves the link live" pass "$c9cd"
+
+  # A label in a definition's title is not a use of it.
+  local c9ce="$tmp/c9ce"; make_corpus "$c9ce"
+  printf '# Jobs\n\n[old]: https://example.com "[mail]"\n\n[mail]: mail.md\n' \
+    > "$c9ce/docs/guide/jobs.md"
+  git -C "$c9ce" add -A && git -C "$c9ce" commit -qm label-in-refdef-title
+  check "a label inside a definition title is not a use" fail "$c9ce"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
