@@ -1638,6 +1638,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spawn site queries fleet-distribution through a named
   `SchedulerCoordinator`/`SchedulerBackend` predicate instead of matching the
   scheduler config enum inline.
+- **ci:** the test suite is now **sharded across runners** instead of running as
+  one job per OS [no-plugin] — CI scheduling only; it adds no framework surface
+  an agent could reach for, and the notes for humans editing tests live in
+  CLAUDE.md rather than the plugin. On the 2026-08-26 trunk run
+  `Test (windows-latest)` alone was 128 minutes and *was* the critical path of a
+  2h27m run. Two things dominated, both measured from that run's logs. First,
+  `compile_fail::` (trybuild) was 37.1 of the 46.8 minutes the consolidated
+  `integration_tests` binary spent running on Windows, and it was the *tail* —
+  the binary finished 0.2s after trybuild did, on every OS. Each case shells out
+  a nested `cargo` build and trybuild serialises them behind a project-dir lock,
+  so only more runners make it faster. Second, the eight non-default feature
+  lanes ran in sequence in that same job, ~44 minutes of pure recompilation on
+  Windows despite being independent builds.
+
+  `test` is now four job families running side by side — `test` (the workspace
+  suite), `trybuild` (four shards), `test-features` (one job per feature set)
+  and `test-docker` — behind one aggregate `Test suite` gate. First fully-green
+  sharded run: **2h27m → 1h57m**. `trybuild`, `test-features` and `coverage`
+  were then narrowed further: the first two to Linux only (a trybuild golden is
+  pinned to the rustc version, not the OS; a feature lane asks about a feature,
+  not a platform), and `coverage` — by then a co-equal 55-minute tail — split
+  into four lanes by feature set, each uploading under its own Codecov flag.
+  That took the workflow from 47 expanded jobs to 32. Those three changes land
+  after the 1h57m measurement, so the new total is not yet measured.
+
+  Test-layout consequences, all of which keep every test running and
+  merge-blocking: `compile_pass_tests` split into `_a`/`_b` (a disjoint split of
+  the same fixture list, no fixture added or removed); the `sim_*` determinism
+  modules got a single-threaded second step, because removing trybuild freed the
+  libtest thread pool and the remaining ~1880 tests went from trickling through
+  trybuild's gaps (863s) to full parallelism (61s), enough to flip them on a
+  4-vCPU runner; and `capsule_cache_effect` moved to its own binary, because it
+  installs a process-global cache that any concurrent `TestApp::build` clears.
+  Every shard runs `cargo test --workspace` deliberately — the trybuild fixture
+  list is `#[cfg(feature = ...)]`-gated, so narrowing a shard would silently
+  compile fewer fixtures and still report green — and each asserts a non-zero
+  pass count, because `cargo test` exits 0 when a filter matches nothing.
+  **Branch protection must be repointed** from the per-OS `Test (…)` checks to
+  `Test suite` (`test-gate`), the one name that stays stable as shards come and
+  go.
 - **plugin-conformance:** **Breaking:** `plugin_conformance::ConformanceConfig`
   gains a `contract` field and is now `#[non_exhaustive]`, so it can no longer
   be built with a struct literal — use `ConformanceConfig::new(name)` and the
