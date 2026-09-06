@@ -123,7 +123,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 run_check() {
   local dir="$1"
   python3 - "$dir" <<'PYEOF'
-import os, posixpath, re, subprocess, sys, urllib.parse
+import html, os, posixpath, re, subprocess, sys, urllib.parse
 
 root = sys.argv[1]
 
@@ -228,21 +228,24 @@ MD_LINK_NESTED = re.compile(
 # Markdown drops the backslash from an escaped ASCII punctuation character, so
 # `guide\(v2\).md` addresses the file `guide(v2).md` — same rule as the sibling.
 UNESCAPE = re.compile(r'\\([!-/:-@\[-`{-~])')
-# A numeric character reference in a destination: `mail&#46;md` and
-# `mail&#x2e;md` both address `mail.md`. The migration-guide gate already pins
-# this behaviour (`repo_hygiene.rs`
-# migration_guide_gate_resolves_a_character_reference_in_a_destination), and
-# comparing the encoded spelling rejects a link that works for the reader.
-CHAR_REF = re.compile(r'&#(?:[xX]([0-9a-fA-F]+)|(\d+));')
-
-
+# A character reference in a destination: `mail&#46;md`, `mail&#x2e;md` and
+# `mail&period;md` all address `mail.md`. `html.unescape` covers the numeric and
+# named forms together, so there is no table to maintain here.
+#
+# NEITHER FORM CAN ACTUALLY BITE TODAY, and that is worth writing down rather
+# than discovering later. `check-docs-links.sh` does not decode references at
+# all: it reports `mail&#46;md` and `mail&period;md` as broken link targets, so
+# a page using one fails the docs job on that gate before reachability is ever
+# in question. Decoding here is therefore about not disagreeing with the
+# reader's view of the page, not about a case a green corpus can contain.
+#
+# The two siblings disagree on this point: `check-migration-guides.sh` resolves
+# numeric references deliberately, with a test
+# (`…_resolves_a_character_reference_in_a_destination`), while
+# `check-docs-links.sh` rejects them. Reconciling that is a change to the link
+# gate's contract and belongs in its own PR, not smuggled into this one.
 def decode_char_refs(s):
-    def one(m):
-        try:
-            return chr(int(m.group(1), 16) if m.group(1) else int(m.group(2)))
-        except (ValueError, OverflowError):
-            return m.group(0)
-    return CHAR_REF.sub(one, s)
+    return html.unescape(s)
 # A reference definition: `[mail]: mail.md`, optionally `<…>`-wrapped. Markdown
 # allows up to three leading spaces. Reference-style links are a syntax
 # check-docs-links.sh already parses and self-tests, so a page linked only that
@@ -1753,6 +1756,12 @@ self_test() {
     > "$c9cz/docs/guide/jobs.md"
   git -C "$c9cz" add -A && git -C "$c9cz" commit -qm terminated-title
   check "a definition with a closed title resolves" pass "$c9cz"
+
+  # A named character reference decodes like the numeric forms.
+  local c9da="$tmp/c9da"; make_corpus "$c9da"
+  printf '# Jobs\n\nSee [mail](mail&period;md).\n' > "$c9da/docs/guide/jobs.md"
+  git -C "$c9da" add -A && git -C "$c9da" commit -qm named-char-ref
+  check "a named character reference in a destination resolves" pass "$c9da"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
