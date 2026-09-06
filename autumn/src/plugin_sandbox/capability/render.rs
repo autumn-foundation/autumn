@@ -269,12 +269,23 @@ fn write_node(
             attributes,
             children,
         } => {
-            let tag = tag.to_ascii_lowercase();
-            if !ALLOWED_TAGS.contains(&tag.as_str()) {
+            // Matched without folding the guest's string first. The allow-list
+            // is a handful of short names, and `eq_ignore_ascii_case` compares
+            // lengths before bytes, so an overlong tag loses against `p` in
+            // constant time. Folding first copied whatever arrived — up to the
+            // stdout-frame ceiling, per concurrent render, outside the Wasm
+            // memory limiter — before anything decided it was a tag at all.
+            // The same shape as the outbound method a few commits back; this is
+            // the sibling that pass did not look for.
+            let Some(tag) = ALLOWED_TAGS
+                .iter()
+                .find(|known| known.eq_ignore_ascii_case(tag))
+            else {
                 return Err(RenderError::ForbiddenTag(super::super::manifest::rejected(
-                    &tag,
+                    tag,
                 )));
-            }
+            };
+            let tag = (*tag).to_owned();
             if attributes.len() > MAX_ATTRIBUTES {
                 return Err(RenderError::TooManyAttributes(attributes.len()));
             }
@@ -320,16 +331,18 @@ fn write_attribute(
     name: &str,
     value: &str,
 ) -> Result<(), RenderError> {
-    let name = name.to_ascii_lowercase();
-    let allowed = ALLOWED_ATTRIBUTES
+    // As for the tag above: compared without allocating, so an overlong
+    // attribute name is refused on its length rather than after a full copy.
+    let Some((_, known)) = ALLOWED_ATTRIBUTES
         .iter()
-        .any(|(on, known)| *known == name && (*on == "*" || *on == tag));
-    if !allowed {
+        .find(|(on, known)| known.eq_ignore_ascii_case(name) && (*on == "*" || *on == tag))
+    else {
         return Err(RenderError::ForbiddenAttribute {
             tag: tag.to_owned(),
-            name: super::super::manifest::rejected(&name),
+            name: super::super::manifest::rejected(name),
         });
-    }
+    };
+    let name = (*known).to_owned();
     if value.len() > MAX_TEXT_BYTES {
         return Err(RenderError::TextTooLong(value.len()));
     }
@@ -590,6 +603,53 @@ mod tests {
 
         let wide: Vec<FragmentNode> = (0..=MAX_NODES).map(|_| text("x")).collect();
         assert_eq!(render(&wide, 1 << 20), Err(RenderError::TooManyNodes));
+    }
+
+    #[test]
+    fn an_overlong_tag_or_attribute_name_is_refused_without_being_copied() {
+        // The outbound method got this treatment a few rounds back and the pass
+        // stopped there. These are the siblings: a tag and an attribute name
+        // were both `to_ascii_lowercase`d before anything decided they were
+        // names at all, so a megabyte of either was copied once for the fold
+        // and again for the denial -- per concurrent render, outside the Wasm
+        // memory limiter.
+        let huge = "p".repeat(512 * 1024);
+        assert!(matches!(
+            render(
+                &[FragmentNode::Element {
+                    tag: huge.clone(),
+                    attributes: Vec::new(),
+                    children: Vec::new(),
+                }],
+                1 << 20
+            ),
+            Err(RenderError::ForbiddenTag(_))
+        ));
+        assert!(matches!(
+            render(
+                &[FragmentNode::Element {
+                    tag: "p".to_owned(),
+                    attributes: vec![(huge, "x".to_owned())],
+                    children: Vec::new(),
+                }],
+                1 << 20
+            ),
+            Err(RenderError::ForbiddenAttribute { .. })
+        ));
+
+        // And the case-insensitivity the fold existed for still holds, so the
+        // allocation-free match did not quietly become a case-sensitive one.
+        assert_eq!(
+            render(
+                &[FragmentNode::Element {
+                    tag: "P".to_owned(),
+                    attributes: vec![("CLASS".to_owned(), "a".to_owned())],
+                    children: Vec::new(),
+                }],
+                1 << 20
+            ),
+            Ok("<p class=\"a\"></p>".to_owned())
+        );
     }
 
     #[test]

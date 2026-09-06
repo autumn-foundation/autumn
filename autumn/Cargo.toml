@@ -578,6 +578,10 @@ path = "tests/sandbox_header_alloc_gate.rs"
 # characters of it. Its own binary for the same reason as the header gate —
 # `allocation-counter` installs a process-wide `#[global_allocator]`.
 [[test]]
+name = "sandbox_render_alloc_gate"
+path = "tests/sandbox_render_alloc_gate.rs"
+
+[[test]]
 name = "sandbox_stderr_alloc_gate"
 path = "tests/sandbox_stderr_alloc_gate.rs"
 

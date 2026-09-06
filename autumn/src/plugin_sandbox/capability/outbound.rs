@@ -267,6 +267,14 @@ pub fn host_of(url: &str) -> Option<String> {
             return None;
         }
     }
+    // Length first, then the fold. `is_grantable_host` refuses anything over
+    // `MAX_HOST_LEN` anyway, but it did so *after* this copied the whole thing —
+    // and the URL is the guest's, bounded only by the frame. Checking the bound
+    // the answer already depends on costs nothing and makes the copy
+    // proportional to a host name rather than to whatever arrived.
+    if host.len() > super::super::grants::MAX_HOST_LEN {
+        return None;
+    }
     let host = host.to_ascii_lowercase();
     // The same shape the grant list is validated against, so a URL can never
     // name something no grant could have named — including a trailing dot,
