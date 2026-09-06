@@ -1052,7 +1052,14 @@ while frontier:
             seen.add(nxt)
             frontier.append(nxt)
 
-WAIVER = re.compile(r'<!--\s*orphan-allow:\s*(.+?)\s*-->', re.S)
+# The reason stops at the first `-->`, and may be EMPTY so the marker is still
+# recognised when it has none. `(.+?)` did neither: needing at least one
+# character, it stepped over the close of `<!-- orphan-allow: -->` and captured
+# the page text plus the next comment's opener as a reason — an empty marker
+# exempting a page from the check entirely, which is the most expensive false
+# negative available here. Matching the marker with an empty reason is what
+# keeps the "no reason after the colon" message pointing at the real problem.
+WAIVER = re.compile(r'<!--\s*orphan-allow:\s*((?:(?!-->).)*?)\s*-->', re.S)
 
 
 def waiver_view(txt):
@@ -2154,6 +2161,28 @@ self_test() {
     > "$c9ec/docs/guide/jobs.md"
   git -C "$c9ec" add -A && git -C "$c9ec" commit -qm anchor-href-after-quoted-gt
   check "an href after quoted > characters still counts as an edge" pass "$c9ec"
+
+  # An empty marker does not reach forward to a LATER comment for its reason.
+  local c9ed="$tmp/c9ed"; make_corpus "$c9ed"
+  printf '# Mail\n\n<!-- orphan-allow: -->\n\ntext\n\n<!-- note -->\n' \
+    > "$c9ed/docs/guide/mail.md"
+  git -C "$c9ed" add -A && git -C "$c9ed" commit -qm waiver-empty-then-comment
+  check "an empty marker does not borrow a later comment as its reason" fail "$c9ed"
+
+  # ...and it is still recognised AS a marker, so the message says why.
+  local c9ee="$tmp/c9ee"; make_corpus "$c9ee"
+  printf '# Mail\n\n<!-- orphan-allow: -->\n\ntext\n\n<!-- note -->\n' \
+    > "$c9ee/docs/guide/mail.md"
+  git -C "$c9ee" add -A && git -C "$c9ee" commit -qm waiver-empty-message
+  # Captured rather than piped: `run_check` exits 1 here by design, and under
+  # `pipefail` that status is the pipeline's however well grep matched.
+  total=$((total + 1))
+  local out9ee; out9ee="$(run_check "$c9ee" 2>&1 || true)"
+  if [[ "$out9ee" == *"has no reason after the colon"* ]]; then
+    pass=$((pass + 1)); echo "  ok: an empty marker is reported as having no reason"
+  else
+    echo "  FAILED: an empty marker is reported as having no reason" >&2
+  fi
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
