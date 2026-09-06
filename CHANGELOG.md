@@ -1920,6 +1920,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🧭 Wayfinder: signup/login redisplay inline on failure in `saas` and
+  `teams` (error-path 1/6 → 6/6 redisplaying the form; 0/6 → 6/6 preserving
+  the entered email):** an error-path inventory of both starters' auth
+  flows — signup and login in the two `supported`-tier examples whose whole
+  purpose is demonstrating that journey — found 5 of 6 recoverable failure
+  modes (malformed email, over-long password, and duplicate email at signup;
+  invalid credentials and over-long input at login) returning
+  `AutumnError`'s generic `application/problem+json`/error-page response
+  instead of redisplaying the form; the sixth (a weak password at signup)
+  did redisplay but still dropped the email the user had already typed, since
+  neither `signup_page` nor `login_form` accepted an `email` parameter to
+  preserve it. Fix: every recoverable failure now redisplays the same form at
+  HTTP 200 with the message adjacent to the fields (the existing `role="alert"`
+  paragraph) and the entered email preserved via a new `value=` attribute —
+  the one convention the weak-password branch already established, now
+  applied consistently. `teams`'s duplicate-email case needed one extra step:
+  its three signup inserts run inside one DB transaction, so that failure is
+  classified (`AutumnError::conflict_msg`, matched by status after the
+  transaction) precisely on Diesel's `UniqueViolation` rather than any insert
+  error, so a real mid-transaction failure (a dropped connection, a
+  permission error) still propagates as the 500/503 it is instead of
+  rendering a fake-successful "could not create account" page — the same
+  precise match was applied to `saas`'s non-transactional insert. `saas`'s
+  login redisplay also threads the submitted "Remember me" checkbox state
+  back through (`checked[remember]`), so a user who ticks it, mistypes their
+  password, and corrects it without re-checking the box does not silently
+  lose that opt-in. Zero-membership and corrupt-role login failures in
+  `teams` (real server-side conditions no resubmit can fix) are left as
+  real error responses. Two new `#[ignore = "requires Docker
+  (testcontainers)"]` integration tests (one per app) exercise all 6 cases
+  end-to-end, including the weak-password branch's email preservation (never
+  previously asserted for either app) and the over-long-input login case; a
+  third proves the remember-me checkbox survives a rejected login both ticked
+  and unticked. `saas` and `teams` were not previously part of CI's
+  Docker-dependent test sweep at all — unlike `autumn-web`'s consolidated
+  binary, example apps are not auto-swept — so `.github/workflows/ci.yml`
+  now runs this PR's tests explicitly. `saas` runs its full `--ignored`
+  suite (`--test-threads=1`: it shares one process-global `TestDb::shared()`
+  container, and each test's setup does a `TRUNCATE`), skipping three
+  pre-existing tests (`tenants_are_isolated` and two `remember_me_*` tests)
+  found to fail once several other ignored tests have already run first in
+  the same process — a real but separate, pre-existing bug this wiring
+  surfaced rather than caused, left for a follow-up with Docker access to
+  diagnose. `teams` is scoped to just the test this PR added, since its own
+  ~20 pre-existing ignored tests have likewise never run together before and
+  may have similar undiscovered ordering sensitivity.
 - **macros: stacked `#[secured]`/`#[step_up]`/`#[throttle]` above a route
   attribute broke instead of composing (issue #2516):** #1668 moved each of
   these three body guards' checks out of the handler body and into a
