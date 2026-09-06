@@ -1735,6 +1735,20 @@ FOREIGN_ROOTS = frozenset(('svg', 'math'))
 # `<E id=E></span>Secret</E>` and then whether `E.textContent` still contains
 # the literal `</span>`. `pre` and `code` do not (they only LOOK verbatim);
 # these ten do.
+# Elements that CANNOT nest in themselves: a second opener implicitly closes
+# the first, it does not open a level inside it. `<p hidden>Secret<p>Mail</p>`
+# leaves `Mail` visible and clickable, but the balancing scan counted that
+# second `<p>` as depth 2, never returned to zero, and masked the label to the
+# end of the anchor — a live link reported as an orphan.
+#
+# Measured one at a time, not listed from the spec: for each, whether the
+# FIRST element's `textContent` still contains text written after the second
+# opener. `div` and `span` do (they nest properly and are correctly absent);
+# these fifteen do not.
+SELF_CLOSING_ON_REOPEN = frozenset((
+    'p', 'li', 'dd', 'dt', 'td', 'th', 'tr', 'rt', 'rp', 'option', 'optgroup',
+    'thead', 'tbody', 'tfoot', 'caption', 'colgroup'))
+
 RAW_TEXT_NAMES = frozenset((
     'textarea', 'title', 'script', 'style', 'xmp', 'iframe', 'noembed',
     'noframes', 'noscript', 'plaintext'))
@@ -1841,6 +1855,10 @@ def element_end(txt, m, name):
                 and gt != -1 and txt[gt - 1] == '/'):
             pos = gt + 1
             continue
+        # A second opener of an element that cannot nest in itself ENDS the
+        # first one rather than opening a level inside it.
+        if not t.group(1) and lname in SELF_CLOSING_ON_REOPEN:
+            return t.start()
         depth += -1 if t.group(1) else 1
         pos = t.end()
         if not depth:
@@ -4491,6 +4509,35 @@ self_test() {
     > "$c9jn/docs/guide/jobs.md"
   git -C "$c9jn" add -A && git -C "$c9jn" commit -qm svg-display-none
   check "inline CSS does hide an svg" fail "$c9jn"
+
+  # A `<p>` cannot nest in itself: the second opener CLOSES the hidden first
+  # one, so the label after it is visible and clickable.
+  local c9kt="$tmp/c9kt"; make_corpus "$c9kt"
+  printf '# Jobs\n\n<a href="mail.md"><p hidden>Secret<p>Mail</p></a>\n' \
+    > "$c9kt/docs/guide/jobs.md"
+  git -C "$c9kt" add -A && git -C "$c9kt" commit -qm p-reopened
+  check "a reopened p ends the hidden one" pass "$c9kt"
+
+  local c9ku="$tmp/c9ku"; make_corpus "$c9ku"
+  printf '# Jobs\n\n<a href="mail.md"><ul><li hidden>Secret<li>Mail</li></ul></a>\n' \
+    > "$c9ku/docs/guide/jobs.md"
+  git -C "$c9ku" add -A && git -C "$c9ku" commit -qm li-reopened
+  check "a reopened li ends the hidden one" pass "$c9ku"
+
+  # ...but `span` and `div` DO nest, so this is a property of those elements
+  # rather than a general "a second opener ends the first".
+  local c9kv="$tmp/c9kv"; make_corpus "$c9kv"
+  printf '# Jobs\n\n<a href="mail.md"><span hidden>Secret<span>Mail</span></span></a>\n' \
+    > "$c9kv/docs/guide/jobs.md"
+  git -C "$c9kv" add -A && git -C "$c9kv" commit -qm span-still-nests
+  check "a nested span is still hidden" fail "$c9kv"
+
+  # ...and a hidden one that is never reopened still hides everything.
+  local c9kw="$tmp/c9kw"; make_corpus "$c9kw"
+  printf '# Jobs\n\n<a href="mail.md"><p hidden>Secret</p></a>\n' \
+    > "$c9kw/docs/guide/jobs.md"
+  git -C "$c9kw" add -A && git -C "$c9kw" commit -qm p-hidden-alone
+  check "a hidden p with no reopen is still hidden" fail "$c9kw"
 
   # A full reference's FIRST label is link text and nests too. When the blank
   # missed it, the trailing `[m]` was left looking like a standalone shortcut
