@@ -384,20 +384,8 @@ pub(super) async fn enqueue_job_at(
         AutumnError::internal_server_error_msg(format!("sqlite jobs pool error: {error}"))
     })?;
 
-    // A TTL hold that has elapsed must not keep the partial unique index busy,
-    // or it would silently drop a legitimate replacement enqueue.
     if let (Some(ttl), Some(key)) = (unique_ttl_ms, constraints.unique_key.as_deref()) {
-        let cutoff = now.saturating_sub(ttl);
-        let _ = diesel::sql_query(
-            "UPDATE autumn_jobs SET unique_key = NULL \
-             WHERE name = ? AND unique_key = ? AND unique_window = 'ttl' \
-               AND enqueued_at <= ? AND status IN ('enqueued', 'running')",
-        )
-        .bind::<diesel::sql_types::Text, _>(name)
-        .bind::<diesel::sql_types::Text, _>(key)
-        .bind::<diesel::sql_types::BigInt, _>(cutoff)
-        .execute(&mut *conn)
-        .await;
+        evict_expired_unique_key(&mut conn, name, key, now.saturating_sub(ttl)).await?;
     }
 
     // The `WHERE` is the dedup check and the partial unique index is the
@@ -476,6 +464,42 @@ pub(super) async fn enqueue_job_at(
     // Wake an idle worker in this process rather than make it wait out a poll.
     queue_handle.wake.notify_one();
     Ok(EnqueueOutcome::Queued)
+}
+
+/// Clear a TTL dedup key whose window has elapsed, so it stops occupying the
+/// partial unique index and blocking a legitimate replacement enqueue.
+///
+/// # Errors
+///
+/// Returns the database error rather than swallowing it. If this fails on
+/// writer contention and the insert that follows then reaches the database, the
+/// stale key is still in the index, the insert conflicts, and the caller is told
+/// its job was deduplicated when the TTL had in fact expired and nothing was
+/// queued. A failed enqueue the caller can retry is the honest answer.
+async fn evict_expired_unique_key(
+    conn: &mut RuntimeConnection,
+    name: &str,
+    key: &str,
+    cutoff: i64,
+) -> AutumnResult<()> {
+    use diesel_async::RunQueryDsl as _;
+
+    diesel::sql_query(format!(
+        "UPDATE autumn_jobs SET unique_key = NULL \
+         WHERE name = ? AND unique_key = ? AND unique_window = 'ttl' \
+           AND enqueued_at <= ? AND status IN ('{STATUS_ENQUEUED}', '{STATUS_RUNNING}')"
+    ))
+    .bind::<diesel::sql_types::Text, _>(name)
+    .bind::<diesel::sql_types::Text, _>(key)
+    .bind::<diesel::sql_types::BigInt, _>(cutoff)
+    .execute(&mut *conn)
+    .await
+    .map_err(|error| {
+        AutumnError::internal_server_error_msg(format!(
+            "sqlite job unique-key eviction failed: {error}"
+        ))
+    })?;
+    Ok(())
 }
 
 /// Claim the oldest ready row on `queue` for `worker_id`.

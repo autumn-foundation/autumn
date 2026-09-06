@@ -1173,10 +1173,25 @@ mod sqlite_impl {
                     .bind::<diesel::sql_types::Text, _>(&owner)
                     .execute(&mut *conn)
                     .await;
-                    // A renewal that touches no row means the lease was already
-                    // taken from us; there is nothing left to renew.
-                    if !matches!(renewed, Ok(rows) if rows > 0) {
-                        return;
+                    match renewed {
+                        // Renewed: keep going.
+                        Ok(rows) if rows > 0 => {}
+                        // Zero rows is the one definitive answer — the lease is
+                        // no longer ours, so there is nothing left to renew.
+                        Ok(_) => return,
+                        // An error is not an answer. Writer contention is
+                        // ordinary on SQLite, and giving up here would let the
+                        // lease expire under a guard whose critical section is
+                        // still running — two holders, which is the one thing
+                        // this lock exists to prevent. Try again next tick; the
+                        // guard's drop stops this task.
+                        Err(error) => {
+                            tracing::debug!(
+                                error = %error,
+                                lock_key = key,
+                                "distributed lock renewal failed; retrying"
+                            );
+                        }
                     }
                 }
             }))
