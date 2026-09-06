@@ -1478,7 +1478,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `scaffold_form_for`) are now named there for the first time, closing the
   same gap for that half of the binary. Two new
   `autumn-cli/tests/integration/repo_hygiene.rs` tests guard both halves of
-  the wiring going forward.
+  the wiring going forward. [no-plugin]
 
 ### Changed
 
