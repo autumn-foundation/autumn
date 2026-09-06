@@ -211,7 +211,9 @@ fn opaque_predicate_distinguishes_a_fieldless_struct_from_a_placeholder() {
 
 // ── Scalar field types that are not Rust primitives ────────────────
 
-#[derive(Serialize, Deserialize, OpenApiSchema)]
+// Only `OpenApiSchema` — the derive under test needs no serde impls, and this
+// crate's `uuid` dependency is built without its `serde` feature.
+#[derive(OpenApiSchema)]
 #[allow(dead_code)]
 struct Timestamped {
     created_at: chrono::NaiveDateTime,

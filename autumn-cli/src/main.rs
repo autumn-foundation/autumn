@@ -495,7 +495,7 @@ pub struct OpenApiExportArgs {
 /// Subcommands for `autumn openapi`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum OpenApiSubcommands {
-    /// Emit the app's OpenAPI 3.1 document without booting it.
+    /// Emit the app's `OpenAPI` 3.1 document without booting it.
     Export(OpenApiExportArgs),
 }
 
@@ -1968,10 +1968,10 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Cache(CacheSubcommands),
 
-    /// OpenAPI tooling — get the contract out of the app.
+    /// `OpenAPI` tooling — get the contract out of the app.
     ///
     /// `autumn openapi export` compiles the app, runs it in a dump mode that
-    /// binds no port and touches no database, and writes the same OpenAPI 3.1
+    /// binds no port and touches no database, and writes the same `OpenAPI` 3.1
     /// document `/openapi.json` serves. That document is the input the standard
     /// generators want, so a typed client is one pipe away:
     ///

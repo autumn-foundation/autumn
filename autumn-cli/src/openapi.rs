@@ -1,13 +1,13 @@
-//! `autumn openapi export` — emit the app's OpenAPI document without booting it.
+//! `autumn openapi export` — emit the app's `OpenAPI` document without booting it.
 //!
 //! Compiles the target binary (debug profile), runs it with
-//! `AUTUMN_DUMP_OPENAPI=1`, and captures the generated OpenAPI 3.1 JSON from its
+//! `AUTUMN_DUMP_OPENAPI=1`, and captures the generated `OpenAPI` 3.1 JSON from its
 //! stdout — the same no-boot child-process protocol `autumn routes` uses. No
 //! HTTP port is bound and no database is touched.
 //!
 //! The app builds that document through the exact pair the `/openapi.json` route
 //! uses, so what this command writes is what the running server serves. That
-//! makes the output directly consumable by the standard OpenAPI toolchain:
+//! makes the output directly consumable by the standard `OpenAPI` toolchain:
 //!
 //! ```text
 //! autumn openapi export --out openapi.json
@@ -69,7 +69,7 @@ pub fn run(opts: &ExportOptions<'_>) {
     }
 }
 
-/// Build the app and read its OpenAPI dump, exiting with an actionable message
+/// Build the app and read its `OpenAPI` dump, exiting with an actionable message
 /// when the binary has no spec to give.
 fn dump_spec(opts: &ExportOptions<'_>) -> String {
     compile_binary_with(opts.package, opts.bin, &opts.features);
@@ -307,14 +307,14 @@ mod tests {
 
     // ── describe_drift ────────────────────────────────────────────────────
 
-    fn doc(paths: serde_json::Value) -> serde_json::Value {
+    fn doc(paths: &serde_json::Value) -> serde_json::Value {
         json!({ "openapi": "3.1.0", "paths": paths })
     }
 
     #[test]
     fn reports_added_and_removed_operations() {
-        let before = doc(json!({ "/a": { "get": { "operationId": "a" } } }));
-        let after = doc(json!({ "/b": { "post": { "operationId": "b" } } }));
+        let before = doc(&json!({ "/a": { "get": { "operationId": "a" } } }));
+        let after = doc(&json!({ "/b": { "post": { "operationId": "b" } } }));
         let drift = describe_drift(&before, &after);
         assert!(drift.contains(&"+ POST /b".to_owned()), "{drift:?}");
         assert!(drift.contains(&"- GET /a".to_owned()), "{drift:?}");
@@ -322,15 +322,15 @@ mod tests {
 
     #[test]
     fn reports_a_changed_operation() {
-        let before = doc(json!({ "/a": { "get": { "operationId": "a" } } }));
-        let after = doc(json!({ "/a": { "get": { "operationId": "a", "deprecated": true } } }));
+        let before = doc(&json!({ "/a": { "get": { "operationId": "a" } } }));
+        let after = doc(&json!({ "/a": { "get": { "operationId": "a", "deprecated": true } } }));
         assert_eq!(describe_drift(&before, &after), vec!["~ GET /a".to_owned()]);
     }
 
     #[test]
     fn falls_back_to_a_generic_note_when_only_components_moved() {
-        let before = doc(json!({ "/a": { "get": { "operationId": "a" } } }));
-        let after = doc(json!({ "/a": { "get": { "operationId": "a" } } }));
+        let before = doc(&json!({ "/a": { "get": { "operationId": "a" } } }));
+        let after = doc(&json!({ "/a": { "get": { "operationId": "a" } } }));
         // Same operations: the caller only reaches this when the documents
         // differ elsewhere, and an empty explanation would be useless.
         assert_eq!(
