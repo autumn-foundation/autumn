@@ -659,8 +659,15 @@ TAG_NAME_END = r'(?=[\s>]|$)'
 # whenever no angle bracket followed — the apparent markdown below it then
 # counted as navigation. The sibling opens on the name alone for the same
 # reason (check-migration-guides.sh:1062-1074).
+# Two spellings, because the name-only form is a BLOCK start condition and
+# nothing else: `prose <script` mid-line is an incomplete tag, which is
+# ordinary visible text, and reading it as an opener masked through EOF.
+# Mid-line it takes a complete tag to be raw HTML at all.
 FIRST_OPENER = re.compile(
-    r'(<!--)|(<(' + HIDDEN_TAGS + r')' + TAG_NAME_END + r')', re.I)
+    r'(<!--)'
+    r'|(?:^ {0,3}(<(' + HIDDEN_TAGS + r')' + TAG_NAME_END + r'))'
+    r'|(<(' + HIDDEN_TAGS + r')' + TAG_NAME_END + r'[^>]*>)',
+    re.I | re.M)
 # `<pre>` and `<textarea>` are CommonMark type-1 raw blocks alongside script and
 # style, so Markdown inside them is literal — but unlike script and style their
 # contents are SHOWN. A path in a `<pre>` block is on screen and still counts,
@@ -789,10 +796,25 @@ BLOCK_TAGS = (
 RAW_DELIM = (
     r'^ {0,3}<\?.*?\?>[^\n]*'
     r'|^ {0,3}<!\[CDATA\[.*?\]\]>[^\n]*'
-    r'|^ {0,3}<![A-Za-z][^>]*>[^\n]*'
+    # UPPERCASE only, and this alternation is the one place `re.I` must not
+    # reach — see the note below `RAW_DELIM`.
+    r'|^ {0,3}(?-i:<![A-Z])[^>]*>[^\n]*'
     r'|^ {0,3}<\?.*'
     r'|^ {0,3}<!\[CDATA\[.*'
-    r'|^ {0,3}<![A-Za-z].*')
+    r'|^ {0,3}(?-i:<![A-Z]).*')
+# CommonMark 0.30 opens a type-4 declaration on `<!` plus an UPPERCASE ASCII
+# letter; 0.31 relaxed that to any ASCII letter. The renderers a reader
+# actually meets — cmark-gfm on GitHub, and markdown-it — implement the
+# 0.30 rule: `<!demo` is a PARAGRAPH there and the link under it is live,
+# verified against markdown-it-py 4.2.0. Masking it reported a page the
+# reader can click as an orphan.
+#
+# This DIVERGES from `check-migration-guides.sh`, which matches
+# `^<![a-zA-Z]` and so follows 0.31. That is a real inconsistency between
+# the two gates and is recorded here rather than papered over: what a
+# reader sees decides this gate's answer, and no corpus page relies on
+# either reading. I had declined this finding on the consistency argument
+# before checking a renderer, which was the wrong order to do it in.
 # The same three on their own, because `mask_invisible` needs them: nothing
 # inside one is Markdown, and `<![CDATA[x]]>` happens to READ as an image
 # reference — `![` … `]]` with one level of nesting. Blanking it there left a
@@ -810,8 +832,13 @@ RAW_BLOCK = re.compile(
 RAW_BLOCK_TYPE7 = re.compile(
     # A malformed `<x =>` is ordinary text, not a tag, so it opens nothing —
     # the attribute grammar is HTML_TAG's rather than a permissive `[^\n]*?`.
-    r'^ {0,3}</?[A-Za-z][A-Za-z0-9-]*(?:' + _TWS + r'+' + ATTR + r')*'
-    + _TWS + r'*/?>[ \t]*$'
+    # An OPENING tag takes attributes and may self-close; a CLOSING tag takes
+    # only its name, optional whitespace and `>`. Sharing one expression let
+    # `</span a=x>` count as a tag, so a type-7 block opened on a line that
+    # is ordinary paragraph text and swallowed the link below it.
+    r'^ {0,3}(?:<[A-Za-z][A-Za-z0-9-]*(?:' + _TWS + r'+' + ATTR + r')*'
+    + _TWS + r'*/?>'
+    r'|</[A-Za-z][A-Za-z0-9-]*' + _TWS + r'*>)[ \t]*$'
     r'(?:\n(?![ \t]*$)[^\n]*)*',
     re.M)
 # A raw anchor IS navigation, so its destination is resolved like any other —
@@ -878,7 +905,7 @@ HTML_CLOSE_TYPE1 = re.compile(r'</(?:' + TYPE1_TAGS + r')\s*>', re.I)
 HTML_DELIM_OPENERS = (
     (re.compile(r'^ {0,3}<!\[CDATA\['), ']]>'),
     (re.compile(r'^ {0,3}<\?'), '?>'),
-    (re.compile(r'^ {0,3}<![A-Za-z]'), '>'),
+    (re.compile(r'^ {0,3}<![A-Z]'), '>'),
 )
 
 
@@ -1065,7 +1092,8 @@ def hidden_spans(seg, protected):
                 return spans
             pos = end + 3
             continue
-        close = re.search(r'</' + m.group(3) + r'\s*>', seg[m.end():], re.I)
+        name = m.group(3) if m.group(3) is not None else m.group(5)
+        close = re.search(r'</' + name + r'\s*>', seg[m.end():], re.I)
         end = len(seg) if close is None else m.end() + close.end()
         spans.append((m.start(), end))
         pos = end
@@ -1093,6 +1121,29 @@ def fold_escapes(txt):
             .replace('\\<', '\x02\x02'))
 
 
+def definition_labels(txt):
+    """Labels of definitions that actually DEFINE something.
+
+    Prose only, code spans removed, and only where a block can start — the same
+    three conditions reference resolution applies, because a definition
+    demonstrated in a fence or continuing a paragraph defines nothing. Reading
+    every `REF_DEF` in the raw document instead made a fenced `[img]: x.png`
+    turn a literal `![docs/guide/mail.md][img]` into an image and hid a path
+    the reader can see.
+    """
+    prose = ''.join(seg for kind, seg in split_fences(txt) if kind == 'prose')
+    prose = CODE_SPAN.sub(' ', prose)
+    starts = block_starts(prose)
+    out = set()
+    for m in REF_DEF.finditer(prose):
+        if m.start() not in starts:
+            continue
+        lbl = ref_label(m.group(1))
+        if lbl is not None:
+            out.add(lbl)
+    return out
+
+
 def _image_resolves(m, defined):
     """Whether an image reference names a definition that exists."""
     first, second = m.group(1), m.group(2)
@@ -1117,9 +1168,7 @@ def mask_invisible(txt):
     Replacements are space-for-space so offsets stay valid for the callers that
     blank spans by position.
     """
-    defined = {lbl for lbl in
-               (ref_label(d.group(1)) for d in REF_DEF.finditer(txt))
-               if lbl is not None}
+    defined = definition_labels(txt)
     out = []
     for kind, seg in split_fences(txt):
         if kind != 'prose':
@@ -1331,8 +1380,21 @@ def edges_from(f):
     # Blank every full-reference span before looking for shortcuts, so the
     # `[mail]` tail of `![alt][mail]` is not re-read as a link of its own.
     shortcut_txt = REF_USE_ANY.sub(lambda m: ' ' * len(m.group(0)), uses_txt)
-    shortcut_txt = INLINE_SPAN_ANY.sub(
-        lambda m: ' ' * len(m.group(0)), shortcut_txt)
+    # An inline span is blanked before the shortcut scan because links cannot
+    # nest — but only when the OUTER link is the one that renders. CommonMark
+    # resolves an inner shortcut at its `]` and deactivates the opener above
+    # it, so in `[outer [Mail]](url)` with a `[mail]` definition the reader
+    # gets a link to mail.md and the outer destination stays literal. Blanking
+    # unconditionally deleted that live reference.
+    _defined = definition_labels(ref_txt)
+
+    def _blank_inline(m):
+        for inner in REF_USE_SHORTCUT.finditer(m.group(0)[1:]):
+            if ref_label(inner.group(1)) in _defined:
+                return m.group(0)
+        return ' ' * len(m.group(0))
+
+    shortcut_txt = INLINE_SPAN_ANY.sub(_blank_inline, shortcut_txt)
     for m in REF_USE_SHORTCUT.finditer(shortcut_txt):
         lbl = ref_label(m.group(1))
         if lbl is not None:
@@ -1920,13 +1982,26 @@ self_test() {
   git -C "$c9ax" add -A && git -C "$c9ax" commit -qm unescaped-image-still-excluded
   check "an unescaped image marker still excludes the destination" fail "$c9ax"
 
-  # Links cannot nest, so the inner label of an inline link is ordinary text,
-  # not a shortcut reference that keeps a definition alive.
+  # CORRECTED, and the correction is the interesting part: this asserted that
+  # the inner label of an inline link is always ordinary text. It is not. When
+  # the inner shortcut RESOLVES, CommonMark makes it a link at its `]` and
+  # deactivates the opener above it, so the reader gets a link to mail.md and
+  # the outer destination renders literally. Verified against markdown-it-py:
+  # `<p>[outer <a href="mail.md">mail</a>](https://example.com)</p>`.
   local c9ay="$tmp/c9ay"; make_corpus "$c9ay"
   printf '# Jobs\n\n[outer [mail]](https://example.com)\n\n[mail]: mail.md\n' \
     > "$c9ay/docs/guide/jobs.md"
-  git -C "$c9ay" add -A && git -C "$c9ay" commit -qm inner-label-not-shortcut
-  check "an inline link's inner label is not a shortcut use" fail "$c9ay"
+  git -C "$c9ay" add -A && git -C "$c9ay" commit -qm inner-shortcut-wins
+  check "a resolving inner shortcut wins over the outer link" pass "$c9ay"
+
+  # ...and the original rule still holds where the inner label resolves to
+  # NOTHING: the outer link is the one that renders, so `mail.md` named only in
+  # its destination is not reachable through a bare-path read of the label.
+  local c9ay2="$tmp/c9ay2"; make_corpus "$c9ay2"
+  printf '# Jobs\n\n[outer [mail]](https://example.com)\n' \
+    > "$c9ay2/docs/guide/jobs.md"
+  git -C "$c9ay2" add -A && git -C "$c9ay2" commit -qm inner-label-unresolved
+  check "an unresolved inner label is ordinary text" fail "$c9ay2"
 
   # Image alt text may contain a bracketed span; the image must still be masked.
   local c9az="$tmp/c9az"; make_corpus "$c9az"
@@ -2757,13 +2832,20 @@ self_test() {
   git -C "$c9fm" add -A && git -C "$c9fm" commit -qm def-in-paragraph-visible
   check "a definition continuing a paragraph is visible text" pass "$c9fm"
 
-  # A lowercase declaration opens a block: CommonMark 0.31 dropped the
-  # uppercase-only condition, and the sibling gate matches `^<![a-zA-Z]`.
-  # Diverging would make the two gates disagree about the same line.
+  # A LOWERCASE declaration opens nothing on the renderers a reader meets, so
+  # the link below it is live. Verified against markdown-it-py, which renders
+  # `<p>&lt;!demo</p>` and then the link. See the note on `RAW_DELIM` for why
+  # this diverges from the sibling gate.
   local c9fn="$tmp/c9fn"; make_corpus "$c9fn"
   printf '# Jobs\n\n<!demo\n\nSee [mail](mail.md).\n' > "$c9fn/docs/guide/jobs.md"
   git -C "$c9fn" add -A && git -C "$c9fn" commit -qm lowercase-declaration
-  check "a lowercase declaration opens a raw block" fail "$c9fn"
+  check "a lowercase declaration opens no raw block" pass "$c9fn"
+
+  # ...while an UPPERCASE one still does.
+  local c9fn2="$tmp/c9fn2"; make_corpus "$c9fn2"
+  printf '# Jobs\n\n<!DEMO\n\nSee [mail](mail.md).\n' > "$c9fn2/docs/guide/jobs.md"
+  git -C "$c9fn2" add -A && git -C "$c9fn2" commit -qm uppercase-declaration
+  check "an uppercase declaration opens a raw block" fail "$c9fn2"
 
   # A definition directly under a closed `<pre>` block IS a definition: the
   # block ended at the close tag, so the line below it starts a new block and
@@ -2847,6 +2929,39 @@ self_test() {
     > "$c9fy/docs/guide/jobs.md"
   git -C "$c9fy" add -A && git -C "$c9fy" commit -qm resolved-image-ref
   check "a resolved image reference confers nothing" fail "$c9fy"
+
+  # A closing tag admits no attributes, so this is not a tag and opens nothing.
+  local c9fz="$tmp/c9fz"; make_corpus "$c9fz"
+  printf '# Jobs\n\n</span a=x>\nSee [mail](mail.md).\n' > "$c9fz/docs/guide/jobs.md"
+  git -C "$c9fz" add -A && git -C "$c9fz" commit -qm closing-tag-with-attrs
+  check "a closing tag with attributes opens no raw block" pass "$c9fz"
+
+  # ...but a well-formed closing tag alone on its line still does.
+  local c9ga="$tmp/c9ga"; make_corpus "$c9ga"
+  printf '# Jobs\n\n</span>\nSee [mail](mail.md).\n' > "$c9ga/docs/guide/jobs.md"
+  git -C "$c9ga" add -A && git -C "$c9ga" commit -qm closing-tag-plain
+  check "a well-formed closing tag opens a raw block" fail "$c9ga"
+
+  # A name-only type-1 opener is a BLOCK start condition: mid-line it is an
+  # incomplete tag, which is ordinary visible text.
+  local c9gb="$tmp/c9gb"; make_corpus "$c9gb"
+  printf '# Jobs\n\nprose <script\n\nSee [mail](mail.md).\n' > "$c9gb/docs/guide/jobs.md"
+  git -C "$c9gb" add -A && git -C "$c9gb" commit -qm midline-script-name-only
+  check "a mid-line name-only script opener hides nothing" pass "$c9gb"
+
+  # ...while a complete tag mid-line is raw HTML wherever it sits.
+  local c9gc="$tmp/c9gc"; make_corpus "$c9gc"
+  printf '# Jobs\n\nprose <script>\n\nSee [mail](mail.md).\n' > "$c9gc/docs/guide/jobs.md"
+  git -C "$c9gc" add -A && git -C "$c9gc" commit -qm midline-script-complete
+  check "a complete mid-line script tag still hides what follows" fail "$c9gc"
+
+  # A definition DEMONSTRATED in a fence defines nothing, so the image
+  # reference below it is unresolved and its path is visible text.
+  local c9gd="$tmp/c9gd"; make_corpus "$c9gd"
+  printf '# Jobs\n\n```\n[img]: x.png\n```\n\n![docs/guide/mail.md][img]\n' \
+    > "$c9gd/docs/guide/jobs.md"
+  git -C "$c9gd" add -A && git -C "$c9gd" commit -qm fenced-def-image-ref
+  check "a fenced definition does not turn text into an image" pass "$c9gd"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
