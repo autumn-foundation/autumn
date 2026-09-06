@@ -1678,23 +1678,28 @@ fn is_generator_output(
     project_root: &Path,
     baseline: Baseline<'_>,
 ) -> bool {
-    match action {
+    let (on_disk_digest, planned) = match action {
         Action::Create { contents, .. } | Action::CreateIfAbsent { contents, .. } => {
             let Ok(on_disk) = fs::read_to_string(path) else {
                 return false;
             };
-            text_matches(&on_disk, contents)
-                || baseline.owns(project_root, path, &provenance::text_digest(&on_disk))
+            if text_matches(&on_disk, contents) {
+                return true;
+            }
+            (provenance::text_digest(&on_disk), Claim::of(action))
         }
         Action::CreateBytes { bytes, .. } => {
             let Ok(on_disk) = fs::read(path) else {
                 return false;
             };
-            &on_disk == bytes
-                || baseline.owns(project_root, path, &provenance::bytes_digest(&on_disk))
+            if &on_disk == bytes {
+                return true;
+            }
+            (provenance::bytes_digest(&on_disk), Claim::of(action))
         }
-        Action::Modify { .. } => false,
-    }
+        Action::Modify { .. } => return false,
+    };
+    baseline.accepts(planned, project_root, path, &on_disk_digest)
 }
 
 /// What a revert compares an on-disk file against: the digests `generate`
@@ -1706,10 +1711,45 @@ struct Baseline<'a> {
 }
 
 impl Baseline<'_> {
-    /// Whether this command recorded exactly `digest` for `path`.
-    fn owns(self, project_root: &Path, path: &Path, digest: &str) -> bool {
-        self.recorded
-            .is_ours(project_root, path, digest, self.invocation)
+    /// Whether `claim` holds for `digest` at `path`.
+    fn accepts(self, claim: Claim, project_root: &Path, path: &Path, digest: &str) -> bool {
+        match claim {
+            Claim::ByThisCommand => {
+                self.recorded
+                    .is_ours(project_root, path, digest, self.invocation)
+            }
+            Claim::ByAnyCommand => self.recorded.was_written(project_root, path, digest),
+        }
+    }
+}
+
+/// Who has to have written a file for its recorded digest to count.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    /// The command doing the destroying — the rule for a file it owns
+    /// outright, so one command cannot delete another's output.
+    ByThisCommand,
+    /// Any command — the rule for a file several resources share, where only
+    /// the first writer was ever recorded, so requiring the destroying command
+    /// to BE that writer would strand the file the moment a template change
+    /// stopped the content compare from matching. Every path that reaches this
+    /// establishes first that no sibling still needs the file: the
+    /// `CreateIfAbsent` pass checks the directory, and the shared
+    /// `mail_unsubscribes` migration has its own still-needed-elsewhere guard
+    /// after the content check.
+    ByAnyCommand,
+}
+
+impl Claim {
+    /// A shared file is written once for all its consumers; anything else
+    /// belongs to the one command that wrote it.
+    const fn of(action: &Action) -> Self {
+        match action {
+            Action::CreateIfAbsent { .. } => Self::ByAnyCommand,
+            Action::Create { .. } | Action::CreateBytes { .. } | Action::Modify { .. } => {
+                Self::ByThisCommand
+            }
+        }
     }
 }
 
@@ -3043,6 +3083,74 @@ mod tests {
         destroy.revert(Flags::default()).unwrap();
 
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn the_last_consumer_of_a_shared_file_can_still_remove_it() {
+        // Only the FIRST writer of a `CreateIfAbsent` file is recorded. The
+        // sibling that destroys last has a different command, so requiring it
+        // to be that writer would strand the layout the moment a template
+        // change stopped the content compare from matching (Codex review of
+        // PR #2551).
+        let (tmp, mut first) = fixture();
+        let shared = tmp.path().join("templates/mailers/_layout.html");
+        first.invocation = "mailer\u{1f}Welcome".to_owned();
+        first.create_if_absent(shared.clone(), "<html>v1</html>\n");
+        first.execute(Flags::default()).unwrap();
+
+        // The second mailer's own run skips the write — the file is there.
+        let mut second = Plan::new(tmp.path());
+        second.invocation = "mailer\u{1f}Receipt".to_owned();
+        second.create_if_absent(shared.clone(), "<html>v2</html>\n");
+        second.execute(Flags::default()).unwrap();
+
+        // Destroying the last consumer, under a newer template.
+        let mut destroy = Plan::new(tmp.path());
+        destroy.invocation = "mailer\u{1f}Receipt".to_owned();
+        destroy.create_if_absent(shared.clone(), "<html>v2</html>\n");
+        destroy.revert(Flags::default()).unwrap();
+
+        assert!(
+            !shared.exists(),
+            "the last consumer takes the layout with it"
+        );
+    }
+
+    #[test]
+    fn a_shared_file_still_survives_while_a_sibling_needs_it() {
+        let (tmp, mut first) = fixture();
+        let shared = tmp.path().join("templates/mailers/_layout.html");
+        let sibling = tmp.path().join("templates/mailers/receipt.html");
+        first.invocation = "mailer\u{1f}Welcome".to_owned();
+        first.create_if_absent(shared.clone(), "<html>v1</html>\n");
+        first.execute(Flags::default()).unwrap();
+        fs::write(&sibling, "<html>receipt</html>\n").unwrap();
+
+        let mut destroy = Plan::new(tmp.path());
+        destroy.invocation = "mailer\u{1f}Welcome".to_owned();
+        destroy.create_if_absent(shared.clone(), "<html>v2</html>\n");
+        destroy.revert(Flags::default()).unwrap();
+
+        assert!(shared.exists(), "a sibling still renders through it");
+    }
+
+    #[test]
+    fn a_hand_written_shared_file_is_still_never_removed() {
+        // The relaxed claim only accepts a digest Autumn recorded. Content
+        // nobody recorded stays put, with a warning, exactly as before.
+        let (tmp, mut plan) = fixture();
+        let shared = tmp.path().join("templates/mailers/_layout.html");
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        fs::write(&shared, "<html>hand-written</html>\n").unwrap();
+
+        plan.create_if_absent(shared.clone(), "<html>generated</html>\n");
+        plan.execute(Flags::default()).unwrap();
+        plan.revert(Flags::default()).unwrap();
+
+        assert!(
+            shared.exists(),
+            "content Autumn never wrote is never deleted"
+        );
     }
 
     #[test]

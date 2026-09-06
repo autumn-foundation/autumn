@@ -133,6 +133,23 @@ pub fn current_invocation(root: &Path) -> String {
     format!("{inputs}{RECORD_SEPARATOR}{config}")
 }
 
+/// An identity built from a generator's RESOLVED inputs instead of its raw
+/// arguments.
+///
+/// For the generators that recover omitted arguments on the destroy path:
+/// `autumn destroy webhook <provider> <Name>` reads a `--path`/`--secret-env`
+/// used at generation time back out of `autumn.toml`, so the recomputed plan is
+/// right while the arguments differ. Keyed on the raw arguments, the baseline
+/// would then be refused for a file nobody has touched — the very case this
+/// manifest exists to serve.
+///
+/// No config fingerprint: `parts` already carries every resolved input, so
+/// there is nothing left for a config file to change.
+#[must_use]
+pub fn resolved_invocation(parts: &[&str]) -> String {
+    parts.join(&UNIT_SEPARATOR.to_string())
+}
+
 /// A digest over every generator config file this run could have read.
 fn config_fingerprint(root: &Path, args: &[String]) -> String {
     let mut sources = vec![root.join(GENERATE_CONFIG_FILENAME)];
@@ -226,6 +243,19 @@ impl Provenance {
                 .get(&k)
                 .is_some_and(|e| e.digest == digest && e.invocation == invocation)
         })
+    }
+
+    /// Whether ANY command wrote exactly `digest` to `path`.
+    ///
+    /// For a file several resources share: only the first writer is recorded,
+    /// so requiring the destroying command to be that writer would strand the
+    /// file the moment a template change stopped the content compare from
+    /// matching. Sound only where the caller has already established that no
+    /// sibling still needs the file — which is what the `CreateIfAbsent` pass
+    /// does before it asks.
+    #[must_use]
+    pub fn was_written(&self, root: &Path, path: &Path, digest: &str) -> bool {
+        key(root, path).is_some_and(|k| self.entries.get(&k).is_some_and(|e| e.digest == digest))
     }
 
     /// Record `digest` as the content `invocation` wrote to `path`.
