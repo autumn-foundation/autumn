@@ -135,18 +135,28 @@ pub fn graphql() -> GraphqlPlugin<notes::Query, notes::Mutation, async_graphql::
 /// Runs through the repository — hooks and validation included — from a
 /// startup hook, where there is no request and therefore no extractor:
 /// `with_pool_untracked` is the constructor for exactly that situation.
+///
+/// Every instance runs its startup hooks, so on a first scaled deployment two
+/// processes could both see an empty table and both seed it. The check and
+/// the insert therefore run under a Postgres advisory lock (`Lock`, the
+/// framework's distributed-lock primitive): the first instance seeds, the
+/// rest wait for it, then see a non-empty table and skip.
 pub async fn seed_if_empty(state: &AppState) -> AutumnResult<()> {
     let pool = state
         .pool()
         .ok_or_else(|| AutumnError::service_unavailable_msg("no database pool configured"))?
         .clone();
     let repo = PgNoteRepository::with_pool_untracked(pool);
-    if repo.count().await? > 0 {
-        return Ok(());
-    }
-    repo.save_many(&seed_notes()).await?;
-    tracing::info!("seeded the notes table");
-    Ok(())
+    let lock = Lock::from_state(state, "react-graphql:seed-notes")?;
+    lock.with(|| async {
+        if repo.count().await? > 0 {
+            return Ok(());
+        }
+        repo.save_many(&seed_notes()).await?;
+        tracing::info!("seeded the notes table");
+        Ok::<(), AutumnError>(())
+    })
+    .await?
 }
 
 /// The seed rows, oldest first (`id` order). The welcome note is pinned.

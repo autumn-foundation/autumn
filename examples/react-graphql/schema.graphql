@@ -22,6 +22,11 @@ type Mutation {
 	Delete a note. Returns whether anything was deleted. A pinned note is
 	refused by the repository's `before_delete` hook, which surfaces here
 	as a field error.
+	
+	One statement, not exists-then-delete: two overlapping deletes of the
+	same note would both pass an existence check and the loser would see
+	a `404` instead of `false`. `delete_by_id` reports a missing row as a
+	`404` `AutumnError`, which is exactly the "nothing to delete" answer.
 	"""
 	deleteNote(id: Int!): Boolean!
 }

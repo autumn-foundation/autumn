@@ -89,10 +89,11 @@ fn to_gql(err: AutumnError) -> async_graphql::Error {
     async_graphql::Error::new(message).extend_with(|_, e| e.set("status", status.as_u16()))
 }
 
-/// Newest first. `find_all`/`find_by_pinned` return primary-key order, and
-/// `id` is a `BIGSERIAL`, so reversing is the same as `ORDER BY id DESC`.
+/// Newest first. `id` is a `BIGSERIAL`, so descending id is creation order;
+/// the generated finders carry no `ORDER BY`, and Postgres promises nothing
+/// about row order without one, so sort explicitly rather than reverse.
 fn newest_first(mut notes: Vec<Note>) -> Vec<Note> {
-    notes.reverse();
+    notes.sort_by_key(|note| std::cmp::Reverse(note.id));
     notes
 }
 
@@ -169,13 +170,17 @@ impl Mutation {
     /// Delete a note. Returns whether anything was deleted. A pinned note is
     /// refused by the repository's `before_delete` hook, which surfaces here
     /// as a field error.
+    ///
+    /// One statement, not exists-then-delete: two overlapping deletes of the
+    /// same note would both pass an existence check and the loser would see
+    /// a `404` instead of `false`. `delete_by_id` reports a missing row as a
+    /// `404` `AutumnError`, which is exactly the "nothing to delete" answer.
     async fn delete_note(&self, ctx: &Context<'_>, id: i64) -> Result<bool> {
-        let repo = repo(ctx)?;
-        if !repo.exists_by_id(id).await.map_err(to_gql)? {
-            return Ok(false);
+        match repo(ctx)?.delete_by_id(id).await {
+            Ok(()) => Ok(true),
+            Err(err) if err.status() == axum::http::StatusCode::NOT_FOUND => Ok(false),
+            Err(err) => Err(to_gql(err)),
         }
-        repo.delete_by_id(id).await.map_err(to_gql)?;
-        Ok(true)
     }
 }
 
