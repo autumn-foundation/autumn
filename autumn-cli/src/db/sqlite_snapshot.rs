@@ -447,6 +447,28 @@ mod tests {
         assert!(message.contains("<redacted>@"), "{message}");
     }
 
+    /// The resolver and the database engine must name the SAME file. diesel opens
+    /// with `SQLITE_OPEN_URI`, so a `file:` target is percent-decoded — this opens
+    /// one through diesel and asserts the file that appears on disk is the one
+    /// `database_path` reports.
+    #[test]
+    fn database_path_names_the_file_diesel_actually_opens_for_a_file_uri() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = format!("file:{}/app%20data.db?mode=rwc", dir.path().display());
+
+        let mut conn = SqliteConnection::establish(&url).expect("diesel opens the URI");
+        conn.batch_execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .expect("write");
+        drop(conn);
+
+        let resolved = database_path(&url).expect("a file: URI names a file");
+        assert!(
+            resolved.is_file(),
+            "the resolver named {resolved:?}, which does not exist"
+        );
+        assert_eq!(resolved, dir.path().join("app data.db"));
+    }
+
     #[test]
     fn snapshot_captures_a_live_wal_database_and_the_copy_verifies() {
         let dir = tempfile::tempdir().expect("tempdir");

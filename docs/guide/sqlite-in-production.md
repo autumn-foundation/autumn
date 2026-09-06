@@ -329,9 +329,10 @@ on every deploy, deleted by release retention — so the deploy keeps the real f
 in `app_dir/shared/data` and links each release at the configured path. An
 absolute path the deploy does not manage is left alone; one inside the app
 directory but outside `shared/`, or an in-memory URL, is refused at preflight
-rather than after the first cutover. The
-full contract, including how an app deployed before this existed is migrated
-automatically, is in
+rather than after the first cutover. An app
+deployed before this contract existed keeps its file in the serving release; the
+next deploy stops and prints the one-time move to make, rather than relocating a
+live database. The full contract is in
 [where a SQLite data file lives](./deployment.md#where-a-sqlite-data-file-lives).
 
 ---

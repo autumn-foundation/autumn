@@ -2245,7 +2245,16 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
                 .to_owned(),
         );
     };
-    let text = path.to_string_lossy().into_owned();
+    // Normalize BEFORE any containment check: a lexical prefix compare on
+    // `/srv/app/shared/../releases/r1/app.db` would call it durable, while the
+    // kernel resolves it into `releases/`, where retention deletes it.
+    let Some(text) = lexically_normalized(&path) else {
+        return SqliteDataFile::Refused(format!(
+            "the configured SQLite database path {} climbs above the filesystem root.",
+            path.display()
+        ));
+    };
+    let path = std::path::Path::new(&text);
     if path.is_absolute() {
         // Anything the deploy itself manages is transient — `releases/` is
         // replaced every deploy and pruned by retention, and `current` is just a
@@ -2266,33 +2275,57 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
         return SqliteDataFile::Persistent(text);
     }
     // A relative path is resolved against the slot unit's `WorkingDirectory`,
-    // which is the release dir. Every component must be an ordinary name: `..`
-    // climbs out of the layout, and a `.`-only path names the release DIRECTORY,
-    // which the link op would then try to replace.
-    // Rebuilt from the components, not taken verbatim: `./app.db`, `data/` and
-    // `a//b.db` all name the same file, and only one spelling makes a valid
-    // `ln -s` target. A `.` normalizes away; anything else that is not an
-    // ordinary name is refused.
-    let mut names: Vec<String> = Vec::new();
-    let mut escapes = false;
-    for component in std::path::Path::new(&text).components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::Normal(name) => names.push(name.to_string_lossy().into_owned()),
-            _ => {
-                escapes = true;
-                break;
-            }
-        }
-    }
-    if escapes || names.is_empty() {
+    // which is the release dir. Normalization above already removed `.` and
+    // resolved `..`; what is left must still name a file INSIDE the release dir,
+    // so a leading `..` (which normalization keeps, having nothing to cancel it
+    // against) and an empty path are both refused.
+    if text.is_empty() || text == ".." || text.starts_with("../") {
         return SqliteDataFile::Refused(format!(
             "the configured SQLite database path {text:?} does not name a file inside the \
              release directory it is resolved against, so a deploy cannot keep it durable. \
              Use a plain relative name (sqlite://app.db) or an absolute path."
         ));
     }
-    SqliteDataFile::Relative(names.join("/"))
+    SqliteDataFile::Relative(text)
+}
+
+/// Collapse `.` and `..` lexically, and normalize separators.
+///
+/// Lexical, not `canonicalize`: the path names a file on the DEPLOY TARGET, which
+/// this process cannot stat. That is enough for the containment rules — it closes
+/// the `shared/../releases` hole — and a symlink on the host that defeats it
+/// would defeat any check made from here.
+///
+/// Returns `None` when the path climbs above the filesystem root.
+fn lexically_normalized(path: &std::path::Path) -> Option<String> {
+    use std::path::Component;
+
+    let absolute = path.is_absolute();
+    let mut names: Vec<String> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            Component::ParentDir => {
+                // A leading `..` on a RELATIVE path has nothing to cancel and is
+                // kept, so the caller can refuse it; on an absolute path it would
+                // climb above the root.
+                if names.last().is_some_and(|name| name != "..") {
+                    names.pop();
+                } else if absolute {
+                    return None;
+                } else {
+                    names.push("..".to_owned());
+                }
+            }
+            Component::Normal(name) => names.push(name.to_string_lossy().into_owned()),
+        }
+    }
+    let joined = names.join("/");
+    Some(if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    })
 }
 
 /// Whether `path` is `root` itself or sits under it. Compares whole path
@@ -5697,13 +5730,23 @@ mod tests {
                 "{spelling}"
             );
         }
-        for spelling in ["sqlite://data/app.db", "sqlite://data//app.db"] {
+        for spelling in [
+            "sqlite://data/app.db",
+            "sqlite://data//app.db",
+            "sqlite://data/./app.db",
+            "sqlite://data/nested/../app.db",
+        ] {
             assert_eq!(
                 classify_sqlite_data_file(Some(spelling), &cfg),
                 SqliteDataFile::Relative("data/app.db".to_owned()),
                 "{spelling}"
             );
         }
+        // A `file:` URI is percent-decoded, because that is what SQLite opens.
+        assert_eq!(
+            classify_sqlite_data_file(Some("file:app%20data.db?mode=rwc"), &cfg),
+            SqliteDataFile::Relative("app data.db".to_owned())
+        );
         // An absolute path outside the app dir already survives a deploy.
         assert_eq!(
             classify_sqlite_data_file(Some("sqlite:///var/lib/myapp/app.db"), &cfg),
@@ -5755,6 +5798,34 @@ mod tests {
         assert!(matches!(
             classify_sqlite_data_file(Some("sqlite:///srv/autumn/myapp-staging/app.db"), &cfg),
             SqliteDataFile::Persistent(_)
+        ));
+
+        // `..` must be resolved BEFORE the containment check: this one reads as
+        // `shared/` lexically but the kernel resolves it into `releases/`.
+        let sneaky = classify_sqlite_data_file(
+            Some("sqlite:///srv/autumn/myapp/shared/../releases/r1/app.db"),
+            &cfg,
+        );
+        let SqliteDataFile::Refused(detail) = sneaky else {
+            panic!("a path that resolves into releases/ must be refused, got {sneaky:?}");
+        };
+        assert!(
+            detail.contains("/srv/autumn/myapp/releases/r1/app.db"),
+            "the refusal must name the RESOLVED path: {detail}"
+        );
+        // The mirror image: a `..` that resolves back OUT of the app dir is fine,
+        // and the normalized text is what the deploy uses.
+        assert_eq!(
+            classify_sqlite_data_file(
+                Some("sqlite:///srv/autumn/myapp/../shared-data/app.db"),
+                &cfg
+            ),
+            SqliteDataFile::Persistent("/srv/autumn/shared-data/app.db".to_owned())
+        );
+        // A path that climbs above the root is not a path.
+        assert!(matches!(
+            classify_sqlite_data_file(Some("sqlite:///../../app.db"), &cfg),
+            SqliteDataFile::Refused(_)
         ));
 
         // A run of spaces mid-sentence means a `\\` continuation was dropped when

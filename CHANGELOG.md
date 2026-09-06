@@ -22,15 +22,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   owner. Stop the app before restoring: a running process keeps open handles to
   the old file. `--keep`, `--upload` and offsite restore are unchanged.
   An artifact whose recorded backend disagrees with the configured database is
-  now refused up front instead of failing inside a driver. `pg_dump` is resolved
+  now refused up front instead of failing inside a driver. A `file:` database URL
+  is percent-decoded the way SQLite decodes a URI filename, so `file:app%20data.db`
+  resolves to the `app data.db` the app actually opens — this also corrects
+  `autumn db replica`, which shares the resolver. `pg_dump` is resolved
   only when a Postgres target is in the run, so an all-SQLite app no longer needs
   Postgres client tools to back up.
   `autumn deploy` treats the SQLite data file as persistent state: a relative
   `sqlite://app.db` is kept in `app_dir/shared/data` and linked into each release
   — before the migration one-shot, and again on rollback — so a deploy, a
   rollback and release retention can never lose or orphan it. An app deployed
-  before this lands has its file adopted into `shared/data` on the next deploy,
-  and the deploy never deletes a database file. A database configured *inside*
+  before this lands keeps its file in the serving release; the next deploy stops
+  and prints the one-time move to make, rather than relocating a live database
+  (SQLite ties the `-wal` name to the resolved path, so a move under a running
+  app is not safe). The deploy never deletes a database file. A database
+  configured *inside*
   the releases directory, an in-memory one, or a relative path that is not a
   plain name is now refused at preflight by a new `sqlite_data_file` grader
   rather than after the first cutover; the grader is emitted only for a SQLite

@@ -1268,16 +1268,30 @@ release reads. SQLite follows the symlink when it names the `-wal`, `-shm` and
 database. `deploy rollback` re-links its target before it starts it, because a
 release deployed before adoption holds no file at that path.
 
-**Upgrading an app deployed before this contract existed:** if the data file is
-still a real file in the currently serving release, the next `deploy up` moves it
-(and its sidecars) into `shared/data` and links it from there. Nothing to do by
-hand. **Take a backup first** (`autumn db backup`): the move happens while the
-old release is still serving, and it is the one deploy that relocates live data.
+**Upgrading an app deployed before this contract existed.** If the data file is
+still a real file in the currently serving release, the next `deploy up` **stops
+and tells you what to run**. It does not move the file for you, and that is
+deliberate: SQLite derives the `-wal` name from the path a connection resolved,
+so a connection opened before a move and one opened after would use two different
+write-ahead logs for one database — and there is no way to move a file and
+create the link in its place atomically, so a pooled connection opening in that
+window creates an empty database at the old path.
+
+The one-time migration, on the host (the deploy prints these paths for you):
+
+```sh
+autumn db backup                      # first, from the project dir
+systemctl stop myapp-blue.service myapp-green.service
+mv /srv/autumn/myapp/current/app.db* /srv/autumn/myapp/shared/data/
+```
+
+Then re-run `autumn deploy up`. From that point on nothing is ever relocated: the
+file stays in `shared/data` and each release is linked at it.
 
 The deploy never deletes a database file. A real file it finds at the link path
-in some other release — a rollback target from before the move — is set aside as
-`shared/data/<file>.superseded`, out of retention's reach; a deploy that would
-overwrite an existing one refuses instead.
+in some other release — a rollback target from before the migration — is set
+aside as `shared/data/<file>.superseded`, out of retention's reach; a deploy that
+would overwrite an existing one refuses instead.
 
 Back it up with [`autumn db backup`](./daemon.md#database-backups), which takes an
 online-safe snapshot of the file with no external tools.

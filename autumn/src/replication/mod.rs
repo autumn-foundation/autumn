@@ -208,17 +208,62 @@ pub fn database_file(url: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    // Reduce a `file:` URI to its path component; SQLite's URI query string
-    // carries options, not path.
-    let path = target
-        .strip_prefix("file:")
-        .map_or(target.as_str(), |rest| rest);
-    let path = path.split(['?', '#']).next().unwrap_or(path);
-    if path.is_empty() {
+    // A `file:` target is a URI, and `SQLite` reads it as one: the query string
+    // carries options rather than path, an empty or `localhost` authority is
+    // dropped, and the filename is percent-decoded. diesel opens with
+    // `SQLITE_OPEN_URI`, so `file:app%20data.db` really does name `app data.db` —
+    // returning the raw text would point every caller at a file that does not
+    // exist. Every other spelling is handed to `sqlite3_open` as a literal path
+    // and is returned verbatim.
+    let Some(uri) = target.strip_prefix("file:") else {
+        return Some(PathBuf::from(target));
+    };
+    let path = uri.split(['?', '#']).next().unwrap_or(uri);
+    // `file://<authority>/path`: SQLite accepts only an empty or `localhost`
+    // authority, and the path starts at the `/` that ends it.
+    let path = path.strip_prefix("//").map_or(path, |rest| {
+        rest.find('/')
+            .map_or("", |slash| rest.get(slash..).unwrap_or_default())
+    });
+    let decoded = percent_decode(path);
+    if decoded.is_empty() {
         None
     } else {
-        Some(PathBuf::from(path))
+        Some(PathBuf::from(decoded))
     }
+}
+
+/// Percent-decode a `SQLite` URI path the way `sqlite3_open` does.
+///
+/// `%HH` with two hex digits becomes that byte; anything else — a stray `%`, a
+/// truncated or non-hex escape — is left alone, matching `SQLite`'s own lenient
+/// parser. Decoding is byte-wise, so a multi-byte UTF-8 escape reassembles.
+fn percent_decode(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        let decoded = if byte == b'%' {
+            bytes
+                .get(index.saturating_add(1))
+                .zip(bytes.get(index.saturating_add(2)))
+                .and_then(|(high, low)| {
+                    let high = char::from(*high).to_digit(16)?;
+                    let low = char::from(*low).to_digit(16)?;
+                    u8::try_from(high.saturating_mul(16).saturating_add(low)).ok()
+                })
+        } else {
+            None
+        };
+        if let Some(value) = decoded {
+            out.push(value);
+            index = index.saturating_add(3);
+        } else {
+            out.push(byte);
+            index = index.saturating_add(1);
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Strip `scheme://user:pass@` userinfo out of every URL embedded in `detail`.
@@ -482,6 +527,38 @@ mod tests {
         assert_eq!(
             database_file("file:/srv/app.db?mode=rwc"),
             Some(PathBuf::from("/srv/app.db"))
+        );
+    }
+
+    /// A `file:` target is a URI. diesel opens with `SQLITE_OPEN_URI`, so the
+    /// filename is percent-decoded and the authority is dropped — the resolver
+    /// must name the file `SQLite` really opens, not the raw text.
+    #[test]
+    fn database_file_decodes_a_file_uri_the_way_sqlite_does() {
+        for (url, expected) in [
+            ("file:app%20data.db", "app data.db"),
+            (
+                "file:/srv/my%20app/db%2Efile?mode=rwc",
+                "/srv/my app/db.file",
+            ),
+            // An empty or `localhost` authority is dropped; the path starts at
+            // the `/` that ends it.
+            ("file:///srv/app.db", "/srv/app.db"),
+            ("file://localhost/srv/app.db", "/srv/app.db"),
+            // A multi-byte UTF-8 escape reassembles.
+            ("file:caf%C3%A9.db", "café.db"),
+            // A stray or truncated escape is left alone, like SQLite's own parser.
+            ("file:100%.db", "100%.db"),
+            ("file:a%zz.db", "a%zz.db"),
+            ("file:trailing%", "trailing%"),
+        ] {
+            assert_eq!(database_file(url), Some(PathBuf::from(expected)), "{url}");
+        }
+        // Every other spelling is a literal path handed to `sqlite3_open`, so a
+        // `%` in it stays a `%`.
+        assert_eq!(
+            database_file("sqlite://app%20data.db"),
+            Some(PathBuf::from("app%20data.db"))
         );
     }
 

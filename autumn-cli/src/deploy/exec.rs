@@ -1741,7 +1741,7 @@ fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> Rem
 
 /// The op that makes a `SQLite` data file survive a deploy (issue #1909), or
 /// `None` when there is nothing to keep (a Postgres app, or an absolute path
-/// already outside the app dir).
+/// the deploy does not manage).
 ///
 /// A slot unit's `WorkingDirectory` is the release dir, so a relative
 /// `sqlite://app.db` resolves inside a directory that is replaced on every
@@ -1757,28 +1757,24 @@ fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> Rem
 ///
 /// Three steps, in order:
 ///
-/// 1. **Adopt.** When the shared file does not exist yet but the currently
-///    serving release holds a REAL one (not a link), move it into `shared/data`.
-///    This is the upgrade path for an app deployed before this contract existed:
-///    without it the first deploy after the upgrade starts against an empty
-///    database and orphans the old one. **Sidecars move first, the database
-///    last**, so `shared/data/<file>` existing means the move finished — a retry
-///    after a dropped connection resumes instead of skipping a half-done move
-///    and silently dropping the old WAL.
-/// 2. **Link the serving release back.** Adoption takes the file out from under
-///    a release that keeps serving until cutover, and that release opens its
-///    database lazily. Without a link at the old path it would create a fresh,
-///    empty one and serve it.
-/// 3. **Link this release.** A stale link at the release path is removed.
-///    Anything else there is a real database — a rollback target from before
-///    adoption — so it is moved beside the shared file as `<file>.superseded`,
-///    under `shared/`, where retention never reaches it. The op refuses rather
-///    than overwrite an existing `.superseded`, so it can never destroy a
-///    database.
+/// 1. **Refuse to relocate a live database.** An app deployed before this
+///    contract holds a real file in the release that is still serving. Moving it
+///    is not safe while that app runs: `SQLite` derives the `-wal` name from the
+///    path it resolved, so a connection opened before the move and one opened
+///    after would use two different write-ahead logs for one database. There is
+///    also no atomic move — between the `mv` and the link, a new pooled
+///    connection creates an empty database at the old path. So the deploy stops
+///    and tells the operator to stop the app and move the file once, by hand.
+/// 2. **Set aside a stale real file.** A rollback target from before that
+///    migration still holds its own database. It is moved beside the shared file
+///    as `<file>.superseded`, under `shared/`, where retention never reaches it.
+///    The op refuses rather than overwrite an existing one, so it can never
+///    destroy a database.
+/// 3. **Link this release.**
 ///
-/// Every interpolated path is shell-quoted. Each `mv` and `ln` carries
-/// `|| exit 1`: a silently failed one leaves a dangling link, and the app then
-/// creates an empty database.
+/// Every interpolated path is shell-quoted. Each `mv` carries `|| exit 1`: a
+/// silently failed one leaves a dangling link, and the app then creates an empty
+/// database.
 #[must_use]
 pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Option<RemoteCommand> {
     let relative = cfg.sqlite_data_file.as_ref()?;
@@ -1787,22 +1783,20 @@ pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Opt
     let shared_parent = parent_dir(&shared);
     let in_release = format!("{release_dir}/{relative}");
     let release_parent = parent_dir(&in_release);
-    let current_dir = cfg.current_symlink();
-    let current = format!("{current_dir}/{relative}");
-    let current_parent = parent_dir(&current);
+    let current = format!("{}/{relative}", cfg.current_symlink());
+    let service = &cfg.service_name;
     Some(RemoteCommand::new(
         "link-data",
         format!(
             "mkdir -p {shared_parent} {release_parent} && \
-             if [ ! -e {shared} ] && [ -f {current} ] && [ ! -L {current} ]; then \
-             for s in -wal -shm -journal; do \
-             if [ -f {current}$s ]; then mv {current}$s {shared}$s || exit 1; fi; \
-             done; \
-             mv {current} {shared} || exit 1; \
-             fi && \
-             if [ -e {shared} ] && [ -d {current_dir} ] && [ ! -e {current} ] && \
-             [ ! -L {current} ]; then \
-             mkdir -p {current_parent} && ln -s {shared} {current} || exit 1; \
+             if [ ! -e {shared} ] && [ -e {current} ] && [ ! -L {current} ]; then \
+             echo \"autumn deploy: {current} is a live SQLite database. The data file \
+             must live at {shared} to survive a deploy, and moving it while the app \
+             runs is not safe, so this deploy stopped.\" >&2; \
+             echo \"Run this on the host once, then deploy again: systemctl stop \
+             {service}-blue.service {service}-green.service; \
+             mv {current}* {shared_parent}/\" >&2; \
+             exit 1; \
              fi && \
              if [ -e {in_release} ] && [ ! -L {in_release} ]; then \
              if [ -e {superseded} ]; then \
@@ -1821,8 +1815,6 @@ pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Opt
             shared = shell_quote(&shared),
             superseded = shell_quote(&superseded),
             current = shell_quote(&current),
-            current_dir = shell_quote(&current_dir),
-            current_parent = shell_quote(&current_parent),
             in_release = shell_quote(&in_release),
         ),
     ))
@@ -7342,88 +7334,55 @@ mod tests {
         );
     }
 
-    /// The upgrade path for an app deployed BEFORE #1909: its data file is a real
-    /// file inside the currently serving release. Without adoption the first
-    /// post-upgrade deploy would start against an empty database and orphan it.
+    /// An app deployed before this contract holds a real file in the release that
+    /// is still serving. Moving it while that app runs is not safe — `SQLite`
+    /// derives the `-wal` name from the path it resolved, and there is no atomic
+    /// move — so the deploy stops and names the one-time manual step.
     #[test]
-    fn the_data_link_op_adopts_a_real_file_from_the_current_release() {
+    fn the_data_link_op_refuses_to_relocate_a_live_database() {
         let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
         assert!(
             op.shell
                 .contains("[ ! -e '/srv/autumn/myapp/shared/data/app.db' ]")
                 && op
                     .shell
-                    .contains("[ -f '/srv/autumn/myapp/current/app.db' ]")
+                    .contains("[ -e '/srv/autumn/myapp/current/app.db' ]")
                 && op
                     .shell
                     .contains("[ ! -L '/srv/autumn/myapp/current/app.db' ]"),
-            "adoption must be guarded on: no shared file yet, and a REAL (not \
-             already-linked) file in the current release: {}",
+            "the refusal must fire only when the shared file is absent and the current \
+             release holds a REAL (not already-linked) file: {}",
             op.shell
         );
         assert!(
-            op.shell.contains(
-                "mv '/srv/autumn/myapp/current/app.db' \
-                '/srv/autumn/myapp/shared/data/app.db'"
-            ),
-            "{}",
+            op.shell.contains("exit 1"),
+            "it must stop the deploy: {}",
+            op.shell
+        );
+        // The message must name the fix, including the units to stop.
+        assert!(
+            op.shell.contains("systemctl stop 'myapp'-blue.service")
+                || op.shell.contains("systemctl stop myapp-blue.service"),
+            "the message must name the units to stop: {}",
             op.shell
         );
         assert!(
-            op.shell.contains("for s in -wal -shm"),
-            "the sidecars of a crashed app must be adopted with the database: {}",
+            op.shell.contains("mv '/srv/autumn/myapp/current/app.db'*"),
+            "the message must name the move, sidecars included: {}",
             op.shell
         );
-        // A silently failed move would leave the link dangling and the app would
-        // create a fresh, empty database — the loss this op exists to prevent.
+        // Nothing in the op moves a live database itself.
         assert!(
-            op.shell.contains("mv '/srv/autumn/myapp/current/app.db'$s"),
-            "sidecar adoption must move the same paths: {}",
-            op.shell
-        );
-        // The sidecars move FIRST and the database LAST, so the shared file
-        // existing means the move finished. A retry after a dropped connection
-        // then resumes instead of skipping a half-done move and dropping the WAL.
-        let sidecar_move = op
-            .shell
-            .find("mv '/srv/autumn/myapp/current/app.db'$s")
-            .expect("sidecar move");
-        let db_move = op
-            .shell
-            .find("mv '/srv/autumn/myapp/current/app.db' '/srv/autumn/myapp/shared/data/app.db'")
-            .expect("database move");
-        assert!(
-            sidecar_move < db_move,
-            "sidecars must move before the database: {}",
-            op.shell
-        );
-    }
-
-    /// Adoption takes the file out from under a release that keeps serving until
-    /// cutover, and that release opens its database lazily. Without a link back
-    /// at the old path it creates a fresh, empty one and serves it.
-    #[test]
-    fn the_data_link_op_links_the_still_serving_release_back() {
-        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
-        assert!(
-            op.shell.contains(
-                "ln -s '/srv/autumn/myapp/shared/data/app.db' '/srv/autumn/myapp/current/app.db'"
-            ),
-            "the serving release must be re-linked at the shared file: {}",
-            op.shell
-        );
-        // …but only when `current` exists, so a first deploy never creates it as a
-        // real directory.
-        assert!(
-            op.shell.contains("[ -d '/srv/autumn/myapp/current' ]"),
-            "the back-link must be guarded on an existing `current`: {}",
+            !op.shell
+                .contains("mv '/srv/autumn/myapp/current/app.db' '/srv/autumn/myapp/shared"),
+            "the op must never relocate the live database itself: {}",
             op.shell
         );
     }
 
     /// The op must never delete a database file. A rollback target deployed
-    /// before adoption still holds a real one at that path; it is moved aside,
-    /// not removed.
+    /// before the migration still holds a real one at that path; it is moved
+    /// aside, not removed.
     #[test]
     fn the_data_link_op_never_deletes_a_real_database_file() {
         let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
@@ -7465,10 +7424,9 @@ mod tests {
     #[test]
     fn the_data_link_op_moves_every_sidecar_kind() {
         let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
-        assert_eq!(
-            op.shell.matches("for s in -wal -shm -journal").count(),
-            2,
-            "both the adopt and the move-aside step must cover every sidecar: {}",
+        assert!(
+            op.shell.contains("for s in -wal -shm -journal"),
+            "the move-aside step must cover every sidecar: {}",
             op.shell
         );
     }
