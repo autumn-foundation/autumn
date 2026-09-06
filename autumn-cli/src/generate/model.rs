@@ -1885,9 +1885,9 @@ fn validate_enum_field_collisions(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 // Retained as a Postgres-default convenience wrapper for the test suite; the
-// backend-aware `parse_model_metadata_for` is what production calls.
+// backend-aware `parse_model_metadata_for` is what production calls. Not doc
+// linked from it: this is `#[cfg(test)]`, so a link would break the doc build.
 #[cfg(test)]
 pub fn parse_model_metadata(
     fields: &[Field],
@@ -1896,14 +1896,16 @@ pub fn parse_model_metadata(
     parse_model_metadata_for(DatabaseBackend::Postgres, fields, options)
 }
 
-/// [`parse_model_metadata`] for a specific `backend` (issue #1924).
+/// Fold every metadata-bearing `--flag` (`--index`, `--validate`, `--default`,
+/// `--searchable`, …) into a [`ModelMetadata`], validated against `fields`.
 ///
-/// Only `--default` rendering differs: a `decimal` default is an unquoted
-/// numeric literal on Postgres and a quoted text literal on `SQLite`. See
-/// [`sql_default_literal`].
+/// `backend` reaches only `--default` rendering (issue #1924): a `decimal`
+/// default is an unquoted numeric literal on Postgres and a quoted, normalized
+/// text literal on `SQLite`. See [`sql_default_literal`].
 ///
 /// # Errors
-/// Same as [`parse_model_metadata`].
+/// Returns [`GenerateError::InvalidField`] for a flag naming an unknown field,
+/// or carrying a value the field's kind cannot take.
 #[allow(
     clippy::too_many_lines,
     reason = "one validation pass per `--flag` that contributes model metadata; \
