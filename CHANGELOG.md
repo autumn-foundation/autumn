@@ -1756,7 +1756,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enumerate. A SQLite target passes through whole — a local file URI carries
   no credentials, and its query string (`mode=ro`, `mode=memory`,
   `cache=shared`) is the diagnostic detail the replica and read-only messages
-  exist to report. A bare filesystem path stays legible for the same reason.
+  exist to report. The libpq keyword/value form (`host=db user=app
+  password=hunter2`) is rebuilt from an allowlist of the keys that identify
+  the target (`host`, `hostaddr`, `port`, `dbname`, `user`) — an allowlist
+  rather than a `password`/`sslpassword` denylist, so a key this code has
+  never heard of cannot default to being printed. A bare filesystem path
+  stays legible, since naming it is the whole value of the message and there
+  is no credential in it to protect.
 
 - **SQLite pool construction accepted a target that names no backend (issue
   #1905):** under `--features sqlite`, `build_sqlite_pool` guarded only

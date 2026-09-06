@@ -1589,6 +1589,27 @@ fn redact_pool_target(url: &str) -> String {
         }
         return url.to_owned();
     }
+    // A libpq keyword/value connection string (`host=db user=app
+    // password=hunter2`) is an explicitly supported Postgres target that
+    // `Url::parse` rejects and that carries no `@` or `?` — so the bare-path
+    // fallback below would hand the password straight back (Codex P2 on
+    // #2537). Rebuild it from an ALLOWLIST of the keys that merely identify
+    // which target this is. An allowlist, not a `password`/`sslpassword`
+    // denylist: the same reason the query string above goes wholesale — a key
+    // this code has never heard of must not default to being printed.
+    if let Some(pairs) = crate::pg_conn_str::keyword_value_pairs(url) {
+        const IDENTIFYING: [&str; 5] = ["host", "hostaddr", "port", "dbname", "user"];
+        let kept: Vec<String> = pairs
+            .iter()
+            .filter(|(key, _)| IDENTIFYING.contains(&key.as_str()))
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        return if kept.is_empty() {
+            "****".to_owned()
+        } else {
+            format!("{} ****", kept.join(" "))
+        };
+    }
     if url.contains('@') || url.contains('?') {
         return "****".to_owned();
     }
@@ -4534,6 +4555,20 @@ mod tests {
             "file::memory:?cache=shared"
         );
         assert_eq!(redact_pool_target(":memory:"), ":memory:");
+        // The libpq keyword/value form: a supported Postgres target that
+        // `Url::parse` rejects and that carries neither `@` nor `?`, so the
+        // bare-path fallback would have returned it whole (Codex P2 on #2537).
+        // Only the identifying keys survive.
+        assert_eq!(
+            redact_pool_target("host=db user=app password=hunter2"),
+            "host=db user=app ****"
+        );
+        assert_eq!(
+            redact_pool_target("host=db port=5432 dbname=app sslmode=require password=hunter2"),
+            "host=db port=5432 dbname=app ****"
+        );
+        // Nothing identifying left to show.
+        assert_eq!(redact_pool_target("password=hunter2"), "****");
         // Unparseable AND credential-shaped: mask wholesale rather than guess.
         assert_eq!(redact_pool_target("://user:secret@host/db"), "****");
         assert_eq!(redact_pool_target("not-a-url?password=hunter2"), "****");
@@ -4550,6 +4585,8 @@ mod tests {
             // The secret in the query string rather than the userinfo.
             "mysql://localhost/app?password=hunter2",
             "postgres://localhost/app?sslpassword=hunter2",
+            // The libpq keyword/value form: no URL shape at all.
+            "host=db user=app password=hunter2",
         ] {
             let config = DatabaseConfig {
                 url: Some(url.into()),
