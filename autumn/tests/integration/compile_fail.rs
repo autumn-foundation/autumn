@@ -307,6 +307,11 @@ fn query_budget_compile_fail_tests() {
     // round 2): `self.conn().await?`, the real shape in
     // `autumn-search/src/postgres.rs`'s `write_documents`.
     t.compile_fail("tests/compile-fail/query_budget_await_try_accessor_n_plus_one.rs");
+    // The `.expect(...)`/`.unwrap()` idiom `autumn/src/seed.rs` documents as
+    // its own canonical usage (PR #2546 review, round 5) — the same
+    // accessor-tracking gap as the `?` shape above, for a different
+    // unwrapping spelling.
+    t.compile_fail("tests/compile-fail/query_budget_expect_accessor_n_plus_one.rs");
 }
 
 /// Every `#[agent_operable]` / `authority_grant!` compile-fail fixture, with

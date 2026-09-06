@@ -241,8 +241,36 @@ where every other `#[query_budget]` fixture lives (no new test harness):
   a fresh handle, since those never issue a query even when awaited. New
   compile-pass fixture: `query_budget_awaited_builder_name_not_promoted.rs`.
 
-  Four review rounds have now each found one distinct edge of the same
-  underlying shape (an awaited/`?`-unwrapped expression can mean three
+- **Update (fifth Codex review round) — the same gap, a different unwrap
+  spelling, in a real named file.** `expr_is_handle`'s new `Expr::Try` arm
+  covers the `?` operator, but `autumn/src/seed.rs` documents its own
+  canonical usage as `let mut db = ctx.conn().await.expect("db
+  connection");` — `.expect(...)`, not `?`. Verified against the actual
+  file: both the module doc example and `SeedContext::conn`'s own doc
+  comment show this exact shape. `.expect(...)` (and `.unwrap()`) are
+  ordinary method calls, not `Expr::Try` nodes, so `expr_is_handle`'s
+  existing `MethodCall` arm never saw past them to the accessor
+  underneath — the same silent-uncounted failure mode as every prior
+  round, for a different piece of syntax. Fixed by adding a
+  `RESULT_UNWRAP_METHODS = ["expect", "unwrap"]` check to `expr_is_handle`'s
+  `MethodCall` arm: when the method is one of these two, the call itself
+  is never counted as a query, but its receiver is checked against the
+  same narrow `awaited_expr_is_fresh_handle` helper used for `?`. New
+  compile-fail fixture: `query_budget_expect_accessor_n_plus_one.rs`,
+  mirroring `seed.rs`'s exact doc-comment shape.
+
+  Deliberately narrow, and said so in the code: `.ok()`,
+  `.unwrap_or_else(...)`, `.map_err(...)?`, and other combinators remain an
+  acknowledged, unaddressed gap — fixing every possible way to unwrap a
+  `Result`/`Option` is not this assay's job, and chasing it indefinitely
+  would turn a bounded review response into unbounded scope creep. `expect`
+  and `unwrap` were fixed because they are the two spellings actually
+  present in this codebase's own documented usage; anything else surfaces
+  the same way every gap in this family has — silently, on a future
+  audit or review — and gets the same treatment when it does.
+
+  Five review rounds have now each found one distinct edge of the same
+  underlying shape (an awaited/unwrapped expression can mean three
   different things — a fresh handle, an unopened `Result`, or an executed
   query's result — and only the first should ever be promoted). Every round
   landed a real fix plus a regression fixture pinning it; none was a
@@ -263,14 +291,15 @@ autumn-web --test integration_tests`, default features `db,maud,htmx,...`):
 | `query_budget_await_try_accessor_n_plus_one.rs` (`self.conn().await?` shape) | compile-fail | **compiled clean pre-fix (confirmed false negative); compile-fail post-fix** | same diagnostic, naming `execute`, pointing at `for _id in ids` |
 | `query_budget_bare_await_not_promoted.rs` (`store.conn().await` — no `?` — then `result.is_err()`) | compile-pass | **compile-pass** | clean build at `#[query_budget(0)]` |
 | `query_budget_awaited_builder_name_not_promoted.rs` (`repo.page(1).await?` — `page` is a `HANDLE_BUILDERS` name — then `rows.len()`) | compile-pass | **compile-pass** | clean build at `#[query_budget(1)]` |
+| `query_budget_expect_accessor_n_plus_one.rs` (`ctx.conn().await.expect(...)`, `seed.rs`'s documented shape) | compile-fail | **compile-fail** | same diagnostic, naming `execute`, pointing at `for id in ids` |
 
 First run generated fresh `.stderr` snapshots via trybuild's standard
 `wip/`-then-promote flow (no snapshot existed yet, matching how every other
 compile-fail fixture in this suite was originally added); every subsequent
 run, after moving the generated snapshots into `tests/compile-fail/`,
 reproduced them byte-for-byte (`query_budget_compile_fail_tests ... ok`,
-~5s incremental with the full 8-fixture family). `compile_pass_tests` (62
-fixtures including both controls) also passed clean. The
+~5s incremental with the full 9-fixture family). `compile_pass_tests` (62
+fixtures including all three controls) also passed clean. The
 `autumn-macros` fix was additionally checked against the crate's own
 `#[cfg(test)]` suite (`cargo test -p autumn-macros --lib`, 1087 tests) to
 catch exactly the kind of regression the first attempt at this fix
@@ -356,16 +385,19 @@ Fixtures: `autumn/tests/compile-fail/query_budget_accessor_handle_n_plus_one.rs`
 `autumn/tests/compile-fail/query_budget_job_shaped_accessor_n_plus_one.rs`,
 `autumn/tests/compile-fail/query_budget_real_job_accessor_n_plus_one.rs`,
 `autumn/tests/compile-fail/query_budget_real_scheduled_accessor_n_plus_one.rs`,
-`autumn/tests/compile-fail/query_budget_await_try_accessor_n_plus_one.rs`
-(all five with pinned `.stderr` snapshots), and
+`autumn/tests/compile-fail/query_budget_await_try_accessor_n_plus_one.rs`,
+`autumn/tests/compile-fail/query_budget_expect_accessor_n_plus_one.rs`
+(all six with pinned `.stderr` snapshots), and
 `autumn/tests/compile-pass/query_budget_job_shaped_accessor_batched.rs`,
 `autumn/tests/compile-pass/query_budget_bare_await_not_promoted.rs`,
 `autumn/tests/compile-pass/query_budget_awaited_builder_name_not_promoted.rs`.
 Wired into `autumn/tests/integration/compile_fail.rs`'s existing
 `query_budget_compile_fail_tests` / `compile_pass_tests` functions. The
 `autumn-macros` fix itself is `expr_is_handle`'s `Expr::Try` arm (no
-`Expr::Await` arm at that level — see the third-review-round update above)
-plus the new `awaited_expr_is_fresh_handle` helper (`HANDLE_ACCESSORS`
+`Expr::Await` arm at that level — see the third-review-round update above),
+the `RESULT_UNWRAP_METHODS` check in its `MethodCall` arm (see the
+fifth-review-round update above), plus the new
+`awaited_expr_is_fresh_handle` helper (`HANDLE_ACCESSORS`
 names only — no `HANDLE_BUILDERS` branch, see the fourth-review-round
 update above) and `chain_root_is_handle`'s comment explaining why it
 deliberately does *not* peel the same way, all in

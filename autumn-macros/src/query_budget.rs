@@ -160,6 +160,14 @@ const SAFE_FREE_FNS: &[&str] = &["drop"];
 /// query issued through it is still counted.
 const HANDLE_ACCESSORS: &[&str] = &["db", "repo", "repository", "pool", "conn", "connection"];
 
+/// `Result`/`Option`-unwrapping methods that stand in for the `?` operator
+/// (`ctx.conn().await.expect("connection")`, the documented shape in
+/// `autumn/src/seed.rs`) without themselves issuing a query. Deliberately
+/// narrow: only the two spellings actually used for this in the codebase —
+/// `.ok()`, `.unwrap_or_else(...)`, and friends are a known, unaddressed gap
+/// (see `docs/guide/query-budgets.md` update tracking #2546).
+const RESULT_UNWRAP_METHODS: &[&str] = &["expect", "unwrap"];
+
 /// Exact type names that name a database handle.
 const HANDLE_TYPES: &[&str] = &[
     "Db",
@@ -1152,6 +1160,19 @@ impl Analyzer {
                 let method = mc.method.to_string();
                 if HANDLE_ACCESSORS.contains(&method.as_str()) {
                     return true;
+                }
+                // `.expect(...)`/`.unwrap()` stand in for `?` on a fallible
+                // accessor (`ctx.conn().await.expect("connection")`, #2546
+                // review round 5) — the unwrap call itself issues nothing,
+                // so it is never counted, but the value it unwraps can still
+                // be a fresh handle. Recurses into the narrower
+                // `awaited_expr_is_fresh_handle`, not `expr_is_handle`, for
+                // the same reason `Expr::Try` does below: a bare
+                // `Expr::Path` here must not re-derive handle-ness from
+                // `chain_root_is_handle`'s unrelated deferred-future
+                // tracking.
+                if RESULT_UNWRAP_METHODS.contains(&method.as_str()) {
+                    return self.awaited_expr_is_fresh_handle(&mc.receiver);
                 }
                 HANDLE_BUILDERS.contains(&method.as_str()) && self.expr_is_handle(&mc.receiver)
             }
