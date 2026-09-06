@@ -1729,10 +1729,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   page. Certifying `secured: true` there made `routes audit` wrongly attest
   the page as protected when an anonymous request against a warm cache entry
   gets the cached HTML unauthenticated either way. `#[static_get]` now
-  rejects the combination outright, in both attribute orders, mirroring
-  `#[ws]`'s identical guard-incompatibility check below, and the error
+  rejects the combination outright, in both attribute orders, and the error
   points authors at `AppBuilder::static_gate` — the gate actually built to
-  protect pre-rendered pages (Codex review on #2513, P1).
+  protect pre-rendered pages (Codex review on #2513, P1). That rejection's
+  first version detected a guard expanded *above* `#[static_get]` by
+  checking for a leading sibling gate item — a shape only a test that
+  hand-concatenates one macro's raw multi-item output into another's input
+  can produce; the real compiler never bundles a sibling item alongside the
+  one it hands to the next attribute macro in a stack (confirmed by
+  `param_helpers::extract_fn_item`'s own doc comment, added for exactly this
+  reason elsewhere in this crate). So in genuine compiled code that leading-
+  item check could never fire, and the rejection for this — the more
+  natural — attribute order silently never worked, an eighth Codex finding
+  on #2513 caught. Fixed by checking what actually does survive onto the
+  single function the real compiler hands `static_get_macro`: the guard's
+  own pre-body gate parameter for `#[secured]`/`#[step_up]`/`#[throttle]`
+  (`param_helpers::has_any_guard_gate_param`), and the role/policy-check
+  body marker for `#[authorize]`, which inserts no such parameter
+  (`api_doc::extract_secured_info`, the same recovery the `#[get]`/`#[post]`
+  route macro already relies on for this scenario). The accompanying unit
+  tests were corrected the same way — sliced through
+  `param_helpers::extract_fn_item` rather than fed a raw multi-item macro
+  output — so they exercise the shape the compiler actually produces instead
+  of a synthetic one, and would have caught this gap themselves.
 
 - **macros: `#[secured]`/`#[step_up]`/`#[throttle]` above `#[ws]` never
   actually worked, and generated silently-broken code rather than a clear
