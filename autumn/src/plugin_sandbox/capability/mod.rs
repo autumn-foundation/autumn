@@ -2710,6 +2710,53 @@ path = "/shop/panel"
     }
 
     #[test]
+    fn a_generated_row_id_never_lands_on_a_seeded_one() {
+        // `seed` places a row at an id of the caller's choosing and cannot
+        // advance the insert counter, because that id need not be a number. So
+        // a store seeded with `r1` handed `r1` back out on its first insert:
+        // `HashMap::insert` replaced the seeded row while both weights had been
+        // charged, losing a row with no error and leaving bytes charged against
+        // capacity that nothing occupies.
+        let store = db::MemoryPluginStore::new();
+        let orders = db::physical_table("shop", "orders").expect("derivable");
+        let tenant = tenant_segment(Some("alpha"));
+        store.seed(&orders, &tenant, "r1", row(&[("sku", "seeded")]));
+
+        let manifest = manifest(&everything());
+        let mut runtime = CapabilityRuntime::new(
+            &manifest,
+            CapabilityServices {
+                db: Some(Arc::clone(&store) as Arc<dyn PluginStore>),
+                ..CapabilityServices::none()
+            }
+            .for_tenant("alpha"),
+        );
+
+        let inserted = runtime.dispatch(&CapabilityCall::DbInsert {
+            id: 1,
+            table: "orders".to_owned(),
+            row: row(&[("sku", "inserted")]),
+        });
+        assert!(
+            matches!(inserted, CallResult::Ok { .. }),
+            "the insert must succeed: {inserted:?}"
+        );
+
+        // Both rows must still be there. The seeded one disappearing is the
+        // defect; counting them is what proves it did not.
+        let keys = store.keys();
+        assert_eq!(
+            keys.len(),
+            2,
+            "the seeded row must survive an insert beside it: {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|(_, _, id)| id == "r1"),
+            "the seeded id must still be occupied by its own row: {keys:?}"
+        );
+    }
+
+    #[test]
     fn another_tenants_rows_are_invisible_and_unwritable() {
         let store = db::MemoryPluginStore::new();
         // Seeded directly: a host-application table, and another tenant's row

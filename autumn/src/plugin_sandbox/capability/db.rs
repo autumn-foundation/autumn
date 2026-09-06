@@ -729,10 +729,37 @@ impl PluginStore for MemoryPluginStore {
                 self.byte_capacity
             )));
         }
+        // Skipping what is already there, rather than trusting the counter to
+        // be the only source of ids. `seed` places a row at an id of the
+        // caller's choosing and does not advance this counter — it cannot, since
+        // that id need not be a number at all — so a store seeded with `r1`
+        // handed `r1` straight back out on its first insert. `HashMap::insert`
+        // would then *replace* the seeded row while the weight of both had been
+        // charged, losing a row silently and leaving bytes charged against
+        // capacity that no row occupies, which a later delete refunds only once.
+        //
+        // Bounded by the number of rows: at most that many candidates can be
+        // occupied, so the search cannot run longer than the map is wide.
         let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
-        *next = next.saturating_add(1);
-        let row_id = format!("r{next}");
+        let mut row_id = None;
+        for _ in 0..=rows.map.len() {
+            *next = next.saturating_add(1);
+            let candidate = format!("r{next}");
+            if !rows.map.contains_key(&(
+                scope.table.clone(),
+                scope.tenant.clone(),
+                candidate.clone(),
+            )) {
+                row_id = Some(candidate);
+                break;
+            }
+        }
         drop(next);
+        let Some(row_id) = row_id else {
+            return Err(StoreError::Backend(
+                "this host's in-memory plugin store could not allocate a free row id".to_owned(),
+            ));
+        };
         rows.bytes = rows.bytes.saturating_add(incoming);
         rows.map.insert(
             (scope.table.clone(), scope.tenant.clone(), row_id.clone()),
