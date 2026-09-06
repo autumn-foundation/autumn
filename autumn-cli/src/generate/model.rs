@@ -2880,6 +2880,11 @@ fn render_enum_decl(
     out
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per axis of the emitted model file; a struct here would \
+              only rename the same list"
+)]
 fn render_model_file(
     name: &str,
     table: &str,
@@ -4418,7 +4423,7 @@ mod tests {
     }
 
     /// A Postgres app's `Cargo.toml` keeps the historical Postgres dependency
-    /// set — the backend-aware split must not leak SQLite into it.
+    /// set — the backend-aware split must not leak `SQLite` into it.
     #[test]
     fn postgres_app_cargo_deps_are_unchanged() {
         with_no_db_env(|| {

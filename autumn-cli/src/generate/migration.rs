@@ -949,7 +949,7 @@ pub struct Post {
     /// conversions, so the generate-time rejection no longer fires. All three
     /// store `TEXT`.
     ///
-    /// Nullable columns here, deliberately: SQLite's own `ALTER TABLE ADD
+    /// Nullable columns here, deliberately: `SQLite`'s own `ALTER TABLE ADD
     /// COLUMN` rule still refuses a `NOT NULL` column with no default, which is
     /// a separate gate (#1918) this test must not trip over.
     #[test]
