@@ -1851,6 +1851,39 @@ def inert_spans(view, src):
 ANY_ELEMENT_TAG = re.compile(r'<(/?)([A-Za-z][A-Za-z0-9-]*)(?=[\s/>]|$)')
 
 
+def _open_names(txt, at):
+    """Element names still open at offset `at`.
+
+    An unmatched end tag is IGNORED by the parser — `</bogus>` with no `bogus`
+    open closes nothing — so a close tag can only end the scanned element if
+    the thing it names is actually open around it. Without this the scan
+    treated every close it did not recognise as an ancestor's, and a stray end
+    tag inside an inert or hidden subtree ended it early.
+    """
+    stack, pos = [], 0
+    while pos < at:
+        t = ANY_ELEMENT_TAG.search(txt, pos)
+        if not t or t.start() >= at:
+            break
+        r = RAW_TEXT_OPEN.search(txt, pos)
+        if r and r.start() < at and r.start() <= t.start():
+            pos = _raw_text_end(txt, r.group(1), r.end())
+            continue
+        tname = t.group(2).lower()
+        gt = txt.find('>', t.end())
+        if t.group(1):
+            if tname in stack:
+                del stack[len(stack) - 1 - stack[::-1].index(tname):]
+        elif (tname not in VOID_ELEMENTS
+              and not (tname in FOREIGN_ROOTS and gt != -1
+                       and txt[gt - 1] == '/')):
+            while stack and tname in IMPLICIT_CLOSERS.get(stack[-1], ()):
+                stack.pop()
+            stack.append(tname)
+        pos = t.end()
+    return set(stack)
+
+
 def element_end(txt, m, name):
     """Where the element opened by match `m` ends, contents and all.
 
@@ -1884,6 +1917,7 @@ def element_end(txt, m, name):
     if lname in RAW_TEXT_NAMES:
         return _raw_text_end(txt, name, m.end())
     closers = IMPLICIT_CLOSERS.get(lname)
+    outer = _open_names(txt, m.start())
     stack, pos = [], m.end()
     while True:
         t = ANY_ELEMENT_TAG.search(txt, pos)
@@ -1912,9 +1946,16 @@ def element_end(txt, m, name):
                 continue
             if tname == lname:
                 return len(txt) if gt == -1 else gt + 1
-            # Nothing here opened it, so it closes an ANCESTOR — which takes
-            # this element with it.
-            return t.start()
+            if tname in outer:
+                # Nothing HERE opened it but something around us did, so it
+                # closes an ANCESTOR — which takes this element with it.
+                return t.start()
+            # Matches nothing open in either direction: the parser drops it,
+            # and so must this. `<div inert></bogus><a …>Mail</a></div>` keeps
+            # the anchor inert, and ending the span at `</bogus>` made a dead
+            # link a route.
+            pos = t.end()
+            continue
         if not stack and closers and tname in closers:
             # Only while this element is still the innermost one: an implicit
             # closer nested deeper belongs to whatever is open there.
@@ -4638,6 +4679,22 @@ self_test() {
   printf '# Jobs\n\n<a href="  mail.md  ">Mail</a>\n' > "$c9lj/docs/guide/jobs.md"
   git -C "$c9lj" add -A && git -C "$c9lj" commit -qm ascii-padded-href
   check "ASCII padding in an href is discarded" pass "$c9lj"
+
+  # An UNMATCHED end tag closes nothing — the parser drops it — so it cannot
+  # end an inert subtree either. Treating every unrecognised close as an
+  # ancestor's ended the span at `</bogus>` and made a dead link a route.
+  local c9ll="$tmp/c9ll"; make_corpus "$c9ll"
+  printf '# Jobs\n\nx <div inert></bogus><a href="mail.md">Mail</a></div>\n' \
+    > "$c9ll/docs/guide/jobs.md"
+  git -C "$c9ll" add -A && git -C "$c9ll" commit -qm unmatched-close-inert
+  check "an unmatched close does not end an inert subtree" fail "$c9ll"
+
+  # ...and the same inside a hidden one.
+  local c9lm="$tmp/c9lm"; make_corpus "$c9lm"
+  printf '# Jobs\n\n<a href="mail.md"><span hidden></bogus>Secret</span></a>\n' \
+    > "$c9lm/docs/guide/jobs.md"
+  git -C "$c9lm" add -A && git -C "$c9lm" commit -qm unmatched-close-hidden
+  check "an unmatched close does not end a hidden subtree" fail "$c9lm"
 
   # Unwinding must find the INNERMOST match: closing the inner `div` here left
   # the whole stack cleared, and the `</span>` after it read as an ancestor
