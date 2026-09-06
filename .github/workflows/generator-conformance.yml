@@ -181,7 +181,13 @@ jobs:
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     # Fail fast instead of burning GitHub's 360-minute default if a
     # generated app wedges on boot (these jobs compile AND run one).
-    timeout-minutes: 90
+    # 90 -> 150 (#1945): 15 more scaffold-and-cargo-check/build/run steps
+    # landed in the "cli_tests per-test triage" block below. The 1.88.0 leg's
+    # existing ~31 steps already ran ~78-81 min against the old 90-minute
+    # budget (per recent run history), and these new steps average ~2 min
+    # each, so the old budget would have started failing on timeout rather
+    # than on a real regression.
+    timeout-minutes: 150
     strategy:
       matrix:
         toolchain: [stable, "1.88.0"]

@@ -1464,21 +1464,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Docker-dependent-tests step, so a new `#[ignore = "requires Docker
   (testcontainers)"]` test in any `autumn-cli/tests/integration/*.rs` module
   runs in CI automatically. Before this, only two hand-picked filters
-  (`offsite`, `db_scrub`) ran anything from that binary, leaving 42 Docker
-  tests across 7 modules (`db.rs`, `db_pull.rs`,
+  (`offsite`, `db_scrub`) ran anything from that binary, leaving 46 Docker
+  tests across 8 modules (`db.rs`, `db_pull.rs`,
   `generate_lock_version_postgres.rs`, `generate_references_postgres.rs`,
-  `migrate_down.rs`, `schema_migrate.rs`, `schema_pull.rs`) dark since they
-  were written — PR #1985's noted follow-up. The sweep's `--skip` list routes
-  the binary's other `#[ignore]`d tests — the ones that scaffold and
-  cargo-check/build/run a fresh generated project instead of touching
-  Docker — to `generator-conformance.yml`, where 15 of them (across
+  `migrate_down.rs`, `schema_migrate.rs`, `schema_pull.rs`, `test_command.rs`)
+  dark since they were written — PR #1985's noted follow-up. The sweep's
+  `--skip` list routes the binary's other `#[ignore]`d tests — the ones that
+  scaffold and cargo-check/build/run a fresh generated project instead of
+  touching Docker — to `generator-conformance.yml`, where 15 of them (across
   `api_scaffold`, `cloud_native_scaffold`, `generate_position_scaffold`,
   `scaffold_belongs_to`, `scaffold_bulk_delete`, `scaffold_rich_text`,
   `scaffold_search`, `scaffold_trash`, `seed_model_linking`, `serve`, and two
   in `scaffold_form_for`) are now named there for the first time, closing the
-  same gap for that half of the binary. Two new
-  `autumn-cli/tests/integration/repo_hygiene.rs` tests guard both halves of
-  the wiring going forward. [no-plugin]
+  same gap for that half of the binary. The sweep also `--skip`s the
+  pre-existing `generate_json_postgres.rs` Docker test, which already ran in
+  `generator-conformance.yml` before this change, so it isn't doubled up.
+  Two new `autumn-cli/tests/integration/repo_hygiene.rs` tests guard both
+  halves of the wiring going forward. [no-plugin]
 
 ### Changed
 

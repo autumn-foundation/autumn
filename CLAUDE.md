@@ -89,7 +89,9 @@ to *any* module under `autumn-cli/tests/integration/` — new or existing —
 executes in CI with no workflow edit, the same guarantee the `autumn` sweep
 above gives. Before this, `cli_tests`'s Docker-gated tests were NOT
 auto-swept; only two filtered invocations ran anything (`offsite`,
-`db_scrub`), leaving 42 tests across 7 modules dark.
+`db_scrub`), leaving 46 tests across 8 modules dark. The sweep also
+`--skip`s the pre-existing `generate_json_postgres.rs` Docker test, which
+already ran in `generator-conformance.yml`, so it doesn't run twice.
 
 That sweep's `--skip` list names every module whose `#[ignore]`d tests are
 NOT Docker tests: they instead scaffold and cargo-check/build/run a fresh
