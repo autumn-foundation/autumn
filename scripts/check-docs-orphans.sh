@@ -1491,12 +1491,23 @@ HIDDEN_OPEN = re.compile(
 VOID_ELEMENTS = frozenset((
     'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta',
     'source', 'track', 'wbr', 'param', 'keygen'))
-# A trailing `/>` self-closes ONLY here. In HTML the slash is ignored and the
-# element stays open — `<span hidden/>Mail</a>` hides `Mail`, which is why `/>`
-# is not treated as self-closing in general. `svg` and `math` are the two
-# elements that enter foreign content, where XML rules apply and `/>` does
-# close. Both halves confirmed against Chromium, not inferred.
-SELF_CLOSING_ROOTS = frozenset(('svg', 'math'))
+# `hidden` DOES NOT HIDE THESE. The attribute has no power of its own — it
+# works through the one UA-stylesheet rule `[hidden] { display: none }`, and
+# that stylesheet is namespaced to HTML, so it never matches an SVG or MathML
+# element. Chromium reports `<svg hidden width=40 height=40>` as
+# `display: inline` with a 40x40 box: it paints, and an anchor wrapping one is
+# an icon link the reader can click.
+#
+# This corrects a `SELF_CLOSING_ROOTS` set that stood here for one commit. It
+# gave `svg` and `math` a self-closing branch so `<svg hidden/>` would end at
+# its opening tag — right about HTML parsing (a trailing `/>` really does close
+# a foreign-content element, and is ignored on every HTML element) but wrong
+# about the premise, since neither is hidden in the first place. Treating them
+# as hidden also broke the balancing scan: in
+# `<svg hidden><svg/></svg>Mail`, the self-closing inner tag was counted as a
+# new open level, the outer close never returned depth to zero, and the visible
+# `Mail` was masked to the end of the anchor.
+NOT_HIDDEN_BY_ATTR = frozenset(('svg', 'math'))
 
 
 def mask_hidden_subtrees(txt):
@@ -1506,17 +1517,25 @@ def mask_hidden_subtrees(txt):
     the one that balances it, not the first one with the same name.
     """
     out = txt
+    # Where to resume. A tag can be passed over rather than masked, so the
+    # scan cannot restart from zero and rely on blanks to make progress.
+    at = 0
     while True:
-        m = HIDDEN_OPEN.search(out)
+        m = HIDDEN_OPEN.search(out, at)
         if not m:
             return out
         name = m.group(1)
         lname = name.lower()
-        if lname in VOID_ELEMENTS or (
-                lname in SELF_CLOSING_ROOTS and m.group(0).endswith('/>')):
+        if lname in NOT_HIDDEN_BY_ATTR:
+            # The attribute does not apply, so this is ordinary visible
+            # content: step over the tag without masking anything.
+            at = m.end()
+            continue
+        if lname in VOID_ELEMENTS:
             # No subtree to balance: the element is the whole of itself.
             end = m.end()
             out = out[:m.start()] + ' ' * (end - m.start()) + out[end:]
+            at = end
             continue
         # Running out of closes is not a bug here: an unclosed element is
         # closed implicitly by its parent, so masking to the end of the span
@@ -1533,6 +1552,7 @@ def mask_hidden_subtrees(txt):
                 close = out.find('>', pos)
                 end = len(out) if close == -1 else close + 1
         out = out[:m.start()] + ' ' * (end - m.start()) + out[end:]
+        at = end
 
 
 # Any HTML tag, open or close, quote-aware so a `>` inside an attribute
@@ -1817,6 +1837,13 @@ def edges_from(f):
         # — the href is metadata and the reader is left with an empty element.
         # An `<img>` inside IS content, which falls out of testing for
         # non-whitespace rather than for text.
+        # The anchor's OWN `hidden` is checked here rather than in
+        # `has_content`, which is handed the content slice and so never sees
+        # the opening tag. `<a hidden href="mail.md">Mail</a>` has a label but
+        # no link: Chromium gives it a 0x0 box, and the edge was recorded from
+        # the `Mail` inside it.
+        if HIDDEN_OPEN.fullmatch(tag.group(0)):
+            continue
         close = ANCHOR_CLOSE.search(raw, tag.end())
         stop = close.start() if close else len(raw)
         if not has_content(img_view[tag.end():stop], txt[tag.end():stop]):
@@ -3967,12 +3994,21 @@ self_test() {
   git -C "$c9iq" add -A && git -C "$c9iq" commit -qm html-slash-not-self-closing
   check "a slash does not self-close an HTML element" fail "$c9iq"
 
-  # ...while `svg` enters foreign content, where `/>` really does close.
+  # `hidden` does not reach an SVG: the UA rule that implements it is
+  # namespaced to HTML, so the icon still paints and the anchor is a route.
   local c9ir="$tmp/c9ir"; make_corpus "$c9ir"
-  printf '# Jobs\n\n<a href="mail.md"><svg hidden/>Mail</a>\n' \
+  printf '# Jobs\n\n<a href="mail.md"><svg hidden width="9" height="9"></svg></a>\n' \
     > "$c9ir/docs/guide/jobs.md"
-  git -C "$c9ir" add -A && git -C "$c9ir" commit -qm foreign-content-self-closes
-  check "a slash self-closes a foreign-content root" pass "$c9ir"
+  git -C "$c9ir" add -A && git -C "$c9ir" commit -qm hidden-does-not-reach-svg
+  check "a hidden attribute does not hide an svg" pass "$c9ir"
+
+  # ...and because it never masks, a self-closing nested SVG cannot unbalance
+  # the scan and swallow the label after it.
+  local c9ix="$tmp/c9ix"; make_corpus "$c9ix"
+  printf '# Jobs\n\n<a href="mail.md"><svg hidden><svg/></svg>Mail</a>\n' \
+    > "$c9ix/docs/guide/jobs.md"
+  git -C "$c9ix" add -A && git -C "$c9ix" commit -qm nested-self-closing-svg
+  check "a nested self-closing svg does not swallow the label" pass "$c9ix"
 
   # An unclosed non-void element is closed implicitly by its parent, so it
   # hides everything to the end of the link — masking that far is correct.
@@ -4013,6 +4049,24 @@ self_test() {
   printf '# Jobs\n\n<a href="mail.md">&#60;span&#62;</a>\n' > "$c9iw/docs/guide/jobs.md"
   git -C "$c9iw" add -A && git -C "$c9iw" commit -qm entity-spelled-tag-text
   check "an entity-spelled tag is visible text, not markup" pass "$c9iw"
+
+  # The anchor's OWN `hidden` renders no link at all, however solid its label.
+  # `has_content` is handed the content slice and never sees the opening tag,
+  # so this is checked where the tag is.
+  local c9iy="$tmp/c9iy"; make_corpus "$c9iy"
+  printf '# Jobs\n\n<a hidden href="mail.md">Mail</a>\n' > "$c9iy/docs/guide/jobs.md"
+  git -C "$c9iy" add -A && git -C "$c9iy" commit -qm hidden-anchor
+  check "a hidden anchor is not a route" fail "$c9iy"
+
+  # ...but the check must read the ATTRIBUTE, not the word. A page whose own
+  # name contains "hidden" is linked by an ordinary anchor, and a substring
+  # test on the tag would strand it.
+  local c9iz="$tmp/c9iz"; make_corpus "$c9iz"
+  printf '# H\n\ntext\n' > "$c9iz/docs/guide/hidden.md"
+  printf '# Jobs\n\n[Mail](mail.md)\n\n<a href="hidden.md">Docs</a>\n' \
+    > "$c9iz/docs/guide/jobs.md"
+  git -C "$c9iz" add -A && git -C "$c9iz" commit -qm href-path-named-hidden
+  check "a path named hidden is still a route" pass "$c9iz"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
