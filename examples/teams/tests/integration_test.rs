@@ -94,12 +94,25 @@ async fn protected_route_redirects_to_login_when_unauthenticated() {
 /// Create the schema and return a CSRF-disabled, DB-backed client. `mail_dir`
 /// captures every invite email as an `.eml` file (AC4's "delivered to the dev
 /// mailbox").
+///
+/// `TestDb::shared()` is one process-wide database (a `OnceCell`-cached
+/// testcontainer + pool, per `autumn_web::test::TestDb`), not a fresh one per
+/// test, and `up.sql`'s plain `CREATE TABLE` (no `IF NOT EXISTS` — unlike
+/// `execute_sql`'s own documented idempotent-SQL convention) is meant to run
+/// once per database. Running it again here for every test — this module's
+/// documented `--test-threads=1` (serial) contract makes a plain flag safe —
+/// would panic the second test onward with `relation "users" already exists`
+/// (Codex finding on this PR's `--test-threads=1` fix).
+static SCHEMA_READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 async fn db_client(mail_dir: &std::path::Path) -> TestClient {
     let db = TestDb::shared().await;
-    db.execute_sql(include_str!(
-        "../migrations/00000000000000_create_teams/up.sql"
-    ))
-    .await;
+    if SCHEMA_READY.get().is_none() {
+        db.execute_sql(include_str!(
+            "../migrations/00000000000000_create_teams/up.sql"
+        ))
+        .await;
+        let _ = SCHEMA_READY.set(());
+    }
     db.execute_sql("TRUNCATE invitations, memberships, organizations, users RESTART IDENTITY")
         .await;
 
