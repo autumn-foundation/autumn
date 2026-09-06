@@ -204,7 +204,11 @@ def read(f):
 # optional link title in any of its three delimiters.
 DEST_BARE = r'(?:[^()\s]|\([^()\s]*\))+'
 TITLE = r'''(?:\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\((?:[^()\\]|\\.)*\)))?'''
-DEST = r'\(\s*(?:<([^<>]*)>|(' + DEST_BARE + r'))' + TITLE + r'\s*\)'
+# `[\s--\n]` style bounds: whitespace inside a destination may span ONE newline
+# but never a blank line — a blank line ends the paragraph, so `[x](y.md\n\n)`
+# renders no link at all and must not record an edge.
+_WS = r'(?:[ \t]*\n?[ \t]*)'
+DEST = r'\(' + _WS + r'(?:<([^<>]*)>|(' + DEST_BARE + r'))' + TITLE + _WS + r'\)'
 # The label has to be matched too, not just the `](…)` tail: `\[Mail](mail.md)`
 # renders as literal text, so treating it as a route would let a link someone
 # deliberately disabled go on hiding an orphan. `\.` keeps an escaped bracket
@@ -452,6 +456,8 @@ ATTR_VALUE = re.compile(
 ATTR_VALUE_ANY = re.compile(
     r'\b[A-Za-z_:][-\w:.]*\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)', re.I)
 ANCHOR_TAG = re.compile(r'<a(?:\s[^>]*)?>', re.I)
+# The `](…)` destination of a rendered link, blanked before the bare-path scan.
+LINK_DEST = re.compile(r'\]' + DEST)
 # A whole raw tag, used to bound where `src=` may be masked. Unscoped, that
 # pattern also eats the query of `[Mail](mail.md?src=guide)`, which is an
 # ordinary Markdown link the sibling gate resolves.
@@ -470,10 +476,24 @@ HTML_TAG = re.compile(
 # that line is allowed, `<div>example` opens one — and ends at the next BLANK
 # line, not at a closing tag. Requiring a stand-alone opener and a matching
 # close missed both halves of that.
+# CommonMark's type-6 block-tag list. ONLY these open a block from a line that
+# merely STARTS with the tag — `<div>example` does, `<span>text` does not,
+# because `span` is inline and its line is ordinary paragraph text where a
+# Markdown link still renders. Accepting every tag name here masked live links.
+BLOCK_TAGS = (
+    'address|article|aside|base|basefont|blockquote|body|caption|center|col|'
+    'colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|'
+    'footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|'
+    'legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|'
+    'param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|'
+    'track|ul')
+# Type 6 (a block tag, trailing content allowed) or type 7 (any complete tag
+# ALONE on its line). Both run to the next blank line.
 RAW_BLOCK = re.compile(
-    r'^ {0,3}</?[A-Za-z][A-Za-z0-9-]*(?:\s[^\n]*|/?>[^\n]*)?$'
+    r'^ {0,3}(?:</?(?:' + BLOCK_TAGS + r')(?:[\s/>][^\n]*)?'
+    r'|</?[A-Za-z][A-Za-z0-9-]*(?:\s[^\n]*?)?/?>[ \t]*)$'
     r'(?:\n(?![ \t]*$)[^\n]*)*',
-    re.M)
+    re.M | re.I)
 # A raw anchor IS navigation, so its destination is resolved like any other —
 # through `add_relative`, which means `<a href="mail.md">` and
 # `<a href="../guide/mail.md">` work, not just the repo-root spelling the
@@ -491,9 +511,25 @@ def sub_in_prose(pat, txt):
     deleted a visible path; this helper exists so the scoping is one call
     rather than something to remember.
     """
-    return ''.join(
-        pat.sub(lambda m: ' ' * len(m.group(0)), seg) if kind == 'prose' else seg
-        for kind, seg in split_fences(txt))
+    out = []
+    for kind, seg in split_fences(txt):
+        if kind != 'prose':
+            out.append(seg)
+            continue
+        # Code SPANS are visible too, and this helper originally missed them —
+        # blanking link destinations erased an image sample written in
+        # backticks. "Rendered" means outside fences AND outside code spans.
+        protected = [(m.start(), m.end()) for m in CODE_SPAN.finditer(seg)]
+        pieces, last = [], 0
+        for m in pat.finditer(seg):
+            if any(a <= m.start() < b for a, b in protected):
+                continue
+            pieces.append(seg[last:m.start()])
+            pieces.append(' ' * (m.end() - m.start()))
+            last = m.end()
+        pieces.append(seg[last:])
+        out.append(''.join(pieces))
+    return ''.join(out)
 
 
 def mask_invisible(txt):
@@ -614,7 +650,13 @@ def edges_from(f):
     # carry an optional title — `[old]: https://example.com "docs/guide/x.md"` —
     # and a title left behind is scanned as a bare path even though the whole
     # unused definition renders nothing.
-    scan = sub_in_prose(REF_DEF_FULL, txt)
+    # A rendered link's DESTINATION is not on screen — the reader sees the
+    # label. So `[search](https://example.test/?q=docs/guide/mail.md)` must not
+    # feed the bare-path scan a path out of its query string; that destination
+    # is `MD_LINK`'s to resolve, and it resolves to an external URL. Prose only:
+    # the same text in a fence shows the path and still counts.
+    scan = sub_in_prose(LINK_DEST, txt)
+    scan = sub_in_prose(REF_DEF_FULL, scan)
     for m in BARE.finditer(scan):
         t = normalize(m.group(1))
         if t in traversable:
@@ -1450,6 +1492,32 @@ self_test() {
     > "$c9ce/docs/guide/jobs.md"
   git -C "$c9ce" add -A && git -C "$c9ce" commit -qm label-in-refdef-title
   check "a label inside a definition title is not a use" fail "$c9ce"
+
+  # An external link's query string is not a visible path.
+  local c9cf="$tmp/c9cf"; make_corpus "$c9cf"
+  printf '# Jobs\n\nSee [search](https://example.test/?q=docs/guide/mail.md).\n' \
+    > "$c9cf/docs/guide/jobs.md"
+  git -C "$c9cf" add -A && git -C "$c9cf" commit -qm external-query-path
+  check "a path inside an external link URL is not an edge" fail "$c9cf"
+
+  # ...but the same text in a fence shows the path.
+  local c9cg="$tmp/c9cg"; make_corpus "$c9cg"
+  printf '# Jobs\n\n```\n[search](https://example.test/?q=docs/guide/mail.md)\n```\n' \
+    > "$c9cg/docs/guide/jobs.md"
+  git -C "$c9cg" add -A && git -C "$c9cg" commit -qm external-query-in-fence
+  check "the same URL shown in a fence keeps its visible path" pass "$c9cg"
+
+  # A destination may wrap one newline but never a blank line.
+  local c9ch="$tmp/c9ch"; make_corpus "$c9ch"
+  printf '# Jobs\n\nSee [mail](mail.md\n\n).\n' > "$c9ch/docs/guide/jobs.md"
+  git -C "$c9ch" add -A && git -C "$c9ch" commit -qm dest-across-blank-line
+  check "a destination split by a blank line is not a link" fail "$c9ch"
+
+  # An inline tag does not open a raw block, so the next line stays Markdown.
+  local c9ci="$tmp/c9ci"; make_corpus "$c9ci"
+  printf '# Jobs\n\n<span>text\n[mail](mail.md)\n' > "$c9ci/docs/guide/jobs.md"
+  git -C "$c9ci" add -A && git -C "$c9ci" commit -qm inline-tag-not-block
+  check "an inline tag with trailing text opens no raw block" pass "$c9ci"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
