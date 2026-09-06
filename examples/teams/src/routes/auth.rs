@@ -33,6 +33,19 @@ use super::layout::{csrf_value, layout};
 // login handler takes the same wall time whether or not the account exists.
 const DUMMY_HASH: &str = "$2b$12$Ro0CUfOqk6cXEKf3dyaM7OhSCvnwM9s1Aw6lfLP2.GvpAfNXwi.2K";
 
+/// The one length this app enforces on a post-login `next` redirect, applied
+/// identically wherever `next` enters the system (the `?next=` query string
+/// on `GET /login` and the hidden form field on a failed `POST /login`) so
+/// there is a single stated contract rather than an unstated one on the GET
+/// side (implicitly bounded only by the HTTP layer's own URL/header limits)
+/// and an explicit, different one on the POST side (Codex finding on this
+/// PR). No route this app generates ever produces a `next` within three
+/// orders of magnitude of this — `safe_next` only ever sees its own short,
+/// query-string-free paths (e.g. `/members`) — so this is headroom for a
+/// same-origin path with a real query string, not a limit anyone
+/// legitimate is expected to approach.
+const MAX_NEXT_LEN: usize = 2048;
+
 /// `email` re-fills the address the user already typed so a rejected
 /// password doesn't also cost them re-typing an unrelated field. `messages`
 /// renders as a list rather than a single blob of text: joined into one
@@ -273,7 +286,12 @@ pub async fn login_form(
     Query(query): Query<crate::models::NextQuery>,
     csrf: Option<CsrfToken>,
 ) -> Markup {
-    let next = query.next.unwrap_or_default();
+    let next: String = query
+        .next
+        .unwrap_or_default()
+        .chars()
+        .take(MAX_NEXT_LEN)
+        .collect();
     login_page("", &next, csrf_value(&csrf), None)
 }
 
@@ -286,28 +304,20 @@ pub async fn login(
     Form(form): Form<LoginForm>,
 ) -> AutumnResult<Response> {
     let email = form.email.trim().to_lowercase();
-    // Bounded before use in any re-render below: unlike `email` (whose only
-    // unbounded reach is the guard branch immediately below — every other
-    // branch here runs after that length check), `next` is never otherwise
-    // validated for length, so an attacker could otherwise post a `next`
-    // field sized against the request-body limit (32MiB default) and have it
-    // echoed back into every failed-login re-render (Codex finding on this
-    // PR, originally raised against the analogous email echo). 2048, not
-    // email's 254: `safe_next` imposes no length contract of its own, so a
-    // tighter bound would silently truncate (and thereby corrupt) a longer
-    // but legitimate same-origin destination — e.g. a path with a real query
-    // string — on the very first failed attempt, redirecting a since-
-    // corrected retry to the wrong place instead of the one the user actually
-    // asked for (Codex finding on this fix). 2048 is far beyond anything this
-    // app's own routes ever produce, while still cutting an attacker's
-    // payload off by three orders of magnitude short of the request-body
-    // limit.
+    // Bounded to the same `MAX_NEXT_LEN` the GET handler above applies, so
+    // there is one stated contract for `next` rather than an implicit one on
+    // GET (bounded only by the HTTP layer's own URL/header limits) and a
+    // different explicit one here (Codex finding on this PR, then a
+    // follow-up finding that a tighter, unshared bound could still diverge
+    // from it). Unbounded, an attacker could otherwise post a `next` field
+    // sized against the request-body limit (32MiB default) and have it
+    // echoed back into every failed-login re-render.
     let next: String = form
         .next
         .as_deref()
         .unwrap_or_default()
         .chars()
-        .take(2048)
+        .take(MAX_NEXT_LEN)
         .collect();
     if email.len() > 254 || form.password.len() > 128 {
         // Same bound as the equivalent signup guard: this branch is the only
