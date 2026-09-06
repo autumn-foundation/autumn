@@ -1255,16 +1255,20 @@ Two things to get right when generating this code:
   process died first, and a sweeper can only duplicate or drop. Implementing the
   trait does not fix it either — `OutboundWebhookHandler` is storage-only and the
   enqueue happens after it returns, so no impl can make the two atomic. If an app
-  needs a stronger guarantee, put the outbox *outside* this subsystem: its own
-  row written in the same transaction as the triggering business data, with a
-  worker calling `dispatch()` and marking the row processed only on `Ok`. Note
-  that a delivery carries only `Content-Type` and `Autumn-Signature` — no event
-  or delivery ID, and the signature's `t=` changes per attempt — so if the
-  receiver must deduplicate, put a stable ID in the payload yourself and reuse
-  it on every retry. Make receivers idempotent regardless — but do not call the
-  result at-least-once: retries can duplicate an event only once the job is
-  enqueued, and before that the loss window above still applies. Idempotency
-  buys protection from duplicates, not from loss.
+  needs a stronger guarantee, do NOT invent an exactly-once design here — the
+  answer depends on the job backend, the handler, and how the app sequences its
+  own transaction against `dispatch()`. Tell the user the constraints and let
+  them decide:
+    - `Ok` from `dispatch()` is not durability. The default
+      `jobs.backend = "local"` queue is in-process and non-durable, so a crash
+      loses it; durable delivery needs `postgres`/`redis` jobs AND a durable
+      `OutboundWebhookHandler`.
+    - No event or delivery ID is transmitted — only `Content-Type` and
+      `Autumn-Signature`, whose `t=` changes per attempt. Receiver-side
+      deduplication needs an ID the app mints into the payload itself.
+    - Retries duplicate only after the job is enqueued, so `dispatch()` is
+      neither at-least-once nor at-most-once. Idempotency buys protection from
+      duplicates, not from loss.
   An enqueue that fails is the one handled case —
   marked `is_dlq` and replayable — but only on the default enqueue path. With a
   `WebhookDelegateExt` installed, `dispatch()` calls the delegate instead of

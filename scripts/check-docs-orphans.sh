@@ -455,7 +455,20 @@ ANCHOR_TAG = re.compile(r'<a(?:\s[^>]*)?>', re.I)
 # A whole raw tag, used to bound where `src=` may be masked. Unscoped, that
 # pattern also eats the query of `[Mail](mail.md?src=guide)`, which is an
 # ordinary Markdown link the sibling gate resolves.
-HTML_TAG = re.compile(r'<[A-Za-z][A-Za-z0-9-]*(?:\s[^>]*)?/?>')
+# Attribute values are consumed as units so a quoted `>` does not end the tag:
+# `<span title="1 > 0" data-note="…">` is one tag, and stopping at the quoted
+# character would leave the later attributes outside the masking bounds.
+HTML_TAG = re.compile(
+    r'<[A-Za-z][A-Za-z0-9-]*'
+    r'(?:\s+[A-Za-z_:][-\w:.]*(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+))?)*'
+    r'\s*/?>')
+# A raw HTML BLOCK of any tag — CommonMark type 6. Its contents are raw HTML,
+# so `[mail]` inside `<div>…</div>` stays literal and resolves no reference.
+# Unlike `HIDDEN_HTML` the text is still VISIBLE, so this bounds Markdown
+# extraction only; bare paths inside it still count.
+RAW_BLOCK = re.compile(
+    r'^ {0,3}<([A-Za-z][A-Za-z0-9-]*)(?:\s[^\n]*)?>\s*$.*?^ {0,3}</\1\s*>\s*$',
+    re.S | re.M)
 # A raw anchor IS navigation, so its destination is resolved like any other —
 # through `add_relative`, which means `<a href="mail.md">` and
 # `<a href="../guide/mail.md">` work, not just the repo-root spelling the
@@ -596,11 +609,18 @@ def edges_from(f):
         if t in traversable:
             out.add(t)
 
+    # Markdown extraction runs over a view with raw HTML BLOCKS removed: inside
+    # `<div>…</div>` a `[mail](x.md)` stays literal, so it is not navigation.
+    # The bare-path scan above deliberately still sees that region, because the
+    # path itself is visible text there — the same visible/invisible split that
+    # governs fences.
+    md_txt = sub_in_prose(RAW_BLOCK, txt)
+
     for pattern in (MD_LINK, MD_LINK_NESTED):
-        for m in pattern.finditer(txt):
+        for m in pattern.finditer(md_txt):
             add_relative(m.group(1) if m.group(1) is not None else m.group(2))
 
-    for m in ANCHOR_HREF.finditer(txt):
+    for m in ANCHOR_HREF.finditer(md_txt):
         add_relative(next(g for g in m.groups() if g is not None))
 
     # A reference USE inside code — `` `[mail][]` `` — is the one code case that
@@ -609,7 +629,8 @@ def edges_from(f):
     # because the PATH is on screen; a reference use in a fence shows only the
     # label, while the path lives in a definition that renders as nothing at
     # all. Nothing a reader can see names the target, so it is not an edge.
-    ref_txt = ''.join(seg for kind, seg in split_fences(txt) if kind == 'prose')
+    ref_txt = ''.join(
+        seg for kind, seg in split_fences(md_txt) if kind == 'prose')
     ref_txt = CODE_SPAN.sub(' ', ref_txt)
 
     used = set()
@@ -1355,6 +1376,30 @@ self_test() {
     > "$c9bw/README.md"
   git -C "$c9bw" add -A && git -C "$c9bw" commit -qm link-element-href
   check "an href on a non-anchor element is not an edge" fail "$c9bw"
+
+  # A quoted `>` does not end a tag, so later attributes stay inside the mask.
+  local c9bx="$tmp/c9bx"; make_corpus "$c9bx"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n<span title="1 > 0" data-note="docs/guide/mail.md">x</span>\n' \
+    > "$c9bx/README.md"
+  git -C "$c9bx" add -A && git -C "$c9bx" commit -qm quoted-gt-in-tag
+  check "a quoted > does not end the attribute mask" fail "$c9bx"
+
+  # Inside a raw HTML block, Markdown stays literal.
+  local c9by="$tmp/c9by"; make_corpus "$c9by"
+  printf '# Jobs\n\n<div>\n[mail]\n</div>\n\n[mail]: mail.md\n' > "$c9by/docs/guide/jobs.md"
+  git -C "$c9by" add -A && git -C "$c9by" commit -qm raw-block-reference
+  check "a reference inside a raw HTML block is not a use" fail "$c9by"
+
+  local c9bz="$tmp/c9bz"; make_corpus "$c9bz"
+  printf '# Jobs\n\n<div>\n[mail](mail.md)\n</div>\n' > "$c9bz/docs/guide/jobs.md"
+  git -C "$c9bz" add -A && git -C "$c9bz" commit -qm raw-block-link
+  check "a markdown link inside a raw HTML block is not an edge" fail "$c9bz"
+
+  # ...but a visible bare path inside one still counts.
+  local c9ca="$tmp/c9ca"; make_corpus "$c9ca"
+  printf '# Jobs\n\n<div>\nSee docs/guide/mail.md\n</div>\n' > "$c9ca/docs/guide/jobs.md"
+  git -C "$c9ca" add -A && git -C "$c9ca" commit -qm raw-block-bare-path
+  check "a bare path inside a raw HTML block still counts" pass "$c9ca"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
