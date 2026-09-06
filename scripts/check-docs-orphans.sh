@@ -427,8 +427,12 @@ def strip_comments(txt):
 # resource attributes whose value never appears on screen. `<a href>` is
 # deliberately absent: a raw anchor IS navigation and must keep conferring
 # reachability.
+# The unclosed alternative matters for the same reason it does for comments: an
+# opener with no matching close makes the rest of the file raw HTML, so
+# Markdown-shaped text after it renders as nothing.
 HIDDEN_HTML = re.compile(
-    r'<(script|style|template)\b[^>]*>.*?</\1\s*>', re.S | re.I)
+    r'<(script|style|template)\b[^>]*>.*?</\1\s*>'
+    r'|<(?:script|style|template)\b[^>]*>.*', re.S | re.I)
 SRC_ATTR = re.compile(r'\bsrc\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)', re.I)
 # A whole raw tag, used to bound where `src=` may be masked. Unscoped, that
 # pattern also eats the query of `[Mail](mail.md?src=guide)`, which is an
@@ -495,20 +499,26 @@ def mask_invisible(txt):
 
 def edges_from(f):
     """Guide pages this file gives a reader a way to reach."""
-    txt = strip_comments(read(f))
-    # An escaped backslash consumes the next one, so `\\\\[x](y.md)` renders a
-    # literal backslash and a LIVE link, while `\\[x](y.md)` renders literal
-    # text. A fixed-width lookbehind cannot count the run to tell them apart, so
-    # pairs are folded to a placeholder first — same trick as the sibling gate,
-    # but with a same-LENGTH placeholder here because reference-definition spans
-    # are blanked by offset further down and the positions must stay valid.
-    txt = txt.replace('\\\\', '\x00\x00')
-    # `\![Mail](mail.md)` renders a literal `!` and a CLICKABLE link — the
-    # backslash stops the `!` opening an image. The image guard is a fixed-width
-    # lookbehind and cannot see that the `!` is itself escaped, so an escaped
-    # marker is folded away here too and the bracket is then read as the link it
-    # is. Same length, same reason as the pair fold above.
-    txt = txt.replace('\\!', '\x01\x01')
+    # THE ORDER OF THESE THREE STEPS IS LOAD-BEARING, and each was set by a
+    # test that failed when it was wrong.
+    #
+    # 1. Escapes fold FIRST. An escaped backslash consumes the next one, so
+    #    `\\\\[x](y.md)` renders a literal backslash and a LIVE link while
+    #    `\\[x](y.md)` renders literal text; and `\![x](y.md)` is a link, not an
+    #    image, because the backslash stops the `!`. Fixed-width lookbehinds
+    #    cannot count a run or see past the `!`, so both are folded to
+    #    same-LENGTH placeholders — same length because spans are blanked by
+    #    offset further down and the positions must stay valid. This has to
+    #    precede masking, or `mask_invisible` reads `\![x](y.md)` as an image
+    #    and blanks a live link.
+    txt = read(f).replace('\\\\', '\x00\x00').replace('\\!', '\x01\x01')
+    # 2. Raw HTML is identified BEFORE comments. A `<!--` inside a closed
+    #    `<script>` is script data, not a Markdown comment, and parsing comments
+    #    first truncated the document at it. This order also settles the
+    #    unclosed-opener case: the block is masked, so nothing inside it can
+    #    open a comment either.
+    # 3. Comments last, over what survives.
+    txt = strip_comments(mask_invisible(txt))
     out = set()
     base = posixpath.dirname(f)
 
@@ -539,13 +549,6 @@ def edges_from(f):
     # below, so blank their spans first: a bare scan over `[old]: docs/guide/x.md`
     # would re-admit an unused definition that renders as nothing, which is the
     # hole the usage check exists to close.
-    # ONE masked view, used by every navigation extractor below. Masking a
-    # single scanner and leaving its siblings on the raw text is a mistake this
-    # gate has made three times — reference definitions bypassing the usage
-    # check, and hidden HTML bypassing the link scan — so the masking happens
-    # once, here, and nothing downstream reads `txt` for navigation again.
-    txt = mask_invisible(txt)
-
     scan = REF_DEF.sub(lambda m: ' ' * len(m.group(0)), txt)
     for m in BARE.finditer(scan):
         t = normalize(m.group(1))
@@ -1273,6 +1276,21 @@ self_test() {
   printf '# Jobs\n\nSee [mail](mail.md?src=guide).\n' > "$c9bp/docs/guide/jobs.md"
   git -C "$c9bp" add -A && git -C "$c9bp" commit -qm src-query-param
   check "a src query parameter does not break the link" pass "$c9bp"
+
+  # A comment-shaped string inside a closed script is script data, not a
+  # Markdown comment, so links after the script stay live.
+  local c9bq="$tmp/c9bq"; make_corpus "$c9bq"
+  printf '# Jobs\n\n<script>const m = "<!--";</script>\n\nSee [mail](mail.md).\n' \
+    > "$c9bq/docs/guide/jobs.md"
+  git -C "$c9bq" add -A && git -C "$c9bq" commit -qm comment-marker-in-script
+  check "a comment marker inside a script does not truncate the page" pass "$c9bq"
+
+  # An unclosed raw-HTML opener makes the rest of the file raw HTML.
+  local c9br="$tmp/c9br"; make_corpus "$c9br"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n<script>\nconst x = "[mail](docs/guide/mail.md)";\n' \
+    > "$c9br/README.md"
+  git -C "$c9br" add -A && git -C "$c9br" commit -qm unclosed-script
+  check "an unclosed script block hides the links after it" fail "$c9br"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
