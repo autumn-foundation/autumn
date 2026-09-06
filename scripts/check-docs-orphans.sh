@@ -506,6 +506,28 @@ FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})(.*)$', re.M)
 CODE_SPAN = re.compile(r'(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)', re.S)
 
 
+# THE TAG VOCABULARY. Everything that walks an HTML tag reads from here, and
+# it sits above every user for a plain reason: twice now a pattern has been
+# added above the fragment it depends on, and Python raised a NameError that
+# failed a hundred tests at once. One block, before anything needs it.
+# Whitespace INSIDE a tag may wrap a line but never cross a blank one: the
+# blank ends the paragraph, so `<a` / blank / ` href="b.md">` is not an anchor
+# at all. `\s+` spanned it and recorded the destination of a tag that never
+# renders — malformed prose concealing a real orphan. Same bound the
+# destination, the title and the label already carry, applied to the fourth
+# place a blank line could get through.
+_TWS = r'(?:[ \t]|\n(?![ \t]*\n))'
+# ...and so does the inside of a quoted value. Bounding only the whitespace
+# BETWEEN attributes left the other half open: `<a title="hello` / blank /
+# `world" href="mail.md">` is two paragraphs and no anchor, and its href was
+# still being recorded. Same rule, the other side of the quote.
+_Q = r'"(?:[^"\n]|\n(?![ \t]*\n))*"'
+_Q1 = r"'(?:[^'\n]|\n(?![ \t]*\n))*'"
+ATTR_ASSIGNED = (r'[A-Za-z_:][-\w:.]*' + _TWS + r'*=' + _TWS +
+                 r'*(?:' + _Q + r'|' + _Q1 + r'|[^\s"\'=<>`]+)')
+ATTR = (r'[A-Za-z_:][-\w:.]*(?:' + _TWS + r'*=' + _TWS +
+        r'*(?:' + _Q + r'|' + _Q1 + r'|[^\s"\'=<>`]+))?')
+
 # The CommonMark type-1 tags. Declared here rather than beside the block
 # pattern that used to own them, because the line scan below needs them
 # first — one vocabulary, read in the order the file is executed.
@@ -761,10 +783,16 @@ TAG_NAME_END = r'(?=[\s>]|$)'
 # nothing else: `prose <script` mid-line is an incomplete tag, which is
 # ordinary visible text, and reading it as an opener masked through EOF.
 # Mid-line it takes a complete tag to be raw HTML at all.
+# The mid-line form is a complete, WELL-FORMED tag, attribute grammar and
+# all: `prose <script a==>` is malformed, so the renderer escapes it and the
+# browser never sees a script — the links below it stay live, and `[^>]*>`
+# masked them away. A well-formed one still masks, because the browser DOES
+# see that tag and swallows what follows it.
 FIRST_OPENER = re.compile(
     r'(<!--)'
     r'|(?:^ {0,3}(<(' + HIDDEN_TAGS + r')' + TAG_NAME_END + r'))'
-    r'|(<(' + HIDDEN_TAGS + r')' + TAG_NAME_END + r'[^>]*>)',
+    r'|(<(' + HIDDEN_TAGS + r')(?:' + _TWS + r'+' + ATTR + r')*'
+    + _TWS + r'*/?>)',
     re.I | re.M)
 # `<pre>` and `<textarea>` are CommonMark type-1 raw blocks alongside script and
 # style, so Markdown inside them is literal — but unlike script and style their
@@ -797,23 +825,6 @@ PRE_BLOCK = re.compile(
 # The distinction is why this belongs to type 7 and not to `RAW_BLOCK`.)
 # Every place that walks a tag shares this, since the four that had their own
 # copy of `[^\s>]+` are exactly the four this file has had to fix in lockstep.
-# Whitespace INSIDE a tag may wrap a line but never cross a blank one: the
-# blank ends the paragraph, so `<a` / blank / ` href="b.md">` is not an anchor
-# at all. `\s+` spanned it and recorded the destination of a tag that never
-# renders — malformed prose concealing a real orphan. Same bound the
-# destination, the title and the label already carry, applied to the fourth
-# place a blank line could get through.
-_TWS = r'(?:[ \t]|\n(?![ \t]*\n))'
-# ...and so does the inside of a quoted value. Bounding only the whitespace
-# BETWEEN attributes left the other half open: `<a title="hello` / blank /
-# `world" href="mail.md">` is two paragraphs and no anchor, and its href was
-# still being recorded. Same rule, the other side of the quote.
-_Q = r'"(?:[^"\n]|\n(?![ \t]*\n))*"'
-_Q1 = r"'(?:[^'\n]|\n(?![ \t]*\n))*'"
-ATTR_ASSIGNED = (r'[A-Za-z_:][-\w:.]*' + _TWS + r'*=' + _TWS +
-                 r'*(?:' + _Q + r'|' + _Q1 + r'|[^\s"\'=<>`]+)')
-ATTR = (r'[A-Za-z_:][-\w:.]*(?:' + _TWS + r'*=' + _TWS +
-        r'*(?:' + _Q + r'|' + _Q1 + r'|[^\s"\'=<>`]+))?')
 # Every attribute value EXCEPT `href`. An attribute is not rendered text, so a
 # path, a reference label or a comment marker parked in one — `<span
 # data-note="[mail](mail.md)">` — is invisible and confers nothing. `href` is
@@ -1276,6 +1287,18 @@ def hidden_spans(seg, protected):
             pos = m.start() + 1
             continue
         if m.group(1):
+            # ...but only where a comment can actually OPEN. Line-initial it is
+            # a type-2 block whatever it contains; mid-line it must be a
+            # well-formed inline comment. `prose <!--> <style>…</style> -->`
+            # skipped to the trailing `-->` and never saw the `<style>`, whose
+            # contents the browser does not render — so a path inside it
+            # counted as visible and let an orphan pass.
+            bol = seg.rfind('\n', 0, m.start()) + 1
+            line_initial = (seg[bol:m.start()].strip() == ''
+                            and m.start() - bol <= 3)
+            if not line_initial and not HTML_COMMENT_INLINE.match(seg, m.start()):
+                pos = m.start() + 1
+                continue
             end = seg.find('-->', m.end())
             if end == -1:
                 return spans
@@ -3440,6 +3463,29 @@ self_test() {
     > "$c9hg/docs/guide/jobs.md"
   git -C "$c9hg" add -A && git -C "$c9hg" commit -qm anchor-comment-only
   check "an anchor holding only a comment is not an edge" fail "$c9hg"
+
+  # `<!-->` is no comment, so the `<style>` after it is real and its contents
+  # are not on screen.
+  local c9hh="$tmp/c9hh"; make_corpus "$c9hh"
+  printf '# Jobs\n\nprose <!--> <style> docs/guide/mail.md </style> -->\n' \
+    > "$c9hh/docs/guide/jobs.md"
+  git -C "$c9hh" add -A && git -C "$c9hh" commit -qm bad-comment-shields-style
+  check "an invalid comment does not shield hidden HTML" fail "$c9hh"
+
+  # A malformed mid-line opener is escaped text, not a tag, so it hides nothing.
+  local c9hi="$tmp/c9hi"; make_corpus "$c9hi"
+  printf '# Jobs\n\nprose <script a==>\n\nSee [mail](mail.md).\n' \
+    > "$c9hi/docs/guide/jobs.md"
+  git -C "$c9hi" add -A && git -C "$c9hi" commit -qm midline-bad-attr
+  check "a malformed mid-line opener hides nothing" pass "$c9hi"
+
+  # ...while a well-formed one still does: the browser sees that tag and
+  # swallows everything after it.
+  local c9hj="$tmp/c9hj"; make_corpus "$c9hj"
+  printf '# Jobs\n\nprose <script a=b>\n\nSee [mail](mail.md).\n' \
+    > "$c9hj/docs/guide/jobs.md"
+  git -C "$c9hj" add -A && git -C "$c9hj" commit -qm midline-ok-attr
+  check "a well-formed mid-line opener still hides what follows" fail "$c9hj"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
