@@ -102,8 +102,7 @@ pub type RuntimeBackend = diesel::pg::Pg;
 #[cfg(feature = "sqlite")]
 pub type RuntimeBackend = diesel::sqlite::Sqlite;
 
-/// Local diesel sql-types backing the `SQLite` conversions for foreign
-/// model-field types (`uuid::Uuid`, `rust_decimal::Decimal`) — issue #1924.
+/// `TEXT`-backed newtypes for foreign model-field types on `SQLite` (#1924).
 #[cfg(feature = "sqlite")]
 pub mod sqlite_types;
 

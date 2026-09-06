@@ -529,10 +529,17 @@ which `REAL` would not.
 
 **Precision and scale are enforced by a `CHECK`.** The column is `TEXT`, so the
 migration carries a generated `CHECK` that holds the declared budget — at most
-`scale` fractional digits and `precision - scale` integer digits. Postgres
-*rounds* a value to `scale`; SQLite has no way to, so it rejects instead. Round
-before saving (`Decimal::round_dp`) if your input can carry more digits than the
-column declares.
+`scale` fractional digits and `precision - scale` integer digits — and that the
+value is a plain decimal literal at all, so a hand-written row cannot satisfy the
+constraint and then fail to load. Postgres *rounds* a value to `scale`; SQLite
+has no way to, so it rejects instead. Round before saving
+(`Decimal::round_dp`) if your input can carry more digits than the column
+declares.
+
+A `--default` on a decimal column is written as a quoted, normalized text
+literal for the same reason the runtime normalizes: the default and every later
+write must be the same text, or a row holding its own default would not match a
+lookup for that value.
 
 **Scale is not padded.** Postgres `NUMERIC(10,2)` reads `19.9` back as `19.90`;
 SQLite reads it back as `19.9`. The two are numerically equal — format for

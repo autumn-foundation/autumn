@@ -2655,20 +2655,36 @@ fn sql_default_literal(
                 );
             }
             validate_decimal_default_fits(value, precision, scale)?;
-            // Emitted as the original string, not `parsed.to_string()` —
-            // `autumn-cli` doesn't depend on `rust_decimal` itself, and an
-            // unquoted numeric literal is valid Postgres `NUMERIC` SQL
-            // whether or not it round-trips exactly through `f64` (this arm
-            // only used `f64` to reject non-numeric garbage above).
-            //
-            // On SQLite the same column is `TEXT`, and SQLite evaluates an
-            // unquoted `DEFAULT 0.10` numerically before applying TEXT
-            // affinity — storing `0.1`, or scientific notation for a wide
-            // value, which `Decimal::from_str` then cannot read back. Quoting
-            // makes it a text literal, stored verbatim (issue #1924).
             match backend {
+                // Emitted as the original string, not `parsed.to_string()` —
+                // an unquoted numeric literal is valid Postgres `NUMERIC` SQL
+                // whether or not it round-trips exactly through `f64` (this arm
+                // only used `f64` to reject non-numeric garbage above).
                 DatabaseBackend::Postgres => Ok(value.to_owned()),
-                DatabaseBackend::Sqlite => Ok(format!("'{value}'")),
+                // On SQLite the column is `TEXT`, so the default has to be a
+                // text literal: unquoted, SQLite evaluates `DEFAULT 0.10`
+                // numerically before applying TEXT affinity and stores `0.1`,
+                // or scientific notation for a wide value, which
+                // `Decimal::from_str` cannot read back at all.
+                //
+                // It also has to be the SAME text `SqliteDecimal` would write,
+                // which is normalized (`db::sqlite_types`). A default of
+                // `0.10` stored verbatim would never equal the `0.1` every
+                // later write produces — a `find_by_…` could not match a row
+                // holding its own default, and a unique index would admit
+                // both. Normalizing through the real `Decimal` rather than by
+                // hand is what guarantees the two agree (issue #1924).
+                DatabaseBackend::Sqlite => {
+                    use autumn_web::reexports::rust_decimal::Decimal;
+                    let decimal = value.parse::<Decimal>().map_err(|err| {
+                        format!(
+                            "decimal default '{value}' is not representable as a \
+                             rust_decimal::Decimal, the Rust type a SQLite decimal \
+                             column round-trips through: {err}"
+                        )
+                    })?;
+                    Ok(format!("'{}'", decimal.normalize()))
+                }
             }
         }
         FieldKind::Json => {
@@ -4530,7 +4546,8 @@ mod tests {
         });
     }
 
-    /// A `decimal` default must reach `SQLite` as a QUOTED text literal. Unquoted,
+    /// A `decimal` default must reach `SQLite` as a quoted, NORMALIZED text
+    /// literal. Unquoted,
     /// `SQLite` evaluates `DEFAULT 0.10` numerically and TEXT affinity stores
     /// `0.1`; a wide value becomes scientific notation, which `Decimal::from_str`
     /// cannot read back at all (Codex #2561, #1924).
@@ -4547,16 +4564,20 @@ mod tests {
             .map(|_| ())
             .expect("plan without default");
 
-            let mut options = ModelOptions::default();
-            options.defaults = vec!["price=0.10".to_owned()];
+            let options = ModelOptions {
+                defaults: vec!["price=0.10".to_owned()],
+                ..Default::default()
+            };
             let fields = parse_fields(&["price:decimal{10,2}".into()]).unwrap();
 
             let sqlite = parse_model_metadata_for(DatabaseBackend::Sqlite, &fields, &options)
                 .expect("sqlite metadata");
             assert_eq!(
                 sqlite.defaults().get("price").map(String::as_str),
-                Some("'0.10'"),
-                "SQLite decimal defaults must be quoted"
+                Some("'0.1'"),
+                "a SQLite decimal default must be quoted AND normalized — the same \
+                 text `SqliteDecimal` writes, or a row holding its own default \
+                 would not match a `find_by_…` for that value"
             );
 
             let postgres = parse_model_metadata_for(DatabaseBackend::Postgres, &fields, &options)

@@ -55,10 +55,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `123456.789` into a `decimal{5,2}`. Postgres keeps its native `NUMERIC(p,s)`
   and gains no `CHECK`. Note that Postgres *rounds* a value to `scale` where
   SQLite rejects it — round before saving if your input can be wider.
-- **sqlite:** a `decimal` `--default` is now written as a quoted text literal
-  (#1924). Unquoted, SQLite evaluated `DEFAULT 0.10` numerically and TEXT
-  affinity stored `0.1`; a wide default became scientific notation that could
-  not be read back at all.
+- **sqlite:** a `decimal` `--default` is now written as a quoted, normalized
+  text literal (#1924). Unquoted, SQLite evaluated `DEFAULT 0.10` numerically
+  and TEXT affinity stored `0.1`; a wide default became scientific notation that
+  could not be read back at all. It is normalized through the real `Decimal` so
+  it is byte-identical to what `SqliteDecimal` writes — otherwise a row holding
+  its own default would not match a `find_by_…` for that value, and a unique
+  index would admit both spellings.
 
 ### Fixed
 

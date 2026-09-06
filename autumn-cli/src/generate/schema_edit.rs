@@ -1002,14 +1002,23 @@ fn sqlite_decimal_check(column: &str, precision: u32, scale: u32) -> String {
     let int_part = format!(
         "CASE WHEN instr({abs},'.') = 0 THEN {abs} ELSE substr({abs}, 1, instr({abs},'.') - 1) END"
     );
+    // The digits alone — sign and point removed. Condition 1 proves it is all
+    // digits, so its length is the digit count.
+    let digits = format!("replace(replace({column},'-',''),'.','')");
     let conditions = [
-        // 1-3: a plain decimal literal — digits, at most one point, leading sign.
-        format!("ltrim(replace({abs},'.',''), '0123456789') = ''"),
+        // 1-5: a plain decimal literal. Without the digit count and the sign
+        // count, `''`, `'-'`, `'.'`, `'--1'` and `'-1-'` all pass — values a
+        // raw INSERT, an import or a hand-written migration can produce, which
+        // would satisfy the constraint and then fail `SqliteDecimal::from_sql`,
+        // leaving a row that cannot be loaded.
+        format!("ltrim({digits}, '0123456789') = ''"),
+        format!("length({digits}) >= 1"),
         format!("length({column}) - length(replace({column},'.','')) <= 1"),
+        format!("length({column}) - length(replace({column},'-','')) <= 1"),
         format!("(instr({column},'-') = 0 OR instr({column},'-') = 1)"),
-        // 4: scale.
+        // 6: scale.
         format!("{frac_len} <= {scale}"),
-        // 5: precision, as the integer-digit budget NUMERIC(p, s) allows.
+        // 7: precision, as the integer-digit budget NUMERIC(p, s) allows.
         format!(
             "length(ltrim({int_part}, '0')) <= {}",
             precision.saturating_sub(scale)
@@ -7836,6 +7845,58 @@ fn main() {
     }
 
     // ── ensure_autumn_web_feature ─────────────────────────────────────────
+
+    /// The `SQLite` decimal `CHECK` is SQL, so it is tested by running it —
+    /// against a real in-memory `SQLite`, not by matching the string (issue
+    /// #1924). Covers the digit budgets it exists for, and the malformed text
+    /// that an earlier version admitted: a value that satisfies the constraint
+    /// but fails `SqliteDecimal::from_sql` is a row nothing can load.
+    #[test]
+    fn sqlite_decimal_check_enforces_precision_scale_and_shape() {
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        let mut conn = diesel::SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        // `decimal{10,2}`: at most 8 integer digits and 2 fractional.
+        let check = sqlite_decimal_check("price", 10, 2);
+        conn.batch_execute(&format!("CREATE TABLE t (price TEXT NULL {check})"))
+            .expect("the generated CHECK must be valid SQLite SQL");
+
+        let accepts = |conn: &mut diesel::SqliteConnection, value: &str| {
+            diesel::sql_query(format!("INSERT INTO t (price) VALUES ('{value}')"))
+                .execute(conn)
+                .is_ok()
+        };
+
+        for value in ["0", "0.1", "19.99", "-19.99", "12345678.99", "-0.01"] {
+            assert!(accepts(&mut conn, value), "`{value}` is in range");
+        }
+        for value in [
+            // Over budget.
+            "123456789.99",
+            "19.999",
+            "123456.789",
+            // Malformed: no digit, or a stray/duplicated sign.
+            "",
+            "-",
+            ".",
+            "-.",
+            "--1",
+            "-1-",
+            "1.2.3",
+            "abc",
+        ] {
+            assert!(!accepts(&mut conn, value), "`{value}` must be rejected");
+        }
+
+        // NULL is the column's own business, not the CHECK's.
+        assert!(
+            diesel::sql_query("INSERT INTO t (price) VALUES (NULL)")
+                .execute(&mut conn)
+                .is_ok(),
+            "NULL must pass; NOT NULL decides that"
+        );
+    }
 
     #[test]
     fn ensure_feature_status_reports_not_found_when_dep_absent() {
