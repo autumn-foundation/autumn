@@ -7,7 +7,7 @@ mod acme_dns01;
 mod acme_end_to_end;
 #[cfg(feature = "acme")]
 mod acme_fake_ca;
-#[cfg(all(feature = "acme", feature = "test-support"))]
+#[cfg(feature = "acme-pebble")]
 mod acme_pebble;
 mod acting_as_integration;
 mod after_commit_integration;

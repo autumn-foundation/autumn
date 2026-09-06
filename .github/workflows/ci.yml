@@ -549,11 +549,17 @@ jobs:
         # Docker/network) and the general "Run Docker-dependent tests" sweep
         # below (whose feature set excludes `acme`/`tls` — see CLAUDE.md): it
         # needs Docker (`testcontainers`, gated by `test-support`) to run
-        # Pebble itself, plus the `host-port-exposure` tunnel sidecar image,
-        # so it stays out of the default `cargo test --workspace` run and out
-        # of contributors' non-Docker inner loop. Pebble is hermetic (no real
-        # Let's Encrypt rate limits at stake), so this runs on every CI
-        # invocation of this job rather than being hand-triggered.
+        # Pebble itself, plus the `host-port-exposure` tunnel sidecar image.
+        # `host-port-exposure` lives behind its OWN `acme-pebble` feature
+        # (implying `acme` + `test-support`) rather than being turned on for
+        # every `testcontainers` consumer workspace-wide — an ordinary
+        # `cargo test -p autumn-web --features test-support` (or a plain
+        # `--workspace` run) must not pull in the `russh`/crypto dependency
+        # subtree that feature adds (Codex review, #2541). So this step, and
+        # only this step, stays out of the default `cargo test --workspace`
+        # run and out of contributors' non-Docker inner loop. Pebble is
+        # hermetic (no real Let's Encrypt rate limits at stake), so this runs
+        # on every CI invocation of this job rather than being hand-triggered.
         #
         # `test-threads=1`-equivalent by construction: exactly one ignored
         # test in this filter, and it binds Pebble's fixed HTTP-01 port
@@ -565,7 +571,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
           }
-          cargo test -p autumn-web --features "acme,test-support" \
+          cargo test -p autumn-web --features acme-pebble \
             --test integration_tests acme_pebble:: -- --ignored \
             | tee "${RUNNER_TEMP}/acme-pebble.log"
           assert_ran "${RUNNER_TEMP}/acme-pebble.log" "acme_pebble"
