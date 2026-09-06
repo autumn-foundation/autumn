@@ -158,13 +158,18 @@ pub const STATIC_ROUTE_HANDLER_MARKER: &str = "__AUTUMN_STATIC_ROUTE_HANDLER_MAR
 /// unconditional rewrite to `Response` is incompatible with.
 pub const WS_HANDLER_MARKER: &str = "__AUTUMN_WS_HANDLER_MARKER";
 
-/// Whether `func`'s body contains a top-level `const` item statement named
-/// `marker_name` — the general form of the marker-const scan
-/// `idempotency_guard.rs` already uses for `__AUTUMN_THROTTLE_ROUTE_ID`.
+/// Whether `func`'s body contains a `const` item statement named
+/// `marker_name`, at the top level or nested inside a wrapper another
+/// attribute macro that expanded in between generated — an intervening
+/// `#[cached]`, for instance, re-homes the entire original body (marker
+/// included) inside a `(|| async move { … })().await` closure IIFE
+/// (`cached_macro`'s `compute`), one level deeper than a top-level-only scan
+/// would look (Codex review on #2513, eleventh finding). Delegates to
+/// `edge::stmts_have_marker`, the same recursive walk `#[edge]`'s own marker
+/// detection already relies on, so every wrapper shape this crate's macros
+/// generate is handled in exactly one place.
 pub fn has_body_const_marker(func: &ItemFn, marker_name: &str) -> bool {
-    func.block.stmts.iter().any(
-        |stmt| matches!(stmt, syn::Stmt::Item(syn::Item::Const(item)) if item.ident == marker_name),
-    )
+    crate::edge::stmts_have_marker(&func.block.stmts, marker_name)
 }
 
 /// Emit an inert `#[allow(dead_code)] const #marker: () = ();` as the first

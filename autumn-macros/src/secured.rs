@@ -377,6 +377,52 @@ mod tests {
     }
 
     #[test]
+    fn secured_rejects_when_a_marker_is_buried_inside_a_cached_wrapper() {
+        // Simulates real source using `use ::autumn_web::secured as auth;`:
+        //   #[static_get("/private")]
+        //   #[cached]
+        //   #[auth("admin")]
+        //   async fn private() -> &'static str { "private" }
+        // `#[static_get]` injects `STATIC_ROUTE_HANDLER_MARKER` into the top
+        // of the original body, but `#[cached]` — the next attribute to
+        // expand — re-homes that ENTIRE body (marker included) one level
+        // deeper, inside its own `(|| async move { ... })().await` closure
+        // IIFE (`cached_macro`'s `compute`). A marker scan that only looks at
+        // the function's top-level statements would miss it entirely,
+        // reopening the exact cache-bypass hole this whole rejection exists
+        // to close (Codex review on #2513, eleventh finding).
+        let marked = static_get_macro(
+            quote! { "/private" },
+            quote! {
+                #[cached]
+                #[auth("admin")]
+                async fn private() -> &'static str { "private" }
+            },
+        );
+        assert!(
+            !marked.to_string().contains("compile_error"),
+            "static_get_macro cannot recognize #[cached] or the aliased guard by name, so it \
+             must accept at this point: {marked}"
+        );
+
+        let marked_fn = crate::param_helpers::extract_fn_item(marked, "private");
+        let cached = crate::cached::cached_macro(quote! {}, quote! { #marked_fn });
+        assert!(
+            !cached.to_string().contains("compile_error"),
+            "#[cached] knows nothing about route guards and must accept unconditionally: {cached}"
+        );
+
+        let cached_fn = crate::param_helpers::extract_fn_item(cached, "private");
+        let generated = secured_macro(quote! { "admin" }, quote! { #cached_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "secured_macro must still find the #[static_get] marker even after #[cached] buried \
+             it inside a closure IIFE: {generated}"
+        );
+    }
+
+    #[test]
     fn secured_string_literal_replay_guard_still_injects_replay_stop() {
         let generated = secured_macro(
             quote! {},

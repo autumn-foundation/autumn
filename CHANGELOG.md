@@ -1914,6 +1914,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   function directly on the result, proving the rejection fires without
   ever relying on the guard's surface name.
 
+- **macros: the tenth finding's marker could still be missed when another
+  attribute macro sat between `#[static_get]`/`#[ws]` and the aliased
+  guard:** `has_body_const_marker` only scanned a handler's top-level body
+  statements, but `#[cached]` — a real, already-shipped macro in this crate
+  — re-homes a handler's entire original body one level deeper, inside a
+  `(|| async move { … })().await` closure IIFE (`cached_macro`'s
+  `compute`). `#[static_get] #[cached] #[auth("admin")]` (`auth` an alias
+  for `secured`) would leave the marker buried inside that IIFE, invisible
+  to the flat scan, silently reopening the exact cache-bypass hole this
+  whole rejection exists to close (eleventh Codex finding on #2513).
+  `edge::stmts_have_marker` already solves this same "wrapper shape buries
+  a marker" problem for `#[edge]` — by recursing into any expression an
+  earlier guard's rewrite (or `#[cached]`'s IIFE, once taught the shape)
+  might hide a marker inside — via the shared
+  `idempotency_guard::expr_nested_async_body` helper, so `#[static_get]`'s
+  new marker check needed the same descent, not a special case of its own.
+  Taught `expr_nested_async_body` to also unwrap a zero-argument closure
+  call (`(|| async move { … })()`, `#[cached]`'s exact shape), and switched
+  `param_helpers::has_body_const_marker` to delegate to
+  `edge::stmts_have_marker` instead of its own flat scan, so every consumer
+  of the marker-const technique benefits uniformly. Covered by a new test
+  that runs a handler through `#[static_get]` then `#[cached]` before the
+  aliased guard, confirmed red (the marker present but buried, no compile
+  error) before the fix and green after.
+
 - **`route_macro` lost a guarded handler's OpenAPI response schema under
   `#[throttle]`/`#[step_up]` (issue #2516):** #2488 moved the
   `#[throttle]`/`#[step_up]` auth/rate-limit checks out of the handler body
