@@ -403,13 +403,25 @@ def ref_label(s):
     """
     if len(s) > LABEL_LIMIT:
         return None
-    return ' '.join(s.split()).lower()
+    # `casefold`, not `lower`: CommonMark matches labels after a full Unicode
+    # case fold, so `[Mail][\u1e9e]` resolves against `[ss]:` — `lower()`
+    # gives `\u00df` there and matched nothing, reporting a page the reader
+    # can click as an orphan. Verified against markdown-it-py.
+    return ' '.join(s.split()).casefold()
 # A bare repo path. The leading guard keeps `…/docs/guide/x.md` inside a longer
 # path from matching at the wrong offset.
 # A URI scheme, for the destinations that leave the site entirely.
 SCHEME = re.compile(r'[A-Za-z][A-Za-z0-9+.-]*:')
+# The trailing guard is the mirror of the leading one: `docs/guide/mail.md.bak`
+# and `docs/guide/mail.md5` name OTHER files, and stopping at the `.md`
+# prefix recorded the tracked page as reachable from a path that does not
+# point at it — an obsolete backup concealing a real orphan. The second
+# lookahead is what keeps a sentence working: `See docs/guide/mail.md.`
+# ends with a period and still counts, because what follows it is not a
+# path character.
 BARE = re.compile(
-    r'(?<![\w/.-])((?:docs|skills|agents|examples)/[A-Za-z0-9._/-]+\.md)')
+    r'(?<![\w/.-])((?:docs|skills|agents|examples)/[A-Za-z0-9._/-]+\.md)'
+    r'(?![A-Za-z0-9_/-])(?!\.[A-Za-z0-9_/-])')
 
 
 def normalize(p):
@@ -1544,9 +1556,35 @@ def waiver_view(txt):
     return CODE_SPAN.sub(' ', ''.join(kept))
 
 
+def find_waiver(txt):
+    """The page's orphan-allow marker, if it has one that actually IS one.
+
+    The marker must OPEN a comment. HTML comments do not nest, so in
+    `<!-- sample: <!-- orphan-allow: x --> -->` the inner opener is content of
+    the outer comment — text a page might well write while documenting the
+    escape hatch — and matching it there let a sample silently switch the whole
+    check off for that page. Comments are walked left to right and the marker
+    is anchored at each opener, which is the same first-opener-wins rule the
+    rest of this file settles fences and raw HTML with.
+    """
+    view = waiver_view(txt)
+    pos = 0
+    while True:
+        start = view.find('<!--', pos)
+        if start == -1:
+            return None
+        m = WAIVER.match(view, start)
+        if m:
+            return m
+        end = view.find('-->', start + 4)
+        if end == -1:
+            return None
+        pos = end + 3
+
+
 defects, waived = [], 0
 for n in sorted(node_set - seen):
-    m = WAIVER.search(waiver_view(read(n)))
+    m = find_waiver(read(n))
     if m and m.group(1).strip():
         waived += 1
     else:
@@ -3078,6 +3116,42 @@ self_test() {
     > "$c9gj/docs/guide/jobs.md"
   git -C "$c9gj" add -A && git -C "$c9gj" commit -qm quoted-used-def
   check "a used definition in a block quote resolves" pass "$c9gj"
+
+  # A path that merely BEGINS with a tracked page names a different file.
+  local c9gk="$tmp/c9gk"; make_corpus "$c9gk"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\nOld copy: docs/guide/mail.md.bak\n' \
+    > "$c9gk/README.md"
+  git -C "$c9gk" add -A && git -C "$c9gk" commit -qm bare-path-suffix
+  check "a suffixed path does not reach the page it prefixes" fail "$c9gk"
+
+  # ...and a sentence-ending period still leaves the path intact.
+  local c9gl="$tmp/c9gl"; make_corpus "$c9gl"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\nSee docs/guide/mail.md.\n' \
+    > "$c9gl/README.md"
+  git -C "$c9gl" add -A && git -C "$c9gl" commit -qm bare-path-sentence
+  check "a path at the end of a sentence still counts" pass "$c9gl"
+
+  # A waiver marker must OPEN its comment: nested inside another, it is the
+  # outer comment's content and exempts nothing.
+  local c9gm="$tmp/c9gm"; make_corpus "$c9gm"
+  printf '# Mail\n\n<!-- sample: <!-- orphan-allow: example only --> -->\n' \
+    > "$c9gm/docs/guide/mail.md"
+  git -C "$c9gm" add -A && git -C "$c9gm" commit -qm nested-waiver
+  check "a waiver nested in another comment exempts nothing" fail "$c9gm"
+
+  # ...and a marker after an UNRELATED comment is still found.
+  local c9gn="$tmp/c9gn"; make_corpus "$c9gn"
+  printf '# Mail\n\n<!-- a note -->\n\n<!-- orphan-allow: appendix, see the notes -->\n' \
+    > "$c9gn/docs/guide/mail.md"
+  git -C "$c9gn" add -A && git -C "$c9gn" commit -qm waiver-after-comment
+  check "a waiver after another comment still waives" pass "$c9gn"
+
+  # Labels match after a full Unicode case fold, not `lower()`.
+  local c9go="$tmp/c9go"; make_corpus "$c9go"
+  printf '# Jobs\n\nSee [mail][\xe1\xba\x9e].\n\n[ss]: mail.md\n' \
+    > "$c9go/docs/guide/jobs.md"
+  git -C "$c9go" add -A && git -C "$c9go" commit -qm casefold-label
+  check "reference labels match under Unicode case folding" pass "$c9go"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
