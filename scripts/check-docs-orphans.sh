@@ -541,7 +541,14 @@ def normalize(p):
 # At the START of a line the loose form still governs: a type-2 block opens
 # on `<!--` whatever follows and ends at the first `-->`.
 HTML_COMMENT_CLOSED = re.compile(r'<!--.*?-->', re.S)
-HTML_COMMENT_INLINE = re.compile(r'<!--->|<!-->|<!--(?!>|->).*?-->', re.S)
+# An INLINE comment cannot contain a BLANK LINE — that ends the paragraph,
+# so `prose <!-- x` and `y --> tail` are two paragraphs of visible text and
+# no comment at all (cmark-gfm escapes both). The line-initial form is
+# unaffected: a type-2 block runs THROUGH blank lines to its first `-->`,
+# which is why only this pattern carries the bound. Same idiom as `FLAT`.
+_CBODY = r'(?:[^\n]|\n(?![ \t]*\n))*?'
+HTML_COMMENT_INLINE = re.compile(
+    r'<!--->|<!-->|<!--(?!>|->)' + _CBODY + r'-->')
 UNCLOSED = '<!--'
 # A paragraph break: one line with nothing on it.
 BLANK_LINE = re.compile(r'\n[ \t]*\n')
@@ -1895,8 +1902,12 @@ def element_end(txt, m, name):
         gt = txt.find('>', t.end())
         if t.group(1):
             if tname in stack:
-                # A close for something opened inside: unwind to it.
-                del stack[stack.index(tname):]
+                # A close for something opened inside: unwind to the INNERMOST
+                # one. `index` finds the oldest, so closing the inner `div` of
+                # `<div><span><div></div></span>` cleared the whole stack and
+                # the following `</span>` was then mistaken for an ancestor's
+                # close, ending the subtree early.
+                del stack[len(stack) - 1 - stack[::-1].index(tname):]
                 pos = t.end()
                 continue
             if tname == lname:
@@ -2143,7 +2154,11 @@ def edges_from(f):
         # written that way IS a route; the same text in a Markdown
         # destination renders literally and is not.
         raw = decode_char_refs(raw) if markdown else html.unescape(raw)
-        raw = raw.split('#', 1)[0].split('?', 1)[0].strip()
+        # ASCII whitespace only. URL processing discards exactly that;
+        # U+00A0 stays IN the path, so `<a href="&nbsp;mail.md">` resolves
+        # to `\xa0mail.md` and reaches the tracked file not at all —
+        # Python's bare `.strip()` removed it and recorded the edge anyway.
+        raw = raw.split('#', 1)[0].split('?', 1)[0].strip(' \t\n\r\f\v')
         raw = urllib.parse.unquote(raw)
         raw = (raw.replace('\x00\x00', '\\\\')
                .replace('\x01\x01', '\\!')
@@ -2496,13 +2511,27 @@ def find_waiver(txt):
         start = view.find('<!--', pos)
         if start == -1:
             return None
+        # The opener must actually OPEN a comment, by the same rule
+        # `hidden_spans` applies. Line-initial it is a type-2 block and runs
+        # through blank lines to its first `-->`; mid-line it must be a
+        # well-formed inline comment, which CANNOT contain a blank line —
+        # `prose <!-- orphan-allow: x` then a blank line then `-->` is two
+        # paragraphs of visible text, and it was waiving the whole page.
+        bol = view.rfind('\n', 0, start) + 1
+        if view[bol:start].strip() == '' and start - bol <= 3:
+            close = view.find('-->', start + 4)
+            extent = len(view) if close == -1 else close + 3
+        else:
+            cm = HTML_COMMENT_INLINE.match(view, start)
+            if not cm:
+                pos = start + 1
+                continue
+            extent = cm.end()
         m = WAIVER.match(view, start)
-        if m:
+        # ...and the marker has to fit INSIDE that comment, not run past it.
+        if m and m.end() <= extent:
             return m
-        end = view.find('-->', start + 4)
-        if end == -1:
-            return None
-        pos = end + 3
+        pos = extent if extent > start else start + 1
 
 
 defects, waived = [], 0
@@ -2884,6 +2913,30 @@ self_test() {
   printf '# Mail\n\n<!-- orphan-allow: -->\n' > "$c16/docs/guide/mail.md"
   git -C "$c16" add -A && git -C "$c16" commit -qm waiver-no-reason
   check "a waiver with no reason does not exempt the page" fail "$c16"
+
+  # A marker that starts MID-PARAGRAPH and crosses a blank line opens no
+  # comment: cmark-gfm renders two paragraphs of visible text. It was waiving
+  # the page anyway, which is the most expensive false negative here.
+  local c9lf="$tmp/c9lf"; make_corpus "$c9lf"
+  printf '# Mail\n\nprose <!-- orphan-allow: merely visible\n\n-->\n' \
+    > "$c9lf/docs/guide/mail.md"
+  git -C "$c9lf" add -A && git -C "$c9lf" commit -qm waiver-across-blank-line
+  check "a marker crossing a blank line waives nothing" fail "$c9lf"
+
+  # ...but the same marker mid-paragraph on ONE line is a real comment.
+  local c9lg="$tmp/c9lg"; make_corpus "$c9lg"
+  printf '# Mail\n\nprose <!-- orphan-allow: deliberate --> more\n' \
+    > "$c9lg/docs/guide/mail.md"
+  git -C "$c9lg" add -A && git -C "$c9lg" commit -qm waiver-inline-one-line
+  check "an inline marker on one line still waives" pass "$c9lg"
+
+  # ...and a LINE-INITIAL one is a type-2 block, which runs THROUGH blank
+  # lines — so the bound belongs to the inline form only.
+  local c9lh="$tmp/c9lh"; make_corpus "$c9lh"
+  printf '# Mail\n\n<!-- orphan-allow: deliberate\n\n-->\n' \
+    > "$c9lh/docs/guide/mail.md"
+  git -C "$c9lh" add -A && git -C "$c9lh" commit -qm waiver-block-across-blank
+  check "a line-initial marker may cross a blank line" pass "$c9lh"
 
   # A disabled collapsed reference link must not keep its definition alive.
   local c9ad="$tmp/c9ad"; make_corpus "$c9ad"
@@ -4572,6 +4625,28 @@ self_test() {
     > "$c9ku/docs/guide/jobs.md"
   git -C "$c9ku" add -A && git -C "$c9ku" commit -qm li-reopened
   check "a reopened li ends the hidden one" pass "$c9ku"
+
+  # U+00A0 stays IN a URL path, so this href resolves to `\xa0mail.md` and
+  # reaches the tracked file not at all. Python's bare `.strip()` removed it.
+  local c9li="$tmp/c9li"; make_corpus "$c9li"
+  printf '# Jobs\n\n<a href="&nbsp;mail.md">Mail</a>\n' > "$c9li/docs/guide/jobs.md"
+  git -C "$c9li" add -A && git -C "$c9li" commit -qm nbsp-in-href
+  check "a non-breaking space in an href is part of the path" fail "$c9li"
+
+  # ...while ASCII padding IS discarded by URL processing, so it still resolves.
+  local c9lj="$tmp/c9lj"; make_corpus "$c9lj"
+  printf '# Jobs\n\n<a href="  mail.md  ">Mail</a>\n' > "$c9lj/docs/guide/jobs.md"
+  git -C "$c9lj" add -A && git -C "$c9lj" commit -qm ascii-padded-href
+  check "ASCII padding in an href is discarded" pass "$c9lj"
+
+  # Unwinding must find the INNERMOST match: closing the inner `div` here left
+  # the whole stack cleared, and the `</span>` after it read as an ancestor
+  # close, ending the hidden subtree early and exposing its text.
+  local c9lk="$tmp/c9lk"; make_corpus "$c9lk"
+  printf '# Jobs\n\n<a href="mail.md"><section hidden><div><span><div></div></span>Secret</div></section></a>\n' \
+    > "$c9lk/docs/guide/jobs.md"
+  git -C "$c9lk" add -A && git -C "$c9lk" commit -qm repeated-descendant-name
+  check "a repeated descendant name unwinds to the innermost" fail "$c9lk"
 
   # A PARENT's close takes its open child with it, so the label after it is
   # visible. The depth counter could not see this at all: it only ever looked
