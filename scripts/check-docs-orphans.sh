@@ -621,8 +621,13 @@ HIDDEN_TAGS = r'script|style|template'
 # perfectly ordinary tag whose contents render. CommonMark's own start
 # condition is the name followed by whitespace, `>` or the end of the line.
 TAG_NAME_END = r'(?=[\s>]|$)'
+# The opener is the tag NAME, with no `>` required: `<script` alone at the
+# end of a line starts the block, and demanding `[^>]*>` left it unmasked
+# whenever no angle bracket followed — the apparent markdown below it then
+# counted as navigation. The sibling opens on the name alone for the same
+# reason (check-migration-guides.sh:1062-1074).
 FIRST_OPENER = re.compile(
-    r'(<!--)|(<(' + HIDDEN_TAGS + r')' + TAG_NAME_END + r'[^>]*>)', re.I)
+    r'(<!--)|(<(' + HIDDEN_TAGS + r')' + TAG_NAME_END + r')', re.I)
 # `<pre>` and `<textarea>` are CommonMark type-1 raw blocks alongside script and
 # style, so Markdown inside them is literal — but unlike script and style their
 # contents are SHOWN. A path in a `<pre>` block is on screen and still counts,
@@ -641,9 +646,9 @@ FIRST_OPENER = re.compile(
 # Markdown under it still renders.
 TYPE1_TAGS = r'pre|textarea|script|style'
 PRE_BLOCK = re.compile(
-    r'^ {0,3}<(?:' + TYPE1_TAGS + r')' + TAG_NAME_END + r'[^>]*>'
+    r'^ {0,3}<(?:' + TYPE1_TAGS + r')' + TAG_NAME_END +
     r'.*?</(?:' + TYPE1_TAGS + r')\s*>[^\n]*'
-    r'|^ {0,3}<(?:' + TYPE1_TAGS + r')' + TAG_NAME_END + r'[^>]*>.*',
+    r'|^ {0,3}<(?:' + TYPE1_TAGS + r')' + TAG_NAME_END + r'.*',
     re.S | re.I | re.M)
 # One HTML attribute, as CommonMark defines it. The unquoted value is the part
 # worth spelling out: it admits no whitespace and none of `"`, `'`, `=`, `<`,
@@ -2528,6 +2533,25 @@ self_test() {
   printf '# Jobs\n\n<a\n href="mail.md">mail</a>\n' > "$c9fe/docs/guide/jobs.md"
   git -C "$c9fe" add -A && git -C "$c9fe" commit -qm anchor-wrapped
   check "an anchor wrapped across one line still counts" pass "$c9fe"
+
+  # A type-1 block opens on its tag NAME: no closing angle bracket needed.
+  local c9ff="$tmp/c9ff"; make_corpus "$c9ff"
+  printf '# Jobs\n\n<script\n\nSee [mail](mail.md).\n' > "$c9ff/docs/guide/jobs.md"
+  git -C "$c9ff" add -A && git -C "$c9ff" commit -qm type1-name-only
+  check "a type-1 opener with no > still opens a block" fail "$c9ff"
+
+  # ...and `<pre` the same way, where the contents stay visible.
+  local c9fg="$tmp/c9fg"; make_corpus "$c9fg"
+  printf '# Jobs\n\n<pre\n\nSee [mail](mail.md).\n' > "$c9fg/docs/guide/jobs.md"
+  git -C "$c9fg" add -A && git -C "$c9fg" commit -qm type1-pre-name-only
+  check "a <pre opener with no > still opens a block" fail "$c9fg"
+
+  # ...but the name must END there: `<scripted` is an ordinary custom element.
+  local c9fh="$tmp/c9fh"; make_corpus "$c9fh"
+  printf '# Jobs\n\n<scripted> See [mail](mail.md). </scripted>\n' \
+    > "$c9fh/docs/guide/jobs.md"
+  git -C "$c9fh" add -A && git -C "$c9fh" commit -qm longer-tag-name
+  check "a longer tag name is not a type-1 opener" pass "$c9fh"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
