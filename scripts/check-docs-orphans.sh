@@ -390,8 +390,18 @@ def strip_comments(txt):
        `<!--` inside one is read as a real comment. A naive "four spaces means
        code" rule would stop a genuinely commented-out link inside a list item
        from being stripped — a false NEGATIVE, and being unsatisfiable by a
-       line no reader can follow is this gate's whole job. `check-docs-links.sh`
-       does not mask indented code either, so the two agree.
+       line no reader can follow is this gate's whole job.
+
+       CORRECTION to what this note said for several commits: it claimed no
+       gate in the repo masks indented code, having checked only
+       `check-docs-links.sh`. That was wrong — `check-migration-guides.sh`
+       does, list-aware, and pins it with
+       `migration_guide_gate_ignores_links_in_indented_code_blocks`. The
+       conclusion stands but the reason is different: that logic lives inside
+       that gate's awk entry-walking state machine, measuring indentation
+       against each list item's content column, so it is not a function to
+       borrow. Porting it means re-deriving it, which is exactly what these
+       limitations exist to avoid.
 
     2. `FENCE` matches at absolute column, so a fence opened inside a block
        quote (`> ```html`) or indented under a list item is not seen as one.
@@ -504,11 +514,21 @@ BLOCK_TAGS = (
     'track|ul')
 # Type 6 (a block tag, trailing content allowed) or type 7 (any complete tag
 # ALONE on its line). Both run to the next blank line.
+#
+# Types 3, 4 and 5 are here too — a processing instruction `<? … ?>`, a
+# declaration `<!DOCTYPE …>`, and `<![CDATA[ … ]]>`. Their contents are raw
+# HTML, so Markdown inside them is literal; unlike 6 and 7 they end at their own
+# closing delimiter rather than at a blank line. The repo's migration gate pins
+# all three (`…_treats_a_cdata_block_as_literal` and its two siblings), and
+# omitting them let a link inside any of the three count as navigation.
 RAW_BLOCK = re.compile(
-    r'^ {0,3}(?:</?(?:' + BLOCK_TAGS + r')(?:[\s/>][^\n]*)?'
+    r'^ {0,3}<\?.*?\?>'
+    r'|^ {0,3}<!\[CDATA\[.*?\]\]>'
+    r'|^ {0,3}<![A-Za-z][^>]*>'
+    r'|^ {0,3}(?:</?(?:' + BLOCK_TAGS + r')(?:[\s/>][^\n]*)?'
     r'|</?[A-Za-z][A-Za-z0-9-]*(?:\s[^\n]*?)?/?>[ \t]*)$'
     r'(?:\n(?![ \t]*$)[^\n]*)*',
-    re.M | re.I)
+    re.M | re.I | re.S)
 # A raw anchor IS navigation, so its destination is resolved like any other —
 # through `add_relative`, which means `<a href="mail.md">` and
 # `<a href="../guide/mail.md">` work, not just the repo-root spelling the
@@ -1568,6 +1588,30 @@ self_test() {
     > "$c9cm/docs/guide/jobs.md"
   git -C "$c9cm" add -A && git -C "$c9cm" commit -qm refdef-after-blank
   check "a definition after a blank line resolves" pass "$c9cm"
+
+  # CommonMark raw-HTML block types 3, 4 and 5 are literal too.
+  local c9cn="$tmp/c9cn"; make_corpus "$c9cn"
+  printf '# Jobs\n\n<![CDATA[\n[mail](mail.md)\n]]>\n' > "$c9cn/docs/guide/jobs.md"
+  git -C "$c9cn" add -A && git -C "$c9cn" commit -qm cdata-block
+  check "a link inside a CDATA block is not an edge" fail "$c9cn"
+
+  local c9co="$tmp/c9co"; make_corpus "$c9co"
+  printf '# Jobs\n\n<?php\n[mail](mail.md)\n?>\n' > "$c9co/docs/guide/jobs.md"
+  git -C "$c9co" add -A && git -C "$c9co" commit -qm processing-instruction
+  check "a link inside a processing instruction is not an edge" fail "$c9co"
+
+  # A declaration runs to the next `>`, which may be lines later.
+  local c9cp="$tmp/c9cp"; make_corpus "$c9cp"
+  printf '# Jobs\n\n<!DOCTYPE demo\n[mail](mail.md)\n>\n' > "$c9cp/docs/guide/jobs.md"
+  git -C "$c9cp" add -A && git -C "$c9cp" commit -qm declaration-block
+  check "a link inside a declaration block is not an edge" fail "$c9cp"
+
+  # ...and it CLOSES on the line carrying that `>`, including the opener, so a
+  # self-contained `<!DOCTYPE html>` must not swallow the next line's link.
+  local c9cq="$tmp/c9cq"; make_corpus "$c9cq"
+  printf '# Jobs\n\n<!DOCTYPE html>\n\nSee [mail](mail.md).\n' > "$c9cq/docs/guide/jobs.md"
+  git -C "$c9cq" add -A && git -C "$c9cq" commit -qm declaration-closes
+  check "a closed declaration does not swallow the next link" pass "$c9cq"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
