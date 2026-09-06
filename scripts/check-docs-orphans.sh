@@ -262,8 +262,19 @@ REF_USE_ANY = re.compile(r'\[' + _LBL + r'*\]\[' + _LBL + r'*\]')
 # scan for the same reason the inline pattern guards against `!`: the path in
 # `![alt](docs/guide/x.md)` is a resource the page loads, never text on screen,
 # so it is not something a reader can find the page by.
-IMAGE_INLINE = re.compile(r'!\[(?:[^\[\]\\]|\\.)*\]' + DEST)
-IMAGE_REF = re.compile(r'!\[(?:[^\[\]\\]|\\.)*\](?:\[[^\]]*\])?')
+# The alt text may itself contain a bracketed span — `![nested [alt]](x.md)` —
+# and a pattern that stops at the inner bracket leaves the image unmasked, so
+# the bare scan picks its destination back up.
+IMAGE_INLINE = re.compile(
+    r'!\[(?:(?:[^\[\]\\]|\\.)|\[(?:[^\[\]\\]|\\.)*\])*\]' + DEST)
+IMAGE_REF = re.compile(
+    r'!\[(?:(?:[^\[\]\\]|\\.)|\[(?:[^\[\]\\]|\\.)*\])*\](?:\[[^\]]*\])?')
+# Any inline link span, image or not. Blanked before the shortcut scan: links
+# cannot nest, so in `[outer [mail]](https://example.com)` only the OUTER link
+# renders and the inner `[mail]` is ordinary label text — not a shortcut
+# reference that should keep `[mail]: mail.md` alive.
+INLINE_SPAN_ANY = re.compile(
+    r'\[(?:(?:[^\[\]\\]|\\.)|\[(?:[^\[\]\\]|\\.)*\])*\]' + DEST)
 
 
 def ref_label(s):
@@ -348,7 +359,7 @@ def strip_comments(txt):
     docs change. So fences are passed through untouched, and the run-to-EOF rule
     for an unclosed comment applies only to prose spans.
 
-    THREE KNOWN LIMITATIONS, all narrow, all false POSITIVES, and all left
+    FOUR KNOWN LIMITATIONS, all narrow, all false POSITIVES, and all left
     deliberately because the available fixes cost more than the bugs:
 
     1. A four-space-INDENTED code block is not recognised, so an unclosed
@@ -363,7 +374,15 @@ def strip_comments(txt):
        An unclosed `<!--` in such a block is then read as a real comment and
        truncates the rest of the page.
 
-    3. Code spans are masked before comments are located, so a comment whose
+    3. Link labels nest only one level deep. `[outer [inner [deep]]](x.md)` is
+       valid Markdown that neither this gate nor `check-docs-links.sh` matches,
+       because balanced nesting to arbitrary depth is not expressible as a
+       regular expression — it needs a bracket-matching scan. Both gates share
+       the limit, so neither disagrees with the other about such a link, and
+       one level covers the shape that actually occurs (a linked image,
+       `[![alt](img.png)](page.md)`).
+
+    4. Code spans are masked before comments are located, so a comment whose
        terminator sits inside backticks — `<!-- note ``-->`` -->` — has that
        terminator blanked, reads as unclosed, and truncates the page. The
        ordering is deliberate and is what makes case (1) of the fenced/inline
@@ -481,6 +500,8 @@ def edges_from(f):
     # Blank every full-reference span before looking for shortcuts, so the
     # `[mail]` tail of `![alt][mail]` is not re-read as a link of its own.
     shortcut_txt = REF_USE_ANY.sub(lambda m: ' ' * len(m.group(0)), ref_txt)
+    shortcut_txt = INLINE_SPAN_ANY.sub(
+        lambda m: ' ' * len(m.group(0)), shortcut_txt)
     for m in REF_USE_SHORTCUT.finditer(shortcut_txt):
         used.add(ref_label(m.group(1)))
 
@@ -1039,6 +1060,21 @@ self_test() {
   printf '# Jobs\n\n![mail](mail.md)\n' > "$c9ax/docs/guide/jobs.md"
   git -C "$c9ax" add -A && git -C "$c9ax" commit -qm unescaped-image-still-excluded
   check "an unescaped image marker still excludes the destination" fail "$c9ax"
+
+  # Links cannot nest, so the inner label of an inline link is ordinary text,
+  # not a shortcut reference that keeps a definition alive.
+  local c9ay="$tmp/c9ay"; make_corpus "$c9ay"
+  printf '# Jobs\n\n[outer [mail]](https://example.com)\n\n[mail]: mail.md\n' \
+    > "$c9ay/docs/guide/jobs.md"
+  git -C "$c9ay" add -A && git -C "$c9ay" commit -qm inner-label-not-shortcut
+  check "an inline link's inner label is not a shortcut use" fail "$c9ay"
+
+  # Image alt text may contain a bracketed span; the image must still be masked.
+  local c9az="$tmp/c9az"; make_corpus "$c9az"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n![nested [alt]](docs/guide/mail.md)\n' \
+    > "$c9az/README.md"
+  git -C "$c9az" add -A && git -C "$c9az" commit -qm nested-alt-image
+  check "an image with nested alt text is still not an edge" fail "$c9az"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
