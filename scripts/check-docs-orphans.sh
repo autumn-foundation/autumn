@@ -1434,8 +1434,30 @@ def hidden_spans(seg, protected):
             pos = cm.end() if cm else m.start() + 1
             continue
         name = m.group(3) if m.group(3) is not None else m.group(5)
-        close = re.search(r'</' + name + r'\s*>', seg[m.end():], re.I)
-        end = len(seg) if close is None else m.end() + close.end()
+        if name.lower() in RAW_TEXT_NAMES:
+            # `script`, `style` and `iframe` hold TEXT, so a `<script>` spelled
+            # inside one is not an opener and the first close ends it.
+            close = re.search(r'</' + name + r'\s*>', seg[m.end():], re.I)
+            end = len(seg) if close is None else m.end() + close.end()
+        else:
+            # `template` is the odd one out: its contents are PARSED (a
+            # `</span>` inside is consumed as markup, not kept as text), so it
+            # nests for real and the first close is the wrong end. In
+            # `<template><template></template> docs/guide/mail.md </template>`
+            # the path is still inside the outer, inert template — Chromium
+            # renders no body text at all — but ending at the first close
+            # exposed it to the bare-path scan as visible navigation.
+            depth, at, end = 1, m.end(), len(seg)
+            nest = re.compile(
+                r'<(/?)' + re.escape(name) + r'(?=[\s/>])[^>]*>', re.I)
+            while depth:
+                t = nest.search(seg, at)
+                if not t:
+                    break
+                depth += -1 if t.group(1) else 1
+                at = t.end()
+                if not depth:
+                    end = t.end()
         spans.append((m.start(), end))
         pos = end
 
@@ -4129,6 +4151,29 @@ self_test() {
   printf '# Jobs\n\n<a href="mail.md">&#60;span&#62;</a>\n' > "$c9iw/docs/guide/jobs.md"
   git -C "$c9iw" add -A && git -C "$c9iw" commit -qm entity-spelled-tag-text
   check "an entity-spelled tag is visible text, not markup" pass "$c9iw"
+
+  # `template` contents are PARSED, so templates nest and the first close is
+  # the wrong end — the path is still inside the outer, inert one.
+  local c9jg="$tmp/c9jg"; make_corpus "$c9jg"
+  printf '# Jobs\n\n<template><template></template> docs/guide/mail.md </template>\n' \
+    > "$c9jg/docs/guide/jobs.md"
+  git -C "$c9jg" add -A && git -C "$c9jg" commit -qm nested-template
+  check "a nested template does not end at the first close" fail "$c9jg"
+
+  # ...but `script` and `iframe` hold TEXT, so the inner spelling is not an
+  # opener, the FIRST close really does end them, and the path after it is on
+  # screen. Balancing these too would strand a page nothing else links.
+  local c9jh="$tmp/c9jh"; make_corpus "$c9jh"
+  printf '# Jobs\n\n<script><script></script> docs/guide/mail.md </script>\n' \
+    > "$c9jh/docs/guide/jobs.md"
+  git -C "$c9jh" add -A && git -C "$c9jh" commit -qm nested-script-raw-text
+  check "a raw-text element ends at its first close" pass "$c9jh"
+
+  local c9ji="$tmp/c9ji"; make_corpus "$c9ji"
+  printf '# Jobs\n\n<iframe><iframe></iframe> docs/guide/mail.md </iframe>\n' \
+    > "$c9ji/docs/guide/jobs.md"
+  git -C "$c9ji" add -A && git -C "$c9ji" commit -qm nested-iframe-raw-text
+  check "an iframe ends at its first close too" pass "$c9ji"
 
   # An anchor cannot contain an anchor: the parser closes the outer one when
   # the inner opens, so the outer has no content at all (Chromium reports an
