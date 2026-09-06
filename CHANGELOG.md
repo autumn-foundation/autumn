@@ -1742,6 +1742,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Database pool refusals echoed credentials into the boot log (issue
+  #1905):** the pool's boot-time refusals name the offending target so the
+  message is actionable, and did so verbatim. `setup_database` surfaces
+  `PoolError` as `"Failed to create database pool: {e}"` and the run path logs
+  it through `tracing::error!`, so under `log.format = "json"` a password
+  reached the structured log stream — one line after `format_config_summary`
+  had masked the same URL. Every refusal in the pool module now routes its
+  target through a redactor: userinfo passwords are replaced, and for a
+  Postgres target or one naming no backend at all the query string goes too,
+  since `?password=`, `?sslpassword=` and `?api_key=` are real spellings that
+  a userinfo check never sees and an unclassifiable target offers no way to
+  enumerate. A SQLite target passes through whole — a local file URI carries
+  no credentials, and its query string (`mode=ro`, `mode=memory`,
+  `cache=shared`) is the diagnostic detail the replica and read-only messages
+  exist to report. A bare filesystem path stays legible for the same reason.
+
 - **SQLite pool construction accepted a target that names no backend (issue
   #1905):** under `--features sqlite`, `build_sqlite_pool` guarded only
   against a Postgres target. Everything else fell through to

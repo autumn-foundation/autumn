@@ -1448,8 +1448,8 @@ fn normalize_sqlite_target(url: &str) -> String {
 /// returns `None` for both even though the pool has always accepted them (and
 /// `run_pending_sqlite` still lists `:memory:` among the spellings it takes).
 /// Kept adjacent to `normalize_sqlite_target`'s matching branch so the two
-/// cannot drift.
-#[cfg(feature = "sqlite")]
+/// cannot drift. Not feature-gated: `redact_pool_target` consults it on both
+/// builds so a target is classified the same way in either.
 fn sqlite_target_is_bare_in_memory(url: &str) -> bool {
     url.is_empty() || url == ":memory:"
 }
@@ -1547,29 +1547,49 @@ fn sqlite_target_is_read_only(target: &str) -> bool {
 /// that through `tracing::error!`, so under `log.format = "json"` the text lands
 /// in whatever ships the structured log stream. The messages below name the
 /// offending target to stay actionable, and that target is whatever string the
-/// configuration supplied: on the `None` arm it is by definition not a target
-/// this backend understands, so it can just as easily be a credential-bearing
-/// URL for some other system. `format_config_summary` already masks the same
-/// URL one line earlier (`mask_database_url`), so leaving it raw here undoes
-/// that a line later.
+/// configuration supplied. `format_config_summary` already masks the same URL
+/// one line earlier (`mask_database_url`), so leaving it raw here undoes that a
+/// line later.
 ///
-/// A parseable URL keeps its shape with the password replaced, which is what
-/// makes the message useful. A string that does not parse as a URL is passed
-/// through **unless** it contains `@` — a bare filesystem path
-/// (`/var/lib/app.db`) is exactly the case where naming the target is the whole
-/// point of the message and there is no credential to protect, while an
-/// unparseable string carrying `@` is masked wholesale rather than risking a
-/// malformed credential.
-#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+/// **A `SQLite` target passes through whole.** Its query string is not a place
+/// credentials live — it is a local file URI — and the query string is exactly
+/// the diagnostic detail that matters (`mode=ro`, `mode=memory`,
+/// `cache=shared`); `reject_unusable_sqlite_replica` names two of them and is
+/// useless without it.
+///
+/// **Anything else keeps only what identifies WHICH target was misconfigured.**
+/// Userinfo is not the only place a secret rides: `?password=`,
+/// `?sslpassword=`, `?api_key=` are all real spellings, and `Url::password()`
+/// sees none of them. For a target that named no backend we cannot even
+/// enumerate the keys that matter, so rather than guess at key names the whole
+/// query string is replaced — scheme, host and path are enough to tell an
+/// operator which URL to go fix. A string that does not parse as a URL is
+/// passed through unless it carries `@` or `?`, so a bare filesystem path
+/// (`/var/lib/app.db`) — where naming the target is the entire value of the
+/// message and there is no credential to protect — stays legible.
 fn redact_pool_target(url: &str) -> String {
+    if crate::config::DatabaseBackend::detect(url) == Some(crate::config::DatabaseBackend::Sqlite)
+        || sqlite_target_is_bare_in_memory(url)
+    {
+        return url.to_owned();
+    }
     if let Ok(mut parsed) = url::Url::parse(url) {
-        if parsed.password().is_some() {
+        let has_password = parsed.password().is_some();
+        if has_password {
             let _ = parsed.set_password(Some("****"));
+        }
+        let has_query = parsed.query().is_some();
+        if has_query {
+            parsed.set_query(Some("****"));
+        }
+        // Re-rendering a parsed URL normalizes it, so only hand back the
+        // rewritten form when something actually had to be hidden.
+        if has_password || has_query {
             return parsed.to_string();
         }
         return url.to_owned();
     }
-    if url.contains('@') {
+    if url.contains('@') || url.contains('?') {
         return "****".to_owned();
     }
     url.to_owned()
@@ -4478,15 +4498,45 @@ mod tests {
             redact_pool_target("postgres://user:secret@localhost:5432/app"),
             "postgres://user:****@localhost:5432/app"
         );
+        // A secret does not have to sit in userinfo: `Url::password()` sees
+        // nothing in `?password=`, `?sslpassword=`, `?api_key=`. For a target
+        // that named no backend the interesting key names cannot be
+        // enumerated, so the whole query goes — scheme/host/path still say
+        // which URL to go fix (Codex P2 on #2537).
+        assert_eq!(
+            redact_pool_target("mysql://host/db?password=hunter2"),
+            "mysql://host/db?****"
+        );
+        assert_eq!(
+            redact_pool_target("postgres://host/app?sslpassword=hunter2&sslmode=require"),
+            "postgres://host/app?****"
+        );
+        assert_eq!(
+            redact_pool_target("mysql://user:secret@host/db?api_key=hunter2"),
+            "mysql://user:****@host/db?****"
+        );
         // No credential to protect: naming the target IS the message's value.
+        assert_eq!(redact_pool_target("/var/lib/app.db"), "/var/lib/app.db");
+        // A SQLite target passes through whole: a local file URI carries no
+        // credentials, and its query string IS the diagnostic detail —
+        // `reject_unusable_sqlite_replica` is useless without it.
         assert_eq!(
             redact_pool_target("sqlite:///var/lib/app.db"),
             "sqlite:///var/lib/app.db"
         );
-        assert_eq!(redact_pool_target("/var/lib/app.db"), "/var/lib/app.db");
         assert_eq!(redact_pool_target("sqlite::memory:"), "sqlite::memory:");
+        assert_eq!(
+            redact_pool_target("sqlite://file:app.db?mode=ro"),
+            "sqlite://file:app.db?mode=ro"
+        );
+        assert_eq!(
+            redact_pool_target("file::memory:?cache=shared"),
+            "file::memory:?cache=shared"
+        );
+        assert_eq!(redact_pool_target(":memory:"), ":memory:");
         // Unparseable AND credential-shaped: mask wholesale rather than guess.
         assert_eq!(redact_pool_target("://user:secret@host/db"), "****");
+        assert_eq!(redact_pool_target("not-a-url?password=hunter2"), "****");
     }
 
     // The end-to-end contract the helper exists for: no refusal this module
@@ -4497,6 +4547,9 @@ mod tests {
         for url in [
             "postgres://user:hunter2@localhost/app",
             "mysql://user:hunter2@localhost/app",
+            // The secret in the query string rather than the userinfo.
+            "mysql://localhost/app?password=hunter2",
+            "postgres://localhost/app?sslpassword=hunter2",
         ] {
             let config = DatabaseConfig {
                 url: Some(url.into()),
