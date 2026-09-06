@@ -146,7 +146,12 @@ def is_root(f):
                 and posixpath.basename(f) in ('SKILL.md', 'AGENT.md'))
             or (f.startswith('agents/') and f.endswith('.md')
                 and posixpath.dirname(f) == 'agents')
-            or (f.startswith('examples/') and posixpath.basename(f) == 'README.md'))
+            # `examples/<app>/README.md` only. A deeper one
+            # (`examples/reddit-clone/capsules/README.md`) is a supporting page
+            # its example links to, not an entry surface — same reason as a
+            # skill's `references/*.md` above.
+            or (f.startswith('examples/') and posixpath.basename(f) == 'README.md'
+                and f.count('/') == 2))
 
 
 roots = [f for f in tracked if is_root(f)]
@@ -155,8 +160,8 @@ node_set = set(nodes)
 # reader can be routed THROUGH — a skill's `references/*.md`. They carry edges
 # only once something reachable links them.
 waypoints = {f for f in tracked
-             if f.startswith(ROOT_DIRS) and f.endswith('.md')
-             and f not in roots and f not in node_set}
+             if f.endswith('.md') and f not in roots and f not in node_set
+             and (f.startswith(ROOT_DIRS) or f.startswith('examples/'))}
 traversable = node_set | waypoints
 
 
@@ -194,7 +199,8 @@ def ref_label(s):
     return ' '.join(s.split()).lower()
 # A bare repo path. The leading guard keeps `…/docs/guide/x.md` inside a longer
 # path from matching at the wrong offset.
-BARE = re.compile(r'(?<![\w/.-])((?:docs/guide|skills|agents)/[A-Za-z0-9._/-]+\.md)')
+BARE = re.compile(
+    r'(?<![\w/.-])((?:docs/guide|skills|agents|examples)/[A-Za-z0-9._/-]+\.md)')
 
 
 def normalize(p):
@@ -220,7 +226,11 @@ def normalize(p):
 # obsolete-link case this gate exists to catch pass silently. Stripped for EDGE
 # extraction only; the waiver scan below deliberately reads the raw text, since
 # `<!-- orphan-allow: … -->` is itself an HTML comment.
-HTML_COMMENT = re.compile(r'<!--.*?-->', re.S)
+# The second alternative matters: an UNCLOSED `<!--` comments out the rest of
+# the file as far as Markdown is concerned, so a missing `-->` must not leave
+# the links after it counting as routes. Closed form is tried first, so a
+# terminated comment still strips only itself.
+HTML_COMMENT = re.compile(r'<!--.*?-->|<!--.*', re.S)
 
 
 def edges_from(f):
@@ -494,6 +504,36 @@ self_test() {
     > "$c13b/skills/x/references/notes.md"
   git -C "$c13b" add -A && git -C "$c13b" commit -qm waypoint-unlinked
   check "an unlinked skill reference page does not confer reachability" fail "$c13b"
+
+  # An unterminated `<!--` comments out the rest of the file for Markdown, so
+  # a missing `-->` must not leave the links after it counting as routes.
+  local c9l="$tmp/c9l"; make_corpus "$c9l"
+  printf '# Jobs\n\n<!-- retired [mail](mail.md)\n' > "$c9l/docs/guide/jobs.md"
+  git -C "$c9l" add -A && git -C "$c9l" commit -qm unclosed-comment
+  check "an unclosed HTML comment hides the links after it" fail "$c9l"
+
+  # ...but a properly closed comment must still strip only itself.
+  local c9m="$tmp/c9m"; make_corpus "$c9m"
+  printf '# Jobs\n\n<!-- note -->\n\nSee [mail](mail.md).\n' > "$c9m/docs/guide/jobs.md"
+  git -C "$c9m" add -A && git -C "$c9m" commit -qm closed-comment-scoped
+  check "a closed comment does not hide links after it" pass "$c9m"
+
+  # A nested example README is a waypoint, not an entry surface.
+  local c14a="$tmp/c14a"; make_corpus "$c14a"
+  mkdir -p "$c14a/examples/blog/capsules"
+  printf '# Blog\n\nnothing linked\n' > "$c14a/examples/blog/README.md"
+  printf '# Capsules\n\nSee [mail](../../../docs/guide/mail.md).\n' \
+    > "$c14a/examples/blog/capsules/README.md"
+  git -C "$c14a" add -A && git -C "$c14a" commit -qm nested-example-unlinked
+  check "an unlinked nested example README does not confer reachability" fail "$c14a"
+
+  local c14b="$tmp/c14b"; make_corpus "$c14b"
+  mkdir -p "$c14b/examples/blog/capsules"
+  printf '# Blog\n\nSee [capsules](capsules/README.md).\n' > "$c14b/examples/blog/README.md"
+  printf '# Capsules\n\nSee [mail](../../../docs/guide/mail.md).\n' \
+    > "$c14b/examples/blog/capsules/README.md"
+  git -C "$c14b" add -A && git -C "$c14b" commit -qm nested-example-linked
+  check "a linked nested example README routes onward" pass "$c14b"
 
   local c14="$tmp/c14"; make_corpus "$c14"
   mkdir -p "$c14/examples/blog"

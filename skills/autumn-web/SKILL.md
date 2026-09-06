@@ -1257,10 +1257,13 @@ Two things to get right when generating this code:
   enqueue happens after it returns, so no impl can make the two atomic. If an app
   needs a stronger guarantee, put the outbox *outside* this subsystem: its own
   row written in the same transaction as the triggering business data, with a
-  worker calling `dispatch()` and marking the row processed only on `Ok`. Make
-  receivers idempotent on the event ID regardless — retries make delivery
-  at-least-once anyway. An enqueue that fails is the one handled case — marked
-  `is_dlq` and replayable.
+  worker calling `dispatch()` and marking the row processed only on `Ok`. Note
+  that a delivery carries only `Content-Type` and `Autumn-Signature` — no event
+  or delivery ID, and the signature's `t=` changes per attempt — so if the
+  receiver must deduplicate, put a stable ID in the payload yourself and reuse
+  it on every retry. Receivers should be idempotent regardless: retries make
+  delivery at-least-once anyway. An enqueue that fails is the one handled case —
+  marked `is_dlq` and replayable.
 
 Do not
 hand-roll outbound delivery with a bare HTTP client — the user-supplied
