@@ -39,11 +39,17 @@
 #   Build the graph a reader can actually walk, and assert every guide page is
 #   in it.
 #     - NODES are `docs/guide/**/*.md`.
-#     - ROOTS are the surfaces a reader enters through: the root `README.md`,
-#       `EXAMPLES.md`, `CONTRIBUTING.md`, `STABILITY.md`, `docs/plugins.md`,
-#       every `skills/` and `agents/` page, and each `examples/*/README.md`.
-#     - EDGES run from a root or another guide page to a guide page it names,
-#       either as a markdown link or as a bare repo path.
+#     - ROOTS are the surfaces a reader or agent ENTERS through: the root
+#       `README.md`, `EXAMPLES.md`, `CONTRIBUTING.md`, `STABILITY.md`,
+#       `docs/plugins.md`, each skill's `SKILL.md`, each top-level `agents/*.md`,
+#       and each `examples/*/README.md`.
+#     - WAYPOINTS are the other pages under `skills/` and `agents/` — a skill's
+#       `references/*.md`. They are NOT roots: they are ordinary pages their
+#       `SKILL.md` links to, so they carry edges only once something reaches
+#       them. Seeding them as roots would let a reference file that nothing
+#       links any more still confer reachability on every guide it names.
+#     - EDGES run from a root, a waypoint, or another guide page to a guide page
+#       (or waypoint) it names, as a markdown link or as a bare repo path.
 #   A page is a defect when no path of edges reaches it from any root.
 #
 # REACHABILITY, NOT INBOUND-LINK COUNT: this walks the graph instead of asking
@@ -126,15 +132,32 @@ nodes = sorted(f for f in tracked if f.startswith(GUIDE) and f.endswith('.md'))
 
 
 def is_root(f):
+    """A surface a reader or agent ENTERS through, rather than one they are
+    routed to. A skill's entry file is `SKILL.md` — the agent machinery loads it
+    by name — but the `references/*.md` beside it are ordinary pages that
+    `SKILL.md` links to. Seeding those as roots would let a reference file that
+    nothing links any more still confer reachability on the guides it names, so
+    they are waypoints (below) instead: traversable, but only once something
+    reaches them."""
     if f in HISTORY or f.startswith(HISTORY):
         return False
     return (f in ROOT_FILES
-            or (f.startswith(ROOT_DIRS) and f.endswith('.md'))
+            or (f.startswith(ROOT_DIRS) and f.endswith('.md')
+                and posixpath.basename(f) in ('SKILL.md', 'AGENT.md'))
+            or (f.startswith('agents/') and f.endswith('.md')
+                and posixpath.dirname(f) == 'agents')
             or (f.startswith('examples/') and posixpath.basename(f) == 'README.md'))
 
 
 roots = [f for f in tracked if is_root(f)]
 node_set = set(nodes)
+# Pages that are neither entry surfaces nor things we assert on, but that a
+# reader can be routed THROUGH — a skill's `references/*.md`. They carry edges
+# only once something reachable links them.
+waypoints = {f for f in tracked
+             if f.startswith(ROOT_DIRS) and f.endswith('.md')
+             and f not in roots and f not in node_set}
+traversable = node_set | waypoints
 
 
 def read(f):
@@ -171,7 +194,7 @@ def ref_label(s):
     return ' '.join(s.split()).lower()
 # A bare repo path. The leading guard keeps `…/docs/guide/x.md` inside a longer
 # path from matching at the wrong offset.
-BARE = re.compile(r'(?<![\w/.-])(docs/guide/[A-Za-z0-9._/-]+\.md)')
+BARE = re.compile(r'(?<![\w/.-])((?:docs/guide|skills|agents)/[A-Za-z0-9._/-]+\.md)')
 
 
 def normalize(p):
@@ -206,7 +229,7 @@ def edges_from(f):
     out = set()
     for m in BARE.finditer(txt):
         t = normalize(m.group(1))
-        if t in node_set:
+        if t in traversable:
             out.add(t)
     base = posixpath.dirname(f)
 
@@ -216,7 +239,7 @@ def edges_from(f):
             return
         # An absolute-looking `/docs/guide/x.md` is a site path, not a file path.
         t = normalize(raw.lstrip('/') if raw.startswith('/') else posixpath.join(base, raw))
-        if t in node_set:
+        if t in traversable:
             out.add(t)
 
     for m in MD_LINK.finditer(txt):
@@ -453,6 +476,24 @@ self_test() {
   printf '# Skill\n\nSee [mail](../../docs/guide/mail.md).\n' > "$c13/skills/x/SKILL.md"
   git -C "$c13" add -A && git -C "$c13" commit -qm skill-root
   check "a skill page is a root" pass "$c13"
+
+  # A skill's reference page is a waypoint: it routes readers onward, but only
+  # once its SKILL.md links it.
+  local c13a="$tmp/c13a"; make_corpus "$c13a"
+  mkdir -p "$c13a/skills/x/references"
+  printf '# Skill\n\nSee [ref](references/notes.md).\n' > "$c13a/skills/x/SKILL.md"
+  printf '# Notes\n\nSee [mail](../../../docs/guide/mail.md).\n' \
+    > "$c13a/skills/x/references/notes.md"
+  git -C "$c13a" add -A && git -C "$c13a" commit -qm waypoint-linked
+  check "a skill reference page linked from SKILL.md routes onward" pass "$c13a"
+
+  local c13b="$tmp/c13b"; make_corpus "$c13b"
+  mkdir -p "$c13b/skills/x/references"
+  printf '# Skill\n\nnothing linked here\n' > "$c13b/skills/x/SKILL.md"
+  printf '# Notes\n\nSee [mail](../../../docs/guide/mail.md).\n' \
+    > "$c13b/skills/x/references/notes.md"
+  git -C "$c13b" add -A && git -C "$c13b" commit -qm waypoint-unlinked
+  check "an unlinked skill reference page does not confer reachability" fail "$c13b"
 
   local c14="$tmp/c14"; make_corpus "$c14"
   mkdir -p "$c14/examples/blog"

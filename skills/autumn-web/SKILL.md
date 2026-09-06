@@ -1252,11 +1252,15 @@ Two things to get right when generating this code:
   never enqueued. Do not present it to a user as an outbox guarantee, and do not
   write a reconciler over the log table to claim one: a successful enqueue
   writes no marker, so an enqueued row is indistinguishable from one whose
-  process died first, and a sweeper can only duplicate or drop. For stronger
-  guarantees implement `OutboundWebhookHandler` over storage that commits the log
-  write and the enqueue together; make receivers idempotent on the event ID
-  either way, since retries make delivery at-least-once regardless. An enqueue
-  that fails is the one handled case — marked `is_dlq` and replayable.
+  process died first, and a sweeper can only duplicate or drop. Implementing the
+  trait does not fix it either — `OutboundWebhookHandler` is storage-only and the
+  enqueue happens after it returns, so no impl can make the two atomic. If an app
+  needs a stronger guarantee, put the outbox *outside* this subsystem: its own
+  row written in the same transaction as the triggering business data, with a
+  worker calling `dispatch()` and marking the row processed only on `Ok`. Make
+  receivers idempotent on the event ID regardless — retries make delivery
+  at-least-once anyway. An enqueue that fails is the one handled case — marked
+  `is_dlq` and replayable.
 
 Do not
 hand-roll outbound delivery with a bare HTTP client — the user-supplied
