@@ -260,6 +260,39 @@ async fn login_with_wrong_password_stays_on_the_form() {
     );
 }
 
+/// A successful login must bound an oversized `next` the same way the GET
+/// and failed-POST renders already do. Before this fix, only the login-page
+/// renders were bounded — the success path's redirect still used the raw,
+/// unbounded `form.next`, so an attacker-sized `next` sailed straight into
+/// the `Location` header on the one path that was never checked (Codex
+/// finding on this PR).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn login_bounds_an_oversized_next_on_success_too() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    signup(&client, "bounded@acme.test").await;
+    client.log_out();
+
+    let oversized_next = format!("/members?{}", "a".repeat(3000));
+    let resp = client
+        .post("/login")
+        .form(&format!(
+            "email=bounded@acme.test&password=Tr0ubad0ur-Xy7-correct-horse&next={oversized_next}"
+        ))
+        .send()
+        .await;
+    resp.assert_status(303);
+    let location = resp
+        .header("location")
+        .expect("redirect has a Location header");
+    assert!(
+        location.len() <= 2048,
+        "expected the redirect target bounded to MAX_NEXT_LEN (2048), got {} chars",
+        location.len()
+    );
+}
+
 /// AC4 + AC5(a) + success metric: inviting sends a real email (captured as an
 /// `.eml`), and accepting via the tokened link as a brand-new user creates
 /// the account and the membership in one step.

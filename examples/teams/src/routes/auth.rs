@@ -384,7 +384,12 @@ pub async fn login(
     };
 
     establish_session(&session, user.id, &active.tenant_id, role).await;
-    Ok(Redirect::to(safe_next(form.next.as_deref())).into_response())
+    // `next` (already bounded to MAX_NEXT_LEN above) rather than raw
+    // `form.next`: the success path must apply the same limit as the GET and
+    // failed-POST renders, or a request-body-sized `next` sails straight into
+    // the `Location` header here while every other path bounds it (Codex
+    // finding on this PR).
+    Ok(Redirect::to(safe_next(Some(&next))).into_response())
 }
 
 #[post("/logout")]
