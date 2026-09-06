@@ -1617,6 +1617,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **admin-plugin:** `ListParams` gains `sql_offset_limit()`, converting a
+  page/per-page request into ready-to-bind `(offset, limit)` — `per_page == 0`
+  means unlimited, offset 0. `ExperimentAdminModel`, `TokenAdminModel`, and
+  `FeatureFlagAdminModel::list()` each reimplemented this identically; history
+  shows the "`per_page == 0`" special case was fixed in two of the three in
+  one commit and copy-pasted into the third when it was added later. A custom
+  `AdminModel::list()` implementation can now reuse the same helper instead of
+  re-deriving it. `[no-plugin]`: internal dedup, no new agent-facing surface.
 - **ci: the Docker/testcontainer sweep runs as its own `Test (Docker)` job
   instead of the last step of `Test (ubuntu-latest)`:** as step 16 of that job
   it inherited a disk already filled by the whole workspace build plus eight
