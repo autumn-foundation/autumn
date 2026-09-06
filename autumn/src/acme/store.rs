@@ -250,25 +250,17 @@ impl AcmeStore for FsAcmeStore {
             // syscalls rather than across a full write+flush of the key. Any
             // residual torn state (a new chain with the old/mismatched key, or
             // vice-versa) is still caught at load time by the renewal decision's
-            // pair validation, which treats a non-loadable pair as absent. If
-            // staging the key fails, clean up the already-staged chain temp so it
-            // does not linger.
+            // pair validation, which treats a non-loadable pair as absent.
+            //
+            // Each staged handle (`crate::fs_atomic::StagedFile`) removes its
+            // own temp file on drop unless `publish_staged` consumes it, so an
+            // early return here — staging the key fails, publishing the chain
+            // fails, or this whole future is cancelled — cannot leak a
+            // partial-secret temp file; no manual cleanup needed.
             let chain_tmp = stage_owner_only(&chain_path, &chain).await?;
-            let key_tmp = match stage_owner_only(&key_path, &key).await {
-                Ok(tmp) => tmp,
-                Err(e) => {
-                    let _ = tokio::fs::remove_file(&chain_tmp).await;
-                    return Err(e);
-                }
-            };
-            // `publish_staged` cleans up its OWN tmp argument on failure, but
-            // if publishing the chain fails, `key_tmp` was never passed to
-            // it and would otherwise leak.
-            if let Err(e) = publish_staged(&chain_tmp, &chain_path).await {
-                let _ = tokio::fs::remove_file(&key_tmp).await;
-                return Err(e);
-            }
-            publish_staged(&key_tmp, &key_path).await
+            let key_tmp = stage_owner_only(&key_path, &key).await?;
+            publish_staged(chain_tmp, &chain_path).await?;
+            publish_staged(key_tmp, &key_path).await
         })
     }
 }
@@ -314,7 +306,7 @@ async fn write_owner_only(path: &Path, data: &[u8]) -> io::Result<()> {
 /// multi-file publish (the cert chain + its key) stage BOTH files before
 /// renaming EITHER, shrinking the window in which a crash could tear the pair
 /// down to the two back-to-back rename syscalls.
-async fn stage_owner_only(path: &Path, data: &[u8]) -> io::Result<PathBuf> {
+async fn stage_owner_only(path: &Path, data: &[u8]) -> io::Result<crate::fs_atomic::StagedFile> {
     let path = path.to_path_buf();
     let data = data.to_vec();
     blocking(move || crate::fs_atomic::stage_owner_only(&path, &data)).await
@@ -323,10 +315,9 @@ async fn stage_owner_only(path: &Path, data: &[u8]) -> io::Result<PathBuf> {
 /// Atomically publish a staged temp file by renaming it over `path`, via the
 /// shared [`crate::fs_atomic`] helper (issue #1864). On error, best-effort
 /// clean up the temp file so it does not accumulate.
-async fn publish_staged(tmp: &Path, path: &Path) -> io::Result<()> {
-    let tmp = tmp.to_path_buf();
+async fn publish_staged(staged: crate::fs_atomic::StagedFile, path: &Path) -> io::Result<()> {
     let path = path.to_path_buf();
-    blocking(move || crate::fs_atomic::publish_staged(&tmp, &path)).await
+    blocking(move || crate::fs_atomic::publish_staged(staged, &path)).await
 }
 
 /// Run a blocking `std::fs` operation on tokio's blocking thread pool,

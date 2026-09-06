@@ -31,9 +31,55 @@ pub fn ensure_owner_only_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// A staged temp file that removes itself on drop unless [`publish_staged`]
+/// consumes it.
+///
+/// Each staging attempt gets a fresh, unpredictable name (unlike the old
+/// fixed `{path}.tmp`, which a failed write would simply overwrite on
+/// retry), so nothing else will ever clean up an abandoned one — a plain
+/// `PathBuf` return would leak a partial-secret file on any early return
+/// between staging and publishing, and on tokio's `spawn_blocking` (as
+/// `crate::acme::store` uses to run this synchronously), even one dropped
+/// for a reason that has nothing to do with the write itself: the blocking
+/// closure keeps running to completion — and returns this value — even
+/// after whatever was awaiting its `JoinHandle` is gone, and that ownerless
+/// return value is simply dropped once produced. Wrapping the path in a
+/// drop-cleans-up guard turns both cases into an automatic removal instead
+/// of a leak.
+pub struct StagedFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl StagedFile {
+    /// The staged temp file's path. Only needed by tests today — production
+    /// callers stage then publish without inspecting the path in between.
+    #[cfg(test)]
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Disarm the guard and take ownership of the path — used by
+    /// [`publish_staged`] right before renaming it into place, since from
+    /// that point on `rename`'s own cleanup-on-error takes over.
+    fn disarm(mut self) -> PathBuf {
+        self.armed = false;
+        std::mem::take(&mut self.path)
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Write `data` to a fresh, unpredictable sibling of `path` with owner-only
 /// (`0600`) permissions on Unix, WITHOUT renaming it into place, and return
-/// the temp path.
+/// a guard over the temp path.
 ///
 /// The temp file is opened `create_new` under a random name, so the write
 /// can never follow a symlink an attacker planted at a predictable path, and
@@ -42,7 +88,7 @@ pub fn ensure_owner_only_dir(dir: &Path) -> std::io::Result<()> {
 /// key) stage every file before renaming any of them, shrinking the window
 /// in which a crash could tear a multi-file pair down to the back-to-back
 /// rename syscalls.
-pub fn stage_owner_only(path: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
+pub fn stage_owner_only(path: &Path, data: &[u8]) -> std::io::Result<StagedFile> {
     let tmp = temp_sibling(path);
 
     let mut options = std::fs::OpenOptions::new();
@@ -53,12 +99,6 @@ pub fn stage_owner_only(path: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
         options.mode(0o600);
     }
 
-    // Each attempt gets a fresh, unpredictable name (unlike the old fixed
-    // `{path}.tmp`, which a failed write would simply overwrite on retry), so
-    // a failure anywhere below must clean up `tmp` itself — otherwise a
-    // persisting fault (disk quota, a failing fsync) would accumulate an
-    // unbounded number of orphaned partial-secret files across retries
-    // instead of the single leaked file the old fixed name self-healed.
     let write_and_sync = || -> std::io::Result<()> {
         let mut file = options.open(&tmp)?;
         #[cfg(unix)]
@@ -73,7 +113,10 @@ pub fn stage_owner_only(path: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
     };
 
     match write_and_sync() {
-        Ok(()) => Ok(tmp),
+        Ok(()) => Ok(StagedFile {
+            path: tmp,
+            armed: true,
+        }),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)
@@ -83,11 +126,12 @@ pub fn stage_owner_only(path: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
 
 /// Atomically publish a staged temp file by renaming it over `path`. On
 /// error, best-effort clean up the temp file so it does not accumulate.
-pub fn publish_staged(tmp: &Path, path: &Path) -> std::io::Result<()> {
-    match std::fs::rename(tmp, path) {
+pub fn publish_staged(staged: StagedFile, path: &Path) -> std::io::Result<()> {
+    let tmp = staged.disarm();
+    match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(error) => {
-            let _ = std::fs::remove_file(tmp);
+            let _ = std::fs::remove_file(&tmp);
             Err(error)
         }
     }
@@ -96,8 +140,8 @@ pub fn publish_staged(tmp: &Path, path: &Path) -> std::io::Result<()> {
 /// Stage then publish in one call — the common case for a single-file
 /// owner-only atomic write.
 pub fn write_owner_only(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let tmp = stage_owner_only(path, data)?;
-    publish_staged(&tmp, path)
+    let staged = stage_owner_only(path, data)?;
+    publish_staged(staged, path)
 }
 
 /// An unpredictable sibling path for the temp file.
@@ -174,12 +218,13 @@ mod tests {
     fn stage_then_publish_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cert.chain.pem");
-        let tmp = stage_owner_only(&path, b"CHAIN").unwrap();
-        assert!(tmp.exists());
+        let staged = stage_owner_only(&path, b"CHAIN").unwrap();
+        let tmp_path = staged.path().to_path_buf();
+        assert!(tmp_path.exists());
         assert!(!path.exists(), "not published yet");
-        publish_staged(&tmp, &path).unwrap();
+        publish_staged(staged, &path).unwrap();
         assert!(path.exists());
-        assert!(!tmp.exists(), "temp file consumed by rename");
+        assert!(!tmp_path.exists(), "temp file consumed by rename");
         assert_eq!(std::fs::read(&path).unwrap(), b"CHAIN");
     }
 
@@ -187,13 +232,38 @@ mod tests {
     fn publish_staged_cleans_up_the_temp_file_on_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cert.chain.pem");
-        let tmp = stage_owner_only(&path, b"CHAIN").unwrap();
+        let staged = stage_owner_only(&path, b"CHAIN").unwrap();
+        let tmp_path = staged.path().to_path_buf();
         // A directory as the destination makes `rename` fail.
         std::fs::create_dir(&path).unwrap();
         let target = path.join("nested").join("impossible");
-        let err = publish_staged(&tmp, &target);
+        let err = publish_staged(staged, &target);
         assert!(err.is_err());
-        assert!(!tmp.exists(), "temp file must be cleaned up on failure");
+        assert!(
+            !tmp_path.exists(),
+            "temp file must be cleaned up on failure"
+        );
+    }
+
+    // Codex review (#1864): a `StagedFile` dropped without being published —
+    // an early return between staging and publishing, or a `spawn_blocking`
+    // closure whose result nobody ever awaits because the caller was
+    // cancelled — must not leak its temp file. Unlike the old fixed `.tmp`
+    // name, nothing will ever overwrite an abandoned unpredictable-named one.
+    #[test]
+    fn staged_file_removes_itself_if_dropped_without_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cert.key.pem");
+        let staged = stage_owner_only(&path, b"KEY").unwrap();
+        let tmp_path = staged.path().to_path_buf();
+        assert!(tmp_path.exists());
+
+        drop(staged);
+
+        assert!(
+            !tmp_path.exists(),
+            "an unpublished staged file must clean itself up on drop"
+        );
     }
 
     #[test]
