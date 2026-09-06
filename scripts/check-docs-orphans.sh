@@ -789,7 +789,12 @@ def strip_comments(txt):
 # The unclosed alternative matters for the same reason it does for comments: an
 # opener with no matching close makes the rest of the file raw HTML, so
 # Markdown-shaped text after it renders as nothing.
-HIDDEN_TAGS = r'script|style|template'
+# `iframe` is here for its CONTENTS: a browser renders the frame and ignores
+# the fallback text inside it, so a path written there is not on screen. The
+# ELEMENT still counts as link content (see `ANY_IMAGE`) — it paints — which
+# is the same split `template` has and the reason this list is not the
+# type-1 one.
+HIDDEN_TAGS = r'script|style|template|iframe'
 # Comments and hidden-HTML openers are found by ONE scan, because whichever
 # opens FIRST wins and neither can decide that alone. `<!-- <script> -->` is a
 # sample INSIDE a comment: matching hidden HTML first read it as an unclosed
@@ -1018,6 +1023,10 @@ FENCE_LINE = re.compile(r'^ {0,3}(?:`{3,}|~{3,})')
 # page the reader can click as an orphan. A single `=` or `-` underlines, which
 # is why this is not the thematic-break rule with a different name.
 SETEXT_UNDERLINE = re.compile(r'^ {0,3}(?:=+|-+)[ \t]*$')
+# A bare container marker: a list bullet or a quote with nothing after it.
+# Checked AFTER the Setext arm, because `-` under a paragraph underlines it
+# rather than starting a list.
+EMPTY_CONTAINER = re.compile(r'^ {0,3}(?:>|[-*+]|\d{1,9}[.)])[ \t]*$')
 # Four columns of indent is a code block — but only where a paragraph is not
 # already open, since indented code cannot interrupt one. Tabs expand to
 # four-column stops, which is what makes a single leading tab count.
@@ -1185,6 +1194,15 @@ def block_starts(txt):
             title_may_follow = REF_DEF_LINE.match(line).group('title') is None
             pos += len(line) + 1
             continue
+        elif EMPTY_CONTAINER.match(line):
+            # A container marker with nothing after it opens an EMPTY block —
+            # `-` is a list item holding nothing, `>` a quote holding nothing —
+            # so no paragraph is open under it and a definition there is a
+            # definition. Read as prose, it left the definition unblanked and
+            # its path counted as visible text. A marker WITH content still
+            # opens a paragraph, and the definition below that one is lazy
+            # continuation the reader can see; both are pinned.
+            para_open = False
         elif para_open and SETEXT_UNDERLINE.match(line):
             # It needs an open paragraph to underline: with none, `===` is
             # ordinary text and `---` is a thematic break, which the next arm
@@ -1437,8 +1455,14 @@ def definition_labels(txt):
 # is visible and clickable — and stripping every tag left it looking empty.
 # Only elements that reliably render are listed; an `<input type=hidden>`
 # is markup, not content.
+# `iframe` was in this list for one round and is deliberately not now. Its
+# CONTENTS are hidden (see `HIDDEN_TAGS`), so the whole element is blanked
+# before this test ever runs and listing it here did nothing but conflict —
+# and an embedded document is not an icon: an anchor wrapping one has no
+# clickable area of its own. It was added speculatively while generalising
+# `<svg>`, which is the reported case and the one that is real.
 ANY_IMAGE = re.compile(
-    r'!\[|<(?:img|svg|video|canvas|picture|iframe|object|embed)\b', re.I)
+    r'!\[|<(?:img|svg|video|canvas|picture|object|embed)\b', re.I)
 # Any HTML tag, open or close, quote-aware so a `>` inside an attribute
 # does not end it early.
 ANY_TAG = re.compile(
@@ -3731,6 +3755,43 @@ self_test() {
     > "$c9ib/docs/guide/jobs.md"
   git -C "$c9ib" add -A && git -C "$c9ib" commit -qm icon-only-link
   check "an icon-only SVG link is a route" pass "$c9ib"
+
+  # A browser renders the frame and ignores the fallback text inside it.
+  local c9ic="$tmp/c9ic"; make_corpus "$c9ic"
+  printf '# Jobs\n\n<iframe src="about:blank">docs/guide/mail.md</iframe>\n' \
+    > "$c9ic/docs/guide/jobs.md"
+  git -C "$c9ic" add -A && git -C "$c9ic" commit -qm iframe-fallback-text
+  check "iframe fallback text is not visible" fail "$c9ic"
+
+  # ...and an anchor wrapping one is not a route either: the element is hidden
+  # content, and an embedded document gives the anchor no clickable area.
+  local c9id="$tmp/c9id"; make_corpus "$c9id"
+  printf '# Jobs\n\n<a href="mail.md"><iframe src="about:blank"></iframe></a>\n' \
+    > "$c9id/docs/guide/jobs.md"
+  git -C "$c9id" add -A && git -C "$c9id" commit -qm iframe-as-link-content
+  check "an anchor wrapping only an iframe is not a route" fail "$c9id"
+
+  # A bare container marker opens an EMPTY block, so the definition under it is
+  # a definition and renders nothing.
+  local c9ie="$tmp/c9ie"; make_corpus "$c9ie"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n-\n[unused]: docs/guide/mail.md\n' \
+    > "$c9ie/README.md"
+  git -C "$c9ie" add -A && git -C "$c9ie" commit -qm empty-list-marker
+  check "a definition under an empty list marker is not visible" fail "$c9ie"
+
+  local c9if="$tmp/c9if"; make_corpus "$c9if"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n>\n[unused]: docs/guide/mail.md\n' \
+    > "$c9if/README.md"
+  git -C "$c9if" add -A && git -C "$c9if" commit -qm empty-quote-marker
+  check "a definition under an empty quote marker is not visible" fail "$c9if"
+
+  # ...but a marker WITH content opens a paragraph, and the line under it is
+  # lazy continuation the reader can see.
+  local c9ig="$tmp/c9ig"; make_corpus "$c9ig"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n- item\n[unused]: docs/guide/mail.md\n' \
+    > "$c9ig/README.md"
+  git -C "$c9ig" add -A && git -C "$c9ig" commit -qm list-item-with-text
+  check "a definition continuing a list item is visible text" pass "$c9ig"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
