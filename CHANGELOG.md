@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **cli:** `autumn destroy` no longer reports `Diverged` for an untouched file
+  whose generator template changed since the project was generated (issue
+  #1835). `generate` now records a digest of every file it owns in
+  `.autumn/generated.toml`, and `destroy` accepts a file matching either that
+  digest or the current render. A real edit matches neither and is still
+  refused without `--force`, and the applied-migration guard is unchanged.
+  Commit the manifest — it is the baseline a later checkout compares against.
+  A project generated before the manifest existed keeps the previous
+  behaviour: compare against the current render only, `--force` to override.
+  A side effect of the digest being taken over LF-normalised text: a CRLF
+  checkout of a generated file (`core.autocrlf`) no longer reads as an edit.
+
 - **plugin-sandbox:** three consequences of #1632 that an existing sandbox
   embedder will notice. `SandboxManifest` gains `grants` and `quotas` fields, so
   a struct literal over it needs two more lines — prefer `SandboxManifest::parse`

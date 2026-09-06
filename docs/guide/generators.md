@@ -2042,6 +2042,32 @@ Every generator accepts:
   collision. `mod.rs` and `schema.rs` are always treated as modify-in-place
   edits and don't trigger collisions.
 
+## Undoing a generator: `autumn destroy`
+
+`autumn destroy <thing> <the same arguments>` reverses a matching `generate`.
+It removes the files that invocation owns. It also takes that invocation's
+edits back out of the files it shares with other resources.
+
+`destroy` refuses to delete a file you have edited. To tell your edits from its
+own output, `generate` records a digest of every file it writes in
+`.autumn/generated.toml`. `destroy` deletes a file when the content matches
+that digest, or matches what the current templates render. It reports
+`Diverged` and stops when the content matches neither.
+
+Commit `.autumn/generated.toml`. It is the baseline a later checkout compares
+against. Without it, `destroy` can only compare against the current templates —
+so a CLI upgrade that changed a template makes every untouched file that
+generator wrote look edited.
+
+Two cases still need `--force`:
+
+- The project was generated before Autumn wrote this manifest.
+- You edited the file, and you want it deleted anyway.
+
+`--force` skips the content check. It does not skip the applied-migration
+guard: `destroy` never removes migration files that a configured database
+records as applied.
+
 ## `autumn db pull` — scaffold models from an existing database
 
 The generators above are greenfield: you describe a table with the `name:Type`

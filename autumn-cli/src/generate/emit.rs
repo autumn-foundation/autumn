@@ -10,7 +10,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use super::{Flags, GenerateError};
+use super::{Flags, GenerateError, provenance};
 
 /// One filesystem operation the generator wants to perform.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -696,6 +696,20 @@ impl Plan {
             fs::create_dir_all(dir)?;
         }
 
+        // Digests of the files this run actually owns, for `revert` to compare
+        // against once the template has moved on (issue #1835). Recorded even
+        // when a later action fails: the files already on disk are ours, and a
+        // re-run has to be able to tell that.
+        let mut written: Vec<(PathBuf, String)> = Vec::new();
+        let result = self.write_actions(&mut written);
+        self.record_provenance(written);
+        result
+    }
+
+    /// Write every action, collecting `(path, digest)` for each file this plan
+    /// owns. Split out of [`Self::execute`] so provenance is recorded on the
+    /// error path too.
+    fn write_actions(&self, written: &mut Vec<(PathBuf, String)>) -> Result<(), GenerateError> {
         for action in &self.actions {
             let path = action.path();
             match action {
@@ -706,10 +720,16 @@ impl Plan {
                         "Created"
                     };
                     fs::write(path, contents)?;
+                    // A `Modify` target is shared — other resources and the
+                    // developer write to it too — so this plan never owns it.
+                    if matches!(action, Action::Create { .. }) {
+                        written.push((path.to_path_buf(), provenance::text_digest(contents)));
+                    }
                     println!("  {label} {}", relative_display(path, &self.project_root));
                 }
                 Action::CreateBytes { bytes, .. } => {
                     fs::write(path, bytes)?;
+                    written.push((path.to_path_buf(), provenance::bytes_digest(bytes)));
                     println!("  Created {}", relative_display(path, &self.project_root));
                 }
                 Action::CreateIfAbsent { contents, .. } => {
@@ -725,10 +745,12 @@ impl Plan {
                                 let _ = fs::remove_file(path);
                                 return Err(GenerateError::Io(e));
                             }
+                            written.push((path.to_path_buf(), provenance::text_digest(contents)));
                             println!("  Created {}", relative_display(path, &self.project_root));
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                            // Another process already created the file; leave it untouched.
+                            // Another process already created the file; leave it
+                            // untouched — and unrecorded: this run did not write it.
                         }
                         Err(e) => return Err(GenerateError::Io(e)),
                     }
@@ -736,6 +758,31 @@ impl Plan {
             }
         }
         Ok(())
+    }
+
+    /// Record what this run wrote, so a later `destroy` can tell its own
+    /// output from a developer's edit even after the template changed
+    /// (issue #1835).
+    ///
+    /// Best effort: a manifest that cannot be written leaves `destroy`
+    /// comparing against the current render alone — the behaviour before this
+    /// existed — so it warns rather than failing a generator run that has
+    /// already written every file it promised.
+    fn record_provenance(&self, written: Vec<(PathBuf, String)>) {
+        if written.is_empty() {
+            return;
+        }
+        let mut recorded = provenance::Provenance::load(&self.project_root);
+        for (path, digest) in written {
+            recorded.record(&self.project_root, &path, digest);
+        }
+        if let Err(e) = recorded.save(&self.project_root) {
+            eprintln!(
+                "Warning: could not record generated-file provenance in {}: {e}. \
+                 `autumn destroy` may need --force after a CLI upgrade.",
+                provenance::MANIFEST_PATH
+            );
+        }
     }
 
     /// Print every advisory warning to stderr. Called only on a path that
@@ -883,6 +930,8 @@ impl Plan {
             prune_empty_ancestors(dir, &self.project_root);
         }
 
+        self.forget_provenance(&plan);
+
         // Nested sub-module declarations (e.g. `src/mailers/mod.rs`'s
         // `pub mod previews;`) must be synced BEFORE `src/main.rs`'s, so a
         // now-empty-and-deleted `src/mailers/mod.rs` is already gone by the
@@ -897,6 +946,31 @@ impl Plan {
         Ok(())
     }
 
+    /// Drop the provenance entries for everything this revert removed, so the
+    /// manifest never outlives the files it describes (issue #1835) — a stale
+    /// entry would otherwise vouch for whatever is written at that path next.
+    ///
+    /// Best effort, like [`Self::record_provenance`]: the files are already
+    /// gone, and failing here would report a destroy that in fact succeeded.
+    fn forget_provenance(&self, plan: &RevertPlan) {
+        let mut recorded = provenance::Provenance::load(&self.project_root);
+        if recorded.is_empty() {
+            return;
+        }
+        for path in &plan.files_to_remove {
+            recorded.forget(&self.project_root, path);
+        }
+        for dir in &plan.migrations_to_remove {
+            recorded.forget_dir(&self.project_root, dir);
+        }
+        if let Err(e) = recorded.save(&self.project_root) {
+            eprintln!(
+                "Warning: could not update {} after destroy: {e}",
+                provenance::MANIFEST_PATH
+            );
+        }
+    }
+
     /// Compute what [`Plan::revert`] would do, without touching disk except
     /// to read files for divergence comparison. Shared by the `--dry-run`
     /// and real-run paths of `revert` so they can never disagree.
@@ -909,6 +983,10 @@ impl Plan {
     )]
     fn compute_revert_plan(&self, force: bool) -> RevertPlan {
         let migrations_root = self.project_root.join("migrations");
+        // What a matching `generate` recorded writing. A file matching either
+        // the current render or this baseline is the generator's own output,
+        // however far the template has moved since (issue #1835).
+        let recorded = provenance::Provenance::load(&self.project_root);
 
         // `Create`/`CreateBytes`/`CreateIfAbsent` actions living directly
         // under `migrations/<dir>/` need suffix-based matching (see
@@ -953,15 +1031,7 @@ impl Plan {
             if !path.exists() {
                 continue; // already gone — idempotent skip.
             }
-            let matches = match action {
-                Action::Create { contents, .. } => {
-                    fs::read_to_string(path).is_ok_and(|d| &d == contents)
-                }
-                Action::CreateBytes { bytes, .. } => fs::read(path).is_ok_and(|d| &d == bytes),
-                Action::CreateIfAbsent { .. } | Action::Modify { .. } => {
-                    unreachable!("filtered out above")
-                }
-            };
+            let matches = is_generator_output(action, path, &recorded, &self.project_root);
             if matches || force {
                 files_to_remove.push(path.to_path_buf());
             } else {
@@ -991,10 +1061,7 @@ impl Plan {
                     continue; // a sibling resource's file still lives here — keep it.
                 }
             }
-            let Action::CreateIfAbsent { contents, .. } = action else {
-                unreachable!("filtered to CreateIfAbsent above");
-            };
-            let matches = fs::read_to_string(path).is_ok_and(|d| &d == contents);
+            let matches = is_generator_output(action, path, &recorded, &self.project_root);
             if matches {
                 files_to_remove.push(path.to_path_buf());
             } else {
@@ -1025,6 +1092,7 @@ impl Plan {
                 force,
                 &self.project_root,
                 &files_to_remove,
+                &recorded,
             ) {
                 MigrationOutcome::Remove(real_dir) => migrations_to_remove.push(real_dir),
                 MigrationOutcome::Diverged(path) => diverged.push(path),
@@ -1526,17 +1594,55 @@ enum MigrationOutcome {
 /// disambiguate between multiple same-suffix migration directories, so it
 /// never honours `--force` (a loose match here would let `--force` guess
 /// wrong on top of bypassing safety, rather than just bypassing safety).
-fn migration_dir_matches_actions(dir: &Path, actions: &[&Action]) -> bool {
+fn migration_dir_matches_actions(
+    dir: &Path,
+    actions: &[&Action],
+    recorded: &provenance::Provenance,
+    project_root: &Path,
+) -> bool {
     actions.iter().all(|action| {
         let Some(file_name) = action.path().file_name() else {
             return true;
         };
-        let expected: &str = match action {
-            Action::Create { contents, .. } | Action::CreateIfAbsent { contents, .. } => contents,
-            Action::CreateBytes { .. } | Action::Modify { .. } => return true,
-        };
-        fs::read_to_string(dir.join(file_name)).is_ok_and(|actual| actual == *expected)
+        if matches!(action, Action::Modify { .. }) {
+            return true;
+        }
+        is_generator_output(action, &dir.join(file_name), recorded, project_root)
     })
+}
+
+/// Whether the file at `path` is this generator's own output.
+///
+/// True when it matches what the plan would write now, and also when it
+/// matches the digest `generate` recorded for it — the same file, written by a
+/// CLI whose template has since moved on (issue #1835). A developer's edit
+/// matches neither, and stays protected.
+///
+/// A `Modify` target is shared, never owned by one plan; callers filter those
+/// out before reaching here.
+fn is_generator_output(
+    action: &Action,
+    path: &Path,
+    recorded: &provenance::Provenance,
+    project_root: &Path,
+) -> bool {
+    match action {
+        Action::Create { contents, .. } | Action::CreateIfAbsent { contents, .. } => {
+            let Ok(on_disk) = fs::read_to_string(path) else {
+                return false;
+            };
+            &on_disk == contents
+                || recorded.is_ours(project_root, path, &provenance::text_digest(&on_disk))
+        }
+        Action::CreateBytes { bytes, .. } => {
+            let Ok(on_disk) = fs::read(path) else {
+                return false;
+            };
+            &on_disk == bytes
+                || recorded.is_ours(project_root, path, &provenance::bytes_digest(&on_disk))
+        }
+        Action::Modify { .. } => false,
+    }
 }
 
 /// Split a migration directory name into its leading numeric timestamp
@@ -1561,6 +1667,7 @@ fn resolve_migration_removal(
     force: bool,
     project_root: &Path,
     excluding: &[PathBuf],
+    recorded: &provenance::Provenance,
 ) -> MigrationOutcome {
     let Some(plan_dir_name) = plan_dir.file_name().and_then(|n| n.to_str()) else {
         return MigrationOutcome::NotFound;
@@ -1592,7 +1699,7 @@ fn resolve_migration_removal(
             // non-deterministic).
             let mut matching: Vec<PathBuf> = candidates
                 .into_iter()
-                .filter(|dir| migration_dir_matches_actions(dir, actions))
+                .filter(|dir| migration_dir_matches_actions(dir, actions, recorded, project_root))
                 .collect();
             if matching.len() != 1 {
                 return MigrationOutcome::Ambiguous(suffix.to_owned());
@@ -1605,13 +1712,14 @@ fn resolve_migration_removal(
         let Some(file_name) = action.path().file_name() else {
             continue;
         };
-        let expected: &str = match action {
-            Action::Create { contents, .. } | Action::CreateIfAbsent { contents, .. } => contents,
-            Action::CreateBytes { .. } | Action::Modify { .. } => continue,
-        };
+        if matches!(action, Action::Modify { .. }) {
+            continue;
+        }
+        // The on-disk directory carries the timestamp `generate` used, not the
+        // fresh one this recomputed plan holds, so compare against the real
+        // file — under its own recorded digest too (issue #1835).
         let real_file = real_dir.join(file_name);
-        let matches = fs::read_to_string(&real_file).is_ok_and(|actual| actual == *expected);
-        if !matches && !force {
+        if !is_generator_output(action, &real_file, recorded, project_root) && !force {
             return MigrationOutcome::Diverged(real_file);
         }
     }
@@ -2315,6 +2423,247 @@ mod tests {
         })
         .unwrap();
         assert!(target.exists());
+    }
+
+    // ---- issue #1835: provenance-tolerant revert -------------------------
+    //
+    // `destroy` run by a NEWER CLI recomputes the plan from the CURRENT
+    // template, so any generator whose template changed since the project was
+    // generated reported `Diverged` on untouched files. These tests pin the
+    // provenance manifest that tells the two cases apart.
+
+    /// The plan a newer CLI would recompute: same path, newer template text.
+    fn newer_template_plan(tmp: &tempfile::TempDir, path: &Path, contents: &str) -> Plan {
+        let mut plan = Plan::new(tmp.path());
+        plan.create(path.to_path_buf(), contents);
+        plan
+    }
+
+    #[test]
+    fn revert_removes_untouched_file_whose_template_changed_since_generation() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("src/routes/auth.rs");
+        plan.create(target.clone(), "// v1 template\n");
+        plan.execute(Flags::default()).unwrap();
+
+        // Newer CLI: the renderer now emits different text for the same file.
+        let newer = newer_template_plan(&tmp, &target, "// v2 template\n");
+        newer.revert(Flags::default()).unwrap();
+
+        assert!(!target.exists(), "untouched generated file must be removed");
+    }
+
+    #[test]
+    fn revert_still_refuses_a_hand_edited_file_whose_template_changed() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("src/routes/auth.rs");
+        plan.create(target.clone(), "// v1 template\n");
+        plan.execute(Flags::default()).unwrap();
+        fs::write(&target, "// hand-edited by user\n").unwrap();
+
+        let newer = newer_template_plan(&tmp, &target, "// v2 template\n");
+        let err = newer.revert(Flags::default()).unwrap_err();
+
+        assert!(matches!(err, GenerateError::Diverged(_)));
+        assert!(target.exists(), "a real edit must survive");
+    }
+
+    #[test]
+    fn execute_records_a_provenance_digest_for_every_owned_file() {
+        let (tmp, mut plan) = fixture();
+        plan.create(tmp.path().join("src/models/post.rs"), "// model\n");
+        plan.create_bytes(tmp.path().join("static/logo.png"), vec![1, 2, 3]);
+        plan.create_if_absent(tmp.path().join("templates/_layout.html"), "<html>\n");
+        plan.modify(tmp.path().join("src/main.rs"), "fn main() {}\n");
+        plan.execute(Flags::default()).unwrap();
+
+        let recorded = provenance::Provenance::load(tmp.path());
+        assert!(recorded.contains("src/models/post.rs"));
+        assert!(recorded.contains("static/logo.png"));
+        assert!(recorded.contains("templates/_layout.html"));
+        assert!(
+            !recorded.contains("src/main.rs"),
+            "a Modify target is shared, never owned by one plan"
+        );
+    }
+
+    #[test]
+    fn dry_run_execute_records_no_provenance() {
+        let (tmp, mut plan) = fixture();
+        plan.create(tmp.path().join("out.txt"), "hello");
+        plan.execute(Flags {
+            dry_run: true,
+            force: false,
+        })
+        .unwrap();
+        assert!(!tmp.path().join(provenance::MANIFEST_PATH).exists());
+    }
+
+    #[test]
+    fn dry_run_revert_records_no_provenance_change() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("out.txt");
+        plan.create(target.clone(), "hello");
+        plan.execute(Flags::default()).unwrap();
+
+        plan.revert(Flags {
+            dry_run: true,
+            force: false,
+        })
+        .unwrap();
+
+        assert!(
+            provenance::Provenance::load(tmp.path()).contains("out.txt"),
+            "a dry run must leave the manifest alone"
+        );
+    }
+
+    #[test]
+    fn revert_prunes_the_provenance_entries_it_removed() {
+        let (tmp, mut plan) = fixture();
+        plan.create(tmp.path().join("out.txt"), "hello");
+        plan.execute(Flags::default()).unwrap();
+        plan.revert(Flags::default()).unwrap();
+
+        assert!(!provenance::Provenance::load(tmp.path()).contains("out.txt"));
+        assert!(
+            !tmp.path().join(provenance::MANIFEST_PATH).exists(),
+            "an emptied manifest is removed, not left as a stub"
+        );
+    }
+
+    #[test]
+    fn a_skipped_create_if_absent_is_not_recorded_as_ours() {
+        let (tmp, mut plan) = fixture();
+        let shared = tmp.path().join("templates/_layout.html");
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        fs::write(&shared, "<html>hand-written</html>\n").unwrap();
+
+        plan.create_if_absent(shared.clone(), "<html>generated</html>\n");
+        plan.execute(Flags::default()).unwrap();
+
+        assert!(
+            !provenance::Provenance::load(tmp.path()).contains("templates/_layout.html"),
+            "generate skipped the write, so it owns nothing"
+        );
+    }
+
+    #[test]
+    fn create_if_absent_matching_provenance_is_removed_after_a_template_change() {
+        let (tmp, mut plan) = fixture();
+        let shared = tmp.path().join("templates/_layout.html");
+        plan.create_if_absent(shared.clone(), "<html>v1</html>\n");
+        plan.execute(Flags::default()).unwrap();
+
+        let mut newer = Plan::new(tmp.path());
+        newer.create_if_absent(shared.clone(), "<html>v2</html>\n");
+        newer.revert(Flags::default()).unwrap();
+
+        assert!(!shared.exists());
+    }
+
+    #[test]
+    fn create_bytes_matching_provenance_is_removed_after_a_template_change() {
+        let (tmp, mut plan) = fixture();
+        let asset = tmp.path().join("static/vendor.js");
+        plan.create_bytes(asset.clone(), b"v1".to_vec());
+        plan.execute(Flags::default()).unwrap();
+
+        let mut newer = Plan::new(tmp.path());
+        newer.create_bytes(asset.clone(), b"v2".to_vec());
+        newer.revert(Flags::default()).unwrap();
+
+        assert!(!asset.exists());
+    }
+
+    #[test]
+    fn a_crlf_checkout_of_a_generated_file_is_not_divergence() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("src/models/post.rs");
+        plan.create(target.clone(), "line one\nline two\n");
+        plan.execute(Flags::default()).unwrap();
+        fs::write(&target, "line one\r\nline two\r\n").unwrap();
+
+        plan.revert(Flags::default()).unwrap();
+
+        assert!(!target.exists(), "core.autocrlf is not a user edit");
+    }
+
+    #[test]
+    fn a_project_without_provenance_still_refuses_a_changed_template() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("src/routes/auth.rs");
+        plan.create(target.clone(), "// v1 template\n");
+        plan.execute(Flags::default()).unwrap();
+        // An app generated before the manifest existed has no baseline.
+        fs::remove_file(tmp.path().join(provenance::MANIFEST_PATH)).unwrap();
+
+        let newer = newer_template_plan(&tmp, &target, "// v2 template\n");
+        let err = newer.revert(Flags::default()).unwrap_err();
+
+        assert!(matches!(err, GenerateError::Diverged(_)));
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn revert_removes_a_migration_whose_template_changed_since_generation() {
+        no_db_env(|| {
+            let (tmp, mut plan) = fixture();
+            let dir = tmp.path().join("migrations/20260101000000_create_posts");
+            plan.create(dir.join("up.sql"), "CREATE TABLE posts ();\n");
+            plan.create(dir.join("down.sql"), "DROP TABLE posts;\n");
+            plan.execute(Flags::default()).unwrap();
+
+            // Destroy recomputes with a fresh timestamp AND a newer template.
+            let mut newer = Plan::new(tmp.path());
+            let fresh = tmp.path().join("migrations/99999999999999_create_posts");
+            newer.create(fresh.join("up.sql"), "CREATE TABLE posts (id BIGINT);\n");
+            newer.create(fresh.join("down.sql"), "DROP TABLE posts;\n");
+            newer.revert(Flags::default()).unwrap();
+
+            assert!(!dir.exists());
+        });
+    }
+
+    #[test]
+    fn a_hand_edited_migration_whose_template_changed_is_still_refused() {
+        no_db_env(|| {
+            let (tmp, mut plan) = fixture();
+            let dir = tmp.path().join("migrations/20260101000000_create_posts");
+            plan.create(dir.join("up.sql"), "CREATE TABLE posts ();\n");
+            plan.create(dir.join("down.sql"), "DROP TABLE posts;\n");
+            plan.execute(Flags::default()).unwrap();
+            fs::write(dir.join("up.sql"), "CREATE TABLE posts (mine INT);\n").unwrap();
+
+            let mut newer = Plan::new(tmp.path());
+            let fresh = tmp.path().join("migrations/99999999999999_create_posts");
+            newer.create(fresh.join("up.sql"), "CREATE TABLE posts (id BIGINT);\n");
+            newer.create(fresh.join("down.sql"), "DROP TABLE posts;\n");
+            let err = newer.revert(Flags::default()).unwrap_err();
+
+            assert!(matches!(err, GenerateError::Diverged(_)));
+            assert!(dir.exists());
+        });
+    }
+
+    #[test]
+    fn regenerating_after_a_template_change_refreshes_the_recorded_digest() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("src/routes/auth.rs");
+        plan.create(target.clone(), "// v1 template\n");
+        plan.execute(Flags::default()).unwrap();
+
+        let mut newer = Plan::new(tmp.path());
+        newer.create(target.clone(), "// v2 template\n");
+        newer
+            .execute(Flags {
+                force: true,
+                dry_run: false,
+            })
+            .unwrap();
+        newer.revert(Flags::default()).unwrap();
+
+        assert!(!target.exists());
     }
 
     #[test]
