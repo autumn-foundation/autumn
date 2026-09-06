@@ -548,6 +548,17 @@ def edges_from(f):
     # all. Nothing a reader can see names the target, so it is not an edge.
     ref_txt = ''.join(seg for kind, seg in split_fences(txt) if kind == 'prose')
     ref_txt = CODE_SPAN.sub(' ', ref_txt)
+    # Raw tags go too. A `[mail]` sitting in an attribute value —
+    # `<span data-note="[mail]">` — is not parsed as a reference link by
+    # Markdown and shows nothing on screen, so it must not keep a definition
+    # alive. Only whole tags are removed, and only from this view: the anchor
+    # extractor reads `txt`, where `<a href=…>` is still intact and still
+    # navigation. Requiring a letter after `<` keeps prose like `a < b` alone.
+    # An HTML tag NAME is letters, digits and hyphens, and ends at whitespace,
+    # `/` or `>`. A looser `<[A-Za-z][^>]*>` also swallows `<mail.md>` — the
+    # angle-wrapped destination of a reference definition — which the self-test
+    # caught immediately.
+    ref_txt = re.sub(r'</?[A-Za-z][A-Za-z0-9-]*(?:\s[^>]*)?/?>', ' ', ref_txt)
 
     used = set()
     for m in REF_USE_FULL.finditer(ref_txt):
@@ -1203,6 +1214,27 @@ self_test() {
   printf '# Jobs\n\nSee [mail].\n\n```\n[mail]: mail.md\n```\n' > "$c9bj/docs/guide/jobs.md"
   git -C "$c9bj" add -A && git -C "$c9bj" commit -qm fenced-refdef
   check "a reference definition inside a fence defines nothing" fail "$c9bj"
+
+  # A label inside a raw-HTML attribute is not a reference use.
+  local c9bk="$tmp/c9bk"; make_corpus "$c9bk"
+  printf '# Jobs\n\n<span data-note="[mail]">text</span>\n\n[mail]: mail.md\n' \
+    > "$c9bk/docs/guide/jobs.md"
+  git -C "$c9bk" add -A && git -C "$c9bk" commit -qm label-in-attribute
+  check "a label inside an HTML attribute is not a reference use" fail "$c9bk"
+
+  # ...and a real shortcut use beside raw HTML still resolves.
+  local c9bl="$tmp/c9bl"; make_corpus "$c9bl"
+  printf '# Jobs\n\n<span>text</span>\n\nSee [mail].\n\n[mail]: mail.md\n' \
+    > "$c9bl/docs/guide/jobs.md"
+  git -C "$c9bl" add -A && git -C "$c9bl" commit -qm shortcut-beside-html
+  check "a shortcut use beside raw HTML still resolves" pass "$c9bl"
+
+  # Prose comparisons are not tags.
+  local c9bm="$tmp/c9bm"; make_corpus "$c9bm"
+  printf '# Jobs\n\nWhen a < b, see [mail].\n\n[mail]: mail.md\n' \
+    > "$c9bm/docs/guide/jobs.md"
+  git -C "$c9bm" add -A && git -C "$c9bm" commit -qm less-than-in-prose
+  check "a less-than in prose does not eat the reference use" pass "$c9bm"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
