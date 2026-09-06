@@ -2375,15 +2375,14 @@ fn replayed_enqueue(
     Some(
         match tape.next_job(name, &capsule_job_payload(payload), schedule) {
             EnqueueVerdict::Queued => Ok(()),
-            // A recorded backend *rejection* is reproduced as one. A handler
-            // whose 500 came from `enqueue(..).await?` — the queue was down,
-            // the channel closed — must meet that error again, not be handed
-            // the success it never got.
-            // The recorded message verbatim, with no replay marker: a handler
-            // that propagates `enqueue(..).await?` puts this text into the
-            // capsule's outcome, and the replay verdict compares outcome text
-            // exactly — so a prefix here would report an unchanged
-            // queue-failure capsule as a mismatch.
+            // A recorded backend rejection is reproduced as one. A handler whose
+            // 500 came from `enqueue(..).await?` — the queue was down, the
+            // channel closed — must meet that error again, not be handed the
+            // success it never got. The recorded message goes back verbatim, with
+            // no replay marker: a handler that propagates `enqueue(..).await?`
+            // puts this text into the capsule's outcome, and the replay verdict
+            // compares outcome text exactly, so a prefix here would report an
+            // unchanged queue-failure capsule as a mismatch.
             EnqueueVerdict::Failed(error) => Err(AutumnError::internal_server_error(
                 std::io::Error::other(error),
             )),
@@ -2788,15 +2787,14 @@ pub async fn enqueue_in(
     payload: Value,
     delay: std::time::Duration,
 ) -> AutumnResult<()> {
-    // Resolve the global client ONCE and both read its clock and submit
-    // through it. Computing the due instant via the free `delay_to_when` and
-    // then calling `enqueue_at` would look up the global twice, and the global
-    // is a swappable `RwLock` (see `global_job_client`): a concurrent
-    // `TestApp::build` between the two lookups would stamp the due instant
-    // from app A's virtual clock and submit it to app B, whose runtime filters
-    // due-at against *its* clock — the job would be years off B's timeline and
-    // never become due. Same failure mode as the real-time bug this migration
-    // fixed, arrived at from the other direction.
+    // Resolve the global client once, then both read its clock and submit through it.
+    // Computing the due instant via the free `delay_to_when` and then calling
+    // `enqueue_at` would look up the global twice, and the global is a swappable
+    // `RwLock` (see `global_job_client`): a concurrent `TestApp::build` between the two
+    // lookups would stamp the due instant from app A's virtual clock and submit it to
+    // app B, whose runtime filters due-at against its own clock, so the job would be
+    // years off B's timeline and never become due. Same failure mode as the real-time
+    // bug this migration fixed, reached from the other direction.
     if let Some(answer) =
         replayed_enqueue(name, &payload, EnqueueSchedule::After(delay_seconds(delay)))
     {
@@ -3291,19 +3289,18 @@ impl JobClient {
         due_at: Option<chrono::DateTime<chrono::Utc>>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> AutumnResult<EnqueueOutcome> {
-        // Capture the reference instant once so every downstream decision
-        // (filter, admin record status, local-backend sleep) uses a consistent
-        // clock reading and near-due jobs cannot be misclassified.
+        // Capture the reference instant once, so every downstream decision — filter,
+        // admin record status, local-backend sleep — uses one clock reading and near-due
+        // jobs cannot be misclassified.
         //
-        // This must be [`Self::due_origin`], not `self.clock.now()`: it is the
-        // same instant `delay_to_when` measured the deadline from, and a
-        // deadline is only "in the future" relative to the clock that stamped
-        // it. Reading the injected clock here while the Postgres path stamps
-        // from real time would make a `TestApp` pinned ahead of real time
-        // discard every durable deadline as already past and insert an
-        // immediately-runnable job. For the local and redis backends
-        // `due_origin` *is* `self.clock.now()`, so this is unchanged there —
-        // including the local-backend sleep computed from `now` below.
+        // It must be [`Self::due_origin`], not `self.clock.now()`: that is the instant
+        // `delay_to_when` measured the deadline from, and a deadline is only "in the
+        // future" relative to the clock that stamped it. Reading the injected clock here
+        // while the Postgres path stamps from real time would make a `TestApp` pinned
+        // ahead of real time discard every durable deadline as already past and insert an
+        // immediately-runnable job. For the local and redis backends `due_origin` is
+        // `self.clock.now()`, so nothing changes there, including the local-backend sleep
+        // computed from `now` below.
         let Some(settings) = self.per_job_settings.get(name) else {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
                 format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
@@ -3383,13 +3380,12 @@ impl JobClient {
                 let send_result = if let Some(due) = due_at {
                     // Delayed enqueue on the in-process backend: hand the job to
                     // a detached timer that sleeps until the due time and then
-                    // delivers it to a worker. This is local-safe only — a
-                    // pending delay is lost if the process restarts before the
-                    // job becomes due (durable backends persist the due time).
-                    // Recompute remaining delay at the moment actual_enqueue
-                    // runs (after any interceptor) so the sleep duration stays
-                    // accurate even if the interceptor took non-trivial time.
-                    // `signed_duration_since` is the operator's own body and
+                    // delivers it to a worker. Local-safe only — a pending delay
+                    // is lost if the process restarts before the job becomes due,
+                    // whereas durable backends persist the due time. The remaining
+                    // delay is recomputed when `actual_enqueue` runs, after any
+                    // interceptor, so the sleep stays accurate even if the
+                    // interceptor took non-trivial time. `signed_duration_since`
                     // is total: the difference of two representable
                     // `DateTime<Utc>` values always fits in a `TimeDelta`.
                     let delay = due
@@ -4027,14 +4023,13 @@ impl JobClient {
                     Ok(EnqueueOutcome::Deduplicated) => {
                         guard.success();
                         // A dedup decision is final even if the surrounding
-                        // transaction rolls back (no row was ever written), so the
-                        // counter can be recorded immediately. Balance the queued
-                        // gauge that record_deduplicated decrements.
-                        //
-                        // This balancing enqueue records a *ready* mark
-                        // (`record_enqueue`) and the dedup pops it back out in the
-                        // same category, so was_scheduled is false regardless of
-                        // the job's own due time — the push/pop nets to zero.
+                        // transaction rolls back, since no row was ever written, so
+                        // the counter can be recorded immediately. This balances the
+                        // queued gauge that `record_deduplicated` decrements. The
+                        // balancing enqueue records a ready mark (`record_enqueue`)
+                        // and the dedup pops it back out in the same category, so
+                        // `was_scheduled` is false whatever the job's own due time —
+                        // the push and pop net to zero.
                         self.registry.record_enqueue(name);
                         self.record_deduplicated_enqueue(name, &id_for_enqueue, false);
                     }
@@ -7359,15 +7354,14 @@ async fn settle_failed_redis_job(
                     job_admin.record_retrying(&schedule.record.id, &error);
                 }
                 Ok(RedisRetryOutcome::DroppedByDuplicate) => {
-                    // A duplicate already claimed the pending-window unique
-                    // lock while this job ran, so the retry was coalesced
-                    // into it (deleted, not requeued) — this job will never
-                    // run again, so its tracked record (if any) must settle
-                    // now rather than being left non-terminal until TTL.
-                    // Retry-dedup: the coalesced retry left the ready set when it
-                    // started and recorded no fresh enqueue mark, so it holds no
-                    // per-queue waiting mark to remove (removing one would steal
-                    // the surviving duplicate's mark and hide its backlog).
+                    // A duplicate already claimed the pending-window unique lock
+                    // while this job ran, so the retry was coalesced into it —
+                    // deleted, not requeued. This job will never run again, so its
+                    // tracked record, if any, must settle now rather than stay
+                    // non-terminal until TTL. The coalesced retry left the ready
+                    // set when it started and recorded no fresh enqueue mark, so it
+                    // holds no per-queue waiting mark to remove; removing one would
+                    // steal the surviving duplicate's mark and hide its backlog.
                     state
                         .job_registry
                         .record_deduplicated(&schedule.record.name, false, false);
@@ -7901,25 +7895,23 @@ fn record_pg_lifecycle_after_ack(
         // Mirror whichever outcome the worker intended so /actuator metrics stay
         // consistent with the database row.
         if let PgLifecycleRecord::Failure { error } = lifecycle {
-            // Terminal failure whose ack no longer applies: stale-claim recovery
-            // already transitioned this row out from under the worker, and it —
-            // not this resuming worker — OWNS the dead-letter accounting for
-            // `!ack_applied` rows:
-            //   * final attempt: `pg_recover_stale_claims` flipped the row to
-            //     `failed` AND already called `record_failure(.., dead_letter=true)`
-            //     + `notify_dead_lettered_job` for it. Recording again here would
-            //     double the `/actuator/jobs` failure/dead-letter counters and fire
-            //     a second (dedup-suppressed) alert for one DB row.
-            //   * non-final panic / unknown-type dead-letter: recovery instead
-            //     requeued the row (it is still alive, so no dead-letter is owed
-            //     yet — the real terminal outcome is recorded when it next runs).
-            // Either way we must NOT record a failure/dead-letter or alert here.
-            // Still balance this worker's own `record_start` so the process-local
-            // `in_flight` gauge doesn't leak — `record_retry` decrements in_flight
-            // without touching the failure/dead-letter counters — and settle this
-            // job_id's admin record to Failed (admin state is keyed per job_id and
-            // is left untouched by the maintenance loop, so this is the single,
-            // non-duplicated update that moves it out of Running).
+            // Terminal failure whose ack no longer applies: stale-claim recovery already
+            // transitioned this row out from under the worker, and recovery — not this
+            // resuming worker — owns the dead-letter accounting for `!ack_applied` rows.
+            //   * Final attempt: `pg_recover_stale_claims` flipped the row to `failed`
+            //     and already called `record_failure(.., dead_letter=true)` plus
+            //     `notify_dead_lettered_job`. Recording again would double the
+            //     `/actuator/jobs` failure and dead-letter counters and fire a second,
+            //     dedup-suppressed alert for one DB row.
+            //   * Non-final panic or unknown-type dead-letter: recovery requeued the row
+            //     instead. It is still alive, so no dead-letter is owed yet; the real
+            //     terminal outcome is recorded when it next runs.
+            // Either way, record no failure, dead-letter, or alert here. Still balance
+            // this worker's own `record_start` so the process-local `in_flight` gauge does
+            // not leak — `record_retry` decrements `in_flight` without touching the
+            // failure counters — and settle this job_id's admin record to Failed. Admin
+            // state is keyed per job_id and untouched by the maintenance loop, so this is
+            // the single, non-duplicated update that moves it out of Running.
             state.job_registry.record_retry(job_name, error, 0);
             job_admin.record_failure(job_id, error.to_owned());
         } else {
@@ -8738,15 +8730,13 @@ async fn pg_update_queue_depth_gauges(pool: &PgPool, state: &AppState) {
     .await;
     match rows {
         Ok(rows) => {
-            // Rebase the database-computed age onto the registry's timeline: the
-            // registry stores ready-at instants and freshens the age at read
-            // time against its own clock, so hand it an instant that means the
-            // same thing there. `survey_now - age` is the DB's "oldest waited
-            // this long" expressed on the injected clock — both subtractions
-            // stay within a single timeline, which is the whole point.
-            //
-            // The redis survey needs no such translation: its marks already come
-            // from `now_unix_ms(state.clock())`.
+            // Rebase the database-computed age onto the registry's timeline: the registry
+            // stores ready-at instants and freshens the age at read time against its own
+            // clock, so hand it an instant that means the same thing there. `survey_now -
+            // age` is the DB's "oldest waited this long" expressed on the injected clock,
+            // and both subtractions stay within one timeline, which is the point. The
+            // redis survey needs no such translation — its marks already come from
+            // `now_unix_ms(state.clock())`.
             let survey_now =
                 u64::try_from(crate::time::clock_unix_duration(state.clock()).as_millis())
                     .unwrap_or(u64::MAX);
@@ -9005,18 +8995,15 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
         Ok(rows) => {
             for row in rows.into_iter().filter(|row| row.status == "failed") {
                 // A crashed worker never resumes to observe its ack returning
-                // `Ok(false)`, so `record_pg_lifecycle_after_ack` never fires
-                // the dead-letter alert for these rows. Emit it here — mirroring
-                // the other dead-letter sites — so genuine crashed-worker
-                // dead-letters still page the operator.
-                //
-                // Record the failure in the registry *before* alerting, exactly
-                // as the sibling stale-recovery route
-                // (`record_pg_lifecycle_after_ack`, `!ack_applied` branch) and
-                // every other dead-letter site do. The alert points operators
-                // at `/actuator/jobs`, which is backed by `JobRegistry::snapshot()`;
-                // without this, a crashed-worker dead-letter would page but not
-                // appear where the alert tells operators to look.
+                // `Ok(false)`, so `record_pg_lifecycle_after_ack` never fires the
+                // dead-letter alert for these rows. Emit it here, mirroring the other
+                // dead-letter sites, so a genuine crashed-worker dead-letter still pages
+                // the operator. Record the failure in the registry before alerting,
+                // exactly as the sibling stale-recovery route and every other
+                // dead-letter site do: the alert points operators at `/actuator/jobs`,
+                // which is backed by `JobRegistry::snapshot()`, so without this a
+                // crashed-worker dead-letter would page but not appear where the alert
+                // says to look.
                 state.job_registry.record_failure(
                     &row.name,
                     "visibility timeout expired".to_owned(),
@@ -15161,20 +15148,17 @@ mod tests {
 
         #[test]
         fn pg_maintenance_stale_recovery_records_dead_letter_in_registry() {
-            // `pg_recover_stale_claims` runs on a maintenance replica that did
-            // NOT execute the job: the worker that claimed it crashed on another
-            // process, so this process never called `record_start` for it and
-            // `in_flight` is 0 here. The maintenance loop still records the
-            // terminal failure in the registry *before* alerting — mirroring the
-            // sibling ack-resume route (`record_pg_lifecycle_after_ack`,
-            // `!ack_applied` branch) — so the crashed-worker dead-letter shows up
-            // in `JobRegistry::snapshot()`, the data behind `/actuator/jobs`
-            // where the alert points operators to look.
-            //
-            // The full `pg_recover_stale_claims` UPDATE ... RETURNING needs a
-            // live Postgres, so this exercises the exact registry recording the
-            // loop now performs for each stale-recovered `failed` row (and proves
-            // it is safe when this process never started the job).
+            // `pg_recover_stale_claims` runs on a maintenance replica that did not
+            // execute the job: the worker that claimed it crashed on another process, so
+            // this process never called `record_start` and `in_flight` is 0 here. The
+            // maintenance loop still records the terminal failure in the registry before
+            // alerting, mirroring the sibling ack-resume route, so the crashed-worker
+            // dead-letter shows up in `JobRegistry::snapshot()` — the data behind
+            // `/actuator/jobs`, where the alert points operators. The full
+            // `pg_recover_stale_claims` UPDATE ... RETURNING needs a live Postgres, so
+            // this exercises the exact registry recording the loop performs for each
+            // stale-recovered `failed` row, and proves it is safe when this process never
+            // started the job.
             let state = AppState::for_test().with_profile("dev");
             state.job_registry().register("crashed_elsewhere");
 

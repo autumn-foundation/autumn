@@ -212,6 +212,15 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
+    // `#[step_up]` written below `#[static_get]`/`#[ws]` — including under an
+    // alias those macros' own by-name attribute scan cannot see — is caught
+    // here instead, once this guard's own macro is the one running (Codex
+    // review on #2513, tenth finding). See
+    // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
+    if let Some(err) = crate::param_helpers::reject_if_incompatible_route_marker(&input_fn) {
+        return err;
+    }
+
     let max_age_tokens = max_age_opt.map_or_else(
         || quote! { ::core::option::Option::None },
         |n| {
@@ -220,17 +229,24 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
     let check_call = build_check_call(&max_age_tokens);
-    let fn_name = input_fn.sig.ident.clone();
-    let gate_ident = format_ident!("__AutumnStepUpGate_{}", fn_name);
-
-    // The marker const also stays in the handler body (not just inside the
-    // gate below) so `api_doc::recover_guarded_return_type` can still
-    // recover the pre-rewrite return type for OpenAPI when #[step_up]
-    // expands before the route macro (#1677).
+    // Inert copy of `check_call`'s own `__AUTUMN_STEP_UP_MAX_AGE` const,
+    // spliced into the handler body below (mirroring `secured_macro`'s
+    // `role_scope_consts`/`markers` split): #1668 moved the step-up check
+    // itself into the gate below, so `check_call`'s copy of this const never
+    // reaches the handler's own body any more, but
+    // `api_doc::infer_response_body`'s guard recovery
+    // (`RESPONSE_REWRITING_GUARD_MARKERS`) requires exactly this const IN the
+    // body to tell a real guard's `__autumn_inner` wrapper apart from
+    // unrelated code with the same shape (issue #2516), so
+    // `api_doc::recover_guarded_return_type` can still recover the
+    // pre-rewrite return type for OpenAPI when #[step_up] expands before the
+    // route macro (#1677).
     let max_age_marker = quote! {
         #[allow(dead_code)]
         const __AUTUMN_STEP_UP_MAX_AGE: ::core::option::Option<u64> = #max_age_tokens;
     };
+    let fn_name = input_fn.sig.ident.clone();
+    let gate_ident = format_ident!("__AutumnStepUpGate_{}", fn_name);
 
     // Whether THIS gate should also serve a cached idempotency replay: see
     // `should_own_replay` for the full ordering rationale (issue #1668's
@@ -363,6 +379,33 @@ mod tests {
     use quote::quote;
 
     use super::step_up_macro;
+    use crate::static_route::static_get_macro;
+
+    #[test]
+    fn step_up_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
+        // See `secured::tests::secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias`
+        // for the full rationale (Codex review on #2513, tenth finding).
+        let accepted = static_get_macro(
+            quote! { "/private" },
+            quote! {
+                #[auth]
+                async fn private() -> &'static str { "private" }
+            },
+        );
+        assert!(
+            !accepted.to_string().contains("compile_error"),
+            "static_get_macro cannot recognize an aliased guard attribute by name: {accepted}"
+        );
+
+        let accepted_fn = crate::param_helpers::extract_fn_item(accepted, "private");
+        let generated = step_up_macro(quote! {}, quote! { #accepted_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "step_up_macro must reject a handler already marked as a #[static_get] route, \
+             regardless of what alias attribute name the source used to invoke it: {generated}"
+        );
+    }
 
     #[test]
     fn step_up_bare_generates_check_call() {

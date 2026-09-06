@@ -295,20 +295,18 @@ pub(super) fn merge_en_ftl_keeping(
                 && !already.contains_key(*k)
         })
         .collect();
-    // Reconciled BEFORE the nothing-to-do check below: a regeneration that
-    // dropped a field or a flag has every REMAINING key already present, so the
-    // "missing" sets are empty while the block still carries keys the rewritten
-    // routes no longer reference — exactly what `autumn i18n check --strict`
-    // fails on. Values, comments, and blank lines for surviving keys carry over.
+    // Reconciled before the nothing-to-do check below: a regeneration that dropped a field
+    // or a flag has every remaining key already present, so the "missing" sets are empty
+    // while the block still carries keys the rewritten routes no longer reference — exactly
+    // what `autumn i18n check --strict` fails on. Values, comments, and blank lines for
+    // surviving keys carry over.
     //
-    // The shared chrome is never pruned here: every resource writes those keys,
-    // so dropping one from this resource's render would delete a key a SIBLING
-    // still uses. Chrome is additive, and `destroy` is what eventually takes it.
-    //
-    // Keys a surviving call site still names are held back from the prune. Only
-    // ones the bundle already DEFINES: a reference to a key no `.ftl` carries
-    // was already failing `t!` before this ran, and reconciliation must not
-    // invent an empty message for it.
+    // The shared chrome is never pruned here: every resource writes those keys, so dropping
+    // one from this resource's render would delete a key a sibling still uses. Chrome is
+    // additive, and `destroy` is what eventually takes it. Keys a surviving call site still
+    // names are held back from the prune — but only ones the bundle already defines, since
+    // a reference to a key no `.ftl` carries was already failing `t!` before this ran, and
+    // reconciliation must not invent an empty message for it.
     let mut wanted = keys.clone();
     for key in still_referenced {
         if key.starts_with(&resource_prefix)
@@ -1285,19 +1283,17 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
     let embedded_in_production = identifier_offsets(main_rs, "EMBEDDED_LOCALES")
         .into_iter()
         .any(|at| !in_cfg_test(main_rs, at));
-    // The static ALONE is not the setup. `embed_locales!` bakes the files into
-    // the binary; `.embedded_locales(&EMBEDDED_LOCALES)` is what makes the app
-    // read them. With the first present and the second missing, an
-    // `autumn build --embed` carries the bundle and never loads it — so a
-    // deployment without the sidecar directory falls through to `.i18n_auto()`
-    // and panics, having been told embedding was configured. Both halves are
+    // The static alone is not the setup. `embed_locales!` bakes the files into the binary;
+    // `.embedded_locales(&EMBEDDED_LOCALES)` is what makes the app read them. With the
+    // first present and the second missing, an `autumn build --embed` carries the bundle
+    // and never loads it, so a deployment without the sidecar directory falls through to
+    // `.i18n_auto()` and panics, having been told embedding was configured. Both halves are
     // required before this is treated as done, and a missing half is added.
-    // Scoped to the function the PRODUCTION builder lives in, not merely to
-    // "outside `cfg(test)`". A preview or helper builder is ordinary
-    // non-test code, and one of those installing the locales says nothing
-    // about the chain the binary runs: treating it as done leaves production
-    // falling through to `.i18n_auto()`, so an `--embed` deployment without the
-    // sidecar directory panics with the static sitting unused in the binary.
+    //
+    // Scoped to the function the production builder lives in, not merely to "outside
+    // `cfg(test)`". A preview or helper builder is ordinary non-test code, and one of those
+    // installing the locales says nothing about the chain the binary runs: treating it as
+    // done leaves production falling through to `.i18n_auto()`.
     if embedded_in_production {
         // Already embedded — but not necessarily from the right place. A
         // project that changed `[i18n] dir` after its first `--i18n` scaffold

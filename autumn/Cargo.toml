@@ -222,6 +222,14 @@ tls = ["dep:tokio-rustls", "dep:x509-parser", "dep:rustls", "dep:rustls-pki-type
 # placeholder), both pinned to `ring` so no second crypto backend enters the
 # graph.
 acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2", "dep:reqwest"]
+# Real-ACME end-to-end coverage against a Pebble container (issue #1863).
+# Turns on `testcontainers`' `host-port-exposure` tunnel — the SSH sidecar
+# that lets a container reach a `127.0.0.1`-bound listener on this host —
+# and implies `acme` + `test-support`. Kept out of both of THOSE features so
+# an ordinary `cargo test -p autumn-web --features test-support` (or a plain
+# `--workspace` run) does not pull in `host-port-exposure`'s `russh`/crypto
+# dependency subtree; only the dedicated Pebble CI step enables it.
+acme-pebble = ["acme", "test-support", "testcontainers/host-port-exposure"]
 # Origin-side half of the edge capsule (issue #1790). Adds the `autumn_web::edge`
 # re-export of the `autumn-edge` crate, the `CacheEdgeKv` adapter that projects
 # the app's `Cache` onto the `EdgeKv` seam, and `AppBuilder::with_edge_kv`, which
@@ -577,6 +585,10 @@ path = "tests/sandbox_header_alloc_gate.rs"
 # bytes must not be expanded into a 192 KiB replacement string to keep 512
 # characters of it. Its own binary for the same reason as the header gate —
 # `allocation-counter` installs a process-wide `#[global_allocator]`.
+[[test]]
+name = "sandbox_render_alloc_gate"
+path = "tests/sandbox_render_alloc_gate.rs"
+
 [[test]]
 name = "sandbox_stderr_alloc_gate"
 path = "tests/sandbox_stderr_alloc_gate.rs"

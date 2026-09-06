@@ -78,12 +78,32 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 | `encrypted_admin_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `generate admin` (wired in) → `cargo check --tests` |
 | `constrained_scaffold_cargo_checks` | `integration/scaffold_validation.rs` | `{min,max}`/`{email}`/`{url}`/nullable-bound scaffold → `cargo check --tests` (#1388) |
 | `plugin_add_first_party_scaffolds_cargo_check` | `generate.rs` | `autumn plugin add` for every first-party plugin into its own fresh scaffold → `cargo check --all-targets` (#1606) |
+| `api_scaffold_cargo_checks` | `integration/api_scaffold.rs` | `--api` scaffold → `cargo check --tests` |
+| `scaffolded_app_passes_routes_audit_gate` | `integration/cloud_native_scaffold.rs` | fresh `autumn new` app passes `autumn routes audit` unmodified (#2154) |
+| `scaffolded_api_app_passes_routes_audit_gate` | `integration/cloud_native_scaffold.rs` | fresh `autumn new --api` app passes `autumn routes audit` unmodified (#2154) |
+| `unscoped_position_generated_project_cargo_checks` | `integration/generate_position_scaffold.rs` | `{position}` scaffold → `cargo check --tests` |
+| `scoped_position_generated_project_cargo_checks` | `integration/generate_position_scaffold.rs` | scoped `{position}` scaffold → `cargo check --tests` |
+| `soft_delete_position_generated_project_cargo_checks` | `integration/generate_position_scaffold.rs` | `{position}` + soft-delete scaffold → `cargo check --tests` |
+| `belongs_to_scaffold_cargo_checks` | `integration/scaffold_belongs_to.rs` | `--belongs-to` scaffold → `cargo check --tests` |
+| `bulk_delete_generated_project_cargo_checks` | `integration/scaffold_bulk_delete.rs` | bulk-delete scaffold → `cargo check --tests` |
+| `richtext_scaffold_cargo_checks` | `integration/scaffold_rich_text.rs` | `{rich_text}` scaffold → `cargo check --tests` |
+| `searchable_scaffold_cargo_checks` | `integration/scaffold_search.rs` | `--searchable` scaffold → `cargo check --tests` |
+| `trash_generated_project_cargo_checks` | `integration/scaffold_trash.rs` | soft-delete trash scaffold → `cargo check --tests` |
+| `linked_seed_binary_cargo_checks` | `integration/seed_model_linking.rs` | scaffolded model linked into `src/bin/seed.rs` → `cargo check --tests` (#1718) |
+| `serve_daemon_start_status_stop_over_unix_socket` | `integration/serve.rs` | fresh scaffold's `autumn serve --daemon` lifecycle over a Unix socket |
+| `generated_form_for_scaffold_cargo_checks` | `integration/scaffold_form_for.rs` | `form_for` view scaffold → `cargo check --tests` |
+| `generated_scaffold_with_missing_reference_target_cargo_checks` | `integration/scaffold_form_for.rs` | `{references}` with a missing target falls back to a number input → `cargo check --tests` |
 
-The `console.rs`, `scaffold_encrypted.rs`, and `scaffold_validation.rs` entries
-compile into the consolidated `cli_tests` binary, whose only other CI
-`--ignored` invocation filters on `offsite`. They are therefore named **explicitly** in
-`.github/workflows/generator-conformance.yml`; a new `#[ignore]`d test in that
-binary which is not added there will never run in CI.
+The `console.rs`, `scaffold_encrypted.rs`, `scaffold_validation.rs`, and the 15
+rows above compile into the consolidated `cli_tests` binary. `ci.yml`'s Docker
+sweep explicitly `--skip`s each of their tests **by exact name** — never by
+module prefix, which would also silently swallow any Docker test later added
+to the same file — because they scaffold and cargo-check/build/run a fresh
+project instead of touching Docker. They are therefore named **explicitly**
+in `.github/workflows/generator-conformance.yml`; a new `#[ignore]`d,
+non-Docker test in that binary needs BOTH a `--skip <exact name>` line in
+`ci.yml`'s sweep AND its own step here, or it either runs in the wrong
+(Docker) step or never runs at all (issue #1945).
 
 ### Why `#[ignore]`?
 

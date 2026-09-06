@@ -441,7 +441,10 @@ AUTUMN_DATABASE__URL=postgres://user:pass@db-host:5432/myapp_prod
 > manifest is re-uploaded on every `deploy up` so the config on the server always
 > matches the shipped binary. If no `autumn.toml` is found in the project
 > directory, the deploy prints a loud warning and the app runs built-in defaults
-> for all non-secret settings.
+> for all non-secret settings. `autumn deploy check` prints the same
+> confirmation or warning **before** anything touches the server, so an
+> operator relying on `check` as a preflight gate gets the same signal `up`
+> would — not just after `up` actually runs.
 > **Secrets never go in the manifest** — the manifest is owner-only (`0600`), so
 > any inline config secrets are never exposed to other local accounts, while the
 > signing secret, database URL, and `AUTUMN_ENV` continue to travel only

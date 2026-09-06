@@ -17,6 +17,13 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/non_function.rs");
     t.compile_fail("tests/compile-fail/routes_nonexistent.rs");
 
+    // Optional tokio runtime arguments on `#[autumn_web::main]`: a typo'd
+    // argument, or one the chosen flavor would silently ignore, is a compile
+    // error rather than a knob that quietly does nothing. Before these
+    // arguments existed the attribute discarded its whole argument list.
+    t.compile_fail("tests/compile-fail/main_unknown_runtime_arg.rs");
+    t.compile_fail("tests/compile-fail/main_worker_threads_current_thread.rs");
+
     // Route-level `seo(...)` defaults (#1182): typos and repeated keys are
     // compile errors rather than silently-ignored metadata.
     t.compile_fail("tests/compile-fail/route_seo_unknown_key.rs");
@@ -415,6 +422,8 @@ fn compile_pass_tests_a() {
     // Route macro passes (always available)
     t.pass("tests/compile-pass/valid_handlers.rs");
     t.pass("tests/compile-pass/async_main.rs");
+    t.pass("tests/compile-pass/main_runtime_args.rs");
+    t.pass("tests/compile-pass/main_runtime_current_thread.rs");
     t.pass("tests/compile-pass/static_get_basic.rs");
     t.pass("tests/compile-pass/static_routes_basic.rs");
     t.pass("tests/compile-pass/static_get_parameterized.rs");
