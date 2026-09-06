@@ -836,8 +836,20 @@ jobs:
           # sweeps, same as the smaller per-crate sweeps above (autumn-cache-redis,
           # autumn-search): every test in the file is a Postgres testcontainer
           # test, so there is nothing to `--skip`.
-          cargo test -p saas --test integration_test -- --ignored
-          cargo test -p teams --test integration_test -- --ignored
+          #
+          # `--test-threads=1`: every test in both files shares ONE `TestDb`
+          # (`TestDb::shared()`, a process-wide `OnceCell`-cached testcontainer +
+          # connection pool — see autumn/src/test.rs), not a fresh container per
+          # test. Concurrent tests therefore race the same `CREATE TABLE IF NOT
+          # EXISTS` bootstrap against the same schema; Postgres's `IF NOT EXISTS`
+          # does not make that race-safe, so this actually failed here with
+          # `duplicate key value violates unique constraint
+          # "pg_type_typname_nsp_index"` the first time this sweep ran under
+          # default (parallel) test threads. Same fix as the consolidated
+          # `integration_tests`/`cli_tests` sweeps above, which share this
+          # constraint for the same reason.
+          cargo test -p saas --test integration_test -- --ignored --test-threads=1
+          cargo test -p teams --test integration_test -- --ignored --test-threads=1
 
   coverage:
     name: Coverage
