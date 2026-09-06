@@ -1657,22 +1657,38 @@ fn html_escape(s: &str) -> String {
 // Opaque-schema (placeholder) detection
 // ──────────────────────────────────────────────────────────────────
 
-/// True when `schema` is the opaque object placeholder [`generate_spec`] emits
-/// for a referenced type that has no `OpenApiSchema` — `{"type":"object",
-/// "title":…}` with no `properties` key.
+/// Keys the generated placeholder may carry. Anything else means the schema
+/// says something real about its instances, so it is not a placeholder.
+#[cfg(feature = "openapi")]
+const PLACEHOLDER_KEYS: [&str; 3] = ["type", "title", "description"];
+
+/// True when `schema` is exactly the opaque object placeholder
+/// [`generate_spec`] emits for a referenced type that has no `OpenApiSchema`:
+/// `{"type":"object","title":…}` and nothing else.
 ///
-/// A derived or explicitly registered object schema always carries a
-/// `properties` key (even when empty), so a legitimately field-less struct is
-/// not flagged. This is the single canonical predicate: the MCP tool-catalog
-/// builder ([`crate::mcp`]) applies it to a tool's `inputSchema`, and
+/// Matched by *shape*, not by the absence of `properties` alone. An object can
+/// describe its instances without that key — `additionalProperties` (a map),
+/// `oneOf`/`allOf`/`anyOf`, `patternProperties`, a bare `$ref` — and a schema
+/// somebody registered deliberately through
+/// [`OpenApiConfig::register_schema`] in one of those forms is a real contract
+/// a client generator can render. Flagging it would make
+/// `autumn openapi export --strict` fail CI over a fully typed map. So a
+/// placeholder is recognised as an object carrying no key beyond `title` /
+/// `description`, which is precisely what the back-fill emits.
+///
+/// This is the single canonical predicate: the MCP tool-catalog builder
+/// ([`crate::mcp`]) applies it to a tool's `inputSchema`, and
 /// [`opaque_component_schemas`] applies it to a built spec's components.
 #[cfg(feature = "openapi")]
 #[must_use]
 pub fn is_opaque_object_schema(schema: &serde_json::Value) -> bool {
-    schema.get("type").and_then(serde_json::Value::as_str) == Some("object")
-        && schema
-            .as_object()
-            .is_none_or(|map| !map.contains_key("properties"))
+    if schema.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+        return false;
+    }
+    schema.as_object().is_none_or(|map| {
+        map.keys()
+            .all(|key| PLACEHOLDER_KEYS.contains(&key.as_str()))
+    })
 }
 
 /// One component schema that degraded to the opaque object placeholder, with
@@ -1717,23 +1733,50 @@ pub fn opaque_component_schemas(spec: &OpenApiSpec) -> Vec<OpaqueSchema> {
         return Vec::new();
     }
 
+    // Pre-compute each component's own outgoing refs, so attribution can follow
+    // the component graph rather than stopping at an operation's direct refs.
+    // An operation usually reaches an opaque type *indirectly* — `POST /orders`
+    // takes a derived `Order` whose `address` field `$ref`s an underived
+    // `Address` — and reporting `Address` with an empty `referenced_by` would
+    // hide the very operation whose contract is degraded.
+    let component_refs: BTreeMap<&str, Vec<String>> = components
+        .schemas
+        .iter()
+        .map(|(name, schema)| {
+            let mut out = Vec::new();
+            collect_body_ref_identities(schema, &mut out);
+            (name.as_str(), out)
+        })
+        .collect();
+
     // Map each opaque component to the operations that reach it. A reference
     // can sit anywhere in an operation (body, response, parameter schema, or
     // nested inside an array/nullable wrapper), so walk the serialized
-    // operation wholesale rather than probing known slots.
+    // operation wholesale rather than probing known slots, then close over the
+    // component graph from whatever that turns up.
     let mut refs: BTreeMap<&str, std::collections::BTreeSet<String>> = BTreeMap::new();
     for (path, item) in &spec.paths {
         for (method, operation) in path_item_operations(item) {
             let Ok(value) = serde_json::to_value(operation) else {
                 continue;
             };
-            let mut identities = Vec::new();
-            collect_body_ref_identities(&value, &mut identities);
-            for identity in identities {
+            let mut frontier = Vec::new();
+            collect_body_ref_identities(&value, &mut frontier);
+
+            // Breadth-first over components, `seen` guarding the cycles a
+            // self- or mutually-recursive schema creates.
+            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            while let Some(identity) = frontier.pop() {
+                if !seen.insert(identity.clone()) {
+                    continue;
+                }
                 if let Some(name) = opaque.get(identity.as_str()) {
                     refs.entry(name)
                         .or_default()
                         .insert(format!("{method} {path}"));
+                }
+                if let Some(nested) = component_refs.get(identity.as_str()) {
+                    frontier.extend(nested.iter().cloned());
                 }
             }
         }

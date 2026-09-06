@@ -144,6 +144,56 @@ fn a_spec_with_no_referenced_types_reports_nothing() {
     assert_eq!(opaque_component_schemas(&spec), Vec::new());
 }
 
+/// A derived component whose field `$ref`s an opaque one: the operation reaches
+/// the placeholder only through the component graph, never directly.
+#[derive(Serialize, Deserialize, OpenApiSchema)]
+#[allow(dead_code)]
+struct Wrapper {
+    inner: UntypedBody,
+}
+
+#[test]
+fn attributes_an_opaque_component_reached_through_another_component() {
+    let mut post = doc("POST", "/wrapped", "create_wrapped");
+    post.request_body = Some(ref_entry(
+        "Wrapper",
+        autumn_web::openapi::type_name_of::<Wrapper>,
+    ));
+
+    let spec = generate_spec(&OpenApiConfig::new("Demo", "1.0.0"), &[&post]);
+    let report = opaque_component_schemas(&spec);
+
+    let entry = report
+        .iter()
+        .find(|e| e.schema == "UntypedBody")
+        .unwrap_or_else(|| panic!("nested opaque type should be reported: {report:?}"));
+    assert_eq!(
+        entry.referenced_by,
+        vec!["POST /wrapped".to_owned()],
+        "the operation reaches it only via Wrapper, but its contract is still \
+         the degraded one: {report:?}"
+    );
+}
+
+#[test]
+fn a_registered_map_schema_is_not_opaque() {
+    // `{"type":"object","additionalProperties":…}` has no `properties`, but it
+    // is a real contract a generator can render — flagging it would make
+    // `--strict` fail CI over a fully typed map.
+    assert!(!is_opaque_object_schema(&serde_json::json!({
+        "type": "object",
+        "additionalProperties": { "type": "string" }
+    })));
+    assert!(!is_opaque_object_schema(&serde_json::json!({
+        "type": "object",
+        "oneOf": [{ "type": "object", "properties": {} }]
+    })));
+    // Still a placeholder with the description the generator may attach.
+    assert!(is_opaque_object_schema(&serde_json::json!({
+        "type": "object", "title": "X", "description": "d"
+    })));
+}
+
 #[test]
 fn opaque_predicate_distinguishes_a_fieldless_struct_from_a_placeholder() {
     // A registered object with an empty `properties` map is a real (if empty)
@@ -157,4 +207,35 @@ fn opaque_predicate_distinguishes_a_fieldless_struct_from_a_placeholder() {
     assert!(!is_opaque_object_schema(&serde_json::json!({
         "type": "string"
     })));
+}
+
+// ── Scalar field types that are not Rust primitives ────────────────
+
+#[derive(Serialize, Deserialize, OpenApiSchema)]
+#[allow(dead_code)]
+struct Timestamped {
+    created_at: chrono::NaiveDateTime,
+    seen_on: chrono::NaiveDate,
+    id: uuid::Uuid,
+}
+
+#[test]
+fn datetime_and_uuid_fields_are_inline_scalars_not_dangling_refs() {
+    let schema = <Timestamped as OpenApiSchema>::schema();
+    let props = &schema["properties"];
+
+    assert_eq!(props["created_at"]["type"], "string");
+    assert_eq!(props["created_at"]["format"], "date-time");
+    assert_eq!(props["seen_on"]["format"], "date");
+    assert_eq!(props["id"]["format"], "uuid");
+
+    // The point: none of them emits a `$ref` to a component nothing registers,
+    // which the back-fill would resolve to the opaque placeholder. A
+    // `created_at` column is near-universal on `#[model]` types.
+    for field in ["created_at", "seen_on", "id"] {
+        assert!(
+            props[field].get("$ref").is_none(),
+            "{field} must not be a dangling ref: {schema}"
+        );
+    }
 }

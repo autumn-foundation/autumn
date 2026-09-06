@@ -134,6 +134,39 @@ fn enum_schema_body(
         ));
     }
 
+    // All-unit is not sufficient: a non-default container representation
+    // changes what a unit variant serializes to, so the string-enum schema
+    // below would be confidently wrong. `#[serde(tag = "t")]` makes each
+    // variant the object `{"t":"Variant"}`, and `#[serde(untagged)]` makes it
+    // `null` — a generated client built from the string enum would send a bare
+    // string to a handler that accepts neither. Refuse rather than guess, on
+    // the same reasoning that refuses data-carrying variants.
+    if let Some(repr) = crate::schema::serde_enum_representation(&input.attrs) {
+        // `untagged` is a bare word; `tag` / `content` take a value. Render each
+        // the way it is actually written, so the diagnostic quotes real syntax.
+        let (written, becomes) = match repr {
+            "untagged" => ("#[serde(untagged)]", "`null`"),
+            other => (
+                if other == "tag" {
+                    "#[serde(tag = \"...\")]"
+                } else {
+                    "#[serde(content = \"...\")]"
+                },
+                "an object",
+            ),
+        };
+        return Err(syn::Error::new_spanned(
+            input,
+            format!(
+                "#[derive(OpenApiSchema)] supports only serde's default (externally tagged) \
+                 enum representation; `{written}` makes a unit variant serialize as {becomes}, \
+                 not the JSON string the derived schema would advertise — a generated client \
+                 would send a contract the handler does not accept. Write the `OpenApiSchema` \
+                 impl by hand and register it with `OpenApiConfig::register_schema`."
+            ),
+        ));
+    }
+
     let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
     let values: Vec<String> = data
         .variants

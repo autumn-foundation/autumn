@@ -180,6 +180,44 @@ pub fn apply_serde_rename_all_rule_to_variant(rule: &str, variant: &str) -> Opti
     }
 }
 
+/// A container-level `#[serde(...)]` enum representation other than serde's
+/// default (externally tagged), as the attribute word that selected it.
+///
+/// Each of these changes what a *unit* variant serializes to, so a schema
+/// generator that ignores them advertises the wrong wire shape:
+///
+/// | Attribute | A unit variant serializes as |
+/// |---|---|
+/// | *(default, externally tagged)* | `"Variant"` — a JSON string |
+/// | `#[serde(tag = "t")]` | `{"t": "Variant"}` — an object |
+/// | `#[serde(tag = "t", content = "c")]` | `{"t": "Variant"}` — an object |
+/// | `#[serde(untagged)]` | `null` |
+///
+/// Returns `None` for the default representation.
+pub fn serde_enum_representation(attrs: &[syn::Attribute]) -> Option<&'static str> {
+    let mut found = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            // `tag` wins the report when both `tag` and `content` are present:
+            // it is the one that changes a unit variant's shape, and naming it
+            // keeps the diagnostic pointing at the cause.
+            if meta.path.is_ident("tag") {
+                found = Some("tag");
+            } else if meta.path.is_ident("untagged") {
+                found = Some("untagged");
+            } else if meta.path.is_ident("content") && found.is_none() {
+                found = Some("content");
+            }
+            // Consume any `= value` so sibling metas keep parsing.
+            if let Ok(value) = meta.value() {
+                let _: syn::Result<syn::Lit> = value.parse();
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
 /// The serde attributes on an enum variant, read for `rename` / `skip`.
 ///
 /// Mirrors [`field_serde_serialize_rename`] but over a
@@ -326,6 +364,24 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     }
 
     let name = type_name_str(ty);
+
+    // Types that serialize as a JSON scalar despite not being Rust primitives.
+    // Without this they fall through to the `$ref` branch below and the spec
+    // carries a dangling component nothing registers — which the back-fill then
+    // resolves to the opaque object placeholder. `created_at` / `updated_at`
+    // columns make `NaiveDateTime` near-universal across `#[model]` types, so
+    // this was one untyped field on almost every model on an API boundary
+    // (issue #802). Each maps to the standard OpenAPI `format` for what serde
+    // actually writes.
+    if let Some((json_type, format)) = scalar_json_type_and_format(&name) {
+        return quote! {
+            ::autumn_web::reexports::serde_json::json!({
+                "type": #json_type,
+                "format": #format,
+            })
+        };
+    }
+
     crate::api_doc::primitive_json_type(&name).map_or_else(
         || {
             // Emit the `$ref` against the field type's FULL `type_name` identity
@@ -345,6 +401,26 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
             quote! { ::autumn_web::reexports::serde_json::json!({ "type": #json_type }) }
         },
     )
+}
+
+/// JSON-Schema `type` + `format` for a non-primitive type that nevertheless
+/// serializes as a single scalar.
+///
+/// Deliberately narrow: only types whose serde output is unambiguous. `chrono`'s
+/// date/time types serialize as RFC 3339 / ISO 8601 strings and `Uuid` as a
+/// hyphenated string, so each has one right answer. Numeric-adjacent wrappers
+/// (`Decimal`, `BigDecimal`) are left out on purpose — whether they serialize as
+/// a JSON number or a string depends on which serde feature the app enabled, and
+/// an opaque placeholder is better than a confidently wrong scalar.
+fn scalar_json_type_and_format(name: &str) -> Option<(&'static str, &'static str)> {
+    Some(match name {
+        // `DateTime<Utc>` reaches here as its last path segment, `DateTime`.
+        "NaiveDateTime" | "DateTime" => ("string", "date-time"),
+        "NaiveDate" => ("string", "date"),
+        "NaiveTime" => ("string", "time"),
+        "Uuid" => ("string", "uuid"),
+        _ => return None,
+    })
 }
 
 /// Emit the body of `OpenApiSchema::schema()` for a list of fields.
