@@ -1841,67 +1841,78 @@ def inert_spans(view, src):
         at = max(end, m.end())
 
 
+ANY_ELEMENT_TAG = re.compile(r'<(/?)([A-Za-z][A-Za-z0-9-]*)(?=[\s/>]|$)')
+
+
 def element_end(txt, m, name):
     """Where the element opened by match `m` ends, contents and all.
 
-    Three shapes, each with a case behind it (see `VOID_ELEMENTS`,
-    `RAW_TEXT_NAMES` and `FOREIGN_ROOTS`): a void element is the whole of
-    itself; a raw-text element ends at its first close, because a same-name
-    spelling inside it is text; anything else has to be BALANCED, since the
-    close that ends it is not necessarily the first one with its name.
+    A STACK, not a depth counter. Depth counting only ever saw this element's
+    own name, so it could not tell an ancestor's close tag from anything else
+    — and an ancestor's close ends this element too. `<div><span hidden>Secret
+    </div>Mail` leaves `Mail` visible, and so does `<ul><li hidden>Secret</ul>
+    Mail`, because in both the parent's close takes the open child with it.
+    Six separate findings arrived against the counter, each another HTML rule;
+    tracking what is actually open answers them together.
 
-    Running out of closes is not a bug: an unclosed element is closed
-    implicitly by its parent, so ending at the end of the span is what the
-    browser shows — `<a …><span hidden>Mail</a>` is an empty link.
+    The rules it applies, each measured rather than read off the spec (see
+    `VOID_ELEMENTS`, `RAW_TEXT_NAMES`, `FOREIGN_ROOTS`, `IMPLICIT_CLOSERS`):
+
+      - a void element is the whole of itself, and opens nothing;
+      - a raw-text element's contents are text, so tags inside it are not tags;
+      - in foreign content `/>` really closes, so `<svg/>` opens no level;
+      - an element with an optional end tag is ended by an opener that
+        implicitly closes it — any block element for a `<p>`, another `<li>`
+        for an `<li>`;
+      - a close tag for something NOT open inside this element belongs to an
+        ancestor, and ends this element where it appears.
+
+    Running out of tags is not a bug: an unclosed element is closed implicitly
+    by its parent, so ending at the end of the span is what the browser shows
+    — `<a …><span hidden>Mail</a>` is an empty link.
     """
     lname = name.lower()
     if lname in VOID_ELEMENTS:
         return m.end()
     if lname in RAW_TEXT_NAMES:
         return _raw_text_end(txt, name, m.end())
-    depth, pos, end = 1, m.end(), len(txt)
-    # The scan looks for this element's own tags AND, when it has an optional
-    # end tag, for the openers that implicitly end it. For `p` those are 33
-    # block elements, so a `<div>` has to be visible to this search or the
-    # implicit close below can never fire.
-    closers = IMPLICIT_CLOSERS.get(lname, frozenset((lname,)))
-    names = '|'.join(re.escape(n) for n in sorted(closers | {lname}))
-    tag = re.compile(r'<(/?)(?:' + names + r')(?=[\s/>]|$)', re.I)
-    own = re.compile(r'<(/?)' + re.escape(name) + r'(?=[\s/>]|$)', re.I)
-    while depth:
-        t = tag.search(txt, pos)
-        # A raw-text element opening BEFORE the next same-name tag means that
-        # tag is inside it, and so is text rather than structure: skip its
-        # contents before counting anything.
+    closers = IMPLICIT_CLOSERS.get(lname)
+    stack, pos = [], m.end()
+    while True:
+        t = ANY_ELEMENT_TAG.search(txt, pos)
+        # A raw-text element opening first means the tags after it are text.
         r = RAW_TEXT_OPEN.search(txt, pos)
-        if r and (not t or r.start() < t.start()):
+        # `<=`, not `<`: both patterns match a raw-text opener at the SAME
+        # offset, and losing that tie pushed `<textarea>` on the stack as an
+        # ordinary element instead of skipping its contents, so a `</span>`
+        # written inside it counted as structure again.
+        if r and (not t or r.start() <= t.start()):
             pos = _raw_text_end(txt, r.group(1), r.end())
             continue
         if not t:
-            break
+            return len(txt)
+        tname = t.group(2).lower()
         gt = txt.find('>', t.end())
-        # In foreign content `/>` genuinely closes, so a nested `<svg/>` opens
-        # no level. Counting it as one left the outer close unable to reach
-        # depth zero and swallowed the label after it.
-        if (not t.group(1) and lname in FOREIGN_ROOTS
-                and gt != -1 and txt[gt - 1] == '/'):
-            pos = gt + 1
-            continue
-        # An opener that implicitly ends this element stops the span here
-        # rather than opening a level inside it.
-        if not t.group(1) and lname in IMPLICIT_CLOSERS:
+        if t.group(1):
+            if tname in stack:
+                # A close for something opened inside: unwind to it.
+                del stack[stack.index(tname):]
+                pos = t.end()
+                continue
+            if tname == lname:
+                return len(txt) if gt == -1 else gt + 1
+            # Nothing here opened it, so it closes an ANCESTOR — which takes
+            # this element with it.
             return t.start()
-        # A CLOSE tag for something else is not this element's close, and an
-        # opener reached here is this element's own: only its own tags move
-        # the depth.
-        if not own.match(txt, t.start()):
-            pos = t.end()
-            continue
-        depth += -1 if t.group(1) else 1
+        if not stack and closers and tname in closers:
+            # Only while this element is still the innermost one: an implicit
+            # closer nested deeper belongs to whatever is open there.
+            return t.start()
+        if (tname not in VOID_ELEMENTS
+                and not (tname in FOREIGN_ROOTS and gt != -1
+                         and txt[gt - 1] == '/')):
+            stack.append(tname)
         pos = t.end()
-        if not depth:
-            end = len(txt) if gt == -1 else gt + 1
-    return end
 
 
 def mask_hidden_subtrees(txt, src=None):
@@ -4561,6 +4572,30 @@ self_test() {
     > "$c9ku/docs/guide/jobs.md"
   git -C "$c9ku" add -A && git -C "$c9ku" commit -qm li-reopened
   check "a reopened li ends the hidden one" pass "$c9ku"
+
+  # A PARENT's close takes its open child with it, so the label after it is
+  # visible. The depth counter could not see this at all: it only ever looked
+  # for the scanned element's own name.
+  local c9lc="$tmp/c9lc"; make_corpus "$c9lc"
+  printf '# Jobs\n\n<a href="mail.md"><ul><li hidden>Secret</ul>Mail</a>\n' \
+    > "$c9lc/docs/guide/jobs.md"
+  git -C "$c9lc" add -A && git -C "$c9lc" commit -qm li-ended-by-ul-close
+  check "a parent close ends the hidden li" pass "$c9lc"
+
+  # ...and this is not an optional-end-tag rule: a `</div>` ends an open
+  # `<span>` the same way, which the reported case did not cover.
+  local c9ld="$tmp/c9ld"; make_corpus "$c9ld"
+  printf '# Jobs\n\n<a href="mail.md"><div><span hidden>Secret</div>Mail</a>\n' \
+    > "$c9ld/docs/guide/jobs.md"
+  git -C "$c9ld" add -A && git -C "$c9ld" commit -qm span-ended-by-div-close
+  check "a parent close ends a hidden span too" pass "$c9ld"
+
+  # ...but a DESCENDANT's close is not the parent's, and must not end it.
+  local c9le="$tmp/c9le"; make_corpus "$c9le"
+  printf '# Jobs\n\n<a href="mail.md"><span hidden><em>x</em>Secret</span>Mail</a>\n' \
+    > "$c9le/docs/guide/jobs.md"
+  git -C "$c9le" add -A && git -C "$c9le" commit -qm descendant-close
+  check "a descendant close does not end the hidden span" pass "$c9le"
 
   # ...and a `p` is ended by any BLOCK element, not only another `p`.
   local c9kx="$tmp/c9kx"; make_corpus "$c9kx"
