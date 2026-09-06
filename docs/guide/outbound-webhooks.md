@@ -41,7 +41,7 @@ let subscription = WebhookSubscription {
 
 To support diverse hosting environments, the persistence layer is abstracted behind the `OutboundWebhookStore` trait. You can implement this trait to store subscription states and delivery logs in PostgreSQL, Redis, MongoDB, or any external service.
 
-By default, Autumn provides `InMemoryOutboundWebhookStore`—a bounded, thread-safe, in-memory store ideal for tests, development, or lightweight deployments.
+Autumn ships `InMemoryOutboundWebhookStore`—a bounded, thread-safe, in-memory implementation—but it is not a default: `OutboundWebhookPlugin::new(store)` requires you to name a store, so choosing it is always explicit. Because it is process-local, its subscriptions and delivery logs are lost on restart and are not shared between replicas. Use it for tests, local development, and single-process apps whose webhook state is genuinely disposable. Anything with more than one replica — or that must survive a deploy — needs a durable implementation of the trait.
 
 ---
 
@@ -161,7 +161,9 @@ async fn create_order(
     let manager = state.extension::<WebhookOutboundManager>()
         .ok_or_else(|| AutumnError::internal_server_error_msg("Webhook outbound subsystem not registered"))?;
 
-    // Dispatch transactionally to all matching active subscribers
+    // Logs a delivery row and enqueues a delivery job for each matching active
+    // subscriber. The two steps are not atomic: a crash between them can drop
+    // the event. Make receivers idempotent — delivery is at-least-once.
     manager.dispatch(&state, "order.created", &order).await?;
 
     Ok(Json(order))

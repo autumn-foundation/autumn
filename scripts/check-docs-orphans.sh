@@ -191,9 +191,18 @@ def normalize(p):
     return '/'.join(parts)
 
 
+# An HTML comment renders as nothing, so a link inside one — `<!-- old:
+# [Mail](mail.md) -->` — is not a route: the reader has nothing to click. Left
+# in, a commented-out link would mark its target reachable and let precisely the
+# obsolete-link case this gate exists to catch pass silently. Stripped for EDGE
+# extraction only; the waiver scan below deliberately reads the raw text, since
+# `<!-- orphan-allow: … -->` is itself an HTML comment.
+HTML_COMMENT = re.compile(r'<!--.*?-->', re.S)
+
+
 def edges_from(f):
     """Guide pages this file gives a reader a way to reach."""
-    txt = read(f)
+    txt = HTML_COMMENT.sub(' ', read(f))
     out = set()
     for m in BARE.finditer(txt):
         t = normalize(m.group(1))
@@ -399,6 +408,25 @@ self_test() {
   printf '# Jobs\n\nSee [other][o].\n\n[o]: https://example.com/mail.md\n' > "$c9d/docs/guide/jobs.md"
   git -C "$c9d" add -A && git -C "$c9d" commit -qm ref-style-external
   check "an external reference definition does not make a page reachable" fail "$c9d"
+
+  # A commented-out link renders as nothing, so it is not a route either.
+  local c9i="$tmp/c9i"; make_corpus "$c9i"
+  printf '# Jobs\n\n<!-- old: [mail](mail.md) -->\n' > "$c9i/docs/guide/jobs.md"
+  git -C "$c9i" add -A && git -C "$c9i" commit -qm html-comment-link
+  check "a link inside an HTML comment does not make a page reachable" fail "$c9i"
+
+  local c9j="$tmp/c9j"; make_corpus "$c9j"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n<!-- was: docs/guide/mail.md -->\n' \
+    > "$c9j/README.md"
+  git -C "$c9j" add -A && git -C "$c9j" commit -qm html-comment-bare
+  check "a bare path inside an HTML comment does not make a page reachable" fail "$c9j"
+
+  # ...but the waiver marker IS an HTML comment, so stripping must not eat it.
+  local c9k="$tmp/c9k"; make_corpus "$c9k"
+  printf '# Mail\n\n<!-- orphan-allow: appendix, linked from the release notes -->\n' \
+    > "$c9k/docs/guide/mail.md"
+  git -C "$c9k" add -A && git -C "$c9k" commit -qm waiver-survives-strip
+  check "the waiver marker still works after comment stripping" pass "$c9k"
 
   # History is a record, not a route.
   local c10="$tmp/c10"; make_corpus "$c10"
