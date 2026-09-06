@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **testing:** a real-ACME end-to-end test drives the ACME order state
+  machine (order → HTTP-01 → finalize → issue) against a real, independently-
+  implemented ACME server — [Pebble](https://github.com/letsencrypt/pebble),
+  run as a Docker container via `testcontainers`' `host-port-exposure` tunnel
+  — asserting a genuine, parseable, not-yet-expired certificate is obtained
+  and hot-swapped into the live TLS resolver. Every other ACME test drives
+  the same `AcmeRenewalTask` against an in-process fake CA; this closes the
+  test-depth gap explicitly deferred from #1608/PR #1858 (issue #1863), so a
+  protocol-level regression (challenge ordering, the finalize payload shape,
+  polling) that the fake CA cannot see would still be caught. Wired into a
+  dedicated, Docker-gated CI step separate from both the fast ACME lane (no
+  Docker/network) and the general Docker-dependent-tests sweep.
 - **macros:** `#[autumn_web::main]` takes optional arguments that reach the
   Tokio runtime it builds. Previously the attribute discarded its argument
   list entirely (`_attr`), so the only way to size a worker pool, name the

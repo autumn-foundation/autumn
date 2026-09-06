@@ -535,6 +535,40 @@ jobs:
           cargo test -p autumn-web --features acme \
             --test integration_tests acme_end_to_end:: | tee "${RUNNER_TEMP}/acme-e2e.log"
           assert_ran "${RUNNER_TEMP}/acme-e2e.log" "acme_end_to_end"
+      - name: Run real-ACME (Pebble) end-to-end test
+        # Issue #1863, deferred from #1608/PR #1858: every ACME test above
+        # drives `instant-acme` against `acme_fake_ca`, an in-process stand-in
+        # built because Pebble needs a container plus container→host
+        # networking for the HTTP-01 fetch. `acme_pebble` closes that gap by
+        # driving the SAME `AcmeRenewalTask` against a real, independently-
+        # implemented ACME server (Pebble), so a protocol-level regression the
+        # stand-in cannot see would fail here even if every test above stayed
+        # green.
+        #
+        # A DEDICATED step, separate from both the fast ACME lane above (no
+        # Docker/network) and the general "Run Docker-dependent tests" sweep
+        # below (whose feature set excludes `acme`/`tls` — see CLAUDE.md): it
+        # needs Docker (`testcontainers`, gated by `test-support`) to run
+        # Pebble itself, plus the `host-port-exposure` tunnel sidecar image,
+        # so it stays out of the default `cargo test --workspace` run and out
+        # of contributors' non-Docker inner loop. Pebble is hermetic (no real
+        # Let's Encrypt rate limits at stake), so this runs on every CI
+        # invocation of this job rather than being hand-triggered.
+        #
+        # `test-threads=1`-equivalent by construction: exactly one ignored
+        # test in this filter, and it binds Pebble's fixed HTTP-01 port
+        # (5002) directly, so it must not run concurrently with itself.
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
+          }
+          cargo test -p autumn-web --features "acme,test-support" \
+            --test integration_tests acme_pebble:: -- --ignored \
+            | tee "${RUNNER_TEMP}/acme-pebble.log"
+          assert_ran "${RUNNER_TEMP}/acme-pebble.log" "acme_pebble"
       - name: Run system-test harness (non-browser) tests
         # `system-tests` is not a default feature. The `cargo test --workspace`
         # above happens to compile it today only because `example-e2e` depends

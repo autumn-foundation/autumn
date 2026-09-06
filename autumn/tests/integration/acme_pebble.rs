@@ -60,14 +60,16 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use autumn_web::acme::challenge::{Http01Tokens, challenge_router};
-use autumn_web::acme::renewal::{AcmeRenewalTask, AcmeStatus, ReporterFn};
+use autumn_web::acme::renewal::{AcmeRenewalTask, AcmeStatus, ReporterFn, self_signed_placeholder};
 use autumn_web::acme::store::{AcmeStore, CertId, FsAcmeStore};
 use autumn_web::config::{AcmeConfig, AcmeDirectory};
 use autumn_web::scheduler::{InProcessSchedulerCoordinator, SchedulerCoordinator};
-use autumn_web::tls::{crypto_provider, leaf_not_after_from_pem};
+use autumn_web::tls::{
+    ReloadableCertResolver, certified_key_from_pem, crypto_provider, leaf_not_after_from_pem,
+};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio_util::sync::CancellationToken;
 
 /// The DNS alias `testcontainers`' `host-port-exposure` feature injects into
@@ -100,61 +102,26 @@ fn now_unix() -> i64 {
     .expect("unix time fits i64")
 }
 
-/// Wait until `status` records either a success or a failure, or panic if the
-/// renewal task ends first (which means it panicked — see
-/// [`acme_end_to_end::run_one_boot`](super::acme_end_to_end)'s identical
-/// reasoning) or the deadline passes.
-async fn await_outcome(status: &AcmeStatus, handle: &tokio::task::JoinHandle<()>) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let snap = status.snapshot();
-        if snap.last_success_unix.is_some() || snap.last_failure.is_some() {
-            return;
-        }
-        assert!(
-            !handle.is_finished(),
-            "the ACME renewal task ended before recording any outcome (it likely panicked)"
-        );
-        assert!(
-            std::time::Instant::now() < deadline,
-            "ACME order against Pebble never settled within 60s"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+/// A running Pebble container plus the pieces the ACME client needs to reach
+/// it: the directory URL and the root that signs Pebble's own HTTPS API.
+struct Pebble {
+    // Never read: kept alive purely so the container isn't dropped (and torn
+    // down) while `directory_url`/`root_pem` are still in use.
+    #[allow(dead_code)]
+    container: ContainerAsync<GenericImage>,
+    directory_url: String,
+    root_pem: Vec<u8>,
 }
 
-// Regression coverage for issue #1863 (deferred from #1608 / PR #1858): every
-// other ACME test drives autumn's order state machine against
-// `acme_fake_ca`, an in-process stand-in. This test drives the SAME
-// `AcmeRenewalTask` against a real, independently-implemented ACME server
-// (Pebble) end to end, so a protocol-level regression the stand-in cannot
-// see (challenge ordering, the finalize payload shape, polling) would fail
-// here even if every other ACME test stayed green.
-#[tokio::test]
-#[ignore = "requires Docker (testcontainers)"]
-async fn drives_a_real_pebble_order_end_to_end() {
-    // Bind the HTTP-01 challenge listener BEFORE starting Pebble: Pebble's
-    // validation port is fixed (see `PEBBLE_HTTP01_PORT`), so nothing here
-    // depends on Pebble's own startup — but binding first still fails fast
-    // and clearly if the port is unexpectedly taken.
-    let tokens = Http01Tokens::new();
-    let challenge_tcp = tokio::net::TcpListener::bind(("127.0.0.1", PEBBLE_HTTP01_PORT))
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "bind the ACME HTTP-01 challenge listener on 127.0.0.1:{PEBBLE_HTTP01_PORT} \
-                 (Pebble's fixed validation port): {e}"
-            )
-        });
-    let challenge_shutdown = CancellationToken::new();
-    let router = challenge_router(tokens.clone(), 443);
-    let serve_shutdown = challenge_shutdown.clone();
-    let challenge_handle = tokio::spawn(async move {
-        let _ = axum::serve(challenge_tcp, router)
-            .with_graceful_shutdown(async move { serve_shutdown.cancelled().await })
-            .await;
-    });
-
+/// Start a Pebble container whose HTTP-01 validation reaches `challenge_port`
+/// on this host via the `host-port-exposure` tunnel (see the module doc).
+///
+/// `#[allow(future_not_send)]`: `ContainerAsync::copy_file_from`'s returned
+/// future is not `Send` (testcontainers' internal archive-reading path), and
+/// this single-threaded `#[tokio::test]` never needs to move it across
+/// threads.
+#[allow(clippy::future_not_send)]
+async fn start_pebble(challenge_port: u16) -> Pebble {
     let container = GenericImage::new(PEBBLE_IMAGE, PEBBLE_TAG)
         .with_exposed_port(ContainerPort::Tcp(PEBBLE_ACME_PORT))
         .with_wait_for(WaitFor::message_on_stdout("ACME directory available at:"))
@@ -167,7 +134,7 @@ async fn drives_a_real_pebble_order_end_to_end() {
         // disable it so this test is not flaky on the CA's own fault
         // injection.
         .with_env_var("PEBBLE_WFE_NONCEREJECT", "0")
-        .with_exposed_host_port(PEBBLE_HTTP01_PORT)
+        .with_exposed_host_port(challenge_port)
         .start()
         .await
         .expect("start the Pebble container");
@@ -192,16 +159,57 @@ async fn drives_a_real_pebble_order_end_to_end() {
         "Pebble's minica root certificate must not be empty"
     );
 
-    let cache_dir = tempfile::tempdir().expect("cache dir");
-    let root_path = cache_dir.path().join("pebble-minica-root.pem");
-    std::fs::write(&root_path, &root_pem).expect("write Pebble's minica root to disk");
+    Pebble {
+        container,
+        directory_url,
+        root_pem,
+    }
+}
+
+/// Bind the ACME HTTP-01 challenge listener on Pebble's fixed validation
+/// port. Returns the shared token map and a guard that tears the listener
+/// down when cancelled.
+fn spawn_challenge_listener(
+    challenge_tcp: tokio::net::TcpListener,
+) -> (Http01Tokens, CancellationToken, tokio::task::JoinHandle<()>) {
+    let tokens = Http01Tokens::new();
+    let shutdown = CancellationToken::new();
+    let router = challenge_router(tokens.clone(), 443);
+    let serve_shutdown = shutdown.clone();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(challenge_tcp, router)
+            .with_graceful_shutdown(async move { serve_shutdown.cancelled().await })
+            .await;
+    });
+    (tokens, shutdown, handle)
+}
+
+/// What's left of the harness once its [`AcmeRenewalTask`] has been handed
+/// off to run — everything [`assert_certificate_issued`] inspects afterward.
+struct Harness {
+    resolver: Arc<ReloadableCertResolver>,
+    store: Arc<dyn AcmeStore>,
+    cert_id: CertId,
+}
+
+/// Build the renewal task the way the app would at boot, pointed at
+/// `pebble`'s directory and trusting its root.
+fn build_harness(
+    pebble: &Pebble,
+    tokens: Http01Tokens,
+    cache_dir: &std::path::Path,
+) -> (AcmeRenewalTask, Harness) {
+    let root_path = cache_dir.join("pebble-minica-root.pem");
+    std::fs::write(&root_path, &pebble.root_pem).expect("write Pebble's minica root to disk");
 
     let domains = vec![HOST_ALIAS.to_owned()];
     let config = AcmeConfig {
         domains: domains.clone(),
         contact_email: "acme-pebble-test@example.com".to_owned(),
-        directory: AcmeDirectory::Custom { url: directory_url },
-        cache_dir: cache_dir.path().to_path_buf(),
+        directory: AcmeDirectory::Custom {
+            url: pebble.directory_url.clone(),
+        },
+        cache_dir: cache_dir.to_path_buf(),
         http_challenge_port: PEBBLE_HTTP01_PORT,
         // Pebble's bundled config declares a `default` (90-day) AND a
         // `shortlived` (6-day) profile, and which one it hands back to an
@@ -217,30 +225,28 @@ async fn drives_a_real_pebble_order_end_to_end() {
         .validate()
         .expect("the test's own ACME config must be valid");
 
-    let placeholder = autumn_web::acme::renewal::self_signed_placeholder(&domains)
-        .expect("self-signed placeholder builds");
+    let placeholder = self_signed_placeholder(&domains).expect("self-signed placeholder builds");
     let provider = crypto_provider();
-    let certified = autumn_web::tls::certified_key_from_pem(
+    let certified = certified_key_from_pem(
         placeholder.chain_pem.as_bytes(),
         placeholder.key_pem.as_bytes(),
         &provider,
     )
     .expect("placeholder cert loads");
-    let resolver = Arc::new(autumn_web::tls::ReloadableCertResolver::new(certified));
+    let resolver = Arc::new(ReloadableCertResolver::new(certified));
 
     let store: Arc<dyn AcmeStore> = Arc::new(FsAcmeStore::new(
         config.cache_dir.clone(),
         autumn_web::acme::directory_label(&config.directory),
     ));
-    let status = AcmeStatus::new();
     let cert_id = CertId::from_domains(&domains);
     let task = AcmeRenewalTask {
         resolver: Arc::clone(&resolver),
         provider: crypto_provider(),
         store: Arc::clone(&store),
         cert_id: cert_id.clone(),
-        tokens: tokens.clone(),
-        status: status.clone(),
+        tokens,
+        status: AcmeStatus::new(),
         config,
         serving_stored_cert: false,
         leadership_degraded: false,
@@ -248,7 +254,42 @@ async fn drives_a_real_pebble_order_end_to_end() {
         dns: None,
         recovery: None,
     };
+    (
+        task,
+        Harness {
+            resolver,
+            store,
+            cert_id,
+        },
+    )
+}
 
+/// Wait until `status` records either a success or a failure, or panic if the
+/// renewal task ends first (which means it panicked — see
+/// [`acme_end_to_end::run_one_boot`](super::acme_end_to_end)'s identical
+/// reasoning) or the deadline passes.
+async fn await_outcome(status: &AcmeStatus, handle: &tokio::task::JoinHandle<()>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let snap = status.snapshot();
+        if snap.last_success_unix.is_some() || snap.last_failure.is_some() {
+            return;
+        }
+        assert!(
+            !handle.is_finished(),
+            "the ACME renewal task ended before recording any outcome (it likely panicked)"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ACME order against Pebble never settled within 60s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Run `task` to a settled outcome (success or failure recorded), then stop
+/// it. Returns whatever the reporter captured, for a clear failure message.
+async fn run_to_outcome(task: AcmeRenewalTask, status: &AcmeStatus) -> Vec<String> {
     let coordinator: Arc<dyn SchedulerCoordinator> =
         Arc::new(InProcessSchedulerCoordinator::new("acme-pebble-test"));
     let failures: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -258,37 +299,44 @@ async fn drives_a_real_pebble_order_end_to_end() {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(msg);
     });
-    let renewal_shutdown = CancellationToken::new();
-    let run_shutdown = renewal_shutdown.clone();
+    let shutdown = CancellationToken::new();
+    let run_shutdown = shutdown.clone();
     let handle = tokio::spawn(task.run(coordinator, reporter, run_shutdown));
 
-    await_outcome(&status, &handle).await;
-    renewal_shutdown.cancel();
+    await_outcome(status, &handle).await;
+    shutdown.cancel();
     match tokio::time::timeout(Duration::from_secs(5), handle).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => panic!("the ACME renewal task panicked: {e}"),
         Err(_elapsed) => {}
     }
-    challenge_shutdown.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(5), challenge_handle).await;
 
-    // ── Assertions: a real, usable certificate was obtained end to end ─────
+    Arc::try_unwrap(failures)
+        .map(|m| {
+            m.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
+        .unwrap_or_default()
+}
+
+/// Assert a real, usable certificate was obtained end to end: recorded as a
+/// success, persisted to the store with a sane not-yet-expired `notAfter`,
+/// and hot-swapped into the live resolver (not left on the placeholder).
+async fn assert_certificate_issued(harness: &Harness, status: &AcmeStatus, failures: &[String]) {
     let snap = status.snapshot();
     assert!(
         snap.last_failure.is_none(),
-        "expected no ACME failure, got: {:?} (reported failures: {:?})",
+        "expected no ACME failure, got: {:?} (reported failures: {failures:?})",
         snap.last_failure,
-        failures
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
     assert!(
         snap.last_success_unix.is_some(),
         "expected the ACME renewal task to record a successful issuance against Pebble"
     );
 
-    let stored = store
-        .load_cert(&cert_id)
+    let stored = harness
+        .store
+        .load_cert(&harness.cert_id)
         .await
         .expect("load the persisted certificate")
         .expect("a certificate must have been persisted for this cert id");
@@ -315,7 +363,7 @@ async fn drives_a_real_pebble_order_end_to_end() {
     // The resolver was hot-swapped, not left on the self-signed placeholder:
     // the served certified key's leaf must now be the persisted, CA-issued
     // chain rather than the boot-time placeholder.
-    let served = resolver.current();
+    let served = harness.resolver.current();
     let served_leaf = served
         .cert
         .first()
@@ -333,4 +381,41 @@ async fn drives_a_real_pebble_order_end_to_end() {
         "the live TLS resolver must serve the freshly-issued Pebble certificate, not the \
          self-signed placeholder or a stale cert"
     );
+}
+
+// Regression coverage for issue #1863 (deferred from #1608 / PR #1858): every
+// other ACME test drives autumn's order state machine against
+// `acme_fake_ca`, an in-process stand-in. This test drives the SAME
+// `AcmeRenewalTask` against a real, independently-implemented ACME server
+// (Pebble) end to end, so a protocol-level regression the stand-in cannot
+// see (challenge ordering, the finalize payload shape, polling) would fail
+// here even if every other ACME test stayed green.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn drives_a_real_pebble_order_end_to_end() {
+    // Bind the HTTP-01 challenge listener BEFORE starting Pebble: Pebble's
+    // validation port is fixed (see `PEBBLE_HTTP01_PORT`), so nothing here
+    // depends on Pebble's own startup — but binding first still fails fast
+    // and clearly if the port is unexpectedly taken.
+    let challenge_tcp = tokio::net::TcpListener::bind(("127.0.0.1", PEBBLE_HTTP01_PORT))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "bind the ACME HTTP-01 challenge listener on 127.0.0.1:{PEBBLE_HTTP01_PORT} \
+                 (Pebble's fixed validation port): {e}"
+            )
+        });
+    let (tokens, challenge_shutdown, challenge_handle) = spawn_challenge_listener(challenge_tcp);
+
+    let pebble = start_pebble(PEBBLE_HTTP01_PORT).await;
+    let cache_dir = tempfile::tempdir().expect("cache dir");
+    let (task, harness) = build_harness(&pebble, tokens, cache_dir.path());
+
+    let status = task.status.clone();
+    let failures = run_to_outcome(task, &status).await;
+
+    challenge_shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), challenge_handle).await;
+
+    assert_certificate_issued(&harness, &status, &failures).await;
 }
