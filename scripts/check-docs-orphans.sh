@@ -202,7 +202,24 @@ def read(f):
 # by the other. That means the angle form (the only way to write a path with
 # spaces), one level of balanced parentheses (`](guide(v2).md)`), and an
 # optional link title in any of its three delimiters.
-DEST_BARE = r'(?:[^()\s]|\([^()\s]*\))+'
+# ...and parentheses NEST. `https://example.test/a(b(c))?q=…` is a valid
+# destination; one level missed it, the link was never recognised, its
+# destination was left unblanked, and the bare-path scan read a repo path out
+# of the query string — an invisible non-route marking a page reachable.
+# Built to a fixed depth because a regular expression cannot count. cmark caps
+# its own nesting at 32; six is far past anything a docs URL does, and past it
+# the link is simply not recognised, which is the direction that reports a
+# reachable page rather than hiding an orphan. Atomic groups keep the nested
+# quantifiers from backtracking exponentially on a destination that does not
+# balance.
+def _nested_parens(depth):
+    body = r'[^()\s]'
+    for _ in range(depth):
+        body = r'(?>[^()\s]|\((?:' + body + r')*\))'
+    return body
+
+
+DEST_BARE = r'(?:' + _nested_parens(6) + r')+'
 # A title may wrap lines but not contain a BLANK one, and the whitespace before
 # it is bounded the same way as the destination's: a blank line ends the
 # paragraph, so `[x](y.md\n\n "t")` renders no link at all. Bounding `_WS` and
@@ -451,7 +468,15 @@ def normalize(p):
 # the file as far as Markdown is concerned, so a missing `-->` must not leave
 # the links after it counting as routes. Closed form is tried first, so a
 # terminated comment still strips only itself.
+# Two grammars, because a comment mid-line is INLINE html and has to be a
+# well-formed one: its text may not begin with `>` or `->`, may not contain
+# `--`, and may not end with `-`. `<!-->` satisfies none of that, so
+# `prose <!--> [Mail](mail.md) -->` renders the link — and stripping through
+# the later `-->` deleted it. At the START of a line the same `<!-->` DOES
+# open a type-2 block, which is why the loose form is still what the
+# line-initial case uses. Both verified against markdown-it-py.
 HTML_COMMENT_CLOSED = re.compile(r'<!--.*?-->', re.S)
+HTML_COMMENT_INLINE = re.compile(r'<!--(?!>|->)(?:[^-]|-(?!-))*-->', re.S)
 UNCLOSED = '<!--'
 # A paragraph break: one line with nothing on it.
 BLANK_LINE = re.compile(r'\n[ \t]*\n')
@@ -608,6 +633,11 @@ def strip_comments(txt):
             if line_initial:
                 eol = masked.find('\n', end)
                 end = len(masked) if eol == -1 else eol
+            elif not HTML_COMMENT_INLINE.fullmatch(masked, start, end):
+                # Mid-line it must be a well-formed INLINE comment. `<!-->` is
+                # not one, so the text around it renders and the link inside
+                # stays live; stripping through the later `-->` deleted it.
+                continue
             elif BLANK_LINE.search(masked[start:end]):
                 # Mid-line, this is INLINE html, and inline html cannot cross a
                 # blank line: the paragraph ends there, so `prose <!-- note` /
@@ -3152,6 +3182,35 @@ self_test() {
     > "$c9go/docs/guide/jobs.md"
   git -C "$c9go" add -A && git -C "$c9go" commit -qm casefold-label
   check "reference labels match under Unicode case folding" pass "$c9go"
+
+  # A destination with NESTED parentheses is still a destination, so the repo
+  # path in its query string is invisible and confers nothing.
+  local c9gp="$tmp/c9gp"; make_corpus "$c9gp"
+  printf '# Jobs\n\n[ext](https://example.test/a(b(c))?q=docs/guide/mail.md)\n' \
+    > "$c9gp/docs/guide/jobs.md"
+  git -C "$c9gp" add -A && git -C "$c9gp" commit -qm nested-paren-dest
+  check "a nested-paren destination is not scanned as a bare path" fail "$c9gp"
+
+  # ...and a nested-paren path that IS the destination still resolves.
+  local c9gq="$tmp/c9gq"; make_corpus "$c9gq"
+  mkdir -p "$c9gq/docs/guide"
+  printf '# V2\n\ntext\n' > "$c9gq/docs/guide/guide(v2).md"
+  printf '# Jobs\n\nSee [mail](mail.md) and [v2](guide(v2).md).\n' \
+    > "$c9gq/docs/guide/jobs.md"
+  git -C "$c9gq" add -A && git -C "$c9gq" commit -qm paren-in-filename
+  check "a parenthesised filename still resolves" pass "$c9gq"
+
+  # `<!-->` is not a well-formed inline comment, so the link beside it renders.
+  local c9gr="$tmp/c9gr"; make_corpus "$c9gr"
+  printf '# Jobs\n\nprose <!--> [mail](mail.md) -->\n' > "$c9gr/docs/guide/jobs.md"
+  git -C "$c9gr" add -A && git -C "$c9gr" commit -qm invalid-inline-comment
+  check "an invalid inline comment strips nothing" pass "$c9gr"
+
+  # ...but at the START of a line the same text opens a type-2 block.
+  local c9gs="$tmp/c9gs"; make_corpus "$c9gs"
+  printf '# Jobs\n\n<!--> [mail](mail.md) -->\n' > "$c9gs/docs/guide/jobs.md"
+  git -C "$c9gs" add -A && git -C "$c9gs" commit -qm invalid-comment-line-initial
+  check "the same text line-initial still opens a block" fail "$c9gs"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
