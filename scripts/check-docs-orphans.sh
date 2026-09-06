@@ -1117,6 +1117,38 @@ def block_starts(txt):
     return starts
 
 
+def decode_visible(txt):
+    """Decode character references where a reader would see them decoded.
+
+    `docs/guide/mail&#46;md` in prose is `docs/guide/mail.md` on screen, and the
+    bare-path scan never saw the `.md` — so a page whose only route was written
+    that way was reported as an orphan. Link destinations were already decoded;
+    visible text was the sibling that was not.
+
+    PROSE ONLY, and outside code spans, which is not a detail: inside a fence
+    or backticks a character reference is literal — the reader sees
+    `mail&#46;md` — so decoding there would invent a path nobody can read and
+    mark a genuinely orphaned page reachable. Verified against markdown-it-py,
+    which renders `&amp;#46;` in both.
+
+    Offsets do not survive this, so it belongs at the end of the pipeline where
+    nothing blanks by position any more.
+    """
+    out = []
+    for kind, seg in split_fences(txt):
+        if kind != 'prose':
+            out.append(seg)
+            continue
+        pieces, last = [], 0
+        for m in CODE_SPAN.finditer(seg):
+            pieces.append(decode_char_refs(seg[last:m.start()]))
+            pieces.append(m.group(0))
+            last = m.end()
+        pieces.append(decode_char_refs(seg[last:]))
+        out.append(''.join(pieces))
+    return ''.join(out)
+
+
 def blank_link_dests(txt):
     """Blank the DESTINATION of every rendered link, leaving its label alone.
 
@@ -1454,7 +1486,9 @@ def edges_from(f):
     # it reported a reachable page as an orphan.
     scan = sub_in_prose(REF_DEF_FULL, scan, only_at_block_start=True,
                         view=strip_quote_markers(scan))
-    for m in BARE.finditer(scan):
+    # Decoded LAST: the blanking above works by offset, and decoding moves
+    # every offset after the first reference.
+    for m in BARE.finditer(decode_visible(scan)):
         t = normalize(m.group(1))
         if t in traversable:
             out.add(t)
@@ -3273,6 +3307,29 @@ self_test() {
     > "$c9gv/docs/guide/jobs.md"
   git -C "$c9gv" add -A && git -C "$c9gv" commit -qm deep-nested-dest
   check "a deeply nested destination is not scanned as a bare path" fail "$c9gv"
+
+  # A character reference in visible prose is decoded on screen, so the path
+  # the reader sees is the tracked one.
+  local c9gw="$tmp/c9gw"; make_corpus "$c9gw"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\nSee docs/guide/mail&#46;md\n' \
+    > "$c9gw/README.md"
+  git -C "$c9gw" add -A && git -C "$c9gw" commit -qm entity-in-prose
+  check "a character reference in prose still names the path" pass "$c9gw"
+
+  # ...but inside a FENCE it is literal, so the reader sees `mail&#46;md` and
+  # decoding there would invent a route nobody can read.
+  local c9gx="$tmp/c9gx"; make_corpus "$c9gx"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n```\ndocs/guide/mail&#46;md\n```\n' \
+    > "$c9gx/README.md"
+  git -C "$c9gx" add -A && git -C "$c9gx" commit -qm entity-in-fence
+  check "a character reference in a fence stays literal" fail "$c9gx"
+
+  # ...and the same holds inside a code span.
+  local c9gy="$tmp/c9gy"; make_corpus "$c9gy"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\nSee `docs/guide/mail&#46;md`\n' \
+    > "$c9gy/README.md"
+  git -C "$c9gy" add -A && git -C "$c9gy" commit -qm entity-in-code-span
+  check "a character reference in a code span stays literal" fail "$c9gy"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
