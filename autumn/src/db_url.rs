@@ -98,6 +98,16 @@ pub fn is_bare_in_memory_sqlite(url: &str) -> bool {
 /// no `?` (no query) and no whitespace (so it is one token, not a keyword/value
 /// string). A bare filesystem path is exactly that, and is the case where
 /// naming the target is the whole value of the message.
+///
+/// # Known gap
+///
+/// "The default is to mask" holds for everything `Url::parse` REJECTS. It does
+/// not yet hold for an OPAQUE url it accepts: `postgres:password=hunter2`
+/// parses, reports no password, query or fragment, and has no `@` in its path,
+/// so it returns verbatim and reaches the boot error. Tracked in #2571 — the
+/// fix is to treat a URL with no authority whose path carries key/value
+/// material as unclassified, rather than trusting that a successful parse
+/// means the parser understood every part of it.
 pub fn redact_target(url: &str) -> String {
     let backend = DatabaseBackend::detect(url);
     if backend == Some(DatabaseBackend::Sqlite) {
