@@ -104,6 +104,9 @@ GATED_MODULES=(
   autumn/src/app.rs:default
   autumn/src/db.rs:default
   autumn/src/job.rs:default
+  # The durable SQLite job backend (#1907): a submodule of the gated job.rs,
+  # listed on its own because its enforcing clippy lane is the sqlite one.
+  autumn/src/job/sqlite.rs:sqlite
   # The ratified W3 identifier sites. They carry no off-seam production call at
   # all — every id they mint already comes from the injected `Entropy` — so
   # gating them costs nothing and is what makes the `Uuid::new_v4` clause of the
@@ -141,7 +144,7 @@ GATED_MODULES=(
 )
 
 # The manifest is a ratchet: it may grow, never shrink.
-MODULE_COUNT_FLOOR=18
+MODULE_COUNT_FLOOR=19
 
 # Every lint the gate header must deny.
 REQUIRED_GATE_LINTS=(

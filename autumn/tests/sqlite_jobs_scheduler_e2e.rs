@@ -1074,3 +1074,207 @@ async fn sqlite_job_backend_reports_the_shared_queue_to_the_dashboard() {
     shutdown.cancel();
     job::clear_global_job_client();
 }
+
+/// (16) A tracked job's status record lives in the same file as the queue, so
+/// it survives a restart and a web/worker split sees one record — not the
+/// per-process memory the in-process backend falls back to.
+#[tokio::test]
+async fn sqlite_job_backend_tracks_job_status_durably() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    // Enqueue-only, so the record is written by a process that never runs the
+    // job — the web half of a split.
+    job::start_runtime(
+        vec![job_info("sqlite_tracked_job", 3, |_state, _payload| {
+            Box::pin(async move { Ok(()) })
+        })],
+        &state,
+        &shutdown,
+        &sqlite_job_config(3),
+        false,
+    )
+    .expect("the enqueue-only sqlite runtime starts");
+
+    let handle = autumn_web::job_tracking::enqueue_tracked(
+        "sqlite_tracked_job",
+        serde_json::json!({ "n": 1 }),
+    )
+    .await
+    .expect("tracked enqueue");
+    assert!(!handle.token.is_empty());
+
+    let key = autumn_web::auth::hash_api_token(&handle.token);
+    assert_eq!(
+        count(
+            &pool,
+            &format!("SELECT COUNT(*) AS value FROM autumn_job_tracking WHERE key = '{key}'"),
+        )
+        .await,
+        1,
+        "the tracked record is a row in the app's own file, not process memory"
+    );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
+/// (17) A `unique_for_ms` window dedupes on time rather than on status, so a
+/// second enqueue inside the window coalesces. The TTL window takes its own
+/// query text, so it needs its own coverage.
+#[tokio::test]
+async fn sqlite_job_backend_deduplicates_inside_a_ttl_window() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    let mut info = job_info("sqlite_ttl_unique_job", 3, |_state, _payload| {
+        Box::pin(async move { Ok(()) })
+    });
+    info.uniqueness = Some(JobUniqueness {
+        by: vec!["order_id".to_string()],
+        window: JobUniquenessWindow::TtlMs(60_000),
+    });
+
+    job::start_runtime(vec![info], &state, &shutdown, &sqlite_job_config(3), false)
+        .expect("the enqueue-only sqlite runtime starts");
+
+    for _ in 0..3 {
+        job::enqueue(
+            "sqlite_ttl_unique_job",
+            serde_json::json!({ "order_id": 7 }),
+        )
+        .await
+        .expect("enqueue");
+    }
+    job::enqueue(
+        "sqlite_ttl_unique_job",
+        serde_json::json!({ "order_id": 8 }),
+    )
+    .await
+    .expect("enqueue");
+
+    assert_eq!(
+        count(&pool, "SELECT COUNT(*) AS value FROM autumn_jobs").await,
+        2,
+        "repeat enqueues inside the TTL window coalesce; a different key does not"
+    );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
+/// (18) The dashboard's retry and discard operate on the table, so an operator
+/// action on one process is visible to every process on the host.
+#[tokio::test]
+async fn sqlite_job_backend_dashboard_retries_and_discards_failed_jobs() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    // Enqueue-only, so nothing re-runs a row this test moves back to enqueued.
+    job::start_runtime(
+        vec![job_info("sqlite_dashboard_job", 1, |_state, _payload| {
+            Box::pin(async move { Ok(()) })
+        })],
+        &state,
+        &shutdown,
+        &sqlite_job_config(1),
+        false,
+    )
+    .expect("the enqueue-only sqlite runtime starts");
+
+    job::enqueue("sqlite_dashboard_job", serde_json::json!({}))
+        .await
+        .expect("enqueue");
+    eventually(200, "the queue schema to be created", async || {
+        queue_table_exists(&pool).await
+    })
+    .await;
+
+    // Settle the row as failed, the state an operator retries or discards from.
+    {
+        use diesel_async::RunQueryDsl as _;
+        let mut conn = pool.get().await.expect("sqlite connection");
+        // `finished_at` must be inside the dashboard's 7-day failed window, so
+        // reuse the row's own enqueue instant.
+        diesel::sql_query(
+            "UPDATE autumn_jobs SET status = 'failed', finished_at = enqueued_at, \
+             last_error = 'boom'",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("mark failed");
+    }
+
+    let admin = job::job_admin_backend(&state).expect("the sqlite runtime installs a dashboard");
+    let failed = admin
+        .snapshot(JobAdminQuery::default())
+        .await
+        .expect("admin snapshot")
+        .failed;
+    assert_eq!(failed.total, 1, "the failed job shows on the dashboard");
+    let id = failed
+        .records
+        .first()
+        .expect("one failed record")
+        .id
+        .clone();
+
+    admin.retry(&id).await.expect("retry the failed job");
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) AS value FROM autumn_jobs WHERE status = 'enqueued' AND attempt = 1"
+        )
+        .await,
+        1,
+        "retry puts the row back in the queue on a fresh attempt"
+    );
+
+    // A retry of a row that is no longer failed is a not-found, not a silent
+    // no-op.
+    let err = admin
+        .retry(&id)
+        .await
+        .expect_err("a job that is not failed cannot be retried");
+    assert_eq!(err.status().as_u16(), 404, "got: {err:?}");
+
+    // Discard needs a failed row again.
+    {
+        use diesel_async::RunQueryDsl as _;
+        let mut conn = pool.get().await.expect("sqlite connection");
+        diesel::sql_query("UPDATE autumn_jobs SET status = 'failed', finished_at = enqueued_at")
+            .execute(&mut *conn)
+            .await
+            .expect("mark failed");
+    }
+    admin.discard(&id).await.expect("discard the failed job");
+    let after = admin
+        .snapshot(JobAdminQuery::default())
+        .await
+        .expect("admin snapshot");
+    assert_eq!(
+        after.failed.total, 0,
+        "a discarded job leaves every dashboard list"
+    );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}

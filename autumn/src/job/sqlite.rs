@@ -23,6 +23,31 @@
 //! uniqueness windows, and concurrency limits — match the Postgres backend, so
 //! an app moves between the two tiers without changing job code.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -56,11 +81,25 @@ const STATUS_FAILED: &str = "failed";
 /// row for audit but out of every dashboard list, as on Postgres.
 const STATUS_DISCARDED: &str = "discarded";
 
+/// Most rows one stale-claim sweep recovers.
+///
+/// Bounded so a large backlog cannot hold the single writer for one long
+/// `UPDATE`. The next sweep takes the next batch.
+const STALE_RECOVERY_BATCH: usize = 100;
+
+/// Most terminal rows one job-history prune removes, for the same reason.
+const HISTORY_PRUNE_BATCH: usize = 500;
+
 /// Longest gap between stale-claim sweeps.
 const MAX_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// Shortest gap between stale-claim sweeps, so a tiny visibility timeout cannot
 /// turn the sweep into a hot loop.
 const MIN_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// How often expired `autumn_job_tracking` rows are swept.
+///
+/// Much slower than a stale-claim sweep: an expired record is already invisible
+/// to reads, so this bounds table growth rather than correctness.
+const TRACKING_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// How often to sweep stale claims for a given visibility timeout.
 ///
@@ -192,6 +231,13 @@ fn now_ms(state: &AppState) -> i64 {
 pub(super) struct SqliteJobQueue {
     pool: SqlitePool,
     schema: Arc<tokio::sync::OnceCell<()>>,
+    /// Raised by an enqueue, awaited by an idle worker.
+    ///
+    /// The enqueue client and the worker loops hold the same handle, so a job
+    /// enqueued in this process starts at once instead of waiting out a poll.
+    /// Work another process enqueued still waits for the poll — `SQLite` has no
+    /// `LISTEN`/`NOTIFY`.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 impl SqliteJobQueue {
@@ -199,6 +245,7 @@ impl SqliteJobQueue {
         Self {
             pool,
             schema: Arc::new(tokio::sync::OnceCell::new()),
+            wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -254,6 +301,13 @@ pub(super) async fn ensure_schema(pool: &SqlitePool) -> AutumnResult<()> {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_autumn_jobs_unique_inflight \
          ON autumn_jobs (name, unique_key) \
          WHERE unique_key IS NOT NULL AND status IN ('enqueued', 'running')",
+        // Serves the TTL dedup guard and the TTL eviction, which carry no
+        // status term and so cannot use the partial unique index above. Partial
+        // itself, so an app with no unique jobs carries an empty index.
+        "CREATE INDEX IF NOT EXISTS idx_autumn_jobs_unique_lookup \
+         ON autumn_jobs (name, unique_key) WHERE unique_key IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_autumn_jobs_enqueued_dashboard \
+         ON autumn_jobs (enqueued_at DESC) WHERE status = 'enqueued'",
         "CREATE INDEX IF NOT EXISTS idx_autumn_jobs_concurrency_running \
          ON autumn_jobs (name, concurrency_key) WHERE status = 'running'",
         "CREATE INDEX IF NOT EXISTS idx_autumn_jobs_status_finished \
@@ -342,21 +396,39 @@ pub(super) async fn enqueue_job_at(
     // The `WHERE` is the dedup check and the partial unique index is the
     // backstop, exactly as on Postgres. A TTL window checks only the time
     // window, so a job that outlives its TTL cannot block a replacement.
+    //
+    // The two windows get separate query text rather than one `CASE`, because a
+    // `CASE` buries the status test where the planner cannot reach the partial
+    // unique index — every unique enqueue would then scan the whole table. Both
+    // texts take the same three guard binds, in the same order, so the bind
+    // chain below stays single.
     let ttl_cutoff = unique_ttl_ms.map(|ttl| now.saturating_sub(ttl));
+    let dedup_guard = if unique_ttl_ms.is_some() {
+        "NOT EXISTS ( \
+           SELECT 1 FROM autumn_jobs dup \
+           WHERE dup.name = ? AND dup.unique_key = ? AND dup.enqueued_at > ?)"
+    } else {
+        // The trailing `? IS NULL` consumes the unused TTL-cutoff bind; it is
+        // always true here, and a constant term does not stop the planner from
+        // using the `(name, unique_key)` terms above it. A job with no unique
+        // key binds NULL, so `dup.unique_key = ?` matches nothing and the guard
+        // passes.
+        "NOT EXISTS ( \
+           SELECT 1 FROM autumn_jobs dup \
+           WHERE dup.name = ? AND dup.unique_key = ? \
+             AND dup.status IN ('enqueued', 'running') \
+             AND ? IS NULL)"
+    };
     let inserted = diesel::sql_query(format!(
         "INSERT INTO autumn_jobs \
          (id, name, queue, payload, status, attempt, max_attempts, initial_backoff_ms, \
           enqueued_at, run_at, unique_key, unique_window, concurrency_key, concurrency_limit, \
           traceparent, tracestate) \
          SELECT ?, ?, ?, ?, '{STATUS_ENQUEUED}', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
-         WHERE (? IS NULL OR NOT EXISTS ( \
-             SELECT 1 FROM autumn_jobs dup \
-             WHERE dup.name = ? AND dup.unique_key = ? \
-               AND CASE WHEN ? IS NOT NULL \
-                        THEN dup.enqueued_at > ? \
-                        ELSE dup.status IN ('{STATUS_ENQUEUED}', '{STATUS_RUNNING}') \
-                   END)) \
-         ON CONFLICT DO NOTHING"
+         WHERE {dedup_guard} \
+         ON CONFLICT (name, unique_key) \
+           WHERE unique_key IS NOT NULL AND status IN ('{STATUS_ENQUEUED}', '{STATUS_RUNNING}') \
+           DO NOTHING"
     ))
     .bind::<diesel::sql_types::Text, _>(id)
     .bind::<diesel::sql_types::Text, _>(name)
@@ -374,10 +446,8 @@ pub(super) async fn enqueue_job_at(
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(concurrency_limit)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(traceparent)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(tracestate)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(constraints.unique_key.clone())
     .bind::<diesel::sql_types::Text, _>(name)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(constraints.unique_key.clone())
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(unique_ttl_ms)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(ttl_cutoff)
     .execute(&mut *conn)
     .await
@@ -385,9 +455,18 @@ pub(super) async fn enqueue_job_at(
         AutumnError::internal_server_error_msg(format!("sqlite job enqueue failed: {error}"))
     })?;
 
-    if inserted == 0 && has_unique_key {
-        return Ok(EnqueueOutcome::Deduplicated);
+    if inserted == 0 {
+        // The conflict target is the dedup index, so a zero row count can only
+        // be a unique job that coalesced — never a silently lost row.
+        if has_unique_key {
+            return Ok(EnqueueOutcome::Deduplicated);
+        }
+        return Err(AutumnError::internal_server_error_msg(
+            "sqlite job enqueue inserted no row",
+        ));
     }
+    // Wake an idle worker in this process rather than make it wait out a poll.
+    queue_handle.wake.notify_one();
     Ok(EnqueueOutcome::Queued)
 }
 
@@ -406,6 +485,28 @@ async fn claim_next_job(
     use diesel_async::RunQueryDsl as _;
 
     let mut conn = pool.get().await.ok()?;
+    // Probe with a read first. The claim is an UPDATE, which opens a write
+    // transaction and takes the single writer lock even when it matches
+    // nothing — so an idle worker fleet would otherwise contend with the
+    // application's own writes on every poll.
+    let ready = diesel::sql_query(format!(
+        "SELECT COUNT(*) AS count FROM ( \
+           SELECT 1 FROM autumn_jobs \
+           WHERE status = '{STATUS_ENQUEUED}' AND run_at <= ? AND queue = ? \
+           LIMIT 1)"
+    ))
+    .bind::<diesel::sql_types::BigInt, _>(now)
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .get_result::<CountRow>(&mut *conn)
+    .await;
+    match ready {
+        Ok(row) if row.count == 0 => return None,
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, "sqlite job ready probe failed");
+            return None;
+        }
+    }
     let claimed = diesel::sql_query(format!(
         "UPDATE autumn_jobs \
          SET status = '{STATUS_RUNNING}', started_at = ?, claimed_by = ?, claimed_at = ?, \
@@ -513,7 +614,8 @@ async fn nack_failure(
                    AND dup.status IN ('{STATUS_ENQUEUED}', '{STATUS_RUNNING}')) \
                THEN ? \
                ELSE unique_key \
-             END \
+             END, \
+             pending_unique_key = NULL \
          WHERE id = ? AND claimed_by = ? AND status = '{STATUS_RUNNING}'"
     ))
     .bind::<diesel::sql_types::BigInt, _>(now.saturating_add(delay_ms))
@@ -612,8 +714,11 @@ async fn recover_stale_claims(pool: &SqlitePool, visibility_timeout_ms: u64, sta
                ELSE unique_key \
              END, \
              pending_unique_key = NULL \
-         WHERE status = '{STATUS_RUNNING}' AND claimed_at IS NOT NULL AND claimed_at <= ? \
-         RETURNING id, name, status"
+         WHERE id IN ( \
+           SELECT id FROM autumn_jobs \
+           WHERE status = '{STATUS_RUNNING}' AND claimed_at IS NOT NULL AND claimed_at <= ? \
+           LIMIT {STALE_RECOVERY_BATCH}) \
+         RETURNING id, name, status, payload"
     );
     let recovered = diesel::sql_query(sql)
         .bind::<diesel::sql_types::BigInt, _>(now)
@@ -646,13 +751,25 @@ async fn recover_stale_claims(pool: &SqlitePool, visibility_timeout_ms: u64, sta
                 &row.id,
                 "visibility timeout expired",
             );
+            // The row will never run again, so settle its tracked record now.
+            // Otherwise the status endpoint reports `running` until the record
+            // expires.
+            let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
+            crate::job_tracking::settle_tracked_payload_as_failed(
+                state,
+                &payload,
+                crate::job_tracking::GENERIC_FAILURE_MESSAGE,
+            )
+            .await;
         } else {
             tracing::warn!(
                 job = %row.name,
                 job_id = %row.id,
                 "sqlite job re-enqueued after its visibility timeout expired"
             );
-            state.job_registry.record_enqueue(&row.name);
+            // No gauge write here: the row is back in the table and the depth
+            // survey publishes it absolutely on its next pass. Postgres does
+            // the same.
         }
     }
 }
@@ -666,6 +783,67 @@ struct RecoveredRow {
     name: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     status: String,
+    /// Needed to settle the tracked record of a row this sweep dead-letters.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    payload: String,
+}
+
+/// Wait until the queue schema exists, then hand back the pool.
+///
+/// Retries every `retry_after` rather than failing the task for good: a first
+/// attempt can lose a `busy_timeout` race with another process booting against
+/// the same file. Returns `None` only on shutdown.
+async fn wait_ready(
+    queue_handle: &SqliteJobQueue,
+    retry_after: std::time::Duration,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> Option<SqlitePool> {
+    loop {
+        match queue_handle.ready().await {
+            Ok(pool) => return Some(pool.clone()),
+            Err(error) => {
+                tracing::error!(error = %error, "sqlite job queue schema setup failed; retrying");
+                tokio::select! {
+                    () = shutdown.cancelled() => return None,
+                    () = tokio::time::sleep(retry_after) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Delete `autumn_job_tracking` rows past their expiry.
+///
+/// Expired rows are already invisible to reads and writes, which filter on
+/// `expires_at`, so this only bounds the table's growth. Skipped while the
+/// dataset is under a GDPR legal hold, exactly as on Postgres.
+async fn cleanup_expired_tracking_rows(pool: &SqlitePool, state: &AppState) {
+    use diesel_async::RunQueryDsl as _;
+
+    let registry = state.extension::<crate::gdpr::GdprRegistry>();
+    if let Some(reason) = crate::data_retention::legal_hold_for(
+        crate::data_retention::RetentionDataset::JobTracking,
+        registry.as_deref(),
+    ) {
+        tracing::debug!(
+            reason = %reason,
+            "job tracking cleanup skipped: autumn_job_tracking is under legal hold"
+        );
+        return;
+    }
+    let Ok(mut conn) = pool.get().await else {
+        tracing::warn!("job tracking cleanup could not acquire a connection");
+        return;
+    };
+    // The table exists only once a tracked job has been enqueued, so a missing
+    // table is the ordinary "no tracked jobs yet" case, not a fault.
+    if let Err(error) = diesel::sql_query("DELETE FROM autumn_job_tracking WHERE expires_at <= ?")
+        .bind::<diesel::sql_types::BigInt, _>(now_ms(state))
+        .execute(&mut *conn)
+        .await
+    {
+        tracing::debug!(error = %error, "sqlite job tracking cleanup skipped");
+    }
 }
 
 /// One `(queue, name)` group of the ready backlog.
@@ -723,14 +901,105 @@ async fn update_queue_depth_gauges(pool: &SqlitePool, state: &AppState) {
     }
 }
 
+/// One `(name, count)` row of the blocked-on-concurrency survey.
+#[derive(diesel::QueryableByName)]
+struct NameCountRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
+/// Refresh the `blocked_on_concurrency` gauge: ready rows a
+/// `#[job(concurrency = N)]` limit is currently holding back.
+///
+/// Only surveyed when some job declares a limit, so an app without one pays
+/// nothing.
+async fn update_concurrency_blocked_gauges(pool: &SqlitePool, state: &AppState) {
+    use diesel_async::RunQueryDsl as _;
+
+    let Ok(mut conn) = pool.get().await else {
+        return;
+    };
+    let rows = diesel::sql_query(format!(
+        "SELECT blocked.name AS name, COUNT(*) AS count \
+         FROM autumn_jobs blocked \
+         WHERE blocked.status = '{STATUS_ENQUEUED}' \
+           AND blocked.run_at <= ? \
+           AND blocked.concurrency_limit IS NOT NULL \
+           AND ( \
+             SELECT COUNT(*) FROM autumn_jobs running \
+             WHERE running.status = '{STATUS_RUNNING}' \
+               AND running.name = blocked.name \
+               AND running.concurrency_key IS blocked.concurrency_key \
+           ) >= blocked.concurrency_limit \
+         GROUP BY blocked.name"
+    ))
+    .bind::<diesel::sql_types::BigInt, _>(now_ms(state))
+    .load::<NameCountRow>(&mut *conn)
+    .await;
+    match rows {
+        Ok(rows) => {
+            let counts: HashMap<String, u64> = rows
+                .into_iter()
+                .map(|row| (row.name, u64::try_from(row.count).unwrap_or(0)))
+                .collect();
+            state.job_registry.set_concurrency_blocked_counts(&counts);
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "sqlite blocked-concurrency survey failed");
+        }
+    }
+}
+
+/// Delete terminal rows past the configured `retention.job_history` window.
+///
+/// Opt-in: with no window set, history is kept forever, exactly as on Postgres.
+/// A row still holding a TTL dedup key is never removed, or a replacement
+/// enqueue would slip past the window it is meant to be deduped by.
+async fn prune_job_history(pool: &SqlitePool, state: &AppState, window: std::time::Duration) {
+    use diesel_async::RunQueryDsl as _;
+
+    let registry = state.extension::<crate::gdpr::GdprRegistry>();
+    if let Some(reason) = crate::data_retention::legal_hold_for(
+        crate::data_retention::RetentionDataset::JobHistory,
+        registry.as_deref(),
+    ) {
+        tracing::debug!(
+            reason = %reason,
+            "job history prune skipped: autumn_jobs is under legal hold"
+        );
+        return;
+    }
+    let Ok(mut conn) = pool.get().await else {
+        return;
+    };
+    let cutoff =
+        now_ms(state).saturating_sub(i64::try_from(window.as_millis()).unwrap_or(i64::MAX));
+    if let Err(error) = diesel::sql_query(format!(
+        "DELETE FROM autumn_jobs \
+         WHERE id IN ( \
+           SELECT id FROM autumn_jobs \
+           WHERE status IN ('{STATUS_COMPLETED}', '{STATUS_FAILED}', '{STATUS_DISCARDED}') \
+             AND finished_at IS NOT NULL AND finished_at < ? \
+             AND NOT (unique_key IS NOT NULL AND unique_window = 'ttl') \
+           LIMIT {HISTORY_PRUNE_BATCH})"
+    ))
+    .bind::<diesel::sql_types::BigInt, _>(cutoff)
+    .execute(&mut *conn)
+    .await
+    {
+        tracing::warn!(error = %error, "sqlite job history prune failed");
+    }
+}
+
 /// Refresh the backlog gauges on an interval.
 async fn queue_depth_survey_loop(
     queue_handle: SqliteJobQueue,
     state: AppState,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    let Ok(pool) = queue_handle.ready().await.cloned() else {
-        // The schema-setup error is already logged by whoever lost this race.
+    let Some(pool) = wait_ready(&queue_handle, MAX_MAINTENANCE_INTERVAL, &shutdown).await else {
         return;
     };
     let mut interval = tokio::time::interval(MAX_MAINTENANCE_INTERVAL);
@@ -930,18 +1199,18 @@ async fn worker_loop(
     poll_interval: std::time::Duration,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    let pool = match queue_handle.ready().await {
-        Ok(pool) => pool.clone(),
-        Err(error) => {
-            tracing::error!(error = %error, "sqlite job queue schema setup failed");
-            return;
-        }
-    };
     let mut cursor = schedule.cursor();
     loop {
         if shutdown.is_cancelled() {
             break;
         }
+        // Retry the schema setup on every pass rather than giving up for the
+        // life of the process: a first attempt can lose a `busy_timeout` race
+        // with another process booting against the same file, and a worker that
+        // returned here would drain nothing until someone restarted it.
+        let Some(pool) = wait_ready(&queue_handle, poll_interval, &shutdown).await else {
+            break;
+        };
         // Walk the priority order and reserve a per-queue slot before the claim,
         // so a queue cap is honored across the claim round-trip.
         let order = cursor.next_order();
@@ -963,6 +1232,7 @@ async fn worker_loop(
         if !handled {
             tokio::select! {
                 () = shutdown.cancelled() => break,
+                () = queue_handle.wake.notified() => {}
                 () = tokio::time::sleep(poll_interval) => {}
             }
         }
@@ -973,25 +1243,35 @@ async fn worker_loop(
 async fn maintenance_loop(
     queue_handle: SqliteJobQueue,
     visibility_timeout_ms: u64,
+    survey_blocked: bool,
+    history_window: Option<std::time::Duration>,
     state: AppState,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    let pool = match queue_handle.ready().await {
-        Ok(pool) => pool.clone(),
-        Err(error) => {
-            tracing::error!(error = %error, "sqlite job queue schema setup failed");
-            return;
-        }
+    let interval_duration = maintenance_interval(visibility_timeout_ms);
+    let Some(pool) = wait_ready(&queue_handle, interval_duration, &shutdown).await else {
+        return;
     };
     // Sweep once at start: a row still marked running belongs to a process that
     // is no longer here.
     recover_stale_claims(&pool, visibility_timeout_ms, &state).await;
-    let mut interval = tokio::time::interval(maintenance_interval(visibility_timeout_ms));
+    let mut tracking_cleanup = tokio::time::interval(TRACKING_CLEANUP_INTERVAL);
+    tracking_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut interval = tokio::time::interval(interval_duration);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 recover_stale_claims(&pool, visibility_timeout_ms, &state).await;
+                if survey_blocked {
+                    update_concurrency_blocked_gauges(&pool, &state).await;
+                }
+            }
+            _ = tracking_cleanup.tick() => {
+                cleanup_expired_tracking_rows(&pool, &state).await;
+                if let Some(window) = history_window {
+                    prune_job_history(&pool, &state, window).await;
+                }
             }
             () = shutdown.cancelled() => break,
         }
@@ -1136,6 +1416,17 @@ pub(super) fn start_runtime(
     }
 
     let visibility_timeout_ms = config.sqlite.visibility_timeout_ms;
+    let survey_blocked = jobs_by_name
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .any(|job| job.concurrency.is_some());
+    // Opt-in, and read from the same `retention.job_history` window the
+    // Postgres sweep uses. Unset means history is kept forever, as on Postgres.
+    let history_window = state
+        .extension::<crate::config::AutumnConfig>()
+        .and_then(|config| config.retention.job_history.clone())
+        .and_then(|window| crate::config::parse_duration_str(&window).ok());
     let poll_interval = std::time::Duration::from_millis(config.sqlite.poll_interval_ms.max(1));
     let worker_count = config.workers.max(1);
 
@@ -1144,7 +1435,15 @@ pub(super) fn start_runtime(
         let state = state.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            maintenance_loop(queue_handle, visibility_timeout_ms, state, shutdown).await;
+            maintenance_loop(
+                queue_handle,
+                visibility_timeout_ms,
+                survey_blocked,
+                history_window,
+                state,
+                shutdown,
+            )
+            .await;
         });
     }
 
@@ -1305,11 +1604,10 @@ impl SqliteJobAdminBackend {
         .map_err(|error| {
             // The retried row keeps its unique key, so re-enqueueing while an
             // equivalent job is in flight trips the partial unique index.
-            // Surface that as an actionable conflict.
-            if error
-                .to_string()
-                .contains("idx_autumn_jobs_unique_inflight")
-            {
+            // Surface that as an actionable conflict. SQLite names the offending
+            // columns ("UNIQUE constraint failed: autumn_jobs.name, …"), never
+            // the index, so match on that rather than on the index name.
+            if error.to_string().contains("UNIQUE constraint failed") {
                 AutumnError::bad_request_msg(
                     "an equivalent unique job is already pending or running; \
                      retry after it settles",

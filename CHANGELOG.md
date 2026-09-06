@@ -53,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   split, so that topology is now valid on the tier. Both backends need the
   non-default `sqlite` cargo feature, and both are refused with an actionable
   message on a build without it. Nothing on the Postgres path changes.
+  **Breaking:** `JobConfig` gains a public `sqlite` field and `SchedulerBackend`
+  gains a `Sqlite` variant, so a struct literal over `JobConfig` or an
+  exhaustive `match` on `SchedulerBackend` needs one line — see the
+  [migration guide](docs/migrations/next.md).
 
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,

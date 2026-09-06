@@ -344,9 +344,14 @@ mid-job loses nothing. A recovered claim consumes another attempt and records a
 `last_error`. A job that exhausts `max_attempts` becomes `failed` and is not
 retried.
 
-There is no `LISTEN`/`NOTIFY`, so an idle worker polls every
+There is no `LISTEN`/`NOTIFY`. An enqueue in the same process wakes a worker
+directly; work another process enqueued is seen within
 `jobs.sqlite.poll_interval_ms` (default 250ms). Lower it for latency, raise it
 to cut idle wakeups.
+
+Terminal rows are pruned by the runtime, not by `autumn db retention`, whose
+sweep is Postgres-only. Set `retention.job_history` to bound the table; leave it
+unset and history is kept forever, exactly as on Postgres.
 
 The runtime creates the table and its indexes at start, because framework
 migrations are Postgres SQL. Nothing to run by hand.
@@ -794,14 +799,14 @@ Progress/result records expire `jobs.tracking.ttl_secs` after their last
 write (default `86400`, 24h). The record store follows whichever job
 backend is configured — `local` and `redis` use an in-memory or Redis-backed
 store respectively, `postgres` uses the `autumn_job_tracking` table (see
-[Migration notes](#migration-notes)) — so a tracked job's status composes
-with the backend an app already runs, with no extra setup. Expired records
-are invisible to reads/writes immediately on all three stores; each also
-actually frees the expired record so long-running processes don't
-accumulate one dead entry per tracked job forever: the in-memory store
-sweeps them out opportunistically (amortized across `create` calls), a
-Postgres background sweep runs every 5 minutes to `DELETE` expired rows,
-and Redis expires keys natively via `EX`.
+[Migration notes](#migration-notes)), and `sqlite` uses the same table in the
+app's own database file — so a tracked job's status composes with the backend
+an app already runs, with no extra setup. Expired records are invisible to
+reads/writes immediately on every store; each also actually frees the expired
+record so long-running processes don't accumulate one dead entry per tracked
+job forever: the in-memory store sweeps them out opportunistically (amortized
+across `create` calls), the Postgres and SQLite background sweeps run every 5
+minutes to `DELETE` expired rows, and Redis expires keys natively via `EX`.
 
 ### Async CSV export, end to end
 

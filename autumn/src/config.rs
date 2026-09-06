@@ -115,6 +115,8 @@
 //! | `AUTUMN_CHANNELS__REDIS__URL` | `channels.redis.url` | `String` |
 //! | `AUTUMN_CHANNELS__REDIS__KEY_PREFIX` | `channels.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `postgres` / `redis` / `sqlite` |
+//! | `AUTUMN_JOBS__SQLITE__VISIBILITY_TIMEOUT_MS` | `jobs.sqlite.visibility_timeout_ms` | `u64` |
+//! | `AUTUMN_JOBS__SQLITE__POLL_INTERVAL_MS` | `jobs.sqlite.poll_interval_ms` | `u64` |
 //! | `AUTUMN_JOBS__WORKERS` | `jobs.workers` | `usize` |
 //! | `AUTUMN_JOBS__PIN` | `jobs.pin` | comma-separated queue names |
 //! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
@@ -3814,8 +3816,8 @@ pub struct JobSqliteConfig {
     pub visibility_timeout_ms: u64,
     /// How long an idle worker waits before it polls the queue table again.
     ///
-    /// `SQLite` has no `LISTEN`/`NOTIFY`, so a worker polls. An enqueue from the
-    /// same process wakes a worker at once; this bound only sets how fast a
+    /// `SQLite` has no `LISTEN`/`NOTIFY`, so a worker polls. An enqueue in the
+    /// same process wakes a worker directly, so this bound sets how fast a
     /// worker sees work another process enqueued. Default: 250ms.
     #[serde(default = "default_jobs_sqlite_poll_interval_ms")]
     pub poll_interval_ms: u64,
@@ -6017,6 +6019,16 @@ impl AutumnConfig {
             env,
             "AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS",
             &mut self.jobs.postgres.visibility_timeout_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__SQLITE__VISIBILITY_TIMEOUT_MS",
+            &mut self.jobs.sqlite.visibility_timeout_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__SQLITE__POLL_INTERVAL_MS",
+            &mut self.jobs.sqlite.poll_interval_ms,
         );
         parse_env(
             env,

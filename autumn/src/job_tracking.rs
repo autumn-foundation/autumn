@@ -451,12 +451,312 @@ pub(crate) fn ensure_tracking_store_installed(state: &AppState) {
     }
 }
 
-/// Build the tracking store matching `config.backend`, honoring
-/// `config.tracking.ttl_secs`: Redis when `backend = "redis"` and a valid
-/// URL is configured, Postgres when `backend = "postgres"` and `state` has a
-/// pool, in-memory otherwise (including as a fallback if the selected
-/// backend isn't actually reachable/configured — logged, not fatal, since
-/// the job runtime itself will raise the real error for that case).
+/// Durable tracked-job store for the `SQLite` backend (issue #1907).
+///
+/// Same contract as [`PgJobTrackingStore`], over a table in the app's own
+/// database file, so a tracked job's status survives a restart and is visible
+/// to every process on the host — which a web/worker split needs. Timestamps
+/// are epoch milliseconds, from the injected clock, matching the durable
+/// `SQLite` job queue.
+///
+/// The runtime creates the table on first use: framework migrations are
+/// Postgres SQL and do not run on `SQLite`.
+#[cfg(feature = "sqlite")]
+pub struct SqliteJobTrackingStore {
+    pool: diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
+    ttl_secs: u64,
+    clock: Arc<dyn ClockSource>,
+    schema: Arc<tokio::sync::OnceCell<()>>,
+}
+
+#[cfg(feature = "sqlite")]
+#[derive(diesel::QueryableByName)]
+struct SqliteTrackingRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    record: String,
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteJobTrackingStore {
+    /// Construct a store backed by `pool`, expiring records `ttl_secs` after
+    /// their last write.
+    #[must_use]
+    pub fn new(
+        pool: diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
+        ttl_secs: u64,
+    ) -> Self {
+        Self {
+            pool,
+            ttl_secs,
+            clock: Arc::new(SystemClock),
+            schema: Arc::new(tokio::sync::OnceCell::new()),
+        }
+    }
+
+    /// Replace the clock used to stamp writes and evaluate expiry.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn ClockSource>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    fn now_ms(&self) -> i64 {
+        self.clock.now().timestamp_millis()
+    }
+
+    fn expires_at_ms(&self, now_ms: i64) -> i64 {
+        now_ms.saturating_add(
+            i64::try_from(self.ttl_secs)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000),
+        )
+    }
+
+    /// Check out a connection, creating the table on the first use.
+    ///
+    /// A failed attempt leaves the cell empty, so the next call retries.
+    async fn conn(
+        &self,
+    ) -> AutumnResult<diesel_async::pooled_connection::deadpool::Object<crate::db::RuntimeConnection>>
+    {
+        use diesel_async::RunQueryDsl as _;
+
+        let mut conn = self.pool.get().await.map_err(|error| {
+            AutumnError::internal_server_error_msg(format!("job tracking pool error: {error}"))
+        })?;
+        if self.schema.initialized() {
+            return Ok(conn);
+        }
+        for statement in [
+            "CREATE TABLE IF NOT EXISTS autumn_job_tracking ( \
+               key        TEXT   PRIMARY KEY NOT NULL, \
+               record     TEXT   NOT NULL, \
+               updated_at BIGINT NOT NULL, \
+               expires_at BIGINT NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_autumn_job_tracking_expires_at \
+             ON autumn_job_tracking (expires_at)",
+        ] {
+            diesel::sql_query(statement)
+                .execute(&mut *conn)
+                .await
+                .map_err(|error| {
+                    AutumnError::internal_server_error_msg(format!(
+                        "job tracking schema setup failed: {error}"
+                    ))
+                })?;
+        }
+        let _ = self.schema.set(());
+        Ok(conn)
+    }
+
+    /// Read-modify-write. A no-op if the key is unknown or expired.
+    async fn update(&self, key: &str, f: impl FnOnce(&mut TrackedJobRecord)) -> AutumnResult<()> {
+        use diesel::OptionalExtension as _;
+        use diesel_async::RunQueryDsl as _;
+
+        let now_ms = self.now_ms();
+        let mut conn = self.conn().await?;
+        let row = diesel::sql_query(
+            "SELECT record FROM autumn_job_tracking WHERE key = ? AND expires_at > ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(key)
+        .bind::<diesel::sql_types::BigInt, _>(now_ms)
+        .get_result::<SqliteTrackingRow>(&mut *conn)
+        .await
+        .optional()
+        .map_err(|error| {
+            AutumnError::internal_server_error_msg(format!("job tracking select failed: {error}"))
+        })?;
+
+        let Some(row) = row else {
+            return Ok(());
+        };
+        let mut record =
+            serde_json::from_str::<TrackedJobRecord>(&row.record).map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "job tracking deserialize failed: {error}"
+                ))
+            })?;
+        f(&mut record);
+        record.updated_at = self.clock.now();
+        let payload = serde_json::to_string(&record).map_err(|error| {
+            AutumnError::internal_server_error_msg(format!(
+                "job tracking serialize failed: {error}"
+            ))
+        })?;
+
+        diesel::sql_query(
+            "UPDATE autumn_job_tracking SET record = ?, updated_at = ?, expires_at = ? \
+             WHERE key = ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(&payload)
+        .bind::<diesel::sql_types::BigInt, _>(now_ms)
+        .bind::<diesel::sql_types::BigInt, _>(self.expires_at_ms(now_ms))
+        .bind::<diesel::sql_types::Text, _>(key)
+        .execute(&mut *conn)
+        .await
+        .map_err(|error| {
+            AutumnError::internal_server_error_msg(format!("job tracking update failed: {error}"))
+        })?;
+        Ok(())
+    }
+
+    /// Serialize a fresh pending record for `owner`, stamped now.
+    fn pending_record(&self, owner: TrackedJobOwner) -> AutumnResult<(TrackedJobRecord, String)> {
+        let record = TrackedJobRecord {
+            status: TrackedJobStatus::Pending,
+            progress_pct: None,
+            progress_message: None,
+            result: None,
+            error: None,
+            owner,
+            updated_at: self.clock.now(),
+        };
+        let payload = serde_json::to_string(&record).map_err(|error| {
+            AutumnError::internal_server_error_msg(format!(
+                "job tracking serialize failed: {error}"
+            ))
+        })?;
+        Ok((record, payload))
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl JobTrackingStore for SqliteJobTrackingStore {
+    fn create<'a>(&'a self, key: &'a str, owner: TrackedJobOwner) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            use diesel_async::RunQueryDsl as _;
+
+            let now_ms = self.now_ms();
+            let (_, payload) = self.pending_record(owner)?;
+            let mut conn = self.conn().await?;
+            diesel::sql_query(
+                "INSERT INTO autumn_job_tracking (key, record, updated_at, expires_at) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(key) DO UPDATE SET \
+                     record = excluded.record, \
+                     updated_at = excluded.updated_at, \
+                     expires_at = excluded.expires_at",
+            )
+            .bind::<diesel::sql_types::Text, _>(key)
+            .bind::<diesel::sql_types::Text, _>(&payload)
+            .bind::<diesel::sql_types::BigInt, _>(now_ms)
+            .bind::<diesel::sql_types::BigInt, _>(self.expires_at_ms(now_ms))
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "job tracking insert failed: {error}"
+                ))
+            })?;
+            Ok(())
+        })
+    }
+
+    fn mark_running<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move { self.update(key, apply_mark_running).await })
+    }
+
+    fn set_progress<'a>(
+        &'a self,
+        key: &'a str,
+        pct: u8,
+        message: Option<String>,
+    ) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            let pct = pct.min(100);
+            self.update(key, |record| apply_set_progress(record, pct, message))
+                .await
+        })
+    }
+
+    fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            self.update(key, |record| apply_complete(record, result))
+                .await
+        })
+    }
+
+    fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move { self.update(key, |record| apply_fail(record, error)).await })
+    }
+
+    fn reset_for_retry<'a>(
+        &'a self,
+        key: &'a str,
+        owner: TrackedJobOwner,
+        expected_updated_at: DateTime<Utc>,
+    ) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            use diesel_async::RunQueryDsl as _;
+
+            let now_ms = self.now_ms();
+            let (_, payload) = self.pending_record(owner)?;
+            let mut conn = self.conn().await?;
+            // Compare-and-swap: the reset applies only while nothing has
+            // written since `expected_updated_at` was read, so a retry that
+            // settles faster than this call returns is never clobbered.
+            diesel::sql_query(
+                "UPDATE autumn_job_tracking SET record = ?, updated_at = ?, expires_at = ? \
+                 WHERE key = ? AND updated_at = ?",
+            )
+            .bind::<diesel::sql_types::Text, _>(&payload)
+            .bind::<diesel::sql_types::BigInt, _>(now_ms)
+            .bind::<diesel::sql_types::BigInt, _>(self.expires_at_ms(now_ms))
+            .bind::<diesel::sql_types::Text, _>(key)
+            .bind::<diesel::sql_types::BigInt, _>(expected_updated_at.timestamp_millis())
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "job tracking reset failed: {error}"
+                ))
+            })?;
+            Ok(())
+        })
+    }
+
+    fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>> {
+        Box::pin(async move {
+            use diesel::OptionalExtension as _;
+            use diesel_async::RunQueryDsl as _;
+
+            let now_ms = self.now_ms();
+            let mut conn = self.conn().await?;
+            let row = diesel::sql_query(
+                "SELECT record FROM autumn_job_tracking WHERE key = ? AND expires_at > ?",
+            )
+            .bind::<diesel::sql_types::Text, _>(key)
+            .bind::<diesel::sql_types::BigInt, _>(now_ms)
+            .get_result::<SqliteTrackingRow>(&mut *conn)
+            .await
+            .optional()
+            .map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "job tracking select failed: {error}"
+                ))
+            })?;
+
+            row.map(|row| {
+                serde_json::from_str::<TrackedJobRecord>(&row.record).map_err(|error| {
+                    AutumnError::internal_server_error_msg(format!(
+                        "job tracking deserialize failed: {error}"
+                    ))
+                })
+            })
+            .transpose()
+        })
+    }
+}
+
+/// Build the tracking store matching `config.backend`.
+///
+/// Honors `config.tracking.ttl_secs`. Redis when `backend = "redis"` and a
+/// valid URL is configured; `SQLite` when `backend = "sqlite"` and `state` has
+/// a pool; Postgres when `backend = "postgres"` and `state` has a pool;
+/// in-memory otherwise — including as a fallback when the selected backend is
+/// not actually reachable or configured, which is logged rather than fatal,
+/// since the job runtime itself raises the real error for that case.
 fn store_for_config(
     state: &AppState,
     config: &crate::config::JobConfig,
@@ -475,12 +775,27 @@ fn store_for_config(
                  in-memory job tracking store (tracked job status will not survive a restart)"
             );
         }
+        // The durable SQLite queue keeps tracked-job records in the same file,
+        // so a status survives a restart and every process on the host reads
+        // the same record — which a web/worker split needs (issue #1907).
+        #[cfg(feature = "sqlite")]
+        "sqlite" => {
+            if let Some(pool) = state.pool() {
+                return Arc::new(
+                    SqliteJobTrackingStore::new(pool.clone(), config.tracking.ttl_secs)
+                        .with_clock(state.clock_arc()),
+                );
+            }
+            tracing::warn!(
+                "jobs.backend=sqlite but no database pool is configured; falling back to an \
+                 in-memory job tracking store (tracked job status will not survive a restart)"
+            );
+        }
         // The Postgres tracking store persists to a Postgres table; under the
         // `sqlite` feature `state.pool()` is a SQLite pool that cannot satisfy
-        // its Postgres connection type. SQLite deployments fall through to the
-        // in-memory tracking store (the same fallback used when no pool is
-        // configured). The Postgres job backend itself is refused earlier under
-        // sqlite (see `start_postgres_runtime`).
+        // its Postgres connection type. The Postgres job backend itself is
+        // refused earlier under sqlite (see `start_postgres_runtime`), so this
+        // arm simply does not exist there.
         #[cfg(all(feature = "db", not(feature = "sqlite")))]
         "postgres" => {
             if let Some(pool) = state.pool() {
@@ -584,13 +899,10 @@ pub(crate) async fn settle_tracked_payload_as_failed(
 /// Like [`settle_tracked_payload_as_failed`], but resolves the store from
 /// the process-global fallback instead of an `AppState` extension.
 ///
-/// For use by admin backends (`RedisJobAdminBackend`/`PgJobAdminBackend`)
-/// that operate directly against a queue backend with no `AppState` in
-/// hand — an operator cancelling a job that hasn't reached a worker yet
-/// goes through these paths, not `run_job_handler`.
-// Only the Postgres/Redis admin backends call this; under `--features sqlite`
-// (Postgres tracking store refused, redis off) it is unused.
-#[cfg_attr(feature = "sqlite", allow(dead_code))]
+/// For use by admin backends (`RedisJobAdminBackend`, `PgJobAdminBackend`, and
+/// the `SQLite` one) that operate directly against a queue backend with no
+/// `AppState` in hand — an operator cancelling a job that hasn't reached a
+/// worker yet goes through these paths, not `run_job_handler`.
 pub(crate) async fn settle_tracked_payload_as_failed_globally(payload: &Value, message: &str) {
     settle_tracked_payload_with_store(global_tracking_store(), payload, message).await;
 }

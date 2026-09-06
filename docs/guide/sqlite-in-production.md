@@ -141,7 +141,7 @@ buckets on SQLite:
 | Migration serialization (concurrent boot) | ✅ `pg_advisory_lock` | ⚠️ | Startup migrations run **unlocked** — no advisory lock and no `BEGIN IMMEDIATE` reservation on the migration path. Concurrent same-host starts are not serialized by an explicit reservation; they rely on SQLite's single-writer semantics plus the pool `busy_timeout`. (Note: application **write-RMW** sites *do* issue `BEGIN IMMEDIATE` since #1996 — this row is only about the migration path.) | ⚠️ **Not serialized** — no advisory lock / no migration-path `BEGIN IMMEDIATE`; explicit reservation is a known gap (planned) |
 | Sessions + auth (DB-backed) | ✅ | ✅ | Session/auth tables live in SQLite; no external store. | ⛔ **Planned — #1908** |
 | Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | `jobs.backend = "sqlite"`: a single-writer claim on the `autumn_jobs` table in the app's own file — durable and restart-safe, **no Redis required**. Retries, backoff, dead-lettering, uniqueness windows, concurrency limits, and the job dashboard match Postgres. | ✅ **Available now** (#1907) |
-| `#[scheduled]` tasks | ✅ advisory-lock leader election | ✅ | `scheduler.backend = "in_process"` (the default) fires every tick locally, because one process is always the leader. `scheduler.backend = "sqlite"` leases each tick in a table, so several processes on the host elect exactly one leader per tick. | ✅ **Available now** (#1907) |
+| `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | `scheduler.backend = "in_process"` (the default) fires every tick locally, because one process is always the leader. `scheduler.backend = "sqlite"` leases each tick in a table, so several processes on the host elect exactly one leader per tick. | ✅ **Available now** (#1907) |
 | Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⚠️ / ⛔ | Single-host mutual exclusion within the process; a multi-replica configuration is refused at boot. | ⛔ **Planned — #1905** (multi-replica boot-refuse ships now) |
 | Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (single host has nothing to notify). | ⛔ **Planned — #1905** |
 | `autumn db backup` / `restore` | ✅ `pg_dump`/`pg_restore` | ✅ | Online-safe snapshot of the data file (safe against a live app). Backup tooling is still `pg_dump`/`pg_restore`-shaped today. | ⛔ **Planned — #1909** |
@@ -254,7 +254,7 @@ advisory locks, so it gets two single-host coordinators instead:
   the old and new process overlap.
 
 The lease carries an expiry, not a session. A leader that dies without releasing
-frees the tick after `scheduler.lease_ttl_secs` (default 60), rather than
+frees the tick after `scheduler.lease_ttl_secs` (default 300), rather than
 wedging the task. Set the TTL above the longest a tick body can take, so a live
 leader is never preempted mid-tick.
 
@@ -269,9 +269,10 @@ Design scheduled tasks to be idempotent regardless of tier.
 built on Postgres advisory locks. On SQLite it provides **single-host** mutual
 exclusion (the whole point of the tier is that "the cluster" is one process).
 Because a SQLite deployment is single-host by definition, a lock used for
-across-host coordination has no counterpart — so a configuration that declares
-multiple replicas against a SQLite database is **refused at boot**, not silently
-downgraded to a no-op that would let two replicas both believe they hold it.
+across-host coordination has no counterpart. Every Postgres-only primitive that
+would imply one — a `replica_url`, a shard directory, a Postgres job or
+scheduler backend — is **refused at boot**, not silently downgraded to a no-op
+that would let two replicas both believe they hold it.
 
 ### Feature-flag / experiment cache invalidation
 
@@ -301,17 +302,29 @@ indexes at start, so no migration is needed.
 
 Everything the Postgres queue gives you carries over: attempt counting,
 exponential backoff, dead-lettering, `#[job(unique)]` windows,
-`#[job(concurrency = N)]` limits, named queues and `[jobs] pin`, and the
-`/admin/jobs` dashboard — which reads the table, so every process on the host
-sees the same queue.
+`#[job(concurrency = N)]` limits, named queues and `[jobs] pin`, the actuator
+backlog gauges, and the `/admin/jobs` dashboard — which reads the table, so
+every process on the host sees the same queue. `enqueue_tracked` records go in
+the same file too, so `GET /_autumn/jobs/{token}` survives a restart and works
+across a web/worker split.
 
-Two differences from Postgres, both by design:
+Three differences from Postgres, all by design:
 
-- **Workers poll.** SQLite has no `LISTEN`/`NOTIFY`, so an idle worker rechecks
-  the table every `jobs.sqlite.poll_interval_ms` (default 250ms). Lower it for
-  latency, raise it to cut idle wakeups.
+- **Workers poll.** SQLite has no `LISTEN`/`NOTIFY`. An enqueue in the same
+  process wakes a worker directly; work another process enqueued is seen within
+  `jobs.sqlite.poll_interval_ms` (default 250ms). Lower it for latency, raise it
+  to cut idle wakeups.
 - **The queue is host-local.** Two processes on one host share it; two hosts do
-  not. A multi-replica SQLite topology is already refused at boot.
+  not. Nothing enforces that at boot — the tier's Postgres-only primitives
+  (`replica_url`, shards, `jobs.backend = "postgres"`,
+  `scheduler.backend = "postgres"`) are each refused, but a second host pointed
+  at the same file over a network filesystem is not detected. Do not do it; see
+  [The single-host constraint](#the-single-host-constraint).
+- **History is pruned by the runtime, not by `autumn db retention`.** The sweep
+  behind `autumn db retention` is Postgres-only (#1909). Instead the SQLite job
+  runtime prunes its own tables: expired tracked-job records always, and
+  terminal `autumn_jobs` rows when `retention.job_history` is set. Leave that
+  window unset and job history is kept forever, exactly as on Postgres.
 
 `jobs.backend = "local"` (the default) stays the right choice when the work does
 not need to survive a restart: it is in-process and needs no table.

@@ -15112,7 +15112,11 @@ mod tests {
 
     // ── Postgres backend (RED → GREEN) ────────────────────────────────────────
 
-    #[cfg(feature = "db")]
+    // Not `not(sqlite)` by accident: under the backend flip the runtime pool is
+    // a SQLite pool, `start_postgres_runtime` is the refusal stub, and these
+    // tests build their fixtures on hard-coded `postgres://` URLs. The refusal
+    // itself is covered by `sqlite_jobs_scheduler_e2e`.
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
     mod pg {
         use super::*;
         use diesel_async::RunQueryDsl as _;

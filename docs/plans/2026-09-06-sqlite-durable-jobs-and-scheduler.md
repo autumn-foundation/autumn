@@ -38,11 +38,12 @@ in the same SQLite file, claimed with a single-writer claim, and restart-safe.
 | Two workers run one job | The claim is one atomic `UPDATE … WHERE status='enqueued'`. Every settle carries `WHERE id=? AND claimed_by=? AND status='running'`. |
 | A crash loses in-flight work | Rows persist. Stale-claim recovery re-enqueues rows whose claim is older than the visibility timeout, at boot and on an interval. |
 | Long write transactions wedge the file | The claim is a single statement. No transaction spans a handler. |
-| Idle workers busy-poll | Bounded poll interval, plus an in-process notify that wakes a worker on same-process enqueue. |
+| Idle workers busy-poll | Bounded poll interval, plus an in-process notify that wakes a worker on same-process enqueue, and a read probe before the write-locking claim. |
 | The Postgres path regresses | Every new path is `#[cfg(feature = "sqlite")]`. Postgres code is untouched. |
 | A typo silently degrades durability | `jobs.backend = "sqlite"` on a build without the feature is refused, not folded into the `local` fallback. |
+| Terminal rows accumulate forever | The maintenance loop prunes expired tracked-job records, and terminal job rows once `retention.job_history` is set. |
 | Timestamps break `#[sim_test]` replay | All times come from the injected clock. No `NOW()`, no `strftime`. |
-| Two hosts both hold the scheduler lease | The tier is single-host by contract, and multi-replica SQLite config is already refused at boot. The lease coordinates processes on one host. |
+| Two hosts both hold the scheduler lease | The tier is single-host by contract, and every Postgres-only primitive that implies a fleet is refused at boot. The lease coordinates processes on one host; two hosts sharing one file over a network filesystem is out of contract and is documented as such. |
 
 ## Design
 

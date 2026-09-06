@@ -2276,14 +2276,21 @@ pub(crate) fn is_production_profile(profile: Option<&str>) -> bool {
 ///   `state.pool().ok_or(...)` and errors without a pool.
 /// - `scheduler.backend = "postgres"` → `scheduler::coordinator_from_config`
 ///   calls `state.pool().ok_or(...)` and errors without a pool.
+/// - `jobs.backend = "sqlite"` / `scheduler.backend = "sqlite"` → the durable
+///   `SQLite` queue and the lease table live in the app's own database, so both
+///   error without a pool too (issue #1907).
 ///
 /// Cache, channels, and idempotency have only in-memory/Redis backends (no
-/// Postgres variant), so they never require a DB pool and are deliberately not
+/// database variant), so they never require a DB pool and are deliberately not
 /// included here.
 #[must_use]
 fn requires_database_pool(config: &AutumnConfig) -> bool {
-    config.jobs.backend == "postgres"
-        || config.scheduler.backend == autumn_web::config::SchedulerBackend::Postgres
+    matches!(config.jobs.backend.as_str(), "postgres" | "sqlite")
+        || matches!(
+            config.scheduler.backend,
+            autumn_web::config::SchedulerBackend::Postgres
+                | autumn_web::config::SchedulerBackend::Sqlite
+        )
 }
 
 /// The label a preflight line leads with: the stable grader name, plus the fleet

@@ -62,9 +62,10 @@ frees the tick after `lease_ttl_secs`, rather than wedging the task. Set the TTL
 above the longest a tick body can take, so a live leader is never preempted
 mid-tick.
 
-A single-process SQLite app needs none of this — keep the default
-`backend = "in_process"`, where the one process is always the leader. Requires
-the `sqlite` cargo feature.
+`backend = "sqlite"` requires the `sqlite` cargo feature.
+
+A single-process SQLite app needs none of this: keep the default
+`backend = "in_process"`, where the one process is always the leader.
 
 ## Declare Scheduled Tasks
 

@@ -275,9 +275,11 @@ deploy, and drain each tier on its own.
 
 Requirements:
 
-- **A durable jobs backend** — `jobs.backend = "postgres"` or `"redis"`. The
-  `local` backend is in-process, so a web replica would enqueue where no worker
-  can drain. Autumn rejects a split role on `local` at startup and
+- **A durable jobs backend** — `jobs.backend = "postgres"` or `"redis"` here,
+  because this page's topology spans hosts. (`"sqlite"` is durable too, but its
+  queue is a table in one file, so it only backs a split whose processes share a
+  host.) The `local` backend is in-process, so a web replica would enqueue where
+  no worker can drain. Autumn rejects a split role on `local` at startup and
   `autumn doctor --strict` flags it. See
   [Web and worker process roles](jobs.md#web-and-worker-process-roles).
 - **The same migration gate** — both tiers share one backend, so run the
@@ -962,7 +964,7 @@ Before calling an Autumn app "cloud ready", verify:
 - migrations run before web rollout via a dedicated migration job
 - destructive/irreversible migrations follow the expand/contract pattern
 - background jobs use the right runtime model
-- a split web/worker topology (`AUTUMN_ROLE=web` / `worker`) runs on a durable jobs backend (`postgres`/`redis`, never `local`), with worker replicas exposing `/live` + `/ready`
+- a split web/worker topology (`AUTUMN_ROLE=web` / `worker`) runs on a durable jobs backend (`postgres`/`redis` across hosts, `sqlite` within one, never `local`), with worker replicas exposing `/live` + `/ready`
 - `autumn_jobs` has `traceparent` / `tracestate` columns if using the Postgres backend with `telemetry-otlp`
 - multi-replica write paths use `#[lock_version]` (optimistic) or `with_lock` (pessimistic) to prevent lost updates
 - the generated container image builds without manual template surgery

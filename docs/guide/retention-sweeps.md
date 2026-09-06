@@ -101,7 +101,8 @@ first — picking up where it left off on the next scheduled tick.
 The sweep is registered exactly like a `#[scheduled(coordination = "fleet")]`
 task, so it reuses the same [multi-replica coordination](scheduled-multi-replica.md)
 guarantee: under the `postgres` scheduler backend, only one replica executes
-a given sweep per tick, no matter how many replicas are running.
+a given sweep per tick, no matter how many replicas are running — and the
+`sqlite` backend gives the same guarantee across the processes on one host.
 
 The generated task name is `retention-sweep-<table>`, using the table name
 exactly as declared — e.g. a `Session` model backed by the `sessions` table

@@ -452,7 +452,8 @@ restoring today's behavior for that one dataset without editing the file.
 The sweep is registered as a
 [`coordination = "fleet"` scheduled task](scheduled-multi-replica.md) named
 `autumn-retention-sweep`. Under the `postgres` scheduler backend only one
-replica executes it per tick, however many replicas are running. It runs in
+replica executes it per tick, however many replicas are running; the `sqlite`
+backend gives the same guarantee across the processes on one host. It runs in
 the `worker` and `combined` process roles, not `web`, like every other
 scheduled task.
 

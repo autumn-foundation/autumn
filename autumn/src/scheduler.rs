@@ -321,16 +321,13 @@ impl PostgresAdvisoryLease {
 
 /// Single-host lease coordinator for the `SQLite` backend (issue #1907).
 ///
-/// `SQLite` has no advisory locks, and a `SQLite` deployment is single-host by
-/// definition. This coordinator leases each `(task, tick)` in a table in the
-/// app's own database file, so several processes on the one host elect exactly
-/// one leader per tick.
+/// Leases each `(task, tick)` in a table in the app's own database file, so
+/// several processes on one host elect exactly one leader per tick.
 ///
-/// A lease carries an expiry, not a session. A leader that dies without
-/// releasing therefore frees the tick when the lease expires
-/// (`scheduler.lease_ttl_secs`), rather than wedging the task forever. Set the
-/// TTL above the longest a tick body can take, so a live leader is never
-/// preempted mid-tick.
+/// A lease carries an expiry, not a session, so a leader that dies frees the
+/// tick after `scheduler.lease_ttl_secs` instead of wedging the task. Set the
+/// TTL above the longest a tick body can take. See
+/// `docs/guide/scheduled-multi-replica.md`.
 #[cfg(feature = "sqlite")]
 #[derive(Clone)]
 pub struct SqliteLeaseSchedulerCoordinator {
@@ -363,16 +360,22 @@ impl SqliteLeaseSchedulerCoordinator {
         }
     }
 
-    /// Create the lease table once per coordinator.
+    /// Create the lease table on first use.
     ///
     /// Framework migrations are Postgres SQL and do not run on `SQLite`, so the
-    /// runtime owns this schema.
+    /// runtime owns this schema. A failed attempt leaves the cell empty, so the
+    /// next acquire retries.
     async fn ensure_table(&self, conn: &mut crate::db::RuntimeConnection) -> AutumnResult<()> {
+        let ready = Arc::clone(&self.ready);
+        ready.get_or_try_init(|| Self::create_table(conn)).await?;
+        Ok(())
+    }
+
+    /// The DDL itself. Idempotent, and safe to run from several processes at
+    /// once: `SQLite` serializes writers and every statement is `IF NOT EXISTS`.
+    async fn create_table(conn: &mut crate::db::RuntimeConnection) -> AutumnResult<()> {
         use diesel_async::RunQueryDsl as _;
 
-        if self.ready.initialized() {
-            return Ok(());
-        }
         for statement in [
             "CREATE TABLE IF NOT EXISTS autumn_scheduler_leases ( \
                lock_key    BIGINT PRIMARY KEY NOT NULL, \
@@ -393,7 +396,6 @@ impl SqliteLeaseSchedulerCoordinator {
                     ))
                 })?;
         }
-        let _ = self.ready.set(());
         Ok(())
     }
 
