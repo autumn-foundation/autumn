@@ -182,11 +182,19 @@ def read(f):
         return ''
 
 
-# `](target)`. Two spellings: angle-wrapped, which is how CommonMark carries a
-# destination containing spaces (`](<docs/guide/mail guide.md>)`) and which the
-# sibling `check-docs-links.sh` accepts, and bare, which stops at whitespace,
-# `#` (anchor) or `)`.
-MD_LINK = re.compile(r'\]\(\s*(?:<([^<>\n]*?\.md)>|([^)\s<>#]+\.md))')
+# `](target)`. The destination grammar is lifted from the sibling
+# `check-docs-links.sh` deliberately: the two gates run in the same CI job, so a
+# link that resolves there and not here would pass one and be called an orphan
+# by the other. That means the angle form (the only way to write a path with
+# spaces), one level of balanced parentheses (`](guide(v2).md)`), and an
+# optional link title in any of its three delimiters.
+DEST_BARE = r'(?:[^()\s]|\([^()\s]*\))+'
+TITLE = r'''(?:\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\((?:[^()\\]|\\.)*\)))?'''
+MD_LINK = re.compile(
+    r'\]\(\s*(?:<([^<>]*)>|(' + DEST_BARE + r'))' + TITLE + r'\s*\)')
+# Markdown drops the backslash from an escaped ASCII punctuation character, so
+# `guide\(v2\).md` addresses the file `guide(v2).md` — same rule as the sibling.
+UNESCAPE = re.compile(r'\\([!-/:-@\[-`{-~])')
 # A reference definition: `[mail]: mail.md`, optionally `<…>`-wrapped. Markdown
 # allows up to three leading spaces. Reference-style links are a syntax
 # check-docs-links.sh already parses and self-tests, so a page linked only that
@@ -246,6 +254,9 @@ HTML_COMMENT_CLOSED = re.compile(r'<!--.*?-->', re.S)
 UNCLOSED = '<!--'
 # A fence opener/closer: ``` or ~~~ , up to three spaces of indent.
 FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})', re.M)
+# A code span is a run of backticks closed by an equal-length run; both
+# delimiters must be complete runs. Same shape as the sibling gate's.
+CODE_SPAN = re.compile(r'(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)', re.S)
 
 
 def strip_comments(txt):
@@ -271,10 +282,17 @@ def strip_comments(txt):
         if kind == 'fence':
             out.append(seg)
             continue
-        seg = HTML_COMMENT_CLOSED.sub(' ', seg)
-        if UNCLOSED in seg:
+        # A `<!--` inside an inline code span is literal text too, so mask code
+        # spans while LOCATING comments and slice the original — the contents
+        # themselves stay, since a bare path in code is still findable.
+        masked = CODE_SPAN.sub(lambda m: ' ' * len(m.group(0)), seg)
+        for cm in reversed(list(HTML_COMMENT_CLOSED.finditer(masked))):
+            seg = seg[:cm.start()] + ' ' * (cm.end() - cm.start()) + seg[cm.end():]
+            masked = masked[:cm.start()] + ' ' * (cm.end() - cm.start()) + masked[cm.end():]
+        idx = masked.find(UNCLOSED)
+        if idx != -1:
             # Everything from here to the end of the document is commented out.
-            out.append(seg[:seg.index(UNCLOSED)])
+            out.append(seg[:idx])
             return ''.join(out)
         out.append(seg)
     return ''.join(out)
@@ -287,7 +305,7 @@ def edges_from(f):
     base = posixpath.dirname(f)
 
     def add_relative(raw):
-        raw = raw.split('#', 1)[0].strip()
+        raw = UNESCAPE.sub(r'\1', raw.split('#', 1)[0].strip())
         if not raw.endswith('.md'):
             return
         # An absolute-looking `/docs/guide/x.md` is a site path, not a file path.
@@ -603,6 +621,33 @@ self_test() {
     > "$c9u/docs/guide/jobs.md"
   git -C "$c9u" add -A && git -C "$c9u" commit -qm unclosed-in-fence
   check "an unclosed comment inside a fence does not hide later links" pass "$c9u"
+
+  # Inline code is literal too: a `<!--` shown as a sample must not comment out
+  # the live links after it.
+  local c9v="$tmp/c9v"; make_corpus "$c9v"
+  printf '# Jobs\n\nThe literal `<!--` marker opens a comment.\n\nSee [mail](mail.md).\n' \
+    > "$c9v/docs/guide/jobs.md"
+  git -C "$c9v" add -A && git -C "$c9v" commit -qm unclosed-in-code-span
+  check "an unclosed comment in inline code does not hide later links" pass "$c9v"
+
+  # Destination grammar shared with check-docs-links.sh: balanced parens, an
+  # escaped-paren spelling of the same path, and a link title.
+  local c9w="$tmp/c9w"; make_corpus "$c9w"
+  mv "$c9w/docs/guide/mail.md" "$c9w/docs/guide/mail(v2).md"
+  printf '# Jobs\n\nSee [mail](mail(v2).md).\n' > "$c9w/docs/guide/jobs.md"
+  git -C "$c9w" add -A && git -C "$c9w" commit -qm balanced-parens
+  check "balanced parentheses in a destination resolve" pass "$c9w"
+
+  local c9x="$tmp/c9x"; make_corpus "$c9x"
+  mv "$c9x/docs/guide/mail.md" "$c9x/docs/guide/mail(v2).md"
+  printf '# Jobs\n\nSee [mail](mail\\(v2\\).md).\n' > "$c9x/docs/guide/jobs.md"
+  git -C "$c9x" add -A && git -C "$c9x" commit -qm escaped-parens
+  check "an escaped-parenthesis destination resolves" pass "$c9x"
+
+  local c9y="$tmp/c9y"; make_corpus "$c9y"
+  printf '# Jobs\n\nSee [mail](mail.md "the mail guide").\n' > "$c9y/docs/guide/jobs.md"
+  git -C "$c9y" add -A && git -C "$c9y" commit -qm link-title
+  check "a destination carrying a link title resolves" pass "$c9y"
 
   # An ordinary docs page can sit mid-path: README -> hub -> guide. Dropping
   # that hop would report a reachable guide as an orphan.
