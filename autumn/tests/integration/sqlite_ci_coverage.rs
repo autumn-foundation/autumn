@@ -48,15 +48,41 @@ fn every_sqlite_test_target_is_named_in_ci() {
         "expected some sqlite [[test]] targets — did the manifest shape change?"
     );
 
+    // Anchored on the token boundary: a bare `contains` would let a future
+    // `sqlite_crud` pass on the listed `--test sqlite_crud_basic` and never run.
     let missing: Vec<&String> = declared
         .iter()
-        .filter(|name| !ci.contains(&format!("--test {name}")))
+        .filter(|name| {
+            !ci.match_indices(&format!("--test {name}")).any(|(at, m)| {
+                ci[at + m.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+            })
+        })
         .collect();
     assert!(
         missing.is_empty(),
         "these sqlite test targets never run in CI — add `--test <name>` to ci.yml's \
          \"Run the sqlite integration suite\" step (or another named sqlite step): {missing:?}"
     );
+}
+
+/// The anchoring above, pinned: a listed longer name must not satisfy a
+/// shorter, unlisted one.
+#[test]
+fn a_prefix_of_a_listed_target_is_still_reported_missing() {
+    let ci = "            --test sqlite_crud_basic \\\n";
+    let anchored = |name: &str| {
+        ci.match_indices(&format!("--test {name}")).any(|(at, m)| {
+            ci[at + m.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        })
+    };
+    assert!(anchored("sqlite_crud_basic"));
+    assert!(!anchored("sqlite_crud"));
 }
 
 #[test]

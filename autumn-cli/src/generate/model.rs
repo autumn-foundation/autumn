@@ -213,18 +213,21 @@ fn plan_model_with_options_impl(
     }
     let pascal_name = pascal(name);
     validate_enum_field_collisions(&pascal_name, &fields)?;
-    let mut metadata = parse_model_metadata(&fields, options)?;
-    // Issue #1367: `#[commentable(by = ...)]` may only name a model that
-    // actually exists in this project — naming a missing one would be a
-    // compile error in a file the author did not write.
-    metadata.set_commentable_author(super::commentable::detect_author_model(project_root));
-
     // Determine the target app's database backend so the emitted DDL / diesel
     // schema is backend-aware (SQLite foundation, issue #1614). Full-text search
     // (`--searchable`) is now supported on both backends — Postgres emits a
     // `tsvector` column + GIN index, SQLite emits an FTS5 virtual table +
     // triggers (issue #1910) — so it is no longer rejected here.
+    //
+    // Read before the metadata: a `--default` literal is rendered per backend
+    // (issue #1924).
     let backend = detect_backend(project_root);
+    let mut metadata = parse_model_metadata_for(backend, &fields, options)?;
+    // Issue #1367: `#[commentable(by = ...)]` may only name a model that
+    // actually exists in this project — naming a missing one would be a
+    // compile error in a file the author did not write.
+    metadata.set_commentable_author(super::commentable::detect_author_model(project_root));
+
     // A UUID primary key needs app-side id generation on SQLite (no
     // `gen_random_uuid()`), which is part of the deferred runtime slice #1905;
     // reject `--id uuid` on a SQLite app at generate time rather than emit a
@@ -240,14 +243,9 @@ fn plan_model_with_options_impl(
     if options.id_type == IdType::Uuid && fields.iter().any(|f| f.kind.is_commentable()) {
         return Err(super::uuid_pk_commentable_unsupported_error());
     }
-    // A few DSL field kinds still render to Rust model types with no working
-    // diesel SQLite FromSql/ToSql (Uuid, Decimal, Enum). #1924 wired DateTime<Utc>
-    // (TimestamptzSqlite) and Attachment (autumn-web's local Blob Text/Sqlite
-    // impls) so those now round-trip, but the remaining kinds' Rust types are
-    // foreign to autumn-web (orphan rule) with only Postgres-side diesel impls,
-    // so a generated SQLite app using one of them would fail to compile. Reject
-    // at generate time rather than emit uncompilable code (AC #4); wrapper-based
-    // support for the rest is tracked in #1924.
+    // Every DSL field kind converts on SQLite as of #1924, so this is a standing
+    // guard rather than an active gate: a NEW kind with no working conversion is
+    // reported here rather than emitted as code that cannot compile (AC #4).
     if backend == autumn_web::config::DatabaseBackend::Sqlite {
         super::reject_sqlite_unsupported_field_kinds(&fields)?;
     }
@@ -1089,7 +1087,9 @@ pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
 /// Same shape, different backend: diesel on its `sqlite` feature with the
 /// bundled `libsqlite3-sys` amalgamation, `diesel-async` on the sync-connection
 /// wrapper that `autumn-web`'s `sqlite` feature runs the pool through, and no
-/// `pq-sys` — a `SQLite` app must not link libpq. `returning_clauses_for_sqlite_3_35`
+/// `pq-sys` — a `SQLite` app has no reason to name libpq itself. (`autumn-web`'s
+/// `db` feature still pulls it in transitively, so this trims the app's direct
+/// dependency list, not its link line.) `returning_clauses_for_sqlite_3_35`
 /// matches `autumn-web`, so the two never disagree about `RETURNING` support.
 pub(super) const MODEL_DEPS_SQLITE: &[(&str, &str)] = &[
     ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),
@@ -1886,7 +1886,31 @@ fn validate_enum_field_collisions(
 }
 
 #[allow(clippy::too_many_lines)]
+// Retained as a Postgres-default convenience wrapper for the test suite; the
+// backend-aware `parse_model_metadata_for` is what production calls.
+#[cfg(test)]
 pub fn parse_model_metadata(
+    fields: &[Field],
+    options: &ModelOptions,
+) -> Result<ModelMetadata, GenerateError> {
+    parse_model_metadata_for(DatabaseBackend::Postgres, fields, options)
+}
+
+/// [`parse_model_metadata`] for a specific `backend` (issue #1924).
+///
+/// Only `--default` rendering differs: a `decimal` default is an unquoted
+/// numeric literal on Postgres and a quoted text literal on `SQLite`. See
+/// [`sql_default_literal`].
+///
+/// # Errors
+/// Same as [`parse_model_metadata`].
+#[allow(
+    clippy::too_many_lines,
+    reason = "one validation pass per `--flag` that contributes model metadata; \
+              splitting it would scatter the shared `metadata` accumulator"
+)]
+pub fn parse_model_metadata_for(
+    backend: DatabaseBackend,
     fields: &[Field],
     options: &ModelOptions,
 ) -> Result<ModelMetadata, GenerateError> {
@@ -1966,11 +1990,12 @@ pub fn parse_model_metadata(
                 ),
             });
         }
-        let sql =
-            sql_default_literal(field, value).map_err(|reason| GenerateError::InvalidField {
+        let sql = sql_default_literal(field, value, backend).map_err(|reason| {
+            GenerateError::InvalidField {
                 token: default.clone(),
                 reason,
-            })?;
+            }
+        })?;
         metadata.defaults.insert(field_name.to_owned(), sql);
     }
 
@@ -2588,7 +2613,11 @@ fn validate_decimal_default_fits(value: &str, precision: u32, scale: u32) -> Res
     Ok(())
 }
 
-fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
+fn sql_default_literal(
+    field: &Field,
+    value: &str,
+    backend: DatabaseBackend,
+) -> Result<String, String> {
     match field.kind {
         FieldKind::Bool => match value.to_ascii_lowercase().as_str() {
             "true" => Ok("TRUE".to_owned()),
@@ -2631,7 +2660,16 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
             // unquoted numeric literal is valid Postgres `NUMERIC` SQL
             // whether or not it round-trips exactly through `f64` (this arm
             // only used `f64` to reject non-numeric garbage above).
-            Ok(value.to_owned())
+            //
+            // On SQLite the same column is `TEXT`, and SQLite evaluates an
+            // unquoted `DEFAULT 0.10` numerically before applying TEXT
+            // affinity — storing `0.1`, or scientific notation for a wide
+            // value, which `Decimal::from_str` then cannot read back. Quoting
+            // makes it a text literal, stored verbatim (issue #1924).
+            match backend {
+                DatabaseBackend::Postgres => Ok(value.to_owned()),
+                DatabaseBackend::Sqlite => Ok(format!("'{value}'")),
+            }
         }
         FieldKind::Json => {
             serde_json::from_str::<serde_json::Value>(value)
@@ -4384,6 +4422,153 @@ mod tests {
         });
     }
 
+    /// `autumn destroy` must not take the `sqlite` feature back out of a `SQLite`
+    /// app. It is a whole-app backend flip, not a per-resource capability: no
+    /// generated code names it, `autumn new` never writes it, and without it the
+    /// app's `sqlite://` URL is refused at boot with `UnsupportedBackend`.
+    /// The generic `owner_dir` rule would strip it once `src/models` empties.
+    #[test]
+    fn destroying_the_last_model_keeps_the_sqlite_feature() {
+        with_no_db_env(|| {
+            // A project that actually declares `autumn-web`, so the feature-wiring
+            // pass has a dependency line to edit.
+            let tmp = project_with_autumn_web_dep();
+            fs::write(
+                tmp.path().join("autumn.toml"),
+                "[database]\nprimary_url = \"sqlite://app.db\"\n",
+            )
+            .unwrap();
+            plan_model(
+                tmp.path(),
+                "Post",
+                &["title:String".into()],
+                "20260427000000",
+            )
+            .expect("plan")
+            .execute(Flags::default())
+            .unwrap();
+            let after_generate = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(
+                after_generate.contains("features = [\"sqlite\"]"),
+                "generate must add the feature first: {after_generate}"
+            );
+
+            plan_model(
+                tmp.path(),
+                "Post",
+                &["title:String".into()],
+                "20260427000001",
+            )
+            .expect("re-plan for revert")
+            .revert(Flags::default())
+            .unwrap();
+
+            let after_destroy = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(
+                after_destroy.contains("features = [\"sqlite\"]"),
+                "destroy stripped the backend flip, so the app no longer boots: {after_destroy}"
+            );
+        });
+    }
+
+    /// A `decimal{p,s}` column is `TEXT` on `SQLite`, so the declared precision
+    /// and scale bind nothing unless the migration says so. Without the `CHECK`
+    /// a repository write persists `123456.789` into a `decimal{5,2}` — the
+    /// invariant Postgres gets free from `NUMERIC(5,2)` (Codex #2561, #1924).
+    #[test]
+    fn sqlite_decimal_column_carries_a_precision_and_scale_check() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            plan_model(
+                tmp.path(),
+                "Post",
+                &["price:decimal{10,2}".into()],
+                "20260427000000",
+            )
+            .expect("plan")
+            .execute(Flags::default())
+            .unwrap();
+
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(up.contains("price TEXT NOT NULL CHECK ("), "up.sql: {up}");
+            // The two digit budgets: 2 fractional, 10 - 2 = 8 integer.
+            assert!(up.contains("<= 2"), "scale bound missing: {up}");
+            assert!(up.contains("<= 8"), "precision bound missing: {up}");
+        });
+    }
+
+    /// Postgres keeps the real `NUMERIC(p,s)`, which enforces this natively —
+    /// no `CHECK` may appear there.
+    #[test]
+    fn postgres_decimal_column_has_no_check_constraint() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("postgres://localhost/app");
+            plan_model(
+                tmp.path(),
+                "Post",
+                &["price:decimal{10,2}".into()],
+                "20260427000000",
+            )
+            .expect("plan")
+            .execute(Flags::default())
+            .unwrap();
+
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(up.contains("price NUMERIC(10,2) NOT NULL"), "up.sql: {up}");
+            assert!(
+                !up.contains("CHECK ("),
+                "Postgres must not gain a CHECK: {up}"
+            );
+        });
+    }
+
+    /// A `decimal` default must reach `SQLite` as a QUOTED text literal. Unquoted,
+    /// `SQLite` evaluates `DEFAULT 0.10` numerically and TEXT affinity stores
+    /// `0.1`; a wide value becomes scientific notation, which `Decimal::from_str`
+    /// cannot read back at all (Codex #2561, #1924).
+    #[test]
+    fn sqlite_decimal_default_is_a_quoted_text_literal() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            plan_model(
+                tmp.path(),
+                "Post",
+                &["price:decimal{10,2}".into()],
+                "20260427000000",
+            )
+            .map(|_| ())
+            .expect("plan without default");
+
+            let mut options = ModelOptions::default();
+            options.defaults = vec!["price=0.10".to_owned()];
+            let fields = parse_fields(&["price:decimal{10,2}".into()]).unwrap();
+
+            let sqlite = parse_model_metadata_for(DatabaseBackend::Sqlite, &fields, &options)
+                .expect("sqlite metadata");
+            assert_eq!(
+                sqlite.defaults().get("price").map(String::as_str),
+                Some("'0.10'"),
+                "SQLite decimal defaults must be quoted"
+            );
+
+            let postgres = parse_model_metadata_for(DatabaseBackend::Postgres, &fields, &options)
+                .expect("postgres metadata");
+            assert_eq!(
+                postgres.defaults().get("price").map(String::as_str),
+                Some("0.10"),
+                "Postgres decimal defaults stay unquoted numeric literals"
+            );
+        });
+    }
+
     /// A `SQLite` app's `Cargo.toml` must describe the `SQLite` backend: diesel
     /// on its `sqlite` feature with the bundled `libsqlite3-sys`, no `pq-sys`,
     /// and `autumn-web`'s `sqlite` feature — otherwise nothing the generator
@@ -4413,7 +4598,7 @@ mod tests {
             );
             assert!(
                 !cargo.contains("pq-sys"),
-                "a SQLite app must not link libpq: {cargo}"
+                "a SQLite app must not name libpq as a direct dependency: {cargo}"
             );
             assert!(
                 !cargo.contains("db-diesel2-postgres"),

@@ -160,10 +160,10 @@ pub fn plan_migration_with_options(
             // lock_version:String` would block the very escape hatch the other
             // error messages point at.
             super::model::validate_lock_version_field(&fields, &[])?;
-            // A field kind with no working diesel SQLite conversion (Uuid,
-            // Attachment, Decimal) would leak an uncompilable column into the
-            // generated SQLite app, so reject it here too — same guard as
-            // `generate model`/`scaffold` (AC #4, #1924).
+            // The same standing guard `generate model`/`scaffold` carries: a
+            // field kind with no working diesel SQLite conversion would leak an
+            // uncompilable column into the app. Every kind converts as of #1924
+            // (AC #4).
             if backend == autumn_web::config::DatabaseBackend::Sqlite {
                 super::reject_sqlite_unsupported_field_kinds(&fields)?;
             }

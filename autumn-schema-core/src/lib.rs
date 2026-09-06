@@ -583,11 +583,20 @@ impl ColumnType {
             "bool" => Some(Self::Bool),
             "f32" => Some(Self::Float32),
             "f64" => Some(Self::Float64),
-            "Uuid" => Some(Self::Uuid),
+            // `SqliteUuid`/`SqliteDecimal` are the `TEXT`-backed newtypes a
+            // SQLite app's model renders instead of the foreign `uuid::Uuid` /
+            // `rust_decimal::Decimal` (issue #1924). They are the same column,
+            // so they must resolve to the same `ColumnType` — otherwise the
+            // declarative lane skips the column and every snapshot, diff and
+            // generated `CREATE TABLE` silently omits it.
+            "Uuid" | "SqliteUuid" => Some(Self::Uuid),
             "NaiveDateTime" => Some(Self::Timestamp),
             "Vec<u8>" => Some(Self::Bytes),
             "Blob" => Some(Self::Attachment),
-            "Decimal" => Some(Self::Decimal {
+            // The declared precision and scale do not survive into the Rust
+            // type on either backend, so both resolve to the same default the
+            // DSL's bare `decimal` token uses.
+            "Decimal" | "SqliteDecimal" => Some(Self::Decimal {
                 precision: 12,
                 scale: 2,
             }),
@@ -1172,13 +1181,12 @@ mod tests {
         assert_eq!(d.sql_type(Backend::Postgres), "NUMERIC(8,4)");
     }
 
+    /// Issue #1924 gave `Uuid`, `Decimal` and `Enum` working `SQLite`
+    /// conversions, so only the introspection-only `Opaque` lacks one.
     #[test]
     fn sqlite_diesel_conversion_flags() {
         for ct in all_column_types() {
-            let expected = !matches!(
-                ct,
-                ColumnType::Uuid | ColumnType::Decimal { .. } | ColumnType::Enum { .. }
-            );
+            let expected = !matches!(ct, ColumnType::Opaque { .. });
             assert_eq!(
                 ct.sqlite_has_diesel_conversion(),
                 expected,
@@ -1364,6 +1372,27 @@ mod tests {
         assert_eq!(ct.rust_type(), "String");
         assert_eq!(ct.diesel_type(Backend::Postgres), "Text");
         assert!(!ct.sqlite_has_diesel_conversion());
+    }
+
+    /// The `SQLite` newtypes must resolve to the same `ColumnType` as the types
+    /// they wrap (issue #1924). Without this the declarative lane drops every
+    /// `Uuid`/`decimal` column of a `SQLite` app from its snapshots and diffs.
+    #[test]
+    fn from_rust_type_maps_the_sqlite_newtypes_like_the_types_they_wrap() {
+        for (wrapper, plain) in [
+            ("autumn_web::db::sqlite_types::SqliteUuid", "uuid::Uuid"),
+            (
+                "autumn_web::db::sqlite_types::SqliteDecimal",
+                "rust_decimal::Decimal",
+            ),
+        ] {
+            assert_eq!(
+                ColumnType::from_rust_type(wrapper),
+                ColumnType::from_rust_type(plain),
+                "`{wrapper}` must resolve like `{plain}`"
+            );
+            assert!(ColumnType::from_rust_type(wrapper).is_some());
+        }
     }
 
     #[test]

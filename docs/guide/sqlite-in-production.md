@@ -490,7 +490,7 @@ as output that compiles on Postgres but breaks on SQLite.
 | `Attachment` / `Blob` | ✅ | `TEXT` | The blob metadata JSON. `Blob` is an `autumn-web` type, so it carries its own `Text`/`Sqlite` conversion. |
 | `Enum` | ✅ | `TEXT` | The generated enum is local to your app, so `autumn generate` emits its `ToSql`/`FromSql<Text, Sqlite>` impls directly. |
 | `Uuid` | ✅ | `TEXT` | Renders as `autumn_web::db::sqlite_types::SqliteUuid` — see [foreign field types](#foreign-field-types-on-sqlite). |
-| `Decimal` | ✅ | `TEXT` | Renders as `autumn_web::db::sqlite_types::SqliteDecimal` — see [foreign field types](#foreign-field-types-on-sqlite). |
+| `Decimal` | ✅ | `TEXT` + `CHECK` | Renders as `autumn_web::db::sqlite_types::SqliteDecimal`; the `CHECK` enforces the declared precision and scale — see [foreign field types](#foreign-field-types-on-sqlite). |
 
 <a id="foreign-field-types-on-sqlite"></a>
 
@@ -521,21 +521,45 @@ assert_eq!(id.to_string(), some_uuid.to_string());
 let back: uuid::Uuid = *id;
 ```
 
-Both store `TEXT`. `SqliteDecimal` keeps the full decimal representation — sign,
-every significant digit, and scale, so `0.10` reads back as `0.10` — which `REAL`
-would lose to a binary float.
+Both store `TEXT`, and both write a **canonical** form, because SQLite compares
+`TEXT` byte for byte — two spellings of one value would break `=` and `UNIQUE`.
+`SqliteUuid` writes hyphenated lowercase; `SqliteDecimal` writes the normalized
+decimal, so `19.990` and `19.99` are one row. The value stays numerically exact,
+which `REAL` would not.
 
-**Ordering limit.** A `TEXT` column compares and sorts lexicographically, so
-`ORDER BY` / `<` / `>` on a `SqliteDecimal` column compares strings, not numbers
-(`"9"` sorts after `"10"`). Sort or range-filter in Rust, or store minor units in
-an `i64`, when SQL ordering matters. `SqliteUuid` is unaffected — UUID columns
-are compared for equality. Postgres `NUMERIC` columns are unaffected.
+**Precision and scale are enforced by a `CHECK`.** The column is `TEXT`, so the
+migration carries a generated `CHECK` that holds the declared budget — at most
+`scale` fractional digits and `precision - scale` integer digits. Postgres
+*rounds* a value to `scale`; SQLite has no way to, so it rejects instead. Round
+before saving (`Decimal::round_dp`) if your input can carry more digits than the
+column declares.
+
+**Scale is not padded.** Postgres `NUMERIC(10,2)` reads `19.9` back as `19.90`;
+SQLite reads it back as `19.9`. The two are numerically equal — format for
+display rather than relying on the stored scale.
+
+**Ordering.** A `TEXT` column sorts lexicographically, so `ORDER BY` / `<` / `>`
+on a `SqliteDecimal` column compares strings, not numbers (`"9"` after `"10"`,
+`"-1.4"` before `"-1.5"`). Sort or range-filter in Rust, or store minor units in
+an `i64`, when SQL ordering matters. For this reason a scaffolded index does not
+offer a sortable header on a decimal column on SQLite — a dead link that stamped
+a misleading `aria-sort` would be worse than no control. `SqliteUuid` is
+unaffected: hyphenated lowercase text sorts in UUID byte order. Postgres
+`NUMERIC` columns are unaffected.
+
+**Equality on rows Autumn did not write.** `=` and `UNIQUE` match the stored
+bytes. Everything written through these types is canonical, so lookups agree with
+Rust equality. A row inserted by hand or migrated from elsewhere may not be:
+`SqliteUuid` *reads* any form `Uuid::parse_str` accepts (braced, URN,
+unhyphenated, uppercase), and such a row loads correctly but will not match a
+`find_by_…` for the same UUID. Write canonical text.
 
 **Smoke test.** A scaffolded SQLite app's `tests/<model>.rs` still uses
 `autumn_web::test::TestDb`, a Postgres-only testcontainer, so `cargo test` on a
-generated SQLite app does not compile yet. The app itself does — `cargo run`,
-`cargo build` and `autumn migrate` are unaffected. A SQLite `TestDb` lands with
-the runtime slice, #1905.
+generated SQLite app does not compile yet — `autumn generate scaffold` warns
+about this on a SQLite app. The app itself is unaffected: `cargo run`, `cargo
+build` and `autumn migrate` all work. A SQLite `TestDb` lands with the runtime
+slice, #1905.
 
 Additional generator shapes are refused on SQLite:
 

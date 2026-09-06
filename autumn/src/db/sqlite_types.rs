@@ -14,13 +14,15 @@
 //! # Storage
 //!
 //! Both wrappers store `TEXT`, the same declared type the `SQLite` DDL emitter
-//! already uses for these kinds:
+//! already uses for these kinds. Both write a **canonical** form, because
+//! `SQLite` compares `TEXT` byte for byte: two spellings of one value would
+//! break `=` and `UNIQUE`.
 //!
-//! - [`SqliteUuid`] — the hyphenated lowercase form. Reads accept any form
-//!   `uuid::Uuid::parse_str` does, so a hand-written or brownfield row loads.
-//! - [`SqliteDecimal`] — `Decimal::to_string`, which keeps sign, every
-//!   significant digit, and scale (`0.10` stays `0.10`). `REAL` would round-trip
-//!   through a binary float and lose both.
+//! - [`SqliteUuid`] — the hyphenated lowercase form.
+//! - [`SqliteDecimal`] — `Decimal::normalize`, which drops trailing fractional
+//!   zeros, so `19.990` and `19.99` are one row, not two. The value stays
+//!   numerically exact; `REAL` would round-trip through a binary float and lose
+//!   digits.
 //!
 //! # Using them
 //!
@@ -32,11 +34,24 @@
 //!
 //! # Limits
 //!
-//! A `TEXT` column compares and sorts lexicographically. [`SqliteUuid`] is
-//! unaffected (equality only), but `ORDER BY` / `<` / `>` on a
-//! [`SqliteDecimal`] column compares strings, not numbers, so `"9"` sorts after
-//! `"10"`. Sort or range-filter in Rust, or store minor units in an `i64`, when
-//! SQL ordering matters. Postgres `NUMERIC` columns are unaffected.
+//! **Ordering.** A `TEXT` column sorts lexicographically, so `ORDER BY` / `<` /
+//! `>` on a [`SqliteDecimal`] column compares strings, not numbers: `"9"` sorts
+//! after `"10"`, and `"-1.4"` before `"-1.5"`. Sort or range-filter in Rust, or
+//! store minor units in an `i64`, when SQL ordering matters. [`SqliteUuid`] is
+//! unaffected — hyphenated lowercase text sorts in UUID byte order.
+//!
+//! **Equality on rows this crate did not write.** `=` and `UNIQUE` match the
+//! stored bytes. Every value written through these types is canonical, so they
+//! agree with Rust equality. A row inserted by hand or migrated from elsewhere
+//! may not be: `SqliteUuid` reads any form `uuid::Uuid::parse_str` accepts
+//! (braced, URN, unhyphenated, uppercase), and such a row loads correctly but
+//! will not match a `find_by_…` lookup for the same UUID. Write canonical text.
+//!
+//! **Scale.** Postgres `NUMERIC(p, s)` coerces a value to exactly `s` decimal
+//! places; `SQLite` stores the normalized value, so a column holding `19.9`
+//! reads back as `19.9`, not `19.90`. The two are numerically equal — format
+//! for display rather than relying on the stored scale. Declared precision and
+//! scale are enforced by a `CHECK` constraint the migration emits.
 
 use std::fmt;
 use std::ops::Deref;
@@ -163,11 +178,12 @@ text_backed_newtype!(
     /// A `rust_decimal::Decimal` model field on the `SQLite` backend, stored as
     /// `TEXT` (issue #1924).
     ///
-    /// The text keeps the full decimal representation — sign, significant
-    /// digits, and scale — so `0.10` reads back as `0.10`, not `0.1`. See the
-    /// module docs for the lexicographic-ordering limit.
+    /// Written normalized — trailing fractional zeros dropped — so one value has
+    /// one spelling and `SQLite`'s byte-wise `=` and `UNIQUE` agree with Rust
+    /// equality. The value stays numerically exact. See the module docs for the
+    /// lexicographic-ordering limit, which normalizing does not fix.
     SqliteDecimal(rust_decimal::Decimal),
-    encode = |value| value.to_string(),
+    encode = |value| value.normalize().to_string(),
 );
 
 #[cfg(test)]
@@ -185,10 +201,35 @@ mod tests {
     }
 
     #[test]
-    fn decimal_newtype_keeps_scale_through_text() {
-        let value = SqliteDecimal::from(rust_decimal::Decimal::from_str("0.10").unwrap());
-        assert_eq!(value.to_string(), "0.10", "trailing-zero scale survives");
+    fn decimal_newtype_round_trips_through_text() {
+        let value = SqliteDecimal::from(rust_decimal::Decimal::from_str("-1234.5678").unwrap());
         assert_eq!(value.to_string().parse::<SqliteDecimal>().unwrap(), value);
+    }
+
+    /// The property `=` and `UNIQUE` depend on: numerically equal values must
+    /// produce identical stored text. `Decimal`'s own `to_string` does not —
+    /// it keeps the written scale — which is why the encoder normalizes.
+    #[test]
+    fn decimal_encoding_is_canonical_per_value() {
+        let written = rust_decimal::Decimal::from_str("19.990").unwrap();
+        let typed = rust_decimal::Decimal::from_str("19.99").unwrap();
+        assert_eq!(written, typed, "the two spellings are one value");
+        assert_ne!(
+            written.to_string(),
+            typed.to_string(),
+            "…but Decimal's own text differs, which SQLite would treat as two rows"
+        );
+        assert_eq!(
+            written.normalize().to_string(),
+            typed.normalize().to_string()
+        );
+        assert_eq!(
+            rust_decimal::Decimal::from_str("0.10")
+                .unwrap()
+                .normalize()
+                .to_string(),
+            "0.1",
+        );
     }
 
     #[test]

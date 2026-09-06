@@ -19,7 +19,7 @@ use super::dsl::{
 };
 use super::emit::{Action, Plan, Revert};
 use super::model::{
-    ModelOptions, augment_fields_for_soft_delete, field_by_name, parse_model_metadata,
+    ModelOptions, augment_fields_for_soft_delete, field_by_name, parse_model_metadata_for,
     plan_cargo_deps, plan_model_with_options,
 };
 use super::naming::{humanize_label, pascal, pluralize, snake};
@@ -702,7 +702,7 @@ fn plan_scaffold_with_options_impl(
             &options_with_key.model,
         )?
     };
-    let mut metadata = parse_model_metadata(&fields, &options_with_key.model)?;
+    let mut metadata = parse_model_metadata_for(backend, &fields, &options_with_key.model)?;
     // Issue #1367: see `model::plan_model` — `by` is emitted only when the
     // author model it names is really there.
     metadata.set_commentable_author(super::commentable::detect_author_model(project_root));
@@ -2350,6 +2350,18 @@ fn plan_scaffold_with_options_impl(
             feature: "sqlite".to_owned(),
             owner_dir: Some(project_root.join("src/models")),
         });
+        // The one file this scaffold writes that is known not to compile here.
+        // Say so at generate time rather than let `cargo test` be the messenger.
+        if !for_revert {
+            plan.warn(format!(
+                "tests/{snake_name}.rs uses `autumn_web::test::TestDb`, a Postgres-only \
+                 testcontainer, so `cargo test` will not compile on this SQLite app. The app \
+                 itself is unaffected — `cargo run`, `cargo build` and `autumn migrate` all \
+                 work. A SQLite `TestDb` lands with the runtime slice, \
+                 https://github.com/autumn-foundation/autumn/issues/1905 — until then, delete \
+                 that file or gate it behind a Postgres-only cargo feature."
+            ));
+        }
     }
 
     // The generated HTML routes render through `autumn_web::form::*` helpers
@@ -6510,6 +6522,7 @@ mod attachment_read_back_tests {{
         //
         // Rebound as `mut` so the two trash-only columns can be pushed after it.
         let trash_columns = render_columns_vec(
+            backend,
             pascal_name,
             snake_name,
             fields,
@@ -6836,6 +6849,7 @@ pub async fn move_down(
         String::new()
     } else {
         render_columns_vec(
+            backend,
             pascal_name,
             snake_name,
             fields,
@@ -6869,6 +6883,7 @@ pub async fn move_down(
         columns_let
     } else {
         render_columns_vec(
+            backend,
             pascal_name,
             snake_name,
             fields,
@@ -7675,6 +7690,7 @@ pub async fn index(
     // wrapper, and the two nested handlers. Empty for a flat scaffold.
     let nested_section = nesting.map_or_else(String::new, |n| {
         render_nested_section(
+            backend,
             pascal_name,
             snake_name,
             plural,
@@ -8395,6 +8411,8 @@ pub async fn events(
               coherent block of generated code"
 )]
 fn render_nested_section(
+    // Passed through to the child list's column vec (issue #1924).
+    backend: DatabaseBackend,
     pascal_name: &str,
     snake_name: &str,
     plural: &str,
@@ -8476,6 +8494,7 @@ fn render_nested_section(
         );
     }
     let columns = render_columns_vec(
+        backend,
         pascal_name,
         snake_name,
         &list_fields,
@@ -11465,7 +11484,15 @@ const fn kind_is_sortable(kind: FieldKind) -> bool {
 /// the header link promises. Either way the control lies about what it does, so
 /// don't render it (same posture as the nested child list, which withholds
 /// `.sortable(..)` rather than stamp an `aria-sort` that never changes).
-const fn field_is_sortable(field: &Field) -> bool {
+/// A `decimal` column is the third case, and only on `SQLite` (issue #1924):
+/// the column is `TEXT` there, so `ORDER BY` compares strings — `"9"` after
+/// `"10"`. The `#[model]` macro leaves such a column out of its sort allowlist
+/// for that reason, so the header link would be dead *and* stamp an `aria-sort`
+/// that never matches the rows. Withhold it, exactly as for an encrypted column.
+const fn field_is_sortable(field: &Field, backend: DatabaseBackend) -> bool {
+    if matches!(backend, DatabaseBackend::Sqlite) && field.kind.is_decimal() {
+        return false;
+    }
     kind_is_sortable(field.kind) && !field.is_encrypted()
 }
 
@@ -11483,6 +11510,9 @@ const fn field_is_sortable(field: &Field) -> bool {
               header/cell emission the four surfaces must agree on"
 )]
 fn render_columns_vec(
+    // Decides whether a `decimal` column may advertise a sortable header
+    // (issue #1924) — see `field_is_sortable`.
+    backend: DatabaseBackend,
     pascal_name: &str,
     snake_name: &str,
     fields: &[Field],
@@ -11543,7 +11573,7 @@ fn render_columns_vec(
         } else {
             format!("\"{}\"", title_case(&f.name))
         };
-        let sortable_suffix = if sortable && field_is_sortable(f) {
+        let sortable_suffix = if sortable && field_is_sortable(f, backend) {
             format!(".sortable(\"{}\")", f.name)
         } else {
             String::new()

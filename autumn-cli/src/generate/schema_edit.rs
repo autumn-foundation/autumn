@@ -324,7 +324,7 @@ pub fn create_table_sql_with_metadata_and_id_for(
         {
             let _ = write!(sql, " DEFAULT {default}");
         }
-        if let Some(check) = enum_check_suffix(f) {
+        if let Some(check) = column_check_suffix(f, backend) {
             let _ = write!(sql, " {check}");
         }
     }
@@ -944,23 +944,78 @@ pub fn unique_index_sql(table: &str, field: &str, fields: &[Field]) -> String {
     format!("CREATE UNIQUE INDEX {name} ON {table} ({field});\n")
 }
 
-/// For an `enum{…}` field, the trailing ` CHECK (col IN ('a', 'b', …))`
-/// clause that enforces the closed set at the database layer. `None` for
-/// every other field kind.
+/// The trailing `CHECK (…)` clause a column needs to enforce at the database
+/// layer what its declared type promises, or `None` when the column type
+/// already enforces it.
 ///
-/// Variants are validated `snake_case` identifiers (see
-/// [`super::dsl::parse_field`]), so no SQL-escaping is needed here.
-fn enum_check_suffix(field: &Field) -> Option<String> {
-    if !field.kind.is_enum() {
-        return None;
+/// Two kinds need one:
+///
+/// - `enum{…}` on both backends — the closed variant set, since the column is
+///   `TEXT` either way.
+/// - `decimal{p,s}` on `SQLite` only (issue #1924) — Postgres gets a real
+///   `NUMERIC(p, s)`, but the `SQLite` column is `TEXT`, so without this the
+///   declared precision and scale bind nothing and a repository write can
+///   persist `123456.789` into a `decimal{5,2}`.
+fn column_check_suffix(field: &Field, backend: DatabaseBackend) -> Option<String> {
+    if field.kind.is_enum() {
+        // Variants are validated `snake_case` identifiers (see
+        // `super::dsl::parse_field`), so no SQL-escaping is needed here.
+        let quoted = field
+            .variants
+            .iter()
+            .map(|v| format!("'{v}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!("CHECK ({} IN ({quoted}))", field.name));
     }
-    let quoted = field
-        .variants
-        .iter()
-        .map(|v| format!("'{v}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(format!("CHECK ({} IN ({quoted}))", field.name))
+    if backend == DatabaseBackend::Sqlite
+        && let FieldKind::Decimal { precision, scale } = field.kind
+    {
+        return Some(sqlite_decimal_check(&field.name, precision, scale));
+    }
+    None
+}
+
+/// The `SQLite` `CHECK` that enforces `NUMERIC(precision, scale)` over a `TEXT`
+/// column (issue #1924).
+///
+/// `SQLite` has no fixed-precision numeric type and no regular expressions, so
+/// the constraint is spelled with string builtins over the stored text, which
+/// `db::sqlite_types::SqliteDecimal` always writes as a plain, normalized
+/// decimal literal. Four conditions, in order:
+///
+/// 1. only digits remain once the sign and the point are removed;
+/// 2. at most one decimal point;
+/// 3. a `-`, if present, is leading;
+/// 4. the fractional part is at most `scale` digits, and the integer part at
+///    most `precision - scale` digits once leading zeros are stripped.
+///
+/// (4) is the invariant `NUMERIC` enforces. It rejects rather than rounds,
+/// unlike Postgres, which rounds a value to `scale` — a loud failure beats
+/// silently storing what the schema says is out of range. `NULL` passes; the
+/// column's own `NOT NULL` decides that.
+fn sqlite_decimal_check(column: &str, precision: u32, scale: u32) -> String {
+    // The unsigned text. Repeated rather than named: a SQLite `CHECK` has no `let`.
+    let abs = format!("replace({column},'-','')");
+    let frac_len =
+        format!("CASE WHEN instr({abs},'.') = 0 THEN 0 ELSE length({abs}) - instr({abs},'.') END");
+    let int_part = format!(
+        "CASE WHEN instr({abs},'.') = 0 THEN {abs} ELSE substr({abs}, 1, instr({abs},'.') - 1) END"
+    );
+    let conditions = [
+        // 1-3: a plain decimal literal — digits, at most one point, leading sign.
+        format!("ltrim(replace({abs},'.',''), '0123456789') = ''"),
+        format!("length({column}) - length(replace({column},'.','')) <= 1"),
+        format!("(instr({column},'-') = 0 OR instr({column},'-') = 1)"),
+        // 4: scale.
+        format!("{frac_len} <= {scale}"),
+        // 5: precision, as the integer-digit budget NUMERIC(p, s) allows.
+        format!(
+            "length(ltrim({int_part}, '0')) <= {}",
+            precision.saturating_sub(scale)
+        ),
+    ];
+    format!("CHECK ({column} IS NULL OR ({}))", conditions.join(" AND "))
 }
 
 /// Result of inferring a migration shape from its name.
@@ -1210,7 +1265,7 @@ pub fn add_columns_up_sql_for(
         if let Some(target) = f.reference_table() {
             let _ = write!(out, " REFERENCES {target}(id)");
         }
-        if let Some(check) = enum_check_suffix(f) {
+        if let Some(check) = column_check_suffix(f, backend) {
             let _ = write!(out, " {check}");
         }
         out.push_str(";\n");
@@ -1598,7 +1653,7 @@ pub fn remove_columns_down_sql_for(
         if let Some(target) = f.reference_table() {
             let _ = write!(out, " REFERENCES {target}(id)");
         }
-        if let Some(check) = enum_check_suffix(f) {
+        if let Some(check) = column_check_suffix(f, backend) {
             let _ = write!(out, " {check}");
         }
         out.push_str(";\n");

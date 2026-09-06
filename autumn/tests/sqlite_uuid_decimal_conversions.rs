@@ -189,8 +189,8 @@ async fn uuid_decimal_and_enum_fields_round_trip_on_sqlite() {
 
     let external_id = uuid_of(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
     let owner_id = uuid_of(0xffff_ffff_ffff_ffff_ffff_ffff_ffff_fffe);
-    // Trailing-zero scale (`0.10`, not `0.1`) and a 28-digit value prove the
-    // TEXT encoding keeps the full `Decimal` representation, unlike `REAL`.
+    // A trailing-zero scale and a negative 26-digit value: the first proves the
+    // encoding is canonical, the second that no precision is lost to a float.
     let price = decimal_of("0.10");
     let discount = decimal_of("-1234567890123456789.0123456");
 
@@ -216,8 +216,9 @@ async fn uuid_decimal_and_enum_fields_round_trip_on_sqlite() {
     assert_eq!(found.price, price, "Decimal round-trips exactly");
     assert_eq!(
         found.price.to_string(),
-        "0.10",
-        "Decimal scale (trailing zero) survives the TEXT round-trip"
+        "0.1",
+        "the stored text is canonical — trailing zeros dropped — so SQLite's \
+         byte-wise `=` and `UNIQUE` agree with Rust equality"
     );
     assert_eq!(
         found.discount,
@@ -252,6 +253,52 @@ async fn uuid_decimal_and_enum_fields_round_trip_on_sqlite() {
     assert_eq!(reloaded.status, Status::Draft);
 }
 
+/// The property `=` and `UNIQUE` rest on, exercised through the real stack:
+/// two spellings of one decimal must reach the same row. `Decimal`'s own
+/// `to_string` keeps the written scale, so without the encoder normalizing,
+/// `19.990` and `19.99` would be two distinct `TEXT` values — a generated
+/// `find_by_<decimal>` would miss, and a `:unique` index would admit both.
+#[tokio::test]
+async fn equal_decimals_written_differently_are_one_row_on_sqlite() {
+    use catalog_rows::dsl as t;
+
+    let pool = boot_pool("decimal_canonical_text").await;
+    let repo = PgCatalogRowRepository::with_pool_untracked(pool.clone());
+
+    let scaled = decimal_of("19.990");
+    let plain = decimal_of("19.99");
+    assert_eq!(scaled, plain, "the two spellings are one value in Rust");
+
+    repo.save(&NewCatalogRow {
+        external_id: uuid_of(1),
+        owner_id: None,
+        price: scaled,
+        discount: None,
+        status: Status::Draft,
+    })
+    .await
+    .expect("save the scaled spelling");
+
+    let mut conn = pool.get().await.expect("checkout");
+
+    // The stored bytes are the canonical form, whichever spelling was written.
+    let stored: Vec<String> = t::catalog_rows
+        .select(diesel::dsl::sql::<diesel::sql_types::Text>("price"))
+        .load(&mut *conn)
+        .await
+        .expect("read the raw text");
+    assert_eq!(stored, vec!["19.99".to_string()]);
+
+    // …so the other spelling finds it, which is what `find_by_<decimal>` does.
+    let found: Vec<SqliteDecimal> = t::catalog_rows
+        .filter(t::price.eq(plain))
+        .select(t::price)
+        .load(&mut *conn)
+        .await
+        .expect("filter by the other spelling");
+    assert_eq!(found, vec![plain], "equal values must match in SQL too");
+}
+
 #[tokio::test]
 async fn uuid_decimal_and_enum_columns_are_filterable_on_sqlite() {
     use catalog_rows::dsl as t;
@@ -277,7 +324,7 @@ async fn uuid_decimal_and_enum_columns_are_filterable_on_sqlite() {
 
     let mut conn = pool.get().await.expect("checkout");
 
-    // `.eq(uuid)` proves `Uuid: AsExpression<UuidText>` binds as a parameter.
+    // `.eq(…)` proves the newtype binds as a query parameter, not just as a column.
     let by_uuid: Vec<SqliteUuid> = t::catalog_rows
         .filter(t::external_id.eq(wanted))
         .select(t::external_id)
@@ -286,7 +333,7 @@ async fn uuid_decimal_and_enum_columns_are_filterable_on_sqlite() {
         .expect("filter by uuid");
     assert_eq!(by_uuid, vec![wanted], "Uuid binds in a WHERE clause");
 
-    // `.eq(decimal)` proves the same for `Decimal: AsExpression<DecimalText>`.
+    // Same for the decimal wrapper.
     let by_decimal: Vec<SqliteDecimal> = t::catalog_rows
         .filter(t::price.eq(decimal_of("19.99")))
         .select(t::price)

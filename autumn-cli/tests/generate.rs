@@ -2086,7 +2086,12 @@ fn generated_sqlite_scaffold_cargo_checks() {
     )
     .unwrap();
 
-    run_autumn(
+    // `run_autumn_with_env`, not `run_autumn`: backend detection gives the
+    // environment precedence over `autumn.toml`, so a developer running this
+    // with `DATABASE_URL=postgres://…` exported would silently get Postgres
+    // output and an opaque assertion failure below. Pinning both spellings to
+    // the same SQLite URL makes the run independent of the ambient shell.
+    run_autumn_with_env(
         &project,
         &[
             "generate",
@@ -2103,6 +2108,10 @@ fn generated_sqlite_scaffold_cargo_checks() {
             "seen_at:Option<NaiveDateTime>",
             "payload:json",
             "cover:Attachment",
+        ],
+        &[
+            ("DATABASE_URL", "sqlite://./app.db"),
+            ("AUTUMN_DATABASE__URL", "sqlite://./app.db"),
         ],
     );
 
