@@ -147,6 +147,12 @@ def read(f):
 
 # `](target)` — the target stops at whitespace, `#` (anchor) or `)`.
 MD_LINK = re.compile(r'\]\(\s*<?([^)\s<>#]+\.md)')
+# A reference definition: `[mail]: mail.md`, optionally `<…>`-wrapped. Markdown
+# allows up to three leading spaces. Reference-style links are a syntax
+# check-docs-links.sh already parses and self-tests, so a page linked only that
+# way is genuinely reachable; without this the gate would report it as an
+# orphan and block a docs change written in a spelling the corpus supports.
+REF_DEF = re.compile(r'^ {0,3}\[[^\]]+\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
 # A bare repo path. The leading guard keeps `…/docs/guide/x.md` inside a longer
 # path from matching at the wrong offset.
 BARE = re.compile(r'(?<![\w/.-])(docs/guide/[A-Za-z0-9._/-]+\.md)')
@@ -178,12 +184,20 @@ def edges_from(f):
         if t in node_set:
             out.add(t)
     base = posixpath.dirname(f)
-    for m in MD_LINK.finditer(txt):
-        raw = m.group(1)
+
+    def add_relative(raw):
+        raw = raw.split('#', 1)[0].strip()
+        if not raw.endswith('.md'):
+            return
         # An absolute-looking `/docs/guide/x.md` is a site path, not a file path.
         t = normalize(raw.lstrip('/') if raw.startswith('/') else posixpath.join(base, raw))
         if t in node_set:
             out.add(t)
+
+    for m in MD_LINK.finditer(txt):
+        add_relative(m.group(1))
+    for m in REF_DEF.finditer(txt):
+        add_relative(m.group(1) if m.group(1) is not None else m.group(2))
     return out
 
 
@@ -308,6 +322,32 @@ self_test() {
   printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\nSee docs/guide/mail.md.\n' > "$c9/README.md"
   git -C "$c9" add -A && git -C "$c9" commit -qm bare
   check "a bare repo path counts as an edge" pass "$c9"
+
+  # Reference-style links are a spelling check-docs-links.sh already parses and
+  # self-tests, so the gate must read them too — otherwise it reports a
+  # perfectly reachable page as an orphan and blocks the docs change.
+  local c9a="$tmp/c9a"; make_corpus "$c9a"
+  printf '# Jobs\n\nSee [mail][mail].\n\n[mail]: mail.md\n' > "$c9a/docs/guide/jobs.md"
+  git -C "$c9a" add -A && git -C "$c9a" commit -qm ref-style
+  check "a relative reference-style link counts as an edge" pass "$c9a"
+
+  local c9b="$tmp/c9b"; make_corpus "$c9b"
+  printf '# Jobs\n\nSee [mail][mail].\n\n[mail]: <mail.md>\n' > "$c9b/docs/guide/jobs.md"
+  git -C "$c9b" add -A && git -C "$c9b" commit -qm ref-style-angle
+  check "an angle-wrapped reference definition counts as an edge" pass "$c9b"
+
+  local c9c="$tmp/c9c"; make_corpus "$c9c"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n- [Mail][m]\n\n   [m]: docs/guide/mail.md#retries\n' \
+    > "$c9c/README.md"
+  git -C "$c9c" add -A && git -C "$c9c" commit -qm ref-style-indented-anchor
+  check "an indented reference definition with an anchor counts as an edge" pass "$c9c"
+
+  # The definition must still name a real node — a reference to something else
+  # does not launder an unreachable page into reachability.
+  local c9d="$tmp/c9d"; make_corpus "$c9d"
+  printf '# Jobs\n\nSee [other][o].\n\n[o]: https://example.com/mail.md\n' > "$c9d/docs/guide/jobs.md"
+  git -C "$c9d" add -A && git -C "$c9d" commit -qm ref-style-external
+  check "an external reference definition does not make a page reachable" fail "$c9d"
 
   # History is a record, not a route.
   local c10="$tmp/c10"; make_corpus "$c10"
