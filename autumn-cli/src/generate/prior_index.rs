@@ -47,23 +47,23 @@ impl PriorIndex {
 #[must_use]
 pub fn scan_prior_indexes(migrations_dir: &Path, table: &str) -> Vec<PriorIndex> {
     let statements = migration_statements(migrations_dir);
-    // A table carries its indexes through a rename, so match every name it has
-    // ever had. Renames are collected first because they happen after the
-    // `CREATE INDEX` statements that used the older name.
-    let names = table_aliases(&statements, table);
+    // The table's name at each point in history, and the first statement that
+    // belongs to this incarnation of it.
+    let (names_at, from) = table_identity(&statements, table);
 
     // Insertion-ordered by a monotonic sequence, so the result keeps creation
     // order while `DROP INDEX` can still remove by name.
     let mut live: BTreeMap<String, (usize, PriorIndex)> = BTreeMap::new();
     let mut seq = 0usize;
 
-    for (raw, normalized) in &statements {
-        if let Some(index) = parse_create_index(raw, normalized, &names) {
+    for (i, (raw, normalized)) in statements.iter().enumerate().skip(from) {
+        let name = &names_at[i];
+        if let Some(index) = parse_create_index(raw, normalized, name) {
             live.insert(normalize_identifier(&index.name), (seq, index));
             seq += 1;
-        } else if let Some(name) = parse_dropped_index_name(normalized) {
-            live.remove(&name);
-        } else if let Some((old, new)) = parse_column_rename(normalized, &names) {
+        } else if let Some(dropped) = parse_dropped_index_name(normalized) {
+            live.remove(&dropped);
+        } else if let Some((old, new)) = parse_column_rename(normalized, name) {
             // SQLite rewrites an index's column references on RENAME COLUMN, so
             // the recorded tokens must follow.
             for (_, index) in live.values_mut() {
@@ -73,7 +73,7 @@ pub fn scan_prior_indexes(migrations_dir: &Path, table: &str) -> Vec<PriorIndex>
                     }
                 }
             }
-        } else if drops_table(normalized, &names) {
+        } else if drops_table(normalized, name) {
             // Every index on the table goes with it.
             live.clear();
         }
@@ -116,29 +116,42 @@ fn migration_statements(migrations_dir: &Path) -> Vec<(String, String)> {
     out
 }
 
-/// Every name `table` has had, following `ALTER TABLE … RENAME TO` backwards.
-fn table_aliases(statements: &[(String, String)], table: &str) -> Vec<String> {
-    let renames: Vec<(String, String)> = statements
-        .iter()
-        .filter_map(|(_, n)| parse_table_rename(n))
-        .collect();
-    let mut names = vec![table.to_lowercase()];
-    // Walk the chain backwards: the last rename into a known name reveals the
-    // name the table had before it.
-    for (from, to) in renames.iter().rev() {
-        if names.contains(to) && !names.contains(from) {
-            names.push(from.clone());
+/// The name `table` carried before each statement, and the index of the first
+/// statement that belongs to this incarnation of the table.
+///
+/// A timeless set of every name the table ever had is not enough: a rename frees
+/// the old name, and a later `CREATE TABLE` can reuse it for an unrelated table.
+/// Matching by name alone would then attribute that table's indexes to this one
+/// and emit a `DROP INDEX` against it. So the history is walked backwards from
+/// the final name, one statement at a time. A `DROP TABLE` of the name in force
+/// at that point ends the search: everything before it was a different table.
+fn table_identity(statements: &[(String, String)], table: &str) -> (Vec<String>, usize) {
+    let mut names_at = vec![String::new(); statements.len()];
+    let mut current = table.to_lowercase();
+    let mut from = 0;
+    for i in (0..statements.len()).rev() {
+        let normalized = &statements[i].1;
+        // Apply the rename before recording: at this statement the table still
+        // had its earlier name.
+        if let Some((old, new)) = parse_table_rename(normalized)
+            && new == current
+        {
+            current = old;
+        }
+        names_at[i].clone_from(&current);
+        if from == 0 && drops_table(normalized, &current) {
+            from = i + 1;
         }
     }
-    names
+    (names_at, from)
 }
 
 /// `(old, new)` column names for an `ALTER TABLE <table> RENAME [COLUMN] <old>
-/// TO <new>` on one of `tables`, lowercased. `None` for a table rename.
-fn parse_column_rename(normalized: &str, tables: &[String]) -> Option<(String, String)> {
+/// TO <new>` on `table`, lowercased. `None` for a table rename.
+fn parse_column_rename(normalized: &str, table: &str) -> Option<(String, String)> {
     let rest = normalized.strip_prefix("alter table ")?;
-    let (table, rest) = rest.split_once(" rename ")?;
-    if !tables.contains(&normalize_identifier(table)) {
+    let (named, rest) = rest.split_once(" rename ")?;
+    if normalize_identifier(named) != table {
         return None;
     }
     // `RENAME TO <table>` is a table rename, not a column rename.
@@ -160,10 +173,10 @@ fn parse_table_rename(normalized: &str) -> Option<(String, String)> {
 }
 
 /// Parse a `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table> …`
-/// statement targeting any of `tables`. `raw` is the original text (kept for the
+/// statement targeting `table`. `raw` is the original text (kept for the
 /// rollback re-create); `normalized` is its comment-stripped, lowercased,
 /// whitespace-collapsed form.
-fn parse_create_index(raw: &str, normalized: &str, tables: &[String]) -> Option<PriorIndex> {
+fn parse_create_index(raw: &str, normalized: &str, table: &str) -> Option<PriorIndex> {
     let rest = normalized
         .strip_prefix("create unique index ")
         .or_else(|| normalized.strip_prefix("create index "))?;
@@ -173,7 +186,7 @@ fn parse_create_index(raw: &str, normalized: &str, tables: &[String]) -> Option<
     let rest = rest.strip_prefix("if not exists ").unwrap_or(rest);
 
     let (name, after_name) = split_index_name(rest)?;
-    let after_table = strip_on_table(after_name, tables)?;
+    let after_table = strip_on_table(after_name, table)?;
 
     Some(PriorIndex {
         // Take the name from the raw statement, so the emitted `DROP INDEX`
@@ -197,18 +210,16 @@ fn split_index_name(rest: &str) -> Option<(&str, &str)> {
 }
 
 /// Strip a leading `on <table>` from `rest`, returning what follows, or `None`
-/// when the index targets some other table.
+/// when the index targets a different table.
 ///
 /// Accepts a double-quoted table name and a `schema.` prefix, the two forms a
 /// hand-written migration realistically uses.
-fn strip_on_table<'a>(rest: &'a str, tables: &[String]) -> Option<&'a str> {
+fn strip_on_table<'a>(rest: &'a str, table: &str) -> Option<&'a str> {
     let after_on = rest.strip_prefix("on ")?;
     // The table name runs to the key list, the `USING` clause, or end of input.
     let end = after_on.find(['(', ' ']).unwrap_or(after_on.len());
     let (named, tail) = after_on.split_at(end);
-    tables
-        .contains(&normalize_identifier(named))
-        .then_some(tail)
+    (normalize_identifier(named) == table).then_some(tail)
 }
 
 /// Index name dropped by a `DROP INDEX [CONCURRENTLY] [IF EXISTS] <name>`
@@ -221,15 +232,15 @@ fn parse_dropped_index_name(normalized: &str) -> Option<String> {
     (!name.is_empty()).then(|| normalize_identifier(name))
 }
 
-/// Whether the statement drops one of `tables` outright, taking its indexes.
-fn drops_table(normalized: &str, tables: &[String]) -> bool {
+/// Whether the statement drops `table` outright, taking its indexes.
+fn drops_table(normalized: &str, table: &str) -> bool {
     let Some(rest) = normalized.strip_prefix("drop table ") else {
         return false;
     };
     let rest = rest.strip_prefix("if exists ").unwrap_or(rest);
     rest.split([' ', ';', ','])
         .next()
-        .is_some_and(|named| tables.contains(&normalize_identifier(named)))
+        .is_some_and(|named| normalize_identifier(named) == table)
 }
 
 /// Lowercase an SQL identifier: drop double quotes, a trailing `;`, and any
@@ -583,6 +594,54 @@ mod tests {
         assert_eq!(found.len(), 1, "got {found:?}");
         assert!(found[0].covers("headline"), "got {found:?}");
         assert!(!found[0].covers("title"), "the old name is gone: {found:?}");
+    }
+
+    #[test]
+    fn a_reused_old_name_does_not_capture_the_new_tables_indexes() {
+        // `articles` is renamed to `posts`, then a DIFFERENT `articles` is
+        // created. Its index must not be attributed to `posts` — a generated
+        // Remove…From… would otherwise DROP INDEX against the unrelated table.
+        let t = tree(&[
+            (
+                "2026_01_01_000000_a",
+                "CREATE INDEX idx_old_title ON articles (title);",
+            ),
+            (
+                "2026_01_02_000000_b",
+                "ALTER TABLE articles RENAME TO posts;",
+            ),
+            (
+                "2026_01_03_000000_c",
+                "CREATE TABLE articles (id INTEGER PRIMARY KEY, title TEXT);\n\
+                 CREATE UNIQUE INDEX idx_new_title ON articles (title);",
+            ),
+        ]);
+        let names: Vec<String> = scan_prior_indexes(t.path(), "posts")
+            .into_iter()
+            .map(|i| i.name)
+            .collect();
+        assert_eq!(names, vec!["idx_old_title"], "got {names:?}");
+    }
+
+    #[test]
+    fn a_table_dropped_and_recreated_starts_from_the_new_one() {
+        let t = tree(&[
+            (
+                "2026_01_01_000000_a",
+                "CREATE INDEX idx_gone ON posts (title);",
+            ),
+            ("2026_01_02_000000_b", "DROP TABLE posts;"),
+            (
+                "2026_01_03_000000_c",
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT);\n\
+                 CREATE INDEX idx_fresh ON posts (title);",
+            ),
+        ]);
+        let names: Vec<String> = scan_prior_indexes(t.path(), "posts")
+            .into_iter()
+            .map(|i| i.name)
+            .collect();
+        assert_eq!(names, vec!["idx_fresh"], "got {names:?}");
     }
 
     #[test]

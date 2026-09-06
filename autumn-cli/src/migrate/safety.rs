@@ -352,6 +352,38 @@ fn is_known_alter_subcommand(backend: DatabaseBackend, subcommand: &str) -> bool
         || (subcommand.starts_with("alter column ") && subcommand.contains(" type "))
 }
 
+/// Rewrite `SQLite`'s optional-`COLUMN` `ALTER TABLE` spellings into the
+/// canonical ones, so `ADD title TEXT` classifies exactly as
+/// `ADD COLUMN title TEXT`. `ADD CONSTRAINT` and `DROP CONSTRAINT` are left
+/// alone: they are Postgres-only, and the grammar rule must still reject them.
+fn canonical_sqlite_alter(normalized: &str) -> String {
+    if !normalized.starts_with("alter table ") {
+        return normalized.to_owned();
+    }
+    let subcommands = alter_table_subcommands(normalized);
+    if subcommands.is_empty() {
+        return normalized.to_owned();
+    }
+    let head_len = normalized.len() - subcommands.join(", ").len();
+    let head = &normalized[..head_len];
+    let rewritten: Vec<String> = subcommands
+        .iter()
+        .map(|sub| {
+            for verb in ["add", "drop"] {
+                let prefix = format!("{verb} ");
+                if let Some(rest) = sub.strip_prefix(&prefix)
+                    && !rest.starts_with("column ")
+                    && !rest.starts_with("constraint ")
+                {
+                    return format!("{verb} column {rest}");
+                }
+            }
+            (*sub).to_owned()
+        })
+        .collect();
+    format!("{head}{}", rewritten.join(", "))
+}
+
 /// Whether `subcommand` is one of the four `ALTER TABLE` forms `SQLite` parses:
 /// `RENAME TO`, `RENAME [COLUMN] … TO …`, `ADD COLUMN` and `DROP COLUMN`.
 /// `SQLite` also accepts `ADD`/`DROP` with the `COLUMN` keyword left out.
@@ -638,7 +670,8 @@ fn has_postgres_table_clause(normalized: &str) -> bool {
 /// Whether a `WITH` statement writes inside a CTE. `SQLite` allows only
 /// `SELECT` there.
 fn contains_data_modifying_cte(normalized: &str) -> bool {
-    let sql = without_string_literals(normalized);
+    // `AS ( DELETE FROM …` is ordinary formatting; close the paren up first.
+    let sql = without_string_literals(normalized).replace("( ", "(");
     ["(update ", "(delete ", "(insert into "]
         .iter()
         .any(|p| sql.contains(p))
@@ -767,6 +800,16 @@ fn classify_statement(
         return vec![];
     }
     let sqlite = backend == DatabaseBackend::Sqlite;
+    // SQLite lets `ALTER TABLE … ADD <col>` and `DROP <col>` omit the `COLUMN`
+    // keyword. Every rule below matches the `COLUMN` spelling, so canonicalize
+    // first rather than duplicating each match.
+    let canonical;
+    let normalized = if sqlite {
+        canonical = canonical_sqlite_alter(normalized);
+        canonical.as_str()
+    } else {
+        normalized
+    };
 
     // Statements SQLite has no syntax for at all. They fail at apply time, so
     // there is nothing further to classify about them.
@@ -775,10 +818,12 @@ fn classify_statement(
     }
 
     let mut findings = Vec::new();
-    // SQLite applies its ADD COLUMN restrictions only to a table that already
-    // has rows. A table this same migration creates has none, so the same
-    // statement applies cleanly — the suppression `classify_sql_for` already
-    // makes for index builds.
+    // Some SQLite ADD COLUMN restrictions apply only to a table that already has
+    // rows: NOT NULL without a usable default, a non-constant default, and a
+    // STORED generated column. A table this same migration creates has none, so
+    // those statements apply cleanly — the suppression `classify_sql_for`
+    // already makes for index builds. UNIQUE and PRIMARY KEY are NOT in that
+    // set: SQLite rejects them on an empty table too.
     let fresh_table = sqlite
         && extract_altered_table_name(normalized)
             .is_some_and(|t| newly_created.iter().any(|c| *c == t));
@@ -1032,10 +1077,7 @@ fn classify_statement(
                 continue;
             }
             if has_inline_unique_constraint(&without_string_literals(subcommand)) {
-                findings.push(if sqlite && fresh_table {
-                    // No rows yet, so SQLite accepts the inline constraint.
-                    continue;
-                } else if sqlite {
+                findings.push(if sqlite {
                     // SQLite: "Cannot add a UNIQUE column".
                     SafetyFinding {
                         operation: "ADD COLUMN UNIQUE (unsupported on SQLite)".to_owned(),
@@ -1058,7 +1100,7 @@ fn classify_statement(
                     }
                 });
             }
-            if sqlite && !fresh_table && subcommand.contains(" primary key") {
+            if sqlite && subcommand.contains(" primary key") {
                 findings.push(SafetyFinding {
                     operation: "ADD COLUMN PRIMARY KEY (unsupported on SQLite)".to_owned(),
                     risk: RiskLevel::Unsupported,
@@ -2688,18 +2730,32 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_add_column_restrictions_do_not_apply_to_a_table_this_migration_creates() {
-        // A table with no rows accepts all of them.
+    fn sqlite_row_dependent_add_column_rules_skip_a_table_this_migration_creates() {
+        // Verified against SQLite 3.45: on an EMPTY table these three apply
+        // cleanly. UNIQUE and PRIMARY KEY do not — see the test below.
         let sql = "CREATE TABLE posts (id INTEGER PRIMARY KEY);\n\
                    ALTER TABLE posts ADD COLUMN a INT NOT NULL;\n\
                    ALTER TABLE posts ADD COLUMN b TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP;\n\
-                   ALTER TABLE posts ADD COLUMN c TEXT UNIQUE;";
+                   ALTER TABLE posts ADD COLUMN c INT GENERATED ALWAYS AS (id + 1) STORED;";
         assert!(
             !classify_sql_for(DatabaseBackend::Sqlite, sql)
                 .iter()
                 .any(|f| f.risk == RiskLevel::Unsupported),
             "got {:?}",
             sqlite_ops(sql)
+        );
+        // On a table the migration does not create, all three are unsupported.
+        let existing = "ALTER TABLE posts ADD COLUMN a INT NOT NULL;\n\
+                        ALTER TABLE posts ADD COLUMN b TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP;\n\
+                        ALTER TABLE posts ADD COLUMN c INT GENERATED ALWAYS AS (id + 1) STORED;";
+        assert_eq!(
+            classify_sql_for(DatabaseBackend::Sqlite, existing)
+                .iter()
+                .filter(|f| f.risk == RiskLevel::Unsupported)
+                .count(),
+            3,
+            "got {:?}",
+            sqlite_ops(existing)
         );
     }
 
@@ -2749,6 +2805,66 @@ mod tests {
                 sqlite_ops(sql)
             );
         }
+    }
+
+    #[test]
+    fn sqlite_unique_and_primary_key_are_rejected_even_on_a_fresh_table() {
+        // Verified against SQLite 3.45: "Cannot add a UNIQUE column" and "Cannot
+        // add a PRIMARY KEY column" fire on an empty table too, unlike the
+        // NOT NULL / non-constant-default / STORED restrictions.
+        let sql = "CREATE TABLE posts (id INTEGER PRIMARY KEY);\n\
+                   ALTER TABLE posts ADD COLUMN a TEXT UNIQUE;\n\
+                   ALTER TABLE posts ADD COLUMN b INTEGER PRIMARY KEY;";
+        let ops = sqlite_ops(sql);
+        assert!(
+            ops.contains(&"ADD COLUMN UNIQUE (unsupported on SQLite)".to_owned()),
+            "got {ops:?}"
+        );
+        assert!(
+            ops.contains(&"ADD COLUMN PRIMARY KEY (unsupported on SQLite)".to_owned()),
+            "got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn sqlite_bare_add_and_drop_forms_get_the_same_rules() {
+        // SQLite lets the COLUMN keyword be omitted.
+        let f = sqlite_finding("ALTER TABLE posts DROP title;", "DROP COLUMN")
+            .expect("a bare DROP is still destructive");
+        assert_eq!(f.risk, RiskLevel::Destructive);
+
+        let f = sqlite_finding(
+            "ALTER TABLE posts ADD title TEXT NOT NULL;",
+            "ADD COLUMN NOT NULL (no default)",
+        )
+        .expect("a bare ADD still hits the NOT NULL rule");
+        assert_eq!(f.risk, RiskLevel::Unsupported);
+
+        // The canonicalization must not swallow the Postgres-only forms.
+        for sql in [
+            "ALTER TABLE t ADD CONSTRAINT ck CHECK (id > 0);",
+            "ALTER TABLE t DROP CONSTRAINT ck;",
+        ] {
+            assert!(
+                classify_sql_for(DatabaseBackend::Sqlite, sql)
+                    .iter()
+                    .any(|f| f.risk == RiskLevel::Unsupported),
+                "{sql} -> {:?}",
+                sqlite_ops(sql)
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_writing_cte_is_caught_through_formatting_whitespace() {
+        let sql = "WITH removed AS ( DELETE FROM posts RETURNING id) SELECT * FROM removed;";
+        assert!(
+            classify_sql_for(DatabaseBackend::Sqlite, sql)
+                .iter()
+                .any(|f| f.risk == RiskLevel::Unsupported),
+            "got {:?}",
+            sqlite_ops(sql)
+        );
     }
 
     #[test]

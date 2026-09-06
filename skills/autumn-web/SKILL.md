@@ -3162,9 +3162,13 @@ outright, and fails the gate:
 | `ADD COLUMN … NOT NULL` with no `DEFAULT` | Cannot backfill existing rows | Give a constant `DEFAULT`, or add the column nullable |
 | `ADD COLUMN … UNIQUE` / `PRIMARY KEY` | Inline constraint not allowed | Add the column, then `CREATE UNIQUE INDEX` |
 | `ADD COLUMN … DEFAULT CURRENT_TIMESTAMP` or `DEFAULT (expr)` | The default must be a constant | Use a literal, or backfill with `UPDATE` |
-| `ADD COLUMN … REFERENCES` with a non-NULL default | The added FK column must default to NULL | Add it nullable, then backfill |
+| More than one action in one `ALTER TABLE` | SQLite takes one action per statement | Split into one `ALTER TABLE` per action |
 | `TRUNCATE` | No such statement | `DELETE FROM <table>;` |
 | Sequences, types, extensions, materialized views, `COMMENT ON`, `GRANT`/`REVOKE` | Postgres-only objects | Remove, or gate the migration to Postgres |
+
+One rule Autumn deliberately does **not** report: SQLite rejects an added
+`REFERENCES` column with a non-NULL default only when `PRAGMA foreign_keys` is
+ON, and the migration connection leaves it OFF, so the statement applies.
 
 `DROP COLUMN` also fails on SQLite when the column is a primary key, is `UNIQUE`,
 is named by any index (including a partial index's `WHERE`), or appears in a
