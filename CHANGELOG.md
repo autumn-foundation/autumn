@@ -45,9 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`with_pool_untracked`, the constructor for code with no request), so
   `#[normalize(trim)]`, the model's `#[validate]` rules, and the repository's
   `MutationHooks` (`before_create` validation, a `before_delete` rule refusing
-  to delete a pinned note) apply identically to a GraphQL mutation, the
-  generated `api = "/api/notes"` REST handlers mounted beside it, and the
-  `on_startup` seed. `AutumnError`s become GraphQL field errors carrying the
+  to delete a pinned note) apply identically to a GraphQL mutation and
+  the generated `api = "/api/notes"` REST handlers mounted beside it (the
+  `on_startup` seed runs once across instances, on one connection under a
+  transaction-scoped advisory lock). `AutumnError`s become GraphQL field errors carrying the
   HTTP status in `extensions.status`. The plugin serves `POST /graphql`, the
   GraphQL-over-HTTP `GET` form, and `GET /graphql/sdl`, whose output is
   drift-tested against a committed `schema.graphql` the TypeScript types are

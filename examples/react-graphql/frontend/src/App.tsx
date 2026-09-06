@@ -99,7 +99,12 @@ export function App() {
             rows={3}
           />
         </label>
-        <button type="submit" disabled={submitting || title.trim() === ""}>
+        {/* Disabled until the first load lands: a create that raced the
+            initial fetch could otherwise be overwritten by its stale result. */}
+        <button
+          type="submit"
+          disabled={submitting || status.kind === "loading" || title.trim() === ""}
+        >
           {submitting ? "Saving…" : "Add note"}
         </button>
       </form>

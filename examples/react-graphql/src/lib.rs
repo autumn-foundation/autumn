@@ -36,7 +36,6 @@ use autumn_web::{AppState, AutumnError};
 
 use crate::graphql_plugin::GraphqlPlugin;
 use crate::models::NewNote;
-use crate::repositories::{NoteRepository, PgNoteRepository};
 
 /// The `notes` table migration, applied on boot (`AUTUMN_ENV=development`)
 /// or by `autumn migrate`. Tests apply it to their testcontainer too.
@@ -132,31 +131,48 @@ pub fn graphql() -> GraphqlPlugin<notes::Query, notes::Mutation, async_graphql::
 /// Seed two notes into an empty table so the first page load has something
 /// to render and the browser smoke has something to look for.
 ///
-/// Runs through the repository — hooks and validation included — from a
-/// startup hook, where there is no request and therefore no extractor:
-/// `with_pool_untracked` is the constructor for exactly that situation.
-///
 /// Every instance runs its startup hooks, so on a first scaled deployment two
-/// processes could both see an empty table and both seed it. The check and
-/// the insert therefore run under a Postgres advisory lock (`Lock`, the
-/// framework's distributed-lock primitive): the first instance seeds, the
-/// rest wait for it, then see a non-empty table and skip.
+/// processes could both see an empty table and both insert. The check and
+/// the insert therefore run in one transaction on **one** connection, behind
+/// a transaction-scoped Postgres advisory lock (`pg_advisory_xact_lock`, keyed
+/// the same way the framework's `Lock` keys its names): the first instance
+/// seeds, the rest queue on the lock, then see rows and skip. One connection
+/// matters — a session lock held on one pool slot while the seed queries
+/// wait for a second would deadlock a `pool_size = 1` deployment on every
+/// boot.
+///
+/// The rows are inserted with Diesel directly rather than through
+/// `PgNoteRepository`, because the repository would check out its own
+/// connection; they are trusted constants that already satisfy the model's
+/// `#[normalize]` and `#[validate]` rules.
 pub async fn seed_if_empty(state: &AppState) -> AutumnResult<()> {
+    use autumn_web::reexports::diesel::prelude::*;
+    use autumn_web::reexports::diesel::sql_types::BigInt;
+    use autumn_web::reexports::diesel_async::{AsyncConnection, RunQueryDsl};
+
     let pool = state
         .pool()
-        .ok_or_else(|| AutumnError::service_unavailable_msg("no database pool configured"))?
-        .clone();
-    let repo = PgNoteRepository::with_pool_untracked(pool);
-    let lock = Lock::from_state(state, "react-graphql:seed-notes")?;
-    lock.with(|| async {
-        if repo.count().await? > 0 {
+        .ok_or_else(|| AutumnError::service_unavailable_msg("no database pool configured"))?;
+    let mut conn = pool.get().await.map_err(AutumnError::from)?;
+    let key = autumn_web::lock::distributed_lock_key("react-graphql:seed-notes");
+
+    conn.transaction::<(), AutumnError, _>(async move |conn| {
+        diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
+            .bind::<BigInt, _>(key)
+            .execute(conn)
+            .await?;
+        let existing: i64 = schema::notes::table.count().get_result(conn).await?;
+        if existing > 0 {
             return Ok(());
         }
-        repo.save_many(&seed_notes()).await?;
+        diesel::insert_into(schema::notes::table)
+            .values(&seed_notes())
+            .execute(conn)
+            .await?;
         tracing::info!("seeded the notes table");
-        Ok::<(), AutumnError>(())
+        Ok(())
     })
-    .await?
+    .await
 }
 
 /// The seed rows, oldest first (`id` order). The welcome note is pinned.

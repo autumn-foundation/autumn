@@ -12,7 +12,7 @@ this order:
    generated `PgNoteRepository` from the pool on `AppState`. GraphQL is one
    more door into the model, not a second data layer: trimming, validation,
    hooks, and transactions are identical whether a write arrives over
-   GraphQL, the generated REST handler, or the startup seed.
+   GraphQL or the generated REST handler.
 3. **`src/graphql_plugin.rs`** — a generic `GraphqlPlugin` that adapts any
    `async-graphql` schema onto an Autumn app. It is the extensibility
    showcase: a `Plugin` that mounts a raw router, declares its routes for
@@ -34,7 +34,8 @@ untouched because the bundle is an external ES module.
 | `#[model]` with `#[normalize(trim)]` + `#[validate]` | `src/models.rs` | One struct yields `Note`, `NewNote`, `UpdateNote`; input is canonicalised before validation on every write path |
 | `MutationHooks` | `src/hooks.rs` | `before_create` runs the model's rules for direct repository callers; `before_delete` refuses to delete a pinned note — inside the transaction, for every door |
 | `#[repository(Note, hooks = …, api = "/api/notes")]` | `src/repositories.rs` | Generated CRUD, a derived `find_by_pinned` finder, and generated REST read handlers mounted next to GraphQL |
-| Repository from `AppState`, outside an extractor | `src/notes.rs`, `src/lib.rs` | `PgNoteRepository::with_pool_untracked(pool)` in resolvers and in the `on_startup` seed |
+| Repository from `AppState`, outside an extractor | `src/notes.rs` | `PgNoteRepository::with_pool_untracked(pool)` in resolvers — the constructor for code with a pool but no request |
+| Run-once startup seed | `src/lib.rs` | One connection, one transaction, `pg_advisory_xact_lock` keyed like the framework's `Lock`: a scaled deployment seeds exactly once, and a `pool_size = 1` deployment never deadlocks on itself |
 | Embedded migrations | `src/lib.rs`, `migrations/` | `embed_migrations!()`, applied on boot in development and by tests to their testcontainer |
 | `AutumnError` → GraphQL error | `src/notes.rs` | 4xx messages on the field, 5xx redacted and logged; HTTP status in `extensions.status`, so a client can tell a 422 from a 503 |
 | `with_lock` pessimistic toggle | `src/notes.rs` | `togglePinned` flips the flag under `SELECT … FOR UPDATE` so overlapping toggles serialise; a missing row is the helper's own 404 |
@@ -119,8 +120,8 @@ curl -s http://127.0.0.1:3000/graphql/sdl
 
 ```
 GraphQL mutation ─┐
-REST POST         ├─► PgNoteRepository::save(&NewNote)
-startup seed      ┘        │
+REST POST         ┴─► PgNoteRepository::save(&NewNote)
+                           │
                            ├─ #[normalize(trim)]   canonicalise (model)
                            ├─ before_create        validate + reject (hooks.rs)
                            ├─ INSERT … RETURNING   inside one transaction

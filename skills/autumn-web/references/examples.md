@@ -476,7 +476,12 @@ async fn create_note(&self, ctx: &Context<'_>, input: NewNoteInput) -> Result<No
 
 so `#[normalize(trim)]`, the model's `#[validate]` rules, and the
 repository's `MutationHooks` apply identically to GraphQL, the generated
-`api = "/api/notes"` REST handlers mounted beside it, and the startup seed.
+`api = "/api/notes"` REST handlers mounted beside it. (The startup seed is
+the one deliberate exception: it runs count-then-insert on a single
+connection inside a transaction behind `pg_advisory_xact_lock`, keyed with
+`autumn_web::lock::distributed_lock_key`, so a scaled deployment seeds once
+and a `pool_size = 1` deployment does not deadlock — a session `Lock` plus a
+repository call would need two pool slots.)
 Two caveats the example documents: `repo.save` does **not** run the model's
 `#[validate]` rules itself (only the generated REST handler does — #2586), so
 a `before_create` hook calls `validate()`; and `AutumnError` exposes no
