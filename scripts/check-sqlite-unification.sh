@@ -88,10 +88,20 @@ scan_manifest() {
     # inside a string is not a comment; a `[` inside one does not open an
     # array. Getting either wrong desynchronizes the section tracker for the
     # rest of the file, which fails OPEN.
+    # A backslash escapes the next character inside a BASIC string ("…") and
+    # is literal inside a literal string ('…'). Reading `\"` as the end of a
+    # string desynchronizes everything after it: a `[` in ordinary package
+    # metadata then reads as structural, the entry assembler swallows the
+    # following dependency, and the scan fails OPEN.
     function strip_comment(s,   i, c, q, out) {
       q = ""; out = ""
       for (i = 1; i <= length(s); i++) {
         c = substr(s, i, 1)
+        if (q == "\"" && c == "\\" && i < length(s)) {
+          out = out c substr(s, i + 1, 1)
+          i++
+          continue
+        }
         if (q != "") { if (c == q) q = "" }
         else if (c == "\"" || c == SQ) q = c
         else if (c == "#") break
@@ -103,6 +113,7 @@ scan_manifest() {
       depth = 0; q = ""
       for (i = 1; i <= length(s); i++) {
         c = substr(s, i, 1)
+        if (q == "\"" && c == "\\") { i++; continue }
         if (q != "") { if (c == q) q = ""; continue }
         if (c == "\"" || c == SQ) { q = c; continue }
         if (c == "[" || c == "{") depth++
@@ -149,6 +160,21 @@ scan_manifest() {
       return name
     }
     function report(msg) { printf "%s:%d: %s\n", FILENAME, entry_line, msg }
+    # Whether a `[features]` entry forwards the flip, under the real crate name
+    # or under a rename. Cargo writes the DEPENDENCY ALIAS in a feature path
+    # (`web/sqlite` for `web = { package = "autumn-web" }`), so matching the
+    # real names alone leaves a rename free to enable the flip.
+    function forwards_flip(e,   tail, name) {
+      tail = e
+      while (match(tail, /"[A-Za-z0-9_-]+\/sqlite"/)) {
+        name = substr(tail, RSTART + 1, RLENGTH - 2)
+        sub(/\/sqlite$/, "", name)
+        if (name ~ ("^(" flip ")$")) return 1
+        if (name in alias_of && alias_of[name] ~ ("^(" flip ")$")) return 1
+        tail = substr(tail, RSTART + RLENGTH)
+      }
+      return 0
+    }
     # The value of a `key = "value"` entry.
     function quoted_value(entry,   value) {
       value = entry
@@ -167,7 +193,7 @@ scan_manifest() {
         sub(/^name[ \t]*=[ \t]*"/, "", pkg)
         sub(/".*$/, "", pkg)
       }
-      if (section == "[features]" && norm ~ /^sqlite[ \t]*=/ && norm ~ ("\"(" flip ")/sqlite\""))
+      if (section == "[features]" && norm ~ /^sqlite[ \t]*=/ && forwards_flip(norm))
         defines_flip_sqlite = 1
 
       # A RENAMED dependency names its real crate in a `package` key that can
@@ -179,12 +205,26 @@ scan_manifest() {
       #   features = ["sqlite"]     |  web.features = ["sqlite"]
       #
       # Cargo accepts both and both enable the flip.
-      if (dep_section_crate() != "" && norm ~ /^package[ \t]*=/)
+      if (dep_section_crate() != "" && norm ~ /^package[ \t]*=/) {
         section_package[section] = quoted_value(norm)
+        alias_of[dep_section_crate()] = section_package[section]
+      }
       if (is_dep_table() && norm ~ /^[A-Za-z0-9_-]+\.package[ \t]*=/) {
-        alias = norm
-        sub(/\.package.*$/, "", alias)
-        dotted_package[alias] = quoted_value(norm)
+        name = norm
+        sub(/\.package.*$/, "", name)
+        dotted_package[name] = quoted_value(norm)
+        alias_of[name] = dotted_package[name]
+      }
+      # The inline form, whose alias a FEATURE path then names:
+      #   web = { package = "autumn-web", optional = true }
+      #   embedded = ["dep:web", "web/sqlite"]
+      if (is_dep_table() && norm ~ /^[A-Za-z0-9_-]+[ \t]*=/ && norm ~ /package[ \t]*=[ \t]*"/) {
+        name = norm
+        sub(/[ \t]*=.*$/, "", name)
+        value = norm
+        sub(/^.*package[ \t]*=[ \t]*"/, "", value)
+        sub(/".*$/, "", value)
+        alias_of[name] = value
       }
       next
     }
@@ -201,7 +241,7 @@ scan_manifest() {
       if (entry == "") next
       norm = normalize_quotes(entry)
       mentions_sqlite = (norm ~ /"sqlite"/)
-      forwards = (norm ~ ("\"(" flip ")/sqlite\""))
+      forwards = forwards_flip(norm)
 
       # ── 1. A dependency edge that enables the flip ────────────────────
       if (is_dep_table() && mentions_sqlite) {
@@ -455,6 +495,34 @@ embedded = ["autumn-web/sqlite"]
 EOF
   check_fail "feature forwarding the flip under another name" forward
 
+  # Cargo writes the dependency ALIAS in a feature path, not the real crate
+  # name, so a rename hides the flip from a match on the real names alone.
+  make_case forward_renamed <<'EOF'
+[package]
+name = "consumer"
+
+[dependencies]
+web = { package = "autumn-web", version = "0.7", optional = true }
+
+[features]
+embedded = ["dep:web", "web/sqlite"]
+EOF
+  check_fail "feature forwarding the flip through a renamed dependency" forward_renamed
+
+  # An escaped quote inside package metadata must not end the string: reading
+  # it as the end lets a later `[` count as structural, and the entry
+  # assembler then swallows the dependency below it.
+  mkdir -p "$tmp/escaped"
+  cat >"$tmp/escaped/Cargo.toml" <<'EOF'
+[package]
+name = "consumer"
+description = "contains \" and [ bracket"
+
+[dependencies]
+autumn-web = { version = "0.7", features = ["sqlite"] }
+EOF
+  check_fail "an escaped quote does not desync the scan" escaped
+
   make_case same_name_elsewhere <<'EOF'
 [package]
 name = "example-app"
@@ -500,6 +568,29 @@ description = "tracks issue #1905"
 autumn-web = { version = "0.7", features = ["db"] }
 EOF
   check_pass "a # inside a string is not a comment" hash_in_string
+
+  mkdir -p "$tmp/escaped_clean"
+  cat >"$tmp/escaped_clean/Cargo.toml" <<'EOF'
+[package]
+name = "example"
+description = "contains \" and [ bracket"
+
+[dependencies]
+autumn-web = { version = "0.7", features = ["db"] }
+EOF
+  check_pass "escape handling does not invent a violation" escaped_clean
+
+  make_case forward_renamed_unrelated <<'EOF'
+[package]
+name = "consumer"
+
+[dependencies]
+store = { package = "some-store", version = "1" }
+
+[features]
+embedded = ["store/sqlite"]
+EOF
+  check_pass "a renamed unrelated crate's sqlite feature is not the flip" forward_renamed_unrelated
 
   make_case same_name <<'EOF'
 [package]

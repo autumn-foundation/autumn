@@ -171,9 +171,10 @@ published support contract**. Available **today**:
   migrated schema lives only on the transient migration connection and is gone
   before the runtime pool anchors it, so a durable deploy must be
   **file-backed**. Postgres-only
-  settings (read replicas, shard directory, Postgres-only job/scheduler
-  backends, multi-replica locks) are **refused at boot** with an actionable
-  message rather than silently at first query.
+  *settings* (read replicas, shard directory, Postgres-only job/scheduler
+  backends) are **refused at boot** with an actionable message rather than
+  silently at first query. A Postgres-only *API* has no config key to screen,
+  so it refuses where it is called instead — see the distributed lock below.
 - **Backend-aware DDL generator** — `autumn generate` emits SQLite column types
   for the supported field kinds (see
   [field-type support](#sqlite-field-type-support)).
@@ -244,12 +245,18 @@ contract holds because there is only one ticker.
 ### Distributed lock
 
 [`autumn_web::lock::Lock`](./distributed-locks.md) is a cluster-wide named lock
-built on Postgres advisory locks. On SQLite it provides **single-host** mutual
-exclusion (the whole point of the tier is that "the cluster" is one process).
-Because a SQLite deployment is single-host by definition, a lock used for
-across-host coordination has no counterpart — so a configuration that declares
-multiple replicas against a SQLite database is **refused at boot**, not silently
-downgraded to a no-op that would let two replicas both believe they hold it.
+built on Postgres advisory locks, and SQLite has no cross-connection analog. So
+under the `sqlite` feature it does not degrade to a single-host lock — it
+**refuses**: `Lock::from_state` returns `LockError::PoolUnavailable` naming the
+backend. That is at **construction**, not at boot, so a SQLite app that never
+takes a lock starts and serves normally, and one that does gets a named error
+at the call rather than a lock that silently guards nothing.
+
+Refusing beats downgrading here. A no-op "lock" would let two callers both
+believe they hold it; and single-host mutual exclusion inside one process is
+what a `Mutex` is for, with no database round-trip. Reach for the lock when you
+need *across-host* coordination — which is exactly what the single-host tier
+does not have.
 
 ### Feature-flag / experiment cache invalidation
 
@@ -584,8 +591,15 @@ never as a runtime surprise on some unlucky code path days later.
   silent output that fails later.
 
 So the operational rule is simple: if a SQLite app boots, every feature it is
-configured to use is supported on SQLite. There is no third state where an
-unsupported feature lurks until first use.
+**configured** to use is supported on SQLite. There is no third state where an
+unsupported *configuration* lurks until first use.
+
+The bound on that rule is the word *configured*. A Postgres-only API that no
+config key selects — `Lock::from_state`, `PgFlagStore::from_database_config`
+and its siblings — cannot be screened at boot, because nothing at boot knows
+the app will call it. Those refuse at the call, with a named error rather than
+a silent no-op: `PoolUnavailable` for the lock, `None` for the stores. Both are
+listed in the support matrix above.
 
 ---
 
