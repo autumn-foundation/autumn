@@ -61,10 +61,9 @@ fn is_guard_response_path(path: &syn::Path) -> bool {
     // renamed or overridden root instead (#1828) — compare it against the
     // actively resolved name, or a genuine match is missed.
     path.segments.len() == GUARD_RESPONSE_PATH.len()
-        && path
-            .segments
-            .first()
-            .is_some_and(|segment| segment.ident == crate::crate_path::current_target())
+        && path.segments.first().is_some_and(|segment| {
+            segment.ident == crate::crate_path::current_target_path_segment()
+        })
         && path
             .segments
             .iter()

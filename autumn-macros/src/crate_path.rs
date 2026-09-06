@@ -353,6 +353,21 @@ pub fn escaped_target_path_segment(target: &str) -> String {
     }
 }
 
+/// [`escaped_target_path_segment`] of [`current_target`] — what a
+/// recognizer comparing a path's crate-root `Ident` against the actively
+/// resolved name must compare against instead of the bare name, once a
+/// keyword rename is in play. A raw identifier `Ident` (`r#type`) compares
+/// equal to the *escaped* string `"r#type"`, not the bare `"type"` — using
+/// [`current_target`] directly here has the same effect as skipping this
+/// module's own [`ident_for_target`] when *emitting* the identifier: both
+/// silently produce a token that no longer matches what it's supposed to
+/// (Codex review, #2552, round 2 of the keyword-rename fix — this recognizer
+/// side was still comparing against the bare name after the emission side
+/// was already fixed).
+pub fn current_target_path_segment() -> String {
+    escaped_target_path_segment(&current_target())
+}
+
 #[cfg(test)]
 mod tests {
     use quote::quote;
@@ -826,6 +841,32 @@ mod tests {
             crate::idempotency_guard::block_has_replay_guard(&block),
             "recognizer must accept the actively-resolved crate name, not just the literal \
              \"autumn_web\""
+        );
+    }
+
+    /// Regression test for a second Codex round on the same #2552 scenario:
+    /// once the target is a keyword (`"type"`, from automatic resolution —
+    /// see `ident_for_target`/`rewrite`), an earlier-expanded macro's own
+    /// `finalize` pass emits the *raw* identifier `r#type`, not the bare
+    /// `type`. A recognizer comparing against the bare `current_target()`
+    /// (rather than `current_target_path_segment()`, which accounts for the
+    /// raw prefix) misses the match — the same class of bug as
+    /// `replay_guard_recognized_after_stacked_macro_rename` above, just
+    /// triggered by a keyword target instead of a plain renamed one.
+    #[test]
+    fn replay_guard_recognized_after_stacked_macro_rename_with_keyword_target() {
+        let _guard = set_target(Some("type"));
+        let block: syn::Block = syn::parse_quote! {{
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::r#type::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return __autumn_response;
+            }
+        }};
+        assert!(
+            crate::idempotency_guard::block_has_replay_guard(&block),
+            "recognizer must compare against the raw-escaped target, not the bare keyword"
         );
     }
 }
