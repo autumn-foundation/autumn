@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **testing:** a real-ACME end-to-end test drives the ACME order state
+  machine (order → HTTP-01 → finalize → issue) against a real, independently-
+  implemented ACME server — [Pebble](https://github.com/letsencrypt/pebble),
+  run as a Docker container via `testcontainers`' `host-port-exposure` tunnel
+  — asserting a genuine, parseable, not-yet-expired certificate is obtained
+  and hot-swapped into the live TLS resolver. Every other ACME test drives
+  the same `AcmeRenewalTask` against an in-process fake CA; this closes the
+  test-depth gap explicitly deferred from #1608/PR #1858 (issue #1863), so a
+  protocol-level regression (challenge ordering, the finalize payload shape,
+  polling) that the fake CA cannot see would still be caught. Wired into a
+  dedicated, Docker-gated CI step separate from both the fast ACME lane (no
+  Docker/network) and the general Docker-dependent-tests sweep. Test-only
+  coverage, no new agent-facing surface. [no-plugin]
 - **graph:** a queryable architecture graph derived from the app's own macros
   (issue #1747). Autumn already declares every architectural element through
   proc-macros it owns, but none of that survived expansion as something you
