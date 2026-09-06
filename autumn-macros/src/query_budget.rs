@@ -1222,6 +1222,30 @@ impl Analyzer {
             // (#2546 review, round 4). A `HANDLE_ACCESSORS` name is
             // different: those never issue a query even when awaited — they
             // only ever produce a handle to query with next.
+            //
+            // KNOWN LIMITATION (#2546 review, round 6): a checkout idiom
+            // like `db.pool().get().await?` (deadpool/bb8-style, and the
+            // shape `autumn-cli`'s own generated scaffold tests emit at
+            // `autumn-cli/src/generate/scaffold.rs:14419`) is *not* caught
+            // here — `get` is not a recognized accessor name, so this falls
+            // through to `false`. A fix was attempted: recurse into the
+            // receiver for any non-accessor terminal name, so `get` would
+            // inherit handle-ness from the `pool` accessor beneath it. That
+            // did catch the checkout idiom, but it is syntactically
+            // indistinguishable from a genuine terminal query made through
+            // an accessor-obtained handle
+            // (`state.db().find_recipients(...).await?`, the exact shape
+            // `query_budget_job_shaped_accessor_batched.rs` already pins as
+            // required to compile clean) — both are "some name, chained off
+            // an accessor call, then awaited." Recursing into the receiver
+            // fixed the former and silently reintroduced round four's exact
+            // regression on the latter, verified with the same fixture and
+            // reverted before landing. There is no reliable syntactic
+            // signal — no type information is available to this proc
+            // macro — that tells "a checkout wrapper" apart from "a named
+            // query" when both share this shape, so this stays a real,
+            // acknowledged boundary of the analysis rather than a bug
+            // fixable by another naming heuristic.
             Expr::MethodCall(mc) => HANDLE_ACCESSORS.contains(&mc.method.to_string().as_str()),
             _ => false,
         }

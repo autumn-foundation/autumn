@@ -268,13 +268,51 @@ where every other `#[query_budget]` fixture lives (no new test harness):
   present in this codebase's own documented usage; anything else surfaces
   the same way every gap in this family has — silently, on a future
   audit or review — and gets the same treatment when it does.
+- **Update (sixth Codex review round) — a real finding, verified, and then
+  reverted rather than patched further.** The review correctly identified
+  that `db.pool().get().await?` (a deadpool/bb8-style connection checkout —
+  `autumn-cli`'s own generated scaffold tests emit exactly this at
+  `autumn-cli/src/generate/scaffold.rs:14419`) is still not caught: `get`
+  is not a recognized accessor name, and `awaited_expr_is_fresh_handle`
+  only checked the outermost method name, never the receiver. A fix was
+  written — recurse into the receiver for any non-accessor terminal name,
+  so `get` inherits handle-ness from the `pool` accessor beneath it — and
+  it did catch the checkout idiom.
 
-  Five review rounds have now each found one distinct edge of the same
+  It also broke `query_budget_job_shaped_accessor_batched.rs`, an
+  **existing, already-verified fixture from this same PR's first commit**:
+  `state.db().find_recipients(&args.recipient_ids).await?` is syntactically
+  identical in shape to `db.pool().get().await?` — "some name, chained off
+  an accessor call, then awaited" — but the first is a genuine domain
+  query (whose result must not become a handle) and the second is a
+  connection checkout (whose result must). Recursing into the receiver
+  cannot tell them apart: it fixed the checkout case and silently
+  reintroduced round four's exact regression on the query case, caught by
+  rerunning the full `compile_pass_tests` suite before the fix was
+  committed.
+
+  There is no purely syntactic signal available to this proc macro — no
+  type information — that distinguishes "a checkout wrapper" from "a named
+  query" once both share this shape. Rather than reach for another naming
+  heuristic (a hardcoded list of checkout-sounding names like `get`,
+  `acquire`, `checkout`, `take`, …, which would be both incomplete and a
+  second parallel guess-list to keep in sync with `HANDLE_ACCESSORS`), the
+  attempted fix was reverted and the gap documented in code as a known,
+  acknowledged limitation. This is the first of the six review rounds
+  where the honest answer was "verified, but not safely fixable this way"
+  rather than a fix — consistent with Prospect's own standard that a
+  correctly-scoped "no" is a valid outcome, not a lesser one, when the
+  alternative is trading a rarer false negative for a more common false
+  positive.
+
+  Six review rounds have now each found one distinct edge of the same
   underlying shape (an awaited/unwrapped expression can mean three
   different things — a fresh handle, an unopened `Result`, or an executed
-  query's result — and only the first should ever be promoted). Every round
-  landed a real fix plus a regression fixture pinning it; none was a
-  documentation-only response.
+  query's result — and only the first should ever be promoted). Five
+  rounds landed a real fix plus a regression fixture pinning it; the sixth
+  landed a verified, documented, and deliberately un-fixed limitation
+  instead, because the alternative fix was checked and found to cost more
+  than it bought.
 
 ## 📊 Assay
 
