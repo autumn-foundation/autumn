@@ -828,6 +828,16 @@ jobs:
           # basecamp/kamal-proxy Docker Hub image) and needs the ssh client
           # installed above.
           cargo test -p autumn-cli --test deploy_e2e -- --ignored
+          # examples/saas and examples/teams (Wayfinder PR #2554, Codex finding):
+          # each carries its own `#[ignore = "requires Docker (testcontainers)"]`
+          # Postgres-integration suite in `tests/integration_test.rs`, but neither
+          # crate was named anywhere in this workflow, so none of those tests —
+          # old or new — ever ran in CI; they only ever compiled. Bare `--ignored`
+          # sweeps, same as the smaller per-crate sweeps above (autumn-cache-redis,
+          # autumn-search): every test in the file is a Postgres testcontainer
+          # test, so there is nothing to `--skip`.
+          cargo test -p saas --test integration_test -- --ignored
+          cargo test -p teams --test integration_test -- --ignored
 
   coverage:
     name: Coverage
