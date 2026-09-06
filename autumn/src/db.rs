@@ -1610,10 +1610,26 @@ fn redact_pool_target(url: &str) -> String {
             format!("{} ****", kept.join(" "))
         };
     }
-    if url.contains('@') || url.contains('?') {
-        return "****".to_owned();
+    // FAIL CLOSED. Everything above identified the target positively — a SQLite
+    // target, a URL `Url::parse` accepted, a keyword/value string
+    // `keyword_value_pairs` accepted. What reaches here could not be
+    // classified at all, and that includes a MALFORMED keyword/value string
+    // such as `host=db user=app password='hunter2`, which the parser rejects
+    // for the unterminated quote and which carries neither `@` nor `?`.
+    //
+    // A default of "hand it back verbatim" has now been wrong three times over
+    // (userinfo, then the query string, then keyword/value — each a shape this
+    // code did not anticipate), so the default is to mask. The exception is
+    // narrow and positive rather than a list of things to look out for: a
+    // single path-shaped token with no `=` (so it cannot carry a key/value
+    // pair), no `@` (no userinfo), no `?` (no query) and no whitespace (so it
+    // is one token, not a keyword/value string). A bare filesystem path is
+    // exactly that, and is the case where naming the target is the entire
+    // value of the message.
+    if !url.is_empty() && !url.contains(['=', '@', '?']) && !url.contains(char::is_whitespace) {
+        return url.to_owned();
     }
-    url.to_owned()
+    "****".to_owned()
 }
 
 #[cfg(feature = "sqlite")]
@@ -4569,9 +4585,17 @@ mod tests {
         );
         // Nothing identifying left to show.
         assert_eq!(redact_pool_target("password=hunter2"), "****");
-        // Unparseable AND credential-shaped: mask wholesale rather than guess.
+        // Unclassifiable: mask rather than guess. A MALFORMED keyword/value
+        // string is the case that keeps finding this fallback — the parser
+        // rejects it for the unterminated quote, and it carries neither `@`
+        // nor `?`, so a fail-open default handed the password back.
+        assert_eq!(
+            redact_pool_target("host=db user=app password='hunter2"),
+            "****"
+        );
         assert_eq!(redact_pool_target("://user:secret@host/db"), "****");
         assert_eq!(redact_pool_target("not-a-url?password=hunter2"), "****");
+        assert_eq!(redact_pool_target("garbage password=hunter2 more"), "****");
     }
 
     // The end-to-end contract the helper exists for: no refusal this module
@@ -4587,6 +4611,8 @@ mod tests {
             "postgres://localhost/app?sslpassword=hunter2",
             // The libpq keyword/value form: no URL shape at all.
             "host=db user=app password=hunter2",
+            // ...and the same, malformed, so neither parser accepts it.
+            "host=db user=app password='hunter2",
         ] {
             let config = DatabaseConfig {
                 url: Some(url.into()),

@@ -1760,9 +1760,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   password=hunter2`) is rebuilt from an allowlist of the keys that identify
   the target (`host`, `hostaddr`, `port`, `dbname`, `user`) — an allowlist
   rather than a `password`/`sslpassword` denylist, so a key this code has
-  never heard of cannot default to being printed. A bare filesystem path
-  stays legible, since naming it is the whole value of the message and there
-  is no credential in it to protect.
+  never heard of cannot default to being printed. Anything the redactor cannot
+  classify — a malformed keyword/value string among them — is masked outright:
+  the default is to hide, and the one exception is a single path-shaped token
+  carrying no `=`, `@`, `?` or whitespace, so a bare filesystem path stays
+  legible where naming it is the whole value of the message.
 
 - **SQLite pool construction accepted a target that names no backend (issue
   #1905):** under `--features sqlite`, `build_sqlite_pool` guarded only
