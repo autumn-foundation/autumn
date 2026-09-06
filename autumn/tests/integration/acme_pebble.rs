@@ -28,6 +28,14 @@
 //! DNS server needed the way [`acme_dns01`](super::acme_dns01)'s `FakeZone`
 //! provides for the wildcard/DNS-01 suite.
 //!
+//! `host-port-exposure` pulls its own small SSH-tunnel sidecar image from
+//! Docker Hub (separately from Pebble's own `ghcr.io` pull) — a second,
+//! unpinned registry dependency and a known source of incidental CI flakes
+//! on shared runner pools (Docker Hub's anonymous-pull rate limit). Accepted
+//! as the cost of testing the real container→host path at all; a failure
+//! pulling that sidecar is distinguishable in CI logs from a genuine ACME
+//! regression.
+//!
 //! Pebble's own HTTP-01 validation port is fixed at `5002` by its default
 //! bundled config (`test/config/pebble-config.json`, loaded automatically —
 //! it is the `-config` flag's own default) — not configurable per run without
@@ -84,13 +92,14 @@ const PEBBLE_HTTP01_PORT: u16 = 5002;
 /// `listenAddress`).
 const PEBBLE_ACME_PORT: u16 = 14000;
 
-/// The image is pulled by floating `latest` tag (Pebble ships no versioned
-/// tags on `ghcr.io/letsencrypt/pebble` as of writing — only `latest`, built
-/// from `main`) rather than a pinned digest: Pebble's ACME surface is a
-/// stable RFC 8555 subset that has not broken this test across releases, and
-/// pinning a digest would silently stop picking up Pebble's own fixes.
+/// Pinned to the rolling major-version tag (`ghcr.io/letsencrypt/pebble`
+/// publishes `latest`, `2`, `2.10`, `2.10.1`, …) rather than `latest`, which
+/// tracks Pebble's `main` branch and would let an upstream behavioral change
+/// break this CI step with no correlated autumn change. `2` still absorbs
+/// Pebble's own patch fixes without a silent major-version jump; a pinned
+/// digest would go further but would also silently stop picking those up.
 const PEBBLE_IMAGE: &str = "ghcr.io/letsencrypt/pebble";
-const PEBBLE_TAG: &str = "latest";
+const PEBBLE_TAG: &str = "2";
 
 fn now_unix() -> i64 {
     i64::try_from(
