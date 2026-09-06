@@ -82,6 +82,37 @@ already live behind `system-tests`) so it never compiles into this run, or be
 added to the step's `--skip` list. The one unconditionally-compiled exception
 (the access_log p99 timing bench) is named in the step's `--skip` list.
 
+##### `autumn-cli`'s `cli_tests` binary gets the same bare Docker sweep
+
+As of #1945, ci.yml's "Run Docker-dependent tests" step also runs a bare
+`--ignored` sweep over **`autumn-cli`**'s consolidated `cli_tests` binary, so a
+new house-pattern `#[ignore = "requires Docker (testcontainers)"]` test added
+to *any* module under `autumn-cli/tests/integration/` — new or existing —
+executes in CI with no workflow edit, the same guarantee the `autumn` sweep
+above gives. Before this, `cli_tests`'s Docker-gated tests were NOT
+auto-swept; only two filtered invocations ran anything (`offsite`,
+`db_scrub`), leaving 46 tests across 8 modules dark. The sweep also
+`--skip`s the pre-existing `generate_json_postgres.rs` Docker test, which
+already ran in `generator-conformance.yml`, so it doesn't run twice.
+
+That sweep's `--skip` list names, **by exact test name** (never
+`--skip <module>::`), every `#[ignore]`d test that is NOT a Docker test: it
+instead scaffolds and cargo-check/build/runs a fresh generated project
+(`#[ignore = "slow: ..."]`), which is too slow for the fast Docker step and
+belongs in `generator-conformance.yml`'s own matrix'd job instead, named
+explicitly there (same convention as every other generator-shaped gate in
+that file). Skipping by exact name, not whole module, matters: a
+module-prefix skip would silently swallow any *Docker* test later added to
+that same file, defeating the very guarantee this sweep exists to give.
+Adding a new cold-start-compile test — to a new module, or an existing
+skipped one — needs BOTH a `--skip <exact test name>` line added to ci.yml's
+sweep AND its own named step in `generator-conformance.yml`, or it runs in
+the (wrong, slow, but not silently dark) Docker step, or never runs at all,
+respectively. `autumn-cli/tests/integration/repo_hygiene.rs`'s
+`cli_tests_cold_start_ignored_tests_are_ci_named` test enforces the
+generator-conformance.yml half for the tests #1945 added; extend its list
+when adding another.
+
 #### 2. Isolated Integration Tests (Separate Binaries)
 
 Only create separate test binaries if the test:

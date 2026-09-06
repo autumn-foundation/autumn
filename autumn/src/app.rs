@@ -5027,10 +5027,7 @@ impl AppBuilder {
                             error = %e,
                             "ACME renewal: falling back to an in-process coordinator"
                         );
-                        leadership_degraded = !matches!(
-                            config.scheduler.backend,
-                            crate::config::SchedulerBackend::InProcess
-                        );
+                        leadership_degraded = config.scheduler.backend.is_fleet_distributed();
                         std::sync::Arc::new(crate::scheduler::InProcessSchedulerCoordinator::new(
                             config.scheduler.resolved_replica_id(),
                         ))
@@ -9107,7 +9104,7 @@ const fn acme_fleet_warning(
     backend: crate::config::SchedulerBackend,
     dns01: bool,
 ) -> Option<&'static str> {
-    if matches!(backend, crate::config::SchedulerBackend::InProcess) {
+    if !backend.is_fleet_distributed() {
         return None;
     }
     Some(if dns01 {

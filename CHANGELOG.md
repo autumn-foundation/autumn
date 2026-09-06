@@ -1487,6 +1487,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliberately differ (no Unix socket, no in-place upgrade handoff). Issue
   #1603.
 
+- **ci:** `autumn-cli`'s consolidated `cli_tests` binary now gets the same
+  discovery sweep as the `autumn` crate's `integration_tests` binary
+  (#1945): a bare `--ignored` run over `cli_tests` in ci.yml's
+  Docker-dependent-tests step, so a new `#[ignore = "requires Docker
+  (testcontainers)"]` test in any `autumn-cli/tests/integration/*.rs` module
+  runs in CI automatically. Before this, only two hand-picked filters
+  (`offsite`, `db_scrub`) ran anything from that binary, leaving 46 Docker
+  tests across 8 modules (`db.rs`, `db_pull.rs`,
+  `generate_lock_version_postgres.rs`, `generate_references_postgres.rs`,
+  `migrate_down.rs`, `schema_migrate.rs`, `schema_pull.rs`, `test_command.rs`)
+  dark since they were written — PR #1985's noted follow-up. The sweep's
+  `--skip` list routes the binary's other `#[ignore]`d tests — the ones that
+  scaffold and cargo-check/build/run a fresh generated project instead of
+  touching Docker — to `generator-conformance.yml`, where 15 of them (across
+  `api_scaffold`, `cloud_native_scaffold`, `generate_position_scaffold`,
+  `scaffold_belongs_to`, `scaffold_bulk_delete`, `scaffold_rich_text`,
+  `scaffold_search`, `scaffold_trash`, `seed_model_linking`, `serve`, and two
+  in `scaffold_form_for`) are now named there for the first time, closing the
+  same gap for that half of the binary. The sweep also `--skip`s the
+  pre-existing `generate_json_postgres.rs` Docker test, which already ran in
+  `generator-conformance.yml` before this change, so it isn't doubled up.
+  Two new `autumn-cli/tests/integration/repo_hygiene.rs` tests guard both
+  halves of the wiring going forward. [no-plugin]
+
 ### Changed
 
 - **ci: the Docker/testcontainer sweep runs as its own `Test (Docker)` job
@@ -1501,6 +1525,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   claimant of. Branch protection still names only the per-OS `Test (…)` checks,
   so `Test (Docker)` needs adding there to block merge again. [no-plugin] —
   CI-only; no API, behaviour or feature change. (#1747)
+- **acme:** [no-plugin] Internal cleanup, no behavior change (#1864): the owner-only
+  temp-write-then-rename idiom, previously duplicated between
+  `acme::store::FsAcmeStore` and the failure-capture capsule writer, is now
+  one shared helper; `FsAcmeStore` gained a `find_cert_for_domains`/
+  `list_certs` API that `autumn doctor`'s ACME preflight reuses instead of
+  re-deriving the on-disk cert-path layout by hand; and the ACME renewal
+  spawn site queries fleet-distribution through a named
+  `SchedulerCoordinator`/`SchedulerBackend` predicate instead of matching the
+  scheduler config enum inline.
 - **plugin-conformance:** **Breaking:** `plugin_conformance::ConformanceConfig`
   gains a `contract` field and is now `#[non_exhaustive]`, so it can no longer
   be built with a struct literal — use `ConformanceConfig::new(name)` and the
@@ -1801,6 +1834,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused/reset split below — that one classifies *which* connection failures
   count, this one stops the predecessor being killed mid-drain.
   [no-plugin] — test-only; no API or behaviour change. (#1747, #2372, #2462)
+- **`autumn new`'s starter template shipped three cookie-consent routes that
+  failed `autumn routes audit` (issue #1214 follow-up):** the cookie-consent
+  banner feature added `POST /consent/accept`, `POST /consent/reject`, and
+  `GET /consent/manage` to `main.rs.tmpl`, but — unlike every other starter
+  handler — never marked them `#[public]`, so a fresh `autumn new` app failed
+  its own generated CI's routes-audit gate before a single line of app code
+  was written. Invisible until now: `scaffolded_app_passes_routes_audit_gate`
+  (added for #2154 specifically to catch this class of regression) was one of
+  the `cli_tests` tests #1945 revived — it had never run in CI before. Added
+  `#[public]` to all three handlers, matching the pattern documented right
+  above them in the template. [no-plugin] — restores previously-documented
+  behavior; no new or changed API.
+
 - **`route_macro` lost a guarded handler's OpenAPI response schema under
   `#[throttle]`/`#[step_up]` (issue #2516):** #2488 moved the
   `#[throttle]`/`#[step_up]` auth/rate-limit checks out of the handler body
