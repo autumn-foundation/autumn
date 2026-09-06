@@ -57,10 +57,14 @@ Each `(task, tick)` is leased in an `autumn_scheduler_leases` table in the same
 database file, so exactly one process runs each tick. The runtime creates that
 table itself.
 
-The lease carries an expiry, not a session: a leader that dies without releasing
-frees the tick after `lease_ttl_secs`, rather than wedging the task. Set the TTL
-above the longest a tick body can take, so a live leader is never preempted
-mid-tick.
+The lease carries an expiry, not a session. The row is what makes the tick
+claimed, and it stays for the whole of `lease_ttl_secs` whether the leader
+finished or died, so a process whose timer reaches the same tick a moment later
+cannot run it a second time. The next acquire reaps the row once it expires.
+
+Set the TTL longer than both the spread between the processes' timers and the
+longest a tick body can take. This is stricter than the Postgres coordinator,
+which frees the tick key as soon as the leader finishes.
 
 `backend = "sqlite"` requires the `sqlite` cargo feature.
 

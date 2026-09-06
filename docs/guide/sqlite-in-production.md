@@ -253,10 +253,17 @@ advisory locks, so it gets two single-host coordinators instead:
   web tier and a worker tier run side by side, or across a rolling restart where
   the old and new process overlap.
 
-The lease carries an expiry, not a session. A leader that dies without releasing
-frees the tick after `scheduler.lease_ttl_secs` (default 300), rather than
-wedging the task. Set the TTL above the longest a tick body can take, so a live
-leader is never preempted mid-tick.
+The lease carries an expiry, not a session. The row is what makes the tick
+claimed, and it stays for the whole of `scheduler.lease_ttl_secs` (default 300)
+whether the leader finished or died — so a second process whose timer reaches the
+same tick a moment later cannot run it again. The next acquire reaps the row once
+it expires.
+
+Set the TTL longer than both the spread between the processes' timers and the
+longest a tick body can take, so a live leader is never preempted mid-tick.
+
+This is stricter than the Postgres coordinator, whose `pg_advisory_unlock` frees
+the tick key the moment the leader finishes.
 
 `scheduler.backend = "postgres"` is refused at boot under SQLite, with a message
 naming both substitutes.

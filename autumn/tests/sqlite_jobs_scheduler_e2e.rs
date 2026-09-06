@@ -969,13 +969,25 @@ async fn sqlite_scheduler_lease_elects_one_leader_per_tick() {
         "the second coordinator must observe the tick as taken"
     );
 
+    // Releasing does NOT free the tick. A second process whose timer reaches the
+    // same tick a moment later must not run it again, so the row keeps the tick
+    // reserved until the lease expires.
     lease_a.release().await.expect("release");
+    assert!(
+        b.try_acquire("digest", "digest:1", TaskCoordination::Fleet)
+            .await
+            .expect("acquire does not error")
+            .is_none(),
+        "a completed tick stays claimed for the rest of its lease"
+    );
 
+    // A different tick of the same task is a different key, so the next tick
+    // runs normally.
     let lease_b = b
-        .try_acquire("digest", "digest:1", TaskCoordination::Fleet)
+        .try_acquire("digest", "digest:2", TaskCoordination::Fleet)
         .await
         .expect("acquire does not error")
-        .expect("a released tick is free again");
+        .expect("the next tick is a separate claim");
     assert_eq!(lease_b.leader_id(), "replica-b");
     lease_b.release().await.expect("release");
 
@@ -1014,8 +1026,8 @@ async fn sqlite_scheduler_lease_expires_after_its_ttl() {
     )
     .expect("coordinator b");
 
-    // Drop the lease without releasing it: release is explicit, so this is the
-    // leader crashing mid-tick.
+    // Whether the leader releases or crashes, the tick stays reserved until the
+    // lease expires — this covers the crash.
     let lease = a
         .try_acquire("sweep", "sweep:1", TaskCoordination::Fleet)
         .await
@@ -1432,6 +1444,97 @@ async fn sqlite_job_backend_dashboard_retries_and_discards_failed_jobs() {
         after.failed.total, 0,
         "a discarded job leaves every dashboard list"
     );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
+/// (22) Retention prunes a terminal row whose TTL dedup hold has expired, and
+/// keeps one whose hold is still live. Without the stored TTL the first case
+/// could never be pruned at all.
+#[tokio::test]
+async fn sqlite_job_backend_prunes_expired_ttl_unique_history() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    let mut info = job_info("sqlite_prunable_job", 3, |_state, _payload| {
+        Box::pin(async move { Ok(()) })
+    });
+    info.uniqueness = Some(JobUniqueness {
+        by: vec!["order_id".to_string()],
+        window: JobUniquenessWindow::TtlMs(60_000),
+    });
+    job::start_runtime(vec![info], &state, &shutdown, &sqlite_job_config(3), false)
+        .expect("the enqueue-only sqlite runtime starts");
+
+    job::enqueue("sqlite_prunable_job", serde_json::json!({ "order_id": 1 }))
+        .await
+        .expect("enqueue");
+    eventually(200, "the queue schema to be created", async || {
+        queue_table_exists(&pool).await
+    })
+    .await;
+
+    // The stored TTL is what lets the prune tell a live hold from a dead one.
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) AS value FROM autumn_jobs WHERE unique_ttl_ms = 60000"
+        )
+        .await,
+        1,
+        "a TTL-window enqueue records the window it was given"
+    );
+
+    // Settle it long ago, with its dedup hold long expired.
+    {
+        use diesel_async::RunQueryDsl as _;
+        let mut conn = pool.get().await.expect("sqlite connection");
+        diesel::sql_query(
+            "UPDATE autumn_jobs SET status = 'completed', finished_at = 1, enqueued_at = 1",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("settle the row");
+    }
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+
+    // Start a worker runtime with a retention window; its maintenance loop
+    // prunes the row the old predicate could never reach.
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    state.insert_extension(autumn_web::config::AutumnConfig {
+        retention: autumn_web::config::RetentionConfig {
+            job_history: Some("1s".to_string()),
+            ..autumn_web::config::RetentionConfig::default()
+        },
+        ..autumn_web::config::AutumnConfig::default()
+    });
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    job::start_runtime(
+        vec![job_info("sqlite_prunable_job", 3, |_state, _payload| {
+            Box::pin(async move { Ok(()) })
+        })],
+        &state,
+        &shutdown,
+        &sqlite_job_config(3),
+        true,
+    )
+    .expect("the worker sqlite runtime starts");
+
+    eventually(800, "the expired TTL-unique row to be pruned", async || {
+        count(&pool, "SELECT COUNT(*) AS value FROM autumn_jobs").await == 0
+    })
+    .await;
 
     shutdown.cancel();
     job::clear_global_job_client();

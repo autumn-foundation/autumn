@@ -405,8 +405,8 @@ impl SqliteLeaseSchedulerCoordinator {
     }
 }
 
-/// Owner token minted per acquire, so a coordinator can only release the lease
-/// it actually took — never one that expired and was granted to someone else.
+/// Owner token minted per acquire, recorded on the row so an operator reading
+/// the table can tell which process claimed a tick.
 #[cfg(feature = "sqlite")]
 fn next_lease_owner(replica_id: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -499,11 +499,7 @@ impl SchedulerCoordinator for SqliteLeaseSchedulerCoordinator {
             }
             Ok(Some(SchedulerLease::sqlite(
                 self.replica_id.clone(),
-                SqliteTableLease {
-                    pool: self.pool.clone(),
-                    key,
-                    owner,
-                },
+                SqliteTableLease { key },
             )))
         })
     }
@@ -511,46 +507,33 @@ impl SchedulerCoordinator for SqliteLeaseSchedulerCoordinator {
 
 /// A held `SQLite` scheduler lease.
 ///
-/// Release is explicit and deletes the row. A lease that is dropped without a
-/// release stays until it expires — the same outcome as the process dying,
-/// which is what the expiry exists for.
+/// Release does **not** delete the row, and that is the point: the row is what
+/// makes the tick claimed. Deleting it would let a second process whose timer
+/// reaches the same tick a moment later insert the same key and run the tick a
+/// second time — duplicating whatever the task does. So a released lease simply
+/// stops being renewed, the tick stays reserved for the rest of
+/// `scheduler.lease_ttl_secs`, and the next acquire reaps the row once it
+/// expires. Set the TTL longer than the spread between the processes' timers.
+///
+/// This is stricter than the Postgres coordinator, whose `pg_advisory_unlock`
+/// frees the key the moment the leader finishes.
 #[cfg(feature = "sqlite")]
 struct SqliteTableLease {
-    pool: diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
     key: i64,
-    owner: String,
 }
 
 #[cfg(feature = "sqlite")]
 impl SqliteTableLease {
+    #[allow(
+        clippy::unused_async,
+        reason = "matches the fallible async release the Postgres lease has, so \
+                  `SchedulerLease::release` keeps one shape across backends"
+    )]
     async fn release(self) -> AutumnResult<()> {
-        use diesel_async::RunQueryDsl as _;
-
-        let mut conn = self.pool.get().await.map_err(|error| {
-            AutumnError::service_unavailable_msg(format!(
-                "scheduler sqlite lease release connection unavailable: {error}"
-            ))
-        })?;
-        // Owner-scoped: if this lease already expired and another replica took
-        // the tick, this deletes nothing rather than freeing their lease.
-        let deleted = diesel::sql_query(
-            "DELETE FROM autumn_scheduler_leases WHERE lock_key = ? AND owner = ?",
-        )
-        .bind::<diesel::sql_types::BigInt, _>(self.key)
-        .bind::<diesel::sql_types::Text, _>(&self.owner)
-        .execute(&mut *conn)
-        .await
-        .map_err(|error| {
-            AutumnError::internal_server_error_msg(format!(
-                "sqlite scheduler lease release failed: {error}"
-            ))
-        })?;
-        if deleted == 0 {
-            tracing::warn!(
-                lock_key = self.key,
-                "sqlite scheduler lease had already expired when released"
-            );
-        }
+        tracing::debug!(
+            lock_key = self.key,
+            "sqlite scheduler tick released; the row keeps the tick reserved until it expires"
+        );
         Ok(())
     }
 }

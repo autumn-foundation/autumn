@@ -554,7 +554,12 @@ impl SqliteJobTrackingStore {
         use diesel::OptionalExtension as _;
         use diesel_async::RunQueryDsl as _;
 
-        let now_ms = self.now_ms();
+        // One clock sample for both the record's `updated_at` and the column.
+        // `reset_for_retry` compares the column against the value it read out
+        // of the record, so two samples that straddle a millisecond make that
+        // compare-and-swap match nothing and leave an admin-retried job stuck.
+        let now = self.clock.now();
+        let now_ms = now.timestamp_millis();
         let mut conn = self.conn().await?;
         let row = diesel::sql_query(
             "SELECT record FROM autumn_job_tracking WHERE key = ? AND expires_at > ?",
@@ -578,7 +583,7 @@ impl SqliteJobTrackingStore {
                 ))
             })?;
         f(&mut record);
-        record.updated_at = self.clock.now();
+        record.updated_at = now;
         let payload = serde_json::to_string(&record).map_err(|error| {
             AutumnError::internal_server_error_msg(format!(
                 "job tracking serialize failed: {error}"
@@ -601,8 +606,11 @@ impl SqliteJobTrackingStore {
         Ok(())
     }
 
-    /// Serialize a fresh pending record for `owner`, stamped now.
-    fn pending_record(&self, owner: TrackedJobOwner) -> AutumnResult<(TrackedJobRecord, String)> {
+    /// Serialize a fresh pending record for `owner`, stamped `now`.
+    ///
+    /// Takes the instant rather than reading the clock, so the caller writes
+    /// the same value into the record and the column.
+    fn pending_record(owner: TrackedJobOwner, now: DateTime<Utc>) -> AutumnResult<String> {
         let record = TrackedJobRecord {
             status: TrackedJobStatus::Pending,
             progress_pct: None,
@@ -610,14 +618,13 @@ impl SqliteJobTrackingStore {
             result: None,
             error: None,
             owner,
-            updated_at: self.clock.now(),
+            updated_at: now,
         };
-        let payload = serde_json::to_string(&record).map_err(|error| {
+        serde_json::to_string(&record).map_err(|error| {
             AutumnError::internal_server_error_msg(format!(
                 "job tracking serialize failed: {error}"
             ))
-        })?;
-        Ok((record, payload))
+        })
     }
 }
 
@@ -627,8 +634,9 @@ impl JobTrackingStore for SqliteJobTrackingStore {
         Box::pin(async move {
             use diesel_async::RunQueryDsl as _;
 
-            let now_ms = self.now_ms();
-            let (_, payload) = self.pending_record(owner)?;
+            let now = self.clock.now();
+            let now_ms = now.timestamp_millis();
+            let payload = Self::pending_record(owner, now)?;
             let mut conn = self.conn().await?;
             diesel::sql_query(
                 "INSERT INTO autumn_job_tracking (key, record, updated_at, expires_at) \
@@ -690,8 +698,9 @@ impl JobTrackingStore for SqliteJobTrackingStore {
         Box::pin(async move {
             use diesel_async::RunQueryDsl as _;
 
-            let now_ms = self.now_ms();
-            let (_, payload) = self.pending_record(owner)?;
+            let now = self.clock.now();
+            let now_ms = now.timestamp_millis();
+            let payload = Self::pending_record(owner, now)?;
             let mut conn = self.conn().await?;
             // Compare-and-swap: the reset applies only while nothing has
             // written since `expected_updated_at` was read, so a retry that

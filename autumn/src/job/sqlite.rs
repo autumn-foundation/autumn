@@ -291,6 +291,7 @@ pub(super) async fn ensure_schema(pool: &SqlitePool) -> AutumnResult<()> {
            last_error         TEXT, \
            unique_key         TEXT, \
            unique_window      TEXT, \
+           unique_ttl_ms      BIGINT, \
            pending_unique_key TEXT, \
            concurrency_key    TEXT, \
            concurrency_limit  INTEGER, \
@@ -324,6 +325,12 @@ pub(super) async fn ensure_schema(pool: &SqlitePool) -> AutumnResult<()> {
                 ))
             })?;
     }
+    // A table an earlier build of this runtime created has no `unique_ttl_ms`.
+    // SQLite has no `ADD COLUMN IF NOT EXISTS`, and a duplicate column is the
+    // ordinary "already migrated" case, so the error is the check.
+    let _ = diesel::sql_query("ALTER TABLE autumn_jobs ADD COLUMN unique_ttl_ms BIGINT")
+        .execute(&mut *conn)
+        .await;
     Ok(())
 }
 
@@ -422,9 +429,9 @@ pub(super) async fn enqueue_job_at(
     let inserted = diesel::sql_query(format!(
         "INSERT INTO autumn_jobs \
          (id, name, queue, payload, status, attempt, max_attempts, initial_backoff_ms, \
-          enqueued_at, run_at, unique_key, unique_window, concurrency_key, concurrency_limit, \
-          traceparent, tracestate) \
-         SELECT ?, ?, ?, ?, '{STATUS_ENQUEUED}', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+          enqueued_at, run_at, unique_key, unique_window, unique_ttl_ms, concurrency_key, \
+          concurrency_limit, traceparent, tracestate) \
+         SELECT ?, ?, ?, ?, '{STATUS_ENQUEUED}', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
          WHERE {dedup_guard} \
          ON CONFLICT (name, unique_key) \
            WHERE unique_key IS NOT NULL AND status IN ('{STATUS_ENQUEUED}', '{STATUS_RUNNING}') \
@@ -442,6 +449,7 @@ pub(super) async fn enqueue_job_at(
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
         constraints.unique_window_tag().map(str::to_owned),
     )
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(unique_ttl_ms)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(concurrency_key)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(concurrency_limit)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(traceparent)
@@ -955,8 +963,10 @@ async fn update_concurrency_blocked_gauges(pool: &SqlitePool, state: &AppState) 
 /// Delete terminal rows past the configured `retention.job_history` window.
 ///
 /// Opt-in: with no window set, history is kept forever, exactly as on Postgres.
-/// A row still holding a TTL dedup key is never removed, or a replacement
-/// enqueue would slip past the window it is meant to be deduped by.
+/// A row whose TTL dedup hold is still live is kept, or a replacement enqueue
+/// would slip past the window it is meant to be deduped by. `unique_ttl_ms` is
+/// what makes that check exact: without it a TTL-unique row could never be
+/// pruned at all, however long ago it settled.
 async fn prune_job_history(pool: &SqlitePool, state: &AppState, window: std::time::Duration) {
     use diesel_async::RunQueryDsl as _;
 
@@ -974,18 +984,21 @@ async fn prune_job_history(pool: &SqlitePool, state: &AppState, window: std::tim
     let Ok(mut conn) = pool.get().await else {
         return;
     };
-    let cutoff =
-        now_ms(state).saturating_sub(i64::try_from(window.as_millis()).unwrap_or(i64::MAX));
+    let now = now_ms(state);
+    let cutoff = now.saturating_sub(i64::try_from(window.as_millis()).unwrap_or(i64::MAX));
     if let Err(error) = diesel::sql_query(format!(
         "DELETE FROM autumn_jobs \
          WHERE id IN ( \
            SELECT id FROM autumn_jobs \
            WHERE status IN ('{STATUS_COMPLETED}', '{STATUS_FAILED}', '{STATUS_DISCARDED}') \
              AND finished_at IS NOT NULL AND finished_at < ? \
-             AND NOT (unique_key IS NOT NULL AND unique_window = 'ttl') \
+             AND NOT ( \
+               unique_key IS NOT NULL AND unique_window = 'ttl' \
+               AND enqueued_at > ? - COALESCE(unique_ttl_ms, 0)) \
            LIMIT {HISTORY_PRUNE_BATCH})"
     ))
     .bind::<diesel::sql_types::BigInt, _>(cutoff)
+    .bind::<diesel::sql_types::BigInt, _>(now)
     .execute(&mut *conn)
     .await
     {
@@ -1568,6 +1581,10 @@ impl SqliteJobAdminBackend {
         // Snapshot the tracking record before the UPDATE makes the retry
         // visible to workers, so the reset can detect a retry that finishes
         // faster than this function returns.
+        //
+        // The UPDATE also restores a `pending`-window dedup key: claiming moved
+        // it to `pending_unique_key`, and re-enqueueing without it would leave
+        // the retried job undeduplicated while it waits.
         let pre_retry_row = diesel::sql_query(format!(
             "SELECT payload FROM autumn_jobs WHERE id = ? AND status = '{STATUS_FAILED}'"
         ))
@@ -1591,7 +1608,18 @@ impl SqliteJobAdminBackend {
             "UPDATE autumn_jobs \
              SET status = '{STATUS_ENQUEUED}', attempt = 1, run_at = ?, enqueued_at = ?, \
                  started_at = NULL, finished_at = NULL, \
-                 claimed_by = NULL, claimed_at = NULL, last_error = NULL \
+                 claimed_by = NULL, claimed_at = NULL, last_error = NULL, \
+                 unique_key = CASE \
+                   WHEN pending_unique_key IS NOT NULL AND NOT EXISTS ( \
+                     SELECT 1 FROM autumn_jobs dup \
+                     WHERE dup.name = autumn_jobs.name \
+                       AND dup.unique_key = autumn_jobs.pending_unique_key \
+                       AND dup.id != autumn_jobs.id \
+                       AND dup.status IN ('{STATUS_ENQUEUED}', '{STATUS_RUNNING}')) \
+                   THEN pending_unique_key \
+                   ELSE unique_key \
+                 END, \
+                 pending_unique_key = NULL \
              WHERE id = ? AND status = '{STATUS_FAILED}' \
              RETURNING payload"
         ))
