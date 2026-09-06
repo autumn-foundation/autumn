@@ -1235,8 +1235,25 @@ jobs:
           # the fixtures are fine and this was an artifact of the environment,
           # not a regression. `compile_fail::` still runs, and still gates
           # merge, in the four `trybuild` shards.
+          #
+          # `--skip sim_` for the SECOND reason the `test` job skips it, and it
+          # is this lane's own doing: dropping `compile_fail::` above frees the
+          # libtest thread pool exactly the way pulling trybuild into its own
+          # job did, and the `sim_*` determinism tests fail under that
+          # concurrency (`sim_retry_storm`, `sim_fault_plan` — see the `Run the
+          # simulation suite single-threaded` step). Before that skip this lane
+          # still ran trybuild, so the simulations were trickling through its
+          # gaps and never saw full parallelism. Skipping trybuild without
+          # skipping `sim_` would hand this lane the known-flaky execution mode
+          # and let it fail otherwise-green PRs (Codex review).
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
-            -- --skip compile_fail::
+            -- --skip compile_fail:: --skip sim_
+          # The same subset, single-threaded, still instrumented — so coverage
+          # keeps the `sim_*` modules rather than trading a flake for a hole.
+          # No rebuild: same package, same features, same target dir, so this
+          # re-runs binaries the step above already built.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            -- sim_ --test-threads=1
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Generate coverage (plugin-sandbox + sqlite)
         if: matrix.lane == 'sandbox-sqlite'
