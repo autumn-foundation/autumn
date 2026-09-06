@@ -234,6 +234,19 @@ async fn main() {
 Use `.one_off_tasks(one_off_tasks![...])` for `#[task]` handlers invoked by
 `autumn task <name>`.
 
+`#[autumn_web::main]` takes optional arguments that tune the tokio runtime it
+builds — `flavor` (`"multi_thread"`, the default, or `"current_thread"`),
+`worker_threads`, `max_blocking_threads`, `thread_name`, `thread_stack_size`,
+`thread_keep_alive = "30s"`, and `configure = path::to::fn`, a
+`fn(&mut tokio::runtime::Builder)` run after the others as the escape hatch for
+`Builder` methods the list doesn't name (unreleased). Numeric arguments take
+expressions, not only literals. Reach for them only with a measurement in hand:
+with no arguments the runtime is tokio's defaults, and the job runner,
+scheduled tasks, and mailer share it, so an undersized worker count throttles
+those too. An unknown, repeated, or zero-valued argument — or `worker_threads`
+under `flavor = "current_thread"`, where it would do nothing — is a compile
+error. See `docs/guide/getting-started.md` "Tuning the Tokio runtime".
+
 ## AppBuilder API
 
 | Method | Purpose |

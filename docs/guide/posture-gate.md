@@ -106,11 +106,22 @@ another is not decidable from the strings, and a gate that blocks on
 ## Turning it on
 
 > **The CLI has to be new enough.** The scaffolded workflow installs the
-> `autumn` release your app's `autumn-web` version tracks, and `routes posture`
-> did not exist in every release. If yours predates it the gate fails on its
-> first run, naming the problem — raise `autumn-web` and the workflow's pin
-> together. It fails rather than skipping on purpose: a gate that waves a pull
-> request through because its own tooling is too old is worse than a red one.
+> `autumn` release your app's `autumn-web` version tracks. If `routes
+> posture` postdates that release, it probes forward through the next few
+> releases and installs the first one that has it — for that run only —
+> instead of staying stuck. That's a specific, bounded release, not a moving
+> "latest": it doesn't drift further from your `autumn-web` version with
+> every later, unrelated release. But it also doesn't resolve itself —
+> the workflow still installs your pinned `autumn-web` version first, on
+> every run, so publishing a newer compatible release upstream changes
+> nothing here on its own. The fallback keeps firing until you raise your
+> app's `autumn-web` version and rerun `autumn upgrade --apply` to pick up
+> a pin that already has the command. Until then, the gate still runs
+> (rather than staying red until you raise `autumn-web` yourself), just
+> under a CLI that may not exactly match your `autumn-web` version. If
+> nothing in range has the command, the first run fails, naming it. It
+> fails rather than skipping on purpose: a gate that waves a pull request
+> through because its own tooling is too old is worse than a red one.
 
 
 **New apps** get it by default: `autumn new` scaffolds

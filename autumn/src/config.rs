@@ -4138,36 +4138,32 @@ impl AutumnConfig {
                     }
                     path.pop();
                 } else if path.is_empty() && plugin_config_roots.contains(k) && val.is_table() {
-                    // A plugin has declared this TOP-LEVEL root as its own config
-                    // section (via `AppBuilder::config_section`). It is known AND
-                    // opaque: accept it and do NOT descend — the plugin, not core,
-                    // owns validation of its subtree. The `path.is_empty()` guard
-                    // keeps this strictly the TRUE top-level root (`[media]`,
-                    // path `[]`), so a key that merely shares a plugin-root name
-                    // while nested inside a known section is still validated
-                    // normally (fail-closed).
+                    // A plugin has declared this top-level root as its own config
+                    // section, via `AppBuilder::config_section`. It is known and opaque:
+                    // accept it and do not descend, because the plugin, not core, owns
+                    // validation of its subtree. The `path.is_empty()` guard keeps this
+                    // strictly the true top-level root (`[media]`, path `[]`), so a key
+                    // that merely shares a plugin-root name while nested inside a known
+                    // section is still validated normally.
                     //
-                    // The `val.is_table()` guard keeps the exemption TABLE-only:
-                    // `config_section` declares a top-level config TABLE (`[media]`),
-                    // so a registered root written as a scalar or array
-                    // (`media = "enabled"`, `media = ["a", "b"]`) is a malformed
-                    // section — nothing would deserialize it and the app would boot
-                    // on default plugin config. A non-table value therefore does NOT
-                    // match here and falls through to the normal unknown-root strict
-                    // rejection below, failing loudly instead of booting on defaults.
+                    // The `val.is_table()` guard keeps the exemption table-only:
+                    // `config_section` declares a top-level config table, so a registered
+                    // root written as a scalar or array (`media = "enabled"`, `media =
+                    // ["a", "b"]`) is a malformed section that nothing would deserialize,
+                    // and the app would boot on default plugin config. A non-table value
+                    // therefore falls through to the normal unknown-root strict rejection
+                    // below and fails loudly.
                     //
-                    // A profile-prefixed plugin root (`[profile.<env>.media]`,
-                    // path `["profile","<env>"]`) is deliberately NOT exempted and
-                    // falls through to the normal unknown-root strict rejection:
-                    // the plugin consumes ONLY the top-level `[media]` table (its
-                    // reader deserializes `root.media` directly and does not apply
-                    // Autumn's profile merge), so exempting a profile layer the
-                    // plugin cannot read would let a strict app with media settings
-                    // only under `[profile.<env>.media]` boot SILENTLY on default
-                    // plugin config instead of failing loudly. Profile-aware plugin
-                    // config is a separate, larger enhancement. Deliberately NOT
-                    // added to `valid_keys`, which would make the walk recurse and
-                    // flag every one of the plugin's children as unknown.
+                    // A profile-prefixed plugin root (`[profile.<env>.media]`, path
+                    // `["profile","<env>"]`) is deliberately not exempted and falls
+                    // through to that same rejection: the plugin consumes only the
+                    // top-level `[media]` table — its reader deserializes `root.media`
+                    // directly and does not apply Autumn's profile merge — so exempting a
+                    // profile layer the plugin cannot read would let a strict app with
+                    // media settings only under `[profile.<env>.media]` boot silently on
+                    // defaults. Profile-aware plugin config is a separate, larger
+                    // enhancement. Deliberately not added to `valid_keys`, which would
+                    // make the walk recurse and flag every plugin child as unknown.
                 } else {
                     let mut full_path_parts = path.clone();
                     full_path_parts.push(k.clone());
@@ -4243,17 +4239,15 @@ impl AutumnConfig {
                     path.pop();
                 } else if plugin_config_roots.contains(k) && val.is_table() {
                     // A plugin has declared this top-level root as its own config
-                    // section (via `AppBuilder::config_section`). It is known AND
-                    // opaque: accept it and do NOT descend — the plugin, not core,
-                    // owns validation of its subtree. Deliberately NOT injected
-                    // into `root_keys`, which would make the walk recurse and flag
-                    // every one of the plugin's children as unknown.
-                    //
-                    // The `val.is_table()` guard keeps the exemption TABLE-only
-                    // (`config_section` declares a top-level `[media]` TABLE): a
-                    // registered root written as a scalar/array is malformed and
-                    // falls through to the unknown-root strict rejection below
-                    // instead of being silently exempted and booting on defaults.
+                    // section, via `AppBuilder::config_section`. It is known and opaque:
+                    // accept it and do not descend, because the plugin owns validation of
+                    // its subtree. Deliberately not injected into `root_keys`, which would
+                    // make the walk recurse and flag every plugin child as unknown. The
+                    // `val.is_table()` guard keeps the exemption table-only, since
+                    // `config_section` declares a top-level `[media]` table: a registered
+                    // root written as a scalar or array is malformed and falls through to
+                    // the unknown-root strict rejection below rather than being exempted
+                    // and booting on defaults.
                 } else {
                     let mut closest: Option<&str> = None;
                     let mut min_dist = usize::MAX;
@@ -4595,60 +4589,46 @@ impl AutumnConfig {
         let mut warn_only = Vec::new();
         let mut opaque_roots = Vec::new();
         for (path, sug, schema_parent, is_table, is_top_level) in errors {
-            // Deploy-CLI leniency (#2063/#2067): a genuinely-unknown TRUE
-            // top-level root — one sitting directly at the document root, i.e.
-            // whose ACTUAL path is a bare root key (no `profile.<name>` prefix)
-            // AND whose schema parent is the document root `""` — is accepted as
-            // opaque rather than failing. It is almost certainly a plugin-owned
-            // config table (e.g. `[media]`) the CLI structurally cannot know
+            // Deploy-CLI leniency (#2063/#2067): a genuinely-unknown true top-level
+            // root — one whose actual path is a bare root key, with no `profile.<name>`
+            // prefix, and whose schema parent is the document root `""` — is accepted
+            // as opaque rather than failing. It is almost certainly a plugin-owned
+            // config table such as `[media]` that the CLI structurally cannot know
             // about, and app boot stays the strict gate for it.
             //
-            // Top-level-ness is STRUCTURAL, taken from the error's `is_top_level`
-            // flag (the offending key's parent path was empty at push time) — the
-            // SAME signal #2061's app-boot exemption keys on (`path.is_empty()`
-            // in `validate_toml_table`). It is deliberately NOT inferred from the
-            // rendered dotted `path` string: that string is AMBIGUOUS, because a
-            // legitimately quoted-dotted top-level key like `["my.plugin"]` (from
-            // `config_section("my.plugin")`) and a 2-level path both render
-            // `my.plugin`. The earlier `!path.contains('.')` heuristic therefore
-            // HARD-FAILED a quoted-dotted top-level plugin root at deploy even
-            // though app boot ACCEPTS it (its exemption keys on the RAW table key
-            // with `path.is_empty()`). Gating on `is_top_level` closes that gap:
-            // a quoted-dotted top-level table matches here exactly as it is
-            // exempted at boot.
+            // Top-level-ness is structural, taken from the error's `is_top_level` flag,
+            // set when the offending key's parent path was empty at push time. That is
+            // the same signal #2061's app-boot exemption keys on (`path.is_empty()` in
+            // `validate_toml_table`). It is deliberately not inferred from the rendered
+            // dotted `path` string, which is ambiguous: a legitimately quoted-dotted
+            // top-level key like `["my.plugin"]`, from `config_section("my.plugin")`,
+            // and a two-level path both render `my.plugin`. The earlier
+            // `!path.contains('.')` heuristic therefore hard-failed a quoted-dotted
+            // top-level plugin root at deploy even though app boot accepts it.
             //
-            // It is also NOT merely `schema_parent.is_empty()`:
-            // `validate_toml_detailed` reports an EMPTY schema parent for a
-            // profile-prefixed section like `[profile.prod.media]` too (the
-            // profile prefix is stripped before root-schema validation, so
-            // `[profile.prod.media]` and top-level `[media]` both surface with
-            // schema parent `""`). But a profile-prefixed section is pushed with a
-            // NON-EMPTY parent path (`["profile","prod"]`), so `is_top_level` is
-            // false for it — and the deployed app, whose `config_section` seam
-            // (#2061) exempts ONLY the TRUE top-level `[media]` via
-            // `path.is_empty()`, still REJECTS `[profile.prod.media]` at boot. So
-            // deploy and app boot AGREE: both accept top-level `[media]` /
-            // `["my.plugin"]`, both reject `[profile.prod.media]`.
+            // Nor is it merely `schema_parent.is_empty()`. `validate_toml_detailed`
+            // reports an empty schema parent for a profile-prefixed section like
+            // `[profile.prod.media]` too, because the profile prefix is stripped before
+            // root-schema validation. But such a section is pushed with a non-empty
+            // parent path (`["profile","prod"]`), so `is_top_level` is false for it, and
+            // the deployed app — whose `config_section` seam exempts only the true
+            // top-level `[media]` via `path.is_empty()` — still rejects it at boot. So
+            // deploy and app boot agree: both accept top-level `[media]` and
+            // `["my.plugin"]`, and both reject `[profile.prod.media]`.
             //
-            // A profile-prefixed root therefore no longer matches this branch
-            // and falls through to the normal (hard, since schema_parent `""` ∈
-            // PRE_1890_STRICT_PARENTS) classification below → strict rejection at
-            // deploy, matching app boot. ONLY a true root is spared: an unknown
-            // key inside a KNOWN section (schema_parent != "") also falls
-            // through, so a `[database] primry_url` typo still hard-fails. The
-            // app-boot path passes `Strict`, so its behavior is unchanged.
+            // A profile-prefixed root therefore falls through to the normal hard
+            // classification below (schema_parent `""` ∈ `PRE_1890_STRICT_PARENTS`) and
+            // is strictly rejected at deploy, matching app boot. Only a true root is
+            // spared: an unknown key inside a known section, with a non-empty
+            // schema_parent, also falls through, so a `[database] primry_url` typo still
+            // hard-fails. The app-boot path passes `Strict`, so its behavior is unchanged.
             //
-            // Leniency additionally requires the root's TOML value to be a TABLE
-            // (`is_table`), mirroring the #2061 `config_section` app-boot
-            // exemption, which accepts a registered plugin root only when
-            // `val.is_table()`. A non-table true-top-level root — a scalar or
-            // array like `media = "enabled"` / `media = ["a", "b"]` — is a
-            // malformed section nothing would deserialize, so it does NOT match
-            // here and falls through to the normal (hard) classification →
-            // strict rejection at deploy, EXACTLY as the deployed app rejects it
-            // at boot. Without this check deploy would accept a non-table root
-            // that app boot rejects, reopening the "deploy accepts what boot
-            // rejects" gap this branch exists to close.
+            // Leniency also requires the root's TOML value to be a table, mirroring the
+            // #2061 app-boot exemption. A non-table true top-level root — `media =
+            // "enabled"`, `media = ["a", "b"]` — is a malformed section nothing would
+            // deserialize, so it falls through to the hard classification exactly as the
+            // deployed app rejects it. Without this check, deploy would accept a
+            // non-table root that boot rejects, reopening the gap this branch closes.
             if root_policy == UnknownRootPolicy::LenientWarn
                 && schema_parent.is_empty()
                 && is_top_level
@@ -4690,14 +4670,12 @@ impl AutumnConfig {
         }
 
         // Warn-first rollout (#1890): unknown keys in sections that only became
-        // strictly validated by the schema-walk fix are surfaced loudly but do
-        // NOT fail startup for one release, so configs that silently passed
-        // before keep booting. `eprintln!` guarantees visibility before the
-        // tracing subscriber is installed; the `tracing::warn!` keeps structured
-        // output for apps that pre-install one. Set
-        // `server.strict_config_enforce_all = true` (or
-        // AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL=1) to promote these to hard
-        // errors now.
+        // strictly validated by the schema-walk fix are surfaced loudly but do not fail
+        // startup for one release, so configs that silently passed before keep booting.
+        // `eprintln!` guarantees visibility before the tracing subscriber is installed;
+        // the `tracing::warn!` keeps structured output for apps that pre-install one.
+        // Set `server.strict_config_enforce_all = true`, or
+        // `AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL=1`, to promote these to hard errors.
         for (path, sug) in &warn_only {
             let hint = sug
                 .as_deref()
@@ -4884,12 +4862,11 @@ impl AutumnConfig {
         // Session backend validation deliberately lives in
         // `crate::session::build_session_layer`, not here. That function
         // short-circuits when a custom `SessionStore` was installed via
-        // `AppBuilder::with_session_store(...)`, so the (then-irrelevant)
-        // `session.backend = "redis"` config without a redis URL doesn't
-        // need to fail the boot. Validating the same thing here would
-        // defeat the override and exit the app before the custom store
-        // ever gets a chance to apply. The "prod profile + memory backend"
-        // warning lives in `build_session_layer` for the same reason.
+        // `AppBuilder::with_session_store(...)`, so a then-irrelevant
+        // `session.backend = "redis"` without a redis URL need not fail the
+        // boot. Validating it here would defeat the override and exit before
+        // the custom store applies. The "prod profile plus memory backend"
+        // warning lives there for the same reason.
         Ok(())
     }
 
@@ -5141,18 +5118,14 @@ impl AutumnConfig {
     /// every send failing `NotConfigured` and the public-key endpoint serving
     /// `503`, with the operator looking at a variable they did set.
     fn apply_push_env_overrides_with_env(&mut self, env: &dyn Env) {
-        // NOT `parse_env_option_secret`. That helper treats a blank value as
-        // "clear this setting", which is right for a section where unsetting
-        // via env is meaningful — but wrong here, and dangerously so: the
-        // commonest way `AUTUMN_PUSH__PRIVATE_KEY` ends up blank is a secret
-        // that failed to interpolate, and clearing it would silently disable
-        // push, sail through `validate_push`, and surface much later as a
-        // `503` and `NotConfigured` on every send. Worse, it would erase a
-        // perfectly good key from `autumn.toml`.
-        //
-        // So a blank value is PRESERVED, precisely so `load_vapid_key` can
-        // reject it at boot with a message naming the environment variable —
-        // the fail-fast contract this whole subsystem is built on.
+        // Not `parse_env_option_secret`. That helper treats a blank value as "clear this
+        // setting", which is right where unsetting via env is meaningful but wrong here,
+        // and dangerously so: the commonest way `AUTUMN_PUSH__PRIVATE_KEY` ends up blank
+        // is a secret that failed to interpolate. Clearing it would silently disable
+        // push, sail through `validate_push`, and surface much later as a 503 and
+        // `NotConfigured` on every send — and it would erase a good key from
+        // `autumn.toml`. So a blank value is preserved, precisely so `load_vapid_key`
+        // can reject it at boot with a message naming the environment variable.
         if let Ok(value) = env.var("AUTUMN_PUSH__PRIVATE_KEY") {
             self.push.private_key = Some(secrecy::SecretString::from(value));
         }
@@ -6537,22 +6510,20 @@ impl AutumnConfig {
     /// section exists in TOML, a default one is materialized only if at least
     /// one offsite env var is present, so an all-env deployment still works.
     fn apply_backup_env_overrides_with_env(&mut self, env: &dyn Env) {
-        // Keys that signal a genuine intent to CONFIGURE an offsite destination —
-        // presence of any REQUIRED destination/credential key materializes the
-        // `[backup.offsite]` section (issue #1791). This is limited to the keys
-        // that a working upload genuinely requires — a bucket, or the access /
-        // secret key-env names. Optional-only keys (`region`,
-        // `force_path_style`, `endpoint`, `prefix`, `keep`) do NOT materialize
-        // the section on their own: a bare `AUTUMN_BACKUP__OFFSITE__S3__REGION`
-        // (or endpoint) with no bucket cannot upload, so it must leave offsite
-        // UNCONFIGURED rather than produce an empty section that then fails
-        // validation / `doctor` with "backup.offsite.s3.bucket is unset". Those
-        // optional keys are still APPLIED below once the section IS materialized
-        // by a required key. This also EXCLUDES the two opt-out toggles: a lone
-        // `AUTO_UPLOAD=false` / `ALLOW_SHARED_BUCKET=false` must NOT create an
-        // otherwise-empty section (issue #1619 P2 #18). A truthy
-        // `AUTO_UPLOAD=true` DOES materialize, since it requires a validated
-        // destination to act on.
+        // Keys that signal genuine intent to configure an offsite destination: the
+        // presence of any required destination or credential key materializes the
+        // `[backup.offsite]` section (#1791). The list is limited to what a working
+        // upload requires — a bucket, or the access and secret key-env names.
+        // Optional-only keys (`region`, `force_path_style`, `endpoint`, `prefix`,
+        // `keep`) do not materialize the section on their own: a bare
+        // `AUTUMN_BACKUP__OFFSITE__S3__REGION` with no bucket cannot upload, so it must
+        // leave offsite unconfigured rather than produce an empty section that then
+        // fails validation or `doctor` with "backup.offsite.s3.bucket is unset". Those
+        // optional keys are still applied below once a required key materializes the
+        // section. The two opt-out toggles are excluded too: a lone `AUTO_UPLOAD=false`
+        // or `ALLOW_SHARED_BUCKET=false` must not create an otherwise-empty section
+        // (#1619 P2 #18). A truthy `AUTO_UPLOAD=true` does materialize, since it needs a
+        // validated destination to act on.
         const OFFSITE_DEST_KEYS: &[&str] = &[
             "AUTUMN_BACKUP__OFFSITE__S3__BUCKET",
             "AUTUMN_BACKUP__OFFSITE__S3__ACCESS_KEY_ID_ENV",
@@ -9077,22 +9048,20 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
         return;
     }
     let deploy = deploy.get_or_insert_with(DeployConfig::default);
-    // #1621 review round 1: `host` and `hosts` are MUTUALLY EXCLUSIVE downstream,
-    // so applying one spelling from the environment on top of the OTHER spelling in
-    // TOML produced a config that refuses every `autumn deploy` subcommand — even
-    // though `AUTUMN_DEPLOY__*` is documented to WIN over TOML. Whether each
-    // spelling was set NON-EMPTY in the environment is therefore captured BEFORE
-    // either is applied, so a non-empty env value can clear the TOML alternate
-    // below.
+    // #1621 review round 1: `host` and `hosts` are mutually exclusive downstream, so
+    // applying one spelling from the environment on top of the other spelling in TOML
+    // produced a config that refuses every `autumn deploy` subcommand — even though
+    // `AUTUMN_DEPLOY__*` is documented to win over TOML. Whether each spelling was set
+    // non-empty in the environment is therefore captured before either is applied, so a
+    // non-empty env value can clear the TOML alternate below.
     //
-    // "Non-empty" is judged conservatively — a value that is blank AFTER TRIMMING
-    // never clears the other spelling — so the established empty-means-unset
-    // semantics survive: `AUTUMN_DEPLOY__HOST=` / ` ` and `AUTUMN_DEPLOY__HOSTS=` /
-    // `,` / ` , ` are the shape a CI or compose template emits for an unfilled
-    // slot. They say NOTHING about the other spelling. (`parse_env_option_string`
-    // below still applies its own, unchanged, `is_empty()` rule to `host` itself;
-    // trimming here only makes the CLEARING decision stricter, so a whitespace-only
-    // value can never silently drop a configured fleet list.)
+    // "Non-empty" is judged conservatively: a value blank after trimming never clears
+    // the other spelling, so the established empty-means-unset semantics survive.
+    // `AUTUMN_DEPLOY__HOST=` and `AUTUMN_DEPLOY__HOSTS=`/`,`/` , ` are the shape a CI or
+    // compose template emits for an unfilled slot, and they say nothing about the other
+    // spelling. `parse_env_option_string` below still applies its own unchanged
+    // `is_empty()` rule to `host` itself; trimming here only makes the clearing decision
+    // stricter, so a whitespace-only value can never drop a configured fleet list.
     let env_set_host = env
         .var("AUTUMN_DEPLOY__HOST")
         .is_ok_and(|value| !value.trim().is_empty());
@@ -9108,15 +9077,14 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
     // CLI as a blank fleet entry that refuses every deploy subcommand. Duplicate
     // entries are still rejected downstream by the CLI's `ResolvedFleet::resolve`.
     parse_env_csv_non_empty(env, "AUTUMN_DEPLOY__HOSTS", &mut deploy.hosts);
-    // Env-over-TOML precedence, applied to the spelling the operator did NOT set:
-    // retargeting a `[deploy] host` project as a fleet (or a `[deploy] hosts`
-    // project at a single server) is a legitimate env override, not a conflict.
-    //
-    // It is deliberately NOT a tie-break: when BOTH env spellings are set
-    // non-empty the rollout order is genuinely ambiguous — an operator error, not a
-    // precedence question — so both survive and the existing mutual-exclusion
-    // refusal (`DeployConfig::validate` / the CLI's `deploy_host_list`) still fires
-    // naming both keys.
+    // Env-over-TOML precedence, applied to the spelling the operator did not set:
+    // retargeting a `[deploy] host` project as a fleet, or a `[deploy] hosts` project at
+    // a single server, is a legitimate env override rather than a conflict. It is
+    // deliberately not a tie-break: when both env spellings are set non-empty the
+    // rollout order is genuinely ambiguous — an operator error, not a precedence
+    // question — so both survive and the existing mutual-exclusion refusal
+    // (`DeployConfig::validate`, the CLI's `deploy_host_list`) still fires, naming both
+    // keys.
     if env_set_hosts && !env_set_host {
         deploy.host = None;
     } else if env_set_host && !env_set_hosts {
@@ -10727,15 +10695,14 @@ mod tests {
         );
     }
 
-    // #2067: a legitimately quoted-dotted TOP-LEVEL table root — the valid TOML
-    // form of a plugin `config_section("my.plugin")`, whose top-level table is
-    // `["my.plugin"]` (a single quoted key that happens to contain a dot) — must
-    // be leniently ACCEPTED by the deploy CLI, because app boot ACCEPTS it too
-    // (the #2061 exemption keys on the RAW table key with `path.is_empty()`). The
-    // earlier `!path.contains('.')` heuristic wrongly HARD-FAILED it: the rendered
-    // dotted string `my.plugin` is ambiguous between a quoted top-level key and a
-    // 2-level path. Gating on the STRUCTURAL `is_top_level` (empty parent path)
-    // fixes it. Regression against that string-heuristic bug.
+    // #2067: a legitimately quoted-dotted top-level table root — the valid TOML form of
+    // a plugin `config_section("my.plugin")`, whose top-level table is `["my.plugin"]`,
+    // one quoted key that happens to contain a dot — must be leniently accepted by the
+    // deploy CLI, because app boot accepts it too: the #2061 exemption keys on the raw
+    // table key with `path.is_empty()`. The earlier `!path.contains('.')` heuristic
+    // wrongly hard-failed it, since the rendered `my.plugin` is ambiguous between a
+    // quoted top-level key and a two-level path. Gating on the structural
+    // `is_top_level`, an empty parent path, fixes it.
     #[test]
     fn deploy_cli_lenient_accepts_quoted_dotted_top_level_root() {
         // `["my.plugin"]` is a quoted top-level key CONTAINING a dot (one
@@ -11066,15 +11033,14 @@ mod tests {
         );
     }
 
-    // A registered plugin root under a PROFILE prefix (`[profile.prod.media]`)
-    // stays STRICT and must be rejected — the exemption only ever covers the
-    // TRUE top-level `[media]` table. Soundness rationale: the media plugin's
-    // reader deserializes only the top-level `root.media` and does NOT apply
-    // Autumn's profile merge, so a profile layer the plugin cannot consume must
-    // not be exempted — otherwise a strict app with media settings only under
-    // `[profile.prod.media]` would boot silently on default plugin config
-    // instead of failing loudly. (Profile-aware plugin config is a separate,
-    // larger enhancement.)
+    // A registered plugin root under a profile prefix (`[profile.prod.media]`) stays
+    // strict and must be rejected: the exemption covers only the true top-level
+    // `[media]` table. The media plugin's reader deserializes only the top-level
+    // `root.media` and does not apply Autumn's profile merge, so a profile layer the
+    // plugin cannot consume must not be exempted — otherwise a strict app with media
+    // settings only under `[profile.prod.media]` would boot silently on default plugin
+    // config instead of failing loudly. Profile-aware plugin config is a separate,
+    // larger enhancement.
     #[test]
     fn strict_config_still_rejects_profile_prefixed_plugin_root() {
         let temp = tempfile::tempdir().unwrap();
@@ -11227,15 +11193,15 @@ mod tests {
         );
     }
 
-    // 7c″ (#1890 P2 fix): a typo under a QUOTED DOTTED profile name (e.g.
-    // `[profile."prod.eu".server]`) must classify by its real segment-derived
-    // schema parent. The `"prod.eu"` key is ONE TOML key (a literal dot), so the
-    // segmented path is `["profile", "prod.eu", "server"]` and the profile-stripped
-    // schema parent is `server` — a pre-#1890 strict section that must keep
-    // hard-failing, NOT be demoted to warn-only by string-splitting the joined
-    // path. A `[profile."prod.eu".resilience]` typo (a newly-#1890-covered section)
-    // with the same strict_config (enforce_all OFF) must still only warn — proving
-    // the fix stays narrow even under dotted profile names.
+    // 7c″ (#1890 P2 fix): a typo under a quoted dotted profile name, such as
+    // `[profile."prod.eu".server]`, must classify by its real segment-derived schema
+    // parent. `"prod.eu"` is one TOML key with a literal dot, so the segmented path is
+    // `["profile", "prod.eu", "server"]` and the profile-stripped schema parent is
+    // `server`, a pre-#1890 strict section that must keep hard-failing rather than be
+    // demoted to warn-only by string-splitting the joined path. A
+    // `[profile."prod.eu".resilience]` typo, in a newly-#1890-covered section, with the
+    // same strict_config and enforce_all off must still only warn — proving the fix
+    // stays narrow under dotted profile names.
     #[test]
     fn dotted_profile_name_preserves_strictness() {
         // Pre-#1890 strict section (`server`) under a quoted dotted profile name:
@@ -12131,15 +12097,13 @@ slots = ["8194-16383"]
 
     #[test]
     fn autumn_config_validate_no_longer_errors_on_invalid_session_backend() {
-        // Session backend validation moved to `build_session_layer` so a
-        // custom store installed via `AppBuilder::with_session_store(...)`
-        // can override an otherwise-invalid backend config without the boot
-        // exiting first. `validate()` is config-shape-only now; runtime
-        // session selection (and the backend error) lives in
-        // `build_session_layer`, which short-circuits when a custom store
-        // is installed. `crate::session::tests::session_backend_plan_*`
-        // still cover the underlying error cases directly on
-        // `SessionConfig::backend_plan`.
+        // Session backend validation moved to `build_session_layer`, so a custom store
+        // installed via `AppBuilder::with_session_store(...)` can override an otherwise
+        // invalid backend config without the boot exiting first. `validate()` is
+        // config-shape-only now; runtime session selection, and the backend error, live
+        // in `build_session_layer`, which short-circuits when a custom store is
+        // installed. `crate::session::tests::session_backend_plan_*` still cover the
+        // error cases directly on `SessionConfig::backend_plan`.
         let mut config = AutumnConfig::default();
         config.session.backend = crate::session::SessionBackend::Redis;
         config.session.redis.url = None;

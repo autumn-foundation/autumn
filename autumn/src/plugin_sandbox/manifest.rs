@@ -353,44 +353,43 @@ impl ResourceLimits {
     #[must_use]
     pub const fn request_footprint_bytes(&self) -> u128 {
         (self.memory_bytes as u128)
-            // Five, not four, and the fifth is a temporary the term used to
-            // miss. At the moment `to_line` runs, four copies of the body are
-            // live at once: the caller's, the clone `HostFrame::request` takes,
-            // the `String` `BASE64.encode` allocates, and the encoded text
+            // Five, not four, and the fifth is a temporary the term used to miss.
+            // At the moment `to_line` runs, four copies of the body are live at
+            // once: the caller's, the clone `HostFrame::request` takes, the
+            // `String` `BASE64.encode` allocates, and the encoded text
             // `serialize_str` copies into the serializer's output. The last two
-            // are 4/3 each because base64 expands, so the peak is
-            // 1 + 1 + 4/3 + 4/3 = 14/3 of the body — over the four this
-            // budgeted, by enough to matter at a concurrency near the product's
-            // own ceiling.
+            // are 4/3 each, because base64 expands, so the peak is
+            // 1 + 1 + 4/3 + 4/3 = 14/3 of the body, over the four this budgeted,
+            // by enough to matter at a concurrency near the product's ceiling.
             //
             // Counted rather than removed: serialising the base64 straight into
-            // the output would delete the temporary outright, which is the
-            // better fix and a larger one — it changes how the frame is written,
-            // and proving the allocation is gone needs more than reading the
-            // code. The bound is corrected here to what the code actually does;
-            // making the code do less is worth doing on its own.
+            // the output would delete the temporary outright, which is the better
+            // fix and a larger one — it changes how the frame is written, and
+            // proving the allocation is gone needs more than reading the code. The
+            // bound is corrected here to what the code does; making the code do
+            // less is worth doing on its own.
             .saturating_add((self.max_request_body_bytes as u128).saturating_mul(5))
             .saturating_add((self.max_response_bytes as u128).saturating_mul(5))
             // The instance's tables, bounded by `MAX_TABLE_ELEMENTS` at a
             // generous 16 bytes a reference. Small, but per-instance storage
             // the footprint would otherwise not know about at all.
             .saturating_add(crate::plugin_sandbox::host::MAX_TABLE_ELEMENTS as u128 * 16)
-            // The request's metadata: the caller's strings, the frame's clone
-            // of them, and the serialised line — which is the term that was
-            // wrong. `4 ×` priced the line at the raw byte count, but JSON is
-            // an *escaping* encoding: `serde_json` writes a control character
-            // as `\u0000`, six bytes for one, and every byte of a metadata
-            // field can be one. An HTTP request cannot carry them (the `http`
-            // crate refuses control characters in header values and URIs), but
-            // `SandboxHost::run` is public and an embedder builds the
-            // `SandboxRequest` by hand, so the bound has to hold for the API
-            // rather than for the adapter that is merely its politest caller.
+            // The request's metadata: the caller's strings, the frame's clone of
+            // them, and the serialised line — the term that was wrong. `4 x`
+            // priced the line at the raw byte count, but JSON is an escaping
+            // encoding: `serde_json` writes a control character as a six-byte
+            // `\uXXXX` escape, and every byte of a metadata field can be one. An
+            // HTTP request cannot carry them — the `http` crate refuses control
+            // characters in header values and URIs — but `SandboxHost::run` is
+            // public and an embedder builds the `SandboxRequest` by hand, so the
+            // bound has to hold for the API rather than for the adapter that is
+            // merely its politest caller.
             //
-            // The ceiling that bounds the raw bytes is the host's rather than
-            // this manifest's, but it is per-request storage all the same:
-            // leaving it out entirely is what made this product understate a
-            // near-maximum-concurrency plugin by hundreds of megabytes, and
-            // pricing it unescaped understated it again by as much.
+            // The ceiling that bounds the raw bytes is the host's rather than this
+            // manifest's, but it is per-request storage all the same: leaving it
+            // out entirely made this product understate a near-maximum-concurrency
+            // plugin by hundreds of megabytes, and pricing it unescaped understated
+            // it again by as much.
             .saturating_add(crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 8)
             // The instance's globals, at a generous 16 bytes each. Per-instance
             // storage the footprint would otherwise not know about at all — the
@@ -1081,25 +1080,23 @@ impl SandboxManifest {
                 SandboxCapability::HttpRequest,
             ));
         }
-        // A repeat grants nothing the first did, so there is no manifest a
-        // repeat makes legal — and every request clones this vector and
-        // serialises it into the frame. Left unbounded it is per-request work
-        // that `request_footprint_bytes` never counted and `encoding_fuel`
-        // never priced, bought once in a manifest and paid for on every call.
-        // Refusing here, rather than deduplicating, keeps the list an operator
-        // reads on the consent screen the same list the guest is handed.
+        // A repeat grants nothing the first did, so no manifest is made legal by one —
+        // and every request clones this vector and serialises it into the frame. Left
+        // unbounded it is per-request work `request_footprint_bytes` never counted and
+        // `encoding_fuel` never priced, bought once in a manifest and paid for on every
+        // call. Refusing here, rather than deduplicating, keeps the list an operator reads
+        // on the consent screen the same list the guest is handed.
         //
-        // Scanned in place rather than into a `Vec::with_capacity`: that vector
-        // was only ever a duplicate set — it is dropped below without being
-        // read — so sizing it from `self.capabilities.len()` performed, on a
-        // list a direct caller chose, exactly the unbounded allocation this
-        // check exists to refuse.
+        // Scanned in place rather than into a `Vec::with_capacity`: that vector was only
+        // ever a duplicate set, dropped below without being read, so sizing it from
+        // `self.capabilities.len()` performed — on a list a direct caller chose — exactly
+        // the unbounded allocation this check exists to refuse.
         //
-        // Pigeonhole bounds the scan: a list longer than the number of
-        // distinct capabilities must repeat one, so a duplicate is certain
-        // within the first `ALL.len() + 1` entries and looking past them
-        // cannot change the answer. Derived from `ALL` rather than written as
-        // a number, so it stays right as the vocabulary grows.
+        // Pigeonhole bounds the scan: a list longer than the number of distinct
+        // capabilities must repeat one, so a duplicate is certain within the first
+        // `ALL.len() + 1` entries and looking past them cannot change the answer. Derived
+        // from `ALL` rather than written as a number, so it stays right as the vocabulary
+        // grows.
         //
         // Sized from the vocabulary, never from `self.capabilities.len()`. That
         // length is the caller's to choose — `from_module` takes a manifest an
