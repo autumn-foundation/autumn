@@ -4152,6 +4152,22 @@ self_test() {
   git -C "$c9iw" add -A && git -C "$c9iw" commit -qm entity-spelled-tag-text
   check "an entity-spelled tag is visible text, not markup" pass "$c9iw"
 
+  # Whitespace just inside angle brackets is syntax, not part of the URL.
+  # Reported as the opposite — that `[Mail](<mail.md >)` navigates to
+  # `mail.md%20` and so is not a route — but both cmark-gfm (the renderer
+  # GitHub runs) and markdown-it emit `href="mail.md"`. Only INTERIOR
+  # whitespace is percent-encoded, and `.strip()` does not touch that. Keeping
+  # the space would strand a page whose only link works fine.
+  local c9jj="$tmp/c9jj"; make_corpus "$c9jj"
+  printf '# Jobs\n\n[Mail](<mail.md >)\n' > "$c9jj/docs/guide/jobs.md"
+  git -C "$c9jj" add -A && git -C "$c9jj" commit -qm bracketed-trailing-space
+  check "a trailing space in a bracketed destination is syntax" pass "$c9jj"
+
+  local c9jk="$tmp/c9jk"; make_corpus "$c9jk"
+  printf '# Jobs\n\n[Mail](< mail.md>)\n' > "$c9jk/docs/guide/jobs.md"
+  git -C "$c9jk" add -A && git -C "$c9jk" commit -qm bracketed-leading-space
+  check "a leading space in a bracketed destination is syntax" pass "$c9jk"
+
   # `template` contents are PARSED, so templates nest and the first close is
   # the wrong end — the path is still inside the outer, inert one.
   local c9jg="$tmp/c9jg"; make_corpus "$c9jg"
