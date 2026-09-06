@@ -120,6 +120,17 @@ fn waived_ids(config: &str) -> Vec<String> {
         .collect()
 }
 
+/// The step in the generated workflow that runs the audit.
+///
+/// Since #1633 that step derives its check list from `deny.toml` — advisories
+/// always, plus any optional section the policy declares — so the assertions
+/// below look for the unconditional seed of that list rather than a fixed
+/// command. The gate itself is unchanged: advisories can never be dropped.
+const AUDIT_STEP: &str = "Audit dependencies (RustSec advisories and declared policy)";
+
+/// The seed of the derived check list. Advisories are not optional.
+const UNCONDITIONAL_ADVISORIES: &str = "checks=\"advisories\"";
+
 /// The body of one workflow step: from its `- name: <step>` to the next step.
 ///
 /// Whole-file `contains` checks on a workflow are how a retry loop gets deleted
@@ -146,7 +157,7 @@ fn scaffolded_ci_audits_dependencies_by_default() {
     let ci = code_only(&read_project_file(&project, ".github/workflows/ci.yml"));
 
     assert!(
-        ci.contains("cargo deny") && ci.contains("check advisories"),
+        ci.contains("cargo deny") && ci.contains(UNCONDITIONAL_ADVISORIES),
         "the generated CI must run a dependency-advisory audit as a real step:\n{ci}"
     );
     assert!(
@@ -286,7 +297,7 @@ fn the_scaffolded_policy_ships_its_widest_scopes() {
 
     let ci = code_only(&read_project_file(&project, ".github/workflows/ci.yml"));
     assert!(
-        ci.contains("check advisories"),
+        ci.contains(UNCONDITIONAL_ADVISORIES),
         "narrowing the policy is pointless if the workflow stops asking for the \
          advisories check:\n{ci}"
     );
@@ -400,9 +411,9 @@ fn scaffolded_audit_retries_then_fails_closed_when_the_database_is_unreachable()
         fetch.contains("deny.toml"),
         "the gate must check its policy exists before auditing:\n{fetch}"
     );
+    let audit = workflow_step(&ci, AUDIT_STEP);
     assert!(
-        workflow_step(&ci, "Audit dependencies (RustSec advisories)")
-            .contains("--offline check advisories"),
+        audit.contains("--offline check $checks") && audit.contains(UNCONDITIONAL_ADVISORIES),
         "the check itself must run against the fetched database, so a failure there \
          is a real advisory and not a network blip:\n{ci}"
     );
@@ -421,7 +432,7 @@ fn the_api_flavor_ships_the_same_gate() {
     let (_tmp, project) = scaffold("api-audit-app", &["--api"]);
     let ci = code_only(&read_project_file(&project, ".github/workflows/ci.yml"));
     assert!(
-        ci.contains("check advisories"),
+        ci.contains(UNCONDITIONAL_ADVISORIES),
         "the --api scaffold must audit its dependencies too:\n{ci}"
     );
     let deny = read_project_file(&project, "deny.toml");
@@ -735,7 +746,7 @@ fn every_flavor_ships_the_gate_and_its_policy() {
         let (_tmp, project) = scaffold(&name, flags);
         let ci = code_only(&read_project_file(&project, ".github/workflows/ci.yml"));
         assert!(
-            ci.contains("--offline check advisories"),
+            ci.contains("--offline check $checks") && ci.contains(UNCONDITIONAL_ADVISORIES),
             "`autumn new {}` must still audit its dependencies:\n{ci}",
             flags.join(" ")
         );

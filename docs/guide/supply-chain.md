@@ -484,6 +484,123 @@ watched fail is indistinguishable from a gate that no longer runs.
 
 ---
 
+## The dev loop
+
+CI is the enforcement point. It is a poor *first* contact with a vulnerable
+dependency: by the time the job is red, the change is pushed and the team is
+blocked. `autumn doctor` and `autumn dev` move that contact left, without
+becoming the kind of audit output developers learn to scroll past.
+
+### One policy file, one waiver store, one auditor
+
+`deny.toml` at the app root is the whole policy surface. It carries the
+advisory rules and their waivers, and — commented out in a fresh scaffold —
+`[licenses]`, `[bans]` and `[sources]`. `autumn doctor` runs the same
+cargo-deny against the same file with the same waivers your CI job does, so its
+verdict *is* the CI verdict. Nothing here is a second implementation, and there
+is no second waiver format: a waiver is an `[advisories] ignore` entry, read by
+doctor, dev and CI alike.
+
+Uncommenting a section widens both sides at once. The generated workflow
+derives its check list from the file:
+
+```bash
+checks="advisories"
+for section in bans licenses sources; do
+  if grep -qE "^[[:space:]]*\[$section\]" deny.toml; then
+    checks="$checks $section"
+  fi
+done
+cargo deny --offline check $checks
+```
+
+`autumn doctor` derives it by the same rule, so a lockfile that passes locally
+cannot fail CI for a dependency reason.
+
+### `autumn doctor` — the dependency check
+
+One check, `dependencies`, reporting each finding with its advisory or
+violation id, its severity, the crate, and the title:
+
+```text
+❌ dependencies — 2 dependency findings, 1 blocking, 1 waived — checks: advisories; advisory data 3 days old
+   RUSTSEC-2099-0001 vulnerability (critical) badcrate 1.2.3 — remote code execution
+   RUSTSEC-2023-0071 unmaintained (low) rsa 0.9.6 — Marvin Attack (waived)
+   hint: `deny.toml` holds the policy and the waivers; docs/guide/supply-chain.md explains how to fix or waive a finding
+```
+
+Blocking findings are listed first. A waived finding is shown as waived and
+never fails the check. The line follows doctor's ordinary conventions, so
+`--json` carries it and `--strict` promotes its warnings to exit 1 — which is
+stricter than the CI gate, where a cargo-deny warning is not a failure. Keep
+`--strict` runs quiet by writing a policy whose warnings you mean, such as the
+scaffold's `multiple-versions = "allow"`.
+
+### Severity defaults
+
+Severity is *consequence*, not taxonomy. What your policy denies is graded
+high or critical; what it only warns about is graded low or medium:
+
+| Finding | Default grade | Doctor |
+|---|---|---|
+| Vulnerability, CVSS ≥ 9.0 | critical | fail |
+| Vulnerability, CVSS 7.0–8.9, or no published CVSS | high | fail |
+| Unmaintained / unsound (denied by the shipped policy) | high | fail |
+| License, ban or source violation | high | fail |
+| Yanked crate (`yanked = "warn"`) | low | warn |
+| Waived by `[advisories] ignore` | — | pass |
+
+Critical and high are exactly the findings cargo-deny grades as errors, which
+is exactly what makes the CI job red. Reading a doctor failure therefore tells
+you which CI failure you are about to get. CVSS v3 base scores come from the
+advisory itself; a vulnerability with no published score — or one published as
+a CVSS v4.0 vector, which is not scored here — is treated as high rather than
+assumed harmless. Such a finding still fails; it just does not earn the
+`autumn dev` banner.
+
+### `autumn dev` — quiet by default
+
+`autumn dev` never blocks startup and never interrupts the rebuild loop over a
+dependency finding. Output is rationed:
+
+- **Clean or fully waived tree** — nothing. Zero dependency lines.
+- **Findings below critical** — one line: the count and the worst severity.
+- **A critical advisory** — a startup banner, in the style of the
+  maintenance-mode warning, naming the ids.
+- **Policy not evaluated** — nothing. Silence is dev's answer to a missing
+  auditor, a missing database, or a missing policy file; `autumn doctor` is
+  where those are reported.
+
+The evaluation runs beside startup and is abandoned after five seconds, so a
+slow or wedged auditor costs the dev loop nothing.
+
+### Offline and air-gapped
+
+Neither command ever fetches. Both run `cargo deny --offline` against whatever
+RustSec data is already on disk, so neither can hang on the network and neither
+depends on it.
+
+- **Database never fetched** — `autumn doctor` warns once, hinting `cargo deny
+  fetch db`. It does not report a clean tree it could not verify.
+- **Database present** — doctor reports its age (`advisory data 3 days old`).
+  Data older than 30 days is marked **stale** and warns, even on a tree with no
+  findings: a verdict is only as fresh as the data behind it.
+- **cargo-deny not installed** — doctor warns with the install command. A
+  missing tool is never a failure and never a silent pass.
+- **`autumn dev`** — silent in every one of those states.
+
+Refresh the data with one command, network permitting:
+
+```bash
+cargo deny fetch db
+```
+
+On an air-gapped machine, point `[advisories] db-path` in `deny.toml` at a
+database checkout you mirror yourself; doctor reads that path and ages it the
+same way.
+
+---
+
 ## Command reference
 
 | Command | Answers |
@@ -497,6 +614,9 @@ watched fail is indistinguishable from a gate that no longer runs.
 | `autumn sbom --binary FILE` | What is compiled into this binary? (no source tree) |
 | `autumn sbom --features F` | …resolving the features the build used. |
 | `autumn sbom --filter-platform T` | …restricted to one target triple. |
+| `autumn doctor` | Does this app's lockfile pass its own dependency policy? |
+| `autumn doctor --json` | …as machine-readable output, ids and severities included. |
+| `cargo deny fetch db` | Refresh the RustSec advisory database doctor reads. |
 | `cargo deny check advisories` | Is anything in this tree known-vulnerable? (reads `deny.toml`) |
 | `./scripts/check-advisories.sh` | …for Autumn's own graphs, and for the app scaffold's. |
 | `./scripts/check-advisories.sh --self-test` | Can that gate still reject a known CVE? |

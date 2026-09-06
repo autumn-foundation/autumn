@@ -37,11 +37,20 @@
 # id through — every other advisory, including a new one in the same crate,
 # still fails CI. Waivers are debt; revisit them on their review-by date.
 #
-# This file configures cargo-deny's `advisories` check, which is the check CI
-# runs. cargo-deny can also check licenses, banned crates and source registries;
-# to adopt those, add `[licenses]` / `[bans]` / `[sources]` sections here *and*
-# widen the command in `.github/workflows/ci.yml` — sections alone change
-# nothing, because the workflow asks only for `advisories`.
+# ── The dev loop ────────────────────────────────────────────────────────────
+# `autumn doctor` evaluates this file too — same auditor, same waivers, same
+# checks as CI — so a local verdict predicts the CI verdict. `autumn dev` stays
+# quiet about it: a clean tree prints nothing, findings print one summary line,
+# and only a critical advisory gets a startup banner. Neither command fetches
+# the advisory database; run `cargo deny fetch db` to refresh it, and doctor
+# reports the data age. See docs/guide/supply-chain.md.
+#
+# ── Optional sections ───────────────────────────────────────────────────────
+# The `[licenses]`, `[bans]` and `[sources]` sections below ship commented out,
+# so a fresh app enforces advisories only. Uncomment one and both `autumn
+# doctor` and `.github/workflows/ci.yml` start to enforce it: the workflow
+# derives its check list from the sections this file declares. Nothing else to
+# wire.
 
 [advisories]
 # Cover the whole resolved dependency graph, transitive crates included.
@@ -91,3 +100,34 @@ ignore = [
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive of the managed-pg-bundled embedded-Postgres stack; no safe upgrade; review-by 2026-10-01" },
     # <<< autumn:bundled-pg-waiver
 ]
+
+# ── Licenses (optional) ─────────────────────────────────────────────────────
+# Enforce a license allow-list over the whole dependency graph. List every
+# license your tree actually uses — `cargo deny list` prints them — and expect
+# to add one when a transitive dependency changes. `private.ignore` keeps this
+# app's own unpublished crates out of the grading; without it they are graded
+# unlicensed.
+#
+# [licenses]
+# allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
+# private = { ignore = true }
+
+# ── Banned crates (optional) ────────────────────────────────────────────────
+# Refuse named crates anywhere in the graph. `multiple-versions = "allow"` is
+# deliberate: a real tree carries dozens of duplicate crates you cannot fix,
+# and a warning for each one buries the bans you did write.
+#
+# [bans]
+# multiple-versions = "allow"
+# deny = [
+#     # { crate = "openssl", reason = "this app uses rustls" },
+# ]
+
+# ── Sources (optional) ──────────────────────────────────────────────────────
+# Restrict where crates may come from. The values below allow crates.io only;
+# add each vendored git dependency to `allow-git` by URL.
+#
+# [sources]
+# unknown-registry = "deny"
+# unknown-git = "deny"
+# allow-git = []

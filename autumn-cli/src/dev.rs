@@ -513,9 +513,33 @@ impl DevReloadState {
     }
 }
 
+/// How long `autumn dev` waits for the dependency policy evaluation.
+///
+/// Startup is never blocked on it: an evaluation that is not ready by then is
+/// abandoned and the dev loop says nothing (issue #1633).
+const DEPENDENCY_AUDIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Start the dependency policy evaluation beside dev startup.
+fn spawn_dependency_audit() -> mpsc::Receiver<crate::deps::Evaluation> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        // A closed receiver means startup moved on. Nothing to report.
+        let _ = sender.send(crate::deps::evaluate(Path::new(".")));
+    });
+    receiver
+}
+
+/// Startup lines for an evaluation that may not have finished in time.
+fn dependency_startup_lines(eval: Option<&crate::deps::Evaluation>) -> Vec<String> {
+    eval.map(crate::deps::dev_lines).unwrap_or_default()
+}
+
 /// Run the dev server with file watching.
 pub fn run(package: Option<&str>, show_config: bool) {
     eprintln!("\u{1F342} autumn dev\n");
+
+    // Start the dependency audit first so it overlaps the rest of startup.
+    let dependency_audit = spawn_dependency_audit();
 
     // Warn when maintenance mode is currently active so the operator is not
     // surprised by 503 responses during local development.
@@ -543,6 +567,18 @@ pub fn run(package: Option<&str>, show_config: bool) {
             None
         }
     };
+    // Dependency findings (issue #1633). Quiet by default: an advisory-clean,
+    // policy-clean tree adds nothing here, and nothing below ever blocks the
+    // rebuild loop.
+    let evaluation = dependency_audit.recv_timeout(DEPENDENCY_AUDIT_TIMEOUT).ok();
+    let dependency_lines = dependency_startup_lines(evaluation.as_ref());
+    if !dependency_lines.is_empty() {
+        for line in &dependency_lines {
+            eprintln!("{line}");
+        }
+        eprintln!();
+    }
+
     // Initial build. There is no prior server here (cold start), so a browser
     // overlay isn't reachable — the CLI doesn't know the app's port and no
     // process is up to answer the state endpoint. We still record the failure
@@ -3803,5 +3839,31 @@ watch_dirs = ["views", "locales"]
         });
         let expected_locales = "locales".to_owned();
         assert_eq!(dirs, vec!["views".to_owned(), expected_locales]);
+    }
+
+    // ── #1633: dependency findings in the dev loop ───────────────────────────
+
+    #[test]
+    fn an_unfinished_dependency_audit_prints_nothing() {
+        // The audit is abandoned on timeout. Startup neither waits for it nor
+        // reports on it.
+        assert!(dependency_startup_lines(None).is_empty());
+    }
+
+    #[test]
+    fn a_clean_tree_prints_nothing() {
+        let clean = crate::deps::Evaluation::Audited {
+            findings: Vec::new(),
+            checks: vec!["advisories".to_owned()],
+            db_age_days: Some(1),
+        };
+        assert!(dependency_startup_lines(Some(&clean)).is_empty());
+    }
+
+    #[test]
+    fn the_audit_timeout_is_bounded() {
+        // A dev loop that stalls on an auditor is worse than one that says
+        // nothing.
+        assert!(DEPENDENCY_AUDIT_TIMEOUT <= Duration::from_secs(10));
     }
 }
