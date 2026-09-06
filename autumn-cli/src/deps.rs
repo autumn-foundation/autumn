@@ -279,15 +279,20 @@ pub fn expand_path_with(path: &str, home: Option<&str>, cargo_home: Option<&str>
 ///
 /// Do not fuse the multiplications. The score is rounded up to one decimal, so
 /// a more accurate intermediate can cross a band boundary that every reference
-/// implementation stays on the near side of.
+/// implementation stays on the near side of. For the same reason the vector's
+/// minor version selects the changed-scope impact equation rather than one
+/// standing in for both.
 #[allow(
     clippy::suboptimal_flops,
     reason = "matches the CVSS reference implementations"
 )]
 pub fn cvss3_base_score(vector: &str) -> Option<f64> {
-    let body = vector
-        .strip_prefix("CVSS:3.1/")
-        .or_else(|| vector.strip_prefix("CVSS:3.0/"))?;
+    // The scope-changed impact equation differs between the two minor
+    // versions, so the prefix is not decoration — it selects the formula.
+    let (body, v31) = match vector.strip_prefix("CVSS:3.1/") {
+        Some(body) => (body, true),
+        None => (vector.strip_prefix("CVSS:3.0/")?, false),
+    };
 
     let (mut av, mut ac, mut pr, mut ui) = (None, None, None, None);
     let (mut scope, mut conf, mut integ, mut avail) = (None, None, None, None);
@@ -350,8 +355,18 @@ pub fn cvss3_base_score(vector: &str) -> Option<f64> {
     let avail = impact_metric(avail?)?;
 
     let iss: f64 = 1.0 - (1.0 - conf) * (1.0 - integ) * (1.0 - avail);
+    // v3.1 revised the changed-scope impact equation (spec §7.1) to remove a
+    // rounding artefact: the exponent dropped from 15 to 13 and the base gained
+    // the 0.9731 factor. It moves scores near a band boundary — the vector in
+    // `the_two_minor_versions_disagree_across_a_band_boundary` is 7.0 (high)
+    // under v3.0 and 6.9 (medium) under v3.1 — so the version must pick the
+    // equation rather than one standing in for both.
     let impact = if changed {
-        7.52 * (iss - 0.029) - 3.25 * (iss - 0.02).powi(15)
+        if v31 {
+            7.52 * (iss - 0.029) - 3.25 * (iss * 0.9731 - 0.02).powi(13)
+        } else {
+            7.52 * (iss - 0.029) - 3.25 * (iss - 0.02).powi(15)
+        }
     } else {
         6.42 * iss
     };
@@ -1410,6 +1425,26 @@ mod tests {
             .collect();
         assert_eq!(set.len(), 1, "the guard must be set exactly once");
         assert_eq!(set[0].1, Some(std::ffi::OsStr::new("0")));
+    }
+
+    #[test]
+    fn the_two_minor_versions_disagree_across_a_band_boundary() {
+        // v3.1 revised the changed-scope impact equation. This vector is the
+        // discriminating case: 7.0 (high) under v3.0, 6.9 (medium) under v3.1.
+        // Every other vector in this suite scores identically under both, which
+        // is exactly why using one equation for both went unnoticed.
+        const METRICS: &str = "AV:P/AC:H/PR:L/UI:N/S:C/C:H/I:H/A:L";
+        assert_eq!(cvss3_base_score(&format!("CVSS:3.0/{METRICS}")), Some(7.0));
+        assert_eq!(cvss3_base_score(&format!("CVSS:3.1/{METRICS}")), Some(6.9));
+        // And the band each lands in differs, which is the reason it matters.
+        assert_eq!(
+            severity_from_cvss(Some(&format!("CVSS:3.0/{METRICS}"))),
+            Some(Severity::High)
+        );
+        assert_eq!(
+            severity_from_cvss(Some(&format!("CVSS:3.1/{METRICS}"))),
+            Some(Severity::Medium)
+        );
     }
 
     // ── Bounded waiting ──────────────────────────────────────────────────────

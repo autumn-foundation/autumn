@@ -590,9 +590,11 @@ live. The number describes the advisory; the verdict describes the gate.
 Critical and high are exactly the findings cargo-deny grades as errors, which
 is exactly what makes the CI job red. Reading a doctor failure therefore tells
 you which CI failure you are about to get. CVSS v3 base scores come from the
-advisory itself; a vulnerability with no published score — or one published as
-a CVSS v4.0 vector, which is not scored here — is treated as high rather than
-assumed harmless. Such a finding still fails; it just does not earn the
+advisory's own vector, computed under the minor version that vector declares —
+v3.1 revised the changed-scope impact equation, so the same metrics can score
+7.0 under `CVSS:3.0/` and 6.9 under `CVSS:3.1/`, which is a band apart. A
+vulnerability with no published score — or one published as a CVSS v4.0 vector,
+which is not scored here — is treated as high rather than assumed harmless. Such a finding still fails; it just does not earn the
 `autumn dev` banner.
 
 ### `autumn dev` — quiet by default
