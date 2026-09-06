@@ -115,8 +115,10 @@ impl FsAcmeStore {
         }
     }
 
-    /// The per-directory subdirectory holding this store's account + certs.
-    fn cert_dir(&self) -> PathBuf {
+    /// The per-directory subdirectory holding this store's account + certs
+    /// (`{dir}/{directory_label}/`).
+    #[must_use]
+    pub fn cert_dir(&self) -> PathBuf {
         self.dir.join(&self.directory_label)
     }
 
@@ -124,12 +126,77 @@ impl FsAcmeStore {
         self.cert_dir().join("account.json")
     }
 
-    fn chain_path(&self, id: &CertId) -> PathBuf {
+    /// The on-disk path of the certificate chain PEM for `id`.
+    #[must_use]
+    pub fn chain_path(&self, id: &CertId) -> PathBuf {
         self.cert_dir().join(format!("{}.chain.pem", id.as_str()))
     }
 
-    fn key_path(&self, id: &CertId) -> PathBuf {
+    /// The on-disk path of the private key PEM for `id`.
+    #[must_use]
+    pub fn key_path(&self, id: &CertId) -> PathBuf {
         self.cert_dir().join(format!("{}.key.pem", id.as_str()))
+    }
+
+    /// The stored chain+key pair for `domains`, if both files are present.
+    ///
+    /// Mirrors [`AcmeStore::load_cert`]'s treatment of a partial pair as
+    /// absent, but works purely off the filesystem (no read/parse), so a
+    /// caller that only needs the paths — like `autumn doctor`'s offline
+    /// certificate scan — can locate them without re-deriving this store's
+    /// on-disk layout independently (issue #1864).
+    #[must_use]
+    pub fn find_cert_for_domains(&self, domains: &[String]) -> Option<(PathBuf, PathBuf)> {
+        let id = CertId::from_domains(domains);
+        let chain = self.chain_path(&id);
+        let key = self.key_path(&id);
+        if chain.is_file() && key.is_file() {
+            Some((chain, key))
+        } else {
+            None
+        }
+    }
+
+    /// Enumerate every complete (chain+key) certificate pair currently stored
+    /// under this store's directory, alongside its [`CertId`] and on-disk
+    /// paths. A partial pair (one file present, its sibling missing — e.g. a
+    /// torn write interrupted mid-publish) is skipped rather than reported,
+    /// mirroring [`AcmeStore::load_cert`]'s treatment of a partial pair as
+    /// absent.
+    ///
+    /// Returns an empty list (not an error) when the store's directory does
+    /// not exist yet — a benign first-run state — so callers do not need to
+    /// special-case "never provisioned" from "provisioned, nothing stored".
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store's directory exists but cannot be read
+    /// (e.g. a permissions problem).
+    pub fn list_certs(&self) -> io::Result<Vec<(CertId, PathBuf, PathBuf)>> {
+        let dir = self.cert_dir();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
+        let mut ids = std::collections::BTreeSet::new();
+        for entry in entries {
+            let name = entry?.file_name();
+            if let Some(id) = name.to_string_lossy().strip_suffix(".chain.pem") {
+                ids.insert(id.to_owned());
+            }
+        }
+
+        Ok(ids
+            .into_iter()
+            .filter_map(|id| {
+                let id = CertId(id);
+                let chain = self.chain_path(&id);
+                let key = self.key_path(&id);
+                key.is_file().then_some((id, chain, key))
+            })
+            .collect())
     }
 }
 
@@ -213,82 +280,62 @@ async fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
 }
 
 /// Create `dir` (and parents), owner-only on Unix.
+///
+/// Delegates to the shared [`crate::fs_atomic`] helper (issue #1864) on
+/// tokio's blocking thread pool, since the helper's core is synchronous
+/// `std::fs`.
 async fn ensure_dir(dir: &Path) -> io::Result<()> {
-    tokio::fs::create_dir_all(dir).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        // Best-effort tighten of the cache dir to owner-only; ignore on
-        // filesystems that reject it (the per-file 0600 below is the real
-        // guarantee).
-        let _ = tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await;
-    }
-    Ok(())
+    let dir = dir.to_path_buf();
+    blocking(move || crate::fs_atomic::ensure_owner_only_dir(&dir)).await
 }
 
 /// Atomically write `data` to `path` with owner-only (`0600`) permissions on
-/// Unix.
+/// Unix, via the shared [`crate::fs_atomic`] helper (issue #1864).
 ///
-/// Stages the data to a sibling `{path}.tmp` and then `rename`s it over `path`.
-/// `rename` is atomic within a directory, so a crash mid-write can never leave a
-/// torn single file for the loader/reload path: `path` is either the old
-/// contents or the complete new contents, never a partial write.
+/// Stages the data to an unpredictable sibling temp file and then `rename`s
+/// it over `path`. `rename` is atomic within a directory, so a crash
+/// mid-write can never leave a torn single file for the loader/reload path:
+/// `path` is either the old contents or the complete new contents, never a
+/// partial write.
 async fn write_owner_only(path: &Path, data: &[u8]) -> io::Result<()> {
-    let tmp = stage_owner_only(path, data).await?;
-    publish_staged(&tmp, path).await
+    let path = path.to_path_buf();
+    let data = data.to_vec();
+    blocking(move || crate::fs_atomic::write_owner_only(&path, &data)).await
 }
 
-/// Write `data` to a sibling `{path}.tmp` with owner-only (`0600`) permissions on
-/// Unix, flush it, and return the temp path — WITHOUT renaming it into place.
+/// Stage `data` to an unpredictable owner-only (`0600` on Unix) sibling of
+/// `path`, WITHOUT renaming it into place, via the shared [`crate::fs_atomic`]
+/// helper (issue #1864).
 ///
-/// The temp file is created `0600` from the start via `OpenOptions::mode`, so it
-/// is never briefly group/other-readable — the same fail-closed discipline the
-/// unix-socket bind uses for its `0600` socket. Splitting staging from the final
-/// [`publish_staged`] rename lets a multi-file publish (the cert chain + its key)
-/// stage BOTH files before renaming EITHER, shrinking the window in which a crash
-/// could tear the pair down to the two back-to-back rename syscalls.
+/// Splitting staging from the final [`publish_staged`] rename lets a
+/// multi-file publish (the cert chain + its key) stage BOTH files before
+/// renaming EITHER, shrinking the window in which a crash could tear the pair
+/// down to the two back-to-back rename syscalls.
 async fn stage_owner_only(path: &Path, data: &[u8]) -> io::Result<PathBuf> {
-    use tokio::io::AsyncWriteExt as _;
-
-    let tmp = tmp_path(path);
-    let mut options = tokio::fs::OpenOptions::new();
-    // Truncate in case a previous crash left a stale temp file behind.
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        // `tokio::fs::OpenOptions::mode` is inherent under Unix.
-        options.mode(0o600);
-    }
-    let mut file = options.open(&tmp).await?;
-    file.write_all(data).await?;
-    file.flush().await?;
-    // Belt-and-suspenders: enforce 0600 on the temp file even if it pre-existed
-    // with a wider mode (OpenOptions::mode only applies at creation), so the
-    // renamed-into-place file is always owner-only.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
-    }
-    Ok(tmp)
+    let path = path.to_path_buf();
+    let data = data.to_vec();
+    blocking(move || crate::fs_atomic::stage_owner_only(&path, &data)).await
 }
 
-/// Atomically publish a staged temp file by renaming it over `path`. On error,
-/// best-effort clean up the temp file so it does not accumulate.
+/// Atomically publish a staged temp file by renaming it over `path`, via the
+/// shared [`crate::fs_atomic`] helper (issue #1864). On error, best-effort
+/// clean up the temp file so it does not accumulate.
 async fn publish_staged(tmp: &Path, path: &Path) -> io::Result<()> {
-    if let Err(e) = tokio::fs::rename(tmp, path).await {
-        let _ = tokio::fs::remove_file(tmp).await;
-        return Err(e);
-    }
-    Ok(())
+    let tmp = tmp.to_path_buf();
+    let path = path.to_path_buf();
+    blocking(move || crate::fs_atomic::publish_staged(&tmp, &path)).await
 }
 
-/// The sibling temp path (`{path}.tmp`) used for the atomic write-then-rename.
-/// Kept in the same directory as `path` so `rename` stays within one filesystem.
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".tmp");
-    PathBuf::from(name)
+/// Run a blocking `std::fs` operation on tokio's blocking thread pool,
+/// converting a task panic into an `io::Error` (not expected in practice —
+/// these closures only perform fallible filesystem I/O, they don't panic).
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(join_error) => Err(io::Error::other(join_error)),
+    }
 }
 
 #[cfg(test)]
@@ -420,6 +467,126 @@ mod tests {
                 !name.to_string_lossy().ends_with(".tmp"),
                 "no staged temp file should linger, found {name:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn find_cert_for_domains_locates_the_configured_pair_and_ignores_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsAcmeStore::new(dir.path(), "production");
+        let configured = vec!["app.example.com".to_owned()];
+        let other = vec!["old.example.com".to_owned()];
+
+        store
+            .save_cert(
+                &CertId::from_domains(&other),
+                &StoredCert {
+                    chain_pem: "OLD-CHAIN".into(),
+                    key_pem: "OLD-KEY".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store.find_cert_for_domains(&configured).is_none(),
+            "a cert for different domains must not be reported as the configured one"
+        );
+
+        let id = CertId::from_domains(&configured);
+        store
+            .save_cert(
+                &id,
+                &StoredCert {
+                    chain_pem: "CHAIN".into(),
+                    key_pem: "KEY".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let (chain, key) = store
+            .find_cert_for_domains(&configured)
+            .expect("configured pair must be found");
+        assert_eq!(chain, store.chain_path(&id));
+        assert_eq!(key, store.key_path(&id));
+    }
+
+    #[tokio::test]
+    async fn find_cert_for_domains_treats_a_partial_pair_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsAcmeStore::new(dir.path(), "production");
+        let id = CertId::from_domains(&["app.example.com".into()]);
+        tokio::fs::create_dir_all(store.cert_dir()).await.unwrap();
+        tokio::fs::write(store.chain_path(&id), b"CHAIN")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .find_cert_for_domains(&["app.example.com".to_owned()])
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn find_cert_for_domains_is_absent_when_the_store_dir_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsAcmeStore::new(dir.path(), "production");
+        assert!(
+            store
+                .find_cert_for_domains(&["app.example.com".to_owned()])
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_certs_is_empty_when_the_store_dir_does_not_exist_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsAcmeStore::new(dir.path(), "production");
+        assert_eq!(store.list_certs().unwrap(), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn list_certs_enumerates_only_complete_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsAcmeStore::new(dir.path(), "production");
+
+        let a = CertId::from_domains(&["a.example.com".into()]);
+        let b = CertId::from_domains(&["b.example.com".into()]);
+        store
+            .save_cert(
+                &a,
+                &StoredCert {
+                    chain_pem: "A-CHAIN".into(),
+                    key_pem: "A-KEY".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .save_cert(
+                &b,
+                &StoredCert {
+                    chain_pem: "B-CHAIN".into(),
+                    key_pem: "B-KEY".into(),
+                },
+            )
+            .await
+            .unwrap();
+        // A partial pair alongside the two complete ones must be skipped.
+        let partial = CertId::from_domains(&["partial.example.com".into()]);
+        tokio::fs::write(store.chain_path(&partial), b"PARTIAL")
+            .await
+            .unwrap();
+
+        let mut listed = store.list_certs().unwrap();
+        listed.sort_by(|x, y| x.0.as_str().cmp(y.0.as_str()));
+        let mut expected = [a.clone(), b.clone()];
+        expected.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+
+        assert_eq!(listed.len(), 2, "the partial pair must not be listed");
+        for ((id, chain, key), expected_id) in listed.iter().zip(expected.iter()) {
+            assert_eq!(id, expected_id);
+            assert_eq!(*chain, store.chain_path(id));
+            assert_eq!(*key, store.key_path(id));
         }
     }
 
