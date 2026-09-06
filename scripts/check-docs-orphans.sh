@@ -159,9 +159,18 @@ node_set = set(nodes)
 # Pages that are neither entry surfaces nor things we assert on, but that a
 # reader can be routed THROUGH — a skill's `references/*.md`. They carry edges
 # only once something reachable links them.
+# Any tracked markdown that is neither an entry surface nor a page we assert on
+# can still sit in the middle of a clickable path: `README.md` links
+# `docs/release-checklist.md`, which links two guide pages. Restricting
+# traversal to a whitelist of directories drops those hops and would report a
+# guide reachable ONLY through such a hub as an orphan — a false positive, and
+# the "tax on writing docs" this gate's header warns against. Reachability, not
+# directory, decides: a hub carries edges only once something reaches it, so a
+# planning note or an incident report that nothing links still confers nothing.
+# History stays out regardless — it is a record, not a route.
 waypoints = {f for f in tracked
              if f.endswith('.md') and f not in roots and f not in node_set
-             and (f.startswith(ROOT_DIRS) or f.startswith('examples/'))}
+             and f not in HISTORY and not f.startswith(HISTORY)}
 traversable = node_set | waypoints
 
 
@@ -200,7 +209,7 @@ def ref_label(s):
 # A bare repo path. The leading guard keeps `…/docs/guide/x.md` inside a longer
 # path from matching at the wrong offset.
 BARE = re.compile(
-    r'(?<![\w/.-])((?:docs/guide|skills|agents|examples)/[A-Za-z0-9._/-]+\.md)')
+    r'(?<![\w/.-])((?:docs|skills|agents|examples)/[A-Za-z0-9._/-]+\.md)')
 
 
 def normalize(p):
@@ -504,6 +513,20 @@ self_test() {
     > "$c13b/skills/x/references/notes.md"
   git -C "$c13b" add -A && git -C "$c13b" commit -qm waypoint-unlinked
   check "an unlinked skill reference page does not confer reachability" fail "$c13b"
+
+  # An ordinary docs page can sit mid-path: README -> hub -> guide. Dropping
+  # that hop would report a reachable guide as an orphan.
+  local c9n="$tmp/c9n"; make_corpus "$c9n"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n- [Hub](docs/hub.md)\n' > "$c9n/README.md"
+  printf '# Hub\n\nSee [mail](guide/mail.md).\n' > "$c9n/docs/hub.md"
+  git -C "$c9n" add -A && git -C "$c9n" commit -qm hub-linked
+  check "an ordinary docs hub linked from a root routes onward" pass "$c9n"
+
+  # ...but only once something reaches it. An unlinked hub confers nothing.
+  local c9o="$tmp/c9o"; make_corpus "$c9o"
+  printf '# Hub\n\nSee [mail](guide/mail.md).\n' > "$c9o/docs/hub.md"
+  git -C "$c9o" add -A && git -C "$c9o" commit -qm hub-unlinked
+  check "an unlinked docs hub does not confer reachability" fail "$c9o"
 
   # An unterminated `<!--` comments out the rest of the file for Markdown, so
   # a missing `-->` must not leave the links after it counting as routes.
