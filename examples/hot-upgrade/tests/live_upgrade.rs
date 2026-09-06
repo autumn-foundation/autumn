@@ -366,6 +366,35 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
         // Nothing here is behind a load balancer, so the deregistration window
         // only slows the test's own teardown down.
         .env("AUTUMN_SERVER__PRESTOP_GRACE_SECS", "0")
+        // Pin the production drain budget, for the same reason the prestop
+        // grace above is pinned: the `dev` profile shortens
+        // `shutdown_timeout_secs` from the 30s default to 1s so Ctrl-C is snappy
+        // while developing, and this test asserts a *production* guarantee, so
+        // it should not inherit a dev-convenience timing knob.
+        //
+        // Without this the test is asking for something it has made impossible:
+        // the predecessor starts draining at the cutover, but the load loop
+        // below keeps driving traffic for another 3.5 seconds. A 1-second drain
+        // budget therefore expires while requests are still arriving, and
+        // whatever is in flight at that moment is aborted — `exit_code: 1`,
+        // failing the "drained and exited 0" assertion below. Nothing about the
+        // upgrade path is wrong when that happens; the budget is just shorter
+        // than the load window.
+        //
+        // Measured, because the intuitive story (a slow cutover) is not the
+        // real one: reproduced locally under CPU oversubscription with the
+        // cutover completing in 135 ms and the drain still aborting two
+        // requests. Contention only changes the odds that a request is in
+        // flight at the one-second mark. See issue #2372.
+        //
+        // This weakens nothing. `wait_for_exit` still caps the wait at 30s, so
+        // a predecessor that genuinely fails to drain still fails the
+        // assertion, and the connection guarantees below — `refused == 0`,
+        // `hard == 0`, and the `MAX_TOLERATED_RESETS` bound (#2510) — are
+        // untouched by it. Verified rather than assumed: under CPU
+        // oversubscription with this pin in place, the refusal/reset assertions
+        // still fired on their own, so the budget is not what was holding them.
+        .env("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "30")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .spawn()
