@@ -1766,6 +1766,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`autumn new`'s starter template shipped three cookie-consent routes that
+  failed `autumn routes audit` (issue #1214 follow-up):** the cookie-consent
+  banner feature added `POST /consent/accept`, `POST /consent/reject`, and
+  `GET /consent/manage` to `main.rs.tmpl`, but — unlike every other starter
+  handler — never marked them `#[public]`, so a fresh `autumn new` app failed
+  its own generated CI's routes-audit gate before a single line of app code
+  was written. Invisible until now: `scaffolded_app_passes_routes_audit_gate`
+  (added for #2154 specifically to catch this class of regression) was one of
+  the `cli_tests` tests #1945 revived — it had never run in CI before. Added
+  `#[public]` to all three handlers, matching the pattern documented right
+  above them in the template. [no-plugin] — restores previously-documented
+  behavior; no new or changed API.
+
 - **`route_macro` lost a guarded handler's OpenAPI response schema under
   `#[throttle]`/`#[step_up]` (issue #2516):** #2488 moved the
   `#[throttle]`/`#[step_up]` auth/rate-limit checks out of the handler body
