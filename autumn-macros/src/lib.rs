@@ -49,6 +49,7 @@ mod public;
 mod query_budget;
 #[cfg(feature = "db")]
 mod repository;
+mod request_gate;
 mod route;
 mod routes_macro;
 mod scheduled;
