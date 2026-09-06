@@ -294,7 +294,6 @@ LABEL_MAX_OPT = '{0,999}'
 # An IMAGE label is not empty — `[![alt](img.png)](page.md)` renders a
 # clickable image — and needs no exception, since the label text is not
 # blank.
-MD_LINK = re.compile(r'(?<![\\!])\[(' + FLAT + r'*)\]' + DEST)
 # A label may nest brackets to any depth, so long as they balance:
 # `[outer [middle [Mail]]](mail.md)` is a real link that renders
 # `outer [middle [Mail]]`. This stood at ONE level for most of this PR and was
@@ -304,15 +303,80 @@ MD_LINK = re.compile(r'(?<![\\!])\[(' + FLAT + r'*)\]' + DEST)
 # Bounded depth rather than true recursion, exactly as `_nested_parens` already
 # does for destinations — the pattern grows linearly per level, so this stays a
 # regular expression instead of becoming a scanner.
-def _nested_brackets(depth):
-    body = FLAT
-    for _ in range(depth):
-        body = r'(?:' + FLAT + r'|\[(?:' + body + r')*\])'
-    return body
+
+DEST_RE = re.compile(DEST)
+_BLANK_NEXT = re.compile(r'[ \t]*\n')
 
 
-MD_LINK_NESTED = re.compile(
-    r'(?<![\\!])\[((?:' + _nested_brackets(16) + r')*)\]' + DEST)
+def _label_end(txt, i):
+    """Index of the `]` matching the `[` at `i`, or None.
+
+    `FLAT` semantics, which is what the patterns used: a backslash escapes the
+    next character, and a BLANK LINE ends the paragraph and with it the label.
+    """
+    depth, j, n = 1, i + 1, len(txt)
+    while j < n:
+        c = txt[j]
+        if c == '\\':
+            j += 2
+            continue
+        if c == '\n' and _BLANK_NEXT.match(txt, j + 1):
+            return None
+        if c == '[':
+            depth += 1
+        elif c == ']':
+            depth -= 1
+            if not depth:
+                return j
+        j += 1
+    return None
+
+
+def _opens_label(txt, i):
+    """Whether the `[` at `i` opens a link label.
+
+    `\\[` is an escaped bracket and `![` opens an image; neither does. Same
+    guard as the patterns' lookbehind.
+    """
+    return not (i and txt[i - 1] in '\\!')
+
+
+def inline_links(txt):
+    """Every inline `[label](dest)`, with the label balanced to ANY depth.
+
+    A regular expression cannot count, so the nesting pattern was bounded —
+    first at one level, then at sixteen — and each bound was beaten by
+    bound+1. There is no bound to pick: cmark-gfm renders a link whose label
+    nests a THOUSAND deep, measured, so it has no limit of its own to match.
+    Counting is the only fix that ends the sequence.
+
+    Label semantics are `FLAT`'s, which is what the patterns used and what the
+    self-tests pin: a backslash escapes the next character, and a BLANK LINE
+    ends the paragraph and with it the label. Code spans are deliberately not
+    special here either — a `]` inside backticks closed the label before this
+    too, and changing that is a separate question from counting brackets.
+
+    Yields `(label_start, label_end, angle_dest, bare_dest)`, matching what
+    the patterns' groups 1, 2 and 3 gave the caller.
+    """
+    i, n = 0, len(txt)
+    while True:
+        i = txt.find('[', i)
+        if i == -1:
+            return
+        # `\[` is an escaped bracket and `![` opens an image; neither starts a
+        # link label. Same guard as the patterns' lookbehind.
+        if not _opens_label(txt, i):
+            i += 1
+            continue
+        j = _label_end(txt, i)
+        if j is not None:
+            m = DEST_RE.match(txt, j + 1)
+            if m:
+                yield i + 1, j, m.group(1), m.group(2)
+                i = m.end()
+                continue
+        i += 1
 # Markdown drops the backslash from an escaped ASCII punctuation character, so
 # `guide\(v2\).md` addresses the file `guide(v2).md` — same rule as the sibling.
 UNESCAPE = re.compile(r'\\([!-/:-@\[-`{-~])')
@@ -409,25 +473,61 @@ _LBL = FLAT  # see LABEL_MAX above: one label grammar, not two
 # ESCAPED bracket in `[a\\]b][]` and produced `a\\`, which matches no
 # definition — a link the reader can click, reported as an orphan.
 # The FIRST label is link TEXT and may nest balanced brackets, exactly as an
-# inline label may (see `_nested_brackets`). The SECOND is a reference LABEL,
-# which by CommonMark ends at the first unescaped `]` and so cannot nest — two
-# different grammars that happen to share a delimiter.
-REF_USE_FULL = re.compile(
-    r'(?<![\\!])\[((?:' + _nested_brackets(16) + r')*)\]'
-    r'\[(' + _LBL + LABEL_MAX_OPT + r')\]')
+# inline label may — see `full_references`, which scans rather than matches for
+# that reason. The SECOND is a reference LABEL, which by CommonMark ends at the
+# first unescaped `]` and so cannot nest — two grammars sharing a delimiter.
 REF_USE_SHORTCUT = re.compile(
     r'(?<![\\!])\[(' + _LBL + LABEL_MAX + r')\](?![\(\[:])')
-# Every full-reference span, image or not. Used to blank them before the
-# shortcut scan: in `![alt][mail]` the guard correctly stops REF_USE_FULL, but
-# the trailing `[mail]` then looks exactly like a standalone shortcut link, so
-# an image would resurrect the label the guard just rejected.
-# Nested first label here too, and this one is why it matters: when the blank
-# fails the trailing `[m]` of `[<span hidden>[x]</span>][m]` is left looking
-# like a standalone shortcut link, so a label the reader cannot see resurrects
-# as a route.
-REF_USE_ANY = re.compile(
-    r'\[(?:' + _nested_brackets(16) + r')*\]\[' + _LBL + LABEL_MAX_OPT
-    + r'\]')
+# `full_references(images=True)` blanks every full-reference span before the
+# shortcut scan: in `![alt][mail]` the image guard correctly rejects the link,
+# but the trailing `[mail]` then looks exactly like a standalone shortcut, so
+# an image would resurrect the label the guard just refused. The same applies
+# to a hidden nested label: when the blank misses, the `[m]` of
+# `[<span hidden>[x]</span>][m]` resurrects as a route the reader cannot see.
+
+# Placed HERE, not beside the other link scanners, because `REF_TAIL` is
+# built at import time from `_LBL` and `LABEL_MAX_OPT` above it. Defining it
+# earlier raised a NameError that failed every test at once — the third time
+# this file has been bitten by a pattern placed above what it is made of.
+
+REF_TAIL = re.compile(r'\[(' + _LBL + LABEL_MAX_OPT + r')\]')
+
+
+def full_references(txt, images=False):
+    """Every `[label][ref]`, with the FIRST label balanced to any depth.
+
+    The first label is link TEXT and nests; the second is a reference LABEL,
+    which by CommonMark ends at the first unescaped `]` and cannot. Two
+    grammars sharing a delimiter, so only the first is scanned.
+
+    `images` includes the `![alt][ref]` spelling, which the blanking pass
+    needs and the extraction pass must not have.
+
+    Yields `(start, end, label_start, label_end, ref)`.
+    """
+    i = 0
+    while True:
+        i = txt.find('[', i)
+        if i == -1:
+            return
+        start = i
+        if images and i and txt[i - 1] == '!':
+            start = i - 1
+        elif not _opens_label(txt, i):
+            i += 1
+            continue
+        j = _label_end(txt, i)
+        if j is None:
+            i += 1
+            continue
+        m = REF_TAIL.match(txt, j + 1)
+        if not m:
+            i += 1
+            continue
+        yield start, m.end(), i + 1, j, m.group(1)
+        i = m.end()
+
+
 # An image and its destination, in both spellings. Blanked before the bare-path
 # scan for the same reason the inline pattern guards against `!`: the path in
 # `![alt](docs/guide/x.md)` is a resource the page loads, never text on screen,
@@ -726,15 +826,23 @@ def strip_comments(txt):
        An unclosed `<!--` in such a block is then read as a real comment and
        truncates the rest of the page.
 
-    3. FIXED, and left here so the reasoning that kept it is on record. This
-       said link labels nest only one level, because "balanced nesting to
-       arbitrary depth is not expressible as a regular expression". True, and
-       beside the point: `_nested_parens` in this same file had already been
-       matching nested destinations for the whole PR by unrolling to a BOUNDED
-       depth, which is expressible and which grows the pattern linearly. Labels
-       now do the same at depth 16 (`_nested_brackets`), measured at no cost to
-       the corpus run. `check-docs-links.sh` still stops at one level, so it is
-       now the stricter of the two on this shape.
+    3. FIXED, TWICE, and left here because the way it was wrong each time is
+       worth more than the line it saved. It first said link labels nest only
+       one level, because "balanced nesting to arbitrary depth is not
+       expressible as a regular expression" — true, and beside the point, since
+       `_nested_parens` in this same file was already matching nested
+       DESTINATIONS by unrolling to a bounded depth. So labels were unrolled
+       the same way, to 16. That bound was then beaten by 17, which is the
+       thing a bound always invites: cmark-gfm has NO limit at all (measured, a
+       label nesting a thousand deep still renders), so there was never a
+       number to pick. Labels are now SCANNED (`inline_links`,
+       `full_references`), which counts and so has no bound.
+
+       Destinations are still unrolled at 32 parens and are beatable at 33 in
+       exactly the same way. Left as is deliberately: cmark itself caps
+       destination nesting at 32, so that bound matches the renderer instead of
+       merely hoping. `check-docs-links.sh` still stops at one level of label
+       nesting, so it is now the stricter of the two on this shape.
 
     4. Code spans are masked before comments are located, so a comment whose
        terminator sits inside backticks — `<!-- note ``-->`` -->` — has that
@@ -2277,8 +2385,8 @@ def edges_from(f):
     # A rendered link's DESTINATION is not on screen — the reader sees the
     # label. So `[search](https://example.test/?q=docs/guide/mail.md)` must not
     # feed the bare-path scan a path out of its query string; that destination
-    # is `MD_LINK`'s to resolve, and it resolves to an external URL. Prose only:
-    # the same text in a fence shows the path and still counts.
+    # is `inline_links`' to resolve, and it resolves to an external URL. Prose
+    # only: the same text in a fence shows the path and still counts.
     scan = blank_link_dests(txt)
     # An `href` value is not visible text either. It is spared from masking
     # so the anchor extractor can read it — and that extractor now REJECTS
@@ -2317,15 +2425,13 @@ def edges_from(f):
     md_txt = sub_in_prose(RAW_BLOCK, md_txt)
     md_txt = sub_in_prose(RAW_BLOCK_TYPE7, md_txt, only_at_block_start=True)
 
-    for pattern in (MD_LINK, MD_LINK_NESTED):
-        for m in pattern.finditer(md_txt):
-            # Offsets line up across both views because every masker replaces
-            # space for space.
-            if not has_content(img_view[m.start(1):m.end(1)],
-                               md_txt[m.start(1):m.end(1)],
-                               raw[m.start(1):m.end(1)]):
-                continue
-            add_relative(m.group(2) if m.group(2) is not None else m.group(3))
+    for lstart, lend, angle, bare in inline_links(md_txt):
+        # Offsets line up across both views because every masker replaces
+        # space for space.
+        if not has_content(img_view[lstart:lend], md_txt[lstart:lend],
+                           raw[lstart:lend]):
+            continue
+        add_relative(angle if angle is not None else bare)
 
     # Anchors read `txt`, NOT the raw-block-stripped view. A type-6 block
     # suppresses MARKDOWN inside it, but its raw HTML is passed through and
@@ -2427,7 +2533,7 @@ def edges_from(f):
     # `None` from `ref_label` means the label is over the character cap and is
     # no label at all; it must not join the used set, or an over-long
     # definition below would find a match for it.
-    for m in REF_USE_FULL.finditer(uses_txt):
+    for _s, _e, lstart, lend, inner in full_references(uses_txt):
         # `[label][]` (collapsed) leaves the SECOND label empty; the label is
         # then the first one, which the pattern captures rather than this
         # having to find where it ends.
@@ -2435,17 +2541,19 @@ def edges_from(f):
         # rendered content — the FIRST label — has to carry something. The
         # inline form and the raw anchor already required it; this was the
         # third spelling of the same link and the one left out.
-        if not has_content(img_view[m.start(1):m.end(1)],
-                           uses_txt[m.start(1):m.end(1)],
-                           raw[m.start(1):m.end(1)]):
+        if not has_content(img_view[lstart:lend], uses_txt[lstart:lend],
+                           raw[lstart:lend]):
             continue
-        inner = m.group(2)
-        lbl = ref_label(inner) if inner.strip() else ref_label(m.group(1))
+        lbl = (ref_label(inner) if inner.strip()
+               else ref_label(uses_txt[lstart:lend]))
         if lbl is not None:
             used.add(lbl)
     # Blank every full-reference span before looking for shortcuts, so the
     # `[mail]` tail of `![alt][mail]` is not re-read as a link of its own.
-    shortcut_txt = REF_USE_ANY.sub(lambda m: ' ' * len(m.group(0)), uses_txt)
+    shortcut_txt = uses_txt
+    for _s, _e, _ls, _le, _r in list(full_references(uses_txt, images=True)):
+        shortcut_txt = (shortcut_txt[:_s] + ' ' * (_e - _s)
+                        + shortcut_txt[_e:])
     # An inline span is blanked before the shortcut scan because links cannot
     # nest — but only when the OUTER link is the one that renders. CommonMark
     # resolves an inner shortcut at its `]` and deactivates the opener above
@@ -4839,6 +4947,20 @@ self_test() {
   printf '# Jobs\n\n[&#65;](mail.md)\n' > "$c9ks/docs/guide/jobs.md"
   git -C "$c9ks" add -A && git -C "$c9ks" commit -qm painting-entity-label
   check "an entity that paints is still a label" pass "$c9ks"
+
+  # No BOUND at all: the label is scanned, not matched, so depth 17 and 40 —
+  # each of which beat a previous bound — work like any other.
+  local c9ls="$tmp/c9ls"; make_corpus "$c9ls"
+  python3 -c "print('# Jobs\n\n[' + '['*17 + 'Mail' + ']'*17 + '](mail.md)')" \
+    > "$c9ls/docs/guide/jobs.md"
+  git -C "$c9ls" add -A && git -C "$c9ls" commit -qm label-depth-17
+  check "a label nested seventeen deep is a link" pass "$c9ls"
+
+  local c9lt="$tmp/c9lt"; make_corpus "$c9lt"
+  python3 -c "print('# Jobs\n\n[' + '['*40 + 'Mail' + ']'*40 + '][m]\n\n[m]: mail.md')" \
+    > "$c9lt/docs/guide/jobs.md"
+  git -C "$c9lt" add -A && git -C "$c9lt" commit -qm ref-label-depth-40
+  check "a reference label nested forty deep is a link" pass "$c9lt"
 
   # A label may nest brackets to any depth so long as they balance, and this
   # matched only one level for most of the PR.
