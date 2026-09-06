@@ -1580,7 +1580,9 @@ path = "/shop/panel"
             Err("the key/value backend is unreachable".to_owned())
         }
 
-        fn delete(&self, _key: &str) {}
+        fn delete(&self, _key: &str) -> Result<(), String> {
+            Err("the key/value backend is unreachable".to_owned())
+        }
     }
 
     #[test]
@@ -1613,6 +1615,85 @@ path = "/shop/panel"
                 }
             ),
             "an unreachable store must deny, not report an absent key: {result:?}"
+        );
+
+        // And a delete that did not happen must not read as `Done` either: a
+        // plugin releasing a lock would carry on over a value still there.
+        let result = runtime.dispatch(&CapabilityCall::KvDelete {
+            id: 2,
+            key: "cart".to_owned(),
+        });
+        assert!(
+            matches!(
+                result,
+                CallResult::Denied {
+                    id: 2,
+                    reason: DenialReason::BackendError,
+                    ..
+                }
+            ),
+            "an unreachable store must deny the delete too: {result:?}"
+        );
+    }
+
+    #[test]
+    fn an_overlong_outbound_method_is_refused_without_being_copied() {
+        // The method was `to_ascii_uppercase`d before anything decided it was
+        // a method, so a frame carrying a megabyte of "method" was copied for
+        // the fold and again for the denial — ahead of the check that refuses
+        // it, and outside `outbound_request_bytes`, which is measured later
+        // and does not count the method. The match is now allocation-free and
+        // length-first, so this is refused in constant time.
+        // A client has to be wired, or the call is refused as `Unavailable`
+        // before the method is looked at — which would have made this test pass
+        // for the wrong reason. It caught exactly that on its first run.
+        let manifest = manifest(&everything());
+        let http = RecordingHttp::new();
+        let mut runtime = CapabilityRuntime::new(
+            &manifest,
+            CapabilityServices {
+                http: Some(Arc::clone(&http) as Arc<dyn OutboundHttp>),
+                ..CapabilityServices::none()
+            }
+            .for_tenant("alpha"),
+        );
+
+        let result = runtime.dispatch(&CapabilityCall::HttpFetch {
+            id: 1,
+            method: "G".repeat(1024 * 1024),
+            url: "https://api.example.com/orders".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        });
+        assert!(
+            matches!(
+                result,
+                CallResult::Denied {
+                    id: 1,
+                    reason: DenialReason::Malformed,
+                    ..
+                }
+            ),
+            "an overlong method is not a method: {result:?}"
+        );
+
+        // And the match stays case-insensitive, which is what the fold was for.
+        let lowercase = runtime.dispatch(&CapabilityCall::HttpFetch {
+            id: 2,
+            method: "post".to_owned(),
+            url: "https://api.example.com/orders".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        });
+        assert!(
+            !matches!(
+                lowercase,
+                CallResult::Denied {
+                    reason: DenialReason::Malformed,
+                    ..
+                }
+            ),
+            "`post` must still be POST: {lowercase:?}"
         );
     }
 

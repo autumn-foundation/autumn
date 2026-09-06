@@ -58,7 +58,17 @@ pub trait KvStore: Send + Sync + 'static {
     /// no is one whose ceiling is the host's memory.
     fn set(&self, key: &str, value: PluginValue) -> Result<(), String>;
     /// Delete one already-namespaced key.
-    fn delete(&self, key: &str);
+    ///
+    /// Deleting a key that was not there is success, not failure: the
+    /// post-condition a caller wants is "this key is gone", and it holds.
+    ///
+    /// # Errors
+    ///
+    /// One line for the guest and the audit ledger when the delete did not
+    /// happen. Reporting an unreachable backend as `Done` is worse here than
+    /// for a read: a plugin releasing a lock or clearing state proceeds as
+    /// though it had, while the value it meant to remove is still readable.
+    fn delete(&self, key: &str) -> Result<(), String>;
 }
 
 /// Escape one namespace segment so the joined key parses back to exactly one
@@ -166,13 +176,16 @@ pub(super) fn perform(runtime: &CapabilityRuntime, call: &CapabilityCall, key: &
                 Err(detail) => CallResult::denied(id, DenialReason::BackendError, detail),
             }
         }
-        CapabilityCall::KvDelete { .. } => {
-            store.delete(&physical);
-            CallResult::Ok {
+        CapabilityCall::KvDelete { .. } => match store.delete(&physical) {
+            Ok(()) => CallResult::Ok {
                 id,
                 value: CallValue::Done,
-            }
-        }
+            },
+            // A delete that did not happen must not read as `Done`. A plugin
+            // releasing a lock or clearing state would carry on as though the
+            // value were gone while it is still there to be read.
+            Err(detail) => CallResult::denied(id, DenialReason::BackendError, detail),
+        },
         // `perform` is only reached from the KV arm of `CapabilityRuntime::perform`.
         _ => CallResult::denied(id, DenialReason::Malformed, "not a kv call"),
     }
@@ -360,14 +373,17 @@ impl KvStore for MemoryKvStore {
         Ok(())
     }
 
-    fn delete(&self, key: &str) {
-        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(removed) = entries.map.remove(key) {
-            // The total follows the map. A delete that freed bytes without
-            // saying so would ratchet the store shut over a long run.
-            let freed = Self::entry_weight(key, &removed);
-            entries.bytes = entries.bytes.saturating_sub(freed);
+    fn delete(&self, key: &str) -> Result<(), String> {
+        {
+            let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(removed) = entries.map.remove(key) {
+                // The total follows the map. A delete that freed bytes without
+                // saying so would ratchet the store shut over a long run.
+                let freed = Self::entry_weight(key, &removed);
+                entries.bytes = entries.bytes.saturating_sub(freed);
+            }
         }
+        Ok(())
     }
 }
 
@@ -423,8 +439,14 @@ impl KvStore for CacheKvStore {
         Ok(())
     }
 
-    fn delete(&self, key: &str) {
+    fn delete(&self, key: &str) -> Result<(), String> {
+        // `Ok` for the same reason `get` is: `Cache::invalidate` returns
+        // nothing, so a backend that refused the eviction and one that
+        // performed it are indistinguishable from here. Filed as finding 14 on
+        // #2523 along with the write and read halves — all three want the one
+        // acknowledged path on the shared `Cache` trait.
         self.0.invalidate(key);
+        Ok(())
     }
 }
 
@@ -497,7 +519,7 @@ mod tests {
             Ok(Some(PluginValue::Text("A-1".to_owned()))),
             "a value written through a serializing backend must read back"
         );
-        store.delete(&key);
+        let _ = store.delete(&key);
         assert_eq!(store.get(&key), Ok(None), "and delete must remove it");
     }
 
@@ -514,7 +536,9 @@ mod tests {
             Err("the key/value backend is unreachable".to_owned())
         }
 
-        fn delete(&self, _key: &str) {}
+        fn delete(&self, _key: &str) -> Result<(), String> {
+            Err("the key/value backend is unreachable".to_owned())
+        }
     }
 
     #[test]

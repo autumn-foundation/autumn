@@ -328,18 +328,29 @@ pub(super) fn perform(
         );
     };
 
-    let method = method.to_ascii_uppercase();
-    if !ALLOWED_OUTBOUND_METHODS.contains(&method.as_str()) {
+    // Matched without allocating, and without folding the guest's string
+    // first. `to_ascii_uppercase` built a second full copy of whatever arrived
+    // *before* anything decided it was a method at all, so a frame carrying a
+    // megabyte-long "method" was copied once for the case fold and once more
+    // for the denial — work done ahead of the check that refuses it, and not
+    // covered by `outbound_request_bytes`, which is measured later and does not
+    // count the method. `eq_ignore_ascii_case` compares lengths first, so an
+    // overlong method loses against `GET` in constant time.
+    let Some(method) = ALLOWED_OUTBOUND_METHODS
+        .iter()
+        .find(|allowed| allowed.eq_ignore_ascii_case(method))
+    else {
         return CallResult::denied(
             id,
             DenialReason::Malformed,
             format!(
-                "method {method:?} is not one of {allowed}",
-                method = super::super::manifest::rejected(&method),
+                "method {method} is not one of {allowed}",
+                method = super::super::manifest::rejected(method),
                 allowed = ALLOWED_OUTBOUND_METHODS.join(", ")
             ),
         );
-    }
+    };
+    let method = (*method).to_owned();
     if headers.len() > MAX_OUTBOUND_HEADERS {
         return CallResult::denied(
             id,
