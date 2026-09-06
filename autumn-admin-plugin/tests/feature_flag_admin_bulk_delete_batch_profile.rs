@@ -376,9 +376,9 @@ async fn feature_flag_admin_bulk_delete_batch_profile() {
     // trait-default loop this replaces would have produced (see
     // docs/reports/2026-09-06-ledger-feature-flag-admin-bulk-delete-batch/baseline/).
     assert_eq!(
-        delete_calls, expected_ids_len as i64,
-        "BASELINE (pre-fix): the trait default's per-id loop issues one \
-         delete statement per id submitted"
+        delete_calls, 1,
+        "the batched execute_action must issue exactly one delete statement \
+         for the whole bulk action, not one per id"
     );
 
     conn.transaction::<(), diesel::result::Error, _>(|conn| {
