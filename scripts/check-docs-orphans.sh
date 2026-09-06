@@ -41,8 +41,9 @@
 #     - NODES are `docs/guide/**/*.md`.
 #     - ROOTS are the surfaces a reader or agent ENTERS through: the root
 #       `README.md`, `EXAMPLES.md`, `CONTRIBUTING.md`, `STABILITY.md`,
-#       `docs/plugins.md`, each skill's `SKILL.md`, each top-level `agents/*.md`,
-#       and each `examples/*/README.md`.
+#       `docs/plugins.md`, each skill's `SKILL.md` (under `skills/` and under
+#       `.claude/skills/`, both of which the agent machinery loads by name),
+#       each top-level `agents/*.md`, and each `examples/*/README.md`.
 #     - WAYPOINTS are the other pages under `skills/` and `agents/` — a skill's
 #       `references/*.md`. They are NOT roots: they are ordinary pages their
 #       `SKILL.md` links to, so they carry edges only once something reaches
@@ -130,7 +131,14 @@ root = sys.argv[1]
 GUIDE = 'docs/guide/'
 ROOT_FILES = ('README.md', 'EXAMPLES.md', 'CONTRIBUTING.md', 'STABILITY.md',
               'docs/plugins.md')
-ROOT_DIRS = ('skills/', 'agents/')
+# `.claude/skills/` too: the agent machinery loads a `SKILL.md` there by name
+# exactly as it does one under `skills/`, so it is a surface an agent ENTERS
+# through, not one it is routed to. It was being treated as a waypoint, which
+# is inert — nothing links `.claude/`, so a guide indexed only from there would
+# have been reported as an orphan. `.claude/agents/` is listed for the same
+# reason though the repo has none today, because the omission of one member of
+# a family is how most of this file's bugs started.
+ROOT_DIRS = ('skills/', 'agents/', '.claude/skills/', '.claude/agents/')
 # History is a record, not a route. See the header.
 HISTORY = ('CHANGELOG.md', 'docs/releases/')
 
@@ -2898,6 +2906,25 @@ self_test() {
   printf '# Skill\n\nSee [mail](../../docs/guide/mail.md).\n' > "$c13/skills/x/SKILL.md"
   git -C "$c13" add -A && git -C "$c13" commit -qm skill-root
   check "a skill page is a root" pass "$c13"
+
+  # ...and so is one under `.claude/skills/`, which the agent machinery loads
+  # by name just the same. As a waypoint it was inert, since nothing links
+  # `.claude/`, so a guide indexed only from there read as an orphan.
+  local c13c="$tmp/c13c"; make_corpus "$c13c"
+  mkdir -p "$c13c/.claude/skills/x"
+  printf '# Skill\n\nSee [mail](../../../docs/guide/mail.md).\n' \
+    > "$c13c/.claude/skills/x/SKILL.md"
+  git -C "$c13c" add -A && git -C "$c13c" commit -qm claude-skill-root
+  check "a .claude skill page is a root" pass "$c13c"
+
+  # ...but only its SKILL.md. A reference page beside it is still a waypoint,
+  # so the new prefix did not turn the whole directory into entry surfaces.
+  local c13d="$tmp/c13d"; make_corpus "$c13d"
+  mkdir -p "$c13d/.claude/skills/x/references"
+  printf '# Notes\n\nSee [mail](../../../../docs/guide/mail.md).\n' \
+    > "$c13d/.claude/skills/x/references/notes.md"
+  git -C "$c13d" add -A && git -C "$c13d" commit -qm claude-skill-reference
+  check "a .claude skill reference page is not a root" fail "$c13d"
 
   # A skill's reference page is a waypoint: it routes readers onward, but only
   # once its SKILL.md links it.
