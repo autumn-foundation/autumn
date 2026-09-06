@@ -1182,6 +1182,21 @@ pub fn grade_database_url(
 /// migrations directory passes (there is nothing to check).
 #[must_use]
 pub fn grade_migrate_check(migrations_dir: &Path) -> PreflightCheck {
+    // Grade against the app's own backend (issue #1906): a SQLite app's
+    // migrations must be judged by SQLite's dialect, not Postgres's.
+    grade_migrate_check_for(
+        crate::generate::detect_backend(Path::new(".")),
+        migrations_dir,
+    )
+}
+
+/// [`grade_migrate_check`] against an explicit `backend`, so the grader is
+/// testable without a project on disk.
+#[must_use]
+pub fn grade_migrate_check_for(
+    backend: autumn_web::config::DatabaseBackend,
+    migrations_dir: &Path,
+) -> PreflightCheck {
     if !migrations_dir.exists() {
         return PreflightCheck::pass(
             "migrate_check",
@@ -1189,7 +1204,7 @@ pub fn grade_migrate_check(migrations_dir: &Path) -> PreflightCheck {
         );
     }
 
-    match crate::migrate::check_migrations_in_dir(migrations_dir) {
+    match crate::migrate::check_migrations_in_dir_for(backend, migrations_dir) {
         Ok(reports) => {
             let unsafe_names: Vec<&str> = reports
                 .iter()

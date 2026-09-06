@@ -30,6 +30,7 @@ mod nested;
 pub mod notifications;
 pub mod plugin;
 pub mod policy;
+pub mod prior_index;
 pub mod pwa;
 pub mod scaffold;
 mod scaffold_i18n;

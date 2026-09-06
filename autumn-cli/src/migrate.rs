@@ -840,7 +840,12 @@ fn print_findings(label: &str, name: &str, findings: &[safety::SafetyFinding]) {
 /// Prints a human-readable report to stderr and exits with code 1 if any
 /// unsafe or potentially-blocking operations are detected in either direction.
 fn run_safety_check(migrations_dir: &str) {
-    let reports = match check_migrations_in_dir(Path::new(migrations_dir)) {
+    // The app's own backend decides the dialect (issue #1906): a SQLite app must
+    // not be told to use `CREATE INDEX CONCURRENTLY`. `detect_backend` reads
+    // `autumn.toml`/`.env` best-effort and never aborts, so `check` stays the
+    // offline, URL-free preflight it is documented to be.
+    let backend = crate::generate::detect_backend(Path::new("."));
+    let reports = match check_migrations_in_dir_for(backend, Path::new(migrations_dir)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("\u{2717} Migration safety check failed: {e}");
@@ -899,7 +904,23 @@ fn rolling_deploy_blocked(reports: &[MigrationSafetyReport]) -> bool {
 ///
 /// Migration directories that have no `up.sql` are silently skipped.
 /// `down.sql` is optional — its findings are empty when the file is absent.
+#[cfg(test)]
 pub fn check_migrations_in_dir(dir: &Path) -> Result<Vec<MigrationSafetyReport>, String> {
+    check_migrations_in_dir_for(autumn_web::config::DatabaseBackend::Postgres, dir)
+}
+
+/// [`check_migrations_in_dir`] for a specific database `backend` (issue #1906).
+///
+/// The Postgres path is unchanged. On `SQLite` the SQL is classified against
+/// `SQLite`'s dialect ([`safety::classify_sql_for`]) and the
+/// `CREATE INDEX CONCURRENTLY` transaction opt-out check is skipped — `SQLite`
+/// has no `CONCURRENTLY`, so the classifier already reports the keyword itself
+/// as unsupported.
+pub fn check_migrations_in_dir_for(
+    backend: autumn_web::config::DatabaseBackend,
+    dir: &Path,
+) -> Result<Vec<MigrationSafetyReport>, String> {
+    let postgres = backend == autumn_web::config::DatabaseBackend::Postgres;
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
         .filter_map(std::result::Result::ok)
@@ -918,19 +939,23 @@ pub fn check_migrations_in_dir(dir: &Path) -> Result<Vec<MigrationSafetyReport>,
         }
         let up_sql = std::fs::read_to_string(&up_sql_path)
             .map_err(|e| format!("cannot read {}: {e}", up_sql_path.display()))?;
-        let mut up_findings = safety::classify_sql(&up_sql);
-        check_concurrent_index_transaction_opt_out(&up_sql, &entry.path(), &mut up_findings);
+        let mut up_findings = safety::classify_sql_for(backend, &up_sql);
+        if postgres {
+            check_concurrent_index_transaction_opt_out(&up_sql, &entry.path(), &mut up_findings);
+        }
 
         let down_sql_path = entry.path().join("down.sql");
         let down_findings = if down_sql_path.exists() {
             let down_sql = std::fs::read_to_string(&down_sql_path)
                 .map_err(|e| format!("cannot read {}: {e}", down_sql_path.display()))?;
-            let mut down_findings = safety::classify_sql(&down_sql);
-            check_concurrent_index_transaction_opt_out(
-                &down_sql,
-                &entry.path(),
-                &mut down_findings,
-            );
+            let mut down_findings = safety::classify_sql_for(backend, &down_sql);
+            if postgres {
+                check_concurrent_index_transaction_opt_out(
+                    &down_sql,
+                    &entry.path(),
+                    &mut down_findings,
+                );
+            }
             down_findings
         } else {
             Vec::new()
@@ -2272,6 +2297,58 @@ mod tests {
             }
             _ => panic!("expected Baseline"),
         }
+    }
+
+    // ── check_migrations_in_dir_for: SQLite dialect (#1906) ────────────────
+
+    /// A migration dir with the given `up.sql`.
+    fn migrations_dir_with_up(up: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("2026_01_01_000000_m");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("up.sql"), up).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn sqlite_dir_scan_does_not_flag_the_drop_index_before_drop_column() {
+        // The generated SQLite remove-column migration must pass the gate: its
+        // DROP INDEX is a precondition of the DROP COLUMN, not a risk.
+        let tmp = migrations_dir_with_up(
+            "DROP INDEX IF EXISTS idx_posts_title;\nALTER TABLE posts DROP COLUMN title;\n",
+        );
+        let reports =
+            check_migrations_in_dir_for(autumn_web::config::DatabaseBackend::Sqlite, tmp.path())
+                .unwrap();
+        let ops: Vec<&str> = reports[0].up.iter().map(|f| f.operation.as_str()).collect();
+        assert_eq!(ops, vec!["DROP COLUMN"], "got {ops:?}");
+    }
+
+    #[test]
+    fn sqlite_dir_scan_skips_the_concurrently_transaction_opt_out_check() {
+        // On SQLite the CONCURRENTLY keyword is itself unsupported; the
+        // Postgres-only `metadata.toml` opt-out finding must not also fire.
+        let tmp = migrations_dir_with_up("CREATE INDEX CONCURRENTLY i ON posts (title);\n");
+        let reports =
+            check_migrations_in_dir_for(autumn_web::config::DatabaseBackend::Sqlite, tmp.path())
+                .unwrap();
+        let ops: Vec<&str> = reports[0].up.iter().map(|f| f.operation.as_str()).collect();
+        assert_eq!(
+            ops,
+            vec!["CREATE INDEX CONCURRENTLY (unsupported on SQLite)"],
+            "got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn check_migrations_in_dir_still_classifies_as_postgres() {
+        let tmp = migrations_dir_with_up("DROP INDEX idx_posts_title;\n");
+        let bare = check_migrations_in_dir(tmp.path()).unwrap();
+        let explicit =
+            check_migrations_in_dir_for(autumn_web::config::DatabaseBackend::Postgres, tmp.path())
+                .unwrap();
+        assert_eq!(bare[0].up.len(), explicit[0].up.len());
+        assert_eq!(bare[0].up[0].operation, "DROP INDEX (non-concurrent)");
     }
 
     // ── check_migrations_in_dir ────────────────────────────────────────────

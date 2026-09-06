@@ -531,12 +531,22 @@ A few SQLite-specific mechanics apply when the generator emits migrations:
 - **Rollback drops indexes before columns.** On the SQLite rollback path the
   generator emits `DROP INDEX` before `DROP COLUMN`, since SQLite will not drop a
   column that an index still references.
-- **Known limitation — dropping a pre-existing indexed column.** A
-  `Remove…From…` migration that drops a column which was indexed by an *earlier*
-  migration can still fail on SQLite, because the generator has no knowledge of
-  the original table's indexes and so cannot emit the matching `DROP INDEX`
-  first. Drop the index in the same migration, or drop the column via a manual
-  table rebuild. Tracked under the SQLite migrations issue #1906.
+- **Pre-existing indexes are dropped too (#1906).** A `Remove…From…` migration
+  reads the project's earlier migrations and emits a `DROP INDEX IF EXISTS` for
+  every index still live on the table that names the removed column — including
+  composite, partial, expression and hand-named indexes the generator did not
+  create. `down.sql` re-creates them after re-adding the column. Indexes created
+  outside `migrations/` (by hand against the database) remain invisible: drop
+  those in the same migration, or rebuild the table.
+- **`autumn migrate check` speaks SQLite (#1906).** The safety classifier reads
+  the app's backend and applies SQLite's own rules. It never recommends
+  `CREATE INDEX CONCURRENTLY` (no such syntax), does not flag a plain
+  `DROP INDEX` (a cheap catalog edit, and a precondition of `DROP COLUMN`), and
+  reports statements SQLite rejects outright — `ALTER COLUMN`, `TRUNCATE`,
+  `ADD COLUMN` with `NOT NULL` and no default, inline `UNIQUE`/`PRIMARY KEY`, a
+  non-constant `ADD COLUMN` default, a `REFERENCES` column with a non-NULL
+  default, sequences, types, extensions, materialized views, `COMMENT ON`,
+  `GRANT`/`REVOKE` — at a new **`unsupported`** risk level that fails the gate.
 
 ---
 
