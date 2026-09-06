@@ -289,6 +289,14 @@ fn query_budget_compile_fail_tests() {
     // The same N+1, against the real generated repository surface.
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/query_budget_repository_n_plus_one.rs");
+    // Prospect assay (ledger, 2026-09-06): the accessor-tracking path
+    // (`state.db()`) that a `#[job]`/`#[scheduled]` handler is structurally
+    // limited to, since neither macro's signature can name a typed
+    // `Db`/`…Repository` parameter the way a route handler does. Both catch
+    // the N+1 with no code change to the analysis — see the report for the
+    // full assay.
+    t.compile_fail("tests/compile-fail/query_budget_accessor_handle_n_plus_one.rs");
+    t.compile_fail("tests/compile-fail/query_budget_job_shaped_accessor_n_plus_one.rs");
 }
 
 /// Every `#[agent_operable]` / `authority_grant!` compile-fail fixture, with
@@ -443,6 +451,10 @@ fn compile_pass_tests() {
     t.pass("tests/compile-pass/query_budget_valid.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/query_budget_route.rs");
+    // Prospect assay control (ledger, 2026-09-06): the job-shaped accessor
+    // pattern batched ahead of the loop compiles clean — the analysis is
+    // actually counting, not just always rejecting the job/scheduled shape.
+    t.pass("tests/compile-pass/query_budget_job_shaped_accessor_batched.rs");
 
     // Maud + form/json handlers (require maud feature)
     #[cfg(feature = "maud")]
