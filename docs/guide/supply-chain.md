@@ -351,13 +351,25 @@ included, not just what your `Cargo.toml` names — and matches it against the
 `unmaintained` and `unsound` advisories fail too (narrow those in `deny.toml`
 if you would rather triage them separately), and a yanked crate warns.
 
-Run exactly what CI runs, locally — or `autumn doctor`, which runs the same
-policy and reports the same verdict:
+Run it locally. CI derives its check list from the sections `deny.toml`
+declares, so the exact command depends on your policy — `autumn doctor` does
+that derivation for you and reports the same verdict:
 
 ```bash
 cargo install --locked cargo-deny   # once
+autumn doctor                       # derives the checks, as CI does
+```
+
+To drive cargo-deny yourself, pass the sections your policy declares. For the
+shipped policy, which declares only `[advisories]`, that is:
+
+```bash
 cargo deny check advisories
 ```
+
+Uncomment `[licenses]` and the CI command becomes `cargo deny check advisories
+licenses`; a bare `cargo deny check advisories` would then pass locally on a
+tree CI rejects.
 
 ### Reading a failure
 
