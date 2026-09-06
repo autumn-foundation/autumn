@@ -326,11 +326,20 @@ pub(super) async fn ensure_schema(pool: &SqlitePool) -> AutumnResult<()> {
             })?;
     }
     // A table an earlier build of this runtime created has no `unique_ttl_ms`.
-    // SQLite has no `ADD COLUMN IF NOT EXISTS`, and a duplicate column is the
-    // ordinary "already migrated" case, so the error is the check.
-    let _ = diesel::sql_query("ALTER TABLE autumn_jobs ADD COLUMN unique_ttl_ms BIGINT")
+    // SQLite has no `ADD COLUMN IF NOT EXISTS`, so the error is the check — but
+    // only the duplicate-column error means "already migrated". Anything else
+    // (writer contention, for one) must propagate, or the schema cell would be
+    // marked ready with the column still missing and every enqueue would fail
+    // until the process restarted.
+    if let Err(error) = diesel::sql_query("ALTER TABLE autumn_jobs ADD COLUMN unique_ttl_ms BIGINT")
         .execute(&mut *conn)
-        .await;
+        .await
+        && !error.to_string().contains("duplicate column name")
+    {
+        return Err(AutumnError::internal_server_error_msg(format!(
+            "sqlite jobs schema setup failed: {error}"
+        )));
+    }
     Ok(())
 }
 

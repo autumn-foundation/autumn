@@ -474,7 +474,17 @@ pub struct SqliteJobTrackingStore {
 struct SqliteTrackingRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     record: String,
+    /// The value the compare-and-swap in `try_update_once` writes against.
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    updated_at: i64,
 }
+
+/// How many times a tracked-job update re-reads after losing its swap.
+///
+/// Only overlapping attempts of one job contend, so a couple of rounds is
+/// plenty; the bound is what keeps a pathological loop finite.
+#[cfg(feature = "sqlite")]
+const CAS_RETRIES: usize = 5;
 
 #[cfg(feature = "sqlite")]
 impl SqliteJobTrackingStore {
@@ -549,8 +559,44 @@ impl SqliteJobTrackingStore {
         Ok(conn)
     }
 
-    /// Read-modify-write. A no-op if the key is unknown or expired.
-    async fn update(&self, key: &str, f: impl FnOnce(&mut TrackedJobRecord)) -> AutumnResult<()> {
+    /// Read-modify-write under a compare-and-swap. A no-op if the key is
+    /// unknown or expired.
+    ///
+    /// Delivery is at-least-once, so two attempts of one job can overlap after
+    /// a visibility timeout. Without the swap the older attempt could read a
+    /// running record, the newer one write `succeeded`, and the older one's
+    /// blind `UPDATE` put `running` back — leaving a finished job reporting as
+    /// running forever. `SQLite` serializes the writes but not the `SELECT`
+    /// before them, so the guard has to be in the statement.
+    ///
+    /// A lost swap re-reads and reapplies rather than dropping the write: the
+    /// mutation may be a `complete`, which must not be lost. Reapplying is safe
+    /// because the `apply_*` helpers refuse to move a record that has already
+    /// settled — so the loser of a race observes the winner's terminal state
+    /// and leaves it alone. `f` is therefore `Fn`, not `FnOnce`.
+    async fn update(
+        &self,
+        key: &str,
+        f: impl Fn(&mut TrackedJobRecord) + Send + Sync,
+    ) -> AutumnResult<()> {
+        for _ in 0..CAS_RETRIES {
+            if self.try_update_once(key, &f).await? {
+                return Ok(());
+            }
+        }
+        tracing::warn!(
+            "job tracking update lost its compare-and-swap {CAS_RETRIES} times; giving up"
+        );
+        Ok(())
+    }
+
+    /// One read-modify-write attempt. Returns whether the swap landed.
+    async fn try_update_once(
+        &self,
+        key: &str,
+        // `&F` crosses an await, so `F` has to be `Sync` as well as `Send`.
+        f: &(impl Fn(&mut TrackedJobRecord) + Send + Sync),
+    ) -> AutumnResult<bool> {
         use diesel::OptionalExtension as _;
         use diesel_async::RunQueryDsl as _;
 
@@ -562,7 +608,8 @@ impl SqliteJobTrackingStore {
         let now_ms = now.timestamp_millis();
         let mut conn = self.conn().await?;
         let row = diesel::sql_query(
-            "SELECT record FROM autumn_job_tracking WHERE key = ? AND expires_at > ?",
+            "SELECT record, updated_at FROM autumn_job_tracking \
+             WHERE key = ? AND expires_at > ?",
         )
         .bind::<diesel::sql_types::Text, _>(key)
         .bind::<diesel::sql_types::BigInt, _>(now_ms)
@@ -573,8 +620,9 @@ impl SqliteJobTrackingStore {
             AutumnError::internal_server_error_msg(format!("job tracking select failed: {error}"))
         })?;
 
+        // Nothing to update, and nothing to retry.
         let Some(row) = row else {
-            return Ok(());
+            return Ok(true);
         };
         let mut record =
             serde_json::from_str::<TrackedJobRecord>(&row.record).map_err(|error| {
@@ -590,20 +638,23 @@ impl SqliteJobTrackingStore {
             ))
         })?;
 
-        diesel::sql_query(
+        // `updated_at = ?` is the swap: it matches only while no one else has
+        // written since the row above was read.
+        let written = diesel::sql_query(
             "UPDATE autumn_job_tracking SET record = ?, updated_at = ?, expires_at = ? \
-             WHERE key = ?",
+             WHERE key = ? AND updated_at = ?",
         )
         .bind::<diesel::sql_types::Text, _>(&payload)
         .bind::<diesel::sql_types::BigInt, _>(now_ms)
         .bind::<diesel::sql_types::BigInt, _>(self.expires_at_ms(now_ms))
         .bind::<diesel::sql_types::Text, _>(key)
+        .bind::<diesel::sql_types::BigInt, _>(row.updated_at)
         .execute(&mut *conn)
         .await
         .map_err(|error| {
             AutumnError::internal_server_error_msg(format!("job tracking update failed: {error}"))
         })?;
-        Ok(())
+        Ok(written > 0)
     }
 
     /// Serialize a fresh pending record for `owner`, stamped `now`.
@@ -673,20 +724,25 @@ impl JobTrackingStore for SqliteJobTrackingStore {
     ) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
             let pct = pct.min(100);
-            self.update(key, |record| apply_set_progress(record, pct, message))
-                .await
+            self.update(key, |record| {
+                apply_set_progress(record, pct, message.clone());
+            })
+            .await
         })
     }
 
     fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
-            self.update(key, |record| apply_complete(record, result))
+            self.update(key, |record| apply_complete(record, result.clone()))
                 .await
         })
     }
 
     fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move { self.update(key, |record| apply_fail(record, error)).await })
+        Box::pin(async move {
+            self.update(key, |record| apply_fail(record, error.clone()))
+                .await
+        })
     }
 
     fn reset_for_retry<'a>(
@@ -733,7 +789,8 @@ impl JobTrackingStore for SqliteJobTrackingStore {
             let now_ms = self.now_ms();
             let mut conn = self.conn().await?;
             let row = diesel::sql_query(
-                "SELECT record FROM autumn_job_tracking WHERE key = ? AND expires_at > ?",
+                "SELECT record, updated_at FROM autumn_job_tracking \
+                 WHERE key = ? AND expires_at > ?",
             )
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::BigInt, _>(now_ms)
@@ -1659,20 +1716,25 @@ impl JobTrackingStore for RedisJobTrackingStore {
     ) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
             let pct = pct.min(100);
-            self.update(key, |record| apply_set_progress(record, pct, message))
-                .await
+            self.update(key, |record| {
+                apply_set_progress(record, pct, message.clone());
+            })
+            .await
         })
     }
 
     fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
-            self.update(key, |record| apply_complete(record, result))
+            self.update(key, |record| apply_complete(record, result.clone()))
                 .await
         })
     }
 
     fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move { self.update(key, |record| apply_fail(record, error)).await })
+        Box::pin(async move {
+            self.update(key, |record| apply_fail(record, error.clone()))
+                .await
+        })
     }
 
     fn reset_for_retry<'a>(
@@ -1901,20 +1963,25 @@ impl JobTrackingStore for PgJobTrackingStore {
     ) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
             let pct = pct.min(100);
-            self.update(key, |record| apply_set_progress(record, pct, message))
-                .await
+            self.update(key, |record| {
+                apply_set_progress(record, pct, message.clone());
+            })
+            .await
         })
     }
 
     fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
-            self.update(key, |record| apply_complete(record, result))
+            self.update(key, |record| apply_complete(record, result.clone()))
                 .await
         })
     }
 
     fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move { self.update(key, |record| apply_fail(record, error)).await })
+        Box::pin(async move {
+            self.update(key, |record| apply_fail(record, error.clone()))
+                .await
+        })
     }
 
     fn reset_for_retry<'a>(

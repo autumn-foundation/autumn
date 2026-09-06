@@ -762,6 +762,16 @@ mod sqlite_impl {
     /// only bounds how long a *dead* holder's lock stays taken.
     pub(super) const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 
+    /// Floor on the effective lease duration.
+    ///
+    /// A zero TTL would write `expires_at == now`, which the reap predicate
+    /// (`expires_at <= now`) treats as already dead — so the next contender
+    /// takes the lock while the first holder is still in its critical section,
+    /// and renewal cannot intervene because it only runs after a sleep. Clamp
+    /// rather than reject: the setter is a `const fn` a caller may reach
+    /// through a computed duration.
+    const MIN_LEASE_TTL: Duration = Duration::from_secs(1);
+
     /// How often a held lock renews its lease, as a fraction of the TTL.
     const RENEW_DIVISOR: u32 = 3;
 
@@ -872,10 +882,12 @@ mod sqlite_impl {
             self
         }
 
-        /// Override the lease duration (default 30s).
+        /// Override the lease duration (default 30s, floor 1s).
         ///
         /// Only bounds how long a lock a *dead* holder took stays taken: a live
-        /// holder renews every third of this interval.
+        /// holder renews every third of this interval. A value below the floor
+        /// is clamped, because a lease that expires the instant it is written
+        /// would let a second holder in while the first is still running.
         #[must_use]
         pub const fn with_lease_ttl(mut self, ttl: Duration) -> Self {
             self.lease_ttl = ttl;
@@ -934,7 +946,8 @@ mod sqlite_impl {
                 .map_err(|error| LockError::Database(error.to_string()))?;
 
             let owner = next_owner();
-            let ttl_ms = i64::try_from(self.lease_ttl.as_millis()).unwrap_or(i64::MAX);
+            let lease_ttl = self.lease_ttl.max(MIN_LEASE_TTL);
+            let ttl_ms = i64::try_from(lease_ttl.as_millis()).unwrap_or(i64::MAX);
             let inserted = diesel::sql_query(
                 "INSERT INTO autumn_locks (lock_key, lock_name, owner, acquired_at, expires_at) \
                  VALUES (?, ?, ?, ?, ?) \
@@ -959,7 +972,7 @@ mod sqlite_impl {
                 self.key,
                 self.name.clone(),
                 owner,
-                self.lease_ttl,
+                lease_ttl,
             )))
         }
 
